@@ -144,7 +144,7 @@ func main() {
 	key := flag.String("key", "", "a virtual key granted to the agent")
 	nogrant := flag.String("nogrant", "", "a virtual key without the agent's grant")
 	push := flag.String("push", "", "the push callback URL")
-	precard := flag.Bool("precard", false, "one call, made before the agent's card is fetched: its status and message only")
+	precard := flag.Bool("precard", false, "one call, made before any refresh-card: its status and message only")
 	flag.Parse()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -152,7 +152,7 @@ func main() {
 	authority := *agent + "." + *domain
 
 	if *precard {
-		// the card is not fetched yet: the gate refuses the call as UNAVAILABLE with the card's message
+		// no refresh-card was made: the gateway fetches the card itself and the agent answers for the unknown task
 		cn := dial(*addr, authority)
 		defer cn.Close()
 		_, err := a2apb.NewA2AServiceClient(cn).GetTask(stubCtx(ctx, *key), &a2apb.GetTaskRequest{Id: "precard-task"})

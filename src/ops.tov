@@ -42,12 +42,15 @@ import * as alerts from "./alerts"
 import { ExposedTool, SessionStore, handleMcp, rpcError, sseStream, SSE_HEARTBEAT_MS } from "./mcpserver"
 import { isMetaTool, metaToolDefs } from "./codemode"
 import { relay } from "./passthrough"
-import { upstreamBinding, grpcSend } from "./a2agrpcup"
+import { grpcSend, upstreamCandidates, attemptVerdict, Candidate, Demotions } from "./a2agrpcup"
+import { versionSupported, paramsTo, resultTo, rpcAnswerTo } from "./a2aver"
+import { checkExtensions, allowedExtensions } from "./a2aext"
+import { agentQuery, selectedCalls, pageOf, agentStatsJson, topAgentsJson, agentHistogramJson, agentFilterDataJson, agentDetailJson, rawCapture, deleteIds } from "./agenthistory"
 import { H2Tls } from "./h2"
-import { findAgent, grantAllows, endpointOf, restEndpointOf, gatewayCard, withGrpcInterface, publicBase, aggregateCard, contextOfParams, contextOfResult, refreshAll, withCard, CARD_PATH, JSON_RPC_SUFFIX, REST_PREFIX } from "./agents"
-import { Call, PushSpec, rpcCall, restCall, restRequestOf, methodOf, rpcIdOf, rpcErrorBody, rpcEvent, restEvent, restErrorBody, restErrorOfStatus, httpOfCode, codeOfRestError, relayMapped, interfacesOf, pushSpecOf, pushUpstreamParams, pushViewJson, pushListJson, pushIdOfResult, embeddedPush, rewriteEmbedded, taskIdOfResult } from "./a2a"
+import { findAgent, endpointOf, restEndpointOf, gatewayCard, withGrpcInterface, publicBase, aggregateCard, contextOfParams, contextOfResult, refreshAll, withCard, fetchCard, CARD_PATH, JSON_RPC_SUFFIX, REST_PREFIX } from "./agents"
+import { Call, PushSpec, CallCancel, StreamTap, tapped, rpcCall, restCall, restRequestOf, methodOf, rpcIdOf, rpcErrorBody, rpcEvent, restEvent, restErrorBody, restErrorOfStatus, httpOfCode, codeOfRestError, relayMapped, pushSpecOf, pushUpstreamParams, pushViewJson, pushListJson, pushIdOfResult, embeddedPush, rewriteEmbedded, taskIdOfResult } from "./a2a"
 import { PushDelivery, pushStore, mintToken, acceptPush, callbackProblem, deliverDue, configView, PENDING_PREFIX, INGRESS_SUFFIX, TOKEN_HEADER } from "./a2apush"
-import { pushShare, cardShare, cardOf, adoptCard, takePeriod, CARD_NS } from "./a2ashare"
+import { pushShare, cardShare, cardOf, adoptCard, takePeriod, CardWire, CARD_NS } from "./a2ashare"
 import { FileLease } from "./filelease"
 import { upstreamHeaders, tlsOf, withAcceptedCredential } from "./agentauth"
 import { tempTokenAllows, USER_HEADER, markUser, flowIdOfPath, userFlowById } from "./mcpuser"
@@ -247,13 +250,38 @@ function json(status: int, body: string): Response {
 
 // The headers of a call that do not go on to the agent: the connection's own, cookies, and the gateway's
 // credentials (the virtual key the caller logged in with is dropped by name where it came in).
-const A2A_NOT_FORWARDED: string[] = ["host", "content-length", "content-type", "content-encoding", "accept", "accept-encoding", "connection", "keep-alive", "proxy-connection", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "cookie", "x-bf-vk", "x-bf-agent-vk-id", "x-bf-agent-auth"]
+// A2A-Version is the gateway's own to send: each interface is called in the version it speaks.
+const A2A_NOT_FORWARDED: string[] = ["host", "content-length", "content-type", "content-encoding", "accept", "accept-encoding", "connection", "keep-alive", "proxy-connection", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "cookie", "x-bf-vk", "x-bf-agent-vk-id", "x-bf-agent-auth", "a2a-version"]
+
+// The largest raw body a call's log row keeps, each way (Bifrost's capture bound).
+const RAW_LIMIT: int = 1048576
 
 // What the agent answered to one call. rpc says which binding it answered in; error is set when no answer came.
-type Fwd = { status: int, text: string, ct: string, stream: ReadableStream | undefined, rpc: bool, error: string }
+// binding is the interface's binding (JSONRPC, HTTP+JSON, GRPC), method the HTTP method, grpc the gRPC status (-1 for
+// none); rawReq and rawResp are the bytes sent and received as text (tap gathers a stream's), for the log row.
+type Fwd = { status: int, text: string, ct: string, stream: ReadableStream | undefined, rpc: bool, error: string, binding: string, method: string, grpc: int, rawReq: string, rawResp: string, tap: StreamTap | undefined }
 
 function fwdFail(message: string): Fwd {
-  return { status: 0, text: "", ct: "", stream: undefined, rpc: true, error: message }
+  return { status: 0, text: "", ct: "", stream: undefined, rpc: true, error: message, binding: "", method: "POST", grpc: -1, rawReq: "", rawResp: "", tap: undefined }
+}
+
+// An answer in the caller's version (a2aver.tov): a JSON-RPC answer's result, a REST answer's body, or each event of a
+// stream.
+function translatedFwd(f: Fwd, op: string, toV03: bool): Fwd {
+  let stream = f.stream
+  let text = f.text
+  const st = f.stream
+  if (st !== undefined) stream = f.rpc ? relayMapped(st, (d: string): string => rpcAnswerTo(op, d, toV03)) : relayMapped(st, (d: string): string => resultTo(op, d, toV03))
+  else if (f.rpc) text = rpcAnswerTo(op, f.text, toV03)
+  else if (f.status >= 200 && f.status < 300 && f.text.trim() !== "") text = resultTo(op, f.text, toV03)
+  return { status: f.status, text: text, ct: f.ct, stream: stream, rpc: f.rpc, error: f.error, binding: f.binding, method: f.method, grpc: f.grpc, rawReq: f.rawReq, rawResp: f.rawResp, tap: f.tap }
+}
+
+// The binding's name in the call log (Bifrost's transports).
+function transportOf(binding: string): string {
+  if (binding === "rest") return "HTTP+JSON"
+  if (binding === "grpc") return "GRPC"
+  return "JSONRPC"
 }
 
 // A unary answer in the one shape both bindings use: failed, with the error's code and message, or the result.
@@ -337,8 +365,11 @@ function a2aCardResponse(body: string, h: Hdrs): Response {
   return new Response(body, { status: 200, headers: hs })
 }
 
-// One A2A call that reached an agent (Ops.recordA2a).
-type A2aCall = { agent: string, method: string, status: int, latencyMs: f64, context: string, vk: string | undefined, error: string }
+// One A2A call that reached an agent (Ops.recordA2a). task is the A2A task it named or made; down and up the caller's
+// binding and the agent's; rawReq and rawResp the bytes sent and received (kept when
+// client.a2a_store_raw_request_response is on); input and output the request params and the result (kept unless
+// content logging is off for the caller).
+type A2aCall = { agent: string, method: string, status: int, latencyMs: f64, context: string, vk: string | undefined, error: string, task?: string, down?: string, up?: string, rawReq?: string, rawResp?: string, input?: string, output?: string }
 
 // Whether an agent's answer is a JSON-RPC error object (false for a body that is not JSON).
 function rpcFailed(text: string): bool {
@@ -908,6 +939,10 @@ export class Ops {
   // last fetched again because its endpoint answered as if it had moved
   cardRefreshOn = false
   cardRefreshAt: Map<string, f64> = new Map()
+  // when a card fetched on demand last failed, by agent (not asked for again for 5 s)
+  cardMissAt: Map<string, f64> = new Map()
+  // the interfaces that failed each agent's calls, tried last (a2agrpcup.tov Demotions)
+  a2aDemoted = new Demotions()
   // when each management API key was last used, by name, as this worker saw it (apikeys.tov)
   private keyUsed: Map<string, string> = new Map()
   // model parameters (GET /api/models/parameters), loaded when first asked and then daily
@@ -2782,11 +2817,25 @@ export class Ops {
     f.agentSessions = agentSessionsOf(scopedView(store, sc, f.since - 1.0), names, f.since, f.until)
   }
 
-  // One A2A call that reached an agent, as a log entry of kind "a2a" under the agent's name.
+  // One A2A call that reached an agent, as a log entry of kind "a2a" under the agent's name, attributed as the caller's
+  // key is (its team, customer and user).
   recordA2a(c: A2aCall): void {
     const store = this.engine.logStore
     if (store === undefined) return
     const now = Date.now()
+    let team: string | undefined = undefined
+    let customer: string | undefined = undefined
+    let user: string | undefined = undefined
+    const kid = c.vk
+    if (kid !== undefined) {
+      for (const k of this.engine.cfg.governance?.virtual_keys ?? []) {
+        if (k.id !== kid) continue
+        team = k.team_id
+        customer = k.customer_id
+        user = k.user_id
+      }
+    }
+    const opt = (v: string | undefined): string | undefined => (v === undefined || v === "" ? undefined : v)
     store.add({
       id: "a2a-" + now + "-" + Math.floor(Math.random() * 1000000000),
       ts: now,
@@ -2801,30 +2850,106 @@ export class Ops {
       cost: 0.0,
       cache_hit: false,
       virtual_key: c.vk,
+      team_id: team,
+      customer_id: customer,
+      user_id: user,
       session_id: c.context === "" ? undefined : c.context,
       error: c.error === "" ? undefined : c.error,
       kind: "a2a",
       agent_name: c.agent,
+      task_id: opt(c.task),
+      downstream_transport: opt(c.down),
+      upstream_transport: opt(c.up),
+      raw_request: rawCapture(c.rawReq ?? ""),
+      raw_response: rawCapture(c.rawResp ?? ""),
+      input: opt(c.input),
+      output: opt(c.output),
     })
   }
 
-  // GET /api/agents/history: the A2A calls the caller's scope sees, newest first (agent_names, limit, offset).
-  agentHistoryRoute(sp: URLSearchParams, sc: DataScope): Reply {
-    const names = listNames(sp.get("agent_names") ?? "")
-    const pg = pageOfQuery(sp, 50, 1000)
-    if (pg.error !== "") return badRequest(pg.error)
-    const store = this.engine.logStore
-    if (store === undefined) return okJson(`{"history":[],"total":0}`)
-    const hits: string[] = []
-    const es = scopedView(store, sc, 0.0)
-    for (let i = es.length - 1; i >= 0; i--) {
-      const e = es[i]!
-      if (kindOf(e) !== "a2a") continue
-      if (names.length > 0 && !names.includes(e.agent_name ?? "")) continue
-      hits.push(a2aLogJson(e))
+  // The names the A2A history shows for the ids its calls carry, from the governance config ("" when unknown). A user is
+  // known by name.
+  historyName(dim: string, id: string): string {
+    if (dim === "users") return id
+    const g = this.engine.cfg.governance
+    if (g === undefined) return ""
+    if (dim === "virtual_keys") {
+      for (const k of g.virtual_keys ?? []) {
+        if (k.id === id) return k.name ?? k.id
+      }
+    } else if (dim === "teams") {
+      for (const t of g.teams ?? []) {
+        if (t.id === id) return t.name
+      }
+    } else if (dim === "customers") {
+      for (const t of g.customers ?? []) {
+        if (t.id === id) return t.name
+      }
+    } else if (dim === "business_units") {
+      for (const t of g.business_units ?? []) {
+        if (t.id === id) return t.name
+      }
+    } else if (dim === "projects") {
+      for (const t of g.projects ?? []) {
+        if (t.id === id) return t.name
+      }
     }
-    const rows = hits.slice(pg.page.offset, pg.page.offset + pg.page.limit)
-    return okJson(`{"history":[${rows.join(",")}],"total":${hits.length}}`)
+    return ""
+  }
+
+  // /api/agents/history and its routes (agenthistory.tov), over the A2A calls the caller's data scope sees: GET lists them
+  // newest first ({history, total}, Bifrost's filters and Raiju's agent_names), DELETE removes the ones a body's ids name,
+  // and stats, histogram, top-agents, filterdata and {id} answer in Bifrost's shapes.
+  agentHistoryRoute(method: string, path: string, sp: URLSearchParams, body: string, sc: DataScope): Reply {
+    const segs = path.split("?")[0]!.split("/").filter((x) => x !== "")
+    const store = this.engine.logStore
+    const json503: Reply = { status: 503, body: errorJson("logs store is not available", "api_error", undefined), contentType: "application/json" }
+    if (segs.length === 3) {
+      if (method === "DELETE") {
+        if (store === undefined) return json503
+        const d = deleteIds(body)
+        if (d.error !== "") return badRequest(d.error)
+        const doomed: string[] = []
+        for (const e of scopedView(store, sc, 0.0)) {
+          if (kindOf(e) === "a2a" && d.ids.includes(e.id)) doomed.push(e.id)
+        }
+        store.delete(doomed)
+        return okJson(`{"message":"Agent logs deleted successfully"}`)
+      }
+      if (method !== "GET") return { status: 405, body: errorJson("use GET or DELETE", "invalid_request_error", undefined), contentType: "application/json" }
+      const q = agentQuery(sp)
+      if (q.error !== "") return badRequest(q.error)
+      if (store === undefined) return okJson(`{"history":[],"total":0}`)
+      const calls = selectedCalls(scopedView(store, sc, 0.0), q.filter)
+      const rows: string[] = []
+      for (const e of pageOf(calls, q.page)) rows.push(a2aLogJson(e))
+      return okJson(`{"history":[${rows.join(",")}],"total":${calls.length}}`)
+    }
+    if (segs.length !== 4) return { status: 404, body: errorJson("no such route", "not_found_error", undefined), contentType: "application/json" }
+    if (method !== "GET") return { status: 405, body: errorJson("use GET", "invalid_request_error", undefined), contentType: "application/json" }
+    if (store === undefined) return json503
+    const sub = segs[3]!
+    const names = (dim: string, id: string): string => this.historyName(dim, id)
+    if (sub === "filterdata") {
+      const dims: string[] = []
+      for (const d of (sp.get("dimensions") ?? "").split(",")) {
+        if (d.trim() !== "") dims.push(d.trim())
+      }
+      const all = selectedCalls(scopedView(store, sc, 0.0), agentQuery(new URLSearchParams("")).filter)
+      return okJson(agentFilterDataJson(all, dims, sp.get("q") ?? "", 100, names))
+    }
+    if (sub === "stats" || sub === "histogram" || sub === "top-agents") {
+      const q = agentQuery(sp)
+      if (q.error !== "") return badRequest(q.error)
+      const calls = selectedCalls(scopedView(store, sc, 0.0), q.filter)
+      if (sub === "stats") return okJson(agentStatsJson(calls))
+      if (sub === "histogram") return okJson(agentHistogramJson(calls, q.filter))
+      return okJson(topAgentsJson(calls, 10))
+    }
+    for (const e of scopedView(store, sc, 0.0)) {
+      if (kindOf(e) === "a2a" && e.id === sub) return okJson(agentDetailJson(e, names))
+    }
+    return { status: 404, body: errorJson("agent history entry not found", "not_found_error", undefined), contentType: "application/json" }
   }
 
   // ---- the A2A gateway ----
@@ -2841,12 +2966,17 @@ export class Ops {
     if (agent === undefined || agent.enabled === false) return gateRefusal(rest, 404, `no agent named ${name}`, "not_found_error", undefined)
     const vk = this.engine.gov.findKey(h)
     if (this.engine.gov.enforce && vk === undefined) return gateRefusal(rest, 401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", vk)
-    if (!grantAllows(agent, vk?.id)) return gateRefusal(rest, 403, `this key may not call the agent ${name}`, "permission_error", vk)
+    // the agent's own grants, the key's, its access profiles' and the project the call names (governance.tov agentAccess)
+    const access = this.engine.gov.agentAccess(h, agent)
+    if (!access.allowed) return gateRefusal(rest, 403, `this key may not call the agent ${name}: ${access.message}`, "permission_error", vk)
     const gate = this.engine.gov.admitTool(h)
     if (gate.kind === "denial") return gateRefusal(rest, gate.status, gate.message, gate.type, vk)
     // an agent whose card is not fetched yet has no endpoint to call: refused here, in every binding, before any
     // budget is counted (the same 503 the card route answers; the gRPC binding maps it to UNAVAILABLE)
     if ((agent.card ?? "") === "") return gateRefusal(rest, 503, `the card of ${name} has not been fetched: refresh it through /api/agents/${name}/refresh-card`, "api_error", vk)
+    // a card that requires an extension the registration does not allow cannot be relayed (Bifrost refuses to build it)
+    const xe = allowedExtensions(agent.card ?? "", agent.extension_uris ?? []).error
+    if (xe !== "") return gateRefusal(rest, 503, `the agent ${name} cannot be relayed: ${xe}`, "api_error", vk)
     if (count) {
       // the key's request and token limits count each call (admitTool checks the budgets only)
       const rls: string[] = []
@@ -2865,6 +2995,52 @@ export class Ops {
     if (a === undefined || (a.card ?? "") !== "") return a
     this.syncShared()
     return findAgent(this.engine.cfg.agents, name)
+  }
+
+  // The agent a call names with its card: a declared agent whose card was never fetched gets it now (Bifrost discovers a
+  // card on its agent's first request). A fetch that failed is not tried again for 5 s; the call is then refused 503.
+  async ensureCard(name: string): Promise<AgentConfig | undefined> {
+    const a = this.heldAgent(name)
+    if (a === undefined || a.enabled === false || (a.card ?? "") !== "") return a
+    const now = Date.now()
+    if (now - (this.cardMissAt.get(name) ?? -10000.0) < 5000.0) return a
+    try {
+      const f = await fetchCard(a.agent_card_url, a.discovery_auth, a.allow_private_network === true, a.name + "|discovery")
+      if (f.error !== "") {
+        this.cardMissAt.set(name, now)
+        console.error(`raiju: agent card of ${name}: ${f.error}`)
+        return a
+      }
+      this.installCard(name, a.agent_card_url, f.card, Math.floor(Date.now()))
+    } catch (e) {
+      this.cardMissAt.set(name, now)
+      return a
+    }
+    return findAgent(this.engine.cfg.agents, name)
+  }
+
+  // A card fetched on demand: into this process's config and the engine's at once (as adoptRemoteCard does), saved, and
+  // published to the node's other workers and the cluster.
+  installCard(name: string, url: string, card: string, at: int): void {
+    const w: CardWire = { url: url, fetched_at: at, card: card }
+    const e = adoptCard(this.engine.cfg.agents ?? [], name, w)
+    if (e !== undefined) {
+      let c = this.engine.cfg
+      c.agents = e
+      this.engine.cfg = c
+    }
+    const st = adoptCard(this.store.cfg.agents ?? [], name, w)
+    if (st !== undefined) this.store.setAgents(st)
+    this.publishCards()
+  }
+
+  // The cards of the declared agents that have none, fetched once at start by one process of the node.
+  async fetchMissingCards(): Promise<void> {
+    const missing = (this.store.cfg.agents ?? []).filter((a) => a.enabled !== false && (a.card ?? "") === "")
+    if (missing.length === 0) return
+    const dir = this.shareDir === "" ? "" : this.shareDir + "/leases"
+    if (!takePeriod(new FileLease(dir, 60000), "a2a-card-start", 60000, Math.floor(Date.now()))) return
+    for (const a of missing) await this.ensureCard(a.name)
   }
 
   // The gRPC binding's gate (a2agrpc.tov), in Bifrost's order: the gateway's public URL is set (the push ingress is
@@ -2894,19 +3070,23 @@ export class Ops {
     if (!isCard && !isRpc && !isRest) return json(404, errorJson("no such agent route", "invalid_request_error", undefined))
     if (isCard && req.method !== "GET") return json(405, errorJson("use GET for the agent card", "invalid_request_error", undefined))
     if (isRpc && req.method !== "POST") return json(405, errorJson("use POST for JSON-RPC", "invalid_request_error", undefined))
-    const agent = this.heldAgent(name)
+    const agent = await this.ensureCard(name)
     const h = snapshot(req.headers)
+    // the version a call names (A2A-Version): one the gateway does not speak is refused, after the caller's credentials
+    // are checked, before anything is counted (Bifrost: -32009 on JSON-RPC, 400 FAILED_PRECONDITION on REST)
+    if (!isCard && !versionSupported(h.get("a2a-version") ?? "")) {
+      const pre = this.a2aGate(agent, name, h, isRest, false)
+      const pr = pre.refusal
+      if (pr !== undefined) return pr
+      const vb = await req.text()
+      if (isRpc) return json(200, rpcErrorBody(rpcIdOf(vb), -32009, "this version is not supported"))
+      return json(400, `{"error":{"code":400,"status":"FAILED_PRECONDITION","message":"this version is not supported"}}`)
+    }
     const gate = this.a2aGate(agent, name, h, isRest, true)
     const refusal = gate.refusal
     if (refusal !== undefined) return refusal
     if (agent === undefined) return json(404, errorJson(`no agent named ${name}`, "not_found_error", undefined))
-    if (isCard) {
-      const card = agent.card ?? ""
-      // the gRPC interface is listed when the binding listens (Bifrost lists it under the same two settings)
-      const grpc = this.a2aGrpc
-      const served = grpc === undefined ? gatewayCard(card, base, name, true) : withGrpcInterface(gatewayCard(card, base, name, true), name, grpc.domain, grpc.port)
-      return a2aCardResponse(served, h)
-    }
+    if (isCard) return a2aCardResponse(this.servedCard(agent, agent.card ?? "", base), h)
     const body = await req.text()
     if (isRpc) {
       const routed = rpcCall(body)
@@ -2921,6 +3101,14 @@ export class Ops {
     return await this.a2aCall(agent, routed.call, "rest", "\"1\"", h, gate.vk, base)
   }
 
+  // A card as the gateway serves it for an agent (its own or its extended card): the gateway's interfaces, the gRPC one
+  // when the binding listens (Bifrost lists it under the same two settings), and the extensions the registration allows.
+  servedCard(agent: AgentConfig, card: string, base: string): string {
+    const served = gatewayCard(card, base, agent.name, true, agent.extension_uris ?? [])
+    const grpc = this.a2aGrpc
+    return grpc === undefined ? served : withGrpcInterface(served, agent.name, grpc.domain, grpc.port)
+  }
+
   // GET /agents/a2a (and .../.well-known/agent-card.json): one card for the gateway, listing the agents the
   // caller may call. Raiju's own; Bifrost has the per-agent cards only.
   async a2aAggregate(req: Request, base: string): Promise<Response> {
@@ -2930,8 +3118,7 @@ export class Ops {
     if (this.engine.gov.enforce && vk === undefined) return a2aDeny(false, 401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error")
     const gate = this.engine.gov.admitTool(h)
     if (gate.kind === "denial") return a2aDeny(false, gate.status, gate.message, gate.type)
-    const vkId = vk?.id
-    const list = (this.engine.cfg.agents ?? []).filter((a) => a.enabled !== false && (a.card ?? "") !== "" && grantAllows(a, vkId))
+    const list = (this.engine.cfg.agents ?? []).filter((a) => a.enabled !== false && (a.card ?? "") !== "" && this.engine.gov.agentAccess(h, a).allowed)
     return a2aCardResponse(aggregateCard(list, base, true), h)
   }
 
@@ -2940,6 +3127,13 @@ export class Ops {
     if (rest) return json(status, restErrorOfStatus(status, message))
     // a JSON-RPC error rides in a 200; only an agent that did not answer is a gateway error
     return json(status === 502 ? 502 : 200, rpcErrorBody(rpcId, code, message))
+  }
+
+  // A protocol error of the gateway's own (a JSON-RPC code), in the caller's binding: a REST error with the code's
+  // status, or a JSON-RPC error.
+  a2aError(rest: bool, rpcId: string, code: int, message: string): Response {
+    if (rest) return json(httpOfCode(code), restErrorBody(code, message))
+    return json(200, rpcErrorBody(rpcId, code, message))
   }
 
   // The result of a call in the caller's binding: the result object itself on REST, a JSON-RPC response on JSON-RPC.
@@ -2970,60 +3164,121 @@ export class Ops {
     return { headers: out, error: "" }
   }
 
-  // Sends one call to the agent, in the binding its card offers that the caller's binding prefers: the card's
-  // interface of the caller's own binding, else the first interface the card lists that the gateway can call
-  // (a2agrpcup.tov upstreamBinding). A GRPC interface is called over gRPC (a2aSendGrpc). params is the call's
-  // params after any push rewriting.
-  async a2aSend(agent: AgentConfig, call: Call, params: string, binding: string, rpcId: string, h: Hdrs, accepted: { header: string, value: string } | undefined): Promise<Fwd> {
+  // Whether the call log keeps the raw bytes of each call (client.a2a_store_raw_request_response).
+  rawOn(): bool {
+    return this.engine.cfg.client?.a2a_store_raw_request_response === true
+  }
+
+  // Sends one call to the agent on the interfaces its card offers, in order (a2agrpcup.tov upstreamCandidates: the
+  // caller's binding first, then the others, newest protocol version first, the ones that failed lately last). A
+  // failure that proves the interface unusable moves the call to the next one, as Bifrost's forwardUpstream does
+  // (attemptVerdict); one that only suggests it sends later calls elsewhere first. params is the call's params after
+  // any push rewriting, in the caller's version.
+  async a2aSend(agent: AgentConfig, call: Call, params: string, binding: string, rpcId: string, h: Hdrs, accepted: { header: string, value: string } | undefined, cancel: CallCancel): Promise<Fwd> {
     const card = agent.card ?? ""
-    const pick = upstreamBinding(card, binding, agent.allow_private_network === true)
-    if (pick.binding === "") return fwdFail(`the card of ${agent.name} names no endpoint`)
-    if (pick.binding === "GRPC") return await this.a2aSendGrpc(agent, call, params, pick.url, rpcId, h, accepted)
-    const useRest = pick.binding === "HTTP+JSON"
-    const restUrl = pick.url
-    let url = pick.url
+    const none = `the card of ${agent.name} names no endpoint the gateway may call`
+    const list = this.a2aDemoted.order(agent.name, card, upstreamCandidates(card, agent.agent_card_url, binding, agent.allow_private_network === true))
+    let last = fwdFail(none)
+    for (const c of list) {
+      const fwd = await this.a2aSendOn(agent, c, call, params, binding, rpcId, h, accepted, cancel)
+      if (cancel.fired) return fwd
+      const rpcCode = fwd.stream === undefined && fwd.error === "" ? unaryOf(fwd).code : 0
+      const v = attemptVerdict({ binding: c.binding, method: fwd.method, status: fwd.status, ct: fwd.ct, rpcCode: rpcCode, grpcCode: fwd.grpc, error: fwd.error })
+      if (v.demote) this.a2aDemoted.demote(agent.name, card, c)
+      else if (fwd.error === "") this.a2aDemoted.restore(agent.name, card, c)
+      if (!v.retry) return fwd
+      last = fwd
+    }
+    return last
+  }
+
+  // One attempt on one interface: the params in the interface's protocol version (a2aver.tov) and the answer back in the
+  // caller's. A JSON-RPC caller speaks the version of its method names; REST and gRPC callers speak v1; the gRPC
+  // interface speaks v1.
+  async a2aSendOn(agent: AgentConfig, c: Candidate, call: Call, params: string, binding: string, rpcId: string, h: Hdrs, accepted: { header: string, value: string } | undefined, cancel: CallCancel): Promise<Fwd> {
+    const callerV03 = binding === "rpc" && call.v03
+    const upV03 = c.binding !== "GRPC" && c.v03
+    const upParams = callerV03 === upV03 ? params : paramsTo(call.op, params, upV03)
+    const upCall: Call = { op: call.op, v03: upV03, params: upParams, stream: call.stream, taskId: call.taskId, configId: call.configId }
+    const fwd = c.binding === "GRPC" ? await this.a2aSendGrpc(agent, upCall, c, rpcId, h, accepted, cancel) : await this.a2aSendHttp(agent, upCall, c, rpcId, h, accepted, cancel)
+    if (callerV03 === upV03 || fwd.error !== "") return fwd
+    return translatedFwd(fwd, call.op, callerV03)
+  }
+
+  // One attempt over JSON-RPC or REST. call is in the interface's version: its method names, its REST routes (v0.3's sit
+  // under /v1) and its A2A-Version (v1 interfaces get theirs). The caller going away aborts the request.
+  async a2aSendHttp(agent: AgentConfig, call: Call, c: Candidate, rpcId: string, h: Hdrs, accepted: { header: string, value: string } | undefined, cancel: CallCancel): Promise<Fwd> {
+    const useRest = c.binding === "HTTP+JSON"
+    let url = c.url
     let method = "POST"
     let body = ""
     if (useRest) {
-      const rr = restRequestOf({ op: call.op, v03: call.v03, params: params, stream: call.stream, taskId: call.taskId, configId: call.configId })
-      let base = restUrl
+      const rr = restRequestOf(call)
+      let base = c.url
       while (base.endsWith("/")) base = base.slice(0, base.byteLength - 1)
-      url = base + rr.path + (rr.query === "" ? "" : "?" + rr.query)
+      const path = call.v03 ? (call.op === "GetExtendedAgentCard" ? "/v1/card" : "/v1" + rr.path) : rr.path
+      url = base + path + (rr.query === "" ? "" : "?" + rr.query)
       method = rr.method
       body = rr.body
     } else {
-      // a JSON-RPC caller's method names are kept; a REST caller's go out in the names the card's version uses
-      const old = binding === "rpc" ? call.v03 : !interfacesOf(card).v1
-      body = `{"jsonrpc":"2.0","id":${rpcId},"method":${JSON.stringify(methodOf(call.op, old))},"params":${params}}`
+      body = `{"jsonrpc":"2.0","id":${rpcId},"method":${JSON.stringify(methodOf(call.op, call.v03))},"params":${call.params}}`
+    }
+    const failed = (message: string): Fwd => {
+      let f = fwdFail(message)
+      f.binding = c.binding
+      f.method = method
+      f.rpc = !useRest
+      return f
     }
     const hd = await this.a2aHeaders(agent, h, accepted, body !== "", call.stream)
-    if (hd.error !== "") return fwdFail(hd.error)
-    const hs: Record<string, string> = hd.headers
+    if (hd.error !== "") return failed(hd.error)
+    let hm = hd.headers
+    if (!call.v03) hm.set("a2a-version", c.version === "" ? "1.0" : c.version)
+    const hs: Record<string, string> = hm
     const dl = deadline(call.stream ? 300000 : 60000)
+    // a caller that went away stops the request, and a stream's body, upstream
+    cancel.on(() => {
+      dl.controller.abort(new DOMException("the caller went away", "AbortError"))
+    })
     try {
       const res = body === "" ? await fetch(url, { method: method, headers: hs, signal: dl.controller.signal, tls: tlsOf(agent.runtime_auth) }) : await fetch(url, { method: method, headers: hs, body: body, signal: dl.controller.signal, tls: tlsOf(agent.runtime_auth) })
       const ct = res.headers.get("content-type") ?? ""
-      if (call.stream && ct.includes("text/event-stream") && res.body !== undefined) {
+      const rb = res.body
+      if (call.stream && ct.includes("text/event-stream") && rb !== undefined) {
         // the stream is passed on as it arrives: the deadline no longer applies to it
         dl.finish()
-        return { status: res.status, text: "", ct: ct, stream: res.body, rpc: !useRest, error: "" }
+        let st: ReadableStream = rb
+        let tap: StreamTap | undefined = undefined
+        if (this.rawOn()) {
+          const t = new StreamTap(RAW_LIMIT)
+          tap = t
+          st = tapped(st, t, undefined, undefined)
+        }
+        return { status: res.status, text: "", ct: ct, stream: st, rpc: !useRest, error: "", binding: c.binding, method: method, grpc: -1, rawReq: body, rawResp: "", tap: tap }
       }
       const text = await res.text()
       dl.finish()
       // an endpoint that is gone or does not speak the protocol: the card may have changed
       if (res.status === 405 || res.status === 410 || res.status === 426 || (res.status === 404 && !ct.includes("json"))) this.refreshSoon(agent.name)
-      return { status: res.status, text: text, ct: ct, stream: undefined, rpc: !useRest, error: "" }
+      return { status: res.status, text: text, ct: ct, stream: undefined, rpc: !useRest, error: "", binding: c.binding, method: method, grpc: -1, rawReq: body, rawResp: text, tap: undefined }
     } catch (e) {
       dl.finish()
-      return fwdFail(`the agent did not answer: ${e.message}`)
+      return failed(`the agent did not answer: ${e.message}`)
     }
   }
 
-  // Sends one call to the agent's gRPC interface (a2agrpcup.tov): the answer comes back as a JSON-RPC answer, or
-  // an event stream of them, so every binding maps it as it maps a JSON-RPC agent's.
-  async a2aSendGrpc(agent: AgentConfig, call: Call, params: string, url: string, rpcId: string, h: Hdrs, accepted: { header: string, value: string } | undefined): Promise<Fwd> {
+  // One attempt on the agent's gRPC interface (a2agrpcup.tov): the answer comes back as a JSON-RPC answer, or an event
+  // stream of them, so every binding maps it as it maps a JSON-RPC agent's. The caller going away resets the call.
+  async a2aSendGrpc(agent: AgentConfig, call: Call, c: Candidate, rpcId: string, h: Hdrs, accepted: { header: string, value: string } | undefined, cancel: CallCancel): Promise<Fwd> {
+    const failed = (message: string): Fwd => {
+      let f = fwdFail(message)
+      f.binding = "GRPC"
+      return f
+    }
     const hd = await this.a2aHeaders(agent, h, accepted, false, call.stream)
-    if (hd.error !== "") return fwdFail(hd.error)
+    if (hd.error !== "") return failed(hd.error)
+    let md = hd.headers
+    md.set("a2a-version", c.version === "" ? "1.0" : c.version)
     const tls: H2Tls = { ca: "", verify: true }
     const t = tlsOf(agent.runtime_auth)
     if (t !== undefined) {
@@ -3031,17 +3286,20 @@ export class Ops {
       if (ca !== undefined) tls.ca = ca
       if (t.rejectUnauthorized === false) tls.verify = false
     }
-    const g = await grpcSend(url, tls, call, params, rpcId, hd.headers)
-    if (g.error !== "") return fwdFail(`the agent did not answer: ${g.error}`)
+    const g = await grpcSend(c.url, tls, call, call.params, rpcId, md, cancel)
+    if (g.error !== "") return failed(`the agent did not answer: ${g.error}`)
     const st = g.stream
-    if (st !== undefined) return { status: 200, text: "", ct: "text/event-stream", stream: st, rpc: true, error: "" }
-    return { status: 200, text: g.text, ct: "application/json", stream: undefined, rpc: true, error: "" }
+    if (st !== undefined) return { status: 200, text: "", ct: "text/event-stream", stream: st, rpc: true, error: "", binding: "GRPC", method: "POST", grpc: 0, rawReq: "", rawResp: "", tap: undefined }
+    return { status: 200, text: g.text, ct: "application/json", stream: undefined, rpc: true, error: "", binding: "GRPC", method: "POST", grpc: g.code, rawReq: "", rawResp: "", tap: undefined }
   }
 
   // One call, whatever binding it came in on: push configs are kept by the gateway (get and list are answered
   // from its store; create and delete go to the agent first), the rest is sent on and its answer brought back
-  // to the caller's binding. Every call that reached the agent is logged.
-  async a2aCall(agent: AgentConfig, call: Call, binding: string, rpcId: string, h: Hdrs, vk: VirtualKeyConfig | undefined, base: string): Promise<Response> {
+  // to the caller's binding. The extensions the caller asks for are checked first (a2aext.tov), and an extended card
+  // comes back as the gateway serves cards. Every call that reached the agent is logged, a stream's when it ends.
+  // cancel (the gRPC binding's) stops the work upstream when the caller goes away; a stream's caller that stops reading
+  // does the same.
+  async a2aCall(agent: AgentConfig, call: Call, binding: string, rpcId: string, h: Hdrs, vk: VirtualKeyConfig | undefined, base: string, cancel?: CallCancel): Promise<Response> {
     const name = agent.name
     const rest = binding === "rest"
     const started = Date.now()
@@ -3049,20 +3307,27 @@ export class Ops {
     const vkId = vk?.id
     const store = pushStore()
     const accepted = vk === undefined ? undefined : this.engine.gov.credentialHeader(h)
+    const cc = cancel ?? new CallCancel()
+    const down = transportOf(binding)
+    const keepContent = !this.engine.contentOff(h)
+    const rawOn = this.rawOn()
     let params = call.params
     let context = contextOfParams(params)
+    // the extensions the caller asks for (A2A-Extensions) against the ones the registration relays
+    const xc = checkExtensions(agent.card ?? "", agent.extension_uris ?? [], h.get("a2a-extensions"), params)
+    if (xc.code !== 0) return this.a2aError(rest, rpcId, xc.code, xc.message)
     // push configs the gateway answers itself
     if (call.op === "GetTaskPushNotificationConfig" || call.op === "ListTaskPushNotificationConfigs") {
       if (call.taskId === "") return this.a2aFail(rest, rpcId, 400, -32602, "invalid params: a task id is required")
       if (call.op === "GetTaskPushNotificationConfig") {
         const c = store.config(name, call.taskId, call.configId)
         if (c === undefined) return this.a2aFail(rest, rpcId, 404, -32001, "push notification config not found")
-        this.recordA2a({ agent: name, method: label, status: 200, latencyMs: Date.now() - started, context: context, vk: vkId, error: "" })
+        this.recordA2a({ agent: name, method: label, status: 200, latencyMs: Date.now() - started, context: context, vk: vkId, error: "", task: call.taskId, down: down })
         return this.a2aResult(rest, rpcId, pushViewJson(c.task, c.id, c.url, c.scheme, call.v03))
       }
       const views: string[] = []
       for (const c of store.forTask(name, call.taskId)) views.push(pushViewJson(c.task, c.id, c.url, c.scheme, call.v03))
-      this.recordA2a({ agent: name, method: label, status: 200, latencyMs: Date.now() - started, context: context, vk: vkId, error: "" })
+      this.recordA2a({ agent: name, method: label, status: 200, latencyMs: Date.now() - started, context: context, vk: vkId, error: "", task: call.taskId, down: down })
       return this.a2aResult(rest, rpcId, pushListJson(views, call.v03))
     }
     // a create or an embedded config: the agent gets the gateway's ingress and a token of its own for it
@@ -3099,26 +3364,38 @@ export class Ops {
     } catch (e) {
       return this.a2aFail(rest, rpcId, 500, -32603, `could not set up the push configuration: ${e.message}`)
     }
-    const fwd = await this.a2aSend(agent, call, params, binding, rpcId, h, accepted)
+    // the caller's request as the log keeps it (the gateway's ingress in place of a callback)
+    const input = keepContent ? params : ""
+    const fwd = await this.a2aSend(agent, call, params, binding, rpcId, h, accepted, cc)
+    const rawReq = rawOn ? fwd.rawReq : ""
     if (fwd.error !== "") {
       if (pendingTask !== "") store.removePending(name, pendingHash, pendingTask)
-      this.recordA2a({ agent: name, method: label, status: 502, latencyMs: Date.now() - started, context: context, vk: vkId, error: fwd.error })
+      this.recordA2a({ agent: name, method: label, status: 502, latencyMs: Date.now() - started, context: context, vk: vkId, error: fwd.error, task: call.taskId, down: down, up: fwd.binding, rawReq: rawReq, input: input })
       return this.a2aFail(rest, rpcId, 502, -32603, fwd.error)
     }
     const up = fwd.stream
     if (call.stream && up !== undefined) {
-      this.recordA2a({ agent: name, method: label, status: fwd.status, latencyMs: Date.now() - started, context: context, vk: vkId, error: fwd.status >= 400 ? `agent answered HTTP ${fwd.status}` : "" })
       const sh: Record<string, string> = new Map()
       sh.set("content-type", "text/event-stream")
       sh.set("cache-control", "no-cache")
       // the same binding on both sides passes the events as they are; the other maps each event's payload
-      const out = !rest && !fwd.rpc ? relayMapped(up, (d: string): string => rpcEvent(rpcId, d)) : (rest && fwd.rpc ? relayMapped(up, restEvent) : relay(up))
+      const mapped = !rest && !fwd.rpc ? relayMapped(up, (d: string): string => rpcEvent(rpcId, d)) : (rest && fwd.rpc ? relayMapped(up, restEvent) : relay(up))
+      // the call is logged when its stream ends (or its caller goes away), with what the agent streamed when kept
+      const tap = fwd.tap
+      const status = fwd.status
+      const err = status >= 400 ? `agent answered HTTP ${status}` : ""
+      const out = tapped(mapped, undefined, () => {
+        const raw = tap === undefined || tap.dropped ? "" : tap.text
+        this.recordA2a({ agent: name, method: label, status: status, latencyMs: Date.now() - started, context: context, vk: vkId, error: err, task: call.taskId, down: down, up: fwd.binding, rawReq: rawReq, rawResp: raw, input: input })
+      }, cc)
       return new Response(out, { status: fwd.status, headers: sh })
     }
     const u = unaryOf(fwd)
     if (context === "" && !u.failed) context = contextOfResult(u.result)
     const err = u.failed ? `agent answered ${fwd.status >= 400 ? "HTTP " + fwd.status : "a JSON-RPC error"}` : ""
-    this.recordA2a({ agent: name, method: label, status: fwd.status, latencyMs: Date.now() - started, context: context, vk: vkId, error: err })
+    let task = call.taskId
+    if (task === "" && !u.failed) task = taskIdOfResult(u.result)
+    this.recordA2a({ agent: name, method: label, status: fwd.status, latencyMs: Date.now() - started, context: context, vk: vkId, error: err, task: task, down: down, up: fwd.binding, rawReq: rawReq, rawResp: rawOn ? fwd.rawResp : "", input: input, output: keepContent && !u.failed ? u.result : "" })
     // an embedded config is bound to the task the send made, or dropped when it made none
     if (pendingTask !== "") {
       const tid = u.failed ? "" : taskIdOfResult(u.result)
@@ -3144,6 +3421,8 @@ export class Ops {
       store.remove(name, call.taskId, call.configId)
       return this.a2aResult(rest, rpcId, rest ? "{}" : "null")
     }
+    // the extended card is the agent's own: it is served as the gateway serves the agent's card
+    if (!u.failed && call.op === "GetExtendedAgentCard" && u.result.trim().startsWith("{")) return this.a2aResult(rest, rpcId, this.servedCard(agent, u.result.trim(), base))
     return a2aRender(rest, rpcId, fwd, u)
   }
 
@@ -3221,6 +3500,10 @@ export class Ops {
   // cardTick gives each period's turn to one of them.
   startCardRefresh(): void {
     this.cardRefreshOn = true
+    // the declared agents whose cards were never fetched get them now
+    setTimeout(() => {
+      this.fetchMissingCards()
+    }, 0)
     const secs = this.store.cfg.client?.a2a_card_refresh_seconds ?? 300
     if (secs <= 0) return
     setInterval(() => {
@@ -4666,7 +4949,7 @@ test("log histogram counts requests per bucket by status", () => {
 })
 
 function fwdOf(status: int, text: string, rpc: bool): Fwd {
-  return { status: status, text: text, ct: "", stream: undefined, rpc: rpc, error: "" }
+  return { status: status, text: text, ct: "", stream: undefined, rpc: rpc, error: "", binding: "", method: "POST", grpc: -1, rawReq: "", rawResp: "", tap: undefined }
 }
 
 test("an agent's unary answer is read the same from either binding", () => {

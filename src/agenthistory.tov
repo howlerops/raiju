@@ -1,0 +1,501 @@
+// The A2A call history under /api/agents/history (Bifrost's agent gateway handlers listHistory, historyStats,
+// historyHistogram, historyTopAgents, historyFilterData, getHistoryEntry and deleteHistory). The calls are the log
+// store's entries of kind "a2a" (ops.tov recordA2a); these are pure functions over them, answering in Bifrost's
+// field names (its logstore AgentLogStats, AgentTopAgentsResult, AgentHistogramResult, AgentFilterData and
+// AgentLogDetail).
+//
+// Filters, in Bifrost's query names: agent_name (and Raiju's agent_names), operation, user_id, virtual_key_id, team_id,
+// customer_id, business_unit_id, project_id and status take several values (repeated or comma-separated, any of them
+// matches); task_id, context_id and search one; start_time and end_time are RFC 3339. A call's status is "success"
+// (it answered 2xx without a protocol error) or "error". The stored request and answer bodies are shown with their
+// credentials redacted, as Bifrost redacts them.
+import { LogEntry, kindOf, bucketSeconds, jobj, jkv, jn, jarr } from "./logstore"
+import { isoMs } from "./exports"
+import { timeOf } from "./logapi"
+import { Field, fields, elements, quote, build, isNull } from "./json"
+import * as b64 from "./base64"
+
+export const HISTORY_MAX_LIMIT: int = 1000
+const HISTORY_DEFAULT_LIMIT: int = 50
+
+export type AgentFilter = {
+  agents: string[],
+  operations: string[],
+  users: string[],
+  keys: string[],
+  teams: string[],
+  customers: string[],
+  units: string[],
+  projects: string[],
+  statuses: string[],
+  taskId: string,
+  contextId: string,
+  requestId: string,
+  search: string,
+  since: f64, // ms, -1 when not bounded
+  until: f64,
+}
+
+export type AgentPage = { limit: int, offset: int, byLatency: bool, ascending: bool }
+
+// A query's repeated or comma-separated values, blanks dropped and duplicates collapsed (Bifrost's
+// parseAgentHistoryMultiValue).
+function multi(sp: URLSearchParams, name: string): string[] {
+  const out: string[] = []
+  for (const raw of sp.getAll(name)) {
+    for (const p of raw.split(",")) {
+      const v = p.trim()
+      if (v !== "" && !out.includes(v)) out.push(v)
+    }
+  }
+  return out
+}
+
+function one(sp: URLSearchParams, name: string): string {
+  return (sp.get(name) ?? "").trim()
+}
+
+// The filter and the page a query asks for; error is Bifrost's 400 message when a parameter is malformed.
+export function agentQuery(sp: URLSearchParams): { filter: AgentFilter, page: AgentPage, error: string } {
+  const agents = multi(sp, "agent_name")
+  for (const n of multi(sp, "agent_names")) {
+    if (!agents.includes(n)) agents.push(n)
+  }
+  const f: AgentFilter = {
+    agents: agents, operations: multi(sp, "operation"), users: multi(sp, "user_id"), keys: multi(sp, "virtual_key_id"),
+    teams: multi(sp, "team_id"), customers: multi(sp, "customer_id"), units: multi(sp, "business_unit_id"),
+    projects: multi(sp, "project_id"), statuses: multi(sp, "status"), taskId: one(sp, "task_id"),
+    contextId: one(sp, "context_id"), requestId: one(sp, "request_id"), search: one(sp, "search"), since: -1.0, until: -1.0,
+  }
+  const page: AgentPage = { limit: HISTORY_DEFAULT_LIMIT, offset: 0, byLatency: one(sp, "sort_by") === "latency", ascending: one(sp, "order") === "asc" }
+  for (const name of ["start_time", "end_time"]) {
+    const raw = one(sp, name)
+    if (raw === "") continue
+    const t = raw.includes("T") ? timeOf(raw) : undefined
+    if (t === undefined) return { filter: f, page: page, error: `invalid ${name}: must be RFC3339` }
+    if (name === "start_time") f.since = t
+    else f.until = t
+  }
+  const ls = sp.get("limit") ?? ""
+  if (ls !== "") {
+    const n = parseInt(ls)
+    if (n === undefined || `${n}` !== ls.trim() || n <= 0 || n > HISTORY_MAX_LIMIT) return { filter: f, page: page, error: `invalid limit parameter: must be between 1 and ${HISTORY_MAX_LIMIT}` }
+    page.limit = Math.trunc(n)
+  }
+  const os = sp.get("offset") ?? ""
+  if (os !== "") {
+    const n = parseInt(os)
+    if (n === undefined || `${n}` !== os.trim() || n < 0) return { filter: f, page: page, error: "invalid offset parameter: must be a non-negative number" }
+    page.offset = Math.trunc(n)
+  }
+  return { filter: f, page: page, error: "" }
+}
+
+// A call's status in Bifrost's words.
+export function statusName(e: LogEntry): string {
+  return e.status >= 200 && e.status < 300 && e.error === undefined ? "success" : "error"
+}
+
+function has(list: string[], v: string | undefined): bool {
+  return list.length === 0 || list.includes(v ?? "")
+}
+
+// Whether an entry is an A2A call the filter selects.
+export function selectsCall(e: LogEntry, f: AgentFilter): bool {
+  if (kindOf(e) !== "a2a") return false
+  if (!has(f.agents, e.agent_name) || !has(f.operations, e.op) || !has(f.users, e.user_id) || !has(f.keys, e.virtual_key)) return false
+  if (!has(f.teams, e.team_id) || !has(f.customers, e.customer_id) || !has(f.units, e.business_unit_id) || !has(f.projects, e.project_id)) return false
+  if (!has(f.statuses, statusName(e))) return false
+  if (f.taskId !== "" && (e.task_id ?? "") !== f.taskId) return false
+  if (f.contextId !== "" && (e.session_id ?? "") !== f.contextId) return false
+  if (f.requestId !== "" && e.request_id !== f.requestId && e.id !== f.requestId) return false
+  if (f.since >= 0.0 && e.ts < f.since) return false
+  if (f.until >= 0.0 && e.ts > f.until) return false
+  if (f.search !== "") {
+    // the metadata only, as Bifrost searches it (the bodies are not searched)
+    const s = f.search.toLowerCase()
+    const hay = [e.agent_name ?? "", e.op, e.task_id ?? "", e.session_id ?? "", e.request_id, e.id, e.error ?? ""]
+    let hit = false
+    for (const h of hay) {
+      if (h.toLowerCase().includes(s)) hit = true
+    }
+    if (!hit) return false
+  }
+  return true
+}
+
+// The calls a filter selects, newest first (es is oldest first), or by latency, then the page.
+export function selectedCalls(es: LogEntry[], f: AgentFilter): LogEntry[] {
+  const out: LogEntry[] = []
+  for (let i = es.length - 1; i >= 0; i--) {
+    if (selectsCall(es[i]!, f)) out.push(es[i]!)
+  }
+  return out
+}
+
+export function pageOf(calls: LogEntry[], p: AgentPage): LogEntry[] {
+  let list = calls
+  if (p.byLatency) list = calls.slice().sort((a, b) => (a.latency_ms === b.latency_ms ? 0 : (a.latency_ms < b.latency_ms ? -1 : 1)))
+  else if (p.ascending) list = calls.slice().reverse()
+  if (p.byLatency && !p.ascending) list = list.reverse()
+  return list.slice(p.offset, p.offset + p.limit)
+}
+
+// GET /api/agents/history/stats: the totals of the selected calls (A2A has no tokens or cost). The success rate is
+// over the calls that ended, which here is all of them.
+export function agentStatsJson(calls: LogEntry[]): string {
+  let ok = 0
+  let bad = 0
+  let latency = 0.0
+  for (const e of calls) {
+    if (statusName(e) === "success") ok += 1
+    else bad += 1
+    latency += e.latency_ms
+  }
+  const n = calls.length
+  const rate = ok + bad > 0 ? (100.0 * ok) / (ok + bad) : 0.0
+  return jobj([jkv("total_entries", jn(n)), jkv("success_count", jn(ok)), jkv("error_count", jn(bad)), jkv("success_rate", jn(rate)), jkv("average_latency", jn(n > 0 ? latency / n : 0.0))])
+}
+
+// GET /api/agents/history/top-agents: the agents with the most calls (ten), then by name.
+export function topAgentsJson(calls: LogEntry[], limit: int): string {
+  const names: string[] = []
+  const counts: Map<string, int> = new Map()
+  const errors: Map<string, int> = new Map()
+  const lat: Map<string, f64> = new Map()
+  for (const e of calls) {
+    const a = e.agent_name ?? ""
+    if (!counts.has(a)) names.push(a)
+    counts.set(a, (counts.get(a) ?? 0) + 1)
+    if (statusName(e) === "error") errors.set(a, (errors.get(a) ?? 0) + 1)
+    lat.set(a, (lat.get(a) ?? 0.0) + e.latency_ms)
+  }
+  const sorted = names.slice().sort((x, y) => {
+    const cx = counts.get(x) ?? 0
+    const cy = counts.get(y) ?? 0
+    if (cx !== cy) return cy - cx
+    return x < y ? -1 : (x > y ? 1 : 0)
+  })
+  const rows: string[] = []
+  for (const a of sorted.slice(0, limit)) {
+    const c = counts.get(a) ?? 0
+    rows.push(jobj([jkv("agent_name", quote(a)), jkv("count", jn(c)), jkv("error_count", jn(errors.get(a) ?? 0)), jkv("average_latency", jn(c > 0 ? (lat.get(a) ?? 0.0) / c : 0.0))]))
+  }
+  return jobj([jkv("agents", jarr(rows))])
+}
+
+// The bucket width of the histogram: Bifrost's ladder over the asked range, hourly when a bound is missing.
+export function histogramBucket(f: AgentFilter): int {
+  if (f.since < 0.0 || f.until < 0.0) return 3600
+  return Math.trunc(bucketSeconds(f.until - f.since))
+}
+
+// GET /api/agents/history/histogram: the calls per bucket, split into success and error. With both bounds every bucket
+// of the range is listed (from the bucket that holds the start); without them only the buckets that hold calls.
+export function agentHistogramJson(calls: LogEntry[], f: AgentFilter): string {
+  const size = histogramBucket(f)
+  const keys: int[] = []
+  const counts: Map<int, int> = new Map()
+  const oks: Map<int, int> = new Map()
+  for (const e of calls) {
+    const sec = Math.trunc(Math.floor(e.ts / 1000.0))
+    const b = Math.trunc(Math.floor(sec / size)) * size
+    if (!counts.has(b)) keys.push(b)
+    counts.set(b, (counts.get(b) ?? 0) + 1)
+    if (statusName(e) === "success") oks.set(b, (oks.get(b) ?? 0) + 1)
+  }
+  let stamps: int[] = []
+  if (f.since >= 0.0 && f.until >= 0.0) {
+    const start = Math.trunc(Math.floor(Math.floor(f.since / 1000.0) / size)) * size
+    const end = Math.trunc(Math.floor(f.until / 1000.0))
+    for (let t = start; t <= end && stamps.length < 10000; t += size) stamps.push(t)
+  } else {
+    stamps = keys.slice().sort((a, b) => a - b)
+  }
+  const rows: string[] = []
+  for (const t of stamps) {
+    const c = counts.get(t) ?? 0
+    const ok = oks.get(t) ?? 0
+    rows.push(jobj([jkv("timestamp", quote(rfc3339(t))), jkv("count", jn(c)), jkv("success", jn(ok)), jkv("error", jn(c - ok))]))
+  }
+  return jobj([jkv("buckets", jarr(rows)), jkv("bucket_size_seconds", jn(size))])
+}
+
+// Whole seconds as Bifrost writes a bucket's time (RFC 3339, UTC, no fraction).
+function rfc3339(sec: int): string {
+  const s = isoMs(sec * 1000)
+  return s.slice(0, 19) + "Z"
+}
+
+// The dimensions of the filter data, Bifrost's names, with the entry field each reads.
+function dimensions(): string[] {
+  return ["users", "virtual_keys", "teams", "customers", "business_units", "projects"]
+}
+
+function idOf(e: LogEntry, dim: string): string {
+  if (dim === "users") return e.user_id ?? ""
+  if (dim === "virtual_keys") return e.virtual_key ?? ""
+  if (dim === "teams") return e.team_id ?? ""
+  if (dim === "customers") return e.customer_id ?? ""
+  if (dim === "business_units") return e.business_unit_id ?? ""
+  return e.project_id ?? ""
+}
+
+// GET /api/agents/history/filterdata: the distinct ids and names of each dimension the calls hold (dimensions picks
+// some; all when empty), names matching q, sorted by name, at most limit each. A dimension with none is left out, as
+// Bifrost's omitempty leaves it. nameOf names an id (the virtual key's name, the team's, ...), "" when unknown; an id
+// without a name is not listed, as Bifrost lists only rows that carry both.
+export function agentFilterDataJson(calls: LogEntry[], wanted: string[], q: string, limit: int, nameOf: (dim: string, id: string) => string): string {
+  const query = q.trim().toLowerCase()
+  const parts: string[] = []
+  for (const dim of dimensions()) {
+    if (wanted.length > 0 && !wanted.includes(dim)) continue
+    const seen: string[] = []
+    const pairs: { id: string, name: string }[] = []
+    for (const e of calls) {
+      const id = idOf(e, dim)
+      if (id === "" || seen.includes(id)) continue
+      seen.push(id)
+      const name = nameOf(dim, id)
+      if (name === "") continue
+      if (query !== "" && !name.toLowerCase().includes(query)) continue
+      pairs.push({ id: id, name: name })
+    }
+    if (pairs.length === 0) continue
+    const sorted = pairs.slice().sort((a, b) => (a.name < b.name ? -1 : (a.name > b.name ? 1 : 0)))
+    const rows: string[] = []
+    for (const p of sorted.slice(0, limit)) rows.push(jobj([jkv("id", quote(p.id)), jkv("name", quote(p.name))]))
+    parts.push(jkv(dim, jarr(rows)))
+  }
+  return jobj(parts)
+}
+
+// ---- one call ----
+
+// Whether a JSON member name holds a credential (Bifrost's IsSensitiveHeader, password, client_secret and the OAuth
+// tokens).
+function sensitive(key: string): bool {
+  const k = key.trim().toLowerCase()
+  if (["authorization", "proxy-authorization", "cookie", "set-cookie", "x-bf-vk", "password", "client_secret", "access_token", "refresh_token"].includes(k)) return true
+  return k.includes("api-key") || k.includes("authorization") || k.includes("secret") || k.includes("assertion") || k.includes("jwt") || k.startsWith("cf-access-") || k.startsWith("x-amzn-oidc-") || k.endsWith("-token") || k.endsWith("_token")
+}
+
+// A stored body with its credentials replaced by "REDACTED", at any depth. An OAuth security scheme's public
+// authorization URL and flows stay. A body that is not JSON is kept as it is.
+export function redactedBody(text: string): string {
+  const t = text.trim()
+  if (!t.startsWith("{") && !t.startsWith("[")) return text
+  try {
+    return redactValue(t, false)
+  } catch (e) {
+    return text
+  }
+}
+
+function redactValue(raw: string, oauth: bool): string throws SyntaxError {
+  if (raw.startsWith("{")) {
+    const out: Field[] = []
+    for (const f of try fields(raw)) {
+      const flow = f.raw.startsWith("{")
+      const publicField = oauth && ((f.key === "authorizationCode" && flow) || f.key === "authorizationUrl")
+      if (!publicField && sensitive(f.key)) {
+        out.push({ key: f.key, raw: "\"REDACTED\"" })
+        continue
+      }
+      out.push({ key: f.key, raw: try redactValue(f.raw, oauth || f.key === "oauth2SecurityScheme") })
+    }
+    return build(out)
+  }
+  if (raw.startsWith("[")) {
+    const items: string[] = []
+    for (const it of try elements(raw)) items.push(try redactValue(it, oauth))
+    return "[" + items.join(",") + "]"
+  }
+  return raw
+}
+
+function optStr(key: string, v: string | undefined): string[] {
+  if (v === undefined || v === "") return []
+  return [jkv(key, quote(v))]
+}
+
+// GET /api/agents/history/{id}: one call in Bifrost's AgentLogDetail shape. Names come from nameOf, as for the filter
+// data.
+export function agentDetailJson(e: LogEntry, nameOf: (dim: string, id: string) => string): string {
+  const parts: string[] = []
+  const raws: string[] = []
+  if (e.raw_request !== undefined && e.raw_request !== "") raws.push(jkv("raw_request", quote(e.raw_request)))
+  if (e.raw_response !== undefined && e.raw_response !== "") raws.push(jkv("raw_response", quote(e.raw_response)))
+  for (const r of raws) parts.push(r)
+  parts.push(jkv("id", quote(e.id)))
+  parts.push(jkv("timestamp", quote(isoMs(e.ts))))
+  parts.push(jkv("record_kind", quote("request")))
+  parts.push(jkv("operation", quote(e.op)))
+  parts.push(jkv("status", quote(statusName(e))))
+  parts.push(jkv("agent_name", quote(e.agent_name ?? "")))
+  const named = (key: string, dim: string, id: string | undefined): void => {
+    if (id === undefined || id === "") return
+    parts.push(jkv(key + "_id", quote(id)))
+    const n = nameOf(dim, id)
+    if (n !== "") parts.push(jkv(key + "_name", quote(n)))
+  }
+  named("user", "users", e.user_id)
+  named("virtual_key", "virtual_keys", e.virtual_key)
+  named("team", "teams", e.team_id)
+  named("customer", "customers", e.customer_id)
+  named("business_unit", "business_units", e.business_unit_id)
+  named("project", "projects", e.project_id)
+  parts.push(jkv("request_id", quote(e.request_id === "" ? e.id : e.request_id)))
+  for (const p of optStr("task_id", e.task_id)) parts.push(p)
+  for (const p of optStr("context_id", e.session_id)) parts.push(p)
+  for (const p of optStr("downstream_transport", e.downstream_transport)) parts.push(p)
+  for (const p of optStr("upstream_transport", e.upstream_transport)) parts.push(p)
+  parts.push(jkv("latency", jn(e.latency_ms)))
+  parts.push(jkv("status_code", jn(e.status)))
+  if (e.input !== undefined && e.input !== "") {
+    const body = quote(redactedBody(e.input))
+    parts.push(jkv("input", body))
+    parts.push(jkv("request_body", body))
+  }
+  if (e.output !== undefined && e.output !== "") parts.push(jkv("response_body", quote(redactedBody(e.output))))
+  if (e.error !== undefined) parts.push(jkv("error_details", jobj([jkv("error", jobj([jkv("message", quote(e.error))]))])))
+  return jobj(parts)
+}
+
+// The raw upstream bytes of a call as Bifrost stores them: base64, a direction too big dropped, not cut. Bifrost keeps up
+// to 1 MiB of bytes; here the base64 text is what the log store bounds at 1 MiB, so up to 768 KiB of bytes are kept.
+// undefined when there is nothing to keep.
+export function rawCapture(text: string): string | undefined {
+  if (text === "") return undefined
+  const bytes = new TextEncoder().encode(text)
+  if (bytes.length > 786432) return undefined
+  return b64.encode(bytes)
+}
+
+// The ids a DELETE /api/agents/history body names ({"ids": [...]}); error is Bifrost's 400 message.
+export function deleteIds(body: string): { ids: string[], error: string } {
+  try {
+    const fs = fields(body.trim() === "" ? "x" : body)
+    const out: string[] = []
+    for (const f of fs) {
+      if (f.key !== "ids" || isNull(f.raw)) continue
+      for (const it of elements(f.raw)) {
+        if (it.startsWith("\"")) out.push(JSON.parse(it) as string)
+      }
+    }
+    if (out.length === 0) return { ids: [], error: "No log IDs provided" }
+    return { ids: out, error: "" }
+  } catch (e) {
+    return { ids: [], error: "Invalid JSON" }
+  }
+}
+
+// ---- tests ----
+
+function call(id: string, agent: string, op: string, status: int, ts: f64, latency: f64): LogEntry {
+  return { id: id, ts: ts, request_id: "", op: op, provider: "", model: "", status: status, latency_ms: latency, prompt_tokens: 0, completion_tokens: 0, cost: 0.0, cache_hit: false, kind: "a2a", agent_name: agent }
+}
+
+test("a history query: Bifrost's filters, its bounds and its errors", () => {
+  const q = agentQuery(new URLSearchParams("agent_name=a,b&agent_name=b&agent_names=c&status=error&limit=10&offset=5&sort_by=latency&order=asc&start_time=2026-10-20T00:00:00Z&task_id=t1"))
+  expect(q.error).toBe("")
+  expect(q.filter.agents.join(",")).toBe("a,b,c")
+  expect(q.filter.statuses.join(",")).toBe("error")
+  expect(q.page.limit).toBe(10)
+  expect(q.page.offset).toBe(5)
+  expect(q.page.byLatency).toBe(true)
+  expect(q.page.ascending).toBe(true)
+  expect(q.filter.since > 0.0).toBe(true)
+  expect(q.filter.until).toBe(-1.0)
+  expect(q.filter.taskId).toBe("t1")
+  expect(agentQuery(new URLSearchParams("limit=0")).error).toBe("invalid limit parameter: must be between 1 and 1000")
+  expect(agentQuery(new URLSearchParams("limit=1001")).error !== "").toBe(true)
+  expect(agentQuery(new URLSearchParams("offset=-1")).error).toBe("invalid offset parameter: must be a non-negative number")
+  expect(agentQuery(new URLSearchParams("end_time=yesterday")).error).toBe("invalid end_time: must be RFC3339")
+  expect(agentQuery(new URLSearchParams("")).page.limit).toBe(50)
+})
+
+test("calls are selected, ordered and paged", () => {
+  let e3 = call("3", "b", "SendMessage", 502, 3000.0, 10.0)
+  e3.error = "agent answered HTTP 502"
+  e3.task_id = "t9"
+  const es = [call("1", "a", "SendMessage", 200, 1000.0, 30.0), call("2", "a", "GetTask", 200, 2000.0, 5.0), e3, call("4", "a", "SendMessage", 200, 4000.0, 20.0)]
+  es.push({ id: "llm", ts: 5000.0, request_id: "", op: "chat", provider: "openai", model: "m", status: 200, latency_ms: 1.0, prompt_tokens: 0, completion_tokens: 0, cost: 0.0, cache_hit: false })
+  const all = selectedCalls(es, agentQuery(new URLSearchParams("")).filter)
+  expect(all.map((e) => e.id).join(",")).toBe("4,3,2,1")
+  expect(selectedCalls(es, agentQuery(new URLSearchParams("agent_name=a&operation=SendMessage")).filter).map((e) => e.id).join(",")).toBe("4,1")
+  expect(selectedCalls(es, agentQuery(new URLSearchParams("status=error")).filter).map((e) => e.id).join(",")).toBe("3")
+  expect(selectedCalls(es, agentQuery(new URLSearchParams("task_id=t9")).filter).length).toBe(1)
+  expect(selectedCalls(es, agentQuery(new URLSearchParams("search=HTTP%20502")).filter).map((e) => e.id).join(",")).toBe("3")
+  expect(pageOf(all, { limit: 2, offset: 1, byLatency: false, ascending: false }).map((e) => e.id).join(",")).toBe("3,2")
+  expect(pageOf(all, { limit: 10, offset: 0, byLatency: false, ascending: true }).map((e) => e.id).join(",")).toBe("1,2,3,4")
+  expect(pageOf(all, { limit: 10, offset: 0, byLatency: true, ascending: false }).map((e) => e.id).join(",")).toBe("1,4,3,2")
+  expect(pageOf(all, { limit: 10, offset: 0, byLatency: true, ascending: true }).map((e) => e.id).join(",")).toBe("2,3,4,1")
+  expect(agentStatsJson(all)).toBe(`{"total_entries":4,"success_count":3,"error_count":1,"success_rate":75,"average_latency":16.25}`)
+  expect(agentStatsJson([])).toBe(`{"total_entries":0,"success_count":0,"error_count":0,"success_rate":0,"average_latency":0}`)
+  expect(topAgentsJson(all, 10)).toBe(`{"agents":[{"agent_name":"a","count":3,"error_count":0,"average_latency":18.333333333333332},{"agent_name":"b","count":1,"error_count":1,"average_latency":10}]}`)
+  expect(topAgentsJson(all, 1).includes(`"b"`)).toBe(false)
+})
+
+test("the histogram fills the asked range and keeps only populated buckets without one", () => {
+  const base = 1792454400000.0
+  const es = [call("1", "a", "SendMessage", 200, base + 30000.0, 1.0), call("2", "a", "SendMessage", 500, base + 90000.0, 1.0), call("3", "a", "SendMessage", 200, base + 95000.0, 1.0)]
+  const f = agentQuery(new URLSearchParams("")).filter
+  expect(agentHistogramJson(es, f)).toBe(`{"buckets":[{"timestamp":"2026-10-20T00:00:00Z","count":3,"success":2,"error":1}],"bucket_size_seconds":3600}`)
+  f.since = base
+  f.until = base + 180000.0
+  const h = agentHistogramJson(es, f)
+  expect(h.includes(`"bucket_size_seconds":60`)).toBe(true)
+  expect(h).toBe(`{"buckets":[{"timestamp":"2026-10-20T00:00:00Z","count":1,"success":1,"error":0},{"timestamp":"2026-10-20T00:01:00Z","count":2,"success":1,"error":1},{"timestamp":"2026-10-20T00:02:00Z","count":0,"success":0,"error":0},{"timestamp":"2026-10-20T00:03:00Z","count":0,"success":0,"error":0}],"bucket_size_seconds":60}`)
+})
+
+test("filter data lists the named ids of each dimension", () => {
+  let a = call("1", "a", "SendMessage", 200, 1.0, 1.0)
+  a.virtual_key = "vk-2"
+  a.team_id = "t-1"
+  let b = call("2", "a", "SendMessage", 200, 2.0, 1.0)
+  b.virtual_key = "vk-1"
+  let c = call("3", "a", "SendMessage", 200, 3.0, 1.0)
+  c.virtual_key = "vk-ghost"
+  const names = (dim: string, id: string): string => {
+    if (id === "vk-1") return "alpha"
+    if (id === "vk-2") return "beta"
+    if (id === "t-1") return "Team One"
+    return ""
+  }
+  expect(agentFilterDataJson([a, b, c], [], "", 100, names)).toBe(`{"virtual_keys":[{"id":"vk-1","name":"alpha"},{"id":"vk-2","name":"beta"}],"teams":[{"id":"t-1","name":"Team One"}]}`)
+  expect(agentFilterDataJson([a, b, c], ["teams"], "", 100, names)).toBe(`{"teams":[{"id":"t-1","name":"Team One"}]}`)
+  expect(agentFilterDataJson([a, b, c], [], "BET", 100, names)).toBe(`{"virtual_keys":[{"id":"vk-2","name":"beta"}]}`)
+  expect(agentFilterDataJson([], [], "", 100, names)).toBe("{}")
+})
+
+test("one call's detail, with the bodies' credentials redacted", () => {
+  let e = call("a2a-1", "echo", "message/send", 200, 1792454400000.0, 12.0)
+  e.virtual_key = "vk-1"
+  e.session_id = "ctx-1"
+  e.task_id = "task-1"
+  e.downstream_transport = "JSONRPC"
+  e.upstream_transport = "HTTP+JSON"
+  e.input = `{"message":{"parts":[]},"metadata":{"authorization":"Bearer x","nested":[{"client_secret":"s","keep":1}]}}`
+  e.output = `{"securitySchemes":{"o":{"oauth2SecurityScheme":{"flows":{"authorizationCode":{"authorizationUrl":"https://a/x","tokenUrl":"https://a/t"}}}}}}`
+  e.raw_request = "e30="
+  const d = agentDetailJson(e, (dim: string, id: string): string => (id === "vk-1" ? "alpha" : ""))
+  expect(d.startsWith(`{"raw_request":"e30=","id":"a2a-1","timestamp":"2026-10-20T00:00:00.000Z","record_kind":"request","operation":"message/send","status":"success","agent_name":"echo","virtual_key_id":"vk-1","virtual_key_name":"alpha","request_id":"a2a-1","task_id":"task-1","context_id":"ctx-1","downstream_transport":"JSONRPC","upstream_transport":"HTTP+JSON","latency":12,"status_code":200`)).toBe(true)
+  expect(d.includes(`\\"authorization\\":\\"REDACTED\\"`)).toBe(true)
+  expect(d.includes(`\\"client_secret\\":\\"REDACTED\\",\\"keep\\":1`)).toBe(true)
+  // an OAuth scheme's public flow stays
+  expect(d.includes(`\\"authorizationUrl\\":\\"https://a/x\\"`)).toBe(true)
+  expect(redactedBody("plain text")).toBe("plain text")
+  let bad = call("x", "echo", "GetTask", 502, 1.0, 1.0)
+  bad.error = "the agent did not answer"
+  expect(agentDetailJson(bad, (dim: string, id: string): string => "").includes(`"status":"error"`)).toBe(true)
+  expect(agentDetailJson(bad, (dim: string, id: string): string => "").includes(`"error_details":{"error":{"message":"the agent did not answer"}}`)).toBe(true)
+})
+
+test("raw captures and delete bodies", () => {
+  expect(rawCapture("{}")).toBe("e30=")
+  expect(rawCapture("")).toBeUndefined()
+  expect(deleteIds(`{"ids":["a","b"]}`).ids.join(",")).toBe("a,b")
+  expect(deleteIds(`{"ids":[]}`).error).toBe("No log IDs provided")
+  expect(deleteIds("nope").error).toBe("Invalid JSON")
+})

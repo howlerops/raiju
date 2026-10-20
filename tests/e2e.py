@@ -4265,10 +4265,10 @@ def l116_e2e(env):
         wait(GW_L116 + "/health")
         s, _, b = api("GET", "/api/agents/echo")
         echo = json.loads(b) if s == 200 else {}
-        check("a declared agent is listed with its gateway endpoints and no card until it is fetched", s == 200 and echo.get("card") is None and echo["gateway"]["json_rpc_url"] == "https://gw.example.test/agents/a2a/echo/json-rpc", (s, b[:300]))
+        check("a declared agent is listed with its gateway endpoints", s == 200 and echo["gateway"]["json_rpc_url"] == "https://gw.example.test/agents/a2a/echo/json-rpc", (s, b[:300]))
         check("a declared agent's runtime header shows its env reference", echo.get("runtime_auth", {}).get("headers", {}).get("Authorization") == "env.E2E_L116_AGENT", b[:300])
         s, _, b = gwc("GET", "/agents/a2a/echo/.well-known/agent-card.json", None, A)
-        check("the gateway card is unavailable until the card is fetched", s == 503, (s, b[:200]))
+        check("a declared agent's card is served with no refresh-card: it is fetched at start, or on first use (L171)", s == 200 and json.loads(b).get("name") == "echo-agent", (s, b[:200]))
         s, _, b = api("POST", "/api/agents/echo/refresh-card")
         check("refresh-card fetches the card and caches it", s == 200 and json.loads(b)["card"]["name"] == "echo-agent" and json.loads(b)["card_fetched_at"] is not None, (s, b[:200]))
         s, _, b = gwc("GET", "/agents/a2a/echo/.well-known/agent-card.json", None, A)
@@ -6067,8 +6067,13 @@ def l149_workers_e2e(env):
         return len([x for x in seen if x["path"] == "/a2a/v1/.well-known/agent-card.json"])
     try:
         wait(GW_L149_W + "/health")
-        codes = card_codes(8)
-        check("before any fetch every worker answers 503 for the card", all(c == 503 for c in codes), codes)
+        codes = []
+        for _ in range(40):
+            codes = card_codes(8)
+            if all(c == 200 for c in codes):
+                break
+            time.sleep(0.25)
+        check("with no refresh-card every worker serves the card (fetched at start or on first use, L171)", all(c == 200 for c in codes), codes)
         s, _, b = call("POST", "/api/agents/w/refresh-card", {}, L149_ADMIN, base=GW_L149_W, auth=False)
         check("the card is fetched through one worker", s == 200 and json.loads(b)["card"]["name"] == "v1-agent", (s, b[:200]))
         served = []
@@ -6084,6 +6089,220 @@ def l149_workers_e2e(env):
         check("the mock agent sees about one card fetch per refresh period, not one per worker", 2 <= n <= 5, n)
         served = card_codes(8)
         check("the workers still serve the card after the timer's fetches", all(c == 200 for c in served), served)
+    finally:
+        gw.terminate()
+        gw.wait()
+
+GW_L171 = "http://127.0.0.1:18292"  # A2A versions, interface failover, extensions, raw capture, history routes, cancellation
+
+def l171_config():
+    """The L171 gateway: the v1 and v0.3 mock agents, cards whose first interface fails (gone, refused) or speaks an unknown
+    protocol version, an agent with extensions (two declared, one allowed) and one that requires a denied extension, a slow
+    streaming agent, raw capture on, and one key (named alpha, in a team) granted all of them. No card is fetched by hand."""
+    import hashlib
+    def agent(name, card, **extra):
+        return {"name": name, "agent_card_url": MOCK + card, "allow_private_network": True, "virtual_key_ids": ["vk-l171-a"], **extra}
+    return {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": True, "a2a_external_client_url": "https://gw.example.test/", "a2a_store_raw_request_response": True, "a2a_card_refresh_seconds": 0},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l171-logs"), "content_logging": True},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "l171", "value": "sk-l171", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l171".encode()).hexdigest()}],
+            "teams": [{"id": "t-l171", "name": "Team L171"}],
+            "virtual_keys": [
+                {"id": "vk-l171-a", "name": "alpha", "value": "sk-bf-l171-a", "team_id": "t-l171"},
+                # grants of their own: the key's agent_grants, and an access profile's
+                {"id": "vk-l171-b", "name": "beta", "value": "sk-bf-l171-b", "agent_grants": [{"agent_name": "v1"}]},
+                {"id": "vk-l171-c", "name": "gamma", "value": "sk-bf-l171-c", "access_profile_ids": ["ap-l171"]},
+            ],
+            "access_profiles": [{"id": "ap-l171", "name": "research", "agent_grants": [{"agent_name": "old"}]}],
+            "projects": [{"id": "p-l171", "name": "agents-project", "membership_mode": "open", "access_rule": "union", "agent_grants": [{"agent_name": "fo"}]}],
+        },
+        "agents": [
+            agent("v1", "/a2a/v1/.well-known/agent-card.json"),
+            agent("old", "/a2a/agent/.well-known/agent-card.json"),
+            agent("fo", "/a2a/fo/.well-known/agent-card.json"),
+            agent("refused", "/a2a/refused/.well-known/agent-card.json"),
+            agent("vers", "/a2a/vers/.well-known/agent-card.json"),
+            agent("ext", "/a2a/ext/.well-known/agent-card.json", tenant="acme", extension_uris=["https://ext.example/trace"]),
+            agent("req", "/a2a/req/.well-known/agent-card.json"),
+            agent("slow", "/a2a/slow/.well-known/agent-card.json"),
+            # declared twice: neither copy is served
+            agent("twice", "/a2a/v1/.well-known/agent-card.json"),
+            agent("twice", "/a2a/v1/.well-known/agent-card.json"),
+        ],
+    }
+
+def l171_e2e(env):
+    """L171: the A2A-Version header (none, 1.x and 0.3 spoken, others refused as Bifrost refuses them), v0.3 and v1 bodies
+    translated both ways, a call moved to a card's next interface when one is gone or refuses connections, interfaces of an
+    unknown protocol version passed over, cards fetched at start, declarations reconciled (a name declared twice is not
+    served), extension_uris and tenant, raw capture, the history's stats, histogram, top agents, filter data, single entry
+    and DELETE, and a stream's caller going away cancelling the agent's stream (Bun server). Its own gateway on 18292."""
+    import shutil, http.client
+    cfg_path = os.path.join(BUILD, "e2e.l171.json")
+    json.dump(l171_config(), open(cfg_path, "w"))
+    shutil.rmtree(os.path.join(BUILD, "e2e-l171-logs"), ignore_errors=True)
+    call("GET", "/_a2a/reset", base=MOCK)
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18292", "-host", "127.0.0.1", "-config", cfg_path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l171.log"), "w"))
+    ADM = {"authorization": "Bearer sk-admin-l171"}
+    A = {"x-bf-vk": "sk-bf-l171-a"}
+    def api(method, path, body=None):
+        return call(method, path, body, ADM, base=GW_L171, auth=False)
+    def gwc(method, path, body=None, headers=None):
+        return call(method, path, body, headers, base=GW_L171, auth=False)
+    def rpc(agent, method, params, extra=None):
+        return gwc("POST", f"/agents/a2a/{agent}/json-rpc", {"jsonrpc": "2.0", "id": "9", "method": method, "params": params}, {**A, **(extra or {})})
+    def rest(agent, method, path, body=None, extra=None):
+        return gwc(method, f"/agents/a2a/{agent}/rest{path}", body, {**A, **(extra or {})})
+    def upstream(path):
+        got = json.loads(call("GET", "/_a2a/seen", base=MOCK)[2])
+        return [x for x in got if x["path"] == path or x["path"].startswith(path)]
+    def v03(text, ctx="l171-ctx"):
+        return {"message": {"kind": "message", "messageId": "m-" + text, "role": "user", "contextId": ctx, "parts": [{"kind": "text", "text": text}]}}
+    def v1(text, ctx="l171-ctx"):
+        return {"message": {"messageId": "m-" + text, "role": "ROLE_USER", "contextId": ctx, "parts": [{"text": text}]}}
+    def until(fn, tries=80):
+        for _ in range(tries):
+            v = fn()
+            if v:
+                return v
+            time.sleep(0.1)
+        return fn()
+    try:
+        wait(GW_L171 + "/health")
+        # ---- cards at start, and the declarations ----
+        def fetched():
+            s, _, b = api("GET", "/api/agents/v1")
+            return s == 200 and json.loads(b).get("card") is not None
+        check("a declared agent's card is fetched at start, with no refresh-card", until(fetched), api("GET", "/api/agents/v1")[2][:200])
+        s, _, b = gwc("GET", "/agents/a2a/twice/.well-known/agent-card.json", None, A)
+        check("a name declared twice is not served (Bifrost skips both declarations)", s == 404, (s, b[:200]))
+        # ---- A2A-Version ----
+        s, _, b = rpc("v1", "SendMessage", v1("ver-2"), {"a2a-version": "2.0"})
+        out = json.loads(b) if s == 200 else {}
+        check("a JSON-RPC call naming A2A-Version 2.0 is refused with -32009 and its id", s == 200 and out.get("error", {}).get("code") == -32009 and out.get("error", {}).get("message") == "this version is not supported" and out.get("id") == "9", (s, b[:200]))
+        s, _, b = rest("v1", "POST", "/message:send", v1("ver-2r"), {"a2a-version": "0.2"})
+        check("a REST call naming an unknown version is 400 FAILED_PRECONDITION", s == 400 and json.loads(b)["error"]["status"] == "FAILED_PRECONDITION", (s, b[:200]))
+        check("a refused version never reaches the agent", not [x for x in upstream("/a2a/v1/") if "ver-2" in x["body"]], "")
+        s, _, b = gwc("POST", "/agents/a2a/v1/json-rpc", {"jsonrpc": "2.0", "id": "9", "method": "SendMessage", "params": v1("ver-nokey")}, {"a2a-version": "2.0"})
+        check("credentials are checked before the version", s == 401, (s, b[:200]))
+        s, _, b = rpc("v1", "SendMessage", v1("ver-1"), {"a2a-version": "1.0"})
+        check("A2A-Version 1.0 is served", s == 200 and "echo: ver-1" in b, (s, b[:200]))
+        sent = [x for x in upstream("/a2a/v1/json-rpc") if "ver-1" in x["body"]]
+        check("the agent's v1 interface gets the gateway's own A2A-Version", len(sent) == 1 and sent[0]["headers"].get("a2a-version") == "1.0", sent[:1])
+        # ---- v0.3 and v1 bodies translated ----
+        s, _, b = rpc("v1", "message/send", v03("tr-1"))
+        res = json.loads(b).get("result", {}) if s == 200 else {}
+        check("a v0.3 caller of a v1 agent gets a v0.3 task: kind, plain state, kind-tagged parts", res.get("kind") == "task" and res.get("status", {}).get("state") == "completed" and res.get("artifacts", [{}])[0].get("parts", [{}])[0].get("kind") == "text", (s, b[:300]))
+        sent = [x for x in upstream("/a2a/v1/json-rpc") if "tr-1" in x["body"]]
+        body = json.loads(sent[0]["body"]) if sent else {}
+        check("the v1 agent gets the v1 method and message: SendMessage, ROLE_USER, parts without kind", body.get("method") == "SendMessage" and body.get("params", {}).get("message", {}).get("role") == "ROLE_USER" and body["params"]["message"]["parts"][0] == {"text": "tr-1"}, sent[:1])
+        s, _, b = rpc("v1", "message/stream", v03("tr-2"))
+        ev = sse_events(b) if s == 200 else []
+        kinds = [e.get("result", {}).get("kind") for e in ev]
+        check("a v0.3 caller's stream from a v1 agent comes as v0.3 events, the last update final", kinds == ["task", "status-update", "status-update"] and ev[2]["result"]["final"] is True and ev[1]["result"]["status"]["state"] == "working", (s, b[:400]))
+        s, _, b = rest("old", "POST", "/message:send", v1("tr-3"))
+        out = json.loads(b) if s == 200 else {}
+        check("a v1 REST caller of a v0.3 agent gets a v1 answer: {task}, TASK_STATE_COMPLETED, parts without kind", out.get("task", {}).get("status", {}).get("state") == "TASK_STATE_COMPLETED" and "kind" not in json.dumps(out), (s, b[:300]))
+        old_task = out.get("task", {}).get("id", "")
+        sent = [x for x in seen() if x["path"] == "/a2a/agent/json-rpc" and "tr-3" in x.get("body", "")]
+        body = json.loads(sent[0]["body"]) if sent else {}
+        check("the v0.3 agent gets message/send with a kind-tagged message", body.get("method") == "message/send" and body.get("params", {}).get("message", {}).get("parts", [{}])[0].get("kind") == "text" and body["params"]["message"].get("role") == "user", sent[:1])
+        s, _, b = rest("old", "GET", f"/tasks/{old_task}")
+        check("a v1 REST read of a v0.3 agent's task is a v1 task", s == 200 and json.loads(b).get("status", {}).get("state") == "TASK_STATE_COMPLETED" and json.loads(b).get("id") == old_task, (s, b[:200]))
+        # ---- failing over between a card's interfaces ----
+        before = len(upstream("/a2a/gone/json-rpc"))
+        s, _, b = rpc("fo", "SendMessage", v1("fo-1"))
+        check("a call to a card whose first interface is gone (404) moves to the next one", s == 200 and "echo: fo-1" in b and len(upstream("/a2a/gone/json-rpc")) == before + 1, (s, b[:200]))
+        s, _, b = rpc("fo", "SendMessage", v1("fo-2"))
+        check("later calls go to the interface that works first", s == 200 and "echo: fo-2" in b and len(upstream("/a2a/gone/json-rpc")) == before + 1, (s, b[:200], len(upstream("/a2a/gone/json-rpc"))))
+        s, _, b = rpc("refused", "SendMessage", v1("fo-3"))
+        check("a call to an interface that refuses connections moves to the next one (REST here)", s == 200 and "echo: fo-3" in b and [x for x in upstream("/a2a/v1/rest/message:send") if "fo-3" in x["body"]], (s, b[:200]))
+        s, _, b = rpc("vers", "SendMessage", v1("fo-4"))
+        check("an interface of a protocol version the gateway does not speak is never called", s == 200 and "echo: fo-4" in b and not [x for x in upstream("/a2a/gone/json-rpc") if "fo-4" in x["body"]], (s, b[:200]))
+        # ---- extensions and tenant ----
+        s, _, b = api("GET", "/api/agents/ext")
+        view = json.loads(b) if s == 200 else {}
+        check("the registration keeps its tenant and extension_uris", view.get("tenant") == "acme" and view.get("extension_uris") == ["https://ext.example/trace"], b[:300])
+        s, _, b = gwc("GET", "/agents/a2a/ext/.well-known/agent-card.json", None, A)
+        exts = json.loads(b).get("capabilities", {}).get("extensions", []) if s == 200 else None
+        check("the served card lists only the allowed extension", exts == [{"uri": "https://ext.example/trace", "params": {"v": 1}}], (s, b[:300]))
+        s, _, b = rpc("ext", "SendMessage", v1("ext-1"), {"a2a-extensions": "https://ext.example/secret"})
+        check("asking for an extension the gateway does not relay is -32004", s == 200 and json.loads(b).get("error", {}).get("code") == -32004, (s, b[:200]))
+        s, _, b = rpc("ext", "SendMessage", v1("ext-2"), {"a2a-extensions": "https://ext.example/trace"})
+        sent = [x for x in upstream("/a2a/v1/json-rpc") if "ext-2" in x["body"]]
+        check("an allowed extension goes on to the agent with the call", s == 200 and "echo: ext-2" in b and sent and sent[0]["headers"].get("a2a-extensions") == "https://ext.example/trace", (s, b[:200], sent[:1]))
+        s, _, b = rpc("req", "SendMessage", v1("ext-3"))
+        check("an agent that requires a denied extension is not relayed (503)", s == 503 and "requires denied extension" in b, (s, b[:200]))
+        # ---- grants: the key's agent_grants, an access profile's and a project's ----
+        Bk = {"x-bf-vk": "sk-bf-l171-b"}
+        Ck = {"x-bf-vk": "sk-bf-l171-c"}
+        def gcall(agent, key, extra=None):
+            return gwc("POST", f"/agents/a2a/{agent}/json-rpc", {"jsonrpc": "2.0", "id": "g", "method": "SendMessage", "params": v1("grant-" + agent)}, {**key, **(extra or {})})
+        s, _, b = gcall("v1", Bk)
+        check("a key's own agent_grants let it call the agent", s == 200 and "echo: grant-v1" in b, (s, b[:200]))
+        s, _, b = gcall("old", Bk)
+        check("a key without a grant for the agent is refused", s == 403 and "is not allowed" in b, (s, b[:200]))
+        s, _, b = gcall("old", Ck)
+        check("an access profile's agent_grants let its keys call the agent", s == 200 and "grant-old" in b, (s, b[:200]))
+        s, _, b = gcall("fo", Bk, {"x-bf-project-name": "agents-project"})
+        check("a union project's agent_grants add the agent to the caller's", s == 200 and "grant-fo" in b, (s, b[:200]))
+        s, _, b = gcall("fo", Bk)
+        check("without the project header the agent stays refused", s == 403, (s, b[:200]))
+        # ---- the history ----
+        s, _, b = api("GET", "/api/agents/history?limit=200")
+        hist = json.loads(b).get("history", []) if s == 200 else []
+        row = next((x for x in hist if x["agent_name"] == "v1" and x["method"] == "message/send"), {})
+        check("a history row names its operation, its bindings and its task", row.get("operation") == "message/send" and row.get("downstream_transport") == "JSONRPC" and row.get("upstream_transport") == "JSONRPC" and row.get("task_id", "") != "", row)
+        s, _, b = api("GET", "/api/agents/history/" + row.get("id", "none"))
+        det = json.loads(b) if s == 200 else {}
+        raw = base64.b64decode(det.get("raw_request", "")).decode() if det.get("raw_request") else ""
+        check("one entry: Bifrost's detail with the raw bytes sent (the v1 body) and received, base64", s == 200 and det.get("status") == "success" and det.get("virtual_key_name") == "alpha" and det.get("team_name") == "Team L171" and '"method":"SendMessage"' in raw and det.get("raw_response"), (s, b[:400]))
+        check("one entry keeps the caller's request body", "tr-1" in det.get("request_body", ""), det.get("request_body", "")[:200])
+        s, _, b = api("GET", "/api/agents/history/nope")
+        check("an unknown entry is 404", s == 404, (s, b[:100]))
+        s, _, b = api("GET", "/api/agents/history/stats?agent_name=v1")
+        st = json.loads(b) if s == 200 else {}
+        check("stats count the agent's calls, its successes and errors", st.get("total_entries", 0) >= 3 and st.get("success_count", 0) >= 3 and st.get("success_rate", 0) > 0 and "average_latency" in st, (s, b[:200]))
+        s, _, b = api("GET", "/api/agents/history/top-agents")
+        top = json.loads(b).get("agents", []) if s == 200 else []
+        check("top agents rank the agents by calls", top and top[0]["agent_name"] == "v1" and top[0]["count"] >= 3 and all("error_count" in x for x in top), (s, b[:300]))
+        now = time.time()
+        q = urllib.parse.urlencode({"start_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 3600)), "end_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 60))})
+        s, _, b = api("GET", "/api/agents/history/histogram?" + q)
+        hg = json.loads(b) if s == 200 else {}
+        check("the histogram buckets the calls over the asked hour, a minute wide", hg.get("bucket_size_seconds") == 60 and sum(x["count"] for x in hg.get("buckets", [])) >= 8 and len(hg.get("buckets", [])) >= 60, (s, b[:300]))
+        s, _, b = api("GET", "/api/agents/history/histogram?start_time=yesterday")
+        check("a malformed time is 400", s == 400 and "RFC3339" in b, (s, b[:200]))
+        s, _, b = api("GET", "/api/agents/history/filterdata")
+        fd = json.loads(b) if s == 200 else {}
+        check("filter data names the keys and teams the calls carry", {"id": "vk-l171-a", "name": "alpha"} in fd.get("virtual_keys", []) and {"id": "t-l171", "name": "Team L171"} in fd.get("teams", []), (s, b[:300]))
+        s, _, b = api("DELETE", "/api/agents/history", {"ids": [row.get("id", "")]})
+        s2, _, _ = api("GET", "/api/agents/history/" + row.get("id", "none"))
+        check("DELETE removes the entries its ids name", s == 200 and "deleted" in b and s2 == 404, (s, b[:200], s2))
+        s, _, b = api("DELETE", "/api/agents/history", {"ids": []})
+        check("DELETE without ids is 400", s == 400 and "No log IDs provided" in b, (s, b[:200]))
+        # ---- a stream's caller going away stops the agent's stream ----
+        if server != "http1":
+            conn = http.client.HTTPConnection("127.0.0.1", 18292, timeout=10)
+            conn.request("POST", "/agents/a2a/slow/json-rpc", json.dumps({"jsonrpc": "2.0", "id": "s1", "method": "SendStreamingMessage", "params": v1("slow-1")}), {"content-type": "application/json", **A})
+            r = conn.getresponse()
+            # the body is chunked: lines up to the first event
+            first = b""
+            for _ in range(10):
+                line = r.fp.readline()
+                if line.startswith(b"data:"):
+                    first = line
+                    break
+            conn.sock.shutdown(socket.SHUT_RDWR)
+            conn.close()
+            state = until(lambda: json.loads(call("GET", "/_a2a/slow-state", base=MOCK)[2])["cancelled"], 50)
+            st = json.loads(call("GET", "/_a2a/slow-state", base=MOCK)[2])
+            check("a stream whose caller goes away is cancelled at the agent", r.status == 200 and first.startswith(b"data:") and state and st["sent"] < 100, (r.status, first[:100], st))
     finally:
         gw.terminate()
         gw.wait()
@@ -9470,12 +9689,12 @@ def l148_run(env, workers: int, label: str, port: int):
         return [x for x in got if x["path"] == "/a2a/v1/json-rpc"]
     try:
         wait(base + "/health")
-        # before the card is fetched, a call is refused in both bindings: 503 over HTTP, UNAVAILABLE over gRPC, the same message
+        # with no refresh-card, the declared agent's card is fetched at start or on its first call (L171): a call reaches the agent
         s, _, b = gwc("POST", "/agents/a2a/grpc/json-rpc", {"jsonrpc": "2.0", "id": "1", "method": "GetTask", "params": {"id": "precard-task"}}, A)
-        check("a call before the agent's card is fetched is refused with 503 and the card's message", s == 503 and "has not been fetched" in b, (s, b[:200]))
+        check("a call before any refresh-card reaches the agent (its card is fetched at start or on first use)", s == 200 and json.loads(b).get("error", {}).get("code") == -32001, (s, b[:200]))
         pre = subprocess.run([client, "-addr", f"127.0.0.1:{A2A_GRPC_LISTEN}", "-domain", A2A_GRPC_DOMAIN, "-agent", "grpc", "-key", "sk-bf-l148-a", "-precard"], capture_output=True, text=True, timeout=120)
         pre_row = json.loads(pre.stdout.strip().splitlines()[0]) if pre.returncode == 0 and pre.stdout.strip() != "" else {}
-        check("a gRPC call before the agent's card is fetched is UNAVAILABLE with the same message", pre_row.get("code") == "UNAVAILABLE" and pre_row.get("message") == "the card of grpc has not been fetched: refresh it through /api/agents/grpc/refresh-card", (pre.returncode, pre.stdout[:200], pre.stderr[-300:], b[:200]))
+        check("a gRPC call before any refresh-card reaches the agent too (NOT_FOUND for the unknown task)", pre_row.get("code") == "NOT_FOUND", (pre.returncode, pre.stdout[:200], pre.stderr[-300:], b[:200]))
         s, _, b = api("POST", "/api/agents/grpc/refresh-card")
         check("the agent's card is fetched for the gRPC checks", s == 200, (s, b[:200]))
         s, _, b = gwc("GET", "/agents/a2a/grpc/.well-known/agent-card.json", None, A)
@@ -13441,6 +13660,9 @@ def main():
         # a card fetched by one worker served by both, fetched once per period: their own gateways
         l149_cluster_e2e(env)
         l149_workers_e2e(env)
+        # L171: A2A-Version, v0.3/v1 translation, interface failover and versions, extensions and tenant, raw capture, the
+        # history routes and stream cancellation: its own gateway (18292)
+        l171_e2e(env)
         # WebAssembly plugins (a .wasm path in plugins[]): rewrites, short circuits, traps, limits and the plugin API: their own gateway
         l121_e2e(env)
         # the plugin chain as Bifrost runs it: HTTP transport hooks, the LLM hooks on every request type and on streams, has_error: their own gateway

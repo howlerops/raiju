@@ -1,6 +1,6 @@
 // Virtual keys, budgets and rate limits, with Bifrost's Customer → Team → VK
 // hierarchy. State is in memory, per process.
-import { Config, VirtualKeyConfig, BudgetConfig, BudgetOverride, RateLimitConfig, RateLimitShare, AccessProfile, ModelConfigGovernance, ProviderGovernance, ProjectConfig, ProviderConfigRef, GovernanceConfig } from "./config"
+import { Config, AgentConfig, VirtualKeyConfig, BudgetConfig, BudgetOverride, RateLimitConfig, RateLimitShare, AccessProfile, ModelConfigGovernance, ProviderGovernance, ProjectConfig, ProviderConfigRef, GovernanceConfig } from "./config"
 import { Effective, applyProfiles, applyHeld, modelAllowed } from "./profiles"
 import { heldProfiles } from "./govapi"
 import { Hdrs, hdrs } from "./schemas"
@@ -210,6 +210,8 @@ export class Governance {
   // a user's own copies of the budgets and rate limits of the profiles they hold, by user name: the derived ids
   heldBudgets: Map<string, string[]> = new Map()
   heldRates: Map<string, string[]> = new Map()
+  // the A2A agents each key's access profiles grant (its own profiles and its user's held ones), by key id
+  profileAgents: Map<string, string[]> = new Map()
 
   constructor(cfg: Config) {
     const g0 = cfg.governance
@@ -261,6 +263,17 @@ export class Governance {
       const ids = vk.access_profile_ids ?? []
       const uid: string = vk.user_id ?? ""
       const hs: AccessProfile[] = held.has(uid) ? held.get(uid)! : []
+      // the agents the active profiles grant: added together across them (Bifrost's profile agent_grants)
+      const granted: string[] = []
+      const fromProfile = (p: AccessProfile | undefined): void => {
+        if (p === undefined || p.is_active === false) return
+        for (const ag of p.agent_grants ?? []) {
+          if (!granted.includes(ag.agent_name)) granted.push(ag.agent_name)
+        }
+      }
+      for (const pid of ids) fromProfile(profiles.get(pid))
+      for (const hp of hs) fromProfile(hp)
+      if (granted.length > 0) this.profileAgents.set(vk.id, granted)
       if (ids.length === 0 && hs.length === 0) {
         this.vks.set(vk.value, vk)
         continue
@@ -564,6 +577,34 @@ export class Governance {
       projectName: project?.name ?? "",
     }
     return this.checkLimits(vk, budgets, rateLimits, attr, peek ?? false)
+  }
+
+  // Whether a call may reach a registered A2A agent (Bifrost's PreA2AHook). An anonymous call (no key, enforcement off)
+  // passes, as Bifrost lets it. The caller's own access is the agent's allow_by_default, its virtual_key_ids, the key's
+  // agent_grants and the agent_grants of the key's active access profiles (its own and its user's), added together. A
+  // project the request names (x-bf-project-id or -name) that exists, is active and admits the caller combines its
+  // agent_grants with that by its access_rule: union when either grants, intersect when both do. A project that is unknown
+  // or does not admit the caller is passed over, and the caller's own access decides (Bifrost's documented fallback).
+  agentAccess(h: Hdrs, agent: AgentConfig): { allowed: bool, message: string } {
+    const vk = this.findKey(h)
+    if (vk === undefined) return { allowed: true, message: "" }
+    const name = agent.name
+    const own = agent.allow_by_default === true || (agent.virtual_key_ids ?? []).includes(vk.id) || (vk.agent_grants ?? []).some((g) => g.agent_name === name) || (this.profileAgents.get(vk.id) ?? []).includes(name)
+    const pr = this.projectOf(h)
+    const p = pr.p
+    if (!pr.requested || p === undefined || p.is_active === false || !this.projectAdmits(p, vk)) {
+      return own ? { allowed: true, message: "" } : { allowed: false, message: `Agent '${name}' is not allowed` }
+    }
+    const projectYes = (p.agent_grants ?? []).some((g) => g.agent_name === name)
+    const rule = p.access_rule ?? "union"
+    if (rule === "intersect") {
+      if (!own) return { allowed: false, message: `Agent '${name}' is not allowed` }
+      if (!projectYes) return { allowed: false, message: `Agent '${name}' is not allowed by project ${p.name}` }
+      return { allowed: true, message: "" }
+    }
+    if (rule === "union") return own || projectYes ? { allowed: true, message: "" } : { allowed: false, message: `Agent '${name}' is not allowed` }
+    // an unrecognised access rule permits nothing
+    return { allowed: false, message: `Agent '${name}' is not allowed by project ${p.name}` }
   }
 
   // The project a request names: x-bf-project-id when present (even empty, which names none), else x-bf-project-name.
@@ -1619,4 +1660,44 @@ test("a member's own percent share caps the member under split none", () => {
   expect((g.admit(h, "openai", "gpt-4o") as Grant).kind).toBe("grant")
   g.record(g.admit(h, "openai", "gpt-4o") as Grant, 0, 5.0)
   expect((g.admit(h, "openai", "gpt-4o") as Denial).status).toBe(402)
+})
+
+test("A2A agent grants: the agent's own, the key's, its profiles' and a project's by its access rule", () => {
+  const g = new Governance({
+    governance: {
+      access_profiles: [{ id: "ap", name: "research", agent_grants: [{ agent_name: "lib" }] }, { id: "off", name: "off", is_active: false, agent_grants: [{ agent_name: "calc" }] }],
+      virtual_keys: [
+        { id: "k-own", value: "sk-bf-own", agent_grants: [{ agent_name: "calc" }] },
+        { id: "k-ap", value: "sk-bf-ap", access_profile_ids: ["ap", "off"] },
+        { id: "k-none", value: "sk-bf-none" },
+      ],
+      projects: [
+        { id: "p-u", name: "union", membership_mode: "open", access_rule: "union", agent_grants: [{ agent_name: "calc" }] },
+        { id: "p-i", name: "narrow", membership_mode: "open", access_rule: "intersect", agent_grants: [{ agent_name: "lib" }] },
+        { id: "p-x", name: "closed", membership_mode: "explicit", access_rule: "union", agent_grants: [{ agent_name: "calc" }] },
+      ],
+    },
+  })
+  const calc: AgentConfig = { name: "calc", agent_card_url: "https://c.example/card" }
+  const lib: AgentConfig = { name: "lib", agent_card_url: "https://l.example/card", virtual_key_ids: ["k-own"] }
+  const open: AgentConfig = { name: "open", agent_card_url: "https://o.example/card", allow_by_default: true }
+  const own = hdrs([["x-bf-vk", "sk-bf-own"]])
+  const ap = hdrs([["x-bf-vk", "sk-bf-ap"]])
+  const none = hdrs([["x-bf-vk", "sk-bf-none"]])
+  expect(g.agentAccess(own, calc).allowed).toBe(true)
+  expect(g.agentAccess(own, lib).allowed).toBe(true)
+  expect(g.agentAccess(ap, lib).allowed).toBe(true)
+  // an inactive profile grants nothing
+  expect(g.agentAccess(ap, calc).allowed).toBe(false)
+  expect(g.agentAccess(none, calc).message).toBe("Agent 'calc' is not allowed")
+  expect(g.agentAccess(none, open).allowed).toBe(true)
+  expect(g.agentAccess(hdrs([]), calc).allowed).toBe(true)
+  // a union project adds its agents; an intersect one narrows the caller's to its own
+  expect(g.agentAccess(hdrs([["x-bf-vk", "sk-bf-none"], ["x-bf-project-name", "union"]]), calc).allowed).toBe(true)
+  expect(g.agentAccess(hdrs([["x-bf-vk", "sk-bf-own"], ["x-bf-project-id", "p-i"]]), calc).message).toBe("Agent 'calc' is not allowed by project narrow")
+  expect(g.agentAccess(hdrs([["x-bf-vk", "sk-bf-own"], ["x-bf-project-id", "p-i"]]), lib).allowed).toBe(true)
+  expect(g.agentAccess(hdrs([["x-bf-vk", "sk-bf-none"], ["x-bf-project-id", "p-i"]]), open).allowed).toBe(false)
+  // a project that does not admit the caller, or is unknown, falls back to the caller's own grants
+  expect(g.agentAccess(hdrs([["x-bf-vk", "sk-bf-none"], ["x-bf-project-id", "p-x"]]), calc).allowed).toBe(false)
+  expect(g.agentAccess(hdrs([["x-bf-vk", "sk-bf-own"], ["x-bf-project-id", "nope"]]), calc).allowed).toBe(true)
 })

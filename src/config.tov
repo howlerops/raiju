@@ -226,6 +226,9 @@ export type ClientConfig = {
   // Raiju's: how often the cards of the registered agents are fetched again, in seconds (default 300; 0 turns
   // the timer off). A card is also fetched again, at most once a minute, when the agent answers HTTP 404, 405, 410 or 426.
   a2a_card_refresh_seconds?: int,
+  // Bifrost's a2a_store_raw_request_response: each A2A call's log row keeps the bytes sent to the agent and the bytes it
+  // answered (base64, at most 1 MiB each way), shown by GET /api/agents/history/{id} (ops.tov a2aCall)
+  a2a_store_raw_request_response?: bool,
   // request headers copied into each log row's metadata: exact names, or prefixes ending in "*" (reqlog.tov)
   logging_headers?: string[],
   // Bifrost's compat plugin settings (src/compat.tov); absent means the plugin is off unless a request's x-bf-compat turns features on
@@ -328,6 +331,8 @@ export type VirtualKeyConfig = {
   mcp_configs?: McpKeyConfig[],
   // the user this key is assigned to (Bifrost's governance user); recorded on the key's log entries
   user_id?: string,
+  // Bifrost's agent_grants: the registered A2A agents (by name) this key may call, besides the agents' own virtual_key_ids
+  agent_grants?: AgentGrant[],
   // Bifrost's delete_after_expire: the cleanup deletes the key once it has expired. Absent inherits
   // client.delete_expired_virtual_keys.
   delete_after_expire?: bool,
@@ -355,6 +360,8 @@ export type AccessProfile = {
   // the MCP tools per client, and the virtual MCPs (by name) the profile grants
   mcp_configs?: McpKeyConfig[],
   virtual_mcps?: string[],
+  // the A2A agents the profile grants its holders (Bifrost Enterprise's profile agent_grants)
+  agent_grants?: AgentGrant[],
   required_headers?: string[],
   max_tokens?: int,
   is_active?: bool,
@@ -432,6 +439,8 @@ export type ProjectConfig = {
   // the MCP tools the project may run, per client, and the virtual MCPs (by name) it is assigned
   mcp_configs?: McpKeyConfig[],
   virtual_mcps?: string[],
+  // the A2A agents the project grants, combined with the caller's by access_rule (Bifrost Enterprise's project agent_grants)
+  agent_grants?: AgentGrant[],
   // "none" (default) holds the members together in the project's caps; "equal" gives each member an equal
   // slice of every budget the project holds (governance.tov addMemberCaps)
   split_policy?: string,
@@ -924,6 +933,9 @@ export type ServerSectionConfig = { a2a_allow_private_push_callbacks?: bool, a2a
 export type AgentOAuth = { provider_url?: string, discovery_url?: string, token_url?: string, client_id: string, client_secret: string, scopes?: string[], resource?: string }
 export type AgentTls = { insecure_skip_verify?: bool, ca_cert_pem?: string, client_cert_pem?: string, client_key_pem?: string }
 export type AgentAuth = { type: string, headers?: Map<string, string>, oauth?: AgentOAuth, security_schemes?: string[], advanced?: bool, tls?: AgentTls }
+// A grant to call one registered A2A agent, by its name (Bifrost's agent_grants entries).
+export type AgentGrant = { agent_name: string }
+
 export type AgentConfig = {
   name: string,
   agent_card_url: string,
@@ -937,6 +949,10 @@ export type AgentConfig = {
   forward_accepted_credential?: bool,
   forward_accepted_credential_overrides_auth?: bool,
   allow_private_network?: bool,
+  // Bifrost's tenant: kept with the registration and shown by the API (Bifrost does not send it on either)
+  tenant?: string,
+  // Bifrost's extension_uris: the A2A extensions of the agent's card the gateway relays (a2aext.tov)
+  extension_uris?: string[],
   card?: string,
   card_fetched_at?: int,
   created_at?: int,
@@ -1096,8 +1112,61 @@ function resolveKey(k: KeyConfig): KeyConfig {
 }
 
 // Replaces every "env.NAME" value in the config with the variable's value.
+// Why a declared agent is not served ("" when it is), as Bifrost's AgentRegistrationFileConfig.validate judges a file
+// declaration: a lowercase slug name of at most 255 bytes, and an absolute http(s) card URL without user info.
+export function agentDeclarationProblem(a: AgentConfig): string {
+  const name = a.name.trim()
+  let slug = name !== "" && name.byteLength <= 255 && !name.startsWith("-") && !name.endsWith("-") && !name.includes("--")
+  for (let i = 0; slug && i < name.byteLength; i++) {
+    const ch = name.slice(i, i + 1)
+    if (!(("a" <= ch && ch <= "z") || ("0" <= ch && ch <= "9") || ch === "-")) slug = false
+  }
+  if (!slug) return "name must be 1-255 lowercase ASCII letters, numbers, or single hyphens, and must start and end with a letter or number"
+  const u = URL.parse(a.agent_card_url)
+  const userInfo = u !== undefined && (u.href.slice(u.protocol.byteLength + 2).split("/")[0] ?? "").includes("@")
+  if (u === undefined || (u.protocol !== "http:" && u.protocol !== "https:") || u.hostname === "" || userInfo) return "agent_card_url must be an absolute HTTP(S) URL without user info"
+  return ""
+}
+
+// The declared agents the gateway serves, reconciled as Bifrost reconciles a config file's declarations with its store:
+// a name declared twice is skipped (every copy of it), and a declaration that fails the checks above is skipped, with a
+// warning at start (config_compat.tov warnings). Raiju's config file is its store, so nothing else is merged: a
+// registration made through the API is a declaration in the file, under either source_of_truth.
+export function servedAgents(list: AgentConfig[]): AgentConfig[] {
+  const counts: Map<string, int> = new Map()
+  for (const a of list) counts.set(a.name.trim(), (counts.get(a.name.trim()) ?? 0) + 1)
+  const out: AgentConfig[] = []
+  for (const a of list) {
+    if ((counts.get(a.name.trim()) ?? 0) > 1) continue
+    if (agentDeclarationProblem(a) !== "") continue
+    out.push(a)
+  }
+  return out
+}
+
+// The warnings for the declarations servedAgents skips.
+export function agentDeclarationNotes(list: AgentConfig[]): string[] {
+  const counts: Map<string, int> = new Map()
+  for (const a of list) counts.set(a.name.trim(), (counts.get(a.name.trim()) ?? 0) + 1)
+  const out: string[] = []
+  const told: string[] = []
+  for (const a of list) {
+    const n = a.name.trim()
+    if ((counts.get(n) ?? 0) > 1) {
+      if (!told.includes(n)) out.push(`config: skipping duplicate agent registration "${n}"`)
+      told.push(n)
+      continue
+    }
+    const p = agentDeclarationProblem(a)
+    if (p !== "") out.push(`config: skipping agent registration "${a.name}": ${p}`)
+  }
+  return out
+}
+
 export function resolveConfig(inout c: Config): void {
   resolveWebhooksAndFlags(&c)
+  const declared = c.agents
+  if (declared !== undefined) c.agents = servedAgents(declared)
   if (c.setup_token !== undefined) c.setup_token = resolveEnv(c.setup_token)
   const ps = c.providers
   if (ps !== undefined) {

@@ -10,8 +10,9 @@
 // How a call is shaped and mapped between the bindings is a2a.tov; the push relay is a2apush.tov; the
 // credentials the gateway sends to the agent (headers, an OAuth token) are agentauth.tov.
 //
-// The gRPC binding (a2agrpc.tov) serves the same agents under <name>.<server.a2a_grpc_base_domain>. Not built: extension
-// URIs, and client certificates for the agent's TLS.
+// The gRPC binding (a2agrpc.tov) serves the same agents under <name>.<server.a2a_grpc_base_domain>. A registration's
+// extension_uris pick the card's extensions the gateway relays (a2aext.tov); its tenant is kept and shown. Not built:
+// client certificates for the agent's TLS.
 import { Field, fields, elements, find, rawStr, rawBool, decodeString, quote, build, setField, isNull } from "./json"
 import { AgentConfig, AgentAuth, AgentOAuth, AgentTls } from "./config"
 import { urlProblem } from "./webhooks"
@@ -19,7 +20,8 @@ import { deadline } from "./deadline"
 import { errorJson } from "./schemas"
 import { upstreamHeaders, tlsOf } from "./agentauth"
 import { interfacesOf, interfaceUrl, cardPushes } from "./a2a"
-import { grpcUrlProblem } from "./a2agrpcup"
+import { cardProblem } from "./a2agrpcup"
+import { extensionUrisProblem, sortedUris, servedExtensionsJson } from "./a2aext"
 
 export const CARD_PATH = "/.well-known/agent-card.json"
 export const JSON_RPC_SUFFIX = "/json-rpc"
@@ -245,7 +247,7 @@ export function restEndpointOf(card: string): string {
 // routes, push notifications advertised only when the gateway relays them and the agent can push, the agent's
 // signatures dropped (the document changed), and the caller authenticating with x-bf-vk. base is the public
 // base URL the gateway is reached at.
-export function gatewayCard(card: string, base: string, name: string, pushOn: bool): string {
+export function gatewayCard(card: string, base: string, name: string, pushOn: bool, extensions: string[]): string {
   let cf: Field[] = objectFields(card) ?? []
   const root = base + "/agents/a2a/" + name
   const rpc = root + JSON_RPC_SUFFIX
@@ -257,12 +259,21 @@ export function gatewayCard(card: string, base: string, name: string, pushOn: bo
   if (!v1 || find(cf, "additionalInterfaces") !== undefined) setField(&cf, "additionalInterfaces", `[{"url":${quote(rpc)},"transport":"JSONRPC"},{"url":${quote(rest)},"transport":"HTTP+JSON"}]`)
   let caps: Field[] = objectFields(find(cf, "capabilities") ?? "") ?? []
   setField(&caps, "pushNotifications", pushOn && cardPushes(card) ? "true" : "false")
+  // only the extensions the registration allows are relayed (Bifrost's gatewayCardWithExtensions)
+  if (find(caps, "extensions") !== undefined) setField(&caps, "extensions", servedExtensionsJson(card, extensions))
   setField(&cf, "capabilities", build(caps))
-  setField(&cf, "securitySchemes", `{"bifrostVirtualKey":{"type":"apiKey","in":"header","name":"x-bf-vk"}}`)
-  setField(&cf, "security", `[{"bifrostVirtualKey":[]}]`)
+  // the gateway's credential, in the card's version: v1's SecurityScheme wrapper and securityRequirements (what the gRPC
+  // binding encodes), or v0.3's OpenAPI form
+  if (v1) {
+    setField(&cf, "securitySchemes", `{"bifrostVirtualKey":{"apiKeySecurityScheme":{"location":"header","name":"x-bf-vk"}}}`)
+    setField(&cf, "securityRequirements", `[{"schemes":{"bifrostVirtualKey":{"list":[]}}}]`)
+  } else {
+    setField(&cf, "securitySchemes", `{"bifrostVirtualKey":{"type":"apiKey","in":"header","name":"x-bf-vk"}}`)
+    setField(&cf, "security", `[{"bifrostVirtualKey":[]}]`)
+  }
   const out: Field[] = []
   for (const f of cf) {
-    if (f.key !== "signatures") out.push(f)
+    if (f.key !== "signatures" && !(v1 && f.key === "security")) out.push(f)
   }
   return build(out)
 }
@@ -364,22 +375,11 @@ export async function fetchCard(url: string, auth: AgentAuth | undefined, allowP
     const cf = objectFields(text)
     if (cf === undefined) return { card: "", error: "the agent card is not a JSON object" }
     if ((rawStr(cf, "name") ?? "") === "") return { card: "", error: "the agent card has no name" }
-    // a JSON-RPC or REST endpoint, or a gRPC interface the gateway may dial (a2agrpcup.tov; one it may not is
-    // passed over, and the card is refused only when it leaves nothing to call)
-    let grpcBad = ""
-    let grpcOk = false
-    for (const i of interfacesOf(text).list) {
-      if (i.binding !== "GRPC") continue
-      const gp = grpcUrlProblem(i.url, allowPrivate)
-      if (gp === "") grpcOk = true
-      else if (grpcBad === "") grpcBad = gp
-    }
-    if (endpointOf(text) === "" && restEndpointOf(text) === "" && !grpcOk) return { card: "", error: grpcBad === "" ? "the agent card names no endpoint" : `the agent card's gRPC interface: ${grpcBad}` }
-    for (const i of interfacesOf(text).list) {
-      if (i.binding !== "JSONRPC" && i.binding !== "HTTP+JSON") continue
-      const epBad = urlProblem(i.url, allowPrivate)
-      if (epBad !== "") return { card: "", error: `the agent card's endpoint: ${epBad}` }
-    }
+    // an interface the gateway may call: a protocol version it speaks, a binding it calls, the URL guard, and no
+    // plaintext endpoint on an https card off the loopback interface (a2agrpcup.tov interfaceProblem); the others
+    // are passed over, and the card is refused only when it leaves nothing to call
+    const cp = cardProblem(text, url, allowPrivate)
+    if (cp !== "") return { card: "", error: cp }
     return { card: text, error: "" }
   } catch (e) {
     dl.finish()
@@ -410,6 +410,8 @@ export function agentView(a: AgentConfig, base: string): string {
     `"discovery_auth":${authView(a.discovery_auth)}`,
     `"runtime_auth":${authView(a.runtime_auth)}`,
     `"allow_private_network":${a.allow_private_network === true ? "true" : "false"}`,
+    `"tenant":${quote(a.tenant ?? "")}`,
+    `"extension_uris":${JSON.stringify(a.extension_uris ?? [])}`,
     `"card":${card}`,
     `"card_fetched_at":${numOrNull(a.card_fetched_at)}`,
     `"endpoint":${quote(endpointOf(card === "null" ? "" : card))}`,
@@ -423,7 +425,7 @@ export function agentView(a: AgentConfig, base: string): string {
 
 // The fields of a create or replace body, checked. error is the reason it is refused. A masked secret
 // keeps the stored value of the same field (old, for a replace).
-type Draft = { url: string, enabled: bool, allowDefault: bool, forward: bool, forwardOver: bool, vks: string[], discovery: AgentAuth | undefined, runtime: AgentAuth | undefined, allowPrivate: bool, error: string }
+type Draft = { url: string, enabled: bool, allowDefault: bool, forward: bool, forwardOver: bool, vks: string[], discovery: AgentAuth | undefined, runtime: AgentAuth | undefined, allowPrivate: bool, tenant: string, extensions: string[], error: string }
 
 // The stored value of a secret, for a masked one.
 function keepStr(v: string, was: string | undefined): string {
@@ -455,7 +457,7 @@ function filled(a: AuthRead, old: AgentAuth | undefined): AgentAuth | undefined 
 function draftOf(fs: Field[], old: AgentConfig | undefined): Draft {
   const url = rawStr(fs, "agent_card_url") ?? ""
   const allowPrivate = rawBool(fs, "allow_private_network") ?? old?.allow_private_network ?? false
-  const bad = (msg: string): Draft => ({ url: url, enabled: true, allowDefault: false, forward: false, forwardOver: false, vks: [], discovery: undefined, runtime: undefined, allowPrivate: allowPrivate, error: msg })
+  const bad = (msg: string): Draft => ({ url: url, enabled: true, allowDefault: false, forward: false, forwardOver: false, vks: [], discovery: undefined, runtime: undefined, allowPrivate: allowPrivate, tenant: "", extensions: [], error: msg })
   if (url === "") return bad("agent_card_url is required")
   const up = urlProblem(url, allowPrivate)
   if (up !== "") return bad(`agent_card_url: ${up}`)
@@ -482,7 +484,23 @@ function draftOf(fs: Field[], old: AgentConfig | undefined): Draft {
     const raw = find(fs, k)
     if (raw !== undefined && !isNull(raw) && raw !== "true" && raw !== "false") return bad(`${k} must be a boolean`)
   }
-  return { url: url, enabled: rawBool(fs, "enabled") ?? true, allowDefault: rawBool(fs, "allow_by_default") ?? false, forward: rawBool(fs, "forward_accepted_credential") ?? false, forwardOver: rawBool(fs, "forward_accepted_credential_overrides_auth") ?? false, vks: vks, discovery: filled(d, old?.discovery_auth), runtime: filled(r, old?.runtime_auth), allowPrivate: allowPrivate, error: "" }
+  const traw = find(fs, "tenant")
+  if (traw !== undefined && !isNull(traw) && !traw.startsWith("\"")) return bad("tenant must be a string")
+  const exts: string[] = []
+  const xraw = find(fs, "extension_uris")
+  if (xraw !== undefined && !isNull(xraw)) {
+    try {
+      for (const it of elements(xraw)) {
+        if (!it.startsWith("\"")) return bad("extension_uris must be an array of strings")
+        exts.push(decodeString(it))
+      }
+    } catch (e) {
+      return bad("extension_uris must be an array of strings")
+    }
+  }
+  const xp = extensionUrisProblem(exts)
+  if (xp !== "") return bad(xp)
+  return { url: url, enabled: rawBool(fs, "enabled") ?? true, allowDefault: rawBool(fs, "allow_by_default") ?? false, forward: rawBool(fs, "forward_accepted_credential") ?? false, forwardOver: rawBool(fs, "forward_accepted_credential_overrides_auth") ?? false, vks: vks, discovery: filled(d, old?.discovery_auth), runtime: filled(r, old?.runtime_auth), allowPrivate: allowPrivate, tenant: rawStr(fs, "tenant") ?? "", extensions: sortedUris(exts), error: "" }
 }
 
 function indexOf(list: AgentConfig[], name: string): int {
@@ -511,7 +529,7 @@ async function create(list: AgentConfig[], body: string, base: string): Promise<
   const f = await fetchCard(d.url, d.discovery, d.allowPrivate, name + "|discovery")
   if (f.error !== "") return fail(400, f.error)
   const now = Math.floor(Date.now())
-  const made: AgentConfig = { name: name, agent_card_url: d.url, enabled: d.enabled, allow_by_default: d.allowDefault, forward_accepted_credential: d.forward, forward_accepted_credential_overrides_auth: d.forwardOver, virtual_key_ids: d.vks, discovery_auth: d.discovery, runtime_auth: d.runtime, allow_private_network: d.allowPrivate, card: f.card, card_fetched_at: now, created_at: now, updated_at: now }
+  const made: AgentConfig = { name: name, agent_card_url: d.url, enabled: d.enabled, allow_by_default: d.allowDefault, forward_accepted_credential: d.forward, forward_accepted_credential_overrides_auth: d.forwardOver, virtual_key_ids: d.vks, discovery_auth: d.discovery, runtime_auth: d.runtime, allow_private_network: d.allowPrivate, tenant: d.tenant === "" ? undefined : d.tenant, extension_uris: d.extensions.length === 0 ? undefined : d.extensions, card: f.card, card_fetched_at: now, created_at: now, updated_at: now }
   return reply(201, agentView(made, base), list.concat([made]))
 }
 
@@ -533,7 +551,7 @@ async function replace(list: AgentConfig[], i: int, body: string, base: string):
     card = f.card
     fetched = now
   }
-  const made: AgentConfig = { name: old.name, agent_card_url: d.url, enabled: d.enabled, allow_by_default: d.allowDefault, forward_accepted_credential: d.forward, forward_accepted_credential_overrides_auth: d.forwardOver, virtual_key_ids: d.vks, discovery_auth: d.discovery, runtime_auth: d.runtime, allow_private_network: d.allowPrivate, card: card, card_fetched_at: fetched, created_at: old.created_at, updated_at: now }
+  const made: AgentConfig = { name: old.name, agent_card_url: d.url, enabled: d.enabled, allow_by_default: d.allowDefault, forward_accepted_credential: d.forward, forward_accepted_credential_overrides_auth: d.forwardOver, virtual_key_ids: d.vks, discovery_auth: d.discovery, runtime_auth: d.runtime, allow_private_network: d.allowPrivate, tenant: d.tenant === "" ? undefined : d.tenant, extension_uris: d.extensions.length === 0 ? undefined : d.extensions, card: card, card_fetched_at: fetched, created_at: old.created_at, updated_at: now }
   const out: AgentConfig[] = []
   for (let j = 0; j < list.length; j++) out.push(j === i ? made : list[j]!)
   return reply(200, agentView(made, base), out)
@@ -553,7 +571,11 @@ async function inspect(body: string): Promise<AgentReply, Error> {
 
 // The registration with a freshly fetched card.
 export function withCard(old: AgentConfig, card: string, now: int): AgentConfig {
-  return { name: old.name, agent_card_url: old.agent_card_url, enabled: old.enabled, allow_by_default: old.allow_by_default, forward_accepted_credential: old.forward_accepted_credential, forward_accepted_credential_overrides_auth: old.forward_accepted_credential_overrides_auth, virtual_key_ids: old.virtual_key_ids, discovery_auth: old.discovery_auth, runtime_auth: old.runtime_auth, allow_private_network: old.allow_private_network, card: card, card_fetched_at: now, created_at: old.created_at, updated_at: now }
+  let made: AgentConfig = old
+  made.card = card
+  made.card_fetched_at = now
+  made.updated_at = now
+  return made
 }
 
 // Fetches the card again for a registration: its cache is replaced.
@@ -748,24 +770,27 @@ test("the endpoints are the card's interfaces of each binding", () => {
 })
 
 test("the gateway card points at the gateway's JSON-RPC and REST routes and asks for the virtual key", () => {
-  const card = try gatewayCard(`{"name":"echo","url":"https://agent.example.com/rpc","signatures":[{"protected":"x","signature":"y"}],"capabilities":{"streaming":true,"pushNotifications":true},"supportedInterfaces":[{"url":"https://agent.example.com/v1","protocolBinding":"JSONRPC"}]}`, "https://gw.example.com", "echo", true)
+  const card = try gatewayCard(`{"name":"echo","url":"https://agent.example.com/rpc","signatures":[{"protected":"x","signature":"y"}],"capabilities":{"streaming":true,"pushNotifications":true},"supportedInterfaces":[{"url":"https://agent.example.com/v1","protocolBinding":"JSONRPC"}]}`, "https://gw.example.com", "echo", true, [])
   expect(endpointOf(card)).toBe("https://gw.example.com/agents/a2a/echo/json-rpc")
   expect(restEndpointOf(card)).toBe("https://gw.example.com/agents/a2a/echo/rest")
   expect(card.includes(`"supportedInterfaces":[{"url":"https://gw.example.com/agents/a2a/echo/json-rpc","protocolBinding":"JSONRPC","protocolVersion":"1.0"},{"url":"https://gw.example.com/agents/a2a/echo/rest","protocolBinding":"HTTP+JSON","protocolVersion":"1.0"}]`)).toBe(true)
-  expect(card.includes(`"securitySchemes":{"bifrostVirtualKey":{"type":"apiKey","in":"header","name":"x-bf-vk"}}`)).toBe(true)
+  // a v1 card names the key in v1's form (the gRPC binding encodes it); a v0.3 card in OpenAPI's
+  expect(card.includes(`"securitySchemes":{"bifrostVirtualKey":{"apiKeySecurityScheme":{"location":"header","name":"x-bf-vk"}}}`)).toBe(true)
+  expect(card.includes(`"securityRequirements":[{"schemes":{"bifrostVirtualKey":{"list":[]}}}]`)).toBe(true)
+  expect(try gatewayCard(`{"name":"echo","url":"https://agent.example.com/rpc"}`, "https://gw.example.com", "echo", true, []).includes(`"securitySchemes":{"bifrostVirtualKey":{"type":"apiKey","in":"header","name":"x-bf-vk"}},"security":[{"bifrostVirtualKey":[]}]`)).toBe(true)
   expect(card.includes("signatures")).toBe(false)
   expect(card.includes(`"streaming":true`)).toBe(true)
   expect(card.includes(`"pushNotifications":true`)).toBe(true)
   expect(rawStr(try fields(card), "name")).toBe("echo")
   // push is advertised only when the gateway relays it and the agent can push
-  expect(try gatewayCard(`{"name":"echo","url":"https://agent.example.com/rpc","capabilities":{"pushNotifications":true}}`, "https://gw.example.com", "echo", false).includes(`"pushNotifications":false`)).toBe(true)
-  expect(try gatewayCard(`{"name":"echo","url":"https://agent.example.com/rpc"}`, "https://gw.example.com", "echo", true).includes(`"pushNotifications":false`)).toBe(true)
+  expect(try gatewayCard(`{"name":"echo","url":"https://agent.example.com/rpc","capabilities":{"pushNotifications":true}}`, "https://gw.example.com", "echo", false, []).includes(`"pushNotifications":false`)).toBe(true)
+  expect(try gatewayCard(`{"name":"echo","url":"https://agent.example.com/rpc"}`, "https://gw.example.com", "echo", true, []).includes(`"pushNotifications":false`)).toBe(true)
   // a v0.3 card lists its additional interfaces
-  const old = try gatewayCard(`{"name":"echo","url":"https://agent.example.com/rpc"}`, "https://gw.example.com", "echo", true)
+  const old = try gatewayCard(`{"name":"echo","url":"https://agent.example.com/rpc"}`, "https://gw.example.com", "echo", true, [])
   expect(old.includes(`"additionalInterfaces":[{"url":"https://gw.example.com/agents/a2a/echo/json-rpc","transport":"JSONRPC"},{"url":"https://gw.example.com/agents/a2a/echo/rest","transport":"HTTP+JSON"}]`)).toBe(true)
   expect(old.includes("supportedInterfaces")).toBe(false)
   // the gRPC interface: listed under <agent>.<domain>:<advertised port>, in the list the card's version uses
-  const v1 = try gatewayCard(`{"name":"echo","supportedInterfaces":[{"url":"https://a.example.com/rpc","protocolBinding":"JSONRPC"}]}`, "https://gw.example.com", "echo", false)
+  const v1 = try gatewayCard(`{"name":"echo","supportedInterfaces":[{"url":"https://a.example.com/rpc","protocolBinding":"JSONRPC"}]}`, "https://gw.example.com", "echo", false, [])
   const withV1 = withGrpcInterface(v1, "echo", "grpc.example.test", 18246)
   expect(withV1.includes(`{"url":"echo.grpc.example.test:18246","protocolBinding":"GRPC","protocolVersion":"1.0"}`)).toBe(true)
   expect(withGrpcInterface(old, "echo", "grpc.example.test", 18246).includes(`{"url":"echo.grpc.example.test:18246","transport":"GRPC"}`)).toBe(true)
@@ -773,6 +798,10 @@ test("the gateway card points at the gateway's JSON-RPC and REST routes and asks
   expect(withGrpcInterface(old, "echo", "grpc.example.test", 0)).toBe(old)
   const long = "a".repeat(64)
   expect(withGrpcInterface(old, long, "grpc.example.test", 18246)).toBe(old)
+  // only the extensions the registration allows are listed
+  const ext = `{"name":"echo","url":"https://a.example.com/rpc","capabilities":{"extensions":[{"uri":"u:trace"},{"uri":"u:other"}]}}`
+  expect(try gatewayCard(ext, "https://gw.example.com", "echo", false, ["u:trace"]).includes(`"extensions":[{"uri":"u:trace"}]`)).toBe(true)
+  expect(try gatewayCard(ext, "https://gw.example.com", "echo", false, []).includes(`"extensions":[]`)).toBe(true)
 })
 
 test("the aggregated card lists the agents' skills under their names", () => {
@@ -843,6 +872,20 @@ test("a registration body is checked: URL, grants and auth", () => {
   expect(fwd.forward).toBe(true)
   expect(fwd.forwardOver).toBe(true)
   expect(try draftOf(try fields(`{"agent_card_url":"https://a.example.com/card","forward_accepted_credential":"yes"}`), undefined).error.includes("boolean")).toBe(true)
+  // tenant and extension_uris: kept, the URIs checked and sorted as Bifrost stores them
+  const ext = try draftOf(try fields(`{"agent_card_url":"https://a.example.com/card","tenant":"acme","extension_uris":["u:b","https://ext.example/a"]}`), undefined)
+  expect(ext.error).toBe("")
+  expect(ext.tenant).toBe("acme")
+  expect(ext.extensions.join(",")).toBe("https://ext.example/a,u:b")
+  expect(try draftOf(try fields(`{"agent_card_url":"https://a.example.com/card","extension_uris":["u:a","u:a"]}`), undefined).error).toBe("duplicate extension URI: u:a")
+  expect(try draftOf(try fields(`{"agent_card_url":"https://a.example.com/card","extension_uris":"u:a"}`), undefined).error).toBe("extension_uris must be an array of strings")
+  expect(try draftOf(try fields(`{"agent_card_url":"https://a.example.com/card","tenant":5}`), undefined).error).toBe("tenant must be a string")
+  const shown: AgentConfig = { name: "echo", agent_card_url: "https://a.example.com/card", tenant: "acme", extension_uris: ["u:a"] }
+  expect(agentView(shown, "https://gw.example.com").includes(`"tenant":"acme","extension_uris":["u:a"]`)).toBe(true)
+  // a fresh card keeps the registration's other settings
+  const wc = withCard(shown, `{"name":"x"}`, 9)
+  expect(wc.tenant).toBe("acme")
+  expect(wc.card_fetched_at).toBe(9)
 })
 
 function draftError(body: string): string {

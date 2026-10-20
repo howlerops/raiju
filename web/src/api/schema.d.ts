@@ -4375,8 +4375,97 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** The A2A calls that reached the agents, newest first */
+        /**
+         * The A2A calls that reached the agents, newest first
+         * @description Bifrost's filters (its listHistory parameters); the answer keeps Raiju's {history, total} shape.
+         */
         get: operations["getApiAgentsHistory"];
+        put?: never;
+        post?: never;
+        /** Delete history entries by id (Bifrost's deleteHistory) */
+        delete: operations["deleteApiAgentsHistory"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agents/history/stats": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Totals of the selected A2A calls (Bifrost's historyStats) */
+        get: operations["getApiAgentsHistoryStats"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agents/history/histogram": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The selected A2A calls per time bucket, success and error (Bifrost's historyHistogram) */
+        get: operations["getApiAgentsHistoryHistogram"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agents/history/top-agents": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The ten agents with the most selected calls (Bifrost's historyTopAgents) */
+        get: operations["getApiAgentsHistoryTopAgents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agents/history/filterdata": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The ids and names of the users, keys, teams, customers, business units and projects the calls carry (Bifrost's historyFilterData) */
+        get: operations["getApiAgentsHistoryFilterdata"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agents/history/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One A2A call (Bifrost's getHistoryEntry); its stored bodies have their credentials redacted */
+        get: operations["getApiAgentsHistoryById"];
         put?: never;
         post?: never;
         delete?: never;
@@ -4843,6 +4932,10 @@ export interface components {
             runtime_auth?: components["schemas"]["AgentUpstreamAuth"];
             /** @description Raiju-only. Lets the card URL and the agent's endpoint be private addresses (the SSRF guard refuses them otherwise, as for webhooks). */
             allow_private_network?: boolean;
+            /** @description Bifrost's tenant, kept and shown. */
+            tenant?: string;
+            /** @description The A2A extensions of the agent's card the gateway relays (absolute URIs, no duplicates; stored sorted). */
+            extension_uris?: string[];
         };
         /** @description A registration, its cached card and the gateway's endpoints. Raiju-only shape (Bifrost's agent records differ). */
         AgentRegistration: {
@@ -4856,6 +4949,8 @@ export interface components {
             discovery_auth?: components["schemas"]["AgentUpstreamAuth"];
             runtime_auth?: components["schemas"]["AgentUpstreamAuth"];
             allow_private_network?: boolean;
+            tenant?: string;
+            extension_uris?: string[];
             /** @description The agent's card as last fetched; null until it is fetched. */
             card?: {
                 [key: string]: unknown;
@@ -4918,6 +5013,14 @@ export interface components {
             timestamp?: string;
             agent_name?: string;
             method?: string;
+            /** @description Bifrost's name for method. */
+            operation?: string;
+            record_kind?: string;
+            task_id?: string;
+            /** @description The caller's binding (JSONRPC, HTTP+JSON, GRPC). */
+            downstream_transport?: string;
+            /** @description The binding the agent was called on. */
+            upstream_transport?: string;
             /** @description The A2A context the call belongs to (the session its LLM requests are logged under). */
             context_id?: string;
             virtual_key_id?: string;
@@ -4933,6 +5036,83 @@ export interface components {
             history?: components["schemas"]["AgentCallLog"][];
             total?: number;
         };
+        AgentGrant: {
+            agent_name: string;
+        };
+        AgentHistoryDeleteRequest: {
+            ids: string[];
+        };
+        AgentHistoryDeleted: {
+            message?: string;
+        };
+        AgentHistoryStats: {
+            total_entries?: number;
+            success_count?: number;
+            error_count?: number;
+            success_rate?: number;
+            average_latency?: number;
+        };
+        AgentHistoryHistogram: {
+            buckets?: {
+                /** Format: date-time */
+                timestamp?: string;
+                count?: number;
+                success?: number;
+                error?: number;
+            }[];
+            bucket_size_seconds?: number;
+        };
+        AgentTopAgents: {
+            agents?: {
+                agent_name?: string;
+                count?: number;
+                error_count?: number;
+                average_latency?: number;
+            }[];
+        };
+        AgentFilterPair: {
+            id?: string;
+            name?: string;
+        };
+        AgentHistoryFilterData: {
+            users?: components["schemas"]["AgentFilterPair"][];
+            virtual_keys?: components["schemas"]["AgentFilterPair"][];
+            teams?: components["schemas"]["AgentFilterPair"][];
+            customers?: components["schemas"]["AgentFilterPair"][];
+            business_units?: components["schemas"]["AgentFilterPair"][];
+            projects?: components["schemas"]["AgentFilterPair"][];
+        };
+        /** @description One A2A call in Bifrost's AgentLogDetail shape. */
+        AgentHistoryEntry: {
+            /** @description The bytes sent to the agent, base64 (client.a2a_store_raw_request_response). */
+            raw_request?: string;
+            /** @description The bytes the agent answered, base64. */
+            raw_response?: string;
+            id?: string;
+            /** Format: date-time */
+            timestamp?: string;
+            record_kind?: string;
+            operation?: string;
+            /** @enum {string} */
+            status?: "success" | "error";
+            agent_name?: string;
+            virtual_key_id?: string;
+            virtual_key_name?: string;
+            request_id?: string;
+            task_id?: string;
+            context_id?: string;
+            downstream_transport?: string;
+            upstream_transport?: string;
+            latency?: number;
+            status_code?: number;
+            request_body?: string;
+            response_body?: string;
+            error_details?: {
+                [key: string]: unknown;
+            };
+        } & {
+            [key: string]: unknown;
+        };
         /** @description Raiju: a reusable permission set that virtual keys reference. */
         AccessProfile: {
             id: string;
@@ -4946,6 +5126,8 @@ export interface components {
             budget_id?: string;
             rate_limit_id?: string;
             mcp_tools?: string[];
+            /** @description The A2A agents the profile grants its holders' keys. */
+            agent_grants?: components["schemas"]["AgentGrant"][];
             required_headers?: string[];
             /** Format: int64 */
             max_tokens?: number;
@@ -6076,6 +6258,8 @@ export interface components {
             budget_id?: string;
             rate_limit_id?: string;
             provider_configs?: components["schemas"]["VirtualKeyProviderConfig"][];
+            /** @description The A2A agents the project grants, combined with the caller's by access_rule. */
+            agent_grants?: components["schemas"]["AgentGrant"][];
         };
         ProjectCreated: {
             project: components["schemas"]["Project"];
@@ -6350,6 +6534,8 @@ export interface components {
                 /** @description * for every tool of the client, a list of tool names, or empty for none */
                 tools_to_execute?: string[];
             }[];
+            /** @description The registered A2A agents this key may call (Bifrost's agent_grants), besides the agents' own virtual_key_ids. */
+            agent_grants?: components["schemas"]["AgentGrant"][];
         };
         /** @description Bifrost VirtualKeyProviderConfig. */
         VirtualKeyProviderConfig: {
@@ -25904,8 +26090,31 @@ export interface operations {
     getApiAgentsHistory: {
         parameters: {
             query?: {
-                /** @description Comma-separated agent names. */
+                /** @description Agent names; repeated or comma-separated, any matches (Bifrost's name). agent_names is taken too. */
+                agent_name?: string;
+                /** @description Comma-separated agent names (Raiju's name for agent_name). */
                 agent_names?: string;
+                /** @description The method names the calls used (message/send, SendMessage, ...); repeated or comma-separated. */
+                operation?: string;
+                virtual_key_id?: string;
+                user_id?: string;
+                team_id?: string;
+                customer_id?: string;
+                business_unit_id?: string;
+                project_id?: string;
+                /** @description success or error; repeated or comma-separated. */
+                status?: string;
+                task_id?: string;
+                context_id?: string;
+                request_id?: string;
+                /** @description Text in the agent name, operation, task, context or request id, or the error (not the bodies). */
+                search?: string;
+                /** @description RFC 3339. */
+                start_time?: string;
+                /** @description RFC 3339. */
+                end_time?: string;
+                sort_by?: "timestamp" | "latency";
+                order?: "desc" | "asc";
                 limit?: number;
                 offset?: number;
             };
@@ -25924,7 +26133,7 @@ export interface operations {
                     "application/json": components["schemas"]["AgentHistory"];
                 };
             };
-            /** @description A limit or offset is not a valid number. */
+            /** @description A limit, offset or time is not valid. */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -25944,6 +26153,425 @@ export interface operations {
             };
             /** @description The caller's role or data access scope does not cover this route. */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    deleteApiAgentsHistory: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AgentHistoryDeleteRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentHistoryDeleted"];
+                };
+            };
+            /** @description The body is not JSON, or names no ids. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The logs store is not enabled. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiAgentsHistoryStats: {
+        parameters: {
+            query?: {
+                /** @description Agent names; repeated or comma-separated, any matches (Bifrost's name). agent_names is taken too. */
+                agent_name?: string;
+                /** @description Comma-separated agent names (Raiju's name for agent_name). */
+                agent_names?: string;
+                /** @description The method names the calls used (message/send, SendMessage, ...); repeated or comma-separated. */
+                operation?: string;
+                virtual_key_id?: string;
+                user_id?: string;
+                team_id?: string;
+                customer_id?: string;
+                business_unit_id?: string;
+                project_id?: string;
+                /** @description success or error; repeated or comma-separated. */
+                status?: string;
+                task_id?: string;
+                context_id?: string;
+                request_id?: string;
+                /** @description Text in the agent name, operation, task, context or request id, or the error (not the bodies). */
+                search?: string;
+                /** @description RFC 3339. */
+                start_time?: string;
+                /** @description RFC 3339. */
+                end_time?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentHistoryStats"];
+                };
+            };
+            /** @description A parameter is not valid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The logs store is not enabled. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiAgentsHistoryHistogram: {
+        parameters: {
+            query?: {
+                /** @description Agent names; repeated or comma-separated, any matches (Bifrost's name). agent_names is taken too. */
+                agent_name?: string;
+                /** @description Comma-separated agent names (Raiju's name for agent_name). */
+                agent_names?: string;
+                /** @description The method names the calls used (message/send, SendMessage, ...); repeated or comma-separated. */
+                operation?: string;
+                virtual_key_id?: string;
+                user_id?: string;
+                team_id?: string;
+                customer_id?: string;
+                business_unit_id?: string;
+                project_id?: string;
+                /** @description success or error; repeated or comma-separated. */
+                status?: string;
+                task_id?: string;
+                context_id?: string;
+                request_id?: string;
+                /** @description Text in the agent name, operation, task, context or request id, or the error (not the bodies). */
+                search?: string;
+                /** @description RFC 3339. */
+                start_time?: string;
+                /** @description RFC 3339. */
+                end_time?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentHistoryHistogram"];
+                };
+            };
+            /** @description A parameter is not valid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The logs store is not enabled. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiAgentsHistoryTopAgents: {
+        parameters: {
+            query?: {
+                /** @description Agent names; repeated or comma-separated, any matches (Bifrost's name). agent_names is taken too. */
+                agent_name?: string;
+                /** @description Comma-separated agent names (Raiju's name for agent_name). */
+                agent_names?: string;
+                /** @description The method names the calls used (message/send, SendMessage, ...); repeated or comma-separated. */
+                operation?: string;
+                virtual_key_id?: string;
+                user_id?: string;
+                team_id?: string;
+                customer_id?: string;
+                business_unit_id?: string;
+                project_id?: string;
+                /** @description success or error; repeated or comma-separated. */
+                status?: string;
+                task_id?: string;
+                context_id?: string;
+                request_id?: string;
+                /** @description Text in the agent name, operation, task, context or request id, or the error (not the bodies). */
+                search?: string;
+                /** @description RFC 3339. */
+                start_time?: string;
+                /** @description RFC 3339. */
+                end_time?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentTopAgents"];
+                };
+            };
+            /** @description A parameter is not valid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The logs store is not enabled. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiAgentsHistoryFilterdata: {
+        parameters: {
+            query?: {
+                /** @description Comma-separated dimensions (users, virtual_keys, teams, customers, business_units, projects); all when absent. */
+                dimensions?: string;
+                /** @description Text the names must contain. */
+                q?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentHistoryFilterData"];
+                };
+            };
+            /** @description A parameter is not valid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The logs store is not enabled. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiAgentsHistoryById: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentHistoryEntry"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No call with this id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The logs store is not enabled. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
