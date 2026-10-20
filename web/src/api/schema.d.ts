@@ -2408,6 +2408,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/audit-logs/{id}/verify": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One audit event's signature computed again from its stored fields and compared with the stored one */
+        get: operations["verifyAuditLogSignature"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/governance/audit-logs/{id}/verify": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One audit event's signature checked (alias of /api/audit-logs/{id}/verify) */
+        get: operations["verifyGovernanceAuditLogSignature"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/governance/audit-logs": {
         parameters: {
             query?: never;
@@ -5284,10 +5318,23 @@ export interface components {
             prev: string;
             hash: string;
         };
+        /** @description Bifrost's audit list (audit_logs as CADF events, total, page, limit, total_pages, has_more, next_cursor), with Raiju's own events alongside */
         AuditEventPage: {
+            audit_logs?: Record<string, never>[];
             events: components["schemas"]["AuditEvent"][];
             /** Format: int64 */
             total: number;
+            page?: number;
+            limit?: number;
+            total_pages?: number;
+            has_more?: boolean;
+            next_cursor?: string;
+        };
+        /** @description One event's signature check (Bifrost's AuditVerifyResult) */
+        AuditEventVerify: {
+            valid: boolean;
+            computed: string;
+            stored: string;
         };
         /** @description Bifrost AuditVerifyResult name; Raiju shape. */
         AuditVerifyResult: {
@@ -15129,8 +15176,64 @@ export interface operations {
             query?: {
                 /** @description Only this actor */
                 actor?: string;
-                /** @description Only this action, e.g. virtual_key.create */
+                /** @description Only this action, a CADF action (create, update, delete, ...) or a Raiju action name such as virtual_key.create */
                 action?: string;
+                /** @description Page number (1 and up); the offset is (page - 1) x limit */
+                page?: number;
+                /** @description The next_cursor of the page before: the page starts after that event */
+                cursor?: string;
+                /** @description Free text, ignoring case: initiator, action, target, path, method, outcome and client address */
+                search?: string;
+                /** @description JSON array of CADF actions (create, update, delete, authenticate, access) or Raiju action names; any of them */
+                actions?: string;
+                /** @description One outcome: success (an answer below 400) or failure */
+                outcome?: string;
+                /** @description JSON array of outcomes; any of them */
+                outcomes?: string;
+                /** @description One event type; every Raiju event is activity */
+                event_type?: string;
+                /** @description JSON array of event types */
+                event_types?: string;
+                /** @description One initiator (the actor) */
+                initiator_id?: string;
+                /** @description JSON array of initiators */
+                initiator_ids?: string;
+                /** @description One initiator type: user, api_key, session or system */
+                initiator_type?: string;
+                /** @description JSON array of initiator types */
+                initiator_types?: string;
+                /** @description One target (the object acted on, else the path) */
+                target_id?: string;
+                /** @description JSON array of targets */
+                target_ids?: string;
+                /** @description One target type (provider, virtual_key, team, customer, plugin, config, ...) */
+                target_type?: string;
+                /** @description JSON array of target types */
+                target_types?: string;
+                /** @description One HTTP method */
+                request_method?: string;
+                /** @description JSON array of HTTP methods */
+                request_methods?: string;
+                /** @description One path prefix */
+                request_path?: string;
+                /** @description JSON array of path prefixes */
+                request_paths?: string;
+                /** @description One client address (ignored with omit_ip_addresses) */
+                request_ip?: string;
+                /** @description JSON array of client addresses */
+                request_ips?: string;
+                /** @description JSON array of tags; Raiju events carry none, so a tag matches nothing */
+                tags?: string;
+                /** @description At or after this time: RFC 3339 or YYYY-MM-DD */
+                start_date?: string;
+                /** @description At or before this time: RFC 3339 or YYYY-MM-DD (a date is the end of that day) */
+                end_date?: string;
+                /** @description A window ending now (30m, 24h, 7d); overrides start_date and end_date */
+                period?: string;
+                /** @description event_time (the only order) */
+                sort_by?: string;
+                /** @description desc (default) or asc */
+                sort_order?: string;
                 /** @description Epoch milliseconds, inclusive */
                 since?: number;
                 /** @description Epoch milliseconds, inclusive */
@@ -17857,7 +17960,12 @@ export interface operations {
     };
     getAuditLogsFilterData: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Comma-separated Bifrost dimensions to return (actions, outcomes, event_types, initiator_types, target_types, request_methods, initiators, targets, request_paths, request_ips, tags); all when absent */
+                dimensions?: string;
+                /** @description Keep the values that hold this text, ignoring case */
+                q?: string;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -17970,18 +18078,192 @@ export interface operations {
             };
         };
     };
+    verifyAuditLogSignature: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Event id (its sequence number) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuditEventVerify"];
+                };
+            };
+            /** @description The request is not valid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No such record (or the route is not served for this input). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    verifyGovernanceAuditLogSignature: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Event id (its sequence number) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuditEventVerify"];
+                };
+            };
+            /** @description The request is not valid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No such record (or the route is not served for this input). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
     getAuditLogs: {
         parameters: {
             query?: {
                 /** @description Actor name */
                 actor?: string;
-                /** @description Action, e.g. virtual_key.create */
+                /** @description Action: a CADF action or a Raiju action name such as virtual_key.create */
                 action?: string;
+                /** @description Page number (1 and up); the offset is (page - 1) x limit */
+                page?: number;
+                /** @description The next_cursor of the page before: the page starts after that event */
+                cursor?: string;
+                /** @description Free text, ignoring case: initiator, action, target, path, method, outcome and client address */
+                search?: string;
+                /** @description JSON array of CADF actions (create, update, delete, authenticate, access) or Raiju action names; any of them */
+                actions?: string;
+                /** @description One outcome: success (an answer below 400) or failure */
+                outcome?: string;
+                /** @description JSON array of outcomes; any of them */
+                outcomes?: string;
+                /** @description One event type; every Raiju event is activity */
+                event_type?: string;
+                /** @description JSON array of event types */
+                event_types?: string;
+                /** @description One initiator (the actor) */
+                initiator_id?: string;
+                /** @description JSON array of initiators */
+                initiator_ids?: string;
+                /** @description One initiator type: user, api_key, session or system */
+                initiator_type?: string;
+                /** @description JSON array of initiator types */
+                initiator_types?: string;
+                /** @description One target (the object acted on, else the path) */
+                target_id?: string;
+                /** @description JSON array of targets */
+                target_ids?: string;
+                /** @description One target type (provider, virtual_key, team, customer, plugin, config, ...) */
+                target_type?: string;
+                /** @description JSON array of target types */
+                target_types?: string;
+                /** @description One HTTP method */
+                request_method?: string;
+                /** @description JSON array of HTTP methods */
+                request_methods?: string;
+                /** @description One path prefix */
+                request_path?: string;
+                /** @description JSON array of path prefixes */
+                request_paths?: string;
+                /** @description One client address (ignored with omit_ip_addresses) */
+                request_ip?: string;
+                /** @description JSON array of client addresses */
+                request_ips?: string;
+                /** @description JSON array of tags; Raiju events carry none, so a tag matches nothing */
+                tags?: string;
+                /** @description At or after this time: RFC 3339 or YYYY-MM-DD */
+                start_date?: string;
+                /** @description At or before this time: RFC 3339 or YYYY-MM-DD (a date is the end of that day) */
+                end_date?: string;
+                /** @description A window ending now (30m, 24h, 7d); overrides start_date and end_date */
+                period?: string;
+                /** @description event_time (the only order) */
+                sort_by?: string;
+                /** @description desc (default) or asc */
+                sort_order?: string;
                 /** @description Epoch ms */
                 since?: string;
                 /** @description Epoch ms */
                 until?: string;
-                /** @description Rows (default 50) */
+                /** @description Rows (default 100, at most 1000) */
                 limit?: string;
                 /** @description Rows to skip */
                 offset?: string;
@@ -18041,7 +18323,12 @@ export interface operations {
     };
     getGovernanceAuditLogsFilterData: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Comma-separated Bifrost dimensions to return (actions, outcomes, event_types, initiator_types, target_types, request_methods, initiators, targets, request_paths, request_ips, tags); all when absent */
+                dimensions?: string;
+                /** @description Keep the values that hold this text, ignoring case */
+                q?: string;
+            };
             header?: never;
             path?: never;
             cookie?: never;

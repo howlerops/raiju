@@ -3,6 +3,7 @@
 // The views are pure: the handlers pass in the entries a caller may see and the filter applied.
 import { LogEntry, Filter, filterFrom, statsView, kindOf, daysFromCivil, jobj, jarr, jkv, jn, hitTypeOf } from "./logstore"
 import { UserAgentMapping } from "./config"
+import { compileRegex, Regex } from "./regex"
 import { isoMs } from "./exports"
 import { newId } from "./schemas"
 
@@ -202,8 +203,30 @@ function builtinApps(): { app: string, ids: string[] }[] {
   ]
 }
 
-// Whether a pattern matches a User-Agent under a mapping's match type. regex needs a regular
-// expression engine, which Raiju does not have, so it never matches (the API refuses it).
+// Compiled mapping regexes by pattern; an invalid one is kept as undefined so it is not
+// compiled again on every request.
+class UaRegexes {
+  items: Map<string, Regex | undefined> = new Map()
+
+  get(pattern: string): Regex | undefined {
+    if (this.items.has(pattern)) return this.items.get(pattern)
+    if (this.items.size >= 256) this.items.clear()
+    let re: Regex | undefined = undefined
+    try {
+      re = compileRegex(pattern)
+    } catch (e) {
+      re = undefined
+    }
+    this.items.set(pattern, re)
+    return re
+  }
+}
+
+const uaRegexes = new UaRegexes()
+
+// Whether a pattern matches a User-Agent under a mapping's match type. regex runs the pattern
+// as written (case-sensitive, unanchored) on the User-Agent, as Bifrost's compiled mappings
+// do; an invalid pattern never matches.
 export function uaMatches(ua: string, pattern: string, matchType: string): bool {
   const u = ua.trim().toLowerCase()
   const p = pattern.trim().toLowerCase()
@@ -211,6 +234,10 @@ export function uaMatches(ua: string, pattern: string, matchType: string): bool 
   if (matchType === "exact") return u === p
   if (matchType === "starts_with") return u.startsWith(p)
   if (matchType === "contains" || matchType === "") return u.includes(p)
+  if (matchType === "regex") {
+    const re = uaRegexes.get(pattern.trim())
+    return re !== undefined && re.test(ua)
+  }
   return false
 }
 
@@ -229,7 +256,7 @@ export function appOf(ua: string, mappings: UserAgentMapping[]): string {
   return "Other"
 }
 
-const UA_MATCH_TYPES = ["contains", "starts_with", "exact"]
+const UA_MATCH_TYPES = ["contains", "starts_with", "exact", "regex"]
 
 export type UaReply = { status: int, body: string, next?: UserAgentMapping[] }
 
@@ -248,8 +275,14 @@ function checkUa(b: UaBody, cur: UserAgentMapping | undefined): UaCheck {
   const matchType = (b.match_type ?? cur?.match_type ?? "").trim()
   if (pattern === "") return { kind: "error", error: "failed to create user agent mapping: pattern cannot be empty" }
   if (app === "") return { kind: "error", error: "failed to create user agent mapping: app cannot be empty" }
-  if (matchType === "regex") return { kind: "error", error: "failed to create user agent mapping: regex match_type is not supported by this gateway" }
   if (!UA_MATCH_TYPES.includes(matchType)) return { kind: "error", error: `failed to create user agent mapping: unsupported match_type "${matchType}"` }
+  if (matchType === "regex") {
+    try {
+      compileRegex(pattern)
+    } catch (e) {
+      return { kind: "error", error: `failed to create user agent mapping: invalid user agent mapping: invalid regex pattern: ${e.message}` }
+    }
+  }
   const m: UserAgentMapping = { id: cur?.id ?? "", pattern: pattern, match_type: matchType, app: app, is_active: b.is_active ?? cur?.is_active ?? true, created_at: cur?.created_at, updated_at: cur?.updated_at }
   return { kind: "ok", m: m }
 }
@@ -484,13 +517,21 @@ test("a user agent maps to the first matching mapping, then the built-in identif
   expect(appOf("internal-tool", [off])).toBe("Other")
 })
 
-test("user agent match types: exact, starts_with, contains; regex never matches here", () => {
+test("user agent match types: exact, starts_with, contains and regex", () => {
   expect(uaMatches("Foo/1", "foo/1", "exact")).toBe(true)
   expect(uaMatches("Foo/1 x", "foo/1", "exact")).toBe(false)
   expect(uaMatches("Foo/1 x", "foo/", "starts_with")).toBe(true)
   expect(uaMatches("x Foo/1", "foo/", "starts_with")).toBe(false)
   expect(uaMatches("x Foo/1", "foo/", "contains")).toBe(true)
-  expect(uaMatches("x Foo/1", "^x", "regex")).toBe(false)
+  // regex: unanchored and case-sensitive, as Bifrost's compiled mappings
+  expect(uaMatches("x Foo/1", "^x", "regex")).toBe(true)
+  expect(uaMatches("x Foo/1", "Foo/[0-9]+$", "regex")).toBe(true)
+  expect(uaMatches("x foo/1", "Foo/[0-9]+$", "regex")).toBe(false)
+  expect(uaMatches("x Foo/1", "(?i)foo", "regex")).toBe(true)
+  expect(uaMatches("x Foo/1", "(", "regex")).toBe(false)
+  const maps: UserAgentMapping[] = [{ id: "r", pattern: "^acme-(cli|ide)/", match_type: "regex", app: "Acme", is_active: true }]
+  expect(appOf("acme-ide/3.1 node", maps)).toBe("Acme")
+  expect(appOf("my acme-ide/3.1", maps)).toBe("Other")
 })
 
 test("RFC 3339 and epoch milliseconds parse to epoch milliseconds; bad values are undefined", () => {
@@ -548,7 +589,12 @@ test("the user agent mapping routes validate, create, update and delete", () => 
   expect(list.length).toBe(1)
   const id = list[0]!.id
   expect(created.body.includes(`"app":"Tool"`)).toBe(true)
-  expect(uaRoute([], "POST", "/api/logs/user-agent-mappings", `{"pattern":"x","match_type":"regex","app":"A"}`, "t").status).toBe(400)
+  const re = uaRoute([], "POST", "/api/logs/user-agent-mappings", `{"pattern":"^x/[0-9]","match_type":"regex","app":"A"}`, "t")
+  expect(re.status).toBe(200)
+  expect(re.body.includes(`"match_type":"regex"`)).toBe(true)
+  const bad = uaRoute([], "POST", "/api/logs/user-agent-mappings", `{"pattern":"x(","match_type":"regex","app":"A"}`, "t")
+  expect(bad.status).toBe(400)
+  expect(bad.body.includes("invalid regex pattern")).toBe(true)
   expect(uaRoute([], "POST", "/api/logs/user-agent-mappings", `{"pattern":"x","match_type":"fuzzy","app":"A"}`, "t").status).toBe(400)
   expect(uaRoute([], "POST", "/api/logs/user-agent-mappings", `{"pattern":"","match_type":"exact","app":"A"}`, "t").status).toBe(400)
   expect(uaRoute([], "POST", "/api/logs/user-agent-mappings", `not json`, "t").status).toBe(400)

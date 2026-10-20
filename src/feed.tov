@@ -8,11 +8,14 @@
 // cluster transport moves the items. Items travel as JSON (the FeedItem fields, data as text).
 
 import { nodeOf } from "./cluster"
+import { DataScope, inScope } from "./scope"
+import { fields, find } from "./json"
 
 // One feed event. data is the event's JSON text (the dashboard's view of a request-log entry). The scope
 // fields are copied, so a relay can check who may see an event without the full entry. bseq is the
 // position in the broker's ring, which a node keeps as its cursor; it is set only there.
-export type FeedItem = { node: string, seq: int, ts: f64, team: string, bu: string, customer: string, project: string, data: string, bseq?: int }
+// kind "store_update" is a management write (data is {"id", "tags"}) that every client sees; absent for a log event.
+export type FeedItem = { node: string, seq: int, ts: f64, team: string, bu: string, customer: string, project: string, data: string, bseq?: int, kind?: string }
 
 export type FeedGap = { node: string, missing: int }
 export type FeedResume = { items: FeedItem[], gaps: FeedGap[] }
@@ -37,8 +40,25 @@ export function feedId(it: FeedItem): string {
 }
 
 // The text a client gets for an item: Bifrost's {"type", "data"} envelope, with the event id, its producer and its sequence.
+// A store update keeps Bifrost's {"type":"store_update","tags":[...]} shape.
 export function feedEnvelope(it: FeedItem): string {
+  if (it.kind === "store_update") return `{"type":"store_update","tags":${tagsOf(it.data)},"id":${JSON.stringify(feedId(it))},"node":${JSON.stringify(it.node)},"seq":${it.seq}}`
   return `{"type":"log","id":${JSON.stringify(feedId(it))},"node":${JSON.stringify(it.node)},"seq":${it.seq},"data":${it.data}}`
+}
+
+// The tags of a store update's data, as JSON ([] when there are none).
+function tagsOf(data: string): string {
+  try {
+    const raw = find(fields(data), "tags")
+    return raw !== undefined && raw.startsWith("[") ? raw : "[]"
+  } catch (e) {
+    return "[]"
+  }
+}
+
+// Whether a client with this scope gets the item: store updates go to every client, log events by data access.
+export function feedVisible(it: FeedItem, sc: DataScope): bool {
+  return it.kind === "store_update" || inScope(sc, it.team, it.bu, it.customer, it.project)
 }
 
 // A gap a resume could not fill: events of node that are no longer in the ring.
@@ -253,6 +273,23 @@ function feedCount(text: string): int {
     return -1
   }
 }
+
+test("a store update rides the feed in Bifrost's shape and every scope sees it", () => {
+  const su: FeedItem = { node: "n1", seq: 5, ts: 1.0, team: "", bu: "", customer: "", project: "", data: `{"id":"su_1","tags":["providers"]}`, kind: "store_update" }
+  expect(feedEnvelope(su)).toBe(`{"type":"store_update","tags":["providers"],"id":"n1:5","node":"n1","seq":5}`)
+  const team: DataScope = { all: false, teams: ["t1"], businessUnits: [], customers: [], projects: [] }
+  expect(feedVisible(su, team)).toBe(true)
+  expect((try parseItem(JSON.stringify(su))).kind).toBe("store_update")
+  const log: FeedItem = { node: "n1", seq: 6, ts: 1.0, team: "t2", bu: "", customer: "", project: "", data: "{}" }
+  expect(feedVisible(log, team)).toBe(false)
+  // a resume replays the store updates it missed with the log events
+  const ring = new FeedRing(10, 60000.0)
+  ring.add(su, 2.0)
+  ring.add(log, 2.0)
+  const cur: Map<string, int> = new Map()
+  cur.set("n1", 4)
+  expect(ring.resume(cur).items.map((it) => feedId(it))).toEqual(["n1:5", "n1:6"])
+})
 
 test("a repeat of a producer's sequence is not added", () => {
   const r = new FeedRing(10, 60000.0)

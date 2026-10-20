@@ -6,6 +6,7 @@ import { writeFileAtomic } from "./atomicfile"
 import { join } from "node:path"
 import { isoMs } from "./exports"
 import { DataScope, inScope } from "./scope"
+import { fields, elements, decodeString } from "./json"
 
 // kind: "mcp" for an MCP tool execution (op "tool", with tool and server set); absent for an LLM request.
 export type LogEntry = {
@@ -67,6 +68,8 @@ export type LogEntry = {
   // the names of the tools the answer called (reqlog.tov toolCallNamesOf), the heuristic complexity score
   // behind the tier (heuristic mechanism only) and the prompt the request named with x-bf-prompt-id
   tool_call_names?: string[],
+  // the answer was asked for as a stream (Bifrost's *_stream request types)
+  streamed?: bool,
   complexity_score?: f64,
   selected_prompt_id?: string,
   selected_prompt_name?: string,
@@ -220,12 +223,77 @@ function mentions(e: LogEntry, text: string): bool {
   const tool = e.tool
   if (tool !== undefined && tool.includes(text)) return true
   const err = e.error
-  return err !== undefined && err.includes(text)
+  if (err !== undefined && err.includes(text)) return true
+  return contentMentions(e.input, text) || contentMentions(e.output, text)
+}
+
+// The keys whose string values are message text (Bifrost's content summary: the input messages, the
+// Responses input, embedding input and the output message), in request and answer bodies of any format.
+const TEXT_KEYS = ["content", "text", "input", "prompt", "instructions", "system", "query", "delta", "output_text", "documents"]
+
+function collectText(raw: string, key: string, inout out: string[], depth: int): void {
+  if (depth > 32 || raw === "") return
+  const c = raw.slice(0, 1)
+  try {
+    if (c === "\"") {
+      if (TEXT_KEYS.includes(key)) out.push(decodeString(raw))
+    } else if (c === "{") {
+      for (const f of fields(raw)) collectText(f.raw, f.key, &out, depth + 1)
+    } else if (c === "[") {
+      for (const el of elements(raw)) collectText(el, key, &out, depth + 1)
+    }
+  } catch (e) {
+    return
+  }
+}
+
+// The message text of a logged body: a JSON body, or the data lines of a streamed answer.
+export function contentTextOf(body: string): string {
+  let out: string[] = []
+  const t = body.trim()
+  if (t.startsWith("{") || t.startsWith("[")) {
+    collectText(t, "", &out, 0)
+  } else {
+    for (const line of t.split("\n")) {
+      if (!line.startsWith("data:")) continue
+      const d = line.slice(5).trim()
+      if (d.startsWith("{")) collectText(d, "", &out, 0)
+    }
+  }
+  return out.join("")
+}
+
+// content_search over a body's message text, ignoring case (as Bifrost's LIKE and full-text search). A JSON
+// body that does not hold the text at all is ruled out before it is parsed; a streamed answer splits its text
+// across events, so it is always parsed.
+function contentMentions(body: string | undefined, text: string): bool {
+  if (body === undefined || body === "") return false
+  const needle = text.toLowerCase()
+  const t = body.trim()
+  const json = t.startsWith("{") || t.startsWith("[")
+  // (a \u escape may spell the text, so a body with one is always parsed)
+  if (json && !t.includes("\\u") && !t.toLowerCase().includes(needle)) return false
+  return contentTextOf(t).toLowerCase().includes(needle)
 }
 
 // LLM requests and MCP tool executions share the store; kind tells them apart.
 export function kindOf(e: LogEntry): string {
   return e.kind ?? "llm"
+}
+
+// Bifrost's request type (its logs' object_type) for one of Raiju's ops; an op with no Bifrost name is
+// returned as it is. Chat, text completions and Responses have a _stream type when the answer streamed.
+export function bifrostRequestType(op: string, streamed: bool): string {
+  const names: Map<string, string> = new Map()
+  for (const p of [
+    ["chat", "chat_completion"], ["anthropic.messages", "chat_completion"], ["completions", "text_completion"],
+    ["embeddings", "embedding"], ["audio.speech", "speech"], ["audio.transcriptions", "transcription"],
+    ["images.generations", "image_generation"], ["images.edits", "image_edit"], ["images.variations", "image_variation"],
+    ["models.list", "list_models"], ["models.retrieve", "model_retrieve"], ["responses.retrieve", "responses_retrieve"],
+    ["responses.delete", "responses_delete"], ["responses.cancel", "responses_cancel"], ["responses.input_items", "responses_input_items"],
+  ]) names.set(p[0]!, p[1]!)
+  const t = names.get(op) ?? op
+  return streamed && (t === "chat_completion" || t === "text_completion" || t === "responses") ? t + "_stream" : t
 }
 
 function matches(e: LogEntry, q: LogQuery): bool {
@@ -572,6 +640,7 @@ export class LogStore {
       cache_hit_type: e.cache_hit_type,
       stop_reason: e.stop_reason,
       tool_call_names: e.tool_call_names,
+      streamed: e.streamed,
       complexity_score: e.complexity_score,
       selected_prompt_id: e.selected_prompt_id,
       selected_prompt_name: e.selected_prompt_name,
@@ -1904,6 +1973,37 @@ test("filters: status, providers, text, bounds and the window", () => {
   mcp.kind = "mcp"
   expect(selects(mcp, f)).toBe(false)
   expect(selects(mcp, filterFrom(new URLSearchParams(""), "mcp", 0.0, 1000.0))).toBe(true)
+})
+
+test("content_search matches prompt and answer text in any format, ignoring case, but not JSON keys", () => {
+  const chat = sample("c1", 500.0, "m", 200, { provider: "openai" })
+  chat.input = `{"model":"m","messages":[{"role":"system","content":"Be brief"},{"role":"user","content":[{"type":"text","text":"What is the Capital of France?"}]}]}`
+  chat.output = `{"choices":[{"message":{"role":"assistant","content":"Paris \\u00e9t\\u00e9"}}]}`
+  const resp = sample("c2", 500.0, "m", 200, { provider: "openai" })
+  resp.input = `{"model":"m","input":"summarise the quarterly report","instructions":"formal"}`
+  const streamed = sample("c3", 500.0, "m", 200, { provider: "openai" })
+  streamed.output = `data: {"choices":[{"delta":{"content":"Blue "}}]}\n\ndata: {"choices":[{"delta":{"content":"whale"}}]}\n\ndata: [DONE]\n\n`
+  const es = [chat, resp, streamed]
+  expect(idsOf(es, "content_search=capital%20of%20france").join(",")).toBe("c1")
+  expect(idsOf(es, "content_search=QUARTERLY").join(",")).toBe("c2")
+  expect(idsOf(es, "content_search=be%20brief").join(",")).toBe("c1")
+  // the answer's text, decoded, and a streamed answer's text across events
+  expect(idsOf(es, "content_search=paris%20%C3%A9t%C3%A9").join(",")).toBe("c1")
+  expect(idsOf(es, "content_search=blue%20whale").join(",")).toBe("c3")
+  // keys and roles are not message text
+  expect(idsOf(es, "content_search=messages").length).toBe(0)
+  expect(idsOf(es, "content_search=assistant").length).toBe(0)
+  expect(contentTextOf(`{"input":["a","b"],"model":"x"}`)).toBe("ab")
+  expect(contentTextOf("not json")).toBe("")
+})
+
+test("Bifrost request type names of Raiju's ops", () => {
+  expect(bifrostRequestType("chat", false)).toBe("chat_completion")
+  expect(bifrostRequestType("chat", true)).toBe("chat_completion_stream")
+  expect(bifrostRequestType("anthropic.messages", true)).toBe("chat_completion_stream")
+  expect(bifrostRequestType("embeddings", true)).toBe("embedding")
+  expect(bifrostRequestType("audio.transcriptions", false)).toBe("transcription")
+  expect(bifrostRequestType("files.upload", false)).toBe("files.upload")
 })
 
 test("routing, cache, stop and chain filters select the recorded fields", () => {

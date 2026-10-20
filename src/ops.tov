@@ -13,9 +13,9 @@ import { OtelMetricsSettings, exportMetricsRequest, validateMetricsSettings, pus
 import { PushGatewayConfig, pushProblem, pushUrl, pushHeaders, pushInterval } from "./pushgateway"
 import { join } from "node:path"
 import { Engine } from "./gateway"
-import { CostRecalc, RecalcStatus } from "./costrecalc"
+import { CostRecalc, RecalcStatus, readShared, requestCancel, sharedInFlight } from "./costrecalc"
 import { issueSetupSession, validSetupSession, setupCookie, cookieValue, SETUP_COOKIE } from "./setupsession"
-import { agentSessionsOf, a2aLogJson, Filter, LogStore, LogEntry, scopedEntries, visibleTo, defaultLogStoreConfig, applyChains, gridOf, filterFrom, selectAll, selects, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, histogramDimName, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
+import { agentSessionsOf, a2aLogJson, bifrostRequestType, Filter, LogStore, LogEntry, scopedEntries, visibleTo, defaultLogStoreConfig, applyChains, gridOf, filterFrom, selectAll, selects, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, histogramDimName, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
 import { setMcpToolLog, McpToolCall } from "./mcp"
 import { McpLibrary, DEFAULT_LIBRARY_URL, DEFAULT_LIBRARY_SYNC_SECONDS, listLibrary, libraryFilterData, createLibraryEntry, deleteLibraryEntry, fetchCatalog } from "./mcplibrary"
 import { parsePolicy, policyView, policyConfigOf } from "./health"
@@ -36,7 +36,8 @@ type QuotaRate = { id: string, token_max_limit?: int, token_reset_duration?: str
 type QuotaModel = { model_name: string, provider?: string, budgets: QuotaBudget[], rate_limit?: QuotaRate }
 import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, roleAllows, isBuiltinRole, customRole, provisioned, disabledNamed, anyRoleId, userByEmail } from "./rbac"
 import { DataScope, allScope, noScope, scopeOf, inScope } from "./scope"
-import { AuditLog, AuditQuery, actionFor, maskDetail } from "./audit"
+import { AuditEvent, AuditLog, actionFor, auditListJson, auditQueryOf, maskDetail } from "./audit"
+import { isCacheId } from "./cache"
 import { AlertEngine, SampleRing, CelEngine, ScopeUsage } from "./alerts"
 import * as alerts from "./alerts"
 import { ExposedTool, SessionStore, handleMcp, rpcError, sseStream, SSE_HEARTBEAT_MS } from "./mcpserver"
@@ -72,7 +73,7 @@ import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync
 import { writeFileAtomic } from "./atomicfile"
 import { Counters, ClusterConfig, BrokerConfig, brokerUrl, syncInterval } from "./cluster"
 import { clusterState, ownerOf } from "./clusterstate"
-import { FeedRing, FeedQueue, FeedItem, feedEnvelope, gapEnvelope, resumedEnvelope, parseFeed, parseItem, parseAnswer, FEED_RING_SIZE, FEED_RING_SECONDS, FEED_QUEUE_MAX, FEED_BATCH_MS, FEED_BATCH_MAX } from "./feed"
+import { FeedRing, FeedQueue, FeedItem, feedEnvelope, feedVisible, gapEnvelope, resumedEnvelope, parseFeed, parseItem, parseAnswer, FEED_RING_SIZE, FEED_RING_SECONDS, FEED_QUEUE_MAX, FEED_BATCH_MS, FEED_BATCH_MAX } from "./feed"
 import * as cluster from "./cluster"
 import { Discoverer } from "./discovery"
 import { SocketExt } from "./realtime"
@@ -81,8 +82,8 @@ import { BROKER_ROUTE, BROKER_FEED_ROUTE } from "./broker"
 import { LockElection } from "./leader"
 import { AuthProxyConfig, ProxyKeys, checkProxyToken, headerOf, mappedRole, proxyProblem } from "./authproxy"
 import { ExportCursor, objectKey, putRequest, putBytesRequest, putObjectRequest, listRequest, deleteRequest, parseListing, expiredKey, isParquet, exportInterval, isoMs, ByteRequest } from "./exports"
-import { planWindow, maxObjectBytes } from "./audit_archive"
-import { jobRequest, MAX_ATTEMPTS } from "./retained"
+import { planWindow, maxObjectBytes, archiveIntervalMs, archiveGraceMs, closedWindows } from "./audit_archive"
+import { jobRequest, hiddenDeletes, MAX_ATTEMPTS } from "./retained"
 import { OidcConfig, Discovery, OidcFlows, Session, UiSessions, parseDiscovery, discoveryUrl, tokenRequestBody, verifyIdToken } from "./oidc"
 import { issuerOf, challengeOf, callerOf, keyById, keyUsable, serverAuthMode, ConsentContext, vkIdentityCut } from "./mcpissuer"
 
@@ -181,6 +182,7 @@ function recalcJson(s: RecalcStatus): string {
     jkv("processed", jn(s.processed)),
     jkv("updated", jn(s.updated)),
     jkv("skipped", jn(s.skipped)),
+    jkv("unpriceable", jn(s.unpriceable ?? 0)),
     jkv("message", JSON.stringify(s.message)),
     jkv("started_at", JSON.stringify(s.started_at)),
     jkv("updated_at", JSON.stringify(s.updated_at)),
@@ -365,11 +367,12 @@ function a2aCardResponse(body: string, h: Hdrs): Response {
   return new Response(body, { status: 200, headers: hs })
 }
 
-// One A2A call that reached an agent (Ops.recordA2a). task is the A2A task it named or made; down and up the caller's
+// One A2A call that reached an agent (Ops.recordA2a). op is the A2A operation (SendMessage, GetTask, ...) when it
+// differs from the wire method name. task is the A2A task it named or made; down and up the caller's
 // binding and the agent's; rawReq and rawResp the bytes sent and received (kept when
 // client.a2a_store_raw_request_response is on); input and output the request params and the result (kept unless
 // content logging is off for the caller).
-type A2aCall = { agent: string, method: string, status: int, latencyMs: f64, context: string, vk: string | undefined, error: string, task?: string, down?: string, up?: string, rawReq?: string, rawResp?: string, input?: string, output?: string }
+type A2aCall = { agent: string, method: string, status: int, latencyMs: f64, context: string, vk: string | undefined, op?: string, error: string, task?: string, down?: string, up?: string, rawReq?: string, rawResp?: string, input?: string, output?: string }
 
 // Whether an agent's answer is a JSON-RPC error object (false for a body that is not JSON).
 function rpcFailed(text: string): bool {
@@ -531,6 +534,24 @@ export async function withSecrets(c: Config): Promise<Config> {
 // The log entries since a time that a data scope may see.
 function scopedView(store: LogStore, sc: DataScope, since: f64): LogEntry[] {
   return scopedEntries(store.viewSince(since), sc)
+}
+
+// client.hidden_request_types: request log reads leave out the LLM entries of these types (Bifrost's
+// withHiddenRequestTypes); writes, deletes and the cost recalculation still see them.
+export function withoutHidden(es: LogEntry[], hidden: string[] | undefined): LogEntry[] {
+  const hs: string[] = []
+  for (const h of hidden ?? []) {
+    const t = h.trim()
+    if (t !== "" && !hs.includes(t)) hs.push(t)
+  }
+  if (hs.length === 0) return es
+  const out: LogEntry[] = []
+  for (const e of es) {
+    // Bifrost's request type names (chat_completion_stream, embedding, ...) and Raiju's op names both work
+    if (kindOf(e) === "llm" && (hs.includes(e.op) || hs.includes(bifrostRequestType(e.op, e.streamed === true)))) continue
+    out.push(e)
+  }
+  return out
 }
 
 async function getText(url: string): Promise<{ status: int, body: string }> {
@@ -751,7 +772,7 @@ export cyclic class UiHub {
     if (from !== "share" && this.shareDir !== "") this.shareBuf.push(JSON.stringify(it))
     const text = feedEnvelope(it)
     for (const c of this.clients) {
-      if (inScope(c.scope, it.team, it.bu, it.customer, it.project)) c.emit(text)
+      if (feedVisible(it, c.scope)) c.emit(text)
     }
     return true
   }
@@ -761,7 +782,7 @@ export cyclic class UiHub {
     const r = this.ring.resume(cursor)
     let n = 0
     for (const it of r.items) {
-      if (!inScope(c.scope, it.team, it.bu, it.customer, it.project)) continue
+      if (!feedVisible(it, c.scope)) continue
       c.emit(feedEnvelope(it))
       n += 1
     }
@@ -2348,10 +2369,10 @@ export class Ops {
     if (start >= end) return badRequest("start_time must be before end_time")
     const g = gridOf(start, end)
     if (g.n > 10000) return badRequest("too many buckets; narrow the time range")
-    const es = selectAll(scopedView(store, sc, start - 1.0), filterFrom(sp, "llm", start, end))
+    const es = selectAll(this.readView(store, sc, start - 1.0), filterFrom(sp, "llm", start, end))
     // the same span just before the window, for the rankings' trends
     const pf = filterFrom(sp, "llm", start - (end - start), start)
-    const prev = selectAll(scopedView(store, sc, pf.since - 1.0), pf)
+    const prev = selectAll(this.readView(store, sc, pf.since - 1.0), pf)
     const dim = sp.get("dimension") ?? ""
     const ranked = this.rankLimit(sp)
     if (ranked < 0) return badRequest("Invalid limit. Expected a positive integer, or all=true for no limit")
@@ -2382,6 +2403,11 @@ export class Ops {
     return { status: 404, body: errorJson(`no route ${path}`, "invalid_request_error", undefined), contentType: "application/json" }
   }
 
+  // The entries a log read may see: the caller's data scope, without client.hidden_request_types.
+  private readView(store: LogStore, sc: DataScope, since: f64): LogEntry[] {
+    return withoutHidden(scopedView(store, sc, since), this.store.cfg.client?.hidden_request_types)
+  }
+
   // GET /api/logs: the logs a filter selects, newest first unless sort_by and order say otherwise
   // (Bifrost's getLogs). Raiju's entries and total ride along with Bifrost's logs, pagination and stats.
   private logList(sp: URLSearchParams, store: LogStore, sc: DataScope): Reply {
@@ -2391,8 +2417,8 @@ export class Ops {
     if (pg.error !== "") return badRequest(pg.error)
     let f = listFilter(sp, Date.now())
     this.withAgents(sp, &f, store, sc)
-    const es = applyChains(selectAll(scopedView(store, sc, f.since - 1.0), f), f)
-    return okJson(listJson(es, pg.page, scopedView(store, sc, 0.0).length > 0))
+    const es = applyChains(selectAll(this.readView(store, sc, f.since - 1.0), f), f)
+    return okJson(listJson(es, pg.page, this.readView(store, sc, 0.0).length > 0))
   }
 
   // GET /api/logs/stats: the totals of the logs a filter selects (Bifrost's SearchStats).
@@ -2401,12 +2427,12 @@ export class Ops {
     if (bad !== "") return badRequest(`the ${bad} filter is not recorded by this gateway`)
     let f = listFilter(sp, Date.now())
     this.withAgents(sp, &f, store, sc)
-    return okJson(statsView(applyChains(selectAll(scopedView(store, sc, f.since - 1.0), f), f)))
+    return okJson(statsView(applyChains(selectAll(this.readView(store, sc, f.since - 1.0), f), f)))
   }
 
   // GET /api/logs/{id}: one log, with its bodies and raw payloads when the store kept them.
   private logById(id: string, store: LogStore, sc: DataScope): Reply {
-    for (const e of scopedView(store, sc, 0.0)) {
+    for (const e of this.readView(store, sc, 0.0)) {
       if (e.id === id && kindOf(e) === "llm") return okJson(detailJson(e))
     }
     return { status: 404, body: errorJson("log not found", "not_found_error", undefined), contentType: "application/json" }
@@ -2419,7 +2445,7 @@ export class Ops {
     const raw = summary ? rest.slice(0, rest.byteLength - "/summary".byteLength) : rest
     const sid = pctDecode(raw) ?? ""
     if (sid === "" || sid.includes("/")) return { status: 404, body: errorJson("no such route", "invalid_request_error", undefined), contentType: "application/json" }
-    const es = scopedView(store, sc, 0.0)
+    const es = this.readView(store, sc, 0.0)
     if (summary) return okJson(sessionSummaryJson(es, sid))
     const pg = pageOfQuery(sp, 500, 500)
     if (pg.error !== "") return badRequest(pg.error)
@@ -2440,11 +2466,38 @@ export class Ops {
     }
     if (ids.length === 0) return badRequest("No log IDs provided")
     const doomed: string[] = []
+    const hidden: LogEntry[] = []
     for (const e of scopedView(store, sc, 0.0)) {
-      if (kindOf(e) === "llm" && ids.includes(e.id)) doomed.push(e.id)
+      if (kindOf(e) === "llm" && ids.includes(e.id)) {
+        doomed.push(e.id)
+        if (e.content_hidden === true) hidden.push(e)
+      }
     }
     const removed = store.delete(doomed)
+    // a hidden row's content object goes with it (Bifrost's DeleteLogs); a failed delete is only reported
+    if (hidden.length > 0) this.deleteHidden(hidden)
     return okJson(JSON.stringify({ message: "Logs deleted successfully", removed: removed }))
+  }
+
+  // Deletes the retained-content objects of deleted rows, in the background: both object names (.json and
+  // .json.gz), since compress may have changed since the row was written.
+  async deleteHidden(es: LogEntry[]): Promise<void> {
+    const q = this.engine.hiddenQueue
+    if (q === undefined) return
+    for (const e of es) {
+      for (const req of hiddenDeletes(q, e.ts, e.id, Date.now())) {
+        const dl = deadline(30000)
+        try {
+          const hs: Record<string, string> = req.headers
+          const r = await fetch(req.url, { method: "DELETE", headers: hs, signal: dl.controller.signal })
+          await r.text()
+          if (r.status >= 300 && r.status !== 404) console.error(`raiju: retained content: delete of ${e.id}: HTTP ${r.status}`)
+        } catch (err) {
+          console.error(`raiju: retained content: delete of ${e.id}: ${err.message}`)
+        }
+        dl.finish()
+      }
+    }
   }
 
   // POST /api/logs/recalculate-cost: starts a background job that prices again the LLM logs the body's
@@ -2461,39 +2514,66 @@ export class Ops {
     }
     const cur = this.recalc
     if (cur !== undefined && cur.inFlight()) return { status: 409, body: recalcJson(cur.snapshot()), contentType: "application/json" }
+    // a job another worker runs (its status file is fresh) is the one in flight
+    const shared = this.recalcFile()
+    if (sharedInFlight(shared, Date.now())) return { status: 409, body: recalcJson(readShared(shared)!), contentType: "application/json" }
     const f = listFilter(recalcQuery(rb.filters), Date.now())
     const pricing = this.engine.pricing
+    // a model the current price list does not know is left as it is (unpriceable), not priced at 0
     const job = new CostRecalc(
-      (e) => (e.op === "decisions" ? pricing.decisionCost(e.provider, e.model, e.prompt_tokens, e.completion_tokens) : pricing.cost(e.provider, e.model, e.prompt_tokens, e.completion_tokens)),
+      (e) => {
+        const decision = e.op === "decisions"
+        if (pricing.priceFor(e.provider, e.model, decision) === undefined) return undefined
+        return decision ? pricing.decisionCost(e.provider, e.model, e.prompt_tokens, e.completion_tokens) : pricing.cost(e.provider, e.model, e.prompt_tokens, e.completion_tokens)
+      },
       (costs) => store.recost((e) => costs.get(e.id))
     )
     job.begin(selectAll(scopedView(store, sc, f.since - 1.0), f), Date.now())
+    if (shared !== "") job.share(shared)
     this.recalc = job
     job.start()
     return { status: 202, body: recalcJson(job.snapshot()), contentType: "application/json" }
   }
 
+  // The shared status file of the cost recalculation job when workers share state, else "".
+  private recalcFile(): string {
+    return this.shareDir === "" ? "" : this.shareDir + "/recalc-cost.json"
+  }
+
   // GET /api/logs/recalculate-cost/status: the job with ?id=, else the one in flight, else idle (Bifrost's status).
+  // A job this worker does not run is read from the shared status file, so every worker answers for it.
   private recalcStatus(sp: URLSearchParams): Reply {
-    const job = this.recalc
+    const local = this.recalc
+    const shared = readShared(this.recalcFile())
     const id = (sp.get("id") ?? "").trim()
     if (id !== "") {
-      if (job === undefined || job.id() !== id) return { status: 404, body: errorJson("Job not found", "not_found_error", undefined), contentType: "application/json" }
-      return okJson(recalcJson(job.snapshot()))
+      if (local !== undefined && local.id() === id) return okJson(recalcJson(local.snapshot()))
+      if (shared !== undefined && shared.id === id) return okJson(recalcJson(shared))
+      return { status: 404, body: errorJson("Job not found", "not_found_error", undefined), contentType: "application/json" }
     }
-    if (job === undefined || !job.inFlight()) return okJson(JSON.stringify({ status: "idle" }))
-    return okJson(recalcJson(job.snapshot()))
+    if (local !== undefined && local.inFlight()) return okJson(recalcJson(local.snapshot()))
+    if (shared !== undefined && sharedInFlight(this.recalcFile(), Date.now())) return okJson(recalcJson(shared))
+    return okJson(JSON.stringify({ status: "idle" }))
   }
 
   // POST /api/logs/recalculate-cost/cancel: stops the job with ?id= (else the one in flight) and answers with its
-  // status. Costs already written stay. A job that finished is answered as it is.
+  // status. Costs already written stay. A job that finished is answered as it is. A job another worker runs is
+  // asked to stop through the shared file; it stops before its next slice.
   private cancelRecalc(sp: URLSearchParams): Reply {
     const job = this.recalc
     const id = (sp.get("id") ?? "").trim()
-    if (job === undefined || (id !== "" && job.id() !== id) || (id === "" && !job.inFlight())) {
-      return { status: 404, body: errorJson("No recalculation job to cancel", "not_found_error", undefined), contentType: "application/json" }
+    if (job !== undefined && ((id !== "" && job.id() === id) || (id === "" && job.inFlight()))) return okJson(recalcJson(job.cancel()))
+    const file = this.recalcFile()
+    const shared = readShared(file)
+    if (shared !== undefined && (id === "" ? sharedInFlight(file, Date.now()) : shared.id === id)) {
+      if (!sharedInFlight(file, Date.now())) return okJson(recalcJson(shared))
+      requestCancel(file, shared.id)
+      let s = shared
+      s.status = "cancelled"
+      s.message = "Cancellation requested; the job stops before its next slice."
+      return okJson(recalcJson(s))
     }
-    return okJson(recalcJson(job.cancel()))
+    return { status: 404, body: errorJson("No recalculation job to cancel", "not_found_error", undefined), contentType: "application/json" }
   }
 
   // /api/logs/user-agent-mappings: the rules that name the app behind a User-Agent. Saved in the config.
@@ -2509,7 +2589,7 @@ export class Ops {
 
   // DELETE /api/cache/clear/{id} and /api/cache/clear-by-key/{key}: drops entries from the exact-match and
   // the semantic cache (Bifrost's cache handler). removed counts what went.
-  cacheClear(method: string, path: string): Reply {
+  async cacheClear(method: string, path: string): Promise<Reply> {
     if (method !== "DELETE") return { status: 405, body: errorJson("use DELETE", "invalid_request_error", undefined), contentType: "application/json" }
     const ex = this.engine.cache
     const sem = this.engine.semantic
@@ -2522,11 +2602,27 @@ export class Ops {
       if (key === "") return badRequest("Invalid cache key")
       if (ex !== undefined) removed += ex.clearKey(key)
       if (sem !== undefined) removed += sem.clearKey(key)
+      // the semantic cache's entries in an external vector store (Bifrost's DeleteAll by cache_key)
+      try {
+        removed += await this.engine.vectorClear("", key)
+      } catch (e) {
+        console.error(`raiju: vector_store clear by key: ${e.message}`)
+        return { status: 500, body: errorJson("Failed to clear cache", "api_error", undefined), contentType: "application/json" }
+      }
     } else if (rest.startsWith("clear/")) {
       const id = rest.slice("clear/".byteLength)
       if (id === "") return badRequest("Invalid cache ID")
       if (ex !== undefined) removed += ex.clearId(id)
       if (sem !== undefined && sem.clearId(id)) removed += 1
+      // a vector-store hit's id is the store's own entry id (not a hash); the store deletes it
+      if (this.engine.vstore !== undefined && !isCacheId(id)) {
+        try {
+          removed += await this.engine.vectorClear(id, "")
+        } catch (e) {
+          console.error(`raiju: vector_store clear: ${e.message}`)
+          return { status: 500, body: errorJson("Failed to clear cache", "api_error", undefined), contentType: "application/json" }
+        }
+      }
     } else {
       return { status: 404, body: errorJson("no such route", "invalid_request_error", undefined), contentType: "application/json" }
     }
@@ -2683,7 +2779,7 @@ export class Ops {
   // GET /api/logs/filterdata: the values the log filters offer, from every entry in memory, and the
   // virtual keys and routing rules of the config.
   private logFilterData(store: LogStore, sc: DataScope): string {
-    const all = scopedView(store, sc, 0.0)
+    const all = this.readView(store, sc, 0.0)
     const llm: LogEntry[] = []
     const mcp: LogEntry[] = []
     for (const e of all) {
@@ -2820,6 +2916,11 @@ export class Ops {
   // One A2A call that reached an agent, as a log entry of kind "a2a" under the agent's name, attributed as the caller's
   // key is (its team, customer and user).
   recordA2a(c: A2aCall): void {
+    // the operation's duration (Bifrost's a2a.client.operation.duration); push traffic is not an agent operation
+    if (c.method !== "push_notification" && c.method !== "push_delivery") {
+      const failed = c.status >= 400 || c.error !== ""
+      metrics.observeA2a(c.op ?? c.method, c.method, c.vk ?? "", failed ? (c.status >= 400 ? "" + c.status : "_OTHER") : "", c.latencyMs / 1000.0)
+    }
     const store = this.engine.logStore
     if (store === undefined) return
     const now = Date.now()
@@ -3322,12 +3423,12 @@ export class Ops {
       if (call.op === "GetTaskPushNotificationConfig") {
         const c = store.config(name, call.taskId, call.configId)
         if (c === undefined) return this.a2aFail(rest, rpcId, 404, -32001, "push notification config not found")
-        this.recordA2a({ agent: name, method: label, status: 200, latencyMs: Date.now() - started, context: context, vk: vkId, error: "", task: call.taskId, down: down })
+        this.recordA2a({ agent: name, method: label, op: call.op, status: 200, latencyMs: Date.now() - started, context: context, vk: vkId, error: "", task: call.taskId, down: down })
         return this.a2aResult(rest, rpcId, pushViewJson(c.task, c.id, c.url, c.scheme, call.v03))
       }
       const views: string[] = []
       for (const c of store.forTask(name, call.taskId)) views.push(pushViewJson(c.task, c.id, c.url, c.scheme, call.v03))
-      this.recordA2a({ agent: name, method: label, status: 200, latencyMs: Date.now() - started, context: context, vk: vkId, error: "", task: call.taskId, down: down })
+      this.recordA2a({ agent: name, method: label, op: call.op, status: 200, latencyMs: Date.now() - started, context: context, vk: vkId, error: "", task: call.taskId, down: down })
       return this.a2aResult(rest, rpcId, pushListJson(views, call.v03))
     }
     // a create or an embedded config: the agent gets the gateway's ingress and a token of its own for it
@@ -3370,7 +3471,7 @@ export class Ops {
     const rawReq = rawOn ? fwd.rawReq : ""
     if (fwd.error !== "") {
       if (pendingTask !== "") store.removePending(name, pendingHash, pendingTask)
-      this.recordA2a({ agent: name, method: label, status: 502, latencyMs: Date.now() - started, context: context, vk: vkId, error: fwd.error, task: call.taskId, down: down, up: fwd.binding, rawReq: rawReq, input: input })
+      this.recordA2a({ agent: name, method: label, op: call.op, status: 502, latencyMs: Date.now() - started, context: context, vk: vkId, error: fwd.error, task: call.taskId, down: down, up: fwd.binding, rawReq: rawReq, input: input })
       return this.a2aFail(rest, rpcId, 502, -32603, fwd.error)
     }
     const up = fwd.stream
@@ -3386,7 +3487,7 @@ export class Ops {
       const err = status >= 400 ? `agent answered HTTP ${status}` : ""
       const out = tapped(mapped, undefined, () => {
         const raw = tap === undefined || tap.dropped ? "" : tap.text
-        this.recordA2a({ agent: name, method: label, status: status, latencyMs: Date.now() - started, context: context, vk: vkId, error: err, task: call.taskId, down: down, up: fwd.binding, rawReq: rawReq, rawResp: raw, input: input })
+        this.recordA2a({ agent: name, method: label, op: call.op, status: status, latencyMs: Date.now() - started, context: context, vk: vkId, error: err, task: call.taskId, down: down, up: fwd.binding, rawReq: rawReq, rawResp: raw, input: input })
       }, cc)
       return new Response(out, { status: fwd.status, headers: sh })
     }
@@ -3395,7 +3496,7 @@ export class Ops {
     const err = u.failed ? `agent answered ${fwd.status >= 400 ? "HTTP " + fwd.status : "a JSON-RPC error"}` : ""
     let task = call.taskId
     if (task === "" && !u.failed) task = taskIdOfResult(u.result)
-    this.recordA2a({ agent: name, method: label, status: fwd.status, latencyMs: Date.now() - started, context: context, vk: vkId, error: err, task: task, down: down, up: fwd.binding, rawReq: rawReq, rawResp: rawOn ? fwd.rawResp : "", input: input, output: keepContent && !u.failed ? u.result : "" })
+    this.recordA2a({ agent: name, method: label, op: call.op, status: fwd.status, latencyMs: Date.now() - started, context: context, vk: vkId, error: err, task: task, down: down, up: fwd.binding, rawReq: rawReq, rawResp: rawOn ? fwd.rawResp : "", input: input, output: keepContent && !u.failed ? u.result : "" })
     // an embedded config is bound to the task the send made, or dropped when it made none
     if (pendingTask !== "") {
       const tid = u.failed ? "" : taskIdOfResult(u.result)
@@ -4020,9 +4121,12 @@ export class Ops {
 
   // The /ws event for a management write that succeeded: the resource it changed, as Bifrost's
   // store_update tags (the first path segment under /api).
+  // It goes through the feed like a log event, so it reaches every worker's and node's clients and a client that
+  // resumes with since= gets the store updates it missed.
   storeUpdated(path: string): void {
     const seg = path.split("/")[2] ?? ""
-    this.ui.send(JSON.stringify({ type: "store_update", tags: [seg] }))
+    const it: FeedItem = { node: this.feedProducer(), seq: this.ui.nextSeq(), ts: Date.now(), team: "", bu: "", customer: "", project: "", data: JSON.stringify({ id: newId("su_"), tags: [seg] }), kind: "store_update" }
+    this.ui.ingest(it, "local")
   }
 
   // The single sign-on session a token names, or undefined when there is none or its user is now disabled in
@@ -4263,8 +4367,9 @@ export class Ops {
       if (done.length > 0) console.error(`raiju: deleted ${done.length} expired virtual key${done.length === 1 ? "" : "s"}`)
       this.auditRetention()
     }, 3600000)
-    // the audit archive copies each closed window every archive interval (five minutes at least)
-    const every = Math.max(300, this.store.cfg.audit?.archive?.interval_seconds ?? 3600) * 1000
+    // the audit archive wakes every archive interval, and at least hourly (as Bifrost's job), so a window that
+    // closes just after a pass does not wait a whole interval
+    const every = Math.min(3600000.0, archiveIntervalMs(this.store.cfg.audit?.archive?.interval_seconds))
     setInterval(() => {
       this.auditArchive()
     }, every)
@@ -4283,38 +4388,44 @@ export class Ops {
     }
   }
 
-  // The archive copy: the events in each window that has closed (archive_grace_seconds before now) since
-  // the last copy go to object storage as a Bifrost-style window (audit.tov's archive layout, planWindow):
-  // parts cut at archive_max_object_bytes, gzipped when archive_compress is set, then the manifest that
-  // commits the window. The mark moves only after the manifest is stored, so a failed window is retried
-  // whole on the next pass. The first run only sets the mark, so events written before archiving was
-  // turned on are not copied. Rows are never deleted here.
+  // The archive copy, as Bifrost's: time is cut into fixed windows of archive_interval aligned to the epoch,
+  // and each window that has closed (archive_grace_period past its end) goes to object storage in order, one
+  // at a time (audit_archive.tov planWindow): parts cut at archive_max_object_bytes, gzipped when
+  // archive_compress is set, then the manifest that commits the window. The mark moves to a window's end only
+  // after its manifest is stored, so a failed window is retried whole on the next pass and later windows wait.
+  // A retried window can leave a part from the failed try that its manifest does not list (Bifrost's readers
+  // go by the manifest). The first run only sets the mark, so events written before archiving was turned on
+  // are not copied. Rows are never deleted here.
   async auditArchive(): Promise<void> {
     const log = this.audit
     const ac = this.store.cfg.audit?.archive
     if (log === undefined || ac === undefined || !ac.enabled) return
     try {
       const now = Date.now()
-      const mark = log.archiveMark()
-      if (mark === undefined) {
+      const first = log.archiveMark()
+      if (first === undefined) {
         log.setArchiveMark({ seq: log.lastSequence(), until: now })
         return
       }
-      const grace = this.store.cfg.audit?.archive_grace_seconds ?? 900
-      const end = now - grace * 1000
-      if (end <= mark.until) return
-      const w = log.exportWindow(mark.seq, end)
+      const interval = archiveIntervalMs(ac.interval_seconds)
+      const grace = archiveGraceMs(this.store.cfg.audit?.archive_grace_seconds, interval)
       const ec: LogExportsConfig = {
         enabled: ac.enabled, kind: ac.kind, bucket: ac.bucket, prefix: ac.prefix, region: ac.region, endpoint: ac.endpoint,
         access_key_id: ac.access_key_id, secret_access_key: ac.secret_access_key, session_token: ac.session_token,
         interval_seconds: ac.interval_seconds, path_style: ac.path_style, format: ac.format, retention_days: ac.retention_days,
       }
-      const plan = planWindow(ac.prefix ?? "bifrost", mark.until, end, w.body, maxObjectBytes(this.store.cfg.audit?.archive_max_object_bytes), this.store.cfg.audit?.archive_compress === true, now)
-      for (const o of plan.objects) {
-        const req = putObjectRequest(ec, o.key, o.body, o.contentType, Date.now())
-        if (!(await this.archivePut(req))) return
+      let mark = first
+      // a pass catches up on at most a day's worth of short windows; the rest wait for the next pass
+      for (const win of closedWindows(mark.until, interval, grace, now, 288)) {
+        const w = log.exportWindow(mark.seq, win.end)
+        const plan = planWindow(ac.prefix ?? "bifrost", win.start, win.end, w.body, maxObjectBytes(this.store.cfg.audit?.archive_max_object_bytes), this.store.cfg.audit?.archive_compress === true, Date.now())
+        for (const o of plan.objects) {
+          const req = putObjectRequest(ec, o.key, o.body, o.contentType, Date.now())
+          if (!(await this.archivePut(req))) return
+        }
+        mark = { seq: w.last, until: win.end }
+        log.setArchiveMark(mark)
       }
-      log.setArchiveMark({ seq: w.last, until: end })
     } catch (e) {
       console.error(`raiju: audit archive failed: ${e.message}`)
     }
@@ -4584,27 +4695,36 @@ export class Ops {
     } catch (e) {
       return { status: 500, body: errorJson(e.message, "api_error", undefined), contentType: "application/json" }
     }
-    if (p === "/api/audit-logs/filterdata") return { status: 200, body: JSON.stringify(log.filterData()), contentType: "application/json" }
-    // GET /api/audit-logs/{id}: one event, by its id (its sequence number), in Bifrost's {audit_log} wrapper
+    // audit.omit_ip_addresses also hides the addresses older events kept, and ip filters and search skip them
+    const omitIps = this.store.cfg.audit?.omit_ip_addresses === true
+    if (p === "/api/audit-logs/filterdata") {
+      const dims = (params.get("dimensions") ?? "").split(",").map((d) => d.trim()).filter((d) => d !== "")
+      return { status: 200, body: log.filterData(dims, params.get("q") ?? "", omitIps), contentType: "application/json" }
+    }
+    // GET /api/audit-logs/{id}: one event, by its id (its sequence number), in Bifrost's {audit_log} wrapper;
+    // GET /api/audit-logs/{id}/verify: its signature computed again and compared with the stored one
     if (p.startsWith("/api/audit-logs/")) {
-      const seq = parseInt(p.slice("/api/audit-logs/".byteLength)) ?? -1
-      const ev = seq >= 0 ? log.find(seq) : undefined
+      const rest = p.slice("/api/audit-logs/".byteLength)
+      const verify = rest.endsWith("/verify")
+      const idText = verify ? rest.slice(0, rest.byteLength - "/verify".byteLength) : rest
+      const seq = idText.includes("/") ? -1 : parseInt(idText) ?? -1
+      if (seq < 0 && verify) return badRequest("invalid audit log id")
+      let ev: AuditEvent | undefined = undefined
+      try {
+        ev = seq >= 0 ? log.findAny(seq) : undefined
+      } catch (e) {
+        return { status: 500, body: errorJson(e.message, "api_error", undefined), contentType: "application/json" }
+      }
       if (ev === undefined) return { status: 404, body: errorJson("audit log not found", "not_found_error", undefined), contentType: "application/json" }
-      return { status: 200, body: JSON.stringify({ audit_log: ev }), contentType: "application/json" }
+      if (verify) return { status: 200, body: JSON.stringify(log.verifyOne(ev)), contentType: "application/json" }
+      const shown: AuditEvent = ev
+      if (omitIps) shown.ip = undefined
+      return { status: 200, body: JSON.stringify({ audit_log: shown }), contentType: "application/json" }
     }
     if (p !== "/api/audit-logs") return { status: 404, body: errorJson(`no route for ${p}`, "invalid_request_error", undefined), contentType: "application/json" }
-    const q: AuditQuery = {}
-    const actor = params.get("actor")
-    if (actor !== undefined && actor !== "") q.actor = actor
-    const action = params.get("action")
-    if (action !== undefined && action !== "") q.action = action
-    q.since = num(params, "since")
-    q.until = num(params, "until")
-    const limit = params.get("limit")
-    if (limit !== undefined) q.limit = parseInt(limit)
-    const offset = params.get("offset")
-    if (offset !== undefined) q.offset = parseInt(offset)
-    return { status: 200, body: JSON.stringify(log.query(q)), contentType: "application/json" }
+    const lq = auditQueryOf(params, Date.now(), omitIps)
+    if (lq.error !== "") return badRequest(lq.error)
+    return { status: 200, body: auditListJson(log.query(lq.q), lq.page, lq.limit, omitIps), contentType: "application/json" }
   }
 
   // GET /api/alerts: rule states and recent transitions.
@@ -4918,6 +5038,33 @@ test("analytics and MCP routes answer from the store and refuse what is not reco
     expect(mcp.body.includes(`"status":"error"`)).toBe(true)
     // the LLM views leave the MCP entry out
     expect(get("/api/logs/dashboard").body.includes(`"total_requests":1`)).toBe(true)
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("hidden_request_types leave entries out of the log reads by Bifrost type or op name", () => {
+  const entry = (id: string, op: string, streamed: bool): LogEntry => ({ id: id, ts: 1.0, request_id: id, op: op, provider: "openai", model: "m", status: 200, latency_ms: 1.0, prompt_tokens: 1, completion_tokens: 1, cost: 0.0, cache_hit: false, streamed: streamed ? true : undefined })
+  const es = [entry("a", "chat", false), entry("b", "chat", true), entry("c", "embeddings", false), entry("d", "files.upload", false)]
+  const tool: LogEntry = entry("t", "tool", false)
+  tool.kind = "mcp"
+  es.push(tool)
+  const ids = (hidden: string[] | undefined): string => withoutHidden(es, hidden).map((e) => e.id).join(",")
+  expect(ids(undefined)).toBe("a,b,c,d,t")
+  expect(ids(["chat_completion_stream"])).toBe("a,c,d,t")
+  expect(ids([" chat_completion ", "embedding", ""])).toBe("b,d,t")
+  expect(ids(["files.upload", "tool"])).toBe("a,b,c,t")
+  const dir = "/tmp/raiju-ops-hidden-" + (try secureHex(6))
+  try {
+    try mkdirSync(dir, { recursive: true })
+    const eng = new Engine({})
+    eng.logStore = try new LogStore(defaultLogStoreConfig(dir))
+    for (const e of es) eng.logStore!.add({ id: e.id, ts: Date.now() - 1000.0, request_id: e.id, op: e.op, provider: "openai", model: "m", status: 200, latency_ms: 1.0, prompt_tokens: 1, completion_tokens: 1, cost: 0.0, cache_hit: false, streamed: e.streamed, kind: e.kind })
+    const ops = new Ops(eng, new ConfigStore(dir + "/config.json", { client: { hidden_request_types: ["embedding"] } }))
+    const get = (p: string): Reply => ops.logsRoute(new Request("http://raiju.test" + p), p.split("?")[0]!, "")
+    expect(get("/api/logs").body.includes(`"total_requests":3`)).toBe(true)
+    expect(get("/api/logs/c").status).toBe(404)
+    expect(get("/api/logs/a").status).toBe(200)
   } finally {
     try rmSync(dir, { recursive: true, force: true })
   }

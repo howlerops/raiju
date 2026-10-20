@@ -8,6 +8,8 @@ import { writeFileAtomic } from "./atomicfile"
 import { join } from "node:path"
 import { sha256, hmacSha256, toHex, utf8, secureHex } from "./crypto"
 import { Field, fields, elements, build, quote } from "./json"
+import { isoMs } from "./exports"
+import { timeOf } from "./logapi"
 
 export type AuditEvent = {
   seq: int,
@@ -32,7 +34,30 @@ export type AuditQuery = {
   until?: f64,
   limit?: int,
   offset?: int,
+  // Bifrost's list filters (any value of one filter, every filter given): CADF actions (Raiju's own action
+  // names work too), outcomes, event types, initiator and target ids and types, request methods, path
+  // prefixes, client addresses and tags; free text; the order by time ("asc" or "desc", the default); and a
+  // cursor, the id of the last event of the page before
+  actions?: string[],
+  outcomes?: string[],
+  eventTypes?: string[],
+  initiatorIds?: string[],
+  initiatorTypes?: string[],
+  targetIds?: string[],
+  targetTypes?: string[],
+  methods?: string[],
+  paths?: string[],
+  ips?: string[],
+  tags?: string[],
+  search?: string,
+  order?: string,
+  cursor?: int,
+  // audit.omit_ip_addresses: addresses are not matched (search and the ip filters skip them)
+  omitIps?: bool,
 }
+
+// A page of events, with the total that match and whether more follow it.
+export type AuditPage = { events: AuditEvent[], total: int, hasMore: bool }
 
 export type VerifyResult = { ok: bool, checked: int, firstBad?: int, reason?: string }
 
@@ -134,11 +159,124 @@ function loadOrCreateKey(dir: string): string throws Error {
   return key
 }
 
+// ---- Bifrost's CADF view of an event ----
+
+export const CADF_TYPE_URI = "https://getbifrost.ai/schemas/auditlog.json"
+
+// The CADF action of an event: create, update or delete for the writes, authenticate for a login, else access.
+export function cadfAction(e: AuditEvent): string {
+  const a = e.action
+  const verb = a.includes(".") ? a.slice(a.indexOf(".") + 1) : a
+  if (e.path.endsWith("/login")) return "authenticate"
+  if (verb === "create" || verb === "post") return "create"
+  if (verb === "update" || verb === "upsert" || verb === "put" || verb === "patch") return "update"
+  if (verb === "delete") return "delete"
+  return "access"
+}
+
+// success for an answer below 400, else failure.
+export function outcomeOf(e: AuditEvent): string {
+  return e.status < 400 ? "success" : "failure"
+}
+
+// The resource type of the caller: api_key for an API key, session for a temporary token, system for an
+// unauthenticated or anonymous caller, else user.
+export function initiatorTypeOf(actor: string): string {
+  if (actor.startsWith("key:")) return "api_key"
+  if (actor === "temp-token") return "session"
+  if (actor === "anonymous" || actor === "unauthenticated" || actor === "") return "system"
+  return "user"
+}
+
+// The resource type of the object acted on, from the action or the route.
+export function targetTypeOf(e: AuditEvent): string {
+  const a = e.action
+  const prefix = a.includes(".") ? a.slice(0, a.indexOf(".")) : a
+  if (prefix === "key" || prefix === "provider") return "provider"
+  if (prefix !== "api") return prefix
+  const segs = e.path.split("?")[0]!.split("/").filter((x) => x !== "")
+  const first = segs.length > 1 ? segs[1]! : ""
+  const second = segs.length > 2 ? segs[2]! : ""
+  if (first === "providers" || first === "keys") return "provider"
+  if (first === "governance") {
+    if (second === "virtual-keys") return "virtual_key"
+    if (second === "teams") return "team"
+    if (second === "customers") return "customer"
+    if (second === "roles") return "role"
+    return "config"
+  }
+  if (first === "plugins") return "plugin"
+  if (first === "guardrails") return "guardrail"
+  if (first === "mcp") return second === "tool-groups" ? "mcp_tool_group" : "mcp_client"
+  if (first === "session") return "session"
+  if (first === "users") return "user"
+  if (first === "roles" || first === "rbac") return "role"
+  return "config"
+}
+
+// The id of the object acted on: the event's target, else its path.
+function targetIdOf(e: AuditEvent): string {
+  return e.target !== "" ? e.target : e.path.split("?")[0]!
+}
+
+// One event as Bifrost's CADF AuditEvent: the event id is its sequence number. The IP is left out with
+// omitIps (audit.omit_ip_addresses hides the addresses older rows kept).
+export function cadfJson(e: AuditEvent, omitIps: bool): string {
+  const ip = omitIps ? undefined : e.ip
+  const parts: string[] = [
+    quote("id") + ":" + quote("" + e.seq),
+    quote("typeURI") + ":" + quote(CADF_TYPE_URI),
+    quote("eventType") + ":" + quote("activity"),
+    quote("eventTime") + ":" + quote(isoMs(e.ts)),
+    quote("action") + ":" + quote(cadfAction(e)),
+    quote("outcome") + ":" + quote(outcomeOf(e)),
+  ]
+  const init: string[] = [quote("id") + ":" + quote(e.actor), quote("typeURI") + ":" + quote("bifrost/" + initiatorTypeOf(e.actor)), quote("name") + ":" + quote(e.actor)]
+  if (ip !== undefined && ip !== "") init.push(quote("host") + ":" + quote(ip))
+  parts.push(quote("initiator") + ":{" + init.join(",") + "}")
+  parts.push(quote("target") + ":{" + quote("id") + ":" + quote(targetIdOf(e)) + "," + quote("typeURI") + ":" + quote("bifrost/" + targetTypeOf(e)) + "}")
+  if (e.status >= 400) parts.push(quote("reason") + ":{" + quote("reasonCode") + ":" + quote("" + e.status) + "," + quote("reasonType") + ":" + quote("HTTP") + "}")
+  const detail = e.detail
+  if (detail !== undefined && detail !== "") parts.push(quote("attachments") + ":[{" + quote("name") + ":" + quote("request_body") + "," + quote("contentType") + ":" + quote("application/json") + "," + quote("content") + ":" + quote(detail) + "}]")
+  parts.push(quote("tags") + ":[]")
+  parts.push(quote("requestMethod") + ":" + quote(e.method))
+  parts.push(quote("requestPath") + ":" + quote(e.path))
+  if (ip !== undefined && ip !== "") parts.push(quote("requestIP") + ":" + quote(ip))
+  parts.push(quote("raiju_action") + ":" + quote(e.action))
+  parts.push(quote("status") + ":" + JSON.stringify(e.status))
+  return "{" + parts.join(",") + "}"
+}
+
+function anyOf(want: string[] | undefined, v: string): bool {
+  return want === undefined || want.length === 0 || want.includes(v)
+}
+
 function matches(e: AuditEvent, q: AuditQuery): bool {
   if (q.actor !== undefined && e.actor !== q.actor) return false
-  if (q.action !== undefined && e.action !== q.action) return false
+  if (q.action !== undefined && e.action !== q.action && cadfAction(e) !== q.action) return false
   if (q.since !== undefined && e.ts < q.since) return false
   if (q.until !== undefined && e.ts > q.until) return false
+  const acts = q.actions
+  if (acts !== undefined && acts.length > 0 && !acts.includes(e.action) && !acts.includes(cadfAction(e))) return false
+  if (!anyOf(q.outcomes, outcomeOf(e))) return false
+  if (!anyOf(q.eventTypes, "activity")) return false
+  if (!anyOf(q.initiatorIds, e.actor)) return false
+  if (!anyOf(q.initiatorTypes, initiatorTypeOf(e.actor))) return false
+  if (!anyOf(q.targetIds, targetIdOf(e))) return false
+  if (!anyOf(q.targetTypes, targetTypeOf(e))) return false
+  if (!anyOf(q.methods, e.method)) return false
+  const ps = q.paths
+  if (ps !== undefined && ps.length > 0 && !ps.some((x) => e.path.startsWith(x))) return false
+  if (q.omitIps !== true && !anyOf(q.ips, e.ip ?? "")) return false
+  // Raiju's events carry no tags, so a tag filter matches none
+  const tags = q.tags
+  if (tags !== undefined && tags.length > 0) return false
+  const text = (q.search ?? "").trim().toLowerCase()
+  if (text !== "") {
+    const hay = [e.actor, e.action, cadfAction(e), targetIdOf(e), e.path, e.method, outcomeOf(e)]
+    if (q.omitIps !== true) hay.push(e.ip ?? "")
+    if (!hay.some((x) => x.toLowerCase().includes(text))) return false
+  }
   return true
 }
 
@@ -289,19 +427,50 @@ export class AuditLog {
     return { ok: true, checked: checked }
   }
 
-  // Events in memory, newest first. Limit is clamped to 1000 and defaults to 50.
-  query(q: AuditQuery): { events: AuditEvent[], total: int } {
+  // Events in memory, newest first (oldest first with order "asc"). Limit is clamped to 1000 and defaults
+  // to 50. total counts every match; a cursor starts the page after that event, offset skips past it.
+  query(q: AuditQuery): AuditPage {
     const limit = Math.min(1000, Math.max(0, q.limit ?? 50))
     const offset = Math.max(0, q.offset ?? 0)
+    const asc = q.order === "asc"
+    const cursor = q.cursor
     const events: AuditEvent[] = []
     let total = 0
-    for (let i = this.mem.length - 1; i >= 0; i--) {
-      const e = this.mem[i]!
+    let skipped = 0
+    let more = false
+    const n = this.mem.length
+    for (let k = 0; k < n; k++) {
+      const e = this.mem[asc ? k : n - 1 - k]!
       if (!matches(e, q)) continue
-      if (total >= offset && events.length < limit) events.push(e)
       total += 1
+      if (cursor !== undefined && (asc ? e.seq <= cursor : e.seq >= cursor)) continue
+      if (skipped < offset) {
+        skipped += 1
+        continue
+      }
+      if (events.length < limit) events.push(e)
+      else more = true
     }
-    return { events: events, total: total }
+    return { events: events, total: total, hasMore: more }
+  }
+
+  // The event with this id from memory, else from the file (an older event the memory window dropped).
+  findAny(seq: int): AuditEvent | undefined throws Error {
+    const m = this.find(seq)
+    if (m !== undefined) return m
+    if (!existsSync(this.file)) return undefined
+    for (const line of try readFileSync(this.file, "utf8").split("\n")) {
+      const e = parseLine(line)
+      if (e !== undefined && e.seq === seq) return e
+    }
+    return undefined
+  }
+
+  // Bifrost's per-event check: the signature computed again from the event's stored fields, compared in
+  // constant time with the one stored. computed covers the content as it stands, so an edited field shows.
+  verifyOne(e: AuditEvent): { valid: bool, computed: string, stored: string } {
+    const computed = sign(this.keyBytes, digest(e))
+    return { valid: sameText(computed, e.sig), computed: computed, stored: e.sig }
   }
 
   // The event with this id (its sequence number), from memory.
@@ -312,23 +481,59 @@ export class AuditLog {
     return undefined
   }
 
-  // The distinct values the audit filters offer, from the events in memory, sorted.
-  filterData(): { actors: string[], actions: string[], methods: string[], paths: string[], ips: string[] } {
-    const actors: string[] = []
-    const actions: string[] = []
-    const methods: string[] = []
-    const paths: string[] = []
-    const ips: string[] = []
+  // The distinct values the audit filters offer, from the events in memory, sorted: Bifrost's dimensions
+  // (actions, outcomes, event_types, initiator_types, target_types, request_methods, initiators, targets,
+  // request_paths, request_ips, tags) and Raiju's own (actors, methods, paths, ips). actions holds the CADF
+  // actions and Raiju's action names, since the action filter takes both. dims limits the Bifrost dimensions
+  // (all when empty; unknown names are ignored), q keeps the values that hold it (ignoring case), and omitIps
+  // leaves the addresses out.
+  filterData(dims: string[], q: string, omitIps: bool): string {
+    let actors: string[] = []
+    let actions: string[] = []
+    let outcomes: string[] = []
+    let initTypes: string[] = []
+    let targetTypes: string[] = []
+    let methods: string[] = []
+    let paths: string[] = []
+    let ips: string[] = []
+    let targets: string[] = []
     for (const e of this.mem) {
-      if (!actors.includes(e.actor)) actors.push(e.actor)
-      if (!actions.includes(e.action)) actions.push(e.action)
-      if (!methods.includes(e.method)) methods.push(e.method)
-      if (!paths.includes(e.path)) paths.push(e.path)
-      const ip = e.ip ?? ""
-      if (ip !== "" && !ips.includes(ip)) ips.push(ip)
+      addUnique(&actors, e.actor)
+      addUnique(&actions, e.action)
+      addUnique(&actions, cadfAction(e))
+      addUnique(&outcomes, outcomeOf(e))
+      addUnique(&initTypes, initiatorTypeOf(e.actor))
+      addUnique(&targetTypes, targetTypeOf(e))
+      addUnique(&methods, e.method)
+      addUnique(&paths, e.path)
+      addUnique(&targets, targetIdOf(e))
+      if (!omitIps) addUnique(&ips, e.ip ?? "")
     }
-    const byName = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0)
-    return { actors: actors.sort(byName), actions: actions.sort(byName), methods: methods.sort(byName), paths: paths.sort(byName), ips: ips.sort(byName) }
+    const needle = q.trim().toLowerCase()
+    const keep = (xs: string[]): string[] => {
+      const out = xs.filter((x) => needle === "" || x.toLowerCase().includes(needle))
+      return out.sort((a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0))
+    }
+    const strs = (xs: string[]): string => "[" + keep(xs).map((x) => quote(x)).join(",") + "]"
+    const pairs = (xs: string[]): string => "[" + keep(xs).map((x) => "{" + quote("id") + ":" + quote(x) + "," + quote("name") + ":" + quote(x) + "}").join(",") + "]"
+    const want = (d: string): bool => dims.length === 0 || dims.includes(d)
+    const out: string[] = []
+    if (want("actions")) out.push(quote("actions") + ":" + strs(actions))
+    if (want("outcomes")) out.push(quote("outcomes") + ":" + strs(outcomes))
+    if (want("event_types")) out.push(quote("event_types") + ":" + strs(this.mem.length > 0 ? ["activity"] : []))
+    if (want("initiator_types")) out.push(quote("initiator_types") + ":" + strs(initTypes))
+    if (want("target_types")) out.push(quote("target_types") + ":" + strs(targetTypes))
+    if (want("request_methods")) out.push(quote("request_methods") + ":" + strs(methods))
+    if (want("initiators")) out.push(quote("initiators") + ":" + pairs(actors))
+    if (want("targets")) out.push(quote("targets") + ":" + pairs(targets))
+    if (want("request_paths")) out.push(quote("request_paths") + ":" + strs(paths))
+    if (want("request_ips")) out.push(quote("request_ips") + ":" + strs(ips))
+    if (want("tags")) out.push(quote("tags") + ":[]")
+    out.push(quote("actors") + ":" + strs(actors))
+    out.push(quote("methods") + ":" + strs(methods))
+    out.push(quote("paths") + ":" + strs(paths))
+    out.push(quote("ips") + ":" + strs(ips))
+    return "{" + out.join(",") + "}"
   }
 
   // The file's lines, unchanged, so each one still verifies on its own. With a
@@ -355,6 +560,171 @@ export class AuditLog {
     this.mem.push(e)
     if (this.mem.length > this.cap) this.mem = this.mem.slice(this.mem.length - this.cap)
   }
+}
+
+// ---- Bifrost's list query (GET /api/audit-logs) ----
+
+// A filter given as a single value (action) or a JSON array (actions); the array wins. An array that is not
+// JSON is read as a comma-separated list.
+function multi(sp: URLSearchParams, one: string, many: string): string[] | undefined {
+  const raw = (sp.get(many) ?? "").trim()
+  if (raw !== "") {
+    let vs: string[] = []
+    try {
+      vs = JSON.parse(raw) as string[]
+    } catch (e) {
+      vs = raw.split(",")
+    }
+    const out: string[] = []
+    for (const v of vs) {
+      const t = v.trim()
+      if (t !== "") out.push(t)
+    }
+    return out
+  }
+  const single = (sp.get(one) ?? "").trim()
+  return single === "" ? undefined : [single]
+}
+
+// 2026-10-14 or RFC 3339 as epoch ms; a bare date is the start of that day, or its end with endOfDay.
+function dateMs(raw: string, endOfDay: bool): f64 | undefined {
+  const t = raw.trim()
+  if (t === "") return undefined
+  if (t.byteLength === 10 && !t.includes("T")) {
+    const d = timeOf(t + "T00:00:00Z")
+    if (d === undefined) return undefined
+    return endOfDay ? d + 86399999.0 : d
+  }
+  return timeOf(t)
+}
+
+// A relative window such as 30m, 24h or 7d in ms; undefined when it is not one.
+function periodMs(raw: string): f64 | undefined {
+  const t = raw.trim()
+  if (t.byteLength < 2) return undefined
+  const unit = t.endsWith("d") ? 86400000.0 : t.endsWith("h") ? 3600000.0 : t.endsWith("m") ? 60000.0 : t.endsWith("s") ? 1000.0 : 0.0
+  const n = parseFloat(t.slice(0, t.byteLength - 1)) ?? 0.0
+  return unit > 0.0 && n > 0.0 ? n * unit : undefined
+}
+
+export type AuditListQuery = { q: AuditQuery, page: int, limit: int, error: string }
+
+function badQuery(m: string): AuditListQuery {
+  return { q: {}, page: 1, limit: 100, error: m }
+}
+
+// The query of GET /api/audit-logs: Bifrost's page, limit (default 100, at most 1000), cursor, search,
+// filters, start_date, end_date, period and sort_order, and Raiju's actor, since, until and offset.
+export function auditQueryOf(sp: URLSearchParams, now: f64, omitIps: bool): AuditListQuery {
+  const q: AuditQuery = {}
+  let limit = 100
+  const lr = (sp.get("limit") ?? "").trim()
+  if (lr !== "") {
+    const l = parseInt(lr)
+    if (l === undefined || l < 1) return badQuery("limit must be a positive integer")
+    limit = Math.min(1000, l)
+  }
+  let page = 1
+  const pr = (sp.get("page") ?? "").trim()
+  if (pr !== "") {
+    const pg = parseInt(pr)
+    if (pg === undefined || pg < 1) return badQuery("page must be a positive integer")
+    page = pg
+  }
+  q.limit = limit
+  const off = parseInt((sp.get("offset") ?? "").trim())
+  q.offset = pr === "" && off !== undefined && off > 0 ? off : (page - 1) * limit
+  const cr = (sp.get("cursor") ?? "").trim()
+  if (cr !== "") {
+    const c = parseInt(cr)
+    if (c === undefined || c < 0) return badQuery("invalid cursor")
+    q.cursor = c
+    q.offset = 0
+  }
+  const actor = (sp.get("actor") ?? "").trim()
+  if (actor !== "") q.actor = actor
+  q.actions = multi(sp, "action", "actions")
+  q.outcomes = multi(sp, "outcome", "outcomes")
+  q.eventTypes = multi(sp, "event_type", "event_types")
+  q.initiatorIds = multi(sp, "initiator_id", "initiator_ids")
+  q.initiatorTypes = multi(sp, "initiator_type", "initiator_types")
+  q.targetIds = multi(sp, "target_id", "target_ids")
+  q.targetTypes = multi(sp, "target_type", "target_types")
+  q.methods = multi(sp, "request_method", "request_methods")
+  q.paths = multi(sp, "request_path", "request_paths")
+  q.ips = multi(sp, "request_ip", "request_ips")
+  q.tags = multi(sp, "tags", "tags")
+  const search = (sp.get("search") ?? "").trim()
+  if (search !== "") q.search = search
+  q.omitIps = omitIps
+  const order = (sp.get("sort_order") ?? sp.get("order") ?? "desc").trim().toLowerCase()
+  if (order !== "asc" && order !== "desc") return badQuery("sort_order must be asc or desc")
+  q.order = order
+  // a period overrides start_date and end_date; since and until (epoch ms) are Raiju's own bounds
+  const per = (sp.get("period") ?? "").trim()
+  if (per !== "") {
+    const span = periodMs(per)
+    if (span === undefined) return badQuery(`invalid period "${per}"`)
+    q.since = now - span
+  } else {
+    const sd = sp.get("start_date") ?? ""
+    const ed = sp.get("end_date") ?? ""
+    if (sd !== "") {
+      const v = dateMs(sd, false)
+      if (v === undefined) return badQuery("invalid start_date")
+      q.since = v
+    }
+    if (ed !== "") {
+      const v = dateMs(ed, true)
+      if (v === undefined) return badQuery("invalid end_date")
+      q.until = v
+    }
+  }
+  const since = parseFloat((sp.get("since") ?? "").trim())
+  if (since !== undefined) q.since = since
+  const until = parseFloat((sp.get("until") ?? "").trim())
+  if (until !== undefined) q.until = until
+  return { q: q, page: page, limit: limit, error: "" }
+}
+
+// The list answer: Bifrost's audit_logs (CADF events), total, page, limit, total_pages, has_more and
+// next_cursor, with Raiju's own events alongside. IPs are left out of both with omitIps.
+export function auditListJson(r: AuditPage, page: int, limit: int, omitIps: bool): string {
+  const cadf: string[] = []
+  const own: string[] = []
+  for (const e of r.events) {
+    cadf.push(cadfJson(e, omitIps))
+    const shown: AuditEvent = e
+    if (omitIps) shown.ip = undefined
+    own.push(JSON.stringify(shown))
+  }
+  const pages = limit <= 0 ? 0 : Math.floor((r.total + limit - 1) / limit)
+  const last = r.events.length > 0 ? r.events[r.events.length - 1]! : undefined
+  const parts: string[] = [
+    quote("audit_logs") + ":[" + cadf.join(",") + "]",
+    quote("total") + ":" + JSON.stringify(r.total),
+    quote("page") + ":" + JSON.stringify(page),
+    quote("limit") + ":" + JSON.stringify(limit),
+    quote("total_pages") + ":" + JSON.stringify(pages),
+    quote("has_more") + ":" + (r.hasMore ? "true" : "false"),
+  ]
+  if (r.hasMore && last !== undefined) parts.push(quote("next_cursor") + ":" + quote("" + last.seq))
+  parts.push(quote("events") + ":[" + own.join(",") + "]")
+  return "{" + parts.join(",") + "}"
+}
+
+function addUnique(inout xs: string[], v: string): void {
+  if (v !== "" && !xs.includes(v)) xs.push(v)
+}
+
+// Equal strings, compared without stopping at the first difference.
+function sameText(a: string, b: string): bool {
+  const x = utf8(a)
+  const y = utf8(b)
+  let diff = x.length === y.length ? 0 : 1
+  const n = Math.min(x.length, y.length)
+  for (let i = 0; i < n; i++) diff = diff | (int(x[i]!) ^ int(y[i]!))
+  return diff === 0
 }
 
 // The singular object name of a governance collection, or undefined.
@@ -662,6 +1032,126 @@ test("query filters by actor, action and time, newest first, with paging", () =>
     const page = log.query({ limit: 2, offset: 1 })
     expect(page.total).toBe(4)
     expect(page.events.map((e) => e.seq).join(",")).toBe("3,2")
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("Bifrost's list filters: CADF action, outcome, initiator, target, path, search, order and cursor", () => {
+  const dir = try tmpDir()
+  try {
+    const log = try new AuditLog(dir, TEST_KEY, 100)
+    try log.record("alice", "provider.upsert", "openai", "PUT", "/api/providers/openai", 200, "10.0.0.1", undefined, 1000.0)
+    try log.record("key:k1", "virtual_key.create", "", "POST", "/api/governance/virtual-keys", 201, "10.0.0.2", undefined, 2000.0)
+    try log.record("alice", "virtual_key.delete", "vk1", "DELETE", "/api/governance/virtual-keys/vk1", 403, undefined, undefined, 3000.0)
+    try log.record("anonymous", "api.post", "/api/session/login", "POST", "/api/session/login", 401, undefined, undefined, 4000.0)
+    const ids = (q: AuditQuery): string => log.query(q).events.map((e) => "" + e.seq).join(",")
+    expect(ids({ actions: ["delete"] })).toBe("3")
+    expect(ids({ action: "update" })).toBe("1")
+    expect(ids({ actions: ["create", "virtual_key.delete"] })).toBe("3,2")
+    expect(ids({ actions: ["authenticate"] })).toBe("4")
+    expect(ids({ outcomes: ["failure"] })).toBe("4,3")
+    expect(ids({ initiatorIds: ["alice"] })).toBe("3,1")
+    expect(ids({ initiatorTypes: ["api_key"] })).toBe("2")
+    expect(ids({ initiatorTypes: ["system"] })).toBe("4")
+    expect(ids({ targetIds: ["openai", "vk1"] })).toBe("3,1")
+    expect(ids({ targetTypes: ["virtual_key"] })).toBe("3,2")
+    expect(ids({ targetTypes: ["session"] })).toBe("4")
+    expect(ids({ methods: ["DELETE"] })).toBe("3")
+    expect(ids({ paths: ["/api/governance"] })).toBe("3,2")
+    expect(ids({ ips: ["10.0.0.2"] })).toBe("2")
+    expect(ids({ ips: ["10.0.0.2"], omitIps: true })).toBe("4,3,2,1")
+    expect(ids({ search: "VK1" })).toBe("3")
+    expect(ids({ search: "10.0.0.1" })).toBe("1")
+    expect(ids({ search: "10.0.0.1", omitIps: true })).toBe("")
+    expect(ids({ eventTypes: ["activity"] })).toBe("4,3,2,1")
+    expect(ids({ eventTypes: ["control"] })).toBe("")
+    expect(ids({ tags: ["security"] })).toBe("")
+    expect(ids({ order: "asc" })).toBe("1,2,3,4")
+    // a cursor pages after the last event of the page before, in either order
+    const first = log.query({ limit: 2 })
+    expect(first.hasMore).toBe(true)
+    expect(first.total).toBe(4)
+    expect(ids({ limit: 2, cursor: 3 })).toBe("2,1")
+    expect(log.query({ limit: 2, cursor: 3 }).hasMore).toBe(false)
+    expect(ids({ limit: 2, cursor: 2, order: "asc" })).toBe("3,4")
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("the list query parses Bifrost's parameters, and the answer carries both shapes", () => {
+  const dir = try tmpDir()
+  try {
+    const log = try new AuditLog(dir, TEST_KEY, 100)
+    try log.record("alice", "provider.upsert", "openai", "PUT", "/api/providers/openai", 200, "10.0.0.1", `{"name":"openai"}`, 86400000.0 * 3.0)
+    try log.record("bob", "provider.delete", "openai", "DELETE", "/api/providers/openai", 500, undefined, undefined, 86400000.0 * 4.0 + 5.0)
+    const parse = (qs: string): AuditListQuery => auditQueryOf(new URLSearchParams(qs), 86400000.0 * 5.0, false)
+    const a = parse(`actions=["update","delete"]&outcome=success&page=2&limit=5&sort_order=asc`)
+    expect(a.error).toBe("")
+    expect((a.q.actions ?? []).join(",")).toBe("update,delete")
+    expect((a.q.outcomes ?? []).join(",")).toBe("success")
+    expect(a.q.offset ?? -1).toBe(5)
+    expect(a.q.order ?? "").toBe("asc")
+    expect(parse("").limit).toBe(100)
+    expect(parse("limit=5000").limit).toBe(1000)
+    expect(parse("limit=0").error).toBe("limit must be a positive integer")
+    expect(parse("page=0").error).toBe("page must be a positive integer")
+    expect(parse("cursor=x").error).toBe("invalid cursor")
+    expect(parse("sort_order=up").error).toBe("sort_order must be asc or desc")
+    // a bare end date is the end of that day; a period overrides the dates
+    const d = parse("start_date=1970-01-04&end_date=1970-01-04")
+    expect(d.q.since ?? 0.0).toBe(86400000.0 * 3.0)
+    expect(d.q.until ?? 0.0).toBe(86400000.0 * 4.0 - 1.0)
+    expect(log.query(d.q).total).toBe(1)
+    expect(parse("period=1d&start_date=1970-01-01").q.since ?? 0.0).toBe(86400000.0 * 4.0)
+    expect(parse("period=soon").error).toBe(`invalid period "soon"`)
+    const body = auditListJson(log.query(parse("limit=1").q), 1, 1, false)
+    expect(body.includes(`"total":2,"page":1,"limit":1,"total_pages":2,"has_more":true,"next_cursor":"2"`)).toBe(true)
+    expect(body.includes(`"id":"2","typeURI":"https://getbifrost.ai/schemas/auditlog.json","eventType":"activity"`)).toBe(true)
+    expect(body.includes(`"action":"delete","outcome":"failure","initiator":{"id":"bob","typeURI":"bifrost/user","name":"bob"},"target":{"id":"openai","typeURI":"bifrost/provider"},"reason":{"reasonCode":"500","reasonType":"HTTP"}`)).toBe(true)
+    expect(body.includes(`"events":[{"seq":2`)).toBe(true)
+    const one = auditListJson(log.query(parse("order=asc&limit=1").q), 1, 1, false)
+    expect(one.includes(`"host":"10.0.0.1"`) && one.includes(`"requestIP":"10.0.0.1"`) && one.includes(`"ip":"10.0.0.1"`)).toBe(true)
+    expect(one.includes(`"attachments":[{"name":"request_body","contentType":"application/json","content":"{\\"name\\":\\"openai\\"}"}]`)).toBe(true)
+    const hidden = auditListJson(log.query(parse("order=asc&limit=1").q), 1, 1, true)
+    expect(hidden.includes("10.0.0.1")).toBe(false)
+    // filter data: Bifrost's dimensions and Raiju's, narrowed by dimensions and q
+    const fd = log.filterData([], "", false)
+    expect(fd.includes(`"actions":["delete","provider.delete","provider.upsert","update"]`)).toBe(true)
+    expect(fd.includes(`"outcomes":["failure","success"]`)).toBe(true)
+    expect(fd.includes(`"initiators":[{"id":"alice","name":"alice"},{"id":"bob","name":"bob"}]`)).toBe(true)
+    expect(fd.includes(`"request_ips":["10.0.0.1"]`)).toBe(true)
+    expect(fd.includes(`"actors":["alice","bob"]`)).toBe(true)
+    const narrow = log.filterData(["outcomes", "nonsense"], "fail", true)
+    expect(narrow.includes(`"outcomes":["failure"]`) && !narrow.includes(`"request_methods"`) && !narrow.includes("10.0.0.1")).toBe(true)
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("one event's signature verifies; an edited field does not", () => {
+  const dir = try tmpDir()
+  try {
+    const log = try new AuditLog(dir, TEST_KEY, 1)
+    const e1 = try log.record("alice", "provider.upsert", "openai", "PUT", "/api/providers/openai", 200, undefined, undefined, 1000.0)
+    try log.record("bob", "provider.delete", "openai", "DELETE", "/api/providers/openai", 200, undefined, undefined, 2000.0)
+    const ok = log.verifyOne(e1)
+    expect(ok.valid).toBe(true)
+    expect(ok.computed).toBe(e1.sig)
+    const sig = e1.sig
+    let edited: AuditEvent = e1
+    edited.actor = "mallory"
+    const bad = log.verifyOne(edited)
+    expect(bad.valid).toBe(false)
+    expect(bad.stored).toBe(sig)
+    // the first event left memory (maxMemory 1) and is read from the file
+    expect(log.find(1)).toBeUndefined()
+    expect((try log.findAny(1))?.actor ?? "").toBe("alice")
+    expect(try log.findAny(9)).toBeUndefined()
+    expect(sameText("abc", "abc")).toBe(true)
+    expect(sameText("abc", "abd")).toBe(false)
+    expect(sameText("abc", "ab")).toBe(false)
   } finally {
     try rmSync(dir, { recursive: true, force: true })
   }

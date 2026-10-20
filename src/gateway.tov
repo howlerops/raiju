@@ -25,7 +25,7 @@ import { CompiledRule, applyRegex } from "./guard_regex"
 import { compileLocal, localVerdict } from "./guard_local"
 import { ToolGuard, compileToolGuards, checkToolCall } from "./guard_mcp"
 import { OutputStreamGuard, GuardedProvider, StreamFormat } from "./guard_stream"
-import { Vault, tokenizeChatRequest, restoreCompletion } from "./guard_reversible"
+import { Vault, tokenizeChatRequest, restoreCompletion, tokenize, tokenizeText } from "./guard_reversible"
 import { Target, Upstream, Translated, proxyOf, tlsOf, poolOf, RS } from "./providers/types"
 import { CompatPlan, Shaped, settingsOf, withHeader, responseToChat, chatToText, textFrame, chatSseToText, textToChatFields } from "./compat"
 import { ResponsesToChatStream, toResponse, toResponseStream } from "./responses"
@@ -1042,6 +1042,8 @@ class ReqCtx {
   stopReason = ""
   // the tools the answer called, the heuristic complexity score and the prompt the request named
   toolNames: string[] = []
+  // the answer was asked for as a stream (the log's *_stream request types)
+  streamed = false
   complexityScore: f64 | undefined = undefined
   promptId = ""
   promptName = ""
@@ -1150,6 +1152,51 @@ function compileLocalRules(providers: GuardrailProvider[]): Map<string, Compiled
     } catch (e) {
       console.error(`raiju: guardrail ${p.id}: ${e.message}`)
     }
+  }
+  return out
+}
+
+// Moves the local rules that redact with redaction_mode logs_only out of the live rules: a secrets provider's
+// rules when the provider redacts logs_only, a regex provider's pattern by pattern (compileRules keeps one rule
+// per pattern, in order). Returns the moved rules by provider id; live keeps the rest.
+function splitLogsOnly(providers: GuardrailProvider[], inout live: Map<string, CompiledRule[]>): Map<string, CompiledRule[]> {
+  const out: Map<string, CompiledRule[]> = new Map()
+  for (const p of providers) {
+    const rules = live.get(p.id)
+    if (rules === undefined) continue
+    if (p.kind === "secrets") {
+      if (p.redaction_mode === "logs_only" && p.action === "redact") {
+        out.set(p.id, rules)
+        live.set(p.id, [])
+      }
+      continue
+    }
+    const pats = p.patterns ?? []
+    if (p.kind !== "regex" || pats.length !== rules.length) continue
+    const keep: CompiledRule[] = []
+    const moved: CompiledRule[] = []
+    for (let i = 0; i < rules.length; i++) {
+      const pat = pats[i]!
+      if (pat.redaction_mode === "logs_only" && (pat.action ?? "block") === "redact") moved.push(rules[i]!)
+      else keep.push(rules[i]!)
+    }
+    if (moved.length === 0) continue
+    out.set(p.id, moved)
+    live.set(p.id, keep)
+  }
+  return out
+}
+
+// One stored text with the logs_only redaction: the built-in guard's findings and the moved local rules'
+// findings become numbered placeholders from the request's vault ([EMAIL-1]), as Bifrost's logs_only stores them.
+export function logsOnlyText(text: string, g: GuardConfig | undefined, rules: CompiledRule[][], vault: Vault): string {
+  if (text === "") return text
+  let out = text
+  if (g !== undefined) out = tokenizeText(out, g, vault)
+  for (const rs of rules) {
+    if (rs.length === 0) continue
+    const found = applyRegex(out, rs).findings.filter((f) => f.end > f.start)
+    if (found.length > 0) out = tokenize(out, found, vault)
   }
   return out
 }
@@ -1288,6 +1335,10 @@ export class Engine {
   guardProviders: GuardrailProvider[] = []
   // compiled regex and secrets providers, by id, and the guards on MCP tool calls
   localRules: Map<string, CompiledRule[]> = new Map()
+  // redaction_mode logs_only: the built-in guard and the local provider rules that redact only the stored copy
+  // of a request (its log row, raw payloads, exports and retained content), never live traffic
+  logGuard: GuardConfig | undefined = undefined
+  logRules: Map<string, CompiledRule[]> = new Map()
   toolGuards: ToolGuard[] = []
   // per-provider concurrency and queue (concurrency_and_buffer_size)
   limiters: Map<string, Limiter> = new Map()
@@ -1390,6 +1441,11 @@ export class Engine {
     if (g !== undefined && g.enabled !== false) {
       const mode = g.mode === "block" ? "block" : g.mode === "log" ? "log" : "redact"
       this.guard = { detect: g.detect ?? ["email", "phone", "ssn", "credit_card", "api_key", "aws_key", "jwt", "private_key"], mode: mode, custom: g.custom }
+      // logs_only: the guard leaves live traffic alone and redacts the stored copy instead (record)
+      if (g.logs_only === true && mode === "redact") {
+        this.logGuard = this.guard
+        this.guard = undefined
+      }
       const where = g.apply_to ?? "input"
       this.guardInput = where === "input" || where === "both"
       this.guardOutput = where === "output" || where === "both"
@@ -1417,6 +1473,7 @@ export class Engine {
     if (injectedNames(cfg).length > 0 && (cfg.mcp?.client_configs ?? []).length === 0) console.error("raiju: injected_tools need MCP clients, and none are configured")
     this.guardProviders = cfg.guardrails?.providers ?? []
     this.localRules = compileLocalRules(this.guardProviders)
+    this.logRules = splitLogsOnly(this.guardProviders, &this.localRules)
     this.toolGuards = compileGuards(this.guardProviders)
     const sa = cfg.session_affinity
     if (sa !== undefined && sa.enabled === true) {
@@ -2130,6 +2187,8 @@ export class Engine {
     this.complexity = fresh.complexity
     this.guardProviders = fresh.guardProviders
     this.localRules = fresh.localRules
+    this.logRules = fresh.logRules
+    this.logGuard = fresh.logGuard
     this.toolGuards = fresh.toolGuards
     this.agent = fresh.agent
     this.limiters = carryLimiters(fresh.limiters, this.limiters)
@@ -2956,6 +3015,7 @@ export class Engine {
       ctx.span = rs
     }
     ctx.contentOff = this.contentOff(h)
+    ctx.streamed = streamed
     // the queue is built at start (as the log store is); the live config can still switch the retention off
     ctx.hidden = ctx.contentOff && this.hiddenQueue !== undefined && this.cfg.client?.retain_content_in_object_storage === true
     ctx.userAgent = h.get("user-agent") ?? ""
@@ -3272,7 +3332,7 @@ export class Engine {
       const ttlHeader = h.get("x-bf-cache-ttl")
       const ttl = ttlHeader === undefined ? undefined : parseTtl(ttlHeader)
       const origin: CacheOrigin = { provider: r.provider, model: r.model, inputTokens: r.promptTokens }
-      if (this.vstore !== undefined) await this.vectorStore(semScope, semVec, r.body, r.contentType, ttl ?? this.semanticCfg.ttl_ms, origin)
+      if (this.vstore !== undefined) await this.vectorStore(semScope, semVec, r.body, r.contentType, ttl ?? this.semanticCfg.ttl_ms, origin, semKey ?? "")
       else sem.store(semScope, semVec, r.body, r.contentType, Date.now(), ttl, origin, semKey)
     }
     if (cache !== undefined && !noStore && r.raw !== true) {
@@ -3358,7 +3418,7 @@ export class Engine {
     if (vs === undefined) return undefined
     try {
       if (!this.vsReady) {
-        await vs.ensure(this.vsNs, this.cfg.semantic_cache?.dimension ?? v.length, ["scope"])
+        await vs.ensure(this.vsNs, this.cfg.semantic_cache?.dimension ?? v.length, ["scope", "cache_key"])
         this.vsReady = true
       }
       const hit = await vs.search(this.vsNs, v, threshold, [{ key: "scope", eq: scopeTag(scope) }])
@@ -3373,11 +3433,13 @@ export class Engine {
     }
   }
 
-  async vectorStore(scope: string, v: f64[], body: string, contentType: string, ttlMs: int, origin?: CacheOrigin): Promise<void> {
+  async vectorStore(scope: string, v: f64[], body: string, contentType: string, ttlMs: int, origin?: CacheOrigin, cacheKey?: string): Promise<void> {
     const vs = this.vstore
     if (vs === undefined || !this.vsReady) return
     const payload: Map<string, string> = new Map()
     payload.set("scope", scopeTag(scope))
+    // the x-bf-cache-key, so DELETE /api/cache/clear-by-key can find the entries (Bifrost's cache_key field)
+    if (cacheKey !== undefined && cacheKey !== "") payload.set("cache_key", cacheKey)
     payload.set("body", body)
     payload.set("contentType", contentType)
     if (origin !== undefined) {
@@ -3390,6 +3452,25 @@ export class Engine {
     } catch (e) {
       console.error(`raiju: vector_store add: ${e.message}`)
     }
+  }
+
+  // Clears semantic cache entries from the vector store: the entry with id (the x-bifrost-cache-id of a hit),
+  // or every entry stored under cacheKey. Returns how many went. The namespace is opened first when no
+  // request has used it yet, which needs semantic_cache.dimension. Throws what the store reports.
+  async vectorClear(id: string, cacheKey: string): Promise<int, Error> {
+    const vs = this.vstore
+    if (vs === undefined) return 0
+    if (!this.vsReady) {
+      const dim = this.cfg.semantic_cache?.dimension ?? 0
+      if (dim <= 0) return 0
+      try await vs.ensure(this.vsNs, dim, ["scope", "cache_key"])
+      this.vsReady = true
+    }
+    if (id !== "") {
+      try await vs.delete(this.vsNs, id)
+      return 1
+    }
+    return try await vs.deleteWhere(this.vsNs, [{ key: "cache_key", eq: cacheKey }])
   }
 
   // Whether a request's bodies stay out of the log store and exporters: the
@@ -3420,6 +3501,16 @@ export class Engine {
   }
 
   record(c: ReqCtx): void {
+    // logs_only: the answer is out; what is stored from here on carries placeholders instead of the findings
+    if (this.logGuard !== undefined || this.logRules.size > 0) {
+      const vault = new Vault()
+      const rs = this.logRules.values()
+      c.input = logsOnlyText(c.input, this.logGuard, rs, vault)
+      c.output = logsOnlyText(c.output, this.logGuard, rs, vault)
+      c.error = logsOnlyText(c.error, this.logGuard, rs, vault)
+      c.rawRequest = logsOnlyText(c.rawRequest, this.logGuard, rs, vault)
+      c.rawResponse = logsOnlyText(c.rawResponse, this.logGuard, rs, vault)
+    }
     const ms = performance.now() - c.started
     const ok = c.status >= 200 && c.status < 300
     if (this.logRequests) {
@@ -3469,6 +3560,7 @@ export class Engine {
         cache_hit_type: c.cacheType === "" ? undefined : c.cacheType,
         stop_reason: c.stopReason === "" ? undefined : c.stopReason,
         tool_call_names: c.toolNames.length === 0 ? undefined : c.toolNames,
+        streamed: c.streamed ? true : undefined,
         complexity_score: c.complexityScore,
         selected_prompt_id: c.promptId === "" ? undefined : c.promptId,
         selected_prompt_name: c.promptName === "" ? undefined : c.promptName,
@@ -3481,7 +3573,7 @@ export class Engine {
         crew_attempt: c.crew === undefined ? undefined : c.crew.attempt,
         raw_request: c.contentOff || c.rawRequest === "" ? undefined : this.redactRaw(c.rawRequest, false),
         raw_response: c.contentOff || c.rawResponse === "" ? undefined : this.redactRaw(c.rawResponse, true),
-        id: c.rid, ts: Date.now(), request_id: c.rid, op: c.op, provider: c.provider, model: c.model, status: c.status,
+        id: c.rid, ts: now, request_id: c.rid, op: c.op, provider: c.provider, model: c.model, status: c.status,
         latency_ms: ms, prompt_tokens: c.promptTokens, completion_tokens: c.completionTokens, cost: c.cost, cache_hit: c.cached,
         virtual_key: c.virtualKey === "" ? undefined : c.virtualKey, team_id: c.teamId === "" ? undefined : c.teamId,
         customer_id: c.customerId === "" ? undefined : c.customerId, business_unit_id: c.businessUnitId === "" ? undefined : c.businessUnitId,
@@ -4651,4 +4743,22 @@ test("x-bf-mcp-include-tools: a list of client-tool names, client-* wildcards, a
   expect(try toolInList(search, ["weather-*"])).toBe(false)
   expect(try toolInList(search, ["search"])).toBe(false)
   expect(try toolInList(search, [])).toBe(false)
+})
+
+test("logs_only: moved local rules and the built-in guard put placeholders in the stored copy only", () => {
+  const providers: GuardrailProvider[] = [
+    { id: "sec", kind: "secrets", action: "redact", redaction_mode: "logs_only" },
+    { id: "rx", kind: "regex", patterns: [{ pattern: "PROJ-\\d+", description: "Project code", action: "redact", redaction_mode: "logs_only" }, { pattern: "ACME-\\d+", description: "Acme code", action: "redact" }] },
+  ]
+  let live = compileLocalRules(providers)
+  const moved = splitLogsOnly(providers, &live)
+  expect((live.get("sec") ?? []).length).toBe(0)
+  expect((moved.get("sec") ?? []).length > 0).toBe(true)
+  expect((live.get("rx") ?? []).length).toBe(1)
+  expect((moved.get("rx") ?? []).length).toBe(1)
+  const g: GuardConfig = { detect: ["email"], mode: "redact" }
+  const vault = new Vault()
+  const out = logsOnlyText(`{"content":"mail a@b.io about PROJ-12 and ACME-3, then a@b.io again"}`, g, moved.values(), vault)
+  expect(out).toBe(`{"content":"mail [EMAIL-1] about [PROJECT_CODE-1] and ACME-3, then [EMAIL-1] again"}`)
+  expect(logsOnlyText("", g, moved.values(), vault)).toBe("")
 })

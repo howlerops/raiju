@@ -85,7 +85,6 @@ function noteTable(): Map<string, string> {
     ["client.initial_pool_size", "is a Go connection-pool setting that Raiju does not use"],
     ["client.disable_db_pings_in_health", "is not used: Raiju has no database"],
     ["client.enforce_scim_auth", "is accepted and ignored: Bifrost's deprecated mirror of enforce_auth_on_inference, which it overwrites on load; set client.enforce_auth_on_inference"],
-    ["client.hidden_request_types", GEN],
     ["client.hide_deleted_virtual_keys_in_filters", "has no effect: Raiju deletes a virtual key outright, so no deleted keys appear in the filters"],
     ["client.enforce_vk_object_ownership", GEN],
     ["client.mcp_external_client_url", GEN],
@@ -1405,6 +1404,41 @@ function plainValue(raw: string): string | undefined throws SyntaxError {
   return quote(rawStr(sf, "value") ?? "")
 }
 
+// A secret reference object ({value, type, ref, env_var, from_env}, Bifrost's EnvVar) as the string Raiju
+// resolves at load: env.NAME for an env reference, vault.<ref> for a vault one, else the value.
+function refValue(raw: string): string throws SyntaxError {
+  const sf = try fields(raw)
+  const kind = rawStr(sf, "type") ?? ""
+  const envVar = rawStr(sf, "env_var") ?? ""
+  const ref = rawStr(sf, "ref") ?? ""
+  if ((rawBool(sf, "from_env") === true || kind === "env") && (envVar !== "" || ref !== "")) return quote("env." + (envVar !== "" ? envVar : ref))
+  if (kind === "vault" && ref !== "") return quote("vault." + ref)
+  return quote(rawStr(sf, "value") ?? "")
+}
+
+// The object_storage blocks of logs_store and audit_logs may give the bucket (and the credentials) as a secret
+// reference object instead of a string; each becomes the string form (refValue).
+function mapStorageRefs(inout top: Field[]): void throws SyntaxError {
+  for (const section of ["logs_store", "audit_logs"]) {
+    const raw = find(top, section)
+    if (raw === undefined || !raw.startsWith("{")) continue
+    let sf = try fields(raw)
+    const os = find(sf, "object_storage")
+    if (os === undefined || !os.startsWith("{")) continue
+    let of = try fields(os)
+    let changed = false
+    for (const k of ["bucket", "region", "endpoint", "access_key_id", "secret_access_key", "session_token"]) {
+      const v = find(of, k)
+      if (v === undefined || !v.startsWith("{")) continue
+      setField(&of, k, try refValue(v))
+      changed = true
+    }
+    if (!changed) continue
+    setField(&sf, "object_storage", build(of))
+    setField(&top, section, build(sf))
+  }
+}
+
 // The agents section with the header values of its auths in the string form (see plainValue).
 function mapAgents(inout top: Field[]): void throws SyntaxError {
   const raw = find(top, "agents")
@@ -1699,6 +1733,7 @@ export function normalize(configText: string): { text: string, notes: string[] }
   try mapAgents(&top)
   try mapAuth(&top, &notes)
   try mapRoleDac(&top)
+  try mapStorageRefs(&top)
   try mapClient(&top, &notes)
   try mapMcp(&top, &notes)
   try mapAccessProfiles(&top, &notes)
@@ -1908,6 +1943,17 @@ test("governance roles: entity_dac in Bifrost's object form is read as the list 
   const e = try fields(list[0]!)
   expect(rawStr(e, "resource")).toBe("Logs")
   expect(rawStr(e, "dac")).toBe("own-data")
+})
+
+test("an object_storage bucket given as a secret reference object is read as its string form", () => {
+  const r = try normalize(`{ "logs_store": { "enabled": true, "object_storage": { "type": "s3", "bucket": { "value": "", "env_var": "LOG_BUCKET", "from_env": true }, "access_key_id": { "value": "", "type": "vault", "ref": "secret/s3#key" }, "secret_access_key": "plain" } },
+    "audit_logs": { "object_storage": { "type": "s3", "bucket": { "value": "audit-bkt", "type": "plain_text" } } } }`)
+  const ls = try fields(find(try fields(r.text), "logs_store")!)
+  const os = try fields(find(ls, "object_storage")!)
+  expect(rawStr(os, "bucket")).toBe("env.LOG_BUCKET")
+  expect(rawStr(os, "access_key_id")).toBe("vault.secret/s3#key")
+  expect(rawStr(os, "secret_access_key")).toBe("plain")
+  expect(r.text.includes(`"bucket":"audit-bkt"`)).toBe(true)
 })
 
 test("audit_logs: omit_ip_addresses, the grace period and object_storage map to audit, and are no longer ignored", () => {

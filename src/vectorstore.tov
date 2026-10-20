@@ -92,6 +92,11 @@ export abstract class VectorStore {
   // payload matches every condition, or undefined.
   abstract search(ns: string, vector: f64[], threshold: f64, filter: Cond[]): Promise<Hit | undefined, Error>
   abstract delete(ns: string, id: string): Promise<void, Error>
+  // Deletes every entry whose payload matches each condition and returns how many went (Bifrost's DeleteAll,
+  // used to clear a cache key). A backend without it throws.
+  async deleteWhere(ns: string, filter: Cond[]): Promise<int, Error> {
+    throw new Error("this vector store cannot delete entries by field")
+  }
 }
 
 // ---- shared helpers ----
@@ -221,6 +226,13 @@ export function qdrantDeleteBody(id: string): string {
   return `{"points":[${quote(pointId(id))}]}`
 }
 
+// The points/count and points/delete body that selects the points matching each condition, expired or not.
+export function qdrantMatchBody(filter: Cond[], count: bool): string {
+  const must: string[] = []
+  for (const c of filter) must.push(`{"key":${quote(c.key)},"match":{"value":${quote(c.eq)}}}`)
+  return `{"filter":{"must":[${must.join(",")}]}${count ? `,"exact":true` : ""}}`
+}
+
 // The best point of a /points/query reply ({"result":{"points":[...]}}), or undefined.
 export function parseQdrantHit(body: string): Hit | undefined throws SyntaxError {
   const top = try fields(body)
@@ -279,6 +291,19 @@ export class QdrantStore extends VectorStore {
     try this.need(ns)
     const r = try await this.call("POST", `/collections/${ns}/points/delete?wait=true`, qdrantDeleteBody(id))
     if (r.status < 200 || r.status >= 300) throw new Error(`qdrant: delete: HTTP ${r.status}: ${r.text}`)
+  }
+
+  // Counts the matching points, then deletes them by the same filter.
+  async deleteWhere(ns: string, filter: Cond[]): Promise<int, Error> {
+    try this.need(ns)
+    const c = try await this.call("POST", `/collections/${ns}/points/count`, qdrantMatchBody(filter, true))
+    if (c.status < 200 || c.status >= 300) throw new Error(`qdrant: count: HTTP ${c.status}: ${c.text}`)
+    const res = try fields(find(try fields(c.text), "result") ?? "{}")
+    const n = Math.trunc(rawNum(res, "count") ?? 0.0)
+    if (n === 0) return 0
+    const r = try await this.call("POST", `/collections/${ns}/points/delete?wait=true`, qdrantMatchBody(filter, false))
+    if (r.status < 200 || r.status >= 300) throw new Error(`qdrant: delete: HTTP ${r.status}: ${r.text}`)
+    return n
   }
 }
 
@@ -402,6 +427,21 @@ export function redisSearchArgs(ns: string, v: f64[], filter: Cond[], nowMs: int
     "RETURN", "2", "score", "p",
     "LIMIT", "0", "1", "DIALECT", "2",
   ]
+}
+
+// FT.SEARCH for the keys of the entries whose TAG fields match each condition, expired or not.
+export function redisMatchArgs(ns: string, filter: Cond[]): (string | u8[])[] {
+  const q: string[] = []
+  for (const c of filter) q.push(`@${c.key}:{${tagEscape(c.eq)}}`)
+  return ["FT.SEARCH", ns, q.join(" "), "NOCONTENT", "LIMIT", "0", "10000", "DIALECT", "2"]
+}
+
+// The keys of a NOCONTENT FT.SEARCH reply ([count, key, key, ...]).
+export function redisKeys(r: Resp): string[] throws Error {
+  if (r.kind !== "arr") throw new SyntaxError("FT.SEARCH reply is not an array")
+  const out: string[] = []
+  for (let i = 1; i < r.items.length; i++) out.push(try bulkText(r.items[i]!))
+  return out
 }
 
 // The hit of an FT.SEARCH reply ([count, key, [field, value, ...]]). Its score is the
@@ -588,6 +628,19 @@ export class RedisStore extends VectorStore {
     try this.tagsOf(ns)
     const r = try await this.client.command(["DEL", `${ns}:${id}`])
     if (r.kind === "err") throw new Error(`redis: delete: ${r.text}`)
+  }
+
+  // The filter's fields must be TAG fields of the index (ensure's tags).
+  async deleteWhere(ns: string, filter: Cond[]): Promise<int, Error> {
+    try this.tagsOf(ns)
+    const r = try await this.client.command(redisMatchArgs(ns, filter))
+    if (r.kind === "err") throw new Error(`redis: search: ${r.text}`)
+    const keys = try redisKeys(r)
+    for (const k of keys) {
+      const d = try await this.client.command(["DEL", k])
+      if (d.kind === "err") throw new Error(`redis: delete: ${d.text}`)
+    }
+    return keys.length
   }
 
   // Closes the connection. An open socket keeps the process running, so call this
@@ -952,6 +1005,16 @@ class ChromemNs {
     }
   }
 
+  // The ids of the entries whose payload matches each condition, expired or not.
+  matching(filter: Cond[]): string[] {
+    const out: string[] = []
+    for (const id of this.meta.keys()) {
+      const e = this.meta.get(id)!
+      if (filter.every((c) => e.payload.get(c.key) === c.eq)) out.push(id)
+    }
+    return out
+  }
+
   // Drops expired entries, at most once a minute.
   sweep(nowMs: int): void {
     if (nowMs - this.lastSweep < 60000) return
@@ -1078,6 +1141,16 @@ export class ChromemStore extends VectorStore {
     st.drop(id)
     st.append(`{"op":"del","id":${quote(id)}}\n`)
   }
+
+  async deleteWhere(ns: string, filter: Cond[]): Promise<int, Error> {
+    const st = try this.nsOf(ns)
+    const dead = st.matching(filter)
+    for (const id of dead) {
+      st.drop(id)
+      st.append(`{"op":"del","id":${quote(id)}}\n`)
+    }
+    return dead.length
+  }
 }
 
 // ---- tests (no network) ----
@@ -1124,6 +1197,16 @@ test("qdrant bodies", () => {
   const up = qdrantUpsertBody("e7", [0.0, 1.0], payloadJson("e7", pm, 99))
   expect(up.startsWith(`{"points":[{"id":"${pointId("e7")}","vector":[0,1],"payload":{"entry_id":"e7","expires_ms":99,"scope":"s","body":"{\\"a\\":1}"}}]}`)).toBe(true)
   expect(qdrantDeleteBody("e7")).toBe(`{"points":["${pointId("e7")}"]}`)
+})
+
+test("delete-by-field requests: Qdrant filter bodies, RediSearch keys, chromem in memory", () => {
+  expect(qdrantMatchBody([{ key: "cache_key", eq: "k1" }], true)).toBe(`{"filter":{"must":[{"key":"cache_key","match":{"value":"k1"}}]},"exact":true}`)
+  expect(qdrantMatchBody([{ key: "cache_key", eq: "k1" }], false)).toBe(`{"filter":{"must":[{"key":"cache_key","match":{"value":"k1"}}]}}`)
+  const args = redisMatchArgs("ns", [{ key: "cache_key", eq: "team-a" }])
+  expect(args[2]!).toBe("@cache_key:{team\\-a}")
+  expect(args[3]!).toBe("NOCONTENT")
+  const keys = try redisKeys({ kind: "arr", items: [{ kind: "int", n: 2 }, { kind: "bulk", bytes: utf8("ns:a") }, { kind: "bulk", bytes: utf8("ns:b") }] })
+  expect(keys.join(",")).toBe("ns:a,ns:b")
 })
 
 test("qdrant search reply: best point, its id and payload", () => {
@@ -1341,6 +1424,11 @@ test("chromem keeps entries by tag, filters, and drops expired ones", () => {
   expect(st.put("e2", [0.0, 1.0], b, 5000)).toBe(true)
   expect(st.meta.size).toBe(1)
   expect(st.lookup([0.0, 1.0], 0.9, [{ key: "scope", eq: "y" }], 2000)!.id).toBe("e2")
+  a.set("cache_key", "k1")
+  expect(st.put("e3", [1.0, 1.0], a, 9000)).toBe(true)
+  expect(st.matching([{ key: "cache_key", eq: "k1" }]).join(",")).toBe("e3")
+  expect(st.matching([{ key: "cache_key", eq: "k2" }]).length).toBe(0)
+  st.drop("e3")
   st.drop("e2")
   expect(st.meta.size).toBe(0)
   expect(st.parts.size).toBe(0)

@@ -2629,8 +2629,8 @@ def l97c_e2e(env):
         s, _, b = api("POST", "/api/logs/user-agent-mappings", {"pattern": "internal-tool", "match_type": "starts_with", "app": "Internal Tool"})
         um = json.loads(b) if s == 200 else {}
         check("a User-Agent mapping is created", s == 200 and um.get("app") == "Internal Tool" and um.get("id", "").startswith("uam_"), (s, b[:200]))
-        s, _, b = api("POST", "/api/logs/user-agent-mappings", {"pattern": "x", "match_type": "regex", "app": "A"})
-        check("a regex mapping is refused: this gateway has no regular expression engine", s == 400 and "regex" in b, (s, b[:200]))
+        s, _, b = api("POST", "/api/logs/user-agent-mappings", {"pattern": "x(", "match_type": "regex", "app": "A"})
+        check("a regex mapping that does not compile is refused", s == 400 and "invalid regex pattern" in b, (s, b[:200]))
         s, _, b = api("POST", "/api/logs/user-agent-mappings", {"pattern": "x", "app": "A"}, who=VIC)
         check("a viewer may not add a mapping", s == 403, (s, b[:200]))
         s, _, b = api("GET", "/api/logs/user-agent-mappings")
@@ -7621,6 +7621,147 @@ def l125_e2e(env):
         call("GET", "/_hidden/up", base=MOCK, auth=False)
         gw.terminate()
         gw.wait()
+
+GW_L168 = "http://127.0.0.1:18287"  # logs, audit and retained content: hidden request types, content search, regex apps, logs_only redaction
+
+
+def l168_config() -> dict:
+    # the retained bucket is the mock (its name given as a secret reference object); the keys are AWS's example values
+    return {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False, "allow_per_request_content_storage_override": True,
+                   "retain_content_in_object_storage": True, "hidden_request_types": ["embedding"]},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l168-logs"), "content_logging": True,
+                       "object_storage": {"type": "s3", "bucket": {"value": "logs-hidden", "type": "plain_text"}, "prefix": "bifrost", "region": "us-east-1", "endpoint": MOCK, "path_style": True,
+                                          "access_key_id": "AKIAIOSFODNN7EXAMPLE", "secret_access_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"}},
+        "audit": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l168-audit"), "key": "e2e-l168-audit-key-0123456789abcdef"},
+        "guardrails": {"enabled": True, "detect": ["email"], "mode": "redact", "apply_to": "both", "logs_only": True},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "s", "value": "sk-l168", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+    }
+
+
+def l168_e2e(env):
+    """L168: log reads leave out client.hidden_request_types; content_search matches prompt text; a regex user agent
+    mapping names the app; guardrails logs_only leaves live traffic raw and puts placeholders in the log; the audit
+    list takes Bifrost's filters, pages and per-event verify; a deleted hidden log's object is deleted; the cost
+    recalculation counts unpriceable logs; a resumed /ws gets the store updates it missed. Its own gateway (18287)."""
+    import shutil
+    for d in ["e2e-l168-logs", "e2e-l168-audit"]:
+        shutil.rmtree(os.path.join(BUILD, d), ignore_errors=True)
+    path = os.path.join(BUILD, "e2e.l168.json")
+    json.dump(l168_config(), open(path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18287", "-host", "127.0.0.1", "-config", path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l168.log"), "w"))
+    try:
+        wait(GW_L168 + "/health")
+        call("GET", "/_hidden/up", base=MOCK, auth=False)
+        api = lambda m, p, b=None, h=None: call(m, p, b, h, base=GW_L168, auth=False)
+        msg = lambda text: [{"role": "user", "content": text}]
+        rows = lambda q="": json.loads(api("GET", "/api/logs?limit=200" + q)[2]).get("entries", [])
+
+        # a regex user agent mapping (Bifrost's regex match_type): unanchored, case-sensitive; a bad pattern is a 400
+        s, _, b = api("POST", "/api/logs/user-agent-mappings", {"pattern": "^l168-(cli|ide)/[0-9]+", "match_type": "regex", "app": "L168 Tool"})
+        check("a regex user agent mapping is created", s == 200 and json.loads(b).get("match_type") == "regex", (s, b[:200]))
+        s, _, b = api("POST", "/api/logs/user-agent-mappings", {"pattern": "l168(", "match_type": "regex", "app": "Bad"})
+        check("a regex mapping that does not compile is refused with Bifrost's message", s == 400 and "invalid regex pattern" in b, (s, b[:200]))
+        s, _, _ = api("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": msg("l168 zebra-quartz prompt")}, {"user-agent": "l168-ide/42 (linux)"})
+        row = next((r for r in rows() if "zebra-quartz" in (r.get("input") or "")), {})
+        check("the app of a request is the regex mapping's", s == 200 and row.get("app") == "L168 Tool", (s, row.get("app"), row.get("user_agent")))
+
+        # content_search over the prompt text, ignoring case; JSON keys are not text
+        hits = json.loads(api("GET", "/api/logs?content_search=ZEBRA-QUARTZ")[2]).get("logs", [])
+        check("content_search finds a log by its prompt text", len(hits) == 1 and hits[0].get("id") == row.get("id"), [h.get("id") for h in hits])
+        hits = json.loads(api("GET", "/api/logs?content_search=messages")[2]).get("logs", [])
+        check("content_search does not match the body's keys", len(hits) == 0, [h.get("id") for h in hits])
+
+        # hidden_request_types: an embedding is logged but left out of the reads
+        s_e, _, _ = api("POST", "/v1/embeddings", {"model": "openai/text-embedding-3-small", "input": "l168 embed"})
+        time.sleep(0.2)
+        listed = rows()
+        stats = json.loads(api("GET", "/api/logs/stats")[2])
+        check("a hidden request type is answered but left out of the list and the stats", s_e == 200 and not any(r.get("object") == "embeddings" for r in listed) and stats.get("total_requests") == len(listed), (s_e, [r.get("object") for r in listed], stats.get("total_requests")))
+        stored = open(os.path.join(BUILD, "e2e-l168-logs", sorted(os.listdir(os.path.join(BUILD, "e2e-l168-logs")))[-1])).read()
+        emb_ids = [json.loads(l)["id"] for l in stored.splitlines() if l.strip() and json.loads(l).get("op") == "embeddings"]
+        check("the hidden request type is still stored, and its detail is not served", len(emb_ids) == 1 and api("GET", "/api/logs/" + emb_ids[0])[0] == 404, emb_ids)
+
+        # guardrails logs_only: the provider gets the raw prompt, the log row holds the placeholder
+        s, _, _ = api("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": msg("l168 mail jane.l168@example.com please")})
+        up = [x for x in seen() if x["path"] == "/v1/chat/completions" and "l168 mail" in x["body"]]
+        check("logs_only leaves the live request raw", s == 200 and up and "jane.l168@example.com" in up[-1]["body"], [x["body"][:200] for x in up[-1:]])
+        lrow = next((r for r in rows() if "l168 mail" in (r.get("input") or "")), {})
+        check("logs_only puts a numbered placeholder in the stored log", "[EMAIL-1]" in (lrow.get("input") or "") and "jane.l168@example.com" not in json.dumps(lrow), (lrow.get("input") or "")[:300])
+
+        # a deleted hidden log's retained object goes too (Bifrost's DeleteLogs)
+        s, _, _ = api("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": msg("l168-hidden-probe")}, {"x-bf-disable-content-logging": "true"})
+        hid = next((r for r in rows() if r.get("content_hidden") is True), {})
+        rid = hid.get("request_id") or ""
+        obj = []
+        for _ in range(30):
+            obj = [x for x in seen(True) if x["path"].startswith("/logs-hidden/") and x["path"].endswith("/" + rid + ".json") and x["body"]]
+            if obj:
+                break
+            time.sleep(0.5)
+        check("the hidden content lands in the bucket named by a secret reference object", s == 200 and len(obj) >= 1 and obj[0]["path"].startswith("/logs-hidden/bifrost/logs/"), [x["path"] for x in obj][:2])
+        s, _, b = api("DELETE", "/api/logs", {"ids": [hid.get("id")]})
+        gone = 0
+        for _ in range(20):
+            gone = call("GET", obj[0]["path"] if obj else "/logs-hidden/none", base=MOCK, auth=False)[0]
+            if gone == 404:
+                break
+            time.sleep(0.25)
+        check("deleting a hidden log deletes its object in the bucket", s == 200 and json.loads(b).get("removed") == 1 and gone == 404, (s, b[:200], gone))
+
+        # cost recalculation: a model the price list does not know is left alone and counted as unpriceable
+        api("POST", "/v1/chat/completions", {"model": "openai/l168-unpriced-model", "messages": msg("l168 unpriced")})
+        s, _, b = api("POST", "/api/logs/recalculate-cost", {})
+        job = json.loads(b) if s in (202, 409) else {}
+        st = {}
+        for _ in range(40):
+            st = json.loads(api("GET", "/api/logs/recalculate-cost/status?id=" + job.get("id", ""))[2])
+            if st.get("status") in ("completed", "cancelled"):
+                break
+            time.sleep(0.1)
+        check("the recalculation reports the unpriceable logs it left unchanged", st.get("status") == "completed" and st.get("unpriceable", 0) >= 1 and "pricing inputs were unavailable" in st.get("message", ""), st)
+
+        # the audit trail: Bifrost's CADF list with filters and pages, and one event's signature
+        s, _, b = api("GET", '/api/audit-logs?actions=["create"]&outcome=success&limit=1')
+        al = json.loads(b) if s == 200 else {}
+        ev = (al.get("audit_logs") or [{}])[0]
+        check("the audit list takes Bifrost's filters and answers its page shape", s == 200 and ev.get("action") == "create" and ev.get("outcome") == "success" and ev.get("typeURI") == "https://getbifrost.ai/schemas/auditlog.json" and al.get("limit") == 1 and "total_pages" in al and isinstance(al.get("events"), list), (s, b[:400]))
+        s, _, b = api("GET", '/api/audit-logs?outcomes=["failure"]')
+        fails = json.loads(b).get("audit_logs", []) if s == 200 else None
+        check("the outcome filter selects the failed writes", s == 200 and all(e.get("outcome") == "failure" for e in fails), (s, b[:300]))
+        s, _, b = api("GET", "/api/audit-logs?limit=1&page=1")
+        p1 = json.loads(b)
+        s2, _, b2 = api("GET", "/api/audit-logs?limit=1&cursor=" + str(p1.get("next_cursor", "")))
+        p2 = json.loads(b2) if s2 == 200 else {}
+        check("a cursor pages past the first event", s == 200 and p1.get("has_more") is True and s2 == 200 and p2.get("audit_logs") and p2["audit_logs"][0]["id"] != p1["audit_logs"][0]["id"], (b[:200], b2[:200]))
+        eid = ev.get("id", "0")
+        s, _, b = api("GET", "/api/audit-logs/" + eid + "/verify")
+        vr = json.loads(b) if s == 200 else {}
+        check("one audit event's signature verifies", s == 200 and vr.get("valid") is True and vr.get("computed") == vr.get("stored") and len(vr.get("stored", "")) == 64, (s, b[:200]))
+        s, _, b = api("GET", "/api/governance/audit-logs/999999/verify")
+        check("verifying an unknown audit event is a 404", s == 404, (s, b[:200]))
+        s, _, b = api("GET", "/api/audit-logs/filterdata?dimensions=outcomes,initiators")
+        fd = json.loads(b) if s == 200 else {}
+        check("the audit filter data has Bifrost's dimensions", s == 200 and "success" in fd.get("outcomes", []) and fd.get("initiators") and "request_paths" not in fd, (s, b[:300]))
+
+        # /ws: a client that resumes gets the store updates it missed, with the log events
+        ws = WsClient("/ws", {}, port=18287)
+        api("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": msg("l168 ws probe")})
+        evs = feed_frames(ws, "log")
+        ws.close()
+        last = evs[-1].get("id", "") if evs else ""
+        api("POST", "/api/logs/user-agent-mappings", {"pattern": "l168-ws", "match_type": "contains", "app": "WS"})
+        time.sleep(0.3)
+        wr = WsClient("/ws?since=" + last, {}, port=18287)
+        rs = feed_frames(wr, "resumed")
+        wr.close()
+        su = [o for o in rs if o.get("type") == "store_update"]
+        check("a resumed /ws gets the store update it missed, in Bifrost's shape", last != "" and su and su[-1].get("tags") == ["logs"] and rs[-1].get("type") == "resumed", (last, rs[-3:]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
 
 def l121_e2e(env):
     """L121: WebAssembly plugins (Bifrost's JSON ABI, on WAMR). A plugin entry whose path is a .wasm file is
@@ -13610,6 +13751,8 @@ def main():
         l112a_e2e(env)
         # retained content: content-off bodies kept as hidden objects in object storage, never served back; a store outage fails no request: their own gateway
         l125_e2e(env)
+        # L168: hidden request types, content search, regex apps, logs_only redaction, audit filters and verify, hidden deletes, /ws replay
+        l168_e2e(env)
         # streams under the built-in guard, tool names of streamed answers, legacy completion and cursor Responses streams, paced cache replays
         l107_e2e(env)
         # L131: hold-and-replay of live streams under a block-capable output guard (port 18205)

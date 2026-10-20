@@ -24,6 +24,9 @@ class Build {
   detect: string[] = []
   modes: string[] = []
   reversible: bool = false
+  // redact rules that asked for logs_only, and redact rules that redact live traffic (runtime or reversible)
+  logsOnly: bool = false
+  liveRedact: bool = false
   // the largest replay interval of the output rules (Bifrost uses the largest of the matched ones)
   replayMs: int = 0
 
@@ -107,7 +110,9 @@ function actionMode(b: Build, label: string, action: string): string {
 function redactNotes(b: Build, label: string, cfg: Field[], action: string): void {
   if (action !== "redact") return
   const rm = rawStr(cfg, "redaction_mode") ?? "runtime"
-  if (rm !== "runtime") b.warn(`${label}: redaction_mode "${rm}" is not supported; Raiju redacts the live request and response`)
+  if (rm === "logs_only") b.logsOnly = true
+  else b.liveRedact = true
+  if (rm !== "runtime" && rm !== "logs_only") b.warn(`${label}: redaction_mode "${rm}" is not supported; Raiju redacts the live request and response`)
   const rs = rawStr(cfg, "redaction_strategy") ?? "replace"
   if (rs !== "replace") b.warn(`${label}: redaction_strategy "${rs}" is not supported; Raiju replaces matches with [REDACTED:KIND]`)
 }
@@ -331,14 +336,15 @@ function ruleAction(b: Build, label: string, action: string): string {
 }
 
 // Flags a Bifrost redaction_mode: runtime_reversible turns on placeholders for the
-// request and their restoration in the response. logs_only is not supported.
-function reversibleMode(b: Build, label: string, cfg: Field[]): string {
+// request and their restoration in the response. logs_only is supported for the local
+// providers (secrets, regex and the built-in detectors), not for the HTTP ones (local false).
+function reversibleMode(b: Build, label: string, cfg: Field[], local: bool): string {
   const rm = rawStr(cfg, "redaction_mode") ?? "runtime"
   if (rm === "runtime_reversible") {
     b.reversible = true
     return rm
   }
-  if (rm === "logs_only") b.warn(`${label}: redaction_mode logs_only is not supported; Raiju redacts the live request and response`)
+  if (rm === "logs_only" && !local) b.warn(`${label}: redaction_mode logs_only is supported for the secrets and regex providers only; Raiju redacts the live request and response`)
   return rm
 }
 
@@ -346,7 +352,7 @@ function reversibleMode(b: Build, label: string, cfg: Field[]): string {
 // targets it is linked to. The built-in key and JWT detectors still run on LLM traffic.
 function secrets(b: Build, label: string, pid: string, scope: Scope, targets: string[], top: Field[], cfg: Field[]): GuardrailProviderConfig throws SyntaxError {
   const action = ruleAction(b, label, rawStr(cfg, "action") ?? "block")
-  reversibleMode(b, label, cfg)
+  reversibleMode(b, label, cfg, true)
   const kw: string[] = []
   const raw = find(cfg, "ignored_secret_keywords")
   if (raw !== undefined && raw.startsWith("[")) {
@@ -377,7 +383,7 @@ function regex(b: Build, label: string, pid: string, scope: Scope, targets: stri
     const desc = rawStr(pf, "description") ?? pattern
     const hint = (rawStr(pf, "description") ?? "") + " " + (rawStr(pf, "entity_type") ?? "")
     const action = ruleAction(b, `${label} pattern "${desc}"`, rawStr(pf, "action") ?? "block")
-    reversibleMode(b, label, pf)
+    reversibleMode(b, label, pf, true)
     const name = builtinFor(hint.toLowerCase())
     if (name !== undefined && pattern.includes("\\b")) {
       if (targets.includes("llm")) {
@@ -394,7 +400,8 @@ function regex(b: Build, label: string, pid: string, scope: Scope, targets: stri
       for (const el2 of try elements(avRaw)) av.push(try decodeString(el2))
     }
     const flags = rawStr(pf, "flags") ?? ""
-    custom.push({ pattern: pattern, description: desc, entity_type: rawStr(pf, "entity_type"), flags: flags, action: action, allowed_values: av })
+    const rm = rawStr(pf, "redaction_mode") ?? "runtime"
+    custom.push({ pattern: pattern, description: desc, entity_type: rawStr(pf, "entity_type"), flags: flags, action: action, allowed_values: av, redaction_mode: rm === "logs_only" ? rm : undefined })
   }
   ignoreNote(b, label, setKeys(top, ["timeout"]))
   if (custom.length === 0) return undefined
@@ -406,7 +413,7 @@ function presidio(b: Build, label: string, pid: string, scope: Scope, targets: s
   const url = need(b, label, "analyzer_url", envStr(b, label, cfg, "analyzer_url"))
   if (url === undefined) return undefined
   const action = ruleAction(b, label, rawStr(cfg, "action") ?? "detect_only")
-  reversibleMode(b, label, cfg)
+  reversibleMode(b, label, cfg, false)
   const ents: string[] = []
   const raw = find(cfg, "entities")
   if (raw !== undefined && raw.startsWith("[")) {
@@ -441,7 +448,7 @@ function azurePii(b: Build, label: string, pid: string, scope: Scope, targets: s
   const key = need(b, label, "api_key", envStr(b, label, cfg, "api_key"))
   if (key === undefined) return undefined
   const action = ruleAction(b, label, rawStr(cfg, "action") ?? "detect_only")
-  reversibleMode(b, label, cfg)
+  reversibleMode(b, label, cfg, false)
   const cats: string[] = []
   const raw = find(cfg, "pii_categories")
   if (raw !== undefined && raw.startsWith("[")) {
@@ -650,6 +657,9 @@ export function fromBifrost(guardrailsConfigJson: string): { config: GuardrailsC
     apply_to: detApply,
     reversible: b.reversible,
   }
+  // the built-in detectors have one mode: logs_only when every redact rule mapped to them asked for it
+  if (b.logsOnly && !b.liveRedact && mode === "redact") config.logs_only = true
+  else if (b.logsOnly && mode === "redact") b.warn("built-in detectors redact live traffic: some redact rules use redaction_mode logs_only and others runtime, and Raiju's built-in detectors take one mode")
   if (b.replayMs > 0) config.stream_replay_event_interval_ms = b.replayMs
   return { config: config, warnings: b.notes }
 }
@@ -688,6 +698,7 @@ export function merge(own: GuardrailsConfig | undefined, fromBifrost: Guardrails
     custom: custom,
     apply_to: own.apply_to ?? fromBifrost.apply_to,
     reversible: own.reversible === true || fromBifrost.reversible === true,
+    logs_only: own.logs_only ?? fromBifrost.logs_only,
     stream_replay_event_interval_ms: own.stream_replay_event_interval_ms ?? fromBifrost.stream_replay_event_interval_ms,
   }
 }
@@ -773,9 +784,32 @@ test("secrets and PII regex patterns map to built-in detectors", () => {
   expect(ps[1]!.patterns![0]!.pattern).toBe("PROJ-\\d+")
   expect(ps[1]!.patterns![0]!.action).toBe("block")
   expect(warned(r.warnings, "Internal project code")).toBe(false)
-  expect(warned(r.warnings, "redaction_mode")).toBe(true)
+  // logs_only is supported: the secrets provider keeps it; the detectors block here, so it has no say over them
+  expect(warned(r.warnings, "redaction_mode")).toBe(false)
+  expect(ps[0]!.redaction_mode).toBe("logs_only")
+  expect(r.config.logs_only).toBeUndefined()
   expect(warned(r.warnings, "allowed_values")).toBe(true)
   expect(warned(r.warnings, "strictest")).toBe(true)
+})
+
+test("redaction_mode logs_only: the built-in detectors and custom patterns keep it; HTTP providers and mixed modes are warned", () => {
+  const only = try fromBifrost(`{"guardrail_rules":[{"id":1,"name":"r","enabled":true,"cel_expression":"true","apply_to":"both","provider_config_ids":[1,2]}],
+  "guardrail_providers":[
+    {"id":1,"provider_name":"secrets","policy_name":"s","enabled":true,"config":{"action":"redact","redaction_mode":"logs_only"}},
+    {"id":2,"provider_name":"regex","policy_name":"p","enabled":true,"config":{"patterns":[{"pattern":"PROJ-\\\\d+","description":"Project code","action":"redact","redaction_mode":"logs_only"}]}}]}`)
+  expect(only.config.mode).toBe("redact")
+  expect(only.config.logs_only).toBe(true)
+  expect(only.config.providers![1]!.patterns![0]!.redaction_mode).toBe("logs_only")
+  expect(only.warnings.length).toBe(0)
+  const mixed = try fromBifrost(`{"guardrail_rules":[{"id":1,"name":"r","enabled":true,"cel_expression":"true","apply_to":"input","provider_config_ids":[1,2]}],
+  "guardrail_providers":[
+    {"id":1,"provider_name":"secrets","policy_name":"s","enabled":true,"config":{"action":"redact","redaction_mode":"logs_only"}},
+    {"id":2,"provider_name":"regex","policy_name":"p","enabled":true,"config":{"patterns":[{"pattern":"\\\\b\\\\d{3}-\\\\d{2}-\\\\d{4}\\\\b","description":"US Social Security Number","action":"redact"}]}}]}`)
+  expect(mixed.config.logs_only).toBeUndefined()
+  expect(warned(mixed.warnings, "take one mode")).toBe(true)
+  const http = try fromBifrost(`{"guardrail_rules":[{"id":1,"name":"r","enabled":true,"cel_expression":"true","apply_to":"input","provider_config_ids":[1]}],
+  "guardrail_providers":[{"id":1,"provider_name":"presidio","policy_name":"pres","enabled":true,"config":{"analyzer_url":"https://presidio.example.com","action":"redact","redaction_mode":"logs_only"}}]}`)
+  expect(warned(http.warnings, "logs_only is supported for the secrets and regex providers only")).toBe(true)
 })
 
 test("detect_only maps to log and secrets alone keeps its mode", () => {
