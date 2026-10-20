@@ -12,7 +12,7 @@
 import { Engine, LiveCost } from "./gateway"
 import { Grant } from "./governance"
 import { Hdrs, newId } from "./schemas"
-import { Pricing, parseDatasheet } from "./pricing"
+import { Pricing, parseDatasheet, SttUsage } from "./pricing"
 import * as metrics from "./metrics"
 import { LiveHooks, ModelTokens, TurnReport, GuardFn, Verdict } from "./webrtc"
 
@@ -46,7 +46,7 @@ const REALTIME_EVENT_TYPES: string[] = [
   "response.output_text.done", "response.output_audio.delta", "response.output_audio.done", "response.output_audio_transcript.delta",
   "response.output_audio_transcript.done", "response.function_call_arguments.delta", "response.function_call_arguments.done",
   "rate_limits.updated", "output_audio_buffer.started", "output_audio_buffer.stopped", "output_audio_buffer.cleared",
-  "transcription_session.updated",
+  "transcription_session.updated", "transcription_session.created",
 ]
 
 // The label an event type is counted under.
@@ -73,6 +73,32 @@ export function liveCost(pricing: Pricing, provider: string, model: string, bill
     output += c.output
   }
   return { total: input + output, input: input, output: output }
+}
+
+// What a transcription unit of a realtime transcription session costs (Bifrost prices such a turn as a
+// transcription: computeTranscriptionCost, pricing.tov transcriptionCost): its audio and text input tokens, else its
+// prompt tokens, else its seconds of audio at the model's rate per second, and its output tokens at the output rate.
+export function transcriptionUnitCost(pricing: Pricing, provider: string, model: string, seconds: f64, uses: ModelTokens[]): LiveCost {
+  let input = 0.0
+  let output = 0.0
+  let timed = seconds
+  for (const u of uses) {
+    const m = u.model === "" ? model : u.model
+    // the audio tokens are the input's audio part, the rest of the prompt its text
+    const text = u.inputAudio > 0 ? Math.max(0, u.prompt - u.inputAudio) : 0
+    const usage: SttUsage = { prompt: u.prompt, completion: u.completion, inputAudio: u.inputAudio, inputText: text, seconds: timed > 0.0 ? timed : undefined }
+    const c = pricing.transcriptionCost(provider, m, usage)
+    input += c.input
+    output += c.output
+    timed = 0.0
+  }
+  return { total: input + output, input: input, output: output }
+}
+
+// What a closed unit costs: a transcription at the transcription rates, any other at liveCost.
+export function unitCost(pricing: Pricing, op: string, provider: string, model: string, t: TurnReport): LiveCost {
+  if (t.kind === "transcription") return transcriptionUnitCost(pricing, provider, model, t.seconds, t.uses)
+  return liveCost(pricing, provider, model, voiceSeconds(op, t.billedSeconds), t.uses)
 }
 
 // The metadata of a unit's log row: the session it belongs to (sessionKey, which is also the row's parent
@@ -107,6 +133,10 @@ export function unitMeta(spec: SessionSpec, sessionKey: string, t: TurnReport): 
   m.set("realtime_cached_tokens", "" + cached)
   m.set("realtime_input_audio_tokens", "" + inAudio)
   m.set("realtime_output_audio_tokens", "" + outAudio)
+  if (t.kind === "transcription") m.set("realtime_audio_seconds", "" + t.seconds)
+  // how the response ended, as its response.done said
+  if (t.state !== "") m.set("realtime_response_status", t.state)
+  if (t.stateReason !== "") m.set("realtime_status_reason", t.stateReason)
   return m
 }
 
@@ -154,7 +184,7 @@ export function sessionHooks(engine: Engine, h: Hdrs, grant: Grant, spec: Sessio
       metrics.inc("raiju_realtime_tokens_total", metrics.labels(provider, model, "input"), t.promptTokens * 1.0)
       metrics.inc("raiju_realtime_tokens_total", metrics.labels(provider, model, "output"), t.completionTokens * 1.0)
     }
-    engine.recordLive(spec.op, h, grant, provider, model, t.status, t.endedMs - t.startedMs, t.promptTokens, t.completionTokens, t.input, t.output, t.error, unitMeta(spec, sessionKey, t), liveCost(engine.pricing, provider, model, voiceSeconds(spec.op, t.billedSeconds), t.uses), newId("req_"), sessionKey)
+    engine.recordLive(spec.op, h, grant, provider, model, t.status, t.endedMs - t.startedMs, t.promptTokens, t.completionTokens, t.input, t.output, t.error, unitMeta(spec, sessionKey, t), unitCost(engine.pricing, spec.op, provider, model, t), newId("req_"), sessionKey)
   })
 }
 
@@ -171,7 +201,7 @@ export function sessionGuard(engine: Engine): GuardFn | undefined {
 
 
 function unit(): TurnReport {
-  return { kind: "end", index: 1, sessionId: "", seconds: 0.0, billedSeconds: 0.0, promptTokens: 0, completionTokens: 0, uses: [], status: 200, error: "", reason: "", startedMs: 0.0, endedMs: 0.0, input: "", output: "", events: 0, last: false }
+  return { kind: "end", index: 1, sessionId: "", seconds: 0.0, billedSeconds: 0.0, promptTokens: 0, completionTokens: 0, uses: [], status: 200, error: "", reason: "", startedMs: 0.0, endedMs: 0.0, input: "", output: "", events: 0, last: false, state: "", stateReason: "" }
 }
 
 test("a live unit costs its billed voice seconds and the tokens of its delegated responses", () => {
@@ -257,4 +287,34 @@ test("a unit's metadata names its session, kind, transport, seconds and tokens",
   expect(n.get("realtime_input_audio_tokens")).toBe("4")
   expect(n.get("realtime_output_audio_tokens")).toBe("2")
   expect(n.has("live_transport")).toBe(false)
+})
+
+test("a transcription unit costs its tokens, or its seconds, at the transcription rates", () => {
+  const p = new Pricing({})
+  const csv = "{\"stt-x\": {\"provider\": \"acme\", \"input_cost_per_token\": 0.000002, \"output_cost_per_token\": 0.00001, \"input_cost_per_audio_token\": 0.000006, \"input_cost_per_second\": 0.0001}}"
+  p.replaceCatalog(try parseDatasheet(csv))
+  const r = unit()
+  r.kind = "transcription"
+  r.uses = [{ model: "stt-x", prompt: 20, completion: 8, cached: 0, inputAudio: 16, outputAudio: 0 }]
+  const c = unitCost(p, "realtime", "acme", "stt-x", r)
+  // 16 audio tokens and 4 text tokens in, 8 out
+  expect(c.input).toBeCloseTo(16 * 0.000006 + 4 * 0.000002)
+  expect(c.output).toBeCloseTo(8 * 0.00001)
+  // a duration usage: its seconds at the rate per second
+  r.uses = [{ model: "stt-x", prompt: 0, completion: 0, cached: 0, inputAudio: 0, outputAudio: 0 }]
+  r.seconds = 30.0
+  expect(unitCost(p, "realtime", "acme", "stt-x", r).total).toBeCloseTo(0.003)
+  // a realtime turn of the same model is billed by its tokens at the realtime rates, never its seconds
+  r.kind = "turn"
+  expect(unitCost(p, "realtime", "acme", "stt-x", r).total).toBe(0.0)
+  const spec: SessionSpec = { op: "realtime", transport: "websocket", provider: "acme", model: "stt-x" }
+  expect(unitMeta(spec, "k", r).has("realtime_audio_seconds")).toBe(false)
+  r.kind = "transcription"
+  expect(unitMeta(spec, "k", r).get("realtime_audio_seconds")).toBe("30")
+  r.kind = "turn"
+  r.state = "failed"
+  r.stateReason = "server_error"
+  const f = unitMeta(spec, "k", r)
+  expect(f.get("realtime_response_status")).toBe("failed")
+  expect(f.get("realtime_status_reason")).toBe("server_error")
 })

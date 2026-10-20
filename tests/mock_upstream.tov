@@ -3,7 +3,7 @@ import { fields, find, rawStr, elements } from "../src/json"
 import { sha256, utf8, toHex } from "../src/crypto"
 import { encodeUrl } from "../src/base64"
 import { encodeEventStreamFrame } from "../src/streams"
-import { liveAnswer, liveEvents, liveStats, liveReset, realtimeAnswer, realtimeTurn } from "./mock_live"
+import { liveAnswer, liveEvents, liveStats, liveReset, realtimeAnswer, realtimeTurn, realtimeTranscription } from "./mock_live"
 import { a2aHandle, pushV03, knowTask, resubscribeV03 } from "./mock_a2a"
 // A fake provider for end-to-end tests. Speaks enough of OpenAI, Anthropic,
 // Gemini and Bedrock to exercise translation, and fails on demand:
@@ -21,6 +21,8 @@ const seen: Seen[] = []
 type Hook = { path: string, id: string, timestamp: string, signature: string, event: string, body: string }
 const hooks: Hook[] = []
 let flakyCalls = 0
+// realtime client secrets minted so far (each gets its own token)
+let mints = 0
 // set by /_hidden/down: the retained-content bucket refuses its PUTs (a store outage) until /_hidden/up
 let hiddenDown = false
 // the OAuth authorization server: codes by their PKCE challenge and redirect URI, and the access token the MCP server accepts
@@ -1585,7 +1587,23 @@ Bun.serve<string>({
       hd.set("content-type", "audio/wav")
       return new Response("RIFF-recording-" + lp.slice(18, lp.byteLength - 8), { headers: hd })
     }
-    if (lp.startsWith("/v1/responses/") || lp === "/v1/realtime/client_secrets" || lp === "/v1/realtime/sessions") {
+    // realtime client secrets (OpenAI's client_secrets, and its older sessions and transcription_sessions; Azure's and
+    // xAI's client_secrets): a token of the provider's own, good for ten minutes, at the top level or under
+    // client_secret. A body naming "mintfail" gets an answer with no token, and "mintrefuse" a refusal.
+    if (req.method === "POST" && (lp === "/v1/realtime/client_secrets" || lp === "/openai/v1/realtime/client_secrets" || lp === "/v1/realtime/sessions" || lp === "/v1/realtime/transcription_sessions")) {
+      const body = await req.text()
+      record(req, lp, body)
+      mints += 1
+      const hj: Record<string, string> = new Map()
+      hj.set("content-type", "application/json")
+      if (body.includes("mintrefuse")) return new Response(`{"error":{"message":"invalid session for a client secret","type":"invalid_request_error"}}`, { status: 400, headers: hj })
+      if (body.includes("mintfail")) return Response.json({ object: "ok" })
+      const value = "ek_mock_" + mints
+      const exp = Math.floor(Date.now() / 1000.0) + 600
+      if (lp.endsWith("/client_secrets")) return new Response(`{"value":"${value}","expires_at":${exp},"session":${wsField(body, "session") === "" ? "{}" : wsField(body, "session")}}`, { headers: hj })
+      return new Response(`{"id":"sess_mint_${mints}","object":"realtime.session","client_secret":{"value":"${value}","expires_at":${exp}}}`, { headers: hj })
+    }
+    if (lp.startsWith("/v1/responses/")) {
       const body = req.method === "GET" || req.method === "DELETE" ? "" : await req.text()
       record(req, lp, req.method + " " + body)
       return Response.json({ object: "ok", method: req.method, path: lp })
@@ -1764,6 +1782,7 @@ Bun.serve<string>({
       //   test.backend {input,output,model}  a live delegated response that completed with that usage
       //   test.rt.start              a realtime session.created
       //   test.rt.turn {...}         a realtime response (mock_live.tov realtimeTurn)
+      //   test.rt.transcribe {...}   a transcription of the caller's audio (mock_live.tov realtimeTranscription)
       //   test.hangup                the provider's connection breaks (close code 1011)
       //   session.close {mock_seconds}   a live session.closed with that many seconds (20), then the close
       let type = ""
@@ -1796,6 +1815,10 @@ Bun.serve<string>({
       }
       if (type === "test.rt.turn") {
         for (const e of realtimeTurn(text)) ws.send(e)
+        return
+      }
+      if (type === "test.rt.transcribe") {
+        for (const e of realtimeTranscription(text)) ws.send(e)
         return
       }
       if (type === "test.hangup") {

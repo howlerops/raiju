@@ -107,6 +107,11 @@ class WsClient:
                 break
             head += chunk
         self.status = int(head.split(b" ")[1]) if head else 0
+        self.headers = {}
+        for line in head.decode("latin-1").split("\r\n")[1:]:
+            if ":" in line:
+                k, v = line.split(":", 1)
+                self.headers[k.strip().lower()] = v.strip()
         self.closed = self.status != 101
 
     def _read(self, k):
@@ -6537,6 +6542,178 @@ def realtime_e2e(env):
         gw.wait()
         gw2.wait()
 
+def l160_e2e(env):
+    """L160: realtime client secrets minted under a virtual key and honoured as it (a WebSocket and a WebRTC call with
+    the gateway's own ek_ token, the provider's token sent upstream), transcription sessions billed per transcription at
+    the transcription rates, and a failed or cancelled response.done logged with its status. Its own gateway (port 18274)."""
+    import shutil
+    GW_E = "http://127.0.0.1:18274"
+    shutil.rmtree(os.path.join(BUILD, "e2e-l160-logs"), ignore_errors=True)
+    rt_price = {"input_cost_per_token": 0.000004, "output_cost_per_token": 0.000016, "cache_read_input_token_cost": 0.0000004, "input_cost_per_audio_token": 0.000032, "output_cost_per_audio_token": 0.000064}
+    tr_price = {"input_cost_per_token": 0.0000025, "output_cost_per_token": 0.00001, "input_cost_per_audio_token": 0.000006, "input_cost_per_second": 0.0001}
+    cfg = {"client": {"enable_logging": False, "enforce_auth_on_inference": True},
+           "providers": {"openai": {"keys": [{"id": "k-pool", "name": "pool", "value": "sk-pool", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+           "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l160-logs"), "content_logging": True},
+           "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+           "pricing": {"openai/gpt-realtime": rt_price, "openai/gpt-4o-transcribe": tr_price},
+           "governance": {"virtual_keys": [{"id": "vk-ek", "value": "sk-bf-ek"}, {"id": "vk-ek-gone", "value": "sk-bf-ek-gone"},
+                                           {"id": "vk-ek-mini", "value": "sk-bf-ek-mini", "provider_configs": [{"provider": "openai", "allowed_models": ["gpt-4o-mini"]}]}]}}
+    path = os.path.join(BUILD, "e2e.l160.json")
+    json.dump(cfg, open(path, "w"))
+    srv = os.environ.get("RAIJU_SERVER", "bun")
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18274", "-host", "127.0.0.1", "-config", path, "-server", srv], env=env, stderr=open(os.path.join(BUILD, "e2e.l160.log"), "w"))
+    VK = {"authorization": "Bearer sk-bf-ek"}
+
+    def mint(body, headers=None, route="/v1/realtime/client_secrets"):
+        s, _, b = call("POST", route, body, headers=headers if headers is not None else VK, base=GW_E)
+        return s, (json.loads(b) if b.startswith("{") else {}), b
+
+    def is_type(t):
+        return lambda ev: ev.get("type") == t
+
+    def rows_of(sid):
+        return session_rows("realtime", sid, GW_E)
+
+    try:
+        wait(GW_E + "/health")
+
+        # ---- minting: under the caller's virtual key, the provider's token replaced by the gateway's own ----
+        s, j, b = mint({"session": {"type": "realtime", "model": "openai/gpt-realtime"}})
+        ek = j.get("value", "")
+        up = [x for x in seen() if x["path"] == "/v1/realtime/client_secrets"][-1]
+        check("a client secret is minted at the provider with the pool key and the bare model", s == 200 and up["auth"] == "Bearer sk-pool" and '"model":"gpt-realtime"' in up["body"] and "openai/" not in up["body"], (s, b, up))
+        check("the caller gets the gateway's own ek_ token, not the provider's, with the provider's expiry", ek.startswith("ek_bf_") and len(ek) == 38 and "ek_mock" not in b and j.get("expires_at", 0) > time.time(), b)
+        n0 = len([x for x in seen() if "/realtime/" in x["path"]])
+        s, _, b = mint({"session": {"type": "realtime", "model": "openai/gpt-realtime"}}, headers={})
+        check("minting needs a virtual key when inference auth is on", s == 401, (s, b))
+        s, _, b = mint({"session": {"type": "realtime", "model": "openai/gpt-realtime"}}, headers={"authorization": "Bearer sk-bf-ek-mini"})
+        check("a virtual key that may not use the model mints nothing", s >= 400 and s != 502 and len([x for x in seen() if "/realtime/" in x["path"]]) == n0, (s, b))
+        s, _, b = call("POST", "/v1/realtime/client_secrets", "session=x", headers={**VK, "content-type": "text/plain"}, base=GW_E)
+        check("a mint must be JSON", s == 400 and "Content-Type must be application/json" in b, (s, b))
+        s, _, b = mint({"session": {"type": "realtime", "model": "openai/gpt-realtime-mintfail"}})
+        check("a provider answer with no token is refused, not passed on", s == 502 and "invalid realtime client secret" in b, (s, b))
+        s, _, b = mint({"session": {"type": "realtime", "model": "openai/gpt-realtime-mintrefuse"}})
+        check("a provider's refusal of a mint is passed on as it came", s == 400 and "invalid session for a client secret" in b, (s, b))
+        s, j2, b = mint({"model": "openai/gpt-realtime", "voice": "alloy"}, route="/v1/realtime/sessions")
+        up = [x for x in seen() if x["path"] == "/v1/realtime/sessions"][-1]
+        check("the older /v1/realtime/sessions mints the same way, its token nested under client_secret", s == 200 and j2.get("client_secret", {}).get("value", "").startswith("ek_bf_") and "ek_mock" not in b and '"model":"gpt-realtime"' in up["body"], (s, b, up))
+        s, j3, b = mint({"session": {"type": "realtime", "model": "openai/gpt-realtime"}}, route="/openai/v1/realtime/client_secrets")
+        check("and so does the /openai family", s == 200 and j3.get("value", "").startswith("ek_bf_"), (s, b))
+
+        # ---- a WebSocket with the minted token is the virtual key's session; the provider gets its own token ----
+        c = WsClient("/v1/realtime?model=openai/gpt-realtime", {"authorization": "Bearer " + ek}, port=18274)
+        check("a WebSocket presenting the minted token is accepted", c.status == 101, c.status)
+        c.send(json.dumps({"type": "test.rt.start", "id": "sess_ek_ws"}))
+        c.send(json.dumps({"type": "test.rt.turn", "id": "resp_ek1", "text": "good morning", "input": 100, "output": 50}))
+        ws_collect(c, is_type("response.done"))
+        c.send(json.dumps({"type": "session.update", "session": {"voice": "alloy"}}))
+        evs = ws_collect(c, is_type("echo"))
+        tag = evs[-1].get("auth", "") if evs else ""
+        check("the provider is sent the token it minted, not the pool key or the gateway's token", tag.startswith("Bearer ek_mock_") and "sk-pool" not in tag and ek not in tag and "model=gpt-realtime" in tag, tag)
+        c.sock.close()
+        rows = rows_of("sess_ek_ws")
+        check("its turn is logged and billed as the virtual key that minted the token", len(rows) == 1 and rows[0].get("virtual_key") == "vk-ek" and rows[0].get("status") == 200 and rows[0].get("prompt_tokens") == 100 and near(rows[0].get("cost"), 100 * 0.000004 + 50 * 0.000016), rows)
+
+        # the token names the model when the URL does not, and a browser may present it as a subprotocol
+        c = WsClient("/v1/realtime", {"sec-websocket-protocol": "realtime, openai-insecure-api-key." + ek}, port=18274)
+        check("a browser's subprotocol credential and no model in the URL: the token's model", c.status == 101, c.status)
+        check("the upgrade answers with the realtime subprotocol the browser offered, never the credential-bearing one", c.headers.get("sec-websocket-protocol") == "realtime", c.headers)
+        if c.status == 101:
+            c.send(json.dumps({"type": "session.update", "session": {"voice": "alloy"}}))
+            evs = ws_collect(c, is_type("echo"))
+            check("and the session goes to that model with the provider's token", evs and "model=gpt-realtime" in evs[-1].get("auth", "") and evs[-1]["auth"].startswith("Bearer ek_mock_"), evs)
+            c.sock.close()
+        c = WsClient("/v1/realtime?model=openai/gpt-realtime", {"authorization": "Bearer " + ek}, port=18274)
+        check("an upgrade that offers no subprotocol is answered with none", c.status == 101 and "sec-websocket-protocol" not in c.headers, c.headers)
+        c.sock.close()
+        c = WsClient("/v1/realtime?model=openai/gpt-realtime", {"authorization": "Bearer ek_bf_" + "0" * 32}, port=18274)
+        check("an ek_ token the gateway did not mint is no virtual key: refused when inference auth is on", c.status == 401, c.status)
+
+        # a token whose virtual key was deleted goes with it
+        s, jg, b = mint({"session": {"type": "realtime", "model": "openai/gpt-realtime"}}, headers={"authorization": "Bearer sk-bf-ek-gone"})
+        s2, _, b2 = call("DELETE", "/api/governance/virtual-keys/vk-ek-gone", base=GW_E, headers=ADMIN)
+        c = WsClient("/v1/realtime?model=openai/gpt-realtime", {"authorization": "Bearer " + jg.get("value", "")}, port=18274)
+        check("a token minted under a virtual key that is gone is refused", s == 200 and s2 in (200, 204) and c.status == 401, (s, s2, b2, c.status))
+
+        # ---- a WebRTC call with the minted token ----
+        r = rtc_client(GW_E, [{"wait": "session.created"}, {"send": {"type": "test.rt.turn", "id": "resp_ek2", "text": "hi", "input": 200, "output": 10}}, {"wait": "response.done"}],
+                       auth="Bearer " + ek, model="openai/gpt-realtime", realtime=True)
+        sent = [x for x in seen() if x["path"] == "/v1/realtime/calls"][-1]
+        check("a realtime call presenting the minted token is terminated, and the provider gets its own token", r.get("status") == 200 and r.get("opened") is True and sent["auth"].startswith("Bearer ek_mock_"), (r, sent["auth"]))
+        sid = next((e["session"]["id"] for e in r.get("events", []) if e.get("type") == "session.created"), "none")
+        rows = rows_of(sid)
+        check("the call's turn is the virtual key's, with its cost", len(rows) == 1 and rows[0].get("virtual_key") == "vk-ek" and rows[0]["metadata"].get("realtime_transport") == "webrtc" and near(rows[0].get("cost"), 200 * 0.000004 + 10 * 0.000016), rows)
+
+        # ---- transcription sessions ----
+        # a WebSocket with ?intent=transcription names its model in its first session.update; it is admitted for it
+        c = WsClient("/v1/realtime?intent=transcription", VK, port=18274)
+        check("a transcription WebSocket is upgraded before it names its model", c.status == 101, c.status)
+        c.send(json.dumps({"type": "session.update", "session": {"type": "transcription", "audio": {"input": {"transcription": {"model": "openai/gpt-4o-transcribe", "language": "en"}}}}}))
+        evs = ws_collect(c, is_type("echo"))
+        tag = evs[-1].get("auth", "") if evs else ""
+        upd = evs[-1].get("event", "") if evs else ""
+        check("the provider's transcription endpoint gets the update, its model bare", "intent=transcription" in tag and "model=" not in tag and tag.startswith("Bearer sk-pool") and '"model":"gpt-4o-transcribe"' in upd and "openai/" not in upd, (tag, upd))
+        c.send(json.dumps({"type": "test.rt.start", "id": "sess_tr_ws"}))
+        c.send(json.dumps({"type": "test.rt.transcribe", "id": "item_t1", "heard": "hello there", "input": 20, "output": 8, "audio_in": 16}))
+        ws_collect(c, is_type("conversation.item.input_audio_transcription.completed"))
+        c.send(json.dumps({"type": "test.rt.transcribe", "id": "item_t2", "heard": "and more", "seconds": 2.5}))
+        ws_collect(c, is_type("conversation.item.input_audio_transcription.completed"))
+        c.sock.close()
+        rows = rows_of("sess_tr_ws")
+        md = [x.get("metadata", {}) for x in rows]
+        check("a transcription session is a row per transcription, of its transcription model", len(rows) == 2 and [m.get("realtime_unit") for m in md] == ["transcription", "transcription"] and all(x.get("model") == "gpt-4o-transcribe" and x.get("virtual_key") == "vk-ek" for x in rows), md)
+        check("each billed at the transcription rates: audio and text tokens, or the seconds of a duration usage", rows and rows[0].get("prompt_tokens") == 20 and rows[0].get("completion_tokens") == 8 and near(rows[0].get("cost"), 16 * 0.000006 + 4 * 0.0000025 + 8 * 0.00001) and near(rows[1].get("cost"), 2.5 * 0.0001) and md[1].get("realtime_audio_seconds") == "2.5", [(x.get("prompt_tokens"), x.get("cost")) for x in rows])
+        check("and each keeps its transcript", rows and rows[0].get("output", "").strip() == "hello there" and rows[1].get("output", "").strip() == "and more", [x.get("output") for x in rows])
+
+        # a minted transcription token: no model needed, the session is the virtual key's
+        s, jt, b = mint({"session": {"type": "transcription", "audio": {"input": {"transcription": {"model": "openai/gpt-4o-transcribe"}}}}})
+        up = [x for x in seen() if x["path"] == "/v1/realtime/client_secrets"][-1]
+        check("a transcription client secret is minted with its model bare in the input transcription", s == 200 and '"type":"transcription"' in up["body"] and '"model":"gpt-4o-transcribe"' in up["body"] and "openai/" not in up["body"], (s, up["body"]))
+        c = WsClient("/v1/realtime?intent=transcription", {"authorization": "Bearer " + jt.get("value", "")}, port=18274)
+        c.send(json.dumps({"type": "test.rt.start", "id": "sess_tr_ek"}))
+        c.send(json.dumps({"type": "test.rt.transcribe", "id": "item_e1", "heard": "via token", "input": 10, "output": 4, "audio_in": 10}))
+        evs = ws_collect(c, is_type("conversation.item.input_audio_transcription.completed"))
+        c.send(json.dumps({"type": "session.update", "session": {"type": "transcription"}}))
+        evs = ws_collect(c, is_type("echo"))
+        c.sock.close()
+        rows = rows_of("sess_tr_ek")
+        check("a transcription session with a minted token is the virtual key's, on the provider's token", c.status == 101 and evs and evs[-1].get("auth", "").startswith("Bearer ek_mock_") and len(rows) == 1 and rows[0].get("virtual_key") == "vk-ek" and near(rows[0].get("cost"), 10 * 0.000006 + 4 * 0.00001), (c.status, evs[-1:] if evs else evs, rows))
+
+        # a transcription session that never names its model is ended
+        c = WsClient("/v1/realtime?intent=transcription", VK, port=18274)
+        for _ in range(16):
+            c.send(json.dumps({"type": "input_audio_buffer.append", "audio": "AAAA"}))
+        evs = ws_collect(c, is_type("error"))
+        check("a transcription session that sends 16 frames without a model is refused", evs and "16 frames" in evs[-1].get("error", {}).get("message", ""), evs)
+
+        # a transcription call over WebRTC: the session's type says so
+        r = rtc_client(GW_E, [{"wait": "session.created"}, {"send": {"type": "test.rt.transcribe", "id": "item_c1", "heard": "on a call", "input": 12, "output": 3, "audio_in": 12}}, {"wait": "conversation.item.input_audio_transcription.completed"}],
+                       auth="Bearer sk-bf-ek", model="openai/gpt-4o-transcribe", realtime=True, extra={"type": "transcription", "audio": {"input": {"transcription": {"model": "openai/gpt-4o-transcribe"}}}})
+        sent = [x for x in seen() if x["path"] == "/v1/realtime/calls"][-1]
+        sid = next((e["session"]["id"] for e in r.get("events", []) if e.get("type") == "session.created"), "none")
+        rows = rows_of(sid)
+        check("a transcription call keeps no top-level model and is billed per transcription", r.get("status") == 200 and '"model":"gpt-4o-transcribe"' in sent["body"] and "openai/" not in sent["body"] and len(rows) == 1 and rows[0]["metadata"].get("realtime_unit") == "transcription" and near(rows[0].get("cost"), 12 * 0.000006 + 3 * 0.00001), (r.get("status"), sent["body"][:300], rows))
+
+        # ---- a response.done that failed, was cancelled or is incomplete ----
+        c = WsClient("/v1/realtime?model=openai/gpt-realtime", VK, port=18274)
+        c.send(json.dumps({"type": "test.rt.start", "id": "sess_rt_status"}))
+        c.send(json.dumps({"type": "test.rt.turn", "id": "resp_f", "text": "x", "input": 30, "output": 2, "status": "failed", "error_type": "server_error", "error_message": "the model crashed"}))
+        ws_collect(c, is_type("response.done"))
+        c.send(json.dumps({"type": "test.rt.turn", "id": "resp_c", "text": "y", "input": 5, "output": 1, "status": "cancelled"}))
+        ws_collect(c, is_type("response.done"))
+        c.send(json.dumps({"type": "test.rt.turn", "id": "resp_r", "text": "z", "input": 5, "output": 1, "status": "failed", "error_type": "invalid_request_error", "error_message": "bad tool"}))
+        ws_collect(c, is_type("response.done"))
+        c.send(json.dumps({"type": "test.rt.turn", "id": "resp_i", "text": "w", "input": 5, "output": 1, "status": "incomplete"}))
+        ws_collect(c, is_type("response.done"))
+        c.sock.close()
+        rows = rows_of("sess_rt_status")
+        md = [x.get("metadata", {}) for x in rows]
+        check("a failed response.done is logged with the status of its error (500), its message, and the tokens it used", len(rows) == 4 and rows[0].get("status") == 500 and rows[0].get("error") == "the model crashed" and md[0].get("realtime_response_status") == "failed" and rows[0].get("prompt_tokens") == 30 and near(rows[0].get("cost"), 30 * 0.000004 + 2 * 0.000016), rows[:1])
+        check("a cancelled one with 499, an invalid request with 400, and an incomplete one stays 200 with its reason", [x.get("status") for x in rows] == [500, 499, 400, 200] and md[1].get("realtime_status_reason") == "turn_detected" and md[3].get("realtime_response_status") == "incomplete" and md[3].get("realtime_status_reason") == "max_output_tokens", [(x.get("status"), x.get("error"), x.get("metadata", {}).get("realtime_response_status")) for x in rows])
+    finally:
+        gw.terminate()
+        gw.wait()
+
 def headers_e2e(env):
     """Request headers reach the log rows (dimensions, logging headers, correlation ids, app, Maxim attributes);
     x-bf-async runs an SDK route as a job with its own TTL; extra_fields_placement "headers" keeps extra_fields out
@@ -10817,7 +10994,7 @@ def main():
         check("responses input_tokens goes to the model's provider with a bare model", s == 200 and up["path"] == "/v1/responses/input_tokens" and '"model":"gpt-4o"' in up["body"].replace(" ", ""), (s, b, up))
         s, _, b = call("POST", "/v1/realtime/client_secrets", {"session": {"type": "realtime", "model": "gpt-realtime"}})
         s2, _, b2 = call("POST", "/v1/realtime/sessions", {"model": "openai/gpt-realtime"})
-        check("realtime client_secrets and sessions pass through", s == 200 and s2 == 200 and seen()[-1]["path"] == "/v1/realtime/sessions", (s, b, s2, b2))
+        check("realtime client_secrets and sessions are minted at the provider and answered with the gateway's own token", s == 200 and s2 == 200 and seen()[-1]["path"] == "/v1/realtime/sessions" and jget(b).get("value", "").startswith("ek_bf_") and jget(b2).get("client_secret", {}).get("value", "").startswith("ek_bf_"), (s, b, s2, b2))
 
         # the unversioned /openai family, as Bifrost mounts it (without the /v1 segment)
         s, _, b = call("POST", "/openai/responses", {"model": "openai/gpt-4o", "input": "unversioned hello"})
@@ -11963,6 +12140,8 @@ def main():
         aiortc_e2e()
         # live and realtime sessions over WebSockets and realtime calls over WebRTC: metered, guarded, admitted per turn and logged with their cost; their own gateways (ports 18200 and 18201)
         realtime_e2e(env)
+        # L160: realtime client secrets honoured as their virtual key, transcription sessions billed, failed responses logged: its own gateway (port 18274)
+        l160_e2e(env)
         # provider create and key reads, config metadata, virtual key rotation and expiry, team members: their own gateway
         l97b_e2e(env)
         # MCP key rules, tool pricing, the SSRF guard, tool groups, OAuth configs and OpenAPI clients: their own gateway

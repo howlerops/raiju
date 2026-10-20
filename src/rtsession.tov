@@ -1,0 +1,593 @@
+// Realtime client secrets and transcription sessions, as Bifrost serves them (handlers/realtime_client_secrets.go,
+// webrtcrealtime.go and wsrealtime.go).
+//
+// Client secrets. POST /v1/realtime/client_secrets (and OpenAI's older /v1/realtime/sessions and
+// /v1/realtime/transcription_sessions) mint a short-lived token at the provider with a pool key, under the caller's
+// virtual key (realtimecalls.tov realtimeMint). The provider's token never reaches the caller: it is replaced by one of
+// this gateway's own ("ek_bf_" and 32 hex digits), and the mapping from it to the provider's token, the virtual key,
+// the pool key and the model is kept until the provider's token expires. A browser that connects with it (a WebSocket
+// on /v1/realtime, or a WebRTC call) is admitted, governed, logged and billed as that virtual key, and the provider is
+// sent its own token (realtimeCredential). An ek_ token this gateway did not mint goes to the provider as it is, which
+// decides whether it is valid, as Bifrost does.
+//
+// The mappings live on the cluster state (clusterstate.tov) under "realtime.ek", so a token minted through one worker
+// or node is honoured by every other: keyed by the SHA-256 of the token (the token itself never travels), the provider's
+// token sealed under the encryption key the nodes share (store.tov sealStored; main sets it with setEkSeal). An expired
+// mapping is refused and deleted when it is read, and the expired ones are swept at each mint.
+//
+// Transcription sessions. A realtime session can be a transcription-only one: a WebSocket with ?intent=transcription,
+// whose model arrives in its first session.update (session.audio.input.transcription.model, or the beta
+// transcription_session.update's session.input_audio_transcription.model), or a call whose session is of type
+// transcription. transcriptionModelOf reads that model and pinTranscriptionModel keeps the event bound to the routed
+// one; their units are billed at the transcription rates (livehooks.tov transcriptionUnitCost).
+import { clusterState } from "./clusterstate"
+import { sha256, toHex, utf8, secureHex } from "./crypto"
+import { Field, fields, find, rawStr, rawNum, setField, build, quote, without, isNull } from "./json"
+import { Config } from "./config"
+import { Hdrs } from "./schemas"
+import { parseModel } from "./router"
+
+export const EK_NS = "realtime.ek"
+
+// The routes that mint a client secret.
+export const MINT_ROUTES: string[] = ["/v1/realtime/client_secrets", "/v1/realtime/sessions", "/v1/realtime/transcription_sessions"]
+
+// What a minted token stands for: the virtual key it was minted under (its id; "" on an open deployment), the pool key
+// that minted it (its id or name), the provider's own token (sealed), the provider and model, whether it is a
+// transcription session, and when it expires (epoch seconds).
+export type EkMapping = { vk: string, key: string, token: string, provider: string, model: string, transcription: bool, expires_at: int }
+
+class Sealer {
+  constructor(readonly seal: (v: string) => string, readonly open: (v: string) => string | undefined) {}
+}
+
+let sealer: Sealer | undefined = undefined
+
+// How the provider's tokens are sealed on the cluster state, and opened (main: store.tov sealStored and openStored with
+// the configured encryption key). Without it they travel as they are.
+export function setEkSeal(seal: (v: string) => string, open: (v: string) => string | undefined): void {
+  sealer = new Sealer(seal, open)
+}
+
+function sealToken(v: string): string {
+  const s = sealer
+  return s === undefined ? v : s.seal(v)
+}
+
+function openToken(v: string): string | undefined {
+  const s = sealer
+  return s === undefined ? v : s.open(v)
+}
+
+export function isEphemeral(token: string): bool {
+  return token.trim().startsWith("ek_")
+}
+
+// The state key of a token: its SHA-256, so the token itself is never written anywhere.
+export function ekKey(token: string): string {
+  return toHex(sha256(utf8(token.trim())))
+}
+
+// A new token of this gateway's own.
+export function newEkToken(): string throws Error {
+  return "ek_bf_" + (try secureHex(32))
+}
+
+// The provider's token in a mint answer and when it expires: OpenAI's client_secrets answer has them at the top level
+// (value, expires_at); the older /realtime/sessions answers nest them under client_secret, which is accepted too.
+// undefined when there is no usable token.
+export type Secret = { value: string, expiresAt: int, nested: bool }
+
+export function secretOf(body: string): Secret | undefined {
+  let root: Field[] = []
+  try {
+    root = fields(body)
+  } catch (e) {
+    return undefined
+  }
+  const top = rawStr(root, "value") ?? ""
+  const topExp = rawNum(root, "expires_at") ?? 0.0
+  if (top.trim() !== "" && topExp > 0.0) return { value: top.trim(), expiresAt: Math.trunc(topExp), nested: false }
+  const cs = find(root, "client_secret")
+  if (cs === undefined || !cs.trim().startsWith("{")) return undefined
+  try {
+    const fs = fields(cs)
+    const v = rawStr(fs, "value") ?? ""
+    const exp = rawNum(fs, "expires_at") ?? 0.0
+    if (v.trim() === "" || exp <= 0.0) return undefined
+    return { value: v.trim(), expiresAt: Math.trunc(exp), nested: true }
+  } catch (e) {
+    return undefined
+  }
+}
+
+// The answer with the provider's token replaced by this gateway's.
+export function withSecret(body: string, token: string, nested: bool): string throws SyntaxError {
+  let root = try fields(body)
+  if (!nested) {
+    setField(&root, "value", quote(token))
+    return build(root)
+  }
+  let cs = try fields(find(root, "client_secret") ?? "{}")
+  setField(&cs, "value", quote(token))
+  setField(&root, "client_secret", build(cs))
+  return build(root)
+}
+
+// Records a token's mapping until it expires, and sweeps the expired ones.
+export function putMapping(token: string, m: EkMapping, nowMs: f64): void {
+  const st = clusterState()
+  const nowS = Math.floor(nowMs / 1000.0)
+  for (const k of st.keys(EK_NS)) {
+    const raw = st.get(EK_NS, k)
+    if (raw === undefined) continue
+    try {
+      const old = JSON.parse(raw) as EkMapping
+      if (old.expires_at <= nowS) st.del(EK_NS, k, nowMs)
+    } catch (e) {
+      st.del(EK_NS, k, nowMs)
+    }
+  }
+  const sealed: EkMapping = { vk: m.vk, key: m.key, token: sealToken(m.token), provider: m.provider, model: m.model, transcription: m.transcription, expires_at: m.expires_at }
+  st.put(EK_NS, ekKey(token), JSON.stringify(sealed), nowMs)
+}
+
+// The mapping of a token this gateway minted, its provider token opened; undefined for a token it did not mint, one
+// that has expired (its mapping is deleted), or one sealed under a key this node does not hold.
+export function lookupMapping(token: string, nowMs: f64): EkMapping | undefined {
+  if (!isEphemeral(token)) return undefined
+  const st = clusterState()
+  const k = ekKey(token)
+  const raw = st.get(EK_NS, k)
+  if (raw === undefined) return undefined
+  let m: EkMapping | undefined = undefined
+  try {
+    m = JSON.parse(raw) as EkMapping
+  } catch (e) {
+    return undefined
+  }
+  if (m === undefined) return undefined
+  if (m.expires_at <= Math.floor(nowMs / 1000.0)) {
+    st.del(EK_NS, k, nowMs)
+    return undefined
+  }
+  const opened = openToken(m.token)
+  if (opened === undefined || opened === "") return undefined
+  return { vk: m.vk, key: m.key, token: opened, provider: m.provider, model: m.model, transcription: m.transcription, expires_at: m.expires_at }
+}
+
+// The bearer token of an Authorization header ("" for none).
+export function bearerOf(v: string | undefined): string {
+  if (v === undefined) return ""
+  const t = v.trim()
+  if (t.byteLength < 8 || t.slice(0, 7).toLowerCase() !== "bearer ") return ""
+  return t.slice(7).trim()
+}
+
+// The credential a browser WebSocket names in its subprotocols (OpenAI's openai-insecure-api-key.<key>, xAI's
+// xai-client-secret.<key>), as Bifrost reads it; "" for none or for two that disagree.
+export function subprotocolCredential(v: string | undefined): string {
+  if (v === undefined) return ""
+  let cred = ""
+  for (const p0 of v.split(",")) {
+    const p = p0.trim()
+    for (const prefix of ["openai-insecure-api-key.", "xai-client-secret."]) {
+      if (!p.startsWith(prefix)) continue
+      const tok = p.slice(prefix.byteLength)
+      if (tok === "" || tok.includes(" ")) return ""
+      if (cred !== "" && cred !== tok) return ""
+      cred = tok
+    }
+  }
+  return cred
+}
+
+// How a realtime connection is admitted. headers are what governance sees: the caller's own, or for a minted token the
+// headers with its credentials replaced by the virtual key it was minted under. providerToken, when set, is the
+// credential the provider is sent instead of the pool key (the provider's token behind a minted one, or an ek_ token
+// this gateway did not mint). pin names the pool key to use. refused is why the connection may not go on ("" when it
+// may).
+export type RealtimeCred = { headers: Hdrs, mapping: EkMapping | undefined, providerToken: string, pin: string | undefined, refused: string }
+
+const CREDENTIAL_HEADERS = ["authorization", "x-api-key", "api-key", "x-goog-api-key", "x-bf-vk"]
+
+export const REVOKED = "the provided credential does not exist, has expired, or has been revoked"
+
+export function realtimeCredential(cfg: Config, h: Hdrs, nowMs: f64): RealtimeCred {
+  let token = bearerOf(h.get("authorization"))
+  const sub = subprotocolCredential(h.get("sec-websocket-protocol"))
+  if (token === "") token = sub
+  const pinned = h.get("x-bf-api-key")
+  if (!isEphemeral(token)) {
+    if (sub === "" || h.has("authorization")) return { headers: h, mapping: undefined, providerToken: "", pin: pinned, refused: "" }
+    // a browser's credential in the subprotocol stands for an Authorization header
+    let withAuth: Hdrs = new Map()
+    for (const k of h.keys()) withAuth.set(k, h.get(k)!)
+    withAuth.set("authorization", "Bearer " + sub)
+    return { headers: withAuth, mapping: undefined, providerToken: "", pin: pinned, refused: "" }
+  }
+  let out: Hdrs = new Map()
+  for (const k of h.keys()) {
+    if (!CREDENTIAL_HEADERS.includes(k)) out.set(k, h.get(k)!)
+  }
+  const m = lookupMapping(token, nowMs)
+  // a token this gateway did not mint: the provider decides
+  if (m === undefined) return { headers: out, mapping: undefined, providerToken: token.trim(), pin: undefined, refused: "" }
+  if (m.vk !== "") {
+    let value = ""
+    for (const vk of cfg.governance?.virtual_keys ?? []) {
+      if (vk.id === m.vk) value = vk.value ?? ""
+    }
+    // the key it was minted under is gone: the token goes with it
+    if (value === "") return { headers: out, mapping: m, providerToken: "", pin: undefined, refused: REVOKED }
+    out.set("x-bf-vk", value)
+  }
+  return { headers: out, mapping: m, providerToken: m.token, pin: m.key === "" ? undefined : m.key, refused: "" }
+}
+
+// ---- the models of a session
+
+function objAt(fs: Field[], key: string): Field[] | undefined {
+  const raw = find(fs, key)
+  if (raw === undefined || !raw.trim().startsWith("{")) return undefined
+  try {
+    return fields(raw)
+  } catch (e) {
+    return undefined
+  }
+}
+
+// session.audio.input.transcription, or undefined when it is absent or null.
+function gaTranscription(session: Field[]): Field[] | undefined {
+  const audio = objAt(session, "audio")
+  if (audio === undefined) return undefined
+  const input = objAt(audio, "input")
+  if (input === undefined) return undefined
+  return objAt(input, "transcription")
+}
+
+// Whether a session object is a transcription-only one (Bifrost's IsGATranscriptionSessionBody): its type says so, or it
+// names no model of its own (nor does the body around it, rootModel) and has an input transcription.
+export function isTranscriptionSession(session: Field[], rootModel: bool): bool {
+  const type = find(session, "type")
+  if (type !== undefined) return rawStr(session, "type") === "transcription"
+  if (find(session, "model") !== undefined || rootModel) return false
+  return gaTranscription(session) !== undefined
+}
+
+// The session with its session.audio.input.transcription.model set (the objects on the way are made when missing).
+function withGaModel(session: Field[], model: string): Field[] {
+  let s = session
+  let audio = objAt(s, "audio") ?? []
+  let input = objAt(audio, "input") ?? []
+  let tr = objAt(input, "transcription") ?? []
+  setField(&tr, "model", quote(model))
+  setField(&input, "transcription", build(tr))
+  setField(&audio, "input", build(input))
+  setField(&s, "audio", build(audio))
+  return s
+}
+
+// A nested object's model with its provider prefix removed ("openai/whisper-1" goes up as "whisper-1"), as Bifrost's
+// StripNestedModelPrefixes; the object is returned as it was when it names no model.
+function bareModelIn(cfg: Config, obj: string): string {
+  try {
+    let fs = fields(obj)
+    const m = rawStr(fs, "model")
+    if (m === undefined) return obj
+    const bare = parseModel(cfg, m).model
+    if (bare === m) return obj
+    setField(&fs, "model", quote(bare))
+    return build(fs)
+  } catch (e) {
+    return obj
+  }
+}
+
+// The session with no provider prefixes on its nested transcription models: the beta input_audio_transcription.model
+// and the GA audio.input.transcription.model.
+export function bareNestedModels(cfg: Config, session: Field[]): Field[] {
+  let fs = session
+  const old = find(fs, "input_audio_transcription")
+  if (old !== undefined && old.trim().startsWith("{")) setField(&fs, "input_audio_transcription", bareModelIn(cfg, old))
+  const audio = objAt(fs, "audio")
+  if (audio !== undefined) {
+    let af = audio
+    const input = objAt(af, "input")
+    if (input !== undefined) {
+      let inf = input
+      const tr = find(inf, "transcription")
+      if (tr !== undefined && tr.trim().startsWith("{")) {
+        setField(&inf, "transcription", bareModelIn(cfg, tr))
+        setField(&af, "input", build(inf))
+        setField(&fs, "audio", build(af))
+      }
+    }
+  }
+  return fs
+}
+
+// The model a mint names (as the caller wrote it, provider prefix and all) and whether it mints a transcription
+// session, in Bifrost's order (ExtractRealtimeClientSecretModel): session.model, the top-level model, then a
+// transcription session's session.audio.input.transcription.model; on /v1/realtime/transcription_sessions the beta
+// input_audio_transcription.model. error is set when none names one.
+export type MintModel = { model: string, transcription: bool, error: string }
+
+export function mintModel(body: string, route: string): MintModel {
+  let root: Field[] = []
+  try {
+    root = fields(body)
+  } catch (e) {
+    return { model: "", transcription: false, error: "the request body must be a JSON object" }
+  }
+  const sraw = find(root, "session")
+  let session: Field[] | undefined = undefined
+  if (!isNull(sraw)) {
+    session = objAt(root, "session")
+    if (session === undefined) return { model: "", transcription: false, error: "session must be an object" }
+  }
+  if (route === "/v1/realtime/transcription_sessions") {
+    const tr = objAt(root, "input_audio_transcription")
+    const m = tr === undefined ? "" : (rawStr(tr, "model") ?? "").trim()
+    if (m === "") return { model: "", transcription: true, error: "input_audio_transcription.model is required" }
+    return { model: m, transcription: true, error: "" }
+  }
+  const rootModel = (rawStr(root, "model") ?? "").trim()
+  if (session !== undefined) {
+    const sm = (rawStr(session, "model") ?? "").trim()
+    if (sm !== "") return { model: sm, transcription: rawStr(session, "type") === "transcription", error: "" }
+  }
+  if (rootModel !== "") return { model: rootModel, transcription: false, error: "" }
+  if (session !== undefined && isTranscriptionSession(session, false)) {
+    const tr = gaTranscription(session)
+    const m = tr === undefined ? "" : (rawStr(tr, "model") ?? "").trim()
+    if (m !== "") return { model: m, transcription: true, error: "" }
+  }
+  return { model: "", transcription: false, error: "session.model or model is required" }
+}
+
+// The body the provider is sent to mint: the model as the provider knows it (bare), as Bifrost normalizes it. For
+// OpenAI and Azure client secrets the session carries the model (a transcription session in
+// session.audio.input.transcription.model) and a type, and the top-level model goes; /v1/realtime/sessions keeps its
+// top-level model and /v1/realtime/transcription_sessions its input_audio_transcription.model. xAI mints connection
+// credentials only: its body loses the model and a session that configures anything else is refused (Bifrost's
+// xaiRealtimeMintBody). Throws a SyntaxError with the message for the caller.
+export function mintBody(cfg: Config, kind: string, route: string, body: string, model: string): string throws SyntaxError {
+  let root = try fields(body)
+  const sraw = find(root, "session")
+  let session: Field[] = []
+  if (!isNull(sraw)) {
+    const s = objAt(root, "session")
+    if (s === undefined) throw new SyntaxError("session must be an object")
+    session = s
+  }
+  if (kind === "xai") {
+    root = without(root, ["model"])
+    if (!isNull(sraw)) {
+      let s = without(session, ["model"])
+      const type = find(s, "type")
+      if (type !== undefined) {
+        if (rawStr(s, "type") !== "realtime") throw new SyntaxError("xai client-secret minting requires a realtime session")
+        s = without(s, ["type"])
+      }
+      if (s.length !== 0) throw new SyntaxError("configure xai voice settings with session.update after connecting")
+      root = without(root, ["session"])
+    }
+    return build(root)
+  }
+  if (route === "/v1/realtime/transcription_sessions") {
+    let tr = objAt(root, "input_audio_transcription") ?? []
+    setField(&tr, "model", quote(model))
+    setField(&root, "input_audio_transcription", build(tr))
+    return build(root)
+  }
+  if (route === "/v1/realtime/sessions") {
+    setField(&root, "model", quote(model))
+    return build(bareNestedModels(cfg, root))
+  }
+  const rootModel = (rawStr(root, "model") ?? "").trim() !== ""
+  if (isTranscriptionSession(session, rootModel)) {
+    session = withGaModel(without(session, ["model"]), model)
+    if (find(session, "type") === undefined) setField(&session, "type", quote("transcription"))
+  } else {
+    setField(&session, "model", quote(model))
+    session = bareNestedModels(cfg, session)
+    if (find(session, "type") === undefined) setField(&session, "type", quote("realtime"))
+  }
+  root = without(root, ["model"])
+  setField(&root, "session", build(session))
+  return build(root)
+}
+
+// ---- transcription sessions over a WebSocket
+
+// The transcription model a client event names: session.update's session.audio.input.transcription.model (GA), or
+// transcription_session.update's session.input_audio_transcription.model (beta); "" for any other event.
+export function transcriptionModelOf(m: string): string {
+  try {
+    const fs = fields(m)
+    const type = rawStr(fs, "type") ?? ""
+    const session = objAt(fs, "session")
+    if (session === undefined) return ""
+    if (type === "session.update") {
+      const tr = gaTranscription(session)
+      return tr === undefined ? "" : (rawStr(tr, "model") ?? "").trim()
+    }
+    if (type === "transcription_session.update") {
+      const tr = objAt(session, "input_audio_transcription")
+      return tr === undefined ? "" : (rawStr(tr, "model") ?? "").trim()
+    }
+  } catch (e) {
+    return ""
+  }
+  return ""
+}
+
+// The event with the transcription model it names replaced by the routed model, so a session stays on the model it
+// was admitted for (Bifrost's pinRealtimeTranscriptionModel). Any other event is returned as it is.
+export function pinTranscriptionModel(m: string, model: string): string {
+  if (transcriptionModelOf(m) === "") return m
+  try {
+    let fs = fields(m)
+    const type = rawStr(fs, "type") ?? ""
+    let session = objAt(fs, "session") ?? []
+    if (type === "session.update") {
+      session = withGaModel(session, model)
+    } else {
+      let tr = objAt(session, "input_audio_transcription") ?? []
+      setField(&tr, "model", quote(model))
+      setField(&session, "input_audio_transcription", build(tr))
+    }
+    setField(&fs, "session", build(session))
+    return build(fs)
+  } catch (e) {
+    return m
+  }
+}
+
+// How long, how many frames and how many bytes a transcription WebSocket may take to name its model (Bifrost's
+// bootstrap limits).
+export const BOOTSTRAP_MS = 15000
+export const BOOTSTRAP_FRAMES = 16
+export const BOOTSTRAP_BYTES = 1048576
+
+test("a mint answer's token is found at the top level or under client_secret, and replaced", () => {
+  const top = `{"value":"ek_up_1","expires_at":1900000000,"session":{"type":"realtime"}}`
+  const s = secretOf(top)!
+  expect(s.value).toBe("ek_up_1")
+  expect(s.expiresAt).toBe(1900000000)
+  expect(s.nested).toBe(false)
+  const out = try withSecret(top, "ek_bf_x", false)
+  expect(out.includes(`"value":"ek_bf_x"`)).toBe(true)
+  expect(out.includes("ek_up_1")).toBe(false)
+  expect(out.includes(`"session":{"type":"realtime"}`)).toBe(true)
+  const nested = `{"id":"sess_1","client_secret":{"value":"ek_up_2","expires_at":1900000001}}`
+  const n = secretOf(nested)!
+  expect(n.nested).toBe(true)
+  expect(n.value).toBe("ek_up_2")
+  const nout = try withSecret(nested, "ek_bf_y", true)
+  expect(nout.includes("ek_up_2")).toBe(false)
+  expect(nout.includes(`"client_secret":{"value":"ek_bf_y","expires_at":1900000001}`)).toBe(true)
+  // no token, or no expiry: not usable
+  expect(secretOf(`{"value":"ek_up_3"}`)).toBe(undefined)
+  expect(secretOf(`{"client_secret":null}`)).toBe(undefined)
+  expect(secretOf("not json")).toBe(undefined)
+})
+
+test("a minted token maps to its virtual key until it expires, sealed on the cluster state", () => {
+  setEkSeal((v) => "sealed:" + v, (v) => (v.startsWith("sealed:") ? v.slice(7) : undefined))
+  const tok = "ek_bf_" + "0123456789abcdef0123456789abcdef"
+  putMapping(tok, { vk: "vk1", key: "pool", token: "ek_up_9", provider: "openai", model: "gpt-realtime", transcription: false, expires_at: 2000 }, 1000000.0)
+  // the state holds neither token in the clear
+  const raw = clusterState().get(EK_NS, ekKey(tok))!
+  expect(raw.includes(tok)).toBe(false)
+  expect(raw.includes(`"token":"sealed:ek_up_9"`)).toBe(true)
+  const m = lookupMapping(tok, 1500000.0)!
+  expect(m.vk).toBe("vk1")
+  expect(m.token).toBe("ek_up_9")
+  expect(lookupMapping("ek_bf_other", 1500000.0)).toBe(undefined)
+  expect(lookupMapping("sk-bf-x", 1500000.0)).toBe(undefined)
+  // past its expiry it is gone, and its entry deleted
+  expect(lookupMapping(tok, 2000000.0)).toBe(undefined)
+  expect(clusterState().get(EK_NS, ekKey(tok))).toBe(undefined)
+  // a mint sweeps the expired mappings of other tokens
+  const old = "ek_bf_old"
+  putMapping(old, { vk: "", key: "", token: "t", provider: "openai", model: "m", transcription: false, expires_at: 10 }, 5000.0)
+  putMapping("ek_bf_new", { vk: "", key: "", token: "t", provider: "openai", model: "m", transcription: false, expires_at: 99999 }, 20000.0)
+  expect(clusterState().get(EK_NS, ekKey(old))).toBe(undefined)
+  expect((try newEkToken()).startsWith("ek_bf_")).toBe(true)
+  expect((try newEkToken()).byteLength).toBe(38)
+})
+
+test("a realtime connection with a minted token is the virtual key it was minted under", () => {
+  setEkSeal((v) => v, (v) => v)
+  const cfg: Config = { governance: { virtual_keys: [{ id: "vk-a", value: "sk-bf-a" }] } }
+  const tok = "ek_bf_" + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  putMapping(tok, { vk: "vk-a", key: "pool", token: "ek_up_a", provider: "openai", model: "gpt-realtime", transcription: false, expires_at: 9999999999 }, 1000.0)
+  const h: Hdrs = new Map()
+  h.set("authorization", "Bearer " + tok)
+  h.set("user-agent", "ua")
+  const c = realtimeCredential(cfg, h, 2000.0)
+  expect(c.refused).toBe("")
+  expect(c.headers.get("x-bf-vk")).toBe("sk-bf-a")
+  expect(c.headers.has("authorization")).toBe(false)
+  expect(c.headers.get("user-agent")).toBe("ua")
+  expect(c.providerToken).toBe("ek_up_a")
+  expect(c.pin).toBe("pool")
+  // a browser names it in the subprotocol
+  const b: Hdrs = new Map()
+  b.set("sec-websocket-protocol", "realtime, openai-insecure-api-key." + tok)
+  expect(realtimeCredential(cfg, b, 2000.0).headers.get("x-bf-vk")).toBe("sk-bf-a")
+  // the virtual key is gone: refused
+  const gone: Config = { governance: { virtual_keys: [] } }
+  expect(realtimeCredential(gone, h, 2000.0).refused).toBe(REVOKED)
+  // a token this gateway did not mint goes to the provider, with no virtual key
+  const u: Hdrs = new Map()
+  u.set("authorization", "Bearer ek_from_elsewhere")
+  const uc = realtimeCredential(cfg, u, 2000.0)
+  expect(uc.mapping).toBe(undefined)
+  expect(uc.providerToken).toBe("ek_from_elsewhere")
+  expect(uc.headers.has("authorization")).toBe(false)
+  // any other credential is the caller's own; a subprotocol one stands for Authorization
+  const v: Hdrs = new Map()
+  v.set("sec-websocket-protocol", "realtime, openai-insecure-api-key.sk-bf-a")
+  expect(realtimeCredential(cfg, v, 2000.0).headers.get("authorization")).toBe("Bearer sk-bf-a")
+  expect(subprotocolCredential("openai-insecure-api-key.a, xai-client-secret.b")).toBe("")
+  expect(bearerOf("bearer  x ")).toBe("x")
+})
+
+test("the model of a mint, in Bifrost's order, and the body the provider is sent", () => {
+  const cfg: Config = {}
+  const a = mintModel(`{"session":{"type":"realtime","model":"openai/gpt-realtime"}}`, "/v1/realtime/client_secrets")
+  expect(a.model).toBe("openai/gpt-realtime")
+  expect(a.transcription).toBe(false)
+  expect(mintModel(`{"model":"openai/gpt-realtime"}`, "/v1/realtime/sessions").model).toBe("openai/gpt-realtime")
+  const t = mintModel(`{"session":{"type":"transcription","audio":{"input":{"transcription":{"model":"openai/gpt-4o-transcribe"}}}}}`, "/v1/realtime/client_secrets")
+  expect(t.model).toBe("openai/gpt-4o-transcribe")
+  expect(t.transcription).toBe(true)
+  const lt = mintModel(`{"input_audio_transcription":{"model":"openai/whisper-1"}}`, "/v1/realtime/transcription_sessions")
+  expect(lt.model).toBe("openai/whisper-1")
+  expect(lt.transcription).toBe(true)
+  expect(mintModel(`{"session":{}}`, "/v1/realtime/client_secrets").error).toBe("session.model or model is required")
+  expect(mintModel(`{"session":3}`, "/v1/realtime/client_secrets").error).toBe("session must be an object")
+  // client secrets: the model in the session, bare, with a type
+  const b = try mintBody(cfg, "openai", "/v1/realtime/client_secrets", `{"model":"openai/gpt-realtime","expires_after":{"seconds":60},"session":{"audio":{"input":{"transcription":{"model":"openai/whisper-1"}}}}}`, "gpt-realtime")
+  expect(b.includes(`"expires_after":{"seconds":60}`)).toBe(true)
+  expect(b.includes(`"model":"gpt-realtime"`)).toBe(true)
+  expect(b.includes(`"model":"whisper-1"`)).toBe(true)
+  expect(b.includes(`"type":"realtime"`)).toBe(true)
+  expect(b.includes("openai/")).toBe(false)
+  const tb = try mintBody(cfg, "openai", "/v1/realtime/client_secrets", `{"session":{"type":"transcription","audio":{"input":{"transcription":{"model":"openai/gpt-4o-transcribe"}}}}}`, "gpt-4o-transcribe")
+  expect(tb).toBe(`{"session":{"type":"transcription","audio":{"input":{"transcription":{"model":"gpt-4o-transcribe"}}}}}`)
+  expect(try mintBody(cfg, "openai", "/v1/realtime/sessions", `{"model":"openai/gpt-realtime","voice":"alloy"}`, "gpt-realtime")).toBe(`{"model":"gpt-realtime","voice":"alloy"}`)
+  expect(try mintBody(cfg, "openai", "/v1/realtime/transcription_sessions", `{"input_audio_transcription":{"model":"openai/whisper-1"}}`, "whisper-1")).toBe(`{"input_audio_transcription":{"model":"whisper-1"}}`)
+  // xAI: connection credentials only
+  expect(try mintBody(cfg, "xai", "/v1/realtime/client_secrets", `{"model":"xai/grok-realtime","expires_after":{"seconds":30},"session":{"model":"grok-realtime","type":"realtime"}}`, "grok-realtime")).toBe(`{"expires_after":{"seconds":30}}`)
+  let threw = ""
+  try {
+    mintBody(cfg, "xai", "/v1/realtime/client_secrets", `{"session":{"voice":"ara"}}`, "grok-realtime")
+  } catch (e) {
+    threw = e.message
+  }
+  expect(threw).toBe("configure xai voice settings with session.update after connecting")
+})
+
+test("a transcription session's model is read from its update, and pinned to the routed one", () => {
+  const ga = `{"type":"session.update","session":{"type":"transcription","audio":{"input":{"transcription":{"model":"openai/gpt-4o-transcribe","language":"en"}}}}}`
+  expect(transcriptionModelOf(ga)).toBe("openai/gpt-4o-transcribe")
+  const p = pinTranscriptionModel(ga, "gpt-4o-transcribe")
+  expect(p.includes(`"model":"gpt-4o-transcribe","language":"en"`)).toBe(true)
+  expect(p.includes("openai/")).toBe(false)
+  const beta = `{"type":"transcription_session.update","session":{"input_audio_transcription":{"model":"openai/whisper-1"}}}`
+  expect(transcriptionModelOf(beta)).toBe("openai/whisper-1")
+  expect(pinTranscriptionModel(beta, "whisper-1")).toBe(`{"type":"transcription_session.update","session":{"input_audio_transcription":{"model":"whisper-1"}}}`)
+  // other events, or an update with no model, are left alone
+  expect(transcriptionModelOf(`{"type":"input_audio_buffer.append","audio":"AAA"}`)).toBe("")
+  expect(transcriptionModelOf(`{"type":"session.update","session":{"instructions":"x"}}`)).toBe("")
+  expect(pinTranscriptionModel(`{"type":"session.update","session":{"instructions":"x"}}`, "m")).toBe(`{"type":"session.update","session":{"instructions":"x"}}`)
+  // a call's session: a transcription one by its type, or by having only an input transcription
+  expect(isTranscriptionSession(try fields(`{"type":"transcription"}`), false)).toBe(true)
+  expect(isTranscriptionSession(try fields(`{"audio":{"input":{"transcription":{"model":"m"}}}}`), false)).toBe(true)
+  expect(isTranscriptionSession(try fields(`{"model":"gpt-realtime","audio":{"input":{"transcription":{"model":"m"}}}}`), false)).toBe(false)
+  expect(isTranscriptionSession(try fields(`{"audio":{"input":{"transcription":null}}}`), false)).toBe(false)
+})

@@ -3,7 +3,9 @@
 // a LiveCore (webrtc.tov), as Bifrost's realtime handler does: each turn (a response, from its start to its
 // response.done) is admitted by governance, the text of both sides is guarded, the tokens that response.done
 // reports are billed (audio tokens at the audio rates, cached tokens at the cache rate), and the session ends
-// as one log row with its cost. The events themselves pass as they came.
+// as one log row with its cost. The events themselves pass as they came. A client secret this gateway minted
+// (rtsession.tov) connects as the virtual key it was minted under, and a transcription session
+// (?intent=transcription) is billed per transcription at the transcription rates.
 import { Engine } from "./gateway"
 import { parseModel, target } from "./router"
 import { Target } from "./providers/types"
@@ -12,12 +14,15 @@ import { Hdrs, snapshot } from "./schemas"
 import { WsConnection, SocketGate } from "./ws"
 import { errorJson } from "./schemas"
 import { SessionSpec, sessionHooks, sessionGuard } from "./livehooks"
-import { Relay, Leg, startClock } from "./webrtc"
+import { Relay, Leg, Refusal, startClock, errorEvent } from "./webrtc"
+import { RealtimeCred, realtimeCredential, transcriptionModelOf, pinTranscriptionModel, BOOTSTRAP_MS, BOOTSTRAP_FRAMES, BOOTSTRAP_BYTES } from "./rtsession"
 
 // What a WebSocket upgrade becomes on the server: the socket's own state in ext.
 export class Session {
   // the state of the WebSocket route (the realtime relay, responses, live, the UI socket)
   ext: SocketExt | undefined = undefined
+  // the subprotocol the 101 answers with ("" for none): one the client offered, never a credential-bearing one
+  protocol = ""
   constructor(readonly url: string, readonly headers: Map<string, string>, readonly provider: string, readonly model: string) {}
 }
 
@@ -233,23 +238,64 @@ export function upstreamFor(t: Target, beta: string | undefined): { url: string,
   return { url: `${wsBase(base)}/v1/realtime?model=${t.model}`, headers: h }
 }
 
+// The provider's realtime WebSocket for a session: its URL and headers, with token (when set) sent instead of the
+// key (the provider's token behind a client secret this gateway minted, or an ek_ token it did not), and for a
+// transcription session the intent=transcription endpoint with no model (Bifrost's RealtimeWebSocketURL with an
+// intent). Azure takes an ephemeral token as a bearer, as Bifrost's Azure RealtimeHeaders does.
+export function sessionUpstream(t: Target, beta: string | undefined, transcription: bool, token: string): { url: string, headers: Map<string, string> } {
+  let k = t.key
+  if (token !== "") k.value = token
+  const tt: Target = { provider: t.provider, kind: t.kind, model: t.model, key: k, cfg: t.cfg }
+  const up = upstreamFor(tt, beta)
+  let h: Map<string, string> = new Map()
+  for (const name of up.headers.keys()) h.set(name, up.headers.get(name)!)
+  if (tt.kind === "azure" && token.startsWith("ek_")) {
+    h.delete("api-key")
+    h.set("authorization", "Bearer " + token)
+  }
+  if (!transcription) return { url: up.url, headers: h }
+  if (tt.kind === "azure") {
+    const endpoint = trim(tt.key.azure_key_config?.endpoint ?? tt.cfg.network_config?.base_url ?? "")
+    return { url: `${wsBase(endpoint)}/openai/v1/realtime?intent=transcription`, headers: h }
+  }
+  const base = trim(tt.cfg.network_config?.base_url ?? "https://api.openai.com")
+  return { url: `${wsBase(base)}/v1/realtime?intent=transcription`, headers: h }
+}
+
+// The subprotocol a realtime upgrade answers with, as Bifrost's upgrader does: "realtime" when the client offered it
+// and the provider's realtime API speaks it (OpenAI and Azure; xAI names none), else none. A credential the client
+// put in its offer (openai-insecure-api-key.<key>) is never echoed. kind is "" while a transcription session's
+// provider is not known yet (Bifrost answers such an upgrade with "realtime").
+export function answerProtocol(offered: string | undefined, kind: string): string {
+  if (offered === undefined || kind === "xai") return ""
+  for (const p of offered.split(",")) {
+    if (p.trim() === "realtime") return "realtime"
+  }
+  return ""
+}
+
 // Decides whether a /v1/realtime upgrade may proceed, and where it goes. The session it returns carries
-// the socket's state (a RealtimeSocket), which both servers run the same way.
+// the socket's state (a RealtimeSocket), which both servers run the same way. A client secret this gateway minted
+// stands for the virtual key it was minted under (rtsession.tov realtimeCredential), and names the model when the
+// URL does not. A transcription session (?intent=transcription) with no model is upgraded first: its model comes in
+// its first update, and it is admitted then.
 export function prepare(engine: Engine, req: Request): Upgrade {
   const u = URL.parse(req.url)
-  const model = u === undefined ? undefined : u.searchParams.get("model")
-  if (model === undefined || model === undefined || model === "") return { kind: "refused", status: 400, message: "add ?model=openai/gpt-realtime (or another realtime model)" }
-  const ref = parseModel(engine.cfg, model)
-  const h = snapshot(req.headers)
-  const admitted = engine.gov.admit(h, ref.provider, ref.model)
-  if (admitted.kind === "denial") return { kind: "refused", status: admitted.status, message: admitted.message }
-  const none: Set<int> = new Set()
-  const sel = target(engine.cfg, ref, none, req.headers.get("x-bf-api-key") ?? undefined)
-  if (sel === undefined) return { kind: "refused", status: 404, message: `no key is configured for ${ref.provider}/${ref.model}` }
-  if (!realtimeKind(sel.t.kind)) return { kind: "refused", status: 400, message: `${ref.provider} has no realtime API this gateway can relay` }
-  const up = upstreamFor(sel.t, req.headers.get("openai-beta") ?? undefined)
-  const session = new Session(up.url, up.headers, ref.provider, ref.model)
-  const sock = new RealtimeSocket(engine, h, admitted, ref.provider, ref.model, up.url, up.headers)
+  let model = u === undefined ? "" : (u.searchParams.get("model") ?? "").trim()
+  const intent = u === undefined ? "" : (u.searchParams.get("intent") ?? "").trim().toLowerCase()
+  const transcription = intent === "transcription"
+  const cred = realtimeCredential(engine.cfg, snapshot(req.headers), Date.now())
+  if (cred.refused !== "") return { kind: "refused", status: 401, message: cred.refused }
+  const m = cred.mapping
+  if (model === "" && m !== undefined && m.transcription === transcription) model = m.provider + "/" + m.model
+  if (model === "" && !transcription) return { kind: "refused", status: 400, message: "add ?model=openai/gpt-realtime (or another realtime model)" }
+  const sock = new RealtimeSocket(engine, cred, transcription, req.headers.get("openai-beta") ?? undefined)
+  if (model !== "") {
+    const why = sock.resolve(model)
+    if (why !== undefined) return { kind: "refused", status: why.status, message: why.message }
+  }
+  const session = new Session(sock.url, sock.upstreamHeaders, sock.provider, sock.model)
+  session.protocol = answerProtocol(req.headers.get("sec-websocket-protocol") ?? undefined, sock.kind)
   sock.gate = engine.wsRealtime
   session.ext = sock
   return { kind: "session", session: session }
@@ -273,19 +319,111 @@ function closeUp(up: WebSocket): void {
 // One realtime WebSocket: the caller's frames and the provider's pass through a relay (webrtc.tov) that
 // admits each turn, guards the text, bills the tokens and logs the session. Frames go on as they came, except
 // where a guard redacted text. The provider's socket is opened with the caller's; what the caller sends before
-// it is open waits.
+// it is open waits. A transcription session that has not named its model yet holds its frames (up to Bifrost's
+// bootstrap limits) until an update names one; it is admitted for that model, and the frames go on.
 export class RealtimeSocket extends SocketExt {
   relay: Relay | undefined = undefined
   upstream: WebSocket | undefined = undefined
-  constructor(readonly engine: Engine, readonly headers: Hdrs, readonly grant: Grant, readonly provider: string, readonly model: string, readonly url: string, readonly upstreamHeaders: Map<string, string>) {
+  // what the session was admitted for, once its model is known: the grant, the provider and model, the model the
+  // provider knows it by, and the provider's socket
+  grant: Grant | undefined = undefined
+  provider = ""
+  model = ""
+  upstreamModel = ""
+  // the provider's kind ("" until the model is known)
+  kind = ""
+  url = ""
+  upstreamHeaders: Map<string, string> = new Map()
+  // the frames a transcription session sent before it named its model
+  pending: string[] = []
+  pendingBytes = 0
+  readonly headers: Hdrs
+  constructor(readonly engine: Engine, readonly cred: RealtimeCred, readonly transcription: bool, readonly beta: string | undefined) {
     super()
+    this.headers = cred.headers
+  }
+
+  // Admits the session for a model and finds the provider's socket for it: undefined, or the refusal. A client
+  // secret's session runs on the pool key that minted it, or another when that key is gone.
+  resolve(rawModel: string): Refusal | undefined {
+    const cfg = this.engine.cfg
+    const ref = parseModel(cfg, rawModel)
+    const admitted = this.engine.gov.admit(this.headers, ref.provider, ref.model)
+    if (admitted.kind === "denial") return { status: admitted.status, type: admitted.type, message: admitted.message }
+    const grant: Grant = admitted
+    const none: Set<int> = new Set()
+    let sel = target(cfg, ref, none, this.cred.pin)
+    if (sel === undefined && this.cred.mapping !== undefined) sel = target(cfg, ref, none, this.headers.get("x-bf-api-key") ?? undefined)
+    if (sel === undefined) return { status: 404, type: "invalid_request_error", message: `no key is configured for ${ref.provider}/${ref.model}` }
+    if (!realtimeKind(sel.t.kind)) return { status: 400, type: "invalid_request_error", message: `${ref.provider} has no realtime API this gateway can relay` }
+    if (this.transcription && sel.t.kind === "xai") return { status: 400, type: "invalid_request_error", message: "xai realtime requires a model and does not support a transcription-only intent" }
+    const up = sessionUpstream(sel.t, this.beta, this.transcription, this.cred.providerToken)
+    this.grant = grant
+    this.provider = ref.provider
+    this.model = ref.model
+    this.upstreamModel = sel.t.model
+    this.kind = sel.t.kind
+    this.url = up.url
+    this.upstreamHeaders = up.headers
+    return undefined
   }
 
   onOpen(): void {
+    if (this.grant !== undefined) {
+      this.start([])
+      return
+    }
+    // a transcription session names its model in its first update, within the bootstrap time
+    const me = this
+    setTimeout(() => {
+      if (me.grant === undefined && !me.closed && !me.ended) me.refuse("invalid_request_error", "transcription session.update model was not received within bootstrap limits")
+    }, BOOTSTRAP_MS)
+  }
+
+  // Ends a session that could not start: the client gets the error event, then the close.
+  private refuse(type: string, message: string): void {
+    this.pending = []
+    this.send(errorEvent(type, message))
+    this.endWith(1008, message.byteLength > 120 ? message.slice(0, 120) : message)
+  }
+
+  // A frame of a transcription session that has not named its model: held, and the session starts with the update
+  // that names one.
+  private bootstrap(m: string): void {
+    this.pending.push(m)
+    this.pendingBytes += m.byteLength
+    if (this.pendingBytes > BOOTSTRAP_BYTES) {
+      this.refuse("invalid_request_error", "transcription bootstrap exceeded 1 MiB")
+      return
+    }
+    const model = transcriptionModelOf(m)
+    if (model !== "") {
+      const why = this.resolve(model)
+      if (why !== undefined) {
+        this.refuse(why.type, why.message)
+        return
+      }
+      const frames = this.pending
+      this.pending = []
+      this.start(frames)
+      return
+    }
+    if (this.pending.length >= BOOTSTRAP_FRAMES) this.refuse("invalid_request_error", "transcription bootstrap exceeded 16 frames before session.update supplied a model")
+  }
+
+  // A client frame as the provider gets it: a transcription session's updates stay on the model it was admitted for.
+  private outbound(m: string): string {
+    return this.transcription ? pinTranscriptionModel(m, this.upstreamModel) : m
+  }
+
+  private start(frames: string[]): void {
+    const grant = this.grant
+    if (grant === undefined) return
     const spec: SessionSpec = { op: "realtime", transport: "websocket", provider: this.provider, model: this.model }
     // a realtime session has no id of its own to record: attach and content are live sessions' routes
-    const relay = new Relay(sessionHooks(this.engine, this.headers, this.grant, spec, (id) => true), sessionGuard(this.engine), Date.now())
+    const relay = new Relay(sessionHooks(this.engine, this.headers, grant, spec, (id) => true), sessionGuard(this.engine), Date.now())
     relay.core.realtime = true
+    relay.core.transcription = this.transcription
     relay.core.minimum = 0.0
     relay.core.model = this.model
     relay.clientOpen = true
@@ -329,12 +467,18 @@ export class RealtimeSocket extends SocketExt {
       relay.providerBroke()
     }
     startClock(relay)
+    // what a transcription session sent before it named its model goes on now
+    for (const f of frames) relay.fromBrowser(this.outbound(f))
   }
 
   onMessage(m: string): void {
     if (this.closed || this.ended) return
+    if (this.grant === undefined) {
+      this.bootstrap(m)
+      return
+    }
     const r = this.relay
-    if (r !== undefined) r.fromBrowser(m)
+    if (r !== undefined) r.fromBrowser(this.outbound(m))
   }
 
   onClose(): void {
@@ -405,4 +549,28 @@ test("realtime Azure with Entra ID and configured headers", () => {
   expect(u.headers.get("authorization")).toBe("Bearer entra-token")
   expect(u.headers.has("api-key")).toBe(false)
   expect(u.headers.get("x-team")).toBe("voice")
+})
+
+test("a realtime upgrade answers with realtime when offered, never the credential", () => {
+  expect(answerProtocol("realtime, openai-insecure-api-key.ek_bf_x", "openai")).toBe("realtime")
+  expect(answerProtocol("openai-insecure-api-key.ek_bf_x", "openai")).toBe("")
+  expect(answerProtocol(undefined, "azure")).toBe("")
+  expect(answerProtocol("realtime", "")).toBe("realtime")
+  expect(answerProtocol("realtime, xai-client-secret.k", "xai")).toBe("")
+})
+
+test("a session's upstream: a client secret's provider token instead of the key, and the transcription endpoint", () => {
+  const t: Target = { provider: "openai", kind: "openai", model: "gpt-realtime", key: { value: "sk-pool" }, cfg: { network_config: { base_url: "https://api.example.test/" } } }
+  const a = sessionUpstream(t, undefined, false, "")
+  expect(a.url).toBe("wss://api.example.test/v1/realtime?model=gpt-realtime")
+  expect(a.headers.get("authorization")).toBe("Bearer sk-pool")
+  const b = sessionUpstream(t, undefined, true, "ek_up_1")
+  expect(b.url).toBe("wss://api.example.test/v1/realtime?intent=transcription")
+  expect(b.headers.get("authorization")).toBe("Bearer ek_up_1")
+  const az: Target = { provider: "azure", kind: "azure", model: "gpt-realtime", key: { value: "ak", azure_key_config: { endpoint: "https://x.openai.azure.com/" } }, cfg: {} }
+  const c = sessionUpstream(az, undefined, true, "ek_up_2")
+  expect(c.url).toBe("wss://x.openai.azure.com/openai/v1/realtime?intent=transcription")
+  expect(c.headers.get("authorization")).toBe("Bearer ek_up_2")
+  expect(c.headers.has("api-key")).toBe(false)
+  expect(sessionUpstream(az, undefined, false, "").headers.get("api-key")).toBe("ak")
 })

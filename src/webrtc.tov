@@ -385,6 +385,47 @@ export type TurnReport = {
   events: int,
   // the unit that ends the session
   last: bool,
+  // how a realtime response ended, as its response.done says ("completed", "failed", "cancelled", "incomplete"; ""
+  // for a unit that is no response), and why (status_details.reason, or the error's code)
+  state: string,
+  stateReason: string,
+}
+
+// How a response ended, for its row: the response.done's status and reason, the HTTP status the row is logged with
+// and its error.
+export type DoneOutcome = { state: string, reason: string, status: int, error: string }
+
+// The status Bifrost gives a realtime error (newBifrostErrorFromRealtimeError): 500, or 400 when its type, code or
+// message names an invalid request, or 429 when one names a rate limit, a quota, a budget or billing (the last of
+// them that matches wins, as Bifrost reads them in that order).
+export function realtimeErrorStatus(values: string[]): int {
+  let status = 500
+  for (const v of values) {
+    const l = v.trim().toLowerCase()
+    if (l === "") continue
+    if (l.includes("invalid_request_error")) status = 400
+    else if (l.includes("rate_limit") || l.includes("rate limit") || l.includes("too many requests") || l.includes("quota") || l.includes("budget") || l.includes("billing")) status = 429
+  }
+  return status
+}
+
+// What a response.done says about the end of its response. completed (or no status) is 200. failed is the realtime
+// error its status_details carry, with Bifrost's status for it (realtimeErrorStatus) and its message. cancelled (the
+// caller's response.cancel, or a turn the caller's speech cut off) is 499, the status Bifrost logs a cancelled
+// request with. incomplete (max_output_tokens, a content filter) delivered what it had, so it is 200 as Bifrost logs
+// it, with the reason beside it.
+export function doneOutcome(m: string): DoneOutcome {
+  const state = strAt(m, ["response", "status"])
+  const reason = strAt(m, ["response", "status_details", "reason"])
+  if (state === "failed") {
+    const e = ["response", "status_details", "error"]
+    const type = strAt(m, e.concat(["type"]))
+    const code = strAt(m, e.concat(["code"]))
+    const msg = strAt(m, e.concat(["message"]))
+    return { state: state, reason: reason !== "" ? reason : code, status: realtimeErrorStatus([type, code, msg]), error: msg.trim() !== "" ? msg.trim() : "realtime turn failed" }
+  }
+  if (state === "cancelled") return { state: state, reason: reason, status: 499, error: "the response was cancelled" + (reason !== "" ? " (" + reason + ")" : "") }
+  return { state: state, reason: reason, status: 200, error: "" }
 }
 
 // One finished session, for its gauge and totals.
@@ -530,6 +571,10 @@ export class LiveCore {
   // session.close or session.closed and no voice seconds: it is admitted again at each turn, its tokens
   // come from response.done, and it ends when either side leaves.
   realtime = false
+  // A realtime transcription session (?intent=transcription, or a call whose session is of type transcription): its
+  // units are the transcriptions of the caller's audio (conversation.item.input_audio_transcription.completed), each
+  // billed from the usage that event reports at the model's transcription rates.
+  transcription = false
   // the model the session runs, which the tokens of its own responses (realtime) are billed under, and the
   // model of a live session's delegated responses when they name none
   model = ""
@@ -722,8 +767,13 @@ export class LiveCore {
     } else if (type === "response.created" || type === "input_audio_buffer.committed") {
       this.startTurn()
     } else if (type === INPUT_TRANSCRIPT) {
-      this.append("user", strAt(m, ["transcript"]))
-      if (repl !== undefined) out = withProviderText(type, m, repl)
+      if (this.transcription) {
+        if (repl !== undefined) out = withProviderText(type, m, repl)
+        this.onTranscribed(m)
+      } else {
+        this.append("user", strAt(m, ["transcript"]))
+        if (repl !== undefined) out = withProviderText(type, m, repl)
+      }
     } else if (isRealtimeOutputDelta(type)) {
       const d = strAt(m, ["delta"])
       this.append("assistant", d)
@@ -751,7 +801,36 @@ export class LiveCore {
     const text = this.takeText()
     const began = this.turnStartMs > 0.0 ? this.turnStartMs : this.now
     this.turnStartMs = 0.0
-    this.emit("turn", 0.0, 0.0, [used], text.input, text.output, began, this.now, false)
+    this.emit("turn", 0.0, 0.0, [used], text.input, text.output, began, this.now, false, doneOutcome(m))
+  }
+
+  // A transcription of the caller's audio finished: the unit is admitted if no commit opened it, then its usage (tokens,
+  // or the seconds of audio for a model billed by duration) is logged and charged on its own, once per item.
+  private onTranscribed(m: string): void {
+    const item = strAt(m, ["item_id"])
+    if (item !== "") {
+      if (this.billed.has("item:" + item)) return
+      this.billed.add("item:" + item)
+    }
+    if (!this.turnActive) {
+      this.startTurn()
+      if (this.refused) return
+    }
+    this.turnActive = false
+    // the transcript is the unit's output: a transcription session answers with what the caller said
+    this.append("assistant", strAt(m, ["transcript"]))
+    let used: ModelTokens = { model: this.model, prompt: 0, completion: 0, cached: 0, inputAudio: 0, outputAudio: 0 }
+    let seconds = 0.0
+    if (strAt(m, ["usage", "type"]) === "duration") {
+      seconds = numAt(m, ["usage", "seconds"])
+    } else {
+      used = this.addTokens(this.model, Math.trunc(numAt(m, ["usage", "input_tokens"])), Math.trunc(numAt(m, ["usage", "output_tokens"])), 0,
+        Math.trunc(numAt(m, ["usage", "input_token_details", "audio_tokens"])), 0)
+    }
+    const text = this.takeText()
+    const began = this.turnStartMs > 0.0 ? this.turnStartMs : this.now
+    this.turnStartMs = 0.0
+    this.emit("transcription", seconds, 0.0, [used], text.input, text.output, began, this.now, false, undefined)
   }
 
   // Adds tokens to the session's totals and to the model's; what was added is returned.
@@ -785,7 +864,8 @@ export class LiveCore {
 
   // A billing unit closes: its row is handed to the gateway, which logs it and charges it (budgets and
   // token limits) at once.
-  private emit(kind: string, seconds: f64, billed: f64, uses: ModelTokens[], input: string, output: string, startedMs: f64, endedMs: f64, last: bool): void {
+  // A response's outcome (outcome) gives its row's status and error; otherwise a unit is 200 unless it ends the session.
+  private emit(kind: string, seconds: f64, billed: f64, uses: ModelTokens[], input: string, output: string, startedMs: f64, endedMs: f64, last: bool, outcome: DoneOutcome | undefined): void {
     this.units += 1
     let prompt = 0
     let completion = 0
@@ -793,10 +873,20 @@ export class LiveCore {
       prompt += u.prompt
       completion += u.completion
     }
+    let status = last ? this.status : 200
+    let error = last ? this.error : ""
+    let state = ""
+    let stateReason = ""
+    if (outcome !== undefined) {
+      status = outcome.status
+      error = outcome.error
+      state = outcome.state
+      stateReason = outcome.reason
+    }
     this.hooks.turn({
       kind: kind, index: this.units, sessionId: this.sessionId, seconds: seconds, billedSeconds: billed, promptTokens: prompt, completionTokens: completion, uses: uses,
-      status: last ? this.status : 200, error: last ? this.error : "", reason: last ? this.reason : "", startedMs: startedMs, endedMs: endedMs, input: input, output: output,
-      events: this.events, last: last,
+      status: status, error: error, reason: last ? this.reason : "", startedMs: startedMs, endedMs: endedMs, input: input, output: output,
+      events: this.events, last: last, state: state, stateReason: stateReason,
     })
   }
 
@@ -806,7 +896,7 @@ export class LiveCore {
     this.emittedBilled += billed
     const began = this.unitStartMs
     this.unitStartMs = this.now
-    this.emit(kind, seconds, billed, [], input, output, began, this.now, last)
+    this.emit(kind, seconds, billed, [], input, output, began, this.now, last, undefined)
   }
 
   private append(role: string, delta: string): void {
@@ -880,7 +970,7 @@ export class LiveCore {
       return
     }
     this.lastBackendMs = this.now
-    this.emit("delegation", 0.0, 0.0, [used], "", "", began, this.now, false)
+    this.emit("delegation", 0.0, 0.0, [used], "", "", began, this.now, false, undefined)
   }
 
   // Tells the browser why the session is ending, then closes it upstream so the usage already spent
@@ -984,11 +1074,11 @@ export class LiveCore {
     const text = this.takeText()
     if (this.realtime) {
       if (this.status !== 200 || this.turnActive || text.input !== "" || text.output !== "") {
-        this.emit("end", 0.0, 0.0, [], text.input, text.output, this.turnStartMs > 0.0 ? this.turnStartMs : nowMs, nowMs, true)
+        this.emit("end", 0.0, 0.0, [], text.input, text.output, this.turnStartMs > 0.0 ? this.turnStartMs : nowMs, nowMs, true, undefined)
       }
     } else {
       if (this.pendingUses.length > 0) {
-        this.emit("delegation", 0.0, 0.0, this.pendingUses, "", "", this.lastBackendMs > 0.0 ? this.lastBackendMs : this.startedMs, nowMs, false)
+        this.emit("delegation", 0.0, 0.0, this.pendingUses, "", "", this.lastBackendMs > 0.0 ? this.lastBackendMs : this.startedMs, nowMs, false, undefined)
         this.pendingUses = []
       }
       const rest = seconds - this.emittedAudio
@@ -1375,6 +1465,8 @@ export type Setup = {
   realtime: bool,
   model: string,
   backendModel: string,
+  // a realtime transcription session (LiveCore.transcription)
+  transcription?: bool,
 }
 
 export type Established = { status: int, type: string, message: string, answer: string, sessionId: string, relay: Relay | undefined, body: string, contentType: string }
@@ -1509,6 +1601,7 @@ export async function establish(s: Setup): Promise<Established> {
   const relay = new Relay(s.hooks, s.guard, Date.now())
   relay.core.filter = s.filter
   relay.core.realtime = s.realtime
+  relay.core.transcription = s.transcription ?? false
   relay.core.model = s.model
   relay.core.backendModel = s.backendModel
   // nothing is billed until the provider has created the session
@@ -2408,6 +2501,85 @@ test("a realtime turn the caller cut off, or text no turn took, is a closing row
   const v = realtimeFixture()
   v.core.clientLeft(1200.0)
   expect(v.cap.turns.length).toBe(0)
+})
+
+test("a failed or cancelled response.done is a row with the status Bifrost gives it; an incomplete one is 200", () => {
+  const t = realtimeFixture()
+  t.core.fromClient(`{"type":"response.create"}`, [], 1100.0)
+  t.core.fromProvider(`{"type":"response.done","response":{"id":"r_f","status":"failed","status_details":{"type":"failed","error":{"type":"server_error","code":"upstream_error","message":"the model crashed"}},"usage":{"input_tokens":30,"output_tokens":2}}}`, undefined, 1200.0)
+  expect(t.cap.turns.length).toBe(1)
+  const f = t.cap.turns[0]!
+  expect(f.status).toBe(500)
+  expect(f.error).toBe("the model crashed")
+  expect(f.state).toBe("failed")
+  expect(f.stateReason).toBe("upstream_error")
+  // what the failed response used is still billed
+  expect(f.promptTokens).toBe(30)
+  t.core.fromClient(`{"type":"response.create"}`, [], 1300.0)
+  t.core.fromProvider(`{"type":"response.done","response":{"id":"r_c","status":"cancelled","status_details":{"type":"cancelled","reason":"turn_detected"},"usage":{"input_tokens":5,"output_tokens":1}}}`, undefined, 1400.0)
+  const c = t.cap.turns[1]!
+  expect(c.status).toBe(499)
+  expect(c.error).toBe("the response was cancelled (turn_detected)")
+  expect(c.stateReason).toBe("turn_detected")
+  t.core.fromClient(`{"type":"response.create"}`, [], 1500.0)
+  t.core.fromProvider(`{"type":"response.done","response":{"id":"r_i","status":"incomplete","status_details":{"type":"incomplete","reason":"max_output_tokens"}}}`, undefined, 1600.0)
+  const i = t.cap.turns[2]!
+  expect(i.status).toBe(200)
+  expect(i.error).toBe("")
+  expect(i.state).toBe("incomplete")
+  expect(i.stateReason).toBe("max_output_tokens")
+  t.core.fromProvider(DONE_2, undefined, 1700.0)
+  expect(t.cap.turns[3]!.status).toBe(200)
+  expect(t.cap.turns[3]!.state).toBe("completed")
+  // the session itself is no failure
+  t.core.clientLeft(1800.0)
+  expect(t.cap.reports[0]!.status).toBe(200)
+})
+
+test("a realtime error's status follows its type, code and message", () => {
+  expect(realtimeErrorStatus(["server_error", "", "boom"])).toBe(500)
+  expect(realtimeErrorStatus(["invalid_request_error", "bad_param", "nope"])).toBe(400)
+  expect(realtimeErrorStatus(["", "rate_limit_exceeded", "slow down"])).toBe(429)
+  expect(realtimeErrorStatus(["invalid_request_error", "insufficient_quota", ""])).toBe(429)
+  expect(doneOutcome(`{"type":"response.done","response":{"status":"failed"}}`).error).toBe("realtime turn failed")
+  expect(doneOutcome(`{"type":"response.done","response":{}}`).status).toBe(200)
+})
+
+test("a transcription session is a row per transcription, billed from the usage that event reports", () => {
+  const t = realtimeFixture()
+  t.core.transcription = true
+  t.core.model = "gpt-4o-transcribe"
+  t.core.fromProvider(`{"type":"transcription_session.created","session":{"id":"sess_tr"}}`, undefined, 1050.0)
+  t.core.fromProvider(`{"type":"input_audio_buffer.committed","item_id":"item_1"}`, undefined, 1100.0)
+  expect(t.cap.readmits).toBe(1)
+  t.core.fromProvider(`{"type":"conversation.item.input_audio_transcription.delta","item_id":"item_1","delta":"hel"}`, undefined, 1150.0)
+  t.core.fromProvider(`{"type":"conversation.item.input_audio_transcription.completed","item_id":"item_1","transcript":"hello there","usage":{"type":"tokens","total_tokens":28,"input_tokens":20,"input_token_details":{"text_tokens":4,"audio_tokens":16},"output_tokens":8}}`, undefined, 1300.0)
+  expect(t.cap.turns.length).toBe(1)
+  const a = t.cap.turns[0]!
+  expect(a.kind).toBe("transcription")
+  expect(a.status).toBe(200)
+  expect(a.promptTokens).toBe(20)
+  expect(a.completionTokens).toBe(8)
+  expect(a.uses[0]!.model).toBe("gpt-4o-transcribe")
+  expect(a.uses[0]!.inputAudio).toBe(16)
+  expect(a.output).toBe("hello there")
+  expect(a.input).toBe("")
+  expect(a.startedMs).toBe(1100.0)
+  // the same item again is not billed twice
+  t.core.fromProvider(`{"type":"conversation.item.input_audio_transcription.completed","item_id":"item_1","transcript":"hello there","usage":{"type":"tokens","input_tokens":20,"output_tokens":8}}`, undefined, 1350.0)
+  expect(t.cap.turns.length).toBe(1)
+  // a model billed by duration: the seconds, and no commit before it (the unit is admitted as it closes)
+  t.core.fromProvider(`{"type":"conversation.item.input_audio_transcription.completed","item_id":"item_2","transcript":"bye","usage":{"type":"duration","seconds":2.5}}`, undefined, 1400.0)
+  expect(t.cap.readmits).toBe(2)
+  const b = t.cap.turns[1]!
+  expect(b.seconds).toBe(2.5)
+  expect(b.promptTokens).toBe(0)
+  expect(b.output).toBe("bye")
+  // a commit that never got its transcript is the closing row
+  t.core.fromProvider(`{"type":"input_audio_buffer.committed","item_id":"item_3"}`, undefined, 1500.0)
+  t.core.clientLeft(1600.0)
+  expect(t.cap.turns.length).toBe(3)
+  expect(t.cap.turns[2]!.kind).toBe("end")
 })
 
 test("a live session is a row per window of voice time, and the last one carries the end", () => {
