@@ -303,6 +303,12 @@ export class StreamConverter {
     this.iv = new InvokeStream(model)
   }
 
+  // The upstream is a legacy text model's InvokeModelWithResponseStream (Bedrock), not a ConverseStream.
+  invokeText(): void {
+    const br = this.br
+    if (br !== undefined) br.invokeText = true
+  }
+
   // Bedrock's event streams are binary, so their frames are kept apart from the text.
   framed(): bool {
     return this.cv !== undefined || this.iv !== undefined
@@ -2397,6 +2403,13 @@ export class Engine {
   // (comma-separated server names) narrows them; "none" leaves the request alone.
   // Bifrost's injected_tools: the provider's MCP tools join each chat request it serves, under their configured names.
   // A client tool with an injected name is replaced. Unchanged when nothing can be injected.
+  // Whether a target's request gets the prompt cache breakpoints: the gateway's prompt_cache.auto_inject, the
+  // request's x-bf-prompt-cache-auto-inject, or the provider's own prompt_cache.auto_inject.
+  cacheAutoFor(req: Request): (t: Target) => bool {
+    const on = this.autoPromptCache || req.headers.get("x-bf-prompt-cache-auto-inject") === "true"
+    return (t: Target): bool => on || (t.cfg.prompt_cache?.auto_inject ?? false)
+  }
+
   withInjected(t: Target, body: Field[]): Field[] throws SyntaxError {
     const inj = t.cfg.injected_tools ?? []
     const m = this.mcp
@@ -4787,12 +4800,14 @@ export class Engine {
       const sh = try cp.shape(t.provider, t.kind, t.model, body)
       if (sh.route === "chat") return try textAsChat(t, sh, stream, canPipe)
       if (t.kind === "replicate") return try replicateText(t, body)
-      // Anthropic's legacy complete API and Bedrock's InvokeModel text models answer whole, as in Bifrost (which has
-      // no Anthropic text stream; Bedrock's InvokeModel stream is not built here)
-      if (t.kind === "anthropic" || t.kind === "bedrock") {
+      // Anthropic's legacy complete API answers whole, as in Bifrost (which has no Anthropic text stream). Bedrock's
+      // InvokeModel text models stream on InvokeModelWithResponseStream, as Bifrost's TextCompletionStream; a stream
+      // that cannot be piped is asked whole and sent as one frame.
+      if (t.kind === "anthropic") {
         if (stream) throw new SyntaxError(`text_completion_stream is not supported by ${t.provider} provider`)
-        return t.kind === "anthropic" ? try anthropicNative.textRequest(t, sh.body) : try bedrockNative.textRequest(t, sh.body)
+        return try anthropicNative.textRequest(t, sh.body)
       }
+      if (t.kind === "bedrock") return canPipe ? try bedrockNative.textStreamRequest(t, sh.body) : try bedrockNative.textRequest(t, sh.body)
       // Sarvam's OpenAI-compatible API has chat only (Bifrost refuses its text completions)
       if (!providers.streamsNatively(t.kind) || t.kind === "sarvam") throw new SyntaxError(`${t.provider} does not serve text completions`)
       return openai.completionsRequest(t, sh.body)
@@ -4810,7 +4825,11 @@ export class Engine {
         return { body: try this.guardWhole(chatSseToText(try completionToSse(tr.body, wantUsage)), "text", true), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
       }
       if (t.kind === "anthropic") return try anthropicNative.textResponse(text, requested)
-      if (t.kind === "bedrock") return try bedrockNative.textResponse(text, t.model, requested)
+      if (t.kind === "bedrock") {
+        const tr = try bedrockNative.textResponse(text, t.model, requested)
+        if (!stream) return tr
+        return { body: try this.guardWhole(try textAnswerSse(tr.body, wantUsage), "text", true), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
+      }
       if (stream) {
         const sr = openai.streamResponse(text, requested)
         return { body: try this.guardWhole(sr.body, "text", true), promptTokens: sr.promptTokens, completionTokens: sr.completionTokens }
@@ -4824,7 +4843,10 @@ export class Engine {
     const mk: ConverterFactory = (t, requested) => {
       if (!streamable(t)) return undefined
       const conv = new StreamConverter(converterKind(t), requested, wantUsage)
-      conv.txt = cp.routeFor(t.provider, t.kind, t.model) === "chat"
+      const chat = cp.routeFor(t.provider, t.kind, t.model) === "chat"
+      // Bedrock's invoke stream of a text model is read as chat chunks, then framed as text completions
+      if (!chat && t.kind === "bedrock") conv.invokeText()
+      conv.txt = chat || t.kind === "bedrock"
       if (stream) conv.guard = this.streamGuard("text", true, true)
       return conv
     }
@@ -4842,6 +4864,27 @@ async function sendSpans(url: string, headers: Map<string, string>, body: string
     console.error(`raiju: trace export failed: ${e.message}`)
   }
 }
+
+// A whole text completion answer as a text completion stream: one frame with the choices, the usage frame when
+// the caller asked for it (stream_options.include_usage), and [DONE].
+export function textAnswerSse(answer: string, includeUsage: bool): string throws SyntaxError {
+  const fs = try fields(answer)
+  const usage = find(fs, "usage")
+  let out = `data: ${build(without(fs, ["usage"]))}\n\n`
+  if (includeUsage && usage !== undefined) {
+    const head = fs.filter((f) => f.key === "id" || f.key === "object" || f.key === "created" || f.key === "model")
+    head.push({ key: "choices", raw: "[]" })
+    head.push({ key: "usage", raw: usage })
+    out += `data: ${build(head)}\n\n`
+  }
+  return out + "data: [DONE]\n\n"
+}
+
+test("a whole text answer as a text stream", () => {
+  const a = `{"id":"c1","object":"text_completion","created":1,"model":"m","choices":[{"index":0,"text":"hi","finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`
+  expect(try textAnswerSse(a, false)).toBe(`data: {"id":"c1","object":"text_completion","created":1,"model":"m","choices":[{"index":0,"text":"hi","finish_reason":"stop"}]}\n\ndata: [DONE]\n\n`)
+  expect((try textAnswerSse(a, true)).includes(`data: {"id":"c1","object":"text_completion","created":1,"model":"m","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}\n\n`)).toBe(true)
+})
 
 // Removes the trailing usage-only chunk the gateway asked for but the caller didn't.
 export function dropUsageChunks(sse: string): string {

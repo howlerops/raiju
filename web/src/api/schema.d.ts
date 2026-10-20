@@ -5641,9 +5641,12 @@ export interface components {
             value?: string;
             models?: string[];
             weight?: number;
+            /** @description Request model name to the provider's model. An alias whose provider override belongs to another provider (azure, vertex, bedrock or replicate fields on another provider's key) is refused with 400 (Invalid aliases). */
             aliases?: {
                 [key: string]: string;
             };
+            /** @description Model names (alias names for aliases) this key never serves or lists; "*" blocks every model. */
+            blacklisted_models?: string[];
             use_for_batch_api?: boolean;
             azure_key_config?: {
                 [key: string]: unknown;

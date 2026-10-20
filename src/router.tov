@@ -5,7 +5,7 @@ import { Target } from "./providers/types"
 import { isOpenAICompatible } from "./providers/openai"
 import { Health, pickAdaptive } from "./health"
 import { datasheetProviders } from "./pricing"
-import { aliasLookup, aliasEntry, aliasProblem, resolveKeyAlias, AliasResult } from "./aliases"
+import { aliasLookup, aliasEntry, aliasProblem, aliasProviderProblem, resolveKeyAlias, AliasResult } from "./aliases"
 
 export type ModelRef = { provider: string, model: string }
 
@@ -116,12 +116,29 @@ export function aliasProblems(cfg: Config): string[] {
       if (a === undefined) continue
       const p = aliasProblem(a, cfg.client?.routing_chain_max_depth)
       if (p !== "") out.push(name + " key " + (keys[i]!.name ?? ("" + i)) + ": " + p)
+      // an override for another provider's keys (Bifrost refuses the aliases; here the override is not applied)
+      const pp = aliasProviderProblem(a, kindOf(name, ps.get(name)!))
+      if (pp !== "") out.push(name + " key " + (keys[i]!.name ?? ("" + i)) + ": " + pp + "; the override is not applied")
     }
   }
   return out
 }
 
+// Whether a key's blacklisted_models block a model (a request model name, so an alias by its name): "*" blocks every
+// model, any other entry the model by name, case-insensitively, as Bifrost's BlackList.
+export function keyBlocks(k: KeyConfig, model: string): bool {
+  const bl = k.blacklisted_models
+  if (bl === undefined || bl.length === 0) return false
+  const low = model.toLowerCase()
+  for (const b of bl) {
+    if (b === "*" || b.toLowerCase() === low) return true
+  }
+  return false
+}
+
 export function keyAllows(k: KeyConfig, model: string): bool {
+  // the blacklist wins over the allow list and the aliases
+  if (keyBlocks(k, model)) return false
   const ms = k.models
   if (ms === undefined || ms.length === 0) return true
   const a = k.aliases
@@ -130,6 +147,59 @@ export function keyAllows(k: KeyConfig, model: string): bool {
     if (m === "*" || m === model) return true
   }
   return false
+}
+
+// A provider's model listing (provider/model ids as its API lists them) through Bifrost's ListModelsPipeline, key by
+// key, the results joined: a model an alias of the key targets is listed under the alias name as well as its own; a
+// model the key blacklists is dropped (by either name); and the key's aliases its listing did not match are added
+// back. A key with a model list lists those models (minus its blacklist), as Bifrost lists a restricted allow list.
+// keys are the provider's keys; none (a keyless provider) lists the ids as they are.
+export function listingPipeline(provider: string, ids: string[], keys: KeyConfig[]): string[] {
+  if (keys.length === 0) return ids
+  const out: string[] = []
+  const seen: Set<string> = new Set()
+  const add = (name: string): void => {
+    const id = provider + "/" + name
+    if (seen.has(id.toLowerCase())) return
+    seen.add(id.toLowerCase())
+    out.push(id)
+  }
+  const pre = provider + "/"
+  for (const k of keys) {
+    const ms = (k.models ?? []).filter((m) => m !== "*")
+    if (ms.length > 0) {
+      for (const m of ms) {
+        if (!keyBlocks(k, m)) add(m)
+      }
+      continue
+    }
+    const a = k.aliases
+    const matched: Set<string> = new Set()
+    for (const id of ids) {
+      const bare = id.startsWith(pre) ? id.slice(pre.byteLength) : id
+      const names: string[] = []
+      if (a !== undefined) {
+        for (const name of a.keys()) {
+          const target = aliasLookup(a, name) ?? ""
+          if (target.toLowerCase() === bare.toLowerCase()) {
+            names.push(name)
+            matched.add(name)
+          }
+        }
+      }
+      names.push(bare)
+      for (const n of names) {
+        if (!keyBlocks(k, n)) add(n)
+      }
+    }
+    // the aliases the provider's listing did not name are still models of this key
+    if (a !== undefined) {
+      for (const name of a.keys()) {
+        if (!matched.has(name) && !keyBlocks(k, name)) add(name)
+      }
+    }
+  }
+  return out
 }
 
 // Weighted random choice among keys that serve the model, skipping excluded ones.
@@ -256,9 +326,9 @@ export function target(cfg: Config, ref: ModelRef, exclude: Set<int>, pinned: st
 
 // The key a request to an alias is sent with: the alias's provider overrides replace the key's own settings, as
 // Bifrost's per-alias AliasConfig overrides the key-level defaults. Each applies to its provider's keys only:
-// api_version and endpoint (Azure), region, project_id, project_number and force_single_region (Vertex), region, inference_profile_arn and
-// use_openai_endpoints (Bedrock; region also on Bedrock Mantle) and use_deployments_endpoint (Replicate). Values
-// written "env.NAME" are read from the environment.
+// api_version and endpoint (Azure), region, project_id, project_number and force_single_region (Vertex), region,
+// inference_profile_arn and use_openai_endpoints (Bedrock), region and project_id (Bedrock Mantle) and
+// use_deployments_endpoint (Replicate). Values written "env.NAME" are read from the environment.
 export function aliasOverrides(k: KeyConfig, a: AliasTarget | undefined, kind: string): KeyConfig {
   if (a === undefined) return k
   let n = k
@@ -288,11 +358,14 @@ export function aliasOverrides(k: KeyConfig, a: AliasTarget | undefined, kind: s
     const rg = a.region
     const arn = kind === "bedrock" ? a.inference_profile_arn : undefined
     const oai = kind === "bedrock" ? a.use_openai_endpoints : undefined
-    if ((rg !== undefined && rg !== "") || (arn !== undefined && arn !== "") || oai !== undefined) {
+    // the Bedrock project (Mantle's OpenAI-Project / anthropic-workspace-id header)
+    const proj = kind === "bedrock_mantle" ? a.project_id : undefined
+    if ((rg !== undefined && rg !== "") || (arn !== undefined && arn !== "") || oai !== undefined || (proj !== undefined && proj !== "")) {
       let bk = n.bedrock_key_config ?? {}
       if (rg !== undefined && rg !== "") bk.region = resolveEnv(rg)
       if (arn !== undefined && arn !== "") bk.arn = resolveEnv(arn)
       if (oai !== undefined) bk.use_openai_endpoints = oai
+      if (proj !== undefined && proj !== "") bk.project_id = resolveEnv(proj)
       n.bedrock_key_config = bk
     }
   }
@@ -439,12 +512,42 @@ test("an alias's provider overrides replace the key's settings for its requests"
   const vk = aliasOverrides({ vertex_key_config: { project_id: "p1", region: "us-central1" } }, { model_id: "m", project_id: "p2", region: "europe-west4" }, "vertex")
   expect(vk.vertex_key_config!.project_id).toBe("p2")
   expect(vk.vertex_key_config!.region).toBe("europe-west4")
+  const mk = aliasOverrides({ value: "m", bedrock_key_config: { project_id: "p-key" } }, { model_id: "m", project_id: "p-alias", region: "us-west-2" }, "bedrock_mantle")
+  expect(mk.bedrock_key_config!.project_id).toBe("p-alias")
+  expect(mk.bedrock_key_config!.region).toBe("us-west-2")
   const rk = aliasOverrides({ value: "r" }, { model_id: "acme/dep", use_deployments_endpoint: true }, "replicate")
   expect(rk.replicate_key_config!.use_deployments_endpoint).toBe(true)
   // an override for another provider is not applied
   const other = aliasOverrides({ value: "k" }, { model_id: "m", api_version: "x", use_deployments_endpoint: true }, "openai")
   expect(other.azure_key_config).toBeUndefined()
   expect(other.replicate_key_config).toBeUndefined()
+})
+
+test("a key's blacklist wins over its models and aliases", () => {
+  const a: Map<string, string | AliasTarget> = new Map()
+  a.set("fast", "gpt-4o-mini")
+  const k: KeyConfig = { value: "k", models: [], aliases: a, blacklisted_models: ["GPT-4o", "fast"] }
+  expect(keyAllows(k, "gpt-4o")).toBe(false)
+  expect(keyAllows(k, "fast")).toBe(false)
+  expect(keyAllows(k, "gpt-4o-mini")).toBe(true)
+  expect(keyAllows({ value: "k", models: ["x"], blacklisted_models: ["*"] }, "x")).toBe(false)
+})
+
+test("the model listing goes through each key's aliases and blacklist", () => {
+  const a: Map<string, string | AliasTarget> = new Map()
+  a.set("house", { model_id: "gpt-4o" })
+  a.set("spare", "never-listed")
+  const ids = ["openai/gpt-4o", "openai/gpt-4o-mini", "openai/old-1"]
+  const k: KeyConfig = { value: "k", models: [], aliases: a, blacklisted_models: ["old-1"] }
+  expect(listingPipeline("openai", ids, [k])).toEqual(["openai/house", "openai/gpt-4o", "openai/gpt-4o-mini", "openai/spare"])
+  // a blacklisted alias name drops the alias, not its target
+  const k2: KeyConfig = { value: "k", models: [], aliases: a, blacklisted_models: ["house", "spare"] }
+  expect(listingPipeline("openai", ids, [k2])).toEqual(["openai/gpt-4o", "openai/gpt-4o-mini", "openai/old-1"])
+  // a key with a model list lists those, minus its blacklist; keys are joined without repeats
+  const k3: KeyConfig = { value: "k", models: ["a", "b", "*"], blacklisted_models: ["b"] }
+  expect(listingPipeline("p", [], [k3, { value: "k", models: ["a", "c"] }])).toEqual(["p/a", "p/c"])
+  // a keyless provider lists as it is
+  expect(listingPipeline("p", ["p/x"], [])).toEqual(["p/x"])
 })
 
 test("parses provider-prefixed and bare models", () => {

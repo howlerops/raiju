@@ -4,7 +4,7 @@ import { Config, VirtualKeyConfig, OAuthKeyConfig, ProviderConfig, providerOf, p
 import { Engine, StreamSink, errorResponse, noHeaders } from "./gateway"
 import { anthropicMessages, anthropicLegacy, cursorChat, genai, genaiSdk, bedrockModel, responsesApi, cohereChat, cohereEmbed, cohereRerank, cohereTokenize } from "./native"
 import * as genaiIn from "./genai_in"
-import { kindOf } from "./router"
+import { kindOf, listingPipeline } from "./router"
 import { Target, Upstream, addExtraHeaders } from "./providers/types"
 import * as openai from "./providers/openai"
 import * as anthropic from "./providers/anthropic"
@@ -17,6 +17,7 @@ import * as openrouter from "./providers/openrouter"
 import * as copilot from "./providers/githubcopilot"
 import * as cohere from "./providers/cohere"
 import * as bedrockMantle from "./providers/bedrock_mantle"
+import * as watsonx from "./providers/watsonx"
 import { bedrockIds, publisherPage, cloudflarePage, cloudflareSearchPath } from "./model_list"
 import { retrieveRequest, retrieveBody } from "./model_retrieve"
 import { fields, find, elements, rawStr, rawBool } from "./json"
@@ -49,7 +50,7 @@ import { McpSession } from "./mcp"
 import { Ops, Reply, UiSocket } from "./ops"
 import { parseCursor } from "./feed"
 import { cookieValue, SETUP_COOKIE } from "./setupsession"
-import { rerank, bedrockRerank, countTokens, responsesInputTokens, asyncSubmit, asyncGet, sdkAsyncSubmit, sdkAsyncPoll, decisionRoute, Dispatch } from "./extras"
+import { rerank, bedrockRerank, countTokens, responsesInputTokens, asyncSubmit, asyncGet, sdkAsyncSubmit, sdkAsyncPoll, decisionRoute, openaiDecisionPath, Dispatch } from "./extras"
 import { asyncPoll } from "./jobs"
 import { serveUi, uiPath, UI_CSP } from "./uiserve"
 import { TransportRun, transportStart, transportEnd, transportDone, transportSink, llmHooked, storageHooked, StorageCall, storageOp, pathWithId } from "./pluginroute"
@@ -84,7 +85,7 @@ function upstreamModels(provider: string, kind: string, t: Target): Upstream | u
 // GitHub Copilot, Bedrock Mantle and Azure answer in OpenAI's shape, but their requests are their own (editor headers
 // and a minted token; the regional host and SigV4; the resource endpoint and api-key or Entra token).
 function nativeList(kind: string): bool {
-  return kind === "bedrock" || kind === "vertex" || kind === "cloudflare" || kind === "databricks" || kind === "replicate" || kind === "github-copilot" || kind === "bedrock_mantle" || kind === "azure"
+  return kind === "bedrock" || kind === "vertex" || kind === "cloudflare" || kind === "databricks" || kind === "replicate" || kind === "github-copilot" || kind === "bedrock_mantle" || kind === "azure" || kind === "watsonx"
 }
 
 // One GET on a provider listing: the body when the answer is 2xx, else undefined.
@@ -166,6 +167,19 @@ async function ownListingIds(engine: Engine | undefined, provider: string, t: Ta
     if (tok.error !== "") return undefined
     lt.key.value = tok.token
   }
+  const bk = lt.key.bedrock_key_config
+  if (lt.kind === "bedrock_mantle" && (lt.key.value ?? "") === "" && bk !== undefined && (bk.role_arn ?? "") !== "") {
+    // a key with role_arn lists with the role's temporary credentials (STS AssumeRole, cached), as its calls do
+    if (engine === undefined) return undefined
+    const ar = await engine.assumeRole(bk)
+    if (ar.error !== "") return undefined
+    let nb = bk
+    nb.access_key = ar.creds!.accessKey
+    nb.secret_key = ar.creds!.secretKey
+    nb.session_token = ar.creds!.sessionToken
+    nb.role_arn = undefined
+    lt.key.bedrock_key_config = nb
+  }
   let up = bedrockMantle.modelsRequest(lt)
   if (lt.kind === "github-copilot") up = try copilot.modelsRequest(lt)
   else if (lt.kind === "azure") up = openai.azureModelsRequest(lt)
@@ -179,7 +193,33 @@ async function nativeModelIds(engine: Engine | undefined, provider: string, t: T
   try {
     if (t.kind === "databricks") return ids
     if (t.kind === "github-copilot" || t.kind === "bedrock_mantle" || t.kind === "azure") return await ownListingIds(engine, provider, t)
+    if (t.kind === "watsonx") {
+      // the instance's foundation model specs (chat models), every page, with the key's IAM token
+      const wk = t.key.watsonx_key_config
+      if (wk === undefined) return undefined
+      let token = ""
+      if (engine !== undefined) {
+        const tok = await engine.watsonxToken(t)
+        if (tok.error !== "") return undefined
+        token = tok.token
+      }
+      let next = ""
+      let any = false
+      for (let page = 0; page < 20; page++) {
+        const text = await getListing(watsonx.modelsRequest(wk, token, next))
+        if (text === undefined) break
+        any = true
+        const pg = try watsonx.modelsPage(text)
+        for (const id of pg.ids) ids.push(provider + "/" + id)
+        if (pg.next === "" || pg.next === next) break
+        next = pg.next
+      }
+      return any ? ids : undefined
+    }
     if (t.kind === "replicate") {
+      // Replicate has no model catalog to list: without use_deployments_endpoint the listing is empty, and the
+      // listing pipeline adds the key's aliases back (listingPipeline), as Bifrost's
+      if (t.key.replicate_key_config?.use_deployments_endpoint !== true) return ids
       // the account's deployments, every page: each answer's next is the full URL of the following page
       const first = replicate.deploymentsRequest(t)
       let next = first.url
@@ -254,16 +294,19 @@ async function nativeModelIds(engine: Engine | undefined, provider: string, t: T
   return undefined
 }
 
+// A provider's models for GET /v1/models: the keys' model lists, or the provider's own listing, through the keys'
+// aliases and blacklists (router.tov listingPipeline, Bifrost's ListModelsPipeline).
 async function providerModels(engine: Engine | undefined, cfg: Config, provider: string): Promise<string[]> {
   const p = providerOf(cfg, provider)
   if (p === undefined) return []
-  const listed: string[] = []
-  for (const k of p.keys ?? []) {
-    for (const m of k.models ?? []) {
-      if (m !== "*" && !listed.includes(provider + "/" + m)) listed.push(provider + "/" + m)
-    }
-  }
-  if (listed.length > 0) return listed
+  const keys = p.keys ?? []
+  const listed = keys.some((k) => (k.models ?? []).some((m) => m !== "*"))
+  if (listed) return listingPipeline(provider, [], keys)
+  return listingPipeline(provider, await upstreamModelIds(engine, cfg, provider, p), keys)
+}
+
+// The provider's own listing (cached for five minutes), as its API names the models.
+async function upstreamModelIds(engine: Engine | undefined, cfg: Config, provider: string, p: ProviderConfig): Promise<string[]> {
   const cachedAt = modelCache.fetchedAt.get(provider) ?? 0.0
   if (Date.now() - cachedAt < 300000.0) return modelCache.ids.get(provider) ?? []
   const kind = kindOf(provider, p)
@@ -973,6 +1016,9 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
   }
   const dep = deploymentRoute(p)
   if (dep !== undefined && m === "POST") return try await dispatch(engine, ops, await deploymentRequest(req, dep))
+  // OpenAI's own decisions route (under /openai and the SDK prefixes) answers in OpenAI's shape, so it is told apart
+  // before the path loses its prefix
+  if (m === "POST" && openaiDecisionPath(p)) return await cors(engine.cfg, req, await decisionRoute(engine, req, "/openai/v1/decisions"))
   const cp = compatPath(p)
   if (cp !== p) return try await dispatch(engine, ops, await unprefixed(req, cp))
   const segs = p.split("/")

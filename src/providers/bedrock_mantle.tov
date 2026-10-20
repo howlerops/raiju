@@ -68,22 +68,53 @@ function withModel(body: Field[], model: string): string {
 }
 
 // The OpenAI body as an Anthropic Messages body for an Anthropic-family model. The provider's prompt_cache injection
-// points mark messages, as on Anthropic.
-function messagesText(body: Field[], model: string, cache?: ProviderPromptCacheConfig): string throws SyntaxError {
+// points mark messages, and auto_inject places the breakpoints, as on Anthropic.
+function messagesText(body: Field[], model: string, cache?: ProviderPromptCacheConfig, autoCache?: bool): string throws SyntaxError {
   const req = try JSON.parse(build(body)) as ChatRequest
-  return try anthropic.messagesBody(req, body, model, false, false, cache)
+  return try anthropic.messagesBody(req, body, model, false, autoCache === true, cache)
 }
 
 // The chat POST at a given time. Bearer auth when the key has a value; otherwise SigV4
 // with the key's access keys, signed for service "bedrock-mantle".
-export function chatRequestAt(t: Target, body: Field[], nowMs: f64): Upstream throws SyntaxError {
+export function chatRequestAt(t: Target, body: Field[], nowMs: f64, autoCache?: bool): Upstream throws SyntaxError {
   const sel = splitRegion(t.model)
   const anth = isAnthropicFamily(sel.model)
   const path = anth ? "/anthropic/v1/messages" : `/${basePath(sel.model)}/chat/completions`
   let text = ""
-  if (anth) text = try messagesText(body, sel.model, t.cfg.prompt_cache)
+  if (anth) text = try messagesText(body, sel.model, t.cfg.prompt_cache, autoCache)
   else text = withModel(body, sel.model)
   return try postAt(t, sel.region, path, text, anth, nowMs)
+}
+
+// Whether a Responses request goes to Mantle's own Responses endpoint: the OpenAI-compatible models (gpt-*, Gemma,
+// Grok) are served there, as Bifrost's Responses sends them (its datasheet check falls back to yes); Claude models
+// are answered through the Messages surface (the chat bridge).
+export function servesResponses(model: string): bool {
+  return !isAnthropicFamily(splitRegion(model).model)
+}
+
+// The Responses POST: the caller's Responses body with the bare model, on the model's base path.
+export function responsesRequestAt(t: Target, body: Field[], nowMs: f64): Upstream throws SyntaxError {
+  const sel = splitRegion(t.model)
+  return try postAt(t, sel.region, `/${basePath(sel.model)}/responses`, withModel(body, sel.model), false, nowMs)
+}
+
+export function responsesRequest(t: Target, body: Field[]): Upstream throws SyntaxError {
+  return try responsesRequestAt(t, body, Date.now())
+}
+
+// The Bedrock project the key (or an alias's override, put on the key) scopes the call to, or "" for the account's
+// default project.
+function projectOf(t: Target): string {
+  return t.key.bedrock_key_config?.project_id ?? ""
+}
+
+// The project header: OpenAI-Project on the OpenAI-compatible surface, anthropic-workspace-id on the Messages
+// surface (Bifrost's MantleOpenAIProjectHeader and MantleAnthropicProjectHeader). It is a plain header, outside the
+// signature.
+function setProject(inout h: Map<string, string>, t: Target, anth: bool): void {
+  const p = projectOf(t)
+  if (p !== "") h.set(anth ? "anthropic-workspace-id" : "OpenAI-Project", p)
 }
 
 // A POST to the Mantle host of the request's region (the model's prefix, else the key's, else us-east-1).
@@ -96,6 +127,7 @@ function postAt(t: Target, modelRegion: string | undefined, path: string, text: 
   if (bearer !== "") {
     let h = headers([["content-type", "application/json"], ["authorization", "Bearer " + bearer]])
     if (anth) h.set("anthropic-version", ANTHROPIC_VERSION)
+    setProject(&h, t, anth)
     addExtraHeaders(&h, t.cfg)
     return { url: at.sch + at.host + path, headers: h, body: text }
   }
@@ -110,8 +142,9 @@ function postAt(t: Target, modelRegion: string | undefined, path: string, text: 
     }
   }
   const creds: AwsCreds = { accessKey: ak, secretKey: bk?.secret_key ?? "", sessionToken: bk?.session_token ?? "" }
-  const h = signV4(creds, region, SIGNING_SERVICE, at.host, path, "application/json", text, nowMs, signedExtra)
+  let h = signV4(creds, region, SIGNING_SERVICE, at.host, path, "application/json", text, nowMs, signedExtra)
   if (anth) h.set("anthropic-version", ANTHROPIC_VERSION)
+  setProject(&h, t, anth)
   if (extra !== undefined) {
     for (const k of extra.keys()) {
       if (!k.toLowerCase().startsWith("x-amz-")) h.set(k, extra.get(k)!)
@@ -131,6 +164,8 @@ export function modelsRequestAt(t: Target, nowMs: f64): Upstream {
   let h: Map<string, string> = new Map()
   if (bearer !== "" || (bk?.access_key ?? "") === "") h = headers([["authorization", "Bearer " + bearer]])
   else h = signRequest("GET", { accessKey: bk?.access_key ?? "", secretKey: bk?.secret_key ?? "", sessionToken: bk?.session_token, region: region }, SIGNING_SERVICE, at.host, path, "", "", nowMs)
+  // the catalog is scoped to the key's project, as Bifrost's listing sends it
+  setProject(&h, t, false)
   addExtraHeaders(&h, t.cfg)
   return { url: at.sch + at.host + path, headers: h, body: "" }
 }
@@ -157,8 +192,8 @@ export function countRequest(t: Target, messagesBody: string): Upstream throws S
   return try countRequestAt(t, messagesBody, Date.now())
 }
 
-export function chatRequest(t: Target, body: Field[]): Upstream throws SyntaxError {
-  return try chatRequestAt(t, body, Date.now())
+export function chatRequest(t: Target, body: Field[], autoCache?: bool): Upstream throws SyntaxError {
+  return try chatRequestAt(t, body, Date.now(), autoCache)
 }
 
 // Mantle answers an OpenAI-family model in the OpenAI shape and a Claude model in the
@@ -280,6 +315,43 @@ test("count tokens goes to the native count path for Claude models only", () => 
   expect(up.url).toBe("https://bedrock-mantle.us-west-2.api.aws/anthropic/v1/messages/count_tokens")
   expect(up.headers.get("anthropic-version")).toBe("2023-06-01")
   expect(up.body).toBe(`{"model":"anthropic.claude-haiku-4-5","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+})
+
+test("project_id scopes calls and the listing: OpenAI-Project, or anthropic-workspace-id for Claude", () => {
+  const body = try fields(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
+  let t = mantleTarget("openai.gpt-oss-120b", "mk", undefined)
+  t.key.bedrock_key_config = { project_id: "proj-1" }
+  expect((try chatRequestAt(t, body, 0.0)).headers.get("OpenAI-Project")).toBe("proj-1")
+  expect(modelsRequestAt(t, 0.0).headers.get("OpenAI-Project")).toBe("proj-1")
+  t.model = "anthropic.claude-haiku-4-5"
+  const anth = try chatRequestAt(t, body, 0.0)
+  expect(anth.headers.get("anthropic-workspace-id")).toBe("proj-1")
+  expect(anth.headers.has("OpenAI-Project")).toBe(false)
+  // signed calls carry it too, outside the signature
+  const sg = mantleTarget("openai.gpt-oss-120b", "", "us-west-2")
+  sg.key.bedrock_key_config!.project_id = "proj-2"
+  const up = try chatRequestAt(sg, body, 1440938160000.0)
+  expect(up.headers.get("OpenAI-Project")).toBe("proj-2")
+  expect(up.headers.get("authorization")!.includes("openai-project")).toBe(false)
+  // none set: no header
+  expect((try chatRequestAt(mantleTarget("openai.gpt-oss-120b", "mk", undefined), body, 0.0)).headers.has("OpenAI-Project")).toBe(false)
+})
+
+test("Responses go to Mantle's own endpoint for the OpenAI-compatible models", () => {
+  expect(servesResponses("openai.gpt-oss-120b")).toBe(true)
+  expect(servesResponses("us-west-2/anthropic.claude-haiku-4-5")).toBe(false)
+  const up = try responsesRequestAt(mantleTarget("us-west-2/openai.gpt-5.5", "mk", undefined), try fields(`{"model":"bedrock_mantle/x","input":"hi","fallbacks":["a"]}`), 0.0)
+  expect(up.url).toBe("https://bedrock-mantle.us-west-2.api.aws/openai/v1/responses")
+  expect(up.body).toBe(`{"model":"openai.gpt-5.5","input":"hi"}`)
+  expect(up.headers.get("authorization")).toBe("Bearer mk")
+})
+
+test("auto_inject marks Claude's prompt on Mantle", () => {
+  const body = try fields(`{"model":"m","messages":[{"role":"system","content":"rules"},{"role":"user","content":"hi"}]}`)
+  const up = try chatRequestAt(mantleTarget("anthropic.claude-haiku-4-5", "mk", undefined), body, 0.0, true)
+  expect(up.body.includes(`"system":[{"type":"text","text":"rules","cache_control":{"type":"ephemeral"}}]`)).toBe(true)
+  const off = try chatRequestAt(mantleTarget("anthropic.claude-haiku-4-5", "mk", undefined), body, 0.0)
+  expect(off.body.includes("cache_control")).toBe(false)
 })
 
 test("Claude on Mantle applies the provider's cache_control_injection_points", () => {

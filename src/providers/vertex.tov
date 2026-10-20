@@ -137,30 +137,33 @@ export function countRequest(t: Target, generateBody: string, messagesBody: stri
 
 // The request for a chat completion. Claude models take the Anthropic Messages
 // body, without model, and the Vertex version; other models take Gemini's body.
-export function chatRequest(t: Target, req: ChatRequest, body: Field[], accessToken: string): Upstream throws SyntaxError {
+export function chatRequest(t: Target, req: ChatRequest, body: Field[], accessToken: string, autoCache?: bool): Upstream throws SyntaxError {
   let h = headers([["content-type", "application/json"], ["authorization", "Bearer " + accessToken]])
   addExtraHeaders(&h, t.cfg)
   if (isClaude(t.model)) {
-    // the provider's prompt_cache: its injection points mark messages, as on Anthropic
-    const raw = try anthropic.messagesBody(req, body, t.model, false, false, t.cfg.prompt_cache)
+    // the provider's prompt_cache: its injection points mark messages and auto_inject places the breakpoints, as on
+    // Anthropic (Gemini models have no per-block marker, so neither applies to them, as in Bifrost)
+    const raw = try anthropic.messagesBody(req, body, t.model, false, autoCache === true, t.cfg.prompt_cache)
     let fs = without(try fields(raw), ["model"])
     setField(&fs, "anthropic_version", quote(ANTHROPIC_VERSION))
     return { url: try vertexUrl(t, "anthropic", "rawPredict"), headers: h, body: build(fs) }
   }
+  if (isEndpointModel(t.model)) return { url: try vertexModelUrl(t, "google", t.model, "generateContent"), headers: h, body: try gemini.generateBody(req, body, t.model) }
   return { url: try vertexUrl(t, "google", "generateContent"), headers: h, body: try gemini.generateBody(req, body, t.model) }
 }
 
 // The streaming request: streamRawPredict (Anthropic events) for Claude models,
 // streamGenerateContent as SSE (Gemini chunks) for the rest.
-export function streamRequest(t: Target, req: ChatRequest, body: Field[], accessToken: string): Upstream throws SyntaxError {
+export function streamRequest(t: Target, req: ChatRequest, body: Field[], accessToken: string, autoCache?: bool): Upstream throws SyntaxError {
   let h = headers([["content-type", "application/json"], ["authorization", "Bearer " + accessToken]])
   addExtraHeaders(&h, t.cfg)
   if (isClaude(t.model)) {
-    const raw = try anthropic.messagesBody(req, body, t.model, true, false, t.cfg.prompt_cache)
+    const raw = try anthropic.messagesBody(req, body, t.model, true, autoCache === true, t.cfg.prompt_cache)
     let fs = without(try fields(raw), ["model"])
     setField(&fs, "anthropic_version", quote(ANTHROPIC_VERSION))
     return { url: try vertexUrl(t, "anthropic", "streamRawPredict"), headers: h, body: build(fs) }
   }
+  if (isEndpointModel(t.model)) return { url: (try vertexModelUrl(t, "google", t.model, "streamGenerateContent")) + "?alt=sse", headers: h, body: try gemini.generateBody(req, body, t.model) }
   return { url: (try vertexUrl(t, "google", "streamGenerateContent")) + "?alt=sse", headers: h, body: try gemini.generateBody(req, body, t.model) }
 }
 
@@ -296,6 +299,34 @@ test("service account and key errors", () => {
     threw = true
   }
   expect(threw).toBe(true)
+})
+
+test("auto_inject marks Claude on Vertex, and leaves Gemini alone", () => {
+  const raw = `{"model":"m","messages":[{"role":"system","content":"rules"},{"role":"user","content":"hi"}]}`
+  const up = try chatRequest(target("claude-sonnet-4-5", "us-east5"), try JSON.parse(raw) as ChatRequest, try fields(raw), "tok", true)
+  expect(up.body.includes(`"system":[{"type":"text","text":"rules","cache_control":{"type":"ephemeral"}}]`)).toBe(true)
+  const g = try chatRequest(target("gemini-2.5-flash", "us-east5"), try JSON.parse(raw) as ChatRequest, try fields(raw), "tok", true)
+  expect(g.body.includes("cache_control")).toBe(false)
+})
+
+test("a tuned model (an endpoint id) is called under the project number", () => {
+  const raw = `{"model":"m","messages":[{"role":"user","content":"hi"}]}`
+  expect(isEndpointModel("1234567890")).toBe(true)
+  expect(isEndpointModel("gemini-2.5-flash")).toBe(false)
+  let t = target("1234567890", "us-central1")
+  t.key.vertex_key_config!.project_number = "987"
+  const up = try chatRequest(t, try JSON.parse(raw) as ChatRequest, try fields(raw), "tok")
+  expect(up.url).toBe("https://us-central1-aiplatform.googleapis.com/v1beta1/projects/987/locations/us-central1/endpoints/1234567890:generateContent")
+  expect(up.body).toBe(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`)
+  const st = try streamRequest(t, try JSON.parse(raw) as ChatRequest, try fields(raw), "tok")
+  expect(st.url.endsWith("/endpoints/1234567890:streamGenerateContent?alt=sse")).toBe(true)
+  let msg = ""
+  try {
+    chatRequest(target("1234567890", "us-central1"), try JSON.parse(raw) as ChatRequest, try fields(raw), "tok")
+  } catch (e) {
+    msg = e.message
+  }
+  expect(msg).toBe("project number is not set for fine-tuned models")
 })
 
 test("Claude on Vertex applies the provider's cache_control_injection_points", () => {

@@ -1,7 +1,7 @@
 import { listen } from "../src/http1"
 import { fields, find, rawStr, elements } from "../src/json"
 import { sha256, utf8, toHex } from "../src/crypto"
-import { encodeUrl } from "../src/base64"
+import { encodeUrl, encode } from "../src/base64"
 import { encodeEventStreamFrame } from "../src/streams"
 import { readFileBytesSync } from "node:fs"
 import { liveAnswer, liveEvents, liveStats, liveReset, realtimeAnswer, realtimeTurn, realtimeTranscription } from "./mock_live"
@@ -15,7 +15,8 @@ import { a2aHandle, pushV03, knowTask, resubscribeV03 } from "./mock_a2a"
 //   model "policy-quota" → 200 with x-quota-state: exhausted (trips a circuit policy)
 // size and sha: the request body's length and SHA-256, kept for bodies too big to keep whole (body is then its first 2000 bytes)
 // hdr: the request's x-amz-date, content-length and transfer-encoding, bar-separated (the SigV4 and framing checks of the large request tests)
-type Seen = { path: string, auth: string, body: string, team: string, tenant: string, size: int, sha: string, hdr?: string }
+// proj: the Bedrock Mantle project headers, OpenAI-Project and anthropic-workspace-id, bar-separated (L173)
+type Seen = { path: string, auth: string, body: string, team: string, tenant: string, size: int, sha: string, hdr?: string, proj?: string }
 
 const seen: Seen[] = []
 // webhook deliveries received: the path, the Standard Webhooks headers and the body
@@ -104,7 +105,8 @@ function record(req: Request, path: string, body: string): void {
   const size = body.byteLength
   const big = size > 65536
   const hdr = (req.headers.get("x-amz-date") ?? "") + "|" + (req.headers.get("content-length") ?? "") + "|" + (req.headers.get("transfer-encoding") ?? "")
-  seen.push({ path: path, auth: auth, body: big ? body.slice(0, 2000) : body, team: req.headers.get("x-team") ?? "", tenant: req.headers.get("x-tenant") ?? "", size: size, sha: big ? toHex(sha256(utf8(body))) : "", hdr: hdr })
+  const proj = (req.headers.get("openai-project") ?? "") + "|" + (req.headers.get("anthropic-workspace-id") ?? "")
+  seen.push({ path: path, auth: auth, body: big ? body.slice(0, 2000) : body, team: req.headers.get("x-team") ?? "", tenant: req.headers.get("x-tenant") ?? "", size: size, sha: big ? toHex(sha256(utf8(body))) : "", hdr: hdr, proj: proj })
 }
 
 // The raw JSON text of a field of an event, or "".
@@ -814,6 +816,8 @@ Bun.serve<string>({
     },
     // Anthropic's list for a client that sends x-api-key, OpenAI's otherwise
     "/v1/models": (req) => {
+      // a Bedrock Mantle listing scoped to a project is recorded (L173); the other listings are not
+      if ((req.headers.get("openai-project") ?? "") !== "") record(req, "/v1/models", "")
       if (isAnthropic(req)) return Response.json({ data: [{ type: "model", id: "claude-sonnet-4", display_name: "Claude Sonnet 4", created_at: STAMP }], has_more: false, first_id: "claude-sonnet-4", last_id: "claude-sonnet-4" })
       return Response.json({ object: "list", data: [{ id: "m-a", object: "model", created: 1735689600 }, { id: "m-b", object: "model" }] })
     },
@@ -1431,6 +1435,31 @@ Bun.serve<string>({
       POST: async (req) => {
         record(req, "/ml/v1/text/chat", await req.text())
         return Response.json({ id: "wx1", model_id: "ibm/granite", created: 1, choices: [{ index: 0, message: { role: "assistant", content: "Hi from watsonx" }, finish_reason: "stop" }], usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 } })
+      },
+    },
+    // watsonx's foundation model specs (L173), two pages, recorded with their query
+    "/ml/v1/foundation_model_specs": (req) => {
+      const lu = URL.parse(req.url)
+      const q = lu === undefined ? "" : lu.search
+      record(req, "/ml/v1/foundation_model_specs" + q, "")
+      if (q.includes("start=2")) return Response.json({ total_count: 3, limit: 2, resources: [{ model_id: "meta-llama/llama-3-3-70b-instruct" }] })
+      return Response.json({ total_count: 3, limit: 2, resources: [{ model_id: "ibm/granite-3-8b-instruct" }, { model_id: "mistralai/mistral-large" }], next: { href: "http://127.0.0.1:18099/ml/v1/foundation_model_specs?version=2024-10-08&filters=function_text_chat&limit=200&start=2" } })
+    },
+    // Bedrock InvokeModelWithResponseStream of a legacy text model (L173): "chunk" events with the model's own JSON in
+    // base64 bytes, the last with the invocation metrics (Claude's completion, else Mistral's outputs)
+    "/model/:modelId/invoke-with-response-stream": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/model/" + req.params.modelId + "/invoke-with-response-stream", body)
+        const claude = body.includes(`"max_tokens_to_sample"`)
+        const parts = claude
+          ? [`{"type":"completion","completion":" Hi from","stop_reason":null,"stop":null}`, `{"type":"completion","completion":" bedrock stream","stop_reason":"stop_sequence","stop":null,"amazon-bedrock-invocationMetrics":{"inputTokenCount":6,"outputTokenCount":4}}`]
+          : [`{"outputs":[{"text":" Hi from","stop_reason":null}]}`, `{"outputs":[{"text":" mistral stream","stop_reason":"length"}],"amazon-bedrock-invocationMetrics":{"inputTokenCount":5,"outputTokenCount":3}}`]
+        const out: u8[] = []
+        for (const p of parts) {
+          for (const b of bedrockFrame("chunk", `{"bytes":"${encode(utf8(p))}"}`)) out.push(b)
+        }
+        return new Response(out, { headers: { "content-type": "application/vnd.amazon.eventstream" } })
       },
     },
     // Bedrock InvokeModel (Titan embeddings)

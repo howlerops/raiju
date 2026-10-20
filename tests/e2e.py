@@ -3421,8 +3421,10 @@ def l109_e2e(env):
         dbody = {"model": "typesafe/jev-latest", "input": "Customer message: I was double charged.", "questions": [{"type": "predicate", "name": "is_frustrated", "instructions": "Is the customer frustrated?", "criteria": {"true": "angry", "false": "calm"}}]}
         s, _, b = call("POST", "/v1/decisions", dbody, base=GW_L109, auth=False)
         check("a native decision answers on /v1/decisions", s == 200 and json.loads(b)["answers"][0].get("probability") == 0.75, (s, b[:300]))
+        # (L173) these paths take OpenAI's request only, so the question goes without its criteria
+        obody = {**dbody, "questions": [{k: v for k, v in q.items() if k != "criteria"} for q in dbody["questions"]]}
         for path in ("/openai/decisions", "/openai/v1/decisions", "/litellm/decisions", "/langchain/v1/decisions", "/pydanticai/decisions"):
-            s, _, b = call("POST", path, dbody, base=GW_L109, auth=False)
+            s, _, b = call("POST", path, obody, base=GW_L109, auth=False)
             check(f"{path} serves decisions, as Bifrost mounts it", s == 200 and json.loads(b)["answers"][0].get("name") == "is_frustrated", (s, b[:200]))
         s, _, b = call("POST", "/decisions", dbody, base=GW_L109, auth=False)
         check("a bare /decisions is not a route, as in Bifrost", s != 200, (s, b[:200]))
@@ -3684,7 +3686,8 @@ def l97q_e2e(env):
         check("replicate files are sent as multipart with the content part", len(up) > 0 and "pic.png" in up[-1]["body"] and up[-1]["auth"] == "Bearer r8_e2e", up[-1:])
         s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "replicate"}, base=GW_L97Q, auth=False)
         ids = [m["id"] for m in json.loads(b)["data"]] if s == 200 else []
-        check("replicate models: the deployments of every page, as provider/owner/name", "replicate/acme/model-a" in ids and "replicate/acme/model-b" in ids and "replicate/acme/model-c" in ids, (s, b[:300]))
+        # (L173) without use_deployments_endpoint the deployments are not read, as in Bifrost: l173_e2e lists them with it set
+        check("replicate models: no deployments are listed without use_deployments_endpoint", s == 200 and ids == [], (s, b[:300]))
         s, _, b = mp_form(GW_L97Q, "/v1/images/edits", [("model", None, "text/plain", "bedrock/stability.stable-image-inpaint-v1:0"), ("prompt", None, "text/plain", "a red fox"), ("type", None, "text/plain", "inpainting"), ("grow_mask", None, "text/plain", "5"), ("image", "in.png", "image/png", png), ("mask", "m.png", "image/png", png)])
         d = json.loads(b) if s == 200 else {}
         check("bedrock stability inpainting answers with the image", s == 200 and d.get("data", [{}])[0].get("b64_json") == "iVBORw0KGgo=", (s, b[:300]))
@@ -11783,6 +11786,176 @@ def l164_e2e(env):
         gw.terminate()
         gw.wait()
 
+GW_L173 = "http://127.0.0.1:18296"  # L173: provider leftovers (Bedrock text streams, OpenAI-shaped decisions, Mantle, Replicate, cache points, aliases, listings)
+
+def l173_config() -> dict:
+    """Providers on the mock for L173: Bedrock (legacy text models), OpenAI decisions (the L163 mock route), Bedrock
+    Mantle with a project and auto_inject, Anthropic with injection points (the Messages route), and Vertex (from the
+    main e2e config) with auto_inject."""
+    base = json.load(open(os.path.join(BUILD, "e2e.config.json")))
+    def key(name, value, **extra):
+        return {"name": name, "value": value, "models": [], "weight": 1.0, **extra}
+    vertex = dict(base["providers"]["vertex"])
+    vertex["prompt_cache"] = {"auto_inject": True}
+    # a tuned model by an alias that names the project number it is served under
+    vertex["keys"] = [{**vertex["keys"][0], "aliases": {"tuned": {"model_id": "1234567890", "project_number": "4321", "force_single_region": True}}}]
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {
+            "bedrock": {"keys": [key("bk", "", bedrock_key_config={"access_key": "AKIDEXAMPLE", "secret_key": "secret", "region": "us-east-1"})],
+                        "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "openai": {"keys": [key("oa", "sk-oa163")], "network_config": {"base_url": MOCK + "/oa163", "max_retries": 0}},
+            "bedrock_mantle": {"keys": [key("mk", "mantle-key", bedrock_mantle_key_config={"project_id": "proj-173"},
+                                            aliases={"scoped": {"model_id": "openai.gpt-oss-120b", "project_id": "proj-alias"}})],
+                               "network_config": {"base_url": MOCK, "max_retries": 0}, "prompt_cache": {"auto_inject": True}},
+            "anthropic": {"keys": [key("an", "sk-ant")], "network_config": {"base_url": MOCK, "max_retries": 0},
+                          "prompt_cache": {"cache_control_injection_points": [{"location": "message", "role": "user", "index": -1}]}},
+            "vertex": vertex,
+            "replicate": {"keys": [key("rp", "r8_e2e", replicate_key_config={"use_deployments_endpoint": True})], "network_config": {"base_url": MOCK + "/replicate", "max_retries": 0}},
+            "rep-plain": {"keys": [key("rpp", "r8_e2e", aliases={"house": "acme/model-a"})], "custom_provider_config": {"base_provider_type": "replicate"},
+                          "network_config": {"base_url": MOCK + "/replicate", "max_retries": 0}},
+            "watsonx": base["providers"]["watsonx"],
+            # the listing pipeline: an alias listed beside its target, a blacklisted model dropped and refused
+            "bl": {"keys": [key("blk", "sk-bl", aliases={"house": "m-a", "spare": "never-listed"}, blacklisted_models=["m-b"])],
+                   "custom_provider_config": {"base_provider_type": "openai"}, "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+    }
+
+def l173_e2e(env):
+    """L173: Bedrock's streamed text completion (InvokeModelWithResponseStream). Its own gateway, started and stopped here."""
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    cfg_path = os.path.join(BUILD, "e2e.l173.json")
+    json.dump(l173_config(), open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18296", "-host", "127.0.0.1", "-config", cfg_path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l173.log"), "w"))
+    def post(path, body, headers=None):
+        return call("POST", path, body, headers, base=GW_L173, auth=False)
+    def last(prefix):
+        rows = [x for x in seen() if x["path"].startswith(prefix)]
+        return rows[-1] if rows else {"path": "", "body": "", "auth": ""}
+    try:
+        wait(GW_L173 + "/health")
+        # Bedrock's legacy text models stream on InvokeModelWithResponseStream, framed as text completions
+        s, h, b = post("/v1/completions", {"model": "bedrock/anthropic.claude-v2:1", "prompt": "Say hi", "stream": True, "stream_options": {"include_usage": True}})
+        evs = [json.loads(l[5:]) for l in b.split("\n") if l.startswith("data:") and l[5:].strip() != "[DONE]"] if s == 200 else []
+        texts = "".join(c.get("text", "") for e in evs for c in e.get("choices", []))
+        finish = [c.get("finish_reason") for e in evs for c in e.get("choices", []) if c.get("finish_reason")]
+        usage = [e["usage"] for e in evs if isinstance(e, dict) and e.get("usage")]
+        up = last("/model/anthropic.claude-v2")
+        check("bedrock: a streamed Claude text completion goes to invoke-with-response-stream", s == 200 and up["path"].endswith("/invoke-with-response-stream") and '"max_tokens_to_sample":4096' in up["body"], (s, b[:300], up))
+        check("bedrock: the invoke stream is framed as text_completion chunks with the usage", texts == " Hi from bedrock stream" and finish == ["stop"] and all(e.get("object") == "text_completion" for e in evs if isinstance(e, dict))
+              and usage and usage[-1].get("prompt_tokens") == 6 and usage[-1].get("completion_tokens") == 4 and b.rstrip().endswith("data: [DONE]"), (b[:600]))
+        s, _, b = post("/v1/completions", {"model": "bedrock/mistral.mistral-7b-instruct-v0:2", "prompt": "<s>[INST] hi [/INST]", "stream": True})
+        evs = [json.loads(l[5:]) for l in b.split("\n") if l.startswith("data:") and l[5:].strip() != "[DONE]"] if s == 200 else []
+        texts = "".join(c.get("text", "") for e in evs for c in e.get("choices", []))
+        finish = [c.get("finish_reason") for e in evs for c in e.get("choices", []) if c.get("finish_reason")]
+        check("bedrock: a streamed Mistral text completion reads its outputs", s == 200 and texts == " Hi from mistral stream" and finish == ["length"] and not any(e.get("usage") for e in evs), (s, b[:400]))
+
+        # /openai/v1/decisions speaks OpenAI's Decisions API: its request only, a bare model is OpenAI's, its answer shape
+        qs = [{"type": "predicate", "name": "upset", "instructions": "Is the customer upset?"},
+              {"type": "choice", "instructions": "Pick the topic", "choices": [{"value": "billing", "description": "money"}, {"value": "bug"}]}]
+        dbody = {"model": "gpt-6-luna", "input": "I was double charged.", "questions": qs}
+        s, _, b = post("/openai/v1/decisions", dbody)
+        r = json.loads(b) if s == 200 else {}
+        up = last("/oa163/v1/decisions")
+        check("openai route: a bare model is OpenAI's, sent to its /v1/decisions", s == 200 and up["path"] == "/oa163/v1/decisions" and json.loads(up["body"]).get("model") == "gpt-6-luna", (s, b[:300], up))
+        ans = r.get("answers", [])
+        check("openai route: the answer is OpenAI's shape (no id, an unnamed answer with name null, OpenAI's usage names)",
+              "id" not in r and len(ans) == 2 and ans[0].get("name") == "upset" and "name" in ans[1] and ans[1]["name"] is None and ans[1].get("choice") == "billing"
+              and r.get("usage") == {"input_tokens": 21, "output_tokens": 5, "total_tokens": 26}, (s, b[:400]))
+        s, _, b = post("/v1/decisions", {**dbody, "model": "openai/gpt-6-luna"})
+        r = json.loads(b) if s == 200 else {}
+        check("the normalized /v1/decisions route keeps Bifrost's shape", s == 200 and r.get("usage", {}).get("prompt_tokens") == 21 and "name" not in r.get("answers", [{}, {}])[1], (s, b[:300]))
+        s, _, b = post("/litellm/decisions", dbody)
+        check("the SDK prefixes mount OpenAI's decisions route too", s == 200 and "input_tokens" in json.loads(b).get("usage", {}), (s, b[:300]))
+        n = len(seen())
+        s, _, b = post("/openai/v1/decisions", {**dbody, "questions": [{**qs[0], "criteria": {"true": "angry"}}]})
+        check("openai route: a field OpenAI's question does not define is refused by name", s == 400 and 'question 0 has \\"criteria\\"' in b and len(seen()) == n, (s, b[:300]))
+        s, _, b = post("/openai/v1/decisions", {**dbody, "state": "x"})
+        check("openai route: Typesafe's state is refused", s == 400 and "state is not part of OpenAI's Decisions request" in b, (s, b[:300]))
+        s, _, b = post("/openai/v1/decisions", {**dbody, "input": {"order": 1}})
+        check("openai route: a structured input is refused", s == 400 and "input must be a string or a list of messages" in b, (s, b[:300]))
+        s, _, b = post("/openai/v1/decisions", {"model": "gpt-6-luna", "questions": qs})
+        check("openai route: an input is required", s == 400 and "input is required for decision" in b, (s, b[:300]))
+
+        # Bedrock Mantle: the project header, its own Responses endpoint, auto_inject on Claude, the listing's project
+        msgs = [{"role": "system", "content": "rules"}, {"role": "user", "content": "hi"}]
+        s, _, b = post("/v1/chat/completions", {"model": "bedrock_mantle/openai.gpt-oss-120b", "messages": msgs})
+        up = last("/v1/chat/completions")
+        check("mantle: the key's project_id goes as OpenAI-Project", s == 200 and up.get("proj") == "proj-173|" and up["auth"] == "Bearer mantle-key", (s, b[:200], up))
+        s, _, b = post("/v1/chat/completions", {"model": "bedrock_mantle/scoped", "messages": msgs})
+        up = last("/v1/chat/completions")
+        check("mantle: an alias's project_id replaces the key's", s == 200 and up.get("proj") == "proj-alias|" and json.loads(up["body"]).get("model") == "openai.gpt-oss-120b", (s, b[:200], up))
+        s, _, b = post("/v1/chat/completions", {"model": "bedrock_mantle/anthropic.claude-haiku-4-5", "messages": msgs})
+        up = last("/anthropic/v1/messages")
+        upb = json.loads(up["body"]) if up["body"] else {}
+        check("mantle: Claude gets anthropic-workspace-id and auto_inject's breakpoint", s == 200 and up.get("proj") == "|proj-173"
+              and upb.get("system") == [{"type": "text", "text": "rules", "cache_control": {"type": "ephemeral"}}], (s, b[:200], up))
+        s, _, b = post("/v1/responses", {"model": "bedrock_mantle/openai.gpt-oss-120b", "input": "hi", "max_output_tokens": 20})
+        up = last("/v1/responses")
+        upb = json.loads(up["body"]) if up["body"] else {}
+        check("mantle: Responses go to Mantle's own /v1/responses with the bare model", s == 200 and json.loads(b).get("object") == "response" and upb.get("model") == "openai.gpt-oss-120b"
+              and upb.get("input") == "hi" and up.get("proj") == "proj-173|" and up["auth"] == "Bearer mantle-key", (s, b[:300], up))
+        s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "bedrock_mantle"}, base=GW_L173, auth=False)
+        up = last("/v1/models")
+        check("mantle: the listing is scoped to the key's project", s == 200 and "bedrock_mantle/m-a" in b and up.get("proj") == "proj-173|", (s, b[:200], up))
+
+        # auto_inject on Vertex Claude, and the injection points on the Anthropic Messages route
+        s, _, b = post("/v1/chat/completions", {"model": "vertex/claude-sonnet-4@20250514", "messages": msgs})
+        up = last("/v1/projects/proj/locations/us-central1/publishers/anthropic/models/claude-sonnet-4@20250514")
+        upb = json.loads(up["body"]) if up["body"] else {}
+        check("vertex: auto_inject marks Claude's prompt", s == 200 and upb.get("system") == [{"type": "text", "text": "rules", "cache_control": {"type": "ephemeral"}}], (s, b[:200], upb))
+        mbody = {"model": "anthropic/claude-sonnet-4", "max_tokens": 20, "system": "rules", "messages": [{"role": "user", "content": "one"}, {"role": "assistant", "content": "two"}, {"role": "user", "content": "three"}]}
+        s, _, b = post("/anthropic/v1/messages", mbody)
+        up = last("/v1/messages")
+        upb = json.loads(up["body"]) if up["body"] else {}
+        check("messages route: the injection point marks the last user message of the body as sent", s == 200
+              and upb.get("messages", [{}])[-1].get("content") == [{"type": "text", "text": "three", "cache_control": {"type": "ephemeral"}}]
+              and upb.get("messages", [{}])[0].get("content") == "one" and upb.get("system") == "rules", (s, b[:200], upb))
+
+        # Replicate: the deployments are listed only with use_deployments_endpoint; extra params go into the input
+        s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "replicate"}, base=GW_L173, auth=False)
+        ids = [m["id"] for m in json.loads(b).get("data", [])] if s == 200 else []
+        check("replicate: with use_deployments_endpoint the deployments of every page are listed", "replicate/acme/model-a" in ids and "replicate/acme/model-c" in ids, (s, b[:300]))
+        s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "rep-plain"}, base=GW_L173, auth=False)
+        ids = [m["id"] for m in json.loads(b).get("data", [])] if s == 200 else []
+        check("replicate: without it only the key's aliases are listed", s == 200 and ids == ["rep-plain/house"], (s, b[:300]))
+        s, _, b = post("/v1/chat/completions", {"model": "rep-plain/acme/chat-x", "messages": [{"role": "user", "content": "hi"}], "seed": 7, "top_k": 40, "webhook": "https://example.com/hook"})
+        up = last("/v1/models/acme/chat-x/predictions")
+        upb = json.loads(up["body"]) if up["body"] else {}
+        check("replicate: extra params are merged into the prediction input, the webhook also on the prediction", s == 200 and upb.get("input", {}).get("top_k") == 40
+              and upb["input"].get("seed") == 7 and upb["input"].get("prompt") == "hi" and upb.get("webhook") == "https://example.com/hook", (s, b[:200], upb))
+
+        # the listing pipeline: aliases listed beside their targets and added back, the blacklist dropping a model
+        s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "bl"}, base=GW_L173, auth=False)
+        ids = [m["id"] for m in json.loads(b).get("data", [])] if s == 200 else []
+        check("listing: an alias beside its target, an unmatched alias added, a blacklisted model gone", s == 200 and ids == ["bl/house", "bl/m-a", "bl/spare"], (s, b[:300]))
+        n = len(seen())
+        s, _, b = post("/v1/chat/completions", {"model": "bl/m-b", "messages": [{"role": "user", "content": "hi"}]})
+        check("a blacklisted model is not served by the key", s >= 400 and len(seen()) == n, (s, b[:200]))
+        s, _, b = post("/v1/chat/completions", {"model": "bl/house", "messages": [{"role": "user", "content": "hi"}]})
+        check("the alias of an allowed model is served", s == 200 and json.loads(last("/v1/chat/completions")["body"]).get("model") == "m-a", (s, b[:200]))
+
+        # watsonx: the instance's chat models, every page, with the IAM token
+        s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "watsonx"}, base=GW_L173, auth=False)
+        ids = [m["id"] for m in json.loads(b).get("data", [])] if s == 200 else []
+        up = [x for x in seen() if x["path"].startswith("/ml/v1/foundation_model_specs")]
+        check("watsonx: the foundation model specs are listed, every page", ids == ["watsonx/ibm/granite-3-8b-instruct", "watsonx/mistralai/mistral-large", "watsonx/meta-llama/llama-3-3-70b-instruct"]
+              and up and up[-1]["auth"] == "Bearer iam-token" and "filters=function_text_chat" in up[0]["path"], (s, b[:300], up[-2:]))
+
+        # alias overrides: a tuned Vertex model under the alias's project number; another provider's override is refused
+        s, _, b = post("/v1/chat/completions", {"model": "vertex/tuned", "messages": [{"role": "user", "content": "hi"}]})
+        up = last("/v1beta1/projects/")
+        check("vertex: an alias's project_number serves a tuned model from its endpoint", s == 200 and "Hi from a tuned vertex model" in b
+              and up["path"] == "/v1beta1/projects/4321/locations/us-central1/endpoints/1234567890:generateContent", (s, b[:200], up))
+        s, _, b = call("POST", "/api/providers/bl/keys", {"name": "wrong", "value": "sk-wrong", "aliases": {"east": {"model_id": "m-a", "endpoint": "https://east.example.com"}}}, base=GW_L173, auth=False)
+        check("an alias with another provider's override is refused by the key API", s == 400 and "azure sub-config is only valid on Azure keys" in b, (s, b[:300]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
 GW_L172 = "http://127.0.0.1:18294"  # L172: Vertex tuned endpoints by project_number, body limits that follow a config change
 
 def l172_config() -> dict:
@@ -13140,7 +13313,9 @@ def main():
         check("the TypeSafe body is keyed by question name, with the key and the upstream model",
               bool(ts) and ts[-1]["auth"] == "Bearer ts-key" and tb.get("model") == "jev-latest" and tb["questions"]["is_frustrated"]["type"] == "noul"
               and tb["questions"]["is_frustrated"]["criteria"] == {"true": "angry", "false": "calm"} and tb["questions"]["urgency"]["criteria"] == ["can wait", "soon", None], ts[-1:])
-        s, _, b = call("POST", "/openai/v1/decisions", dbody, base=GW)
+        # (L173) the /openai/v1 path takes OpenAI's request only: no criteria
+        obody = {**dbody, "questions": [{k: v for k, v in q.items() if k != "criteria"} for q in dq]}
+        s, _, b = call("POST", "/openai/v1/decisions", obody, base=GW)
         check("the /openai/v1 path serves decisions too", s == 200 and json.loads(b)["answers"][1]["choice"] == "billing", (s, b))
         s, _, b = call("POST", "/v1/decisions", {**dbody, "min_confidence": 0.8, "fallbacks": ["openai/gpt-4o"]}, base=GW)
         ts = [x for x in seen() if x["path"] == "/ts/v1/systemone"]
@@ -14233,6 +14408,9 @@ def main():
         l167_e2e(env, idp_state)
         # L172: Vertex tuned endpoints and body limits that follow the config: its own gateway (18294)
         l172_e2e(env)
+        # L173: provider leftovers (Bedrock text streams, OpenAI-shaped decisions, Mantle, Replicate, cache points, alias
+        # overrides, listings): its own gateway (18296)
+        l173_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

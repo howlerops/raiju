@@ -246,6 +246,105 @@ export function largeRequest(t: Target): Upstream {
   return { url: apiBase(t) + "/v1/messages", headers: upstreamHeaders(t), body: "" }
 }
 
+// ---- prompt cache breakpoints on a Messages body as the caller sent it (the /anthropic/v1/messages route) ----
+
+const MAX_INJECTED = 4
+
+// Whether a marker on a content block means anything upstream: text, images and documents carry prompt content.
+function cacheableBlock(raw: string): bool throws SyntaxError {
+  const t = rawStr(try fields(raw), "type") ?? ""
+  return t === "text" || t === "image" || t === "document"
+}
+
+// A content value (a string, or an array of blocks) with one block marked: the last cacheable block (an injection
+// point names a message cached to its end) or the first (auto_inject marks the start of the stable prefix). A string
+// becomes one text block. undefined when nothing in it can be marked.
+function markContent(raw: string, marker: string, last: bool): string | undefined throws SyntaxError {
+  if (raw.startsWith("\"")) {
+    if (raw === `""`) return undefined
+    return `[${cached(`{"type":"text","text":${raw}}`, marker)}]`
+  }
+  if (!raw.startsWith("[")) return undefined
+  let blocks = try elements(raw)
+  let at = -1
+  for (let i = 0; i < blocks.length; i++) {
+    if (!(try cacheableBlock(blocks[i]!))) continue
+    at = i
+    if (!last) break
+  }
+  if (at < 0) return undefined
+  blocks[at] = cached(blocks[at]!, marker)
+  return "[" + blocks.join(",") + "]"
+}
+
+// The provider's prompt cache on a Messages body sent as it came, as Bifrost injects on every route: the injection
+// points (a message by role and/or index, the system prompt counted as the first message with role "system"; at most
+// four) replace auto_inject, which marks the first cacheable block. A body that carries cache_control of its own is
+// left alone.
+export function injectMessagesCache(body: Field[], autoCache: bool, cache?: ProviderPromptCacheConfig): Field[] throws SyntaxError {
+  const points = cache?.cache_control_injection_points ?? []
+  if (points.length === 0 && !autoCache) return body
+  const sys = find(body, "system")
+  const msgsRaw = find(body, "messages") ?? "[]"
+  if ((sys ?? "").includes("cache_control") || msgsRaw.includes("cache_control")) return body
+  const hasSys = sys !== undefined && !isNull(sys)
+  const msgs: string[] = msgsRaw.startsWith("[") ? try elements(msgsRaw) : []
+  const roles: string[] = hasSys ? ["system"] : []
+  const contents: string[] = hasSys ? [sys!] : []
+  for (const m of msgs) {
+    const mf = try fields(m)
+    roles.push(rawStr(mf, "role") ?? "")
+    contents.push(find(mf, "content") ?? "null")
+  }
+  const n = roles.length
+  const marker = cacheMarker(cache?.ttl)
+  const marked: Map<int, string> = new Map()
+  if (points.length > 0) {
+    for (const pt of points) {
+      if (pt.location !== undefined && pt.location !== "" && pt.location !== "message") continue
+      const hasRole = pt.role !== undefined && pt.role !== ""
+      const idxs: int[] = []
+      if (pt.index !== undefined) {
+        const i = pt.index < 0 ? n + pt.index : pt.index
+        if (i >= 0 && i < n && (!hasRole || roles[i] === pt.role)) idxs.push(i)
+      } else if (hasRole) {
+        for (let i = 0; i < n; i++) {
+          if (roles[i] === pt.role) idxs.push(i)
+        }
+      }
+      for (const i of idxs) {
+        if (marked.has(i) || marked.size >= MAX_INJECTED) continue
+        const c = try markContent(contents[i]!, marker, true)
+        if (c !== undefined) marked.set(i, c)
+      }
+    }
+  } else {
+    for (let i = 0; i < n; i++) {
+      const c = try markContent(contents[i]!, marker, false)
+      if (c === undefined) continue
+      marked.set(i, c)
+      break
+    }
+  }
+  if (marked.size === 0) return body
+  const off = hasSys ? 1 : 0
+  const out: string[] = []
+  for (let j = 0; j < msgs.length; j++) {
+    const c = marked.get(j + off)
+    if (c === undefined) {
+      out.push(msgs[j]!)
+      continue
+    }
+    out.push(build((try fields(msgs[j]!)).map((f) => f.key === "content" ? { key: "content", raw: c } : f)))
+  }
+  const sysMarked = hasSys ? marked.get(0) : undefined
+  return body.map((f) => {
+    if (f.key === "messages") return { key: "messages", raw: "[" + out.join(",") + "]" }
+    if (f.key === "system" && sysMarked !== undefined) return { key: "system", raw: sysMarked }
+    return f
+  })
+}
+
 // Native passthrough for /anthropic/v1/messages: only the model changes.
 export function nativeRequest(t: Target, body: Field[]): Upstream {
   const fs = body.map((f) => f.key === "model" ? { key: "model", raw: quote(t.model) } : f)
@@ -495,6 +594,23 @@ test("auto prompt caching marks system and the newest turn", () => {
   expect(out.includes(`"system":[{"type":"text","text":"long rules","cache_control":{"type":"ephemeral"}}]`)).toBe(true)
   expect(out.includes(`{"role":"user","content":[{"type":"text","text":"c","cache_control":{"type":"ephemeral"}}]}`)).toBe(true)
   expect(out.includes(`{"type":"text","text":"a"}`)).toBe(true)
+})
+
+test("a Messages body as sent gets the provider's injection points, or auto_inject's first block", () => {
+  const body = try fields(`{"model":"m","system":"rules","messages":[{"role":"user","content":"one"},{"role":"assistant","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]},{"role":"user","content":"three"}],"max_tokens":5}`)
+  const pts = try injectMessagesCache(body, false, { cache_control_injection_points: [{ location: "message", role: "system" }, { index: -1 }, { role: "assistant" }] })
+  const out = build(pts)
+  expect(out).toBe(`{"model":"m","system":[{"type":"text","text":"rules","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":"one"},{"role":"assistant","content":[{"type":"text","text":"a"},{"type":"text","text":"b","cache_control":{"type":"ephemeral"}}]},{"role":"user","content":[{"type":"text","text":"three","cache_control":{"type":"ephemeral"}}]}],"max_tokens":5}`)
+  // auto_inject: the first cacheable block (the system prompt here), with the provider's ttl
+  const auto = build(try injectMessagesCache(body, true, { ttl: "1h" }))
+  expect(auto.includes(`"system":[{"type":"text","text":"rules","cache_control":{"type":"ephemeral","ttl":"1h"}}]`)).toBe(true)
+  expect(auto.includes(`{"role":"user","content":"one"}`)).toBe(true)
+  // nothing configured, or a caller that marked its own blocks: unchanged
+  expect(build(try injectMessagesCache(body, false, {}))).toBe(build(body))
+  const own = try fields(`{"messages":[{"role":"user","content":[{"type":"text","text":"x","cache_control":{"type":"ephemeral"}}]}]}`)
+  expect(build(try injectMessagesCache(own, true, {}))).toBe(build(own))
+  // an index out of range marks nothing
+  expect(build(try injectMessagesCache(body, false, { cache_control_injection_points: [{ index: 9 }] }))).toBe(build(body))
 })
 
 test("translates a Messages response", () => {

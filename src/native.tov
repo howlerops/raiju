@@ -28,6 +28,7 @@ import { cursorResponsesBody, cursorChatBody, cursorUsesInput } from "./cursor_i
 import * as anthropic from "./providers/anthropic"
 import * as gemini from "./providers/gemini"
 import * as bedrock from "./providers/bedrock"
+import * as bedrockMantle from "./providers/bedrock_mantle"
 
 type AUsage = { input_tokens?: int, output_tokens?: int, cache_read_input_tokens?: int, cache_creation_input_tokens?: int }
 type AUsageHolder = { usage?: AUsage, message?: { usage?: AUsage } }
@@ -95,7 +96,7 @@ export function bedrockUsage(text: string): Translated {
 // callers convert that into their own wire format.
 type Bridge = { build: Build, toOpenAI: Translate }
 
-function chatBridge(chatText: string, stream: bool, autoCache: bool, pipe: bool): Bridge throws SyntaxError {
+function chatBridge(chatText: string, stream: bool, autoCache: (t: Target) => bool, pipe: bool): Bridge throws SyntaxError {
   let fs = try fields(chatText)
   if (stream) setField(&fs, "stream_options", `{"include_usage":true}`)
   const streamFields = fs
@@ -105,10 +106,10 @@ function chatBridge(chatText: string, stream: bool, autoCache: bool, pipe: bool)
     if (providers.streamsNatively(t.kind)) return openai.chatRequest(t, stream ? streamFields : plain)
     // with a streaming client, providers that stream are converted as they go
     if (stream && pipe) {
-      const su = try providers.streamUpstream(t, req, plain, autoCache)
+      const su = try providers.streamUpstream(t, req, plain, autoCache(t))
       if (su !== undefined) return su
     }
-    return try providers.chatUpstream(t, req, plain, autoCache)
+    return try providers.chatUpstream(t, req, plain, autoCache(t))
   }
   const tr: Translate = (t, text, requested) => {
     if (stream && providers.streamsNatively(t.kind)) return openai.streamResponse(text, requested)
@@ -146,15 +147,17 @@ export async function anthropicMessages(engine: Engine, req: Request, sink?: Str
     // with plugins in the chat hooks of this request, it goes through chat, where they run (nativehook.tov)
     if (hooksOn(engine, chat)) return await viaChat(engine, req, chat, { kind: "anthropic", model: clientModel }, stream, sink)
     // Every provider other than Anthropic (and non-streaming Bedrock) is reached through OpenAI chat.
-    bridge = chatBridge(chat, stream, false, stream && sink !== undefined)
+    bridge = chatBridge(chat, stream, engine.cacheAutoFor(req), stream && sink !== undefined)
   } catch (e) {
     return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
   }
   const br = bridge!
   const native = (t: Target) => t.kind === "anthropic" || (t.kind === "bedrock" && !stream)
+  const auto = engine.cacheAutoFor(req)
   const b: Build = (t) => {
-    if (t.kind === "anthropic") return anthropic.nativeRequest(t, body)
-    if (t.kind === "bedrock" && !stream) return bedrock.signedRequest(t, "invoke", bedrockAnthropicBody(body))
+    // the body goes as sent, with the provider's prompt cache breakpoints (injection points or auto_inject)
+    if (t.kind === "anthropic") return anthropic.nativeRequest(t, try anthropic.injectMessagesCache(body, auto(t), t.cfg.prompt_cache))
+    if (t.kind === "bedrock" && !stream) return bedrock.signedRequest(t, "invoke", bedrockAnthropicBody(try anthropic.injectMessagesCache(body, auto(t), t.cfg.prompt_cache)))
     return try br.build(t)
   }
   const tr: Translate = (t, text, requested) => {
@@ -236,16 +239,18 @@ export async function responsesApi(engine: Engine, req: Request, sink?: StreamSi
   const b: Build = (t) => {
     const sh = try shapeTarget(cp, t, body, settings.azureDeepseek, harness)
     if (t.kind === "openai") return openai.responsesRequest(t, try fields(shapedText(sh, reqText)))
-    const br = try chatBridge(responses.toChatRequest(shapedText(sh, reqText), clientModel), stream, false, false)
+    // Bedrock Mantle serves its OpenAI-compatible models on its own Responses endpoint, as Bifrost sends them there
+    if (mantleResponses(t)) return try bedrockMantle.responsesRequest(t, try fields(shapedText(sh, reqText)))
+    const br = try chatBridge(responses.toChatRequest(shapedText(sh, reqText), clientModel), stream, engine.cacheAutoFor(req), false)
     return try br.build(t)
   }
   const tr: Translate = (t, text, requested) => {
-    if (t.kind === "openai") {
+    if (t.kind === "openai" || mantleResponses(t)) {
       const u = responsesUsage(text, stream)
       return stream ? { body: try engine.guardWhole(u.body, "responses", true), promptTokens: u.promptTokens, completionTokens: u.completionTokens } : u
     }
     const sh = try shapeTarget(cp, t, body, settings.azureDeepseek, harness)
-    const br = try chatBridge(responses.toChatRequest(shapedText(sh, reqText), clientModel), stream, false, false)
+    const br = try chatBridge(responses.toChatRequest(shapedText(sh, reqText), clientModel), stream, engine.cacheAutoFor(req), false)
     const o = try br.toOpenAI(t, text, requested)
     const out = stream ? try engine.guardWhole(responses.toResponseStream(try asSse(o.body), clientModel), "responses", true) : try responses.toResponse(o.body, clientModel, reqText)
     return { body: out, promptTokens: o.promptTokens, completionTokens: o.completionTokens }
@@ -253,12 +258,17 @@ export async function responsesApi(engine: Engine, req: Request, sink?: StreamSi
   // an OpenAI upstream's stream goes to the sink as it arrives; the other kinds are answered whole
   // the output guards check the events as they are passed through (guard_stream.tov)
   const mk: ConverterFactory = (t, requested) => {
-    if (t.kind !== "openai") return undefined
+    if (t.kind !== "openai" && !mantleResponses(t)) return undefined
     const c = new StreamConverter("responses-raw", requested, true)
     if (stream) c.guard = engine.streamGuard("responses", true, true)
     return c
   }
   return await engine.serve(req, "responses", undefined, body, reqText, b, tr, stream, undefined, stream ? sink : undefined, mk, cp)
+}
+
+// A Responses request Bedrock Mantle answers on its own Responses endpoint (its OpenAI-compatible models).
+function mantleResponses(t: Target): bool {
+  return t.kind === "bedrock_mantle" && bedrockMantle.servesResponses(t.model)
 }
 
 // One target's Responses request, shaped by compat. Azure DeepSeek refuses reasoning on Responses, so it
@@ -619,7 +629,7 @@ export async function cohereChat(engine: Engine, req: Request, sink?: StreamSink
   try {
     const chat = cohereIn.chatToOpenAI(text, clientModel)
     if (hooksOn(engine, chat)) return await viaChat(engine, req, chat, { kind: "cohere", model: clientModel }, stream, sink)
-    bridge = chatBridge(chat, stream, false, stream && sink !== undefined)
+    bridge = chatBridge(chat, stream, engine.cacheAutoFor(req), stream && sink !== undefined)
   } catch (e) {
     return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
   }
@@ -709,7 +719,7 @@ export async function genai(engine: Engine, req: Request, modelAction: string, s
   try {
     const chat = genaiIn.generateToOpenAI(text, full, stream)
     if (hooksOn(engine, chat)) return await viaChat(engine, req, chat, { kind: "genai", model: full }, stream, sink)
-    bridge = chatBridge(chat, stream, false, stream && sink !== undefined)
+    bridge = chatBridge(chat, stream, engine.cacheAutoFor(req), stream && sink !== undefined)
   } catch (e) {
     return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
   }
@@ -1209,7 +1219,7 @@ export async function bedrockModel(engine: Engine, req: Request, modelId: string
     // the chat request names the model as the route resolves it ("bedrock/<id>" for a bare id)
     const hooked = invoke ? (stream ? bedrockIn.invokeStreamToOpenAI(text, full) : bedrockIn.invokeToOpenAI(text, full)) : bedrockIn.converseToOpenAI(text, full, stream)
     if (hooksOn(engine, hooked)) return await viaChat(engine, req, hooked, { kind: invoke ? "invoke" : "converse", model: id }, stream, sink)
-    bridge = chatBridge(chat, stream, false, stream && sink !== undefined)
+    bridge = chatBridge(chat, stream, engine.cacheAutoFor(req), stream && sink !== undefined)
   } catch (e) {
     return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
   }

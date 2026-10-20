@@ -3,7 +3,7 @@
 // options as raw JSON so descriptions and instructions reach the provider untouched. Providers
 // convert that form to their own wire shape (providers/typesafe.tov), and the answers come back
 // in the canonical response rendered here.
-import { Field, fields, elements, find, rawStr, decodeString, quote } from "./json"
+import { Field, fields, elements, find, rawStr, decodeString, quote, build } from "./json"
 
 // A choice option. desc is raw JSON: "null" when sent as null or absent.
 export type Choice = { key: string, bool: bool, desc: string }
@@ -244,6 +244,113 @@ export function renderResponse(model: string, answers: string[], prompt: int, co
   if (routing !== "") parts.push(`"routing":${routing}`)
   return "{" + parts.join(",") + "}"
 }
+
+// ---- OpenAI's own shape (the /openai/v1/decisions route and the SDK prefixes) ----
+
+const OPENAI_QUESTION_FIELDS: string[] = ["type", "name", "instructions", "choices", "levels"]
+
+// The first key of an object outside known, or "".
+function unknownKey(fs: Field[], known: string[]): string {
+  for (const f of fs) {
+    if (!known.includes(f.key)) return f.key
+  }
+  return ""
+}
+
+// Why a request on OpenAI's decisions route is not OpenAI's Decisions request, as Bifrost's
+// ToBifrostDecisionRequest rejects it by name: no input, a structured input, Typesafe's top-level state, no
+// questions, a field a question, choice or level does not define, or text OpenAI takes as a string sent as
+// something else. "" when it is OpenAI's request. Positions count from 0, as Bifrost's messages do.
+export function openaiRequestProblem(text: string): string throws SyntaxError {
+  const top = try fields(text)
+  const input = find(top, "input")
+  if (input === undefined || input === "null") return "input is required for decision"
+  if (input.startsWith("{")) return "input must be a string or a list of messages, as in OpenAI's Decisions request"
+  if (find(top, "state") !== undefined) return "state is not part of OpenAI's Decisions request; send input"
+  const list = find(top, "questions")
+  const raws: string[] = list === undefined || !list.startsWith("[") ? [] : try elements(list)
+  if (raws.length === 0) return "questions are required for decision"
+  for (let i = 0; i < raws.length; i++) {
+    const q = try fields(raws[i]!)
+    const qk = unknownKey(q, OPENAI_QUESTION_FIELDS)
+    if (qk !== "") return `question ${i} has "${qk}", which is not part of OpenAI's Decisions request`
+    const ins = find(q, "instructions")
+    if (ins !== undefined && ins !== "null" && !ins.startsWith("\"")) return `question ${i} instructions must be a string, as in OpenAI's Decisions request`
+    const cs = find(q, "choices")
+    const choices: string[] = cs === undefined || !cs.startsWith("[") ? [] : try elements(cs)
+    for (let j = 0; j < choices.length; j++) {
+      const cf = try fields(choices[j]!)
+      const ck = unknownKey(cf, ["value", "description"])
+      if (ck !== "") return `choice ${j} of question ${i} has "${ck}", which is not part of OpenAI's Decisions request`
+      const d = find(cf, "description")
+      if (d !== undefined && d !== "null" && !d.startsWith("\"")) return `choice ${j} of question ${i} description must be a string, as in OpenAI's Decisions request`
+    }
+    const ls = find(q, "levels")
+    const levels: string[] = ls === undefined || !ls.startsWith("[") ? [] : try elements(ls)
+    for (let j = 0; j < levels.length; j++) {
+      const lf = try fields(levels[j]!)
+      const lk = unknownKey(lf, ["label", "description"])
+      if (lk !== "") return `level ${j} of question ${i} has "${lk}", which is not part of OpenAI's Decisions request`
+      const d = find(lf, "description")
+      if (d !== undefined && d !== "null" && !d.startsWith("\"")) return `level ${j} of question ${i} description must be a string, as in OpenAI's Decisions request`
+    }
+  }
+  return ""
+}
+
+// A canonical decision response in OpenAI's shape, as Bifrost's ToOpenAIDecisionResponse renders it on OpenAI's
+// route whichever provider answered: no id, an unnamed answer with name null, and usage under OpenAI's names
+// (input_tokens, output_tokens, total_tokens; no cost). The other fields (model, routing) are kept as they are.
+export function openaiResponse(text: string): string throws SyntaxError {
+  const out: Field[] = []
+  for (const f of try fields(text)) {
+    if (f.key === "id") continue
+    if (f.key === "answers" && f.raw.startsWith("[")) {
+      const answers: string[] = []
+      for (const a of try elements(f.raw)) {
+        const af = try fields(a)
+        if (find(af, "name") !== undefined) {
+          answers.push(a)
+          continue
+        }
+        const named: Field[] = []
+        for (const x of af) {
+          named.push(x)
+          if (x.key === "type") named.push({ key: "name", raw: "null" })
+        }
+        answers.push(build(named))
+      }
+      out.push({ key: "answers", raw: "[" + answers.join(",") + "]" })
+      continue
+    }
+    if (f.key === "usage" && f.raw.startsWith("{")) {
+      const u = try fields(f.raw)
+      const n = (k: string): string => find(u, k) ?? "0"
+      out.push({ key: "usage", raw: `{"input_tokens":${n("prompt_tokens")},"output_tokens":${n("completion_tokens")},"total_tokens":${n("total_tokens")}}` })
+      continue
+    }
+    out.push(f)
+  }
+  return build(out)
+}
+
+test("OpenAI's route takes exactly OpenAI's request", () => {
+  const ok = `{"model":"gpt-6-luna","input":"hi","safety_identifier":"u","questions":[{"type":"choice","name":"t","instructions":"Pick","choices":[{"value":"a","description":"x"}]},{"type":"score","instructions":"How","levels":[{"label":"low"}]}]}`
+  expect(try openaiRequestProblem(ok)).toBe("")
+  expect(try openaiRequestProblem(`{"model":"m","questions":[{"type":"predicate","instructions":"x"}]}`)).toBe("input is required for decision")
+  expect(try openaiRequestProblem(`{"model":"m","input":{"a":1},"questions":[{"type":"predicate","instructions":"x"}]}`)).toBe("input must be a string or a list of messages, as in OpenAI's Decisions request")
+  expect(try openaiRequestProblem(`{"model":"m","input":"x","state":"y","questions":[{"type":"predicate","instructions":"x"}]}`)).toBe("state is not part of OpenAI's Decisions request; send input")
+  expect(try openaiRequestProblem(`{"model":"m","input":"x","questions":[]}`)).toBe("questions are required for decision")
+  expect(try openaiRequestProblem(`{"model":"m","input":"x","questions":[{"type":"predicate","instructions":"x","criteria":{"true":"y"}}]}`)).toBe(`question 0 has "criteria", which is not part of OpenAI's Decisions request`)
+  expect(try openaiRequestProblem(`{"model":"m","input":"x","questions":[{"type":"predicate","instructions":"x"},{"type":"choice","instructions":"x","choices":[{"value":"a","weight":2}]}]}`)).toBe(`choice 0 of question 1 has "weight", which is not part of OpenAI's Decisions request`)
+  expect(try openaiRequestProblem(`{"model":"m","input":"x","questions":[{"type":"score","instructions":"x","levels":[{"label":"a"},{"label":"b","value":1}]}]}`)).toBe(`level 1 of question 0 has "value", which is not part of OpenAI's Decisions request`)
+  expect(try openaiRequestProblem(`{"model":"m","input":"x","questions":[{"type":"predicate","instructions":{"a":1}}]}`)).toBe("question 0 instructions must be a string, as in OpenAI's Decisions request")
+})
+
+test("a canonical answer in OpenAI's shape", () => {
+  const body = `{"id":"dec_1","model":"jev-1","answers":[{"type":"predicate","name":"p","probability":0.5},{"type":"choice","choice":"a"}],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15,"cost":{"total_cost":0.5}},"routing":{"x":1}}`
+  expect(try openaiResponse(body)).toBe(`{"model":"jev-1","answers":[{"type":"predicate","name":"p","probability":0.5},{"type":"choice","name":null,"choice":"a"}],"usage":{"input_tokens":12,"output_tokens":3,"total_tokens":15},"routing":{"x":1}}`)
+})
 
 test("a decision request is read into canonical form", () => {
   const d = try parseDecision(`{"model":"typesafe/jev-latest","input":"hello","questions":[` +

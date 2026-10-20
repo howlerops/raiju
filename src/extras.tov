@@ -2,8 +2,8 @@
 import { Field, fields, rawStr, rawBool, rawNum, setField, build, quote } from "./json"
 import { Engine, Build, Translate, errorResponse, noHeaders } from "./gateway"
 import { ChatRequest, snapshot, errorJson } from "./schemas"
-import { parseModel, kindOf } from "./router"
-import { providerOf } from "./config"
+import { parseModel, kindOf, isKnownKind } from "./router"
+import { providerOf, Config } from "./config"
 import { JobStore, jobJson, resultTtlMs, asyncOp, estimateChatTokens, anthropicCountRequest, geminiCountRequest, countResponse, countTokensJson, parseRerank, rerankJson, lexicalRerank } from "./jobs"
 import * as cohere from "./providers/cohere"
 import * as openai from "./providers/openai"
@@ -19,7 +19,7 @@ import * as decisionNative from "./providers/decision_native"
 import * as vertex from "./providers/vertex"
 import * as providers from "./providers/index"
 import * as bedrockMantle from "./providers/bedrock_mantle"
-import { DecisionReq, parseDecision } from "./decisions"
+import { DecisionReq, parseDecision, openaiRequestProblem, openaiResponse } from "./decisions"
 import { emulationBody, emulatedDecision } from "./decision_emulate"
 import { settingsOf, withHeader, responseToChat, chatToResponsesFields } from "./compat"
 import * as responses from "./responses"
@@ -290,7 +290,59 @@ export async function bedrockCountTokens(engine: Engine, req: Request, id: strin
 export async function decisionRoute(engine: Engine, req: Request, p: string): Promise<Response> {
   if (p === "/typesafe/v1/models") return await typesafeModels(engine, req)
   if (p === "/typesafe/v1/systemone") return await typesafeSystemOne(engine, req)
-  const text = await req.text()
+  const raw = await req.text()
+  const u = URL.parse(req.url)
+  // dispatch sends the OpenAI-shaped paths here as /openai/v1/decisions before it unprefixes them (server.tov)
+  if (p !== "/openai/v1/decisions" && !openaiDecisionPath(u === undefined ? "" : u.pathname)) return await decide(engine, req, raw)
+  // OpenAI's own route (and the SDK prefixes, which mount it): OpenAI's request only, a bare model is OpenAI's,
+  // and the answer in OpenAI's shape, as Bifrost's /openai/v1/decisions route
+  let text = raw
+  try {
+    const problem = try openaiRequestProblem(raw)
+    if (problem !== "") return errorResponse(400, `failed to convert request to Bifrost format: ${problem}`, "invalid_request_error", noHeaders())
+    text = try openaiModel(engine.cfg, raw)
+  } catch (e) {
+    return errorResponse(400, `invalid decision request: ${e.message}`, "invalid_request_error", noHeaders())
+  }
+  const r = await decide(engine, req, text)
+  if (r.status !== 200) return r
+  let out = ""
+  try {
+    out = try openaiResponse(await r.text())
+  } catch (e) {
+    return errorResponse(502, `could not read the answer: ${e.message}`, "api_error", noHeaders())
+  }
+  const hs: Record<string, string> = new Map()
+  r.headers.forEach((v, key) => {
+    if (key !== "content-length") hs.set(key, v)
+  })
+  return new Response(out, { status: 200, headers: hs })
+}
+
+// The decisions paths that speak OpenAI's Decisions API: Bifrost mounts its OpenAI routes under /openai and the
+// SDK prefixes (/litellm, /langchain, /pydanticai), with and without the version segment. /v1/decisions is
+// Bifrost's own normalized route.
+export function openaiDecisionPath(path: string): bool {
+  for (const pre of ["/openai", "/litellm", "/langchain", "/pydanticai"]) {
+    if (path === pre + "/v1/decisions" || path === pre + "/decisions") return true
+  }
+  return false
+}
+
+// The request with a model that names no provider read as OpenAI's (Bifrost's ParseModelString with OpenAI as the
+// default), since this is OpenAI's route.
+export function openaiModel(cfg: Config, text: string): string throws SyntaxError {
+  let fs = try fields(text)
+  const model = rawStr(fs, "model") ?? ""
+  const i = model.indexOf("/")
+  const pre = i > 0 ? model.slice(0, i) : ""
+  const ps = cfg.providers
+  if (model === "" || (pre !== "" && ((ps !== undefined && ps.has(pre)) || isKnownKind(pre)))) return text
+  setField(&fs, "model", quote("openai/" + model))
+  return build(fs)
+}
+
+async function decide(engine: Engine, req: Request, text: string): Promise<Response> {
   let d: DecisionReq = { model: "", state: "null", questions: [] }
   let body: Field[] = []
   try {
@@ -492,6 +544,20 @@ export function sdkAsyncPoll(jobs: JobStore, op: string, id: string): Response {
   const st = j.http_status ?? (j.status === "failed" ? 500 : 200)
   return new Response(j.raw ?? "", { status: st, headers: { "content-type": "application/json" } })
 }
+
+test("OpenAI's decisions route: its paths, and a bare model read as OpenAI's", () => {
+  expect(openaiDecisionPath("/openai/v1/decisions")).toBe(true)
+  expect(openaiDecisionPath("/openai/decisions")).toBe(true)
+  expect(openaiDecisionPath("/litellm/v1/decisions")).toBe(true)
+  expect(openaiDecisionPath("/pydanticai/decisions")).toBe(true)
+  expect(openaiDecisionPath("/v1/decisions")).toBe(false)
+  const cfg: Config = { providers: new Map() }
+  cfg.providers!.set("mine", { keys: [] })
+  expect(try openaiModel(cfg, `{"model":"gpt-6-luna","input":"x"}`)).toBe(`{"model":"openai/gpt-6-luna","input":"x"}`)
+  expect(try openaiModel(cfg, `{"model":"azure/Microsoft-Decision-1"}`)).toBe(`{"model":"azure/Microsoft-Decision-1"}`)
+  expect(try openaiModel(cfg, `{"model":"mine/m"}`)).toBe(`{"model":"mine/m"}`)
+  expect(try openaiModel(cfg, `{"model":"acme/m"}`)).toBe(`{"model":"openai/acme/m"}`)
+})
 
 test("a decision is native on TypeSafe for any model, and on OpenRouter for TypeSafe's and the decision rows", () => {
   expect(servesDecisionNatively("typesafe", "jev-latest")).toBe(true)

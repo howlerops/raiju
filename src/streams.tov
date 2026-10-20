@@ -6,6 +6,7 @@
 // must hold back an incomplete trailing sequence until the next chunk.
 import { Field, fields, elements, find, quote, rawStr, rawNum, setField, build } from "./json"
 import { newId, nowSeconds } from "./schemas"
+import * as b64 from "./base64"
 
 const DONE = "data: [DONE]\n\n"
 const MAX_FRAME = 16777216
@@ -603,6 +604,9 @@ export class BedrockEventStreamToOpenAI {
   private curTool = -1
   private nextTool = 0
   private finish = "stop"
+  // InvokeModelWithResponseStream of a legacy text model: "chunk" events whose base64 bytes are Claude's
+  // {completion, stop_reason} or Mistral's {outputs}; the last one carries the invocation metrics
+  invokeText = false
 
   constructor(readonly requestedModel: string, readonly includeUsage: bool) {
     this.w = new ChunkWriter(requestedModel)
@@ -638,9 +642,47 @@ export class BedrockEventStreamToOpenAI {
     if (this.done) return ""
     if (this.finished) {
       this.done = true
+      // an invoke stream has no metadata event: its usage goes out at the end
+      if (this.invokeText && this.includeUsage) return this.w.usage(this.promptTokens, this.completionTokens) + DONE
       return DONE
     }
-    return this.fail("upstream stream ended before messageStop", "api_error")
+    return this.fail(this.invokeText ? "upstream stream ended before its stop reason" : "upstream stream ended before messageStop", "api_error")
+  }
+
+  // One chunk of a legacy text model's invoke stream, as chat chunks (the text frames are made from them).
+  private invokeChunk(payload: string): string throws SyntaxError {
+    const bytes = rawStr(try fields(payload), "bytes") ?? ""
+    const inner = try fields(try decodeText(try b64.decode(bytes)))
+    const metrics = find(inner, "amazon-bedrock-invocationMetrics")
+    if (metrics !== undefined && metrics.startsWith("{")) {
+      const m = try fields(metrics)
+      this.promptTokens = count(m, "inputTokenCount")
+      this.completionTokens = count(m, "outputTokenCount")
+    }
+    let text = ""
+    let stop: string | undefined = undefined
+    const outs = find(inner, "outputs")
+    if (outs !== undefined && outs.startsWith("[")) {
+      // Mistral: the first output, its stop reason as sent ("stop", "length")
+      const first = (try elements(outs))[0]
+      if (first !== undefined) {
+        const of = try fields(first)
+        text = rawStr(of, "text") ?? ""
+        stop = rawStr(of, "stop_reason")
+      }
+    } else {
+      // Claude's legacy body: max_tokens is "length", any other stop reason "stop"
+      text = rawStr(inner, "completion") ?? ""
+      const r = rawStr(inner, "stop_reason")
+      if (r !== undefined && r !== "") stop = r === "max_tokens" ? "length" : "stop"
+    }
+    let out = ""
+    if (text !== "") out += this.begin() + this.w.text(text)
+    if (stop !== undefined && stop !== "" && !this.finished) {
+      this.finished = true
+      out += this.begin() + this.w.finishChunk(stop)
+    }
+    return out
   }
 
   private message(frame: u8[], hlen: int): string throws SyntaxError {
@@ -651,6 +693,7 @@ export class BedrockEventStreamToOpenAI {
       return this.fail(errorMessage(payload), headers.get(":exception-type") ?? headers.get(":error-code") ?? "api_error")
     }
     const type = headers.get(":event-type") ?? ""
+    if (this.invokeText) return type === "chunk" ? try this.invokeChunk(payload) : ""
     if (type === "messageStart") return this.begin()
     if (type === "contentBlockStart") {
       const fs = try fields(payload)
@@ -1121,6 +1164,38 @@ test("event stream frames fed byte by byte", () => {
   expect(chunks[3]!.usage!.completion_tokens).toBe(2)
   expect(conv.promptTokens).toBe(5)
   expect(out.endsWith("data: [DONE]\n\n")).toBe(true)
+})
+
+test("invoke streams of legacy text models: Claude's completion chunks and Mistral's outputs", () => {
+  const chunk = (inner: string): u8[] => converseFrame("chunk", `{"bytes":${quote(b64.encode(enc.encode(inner)))}}`)
+  const conv = new BedrockEventStreamToOpenAI("bedrock/anthropic.claude-v2", true)
+  conv.invokeText = true
+  const frames = concatBytes([
+    chunk(`{"type":"completion","completion":" Hi","stop_reason":null,"stop":null}`),
+    chunk(`{"type":"completion","completion":" there","stop_reason":"stop_sequence","stop":"x","amazon-bedrock-invocationMetrics":{"inputTokenCount":7,"outputTokenCount":3}}`),
+  ])
+  let out = bytePieces(frames, 5, (b) => conv.push(b))
+  out += conv.end()
+  const chunks = try chunksOf(out)
+  expect(chunks.length).toBe(5)
+  expect(chunks[1]!.choices[0]!.delta.content).toBe(" Hi")
+  expect(chunks[2]!.choices[0]!.delta.content).toBe(" there")
+  expect(chunks[3]!.choices[0]!.finish_reason).toBe("stop")
+  expect(chunks[4]!.usage!.prompt_tokens).toBe(7)
+  expect(chunks[4]!.usage!.completion_tokens).toBe(3)
+  expect(out.endsWith("data: [DONE]\n\n")).toBe(true)
+  const m = new BedrockEventStreamToOpenAI("m", false)
+  m.invokeText = true
+  let mo = m.push(chunk(`{"outputs":[{"text":"a","stop_reason":null}]}`))
+  mo += m.push(chunk(`{"outputs":[{"text":"b","stop_reason":"length"}]}`)) + m.end()
+  const mc = try chunksOf(mo)
+  expect(mc[mc.length - 1]!.choices[0]!.finish_reason).toBe("length")
+  expect(mo.includes(`"usage"`)).toBe(false)
+  // a stream cut before its stop reason is an error
+  const cut = new BedrockEventStreamToOpenAI("m", false)
+  cut.invokeText = true
+  cut.push(chunk(`{"completion":"x","stop_reason":null}`))
+  expect(cut.end().includes(`"type":"api_error"`)).toBe(true)
 })
 
 test("event stream tool use", () => {
