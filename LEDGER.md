@@ -400,3 +400,16 @@ Ports from 18270.
 | L160 | G40 | Realtime ephemeral client tokens (ek_) attributed to the minting virtual key; transcription sessions metered and billed; failed response.done logged as such | worker | assigned |
 | L161 | (g) A2A gRPC | google.rpc.Status ErrorInfo details; gRPC-only upstream agents dialed from every inbound binding | worker | assigned |
 | L162 | G48, pricing | Bedrock large-payload streams live (event-stream); large completions and Titan embeddings streamed; Gemini transcription cost | worker | assigned |
+
+## Wave 21 (the buildable remainder of the partial rows)
+
+From a triage of every partial row (work packages WP1 to WP9). Ports from 18280.
+
+| ID | Gap | Work | Owner | Status |
+|---|---|---|---|---|
+| L163 | (d) Providers | WP1: native Decision for openai, azure, cloudflare, databricks, perplexity, ollama; native legacy text completions for Anthropic and Bedrock | worker | assigned |
+| L164 | (d) Providers | WP2: provider operation gaps (xai compact, github-copilot, bedrock_mantle, sarvam, batch delete, exact OpenAI counts, replicate, cache injection points, alias overrides) | worker | todo |
+| L165 | (f) Governance | WP4: governance and RBAC API remainders, access-profile options, complexity analyzer config, load_balancer_config options | worker | todo |
+| L166 | (g) MCP | WP5a: GET /mcp heartbeats, OpenAPI import, spec_url, library, ping, per-client timeout, tool cost, instructions on Responses | worker | todo |
+| L167 | (g) MCP | WP5b: MCP user mode on OIDC, OAuth status states, persisted auth codes and flow state, temp tokens, dual-credential conflict check | worker | todo |
+| L168 | (h) Observability | WP7: logs, audit, retained content, webhooks, OTLP A2A histogram, cache clear across workers, logs_only redaction | worker | todo |
