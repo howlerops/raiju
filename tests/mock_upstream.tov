@@ -438,6 +438,26 @@ async function sttAnswer(req: Request, path: string): Promise<Response> throws T
   if (raw.length > 65536) seen.push({ path: path, auth: req.headers.get("authorization") ?? "", body: `{"model":"${model}"}`, team: "", tenant: "", size: raw.length, sha: toHex(sha256(raw)) })
   else record(req, path, `{"model":"${model}"}`)
   const text = "transcribed by " + model
+  // a model the provider refuses
+  if (model.includes("refuse")) return new Response(`{"error":{"message":"the audio could not be decoded","type":"invalid_request_error"}}`, { status: 400, headers: { "content-type": "application/json" } })
+  // a slow stream: its first event, then the rest 1.5 s later (a gateway that buffers holds the first back)
+  if (streamed && model.includes("slow")) {
+    const first = new TextEncoder().encode(`data: {"type":"transcript.text.delta","delta":"transcribed"}\n\n`)
+    const rest = new TextEncoder().encode(`data: {"type":"transcript.text.done","text":"${text}","usage":{"type":"tokens","input_tokens":30,"output_tokens":10,"total_tokens":40}}\n\ndata: [DONE]\n\n`)
+    const stream = new ReadableStream({
+      start: async (c) => {
+        c.enqueue(first)
+        await new Promise((done) => setTimeout(done, 1500))
+        try {
+          c.enqueue(rest)
+          c.close()
+        } catch (e) {
+          // the client went away
+        }
+      },
+    })
+    return new Response(stream, { headers: { "content-type": "text/event-stream" } })
+  }
   if (streamed) {
     const sse = `data: {"type":"transcript.text.delta","delta":"transcribed"}\n\n` +
       `data: {"type":"transcript.text.done","text":"${text}","usage":{"type":"tokens","input_tokens":3,"output_tokens":1,"total_tokens":4}}\n\n` +
@@ -1306,9 +1326,60 @@ Bun.serve<string>({
       POST: async (req) => {
         const body = await req.text()
         record(req, "/v1/audio/speech", body)
+        if (body.includes("tts-refuse")) return new Response(`{"error":{"message":"voice not available","type":"invalid_request_error"}}`, { status: 400, headers: { "content-type": "application/json" } })
+        // stream_format sse: OpenAI's speech events
+        if (body.includes(`"stream_format":"sse"`)) {
+          return new Response(`data: {"type":"speech.audio.delta","audio":"SUQz"}\n\ndata: {"type":"speech.audio.done","usage":{"input_tokens":2,"output_tokens":5,"total_tokens":7}}\n\n`, { headers: { "content-type": "text/event-stream" } })
+        }
         // real binary (not valid UTF-8), so a text round trip would corrupt it
         const audio: u8[] = [u8(0x49), u8(0x44), u8(0x33), u8(0xff), u8(0xfb), u8(0x90), u8(0x00), u8(0x80), u8(0xc3), u8(0x28)]
         return new Response(new Blob([audio], { type: "audio/mpeg" }), { headers: { "content-type": "audio/mpeg" } })
+      },
+    },
+    // Sarvam's speech (base64 audios), its streamed speech (raw audio bytes, the second chunk 1.5 s later) and its speech-to-text
+    "/text-to-speech": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/text-to-speech", body)
+        if ((req.headers.get("api-subscription-key") ?? "") !== "sarvam-e2e-key") return new Response(`{"error":{"message":"Invalid API subscription key","code":"invalid_api_key_error"}}`, { status: 403, headers: { "content-type": "application/json" } })
+        if (body.includes(`"text":"refuse"`)) return new Response(`{"detail":[{"msg":"speaker is not valid"}]}`, { status: 422, headers: { "content-type": "application/json" } })
+        return Response.json({ request_id: "sv_1", audios: ["UklGRmF1ZGlv"] })
+      },
+    },
+    "/text-to-speech/stream": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/text-to-speech/stream", body)
+        const first: u8[] = [u8(0x52), u8(0x49), u8(0x46), u8(0x46)]
+        const rest: u8[] = [u8(0xff), u8(0x00), u8(0x7f)]
+        const stream = new ReadableStream({
+          start: async (c) => {
+            c.enqueue(first)
+            await new Promise((done) => setTimeout(done, 1500))
+            try {
+              c.enqueue(rest)
+              c.close()
+            } catch (e) {
+              // the client went away
+            }
+          },
+        })
+        return new Response(stream, { headers: { "content-type": "application/octet-stream" } })
+      },
+    },
+    "/speech-to-text": {
+      POST: async (req) => {
+        let fd = new FormData()
+        try {
+          fd = try await req.formData()
+        } catch (e) {
+          return new Response(`{"detail":"the body is not a form"}`, { status: 400, headers: { "content-type": "application/json" } })
+        }
+        const mv = fd.get("model")
+        const lv = fd.get("language_code")
+        const file = fd.get("file")
+        record(req, "/speech-to-text", JSON.stringify({ model: typeof mv === "string" ? mv : "", language_code: typeof lv === "string" ? lv : "", file: file !== undefined && typeof file !== "string" }))
+        return Response.json({ request_id: "sv_2", transcript: "namaste duniya", language_code: "hi-IN", timestamps: { words: ["namaste", "duniya"], start_time_seconds: [0.0, 1.0], end_time_seconds: [0.9, 2.5] } })
       },
     },
     "/v1/ocr": {

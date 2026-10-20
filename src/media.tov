@@ -114,6 +114,44 @@ export function transcriptionUsage(body: string): SttUsage | undefined {
   }
 }
 
+// A streamed line longer than this is not read for usage.
+const LINE_CAP = 1048576
+
+// The usage of a streamed transcription, read from its events as they pass (the last event with a usage counts, as
+// transcriptionUsage reads a whole answer). Lines are cut at their newline byte, so a character split across chunks
+// is whole when its line is read.
+export class StreamUsage {
+  usage: SttUsage | undefined = undefined
+  line: u8[] = []
+
+  push(chunk: u8[]): void {
+    for (const b of chunk) {
+      if (int(b) === 10) this.take()
+      else if (this.line.length < LINE_CAP) this.line.push(b)
+    }
+  }
+
+  // The usage once the stream has ended (a last line with no newline counts too).
+  end(): SttUsage | undefined {
+    this.take()
+    return this.usage
+  }
+
+  private take(): void {
+    if (this.line.length === 0) return
+    let text = ""
+    try {
+      text = new TextDecoder().decode(this.line)
+    } catch (e) {
+      text = ""
+    }
+    this.line = []
+    if (!text.trim().startsWith("data:")) return
+    const u = transcriptionUsage(text)
+    if (u !== undefined) this.usage = u
+  }
+}
+
 // Azure's api-version when the key does not set one (as in openai.tov).
 const API_VERSION = "2024-10-21"
 
@@ -361,13 +399,84 @@ export async function send(t: Target, mr: native.MediaRequest): Promise<Response
     const pool = poolOf(t.cfg)
     if (body === undefined) res = try await fetch(mr.url, { method: mr.method, headers: r, signal: signal, proxy: px, tls: tls, pool: pool })
     else res = try await fetch(mr.url, { method: mr.method, headers: r, body: body, signal: signal, proxy: px, tls: tls, pool: pool })
+    const ct = res.headers.get("content-type") ?? "application/json"
+    // an event stream (a streamed transcription or speech) goes to the caller as it arrives; the deadline covers the head
+    const st = res.body
+    if (res.status === 200 && isEventStream(ct) && st !== undefined) {
+      dl.finish()
+      return new Response(pump(st, passChunk, noTail), { status: 200, headers: { "content-type": ct, "cache-control": "no-cache" } })
+    }
     const bytes = try await res.bytes()
     dl.finish()
-    const ct = res.headers.get("content-type") ?? "application/json"
     return new Response(bytes, { status: res.status, headers: { "content-type": ct } })
   } catch (e) {
     dl.finish()
     return errorReply(502, `${t.provider} request failed: ${e.message}`, "api_connection_error")
+  }
+}
+
+// Whether an answer's content type is a server-sent event stream.
+export function isEventStream(contentType: string): bool {
+  return contentType.toLowerCase().trim().startsWith("text/event-stream")
+}
+
+function passChunk(c: u8[]): u8[] {
+  return c
+}
+
+function noTail(ok: bool): u8[] {
+  return []
+}
+
+// The copy of an upstream body into the caller's: the caller's stream is fed chunk by chunk (Tov's fetch body cannot
+// be handed to a Response as it is), and a caller that goes away stops the copy.
+class Pump {
+  ctl: ReadableStreamDefaultController | undefined = undefined
+  cancelled = false
+}
+
+// The caller's stream of an upstream body, copied in the background: each chunk as conv makes it (an empty one is not
+// sent), then what tail adds when the upstream body has ended (ok false when it broke off or the caller left).
+export function pump(upstream: ReadableStream, conv: (chunk: u8[]) => u8[], tail: (ok: bool) => u8[]): ReadableStream {
+  const p = new Pump()
+  const out = new ReadableStream({
+    start: (c) => {
+      p.ctl = c
+    },
+    cancel: () => {
+      p.cancelled = true
+    },
+  })
+  copyPump(upstream, p, conv, tail)
+  return out
+}
+
+async function copyPump(upstream: ReadableStream, p: Pump, conv: (chunk: u8[]) => u8[], tail: (ok: bool) => u8[]): Promise<void> {
+  let ok = true
+  try {
+    const reader = upstream.getReader()
+    while (!p.cancelled) {
+      const r = await reader.read()
+      if (r.done) break
+      const v = r.value
+      const c = p.ctl
+      if (v === undefined || c === undefined) continue
+      const out = conv(v)
+      if (out.length > 0) c.enqueue(out)
+    }
+  } catch (e) {
+    // the upstream broke off: the caller's body ends here
+    ok = false
+  }
+  const end = tail(ok && !p.cancelled)
+  const c = p.ctl
+  if (c !== undefined && !p.cancelled) {
+    try {
+      if (end.length > 0) c.enqueue(end)
+      c.close()
+    } catch (e) {
+      // already closed by the caller
+    }
   }
 }
 
@@ -530,11 +639,17 @@ export async function handleMediaLarge(cfg: Config, req: Request, route: MediaRo
   const dl = deadline(timeoutMs(tt.cfg))
   try {
     const res = await fetch(upstreamUrl(tt, route, qs), { method: "POST", headers: hr, body: lg.stream(), signal: dl.controller.signal, proxy: proxyOf(tt.cfg), tls: tlsOf(tt.cfg), pool: poolOf(tt.cfg) })
+    const ct = res.headers.get("content-type") ?? "application/json"
+    // a streamed transcription goes to the caller as it arrives (the upload has been sent by now)
+    const st = res.body
+    if (res.status === 200 && isEventStream(ct) && st !== undefined && !lg.tap.over) {
+      dl.finish()
+      return new Response(pump(st, passChunk, noTail), { status: 200, headers: { "content-type": ct, "cache-control": "no-cache" } })
+    }
     const bytes = await res.bytes()
     dl.finish()
     // a body with no declared length that grew past max_payload_bytes cut its own upload short
     if (lg.tap.over) return errorReply(413, `request body is over the maximum payload size of ${lp.maxPayload} bytes (large_payload_optimization.max_payload_bytes)`, "invalid_request_error")
-    const ct = res.headers.get("content-type") ?? "application/json"
     return new Response(bytes, { status: res.status, headers: { "content-type": ct } })
   } catch (e) {
     dl.finish()
@@ -935,6 +1050,47 @@ async function imageReply(t: Target, mr: native.MediaRequest, bedrockAnswer: boo
   if (bedrockAnswer) return jsonReply(try cloud.bedrockImagesToOpenAI(raw))
   if (t.model.toLowerCase().includes("imagen")) return jsonReply(try native.imagenToOpenAI(raw))
   return jsonReply(try native.geminiImageToOpenAI(raw))
+}
+
+// Sarvam's refusal in the OpenAI error shape, with its status (a failed call stays the 502 send made).
+function sarvamFailure(status: int, raw: string): Response {
+  if (status === 502 && raw.includes("api_connection_error")) return new Response(raw, { status: 502, headers: { "content-type": "application/json" } })
+  return new Response(native.sarvamError(raw), { status: status, headers: { "content-type": "application/json" } })
+}
+
+// The bytes of a server-sent event.
+function eventBytes(s: string): u8[] {
+  return new TextEncoder().encode(s)
+}
+
+function sarvamDelta(c: u8[]): u8[] {
+  return eventBytes(native.speechStreamEvent(c, false))
+}
+
+function sarvamDone(ok: bool): u8[] {
+  return eventBytes(native.speechStreamEvent([], true) + "data: [DONE]\n\n")
+}
+
+// Sarvam's streamed speech: the raw audio as it comes, each chunk a speech.audio.delta event, then speech.audio.done and
+// [DONE] (Bifrost's SpeechStream for Sarvam). A refusal before the stream is the error answer.
+async function sarvamSpeechStream(t: Target, mr: native.MediaRequest): Promise<Response> {
+  const r: Record<string, string> = mr.headers
+  const dl = deadline(timeoutMs(t.cfg))
+  try {
+    const body = mr.body
+    const res = typeof body === "string" ? await fetch(mr.url, { method: "POST", headers: r, body: body, signal: dl.controller.signal, proxy: proxyOf(t.cfg), tls: tlsOf(t.cfg), pool: poolOf(t.cfg) }) : await fetch(mr.url, { method: "POST", headers: r, signal: dl.controller.signal, proxy: proxyOf(t.cfg), tls: tlsOf(t.cfg), pool: poolOf(t.cfg) })
+    const st = res.body
+    if (res.status !== 200 || st === undefined) {
+      const raw = await res.text()
+      dl.finish()
+      return sarvamFailure(res.status === 200 ? 502 : res.status, raw)
+    }
+    dl.finish()
+    return new Response(pump(st, sarvamDelta, sarvamDone), { status: 200, headers: { "content-type": "text/event-stream", "cache-control": "no-cache" } })
+  } catch (e) {
+    dl.finish()
+    return errorReply(502, `${t.provider} request failed: ${e.message}`, "api_connection_error")
+  }
 }
 
 // A GET to the upstream URL of a route, with the provider's auth.
@@ -1367,16 +1523,20 @@ async function sarvamMedia(t: Target, route: MediaRoute, text: string, form: For
   if (route.op === "audio.speech") {
     let mr: native.MediaRequest | undefined = undefined
     let codec = ""
+    let stream = false
     try {
       const fs = try fields(text)
       codec = rawStr(fs, "output_audio_codec") ?? ""
+      stream = rawStr(fs, "stream_format") === "sse"
       mr = try native.sarvamSpeech(t, fs)
     } catch (e) {
       return errorReply(400, e.message, "invalid_request_error")
     }
     if (mr === undefined) return errorReply(400, "the request needs input", "invalid_request_error")
+    // stream_format sse: Sarvam's /text-to-speech/stream, its raw audio sent on as speech.audio.delta events
+    if (stream) return await sarvamSpeechStream(t, { method: mr.method, url: mr.url + "/stream", headers: mr.headers, body: mr.body })
     const up = await send(t, mr)
-    if (!up.ok) return up
+    if (up.status !== 200) return sarvamFailure(up.status, try await up.text())
     let audio: native.SpeechAudio | undefined = undefined
     try {
       audio = try native.sarvamSpeechAudio(try await up.text(), codec)
@@ -1396,7 +1556,7 @@ async function sarvamMedia(t: Target, route: MediaRoute, text: string, form: For
     fd.append("file", f)
     for (const kv of st.fields) fd.append(kv[0]!, kv[1]!)
     const up = await send(t, { method: "POST", url: st.request.url, headers: st.request.headers, body: fd })
-    if (!up.ok) return up
+    if (up.status !== 200) return sarvamFailure(up.status, try await up.text())
     const body = try native.sarvamTranscriptToOpenAI(try await up.text())
     if (format === "text") return new Response(rawStr(try fields(body), "text") ?? "", { headers: { "content-type": "text/plain; charset=utf-8" } })
     return jsonReply(body)
@@ -2082,4 +2242,31 @@ test("a streamed transcription's usage is on its last event that has one", () =>
   expect(u.prompt).toBe(3)
   expect(u.completion).toBe(1)
   expect(transcriptionUsage("data: {\"type\":\"transcript.text.delta\",\"delta\":\"hi\"}\n\ndata: [DONE]\n\n")).toBeUndefined()
+})
+
+test("a streamed transcription's usage is read as its events pass, whatever the chunks", () => {
+  const s = "data: {\"type\":\"transcript.text.delta\",\"delta\":\"hé\"}\n\n" +
+    "data: {\"type\":\"transcript.text.done\",\"text\":\"hé\",\"usage\":{\"type\":\"tokens\",\"input_tokens\":3,\"output_tokens\":1,\"total_tokens\":4}}\n\n" +
+    "data: [DONE]"
+  const bytes = new TextEncoder().encode(s)
+  // fed three bytes at a time: lines and characters split across chunks
+  const su = new StreamUsage()
+  let i = 0
+  while (i < bytes.length) {
+    su.push(bytes.slice(i, Math.min(i + 3, bytes.length)))
+    i += 3
+  }
+  const u = su.end()!
+  expect(u.prompt).toBe(3)
+  expect(u.completion).toBe(1)
+  const none = new StreamUsage()
+  none.push(new TextEncoder().encode("event: x\ndata: {\"type\":\"transcript.text.delta\"}\n"))
+  expect(none.end()).toBeUndefined()
+  expect(isEventStream("text/event-stream; charset=utf-8")).toBe(true)
+  expect(isEventStream("application/json")).toBe(false)
+})
+
+test("sarvam is served natively", () => {
+  expect(isNative("sarvam")).toBe(true)
+  expect(isNative("groq")).toBe(false)
 })

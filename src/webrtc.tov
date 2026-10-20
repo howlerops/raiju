@@ -182,7 +182,7 @@ function jsonAt(text: string, path: string[]): string | undefined {
   return cur
 }
 
-function strAt(text: string, path: string[]): string {
+export function strAt(text: string, path: string[]): string {
   const v = jsonAt(text, path)
   if (v === undefined) return ""
   try {
@@ -199,7 +199,7 @@ function numAt(text: string, path: string[]): f64 {
 }
 
 // The text with the value at path replaced by raw (the objects on the way must exist).
-function withJsonAt(text: string, path: string[], raw: string): string throws SyntaxError {
+export function withJsonAt(text: string, path: string[], raw: string): string throws SyntaxError {
   if (path.length === 0) return raw
   let fs = try fields(text)
   const k = path[0]!
@@ -546,6 +546,13 @@ function isRealtimeOutputDelta(type: string): bool {
 }
 
 const INPUT_TRANSCRIPT = "conversation.item.input_audio_transcription.completed"
+// What Bifrost answers a response.create made while a response is running.
+const ACTIVE_RESPONSE = "Conversation already has an active response in progress."
+
+// The check of a live session.update before it reaches the provider (live.tov checkDelegation): the frame to send (its
+// delegated-responses model put as the provider names it) and the backend model it switches to ("" for none), or the
+// refusal (message not "") the client is sent instead.
+export type UpdateCheck = { frame: string, model: string, status: int, type: string, message: string }
 
 // What a provider event's text is checked as: "input" for the transcript of the caller's own audio, "output" for
 // anything the model said.
@@ -579,6 +586,8 @@ export class LiveCore {
   // model of a live session's delegated responses when they name none
   model = ""
   backendModel = ""
+  // a live session's check of each session.update (Bifrost's liveUpdatePolicy), when it has one
+  checkUpdate: ((m: string) => UpdateCheck) | undefined = undefined
   // a turn (a response, from its start to its response.done) is running
   turnActive = false
   // the provider's connection ended abnormally
@@ -648,10 +657,27 @@ export class LiveCore {
     if (texts.length > 0) out = rewriteClientTexts(type, m, texts)
     this.hooks.count("in", type)
     this.events += 1
-    // a realtime turn the caller starts is admitted first; a refusal ends the session and the event goes nowhere
+    // a realtime turn the caller starts is admitted first; a refusal ends the session and the event goes nowhere. A
+    // response.create while a turn is running is refused and goes nowhere either, as Bifrost does (the session goes on)
     if (this.realtime && type === "response.create") {
+      if (this.turnActive) {
+        this.io.toClient(errorEvent("invalid_request_error", ACTIVE_RESPONSE))
+        return
+      }
       this.startTurn()
       if (this.refused) return
+    }
+    // a live session.update that names a delegated-responses model is checked first: a refused one goes nowhere and the
+    // session goes on; an admitted one switches the model its delegated responses are billed under
+    const chk = this.checkUpdate
+    if (!this.realtime && type === "session.update" && chk !== undefined) {
+      const c = chk(out)
+      if (c.message !== "") {
+        this.io.toClient(errorEvent(c.type, c.message))
+        return
+      }
+      out = c.frame
+      if (c.model !== "") this.backendModel = c.model
     }
     if (type === "session.close") {
       this.closeSent = true
@@ -1467,6 +1493,8 @@ export type Setup = {
   backendModel: string,
   // a realtime transcription session (LiveCore.transcription)
   transcription?: bool,
+  // a live session's check of each session.update (LiveCore.checkUpdate)
+  checkUpdate?: (m: string) => UpdateCheck,
 }
 
 export type Established = { status: int, type: string, message: string, answer: string, sessionId: string, relay: Relay | undefined, body: string, contentType: string }
@@ -1604,6 +1632,7 @@ export async function establish(s: Setup): Promise<Established> {
   relay.core.transcription = s.transcription ?? false
   relay.core.model = s.model
   relay.core.backendModel = s.backendModel
+  relay.core.checkUpdate = s.checkUpdate
   // nothing is billed until the provider has created the session
   relay.core.minimum = 0.0
   const downLeg = new PeerLeg(down, randomSsrc())
@@ -2245,19 +2274,53 @@ test("a realtime turn is admitted when it starts, once, whoever starts it", () =
   expect(t.cap.provider.length).toBe(1)
   // the provider's own events for the same turn do not admit it again
   t.core.fromProvider(`{"type":"response.created","response":{"id":"resp_1"}}`, undefined, 1150.0)
+  expect(t.cap.readmits).toBe(1)
+  // another response.create while it runs is refused, as Bifrost does: the caller is told, the provider never sees it
+  const sentBefore = t.cap.client.length
   t.core.fromClient(`{"type":"response.create"}`, [], 1160.0)
   expect(t.cap.readmits).toBe(1)
+  expect(t.cap.provider.length).toBe(1)
+  expect(t.cap.client.length).toBe(sentBefore + 1)
+  expect(t.cap.client[sentBefore]!).toBe(`{"type":"error","error":{"message":"Conversation already has an active response in progress.","type":"invalid_request_error","code":"invalid_request_error"}}`)
+  expect(t.core.finished).toBe(false)
   t.core.fromProvider(DONE_1, undefined, 1200.0)
   expect(t.core.turnActive).toBe(false)
+  // once the response is done, the next response.create starts a turn
+  t.core.fromClient(`{"type":"response.create"}`, [], 1250.0)
+  expect(t.cap.readmits).toBe(2)
+  expect(t.cap.provider.length).toBe(2)
+  t.core.fromProvider(`{"type":"response.done","response":{"id":"resp_1b"}}`, undefined, 1260.0)
+  expect(t.cap.readmits).toBe(2)
   // the provider starts the next one (the caller's speech was committed)
   t.core.fromProvider(`{"type":"input_audio_buffer.committed","item_id":"item_1"}`, undefined, 1300.0)
-  expect(t.cap.readmits).toBe(2)
+  expect(t.cap.readmits).toBe(3)
   t.core.fromProvider(`{"type":"response.created","response":{"id":"resp_2"}}`, undefined, 1310.0)
-  expect(t.cap.readmits).toBe(2)
+  expect(t.cap.readmits).toBe(3)
   // events that start no turn do not admit
   t.core.fromProvider(`{"type":"response.output_audio.delta","delta":"AAAA"}`, undefined, 1320.0)
   t.core.fromClient(`{"type":"input_audio_buffer.append","audio":"AAAA"}`, [], 1330.0)
-  expect(t.cap.readmits).toBe(2)
+  expect(t.cap.readmits).toBe(3)
+})
+
+test("a live session.update is checked before it goes: a refusal is the client's error, an admitted model is billed next", () => {
+  const t = fixture()
+  t.core.backendModel = "gpt-back"
+  t.core.checkUpdate = (m: string): UpdateCheck => {
+    if (m.includes("anthropic/")) return { frame: "", model: "", status: 400, type: "invalid_request_error", message: "session.delegation.responses.model must be served by openai, the provider of session.model" }
+    if (m.includes("gpt-next")) return { frame: m.replace("openai/gpt-next", "gpt-next"), model: "gpt-next", status: 0, type: "", message: "" }
+    return { frame: m, model: "", status: 0, type: "", message: "" }
+  }
+  t.core.fromClient(`{"type":"session.update","session":{"delegation":{"type":"responses","responses":{"model":"anthropic/claude"}}}}`, [], 1100.0)
+  expect(t.cap.provider.length).toBe(0)
+  expect(t.cap.client.join("|")).toBe(`{"type":"error","error":{"message":"session.delegation.responses.model must be served by openai, the provider of session.model","type":"invalid_request_error","code":"invalid_request_error"}}`)
+  expect(t.core.finished).toBe(false)
+  expect(t.core.backendModel).toBe("gpt-back")
+  t.core.fromClient(`{"type":"session.update","session":{"delegation":{"type":"responses","responses":{"model":"openai/gpt-next"}}}}`, [], 1200.0)
+  expect(t.cap.provider.join("|")).toBe(`{"type":"session.update","session":{"delegation":{"type":"responses","responses":{"model":"gpt-next"}}}}`)
+  expect(t.core.backendModel).toBe("gpt-next")
+  // other events are not checked
+  t.core.fromClient(`{"type":"session.input_audio.mute","x":"anthropic/"}`, [], 1300.0)
+  expect(t.cap.provider.length).toBe(2)
 })
 
 test("a refused realtime turn ends the session: the caller is told and the event goes nowhere", () => {

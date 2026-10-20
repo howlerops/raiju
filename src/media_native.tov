@@ -8,7 +8,7 @@ import { Target, headers, addExtraHeaders, trimSlash } from "./providers/types"
 import * as anthropic from "./providers/anthropic"
 import * as anthropicBeta from "./anthropic_beta"
 import * as gemini from "./providers/gemini"
-import { ChatRequest, newId, nowSeconds } from "./schemas"
+import { ChatRequest, newId, nowSeconds, errorJson } from "./schemas"
 import { decode, encode } from "./base64"
 
 // The request to send. A FormData body is a multipart upload; the caller leaves
@@ -1044,6 +1044,47 @@ export function sarvamSpeechAudio(raw: string, codec: string): SpeechAudio throw
   return { bytes: try decode(first), contentType: ct }
 }
 
+// One event of a streamed Sarvam speech answer in Bifrost's shape (BifrostSpeechStreamResponse): a chunk of audio as a
+// speech.audio.delta, or the speech.audio.done that ends it.
+export function speechStreamEvent(audio: u8[], done: bool): string {
+  const type = done ? "speech.audio.done" : "speech.audio.delta"
+  return `data: {"type":"${type}","audio":${quote(encode(audio))}}\n\n`
+}
+
+// An error answer of Sarvam as an OpenAI error body (Bifrost's parseSarvamError): error.message, else detail (a string, or
+// FastAPI's list of {msg}), else the body itself; error.code is the type.
+export function sarvamError(raw: string): string {
+  let message = ""
+  let type = "api_error"
+  try {
+    const fs = fields(raw)
+    const e = find(fs, "error")
+    if (e !== undefined && !isNull(e) && e.startsWith("{")) {
+      const ef = fields(e)
+      message = rawStr(ef, "message") ?? ""
+      const code = rawStr(ef, "code") ?? ""
+      if (code !== "" && message !== "") type = code
+    }
+    if (message === "") {
+      const d = find(fs, "detail")
+      if (d !== undefined && d.startsWith("\"")) message = rawStr(fs, "detail") ?? ""
+      else if (d !== undefined && d.startsWith("[")) {
+        const msgs: string[] = []
+        for (const item of elements(d)) {
+          if (!item.startsWith("{")) continue
+          const m = rawStr(fields(item), "msg") ?? ""
+          if (m !== "") msgs.push(m)
+        }
+        message = msgs.join("; ")
+      }
+    }
+  } catch (e) {
+    message = ""
+  }
+  if (message === "") message = raw.trim() === "" ? "Sarvam request failed" : raw.trim()
+  return errorJson(message, type, undefined)
+}
+
 // The speech-to-text POST: the file goes in the "file" part (added by the caller) with these text fields: the
 // model, mode, the language (language_code, else OpenAI's language) and input_audio_codec, each when set.
 export function sarvamTranscription(t: Target, mode: string, language: string, codec: string): { request: MediaRequest, fields: string[][] } {
@@ -1509,4 +1550,13 @@ test("Sarvam speech-to-text: fields and the transcript as OpenAI's", () => {
   const body = try sarvamTranscriptToOpenAI(`{"request_id":"r","transcript":"namaste duniya","language_code":"hi-IN","timestamps":{"words":["namaste","duniya"],"start_time_seconds":[0.0,0.6],"end_time_seconds":[0.5,1.25]},"diarized_transcript":{"entries":[{"transcript":"namaste duniya","start_time_seconds":0.0,"end_time_seconds":1.5,"speaker_id":"0"}]}}`)
   expect(body).toBe(`{"text":"namaste duniya","language":"hi-IN","words":[{"word":"namaste","start":0.0,"end":0.5},{"word":"duniya","start":0.6,"end":1.25}],"segments":[{"id":"","type":"transcript.text.segment","speaker":"0","start":0.0,"end":1.5,"text":"namaste duniya"}],"duration":1.5}`)
   expect(try sarvamTranscriptToOpenAI(`{"transcript":"hi","language_code":null}`)).toBe(`{"text":"hi"}`)
+})
+
+test("Sarvam's streamed speech events and its errors in OpenAI's shape", () => {
+  expect(speechStreamEvent([u8(72), u8(105)], false)).toBe(`data: {"type":"speech.audio.delta","audio":"SGk="}\n\n`)
+  expect(speechStreamEvent([], true)).toBe(`data: {"type":"speech.audio.done","audio":""}\n\n`)
+  expect(sarvamError(`{"error":{"message":"bad speaker","code":"invalid_request_error"}}`)).toBe(`{"error":{"message":"bad speaker","type":"invalid_request_error"}}`)
+  expect(sarvamError(`{"detail":"Invalid API key"}`)).toBe(`{"error":{"message":"Invalid API key","type":"api_error"}}`)
+  expect(sarvamError(`{"detail":[{"msg":"text is required"},{"msg":"bad pace"}]}`)).toBe(`{"error":{"message":"text is required; bad pace","type":"api_error"}}`)
+  expect(sarvamError("upstream down")).toBe(`{"error":{"message":"upstream down","type":"api_error"}}`)
 })

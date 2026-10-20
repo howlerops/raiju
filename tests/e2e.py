@@ -5764,6 +5764,196 @@ def l144_e2e(env):
         gw.terminate()
 
 
+GW_L169 = "http://127.0.0.1:18290"  # streamed transcriptions, Sarvam's audio, refused and failed audio logged, realtime and live checks
+
+def l169_config() -> dict:
+    """OpenAI and Sarvam audio through the mock, a live and realtime OpenAI key, and the log store. Virtual keys: one with
+    no limits, one that may use only some models (refused audio and live delegation checks)."""
+    import hashlib
+    def tok(t):
+        return hashlib.sha256(t.encode()).hexdigest()
+    return {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": True},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l169-logs")},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "pricing": {
+            "openai/gpt-4o-transcribe-slow": {"input_cost_per_token": 0.000002, "output_cost_per_token": 0.00001},
+            # the live session's backend models: a delegated response is billed at the rates of the model it ran on
+            "openai/gpt-back": {"input_cost_per_token": 0.000002, "output_cost_per_token": 0.000008},
+            "openai/gpt-next": {"input_cost_per_token": 0.000001, "output_cost_per_token": 0.000004},
+            # Sarvam's speech is billed by its characters at the text rate (no character rate here), its transcription by
+            # its seconds at the audio rate per second, which wins over the voice rate
+            "sarvam/bulbul:v2": {"input_cost_per_token": 0.00001, "output_cost_per_token": 0.0},
+            "sarvam/saarika:v2.5": {"input_cost_per_token": 0.0, "output_cost_per_token": 0.0, "input_cost_per_second": 0.1, "input_cost_per_audio_per_second": 0.001},
+        },
+        "providers": {
+            "openai": {"keys": [{"name": "pool-l169", "value": "sk-l169", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "sarvam": {"keys": [{"name": "sv", "value": "sarvam-e2e-key", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": tok("sk-admin-l169")}],
+            "virtual_keys": [{"id": "vk-l169", "value": "sk-bf-l169"},
+                             {"id": "vk-l169-narrow", "value": "sk-bf-l169-narrow", "provider_configs": [{"provider": "openai", "allowed_models": ["whisper-1", "gpt-live", "gpt-back", "gpt-next"]}]}],
+        },
+    }
+
+
+def l169_e2e(env):
+    """L169: a streamed transcription passes through as it arrives and is billed from its last usage; Sarvam's speech, its
+    streamed speech (/text-to-speech/stream) and its speech-to-text are served natively, the transcription billed by its
+    seconds at input_cost_per_audio_per_second; refused and failed audio calls are logged as errors; a realtime session
+    refuses a second response.create while a response runs; a live session's delegated model is checked on start and
+    on session.update and goes up bare. Its own gateway (port 18290), started and stopped here."""
+    import http.client, shutil
+    cfg_path = os.path.join(BUILD, "e2e.l169.json")
+    json.dump(l169_config(), open(cfg_path, "w"))
+    shutil.rmtree(os.path.join(BUILD, "e2e-l169-logs"), ignore_errors=True)
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18290", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l169.log"), "w"))
+    vk = {"authorization": "Bearer sk-bf-l169"}
+    narrow = {"authorization": "Bearer sk-bf-l169-narrow"}
+    adm_h = {"authorization": "Bearer sk-admin-l169"}
+
+    def rows_of(op, model=None, wait_s=4.0):
+        out = []
+        deadline = time.time() + wait_s
+        while True:
+            s, _, b = call("GET", "/api/logs", None, adm_h, base=GW_L169, auth=False)
+            rows = json.loads(b).get("logs", []) if s == 200 else []
+            out, ids = [], set()
+            for x in rows:
+                if x.get("object") != op or (model is not None and x.get("model") != model) or x.get("id") in ids:
+                    continue
+                ids.add(x.get("id"))
+                out.append(x)
+            if out or time.time() > deadline:
+                return out
+            time.sleep(0.2)
+
+    def form_body(fields, filename="talk.wav"):
+        boundary = "raiju-e2e-l169-boundary"
+        out = []
+        for k, v in fields.items():
+            out.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
+        out.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\nContent-Type: audio/wav\r\n\r\n'.encode() + b"RIFF\x00\x00\x00\x00WAVEfmt " + b"\r\n")
+        out.append(f"--{boundary}--\r\n".encode())
+        return b"".join(out), f"multipart/form-data; boundary={boundary}"
+
+    def timed_stream(path, body, ctype, headers, marker):
+        """POSTs body and reads the answer line by line: the status, how long the line holding marker took, and the whole body."""
+        conn = http.client.HTTPConnection("127.0.0.1", 18290, timeout=10)
+        t0 = time.time()
+        conn.request("POST", path, body=body, headers={"content-type": ctype, **headers})
+        r = conn.getresponse()
+        first_at = None
+        lines = []
+        while True:
+            line = r.readline()
+            if not line:
+                break
+            lines.append(line)
+            if first_at is None and marker in line:
+                first_at = time.time() - t0
+        conn.close()
+        return r.status, first_at, time.time() - t0, b"".join(lines)
+
+    try:
+        wait(GW_L169 + "/health")
+
+        # ---- a streamed transcription passes through as it arrives ----
+        body, ctype = form_body({"model": "openai/gpt-4o-transcribe-slow", "stream": "true"})
+        s, first_at, total, raw = timed_stream("/v1/audio/transcriptions", body, ctype, vk, b"transcript.text.delta")
+        check("a streamed transcription's first event reaches the caller before the provider has finished", s == 200 and first_at is not None and first_at < 1.2 and total >= 1.4 and b"transcript.text.done" in raw and b"data: [DONE]" in raw, (s, first_at, total, raw[:300]))
+        tr = rows_of("transcription", "gpt-4o-transcribe-slow")
+        check("and it is billed from the usage of its last event when it ends", len(tr) == 1 and tr[0].get("prompt_tokens") == 30 and tr[0].get("completion_tokens") == 10 and near(tr[0].get("cost"), 30 * 0.000002 + 10 * 0.00001) and tr[0].get("status") == "success", tr)
+        # OpenAI's streamed speech (stream_format sse) passes through as events too
+        s, h, b = call_bytes("POST", "/v1/audio/speech", {"model": "openai/tts-1", "input": "hi", "voice": "alloy", "stream_format": "sse"}, vk, base=GW_L169)
+        check("a streamed OpenAI speech answer comes back as its events", s == 200 and b"speech.audio.delta" in b and b"speech.audio.done" in b and "text/event-stream" in (h.get("content-type") or ""), (s, b[:200]))
+
+        # ---- refused and failed audio calls are logged as errors, charged nothing ----
+        s, _, b = mp_form(GW_L169, "/v1/audio/transcriptions", [("model", None, "text/plain", "openai/gpt-4o-transcribe"), ("file", "talk.wav", "audio/wav", b"RIFF\x00\x00\x00\x00WAVEfmt ")], narrow)
+        check("a transcription the virtual key may not use is refused", s in (401, 403) and "gpt-4o-transcribe" in b, (s, b[:200]))
+        rows = rows_of("transcription", "gpt-4o-transcribe")
+        check("and the refusal is logged as an error row with its message", len(rows) == 1 and rows[0].get("status") == "error" and "gpt-4o-transcribe" in (rows[0].get("error_details") or {}).get("message", "") and float(rows[0].get("cost") or 0) == 0.0, rows)
+        s, _, b = mp_form(GW_L169, "/v1/audio/transcriptions", [("model", None, "text/plain", "openai/whisper-refuse"), ("file", "talk.wav", "audio/wav", b"RIFF\x00\x00\x00\x00WAVEfmt ")], vk)
+        check("a transcription the provider refuses comes back with its status", s == 400 and "could not be decoded" in b, (s, b[:200]))
+        rows = rows_of("transcription", "whisper-refuse")
+        check("and it is logged as an error row of its virtual key, with the provider's message", len(rows) == 1 and rows[0].get("status") == "error" and rows[0].get("virtual_key_id") == "vk-l169" and "could not be decoded" in (rows[0].get("error_details") or {}).get("message", ""), rows)
+        s, _, b = call("POST", "/v1/audio/speech", {"model": "openai/tts-refuse", "input": "hello", "voice": "alloy"}, vk, base=GW_L169, auth=False)
+        rows = rows_of("speech", "tts-refuse")
+        check("a speech call the provider refuses is logged as an error row too", s == 400 and len(rows) == 1 and rows[0].get("status") == "error" and "voice not available" in (rows[0].get("error_details") or {}).get("message", ""), (s, rows))
+
+        # ---- Sarvam's audio, served natively ----
+        s, h, audio = call_bytes("POST", "/v1/audio/speech", {"model": "sarvam/bulbul:v2", "input": "namaste", "voice": "anushka", "language_code": "hi-IN", "speed": 1.1}, vk, base=GW_L169)
+        sent = [x for x in seen() if x["path"] == "/text-to-speech"]
+        sbody = json.loads(sent[-1]["body"]) if sent else {}
+        check("Sarvam speech is its text-to-speech: the body in Sarvam's names, the audio decoded", s == 200 and audio == b64lib.b64decode("UklGRmF1ZGlv") and sbody == {"text": "namaste", "target_language_code": "hi-IN", "model": "bulbul:v2", "speaker": "anushka", "pace": 1.1}, (s, audio[:20], sbody))
+        rows = rows_of("speech", "bulbul:v2")
+        check("and it is billed by its characters", len(rows) == 1 and rows[0].get("provider") == "sarvam" and near(rows[0].get("cost"), 7 * 0.00001), rows)
+        s, _, b = call("POST", "/v1/audio/speech", {"model": "sarvam/bulbul:v2", "input": "refuse", "voice": "x"}, vk, base=GW_L169, auth=False)
+        check("Sarvam's refusal keeps its status and message", s == 422 and "speaker is not valid" in b, (s, b[:200]))
+        s, first_at, total, raw = timed_stream("/v1/audio/speech", json.dumps({"model": "sarvam/bulbul:v2", "input": "namaste", "voice": "anushka", "stream_format": "sse"}).encode(), "application/json", vk, b"speech.audio.delta")
+        events = [json.loads(l[5:]) for l in raw.split(b"\n") if l.startswith(b"data: {")]
+        audio = b"".join(b64lib.b64decode(e.get("audio", "")) for e in events if e.get("type") == "speech.audio.delta")
+        check("Sarvam's streamed speech is its /text-to-speech/stream, each chunk of audio a speech.audio.delta as it comes", s == 200 and first_at is not None and first_at < 1.2 and total >= 1.4 and audio == bytes([0x52, 0x49, 0x46, 0x46, 0xff, 0x00, 0x7f]) and events[-1].get("type") == "speech.audio.done" and raw.rstrip().endswith(b"data: [DONE]") and any(x["path"] == "/text-to-speech/stream" for x in seen()), (s, first_at, total, raw[:300]))
+        s, _, b = mp_form(GW_L169, "/v1/audio/transcriptions", [("model", None, "text/plain", "sarvam/saarika:v2.5"), ("language", None, "text/plain", "hi-IN"), ("file", "talk.wav", "audio/wav", b"RIFF\x00\x00\x00\x00WAVEfmt ")], vk)
+        out = json.loads(b) if s == 200 else {}
+        stt_sent = [x for x in seen() if x["path"] == "/speech-to-text"]
+        check("Sarvam's speech-to-text answers in Bifrost's transcription shape", s == 200 and out.get("text") == "namaste duniya" and out.get("language") == "hi-IN" and out.get("duration") == 2.5 and [w["word"] for w in out.get("words", [])] == ["namaste", "duniya"] and stt_sent and json.loads(stt_sent[-1]["body"]) == {"model": "saarika:v2.5", "language_code": "hi-IN", "file": True}, (s, b[:300]))
+        rows = rows_of("transcription", "saarika:v2.5")
+        check("and it is billed by its seconds at input_cost_per_audio_per_second", len(rows) == 1 and near(rows[0].get("cost"), 2.5 * 0.001), rows)
+
+        # ---- realtime: a second response.create while a response runs is refused ----
+        c = WsClient("/v1/realtime?model=openai/gpt-realtime", vk, port=18290)
+        c.send(json.dumps({"type": "test.rt.start", "id": "sess_l169_rt"}))
+        ws_collect(c, lambda e: e.get("type") == "session.created")
+        c.send(json.dumps({"type": "response.create"}))
+        first = ws_collect(c, lambda e: e.get("type") == "echo")
+        c.send(json.dumps({"type": "response.create", "response": {"instructions": "again"}}))
+        refused = ws_collect(c, lambda e: e.get("type") in ("error", "echo"))
+        check("a response.create while a response is running is refused, as Bifrost does, and never reaches the provider", first and first[-1].get("type") == "echo" and refused and refused[-1].get("type") == "error" and refused[-1]["error"]["message"] == "Conversation already has an active response in progress." and refused[-1]["error"]["type"] == "invalid_request_error", (first, refused))
+        c.send(json.dumps({"type": "test.rt.turn", "id": "resp_l169", "input": 10, "output": 5}))
+        ws_collect(c, lambda e: e.get("type") == "response.done")
+        c.send(json.dumps({"type": "response.create"}))
+        again = ws_collect(c, lambda e: e.get("type") in ("error", "echo"))
+        check("once the response is done, the next response.create goes on", again and again[-1].get("type") == "echo", again)
+        c.sock.close()
+
+        # ---- live: the delegated model is checked and sent bare ----
+        def live(headers, model, sid):
+            lc = WsClient("/v1/live/sessions", headers, port=18290)
+            lc.send(json.dumps({"type": "session.start", "session": {"model": "openai/gpt-live", "mock_id": sid, "delegation": {"type": "responses", "responses": {"model": model}}}}))
+            return lc
+
+        c = live(narrow, "openai/gpt-back", "sess_l169_live")
+        evs = ws_collect(c, lambda e: e.get("type") in ("echo", "error"))
+        start = evs[-1].get("event", "") if evs else ""
+        check("a live start's delegated model goes to the provider without its provider prefix", evs and evs[-1].get("type") == "echo" and '"model":"gpt-back"' in start and "openai/gpt-back" not in start, evs)
+        c.send(json.dumps({"type": "session.update", "session": {"delegation": {"type": "responses", "responses": {"model": "anthropic/claude-sonnet"}}}}))
+        evs = ws_collect(c, lambda e: e.get("type") in ("echo", "error"))
+        check("a session.update naming another provider's model is refused and never reaches the provider", evs and evs[-1].get("type") == "error" and evs[-1]["error"]["message"] == "session.delegation.responses.model must be served by openai, the provider of session.model", evs)
+        c.send(json.dumps({"type": "session.update", "session": {"delegation": {"type": "responses", "responses": {"model": "openai/gpt-other"}}}}))
+        evs = ws_collect(c, lambda e: e.get("type") in ("echo", "error"))
+        check("a session.update naming a model the virtual key may not use is refused by governance", evs and evs[-1].get("type") == "error" and "gpt-other" in evs[-1]["error"]["message"], evs)
+        c.send(json.dumps({"type": "session.update", "session": {"delegation": {"type": "responses", "responses": {"model": "openai/gpt-next"}}}}))
+        evs = ws_collect(c, lambda e: e.get("type") in ("echo", "error"))
+        upd = evs[-1].get("event", "") if evs else ""
+        check("an allowed session.update goes on, its model bare", evs and evs[-1].get("type") == "echo" and '"model":"gpt-next"' in upd and "openai/gpt-next" not in upd, evs)
+        # a delegated response that names no model is billed under the model the update switched to
+        c.send(json.dumps({"type": "test.backend", "input": 100, "output": 10}))
+        ws_collect(c, lambda e: e.get("type") == "response.event")
+        c.send(json.dumps({"type": "session.close", "mock_seconds": 2}))
+        ws_collect(c, lambda e: e.get("type") == "session.closed")
+        lrows = [x for x in rows_of("live", wait_s=6.0) if x.get("prompt_tokens") == 100]
+        check("the delegated response after the update is billed at its model's rates", len(lrows) == 1 and near(lrows[0].get("cost"), 100 * 0.000001 + 10 * 0.000004), [(x.get("model"), x.get("prompt_tokens"), x.get("cost")) for x in lrows])
+        c = live(vk, "anthropic/claude-sonnet", "sess_l169_bad")
+        evs = ws_collect(c, lambda e: e.get("type") in ("echo", "error", "session.started"))
+        check("a live start delegating to another provider's model is refused before the provider is called", evs and evs[-1].get("type") == "error" and "must be served by openai" in evs[-1]["error"]["message"] and c.recv() is None, evs)
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
 GW_L149_A = "http://127.0.0.1:18248"  # two cluster nodes, each with its own logs folder: push configs and the relay across them
 GW_L149_B = "http://127.0.0.1:18249"
 GW_L149_W = "http://127.0.0.1:18250"  # two workers of one node: the card fetched once, served by both, fetched once per period
@@ -13244,6 +13434,9 @@ def main():
         l147_cluster_e2e(env)
         # audio billing: speech by its characters, transcriptions and translations by their usage, the log rows and the budgets: their own gateway
         l144_e2e(env)
+        # L169: streamed transcriptions, Sarvam's audio, refused and failed audio logged, a second response.create refused,
+        # live delegation checks: its own gateway (port 18290)
+        l169_e2e(env)
         # L149: push configs shared across the cluster (a callback registered on one node is answered and relayed by another), and
         # a card fetched by one worker served by both, fetched once per period: their own gateways
         l149_cluster_e2e(env)

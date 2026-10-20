@@ -14,22 +14,23 @@
 // (webrtc.tov) as the WebRTC one, so its voice seconds are billed in 30 s windows that governance admits
 // again, its text is guarded, and it ends as one log row with its cost (livehooks.tov). It has no minimum:
 // only a created WebRTC session bills one. An attach (a sideband) bills nothing, the primary does, and
-// relays frames untouched. Not here: delegation checks, and forks. Bifrost's live sessions are OpenAI only,
+// relays frames untouched. The delegated-responses model of a start, a create and each session.update is checked as
+// Bifrost's liveUpdatePolicy checks it (checkDelegation) and goes up bare. Not here: forks. Bifrost's live sessions are OpenAI only,
 // and so are these. The registry is shared by the workers of one node through a directory (share).
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { writeFileAtomic } from "./atomicfile"
 import { sha256, toHex, utf8 } from "./crypto"
 import { Engine, errorResponse, noHeaders } from "./gateway"
-import { parseModel, target } from "./router"
+import { parseModel, target, keyAllows, resolveAlias, isKnownKind, ModelRef } from "./router"
 import { Target } from "./providers/types"
 import { trimSlash } from "./providers/types"
 import { Field, fields, find, rawStr, setField, build, quote } from "./json"
 import { Hdrs, snapshot } from "./schemas"
-import { Config } from "./config"
+import { Config, KeyConfig, AliasTarget } from "./config"
 import { SocketExt, upstreamFor, wsBase } from "./realtime"
 import { Grant } from "./governance"
 import { SessionSpec, sessionHooks, sessionGuard } from "./livehooks"
-import { Relay, Leg, Exchange, establish, prepareServerEvents, startClock, withOffer } from "./webrtc"
+import { Relay, Leg, Exchange, Refusal, UpdateCheck, establish, prepareServerEvents, startClock, withOffer, strAt, withJsonAt, eventType } from "./webrtc"
 
 // How many sessions the registry holds. Past that a new session is refused, not left unrecorded.
 const MAX_RECORDS = 10000
@@ -132,20 +133,76 @@ export function liveAnswer(text: string): { id: string, sdp: string } | undefine
   }
 }
 
-// The model a start body names for its delegated responses (session.delegation.responses.model), bare, or
-// "" when it names none: the tokens of those responses are billed under it.
-export function backendModelOf(cfg: Config, body: string): string {
+// Where a live session names the model of its delegated responses.
+const DELEGATION_MODEL = ["session", "delegation", "responses", "model"]
+
+// The provider and model a delegated-responses model names: "provider/model" when its prefix is a provider, else the
+// session's provider (Bifrost's ParseModelString with the session's provider as the default).
+export function delegationRef(cfg: Config, provider: string, sent: string): ModelRef {
+  const s = sent.trim()
+  const i = s.indexOf("/")
+  if (i > 0) {
+    const p = s.slice(0, i)
+    const ps = cfg.providers
+    if ((ps !== undefined && ps.has(p)) || isKnownKind(p)) return { provider: p, model: s.slice(i + 1) }
+  }
+  return { provider: provider, model: s }
+}
+
+// Whether a start frame (or a WebRTC create body) delegates to the Responses API: a delegation of type responses with
+// its responses settings (Bifrost's liveBackendModel reads a backend model only then).
+export function delegatesResponses(frame: string): bool {
+  if (strAt(frame, ["session", "delegation", "type"]) !== "responses") return false
   try {
-    const s = find(fields(body), "session")
-    if (s === undefined) return ""
+    const s = find(fields(frame), "session")
+    if (s === undefined) return false
     const d = find(fields(s), "delegation")
-    if (d === undefined) return ""
+    if (d === undefined) return false
     const r = find(fields(d), "responses")
-    if (r === undefined) return ""
-    const m = rawStr(fields(r), "model") ?? ""
-    return m.trim() === "" ? "" : parseModel(cfg, m).model
+    return r !== undefined && r.startsWith("{")
   } catch (e) {
-    return ""
+    return false
+  }
+}
+
+function refusal(status: int, type: string, message: string): UpdateCheck {
+  return { frame: "", model: "", status: status, type: type, message: message }
+}
+
+// The check of a live frame's delegated-responses model before it reaches the provider (Bifrost's liveUpdatePolicy.check,
+// and liveBackendModel for a start with required set): it must be served by the session's provider and by the session's
+// key, and governance must admit it (admit, when given); the frame then names it as the provider knows it (bare, its alias
+// resolved). A frame that names none passes as it is, unless the model is required.
+export function checkDelegation(cfg: Config, provider: string, key: KeyConfig, frame: string, admit: ((provider: string, model: string) => Refusal | undefined) | undefined, required: bool): UpdateCheck {
+  const sent = strAt(frame, DELEGATION_MODEL)
+  const ref = delegationRef(cfg, provider, sent)
+  if (ref.model.trim() === "") {
+    if (required) return refusal(400, "invalid_request_error", "session.delegation.responses.model is required for responses delegation")
+    return { frame: frame, model: "", status: 0, type: "", message: "" }
+  }
+  if (ref.provider !== provider) return refusal(400, "invalid_request_error", `session.delegation.responses.model must be served by ${provider}, the provider of session.model`)
+  if (!keyAllows(key, ref.model)) return refusal(400, "invalid_request_error", `the key serving this session does not support model ${ref.model}`)
+  if (admit !== undefined) {
+    const why = admit(ref.provider, ref.model)
+    if (why !== undefined) return refusal(why.status, why.type, why.message)
+  }
+  const alias = resolveAlias(key, ref.model, cfg.client?.routing_chain_max_depth)
+  const wire = alias.error === "" ? alias.model : ref.model
+  if (wire === sent) return { frame: frame, model: ref.model, status: 0, type: "", message: "" }
+  try {
+    return { frame: try withJsonAt(frame, DELEGATION_MODEL, quote(wire)), model: ref.model, status: 0, type: "", message: "" }
+  } catch (e) {
+    return refusal(500, "server_error", "failed to prepare session.update: " + e.message)
+  }
+}
+
+// Governance's admission of a delegated model for the caller, as a refusal or undefined. It is a peek: the delegated
+// responses are admitted and charged as each one closes (webrtc.tov LiveCore), so the check takes no request of its own.
+function admitFor(engine: Engine, h: Hdrs): (provider: string, model: string) => Refusal | undefined {
+  return (provider: string, model: string): Refusal | undefined => {
+    const a = engine.gov.admit(h, provider, model, true)
+    if (a.kind === "denial") return { status: a.status, type: a.type, message: a.message }
+    return undefined
   }
 }
 
@@ -195,6 +252,17 @@ export async function liveCreate(engine: Engine, reg: LiveRegistry, req: Request
   } catch (e) {
     return errorReply400("the request body must be JSON with session and transport")
   }
+  // the delegated-responses model: the session's provider and key must serve it, governance admits it, and it goes up bare
+  const admitBackend = admitFor(engine, h)
+  let backend = ""
+  if (delegatesResponses(body)) {
+    const d = checkDelegation(engine.cfg, ref.provider, t.key, upstreamBody, admitBackend, true)
+    if (d.message !== "") return errorResponse(d.status, d.message, d.type, noHeaders())
+    upstreamBody = d.frame
+    backend = d.model
+  }
+  const sessionProvider = ref.provider
+  const sessionKey = t.key
   // the browser's own list of server events is widened for the provider and kept for the browser
   const events = prepareServerEvents(upstreamBody)
   if (events.error !== "") return errorReply400(events.error)
@@ -236,7 +304,8 @@ export async function liveCreate(engine: Engine, reg: LiveRegistry, req: Request
     bindAddress: process.env.RAIJU_WEBRTC_BIND ?? "",
     realtime: false,
     model: modelName,
-    backendModel: backendModelOf(engine.cfg, body),
+    backendModel: backend,
+    checkUpdate: (m: string): UpdateCheck => checkDelegation(engine.cfg, sessionProvider, sessionKey, m, admitBackend, false),
   })
   if (est.status !== 0) {
     if (est.body !== "") {
@@ -409,7 +478,21 @@ export class LiveSocket extends SocketExt {
     }
     const up = this.upstream
     if (up !== undefined) {
-      up.send(m)
+      // a sideband's session.update is checked as the primary's is, against the key the attach runs on (Bifrost's
+      // sideband relay applies the same policy); it opens no billing unit of its own
+      let out = m
+      if (eventType(m) === "session.update") {
+        const t = controlTarget(this.engine, this.headers)
+        if (t !== undefined) {
+          const d = checkDelegation(this.engine.cfg, t.provider, t.key, m, undefined, false)
+          if (d.message !== "") {
+            this.send(refusalEvent(d.type, d.message))
+            return
+          }
+          out = d.frame
+        }
+      }
+      up.send(out)
       return
     }
     if (!this.started) this.start(m)
@@ -469,8 +552,25 @@ export class LiveSocket extends SocketExt {
       this.refuse("invalid_request_error", "failed to parse session.start JSON")
       return
     }
+    // the delegated-responses model: the session's provider and key must serve it, governance admits it, and it goes up bare
+    const admitBackend = admitFor(this.engine, this.headers)
+    let backend = ""
+    if (delegatesResponses(m)) {
+      const d = checkDelegation(cfg, ref.provider, sel.t.key, frame, admitBackend, true)
+      if (d.message !== "") {
+        this.refuse(d.type, d.message)
+        return
+      }
+      frame = d.frame
+      backend = d.model
+    }
     this.started = true
-    this.session(admitted, ref.provider, ref.model, backendModelOf(cfg, m), wsBase(liveBase(sel.t)) + "/v1/live/sessions", up.headers, frame)
+    this.session(admitted, ref.provider, ref.model, backend, wsBase(liveBase(sel.t)) + "/v1/live/sessions", up.headers, frame)
+    const r = this.relay
+    const engine = this.engine
+    const provider = ref.provider
+    const key = sel.t.key
+    if (r !== undefined) r.core.checkUpdate = (u: string): UpdateCheck => checkDelegation(engine.cfg, provider, key, u, admitBackend, false)
   }
 
   // A sideband: frames pass between the client and the session another connection runs, untouched. It bills
@@ -632,13 +732,55 @@ test("live start frames and ids", () => {
   expect(startedId(`{"type":"response.audio.delta"}`)).toBe("")
 })
 
-test("the model a live start names for its delegated responses", () => {
+test("the model a live start names for its delegated responses: checked, and sent bare", () => {
   const cfg: Config = {}
-  const start = `{"type":"session.start","session":{"model":"openai/gpt-live","delegation":{"type":"responses","responses":{"model":"openai/gpt-5.4","instructions":"x"}}}}`
-  expect(backendModelOf(cfg, start)).toBe("gpt-5.4")
-  expect(backendModelOf(cfg, `{"session":{"model":"gpt-live","delegation":{"type":"responses","responses":{"model":"gpt-5.4-mini"}}}}`)).toBe("gpt-5.4-mini")
-  expect(backendModelOf(cfg, `{"session":{"model":"gpt-live"}}`)).toBe("")
-  expect(backendModelOf(cfg, `{"session":{"delegation":{"type":"responses"}}}`)).toBe("")
-  expect(backendModelOf(cfg, `{"session":{"delegation":{"responses":{"model":"  "}}}}`)).toBe("")
-  expect(backendModelOf(cfg, "not json")).toBe("")
+  const key: KeyConfig = { value: "sk" }
+  const start = `{"type":"session.start","session":{"model":"gpt-live","delegation":{"type":"responses","responses":{"model":"openai/gpt-5.4","instructions":"x"}}}}`
+  expect(delegatesResponses(start)).toBe(true)
+  const d = checkDelegation(cfg, "openai", key, start, undefined, true)
+  expect(d.message).toBe("")
+  expect(d.model).toBe("gpt-5.4")
+  expect(d.frame).toBe(`{"type":"session.start","session":{"model":"gpt-live","delegation":{"type":"responses","responses":{"model":"gpt-5.4","instructions":"x"}}}}`)
+  // a bare name is the session's provider's, and goes as it is
+  const bare = `{"session":{"model":"gpt-live","delegation":{"type":"responses","responses":{"model":"gpt-5.4-mini"}}}}`
+  const b = checkDelegation(cfg, "openai", key, bare, undefined, true)
+  expect(b.frame).toBe(bare)
+  expect(b.model).toBe("gpt-5.4-mini")
+  // only a responses delegation with its settings has a backend model, and then it must name one
+  expect(delegatesResponses(`{"session":{"model":"gpt-live"}}`)).toBe(false)
+  expect(delegatesResponses(`{"session":{"delegation":{"type":"client"}}}`)).toBe(false)
+  expect(delegatesResponses(`{"session":{"delegation":{"type":"responses"}}}`)).toBe(false)
+  expect(delegatesResponses("not json")).toBe(false)
+  expect(checkDelegation(cfg, "openai", key, `{"session":{"delegation":{"type":"responses","responses":{"model":"  "}}}}`, undefined, true).message).toBe("session.delegation.responses.model is required for responses delegation")
+})
+
+test("a live session.update's delegated model: the session's provider, the key's models, governance, and the alias", () => {
+  const cfg: Config = {}
+  const upd = (m: string): string => `{"type":"session.update","session":{"delegation":{"type":"responses","responses":{"model":"${m}"}}}}`
+  const any: KeyConfig = { value: "sk" }
+  // another provider's model is refused
+  const other = checkDelegation(cfg, "openai", any, upd("anthropic/claude-sonnet"), undefined, false)
+  expect(other.status).toBe(400)
+  expect(other.type).toBe("invalid_request_error")
+  expect(other.message).toBe("session.delegation.responses.model must be served by openai, the provider of session.model")
+  // a model the key does not serve is refused
+  const narrow: KeyConfig = { value: "sk", models: ["gpt-5.4"] }
+  expect(checkDelegation(cfg, "openai", narrow, upd("openai/gpt-4o"), undefined, false).message).toBe("the key serving this session does not support model gpt-4o")
+  expect(checkDelegation(cfg, "openai", narrow, upd("openai/gpt-5.4"), undefined, false).message).toBe("")
+  // governance's refusal is the client's error
+  const denied = checkDelegation(cfg, "openai", any, upd("gpt-5.4"), (p: string, m: string): Refusal | undefined => ({ status: 403, type: "permission_error", message: `model ${p}/${m} is not allowed` }), false)
+  expect(denied.status).toBe(403)
+  expect(denied.message).toBe("model openai/gpt-5.4 is not allowed")
+  // an alias goes up as the provider's model
+  const aliases: Map<string, string | AliasTarget> = new Map()
+  aliases.set("fast", "gpt-5.4-mini")
+  const aliased = checkDelegation(cfg, "openai", { value: "sk", aliases: aliases }, upd("openai/fast"), undefined, false)
+  expect(aliased.model).toBe("fast")
+  expect(aliased.frame).toBe(upd("gpt-5.4-mini"))
+  // an update that names no delegated model passes untouched
+  const voice = `{"type":"session.update","session":{"voice":"alloy"}}`
+  const v = checkDelegation(cfg, "openai", narrow, voice, undefined, false)
+  expect(v.frame).toBe(voice)
+  expect(v.model).toBe("")
+  expect(delegationRef(cfg, "openai", "nope/x").model).toBe("nope/x")
 })
