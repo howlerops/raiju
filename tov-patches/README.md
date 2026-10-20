@@ -452,7 +452,8 @@ Bun.serve({
   handler slows the sender. A body nobody reads is dropped when the request is answered (at most
   32 MiB further; past that the connection closes), and the connection serves its next request. A
   client that leaves or half-closes fails the stream. `text()`, `json()` and the others read it whole.
-  `Expect: 100-continue` is answered for a streamed body.
+  `Expect: 100-continue` is answered for a streamed body. Cancelling a body that is all in frees its
+  stream at once (`httpBodyCancel` keeps the connection it marks for reading, not the stream).
 - `Socket.pause()` (runtime/net.c) takes the socket off the read interest; `src/http1.tov` uses it for
   the same backpressure on raw sockets.
 

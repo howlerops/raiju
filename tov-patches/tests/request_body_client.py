@@ -226,4 +226,14 @@ big2 = body_bytes(1 << 20, 11) * 10
 st, txt = post("/relay", big2)
 check("req.body can be the body of a fetch() (10 MiB relayed)", st == 200 and txt == f"{len(big2)} {checksum(big2)} chunks\n", (st, txt))
 
+# a body that is all in when the handler cancels it: the stream is freed then, and the server serves on
+mid = body_bytes(200000, 13)
+st, txt = post("/cancel", mid)
+check("a handler may cancel a streamed body that is all in", st == 200 and txt == "cancelled\n", (st, txt))
+try:
+    st, txt = post("/sum", small)
+except OSError as e:
+    st, txt = 0, str(e)
+check("the server serves on after a cancelled body", st == 200 and txt == f"{len(small)} {checksum(small)} one\n", (st, txt))
+
 sys.exit(1 if fails else 0)

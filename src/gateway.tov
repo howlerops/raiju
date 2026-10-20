@@ -73,7 +73,8 @@ import { VectorStore, openVectorStore, scopeTag } from "./vectorstore"
 import * as cloudAuth from "./cloud_auth"
 import * as oauthKey from "./oauth_key"
 import { LargeBody, LargeSettings, BodyTap, UsageTap, largeSettings, scanPrefix, usageOfText } from "./largepayload"
-import { AnyConv, ConvRef, familyFor, needsHash, newConv, upstreamFor, convertedStream, spoolConverted } from "./largeconv"
+import { AnyConv, ConvRef, familyFor, needsHash, newConv, upstreamFor, convertedStream, spoolConverted, spoolTitan, titanExtras } from "./largeconv"
+import { EMB_TITAN } from "./embconv"
 
 export type Build = (t: Target) => Upstream throws SyntaxError
 // a chat request for a target, from its shaped body (tc parses the same request as a typed chat)
@@ -1955,7 +1956,9 @@ export class Engine {
           if (more !== undefined && status >= 200 && status < 300) {
             for (const x of more) {
               const xh: Record<string, string> = x.headers
-              const xr = await fetch(x.url, { method: "POST", headers: xh, body: x.body, signal: signal, proxy: px, tls: tlsOf(t.cfg), pool: poolOf(t.cfg) })
+              // (a large request's further bodies are spooled streams)
+              const xs = x.stream
+              const xr = xs !== undefined ? await fetch(x.url, { method: "POST", headers: xh, body: xs, signal: signal, proxy: px, tls: tlsOf(t.cfg), pool: poolOf(t.cfg) }) : await fetch(x.url, { method: "POST", headers: xh, body: x.body, signal: signal, proxy: px, tls: tlsOf(t.cfg), pool: poolOf(t.cfg) })
               const xt = await xr.text()
               if (xr.status < 200 || xr.status >= 300) {
                 status = xr.status
@@ -3521,7 +3524,8 @@ export class Engine {
         } catch (e) {
           text = ""
         }
-        usage = transcriptionUsage(text) ?? usage
+        // (a native answer whose body cannot carry its usage, Gemini's plain text, leaves it on the bill)
+        usage = transcriptionUsage(text) ?? bill.usage ?? usage
         out = new Response(bytes, { status: 200, headers: { "content-type": res.headers.get("content-type") ?? "application/json" } })
       } catch (e) {
         return errorResponse(502, `the answer could not be read: ${e.message}`, "api_error", noHeaders())
@@ -3701,8 +3705,18 @@ export class Engine {
     const limit = (this.cfg.client?.max_request_body_size_mb ?? 100) * 1048576
     let family = ""
     let convModel = first.model
-    if (p !== undefined && !takesBodyAsIs(route, kind)) {
-      family = familyFor(route, kind, first.model, p, stream)
+    // a text completion that compat sends as chat (the model's datasheet row serves chat but not text completions)
+    // becomes the chat body as it streams in (textconv.tov), for any provider whose chat it can reach
+    let textChat = false
+    if (route === "completions" && p !== undefined) {
+      const cp = new CompatPlan(withHeader(settingsOf(this.cfg.client?.compat), hs.get("x-bf-compat") ?? undefined), "completions", stream)
+      if (cp.enabled) {
+        await this.compatLoad(cp, [first])
+        textChat = cp.routeFor(first.provider, kind, first.model) === "chat"
+      }
+    }
+    if (p !== undefined && (textChat || !takesBodyAsIs(route, kind))) {
+      family = familyFor(textChat ? "text-chat" : route, kind, first.model, p, stream)
       if (family !== "" && needsHash(family)) {
         const ks = p.keys ?? []
         for (let i = 0; i < ks.length; i++) {
@@ -3735,10 +3749,12 @@ export class Engine {
     const lg = new LargeBody(lp, head, meta, ended ? undefined : src, declared)
     const tiny: Field[] = [{ key: "model", raw: quote(meta.model) }]
     // A chat stream to a converted provider is called as a stream and its events are converted as they arrive (Bedrock's
-    // binary event frames are not: its answer is read whole and replayed). A Messages stream passes through.
-    // (a Messages stream converted to chat, Gemini or Cohere is converted as it arrives, as a chat stream is)
-    const msgLive = route === "messages" && (family === "messages-chat" || family === "messages-gemini" || family === "messages-cohere")
-    const live = family !== "" && family !== "converse" && stream && (route === "chat" || msgLive)
+    // binary event-stream frames too, from ConverseStream). A Messages stream passes through.
+    // (a Messages stream converted to chat, Gemini, Cohere or Bedrock Converse is converted as it arrives, as a chat
+    // stream is, and so is a text completion sent as chat, in text_completion chunks)
+    const msgLive = route === "messages" && (family === "messages-chat" || family === "messages-gemini" || family === "messages-cohere" || family === "messages-converse")
+    const textLive = route === "completions" && family.startsWith("text-")
+    const live = family !== "" && stream && (route === "chat" || msgLive || textLive)
     const wire = live || (route === "messages" && stream)
     const holder = new ConvRef()
     const autoCache = this.autoPromptCache || hs.get("x-bf-prompt-cache-auto-inject") === "true" || (p?.prompt_cache?.auto_inject ?? false)
@@ -3754,7 +3770,7 @@ export class Engine {
         // converted into a spool on disk and hashed, so the request can be signed before its first byte goes out
         const c = newConv(family, convModel, p!, autoCache, wire, limit, 4096)
         holder.conv = c
-        const sp = await spoolConverted(lg, c)
+        const sp = family === EMB_TITAN ? await spoolTitan(lg, c) : await spoolConverted(lg, c)
         if (!sp.ok) {
           const rel = lg.release
           if (rel !== undefined) rel()
@@ -3774,7 +3790,10 @@ export class Engine {
           holder.conv = c
           lg.converted = convertedStream(lg, c)
         }
-        return try upstreamFor(family, t, wire, lg.payloadHash)
+        const cu = try upstreamFor(family, t, wire, lg.payloadHash)
+        // Titan: one more signed call per further input, each with its own spooled body
+        if (family !== EMB_TITAN || lg.extras.length === 0) return cu
+        return { url: cu.url, headers: cu.headers, body: cu.body, extra: titanExtras(t, lg) }
       }
       if (!takesBodyAsIs(route, t.kind)) throw new SyntaxError(`${t.provider} needs the whole request body in memory, which large_payload_optimization does not allow: a large ${route} request goes only to a provider that takes its format as it is`)
       const up = route === "embeddings" ? try providers.embeddingsUpstream(t, tiny) : route === "completions" ? openai.completionsRequest(t, tiny) : route === "responses" ? openai.responsesRequest(t, tiny) : route === "messages" ? anthropicNative.nativeRequest(t, tiny) : openai.chatRequest(t, tiny)
@@ -3805,6 +3824,18 @@ export class Engine {
         return { body: try toMessage(tr.body, meta.model), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
       }
       if (route === "embeddings") return try providers.embeddingsTranslate(t.kind, t.model, text, requested)
+      if (route === "completions" && family !== "") {
+        // a text completion sent as chat: the chat answer as a text completion, as the whole-body route converts it
+        // (a stream is converted as it arrives, in largeLive)
+        if (stream && providers.streamsNatively(t.kind)) {
+          const sr = openai.streamResponse(text, requested)
+          return { body: chatSseToText(sr.body), promptTokens: sr.promptTokens, completionTokens: sr.completionTokens }
+        }
+        const tc = try providers.chatTranslate(t.kind, t.model, text, requested, false)
+        if (!stream) return { body: try chatToText(tc.body), promptTokens: tc.promptTokens, completionTokens: tc.completionTokens }
+        const hc = holder.conv
+        return { body: chatSseToText(try completionToSse(tc.body, hc !== undefined && hc.wantsUsage())), promptTokens: tc.promptTokens, completionTokens: tc.completionTokens }
+      }
       if (route === "completions") return try openai.chatResponse(text, requested)
       const tr = try providers.chatTranslate(t.kind, t.model, text, requested, false)
       if (family !== "" && stream) {
@@ -3871,6 +3902,8 @@ export class Engine {
       // a Messages stream is answered as Messages events (with usage, as the whole-body route asks the provider for it)
       const messages = op === "anthropic.messages"
       const conv = new StreamConverter(converterKind(t), requested, messages || (hc !== undefined && hc.wantsUsage()))
+      // a text completion sent as chat streams as text_completion chunks
+      conv.txt = op === "completions"
       if (messages) conv.asAnthropic(rawStr(modelBody, "model") ?? "")
       conv.stopAtFinish = quirkStopsAtFinish(t)
       return conv

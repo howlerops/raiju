@@ -1,6 +1,6 @@
 // Drop-in SDK routes: requests in a provider's own format, forwarded with
 // governance, retries, fallbacks across keys, metrics and cost tracking.
-import { Field, fields, elements, find, quote, build, isNull, rawStr, rawBool, setField } from "./json"
+import { Field, fields, elements, find, quote, build, isNull, rawStr, rawBool, setField, without } from "./json"
 import { Engine, Build, Translate, StreamSink, StreamConverter, ConverterFactory, streamable, converterKind, errorResponse, noHeaders } from "./gateway"
 import { Target, Translated, trimSlash, proxyOf, tlsOf, poolOf } from "./providers/types"
 import { ChatRequest, snapshot, newId, nowSeconds } from "./schemas"
@@ -15,8 +15,8 @@ import * as genaiIn from "./genai_in"
 import * as bedrockIn from "./bedrock_in"
 import { estimateChatTokens, estimateTokens } from "./jobs"
 import { rerank, bedrockCountTokens } from "./extras"
-import { hooksOn, viaChat } from "./nativehook"
-import { Handler, llmHooked } from "./pluginroute"
+import { hooksOn, viaChat, nativeHeaders } from "./nativehook"
+import { Handler, llmHooked, llmHandles } from "./pluginroute"
 import { completionToSse } from "./sse"
 import * as providers from "./providers/index"
 import * as openai from "./providers/openai"
@@ -140,17 +140,12 @@ export async function anthropicMessages(engine: Engine, req: Request, sink?: Str
   }
   const stream = find(body, "stream") === "true"
   const clientModel = rawStr(body, "model") ?? ""
-  // with plugins in the chat hooks, the request goes through chat, where they run (nativehook.tov)
-  if (hooksOn(engine)) {
-    try {
-      return await viaChat(engine, req, anthropicIn.toChatRequest(text, clientModel), { kind: "anthropic", model: clientModel }, stream, sink)
-    } catch (e) {
-      return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
-    }
-  }
   try {
+    const chat = anthropicIn.toChatRequest(text, clientModel)
+    // with plugins in the chat hooks of this request, it goes through chat, where they run (nativehook.tov)
+    if (hooksOn(engine, chat)) return await viaChat(engine, req, chat, { kind: "anthropic", model: clientModel }, stream, sink)
     // Every provider other than Anthropic (and non-streaming Bedrock) is reached through OpenAI chat.
-    bridge = chatBridge(anthropicIn.toChatRequest(text, clientModel), stream, false, stream && sink !== undefined)
+    bridge = chatBridge(chat, stream, false, stream && sink !== undefined)
   } catch (e) {
     return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
   }
@@ -181,7 +176,7 @@ export async function anthropicMessages(engine: Engine, req: Request, sink?: Str
     c.asAnthropic(clientModel)
     return c
   }
-  return await engine.serve(req, "anthropic.messages", undefined, body, text, b, tr, stream, undefined, stream ? sink : undefined, mk)
+  return await engine.serve(req, "anthropic.messages", undefined, body, text, b, tr, stream, nativeHeaders(engine), stream ? sink : undefined, mk)
 }
 
 type RUsage = { usage?: { input_tokens?: int, output_tokens?: int }, response?: { usage?: { input_tokens?: int, output_tokens?: int } } }
@@ -556,15 +551,10 @@ export async function cohereChat(engine: Engine, req: Request, sink?: StreamSink
   }
   const stream = find(body, "stream") === "true"
   const clientModel = rawStr(body, "model") ?? ""
-  if (hooksOn(engine)) {
-    try {
-      return await viaChat(engine, req, cohereIn.chatToOpenAI(text, clientModel), { kind: "cohere", model: clientModel }, stream, sink)
-    } catch (e) {
-      return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
-    }
-  }
   try {
-    bridge = chatBridge(cohereIn.chatToOpenAI(text, clientModel), stream, false, stream && sink !== undefined)
+    const chat = cohereIn.chatToOpenAI(text, clientModel)
+    if (hooksOn(engine, chat)) return await viaChat(engine, req, chat, { kind: "cohere", model: clientModel }, stream, sink)
+    bridge = chatBridge(chat, stream, false, stream && sink !== undefined)
   } catch (e) {
     return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
   }
@@ -581,7 +571,7 @@ export async function cohereChat(engine: Engine, req: Request, sink?: StreamSink
     c.asCohere(clientModel)
     return c
   }
-  return await engine.serve(req, "cohere.chat", undefined, body, text, b, tr, stream, undefined, stream ? sink : undefined, mk)
+  return await engine.serve(req, "cohere.chat", undefined, body, text, b, tr, stream, nativeHeaders(engine), stream ? sink : undefined, mk)
 }
 
 // /cohere/v2/embed: the embeddings of any provider that serves them, in Cohere's shape.
@@ -647,19 +637,14 @@ export async function genai(engine: Engine, req: Request, modelAction: string, s
   const full = model.includes("/") ? model : "gemini/" + model
   const text = await req.text()
   if (method === "embedContent" || method === "batchEmbedContents") return await genaiEmbed(engine, req, method, full, text)
-  if (method === "countTokens") return genaiCount(text, full)
+  if (method === "countTokens") return await modelHooked(engine, req, "count_tokens_genai", full, text, async (t: string) => genaiCount(t, full))
   if (method !== "generateContent" && method !== "streamGenerateContent") return errorResponse(404, `${method} isn't supported`, "invalid_request_error", noHeaders())
   const stream = method === "streamGenerateContent"
-  if (hooksOn(engine)) {
-    try {
-      return await viaChat(engine, req, genaiIn.generateToOpenAI(text, full, stream), { kind: "genai", model: full }, stream, sink)
-    } catch (e) {
-      return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
-    }
-  }
   let bridge: Bridge | undefined = undefined
   try {
-    bridge = chatBridge(genaiIn.generateToOpenAI(text, full, stream), stream, false, stream && sink !== undefined)
+    const chat = genaiIn.generateToOpenAI(text, full, stream)
+    if (hooksOn(engine, chat)) return await viaChat(engine, req, chat, { kind: "genai", model: full }, stream, sink)
+    bridge = chatBridge(chat, stream, false, stream && sink !== undefined)
   } catch (e) {
     return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
   }
@@ -685,7 +670,38 @@ export async function genai(engine: Engine, req: Request, modelAction: string, s
     c.asGenAI(full)
     return c
   }
-  return await engine.serve(req, "genai." + method, full, [], text, b, tr, stream, undefined, stream ? sink : undefined, mk)
+  return await engine.serve(req, "genai." + method, full, [], text, b, tr, stream, nativeHeaders(engine), stream ? sink : undefined, mk)
+}
+
+// A request of a route whose body names no model (GenAI's :countTokens and batches.create, Bedrock's count-tokens),
+// with the plugins' LLM hooks of a request type around it (Bifrost's count_tokens and batch_create). The plugins see the
+// body with the route's model in it; the handler gets the body as they left it, without that model.
+async function modelHooked(engine: Engine, req: Request, op: string, model: string, text: string, count: (body: string) => Promise<Response>): Promise<Response> {
+  if (!llmHandles(engine, op)) return await count(text)
+  let withModel = text
+  try {
+    let fs = fields(text)
+    setField(&fs, "model", quote(model))
+    withModel = build(fs)
+  } catch (e) {
+    // not a JSON object: the count refuses it
+    return await count(text)
+  }
+  return await hooked(engine, internalRequest(req, routePath(req), withModel), op, async (hr, hs) => {
+    let body = await hr.text()
+    try {
+      body = build(without(fields(body), ["model"]))
+    } catch (e) {
+      // the count refuses it
+    }
+    return await count(body)
+  }, undefined)
+}
+
+// The request's path.
+function routePath(req: Request): string {
+  const u = URL.parse(req.url)
+  return u === undefined ? "/" : u.pathname
 }
 
 // :countTokens is an estimate of the request's text; no provider is called.
@@ -701,10 +717,23 @@ function genaiCount(text: string, full: string): Response {
 async function genaiEmbed(engine: Engine, req: Request, method: string, full: string, text: string): Promise<Response> {
   const batch = method === "batchEmbedContents"
   let body: Field[] = []
+  let conv = ""
   try {
-    body = fields(genaiIn.embedToOpenAI(text, full))
+    conv = genaiIn.embedToOpenAI(text, full)
+    body = fields(conv)
   } catch (e) {
     return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+  }
+  // with plugins in the embedding hooks, the request is Bifrost's embedding request: served by the embeddings route
+  // (Gemini included), where the plugins see it, and answered in Gemini's shape
+  if (llmHandles(engine, "embeddings")) {
+    const r = await hooked(engine, internalRequest(req, "/v1/embeddings", conv), "embeddings", async (hr, hs) => await engine.embeddings(hr), undefined)
+    if (r.status !== 200) return r
+    try {
+      return jsonBody(genaiIn.openAIToEmbed(await r.text(), batch))
+    } catch (e) {
+      return errorResponse(502, `invalid upstream answer: ${e.message}`, "api_error", noHeaders())
+    }
   }
   const b: Build = (t) => {
     if (t.kind === "gemini") return gemini.nativeRequest(t, method, text)
@@ -944,8 +973,15 @@ async function genaiModelRoute(engine: Engine, req: Request, op: string, model: 
   }
   const text = await req.text()
   if (op === "batches.create") {
-    if (t.kind === "gemini") return await passGemini(t, "POST", `/v1beta/models/${t.model}:batchGenerateContent`, "", text)
-    return try await batchCreate(engine.cfg, t, text)
+    const cfg = engine.cfg
+    return await modelHooked(engine, req, "batch_create", t.provider + "/" + t.model, text, async (body: string) => {
+      if (t.kind === "gemini") return await passGemini(t, "POST", `/v1beta/models/${t.model}:batchGenerateContent`, "", body)
+      try {
+        return try await batchCreate(cfg, t, body)
+      } catch (e) {
+        return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+      }
+    })
   }
   if (t.kind === "gemini") return await passGemini(t, "POST", `/v1beta/models/${t.model}:predict`, "", text)
   // Imagen models make images; any other model's :predict is an embedding, as in Bifrost
@@ -1095,7 +1131,7 @@ export async function bedrockModel(engine: Engine, req: Request, modelId: string
   const text = await req.text()
   // percent-decoded through URLSearchParams (model ids never contain "+")
   const id = new URLSearchParams("id=" + modelId).get("id") ?? modelId
-  if (action === "count-tokens") return await bedrockCountTokens(engine, req, id, text)
+  if (action === "count-tokens") return await modelHooked(engine, req, "count_tokens_bedrock", id.includes("/") && !id.startsWith("arn:") ? id : "bedrock/" + id, text, async (t: string) => await bedrockCountTokens(engine, req, id, t))
   const stream = action.endsWith("-stream")
   const invoke = action.startsWith("invoke")
   // "provider/model" names pass through; a bare Bedrock id is a Bedrock model
@@ -1103,11 +1139,9 @@ export async function bedrockModel(engine: Engine, req: Request, modelId: string
   let bridge: Bridge | undefined = undefined
   try {
     const chat = invoke ? (stream ? bedrockIn.invokeStreamToOpenAI(text, id) : bedrockIn.invokeToOpenAI(text, id)) : bedrockIn.converseToOpenAI(text, id, stream)
-    if (hooksOn(engine)) {
-      // the chat request names the model as the route resolves it ("bedrock/<id>" for a bare id)
-      const hooked = invoke ? (stream ? bedrockIn.invokeStreamToOpenAI(text, full) : bedrockIn.invokeToOpenAI(text, full)) : bedrockIn.converseToOpenAI(text, full, stream)
-      return await viaChat(engine, req, hooked, { kind: invoke ? "invoke" : "converse", model: id }, stream, sink)
-    }
+    // the chat request names the model as the route resolves it ("bedrock/<id>" for a bare id)
+    const hooked = invoke ? (stream ? bedrockIn.invokeStreamToOpenAI(text, full) : bedrockIn.invokeToOpenAI(text, full)) : bedrockIn.converseToOpenAI(text, full, stream)
+    if (hooksOn(engine, hooked)) return await viaChat(engine, req, hooked, { kind: invoke ? "invoke" : "converse", model: id }, stream, sink)
     bridge = chatBridge(chat, stream, false, stream && sink !== undefined)
   } catch (e) {
     return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
@@ -1133,7 +1167,7 @@ export async function bedrockModel(engine: Engine, req: Request, modelId: string
     else c.asConverse()
     return c
   }
-  const r = await engine.serve(req, "bedrock." + action, full, [], text, b, tr, stream, undefined, stream ? sink : undefined, mk)
+  const r = await engine.serve(req, "bedrock." + action, full, [], text, b, tr, stream, nativeHeaders(engine), stream ? sink : undefined, mk)
   // a buffered streaming answer: its SSE, turned into the frames the client reads
   if (!stream || r.status !== 200 || (sink !== undefined && sink.started)) return r
   let sse = ""

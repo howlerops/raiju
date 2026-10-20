@@ -121,7 +121,7 @@ RB_PORT=$(sed -n 's/^listening //p' "$OUT/request_body_server.out")
 python3 "$DIR/request_body_client.py" "$RB_PORT" "$SRV" > "$OUT/request_body_client.out" || true
 kill $SRV 2>/dev/null || true
 SRV=""
-expect "$OUT/request_body_client.out" 17 "Bun.serve request body streams"
+expect "$OUT/request_body_client.out" 19 "Bun.serve request body streams"
 
 # Socket.pause() and resume() (patch 0008)
 TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/socket_pause.tov" -o "$OUT/socket_pause" >/dev/null

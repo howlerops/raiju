@@ -2,6 +2,7 @@ import { listen } from "../src/http1"
 import { fields, find, rawStr } from "../src/json"
 import { sha256, utf8, toHex } from "../src/crypto"
 import { encodeUrl } from "../src/base64"
+import { encodeEventStreamFrame } from "../src/streams"
 import { liveAnswer, liveEvents, liveStats, liveReset, realtimeAnswer, realtimeTurn } from "./mock_live"
 import { a2aHandle, pushV03, knowTask, resubscribeV03 } from "./mock_a2a"
 // A fake provider for end-to-end tests. Speaks enough of OpenAI, Anthropic,
@@ -85,6 +86,15 @@ function anthropicRequests(body: string): { id: string, model: string }[] throws
 const GEMINI_SSE = `data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Hi from "}]}}]}\n\ndata: {"candidates":[{"content":{"role":"model","parts":[{"text":"gemini"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":6,"candidatesTokenCount":3,"totalTokenCount":9}}\n\n`
 const ANTHROPIC_SSE = `event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":9,"output_tokens":1}}}\n\nevent: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n`
 const COHERE_SSE = `event: message-start\ndata: {"type":"message-start","id":"co_s","delta":{"message":{"role":"assistant"}}}\n\nevent: content-start\ndata: {"type":"content-start","index":0,"delta":{"message":{"content":{"type":"text","text":""}}}}\n\nevent: content-delta\ndata: {"type":"content-delta","index":0,"delta":{"message":{"content":{"text":"Hi from "}}}}\n\nevent: content-delta\ndata: {"type":"content-delta","index":0,"delta":{"message":{"content":{"text":"cohere"}}}}\n\nevent: message-end\ndata: {"type":"message-end","id":"co_s","delta":{"finish_reason":"COMPLETE","usage":{"tokens":{"input_tokens":7,"output_tokens":3}}}}\n\n`
+
+// One event frame of a Bedrock event stream (ConverseStream)
+function bedrockFrame(eventType: string, payload: string): u8[] {
+  const h: Map<string, string> = new Map()
+  h.set(":event-type", eventType)
+  h.set(":content-type", "application/json")
+  h.set(":message-type", "event")
+  return encodeEventStreamFrame(h, payload)
+}
 
 function record(req: Request, path: string, body: string): void {
   const auth = req.headers.get("authorization") ?? req.headers.get("x-api-key") ?? req.headers.get("x-goog-api-key") ?? req.headers.get("api-key") ?? ""
@@ -885,6 +895,8 @@ Bun.serve<string>({
         // image models answer with inline image data; TTS with 16-bit mono PCM at 24 kHz
         if (body.includes(`"IMAGE"`)) return Response.json({ candidates: [{ content: { role: "model", parts: [{ inlineData: { mimeType: "image/png", data: "iVBORw0KGgo=" } }] }, finishReason: "STOP" }] })
         if (body.includes(`"AUDIO"`)) return Response.json({ candidates: [{ content: { role: "model", parts: [{ inlineData: { mimeType: "audio/L16;codec=pcm;rate=24000", data: "AAECAw==" } }] }, finishReason: "STOP" }] })
+        // speech-to-text (audio inline): the transcript, with the prompt's tokens split by modality as Gemini reports them
+        if (body.includes(`"inlineData":{"mimeType":"audio/`)) return Response.json({ candidates: [{ content: { role: "model", parts: [{ text: "Hi from gemini" }] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 14, candidatesTokenCount: 3, totalTokenCount: 17, promptTokensDetails: [{ modality: "TEXT", tokenCount: 4 }, { modality: "AUDIO", tokenCount: 10 }] } })
         if (req.params.modelAction.endsWith(":batchEmbedContents")) {
           const n = body.split(`"content"`).length - 1
           const vs: string[] = []
@@ -953,6 +965,36 @@ Bun.serve<string>({
         const body = await req.text()
         record(req, "/model/" + req.params.modelId + "/converse", body)
         return Response.json({ output: { message: { role: "assistant", content: [{ text: "Hi from bedrock" }] } }, stopReason: "end_turn", usage: { inputTokens: 8, outputTokens: 2, totalTokens: 10 } })
+      },
+    },
+    // ConverseStream: real AWS event-stream frames (CRCs and all). A model named "*slow*" pauses 2 s after its first
+    // text, so a test can see the first chunk arrive before the stream is over.
+    "/model/:modelId/converse-stream": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/model/" + req.params.modelId + "/converse-stream", body)
+        const first: u8[] = []
+        for (const b of bedrockFrame("messageStart", `{"role":"assistant"}`)) first.push(b)
+        for (const b of bedrockFrame("contentBlockDelta", `{"contentBlockIndex":0,"delta":{"text":"Hi from "}}`)) first.push(b)
+        const rest: u8[] = []
+        for (const b of bedrockFrame("contentBlockDelta", `{"contentBlockIndex":0,"delta":{"text":"bedrock"}}`)) rest.push(b)
+        for (const b of bedrockFrame("contentBlockStop", `{"contentBlockIndex":0}`)) rest.push(b)
+        for (const b of bedrockFrame("messageStop", `{"stopReason":"end_turn"}`)) rest.push(b)
+        for (const b of bedrockFrame("metadata", `{"usage":{"inputTokens":8,"outputTokens":2,"totalTokens":10},"metrics":{"latencyMs":1}}`)) rest.push(b)
+        const pause = req.params.modelId.includes("slow") ? 2000 : 0
+        const stream = new ReadableStream({
+          start: async (c) => {
+            c.enqueue(first)
+            if (pause > 0) await new Promise((done) => setTimeout(done, pause))
+            try {
+              c.enqueue(rest)
+              c.close()
+            } catch (e) {
+              // the client went away
+            }
+          },
+        })
+        return new Response(stream, { headers: { "content-type": "application/vnd.amazon.eventstream" } })
       },
     },
     "/model/:modelId/count-tokens": {

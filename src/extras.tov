@@ -21,6 +21,7 @@ import { DecisionReq, parseDecision } from "./decisions"
 import { emulationBody, emulatedDecision } from "./decision_emulate"
 import { settingsOf, withHeader, responseToChat } from "./compat"
 import * as responses from "./responses"
+import { llmHooked, llmHandles } from "./pluginroute"
 
 function json(status: int, body: string): Response {
   const h: Record<string, string> = new Map()
@@ -50,7 +51,23 @@ export async function bedrockRerank(engine: Engine, req: Request): Promise<Respo
   } catch (e) {
     return errorResponse(400, `invalid rerank request: ${e.message}`, "invalid_request_error", noHeaders())
   }
-  return await rerankText(engine, req, cohere, true)
+  if (!llmHandles(engine, "rerank")) return await rerankText(engine, req, cohere, true)
+  // with plugins in the rerank hooks, they see Bifrost's rerank request (query, documents, top_n) and its answer, which
+  // is then put in Bedrock's shape (a short circuit's too)
+  const u = URL.parse(req.url)
+  const inner = new Request((u === undefined ? "http://localhost" : u.origin) + "/v1/rerank", { method: "POST", headers: snapshot(req.headers), body: cohere })
+  let r: Response = errorResponse(502, "the plugin hooks failed", "api_error", noHeaders())
+  try {
+    r = try await llmHooked(engine, inner, "rerank", async (hr, hs) => await rerank(engine, hr), undefined)
+  } catch (e) {
+    return errorResponse(502, `the plugin hooks failed: ${e.message}`, "api_error", noHeaders())
+  }
+  if (r.status !== 200) return r
+  try {
+    return json(200, try bedrock.rerankWire(await r.text()))
+  } catch (e) {
+    return errorResponse(502, `invalid rerank answer: ${e.message}`, "api_error", noHeaders())
+  }
 }
 
 // The reply in the route's shape: Bedrock's when wire is set.
@@ -117,6 +134,15 @@ async function rerankText(engine: Engine, req: Request, text: string, wire: bool
 // (an Anthropic Messages body). Anthropic and Gemini count exactly through their
 // APIs; everyone else gets an estimate, marked "exact": false.
 export async function countTokens(engine: Engine, req: Request, anthropicShape: bool): Promise<Response> {
+  // the plugins' LLM hooks run on it as Bifrost's count_tokens request (the body has its messages)
+  try {
+    return try await llmHooked(engine, req, "count_tokens", async (hr, hs) => await countTokensOf(engine, hr, anthropicShape), undefined)
+  } catch (e) {
+    return errorResponse(502, `the plugin hooks failed: ${e.message}`, "api_error", noHeaders())
+  }
+}
+
+async function countTokensOf(engine: Engine, req: Request, anthropicShape: bool): Promise<Response> {
   const text = await req.text()
   let body: Field[] = []
   try {

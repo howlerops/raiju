@@ -7432,6 +7432,184 @@ def l139_e2e(env):
         check("with only built-in plugins the Messages route is served as before", s == 200 and anth_text(b) == "Hello from gpt-4o-mini", (s, h, b[:200]))
     finally:
         gw.terminate()
+GW_L159 = "http://127.0.0.1:18273"  # plugins: the built-in plugins on the provider-format routes; embedContent, Bedrock rerank, count-tokens and batch creation hooked
+
+def l159_e2e(env):
+    """L159: the built-in plugins (blocklist, maxtokens, header, mocker) on the routes that speak a provider's own
+    format (Anthropic Messages, GenAI generateContent, Bedrock Converse, Cohere chat), where Bifrost runs them because
+    those requests become chat and Responses requests: a request one of them acts on is served through chat, others in
+    the route's own format. Then the WASM test plugin (tests/wasm/plugin.wasm) on GenAI :embedContent and
+    :batchEmbedContents, /bedrock/rerank, the count-tokens routes and the batch creations. Its own gateway (18273)."""
+    import hashlib
+    base = GW_L159
+    wasm = os.path.join(ROOT, "tests", "wasm", "plugin.wasm")
+    cfg_path = os.path.join(BUILD, "e2e.l159.json")
+    adm = {"authorization": "Bearer sk-admin-l159"}
+    bedrock_key = {"models": [], "weight": 1.0, "bedrock_key_config": {"access_key": "AKIDEXAMPLE", "secret_key": "secret", "region": "us-west-2", "deployments": {"claude": "anthropic.claude-3-haiku-20240307-v1:0"}}}
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {
+            "openai": {"keys": [{"name": "pool", "value": "sk-pool-l159", "models": [], "weight": 1.0, "use_for_batch_api": True}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "bedrock": {"keys": [bedrock_key], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+        "governance": {"users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256(b"sk-admin-l159").hexdigest()}]},
+        "plugins": [
+            {"name": "blocklist", "enabled": True, "config": {"words": ["forbidden-l159"], "status": 403}},
+            {"name": "maxtokens", "enabled": True, "config": {"cap_max_tokens": 7}},
+            {"name": "mocker", "enabled": True, "config": {"rules": [{"name": "l159", "conditions": {"message_regex": "mock-me"}, "content": "mocked by l159"}]}},
+        ],
+    }
+    json.dump(cfg, open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18273", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l159.log"), "w"))
+
+    def api(method, path, body=None):
+        s, _, b = call(method, path, body, adm, base=base, auth=False)
+        if s not in (200, 201, 204):
+            raise SystemExit(f"l159: {method} {path} failed: {s} {b[:200]}")
+
+    def post(path, body, headers=None):
+        return call("POST", path, body, headers, base=base, auth=False)
+
+    def since(n, path):
+        return [u for u in seen()[n:] if u["path"] == path]
+
+    # each route's request with a text and a max_tokens of 50, and how to read the text of its answer
+    def anth(text):
+        return {"model": "openai/gpt-4o-mini", "max_tokens": 50, "messages": [{"role": "user", "content": text}]}
+
+    def gen(text):
+        return {"contents": [{"role": "user", "parts": [{"text": text}]}], "generationConfig": {"maxOutputTokens": 50}}
+
+    def conv(text):
+        return {"messages": [{"role": "user", "content": [{"text": text}]}], "inferenceConfig": {"maxTokens": 50}}
+
+    def coh(text):
+        return {"model": "openai/gpt-4o-mini", "max_tokens": 50, "messages": [{"role": "user", "content": text}]}
+
+    def anth_text(b):
+        return "".join(c.get("text", "") for c in json.loads(b).get("content", []))
+
+    def gen_text(b):
+        return "".join(p.get("text", "") for p in json.loads(b)["candidates"][0]["content"]["parts"])
+
+    def conv_text(b):
+        return "".join(c.get("text", "") for c in json.loads(b)["output"]["message"]["content"])
+
+    def coh_text(b):
+        return "".join(c.get("text", "") for c in json.loads(b).get("message", {}).get("content", []))
+
+    ROUTES = [
+        ("anthropic", "/anthropic/v1/messages", anth, anth_text),
+        ("genai", "/genai/v1beta/models/openai/gpt-4o-mini:generateContent", gen, gen_text),
+        ("bedrock converse", "/bedrock/model/openai%2Fgpt-4o-mini/converse", conv, conv_text),
+        ("cohere", "/cohere/v2/chat", coh, coh_text),
+    ]
+
+    try:
+        wait(base + "/health")
+        # ---- the built-in plugins on the provider-format routes ----
+        for name, path, mk, rd in ROUTES:
+            n = len(seen())
+            s, _, b = post(path, mk("a forbidden-l159 word"))
+            check(f"{name}: blocklist refuses a request with a blocked word, and the provider is not called", s == 403 and "blocked_content" in b and since(n, "/v1/chat/completions") == [], (s, b[:200]))
+            n = len(seen())
+            s, _, b = post(path, mk("ping"))
+            up = [json.loads(u["body"]) for u in since(n, "/v1/chat/completions")]
+            clamped = len(up) == 1 and (up[0].get("max_tokens") == 7 or up[0].get("max_completion_tokens") == 7)
+            check(f"{name}: maxtokens lowers the request's max_tokens to its cap, and the answer is in the route's format", s == 200 and clamped and rd(b) == "Hello from gpt-4o-mini", (s, b[:200], up))
+            n = len(seen())
+            s, h, b = post(path, mk("please mock-me now"))
+            check(f"{name}: a mocker rule answers in the route's format without the provider", s == 200 and rd(b) == "mocked by l159" and hdr(h, "x-bf-plugin-short-circuit") == "true" and since(n, "/v1/chat/completions") == [], (s, b[:300]))
+        # a request no built-in plugin acts on is served in the route's own format: a Bedrock model on the Messages route
+        # goes to InvokeModel with the Messages body, not through chat (which would call Converse)
+        n = len(seen())
+        s, _, b = post("/anthropic/v1/messages", {"model": "bedrock/claude", "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]})
+        paths = [u["path"] for u in seen()[n:]]
+        check("a request no built-in plugin acts on is served in the route's own format (Messages to InvokeModel)", s == 200 and any(p.endswith("/invoke") for p in paths) and not any(p.endswith("/converse") for p in paths), (s, b[:200], paths))
+        # with max_tokens over the cap the same request is served through chat, where the plugin lowers it
+        n = len(seen())
+        s, _, b = post("/anthropic/v1/messages", {"model": "bedrock/claude", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}]})
+        conv_up = [json.loads(u["body"]) for u in seen()[n:] if u["path"].endswith("/converse")]
+        check("and one maxtokens acts on goes through chat (Converse) with the cap", s == 200 and len(conv_up) == 1 and conv_up[0].get("inferenceConfig", {}).get("maxTokens") == 7, (s, b[:200], [u["path"] for u in seen()[n:]]))
+        # the header plugin's request headers go upstream on every request of these routes, on the route's own path too
+        api("POST", "/api/plugins", {"name": "header", "enabled": True, "config": {"set_request_headers": {"x-team": "team-l159"}}})
+        for name, path, mk, rd in ROUTES:
+            n = len(seen())
+            s, _, b = post(path, mk("hello"))
+            up = since(n, "/v1/chat/completions")
+            check(f"{name}: the header plugin's request headers reach the provider", s == 200 and len(up) == 1 and up[0]["team"] == "team-l159" and rd(b) == "Hello from gpt-4o-mini", (s, b[:200], up))
+        n = len(seen())
+        s, _, b = post("/anthropic/v1/messages", {"model": "bedrock/claude", "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]})
+        inv = [u for u in seen()[n:] if u["path"].endswith("/invoke")]
+        check("the header plugin keeps a request on the route's own path (Messages to InvokeModel) and sets its headers there", s == 200 and len(inv) == 1 and inv[0]["team"] == "team-l159", (s, b[:200], [u["path"] for u in seen()[n:]]))
+        s, _, b = post("/v1/embeddings", {"model": "openai/text-embedding-3-small", "input": "forbidden-l159"})
+        check("the built-in plugins stay off the other request types (embeddings), as Bifrost's", s == 200, (s, b[:200]))
+        for p in ["blocklist", "maxtokens", "mocker", "header"]:
+            api("DELETE", "/api/plugins/" + p)
+
+        # ---- the WASM test plugin on embedContent, Bedrock rerank, count-tokens and batch creation ----
+        api("POST", "/api/plugins", {"name": "w159", "enabled": True, "path": wasm, "config": {"mode": "rewrite", "from": "ping", "to": "pong", "tag": "l159"}})
+        EMB = "/genai/v1beta/models/openai/text-embedding-3-small"
+        n = len(seen())
+        s, _, b = post(EMB + ":embedContent", {"content": {"parts": [{"text": "ping one"}]}})
+        up = [json.loads(u["body"]) for u in since(n, "/v1/embeddings")]
+        check("genai embedContent: pre_hook rewrites the text the provider embeds, answered in Gemini's shape", s == 200 and len(up) == 1 and up[0].get("input") == "pong one" and "values" in json.loads(b).get("embedding", {}), (s, b[:200], up))
+        n = len(seen())
+        s, _, b = post(EMB + ":batchEmbedContents", {"requests": [{"content": {"parts": [{"text": "ping a"}]}}, {"content": {"parts": [{"text": "b"}]}}]})
+        up = [json.loads(u["body"]) for u in since(n, "/v1/embeddings")]
+        check("genai batchEmbedContents: the same, one vector per request", s == 200 and len(up) == 1 and up[0].get("input") == ["pong a", "b"] and len(json.loads(b).get("embeddings", [])) == 2, (s, b[:200], up))
+        WIRE = {"queries": [{"type": "TEXT", "textQuery": {"text": "ping"}}], "sources": [{"type": "INLINE", "inlineDocumentSource": {"type": "TEXT", "textDocument": {"text": t}}} for t in ["a", "b"]], "rerankingConfiguration": {"type": "BEDROCK_RERANKING_MODEL", "bedrockRerankingConfiguration": {"modelConfiguration": {"modelArn": "arn:aws:bedrock:us-west-2::foundation-model/cohere.rerank-v3-5:0"}, "numberOfResults": 2}}}
+        n = len(seen())
+        s, _, b = post("/bedrock/rerank", WIRE)
+        up = since(n, "/rerank")
+        check("bedrock rerank: pre_hook rewrites the query Bedrock gets, and the answer is in Bedrock's shape", s == 200 and len(up) == 1 and '"pong"' in up[0]["body"] and '"ping"' not in up[0]["body"] and json.loads(b).get("results", [{}])[0].get("relevanceScore") == 0.9, (s, b[:200], up))
+        # count-tokens: post_hook marks the count, and the rewritten request is what is counted
+        COUNTS = [
+            ("anthropic count_tokens", "/anthropic/v1/messages/count_tokens", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "ping"}]}),
+            ("openai count_tokens", "/v1/count_tokens", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "ping"}]}),
+            ("genai countTokens", "/genai/v1beta/models/openai/gpt-4o-mini:countTokens", {"contents": [{"role": "user", "parts": [{"text": "ping"}]}]}),
+            ("bedrock count-tokens", "/bedrock/model/openai%2Fgpt-4o-mini/count-tokens", {"input": {"converse": {"messages": [{"role": "user", "content": [{"text": "ping"}]}]}}}),
+        ]
+        for name, path, body in COUNTS:
+            s, _, b = post(path, body)
+            check(f"{name}: post_hook sees the count and marks it (the context from pre_hook arrived)", s == 200 and json.loads(b).get("x_wasm_plugin") == "ctx-ok:l159", (s, b[:200]))
+        n = len(seen())
+        s, _, b = post("/bedrock/model/claude/count-tokens", COUNTS[3][2])
+        up = since(n, "/model/anthropic.claude-3-haiku-20240307-v1:0/count-tokens")
+        check("bedrock count-tokens on Bedrock: the rewritten body is counted, without the model the plugins saw", s == 200 and len(up) == 1 and "pong" in up[0]["body"] and '"model"' not in up[0]["body"] and json.loads(b).get("inputTokens") == 17, (s, b[:200], up))
+        # batch creation: the requests the provider gets are the rewritten ones (the mock answers each with the model
+        # its line names), and post_hook sees the created batch
+        api("PUT", "/api/plugins/w159", {"config": {"mode": "rewrite", "from": "gpt-4o-mini", "to": "gpt-4o-l159", "tag": "l159"}})
+        n = len(seen())
+        oa = {"x-model-provider": "openai"}
+        s, _, b = post("/anthropic/v1/messages/batches", {"requests": [{"custom_id": "a", "params": {"model": "gpt-4o-mini", "max_tokens": 10, "messages": [{"role": "user", "content": "ping"}]}}]}, oa)
+        mb = json.loads(b) if s == 200 else {}
+        rs, _, rb = call("GET", f"/anthropic/v1/messages/batches/{mb.get('id', '')}/results", None, oa, base=base, auth=False)
+        check("anthropic batch create: pre_hook rewrites the batch's requests, and post_hook marks the batch", s == 200 and mb.get("type") == "message_batch" and mb.get("x_wasm_plugin") == "ctx-ok:l159" and len(since(n, "/v1/files")) == 1 and rs == 200 and "Batch reply from gpt-4o-l159" in rb, (s, b[:200], rs, rb[:300]))
+        inline = {"batch": {"displayName": "d", "inputConfig": {"requests": {"requests": [{"request": {"contents": [{"role": "user", "parts": [{"text": "ping"}]}]}, "metadata": {"key": "k1"}}]}}}}
+        n = len(seen())
+        s, _, b = post("/genai/v1beta/models/openai/gpt-4o-mini:batchGenerateContent", inline)
+        check("genai batch create: the hooks run around it, and the batch is created at the provider", s == 200 and json.loads(b).get("x_wasm_plugin") == "ctx-ok:l159" and len(since(n, "/v1/files")) == 1 and len(since(n, "/v1/batches")) == 1, (s, b[:200], [u["path"] for u in seen()[n:]]))
+        # a short-circuit error answers each of these routes, and no provider is called
+        api("PUT", "/api/plugins/w159", {"config": {"mode": "fail"}})
+        FAILS_AT = [
+            ("genai embedContent", EMB + ":embedContent", {"content": {"parts": [{"text": "x"}]}}),
+            ("bedrock rerank", "/bedrock/rerank", WIRE),
+            ("bedrock count-tokens", "/bedrock/model/claude/count-tokens", COUNTS[3][2]),
+            ("anthropic batch create", "/anthropic/v1/messages/batches", {"requests": [{"custom_id": "a", "params": {"model": "gpt-4o-mini", "max_tokens": 10, "messages": [{"role": "user", "content": "x"}]}}]}),
+            ("bedrock job create", "/bedrock/model-invocation-job", {"jobName": "l159", "modelId": "anthropic.claude-3-haiku-20240307-v1:0", "roleArn": "arn:aws:iam::123456789012:role/batch", "inputDataConfig": {"s3InputDataConfig": {"s3Uri": "s3://e2e-files/in.jsonl"}}, "outputDataConfig": {"s3OutputDataConfig": {"s3Uri": "s3://e2e-files/out/"}}}),
+        ] + [(name, path, body) for name, path, body in COUNTS]
+        for name, path, body in FAILS_AT:
+            n = len(seen())
+            s, h, b = post(path, body, {"x-model-provider": "openai"} if "batches" in path else None)
+            check(f"{name}: a short-circuit error carries its status and body, and the provider is not called", s == 418 and "plugin_blocked" in b and seen()[n:] == [], (s, b[:200], [u["path"] for u in seen()[n:]]))
+        # a batch's other calls run no hooks (Raiju hooks the creation only)
+        s, _, b = call("GET", "/anthropic/v1/messages/batches", None, {"x-model-provider": "openai"}, base=base, auth=False)
+        check("listing batches runs no LLM hooks", s == 200 and "plugin_blocked" not in b, (s, b[:200]))
+    finally:
+        gw.terminate()
 GW_L126 = "http://127.0.0.1:18186"  # network_config pool knobs and upstream HTTP/2, against tov-patches/tests/h2_server.py origins
 
 def l126_python_env():
@@ -8158,7 +8336,7 @@ def l136_e2e(env):
         check("a 12 MiB Messages request to Vertex Claude goes to rawPredict without the model, with the Vertex version", s == 200 and row["sha"] == sha(want), (s, b[:200], row["size"], len(want)))
 
         # ---- a stream the caller asked for: the provider streams, its events are converted to chat chunks as they arrive
-        # (Bedrock's binary frames are not: its answer is read whole and replayed as a stream) ----
+        # (Bedrock's binary event-stream frames too, from ConverseStream) ----
         def sse_text(t):
             out = ""
             for line in t.split("\n"):
@@ -8173,14 +8351,14 @@ def l136_e2e(env):
             ("cohere/command-l136", "Hi from cohere", "/v2/chat"),
             ("vertex/claude-l136", "hi", vx % ("anthropic", "claude-l136:streamRawPredict")),
             ("vertex/gemini-l136", "Hi from gemini", vx % ("google", "gemini-l136:streamGenerateContent")),
-            ("bedrock/claude-l136", "Hi from bedrock", "/model/claude-l136/converse"),
+            ("bedrock/claude-l136", "Hi from bedrock", "/model/claude-l136/converse-stream"),
         ]:
             sb = ('{"model":"%s","stream":true,"stream_options":{"include_usage":true},"max_tokens":16,"messages":[{"role":"user","content":"%s"}]}' % (model, FILL(2 * MB))).encode()
             s, hs, b = l124_http(port, "POST", "/v1/chat/completions", sb, timeout=120)
             t = b.decode("utf8", "replace")
             check("a big streamed chat request to %s gets an event stream with the answer, its usage and [DONE]" % model, s == 200 and hdr(hs, "content-type") == "text/event-stream" and sse_text(t) == says and '"usage"' in t and t.rstrip().endswith("data: [DONE]"), (s, hs, t[:400]))
             row = mine(wirepath.split("?")[0])[-1]
-            check("... the provider was called with the stream variant of its API" if "converse" not in wirepath else "... Bedrock was called once, without streaming", row["size"] > 2 * MB, (wirepath, row["size"]))
+            check("... the provider was called with the stream variant of its API", row["size"] > 2 * MB, (wirepath, row["size"]))
 
         # ---- usage: the converted answer is counted in the key's budget, the request log and the metrics ----
         vk = "sk-bf-l136-budget-0123456789"
@@ -8195,7 +8373,7 @@ def l136_e2e(env):
         sb = ('{"model":"bedrock/claude-l136u","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"%s"}]}' % FILL(1 * MB)).encode()
         s, _, b = l124_http(port, "POST", "/v1/chat/completions", sb, headers={"x-bf-vk": vk})
         u3 = used()["b-l136"]
-        check("... and a replayed Bedrock stream (8 + 2 tokens)", s == 200 and abs((u3 - u2) - 10e-6) < 1e-9, (s, b[:100], u2, u3))
+        check("... and a Bedrock stream converted from its event-stream frames (8 + 2 tokens)",s == 200 and abs((u3 - u2) - 10e-6) < 1e-9, (s, b[:100], u2, u3))
         time.sleep(0.5)
         entries = logs()
         r = [e for e in entries if e.get("model") == "anthropic/claude-l136u"]
@@ -8378,6 +8556,39 @@ def l145_e2e(env):
         gw145b.wait()
 
 
+GW_L157 = "http://127.0.0.1:18271"  # large_payload_optimization with an unreachable provider: a streamed body the gateway cancels
+
+def l157_e2e(env):
+    """A request body over large_payload_optimization's threshold that never reaches its provider (the connection is refused):
+    the gateway answers 502 and cancels the body, which is all in by then. Tov patch 0008's httpBodyCancel freed the stream and
+    then read it (a use-after-free that crashed the gateway; found by tests/smoke.py's large request). The same port as
+    tests/smoke.py, which is not run under the e2e lock."""
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "large_payload_optimization": {"enabled": True, "request_threshold_bytes": 8192, "response_threshold_bytes": 1048576, "prefetch_size_bytes": 4096, "max_payload_bytes": 16777216, "truncated_log_bytes": 1024},
+        # port 1 (tcpmux) is closed: every call is refused before a byte of the body is sent
+        "providers": {"openai": {"keys": [{"name": "o", "value": "sk-" + "l157", "models": [], "weight": 1.0}], "network_config": {"base_url": "http://127.0.0.1:1", "max_retries": 0}}},
+    }
+    path = os.path.join(BUILD, "e2e.l157.json")
+    json.dump(cfg, open(path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18271", "-host", "127.0.0.1", "-config", path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l157.log"), "w"))
+    try:
+        wait(GW_L157 + "/health")
+        body = lambda n, extra="": ('{"model":"openai/gpt-4o-mini","max_tokens":8%s,"messages":[{"role":"user","content":"%s"}]}' % (extra, "x" * n)).encode()
+        got = []
+        for b in (body(9000), body(9000, ',"stream":true'), body(20000), body(100)):
+            try:
+                s = l124_http(18271, "POST", "/v1/chat/completions", b, timeout=20)[0]
+            except OSError:  # the gateway is gone
+                s = 0
+            got.append(s)
+        check("requests over the large payload threshold to an unreachable provider are 502s, and the gateway serves on", got == [502, 502, 502, 502] and gw.poll() is None, (got, gw.poll()))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
 GW_L146 = "http://127.0.0.1:18236"  # large Messages to OpenAI-format, Gemini and Cohere, and large embeddings to Gemini: converted as they stream
 GW_L146B = "http://127.0.0.1:18237"  # the same with client.max_request_body_size_mb 1: what is held is bounded by it
 
@@ -8510,6 +8721,211 @@ def l146_e2e(env):
     finally:
         gw.terminate()
         gwb.terminate()
+
+
+GW_L162 = "http://127.0.0.1:18278"  # L162: Bedrock streams of large requests live, large completions sent as chat, large Titan embeddings, Gemini transcription cost
+
+def l162_timed(port, path, body, timeout=180):
+    """A request whose answer is read as it arrives: (status, headers, body, seconds from the first piece holding "Hi from " to the end)."""
+    s = l124_http(port, "POST", path, body, read=False, timeout=timeout)
+    raw, first, t_end = b"", None, None
+    try:
+        while True:
+            c = s.recv(65536)
+            if not c:
+                break
+            raw += c
+            if first is None and b"Hi from " in raw.partition(b"\r\n\r\n")[2]:
+                first = time.time()
+        t_end = time.time()
+    finally:
+        s.close()
+    head, _, rest = raw.partition(b"\r\n\r\n")
+    lines = head.decode("latin1").split("\r\n")
+    status = int(lines[0].split(" ")[1]) if lines and lines[0] else 0
+    hs = {}
+    for l in lines[1:]:
+        k, _, v = l.partition(":")
+        hs[k.strip().lower()] = v.strip()
+    out = rest
+    if hs.get("transfer-encoding", "").lower() == "chunked":
+        out, data = b"", rest
+        while b"\r\n" in data:
+            line, _, data = data.partition(b"\r\n")
+            n = int(line.split(b";")[0] or b"0", 16)
+            if n == 0:
+                break
+            out += data[:n]
+            data = data[n + 2:]
+    return status, hs, out, (t_end - first) if first is not None else -1.0
+
+
+def l162_e2e(env):
+    """L162. A large chat stream and a large Messages stream to Bedrock call ConverseStream and their event-stream frames are converted
+    as they arrive (the first text reaches the caller before the provider's stream is over), the request converted while it streams
+    in, spooled, hashed and signed. A large text completion that compat sends as chat becomes the chat body as it streams in (Anthropic,
+    an OpenAI-format provider, Bedrock), whole and streamed as text_completion chunks. A large Titan embeddings request becomes one
+    signed body per input. A Gemini transcription is billed from its usageMetadata as Bifrost's computeTranscriptionCost bills it. Its
+    own gateway (18278)."""
+    import hashlib, shutil
+    logs_dir = os.path.join(BUILD, "e2e-l162-logs")
+    shutil.rmtree(logs_dir, ignore_errors=True)
+    bk = {"access_key": L136_AK, "secret_key": L136_SK, "region": "us-east-1"}
+    net = {"base_url": MOCK, "max_retries": 0}
+    cfg = {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False, "max_request_body_size_mb": 8, "compat": {}},
+        "logs_store": {"enabled": True, "dir": logs_dir, "content_logging": False},
+        # the compat datasheet rows (chatonly-mini serves chat, not text completions); prices are the built-in table
+        "pricing_sync": {"url": MOCK + "/cdatasheet", "enabled": False},
+        "large_payload_optimization": {"enabled": True, "request_threshold_bytes": 262144, "response_threshold_bytes": 1048576, "prefetch_size_bytes": 16384, "max_payload_bytes": 134217728, "truncated_log_bytes": 4096},
+        "governance": {
+            "budgets": [{"id": "b-l162", "max_limit": 100, "reset_duration": "1d"}],
+            "virtual_keys": [{"id": "vk-l162", "value": "sk-bf-l162-budget-0123456789", "budget_id": "b-l162"}],
+        },
+        "providers": {
+            "bedrock": {"keys": [{"name": "b", "models": [], "weight": 1.0, "bedrock_key_config": bk}], "network_config": net},
+            "anthropic": {"keys": [{"name": "a", "value": "sk-ant-" + "l162", "models": [], "weight": 1.0}], "network_config": net},
+            "openai": {"keys": [{"name": "o", "value": "sk-" + "l162", "models": [], "weight": 1.0}], "network_config": net},
+            "gemini": {"keys": [{"name": "g", "value": "g-" + "l162", "models": [], "weight": 1.0}], "network_config": net},
+        },
+    }
+    path = os.path.join(BUILD, "e2e.l162.json")
+    json.dump(cfg, open(path, "w"))
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18278", "-host", "127.0.0.1", "-config", path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l162.log"), "w"))
+    port = 18278
+    try:
+        wait(GW_L162 + "/health")
+        mine = lambda p_: [x for x in seen() if x["path"] == p_]
+        sha = lambda b: hashlib.sha256(b).hexdigest()
+        used = lambda: {x["id"]: x["used"] for x in json.loads(call("GET", "/api/governance/usage", base=GW_L162, auth=False)[2])["budgets"]}
+        logs = lambda: json.loads(call("GET", "/api/logs?limit=500", base=GW_L162, auth=False)[2])["entries"]
+        MB = 1048576
+        FILL = lambda n, c="F": c * n
+        converse_want = lambda n: ('{"messages":[{"role":"user","content":[{"text":"%s"}]}],"inferenceConfig":{"maxTokens":16}}' % FILL(n)).encode()
+
+        def sse_text(t):
+            out = ""
+            for line in t.split("\n"):
+                if line.startswith("data: {"):
+                    ch = json.loads(line[6:])
+                    for c in ch.get("choices", []):
+                        out += c.get("delta", {}).get("content") or c.get("text") or ""
+            return out
+
+        # ---- a 12 MiB chat stream to Bedrock: ConverseStream, its frames converted to chat chunks as they arrive ----
+        # (12 MiB is over client.max_request_body_size_mb: a buffered request would be refused)
+        body = ('{"model":"bedrock/claude-l162slow","stream":true,"stream_options":{"include_usage":true},"max_tokens":16,"messages":[{"role":"user","content":"%s"}]}' % FILL(12 * MB)).encode()
+        s, hs, b, gap = l162_timed(port, "/v1/chat/completions", body)
+        t = b.decode("utf8", "replace")
+        row = (mine("/model/claude-l162slow/converse-stream") or [{}])[-1]
+        check("a 12 MiB chat stream to Bedrock gets the converted event stream: the text, its usage and [DONE]", s == 200 and hdr(hs, "content-type") == "text/event-stream" and sse_text(t) == "Hi from bedrock" and '"usage"' in t and t.rstrip().endswith("data: [DONE]"), (s, hs, t[:400]))
+        check("... the first text reached the caller before Bedrock's stream was over (%.2f s before the end)" % gap, gap >= 1.5, gap)
+        want = converse_want(12 * MB)
+        check("... ConverseStream was called with the converted body, intact by content hash", row.get("size") == len(want) and row.get("sha") == sha(want), (row.get("size"), len(want)))
+        if row:
+            want_sig, got_sig = l136_sigv4(row, "/model/claude-l162slow/converse-stream")
+            check("... and signed over those bytes (the spool's hash)", want_sig == got_sig, (want_sig, got_sig))
+
+        # ---- a 12 MiB Messages stream to Bedrock: ConverseStream through chat, the answer as Messages events as they arrive ----
+        body = ('{"model":"bedrock/claude-l162slow","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"%s"}]}' % FILL(12 * MB)).encode()
+        s, hs, b, gap = l162_timed(port, "/anthropic/v1/messages", body)
+        t = b.decode("utf8", "replace")
+        texts = "".join(json.loads(l[6:]).get("delta", {}).get("text", "") for l in t.split("\n") if l.startswith("data: {") and "text_delta" in l)
+        row = (mine("/model/claude-l162slow/converse-stream") or [{}])[-1]
+        check("a 12 MiB Messages stream to Bedrock is answered with Messages events carrying the text", s == 200 and hdr(hs, "content-type") == "text/event-stream" and "event: message_start" in t and "event: message_stop" in t and texts == "Hi from bedrock", (s, hs, t[:400]))
+        check("... the first text reached the caller before Bedrock's stream was over (%.2f s before the end)" % gap, gap >= 1.5, gap)
+        check("... ConverseStream got the Converse body of the chat request the Messages body becomes, intact", row.get("size") == len(want) and row.get("sha") == sha(want), (row.get("size"), len(want)))
+        if row:
+            want_sig, got_sig = l136_sigv4(row, "/model/claude-l162slow/converse-stream")
+            check("... signed over its bytes", want_sig == got_sig, (want_sig, got_sig))
+        spools = [n for n in os.listdir("/tmp") if n.startswith("raiju-spool-")]
+        check("the spools are gone when the streams are over", not spools, spools)
+
+        # ---- a 12 MiB text completion that compat sends as chat (chatonly-mini serves chat only) ----
+        def comp(model, n, stream=False):
+            # (the stream flag goes in the prefix, where large_payload_optimization reads it)
+            st = '"stream":true,' if stream else ""
+            return ('{"model":"%s",%s"prompt":"%s","max_tokens":16,"echo":false}' % (model, st, FILL(n))).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/completions", comp("anthropic/chatonly-mini", 12 * MB), timeout=180)
+        row = mine("/v1/messages")[-1]
+        want = ('{"model":"chatonly-mini","messages":[{"role":"user","content":[{"type":"text","text":"%s"}]}],"max_tokens":16}' % FILL(12 * MB)).encode()
+        check("a 12 MiB text completion to Anthropic arrives as its Messages body, converted as it streams in", s == 200 and row["sha"] == sha(want), (s, b[:200], row["size"], len(want)))
+        out = json.loads(b) if s == 200 else {}
+        check("... and is answered as a text completion", out.get("object") == "text_completion" and out["choices"][0]["text"] == "Hi from claude" and out.get("usage", {}).get("prompt_tokens") == 11, b[:300])
+        s, hs, b = l124_http(port, "POST", "/v1/completions", comp("openai/chatonly-mini", 12 * MB), timeout=180)
+        row = mine("/v1/chat/completions")[-1]
+        want = ('{"model":"chatonly-mini","messages":[{"role":"user","content":"%s"}],"max_tokens":16}' % FILL(12 * MB)).encode()
+        check("a 12 MiB text completion to an OpenAI-format chat-only model goes to its chat endpoint as the chat body, intact", s == 200 and row["sha"] == sha(want) and json.loads(b).get("object") == "text_completion", (s, b[:200], row["size"], len(want)))
+        s, hs, b = l124_http(port, "POST", "/v1/completions", comp("bedrock/chatonly-mini", 12 * MB), timeout=180)
+        row = mine("/model/chatonly-mini/converse")[-1]
+        want = converse_want(12 * MB)
+        want_sig, got_sig = l136_sigv4(row, "/model/chatonly-mini/converse")
+        check("a 12 MiB text completion to Bedrock arrives as a signed Converse body, intact", s == 200 and row["sha"] == sha(want) and want_sig == got_sig and json.loads(b)["choices"][0]["text"] == "Hi from bedrock", (s, b[:200], row["size"], len(want)))
+        s, hs, b = l124_http(port, "POST", "/v1/completions", comp("anthropic/chatonly-mini", 12 * MB, stream=True), timeout=180)
+        t = b.decode("utf8", "replace")
+        row = mine("/v1/messages")[-1]
+        frames = [json.loads(l[6:]) for l in t.split("\n") if l.startswith("data: {")]
+        check("a streamed 12 MiB text completion to Anthropic streams as text_completion chunks", s == 200 and frames and all(f.get("object") == "text_completion" for f in frames) and sse_text(t) == "hi" and t.rstrip().endswith("data: [DONE]") and row["size"] > 12 * MB, (s, t[:300]))
+        hwm0 = l124_vm(gw.pid, "VmHWM")
+        s, hs, b = l124_http(port, "POST", "/v1/completions", comp("anthropic/chatonly-mini", 48 * MB), timeout=240)
+        hwm1 = l124_vm(gw.pid, "VmHWM")
+        row = mine("/v1/messages")[-1]
+        want = ('{"model":"chatonly-mini","messages":[{"role":"user","content":[{"type":"text","text":"%s"}]}],"max_tokens":16}' % FILL(48 * MB)).encode()
+        check("a 48 MiB text completion to Anthropic arrives intact, the gateway's peak memory up by under 24 MiB (%d to %d MiB)" % (hwm0, hwm1), s == 200 and row["sha"] == sha(want) and hwm1 - hwm0 < 24, (s, b[:200], hwm0, hwm1))
+
+        # ---- Titan: one signed InvokeModel body per input, each spooled ----
+        titan = "/model/amazon.titan-embed-text-v2/invoke"
+        n0 = len(mine(titan))
+        body = ('{"model":"bedrock/amazon.titan-embed-text-v2","input":"%s","dimensions":256}' % FILL(12 * MB)).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/embeddings", body, timeout=180)
+        rows = mine(titan)[n0:]
+        want = ('{"inputText":"%s","dimensions":256,"normalize":true}' % FILL(12 * MB)).encode()
+        ok = s == 200 and len(rows) == 1 and rows[0]["sha"] == sha(want)
+        check("a 12 MiB Titan embeddings request is one InvokeModel body (dimensions after the text), intact", ok, (s, b[:200], [r["size"] for r in rows], len(want)))
+        if ok:
+            want_sig, got_sig = l136_sigv4(rows[0], titan.replace(":", "%3A"))
+            check("... signed over its bytes", want_sig == got_sig, (want_sig, got_sig))
+            check("... answered as the embeddings list with Titan's token count", json.loads(b)["usage"]["prompt_tokens"] == 3 and len(json.loads(b)["data"]) == 1, b[:200])
+        n0 = len(mine(titan))
+        hwm2 = l124_vm(gw.pid, "VmHWM")
+        body = ('{"model":"bedrock/amazon.titan-embed-text-v2","input":["%s","short one","%s"],"dimensions":8}' % (FILL(12 * MB, "A"), FILL(12 * MB, "B"))).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/embeddings", body, timeout=240)
+        hwm3 = l124_vm(gw.pid, "VmHWM")
+        rows = mine(titan)[n0:]
+        wa = ('{"inputText":"%s","dimensions":8,"normalize":true}' % FILL(12 * MB, "A")).encode()
+        wb = ('{"inputText":"%s","dimensions":8,"normalize":true}' % FILL(12 * MB, "B")).encode()
+        ok = s == 200 and len(rows) == 3 and rows[0]["sha"] == sha(wa) and json.loads(rows[1]["body"]) == {"inputText": "short one", "dimensions": 8, "normalize": True} and rows[2]["sha"] == sha(wb)
+        check("a 24 MiB Titan request with three inputs is three InvokeModel calls, one body each, in order and intact", ok, (s, b[:200], [r["size"] for r in rows]))
+        if ok:
+            sigs = [l136_sigv4(rows[i], titan.replace(":", "%3A")) for i in (0, 2)]
+            check("... each signed over its own bytes", all(w == g for w, g in sigs), sigs)
+            out = json.loads(b)
+            check("... answered with three vectors and the token counts summed", len(out["data"]) == 3 and out["usage"]["prompt_tokens"] == 9, b[:200])
+        check("... with the gateway's peak memory up by under 24 MiB (%d to %d MiB)" % (hwm2, hwm3), hwm3 - hwm2 < 24, (hwm2, hwm3))
+        spools = [n for n in os.listdir("/tmp") if n.startswith("raiju-spool-")]
+        check("the Titan spools are gone when the request is over", not spools, spools)
+
+        # ---- a Gemini transcription billed from its usageMetadata (10 audio and 4 text prompt tokens, 3 output tokens) ----
+        vk = {"x-bf-vk": "sk-bf-l162-budget-0123456789"}
+        parts = [("model", None, "text/plain", "gemini/gemini-2.5-flash"), ("file", "talk.wav", "audio/wav", b"RIFF\x00\x00\x00\x00WAVEfmt ")]
+        u0 = used()["b-l162"]
+        s, _, b = mp_form(GW_L162, "/v1/audio/transcriptions", parts, vk)
+        u1 = used()["b-l162"]
+        out = json.loads(b) if s == 200 else {}
+        check("a Gemini transcription answers with the transcript and Bifrost's usage (type tokens, the prompt split by modality)", out.get("text") == "Hi from gemini" and out.get("usage") == {"type": "tokens", "input_tokens": 14, "input_token_details": {"text_tokens": 4, "audio_tokens": 10}, "output_tokens": 3, "total_tokens": 17}, (s, b[:300]))
+        # computeTranscriptionCost: audio tokens at the audio rate, text tokens at the input rate, output tokens at the output rate
+        cost = 10 * 0.000001 + 4 * 0.0000003 + 3 * 0.0000024999999999999998
+        check("... and its cost, %.3g USD, is charged to the key's budget" % cost, near(u1 - u0, cost), (u0, u1, cost))
+        s, _, b = mp_form(GW_L162, "/v1/audio/transcriptions", parts + [("response_format", None, "text/plain", "text")], vk)
+        u2 = used()["b-l162"]
+        check("a plain-text Gemini transcription is billed the same (the usage read from the answer, not the body)", s == 200 and b == "Hi from gemini" and near(u2 - u1, cost), (s, b[:100], u1, u2))
+        time.sleep(0.5)
+        rows = [e for e in logs() if e.get("model") == "gemini-2.5-flash" and e.get("op") == "transcription"]
+        check("... each logged with its tokens and cost", len(rows) == 2 and all(e.get("prompt_tokens") == 14 and e.get("completion_tokens") == 3 and near(float(e.get("cost") or 0), cost) for e in rows), [(e.get("prompt_tokens"), e.get("completion_tokens"), e.get("cost")) for e in rows])
+    finally:
+        gw.terminate()
+        gw.wait()
 
 
 A2A_GRPC_LISTEN = 18245  # the port the listener binds (RAIJU_A2A_GRPC_LISTEN_PORT)
@@ -10072,7 +10488,7 @@ def main():
         check("gemini speech returns a WAV", s == 200 and audio[:4] == b"RIFF" and audio[8:12] == b"WAVE" and h.get("content-type") == "audio/wav" and struct.unpack("<I", audio[40:44])[0] == 4 and audio[44:] == bytes([0, 1, 2, 3]), (s, audio[:44]))
         # Gemini speech-to-text: the audio inline in generateContent, the transcript as OpenAI's JSON or text
         s, b = multipart("/v1/audio/transcriptions", "talk.wav", b"RIFF\x00\x00\x00\x00WAVEfmt ", {"model": "gemini/gemini-2.5-flash", "prompt": "Transcribe."})
-        check("gemini transcription returns OpenAI's JSON", s == 200 and json.loads(b) == {"text": "Hi from gemini"}, (s, b))
+        check("gemini transcription returns OpenAI's JSON, with the usage Bifrost reports", s == 200 and json.loads(b).get("text") == "Hi from gemini" and json.loads(b).get("usage", {}).get("type") == "tokens", (s, b))
         stt = seen()[-1]
         check("gemini transcription sends the audio inline", stt["path"] == "/v1beta/models/gemini-2.5-flash:generateContent" and '"inlineData":{"mimeType":"audio/wav","data":"UklGRgAAAABXQVZFZm10IA=="}' in stt["body"] and '"text":"Transcribe."' in stt["body"], stt)
         s, b = multipart("/v1/audio/transcriptions", "talk.mp3", b"ID3", {"model": "gemini/gemini-2.5-flash", "response_format": "text"})
@@ -11523,6 +11939,8 @@ def main():
         l130_e2e(env)
         # the LLM hooks on the Anthropic Messages, Cohere, GenAI and Bedrock routes and Cursor's Responses-shaped chat: their own gateway
         l139_e2e(env)
+        # the built-in plugins on the provider-format routes; embedContent, Bedrock rerank, count-tokens and batch creation hooked: their own gateway
+        l159_e2e(env)
         # serving the web UI: the embedded build and RAIJU_UI_DIR: their own gateways
         l113_ui_e2e(env)
         # network_config pool knobs and upstream HTTP/2 (Tov patch 0007): origins from tov-patches/tests/h2_server.py, their own gateway
@@ -11537,6 +11955,11 @@ def main():
         l145_e2e(env)
         # large_payload_optimization for Messages to OpenAI-format, Gemini and Cohere, and embeddings to Gemini (L146): their own gateways
         l146_e2e(env)
+        # a large request whose provider is unreachable: the cancelled body stream (Tov patch 0008, L157): its own gateway
+        l157_e2e(env)
+        # L162: Bedrock streams of large requests converted live, large completions sent as chat and Titan embeddings streamed,
+        # Gemini transcription cost: its own gateway
+        l162_e2e(env)
         # L153: crew routing (crew/<pool> models, the task headers, the assign API, the task detail): its own gateways
         l153_e2e(env)
         # L154: crew outcomes, learning, budget pacing and the sequential layer: its own gateways

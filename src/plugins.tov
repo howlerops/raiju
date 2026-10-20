@@ -82,6 +82,20 @@ export abstract class BasePlugin {
     return false
   }
 
+  // Whether the plugin's chat hooks would act on this request of a provider-format route, given as the chat request it
+  // converts to. When one does (a built-in plugin whose rule matches, a WebAssembly plugin always), the request is served
+  // through chat (nativehook.tov); when none does, the route serves it in its own format, as without plugins. Bifrost
+  // runs its plugins on these routes because they become chat and Responses requests there.
+  appliesNative(ctx: PluginContext, chat: string): bool {
+    return this.hooksNative()
+  }
+
+  // Headers the plugin sets on every upstream request, which a provider-format route that keeps its own path (no plugin
+  // acts on the request) sets as well.
+  nativeRequestHeaders(): Map<string, string> {
+    return new Map()
+  }
+
   // Whether the plugin has an HTTP transport hook (the servers read request bodies only when one does).
   hasHttp(): bool {
     return false
@@ -178,6 +192,25 @@ export class PluginChain {
   hooksNative(): bool {
     for (const p of this.plugins) {
       if (p.hooksNative() && p.handlesOp("chat")) return true
+    }
+    return false
+  }
+
+  // The upstream headers the chat plugins set on every request, for a provider-format route's own path.
+  nativeRequestHeaders(): Map<string, string> {
+    const out: Map<string, string> = new Map()
+    for (const p of this.plugins) {
+      if (!p.handlesOp("chat")) continue
+      const hs = p.nativeRequestHeaders()
+      for (const k of hs.keys()) out.set(k, hs.get(k)!)
+    }
+    return out
+  }
+
+  // Whether any plugin's chat hooks would act on one request of a provider-format route (its chat form).
+  hooksNativeFor(ctx: PluginContext, chat: string): bool {
+    for (const p of this.plugins) {
+      if (p.handlesOp("chat") && p.appliesNative(ctx, chat)) return true
     }
     return false
   }
@@ -345,6 +378,16 @@ export class HeaderPlugin extends BasePlugin {
     return ""
   }
 
+  // set_request_headers go upstream on the provider-format routes' own path too, so those routes keep it
+  nativeRequestHeaders(): Map<string, string> {
+    const out: Map<string, string> = new Map()
+    const set = this.config.set_request_headers
+    if (set !== undefined) {
+      for (const k of set.keys()) out.set(k.toLowerCase(), set.get(k)!)
+    }
+    return out
+  }
+
   preRequest(inout ctx: PluginContext, body: string): PreResult {
     const set = this.config.set_request_headers
     if (set !== undefined) {
@@ -441,15 +484,24 @@ function byPriority(rules: MockRule[]): MockRule[] {
   return rules.slice().sort((a: MockRule, b: MockRule) => (b.priority ?? 0) - (a.priority ?? 0))
 }
 
-// The text of the messages' string contents: what message_regex is matched against.
+// The text of the messages' contents (a string, or the text parts of an array, as the provider-format routes' requests
+// have them): what message_regex is matched against.
 function messageText(body: string): string {
   let out = ""
   try {
     const raw = find(try fields(body), "messages")
     if (raw === undefined) return ""
     for (const el of try elements(raw)) {
-      const c = rawStr(try fields(el), "content")
+      const mf = try fields(el)
+      const c = rawStr(mf, "content")
       if (c !== undefined) out += c + "\n"
+      const parts = find(mf, "content")
+      if (c === undefined && parts !== undefined && parts.startsWith("[")) {
+        for (const p of try elements(parts)) {
+          const t = p.startsWith("{") ? rawStr(try fields(p), "text") : undefined
+          if (t !== undefined) out += t + "\n"
+        }
+      }
     }
   } catch (e) {
     return out
@@ -535,6 +587,17 @@ export class MockerPlugin extends BasePlugin {
 
   name(): string {
     return "mocker"
+  }
+
+  // A rule that matches the request (its probability aside), or a default behaviour that answers. Bifrost's mocker runs
+  // on chat and Responses requests, which the Anthropic, GenAI, Bedrock and Cohere chat routes become.
+  appliesNative(ctx: PluginContext, chat: string): bool {
+    if (this.config.default_behavior === "error" || this.config.default_behavior === "success") return true
+    for (const r of this.config.rules) {
+      if (r.enabled === false) continue
+      if (matchesRule(r, ctx.model, chat) && conditionsMatch(r.conditions, ctx.model, chat)) return true
+    }
+    return false
   }
 
   preRequest(inout ctx: PluginContext, body: string): PreResult {
@@ -635,6 +698,11 @@ export class JsonParserPlugin extends BasePlugin {
 
   name(): string {
     return "jsonparser"
+  }
+
+  // the fences are taken out of the chat answer, before it is converted to the route's format
+  appliesNative(ctx: PluginContext, chat: string): bool {
+    return this.config.strip_markdown_fences === true
   }
 
   postResponse(inout ctx: PluginContext, status: int, body: string): PostResult {
@@ -990,6 +1058,14 @@ export class BlocklistPlugin extends BasePlugin {
     return "blocklist"
   }
 
+  appliesNative(ctx: PluginContext, chat: string): bool {
+    const lower = lowerAscii(chat)
+    for (const w of this.words) {
+      if (lower.indexOf(w) >= 0) return true
+    }
+    return false
+  }
+
   preRequest(inout ctx: PluginContext, body: string): PreResult {
     const lower = lowerAscii(body)
     for (const w of this.words) {
@@ -1016,6 +1092,19 @@ export class MaxTokensPlugin extends BasePlugin {
 
   name(): string {
     return "maxtokens"
+  }
+
+  // when the request's max_tokens is over the cap. The default is for chat requests: a provider-format request without
+  // a limit keeps its own path (its format has its own default, and Anthropic's requires one).
+  appliesNative(ctx: PluginContext, chat: string): bool {
+    const cap = this.config.cap_max_tokens
+    if (cap === undefined) return false
+    try {
+      const v = rawNum(fields(chat), "max_tokens")
+      return v !== undefined && v > cap * 1.0
+    } catch (e) {
+      return false
+    }
   }
 
   preRequest(inout ctx: PluginContext, body: string): PreResult throws Error {
@@ -1840,6 +1929,59 @@ test("only a plugin that opts in takes part in the hooks of the provider-format 
   expect(new PluginChain([chat]).hooksNative()).toBe(false)
   expect(new PluginChain([chat, new NativeRecorder()]).hooksNative()).toBe(true)
   expect(new PluginChain([]).hooksNative()).toBe(false)
+})
+
+const NATIVE_CHAT = `{"model":"openai/gpt-4o-mini","max_tokens":50,"messages":[{"role":"user","content":"tell me a secret"}]}`
+
+test("a built-in plugin takes part in a provider-format request only when it would act on it", () => {
+  const ctx = ctxFor("openai/gpt-4o-mini")
+  // blocklist: a blocked word in the request
+  const bl = new BlocklistPlugin({ words: ["Secret"] })
+  expect(bl.appliesNative(ctx, NATIVE_CHAT)).toBe(true)
+  expect(bl.appliesNative(ctx, `{"messages":[{"role":"user","content":"hello"}]}`)).toBe(false)
+  // maxtokens: a max_tokens to set or lower
+  expect(new MaxTokensPlugin({ cap_max_tokens: 10 }).appliesNative(ctx, NATIVE_CHAT)).toBe(true)
+  expect(new MaxTokensPlugin({ cap_max_tokens: 100 }).appliesNative(ctx, NATIVE_CHAT)).toBe(false)
+  // the default is for chat requests: a provider-format request without a limit keeps its path
+  expect(new MaxTokensPlugin({ default_max_tokens: 64 }).appliesNative(ctx, `{"messages":[]}`)).toBe(false)
+  expect(new MaxTokensPlugin({ default_max_tokens: 64, cap_max_tokens: 10 }).appliesNative(ctx, `{"messages":[]}`)).toBe(false)
+  expect(new MaxTokensPlugin({}).appliesNative(ctx, NATIVE_CHAT)).toBe(false)
+  // header: its request headers are set on the route's own path, so it never moves a request to chat
+  const hs: Map<string, string> = new Map()
+  hs.set("X-Team", "a")
+  const hp = new HeaderPlugin({ set_request_headers: hs })
+  expect(hp.appliesNative(ctx, NATIVE_CHAT)).toBe(false)
+  expect(hp.nativeRequestHeaders().get("x-team")).toBe("a")
+  expect(new HeaderPlugin({ set_response_headers: hs }).nativeRequestHeaders().size).toBe(0)
+  expect(new PluginChain([bl, hp]).nativeRequestHeaders().get("x-team")).toBe("a")
+  expect(new PluginChain([bl]).nativeRequestHeaders().size).toBe(0)
+  // mocker: a matching rule, or a default that answers
+  expect(new MockerPlugin({ rules: [{ model: "openai/gpt-4o-mini", content: "x" }] }).appliesNative(ctx, NATIVE_CHAT)).toBe(true)
+  expect(new MockerPlugin({ rules: [{ model: "other/m", content: "x" }] }).appliesNative(ctx, NATIVE_CHAT)).toBe(false)
+  expect(new MockerPlugin({ rules: [{ model: "*", enabled: false }] }).appliesNative(ctx, NATIVE_CHAT)).toBe(false)
+  expect(new MockerPlugin({ rules: [{ conditions: { message_regex: "secret" } }] }).appliesNative(ctx, NATIVE_CHAT)).toBe(true)
+  expect(new MockerPlugin({ rules: [{ conditions: { message_regex: "weather" } }] }).appliesNative(ctx, NATIVE_CHAT)).toBe(false)
+  // the text parts of an array content count (Bedrock's and GenAI's requests convert to them)
+  const parts = `{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":[{"type":"text","text":"a secret"},{"type":"image_url","image_url":{"url":"x"}}]}]}`
+  const byParts = new MockerPlugin({ rules: [{ conditions: { message_regex: "secret" }, content: "hidden" }] })
+  expect(byParts.appliesNative(ctx, parts)).toBe(true)
+  let mctx = ctxFor("openai/gpt-4o-mini")
+  expect(byParts.preRequest(&mctx, parts).kind).toBe("short_circuit")
+  expect(new MockerPlugin({ rules: [], default_behavior: "success" }).appliesNative(ctx, NATIVE_CHAT)).toBe(true)
+  expect(new MockerPlugin({ rules: [], default_behavior: "passthrough" }).appliesNative(ctx, NATIVE_CHAT)).toBe(false)
+  // jsonparser: the answer's fences, which only chat answers have here
+  expect(new JsonParserPlugin({ strip_markdown_fences: true }).appliesNative(ctx, NATIVE_CHAT)).toBe(true)
+  expect(new JsonParserPlugin({ usage: "all_requests" }).appliesNative(ctx, NATIVE_CHAT)).toBe(false)
+})
+
+test("the chain serves a provider-format request through chat when any chat plugin would act on it", () => {
+  const ctx = ctxFor("openai/gpt-4o-mini")
+  const quiet = new BlocklistPlugin({ words: ["forbidden"] })
+  expect(new PluginChain([quiet]).hooksNativeFor(ctx, NATIVE_CHAT)).toBe(false)
+  expect(new PluginChain([quiet, new MaxTokensPlugin({ cap_max_tokens: 5 })]).hooksNativeFor(ctx, NATIVE_CHAT)).toBe(true)
+  // a plugin that opts in always takes part; one that does not handle chat never does
+  expect(new PluginChain([quiet, new NativeRecorder()]).hooksNativeFor(ctx, NATIVE_CHAT)).toBe(true)
+  expect(new PluginChain([]).hooksNativeFor(ctx, NATIVE_CHAT)).toBe(false)
 })
 
 test("the plugins that handle a request type are the only ones that see it", () => {
