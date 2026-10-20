@@ -174,7 +174,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Start an SSO sign-in: redirects to the identity provider */
+        /**
+         * Start an SSO sign-in: redirects to the identity provider
+         * @description With return_to, the sign-in returns to that page of the gateway once it completes (only the MCP consent pages, /oauth/consent?... and /workspace/mcp-sessions/auth?..., are accepted; anything else returns to /).
+         */
         get: operations["getApiOidcLogin"];
         put?: never;
         post?: never;
@@ -3503,7 +3506,7 @@ export interface paths {
         };
         /**
          * Get OAuth config status
-         * @description The status of an OAuth config, which is the MCP client of auth type oauth with that name. authorized when it holds a token, pending otherwise.
+         * @description The status of an OAuth config, which is the MCP client of auth type oauth with that name. authorized when it holds a token, failed when its last verification flow failed and it holds none, pending otherwise. With flow_id (the flow_id of an initiate-verification or reauthorize answer) the status is that flow's, as Bifrost's resolveOAuthFlowPollStatus answers it. pending until the callback (expired after the flow's deadline), failed when the authorization server refused it or the token request failed, and once the flow is done the config's status (authorized), or expired when it ended without one. A flow of another config is 404.
          */
         get: operations["getApiOauthConfigIdStatus"];
         put?: never;
@@ -3523,12 +3526,12 @@ export interface paths {
         };
         /**
          * Read an MCP authorization request on the consent page (the client, its redirect URI and expiry)
-         * @description The request is the one the MCP authorization server's /oauth2/authorize stored. Its consent temp token (the fragment after the hash, t=, of the consent link) is sent in the X-Bifrost-Temp-Token header. The modes offered are listed in the available_modes field, which lists "vk", and "session" for a dashboard user signed in on this request while inference auth is not enforced. The user mode is not offered (no identity provider).
+         * @description The request is the one the MCP authorization server's /oauth2/authorize stored. Its consent temp token (the fragment after the hash, t=, of the consent link) is sent in the X-Bifrost-Temp-Token header. The modes offered are listed in the available_modes field. "vk" (unless oauth2_server_config.disable_vk_identity is set while user mode is available), "session" for a dashboard user signed in on this request while inference auth is not enforced, and "user" while the gateway's OIDC sign-in is on. logged_in_user (id, name) names the identity-provider user whose single sign-on session token is sent as the Authorization bearer, so the page can offer to continue as that user; the consent page sends its user to /api/oidc/login?return_to=... to sign in.
          */
         get: operations["getApiOauth2ConsentFlowsId"];
         /**
-         * Approve an MCP authorization request with a virtual key (or as the signed-in dashboard user) and answer the client's redirect URL with a one-time code
-         * @description Body {"mode": "vk", "value": "<virtual key>"}. The key must be active and unexpired, and its current value (not a rotated one). Body {"mode": "session"} approves as the dashboard user signed in on this request: the token then names a new session id and runs without a key (refused with 401 without that sign-in, and with 400 while inference auth is enforced). The redirect URL carries code, state and iss (RFC 9207); the client exchanges the code at /oauth2/token.
+         * Approve an MCP authorization request with a virtual key, as the signed-in dashboard user or as the signed-in identity-provider user, and answer the client's redirect URL with a one-time code
+         * @description Body {"mode": "vk", "value": "<virtual key>"}. The key must be active and unexpired, and its current value (not a rotated one). A key that belongs to a user (its user_id) grants user mode for that user while user mode is available, and only to that user signed in (400 otherwise). Body {"mode": "session"} approves as the dashboard user signed in on this request: the token then names a new session id and runs without a key (refused with 401 without that sign-in, and with 400 while inference auth is enforced). Body {"mode": "user"} approves as the identity-provider user whose single sign-on session token is the Authorization bearer (400 without one): the token's sub is that user and bf_mode is user. The redirect URL carries code, state and iss (RFC 9207); the client exchanges the code at /oauth2/token.
          */
         put: operations["putApiOauth2ConsentFlowsId"];
         post?: never;
@@ -3587,7 +3590,7 @@ export interface paths {
         };
         /**
          * Read a per-user OAuth consent flow (its client, the caller it is for and its expiry)
-         * @description The flow is the consent link a caller was given. Its temp token (client.mcp_enable_temp_token_auth) is sent in the X-Bifrost-Temp-Token header in place of a dashboard session. 404 when the flow is unknown or expired.
+         * @description The flow is the consent link a caller was given. Its temp token (client.mcp_enable_temp_token_auth) is sent in the X-Bifrost-Temp-Token header in place of a dashboard session; it opens the flow until the flow ends. The answer has id, flow_mode (vk, session or user), status, mcp_client, user_id, virtual_key_id, session_id, expires_at, created_at and has_active_token. A user-mode flow (opened by a user-mode MCP token) has no temp token and opens only for its own user signed in through the gateway's OIDC sign-in, whatever that user's role (403 for anyone else). 404 when the flow is unknown or expired. Flows are kept in mcp-flow-state.json beside config.json, so a restart keeps them.
          */
         get: operations["getApiOauthPerUserFlowsId"];
         put?: never;
@@ -3627,7 +3630,7 @@ export interface paths {
         };
         /**
          * List the MCP sessions: per-user OAuth token rows, pending consent flows and per-user header credentials
-         * @description Each row has kind (token, flow or header), auth_kind (oauth or headers), auth_mode (vk or session), virtual_key_id, session_id, mcp_client, status (active, needs_reauth, pending), expires_at and created_at (epoch milliseconds), has_refresh_token and can_reauth. Tokens are never listed. Paged by limit (default 50, at most 500) and offset; kind narrows the rows.
+         * @description Each row has kind (token, flow or header), auth_kind (oauth or headers), auth_mode (vk, session or user), user_id, virtual_key_id, session_id, mcp_client, status (active, needs_reauth, pending), expires_at and created_at (epoch milliseconds), has_refresh_token and can_reauth. Tokens are never listed. Paged by limit (default 50, at most 500) and offset; kind narrows the rows.
          */
         get: operations["getApiMcpSessions"];
         put?: never;
@@ -3721,7 +3724,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Add an MCP client and connect to it */
+        /**
+         * Add an MCP client and connect to it
+         * @description An auth_type token_exchange client is refused with 400 while client.dual_credential_conflict_behavior is error (that setting refuses the requests such a client relies on), as Bifrost refuses it.
+         */
         post: operations["postApiMcpClient"];
         delete?: never;
         options?: never;
@@ -5202,6 +5208,11 @@ export interface components {
             allowed_origins?: string[];
             prometheus_labels?: string[];
             mcp_auto_execute?: string[];
+            /**
+             * @description A request with an identity token and x-bf-vk. error cannot be set while an MCP client uses auth_type token_exchange (400), as Bifrost refuses it.
+             * @enum {string}
+             */
+            dual_credential_conflict_behavior?: "error" | "prefer_vk" | "prefer_idp";
         };
         /** @description Our counters after the merge, as the cluster encodes them. */
         ClusterCounters: {
@@ -6002,15 +6013,17 @@ export interface components {
             notifications: components["schemas"]["Notification"][];
             next_cursor?: string;
         };
-        /** @description Bifrost OAuth flow initiation; Raiju's field names. */
+        /** @description Bifrost OAuth flow initiation. oauth_config_id is the client's name; flow_id names the verification flow, and status_url is the route to poll (with ?flow_id= after a reauthorize, whose config may read authorized all along). */
         OAuthFlowInitiation: {
             status: string;
             oauth_config_id?: string;
+            flow_id?: string;
             authorize_url: string;
             /** Format: int64 */
             expires_at?: number;
             mcp_client_id?: string;
             complete_url: string;
+            status_url?: string;
             next_steps?: string[];
         };
         OIDCStatus: {
@@ -7062,7 +7075,10 @@ export interface operations {
     };
     getApiOidcLogin: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description The consent page (path and query) to come back to after the sign-in */
+                return_to?: string;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -22856,7 +22872,10 @@ export interface operations {
     };
     getApiOauthConfigIdStatus: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description A verification flow of this config, to read that flow's status */
+                flow_id?: string;
+            };
             header?: never;
             path: {
                 /** @description Name of the OAuth config (MCP client) */
@@ -22875,11 +22894,20 @@ export interface operations {
                     "application/json": {
                         id?: string;
                         /** @enum {string} */
-                        status?: "pending" | "authorized";
+                        status?: "pending" | "authorized" | "failed" | "expired";
+                        /** @description The flow asked about (with flow_id only) */
+                        flow_id?: string;
+                        /** @description The flow's own state while it is held (pending or failed; with flow_id only) */
+                        flow_status?: string;
+                        /**
+                         * Format: date-time
+                         * @description When the access token expires (authorized only, when known)
+                         */
+                        token_expires_at?: string;
                     };
                 };
             };
-            /** @description No such OAuth config. */
+            /** @description No such OAuth config, or the flow belongs to another config. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -22951,7 +22979,7 @@ export interface operations {
             content: {
                 "application/json": {
                     /** @enum {string} */
-                    mode?: "vk" | "session";
+                    mode?: "vk" | "session" | "user";
                     /** @description The virtual key's value (mode vk only) */
                     value?: string;
                 };
@@ -23104,6 +23132,15 @@ export interface operations {
                     "application/json": components["schemas"]["ManagementErrorResponse"];
                 };
             };
+            /** @description A user-mode flow of another user. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
             /** @description The flow is unknown or expired. */
             404: {
                 headers: {
@@ -23132,6 +23169,15 @@ export interface operations {
         responses: {
             /** @description OK */
             200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description A user-mode flow of another user. */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -24137,7 +24183,10 @@ export interface operations {
     getApiMcpPerUserHeadersFlowsId: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description The submission's temp token (the fragment of the link a tool call answered), when client.mcp_enable_temp_token_auth is on */
+                "X-Bifrost-Temp-Token"?: string;
+            };
             path: {
                 /** @description The submission flow's id */
                 id: string;
@@ -24214,7 +24263,10 @@ export interface operations {
     putApiMcpPerUserHeadersFlowsId: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description The submission's temp token (the fragment of the link a tool call answered), when client.mcp_enable_temp_token_auth is on */
+                "X-Bifrost-Temp-Token"?: string;
+            };
             path: {
                 /** @description The submission flow's id */
                 id: string;

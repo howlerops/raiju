@@ -2476,7 +2476,7 @@ def mcp_peruser_e2e(env):
         s, _, b = call("GET", "/api/mcp/clients", base=MCP_PU, auth=False)
         check("the sample is masked on read", s == 200 and "tenant-a-key-example" not in b and "tenant" in b, (s, b[:200]))
         s, _, b = tool("sk-bf-tenant-a")
-        check("a key with no submitted values is refused before the call", s == 401 and "not submitted" in b, (s, b[:200]))
+        check("a key with no submitted values is refused before the call", s == 401 and "Authentication required for tenant" in b and "kind=headers" in b, (s, b[:200]))
         s, _, b = call("POST", "/api/mcp/per-user-headers/flows", {"mcp_client_name": "tenant", "virtual_key_id": "vk-a"}, base=MCP_PU, auth=False)
         check("a flow opens for a key and client", s == 201 and json.loads(b)["status"] == "pending", (s, b[:200]))
         fid = json.loads(b)["id"]
@@ -2494,7 +2494,7 @@ def mcp_peruser_e2e(env):
         s, _, b = tool("sk-bf-tenant-a")
         check("the key's own values go with its tool call", s == 200 and "Sunny in Oslo" in b and sent_tenants()[-1:] == ["tenant-a-key-example"], (s, b[:200], sent_tenants()[-1:]))
         s, _, b = tool("sk-bf-tenant-b")
-        check("a second key with no values is still refused", s == 401 and "not submitted" in b, (s, b[:200]))
+        check("a second key with no values is still refused", s == 401 and "Authentication required for tenant" in b and "kind=headers" in b, (s, b[:200]))
         s, _, b = call("POST", "/api/mcp/per-user-headers/flows", {"mcp_client_name": "tenant", "virtual_key_id": "vk-b"}, base=MCP_PU, auth=False)
         fb = json.loads(b)["id"]
         s, _, b = call("PUT", "/api/mcp/per-user-headers/flows/" + fb, {"headers": {"X-Tenant": "tenant-b-key-example"}}, base=MCP_PU, auth=False)
@@ -2506,7 +2506,7 @@ def mcp_peruser_e2e(env):
         s, _, b = call("DELETE", "/api/mcp/per-user-headers/credential/" + cred_b, base=MCP_PU, auth=False)
         check("a credential can be revoked", s == 200, (s, b[:200]))
         s, _, b = tool("sk-bf-tenant-b")
-        check("a revoked credential is no longer used", s == 401 and "not submitted" in b, (s, b[:200]))
+        check("a revoked credential is no longer used", s == 401 and "Authentication required for tenant" in b and "kind=headers" in b, (s, b[:200]))
         s, _, b = tool("sk-bf-tenant-a")
         check("revoking one key leaves the others", s == 200, (s, b[:200]))
         s, _, b = call("DELETE", "/api/mcp/per-user-headers/credential/" + cred_a, base=MCP_PU, auth=False)
@@ -10113,6 +10113,282 @@ def l158_e2e(env):
         gw.terminate()
         gw.wait()
 
+GW_L167 = "http://127.0.0.1:18286"  # L167: MCP OAuth user mode on the OIDC sign-in, status states, flows and codes kept across restarts, temp tokens, dual credentials
+
+def l167_e2e(env, idp_state):
+    """L167, its own gateway restarted three times on one folder: dual_credential_conflict_behavior error refused with a
+    token_exchange client (both ways); the OAuth config status of a flow (flow_id: pending, failed, authorized); a per-user
+    headers submission opened by the tool call, its link and temp token; a per-user consent flow, a pending authorization
+    request and a consented code surviving restarts; user mode on the OIDC sign-in (consent, the /mcp token, the per-user
+    flow its own user opens, conflicting credentials); disable_vk_identity."""
+    import http.client, shutil, re as _re
+    folder = os.path.join(BUILD, "l167")
+    shutil.rmtree(folder, ignore_errors=True)
+    os.makedirs(folder)
+    path = os.path.join(folder, "config.json")
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    ADMIN_H = {"authorization": "Bearer admin-secret"}
+
+    def client_cfg(disable_vk=False):
+        return {"enable_logging": False, "enforce_auth_on_inference": False, "mcp_enable_temp_token_auth": True,
+                "mcp_server_auth_mode": "both", "oauth2_server_config": {"issuer_url": GW_L167, "disable_vk_identity": disable_vk}}
+
+    def config(disable_vk=False):
+        return {
+            "encryption_key": "an e2e passphrase of some length",
+            "client": client_cfg(disable_vk),
+            "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+            "providers": {"openai": {"keys": [{"name": "k", "value": "sk-k", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+            "governance": {"auth_config": {"token": "admin-secret"}, "virtual_keys": [{"id": "vk-l167-a", "value": "sk-bf-l167-a"}]},
+            "oidc": {"enabled": True, "issuer": "http://127.0.0.1:18096", "client_id": "raiju", "redirect_uri": GW_L167 + "/api/oidc/callback", "role_claim": "groups", "role_map": {"raiju-editors": "editor"}},
+            "mcp": {"tool_sync_interval": "1h", "oauth_private_allowlist": ["127.0.0.1"], "client_configs": [
+                {"name": "po", "connection_type": "http", "connection_string": MOCK + "/mcp-peruser-oauth", "auth_type": "per_user_oauth", "auth": {"type": "oauth"}},
+                {"name": "oa", "connection_type": "http", "connection_string": MOCK + "/mcp-oauth", "auth": {"type": "oauth"}},
+                {"name": "tenant", "connection_type": "http", "connection_string": MOCK + "/mcp-peruser", "auth_type": "per_user_headers", "per_user_header_keys": ["x-tenant"]},
+                {"name": "jira", "connection_type": "http", "connection_string": MOCK + "/mcp-exchange", "auth_type": "token_exchange", "token_exchange": {"audience": "api://jira", "client_id": "exch"}},
+            ]},
+        }
+
+    def start():
+        p = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18286", "-host", "127.0.0.1", "-config", path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l167.log"), "a"))
+        wait(GW_L167 + "/health")
+        return p
+
+    def restart(p, cfg=None):
+        p.terminate()
+        p.wait()
+        if cfg is not None:
+            # the file the gateway saved keeps its sealed state; only the client section changes
+            saved = json.load(open(path))
+            saved["client"] = cfg["client"]
+            json.dump(saved, open(path, "w"))
+        return start()
+
+    def api(method, p, body=None, headers=None):
+        return call(method, p, body, {**ADMIN_H, **(headers or {})}, base=GW_L167, auth=False)
+
+    def follow(url):
+        """The authorization server's redirect for an authorize URL: (path, query) of the callback."""
+        loc = ""
+        try:
+            urllib.request.build_opener(NoFollow).open(url, timeout=10)
+        except urllib.error.HTTPError as e:
+            loc = e.headers.get("location", "")
+        lu = urllib.parse.urlparse(loc)
+        return lu.path, lu.query
+
+    def sign_in(sub="alice", return_to=""):
+        """An OIDC sign-in through the mock identity provider: (callback status, page, session token)."""
+        conn = http.client.HTTPConnection("127.0.0.1", 18286, timeout=10)
+        conn.request("GET", "/api/oidc/login" + ("?return_to=" + urllib.parse.quote(return_to, safe="") if return_to else ""))
+        r = conn.getresponse(); r.read()
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(r.getheader("location") or "").query)
+        idp_state["nonce"] = q.get("nonce", [""])[0]
+        idp_state["claims"] = {"sub": sub, "email": sub + "@example.com"}
+        try:
+            s, _, page = call("GET", "/api/oidc/callback?code=abc&state=" + q.get("state", [""])[0], base=GW_L167, auth=False)
+        finally:
+            idp_state["claims"] = {}
+        m = _re.search(r'"(sk-sess-[0-9a-f]+)"', page)
+        return s, page, (m.group(1) if m else "")
+
+    def tool(key, name):
+        return call("POST", "/v1/mcp/tool/execute", {"id": "c1", "type": "function", "function": {"name": name, "arguments": "{\"city\":\"Oslo\"}"}}, {"authorization": "Bearer " + key}, base=GW_L167, auth=False)
+
+    def mcp_rpc(headers, method, params):
+        """initialize, then one JSON-RPC call on /mcp: (initialize status, call status, call body)."""
+        h = {"content-type": "application/json", **headers}
+        s, hh, _ = raw("POST", GW_L167 + "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "e2e-l167", "version": "1"}}}, h)
+        sid = {k.lower(): v for k, v in hh.items()}.get("mcp-session-id", "")
+        s2, _, b2 = raw("POST", GW_L167 + "/mcp", {"jsonrpc": "2.0", "id": 2, "method": method, "params": params}, {**h, "mcp-session-id": sid})
+        return s, s2, b2
+
+    def as_open():
+        cid = as_register(GW_L167)
+        verifier, challenge = as_pkce()
+        fid, tok = as_authorize(GW_L167, cid, challenge, "st-l167")
+        return cid, verifier, fid, tok
+
+    def consent_put(fid, tok, body, session=""):
+        h = {"content-type": "application/json", "x-bifrost-temp-token": tok}
+        if session:
+            h["authorization"] = "Bearer " + session
+        s, _, b = raw("PUT", GW_L167 + "/api/oauth2/consent/flows/" + fid, body, h)
+        return s, (json.loads(b).get("redirect_url", "") if s == 200 else b)
+
+    json.dump(config(), open(path, "w"))
+    gw = start()
+    try:
+        # dual_credential_conflict_behavior "error" and a token_exchange client cannot be set together (Bifrost's config.go and mcp.go)
+        cl = client_cfg()
+        s, _, b = api("PUT", "/api/config", {"client_config": {**cl, "dual_credential_conflict_behavior": "error"}})
+        check("l167: dual_credential_conflict_behavior error is refused while a token_exchange client exists", s == 400 and "jira" in b and "token_exchange" in b, (s, b[:300]))
+        s, _, b = api("PUT", "/api/config", {"client_config": {**cl, "dual_credential_conflict_behavior": "prefer_idp"}})
+        check("l167: prefer_idp is accepted with a token_exchange client", s == 200, (s, b[:200]))
+        s, _, b = api("DELETE", "/api/mcp/client/jira")
+        s, _, b = api("PUT", "/api/config", {"client_config": {**cl, "dual_credential_conflict_behavior": "error"}})
+        check("l167: error is accepted once no client uses token_exchange", s == 200, (s, b[:200]))
+        s, _, b = api("POST", "/api/mcp/client", {"name": "jira", "connection_type": "http", "connection_string": MOCK + "/mcp-exchange", "auth_type": "token_exchange", "token_exchange": {"audience": "api://jira", "client_id": "exch"}})
+        check("l167: a token_exchange client is refused while the behaviour is error", s == 400 and "dual_credential_conflict_behavior is 'error'" in b, (s, b[:300]))
+        s, _, b = api("PUT", "/api/config", {"client_config": cl})
+
+        # the OAuth config status: the bare form and the flow_id form, with failed and authorized
+        s, _, b = api("POST", "/api/mcp/client/oa/initiate-verification")
+        init = json.loads(b) if s == 200 else {}
+        check("l167: initiate-verification names its flow and the status URL", s == 200 and init.get("oauth_config_id") == "oa" and init.get("flow_id") and init.get("status_url") == "/api/oauth/config/oa/status", (s, b[:300]))
+        state = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(init.get("authorize_url", "")).query)).get("state", "")
+        s, _, b = api("GET", "/api/oauth/config/oa/status?flow_id=" + init.get("flow_id", ""))
+        check("l167: a flow waiting for its callback is pending", s == 200 and json.loads(b)["status"] == "pending" and json.loads(b).get("flow_status") == "pending", (s, b[:200]))
+        s, _, b = call("GET", "/api/oauth/callback?error=access_denied&state=" + state, base=GW_L167, auth=False)
+        check("l167: a refused authorization comes back to the callback", s == 400 and "refused" in b, (s, b[:200]))
+        s, _, b = api("GET", "/api/oauth/config/oa/status?flow_id=" + init.get("flow_id", ""))
+        check("l167: the refused flow reads failed", s == 200 and json.loads(b)["status"] == "failed", (s, b[:200]))
+        s, _, b = api("GET", "/api/oauth/config/oa/status")
+        check("l167: a config whose last flow failed and that holds no token reads failed", s == 200 and json.loads(b)["status"] == "failed", (s, b[:200]))
+        s, _, b = api("POST", "/api/mcp/client/oa/initiate-verification")
+        init = json.loads(b) if s == 200 else {}
+        cp, cq = follow(init.get("authorize_url", ""))
+        s, _, b = call("GET", cp + "?" + cq, base=GW_L167, auth=False)
+        check("l167: the second flow completes", s == 200 and "is authorized" in b, (s, b[:200]))
+        s, _, b = api("GET", "/api/oauth/config/oa/status")
+        check("l167: an authorized config reads authorized with its token expiry", s == 200 and json.loads(b)["status"] == "authorized" and "token_expires_at" in json.loads(b), (s, b[:200]))
+        s, _, b = api("GET", "/api/oauth/config/oa/status?flow_id=" + init.get("flow_id", ""))
+        check("l167: a completed flow reads authorized", s == 200 and json.loads(b)["status"] == "authorized", (s, b[:200]))
+        s, _, b = api("POST", "/api/mcp/client/oa/reauthorize")
+        re_init = json.loads(b) if s == 200 else {}
+        check("l167: reauthorize names a status URL with its flow", s == 200 and re_init.get("status_url") == "/api/oauth/config/oa/status?flow_id=" + re_init.get("flow_id", "-"), (s, b[:300]))
+        s, _, b = api("GET", re_init.get("status_url", "/x"))
+        check("l167: a reauthorize polls pending while the config is still authorized", s == 200 and json.loads(b)["status"] == "pending", (s, b[:200]))
+        s, _, b = api("GET", "/api/oauth/config/oa/status")
+        check("l167: the bare status of a reauthorizing config stays authorized", s == 200 and json.loads(b)["status"] == "authorized", (s, b[:200]))
+        s, _, b = api("GET", "/api/oauth/config/po/status?flow_id=" + re_init.get("flow_id", ""))
+        check("l167: another config's flow is not found", s == 404, (s, b[:200]))
+
+        # the per-user OAuth client is verified by the admin, as before
+        s, _, b = api("POST", "/api/mcp/client/po/initiate-verification")
+        cp, cq = follow(json.loads(b).get("authorize_url", "") if s == 200 else "")
+        call("GET", cp + "?" + cq, base=GW_L167, auth=False)
+        api("POST", "/api/mcp/client/po/complete-oauth")
+        wait_mcp_tools(GW_L167, ["po-get_weather"])
+
+        # per-user headers: the tool call opens the submission and names its page, with a temp token
+        s, _, b = api("POST", "/api/mcp/client/tenant/verify-headers", {"headers": {"X-Tenant": "tenant-a-key-example"}})
+        wait_mcp_tools(GW_L167, ["tenant-get_weather"])
+        s, _, b = tool("sk-bf-l167-a", "tenant-get_weather")
+        m = _re.search(r"/workspace/mcp-sessions/auth\?flow=([A-Za-z0-9_-]+)&kind=headers#t=([0-9a-f]+)", b)
+        check("l167: a key without headers is sent the submission page, with its temp token", s == 401 and m is not None and "to submit the required headers" in b, (s, b[:300]))
+        hf, ht = (m.group(1), m.group(2)) if m else ("", "")
+        s, _, b = call("GET", "/api/mcp/per-user-headers/flows/" + hf, headers={"x-bifrost-temp-token": ht}, base=GW_L167, auth=False)
+        check("l167: the temp token opens the submission", s == 200 and json.loads(b)["required_header_keys"] == ["x-tenant"], (s, b[:200]))
+        s, _, b = call("GET", "/api/mcp/per-user-headers/flows/" + hf, base=GW_L167, auth=False)
+        check("l167: without it the submission is closed", s == 401, (s, b[:200]))
+        s, _, b = call("PUT", "/api/mcp/per-user-headers/flows/" + hf, {"headers": {"X-Tenant": "tenant-a-key-example"}}, {"x-bifrost-temp-token": ht}, base=GW_L167, auth=False)
+        check("l167: the temp token submits the values", s == 200 and json.loads(b)["status"] == "success", (s, b[:200]))
+        s, _, b = call("GET", "/api/mcp/per-user-headers/flows/" + hf, headers={"x-bifrost-temp-token": ht}, base=GW_L167, auth=False)
+        check("l167: the temp token ends with the submission", s == 401, (s, b[:200]))
+        s, _, b = tool("sk-bf-l167-a", "tenant-get_weather")
+        check("l167: the submitted values go with the key's tool call", s == 200 and "Sunny in Oslo" in b, (s, b[:200]))
+        ps, ph, page = raw("GET", GW_L167 + "/workspace/mcp-sessions/auth?flow=" + hf + "&kind=headers")
+        check("l167: the auth page serves the headers submission", ps == 200 and "kind" in page and "per-user-headers/flows/" in page, (ps, page[:200]))
+
+        # a per-user consent flow and a pending authorization request, then a restart
+        s, _, b = tool("sk-bf-l167-a", "po-get_weather")
+        m = _re.search(r"flow=([0-9a-f]+)#t=([0-9a-f]+)", b)
+        check("l167: a caller without a token gets a consent link with a temp token", s == 401 and m is not None, (s, b[:300]))
+        pf, pt = (m.group(1), m.group(2)) if m else ("", "")
+        cid, verifier, fid, ftok = as_open()
+        check("l167: an authorization request is open", fid != "" and ftok != "", (fid, ftok))
+        cid_u, verifier_u, fid_u, ftok_u = as_open()
+        s, page, sess = sign_in("alice", "/oauth/consent?flow=" + fid_u)
+        check("l167: a sign-in started from the consent page returns to it", s == 200 and sess != "" and ('location.replace("/oauth/consent?flow=' + fid_u + '")') in page, (s, page[:300]))
+        s, page, _ = sign_in("alice", "https://elsewhere.example/x")
+        check("l167: a sign-in never returns to another site", s == 200 and 'location.replace("/")' in page, (s, page[:300]))
+        state_files = sorted(os.listdir(folder))
+        flows_text = open(os.path.join(folder, "mcp-flow-state.json")).read() if "mcp-flow-state.json" in state_files else ""
+        check("l167: the flows are kept beside config.json, the temp token only as its hash", "mcp-flow-state.json" in state_files and pf in flows_text and pt not in flows_text and "enc:v1:" in flows_text, state_files)
+
+        gw = restart(gw)
+        s, _, b = call("GET", "/api/oauth/per-user/flows/" + pf, headers={"x-bifrost-temp-token": pt}, base=GW_L167, auth=False)
+        check("l167: after a restart the consent flow and its temp token still open", s == 200 and json.loads(b)["virtual_key_id"] == "vk-l167-a" and json.loads(b)["flow_mode"] == "vk", (s, b[:200]))
+        s, _, b = call("GET", "/api/oauth/per-user/flows/" + pf + "/start", headers={"x-bifrost-temp-token": pt}, base=GW_L167, auth=False)
+        cp, cq = follow(json.loads(b)["authorize_url"] if s == 200 else "")
+        s, _, b = call("GET", cp + "?" + cq, base=GW_L167, auth=False)
+        check("l167: the callback of a flow from before the restart saves the caller's token", s == 200 and "for this caller" in b, (s, b[:200]))
+        s, _, b = call("GET", "/api/oauth/per-user/flows/" + pf, headers={"x-bifrost-temp-token": pt}, base=GW_L167, auth=False)
+        check("l167: the temp token ends with its flow", s == 401, (s, b[:200]))
+        s, _, b = tool("sk-bf-l167-a", "po-get_weather")
+        check("l167: the caller's tool call runs with its token", s == 200 and "Sunny in Oslo" in b, (s, b[:200]))
+        s, _, b = raw("GET", GW_L167 + "/api/oauth2/consent/flows/" + fid, headers={"x-bifrost-temp-token": ftok})
+        check("l167: after a restart the authorization request still opens on the consent page", s == 200 and "e2e-client" in b, (s, b[:200]))
+        s, vk_redirect = consent_put(fid, ftok, {"mode": "vk", "value": "sk-bf-l167-a"})
+        check("l167: the request from before the restart is approved with a key", s == 200 and "code=" in vk_redirect, (s, vk_redirect[:200]))
+        s, _, sess = sign_in("alice")
+        s, _, b = raw("GET", GW_L167 + "/api/oauth2/consent/flows/" + fid_u, headers={"x-bifrost-temp-token": ftok_u, "authorization": "Bearer " + sess})
+        d = json.loads(b) if s == 200 else {}
+        check("l167: user mode is offered to the signed-in user, who is named", s == 200 and "user" in d.get("available_modes", []) and d.get("logged_in_user", {}).get("id") == "alice", (s, b[:300]))
+        s, _, b = raw("GET", GW_L167 + "/api/oauth2/consent/flows/" + fid_u, headers={"x-bifrost-temp-token": ftok_u})
+        check("l167: without a sign-in user mode is offered with no user named", s == 200 and "user" in json.loads(b)["available_modes"] and "logged_in_user" not in json.loads(b), (s, b[:300]))
+        s, b = consent_put(fid_u, ftok_u, {"mode": "user"})
+        check("l167: user mode without a sign-in is refused", s == 400 and "sign in" in b, (s, b[:200]))
+        s, user_redirect = consent_put(fid_u, ftok_u, {"mode": "user"}, sess)
+        check("l167: the signed-in user approves in user mode", s == 200 and "code=" in user_redirect, (s, user_redirect[:200]))
+
+        gw = restart(gw)
+        s, vk_tokens = as_token(GW_L167, cid, vk_redirect, verifier)
+        check("l167: a code consented before a restart exchanges after it", s == 200 and vk_tokens.get("access_token"), (s, vk_tokens))
+        s, user_tokens = as_token(GW_L167, cid_u, user_redirect, verifier_u)
+        check("l167: the user-mode code exchanges for tokens", s == 200 and user_tokens.get("access_token"), (s, user_tokens))
+        s = as_token(GW_L167, cid, vk_redirect, verifier)[0]
+        check("l167: a code exchanges once, across the restart too", s == 400, s)
+        ut = user_tokens.get("access_token", "")
+        payload = json.loads(base64.urlsafe_b64decode(ut.split(".")[1] + "==")) if ut.count(".") == 2 else {}
+        check("l167: the user-mode token names the user", payload.get("bf_mode") == "user" and payload.get("sub") == "alice", payload)
+        s, s2, b = mcp_rpc({"authorization": "Bearer " + ut}, "tools/list", {})
+        check("l167: /mcp takes the user-mode token", s == 200 and s2 == 200 and "po-get_weather" in b, (s, s2, b[:200]))
+        s, _, b = raw("POST", GW_L167 + "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, {"content-type": "application/json", "authorization": "Bearer " + ut, "x-bf-vk": "sk-bf-l167-a"})
+        check("l167: an OAuth token with a virtual key header is refused as conflicting", s == 401 and "conflicting credentials" in b, (s, b[:200]))
+        s, s2, b = mcp_rpc({"authorization": "Bearer " + ut}, "tools/call", {"name": "po-get_weather", "arguments": {"city": "Oslo"}})
+        m = _re.search(r"flow=([0-9a-f]+)", b)
+        check("l167: the user's first call of a per-user client needs the user's own consent, with no temp token", s2 == 200 and m is not None and "#t=" not in b, (s2, b[:300]))
+        uf = m.group(1) if m else ""
+        s, _, b = call("GET", "/api/oauth/per-user/flows/" + uf, base=GW_L167, auth=False)
+        check("l167: the user's flow does not open without a sign-in", s == 401, (s, b[:200]))
+        s, _, bob = sign_in("bob")
+        s, _, b = call("GET", "/api/oauth/per-user/flows/" + uf, headers={"authorization": "Bearer " + bob}, base=GW_L167, auth=False)
+        check("l167: another user cannot open the user's flow", s in (403,), (s, b[:200]))
+        s, _, sess = sign_in("alice")
+        s, _, b = call("GET", "/api/oauth/per-user/flows/" + uf, headers={"authorization": "Bearer " + sess}, base=GW_L167, auth=False)
+        check("l167: the user opens their own flow", s == 200 and json.loads(b)["flow_mode"] == "user" and json.loads(b)["user_id"] == "alice", (s, b[:200]))
+        s, _, b = call("GET", "/api/oauth/per-user/flows/" + uf + "/start", headers={"authorization": "Bearer " + sess}, base=GW_L167, auth=False)
+        cp, cq = follow(json.loads(b)["authorize_url"] if s == 200 else "")
+        s, _, b = call("GET", cp + "?" + cq, base=GW_L167, auth=False)
+        check("l167: the callback saves the user's own token", s == 200 and "for this caller" in b, (s, b[:200]))
+        s, s2, b = mcp_rpc({"authorization": "Bearer " + ut}, "tools/call", {"name": "po-get_weather", "arguments": {"city": "Oslo"}})
+        check("l167: the user's tool call runs with the user's token", s2 == 200 and "Sunny in Oslo" in b, (s2, b[:300]))
+        s, _, b = api("GET", "/api/mcp/sessions?kind=token")
+        rows = [r for r in json.loads(b)["sessions"] if r.get("user_id") == "alice"] if s == 200 else []
+        check("l167: the sessions list shows the user's token row in user mode", len(rows) == 1 and rows[0]["auth_mode"] == "user", (s, b[:300]))
+        s, _, b = api("GET", "/api/oauth2/sessions?bf_mode=user&user_id=alice")
+        check("l167: the user-mode grant is listed by its user", s == 200 and json.loads(b)["total_count"] == 1, (s, b[:300]))
+
+        # disable_vk_identity, with user mode available: vk tokens and refreshes stop, and consent offers no vk mode
+        cfg = config(disable_vk=True)
+        gw = restart(gw, cfg)
+        s, _, b = raw("POST", GW_L167 + "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, {"content-type": "application/json", "authorization": "Bearer " + vk_tokens.get("access_token", "")})
+        check("l167: a vk-mode token is refused once virtual-key identity is disabled", s == 401 and "virtual-key identity is no longer accepted" in b, (s, b[:200]))
+        form = urllib.parse.urlencode({"grant_type": "refresh_token", "refresh_token": vk_tokens.get("refresh_token", ""), "client_id": cid})
+        s, _, b = raw("POST", GW_L167 + "/oauth2/token", form, {"content-type": "application/x-www-form-urlencoded"})
+        check("l167: a vk-mode grant no longer refreshes", s == 400 and "virtual-key identity is no longer accepted" in b, (s, b[:200]))
+        _, _, fid3, ftok3 = as_open()
+        s, _, b = raw("GET", GW_L167 + "/api/oauth2/consent/flows/" + fid3, headers={"x-bifrost-temp-token": ftok3})
+        check("l167: consent offers no vk mode", s == 200 and json.loads(b)["available_modes"] == ["user"], (s, b[:200]))
+        s, s2, b = mcp_rpc({"authorization": "Bearer " + ut}, "tools/list", {})
+        check("l167: the user-mode token still works", s == 200 and s2 == 200, (s, s2, b[:200]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
 GW_L166 = "http://127.0.0.1:18285"  # MCP management: SSE heartbeats, OpenAPI YAML/$ref/security, spec_url, library, ping, tool cost, Responses, project MCP access
 
 def l166_config():
@@ -12622,7 +12898,7 @@ def main():
             loc = e.headers.get("location", "")
         lu = urllib.parse.urlparse(loc)
         lq = dict(urllib.parse.parse_qsl(lu.query))
-        check("the authorization server redirects to the callback with a code and the state", lu.path == "/api/oauth/callback" and "code" in lq and lq.get("state") == init.get("oauth_config_id"), loc)
+        check("the authorization server redirects to the callback with a code and the state", lu.path == "/api/oauth/callback" and "code" in lq and lq.get("state") == dict(urllib.parse.parse_qsl(urllib.parse.urlparse(auth_url).query)).get("state") and init.get("oauth_config_id") == "authcode", loc)
         s, _, b = call("GET", lu.path + "?" + lu.query, base=GW_POL)
         check("the callback exchanges the code and reports the client authorized", s == 200 and "is authorized" in b, (s, b))
         s, _, b = call("POST", "/api/mcp/client/authcode/complete-oauth", base=GW_POL)
@@ -13012,6 +13288,8 @@ def main():
         # L165: built-in role ids, user emails, quota model_configs, role attachments, the complexity status routes and
         # rotation revoking MCP grants: its own gateway (18284)
         l165_e2e(env)
+        # L167: MCP OAuth user mode on the OIDC sign-in, the OAuth status states, flows and codes across restarts, temp tokens and dual credentials: its own gateway
+        l167_e2e(env, idp_state)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

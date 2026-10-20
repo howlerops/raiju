@@ -50,7 +50,7 @@ import { PushDelivery, pushStore, mintToken, acceptPush, callbackProblem, delive
 import { pushShare, cardShare, cardOf, adoptCard, takePeriod, CARD_NS } from "./a2ashare"
 import { FileLease } from "./filelease"
 import { upstreamHeaders, tlsOf, withAcceptedCredential } from "./agentauth"
-import { tempTokenAllows } from "./mcpuser"
+import { tempTokenAllows, USER_HEADER, markUser, flowIdOfPath, userFlowById } from "./mcpuser"
 import * as vmcp from "./vmcp"
 import { handleProfiles } from "./profiles"
 import { ExportQueue, SinkSender } from "./exporters"
@@ -81,7 +81,7 @@ import { ExportCursor, objectKey, putRequest, putBytesRequest, putObjectRequest,
 import { planWindow, maxObjectBytes } from "./audit_archive"
 import { jobRequest, MAX_ATTEMPTS } from "./retained"
 import { OidcConfig, Discovery, OidcFlows, Session, UiSessions, parseDiscovery, discoveryUrl, tokenRequestBody, verifyIdToken } from "./oidc"
-import { issuerOf, challengeOf, callerOf, keyById, keyUsable, serverAuthMode } from "./mcpissuer"
+import { issuerOf, challengeOf, callerOf, keyById, keyUsable, serverAuthMode, ConsentContext, vkIdentityCut } from "./mcpissuer"
 
 export type Gate = { kind: "ok", actor: string } | { kind: "deny", res: Response }
 
@@ -203,6 +203,33 @@ function policyAt(list: CircuitPolicyConfig[], name: string): int {
 function byName(a: string, b: string): int {
   if (a === b) return 0
   return a < b ? -1 : 1
+}
+
+// A virtual key a request names in a header other than Authorization (Bifrost's getVKFromRequest without the
+// bearer): x-bf-vk as sent, or x-api-key, x-goog-api-key or api-key with the key prefix. "" when none.
+export function headerKeyOf(h: Hdrs): string {
+  const direct = (h.get("x-bf-vk") ?? "").trim()
+  if (direct !== "") return direct
+  for (const name of ["x-api-key", "x-goog-api-key", "api-key"]) {
+    const v = (h.get(name) ?? "").trim()
+    if (v.startsWith("sk-bf-")) return v
+  }
+  return ""
+}
+
+// Whether a path is a per-user OAuth flow route (its detail or start) of a user-mode flow that belongs to this user.
+function ownUserFlow(path: string, sub: string): bool {
+  const id = flowIdOfPath(path)
+  if (id === "") return false
+  const f = userFlowById(id, Date.now())
+  return f !== undefined && (f.user_id ?? "") !== "" && f.user_id === sub
+}
+
+// The page a sign-in may return to: only the gateway's own MCP consent pages, as a path with its query.
+export function returnPath(raw: string): string {
+  if (raw.includes("//") || raw.includes("\\") || raw.includes("#")) return ""
+  if (raw.startsWith("/oauth/consent?") || raw.startsWith("/workspace/mcp-sessions/auth?")) return raw
+  return ""
 }
 
 // The names a single sign-on identity is known by in governance: its subject and its email, lower-cased.
@@ -934,6 +961,8 @@ export class Ops {
   oidcCfg: OidcConfig | undefined = undefined
   discovery: Discovery | undefined = undefined
   flows = new OidcFlows()
+  // where a sign-in started from an MCP consent page returns, by the sign-in's state
+  oidcReturn: Map<string, string> = new Map()
   sessions = new UiSessions(28800)
   // the /ws clients, and the virtual key that opened each live session (/v1/live/sessions)
   ui: UiHub
@@ -3559,6 +3588,12 @@ export class Ops {
     if (path === "/api/oidc/login") {
       try {
         const b = this.flows.begin(oc, d, now)
+        // a consent page that sent its user to sign in gets them back (only the gateway's own consent pages)
+        const lu = URL.parse(req.url)
+        const back = returnPath(lu === undefined ? "" : (lu.searchParams.get("return_to") ?? ""))
+        // abandoned sign-ins leave entries behind: the table is bounded as the sign-ins in flight are
+        if (this.oidcReturn.size > 10000) this.oidcReturn.clear()
+        if (back !== "") this.oidcReturn.set(b.state, back)
         const h: Record<string, string> = new Map()
         h.set("location", b.url)
         h.set("cache-control", "no-store")
@@ -3570,7 +3605,10 @@ export class Ops {
     if (path !== "/api/oidc/callback") return json(404, errorJson(`no route for ${path}`, "invalid_request_error", undefined))
     const u = URL.parse(req.url)
     const params = u === undefined ? new URLSearchParams("") : u.searchParams
-    const flow = this.flows.complete(params.get("state") ?? "", now)
+    const st = params.get("state") ?? ""
+    const backTo = this.oidcReturn.get(st) ?? "/"
+    this.oidcReturn.delete(st)
+    const flow = this.flows.complete(st, now)
     if (flow === undefined) return html(401, "<p>This sign-in link expired or was already used. <a href=\"/api/oidc/login\">Sign in again</a>.</p>")
     const th: Map<string, string> = new Map()
     th.set("content-type", "application/x-www-form-urlencoded")
@@ -3600,7 +3638,7 @@ export class Ops {
       return html(500, "<p>Could not create a session.</p>")
     }
     // the UI keeps its admin token in sessionStorage; the session token takes its place
-    return html(200, `<!doctype html><meta charset="utf-8"><title>Signed in</title><script>sessionStorage.setItem("raiju.adminToken", ${JSON.stringify(token)}); location.replace("/");</script><p>Signed in as ${(v.email ?? v.sub).replace("<", "&lt;")}.</p>`)
+    return html(200, `<!doctype html><meta charset="utf-8"><title>Signed in</title><script>sessionStorage.setItem("raiju.adminToken", ${JSON.stringify(token)}); location.replace(${JSON.stringify(backTo)});</script><p>Signed in as ${(v.email ?? v.sub).replace("<", "&lt;")}.</p>`)
   }
 
   configureAlerts(al: AlertsConfig | undefined): void {
@@ -3725,6 +3763,8 @@ export class Ops {
       // a single sign-on session holds a built-in role
       const role = s === undefined ? undefined : (isBuiltinRole(s.role) ? s.role : undefined)
       if (s === undefined || role === undefined) return { kind: "deny", res: denied(401, "the session expired; sign in again") }
+      // a user-mode per-user flow is opened by its own user, whatever the user's role (the route checks the user again)
+      if (req.method === "GET" && ownUserFlow(path, s.sub)) return { kind: "ok", actor: "sso:" + s.sub }
       const perm = required(req.method, path)
       if (!roleAllows(this.store.cfg.governance?.roles, role, req.method, path)) {
         this.recordChange("sso:" + s.sub, req, path, 403, "")
@@ -3742,6 +3782,39 @@ export class Ops {
     }
     this.recordChange("unauthenticated", req, path, v.status, "")
     return { kind: "deny", res: denied(v.status, v.message) }
+  }
+
+  // Who is consenting on an MCP OAuth consent request (Bifrost's identity resolver): the dashboard sign-in, the
+  // identity-provider user of a single sign-on session (user mode, offered while OIDC is on), and the settings that
+  // decide the modes offered.
+  // needed is false on the routes that read none of it, so they cost no credential check.
+  consentContext(req: Request, needed: bool): ConsentContext {
+    const auth = req.headers.get("authorization") ?? ""
+    let user = ""
+    let name = ""
+    if (needed && this.oidcCfg !== undefined && auth.startsWith("Bearer sk-sess-")) {
+      const s = this.liveSession(auth.slice(7))
+      if (s !== undefined) {
+        user = s.sub
+        name = s.email ?? ""
+      }
+    }
+    const disable = this.engine.cfg.client?.oauth2_server_config?.disable_vk_identity === true
+    return { signedIn: needed && (user !== "" || this.consentSignedIn(req)), enforce: this.engine.gov.enforce, userAvailable: this.oidcCfg !== undefined, disableVk: disable, user: user, userName: name, userActive: (sub: string): bool => this.userActive(sub) }
+  }
+
+  // Whether an identity-provider user may still use a user-mode grant: governance does not list the user as disabled
+  // (a SCIM deactivation, say), as for the single sign-on sessions.
+  userActive(sub: string): bool {
+    return !disabledNamed(this.rbac, ssoNames(sub, undefined))
+  }
+
+  // The identity-provider user a request's single sign-on session names, or "".
+  sessionUser(req: Request): string {
+    const auth = req.headers.get("authorization") ?? ""
+    if (!auth.startsWith("Bearer sk-sess-")) return ""
+    const s = this.liveSession(auth.slice(7))
+    return s === undefined ? "" : s.sub
   }
 
   // Whether a request carries a dashboard sign-in (a session token, or admin credentials): the identity a session-mode
@@ -4293,7 +4366,22 @@ export class Ops {
     const challenge = iss === undefined ? undefined : challengeOf(iss)
     const caller = callerOf(iss, h.get("authorization"), Date.now())
     if (caller.kind === "error") return denied(401, caller.message, challenge)
-    if (caller.kind === "vk") {
+    // a user is named only by a user-mode token checked here (mcpuser.tov markUser), never by a header the caller sent
+    h.delete(USER_HEADER)
+    if (caller.kind !== "none" && headerKeyOf(h) !== "") {
+      // the OAuth token is the request's only identity: a virtual key header beside it is ambiguous (Bifrost)
+      return denied(401, "conflicting credentials: an OAuth token and a virtual key header were both provided; send only the OAuth token", challenge)
+    }
+    let mcpUser = ""
+    if (caller.kind === "user") {
+      // a dashboard sign-in on the same request must name the same user; a user governance disabled is refused at once
+      const su = this.sessionUser(req)
+      if (su !== "" && su !== caller.sub) return denied(401, "session user does not match the authenticated token", challenge)
+      if (!this.userActive(caller.sub)) return denied(401, "user is no longer active", challenge)
+      mcpUser = caller.sub
+      h.set(USER_HEADER, markUser(caller.sub))
+    } else if (caller.kind === "vk") {
+      if (vkIdentityCut(this.engine.cfg, this.oidcCfg !== undefined)) return denied(401, "virtual-key identity is no longer accepted; re-authenticate", challenge)
       const named = keyById(this.engine.cfg, caller.vk)
       if (!keyUsable(named, Date.now()) || named === undefined) return denied(401, "the virtual key this token names is not active", challenge)
       h.set("x-bf-vk", named.value)
@@ -4306,7 +4394,8 @@ export class Ops {
       return denied(401, "this server requires OAuth JWT authentication; header credentials are not accepted in oauth mode", challenge)
     }
     const vk = this.engine.gov.findKey(h)
-    if (this.engine.gov.enforce && vk === undefined) return denied(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", challenge)
+    // a user-mode token is an identity of its own, as an upstream-authenticated user is in Bifrost
+    if (this.engine.gov.enforce && vk === undefined && mcpUser === "") return denied(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", challenge)
     // a key's access profile may limit the tools it sees; allow_by_default opens the clients it does not name
     const allowedTools = this.engine.gov.policyFor(h)?.mcpTools
     let tools = exposedTools(m.allToolsFor(allowedTools, vk?.mcp_configs, this.engine.projectMcp(h, virtualName)))
@@ -4633,4 +4722,25 @@ test("a refusal comes in the caller's binding, and an ETag is matched like HTTP 
   expect(tag.byteLength).toBe(34)
   h.set("if-none-match", tag)
   expect(a2aCardResponse("{}", h).status).toBe(304)
+})
+
+test("a sign-in returns only to the gateway's own consent pages", () => {
+  expect(returnPath("/oauth/consent?flow=abc")).toBe("/oauth/consent?flow=abc")
+  expect(returnPath("/workspace/mcp-sessions/auth?flow=abc&kind=headers")).toBe("/workspace/mcp-sessions/auth?flow=abc&kind=headers")
+  expect(returnPath("https://evil.example/oauth/consent?flow=abc")).toBe("")
+  expect(returnPath("//evil.example/oauth/consent?x")).toBe("")
+  expect(returnPath("/oauth/consent?flow=abc#t=x")).toBe("")
+  expect(returnPath("/api/config")).toBe("")
+  expect(returnPath("")).toBe("")
+})
+
+test("a virtual key in a header beside an OAuth token is found, a provider key is not", () => {
+  const h: Hdrs = new Map()
+  expect(headerKeyOf(h)).toBe("")
+  h.set("x-api-key", "sk-ant-provider")
+  expect(headerKeyOf(h)).toBe("")
+  h.set("api-key", "sk-bf-x")
+  expect(headerKeyOf(h)).toBe("sk-bf-x")
+  h.set("x-bf-vk", "anything")
+  expect(headerKeyOf(h)).toBe("anything")
 })

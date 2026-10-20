@@ -6,14 +6,15 @@
 // sent back unchanged keeps the stored secret. Reconnect and refresh need the live manager, so
 // they come back as an action for the lead to run on it.
 import { readFileSync, unlinkSync } from "node:fs"
-import { Config } from "./config"
+import { Config, ClientConfig } from "./config"
 import { ConfigStore, maskSecret, randomId } from "./store"
 import { McpAuthConfig, AuthEndpoints, discoveryUrls, registrationRequest, registrationResult, parseAuthEndpoints, codeTokenRequest, authorizeUrl, pkceVerifier, pkceChallenge, tokenFields } from "./mcpauth"
 import { deadline } from "./deadline"
+import { rfc3339Of } from "./vkexpiry"
 import { secureHex } from "./crypto"
 import { McpClientConfig, McpConfig, McpTlsConfig, McpUserCredential, McpHeaderFlow, McpSession, sanitizeName, durationMsOf, userHeadersOf } from "./mcp"
 import { McpTokenExchange, IdpEndpoints, exchangeToken, adminCredential, needsReverify } from "./tokenexchange"
-import { McpUserToken, UserFlow, userFlowById, userFlowsLive, takeUserFlow, forgetUserFlows, dropUserFlow, startUserFlow, exchangeUserCode, rowFromTokens, upsertUserRow, dropUserRow, userTokenIndex, tokenAction, flowIdOfPath, consentLink } from "./mcpuser"
+import { McpUserToken, UserFlow, userFlowById, userFlowsLive, takeUserFlow, forgetUserFlows, dropUserFlow, startUserFlow, startAdminFlow, adminFlowById, adminFlowsOf, failAdminFlow, endAdminFlow, peekFlow, mayOpenFlow, mintTempToken, endTempTokens, headersLink, exchangeUserCode, rowFromTokens, upsertUserRow, dropUserRow, userTokenIndex, tokenAction, flowIdOfPath, consentLink } from "./mcpuser"
 import { OpenApiConfig, OpenApiCred, OpenApiDoc, OpenApiOp, OpScheme, Unsupported, parseSpec, inputSchema, previewJson, baseUrlOf, operationServersCover } from "./openapi"
 import { targetProblem } from "./netguard"
 import * as vmcp from "./vmcp"
@@ -492,14 +493,50 @@ function listClients(store: ConfigStore): McpReply {
         if (r.mcp_client_name === c.name) row = r
       }
     }
-    if (row === undefined) parts.push(j)
-    else {
+    if (row !== undefined) {
       const cred = adminCredential(row)
       const state = needsReverify(row) ? `,"state":"needs_reauth"` : ""
       parts.push(`${j.slice(0, j.byteLength - 1)},"credential":${JSON.stringify(cred)}${state}}`)
+      continue
     }
+    const own = ownCredential(c, Date.now())
+    if (own.json === "") parts.push(j)
+    else parts.push(`${j.slice(0, j.byteLength - 1)},"credential":${own.json}${own.reauth ? `,"state":"needs_reauth"` : ""}}`)
   }
   return reply(200, `{"clients":[${parts.join(",")}],"count":${list.length},"total_count":${list.length}}`)
+}
+
+// The credential a per-user client holds on its own behalf to list its tools, as Bifrost's credential block shows it
+// (no secret values): a per_user_headers client's admin sample (kind headers, its header names; needs_update when a
+// declared header has no sample value, which puts the client in needs_reauth), and a per_user_oauth client's token from
+// the admin's verification (kind oauth, its expiry and whether it can be refreshed). json is "" when there is none.
+export function ownCredential(c: McpClientConfig, nowMs: f64): { json: string, reauth: bool } {
+  if (c.auth_type === "per_user_headers") {
+    const names: string[] = []
+    const hs = c.headers
+    if (hs !== undefined) {
+      for (const k of hs.keys()) names.push(k.trim().toLowerCase())
+    }
+    if (names.length === 0) return { json: "", reauth: false }
+    names.sort()
+    let missing = false
+    for (const k of c.per_user_header_keys ?? []) {
+      if (!names.includes(k)) missing = true
+    }
+    const st = missing ? "needs_update" : "active"
+    return { json: `{"kind":"headers","status":"${st}","has_refresh_token":false,"header_keys":${JSON.stringify(names)}}`, reauth: missing }
+  }
+  const a = c.auth
+  if (c.auth_type === "per_user_oauth" && a !== undefined && a.type === "oauth" && authorized(a)) {
+    const refresh = (a.refresh_token ?? "") !== ""
+    const exp = a.token_expires_at ?? 0.0
+    // a token past its expiry with nothing to renew it needs the admin's verification again
+    const dead = !refresh && exp > 0.0 && exp <= nowMs
+    const st = dead ? "needs_reauth" : "active"
+    const expires = exp > 0.0 ? `,"expires_at":${quote(rfc3339Of(exp))}` : ""
+    return { json: `{"kind":"oauth","status":"${st}"${expires},"has_refresh_token":${refresh}}`, reauth: dead }
+  }
+  return { json: "", reauth: false }
 }
 
 function createClient(store: ConfigStore, body: string, publicOnly: bool): McpReply {
@@ -536,6 +573,8 @@ function createClient(store: ConfigStore, body: string, publicOnly: bool): McpRe
   if (pue !== "") return fail(400, pue)
   const tee = exchangeError(auth, ct, b.auth?.type ?? "", b.token_exchange)
   if (tee !== "") return fail(400, tee)
+  const dce = dualConflictError(auth, store.cfg)
+  if (dce !== "") return fail(400, dce)
   const cp = connectionError(b, ct)
   if (cp !== "") return fail(400, cp)
   const ae = authError(b.auth)
@@ -668,6 +707,10 @@ function updateClient(store: ConfigStore, id: string, body: string, publicOnly: 
     if (pue !== "") return fail(400, pue)
     const tte = exchangeError(t, c.connection_type, c.auth?.type ?? "", has(fs, "token_exchange") ? b.token_exchange : c.token_exchange)
     if (tte !== "") return fail(400, tte)
+    if (list[at]!.auth_type !== "token_exchange") {
+      const dce = dualConflictError(t, store.cfg)
+      if (dce !== "") return fail(400, dce)
+    }
     c.auth_type = t === "per_user_headers" || t === "per_user_oauth" || t === "token_exchange" ? t : undefined
     c.per_user_header_keys = t === "per_user_headers" ? normalKeys(keys) : undefined
     c.token_exchange = t === "token_exchange" ? (has(fs, "token_exchange") ? b.token_exchange : c.token_exchange) : undefined
@@ -896,6 +939,13 @@ function perUserError(t: string, ct: string, authT: string, keys: string[] | und
   return ""
 }
 
+// A token_exchange client cannot be added while client.dual_credential_conflict_behavior is "error": that setting
+// refuses the requests such a client relies on (Bifrost's mcp.go). "" when the pairing is fine.
+export function dualConflictError(authType: string, c: Config): string {
+  if (authType !== "token_exchange" || c.client?.dual_credential_conflict_behavior !== "error") return ""
+  return "auth_type 'token_exchange' cannot be used while dual_credential_conflict_behavior is 'error': change it to 'prefer_idp' or 'prefer_vk' first"
+}
+
 // auth_type token_exchange applies to http and sse clients with a token_exchange block (its audience, and the
 // exchange application's client_id unless use_idp_credentials), and no auth object. "" when the combination is fine.
 function exchangeError(t: string, ct: string, authT: string, te: McpTokenExchange | undefined): string {
@@ -1005,6 +1055,15 @@ function createFlow(store: ConfigStore, body: string): McpReply {
   const vks = cfg.governance?.virtual_keys ?? []
   if (!vks.some((v) => v.id === vk)) return fail(404, `virtual key '${vk}' not found`)
   const now = Date.now()
+  const o = openHeaderFlow(store, cname, vk, now)
+  if (o.error !== undefined) return o.error
+  return reply(201, `{"id":${quote(o.id)},"flow_mode":"vk","status":"pending","mcp_client_name":${quote(cname)},"virtual_key_id":${quote(vk)},"expires_at":${now + HEADER_FLOW_TTL_MS},"url":${quote(`/api/mcp/per-user-headers/flows/${o.id}`)}}`)
+}
+
+// Opens a submission for one key and one per_user_headers client, or renews the pending one of that pair (Bifrost's
+// find-or-update), and saves it. The flow's id, or the reply that says why it could not be saved.
+function openHeaderFlow(store: ConfigStore, cname: string, vk: string, now: f64): { id: string, error: McpReply | undefined } {
+  const cfg = store.cfg
   let list = dropExpired(cfg.mcp?.header_flows ?? [], now)
   let id = ""
   const at = list.findIndex((f) => f.mcp_client_name === cname && f.virtual_key_id === vk)
@@ -1018,8 +1077,34 @@ function createFlow(store: ConfigStore, body: string): McpReply {
     list.push({ id: id, mcp_client_name: cname, virtual_key_id: vk, expires_at: now + HEADER_FLOW_TTL_MS, created_at: now })
   }
   const err = persist(store, withHeaderState(cfg, cfg.mcp?.user_credentials ?? [], list))
-  if (err !== undefined) return err
-  return reply(201, `{"id":${quote(id)},"flow_mode":"vk","status":"pending","mcp_client_name":${quote(cname)},"virtual_key_id":${quote(vk)},"expires_at":${now + HEADER_FLOW_TTL_MS},"url":${quote(`/api/mcp/per-user-headers/flows/${id}`)}}`)
+  return { id: id, error: err }
+}
+
+// The answer of a tool call whose key has not submitted the per-user headers of a client: a submission is opened
+// (or renewed) for the key, and the message names its page (the auth page with kind=headers), with a temp token in
+// the fragment when client.mcp_enable_temp_token_auth is on (Bifrost's inline 401). "" when no flow could be opened.
+export function headersAuthMessage(store: ConfigStore, client: string, vk: string, base: string): string {
+  const now = Date.now()
+  const o = openHeaderFlow(store, client, vk, now)
+  if (o.error !== undefined) return ""
+  let temp = ""
+  if (store.cfg.client?.mcp_enable_temp_token_auth === true) {
+    try {
+      // the token lives as long as the submission, at most the temp tokens' 15 minutes
+      temp = mintTempToken("mcp_headers_auth", o.id, now + Math.min(HEADER_FLOW_TTL_MS, 900000.0))
+    } catch (e) {
+      temp = ""
+    }
+  }
+  const link = headersLink(base, o.id, temp)
+  return consentMessageOf(client, link, temp !== "", "to submit the required headers")
+}
+
+// Bifrost's wording of an inline 401 with a page to visit, and the reminder to keep the fragment when there is one.
+function consentMessageOf(client: string, link: string, tempToken: bool, what: string): string {
+  let m = `Authentication required for ${client}. Visit ${link} ${what}.`
+  if (tempToken) m += " IMPORTANT: this link includes a required fragment after the '#' character (a one-time auth token). Copy and share the ENTIRE URL exactly as given, including everything after the '#' — the link will not work without it."
+  return m
 }
 
 // GET /api/mcp/per-user-headers/flows/{id}: the flow, the header names it asks for and the names already submitted.
@@ -1066,11 +1151,14 @@ function revokeCredential(store: ConfigStore, id: string): McpReply {
     if (c.id !== id) kept.push(c)
   }
   const flows: McpHeaderFlow[] = []
+  const ended: string[] = []
   for (const f of cfg.mcp?.header_flows ?? []) {
     if (!(f.mcp_client_name === row.mcp_client_name && f.virtual_key_id === row.virtual_key_id)) flows.push(f)
+    else ended.push(f.id)
   }
   const err = persist(store, withHeaderState(cfg, kept, flows))
   if (err !== undefined) return err
+  for (const id of ended) endTempTokens(id)
   return reply(200, `{"status":"success","message":"credential revoked"}`)
 }
 
@@ -1117,6 +1205,8 @@ async function submitFlow(store: ConfigStore, id: string, body: string): Promise
   }
   const err = persist(store, withHeaderState(cfg, creds, flows))
   if (err !== undefined) return err
+  // the submission is done: its temp token ends with it (Bifrost deletes it by the flow's id)
+  endTempTokens(id)
   return { status: 200, body: `{"status":"success","credential_id":${quote(credId)},"updated_at":${now}}` }
 }
 
@@ -1661,9 +1751,23 @@ function toolGroupRoute(store: ConfigStore, m: string, segs: string[], body: str
 }
 
 // ---- OAuth configs: /api/oauth/config/{id}/status and DELETE /api/oauth/config/{id} ----
-// An OAuth config is the MCP client of auth type "oauth" with that name. Its status is "authorized"
-// when the client holds a token and "pending" otherwise. DELETE revokes: the tokens are dropped and the
-// client stays. A live session keeps the token it had until the client next connects (see LIMITS).
+// An OAuth config is the MCP client of auth type "oauth" with that name. Its status is "authorized" when the
+// client holds a token, "failed" when its last verification flow failed, and "pending" otherwise. With
+// ?flow_id= (the flow a reauthorize answered) the status is that flow's (pollStatus). DELETE revokes: the tokens
+// are dropped and the client stays. A live session keeps the token it had until the client next connects.
+
+// The status a poller acts on for one admin flow (Bifrost's resolveOAuthFlowPollStatus). A flow still held is
+// failed, or pending until its deadline and expired after it; a flow no longer held finished, and the config's
+// status says how (authorized or failed), else it expired unseen.
+export function pollStatus(flow: UserFlow | undefined, configStatus: string, nowMs: f64): string {
+  if (flow !== undefined) {
+    if (flow.status === "failed") return "failed"
+    return nowMs > flow.expires_at ? "expired" : "pending"
+  }
+  if (configStatus === "authorized" || configStatus === "failed") return configStatus
+  return "expired"
+}
+
 export function oauthConfigRoute(store: ConfigStore, method: string, path: string): McpReply | undefined {
   const q = path.indexOf("?")
   const pure = q < 0 ? path : path.slice(0, q)
@@ -1678,8 +1782,22 @@ export function oauthConfigRoute(store: ConfigStore, method: string, path: strin
   if (isStatus) {
     if (method !== "GET") return notAllowed(method)
     if (a === undefined) return fail(404, "OAuth config not found")
-    const st = authorized(a) ? "authorized" : "pending"
-    return reply(200, `{"id":${quote(id)},"status":"${st}"}`)
+    const flows = adminFlowsOf(id)
+    const lastFailed = flows.length > 0 && flows[0]!.status === "failed"
+    const configStatus = authorized(a) ? "authorized" : lastFailed ? "failed" : "pending"
+    const flowId = queryParam(path, "flow_id")
+    if (flowId !== "") {
+      const f = adminFlowById(flowId)
+      // a flow of another config is not found here, so a poll on one config cannot read another's flow
+      if (f !== undefined && f.client !== id) return fail(404, "OAuth flow not found for this OAuth config")
+      const st = pollStatus(f, configStatus, Date.now())
+      let out = `{"id":${quote(id)},"status":"${st}","flow_id":${quote(flowId)}`
+      if (f !== undefined) out += `,"flow_status":${quote(f.status ?? "pending")}`
+      if (st === "authorized") out += tokenFieldsOf(a)
+      return reply(200, out + "}")
+    }
+    const tail = configStatus === "authorized" ? tokenFieldsOf(a) : ""
+    return reply(200, `{"id":${quote(id)},"status":"${configStatus}"${tail}}`)
   }
   if (method !== "DELETE") return notAllowed(method)
   if (a === undefined) return fail(404, "OAuth config not found")
@@ -1695,16 +1813,18 @@ export function oauthConfigRoute(store: ConfigStore, method: string, path: strin
   return reply(200, `{"status":"success","message":"OAuth config revoked"}`)
 }
 
+// The token fields of an authorized config's status: when its access token expires (RFC 3339), if known.
+function tokenFieldsOf(a: McpAuthConfig): string {
+  const exp = a.token_expires_at ?? 0.0
+  return exp > 0.0 ? `,"token_expires_at":${quote(rfc3339Of(exp))}` : ""
+}
+
 // ---- OAuth for clients of auth type "oauth": the authorization code flow with PKCE (Bifrost's
-// initiate-verification, complete-oauth, reauthorize and reregister). A flow's state (its verifier
-// and redirect URI) is held by this process until the callback returns, for FLOW_TTL_MS. The
-// callback saves the tokens on the client; the client connects with them.
+// initiate-verification, complete-oauth, reauthorize and reregister). A flow (its state, verifier and redirect
+// URI) is an admin flow of mcpuser.tov's table, kept in the flow state file until the callback returns or its
+// time is up. The callback saves the tokens on the client; the client connects with them.
 
-type OauthFlow = { client: string, verifier: string, redirect: string, expiresAt: number }
-
-const FLOW_TTL_MS = 900000
 const FLOW_TIMEOUT_MS = 10000
-const FLOWS: Map<string, OauthFlow> = new Map()
 
 // The auth of a client that uses the authorization code flow, else undefined.
 function oauthAuthOf(c: McpClientConfig): McpAuthConfig | undefined {
@@ -1762,16 +1882,6 @@ async function register(url: string, redirect: string): Promise<{ client_id: str
   return try registrationResult(text)
 }
 
-// Flows whose time is up, by state.
-function expiredFlows(now: f64): string[] {
-  const out: string[] = []
-  for (const k of FLOWS.keys()) {
-    const f = FLOWS.get(k)
-    if (f !== undefined && f.expiresAt < now) out.push(k)
-  }
-  return out
-}
-
 // Starts the authorization flow of a client. It finds the endpoints in the server's metadata and
 // registers a client when it has none; then it saves the client and returns the authorize URL.
 // mode is "initiate", "reauthorize" (the client must be authorized already) or "reregister" (a new
@@ -1825,19 +1935,29 @@ async function startFlow(store: ConfigStore, id: string, base: string, mode: str
   } catch (e) {
     return fail(500, `could not start the flow: ${e.message}`)
   }
-  for (const k of expiredFlows(Date.now())) FLOWS.delete(k)
-  const expires = Date.now() + FLOW_TTL_MS
-  FLOWS.set(state, { client: id, verifier: verifier, redirect: redirect, expiresAt: expires })
+  let flowId = ""
+  let expires = 0.0
+  try {
+    const flow = startAdminFlow(id, state, verifier, redirect, authUrl, Date.now())
+    flowId = flow.id
+    expires = flow.expires_at
+  } catch (e) {
+    return fail(500, `could not start the flow: ${e.message}`)
+  }
   const perr = persist(store, withClients(store.cfg, replaceAt(list, at, withAuth(c, a))))
   if (perr !== undefined) return perr
+  // a reauthorize polls its flow: the config may read authorized from an earlier verification all along
+  const statusUrl = mode === "reauthorize" ? `/api/oauth/config/${id}/status?flow_id=${flowId}` : `/api/oauth/config/${id}/status`
   const out = {
     status: "pending_oauth",
-    oauth_config_id: state,
+    oauth_config_id: id,
+    flow_id: flowId,
     authorize_url: authUrl,
     expires_at: expires,
     mcp_client_id: id,
     complete_url: `/api/mcp/client/${id}/complete-oauth`,
-    next_steps: ["1. Open authorize_url in a browser to approve access", "2. The authorization server returns to the gateway's callback, which saves the tokens", "3. POST complete_url to connect the MCP client"],
+    status_url: statusUrl,
+    next_steps: ["1. Open authorize_url in a browser to approve access", "2. Poll status_url to check when status becomes 'authorized'", "3. POST complete_url to connect the MCP client"],
   }
   return reply(200, JSON.stringify(out))
 }
@@ -1853,28 +1973,42 @@ function callbackPage(status: int, msg: string): { status: int, html: string } {
 // the client, and the page says what happened. A flow is single use.
 export async function oauthCallback(store: ConfigStore, query: URLSearchParams): Promise<{ status: int, html: string }> {
   const state = query.get("state") ?? ""
-  // a per-user consent flow (auth_type per_user_oauth): the caller's own token row is saved
-  const pf = takeUserFlow(state, Date.now())
-  if (pf !== undefined) return await userCallback(store, pf, query)
-  const flow = FLOWS.get(state)
-  FLOWS.delete(state)
-  if (flow === undefined || flow.expiresAt < Date.now()) return callbackPage(400, "This authorization link is unknown or has expired. Start the flow again.")
   const refused = query.get("error") ?? ""
-  if (refused !== "") return callbackPage(400, `The authorization server refused access: ${refused}`)
+  if (refused !== "") {
+    // the authorization server refused: an admin flow is marked failed (its status route says so); a per-user flow
+    // stays pending, so the same link can be tried again while it lives (as Bifrost)
+    const seen = peekFlow(state)
+    if (seen !== undefined && seen.mode === "admin" && seen.status !== "failed") failAdminFlow(seen, Date.now())
+    return callbackPage(400, `The authorization server refused access: ${refused}`)
+  }
+  const flow = takeUserFlow(state, Date.now())
+  if (flow === undefined) return callbackPage(400, "This authorization link is unknown or has expired. Start the flow again.")
+  // a per-user consent flow (auth_type per_user_oauth): the caller's own token row is saved
+  if (flow.mode !== "admin") return await userCallback(store, flow, query)
   const code = query.get("code") ?? ""
-  if (code === "") return callbackPage(400, "The callback has no authorization code.")
+  if (code === "") {
+    failAdminFlow(flow, Date.now())
+    return callbackPage(400, "The callback has no authorization code.")
+  }
   const list = clientsOf(store.cfg)
   const at = clientIndex(list, flow.client)
-  if (at < 0) return callbackPage(404, `MCP client '${flow.client}' no longer exists.`)
+  if (at < 0) {
+    endAdminFlow(flow.id, Date.now())
+    return callbackPage(404, `MCP client '${flow.client}' no longer exists.`)
+  }
   const c = list[at]!
   const a = oauthAuthOf(c)
-  if (a === undefined) return callbackPage(400, "The MCP client does not use the OAuth flow.")
+  if (a === undefined) {
+    endAdminFlow(flow.id, Date.now())
+    return callbackPage(400, "The MCP client does not use the OAuth flow.")
+  }
   let tokens = { access: "", refresh: "", expiresAt: 0.0 }
   try {
     const tr = codeTokenRequest(a, code, flow.verifier, flow.redirect)
     const text = await callAuthServer(tr.url, "POST", tr.headers, tr.body)
     tokens = tokenFields(text, Date.now())
   } catch (e) {
+    failAdminFlow(flow, Date.now())
     return callbackPage(502, `The token request failed: ${e.message}`)
   }
   let next = a
@@ -1882,7 +2016,11 @@ export async function oauthCallback(store: ConfigStore, query: URLSearchParams):
   next.token_expires_at = tokens.expiresAt
   if (tokens.refresh !== "") next.refresh_token = tokens.refresh
   const perr = persist(store, withClients(store.cfg, replaceAt(list, at, withAuth(c, next))))
-  if (perr !== undefined) return callbackPage(500, "The tokens could not be saved.")
+  if (perr !== undefined) {
+    failAdminFlow(flow, Date.now())
+    return callbackPage(500, "The tokens could not be saved.")
+  }
+  endAdminFlow(flow.id, Date.now())
   return callbackPage(200, `MCP client ${flow.client} is authorized. You can close this window.`)
 }
 
@@ -1967,7 +2105,7 @@ async function userCallback(store: ConfigStore, f: UserFlow, query: URLSearchPar
   const now = Date.now()
   try {
     const list = store.cfg.mcp?.user_tokens ?? []
-    const ui = userTokenIndex(list, f.client, f.virtual_key_id, f.session_id)
+    const ui = userTokenIndex(list, f.client, f.virtual_key_id, f.session_id, f.user_id)
     let id = ""
     let oldRefresh = ""
     if (ui >= 0) {
@@ -1977,7 +2115,7 @@ async function userCallback(store: ConfigStore, f: UserFlow, query: URLSearchPar
       id = try secureHex(12)
     }
     const text = await exchangeUserCode(a, code, f.verifier, f.redirect, now)
-    const row = try rowFromTokens(text, now, f.client, f.virtual_key_id, f.session_id, id, oldRefresh)
+    const row = try rowFromTokens(text, now, f.client, f.virtual_key_id, f.session_id, id, oldRefresh, f.user_id)
     const perr = persist(store, withUserTokens(store.cfg, upsertUserRow(list, row)))
     if (perr !== undefined) return callbackPage(500, "The tokens could not be saved.")
   } catch (e) {
@@ -1988,42 +2126,52 @@ async function userCallback(store: ConfigStore, f: UserFlow, query: URLSearchPar
 
 // The per-user OAuth routes: GET /api/oauth/per-user/flows/{id} (the flow), GET .../{id}/start (its upstream
 // authorize URL) and /api/mcp/sessions (list; DELETE {id}; POST {id}/reauth). base is the gateway's origin, the
-// redirect URI of a flow started here. undefined for any other route.
-export function perUserApi(store: ConfigStore, method: string, path: string, body: string, base: string): McpReply | undefined {
+// redirect URI of a flow started here. callerUser is the identity-provider user of the caller's single sign-on
+// session ("" when none): a user-mode flow opens for that user only. undefined for any other route.
+export function perUserApi(store: ConfigStore, method: string, path: string, body: string, base: string, callerUser?: string): McpReply | undefined {
   const m = method.toUpperCase()
   const q = path.indexOf("?")
   const pure = q < 0 ? path : path.slice(0, q)
   const fid = flowIdOfPath(path)
-  if (fid !== "") return perUserFlowRoute(m, fid, pure)
+  if (fid !== "") return perUserFlowRoute(store, m, fid, pure, callerUser ?? "")
   const segs = pure.split("/").filter((s) => s !== "")
   if (segs.length >= 3 && segs[0] === "api" && segs[1] === "mcp" && segs[2] === "sessions") return sessionRoute(store, m, segs, path, base)
   return undefined
 }
 
-// The flow's detail, or its start URL (the upstream authorize URL, with the flow's state).
-function perUserFlowRoute(m: string, id: string, pure: string): McpReply {
+// The flow's mode: user, session or vk.
+function flowModeOf(vk: string, session: string, user: string | undefined): string {
+  if ((user ?? "") !== "") return "user"
+  return session !== "" ? "session" : "vk"
+}
+
+// The flow's detail, or its start URL (the upstream authorize URL, with the flow's state). A user-mode flow opens
+// only for its own user (Bifrost's canAccessUserFlow).
+function perUserFlowRoute(store: ConfigStore, m: string, id: string, pure: string, callerUser: string): McpReply {
   if (m !== "GET") return notAllowed(m)
   const f = userFlowById(id, Date.now())
   if (f === undefined) return fail(404, "Per-user OAuth flow not found or expired")
+  if (!mayOpenFlow(f, callerUser)) return fail(403, "This authentication link is bound to a different user.")
   if (pure.endsWith("/start")) return reply(200, JSON.stringify({ authorize_url: f.authorize_url }))
-  return reply(200, JSON.stringify({ id: f.id, status: "pending", mcp_client: { name: f.client }, virtual_key_id: f.virtual_key_id, session_id: f.session_id, expires_at: f.expires_at, created_at: f.created_at }))
+  const has = userTokenIndex(store.cfg.mcp?.user_tokens ?? [], f.client, f.virtual_key_id, f.session_id, f.user_id) >= 0
+  return reply(200, JSON.stringify({ id: f.id, flow_mode: flowModeOf(f.virtual_key_id, f.session_id, f.user_id), status: "pending", mcp_client: { name: f.client }, user_id: f.user_id ?? "", virtual_key_id: f.virtual_key_id, session_id: f.session_id, expires_at: f.expires_at, created_at: f.created_at, has_active_token: has }))
 }
 
 // One row of the sessions list: a token row ("token"), a pending consent flow ("flow") or a per-user header
 // credential ("header"). Fields that do not apply are "" (or 0 and false).
-type SessionRow = { id: string, kind: string, auth_kind: string, auth_mode: string, virtual_key_id: string, session_id: string, mcp_client: { name: string }, status: string, expires_at: f64, created_at: f64, has_refresh_token: bool, can_reauth: bool }
+type SessionRow = { id: string, kind: string, auth_kind: string, auth_mode: string, user_id: string, virtual_key_id: string, session_id: string, mcp_client: { name: string }, status: string, expires_at: f64, created_at: f64, has_refresh_token: bool, can_reauth: bool }
 
 function sessionRows(cfg: Config, now: f64): SessionRow[] {
   const out: SessionRow[] = []
   for (const t of cfg.mcp?.user_tokens ?? []) {
     const st = tokenAction(t, now) === "consent" ? "needs_reauth" : "active"
-    out.push({ id: t.id, kind: "token", auth_kind: "oauth", auth_mode: t.session_id !== "" ? "session" : "vk", virtual_key_id: t.virtual_key_id, session_id: t.session_id, mcp_client: { name: t.mcp_client_name }, status: st, expires_at: t.token_expires_at, created_at: t.created_at, has_refresh_token: t.refresh_token !== "", can_reauth: true })
+    out.push({ id: t.id, kind: "token", auth_kind: "oauth", auth_mode: flowModeOf(t.virtual_key_id, t.session_id, t.user_id), user_id: t.user_id ?? "", virtual_key_id: t.virtual_key_id, session_id: t.session_id, mcp_client: { name: t.mcp_client_name }, status: st, expires_at: t.token_expires_at, created_at: t.created_at, has_refresh_token: t.refresh_token !== "", can_reauth: true })
   }
   for (const f of userFlowsLive(now)) {
-    out.push({ id: f.id, kind: "flow", auth_kind: "oauth", auth_mode: f.session_id !== "" ? "session" : "vk", virtual_key_id: f.virtual_key_id, session_id: f.session_id, mcp_client: { name: f.client }, status: "pending", expires_at: f.expires_at, created_at: f.created_at, has_refresh_token: false, can_reauth: false })
+    out.push({ id: f.id, kind: "flow", auth_kind: "oauth", auth_mode: flowModeOf(f.virtual_key_id, f.session_id, f.user_id), user_id: f.user_id ?? "", virtual_key_id: f.virtual_key_id, session_id: f.session_id, mcp_client: { name: f.client }, status: "pending", expires_at: f.expires_at, created_at: f.created_at, has_refresh_token: false, can_reauth: false })
   }
   for (const c of cfg.mcp?.user_credentials ?? []) {
-    out.push({ id: c.id, kind: "header", auth_kind: "headers", auth_mode: "vk", virtual_key_id: c.virtual_key_id, session_id: "", mcp_client: { name: c.mcp_client_name }, status: "active", expires_at: 0.0, created_at: c.updated_at, has_refresh_token: false, can_reauth: false })
+    out.push({ id: c.id, kind: "header", auth_kind: "headers", auth_mode: "vk", user_id: "", virtual_key_id: c.virtual_key_id, session_id: "", mcp_client: { name: c.mcp_client_name }, status: "active", expires_at: 0.0, created_at: c.updated_at, has_refresh_token: false, can_reauth: false })
   }
   return out
 }
@@ -2073,7 +2221,7 @@ function revokeSession(store: ConfigStore, id: string): McpReply {
   const ti = tokenRowIndex(toks, id)
   if (ti >= 0) {
     const row = toks[ti]!
-    forgetUserFlows(row.mcp_client_name, row.virtual_key_id, row.session_id)
+    forgetUserFlows(row.mcp_client_name, row.virtual_key_id, row.session_id, row.user_id)
     const err = persist(store, withUserTokens(cfg, dropUserRow(toks, id)))
     if (err !== undefined) return err
     return reply(200, `{"status":"success","message":"session revoked"}`)
@@ -2102,9 +2250,9 @@ function reauthSession(store: ConfigStore, id: string, base: string): McpReply {
   if (ci < 0) return fail(404, `MCP client '${row.mcp_client_name}' not found`)
   const a = oauthAuthOf(clients[ci]!)
   if (a === undefined) return fail(400, "reauth applies to per_user_oauth clients only")
-  forgetUserFlows(row.mcp_client_name, row.virtual_key_id, row.session_id)
+  forgetUserFlows(row.mcp_client_name, row.virtual_key_id, row.session_id, row.user_id)
   const tempOn = cfg.client?.mcp_enable_temp_token_auth === true
-  const r = startUserFlow(a, row.mcp_client_name, row.virtual_key_id, row.session_id, base, tempOn, Date.now())
+  const r = startUserFlow(a, row.mcp_client_name, row.virtual_key_id, row.session_id, base, tempOn, Date.now(), row.user_id)
   if (r.flow === undefined) return fail(400, r.error)
   const f = r.flow!
   return reply(200, JSON.stringify({ status: "pending_oauth", id: f.id, mcp_client: { name: f.client }, url: consentLink(base, f.id, f.temp_token), expires_at: f.expires_at }))
@@ -2503,5 +2651,74 @@ test("the session list pages", () => {
   expect(page.status).toBe(200)
   expect(page.body.includes("\"limit\":1")).toBe(true)
   expect(page.body.includes("\"total_count\":0")).toBe(true)
+  cleanupFile(s.path)
+})
+
+test("the OAuth config status answers a flow's own state with flow_id: pending, failed, expired or the config's", () => {
+  const s = fixture()
+  mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"gh2\",\"connection_type\":\"http\",\"connection_string\":\"https://gh.example/mcp\",\"auth\":{\"type\":\"oauth\",\"client_id\":\"c\",\"authorize_url\":\"https://gh.example/authorize\",\"token_url\":\"https://gh.example/token\"}}")
+  const now = Date.now()
+  const f = try startAdminFlow("gh2", "st-poll-1", "v".repeat(50), "http://gw/api/oauth/callback", "https://gh.example/authorize", now)
+  const pending = oauthConfigRoute(s, "GET", "/api/oauth/config/gh2/status?flow_id=" + f.id)!
+  expect(pending.body.includes("\"status\":\"pending\"")).toBe(true)
+  expect(pending.body.includes("\"flow_status\":\"pending\"")).toBe(true)
+  // a flow of another config is not found
+  expect(oauthConfigRoute(s, "GET", "/api/oauth/config/fs/status?flow_id=" + f.id)!.status).toBe(404)
+  failAdminFlow(f, now)
+  expect(oauthConfigRoute(s, "GET", "/api/oauth/config/gh2/status?flow_id=" + f.id)!.body.includes("\"status\":\"failed\"")).toBe(true)
+  // without flow_id the config reads failed: its last flow failed and it holds no token
+  expect(oauthConfigRoute(s, "GET", "/api/oauth/config/gh2/status")!.body).toBe("{\"id\":\"gh2\",\"status\":\"failed\"}")
+  // a flow that is gone while the config never got a token expired
+  expect(oauthConfigRoute(s, "GET", "/api/oauth/config/gh2/status?flow_id=nope")!.body.includes("\"status\":\"failed\"")).toBe(true)
+  endAdminFlow(f.id, now)
+  expect(oauthConfigRoute(s, "GET", "/api/oauth/config/gh2/status?flow_id=nope")!.body.includes("\"status\":\"expired\"")).toBe(true)
+  expect(pollStatus(undefined, "authorized", now)).toBe("authorized")
+  expect(pollStatus(undefined, "pending", now)).toBe("expired")
+  let failed = try JSON.parse(JSON.stringify(f)) as UserFlow
+  failed.status = "failed"
+  expect(pollStatus(failed, "authorized", now + 3600000.0)).toBe("failed")
+  let live = try JSON.parse(JSON.stringify(f)) as UserFlow
+  live.status = "pending"
+  expect(pollStatus(live, "authorized", now)).toBe("pending")
+  expect(pollStatus(live, "authorized", live.expires_at + 1.0)).toBe("expired")
+  cleanupFile(s.path)
+})
+
+test("a per-user client lists the credential it keeps for its tools, without values", () => {
+  const h: Map<string, string> = new Map()
+  h.set("X-Tenant", "tenant-a-key-example")
+  const hc: McpClientConfig = { name: "t", connection_type: "http", auth_type: "per_user_headers", per_user_header_keys: ["x-tenant"], headers: h }
+  const ok = ownCredential(hc, 1.0)
+  expect(ok.json).toBe(`{"kind":"headers","status":"active","has_refresh_token":false,"header_keys":["x-tenant"]}`)
+  expect(ok.reauth).toBe(false)
+  let more = hc
+  more.per_user_header_keys = ["x-tenant", "x-region"]
+  const stale = ownCredential(more, 1.0)
+  expect(stale.json.includes("needs_update")).toBe(true)
+  expect(stale.reauth).toBe(true)
+  const none: McpClientConfig = { name: "u", connection_type: "http", auth_type: "per_user_headers", per_user_header_keys: ["x-tenant"] }
+  expect(ownCredential(none, 1.0).json).toBe("")
+  const po: McpClientConfig = { name: "po", connection_type: "http", auth_type: "per_user_oauth", auth: { type: "oauth", access_token: "at-example", refresh_token: "rt-example", token_expires_at: 2000.0 } }
+  const live = ownCredential(po, 1000.0)
+  expect(live.json.includes(`"kind":"oauth"`) && live.json.includes(`"has_refresh_token":true`) && !live.json.includes("at-example")).toBe(true)
+  const dead: McpClientConfig = { name: "po", connection_type: "http", auth_type: "per_user_oauth", auth: { type: "oauth", access_token: "at-example", token_expires_at: 2000.0 } }
+  expect(ownCredential(dead, 3000.0).reauth).toBe(true)
+})
+
+test("a token_exchange client is refused while dual_credential_conflict_behavior is error", () => {
+  const s = fixture()
+  const errMode: ClientConfig = { dual_credential_conflict_behavior: "error" }
+  s.cfg.client = errMode
+  const body = "{\"name\":\"jira\",\"connection_type\":\"http\",\"connection_string\":\"http://127.0.0.1:1/mcp\",\"auth_type\":\"token_exchange\",\"token_exchange\":{\"audience\":\"api://jira\",\"client_id\":\"exch\"}}"
+  const refused = mcpApi(s, "POST", "/api/mcp/client", body)!
+  expect(refused.status).toBe(400)
+  expect(refused.body.includes("dual_credential_conflict_behavior is 'error'")).toBe(true)
+  // an existing client cannot be switched to token_exchange either
+  expect(mcpApi(s, "PUT", "/api/mcp/client/fs", "{\"auth_type\":\"token_exchange\",\"token_exchange\":{\"audience\":\"api://jira\",\"client_id\":\"exch\"}}")!.body.includes("dual_credential")).toBe(true)
+  const vkMode: ClientConfig = { dual_credential_conflict_behavior: "prefer_vk" }
+  s.cfg.client = vkMode
+  expect(mcpApi(s, "POST", "/api/mcp/client", body)!.status).toBe(201)
+  expect(dualConflictError("token_exchange", { client: { dual_credential_conflict_behavior: "error" } }).includes("prefer_idp")).toBe(true)
+  expect(dualConflictError("per_user_oauth", { client: { dual_credential_conflict_behavior: "error" } })).toBe("")
   cleanupFile(s.path)
 })
