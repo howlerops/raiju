@@ -11,11 +11,13 @@
 // plugin's context travels from http_pre_hook to pre_hook, post_hook and http_post_hook.
 
 import { Engine, StreamSink, EventStep, eventSink, llmStreamSink, errorResponse, noHeaders } from "./gateway"
-import { PluginChain, PluginRun, PluginContext, BasePlugin, PostResult, HttpChunkResult, RUN_HEADER, errorPost } from "./plugins"
+import { PluginChain, PluginRun, PluginContext, PluginTrace, BasePlugin, PostResult, PreResult, HttpChunkResult, RUN_HEADER, TRACE_HEADER, errorPost } from "./plugins"
 import { HttpReq, HttpResp, LlmKind, SseBuffer, HOOK_BODY_LIMIT, emptyReq, queryMap, queryString, sseData, sseWithData, sseErrorEvent, isInferencePath, kindOfOp } from "./plughttp"
 import { snapshot, newId } from "./schemas"
-import { fields, find, rawStr, quote, decodeString, isNull } from "./json"
+import { Field, fields, find, rawStr, quote, decodeString, isNull, build, setField } from "./json"
 import { encode, decode } from "./base64"
+import { parseModel } from "./router"
+import { EventFrames, EventFrame, encodeEventStreamFrame } from "./streams"
 import { utf8, secureHex } from "./crypto"
 
 // The plugin chain, when there is one with plugins.
@@ -89,11 +91,12 @@ export async function transportStart(engine: Engine, req: Request): Promise<Tran
   hr.rawQuery = search
   hr.body = bytes
   const rid = hs.get("x-request-id") ?? newId("req_")
-  const run = new PluginRun({ requestId: rid, op: "http", model: "", provider: "", headers: new Map(), values: new Map() })
+  const run = new PluginRun({ requestId: rid, op: "http", model: "", provider: "", headers: new Map(), values: new Map(), trace: new PluginTrace() })
   const method0 = hr.method
   const path0 = hr.path
   const pre = chain.runHttpPre(&run.ctx, &hr)
-  if (pre.kind === "error") return { response: errorResponse(500, pre.message, "api_error", noHeaders()), request: req, tr: undefined, body: "" }
+  // a failed pre hook answers with its message as bare text, as Bifrost's middleware does (SetBodyString)
+  if (pre.kind === "error") return { response: bareError(500, pre.message), request: req, tr: undefined, body: "" }
   if (pre.kind === "respond") return { response: responseOf(pre.resp), request: req, tr: undefined, body: "" }
   // Bifrost refuses a plugin that moves the request to another route
   if (hr.method !== method0 || hr.path !== path0) return { response: errorResponse(409, "request method/path was modified by a plugin, this is not allowed", "api_error", noHeaders()), request: req, tr: undefined, body: "" }
@@ -112,6 +115,13 @@ export async function transportStart(engine: Engine, req: Request): Promise<Tran
   nh.set(RUN_HEADER, id)
   const qs = hr.queryEdited ? queryString(hr.query) : hr.rawQuery
   return { response: undefined, request: rebuild(origin, hr.path, qs, hr.method, nh, hr.body, undefined), tr: tr, body: text(hr.body) }
+}
+
+// An error answered with its message as the whole body (fasthttp's default text type).
+export function bareError(status: int, message: string): Response {
+  const hs: Record<string, string> = new Map()
+  hs.set("content-type", "text/plain; charset=utf-8")
+  return new Response(message, { status: status, headers: hs })
 }
 
 // A request for a URL with a body (bytes, or a form that brings its own boundary).
@@ -153,6 +163,10 @@ export async function transportEnd(engine: Engine, tr: TransportRun | undefined,
     const out = chunkWhole(tr, text(bytes))
     return new Response(out, { status: res.status, headers: snapshotRecord(res.headers) })
   }
+  // a Bedrock event stream answered whole (the http1 server writes binary streams whole): its frames through the chunk hooks
+  if (ct.startsWith("application/vnd.amazon.eventstream") && res.status < 400) {
+    return new Response(framesWhole(tr, bytes), { status: res.status, headers: snapshotRecord(res.headers) })
+  }
   if (bytes.length > HOOK_BODY_LIMIT) return new Response(bytes, { status: res.status, headers: snapshotRecord(res.headers) })
   let hr: HttpResp = { status: res.status, headers: snapshot(res.headers), body: bytes }
   tr.chain.runHttpPost(&tr.run.ctx, req, &hr)
@@ -182,10 +196,73 @@ function chunkStep(tr: TransportRun, block: string): EventStep {
   return { kind: "send", block: sseWithData(block, r.data) }
 }
 
-// The sink of a streamed answer with the plugins' chunk hooks on each event.
+// The sink of a streamed answer with the plugins' chunk hooks on each event: the server-sent events, and the frames of a
+// Bedrock binary event stream (each frame's JSON payload is the chunk).
 export function transportSink(tr: TransportRun | undefined, real: StreamSink): StreamSink {
   if (tr === undefined) return real
-  return eventSink(real, (block) => chunkStep(tr, block))
+  const s = eventSink(real, (block) => chunkStep(tr, block))
+  const fr = new EventFrames()
+  const st = new FrameState()
+  s.writeBytes = (b: u8[]) => {
+    const w = real.writeBytes
+    if (real.cancelled) s.cancelled = true
+    if (w === undefined || st.ended) return
+    for (const f of fr.push(b)) {
+      const step = frameStep(tr, f)
+      if (step.kind === "drop") continue
+      w(step.bytes)
+      if (step.kind === "end") {
+        st.ended = true
+        // what feeds this sink stops reading the upstream
+        s.cancelled = true
+        return
+      }
+    }
+  }
+  return s
+}
+
+class FrameState {
+  ended = false
+}
+
+// What the chunk hooks do with one frame of a binary event stream: an event frame's JSON payload goes through them (a
+// changed payload is framed again with the same headers), a skipped one is dropped, and an error ends the stream with an
+// exception frame. Other frames pass as they came.
+type FrameStep = { kind: "send", bytes: u8[] } | { kind: "drop" } | { kind: "end", bytes: u8[] }
+
+function frameStep(tr: TransportRun, f: EventFrame): FrameStep {
+  const req = tr.run.req
+  if (!f.ok || req === undefined || (f.headers.get(":message-type") ?? "event") !== "event" || !f.payload.startsWith("{")) return { kind: "send", bytes: f.raw }
+  const r = tr.chain.runHttpChunk(&tr.run.ctx, req, f.payload)
+  if (r.kind === "skip") return { kind: "drop" }
+  if (r.kind === "stop") return { kind: "end", bytes: exceptionFrameOf(r.message) }
+  if (r.data === f.payload) return { kind: "send", bytes: f.raw }
+  return { kind: "send", bytes: encodeEventStreamFrame(f.headers, r.data) }
+}
+
+// An exception frame (the event stream's error after it has begun) with a message.
+function exceptionFrameOf(message: string): u8[] {
+  const h: Map<string, string> = new Map()
+  h.set(":exception-type", "internalServerException")
+  h.set(":content-type", "application/json")
+  h.set(":message-type", "exception")
+  return encodeEventStreamFrame(h, `{"message":${quote(message)}}`)
+}
+
+// A binary event stream answered whole, through the chunk hooks frame by frame.
+function framesWhole(tr: TransportRun, bytes: u8[]): u8[] {
+  const fr = new EventFrames()
+  const out: u8[] = []
+  const frames = fr.push(bytes)
+  for (const f of frames) {
+    const step = frameStep(tr, f)
+    if (step.kind === "drop") continue
+    for (const b of step.bytes) out.push(b)
+    if (step.kind === "end") return out
+  }
+  for (const b of fr.rest()) out.push(b)
+  return out
 }
 
 // An event stream that was built whole, through the chunk hooks event by event.
@@ -314,9 +391,36 @@ export async function llmHooked(engine: Engine, req: Request, op: string, handle
     return try await handler(rebuild(origin, path, qs, req.method, hs, utf8(body), fd), sink)
   }
   const shared = engine.pluginRuns.get(req.headers.get(RUN_HEADER) ?? "")
-  const run = shared ?? new PluginRun({ requestId: req.headers.get("x-request-id") ?? newId("req_"), op: op, model: model, provider: "", headers: new Map(), values: new Map() })
+  const run = shared ?? new PluginRun({ requestId: req.headers.get("x-request-id") ?? newId("req_"), op: op, model: model, provider: "", headers: new Map(), values: new Map(), trace: new PluginTrace() })
   run.ctx.op = op
   run.ctx.model = model
+  run.ctx.provider = parseModel(engine.cfg, model).provider
+  // the request log and the trace of the handler's request read the plugin spans and logs from here (TRACE_HEADER)
+  const tid = traceFor(engine, run)
+  try {
+    if (tid !== "") hs.set(TRACE_HEADER, tid)
+    return try await hookedRun(engine, chain, run, k, req, hs, body, fd, origin, path, qs, handler, sink)
+  } finally {
+    if (tid !== "") engine.pluginTraces.delete(tid)
+  }
+}
+
+// Registers a run's trace for the handler's request; "" when the run has none.
+function traceFor(engine: Engine, run: PluginRun): string {
+  const tr = run.ctx.trace
+  if (tr === undefined) return ""
+  let id = newId("trace_")
+  try {
+    id = "trace_" + secureHex(24)
+  } catch (e) {
+    // the time-based id stands
+  }
+  engine.pluginTraces.set(id, tr)
+  return id
+}
+
+// llmHooked once the run is set up: the pre hooks, the handler, and the post hooks.
+async function hookedRun(engine: Engine, chain: PluginChain, run: PluginRun, k: LlmKind, req: Request, hs: Map<string, string>, body: string, fd: FormData | undefined, origin: string, path: string, qs: string, handler: Handler, sink: StreamSink | undefined): Promise<Response> throws TypeError {
   const pre = chain.runPre(&run.ctx, body)
   if (pre.kind === "short_circuit") {
     const post = chain.runPost(&run.ctx, pre.status, pre.body)
@@ -379,6 +483,226 @@ async function postProcess(chain: PluginChain, run: PluginRun, k: LlmKind, res: 
   return new Response(o.body, { status: o.status, headers: hs })
 }
 
+// ---- the batch and file calls ----
+
+// A batch or file call as Bifrost's request types name it (op: batch_list, batch_retrieve, batch_cancel, batch_results,
+// batch_delete, batch_create, file_upload, file_list, file_retrieve, file_delete, file_content), the provider it is for,
+// the member its id goes in ("batch_id", "file_id", or "" for a call with no id), the id, and the path the call takes
+// for an id (where it is sent when a plugin changes the id).
+export type StorageCall = { op: string, provider: string, idKey: string, id: string, pathFor: (id: string) => string }
+
+// The request of a batch or file call as the plugins get it: the provider (as "provider/" in model, so it reaches them as
+// the request's provider with no model), the id, the query's fields, a JSON body's fields, and an upload's text fields
+// with the file's filename and content_type (the bytes are not passed, as Bifrost does not serialise them). Which
+// fields came from the query and which from the body is kept, so a plugin's change goes back where the field came from.
+export type StorageRequest = { json: string, fromQuery: string[], fromBody: string[], jsonBody: bool }
+
+export function storageRequest(call: StorageCall, query: string, body: string, form: FormData | undefined): StorageRequest {
+  let fs: Field[] = []
+  setField(&fs, "model", quote(call.provider + "/"))
+  if (call.idKey !== "" && call.id !== "") setField(&fs, call.idKey, quote(call.id))
+  const fromQuery: string[] = []
+  const qm = queryMap(query)
+  for (const key of qm.keys()) {
+    if (key === "model" || key === call.idKey) continue
+    setField(&fs, key, quote(qm.get(key)!))
+    fromQuery.push(key)
+  }
+  const fromBody: string[] = []
+  let jsonBody = false
+  if (form !== undefined) {
+    const tf = fieldsOfForm(form)
+    for (const f of tf.text) {
+      setField(&fs, f.key, f.raw)
+      fromBody.push(f.key)
+    }
+    if (tf.filename !== "") setField(&fs, "filename", quote(tf.filename))
+    if (tf.contentType !== "") setField(&fs, "content_type", quote(tf.contentType))
+  } else if (body.trimStart().startsWith("{")) {
+    try {
+      for (const f of fields(body)) {
+        if (f.key === "model") continue
+        setField(&fs, f.key, f.raw)
+        fromBody.push(f.key)
+      }
+      jsonBody = true
+    } catch (e) {
+      // a body that is not JSON goes on as it came; the plugins see the rest of the call
+    }
+  }
+  return { json: build(fs), fromQuery: fromQuery, fromBody: fromBody, jsonBody: jsonBody }
+}
+
+// A form's text fields (as JSON values) and its first file's name and type.
+function fieldsOfForm(fd: FormData): { text: Field[], filename: string, contentType: string } {
+  const out: Field[] = []
+  let filename = ""
+  let ct = ""
+  fd.forEach((value, key) => {
+    if (typeof value === "string") out.push({ key: key, raw: quote(value) })
+    else if (filename === "") {
+      filename = value.name
+      ct = value.type
+    }
+  })
+  return { text: out, filename: filename, contentType: ct }
+}
+
+// The call a plugin's changed request makes: the id (its path), the query and the JSON body or form text fields.
+export type StorageChange = { id: string, query: Map<string, string>, body: Field[] }
+
+export function storageChange(call: StorageCall, sr: StorageRequest, changed: string): StorageChange throws SyntaxError {
+  const nf = try fields(changed)
+  const id = call.idKey === "" ? call.id : (rawStr(nf, call.idKey) ?? call.id)
+  const query: Map<string, string> = new Map()
+  const body: Field[] = []
+  for (const f of nf) {
+    if (f.key === "model" || f.key === "provider" || f.key === call.idKey || f.key === "filename" || f.key === "content_type") continue
+    if (isNull(f.raw)) continue
+    // a field goes back where it came from; a new one goes in the JSON body when the call has one, else in the query
+    if (sr.fromBody.includes(f.key) || (!sr.fromQuery.includes(f.key) && sr.jsonBody)) body.push(f)
+    else query.set(f.key, fieldText(f.raw))
+  }
+  return { id: id, query: query, body: body }
+}
+
+// Runs a batch or file call with the plugins' LLM hooks around it, as Bifrost runs them on every batch and file request:
+// pre_hook on the call's request (storageRequest; a change to its id, query or body fields is the call that is made, a
+// short circuit answers it), post_hook on the answer or its error. A file's content goes to post_hook as
+// {file_id, content_type}: the plugin may turn it into an error, and the bytes go back as they came. Without plugins
+// that handle the call's type the handler just runs.
+export async function storageHooked(engine: Engine, req: Request, call: StorageCall, handler: Handler): Promise<Response> throws TypeError {
+  const chain = chainOf(engine)
+  const k = kindOfOp(call.op)
+  if (chain === undefined || k === undefined || !chain.handles(call.op)) return try await handler(req, undefined)
+  const hs = snapshot(req.headers)
+  const u = URL.parse(req.url)
+  const origin = u === undefined ? "http://localhost" : u.origin
+  const path = u === undefined ? "" : u.pathname
+  const qs = u === undefined ? "" : (u.search.startsWith("?") ? u.search.slice(1) : u.search)
+  const method = req.method
+  let bytes: u8[] = []
+  let fd: FormData | undefined = undefined
+  try {
+    if (k.form && (hs.get("content-type") ?? "").toLowerCase().includes("multipart/form-data")) fd = try await req.formData()
+    else if (method !== "GET" && method !== "HEAD" && method !== "DELETE") bytes = try await req.bytes()
+  } catch (e) {
+    return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+  }
+  const sr = storageRequest(call, qs, text(bytes), fd)
+  const shared = engine.pluginRuns.get(req.headers.get(RUN_HEADER) ?? "")
+  const run = shared ?? new PluginRun({ requestId: req.headers.get("x-request-id") ?? newId("req_"), op: call.op, model: "", provider: "", headers: new Map(), values: new Map(), trace: new PluginTrace() })
+  run.ctx.op = call.op
+  run.ctx.model = call.provider + "/"
+  run.ctx.provider = call.provider
+  const pre = chain.runPre(&run.ctx, sr.json)
+  if (pre.kind === "short_circuit") {
+    const post = chain.runPost(&run.ctx, pre.status, pre.body)
+    return shortResponse(CHAT_LIKE, post.status, post.body, pre.contentType)
+  }
+  let next = rebuild(origin, path, qs, method, hs, bytes, fd)
+  let id = call.id
+  if (pre.body !== sr.json) {
+    try {
+      const ch = try storageChange(call, sr, pre.body)
+      id = ch.id
+      const np = ch.id !== call.id ? call.pathFor(ch.id) : path
+      const nq = queryString(ch.query)
+      if (fd !== undefined) next = rebuild(origin, np, nq, method, hs, [], try formWith(fd, build(ch.body)))
+      else if (sr.jsonBody) next = rebuild(origin, np, nq, method, hs, utf8(build(ch.body)), undefined)
+      else next = rebuild(origin, np, nq, method, hs, bytes, undefined)
+    } catch (e) {
+      return errorResponse(500, `a plugin produced an invalid request: ${e.message}`, "api_error", noHeaders())
+    }
+  }
+  const res = try await handler(next, undefined)
+  if (call.op === "file_content" && res.status < 400) return await contentPost(chain, run, id, res)
+  return await postProcess(chain, run, CHAT_LIKE, res)
+}
+
+// Bifrost's request type of a batch or file operation as the routes name it (media.tov, anthropic_batch.tov, genai_in.tov),
+// or "".
+export function storageOp(op: string): string {
+  if (op === "files.create" || op === "files.upload") return "file_upload"
+  if (op === "files.list") return "file_list"
+  if (op === "files.retrieve") return "file_retrieve"
+  if (op === "files.delete") return "file_delete"
+  if (op === "files.content") return "file_content"
+  if (op === "batches.create") return "batch_create"
+  if (op === "batches.list") return "batch_list"
+  if (op === "batches.retrieve") return "batch_retrieve"
+  if (op === "batches.cancel") return "batch_cancel"
+  if (op === "batches.results") return "batch_results"
+  if (op === "batches.delete") return "batch_delete"
+  return ""
+}
+
+// A path segment's text with %XX escapes undone.
+function segmentText(seg: string): string {
+  if (!seg.includes("%")) return seg
+  return new URLSearchParams("s=" + seg.replaceAll("+", "%2B")).get("s") ?? seg
+}
+
+// A text as one path segment (unreserved characters and ":" kept, the rest %XX).
+function segmentOf(s: string): string {
+  const hex = utf8("0123456789ABCDEF")
+  const out: u8[] = []
+  for (const b of utf8(s)) {
+    const v = int(b)
+    const keep = (v >= 48 && v <= 57) || (v >= 65 && v <= 90) || (v >= 97 && v <= 122) || v === 45 || v === 46 || v === 95 || v === 126 || v === 58
+    if (keep) {
+      out.push(b)
+    } else {
+      out.push(u8(37))
+      out.push(hex[v >> 4]!)
+      out.push(hex[v & 15]!)
+    }
+  }
+  return text(out)
+}
+
+// The path of the same call for another id: the first segment that is the id (or the id with a ":action" suffix, as
+// GenAI's batches/{id}:cancel) gets the new one.
+export function pathWithId(path: string, oldId: string, newId: string): string {
+  if (oldId === "") return path
+  const segs = path.split("/")
+  for (let i = 0; i < segs.length; i++) {
+    const s = segs[i]!
+    const t = segmentText(s)
+    if (t === oldId) {
+      segs[i] = segmentOf(newId)
+      return segs.join("/")
+    }
+    if (t.startsWith(oldId + ":")) {
+      segs[i] = segmentOf(newId) + t.slice(oldId.byteLength)
+      return segs.join("/")
+    }
+  }
+  return path
+}
+
+// The kind whose answers are JSON (shortResponse and postProcess read no audio from it).
+const CHAT_LIKE: LlmKind = { op: "storage", reqType: "", reqKey: "", respKey: "", streamKey: "", inputKey: "", form: false, binary: false }
+
+// A file's content through the post hooks, as Bifrost's FileContentResponse ({file_id, content_type}; the bytes are not
+// serialised): an error a plugin makes of it is the answer, otherwise the content goes back as it came.
+async function contentPost(chain: PluginChain, run: PluginRun, id: string, res: Response): Promise<Response> {
+  let bytes: u8[] = []
+  try {
+    bytes = await res.bytes()
+  } catch (e) {
+    return errorResponse(502, `the answer could not be read: ${e.message}`, "api_error", noHeaders())
+  }
+  const ct = res.headers.get("content-type") ?? ""
+  const o = chain.runPost(&run.ctx, res.status, `{"file_id":${quote(id)},"content_type":${quote(ct)}}`)
+  if (o.status >= 400) {
+    const eh: Record<string, string> = new Map()
+    eh.set("content-type", "application/json")
+    return new Response(o.body, { status: o.status, headers: eh })
+  }
+  return new Response(bytes, { status: res.status, headers: snapshotRecord(res.headers) })
+}
+
 // ---- tests ----
 
 // A plugin for the chunk hooks: skip drops a chunk that has "skipme", end stops the stream on "endme", upper
@@ -436,6 +760,57 @@ function hookRun(mode: string): TransportRun {
   run.req = emptyReq("POST", "/v1/chat/completions")
   return new TransportRun("run_t", chain, run)
 }
+
+class Bytes {
+  out: u8[] = []
+}
+
+function eventFrameOf(payload: string): u8[] {
+  const h: Map<string, string> = new Map()
+  h.set(":event-type", "contentBlockDelta")
+  h.set(":content-type", "application/json")
+  h.set(":message-type", "event")
+  return encodeEventStreamFrame(h, payload)
+}
+
+function payloadsOf(b: u8[]): string[] {
+  const out: string[] = []
+  for (const f of new EventFrames().push(b)) out.push(f.payload)
+  return out
+}
+
+test("the chunk hooks see each frame of a Bedrock binary event stream: rewrite, drop, or end with an exception", () => {
+  const got = new Bytes()
+  const real = collector(new Collected())
+  real.writeBytes = (b: u8[]) => {
+    for (const x of b) got.out.push(x)
+  }
+  const s = transportSink(hookRun("upper"), real)
+  const two = eventFrameOf(`{"t":"aa"}`).concat(eventFrameOf(`{"t":"ab"}`))
+  const w = s.writeBytes!
+  w(two.slice(0, 10))
+  w(two.slice(10))
+  expect(payloadsOf(got.out)).toEqual([`{"t":"Aa"}`, `{"t":"Ab"}`])
+  const skipped = new Bytes()
+  const r2 = collector(new Collected())
+  r2.writeBytes = (b: u8[]) => {
+    for (const x of b) skipped.out.push(x)
+  }
+  const s2 = transportSink(hookRun("skip"), r2)
+  s2.writeBytes!(eventFrameOf(`{"t":"keep"}`).concat(eventFrameOf(`{"t":"skipme"}`)))
+  expect(payloadsOf(skipped.out)).toEqual([`{"t":"keep"}`])
+  const ended = new Bytes()
+  const r3 = collector(new Collected())
+  r3.writeBytes = (b: u8[]) => {
+    for (const x of b) ended.out.push(x)
+  }
+  const s3 = transportSink(hookRun("end"), r3)
+  s3.writeBytes!(eventFrameOf(`{"t":"endme"}`).concat(eventFrameOf(`{"t":"never"}`)))
+  expect(payloadsOf(ended.out)).toEqual([`{"message":"enough"}`])
+  expect(s3.cancelled).toBe(true)
+  // an answer written whole goes through the same hooks
+  expect(payloadsOf(framesWhole(hookRun("upper"), eventFrameOf(`{"t":"a"}`)))).toEqual([`{"t":"A"}`])
+})
 
 test("the chunk hooks see whole events however the stream is cut, and [DONE] and comments pass", () => {
   const c = new Collected()
@@ -539,4 +914,47 @@ test("a short circuit of speech is audio, and others are the plugin's body", () 
   const e = shortResponse(speech, 429, `{"error":{"message":"no"}}`, "audio/mpeg")
   expect(e.status).toBe(429)
   expect(e.headers.get("content-type")).toBe("application/json")
+})
+
+function callFor(op: string, idKey: string, id: string, path: string): StorageCall {
+  return { op: op, provider: "openai", idKey: idKey, id: id, pathFor: (nid: string): string => pathWithId(path, id, nid) }
+}
+
+test("a batch or file call is a request of its type: the id, the query and the body's fields", () => {
+  const list = callFor("batch_list", "batch_id", "", "/v1/batches")
+  const r = storageRequest(list, "limit=2&after=b_1", "", undefined)
+  expect(r.json).toBe(`{"model":"openai/","limit":"2","after":"b_1"}`)
+  expect(r.fromQuery.join(",")).toBe("limit,after")
+  const get = callFor("batch_retrieve", "batch_id", "b_7", "/v1/batches/b_7")
+  expect(storageRequest(get, "", "", undefined).json).toBe(`{"model":"openai/","batch_id":"b_7"}`)
+  const create = callFor("batch_create", "batch_id", "", "/v1/batches")
+  const c = storageRequest(create, "", `{"input_file_id":"file-1","endpoint":"/v1/chat/completions"}`, undefined)
+  expect(c.jsonBody).toBe(true)
+  expect(c.json).toBe(`{"model":"openai/","input_file_id":"file-1","endpoint":"/v1/chat/completions"}`)
+  const fd = new FormData()
+  fd.append("purpose", "batch")
+  fd.append("file", new File([utf8("{}")], "in.jsonl"))
+  const up = storageRequest(callFor("file_upload", "file_id", "", "/v1/files"), "", "", fd)
+  expect(up.json.startsWith(`{"model":"openai/","purpose":"batch","filename":"in.jsonl"`)).toBe(true)
+  expect(storageOp("files.create")).toBe("file_upload")
+  expect(storageOp("batches.results")).toBe("batch_results")
+  expect(storageOp("cached.list")).toBe("")
+})
+
+test("a plugin's change to a batch or file call goes back where each field came from", () => {
+  const get = callFor("batch_retrieve", "batch_id", "b_7", "/v1/batches/b_7")
+  const sr = storageRequest(get, "x=1", "", undefined)
+  const ch = try storageChange(get, sr, `{"model":"openai/","batch_id":"b_9","x":"2","extra":"y"}`)
+  expect(ch.id).toBe("b_9")
+  expect(ch.query.get("x")).toBe("2")
+  expect(ch.query.get("extra")).toBe("y")
+  expect(get.pathFor(ch.id)).toBe("/v1/batches/b_9")
+  const create = callFor("batch_create", "batch_id", "", "/v1/batches")
+  const sc = storageRequest(create, "", `{"input_file_id":"file-1"}`, undefined)
+  const cc = try storageChange(create, sc, `{"model":"openai/","input_file_id":"file-2","metadata":{"a":"b"}}`)
+  expect(cc.body.length).toBe(2)
+  expect(cc.query.size).toBe(0)
+  expect(pathWithId("/genai/v1beta/batches/b1:cancel", "b1", "b 2")).toBe("/genai/v1beta/batches/b%202:cancel")
+  expect(pathWithId("/bedrock/model-invocation-job/arn%3Aaws%3Ajob%2F1/stop", "arn:aws:job/1", "arn:aws:job/2")).toBe("/bedrock/model-invocation-job/arn:aws:job%2F2/stop")
+  expect(pathWithId("/v1/files", "", "x")).toBe("/v1/files")
 })

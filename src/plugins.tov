@@ -12,11 +12,13 @@ import { errorJson, newId, nowSeconds } from "./schemas"
 import { compileRegex } from "./regex"
 import { deltaText } from "./guard_stream"
 import { WasmPluginInst, WasmPluginLimits, openWasmPlugin } from "./wasmplugin"
+import { isPluginUrl, downloadedPlugin } from "./plugindl"
 import { HttpReq, HttpResp, LlmKind, CHAT_KIND, kindOfOp, emptyReq, httpReqJson, httpRespJson, applyHttpReq, applyHttpResp, respFromJson } from "./plughttp"
 import { utf8 } from "./crypto"
 
 // Hooks take the context by inout: plugins add headers and share values
-// through ctx.headers and ctx.values, which parameters can't change.
+// through ctx.headers and ctx.values, which parameters can't change. trace collects the
+// request's plugin spans and plugin logs (a class, so every copy of the context shares it).
 export type PluginContext = {
   requestId: string,
   op: string,
@@ -24,20 +26,104 @@ export type PluginContext = {
   provider: string,
   headers: Map<string, string>,
   values: Map<string, string>,
+  trace?: PluginTrace,
 }
 
+// One plugin log entry, as Bifrost's PluginLogEntry: the plugin, the level, the message, and when (Unix ms).
+export type PluginLogEntry = { plugin_name: string, level: string, message: string, timestamp: f64 }
+
+// A plugin span: Bifrost's plugin.<name>.<hook> (prehook, posthook, transportprehook, transportposthook,
+// transportchunkhook), its start (epoch ms) and duration (us), and the error a hook ended with.
+export type PluginSpan = { name: string, startMs: f64, durUs: f64, error: string }
+
+// The plugin spans and plugin logs of one request. A stream's chunk hooks add up into one span per plugin and hook,
+// as Bifrost accumulates a plugin's post-hook time across the chunks of a stream.
+export class PluginTrace {
+  spans: PluginSpan[] = []
+  logs: PluginLogEntry[] = []
+
+  // A hook's span; with accumulate, a span of the same name already recorded grows by this duration.
+  span(name: string, startMs: f64, durUs: f64, error: string, accumulate: bool): void {
+    if (accumulate) {
+      for (let i = 0; i < this.spans.length; i++) {
+        const s = this.spans[i]!
+        if (s.name === name) {
+          this.spans[i] = { name: name, startMs: s.startMs, durUs: s.durUs + durUs, error: s.error !== "" ? s.error : error }
+          return
+        }
+      }
+    }
+    this.spans.push({ name: name, startMs: startMs, durUs: durUs, error: error })
+  }
+
+  log(plugin: string, level: string, message: string): void {
+    if (message.trim() === "") return
+    this.logs.push({ plugin_name: plugin, level: level, message: message, timestamp: Date.now() })
+  }
+}
+
+// The plugin logs grouped by plugin name as JSON ({"<plugin>": [entries]}), as Bifrost stores them on a log row; ""
+// when there are none.
+export function pluginLogsJson(logs: PluginLogEntry[]): string {
+  if (logs.length === 0) return ""
+  const names: string[] = []
+  for (const l of logs) {
+    if (!names.includes(l.plugin_name)) names.push(l.plugin_name)
+  }
+  const parts: string[] = []
+  for (const n of names) {
+    const items: string[] = []
+    for (const l of logs) {
+      if (l.plugin_name === n) items.push(`{"plugin_name":${quote(n)},"level":${quote(l.level)},"message":${quote(l.message)},"timestamp":${Math.round(l.timestamp)}}`)
+    }
+    parts.push(`${quote(n)}:[${items.join(",")}]`)
+  }
+  return "{" + parts.join(",") + "}"
+}
+
+// A plugin's name as a span name segment (Bifrost's sanitizeSpanName keeps letters, digits, "-" and "_").
+export function spanSegment(name: string): string {
+  const out: u8[] = []
+  for (const b of utf8(name)) {
+    const v = int(b)
+    const ok = (v >= 48 && v <= 57) || (v >= 65 && v <= 90) || (v >= 97 && v <= 122) || v === 45 || v === 95
+    out.push(ok ? b : u8(95))
+  }
+  try {
+    return new TextDecoder().decode(out)
+  } catch (e) {
+    return name
+  }
+}
+
+// Times one hook of a plugin into the request's trace (when it has one).
+function timed(ctx: PluginContext, p: BasePlugin, hook: string, t0: f64, wall0: f64, error: string, accumulate: bool): void {
+  const tr = ctx.trace
+  if (tr === undefined) return
+  tr.span(`plugin.${spanSegment(p.name())}.${hook}`, wall0, (performance.now() - t0) * 1000.0, error, accumulate)
+  const out = p.takeOutput()
+  if (out !== "") {
+    for (const line of out.split("\n")) tr.log(p.name(), "info", line)
+  }
+  if (error !== "") tr.log(p.name(), "error", `${hook} failed: ${error}`)
+}
+
+// A short circuit with an error status may let the request's fallbacks be tried (Bifrost's AllowFallbacks: unset
+// means allowed); allowFallbacks false makes the error final.
 export type PreResult =
   | { kind: "continue", body: string }
-  | { kind: "short_circuit", status: int, body: string, contentType: string }
+  | { kind: "short_circuit", status: int, body: string, contentType: string, allowFallbacks?: bool }
 
 // A post hook's answer: the body, or the body with the status the answer now has (an error made of a
-// response, or a response made of an error).
+// response, or a response made of an error). skip, for a chunk of a stream, drops the chunk and the stream goes on
+// (Bifrost's StreamControl with skip_stream); on a whole answer it changes nothing.
 export type PostResult =
   | { kind: "continue", body: string }
   | { kind: "status", status: int, body: string }
+  | { kind: "skip" }
 
-// What the post hooks leave of an answer.
-export type PostOutcome = { status: int, body: string }
+// What the post hooks leave of an answer; skip: a chunk a plugin dropped.
+export type PostOutcome = { status: int, body: string, skip?: bool }
 
 // What an httpPre hook decides: go on with the (possibly rewritten) request, answer at once with a response, or fail the request.
 export type HttpPreResult =
@@ -101,6 +187,17 @@ export abstract class BasePlugin {
     return false
   }
 
+  // The plugin's own statistics as a JSON object (the mocker's GetStats), or "" for none.
+  statsJson(): string {
+    return ""
+  }
+
+  // What the plugin printed during its last hook (a WebAssembly plugin's standard output and error), which becomes
+  // its plugin logs; "" for none.
+  takeOutput(): string {
+    return ""
+  }
+
   httpPre(inout ctx: PluginContext, inout req: HttpReq): HttpPreResult throws Error {
     return { kind: "continue" }
   }
@@ -125,6 +222,10 @@ export class PluginRun {
 // The header that carries the id of a request's PluginRun from the transport hooks to the handler that runs
 // the LLM hooks (pluginroute.tov). The gateway's own x-bf-* headers never go upstream.
 export const RUN_HEADER = "x-bf-plugin-run"
+
+// The header that names a request's plugin trace (PluginTrace) for the handler that serves it (Engine.pluginTraces):
+// the request log and the trace read its plugin spans and logs.
+export const TRACE_HEADER = "x-bf-plugin-trace"
 
 // A throw that carries a plugin's error out of a place that can only fail (a translate step): the
 // status and body are in the message.
@@ -151,33 +252,52 @@ const RAN_KEY = "plugins.ran"
 
 // A hook that throws is logged and skipped; it never fails the request.
 function safePre(p: BasePlugin, inout ctx: PluginContext, body: string): PreResult | undefined {
+  const t0 = performance.now()
+  const wall0 = Date.now()
   try {
-    return p.preRequest(&ctx, body)
+    const r = p.preRequest(&ctx, body)
+    timed(ctx, p, "prehook", t0, wall0, "", false)
+    return r
   } catch (e) {
     console.error(`raiju: plugin ${p.name()} preRequest failed: ${e.message}`)
+    timed(ctx, p, "prehook", t0, wall0, e.message, false)
     return undefined
   }
 }
 
 function safePost(p: BasePlugin, inout ctx: PluginContext, status: int, body: string): PostResult | undefined {
+  const t0 = performance.now()
+  const wall0 = Date.now()
   try {
-    return p.postResponse(&ctx, status, body)
+    const r = p.postResponse(&ctx, status, body)
+    timed(ctx, p, "posthook", t0, wall0, "", false)
+    return r
   } catch (e) {
     console.error(`raiju: plugin ${p.name()} postResponse failed: ${e.message}`)
+    timed(ctx, p, "posthook", t0, wall0, e.message, false)
     return undefined
   }
 }
 
+// (a stream's post hooks add up into one posthook span per plugin)
 function safeChunk(p: BasePlugin, inout ctx: PluginContext, status: int, chunk: string): PostResult | undefined {
+  const t0 = performance.now()
+  const wall0 = Date.now()
   try {
-    return p.postChunk(&ctx, status, chunk)
+    const r = p.postChunk(&ctx, status, chunk)
+    timed(ctx, p, "posthook", t0, wall0, "", true)
+    return r
   } catch (e) {
     console.error(`raiju: plugin ${p.name()} postChunk failed: ${e.message}`)
+    timed(ctx, p, "posthook", t0, wall0, e.message, true)
     return undefined
   }
 }
 
 export class PluginChain {
+  // each plugin's placement rank (placementRank), set by buildChain; a plugin without one is post_builtin
+  ranks: int[] = []
+
   constructor(readonly plugins: BasePlugin[]) {}
 
   // Whether any plugin takes part in the LLM hooks of a request type.
@@ -215,6 +335,16 @@ export class PluginChain {
     return false
   }
 
+  // The statistics of the first plugin of a name that keeps any, or "".
+  statsOf(name: string): string {
+    for (const p of this.plugins) {
+      if (p.name() !== name) continue
+      const s = p.statsJson()
+      if (s !== "") return s
+    }
+    return ""
+  }
+
   // Whether any plugin has an HTTP transport hook.
   hasHttp(): bool {
     for (const p of this.plugins) {
@@ -229,11 +359,15 @@ export class PluginChain {
     for (let i = 0; i < this.plugins.length; i++) {
       const p = this.plugins[i]!
       if (!p.hasHttp()) continue
+      const t0 = performance.now()
+      const wall0 = Date.now()
       try {
         const r = p.httpPre(&ctx, &req)
+        timed(ctx, p, "transportprehook", t0, wall0, r.kind === "error" ? r.message : "", false)
         if (r.kind !== "continue") return r
       } catch (e) {
         console.error(`raiju: plugin ${p.name()} httpPre failed: ${e.message}`)
+        timed(ctx, p, "transportprehook", t0, wall0, e.message, false)
       }
     }
     return { kind: "continue" }
@@ -245,14 +379,18 @@ export class PluginChain {
     for (let i = this.plugins.length - 1; i >= 0; i--) {
       const p = this.plugins[i]!
       if (!p.hasHttp()) continue
+      const t0 = performance.now()
+      const wall0 = Date.now()
       try {
         const msg = p.httpPost(&ctx, req, &resp)
+        timed(ctx, p, "transportposthook", t0, wall0, msg, false)
         if (msg !== "") {
           console.error(`raiju: plugin ${p.name()} httpPost: ${msg}`)
           return
         }
       } catch (e) {
         console.error(`raiju: plugin ${p.name()} httpPost failed: ${e.message}`)
+        timed(ctx, p, "transportposthook", t0, wall0, e.message, false)
       }
     }
   }
@@ -264,12 +402,16 @@ export class PluginChain {
     for (let i = this.plugins.length - 1; i >= 0; i--) {
       const p = this.plugins[i]!
       if (!p.hasHttp()) continue
+      const t0 = performance.now()
+      const wall0 = Date.now()
       try {
         const r = p.httpChunk(&ctx, req, cur)
+        timed(ctx, p, "transportchunkhook", t0, wall0, r.kind === "stop" ? r.message : "", true)
         if (r.kind === "skip" || r.kind === "stop") return r
         cur = r.data
       } catch (e) {
         console.error(`raiju: plugin ${p.name()} httpChunk failed: ${e.message}`)
+        timed(ctx, p, "transportchunkhook", t0, wall0, e.message, true)
       }
     }
     return { kind: "chunk", data: cur }
@@ -285,10 +427,17 @@ export class PluginChain {
       if (!ran.includes(`${i}`)) continue
       const r = safeChunk(this.plugins[i]!, &ctx, status, cur)
       if (r === undefined) continue
+      // a dropped chunk is seen by no plugin after this one
+      if (r.kind === "skip") return { status: status, body: cur, skip: true }
       cur = r.body
       if (r.kind === "status") status = r.status
     }
     return { status: status, body: cur }
+  }
+
+  // Whether a plugin's preRequest ran for the request and its post hooks have not run since.
+  ranPre(ctx: PluginContext): bool {
+    return (ctx.values.get(RAN_KEY) ?? "") !== ""
   }
 
   // Ends a streamed run: the record of the plugins whose preRequest ran is dropped.
@@ -321,16 +470,50 @@ export class PluginChain {
   runPost(inout ctx: PluginContext, status: int, body: string): PostOutcome {
     const ran = (ctx.values.get(RAN_KEY) ?? "").split(",")
     ctx.values.delete(RAN_KEY)
+    return this.postRange(&ctx, ran, status, body, 0, this.plugins.length)
+  }
+
+  // postResponse in reverse over plugins [from, to) whose preRequest ran.
+  private postRange(inout ctx: PluginContext, ran: string[], status: int, body: string, from: int, to: int): PostOutcome {
     let cur = body
     let st = status
-    for (let i = this.plugins.length - 1; i >= 0; i--) {
+    for (let i = to - 1; i >= from; i--) {
       if (!ran.includes(`${i}`)) continue
       const r = safePost(this.plugins[i]!, &ctx, st, cur)
-      if (r === undefined) continue
+      if (r === undefined || r.kind === "skip") continue
       cur = r.body
       if (r.kind === "status") st = r.status
     }
     return { status: st, body: cur }
+  }
+
+  // Where the gateway's cache sits in the chain, as Bifrost's semantic cache is a builtin plugin: the plugins before
+  // this index are pre_builtin and builtin, the rest post_builtin (the default placement).
+  cacheAt(): int {
+    let n = 0
+    for (let i = 0; i < this.plugins.length; i++) {
+      if ((this.ranks[i] ?? 2) < 2) n = i + 1
+    }
+    return n
+  }
+
+  // runPost in two parts around the cache: the post_builtin plugins first (the answer as the cache keeps it), then the
+  // pre_builtin and builtin ones (the answer as the caller gets it).
+  runPostSplit(inout ctx: PluginContext, status: int, body: string): { cached: PostOutcome, out: PostOutcome } {
+    const ran = (ctx.values.get(RAN_KEY) ?? "").split(",")
+    ctx.values.delete(RAN_KEY)
+    const at = this.cacheAt()
+    const cached = this.postRange(&ctx, ran, status, body, at, this.plugins.length)
+    const out = this.postRange(&ctx, ran, cached.status, cached.body, 0, at)
+    return { cached: cached, out: out }
+  }
+
+  // The post hooks of a cached answer: those of the plugins before the cache whose preRequest ran (a cache hit is a short
+  // circuit by the cache, so the plugins after it have no part in it).
+  runPostCached(inout ctx: PluginContext, status: int, body: string): PostOutcome {
+    const ran = (ctx.values.get(RAN_KEY) ?? "").split(",")
+    ctx.values.delete(RAN_KEY)
+    return this.postRange(&ctx, ran, status, body, 0, this.cacheAt())
   }
 }
 
@@ -401,13 +584,13 @@ export class HeaderPlugin extends BasePlugin {
 
 // Bifrost's mocker shape: rules have name, enabled, priority, conditions, responses (weighted),
 // latency and probability; the config has default_behavior and global_latency. Durations are Go
-// strings ("500ms", "2s"). Integer nanoseconds are not read.
+// strings ("500ms", "2s") or integer nanoseconds (mockerConfigText turns those into "<n>ns").
 export type MockConditions = { providers?: string[], models?: string[], message_regex?: string, request_size?: { min?: int, max?: int } }
 export type MockLatency = { min?: string, max?: string, type?: string }
 export type MockUsage = { prompt_tokens?: int, completion_tokens?: int, total_tokens?: int }
 export type MockContent = { message?: string, message_template?: string, model?: string, finish_reason?: string, usage?: MockUsage }
 export type MockError = { message?: string, type?: string, code?: string, status_code?: int }
-export type MockResponse = { type?: string, weight?: f64, content?: MockContent, error?: MockError }
+export type MockResponse = { type?: string, weight?: f64, content?: MockContent, error?: MockError, allow_fallbacks?: bool }
 
 export type MockRule = {
   model?: string,
@@ -471,6 +654,186 @@ function unitMs(u: string): f64 | undefined {
   return undefined
 }
 
+// A latency object with integer nanosecond min and max written as Go strings ("<n>ns"), as Bifrost's Duration reads both.
+function latencyText(raw: string): string throws SyntaxError {
+  if (!raw.startsWith("{")) return raw
+  let fs = try fields(raw)
+  let changed = false
+  for (const k of ["min", "max"]) {
+    const v = find(fs, k)
+    if (v === undefined || isNull(v) || v.startsWith("\"")) continue
+    const n = parseFloat(v)
+    if (n === undefined) continue
+    setField(&fs, k, quote(`${Math.round(n)}ns`))
+    changed = true
+  }
+  return changed ? build(fs) : raw
+}
+
+// The mocker's config text with its latencies (global_latency and each rule's) in Go strings, so a config that gives them
+// as integer nanoseconds reads as one that gives "<n>ns".
+export function mockerConfigText(text: string): string throws SyntaxError {
+  let fs = try fields(text)
+  const gl = find(fs, "global_latency")
+  if (gl !== undefined) setField(&fs, "global_latency", try latencyText(gl))
+  const rules = find(fs, "rules")
+  if (rules !== undefined && rules.startsWith("[")) {
+    const out: string[] = []
+    for (const el of try elements(rules)) {
+      if (!el.startsWith("{")) {
+        out.push(el)
+        continue
+      }
+      let rf = try fields(el)
+      const lat = find(rf, "latency")
+      if (lat !== undefined) setField(&rf, "latency", try latencyText(lat))
+      out.push(build(rf))
+    }
+    setField(&fs, "rules", "[" + out.join(",") + "]")
+  }
+  return build(fs)
+}
+
+// ---- faker values for message templates ({{faker.<method>}} or {{faker.<method>:<args>}}, Bifrost's set) ----
+
+const FIRST_NAMES = ["Ada", "Grace", "Alan", "Linus", "Margaret", "Dennis", "Barbara", "Ken", "Frances", "John"]
+const LAST_NAMES = ["Lovelace", "Hopper", "Turing", "Torvalds", "Hamilton", "Ritchie", "Liskov", "Thompson", "Allen", "Backus"]
+const CITIES = ["Springfield", "Riverton", "Fairview", "Lakewood", "Greenville", "Madison", "Georgetown", "Franklin"]
+const STATES = ["California", "Texas", "Oregon", "Vermont", "Ohio", "Nevada", "Maine", "Utah"]
+const STREETS = ["Main St", "Oak Ave", "Maple Dr", "Cedar Ln", "Pine Rd", "Elm St", "Lake View", "Hill Rd"]
+const COMPANIES = ["Acme", "Globex", "Initech", "Umbrella", "Hooli", "Vandelay", "Stark", "Wayne"]
+const SUFFIXES = ["Inc", "LLC", "Group", "Labs", "Corp"]
+const JOBS = ["Engineer", "Designer", "Analyst", "Manager", "Architect", "Scientist", "Consultant", "Technician"]
+const WORDS = ["lorem", "ipsum", "dolor", "sit", "amet", "consectetur", "adipiscing", "elit", "sed", "do", "eiusmod", "tempor", "incididunt", "ut", "labore", "et", "dolore", "magna", "aliqua", "enim"]
+const HEX = "0123456789abcdef"
+
+function pickOf(xs: string[]): string {
+  return xs[Math.floor(Math.random() * xs.length)] ?? ""
+}
+
+function intBetween(min: int, max: int): int {
+  if (max <= min) return min
+  return min + Math.floor(Math.random() * (max - min + 1))
+}
+
+function digits(n: int): string {
+  let out = ""
+  for (let i = 0; i < n; i++) out += `${intBetween(0, 9)}`
+  return out
+}
+
+function hexDigits(n: int): string {
+  let out = ""
+  for (let i = 0; i < n; i++) {
+    const k = intBetween(0, 15)
+    out += HEX.slice(k, k + 1)
+  }
+  return out
+}
+
+function padTwo(n: int): string {
+  return n < 10 ? `0${n}` : `${n}`
+}
+
+// A sentence of n lorem words, capitalised and ended with a full stop.
+function sentence(n: int): string {
+  const ws: string[] = []
+  for (let i = 0; i < Math.max(1, n); i++) ws.push(pickOf(WORDS))
+  const s = ws.join(" ")
+  return s.slice(0, 1).toUpperCase() + s.slice(1) + "."
+}
+
+function countArg(args: string, dflt: int): int {
+  const n = parseInt(args.trim())
+  return n === undefined || n < 1 ? dflt : n
+}
+
+// A UTC time in milliseconds as Go's 2006-01-02, or 2006-01-02 15:04:05 with the clock (days to a civil date).
+export function goTime(ms: f64, withClock: bool): string {
+  const secs = Math.floor(ms / 1000.0)
+  const days = Math.floor(secs / 86400)
+  const rem = secs - days * 86400
+  const z = days + 719468
+  const era = Math.floor(z / 146097)
+  const doe = z - era * 146097
+  const yoe = Math.floor((doe - Math.floor(doe / 1460) + Math.floor(doe / 36524) - Math.floor(doe / 146096)) / 365)
+  const doy = doe - (365 * yoe + Math.floor(yoe / 4) - Math.floor(yoe / 100))
+  const mp = Math.floor((5 * doy + 2) / 153)
+  const d = doy - Math.floor((153 * mp + 2) / 5) + 1
+  const m = mp < 10 ? mp + 3 : mp - 9
+  const y = yoe + era * 400 + (m <= 2 ? 1 : 0)
+  const day = `${y}-${padTwo(m)}-${padTwo(d)}`
+  if (!withClock) return day
+  return `${day} ${padTwo(Math.floor(rem / 3600))}:${padTwo(Math.floor((rem % 3600) / 60))}:${padTwo(rem % 60)}`
+}
+
+// A random time in the past year (the faker's date and datetime).
+function fakeTime(withClock: bool): string {
+  return goTime(Date.now() - Math.random() * 365.0 * 86400000.0, withClock)
+}
+
+// The value of one faker method (with its arguments after a colon), or undefined for a method Bifrost does not have
+// (the placeholder then stays as written).
+export function fakerValue(method: string): string | undefined {
+  const colon = method.indexOf(":")
+  const base = colon < 0 ? method : method.slice(0, colon)
+  const args = colon < 0 ? "" : method.slice(colon + 1)
+  if (base === "name") return `${pickOf(FIRST_NAMES)} ${pickOf(LAST_NAMES)}`
+  if (base === "first_name") return pickOf(FIRST_NAMES)
+  if (base === "last_name") return pickOf(LAST_NAMES)
+  if (base === "email") return `${pickOf(FIRST_NAMES).toLowerCase()}.${pickOf(LAST_NAMES).toLowerCase()}@example.com`
+  if (base === "phone") return `${digits(3)}-${digits(3)}-${digits(4)}`
+  if (base === "address") return `${intBetween(1, 9999)} ${pickOf(STREETS)}, ${pickOf(CITIES)}`
+  if (base === "city") return pickOf(CITIES)
+  if (base === "state") return pickOf(STATES)
+  if (base === "zip_code") return digits(5)
+  if (base === "company") return `${pickOf(COMPANIES)} ${pickOf(SUFFIXES)}`
+  if (base === "job_title") return pickOf(JOBS)
+  if (base === "lorem_ipsum") return sentence(countArg(args, 10))
+  if (base === "sentence") return sentence(countArg(args, 8))
+  if (base === "word") return pickOf(WORDS)
+  if (base === "uuid") {
+    const v = intBetween(0, 3)
+    return `${hexDigits(8)}-${hexDigits(4)}-4${hexDigits(3)}-${"89ab".slice(v, v + 1)}${hexDigits(3)}-${hexDigits(12)}`
+  }
+  if (base === "hex_color") return "#" + hexDigits(6)
+  if (base === "integer" || base === "float") {
+    const ps = args.split(",")
+    const dmax = base === "integer" ? 100 : 100
+    let lo = base === "integer" ? 1 : 0
+    let hi = dmax
+    if (ps.length >= 2) {
+      lo = parseInt(ps[0]!.trim()) ?? lo
+      hi = parseInt(ps[1]!.trim()) ?? hi
+    }
+    if (base === "integer") return `${intBetween(lo, hi)}`
+    const f = lo * 1.0 + Math.random() * (hi - lo) * 1.0
+    return f.toFixed(2)
+  }
+  if (base === "boolean") return Math.random() < 0.5 ? "true" : "false"
+  if (base === "date") return fakeTime(false)
+  if (base === "datetime") return fakeTime(true)
+  return undefined
+}
+
+// A message template with {{provider}}, {{model}} and the {{faker.*}} variables filled in (Bifrost's applyTemplate).
+export function applyTemplate(template: string, provider: string, model: string): string {
+  if (!template.includes("{{")) return template
+  const s = template.replaceAll("{{provider}}", provider).replaceAll("{{model}}", model)
+  let out = ""
+  let rest = s
+  while (true) {
+    const at = rest.indexOf("{{faker.")
+    if (at < 0) break
+    const end = rest.slice(at).indexOf("}}")
+    if (end < 0) break
+    const v = fakerValue(rest.slice(at + 8, at + end))
+    out += rest.slice(0, at) + (v ?? rest.slice(at, at + end + 2))
+    rest = rest.slice(at + end + 2)
+  }
+  return out + rest
+}
+
 // The delay of one request: fixed at min, or uniform between min and max.
 function latencyMs(l: MockLatency): int {
   const min = goDurationMs(l.min ?? "") ?? 0.0
@@ -509,12 +872,25 @@ function messageText(body: string): string {
   return out
 }
 
-// Whether the request meets a rule's conditions. A provider is taken from a "provider/model" name.
-function conditionsMatch(c: MockConditions | undefined, model: string, body: string): bool {
-  if (c === undefined) return true
+// The request's provider and its model without the provider: the provider the gateway resolved for it (ctx.provider, so a
+// bare model name has its default provider, as Bifrost's request carries one), else the "provider/" of the name.
+export function providerAndModel(ctx: PluginContext): { provider: string, model: string } {
+  const model = ctx.model
+  if (ctx.provider !== "") {
+    const prefix = ctx.provider + "/"
+    return { provider: ctx.provider, model: model.startsWith(prefix) ? model.slice(prefix.byteLength) : model }
+  }
   const slash = model.indexOf("/")
-  const provider = slash < 0 ? "" : model.slice(0, slash)
-  const bare = slash < 0 ? model : model.slice(slash + 1)
+  return { provider: slash < 0 ? "" : model.slice(0, slash), model: slash < 0 ? model : model.slice(slash + 1) }
+}
+
+// Whether the request meets a rule's conditions.
+function conditionsMatch(c: MockConditions | undefined, ctx: PluginContext, body: string): bool {
+  if (c === undefined) return true
+  const model = ctx.model
+  const pm = providerAndModel(ctx)
+  const provider = pm.provider
+  const bare = pm.model
   const ps = c.providers ?? []
   if (ps.length > 0 && !ps.includes(provider)) return false
   const ms = c.models ?? []
@@ -549,21 +925,22 @@ function pickResponse(rs: MockResponse[]): MockResponse {
   return rs[rs.length - 1]!
 }
 
-// A success answer built from Bifrost's content fields. {{model}} and {{provider}} are filled in.
-function contentShort(c: MockContent | undefined, model: string, status: int): PreResult {
-  const at = model.indexOf("/")
-  const provider = at < 0 ? "" : model.slice(0, at)
-  const bare = at < 0 ? model : model.slice(at + 1)
-  const text = (c?.message_template ?? c?.message ?? "").replaceAll("{{model}}", bare).replaceAll("{{provider}}", provider)
+// A success answer built from Bifrost's content fields. A message_template has {{model}}, {{provider}} and the
+// {{faker.*}} variables filled in; a plain message has {{model}} and {{provider}} filled in (Raiju's own).
+function contentShort(c: MockContent | undefined, ctx: PluginContext, status: int): PreResult {
+  const pm = providerAndModel(ctx)
+  const tpl = c?.message_template
+  const text = tpl !== undefined && tpl !== "" ? applyTemplate(tpl, pm.provider, pm.model) : (c?.message ?? "").replaceAll("{{model}}", pm.model).replaceAll("{{provider}}", pm.provider)
   const usage = c?.usage ?? {}
-  const out = completionFull(c?.model ?? bare, text, usage, c?.finish_reason ?? "stop")
+  const out = completionFull(c?.model ?? pm.model, text, usage, c?.finish_reason ?? "stop")
   return { kind: "short_circuit", status: status, body: out, contentType: "application/json" }
 }
 
-// An error answer: Bifrost's status_code, 500 when none is given.
-function errorShort(e: MockError | undefined): PreResult {
+// An error answer: Bifrost's status_code, 500 when none is given. allow_fallbacks false makes it final; unset, the
+// request's fallbacks are tried (Bifrost's AllowFallbacks, nil meaning true).
+function errorShort(e: MockError | undefined, allowFallbacks: bool | undefined): PreResult {
   const status = e?.status_code ?? 500
-  return { kind: "short_circuit", status: status, body: errorJson(e?.message ?? "", e?.type ?? "", e?.code), contentType: "application/json" }
+  return { kind: "short_circuit", status: status, body: errorJson(e?.message ?? "", e?.type ?? "", e?.code), contentType: "application/json", allowFallbacks: allowFallbacks }
 }
 
 // model: exact match or "*"; contains: substring of the request body. A missing
@@ -581,6 +958,13 @@ function matchesRule(r: MockRule, model: string, body: string): bool {
 // (Bifrost stops at that rule). With no rule matching, default_behavior decides: passthrough
 // (the default), error or success.
 export class MockerPlugin extends BasePlugin {
+  // Bifrost's GetStats counters, for this process
+  totalRequests = 0
+  mockedRequests = 0
+  responsesGenerated = 0
+  errorsGenerated = 0
+  ruleHits: Map<string, int> = new Map()
+
   constructor(readonly config: MockerConfig) {
     super()
   }
@@ -595,26 +979,51 @@ export class MockerPlugin extends BasePlugin {
     if (this.config.default_behavior === "error" || this.config.default_behavior === "success") return true
     for (const r of this.config.rules) {
       if (r.enabled === false) continue
-      if (matchesRule(r, ctx.model, chat) && conditionsMatch(r.conditions, ctx.model, chat)) return true
+      if (matchesRule(r, ctx.model, chat) && conditionsMatch(r.conditions, ctx, chat)) return true
     }
     return false
   }
 
+  // Bifrost's MockStats: requests seen, requests mocked (a rule answered), hits per rule name, and the answers made.
+  statsJson(): string {
+    const hits: string[] = []
+    for (const k of this.ruleHits.keys()) hits.push(`${quote(k)}:${this.ruleHits.get(k) ?? 0}`)
+    return `{"total_requests":${this.totalRequests},"mocked_requests":${this.mockedRequests},"rule_hits":{${hits.join(",")}},"errors_generated":${this.errorsGenerated},"responses_generated":${this.responsesGenerated}}`
+  }
+
+  private hit(r: MockRule): void {
+    this.mockedRequests += 1
+    const name = r.name ?? ""
+    this.ruleHits.set(name, (this.ruleHits.get(name) ?? 0) + 1)
+  }
+
   preRequest(inout ctx: PluginContext, body: string): PreResult {
+    this.totalRequests += 1
     for (const r of byPriority(this.config.rules)) {
       if (r.enabled === false) continue
-      if (!matchesRule(r, ctx.model, body) || !conditionsMatch(r.conditions, ctx.model, body)) continue
+      if (!matchesRule(r, ctx.model, body) || !conditionsMatch(r.conditions, ctx, body)) continue
       if (r.probability !== undefined && r.probability > 0.0 && Math.random() > r.probability) return { kind: "continue", body: body }
       const lat = r.latency ?? (r.latency_ms === undefined ? this.config.global_latency : undefined)
       const delay = lat !== undefined ? latencyMs(lat) : (r.latency_ms ?? 0)
       if (delay > 0) ctx.values.set("mock_latency_ms", `${delay}`)
       if (r.responses !== undefined && r.responses.length > 0) {
         const pick = pickResponse(r.responses)
-        if (pick.type === "error") return errorShort(pick.error)
-        if (pick.type === "success") return contentShort(pick.content, ctx.model, 200)
+        if (pick.type === "error") {
+          this.hit(r)
+          this.errorsGenerated += 1
+          return errorShort(pick.error, pick.allow_fallbacks)
+        }
+        if (pick.type === "success") {
+          this.hit(r)
+          this.responsesGenerated += 1
+          return contentShort(pick.content, ctx, 200)
+        }
         return { kind: "continue", body: body }
       }
+      this.hit(r)
       const status = r.status ?? 200
+      if (status >= 400) this.errorsGenerated += 1
+      else this.responsesGenerated += 1
       const raw = r.response
       if (raw !== undefined) {
         return { kind: "short_circuit", status: status, body: raw, contentType: "application/json" }
@@ -622,10 +1031,9 @@ export class MockerPlugin extends BasePlugin {
       const out = completionJson(ctx.model, r.content ?? "")
       return { kind: "short_circuit", status: status, body: out, contentType: "application/json" }
     }
-    const model = ctx.model
-    if (this.config.default_behavior === "error") return errorShort({ message: "Mock plugin default error" })
+    if (this.config.default_behavior === "error") return errorShort({ message: "Mock plugin default error" }, undefined)
     if (this.config.default_behavior === "success") {
-      return contentShort({ message: "Mock plugin default response", usage: { prompt_tokens: 5, completion_tokens: 10, total_tokens: 15 } }, model, 200)
+      return contentShort({ message: "Mock plugin default response", usage: { prompt_tokens: 5, completion_tokens: 10, total_tokens: 15 } }, ctx, 200)
     }
     return { kind: "continue", body: body }
   }
@@ -691,6 +1099,9 @@ function stripFencesIn(body: string): string throws SyntaxError {
   return build(fs)
 }
 
+// The text of a Responses stream so far, per request (ctx.values), for the jsonparser.
+const JSON_ACC = "jsonparser.acc"
+
 export class JsonParserPlugin extends BasePlugin {
   constructor(readonly config: JsonParserConfig) {
     super()
@@ -703,6 +1114,32 @@ export class JsonParserPlugin extends BasePlugin {
   // the fences are taken out of the chat answer, before it is converted to the route's format
   appliesNative(ctx: PluginContext, chat: string): bool {
     return this.config.strip_markdown_fences === true
+  }
+
+  // Chat, and with usage all_requests the Responses API too (Bifrost completes the JSON of Responses streams).
+  handlesOp(op: string): bool {
+    return op === "chat" || (op === "responses" && this.config.usage === "all_requests")
+  }
+
+  // A Responses stream's output_text.delta events carry the text so far completed as JSON, as Bifrost's PostLLMHook
+  // does for ResponsesStreamRequest; an event whose text so far cannot be completed is skipped (StreamControl). Chat
+  // streams are completed as they are converted (JsonStreamFixer).
+  postChunk(inout ctx: PluginContext, status: int, chunk: string): PostResult {
+    if (ctx.op !== "responses" || this.config.usage !== "all_requests" || status >= 400) return { kind: "continue", body: chunk }
+    try {
+      let fs = fields(chunk)
+      if (rawStr(fs, "type") !== "response.output_text.delta") return { kind: "continue", body: chunk }
+      const delta = rawStr(fs, "delta") ?? ""
+      if (delta === "") return { kind: "continue", body: chunk }
+      const acc = (ctx.values.get(JSON_ACC) ?? "") + delta
+      ctx.values.set(JSON_ACC, acc)
+      const fixed = completePartialJson(acc)
+      if (!validJson(fixed)) return { kind: "skip" }
+      setField(&fs, "delta", quote(fixed))
+      return { kind: "continue", body: build(fs) }
+    } catch (e) {
+      return { kind: "continue", body: chunk }
+    }
   }
 
   postResponse(inout ctx: PluginContext, status: int, body: string): PostResult {
@@ -958,10 +1395,11 @@ function withContent(ev: string, text: string): string {
 }
 
 // Bifrost's jsonparser on a stream: each chunk's content is added to the answer so far, and the chunk
-// carries that answer completed as JSON. Text that cannot be completed ends the stream with an error
-// event, as Bifrost's SkipStream error does. Events are passed on whole, as the converter produced them.
+// carries that answer completed as JSON. A chunk whose answer so far cannot be completed is dropped and the
+// stream goes on, as Bifrost's error with StreamControl skip_stream does. Events are passed on whole, as the
+// converter produced them.
 export class JsonStreamFixer {
-  // set when the text could not be completed and the stream has ended
+  // never set: a chunk that cannot be completed is skipped, it does not end the stream
   stopped = false
   private acc = ""
   private pending = ""
@@ -983,11 +1421,7 @@ export class JsonStreamFixer {
       }
       this.acc += piece
       const fixed = completePartialJson(this.acc)
-      if (!validJson(fixed)) {
-        this.stopped = true
-        this.pending = ""
-        return out + `data: ${errorJson("Invalid JSON in streaming response", "api_error", undefined)}\n\ndata: [DONE]\n\n`
-      }
+      if (!validJson(fixed)) continue
       out += withContent(ev, fixed)
     }
     return out
@@ -1157,6 +1591,11 @@ export class WasmPlugin extends BasePlugin {
     return this.host.hasHttp()
   }
 
+  // its standard output and error become its plugin logs
+  takeOutput(): string {
+    return this.host.takeOutput()
+  }
+
   private context(ctx: PluginContext): string {
     const have = ctx.values.get(WASM_CONTEXT) ?? ""
     return have === "" ? `{"request_id":${quote(ctx.requestId)}}` : have
@@ -1178,6 +1617,7 @@ export class WasmPlugin extends BasePlugin {
     ctx.values.set(WASM_CONTEXT, r.context)
     if (r.kind === "status") return { kind: "status", status: r.status, body: r.body }
     if (r.kind === "body") return { kind: "continue", body: r.body }
+    if (r.kind === "skip") return { kind: "skip" }
     return { kind: "continue", body: body }
   }
 
@@ -1246,8 +1686,15 @@ type Sequenced = { p: BasePlugin, rank: int, order: int, at: int }
 // on a bad config; returns undefined for a name nothing provides.
 function makePlugin(name: string, text: string, path: string | undefined, limits: WasmPluginLimits | undefined): BasePlugin | undefined throws SyntaxError {
   if (path !== undefined && path.trim() !== "") {
+    // a URL loads from the copy plugindl.tov downloaded (at startup, on the API's save, or on a reload)
+    let file = path.trim()
+    if (isPluginUrl(file)) {
+      const got = downloadedPlugin(file)
+      if (got === undefined) throw new SyntaxError(`the plugin at "${file}" has not been downloaded`)
+      file = got
+    }
     try {
-      return new WasmPlugin(openWasmPlugin(path.trim(), text, limits))
+      return new WasmPlugin(openWasmPlugin(file, text, limits))
     } catch (e) {
       throw new SyntaxError(e.message)
     }
@@ -1257,7 +1704,7 @@ function makePlugin(name: string, text: string, path: string | undefined, limits
     return new HeaderPlugin(cfg)
   }
   if (name === "mocker") {
-    const cfg = try JSON.parse(text) as MockerConfig
+    const cfg = try JSON.parse(try mockerConfigText(text)) as MockerConfig
     return new MockerPlugin(cfg)
   }
   if (name === "jsonparser") {
@@ -1304,8 +1751,14 @@ export function buildChain(entries: PluginEntry[]): { chain: PluginChain, errors
     return a.at - b.at
   })
   const plugins: BasePlugin[] = []
-  for (const s of seq) plugins.push(s.p)
-  return { chain: new PluginChain(plugins), errors: errors }
+  const ranks: int[] = []
+  for (const s of seq) {
+    plugins.push(s.p)
+    ranks.push(s.rank)
+  }
+  const chain = new PluginChain(plugins)
+  chain.ranks = ranks
+  return { chain: chain, errors: errors }
 }
 
 // The status of one configured entry, as the plugin list reports it: disabled, active, or error with
@@ -1347,6 +1800,12 @@ class Recorder extends BasePlugin {
     if (this.failPost) throw new Error("boom")
     return { kind: "continue", body: body + "+" + this.id }
   }
+}
+
+// The body a post hook answered with ("" for a skip).
+function bodyOf(r: PostResult): string {
+  if (r.kind === "skip") return ""
+  return r.body
 }
 
 function add(inout ctx: PluginContext, entry: string): void {
@@ -1468,20 +1927,20 @@ test("jsonparser strips json fences with and without a language tag", () => {
   const bare = JSON.stringify({ object: "chat.completion", model: "m", choices: [{ index: 0, message: { role: "assistant", content: "```\n[1,2]\n```" } }] })
   let ctx = ctxFor("m")
   const t = plugin.postResponse(&ctx, 200, tagged)
-  expect((try JSON.parse(t.body) as Completion).choices[0]!.message.content).toBe("{\"a\":1}")
+  expect((try JSON.parse(bodyOf(t)) as Completion).choices[0]!.message.content).toBe("{\"a\":1}")
   const b = plugin.postResponse(&ctx, 200, bare)
-  expect((try JSON.parse(b.body) as Completion).choices[0]!.message.content).toBe("[1,2]")
+  expect((try JSON.parse(bodyOf(b)) as Completion).choices[0]!.message.content).toBe("[1,2]")
 })
 
 test("jsonparser leaves unfenced content and other bodies untouched", () => {
   const plugin = new JsonParserPlugin({ strip_markdown_fences: true })
   const plain = JSON.stringify({ object: "chat.completion", model: "m", choices: [{ index: 0, message: { role: "assistant", content: "{\"a\":1}" } }] })
   let ctx = ctxFor("m")
-  expect(plugin.postResponse(&ctx, 200, plain).body).toBe(plain)
-  expect(plugin.postResponse(&ctx, 200, "not json").body).toBe("not json")
+  expect(bodyOf(plugin.postResponse(&ctx, 200, plain))).toBe(plain)
+  expect(bodyOf(plugin.postResponse(&ctx, 200, "not json"))).toBe("not json")
   const off = new JsonParserPlugin({ strip_markdown_fences: false })
   const fenced = JSON.stringify({ object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: "```json\n{}\n```" } }] })
-  expect(off.postResponse(&ctx, 200, fenced).body).toBe(fenced)
+  expect(bodyOf(off.postResponse(&ctx, 200, fenced))).toBe(fenced)
 })
 
 test("blocklist rejects any case of a listed word", () => {
@@ -1565,7 +2024,7 @@ function jsonChunk(c: string): string {
   return `data: {"choices":[{"index":0,"delta":{"content":${JSON.stringify(c)}}}]}\n\n`
 }
 
-test("JsonStreamFixer completes the answer so far, and text that cannot be completed ends the stream", () => {
+test("JsonStreamFixer completes the answer so far, and a chunk that cannot be completed is skipped", () => {
   const f = new JsonStreamFixer()
   const one = f.filter(jsonChunk(`{"a":1`))
   expect(one.includes(`"content":${JSON.stringify(`{"a":1}`)}`)).toBe(true)
@@ -1574,10 +2033,96 @@ test("JsonStreamFixer completes the answer so far, and text that cannot be compl
   expect(two.startsWith(`data: {"choices":[{"index":0,`)).toBe(true)
   expect(f.stopped).toBe(false)
   const bad = new JsonStreamFixer()
-  const out = bad.filter(jsonChunk("not json"))
-  expect(bad.stopped).toBe(true)
-  expect(out.includes("Invalid JSON in streaming response")).toBe(true)
+  const out = bad.filter(jsonChunk("not json") + `data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n` + "data: [DONE]\n\n")
+  expect(bad.stopped).toBe(false)
+  expect(out.includes("not json")).toBe(false)
+  expect(out.includes(`"finish_reason":"stop"`)).toBe(true)
   expect(out.endsWith("data: [DONE]\n\n")).toBe(true)
+})
+
+// Drops a chunk that contains "drop" (StreamControl skip), and marks each chunk it passes.
+class SkipChunks extends BasePlugin {
+  constructor(readonly id: string) {
+    super()
+  }
+
+  name(): string {
+    return this.id
+  }
+
+  postChunk(inout ctx: PluginContext, status: int, chunk: string): PostResult {
+    add(&ctx, "chunk:" + this.id)
+    if (chunk.includes("drop")) return { kind: "skip" }
+    return { kind: "continue", body: chunk + this.id }
+  }
+
+  postResponse(inout ctx: PluginContext, status: int, body: string): PostResult {
+    return { kind: "skip" }
+  }
+}
+
+test("a chunk a post hook skips is dropped, and the plugins before it in the chain do not see it", () => {
+  const chain = new PluginChain([new SkipChunks("a"), new SkipChunks("b")])
+  let ctx = ctxFor("m")
+  chain.runPre(&ctx, "{}")
+  const kept = chain.runPostChunk(&ctx, "x")
+  expect(kept.body).toBe("xba")
+  expect(kept.skip === true).toBe(false)
+  ctx.values.delete("trace")
+  const dropped = chain.runPostChunk(&ctx, "drop")
+  expect(dropped.skip).toBe(true)
+  expect(ctx.values.get("trace")).toBe("chunk:b")
+  // on a whole answer a skip changes nothing
+  expect(chain.runPost(&ctx, 200, "whole").body).toBe("whole")
+})
+
+test("the post hooks split at the cache: post_builtin plugins first, then pre_builtin and builtin ones", () => {
+  const chain = new PluginChain([new Recorder("pre", false, false, false), new Recorder("post1", false, false, false), new Recorder("post2", false, false, false)])
+  chain.ranks = [0, 2, 2]
+  expect(chain.cacheAt()).toBe(1)
+  let ctx = ctxFor("m")
+  chain.runPre(&ctx, "x")
+  const s = chain.runPostSplit(&ctx, 200, "r")
+  expect(s.cached.body).toBe("r+post2+post1")
+  expect(s.out.body).toBe("r+post2+post1+pre")
+  expect(ctx.values.get("plugins.ran")).toBeUndefined()
+  // a cache hit: only the plugins before the cache see the cached answer
+  let hit = ctxFor("m")
+  chain.runPre(&hit, "x")
+  expect(chain.runPostCached(&hit, 200, "cached").body).toBe("cached+pre")
+  // with every plugin post_builtin (the default) nothing runs on a hit
+  const plain = new PluginChain([new Recorder("a", false, false, false)])
+  expect(plain.cacheAt()).toBe(0)
+  let p = ctxFor("m")
+  plain.runPre(&p, "x")
+  expect(plain.runPostCached(&p, 200, "c").body).toBe("c")
+  const built = buildChain([{ name: "header", configJson: "{}", placement: "pre_builtin" }, { name: "maxtokens", configJson: "{}" }])
+  expect(built.chain.ranks.join(",")).toBe("0,2")
+  expect(built.chain.cacheAt()).toBe(1)
+})
+
+test("jsonparser completes a Responses stream's text deltas and skips one that cannot be completed", () => {
+  const p = new JsonParserPlugin({ usage: "all_requests" })
+  expect(p.handlesOp("responses")).toBe(true)
+  expect(new JsonParserPlugin({ strip_markdown_fences: true }).handlesOp("responses")).toBe(false)
+  const chain = new PluginChain([p])
+  let ctx = ctxFor("m")
+  ctx.op = "responses"
+  chain.runPre(&ctx, "{}")
+  const one = chain.runPostChunk(&ctx, `{"type":"response.output_text.delta","item_id":"i","delta":"{\\"a\\":1"}`)
+  expect(one.skip === true).toBe(false)
+  expect(one.body).toBe(`{"type":"response.output_text.delta","item_id":"i","delta":"{\\"a\\":1}"}`)
+  const other = chain.runPostChunk(&ctx, `{"type":"response.created","response":{}}`)
+  expect(other.body).toBe(`{"type":"response.created","response":{}}`)
+  let bad = ctxFor("m")
+  bad.op = "responses"
+  chain.runPre(&bad, "{}")
+  const skipped = chain.runPostChunk(&bad, `{"type":"response.output_text.delta","delta":"plain words"}`)
+  expect(skipped.skip).toBe(true)
+  // chat streams are left to the converter
+  let chat = ctxFor("m")
+  chain.runPre(&chat, "{}")
+  expect(chain.runPostChunk(&chat, `{"choices":[]}`).body).toBe(`{"choices":[]}`)
 })
 
 test("jsonparser streams only with usage all_requests", () => {
@@ -1684,6 +2229,60 @@ test("mocker weights pick a response, and global latency sets the delay", () => 
   const r = p.preRequest(&ctx, "{}")
   expect(ctx.values.get("mock_latency_ms")).toBe("250")
   if (r.kind === "short_circuit") expect(r.body.includes(`"content":"always"`)).toBe(true)
+})
+
+test("message templates fill the model, the provider and Bifrost's faker variables", () => {
+  const out = applyTemplate("{{provider}}/{{model}}: {{faker.first_name}} {{faker.integer:7,7}} {{faker.nope}}", "openai", "gpt-4o")
+  expect(out.startsWith("openai/gpt-4o: ")).toBe(true)
+  expect(out.includes("{{faker.first_name}}")).toBe(false)
+  expect(out.includes(" 7 ")).toBe(true)
+  expect(out.endsWith("{{faker.nope}}")).toBe(true)
+  expect((fakerValue("uuid") ?? "").byteLength).toBe(36)
+  expect((fakerValue("hex_color") ?? "").startsWith("#")).toBe(true)
+  expect((fakerValue("lorem_ipsum:3") ?? "").split(" ").length).toBe(3)
+  expect((fakerValue("float:2,2") ?? "")).toBe("2.00")
+  expect((fakerValue("date") ?? "").byteLength).toBe(10)
+  expect(fakerValue("email")!.endsWith("@example.com")).toBe(true)
+  expect(goTime(0.0, true)).toBe("1970-01-01 00:00:00")
+  expect(goTime(1700000000000.0, false)).toBe("2023-11-14")
+  expect(goTime(951782400000.0, false)).toBe("2000-02-29")
+})
+
+test("mocker latencies read integer nanoseconds as Bifrost's Duration does", () => {
+  const text = try mockerConfigText(`{"global_latency":{"min":250000000,"max":null,"type":"fixed"},"rules":[{"name":"a","latency":{"min":"5ms","max":2000000000,"type":"uniform"},"responses":[]}]}`)
+  expect(text.includes(`"min":"250000000ns"`)).toBe(true)
+  expect(text.includes(`"min":"5ms","max":"2000000000ns"`)).toBe(true)
+  const built = buildChain([{ name: "mocker", configJson: `{"global_latency":{"min":250000000,"type":"fixed"},"rules":[{"name":"r","responses":[{"type":"success","content":{"message":"x"}}]}]}` }])
+  expect(built.errors.length).toBe(0)
+  let ctx = mockCtx("m")
+  built.chain.runPre(&ctx, "{}")
+  expect(ctx.values.get("mock_latency_ms")).toBe("250")
+})
+
+test("mocker: the resolved provider stands for a bare model, allow_fallbacks rides on errors, and stats count", () => {
+  const cfg = try JSON.parse(`{"rules":[
+    {"name":"prov","conditions":{"providers":["openai"],"models":["gpt-4o"]},"responses":[{"type":"success","content":{"message_template":"{{provider}} {{model}}"}}]},
+    {"name":"final","conditions":{"models":["final-1"]},"responses":[{"type":"error","allow_fallbacks":false,"error":{"message":"no","status_code":503}}]},
+    {"name":"soft","conditions":{"models":["soft-1"]},"responses":[{"type":"error","error":{"message":"no","status_code":503}}]}
+  ]}`) as MockerConfig
+  const p = new MockerPlugin(cfg)
+  let bare = mockCtx("gpt-4o")
+  bare.provider = "openai"
+  const r = p.preRequest(&bare, "{}")
+  expect(r.kind).toBe("short_circuit")
+  if (r.kind === "short_circuit") expect(r.body.includes(`"content":"openai gpt-4o"`)).toBe(true)
+  let unknown = mockCtx("gpt-4o")
+  expect(p.preRequest(&unknown, "{}").kind).toBe("continue")
+  let f = mockCtx("openai/final-1")
+  const fr = p.preRequest(&f, "{}")
+  expect(fr.kind === "short_circuit" && fr.allowFallbacks === false && fr.status === 503).toBe(true)
+  let s = mockCtx("openai/soft-1")
+  const sr = p.preRequest(&s, "{}")
+  expect(sr.kind === "short_circuit" && sr.allowFallbacks === undefined).toBe(true)
+  expect(p.statsJson()).toBe(`{"total_requests":4,"mocked_requests":3,"rule_hits":{"prov":1,"final":1,"soft":1},"errors_generated":2,"responses_generated":1}`)
+  const chain = new PluginChain([p])
+  expect(chain.statsOf("mocker")).toBe(p.statsJson())
+  expect(chain.statsOf("header")).toBe("")
 })
 
 // ---- WebAssembly plugins in the chain (tests/wasm/plugin.wasm; source tests/wasm/plugin.c) ----

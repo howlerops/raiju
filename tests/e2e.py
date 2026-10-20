@@ -2841,7 +2841,7 @@ def l97m_e2e(env):
         up = [x for x in seen() if x["path"] == "/v1/chat/completions"][-1]
         check("a chain rule re-routes the model before the upstream call", s == 200 and json.loads(up["body"])["model"] == "gpt-4o-mini", (s, up["body"][:200]))
         s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "stream": True, "messages": msgs}, None, base=GW_L97M_A, auth=False)
-        check("jsonparser completes a stream, and text that is not JSON ends it with an error event", "Invalid JSON in streaming response" in b and "[DONE]" in b, b[:300])
+        check("jsonparser on a stream: chunks whose text is not JSON are skipped (Bifrost's StreamControl skip) and the stream still ends", "Invalid JSON in streaming response" not in b and '"Hel"' not in b and "[DONE]" in b, b[:300])
 
         mine = ""
         for _ in range(40):
@@ -3861,6 +3861,8 @@ def l97l_e2e(env):
         cookie = hdr(h, "set-cookie") or ""
         check("the setup token trades for an HttpOnly setup session cookie with an expiry", s == 200 and cookie.startswith("bifrost_setup_session=") and "HttpOnly" in cookie and "SameSite=Strict" in cookie and "expires_at" in b, (s, cookie[:120], b[:200]))
         value = cookie.split(";")[0].split("=", 1)[1] if cookie != "" else ""
+        s, _, b = call("POST", "/api/plugins", {"name": "x-l170", "path": "/tmp/x-l170.wasm"}, {"cookie": "bifrost_setup_session=" + value}, base=GW_L97L_SETUP, auth=False)
+        check("a custom plugin path needs genuine admin authentication while dashboard auth is off", s == 403 and "genuine admin authentication" in b, (s, b[:200]))
         s, _, b = call("POST", "/api/users", {"name": "first", "role": "admin", "password": "first-pass-1"}, {"cookie": "bifrost_setup_session=" + value}, base=GW_L97L_SETUP, auth=False)
         check("the setup session cookie creates the first admin without the token", s in (200, 201), (s, b[:200]))
         s, _, b = call("POST", "/api/session/setup", None, {"x-bifrost-setup-token": "l97l-setup"}, base=GW_L97L_SETUP, auth=False)
@@ -4014,7 +4016,7 @@ def l97l_e2e(env):
         blocked = l97l_chat("a forbidden-l97l word, switched on again")
         check("a switched-on plugin refuses again", s == 200 and blocked[0] == 400, (s, blocked[0]))
         s, _, b = api("PUT", "/api/plugins/nosuch-l97l", {"enabled": True})
-        check("changing a plugin that is not configured is a 404", s == 404, (s, b[:200]))
+        check("changing an unconfigured plugin this gateway does not build is refused", s == 400 and "unknown plugin" in b, (s, b[:200]))
         s, _, b = api("DELETE", "/api/plugins/blocklist")
         check("a plugin is removed", s == 200, (s, b[:200]))
         s, _, b = api("GET", "/api/plugins/blocklist")
@@ -4026,6 +4028,12 @@ def l97l_e2e(env):
         check("the removal is persisted", all(p.get("name") != "blocklist" for p in saved.get("plugins", [])), [p.get("name") for p in saved.get("plugins", [])])
         s, _, b = api("DELETE", "/api/plugins/blocklist")
         check("removing a plugin twice is a 404", s == 404, (s, b[:200]))
+        s, _, b = api("PUT", "/api/plugins/blocklist", {"config": {"words": ["forbidden-l97l"]}})
+        made = json.loads(b) if s == 200 else {}
+        check("changing a plugin that is not configured creates it, off", s == 200 and made.get("plugin", {}).get("enabled") is False, (s, b[:200]))
+        s, _, b = api("GET", "/api/plugins/blocklist")
+        check("the plugin created by a change is listed", s == 200, (s, b[:200]))
+        s, _, b = api("DELETE", "/api/plugins/blocklist")
     finally:
         gw.terminate()
         gw.wait()
@@ -7841,7 +7849,7 @@ def l121_e2e(env):
         s, _, b = api("POST", "/api/plugins", {"name": "gone", "path": "/no/such/plugin.wasm", "enabled": True})
         check("a plugin file that does not exist is refused", s == 400 and "plugin file" in b, (s, b[:300]))
         s, _, b = api("POST", "/api/plugins", {"name": "url", "path": "https://example.test/p.wasm", "enabled": True})
-        check("a plugin URL is refused", s == 400 and "URL" in b, (s, b[:300]))
+        check("a plugin URL that cannot be downloaded is answered as Bifrost answers a plugin that does not load", s == 500 and "Plugin was not created, it failed to load: " in b, (s, b[:300]))
         s, _, b = api("POST", "/api/plugins", {"name": "init-fails", "path": wasm, "enabled": True, "config": {"mode": "initfail"}})
         check("a plugin whose init fails is refused", s == 400 and "init returned 1" in b, (s, b[:300]))
         s, _, b = api("POST", "/api/plugins", {"name": "wasm-viewer", "path": wasm, "enabled": True}, who=vic)
@@ -8006,7 +8014,7 @@ def l130_e2e(env):
         check("http_pre_hook can answer the request itself: status, headers and body, and the provider is not called", s == 202 and h.get("x-plugin") == "pre" and json.loads(b) == {"answered": "by the plugin"} and len(seen()) == n, (s, h, b[:200]))
         setp({"mode": "rewrite", "http": "error"})
         s, h, b = raw("POST", "/v1/chat/completions", CHAT)
-        check("an error from http_pre_hook fails the request with 500 and its message", s == 500 and "http pre refused" in b.decode(), (s, b[:200]))
+        check("an error from http_pre_hook fails the request with 500 and its message as bare text, as Bifrost sends it", s == 500 and b.decode().endswith("http pre refused") and not b.decode().startswith("{") and h.get("content-type", "").startswith("text/plain"), (s, h.get("content-type"), b[:200]))
         setp({"mode": "rewrite", "http": "path"})
         s, h, b = raw("POST", "/v1/chat/completions", CHAT)
         check("a plugin that moves the request to another route is refused with 409, as Bifrost does", s == 409 and "modified by a plugin" in b.decode(), (s, b[:200]))
@@ -8453,9 +8461,273 @@ def l159_e2e(env):
             n = len(seen())
             s, h, b = post(path, body, {"x-model-provider": "openai"} if "batches" in path else None)
             check(f"{name}: a short-circuit error carries its status and body, and the provider is not called", s == 418 and "plugin_blocked" in b and seen()[n:] == [], (s, b[:200], [u["path"] for u in seen()[n:]]))
-        # a batch's other calls run no hooks (Raiju hooks the creation only)
+        # a batch's other calls run the hooks too, as Bifrost runs them on every batch and file request (L170)
+        n = len(seen())
         s, _, b = call("GET", "/anthropic/v1/messages/batches", None, {"x-model-provider": "openai"}, base=base, auth=False)
-        check("listing batches runs no LLM hooks", s == 200 and "plugin_blocked" not in b, (s, b[:200]))
+        check("listing batches runs the LLM hooks too (batch_list): the short circuit answers it", s == 418 and "plugin_blocked" in b and seen()[n:] == [], (s, b[:200]))
+    finally:
+        gw.terminate()
+
+GW_L170 = "http://127.0.0.1:18291"  # plugins: the WP6 remainder (fallback pre hooks, cache-hit post hooks, chunk skip, /mcp and Bedrock frames, batch and file hooks, mocker, jsonparser, placement)
+
+def l170_frames(raw):
+    """The payloads of a binary AWS event stream, in order."""
+    out, at = [], 0
+    while at + 12 <= len(raw):
+        total = int.from_bytes(raw[at:at + 4], "big")
+        hlen = int.from_bytes(raw[at + 4:at + 8], "big")
+        if total < 16 or at + total > len(raw):
+            break
+        out.append(raw[at + 12 + hlen:at + total - 4].decode("utf-8", "replace"))
+        at += total
+    return out
+
+def l170_e2e(env):
+    """L170: the plugin pipeline as Bifrost runs it, the WP6 remainder. The mocker (faker templates, allow_fallbacks,
+    stats, integer nanosecond latency, the provider of a bare model) and the pre hooks run again on each fallback; the
+    cache sits among the plugins (a cache hit goes through the post hooks of the pre_builtin plugins only); a post hook
+    skips a stream chunk (StreamControl); the HTTP transport hooks on /mcp and on Bedrock's binary event streams; the LLM
+    hooks on the batch and file calls; /api/plugins placement and order; jsonparser on Responses streams; telemetry's
+    user_name. Its own gateway (18291)."""
+    import hashlib, re, shutil
+    shutil.rmtree(os.path.join(BUILD, "e2e-l170-logs"), ignore_errors=True)
+    base = GW_L170
+    wasm = os.path.join(ROOT, "tests", "wasm", "plugin.wasm")
+    cfg_path = os.path.join(BUILD, "e2e.l170.json")
+    adm = {"authorization": "Bearer sk-admin-l170"}
+    mocker = {"rules": [
+        {"name": "bare", "conditions": {"providers": ["openai"], "models": ["l170-bare"]}, "responses": [{"type": "success", "content": {"message_template": "{{provider}} {{model}} {{faker.uuid}}"}}]},
+        {"name": "fbmock", "conditions": {"models": ["l170-fb"]}, "responses": [{"type": "success", "content": {"message": "mocked on the fallback"}}]},
+        {"name": "soft", "conditions": {"models": ["l170-soft"]}, "responses": [{"type": "error", "error": {"message": "soft refusal", "status_code": 503}}]},
+        {"name": "final", "conditions": {"models": ["l170-final"]}, "responses": [{"type": "error", "allow_fallbacks": False, "error": {"message": "final refusal", "status_code": 503}}]},
+        {"name": "slow", "conditions": {"models": ["l170-slow"]}, "latency": {"min": 300000000, "type": "fixed"}, "responses": [{"type": "success", "content": {"message": "slow answer"}}]},
+    ]}
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "cache": {"enabled": True, "ttl_seconds": 60},
+        "telemetry": {"user_labels_enabled": True},
+        "server": {"plugin_download_private_allowlist": ["127.0.0.1"]},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l170-logs")},
+        "otel": {"endpoint": MOCK + "/v1/traces", "service_name": "raiju-l170", "flush_ms": 100},
+        "providers": {
+            "openai": {"keys": [{"name": "pool", "value": "sk-pool-l170", "models": [], "weight": 1.0, "use_for_batch_api": True}, {"name": "bare", "value": "sk-pool-l170", "models": ["l170-bare"], "weight": 0.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "anthropic": {"keys": [{"name": "a", "value": "sk-ant-l170", "models": [], "weight": 1.0, "use_for_batch_api": True}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+        "mcp": {"client_configs": [{"name": "weather", "connection_type": "http", "connection_string": MOCK + "/mcp"}]},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256(b"sk-admin-l170").hexdigest()}, {"name": "ada-l170", "role": "viewer"}],
+            "virtual_keys": [{"id": "vk-l170", "name": "l170", "value": "sk-bf-l170", "user_id": "ada-l170"}],
+        },
+        "plugins": [{"name": "mocker", "enabled": True, "config": mocker}],
+    }
+    json.dump(cfg, open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18291", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l170.log"), "w"))
+
+    def api(method, p, body=None):
+        return call(method, p, body, adm, base=base, auth=False)
+
+    def raw(method, path, body=None, headers=None, ctype="application/json"):
+        data = None if body is None else (body if isinstance(body, bytes) else (body if isinstance(body, str) else json.dumps(body)).encode())
+        req = urllib.request.Request(base + path, data=data, method=method, headers={"content-type": ctype, **(headers or {})})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return r.status, {k.lower(): v for k, v in r.headers.items()}, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, {k.lower(): v for k, v in e.headers.items()}, e.read()
+
+    def chat(model, text="hello", **kw):
+        return raw("POST", "/v1/chat/completions", {"model": model, "messages": [{"role": "user", "content": text}], **kw})
+
+    def content(b):
+        try:
+            return json.loads(b)["choices"][0]["message"]["content"]
+        except Exception:
+            return None
+
+    def events(text):
+        out = []
+        for block in text.split("\n\n"):
+            for line in block.split("\n"):
+                if line.startswith("data:"):
+                    out.append(line[5:].strip())
+        return out
+
+    def deltas(text):
+        got = []
+        for d in events(text):
+            if d.startswith("{") and '"choices"' in d:
+                for c in json.loads(d).get("choices", []):
+                    t = c.get("delta", {}).get("content")
+                    if t:
+                        got.append(t)
+        return got
+
+    def setp(config, name="h170"):
+        s, _, b = api("PUT", "/api/plugins/" + name, {"config": config})
+        if s != 200:
+            raise SystemExit(f"l170: could not set the plugin config {config}: {s} {b[:200]}")
+
+    def chat_upstream(n):
+        return [u for u in seen()[n:] if u["path"] == "/v1/chat/completions"]
+
+    try:
+        wait(base + "/health")
+        # ---- the mocker ----
+        s, h, b = chat("l170-bare")
+        c = content(b) or ""
+        check("mocker: a bare model's provider is the one it resolves to, and the template's faker values are filled", s == 200 and re.fullmatch(r"openai l170-bare [0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", c) is not None, (s, b[:300]))
+        n = len(seen())
+        s, h, b = chat("openai/down-1", fallbacks=["openai/l170-fb"])
+        up = chat_upstream(n)
+        check("the pre hooks run again on a fallback: the mocker answers the fallback after the primary failed", s == 200 and content(b) == "mocked on the fallback" and h.get("x-bf-plugin-short-circuit") == "true" and len(up) == 1 and json.loads(up[0]["body"])["model"] == "down-1", (s, b[:300], [u["body"][:80] for u in up]))
+        n = len(seen())
+        s, h, b = chat("openai/l170-soft", fallbacks=["openai/gpt-4o-mini"])
+        up = chat_upstream(n)
+        check("a mocker error with allow_fallbacks unset is the primary's error: the fallback serves the request", s == 200 and len(up) == 1 and json.loads(up[0]["body"])["model"] == "gpt-4o-mini" and "soft refusal" not in b.decode(), (s, b[:300], len(up)))
+        n = len(seen())
+        s, h, b = chat("openai/l170-final", fallbacks=["openai/gpt-4o-mini"])
+        check("a mocker error with allow_fallbacks false is final: no fallback is tried", s == 503 and "final refusal" in b.decode() and chat_upstream(n) == [], (s, b[:300]))
+        t0 = time.time()
+        s, h, b = chat("openai/l170-slow")
+        took = time.time() - t0
+        check("mocker latency given as integer nanoseconds (300000000) delays the answer 300 ms", s == 200 and content(b) == "slow answer" and took >= 0.29, (s, took, b[:200]))
+        s, _, b = api("GET", "/api/plugins/mocker")
+        st = json.loads(b).get("stats", {}) if s == 200 else {}
+        hits = st.get("rule_hits", {})
+        check("the mocker's stats (Bifrost's GetStats) count requests, mocked requests, rule hits and the answers made", s == 200 and st.get("total_requests", 0) >= 5 and hits.get("bare") == 1 and hits.get("fbmock") == 1 and hits.get("soft") == 1 and hits.get("final") == 1 and hits.get("slow") == 1 and st.get("errors_generated") == 2 and st.get("responses_generated") == 3, (s, b[:400]))
+
+        # ---- /api/plugins: placement and order from the body ----
+        s, _, b = api("POST", "/api/plugins", {"name": "blocklist", "enabled": True, "placement": "pre_builtin", "order": 4, "config": {"words": ["nope-l170"]}})
+        pl = json.loads(b).get("plugin", {}) if s == 201 else {}
+        check("POST /api/plugins takes placement and order from the body", s == 201 and pl.get("placement") == "pre_builtin" and pl.get("order") == 4, (s, b[:300]))
+        s, _, b = api("PUT", "/api/plugins/blocklist", {"order": 2})
+        pl = json.loads(b).get("plugin", {}) if s == 200 else {}
+        check("PUT changes the order and keeps the placement it does not name", s == 200 and pl.get("order") == 2 and pl.get("placement") == "pre_builtin", (s, b[:300]))
+        s, _, b = api("PUT", "/api/plugins/blocklist", {"placement": "middle"})
+        check("a placement other than pre_builtin or post_builtin is refused with Bifrost's message", s == 400 and "Invalid placement value" in b, (s, b[:200]))
+        s, _, b = api("POST", "/api/plugins", {"name": "maxtokens", "placement": "builtin"})
+        check("builtin is not a placement the API takes", s == 400, (s, b[:200]))
+        s, _, b = api("GET", "/api/plugins/blocklist")
+        check("GET shows the placement and order", s == 200 and json.loads(b).get("placement") == "pre_builtin" and json.loads(b).get("order") == 2, (s, b[:300]))
+        api("DELETE", "/api/plugins/blocklist")
+
+        # ---- the cache among the plugins ----
+        s, _, b = api("POST", "/api/plugins", {"name": "h170", "enabled": True, "path": wasm, "placement": "pre_builtin", "config": {"mode": "rewrite", "tag": "pre", "count": "on"}})
+        check("a WebAssembly plugin is added before the cache (pre_builtin)", s == 201, (s, b[:200]))
+        s1, h1, b1 = chat("openai/gpt-4o-mini", "cache me l170 one")
+        s2, h2, b2 = chat("openai/gpt-4o-mini", "cache me l170 one")
+        n1 = json.loads(b1).get("x_post_n", -1) if s1 == 200 else -1
+        n2 = json.loads(b2).get("x_post_n", -1) if s2 == 200 else -1
+        check("a cache hit goes through the post hooks of a pre_builtin plugin (post_hook runs again on the cached answer)", s2 == 200 and h2.get("x-bf-cache") == "hit" and n1 >= 1 and n2 == n1 + 1, (h2.get("x-bf-cache"), n1, n2, b2[:200]))
+        s, _, b = api("PUT", "/api/plugins/h170", {"placement": "post_builtin"})
+        s1, h1, b1 = chat("openai/gpt-4o-mini", "cache me l170 two")
+        s2, h2, b2 = chat("openai/gpt-4o-mini", "cache me l170 two")
+        check("a post_builtin plugin (the default) is not run on a hit: the cached answer is the one its post hook made", s2 == 200 and h2.get("x-bf-cache") == "hit" and json.loads(b2).get("x_post_n") == json.loads(b1).get("x_post_n"), (h2.get("x-bf-cache"), b1[:120], b2[:120]))
+
+        # ---- a post hook skips a stream chunk (StreamControl) ----
+        setp({"mode": "rewrite", "post": "skip", "chunk_skip": "lo"})
+        s, h, b = chat("openai/gpt-4o-mini", "stream me", stream=True)
+        text = b.decode()
+        check("a chunk post_hook skips (stream_control skip_stream) is not sent, and the stream goes on to [DONE]", s == 200 and deltas(text) == ["Hel"] and events(text)[-1] == "[DONE]", (s, text[:400]))
+
+        # ---- the HTTP transport hooks on /mcp and on Bedrock's binary event streams ----
+        setp({"mode": "rewrite", "http": "rewrite", "tag": "mcp170"})
+        s, h, b = raw("POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "l170", "version": "1"}}})
+        mb = json.loads(b) if s == 200 and b[:1] == b"{" else {}
+        check("the HTTP transport hooks run on /mcp: http_pre_hook's header and http_post_hook's changes", s == 200 and h.get("x-wasm-http-post") == "mcp170" and mb.get("x_http_post") == "mcp170" and h.get("x-wasm-http-ctx") == "ok", (s, h.get("x-wasm-http-post"), b[:300]))
+        setp({"mode": "rewrite", "chunk_from": "Hel", "chunk_to": "Howdy"})
+        s, h, b = raw("POST", "/bedrock/model/openai%2Fgpt-4o-mini/converse-stream", {"messages": [{"role": "user", "content": [{"text": "hi"}]}]})
+        frames = l170_frames(b)
+        check("the chunk hook sees each frame of a Bedrock binary event stream and rewrites its payload", s == 200 and any("Howdy" in f for f in frames) and not any('"Hel"' in f for f in frames), (s, h.get("content-type"), frames[:6]))
+        setp({"mode": "rewrite", "chunk_skip": "Hel"})
+        s, h, b = raw("POST", "/bedrock/model/openai%2Fgpt-4o-mini/converse-stream", {"messages": [{"role": "user", "content": [{"text": "hi"}]}]})
+        frames = l170_frames(b)
+        check("a frame the chunk hook skips is dropped and the rest of the stream goes on", s == 200 and not any("Hel" in f for f in frames) and any('"lo"' in f for f in frames), (s, frames[:6]))
+
+        # ---- the LLM hooks on the batch and file calls ----
+        setp({"mode": "rewrite", "tag": "bf"})
+        line = json.dumps({"custom_id": "l170-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}})
+        boundary = "l170boundary"
+        form = (f'--{boundary}\r\nContent-Disposition: form-data; name="purpose"\r\n\r\nbatch\r\n--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="l170.jsonl"\r\nContent-Type: application/jsonl\r\n\r\n{line}\n\r\n--{boundary}--\r\n').encode()
+        s, h, b = raw("POST", "/v1/files", form, ctype=f"multipart/form-data; boundary={boundary}")
+        up = json.loads(b) if s == 200 else {}
+        fid = up.get("id", "")
+        check("a file upload runs the LLM hooks (file_upload): post_hook marks the answer", s == 200 and fid != "" and up.get("x_wasm_plugin") == "ctx-ok:bf", (s, b[:300]))
+        setp({"mode": "rewrite", "tag": "bf", "from": "file-l170-ghost", "to": fid})
+        n = len(seen())
+        s, h, b = raw("GET", "/v1/files/file-l170-ghost")
+        got = json.loads(b) if s == 200 else {}
+        check("a plugin's pre_hook changes a file call's id (file_retrieve): the call goes to the file it names", s == 200 and got.get("id") == fid and got.get("x_wasm_plugin") == "ctx-ok:bf" and any(u["path"] == "/v1/files/" + fid for u in seen()[n:]), (s, b[:300], [u["path"] for u in seen()[n:]]))
+        setp({"mode": "rewrite", "tag": "bf"})
+        s, h, b = raw("POST", "/v1/batches", {"input_file_id": fid, "endpoint": "/v1/chat/completions", "completion_window": "24h"})
+        bt = json.loads(b) if s == 200 else {}
+        check("an OpenAI batch creation runs the hooks (batch_create)", s == 200 and bt.get("object") == "batch" and bt.get("x_wasm_plugin") == "ctx-ok:bf", (s, b[:300]))
+        s, h, b = raw("GET", "/v1/batches?limit=5")
+        check("listing batches runs the hooks (batch_list)", s == 200 and json.loads(b).get("x_wasm_plugin") == "ctx-ok:bf", (s, b[:300]))
+        s, h, b = raw("GET", "/anthropic/v1/files", headers={"x-model-provider": "openai"})
+        check("the Anthropic SDK's file list runs the hooks too", s == 200 and json.loads(b).get("x_wasm_plugin") == "ctx-ok:bf", (s, b[:300]))
+        setp({"mode": "rewrite", "post": "error"})
+        s, h, b = raw("GET", f"/v1/files/{fid}/content")
+        check("a file's content goes to post_hook ({file_id, content_type}), which may turn it into an error", s == 429 and b"turned into an error by the plugin" in b, (s, b[:300]))
+        api("DELETE", "/api/plugins/h170")
+
+        # ---- jsonparser on a Responses stream ----
+        s, _, b = api("POST", "/api/plugins", {"name": "jsonparser", "enabled": True, "config": {"usage": "all_requests"}})
+        check("jsonparser with usage all_requests is added", s == 201, (s, b[:200]))
+        s, h, b = raw("POST", "/v1/responses", {"model": "openai/json-responses", "input": "json please", "stream": True})
+        ds = [json.loads(d).get("delta") for d in events(b.decode()) if d.startswith("{") and '"response.output_text.delta"' in d]
+        check("jsonparser completes the JSON of a Responses stream delta by delta", s == 200 and ds == ['{"a":1}', '{"a":1,"b":2}'], (s, ds, b[:400]))
+        s, h, b = raw("POST", "/v1/responses", {"model": "openai/gpt-4o-mini", "input": "plain please", "stream": True})
+        text = b.decode()
+        check("a Responses delta whose text cannot be completed is skipped, and the stream still completes", s == 200 and '"response.output_text.delta"' not in text and "response.completed" in text, (s, text[:400]))
+        api("DELETE", "/api/plugins/jsonparser")
+
+        # ---- telemetry: user_name from the admin users ----
+        s, h, b = raw("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "who am i l170"}]}, headers={"x-bf-vk": "sk-bf-l170"})
+        s, _, metrics_text = call("GET", "/metrics", base=base, auth=False)
+        check("telemetry's user_name is the name of the user the key is assigned to", s == 200 and 'user_id="ada-l170",user_name="ada-l170"' in metrics_text, [l for l in metrics_text.split("\n") if "ada-l170" in l][:2])
+
+        # ---- a plugin loaded from a URL ----
+        s, _, b = api("POST", "/api/plugins", {"name": "urlplug", "enabled": True, "path": MOCK + "/plugins/plugin.wasm", "config": {"mode": "rewrite", "tag": "url"}})
+        check("a plugin whose path is a URL is downloaded and loaded (its host is in server.plugin_download_private_allowlist)", s == 201 and json.loads(b).get("plugin", {}).get("status", {}).get("status") == "active", (s, b[:300]))
+        s, h, b = chat("openai/gpt-4o-mini", "from a url plugin l170")
+        check("the downloaded plugin runs: its post_hook marks the answer", s == 200 and json.loads(b).get("x_wasm_plugin") == "ctx-ok:url", (s, b[:200]))
+        api("DELETE", "/api/plugins/urlplug")
+        s, _, b = api("POST", "/api/plugins", {"name": "gone", "enabled": True, "path": MOCK + "/plugins/missing.wasm"})
+        check("a download that fails is answered as Bifrost answers a plugin that does not load", s == 500 and "Plugin was not created, it failed to load: failed to download plugin: HTTP 404" in b, (s, b[:300]))
+        s, _, b = api("POST", "/api/plugins", {"name": "local", "enabled": True, "path": "http://localhost:18099/plugins/plugin.wasm"})
+        check("a URL on a private host the allowlist does not name is refused", s == 500 and "private address" in b, (s, b[:300]))
+
+        # ---- a wall-clock bound on a WebAssembly call, and the plugin spans and logs ----
+        s, _, b = api("POST", "/api/plugins", {"name": "slowplug", "enabled": True, "path": wasm, "wasm_limits": {"max_instructions": 2000000000, "max_time_ms": 200}, "config": {"mode": "loop"}})
+        check("a plugin with a wall-clock limit (wasm_limits.max_time_ms) is added", s == 201, (s, b[:200]))
+        t0 = time.time()
+        s, h, b = chat("openai/gpt-4o-mini", "a slow plugin l170")
+        took = time.time() - t0
+        rid = h.get("x-request-id", "")
+        check("a hook that runs past max_time_ms is stopped by the clock (its instruction budget is far off) and skipped", s == 200 and content(b) is not None and took < 3.0, (s, took, b[:200]))
+        row = {}
+        for _ in range(20):
+            ls, _, lb = api("GET", "/api/logs/" + rid)
+            if ls == 200:
+                row = json.loads(lb)
+                if row.get("plugin_logs"):
+                    break
+            time.sleep(0.1)
+        logs = json.loads(row.get("plugin_logs") or "{}")
+        entries = logs.get("raiju-test-plugin", [])
+        check("the log row carries the plugin logs grouped by plugin (Bifrost's plugin_logs): the hook that ran out of time", any("time limit exceeded" in e.get("message", "") and e.get("level") == "error" for e in entries), row.get("plugin_logs"))
+        spans = ""
+        for _ in range(20):
+            spans = "".join(x["body"] for x in seen(traces=True) if x["path"] == "/v1/traces")
+            if "plugin.raiju-test-plugin.prehook" in spans:
+                break
+            chat("openai/gpt-4o-mini", "flush the traces l170")
+            time.sleep(0.2)
+        check("the plugin's hooks are exported as spans (plugin.<name>.prehook)", "plugin.raiju-test-plugin.prehook" in spans, spans[-300:])
+        api("DELETE", "/api/plugins/slowplug")
     finally:
         gw.terminate()
 GW_L126 = "http://127.0.0.1:18186"  # network_config pool knobs and upstream HTTP/2, against tov-patches/tests/h2_server.py origins
@@ -13814,6 +14086,9 @@ def main():
         l139_e2e(env)
         # the built-in plugins on the provider-format routes; embedContent, Bedrock rerank, count-tokens and batch creation hooked: their own gateway
         l159_e2e(env)
+        # the WP6 remainder: fallback pre hooks, cache-hit post hooks, chunk skip, /mcp and Bedrock frame hooks, batch and file
+        # hooks, the mocker's remainders, jsonparser on Responses, placement from the API, telemetry user_name: its own gateway
+        l170_e2e(env)
         # serving the web UI: the embedded build and RAIJU_UI_DIR: their own gateways
         l113_ui_e2e(env)
         # network_config pool knobs and upstream HTTP/2 (Tov patch 0007): origins from tov-patches/tests/h2_server.py, their own gateway

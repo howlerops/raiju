@@ -1,5 +1,5 @@
 #!/bin/sh
-# Checks patches 0001-0009 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
+# Checks patches 0001-0010 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
 # (or `make tov-test`). Each program prints "ok" lines and "FAIL" lines; a run passes when no line
 # fails and the expected number of "ok" lines appears.
 set -eu
@@ -78,10 +78,10 @@ expect "$OUT/udp.out" 8 "Bun.udpSocket"
 "$TOV" run "$DIR/udp_dgram.tov" > "$OUT/dgram.out"
 expect "$OUT/dgram.out" 8 "node:dgram"
 
-# WebAssembly (patch 0005): std/wasm on WAMR, with its limits (run from the tests directory: it reads wasm_mod.wasm)
+# WebAssembly (patches 0005 and 0010): std/wasm on WAMR, with its limits and a time limit per call (run from the tests directory: it reads wasm_mod.wasm)
 TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/wasm.tov" -o "$OUT/wasm" >/dev/null
 (cd "$DIR" && "$OUT/wasm") > "$OUT/wasm.out"
-expect "$OUT/wasm.out" 22 "std/wasm"
+expect "$OUT/wasm.out" 24 "std/wasm"
 # WebRTC (patch 0006): two std/rtc peer connections in one program, on the loopback address (a data channel
 # both ways, Opus RTP with rewritten headers, states, close). The first build compiles libdatachannel (cached).
 TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/rtc.tov" -o "$OUT/rtc" >/dev/null

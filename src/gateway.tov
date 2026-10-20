@@ -66,7 +66,8 @@ import { FileLease, FILE_LEASE_MS } from "./filelease"
 import { McpUserToken, tokenAction, userTokenOf, identityOf, consentMessage, consentLink, startUserFlow, refreshUserRow, USER_HEADER, userOfMark } from "./mcpuser"
 import { Limiter } from "./limiter"
 import { JobStore } from "./jobs"
-import { PluginChain, PluginContext, PluginEntry, PluginRun, RUN_HEADER, buildChain, jsonStreamEnabled, JsonStreamFixer, pluginErrorMessage, parsePluginError, errorPost } from "./plugins"
+import { fetchPluginUrls, missingPluginUrls } from "./plugindl"
+import { BasePlugin, PreResult, PostResult, PluginChain, PluginContext, PluginEntry, PluginRun, PluginTrace, PluginLogEntry, pluginLogsJson, PostOutcome, RUN_HEADER, TRACE_HEADER, buildChain, jsonStreamEnabled, JsonStreamFixer, pluginErrorMessage, parsePluginError, errorPost } from "./plugins"
 import { SseBuffer, sseData, sseWithData } from "./plughttp"
 import { SemanticCache, SemanticCacheConfig, defaultSemanticConfig, promptText, parseEmbedding, scopeKey, identityScope, hasToolCalls } from "./semcache"
 import { Deadline, deadline } from "./deadline"
@@ -81,9 +82,12 @@ import { EMB_TITAN } from "./embconv"
 export type Build = (t: Target) => Upstream throws SyntaxError
 // a chat request for a target, from its shaped body (tc parses the same request as a typed chat)
 type ChatSender = (t: Target, b: Field[], tc: LazyChat) => Upstream throws SyntaxError
+// the last steps of an answer (chatOnce: the reversible redaction restored, the output guards)
+type AnswerStep = (s: string) => string throws SyntaxError
 export type Translate = (t: Target, text: string, requestedModel: string) => Translated throws SyntaxError
 
-type Outcome = { ok: bool, status: int, body: string, contentType: string, provider: string, model: string, promptTokens: int, completionTokens: int, attempts: int, upstreamMs: f64, direct?: bool, raw?: bool, key?: string, alias?: string, aliasName?: string, aliasFamily?: string, retryMs?: f64, served?: string, billed?: f64, pass?: Response, finish?: () => void, noBilled?: bool }
+// shortCircuit: the answer (or error) is a plugin's, not the provider's (x-bf-plugin-short-circuit)
+type Outcome = { ok: bool, status: int, body: string, contentType: string, provider: string, model: string, promptTokens: int, completionTokens: int, attempts: int, upstreamMs: f64, direct?: bool, raw?: bool, key?: string, alias?: string, aliasName?: string, aliasFamily?: string, retryMs?: f64, served?: string, billed?: f64, pass?: Response, finish?: () => void, noBilled?: bool, shortCircuit?: bool }
 
 // The answer of a large request whose events are converted as they arrive: the Response is given when the
 // provider's answer starts, and its body is fed by a StreamSink.
@@ -186,6 +190,8 @@ export function llmStreamSink(chain: PluginChain, run: PluginRun, real: StreamSi
     const data = sseData(block)
     if (data === undefined || !data.startsWith("{") || data.startsWith("{\"error\"")) return { kind: "send", block: block }
     const o = chain.runPostChunk(&run.ctx, data)
+    // a chunk a plugin skipped (StreamControl) is not sent, and the stream goes on
+    if (o.skip === true) return { kind: "drop" }
     if (o.status >= 400) return { kind: "end", block: "data: " + o.body + "\n\n" }
     if (o.body === data) return { kind: "send", block: block }
     return { kind: "send", block: sseWithData(block, o.body) }
@@ -761,6 +767,43 @@ async function sleep(ms: int): Promise<void> {
   })
 }
 
+// A request's plugin logs as its log row keeps them (grouped by plugin, Bifrost's plugin_logs), or undefined.
+function pluginLogsOf(c: ReqCtx): string | undefined {
+  const tr = c.pluginTrace
+  const all = tr === undefined ? c.pluginLogs : tr.logs.concat(c.pluginLogs)
+  const j = pluginLogsJson(all)
+  return j === "" ? undefined : j
+}
+
+// A request's plugin spans (plugin.<name>.<hook>) as stages of its trace; plugin_span_filter applies to them.
+function pluginStagesOf(c: ReqCtx): StageTiming[] {
+  const out: StageTiming[] = []
+  const tr = c.pluginTrace
+  if (tr === undefined) return out
+  for (const s of tr.spans) out.push({ name: s.name, startMs: s.startMs, durUs: s.durUs })
+  return out
+}
+
+// The paths of the enabled plugins that load from a file or a URL.
+export function pluginPaths(cfg: Config): string[] {
+  const out: string[] = []
+  for (const p of cfg.plugins ?? []) {
+    const path = p.path
+    if (p.enabled !== false && path !== undefined && path.trim() !== "") out.push(path.trim())
+  }
+  return out
+}
+
+// The name of the user a virtual key is assigned to (telemetry's user_name, as Bifrost reads it from governance):
+// a configured user whose name is the id, as users are named by their id here; "" for none.
+export function userNameOf(cfg: Config, userId: string): string {
+  if (userId === "") return ""
+  for (const u of cfg.governance?.users ?? []) {
+    if (u.name === userId) return u.name
+  }
+  return ""
+}
+
 export function errorResponse(status: int, message: string, type: string, extra: Hdrs): Response {
   let h: Record<string, string> = extra
   h.set("content-type", "application/json")
@@ -1062,7 +1105,111 @@ class ReqCtx {
   settle: ((pt: int, ct: int, billed: f64 | undefined) => void) | undefined = undefined
   // an ordinary request's answer longer than this many bytes goes back as it arrives (-1: always read whole)
   passAbove = -1
+  // a chat request's plugin hooks across its attempts and around the cache (AttemptPlugins)
+  attemptHook: AttemptPlugins | undefined = undefined
+  // the request's plugin spans and plugin logs (its plugin run's trace), and the plugin logs of the gateway's own
+  // steps that are plugins in Bifrost (compat's warnings)
+  pluginTrace: PluginTrace | undefined = undefined
+  pluginLogs: PluginLogEntry[] = []
   constructor(readonly rid: string, readonly op: string, readonly started: f64) {}
+}
+
+// What the plugins decide at the start of an attempt: go on with it, answer the caller (a short circuit, or a failed
+// attempt a post hook recovered), move on to the next fallback with an error, or end the request with an error.
+export type RefStep =
+  | { kind: "go" }
+  | { kind: "answer", status: int, body: string }
+  | { kind: "fail", status: int, body: string }
+  | { kind: "final", status: int, body: string }
+
+// The request with its model set to provider/model.
+function withModel(text: string, provider: string, model: string): string {
+  try {
+    let fs = fields(text)
+    setField(&fs, "model", quote(provider === "" ? model : `${provider}/${model}`))
+    return build(fs)
+  } catch (e) {
+    return text
+  }
+}
+
+// A chat request's LLM hooks as Bifrost runs them in each attempt (core/bifrost.go tryRequest): the primary's pre hooks
+// ran before routing (chatOnce); before each fallback the post hooks see the failed attempt's error (a plugin may recover
+// it into the answer), and the pre hooks run again on the request as it came, with the fallback's provider and model,
+// so the fallback sends what they make of it (or their short circuit answers). The cache sits among the plugins as
+// Bifrost's builtin cache plugin does: an answer is cached as the post_builtin plugins left it, and a cache hit goes
+// through the post hooks of the pre_builtin and builtin plugins only (PluginChain.runPostSplit, runPostCached).
+export class AttemptPlugins {
+  // the request the current attempt sends (build reads it)
+  body: Field[]
+  text: string
+  typed: LazyChat
+  // the answer as the cache keeps it, when the plugins before the cache changed it after (set by translate)
+  cachedBody: string | undefined = undefined
+  // the answer must not be cached (its cached form could not be made)
+  noStore = false
+  // the error a short circuit of the primary's pre hooks gave, to be tried against the fallbacks (allow_fallbacks)
+  primaryFail: { status: int, body: string } | undefined = undefined
+
+  constructor(readonly chain: PluginChain, readonly run: PluginRun, readonly original: string, body: Field[], text: string) {
+    this.body = body
+    this.text = text
+    this.typed = new LazyChat(text)
+  }
+
+  // the mocker's latency for a short circuit stepAt made, slept by atRef
+  delayMs = 0
+
+  // The hooks at the start of attempt i (0 is the primary) for ref; prev is how the attempt before ended.
+  async atRef(i: int, ref: ModelRef, prev: { status: int, body: string }): Promise<RefStep> {
+    const s = this.stepAt(i, ref, prev)
+    const d = this.delayMs
+    this.delayMs = 0
+    if (d > 0) await sleep(d)
+    return s
+  }
+
+  stepAt(i: int, ref: ModelRef, prev: { status: int, body: string }): RefStep {
+    const pf = this.primaryFail
+    if (i === 0) {
+      if (pf === undefined) return { kind: "go" }
+      // the primary's short circuit is its attempt's error: the post hooks see it, then the fallbacks are tried
+      this.primaryFail = undefined
+      const o = this.chain.runPost(&this.run.ctx, pf.status, pf.body)
+      if (o.status < 400) return { kind: "answer", status: o.status, body: o.body }
+      return { kind: "fail", status: o.status, body: o.body }
+    }
+    // the failed attempt's post hooks (for the plugins whose pre hook ran for it): a recovery is the answer
+    if (this.chain.ranPre(this.run.ctx) && prev.status >= 400) {
+      const o = this.chain.runPost(&this.run.ctx, prev.status, prev.body)
+      if (o.status < 400) return { kind: "answer", status: o.status, body: o.body }
+    }
+    this.run.ctx.model = ref.provider === "" ? ref.model : `${ref.provider}/${ref.model}`
+    this.run.ctx.provider = ref.provider
+    this.run.ctx.values.delete("mock_latency_ms")
+    const sent = withModel(this.original, ref.provider, ref.model)
+    const pre = this.chain.runPre(&this.run.ctx, sent)
+    if (pre.kind === "short_circuit") {
+      this.delayMs = parseInt(this.run.ctx.values.get("mock_latency_ms") ?? "0") ?? 0
+      const post = this.chain.runPost(&this.run.ctx, pre.status, pre.body)
+      if (post.status < 400) return { kind: "answer", status: post.status, body: post.body }
+      if (pre.allowFallbacks === false) return { kind: "final", status: post.status, body: post.body }
+      return { kind: "fail", status: post.status, body: post.body }
+    }
+    try {
+      this.body = fields(pre.body)
+    } catch (e) {
+      return { kind: "fail", status: 500, body: errorJson(`a plugin produced an invalid request: ${e.message}`, "api_error", undefined) }
+    }
+    this.text = pre.body
+    this.typed = new LazyChat(pre.body)
+    return { kind: "go" }
+  }
+
+  // A cached answer through the post hooks of the plugins before the cache.
+  onHit(body: string): PostOutcome {
+    return this.chain.runPostCached(&this.run.ctx, 200, body)
+  }
 }
 
 class LazyChat {
@@ -1298,6 +1445,8 @@ export class Engine {
   // the plugin runs of the requests in flight, by the id the transport hooks put in x-bf-plugin-run: the LLM hooks
   // of a request use the context its transport hooks used (pluginroute.tov)
   pluginRuns: Map<string, PluginRun> = new Map()
+  // the plugin spans and logs of the requests a non-chat route hooked, found by x-bf-plugin-trace (pluginroute.tov)
+  pluginTraces: Map<string, PluginTrace> = new Map()
   // jsonparser with usage all_requests: the JSON of each stream is completed (plugins.tov JsonStreamFixer)
   jsonStreamOn = false
   semantic: SemanticCache | undefined = undefined
@@ -1752,6 +1901,17 @@ export class Engine {
         last = { ok: false, status: 400, body: errorJson(`${rtype} is not supported by ${ref.provider} provider`, "invalid_request_error", "unsupported_operation"), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
         continue
       }
+      // a chat request's plugins at the start of each attempt: the pre hooks run again for a fallback (AttemptPlugins)
+      const ah = ctx.attemptHook
+      if (ah !== undefined) {
+        const step = await ah.atRef(refIndex, ref, { status: last.status, body: last.body })
+        if (step.kind === "answer") return { ok: true, status: step.status, body: step.body, contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs, raw: true, shortCircuit: true }
+        if (step.kind === "final") return { ok: false, status: step.status, body: step.body, contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs, shortCircuit: true }
+        if (step.kind === "fail") {
+          last = { ok: false, status: step.status, body: step.body, contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs, shortCircuit: true }
+          continue
+        }
+      }
       const retries = maxRetries(p)
       let retry = 0
       // session affinity: the key that served this session before, tried first
@@ -2149,10 +2309,21 @@ export class Engine {
     return last
   }
 
+  // Downloads the plugin URLs a config names that have no local copy, and applies the config again when any arrived.
+  async fetchPluginsThenReload(cfg: Config): Promise<void> {
+    const r = await fetchPluginUrls(pluginPaths(cfg), cfg.server?.plugin_download_private_allowlist ?? [], true)
+    for (const e of r.errors) console.error(`raiju: plugin: ${e}`)
+    if (r.fetched > 0 && missingPluginUrls(pluginPaths(this.cfg)).length === 0) this.reload(this.cfg)
+  }
+
   // Applies a changed config (from the management API) without dropping state:
   // budget and rate-limit usage, key health, the response cache, the request log,
   // the tracer and MCP connections all carry over.
   reload(cfg: Config): void {
+    // a plugin URL this process has no copy of (a config saved by another node) is downloaded, then the config is
+    // applied again with it (plugindl.tov); a download that fails leaves the plugin out, as at the start
+    const missing = missingPluginUrls(pluginPaths(cfg))
+    if (missing.length > 0) this.fetchPluginsThenReload(cfg)
     const fresh = new Engine(cfg)
     fresh.gov.carryUsage(this.gov)
     if (this.sharedWindows) fresh.gov.alignWindows()
@@ -2980,10 +3151,14 @@ export class Engine {
 
   // Shared front half of every inference endpoint.
   // emulated: a decision answered by a chat or Responses call (compat's convert_decision_to_responses), billed as that call
-  async serve(req: Request, op: string, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool, upstreamHeaders?: Map<string, string>, sink?: StreamSink, makeConverter?: ConverterFactory, compat?: CompatPlan, prompt?: Applied, emulated?: bool, large?: LargeBody): Promise<Response> {
+  async serve(req: Request, op: string, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool, upstreamHeaders?: Map<string, string>, sink?: StreamSink, makeConverter?: ConverterFactory, compat?: CompatPlan, prompt?: Applied, emulated?: bool, large?: LargeBody, attemptHook?: AttemptPlugins): Promise<Response> {
     const h = snapshot(req.headers)
     const ctx = new ReqCtx(h.get("x-request-id") ?? newId("req_"), op, performance.now())
     ctx.large = large
+    ctx.attemptHook = attemptHook
+    // the plugin spans and logs: the chat request's plugin run, or the one a hooked route registered for this request
+    if (attemptHook !== undefined) ctx.pluginTrace = attemptHook.run.ctx.trace
+    else ctx.pluginTrace = this.pluginTraces.get(h.get(TRACE_HEADER) ?? "")
     // large_payload_optimization: a long answer to an ordinary request is not read whole either, unless something
     // here has to see it (output guardrails, plugins)
     const lps = this.large
@@ -3046,6 +3221,14 @@ export class Engine {
     }
     if (!ctx.deferRecord) this.record(ctx)
     return res
+  }
+
+  // A cached answer as the caller gets it: through the post hooks of the plugins before the cache, when a chat request's
+  // plugins ran (an event stream stays as it was cached).
+  hitThroughPlugins(ctx: ReqCtx, body: string, contentType: string): PostOutcome {
+    const ah = ctx.attemptHook
+    if (ah === undefined || contentType.startsWith("text/event-stream")) return { status: 200, body: body }
+    return ah.onHit(body)
   }
 
   async serveInner(req: Request, h0: Hdrs, ctx: ReqCtx, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool, compat?: CompatPlan): Promise<Response> {
@@ -3176,6 +3359,8 @@ export class Engine {
     rl.app = xApp !== "" ? xApp : appOf(h.get("user-agent") ?? "", this.cfg.user_agent_mappings ?? [])
     ctx.app = rl.app
     rl.userId = ctx.userId
+    // the user's name from the admin users (telemetry's user_name; a user's id is its name here)
+    rl.userName = userNameOf(this.cfg, ctx.userId)
     rl.custom = metrics.customValues(h)
     ctx.labels = rl
     // Fallbacks the key may not use are dropped.
@@ -3212,11 +3397,17 @@ export class Engine {
         out.set("content-type", hit.contentType)
         ctx.cached = true
         ctx.cacheType = "direct"
-        if (this.logStore !== undefined) {
-          ctx.stopReason = stopReasonOf(hit.body)
-          ctx.toolNames = toolNamesOfBody(hit.body)
+        // the post hooks of the plugins before the cache see the cached answer (a cached stream is replayed as it is)
+        const hitBody = this.hitThroughPlugins(ctx, hit.body, hit.contentType)
+        if (hitBody.status >= 400) {
+          out.set("content-type", "application/json")
+          return respond(hitBody.status, hitBody.body, out)
         }
-        ctx.output = hit.body
+        if (this.logStore !== undefined) {
+          ctx.stopReason = stopReasonOf(hitBody.body)
+          ctx.toolNames = toolNamesOfBody(hitBody.body)
+        }
+        ctx.output = hitBody.body
         // a cached stream sent to a streamed caller is replayed event by event, paced when a block-capable guard applies
         const pace = this.replayPace()
         const sink = ctx.sink
@@ -3224,7 +3415,7 @@ export class Engine {
           await this.replayStream(sink, hit.body, out, pace)
           return respond(200, "", out)
         }
-        return respond(200, hit.body, out)
+        return respond(200, hitBody.body, out)
       }
     }
 
@@ -3252,7 +3443,9 @@ export class Engine {
             out.set("content-type", hit.contentType)
             ctx.cached = true
             ctx.cacheType = "semantic"
-            return respond(200, hit.body, out)
+            const semBody = this.hitThroughPlugins(ctx, hit.body, hit.contentType)
+            if (semBody.status >= 400) out.set("content-type", "application/json")
+            return respond(semBody.status, semBody.body, out)
           }
         }
       } catch (e) {
@@ -3272,9 +3465,13 @@ export class Engine {
     // translation and retries: the attempt's time less the upstream calls
     const convertUs = Math.max(0.0, (performance.now() - tAtt) * 1000.0 - r.upstreamMs * 1000.0)
     out.set("x-bf-attempts", "" + r.attempts)
+    if (r.shortCircuit === true) out.set("x-bf-plugin-short-circuit", "true")
     if (compat !== undefined && compat.enabled) {
-      // Bifrost logs these as warnings: the fitted values and a dropped service tier
-      for (const w of compat.warnings) console.error(`raiju: compat: ${w}`)
+      // Bifrost logs these as warnings: the fitted values and a dropped service tier (the compat plugin's logs)
+      for (const w of compat.warnings) {
+        console.error(`raiju: compat: ${w}`)
+        ctx.pluginLogs.push({ plugin_name: "compat", level: "warn", message: w, timestamp: Date.now() })
+      }
       compatHeaders(&out, compat)
     }
     if (!r.ok) {
@@ -3328,17 +3525,21 @@ export class Engine {
     }
     // a body with raw fields is for this caller only: it never enters a cache
     // a response with tool calls is replayed into someone else's agent loop, so it is kept only when opted in
-    if (sem !== undefined && semVec.length > 0 && !noStore && r.raw !== true && (this.semanticCfg.cache_tool_call_responses || !hasToolCalls(r.body))) {
+    // the answer as the cache keeps it: before the post hooks of the plugins before the cache (AttemptPlugins)
+    const ahc = ctx.attemptHook
+    const plugNoStore = ahc !== undefined && ahc.noStore
+    const cachedBody = ahc !== undefined && ahc.cachedBody !== undefined ? ahc.cachedBody! : r.body
+    if (sem !== undefined && semVec.length > 0 && !noStore && !plugNoStore && r.raw !== true && (this.semanticCfg.cache_tool_call_responses || !hasToolCalls(cachedBody))) {
       const ttlHeader = h.get("x-bf-cache-ttl")
       const ttl = ttlHeader === undefined ? undefined : parseTtl(ttlHeader)
       const origin: CacheOrigin = { provider: r.provider, model: r.model, inputTokens: r.promptTokens }
-      if (this.vstore !== undefined) await this.vectorStore(semScope, semVec, r.body, r.contentType, ttl ?? this.semanticCfg.ttl_ms, origin, semKey ?? "")
-      else sem.store(semScope, semVec, r.body, r.contentType, Date.now(), ttl, origin, semKey)
+      if (this.vstore !== undefined) await this.vectorStore(semScope, semVec, cachedBody, r.contentType, ttl ?? this.semanticCfg.ttl_ms, origin, semKey ?? "")
+      else sem.store(semScope, semVec, cachedBody, r.contentType, Date.now(), ttl, origin, semKey)
     }
-    if (cache !== undefined && !noStore && r.raw !== true) {
+    if (cache !== undefined && !noStore && !plugNoStore && r.raw !== true) {
       const ttlHeader = h.get("x-bf-cache-ttl")
       const ttl = ttlHeader === undefined ? this.cacheTtlMs : parseTtl(ttlHeader) ?? this.cacheTtlMs
-      cache.set(key, r.body, r.contentType, ttl, { provider: r.provider, model: r.model, inputTokens: r.promptTokens }, h.get("x-bf-cache-key") ?? "")
+      cache.set(key, cachedBody, r.contentType, ttl, { provider: r.provider, model: r.model, inputTokens: r.promptTokens }, h.get("x-bf-cache-key") ?? "")
     }
     if (r.provider !== primary.provider || r.model !== primary.model) out.set("x-bf-fallback-used", r.provider + "/" + r.model)
     const idx = fallbackIndex(allowed, r.provider, r.model)
@@ -3549,6 +3750,7 @@ export class Engine {
       const keyRef = lb.selectedKeyId !== "" ? lb.selectedKeyId : lb.selectedKeyName
       const engine = lb.routingRuleId !== "" ? "routing-rule" : keyRef !== "" ? "loadbalancing" : ""
       store.add({
+        plugin_logs: pluginLogsOf(c),
         content_hidden: c.hidden ? true : undefined,
         selected_key_id: keyRef === "" ? undefined : keyRef,
         selected_key_name: lb.selectedKeyName === "" ? undefined : lb.selectedKeyName,
@@ -3596,7 +3798,7 @@ export class Engine {
       if (ov !== undefined) span.setNum("bifrost.overhead.duration_ms", ov / 1000.0)
       if (!ok) span.fail(c.error === "" ? `HTTP ${c.status}` : c.error)
       span.end(Date.now())
-      tracer.addStages(span, c.stages)
+      tracer.addStages(span, c.stages.concat(pluginStagesOf(c)))
       tracer.finish(span)
       if (tracer.shouldFlush(Date.now())) this.flushTraces(tracer)
     }
@@ -3801,6 +4003,8 @@ export class Engine {
       rl.virtualKeyId = gvk.id
       rl.virtualKeyName = gvk.name ?? ""
     }
+    rl.userId = ctx.userId
+    rl.userName = userNameOf(this.cfg, ctx.userId)
     metrics.observeUsage(rl, { input: usage.prompt, output: usage.completion, cost: c, cacheRead: 0.0, cacheWrite: 0.0, cacheWrite5m: 0.0, cacheWrite1h: 0.0 })
   }
 
@@ -4343,24 +4547,36 @@ export class Engine {
     }
     const chain = this.plugins
     let run: PluginRun | undefined = undefined
+    let hook: AttemptPlugins | undefined = undefined
     if (chain !== undefined) {
       // the context of the transport hooks, when they ran for this request
       const shared = this.pluginRuns.get(req.headers.get(RUN_HEADER) ?? "")
-      const r = shared ?? new PluginRun({ requestId: req.headers.get("x-request-id") ?? newId("req_"), op: "chat", model: "", provider: "", headers: new Map(), values: new Map() })
+      const r = shared ?? new PluginRun({ requestId: req.headers.get("x-request-id") ?? newId("req_"), op: "chat", model: "", provider: "", headers: new Map(), values: new Map(), trace: new PluginTrace() })
       r.ctx.op = "chat"
       r.ctx.model = rawStr(body, "model") ?? ""
+      // the provider the model resolves to (a bare model's default one), as Bifrost's request carries it
+      r.ctx.provider = parseModel(this.cfg, r.ctx.model).provider
+      // the request as it came, for the pre hooks of each fallback
+      const original = text
       const pre = chain.runPre(&r.ctx, text)
+      let primaryFail: { status: int, body: string } | undefined = undefined
       if (pre.kind === "short_circuit") {
-        const post = chain.runPost(&r.ctx, pre.status, pre.body)
         const delay = parseInt(r.ctx.values.get("mock_latency_ms") ?? "0") ?? 0
         if (delay > 0) await sleep(delay)
-        const hs: Record<string, string> = new Map()
-        hs.set("content-type", post.status === pre.status ? pre.contentType : "application/json")
-        hs.set("x-bf-plugin-short-circuit", "true")
-        return new Response(post.body, { status: post.status, headers: hs })
+        // an error that lets the fallbacks be tried (Bifrost's AllowFallbacks unset or true) is the primary attempt's: the
+        // fallbacks run, each with the pre hooks again (AttemptPlugins)
+        if (pre.status >= 400 && pre.allowFallbacks !== false && fallbackRefs(this.cfg, body).length > 0) {
+          primaryFail = { status: pre.status, body: pre.body }
+        } else {
+          const post = chain.runPost(&r.ctx, pre.status, pre.body)
+          const hs: Record<string, string> = new Map()
+          hs.set("content-type", post.status === pre.status ? pre.contentType : "application/json")
+          hs.set("x-bf-plugin-short-circuit", "true")
+          return new Response(post.body, { status: post.status, headers: hs })
+        }
       }
       run = r
-      if (pre.body !== text) {
+      if (pre.kind === "continue" && pre.body !== text) {
         text = pre.body
         try {
           body = fields(text)
@@ -4368,6 +4584,9 @@ export class Engine {
           return errorResponse(500, `a plugin produced an invalid request: ${e.message}`, "api_error", noHeaders())
         }
       }
+      const ah = new AttemptPlugins(chain, r, original, body, text)
+      ah.primaryFail = primaryFail
+      hook = ah
     }
     // The typed request is only needed to translate for non-OpenAI providers.
     const typed = new LazyChat(text)
@@ -4407,20 +4626,34 @@ export class Engine {
       if (providers.streamsNatively(t.kind)) return openai.chatRequest(t, try this.withInjected(t, b))
       return try providers.chatUpstream(t, try tc.get(), try this.withInjected(t, b), autoFor(t))
     }
+    // the plugins across the attempts: each fallback sends the request its own pre hooks made (AttemptPlugins)
+    const plugHook = hook
     const build: Build = (t) => {
+      const cur = plugHook === undefined ? body : plugHook.body
+      const curTyped = plugHook === undefined ? typed : plugHook.typed
       // a routed crew/<pool> candidate's reasoning effort goes on the body (crew.tov)
       const eff = cp.crewEffort
-      const sh = try cp.shape(t.provider, t.kind, t.model, eff === "" ? body : withReasoningEffort(body, eff))
+      const sh = try cp.shape(t.provider, t.kind, t.model, eff === "" ? cur : withReasoningEffort(cur, eff))
       if (sh.route === "responses") return openai.responsesRequest(t, streamedBody(sh.body, canPipe))
-      if (eff !== "" && !sh.changed) return try sendChat(t, sh.body, new LazyChat(reasoningEffortText(body, eff)))
-      return try sendChat(t, sh.body, sh.changed ? new LazyChat(sh.text) : typed)
+      if (eff !== "" && !sh.changed) return try sendChat(t, sh.body, new LazyChat(reasoningEffortText(cur, eff)))
+      return try sendChat(t, sh.body, sh.changed ? new LazyChat(sh.text) : curTyped)
     }
     const outGuard = this.guardOutput ? guard : undefined
     const pluginRun = run
     const pluginChain = chain
+    // an answer as the caller gets it: the reversible redaction restored, then the output guards
+    const finishAnswer: AnswerStep = (out0) => {
+      let out = out0
+      if (reversible) out = try restoreCompletion(out, vault)
+      if (outGuard === undefined) return out
+      const g = try applyToCompletion(out, outGuard)
+      for (const f of g.findings) metrics.inc("raiju_guardrail_findings_total", metrics.labels("", f.kind, outGuard.mode), 1.0)
+      if (g.blocked) throw new SyntaxError("the response was blocked by guardrails")
+      return g.body
+    }
     const translate: Translate = (t, text, requested) => {
       if (!stream) {
-        const sh = try cp.shape(t.provider, t.kind, t.model, body)
+        const sh = try cp.shape(t.provider, t.kind, t.model, plugHook === undefined ? body : plugHook.body)
         let src = text
         if (sh.route === "responses") {
           const rc = try responseToChat(text, requested)
@@ -4428,20 +4661,30 @@ export class Engine {
         }
         const tr = try providers.chatTranslate(t.kind, t.model, src, requested, false)
         let out = tr.body
+        // the answer as the cache keeps it, when the plugins before the cache change it after
+        let cachedRaw: string | undefined = undefined
         if (pluginChain !== undefined && pluginRun !== undefined) {
-          const po = pluginChain.runPost(&pluginRun.ctx, 200, out)
-          if (po.status >= 400) throw new SyntaxError(pluginErrorMessage(po.status, po.body))
-          out = po.body
+          if (plugHook !== undefined) {
+            plugHook.cachedBody = undefined
+            plugHook.noStore = false
+          }
+          const sp = pluginChain.runPostSplit(&pluginRun.ctx, 200, out)
+          if (sp.out.status >= 400) throw new SyntaxError(pluginErrorMessage(sp.out.status, sp.out.body))
+          out = sp.out.body
+          if (sp.cached.status < 400 && sp.cached.body !== sp.out.body) cachedRaw = sp.cached.body
         }
-        if (reversible) out = try restoreCompletion(out, vault)
-        if (outGuard === undefined) return { body: out, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens, served: tr.served, billed: tr.billed }
-        const g = try applyToCompletion(out, outGuard)
-        for (const f of g.findings) metrics.inc("raiju_guardrail_findings_total", metrics.labels("", f.kind, outGuard.mode), 1.0)
-        if (g.blocked) throw new SyntaxError("the response was blocked by guardrails")
-        return { body: g.body, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens, served: tr.served, billed: tr.billed }
+        const final = try finishAnswer(out)
+        if (cachedRaw !== undefined && plugHook !== undefined) {
+          try {
+            plugHook.cachedBody = finishAnswer(cachedRaw)
+          } catch (e) {
+            plugHook.noStore = true
+          }
+        }
+        return { body: final, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens, served: tr.served, billed: tr.billed }
       }
       // a chat request converted to Responses, answered whole (not piped): its chat completion, as SSE
-      const shs = try cp.shape(t.provider, t.kind, t.model, body)
+      const shs = try cp.shape(t.provider, t.kind, t.model, plugHook === undefined ? body : plugHook.body)
       if (shs.route === "responses") {
         const rc = try responseToChat(text, requested)
         return { body: try this.guardWhole(try completionToSse(rc.body, wantUsage), "chat", guardOn), promptTokens: rc.promptTokens, completionTokens: rc.completionTokens }
@@ -4470,7 +4713,7 @@ export class Engine {
       conv.stopAtFinish = quirkStopsAtFinish(t)
       return guardedConv(conv)
     }
-    let res = try await this.serve(req, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers, stream ? pipeSink : undefined, mk, cp, promptUsed)
+    let res = try await this.serve(req, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers, stream ? pipeSink : undefined, mk, cp, promptUsed, undefined, undefined, plugHook)
     // post hooks on an error answer (they may recover from it or change it); a stream's hooks ran per chunk
     if (chain !== undefined && run !== undefined) {
       if (pipeSink !== undefined && pipeSink.started) chain.finish(&run.ctx)
@@ -4761,4 +5004,102 @@ test("logs_only: moved local rules and the built-in guard put placeholders in th
   const out = logsOnlyText(`{"content":"mail a@b.io about PROJ-12 and ACME-3, then a@b.io again"}`, g, moved.values(), vault)
   expect(out).toBe(`{"content":"mail [EMAIL-1] about [PROJECT_CODE-1] and ACME-3, then [EMAIL-1] again"}`)
   expect(logsOnlyText("", g, moved.values(), vault)).toBe("")
+})
+
+// ---- the plugins across attempts (AttemptPlugins) ----
+
+// A plugin that records its hooks in ctx.values "trace", stamps the model it saw into the request, short-circuits a
+// model named mock-ok (an answer), mock-final (an error with no fallbacks) or mock-soft (an error the fallbacks may
+// take), and recovers an error of status 599.
+class AttemptProbe extends BasePlugin {
+  name(): string {
+    return "probe"
+  }
+
+  preRequest(inout ctx: PluginContext, body: string): PreResult throws Error {
+    const prev = ctx.values.get("trace") ?? ""
+    ctx.values.set("trace", prev + " pre:" + ctx.model)
+    if (ctx.model.endsWith("mock-ok")) return { kind: "short_circuit", status: 200, body: `{"mock":true}`, contentType: "application/json" }
+    if (ctx.model.endsWith("mock-final")) return { kind: "short_circuit", status: 503, body: `{"error":{"message":"final"}}`, contentType: "application/json", allowFallbacks: false }
+    if (ctx.model.endsWith("mock-soft")) return { kind: "short_circuit", status: 503, body: `{"error":{"message":"soft"}}`, contentType: "application/json" }
+    let fs = try fields(body)
+    setField(&fs, "seen", quote(ctx.model))
+    return { kind: "continue", body: build(fs) }
+  }
+
+  postResponse(inout ctx: PluginContext, status: int, body: string): PostResult {
+    const prev = ctx.values.get("trace") ?? ""
+    ctx.values.set("trace", prev + " post:" + status)
+    if (status === 599) return { kind: "status", status: 200, body: `{"recovered":true}` }
+    return { kind: "continue", body: body + "!" }
+  }
+}
+
+function attemptHookFor(model: string): AttemptPlugins {
+  const chain = new PluginChain([new AttemptProbe()])
+  const run = new PluginRun({ requestId: "r", op: "chat", model: model, provider: "", headers: new Map(), values: new Map() })
+  const original = `{"model":${quote(model)},"messages":[]}`
+  const pre = chain.runPre(&run.ctx, original)
+  const text = pre.kind === "continue" ? pre.body : original
+  let body: Field[] = []
+  try {
+    body = fields(text)
+  } catch (e) {
+    body = []
+  }
+  return new AttemptPlugins(chain, run, original, body, text)
+}
+
+test("a fallback runs the pre hooks again on the request as it came, after the failed attempt's post hooks", () => {
+  const ah = attemptHookFor("openai/a")
+  expect(ah.text.includes(`"seen":"openai/a"`)).toBe(true)
+  expect(ah.stepAt(0, { provider: "openai", model: "a" }, { status: 404, body: "" }).kind).toBe("go")
+  const s = ah.stepAt(1, { provider: "anthropic", model: "b" }, { status: 503, body: `{"error":{"message":"down"}}` })
+  expect(s.kind).toBe("go")
+  expect(ah.run.ctx.values.get("trace")).toBe(" pre:openai/a post:503 pre:anthropic/b")
+  expect(ah.text.includes(`"model":"anthropic/b"`) && ah.text.includes(`"seen":"anthropic/b"`)).toBe(true)
+  expect(rawStr(ah.body, "seen")).toBe("anthropic/b")
+  expect(ah.run.ctx.provider).toBe("anthropic")
+})
+
+test("a failed attempt a post hook recovers is the answer, and a fallback's short circuit answers or moves on", () => {
+  const ah = attemptHookFor("openai/a")
+  const rec = ah.stepAt(1, { provider: "openai", model: "b" }, { status: 599, body: `{"error":{"message":"x"}}` })
+  expect(rec.kind === "answer" && rec.body === `{"recovered":true}`).toBe(true)
+  const ok = attemptHookFor("openai/a")
+  const answered = ok.stepAt(1, { provider: "openai", model: "mock-ok" }, { status: 503, body: "{}" })
+  expect(answered.kind === "answer" && answered.status === 200 && answered.body === `{"mock":true}!`).toBe(true)
+  const fin = attemptHookFor("openai/a")
+  expect(fin.stepAt(1, { provider: "openai", model: "mock-final" }, { status: 503, body: "{}" }).kind).toBe("final")
+  const soft = attemptHookFor("openai/a")
+  const f = soft.stepAt(1, { provider: "openai", model: "mock-soft" }, { status: 503, body: "{}" })
+  expect(f.kind === "fail" && f.status === 503).toBe(true)
+  // the soft error's post hooks ran already: the next attempt does not run them again
+  const next = soft.stepAt(2, { provider: "openai", model: "c" }, { status: 503, body: "{}" })
+  expect(next.kind).toBe("go")
+  expect(soft.run.ctx.values.get("trace")).toBe(" pre:openai/a post:503 pre:openai/mock-soft post:503 pre:openai/c")
+})
+
+test("the primary's short-circuit error goes through the post hooks and on to the fallbacks", () => {
+  const ah = attemptHookFor("openai/mock-soft")
+  ah.primaryFail = { status: 503, body: `{"error":{"message":"soft"}}` }
+  const s = ah.stepAt(0, { provider: "openai", model: "mock-soft" }, { status: 0, body: "" })
+  expect(s.kind === "fail" && s.status === 503).toBe(true)
+  expect(ah.primaryFail === undefined).toBe(true)
+  expect(ah.stepAt(1, { provider: "openai", model: "d" }, { status: 503, body: "{}" }).kind).toBe("go")
+})
+
+test("a cache hit goes through the post hooks of the plugins before the cache only", () => {
+  const before = attemptHookFor("openai/a")
+  before.chain.ranks = [0]
+  expect(before.onHit(`{"cached":1}`).body).toBe(`{"cached":1}!`)
+  const after = attemptHookFor("openai/a")
+  expect(after.onHit(`{"cached":1}`).body).toBe(`{"cached":1}`)
+})
+
+test("the user a key is assigned to is named from the admin users", () => {
+  const cfg: Config = { governance: { users: [{ name: "ada", role: "viewer" }] } }
+  expect(userNameOf(cfg, "ada")).toBe("ada")
+  expect(userNameOf(cfg, "nobody")).toBe("")
+  expect(userNameOf(cfg, "")).toBe("")
 })

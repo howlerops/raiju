@@ -28,7 +28,7 @@ import { WsConnection, SocketGate } from "./ws"
 import { DataScope } from "./scope"
 import { resourceOf } from "./rbac"
 import { largeRoute } from "./largepayload"
-import { matchRoute, billedMedia, handleMediaLarge, deploymentRoute, deploymentRequest, nativeRoute, nativeCloud, vertexBearer } from "./media"
+import { matchRoute, billedMedia, handleMediaLarge, deploymentRoute, deploymentRequest, nativeRoute, nativeCloud, vertexBearer, providerFor, NativeRoute } from "./media"
 import { realtimeCall, realtimeMint } from "./realtimecalls"
 import { MINT_ROUTES } from "./rtsession"
 import { sdkRoute, anthropicSdk } from "./anthropic_batch"
@@ -52,7 +52,7 @@ import { cookieValue, SETUP_COOKIE } from "./setupsession"
 import { rerank, bedrockRerank, countTokens, responsesInputTokens, asyncSubmit, asyncGet, sdkAsyncSubmit, sdkAsyncPoll, decisionRoute, Dispatch } from "./extras"
 import { asyncPoll } from "./jobs"
 import { serveUi, uiPath, UI_CSP } from "./uiserve"
-import { TransportRun, transportStart, transportEnd, transportDone, transportSink, llmHooked } from "./pluginroute"
+import { TransportRun, transportStart, transportEnd, transportDone, transportSink, llmHooked, storageHooked, StorageCall, storageOp, pathWithId } from "./pluginroute"
 import { kindOfPath } from "./plughttp"
 
 type ModelEntry = { id: string, object: string, created: int, owned_by: string }
@@ -546,7 +546,7 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   else if (path === "/api/api-keys" || path.startsWith("/api/api-keys/")) r = ops.apiKeysRoute(req.method, path, req.url, body, gate.actor)
   // the cache clears (DELETE) and the read-only plugin listings
   else if (path.startsWith("/api/cache/")) r = await ops.cacheClear(req.method, path)
-  else if (path === "/api/plugins" || path.startsWith("/api/plugins/")) r = ops.pluginsRoute(req.method, path, body)
+  else if (path === "/api/plugins" || path.startsWith("/api/plugins/")) r = await ops.pluginsRouteAsync(req.method, path, body)
   else if (path === "/api/mcp/virtual") r = req.method === "GET" ? ops.virtualView() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
   else if (path === "/api/governance/access-profiles" || path.startsWith("/api/governance/access-profiles/")) r = ops.profiles(req.method, path, body)
   else if (path.startsWith("/api/alerting/")) {
@@ -974,13 +974,31 @@ async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response>
     if (engine.gov.enforce && engine.gov.findKey(snapshot(req.headers)) === undefined) {
       return errorResponse(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", noHeaders())
     }
-    // a batch's creation runs the plugins' LLM hooks (Bifrost's batch_create); the other batch and file calls do not
+    // a batch's creation runs the plugins' LLM hooks (Bifrost's batch_create), and so do the other batch and file calls
     if (sr.op === "batches.create") return await cors(engine.cfg, req, try await llmHooked(engine, req, "batch_create", async (r, s) => await anthropicSdk(engine.cfg, r), undefined))
+    const aop = storageOp(sr.op)
+    if (aop !== "") {
+      const call: StorageCall = { op: aop, provider: headerOr(req, "x-model-provider", "anthropic"), idKey: idKeyOf(aop), id: sr.id, pathFor: (nid: string): string => pathWithId(p, sr.id, nid) }
+      return await cors(engine.cfg, req, try await storageHooked(engine, req, call, async (r, s) => await anthropicSdk(engine.cfg, r)))
+    }
     return await cors(engine.cfg, req, await anthropicSdk(engine.cfg, req))
   }
   // the GenAI SDK's files, batches, cached contents, operations, :predict and rank
   const gop = genaiIn.genaiRoute(m, p)
-  if (gop !== undefined) return await cors(engine.cfg, req, await genaiSdk(engine, req, gop.op, gop.model, gop.id))
+  if (gop !== undefined) {
+    // the batch and file calls run the plugins' LLM hooks (a resumable upload's protocol does not)
+    const gsop = gop.op === "files.upload" ? "" : storageOp(gop.op)
+    if (gsop !== "" && gsop !== "batch_create") {
+      const call: StorageCall = { op: gsop, provider: headerOr(req, "x-model-provider", "gemini"), idKey: idKeyOf(gsop), id: gop.id, pathFor: (nid: string): string => pathWithId(p, gop.id, nid) }
+      return await cors(engine.cfg, req, try await storageHooked(engine, req, call, async (r, s) => {
+        const rp = pathOfReq(r)
+        const g2 = genaiIn.genaiRoute(r.method, rp)
+        if (g2 === undefined) return errorResponse(404, `no route for ${r.method} ${rp}`, "invalid_request_error", noHeaders())
+        return await genaiSdk(engine, r, g2.op, g2.model, g2.id)
+      }))
+    }
+    return await cors(engine.cfg, req, await genaiSdk(engine, req, gop.op, gop.model, gop.id))
+  }
   // Bedrock's jobs and S3 files, and Vertex's regional batch and cache paths: the provider's own bodies
   const nr = nativeRoute(m, p)
   if (nr !== undefined) {
@@ -997,6 +1015,21 @@ async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response>
         }
       }, undefined)
       return await cors(engine.cfg, req, hookedJob)
+    }
+    // the other job, file and batch calls run the plugins' LLM hooks as Bifrost's batch_* and file_* requests
+    const ns = nativeStorage(nr)
+    if (ns !== undefined) {
+      const call: StorageCall = { op: ns.op, provider: ns.provider, idKey: idKeyOf(ns.op), id: ns.id, pathFor: (nid: string): string => ns.s3 ? s3Path(nid) : pathWithId(p, ns.id, nid) }
+      return await cors(engine.cfg, req, try await storageHooked(engine, req, call, async (r, s) => {
+        const rp = pathOfReq(r)
+        const n2 = nativeRoute(r.method, rp)
+        if (n2 === undefined) return errorResponse(404, `no route for ${r.method} ${rp}`, "invalid_request_error", noHeaders())
+        try {
+          return try await nativeCloud(engine.cfg, r, n2)
+        } catch (e) {
+          return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+        }
+      }))
     }
     return try await cors(engine.cfg, req, try await nativeCloud(engine.cfg, req, nr))
   }
@@ -1106,6 +1139,19 @@ async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response>
     }
     const lk = kindOfPath(m, p)
     if (lk !== undefined) return try await llmHooked(engine, req, lk.op, async (r, s) => try await engine.media(r, media), undefined)
+    // the OpenAI files and batches calls run the plugins' LLM hooks as Bifrost's file_* and batch_* requests
+    const mop = storageOp(media.op)
+    if (mop !== "") {
+      const u0 = URL.parse(req.url)
+      const id = mop.endsWith("_list") || mop === "file_upload" || mop === "batch_create" ? "" : segmentId(p, 3)
+      const call: StorageCall = { op: mop, provider: providerFor(snapshot(req.headers), u0 === undefined ? new URLSearchParams("") : u0.searchParams), idKey: idKeyOf(mop), id: id, pathFor: (nid: string): string => pathWithId(p, id, nid) }
+      return try await storageHooked(engine, req, call, async (r, s) => {
+        const rp = pathOfReq(r)
+        const mr = matchRoute(r.method, rp)
+        if (mr === undefined) return errorResponse(404, `no route for ${r.method} ${rp}`, "invalid_request_error", noHeaders())
+        return try await engine.media(r, mr)
+      })
+    }
     return try await engine.media(req, media)
   }
   if (m === "OPTIONS") {
@@ -1113,6 +1159,65 @@ async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response>
     return await cors(engine.cfg, req, res)
   }
   return errorResponse(404, `no route for ${m} ${p}`, "invalid_request_error", noHeaders())
+}
+
+// ---- the batch and file calls through the plugins' LLM hooks (pluginroute.tov storageHooked) ----
+
+// A request header, or a default when it is absent or empty.
+function headerOr(r: Request, name: string, dflt: string): string {
+  const v = r.headers.get(name) ?? ""
+  return v === "" ? dflt : v
+}
+
+// The member a batch or file request's id goes in.
+function idKeyOf(op: string): string {
+  return op.startsWith("file_") ? "file_id" : "batch_id"
+}
+
+// A request's path.
+function pathOfReq(r: Request): string {
+  const u = URL.parse(r.url)
+  return u === undefined ? "" : u.pathname
+}
+
+// The path segment at i, its %XX escapes undone ("" when there is none).
+function segmentId(p: string, i: int): string {
+  const s = p.split("/")[i] ?? ""
+  if (!s.includes("%")) return s
+  return new URLSearchParams("s=" + s.replaceAll("+", "%2B")).get("s") ?? s
+}
+
+// The S3 object of an s3://bucket/key file id as its /bedrock/files path.
+function s3Path(id: string): string {
+  const rest = id.startsWith("s3://") ? id.slice(5) : id
+  const i = rest.indexOf("/")
+  if (i < 0) return "/bedrock/files/" + bedrock.encodeSegment(rest)
+  const keyParts: string[] = []
+  for (const part of rest.slice(i + 1).split("/")) keyParts.push(bedrock.encodeSegment(part))
+  return "/bedrock/files/" + bedrock.encodeSegment(rest.slice(0, i)) + "/" + keyParts.join("/")
+}
+
+// The Bifrost request a native cloud call is (Bedrock's model invocation jobs and S3 files, Vertex's batch prediction
+// jobs; Vertex's cached contents are not batch or file calls), or undefined. s3: the id is the object's s3:// URI.
+function nativeStorage(nr: NativeRoute): { op: string, provider: string, id: string, s3: bool } | undefined {
+  if (nr.kind === "bedrock.list") return { op: "batch_list", provider: "bedrock", id: "", s3: false }
+  if (nr.kind === "bedrock.get") return { op: "batch_retrieve", provider: "bedrock", id: nr.id, s3: false }
+  if (nr.kind === "bedrock.stop") return { op: "batch_cancel", provider: "bedrock", id: nr.id, s3: false }
+  if (nr.kind === "bedrock.files.list") return { op: "file_list", provider: "bedrock", id: "", s3: false }
+  if (nr.kind === "bedrock.files.object") {
+    const uri = `s3://${nr.bucket}/${nr.key}`
+    if (nr.method === "PUT") return { op: "file_upload", provider: "bedrock", id: uri, s3: true }
+    if (nr.method === "GET") return { op: "file_content", provider: "bedrock", id: uri, s3: true }
+    if (nr.method === "HEAD") return { op: "file_retrieve", provider: "bedrock", id: uri, s3: true }
+    if (nr.method === "DELETE") return { op: "file_delete", provider: "bedrock", id: uri, s3: true }
+    return undefined
+  }
+  if (nr.kind === "vertex.create") return { op: "batch_create", provider: "vertex", id: "", s3: false }
+  if (nr.kind === "vertex.list") return { op: "batch_list", provider: "vertex", id: "", s3: false }
+  if (nr.kind === "vertex.get") return { op: "batch_retrieve", provider: "vertex", id: nr.id, s3: false }
+  if (nr.kind === "vertex.cancel") return { op: "batch_cancel", provider: "vertex", id: nr.id, s3: false }
+  if (nr.kind === "vertex.delete") return { op: "batch_delete", provider: "vertex", id: nr.id, s3: false }
+  return undefined
 }
 
 // The virtual key a value names, its rotation cooldown included (the governance lookup of a header value).

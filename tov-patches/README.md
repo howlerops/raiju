@@ -10,6 +10,7 @@ patches apply in order only. Patches 0005 (WAMR) and 0006 (libdatachannel) add v
 libraries (about 2.7 MB and 4.9 MB of text), which the first four do not; 0006 is applied on top of 0005.
 Patch 0008 changes the fetch and HTTP/2 code that 0007 adds, so it is applied on top of 0007.
 Patch 0009 (node:fs rename and fsync) touches the shared lists in `builtins.rs` and `tov.h` and is written on top of 0001-0008.
+Patch 0010 (WebAssembly wall-clock limit) changes `std/wasm`, `runtime/wasm.c` and the WAMR interpreter that 0005 adds, and is written on top of 0001-0009.
 
 ## Submitting upstream
 
@@ -519,3 +520,37 @@ Errors carry Node's messages: `ENOENT: no such file or directory, rename 'a' -> 
 **Not covered.** POSIX only, as the rest of Tov's file API (Windows' rename does not replace an existing
 file). No `fs.promises`, no `readSync`/positioned writes, no `encoding` or `flag` options on
 `writeFileSync`. The test (`tests/fs_atomic.tov`, 17 checks) is in `run.sh`.
+
+## 0010 — a wall-clock limit per WebAssembly call (`std/wasm` `timeMs`)
+
+**Problem.** 0005 bounds a call by its instruction count (`fuel`), but a call that is slow for another
+reason (a budget set high, a host import that takes long) still holds the thread. A gateway that runs
+plugin hooks on its request path needs a time bound per call as well.
+
+**API.**
+
+```ts
+import { instantiate } from "std/wasm"
+
+const m = instantiate(bytes, { fuel: 200000000, timeMs: 5000 })  // the most wall-clock ms one call may take
+m.setTimeLimit(250)                                              // changes it later (0: no limit)
+m.call("pre_hook", [ptr, len])  // past the limit it throws "time limit exceeded", as a call out of fuel does
+```
+
+**Design.** `runtime/wasm.c` keeps the deadline of the call in progress (CLOCK_MONOTONIC nanoseconds) in a
+global around `wasm_runtime_call_wasm_a`; a nested call keeps the earlier deadline. WAMR's fast
+interpreter runs `CHECK_INSTRUCTION_LIMIT` on every instruction when instruction metering is on (0005
+turns it on); the macro now also counts a tick and, every 65536 instructions, compares the clock with the
+deadline and raises "time limit exceeded". With no deadline set the added cost is one compare. The limit
+is capped at one day.
+
+**Files.**
+- `runtime/wasm.c`, `runtime/tov.h`: the deadline, `tv_wasm_now_ns`, the `wasmTimeLimit` native (and its stub
+  when WAMR is not built).
+- `vendor/wamr/core/iwasm/interpreter/wasm_interp_fast.c`: the clock check in `CHECK_INSTRUCTION_LIMIT`.
+- `crates/tov/src/check/builtins.rs`: the signature.
+- `crates/tov/src/std/wasm.tov`: `WasmLimits.timeMs`, `WasmInstance.setTimeLimit`.
+
+**Not covered.** The clock is read only between instructions, so one host call that blocks is not cut
+short (the call ends at the next check after it returns). Only the fast interpreter is built, so only it
+has the check. The test (2 more checks in `tests/wasm.tov`, 24 in all) is in `run.sh`.

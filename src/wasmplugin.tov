@@ -49,11 +49,13 @@ function text(b: u8[]): string throws Error {
 }
 
 // Limits for one plugin, set on its entry in the config (wasm_limits); a field left out takes the default.
-export type WasmPluginLimits = { max_memory_pages?: int, max_stack_bytes?: int, max_instructions?: int }
+// max_time_ms: the most wall-clock milliseconds one hook call may take (the WAMR time limit of tov-patches/0010).
+export type WasmPluginLimits = { max_memory_pages?: int, max_stack_bytes?: int, max_instructions?: int, max_time_ms?: int }
 
 const DEFAULT_PAGES = 1024
 const DEFAULT_STACK = 262144
 const DEFAULT_FUEL = 200000000
+const DEFAULT_TIME_MS = 5000
 const MAX_OUT = 67108864
 const MAX_CACHED = 64
 
@@ -63,10 +65,12 @@ export type WasmPre =
 
 // A post_hook's answer: the body (and the status it now has, when the plugin changed it: an error made
 // of a response, or a response made of an error), and the shared context.
+// skip: on a stream, the plugin dropped the chunk (an error with Bifrost's stream_control skip_stream).
 export type WasmPost =
   | { kind: "same", context: string }
   | { kind: "body", body: string, context: string }
   | { kind: "status", status: int, body: string, context: string }
+  | { kind: "skip", context: string }
 
 // The hooks a module exports. httpPre is the export that runs before routing (http_pre_hook, or
 // http_intercept, its older name), "" when there is none.
@@ -274,6 +278,17 @@ function errorReply(ef: Field[]): { status: int, body: string } {
   return { status: status, body: errorJson("the plugin refused the request", "api_error", undefined) }
 }
 
+// The message of a Bifrost error ({"error": {"message"}}), or "".
+function errorMessageOf(ef: Field[]): string {
+  const inner = find(ef, "error")
+  if (inner === undefined || !inner.startsWith("{")) return ""
+  try {
+    return rawStr(fields(inner), "message") ?? ""
+  } catch (e) {
+    return ""
+  }
+}
+
 // Whether a Bifrost error carries nothing: Bifrost's pipeline reads such an error as a recovery.
 function emptyError(ef: Field[]): bool {
   for (const key of ["status_code", "type", "code"]) {
@@ -353,10 +368,23 @@ export class WasmPluginInst {
     freeBuffer(this.inst, this.freeArity, ptr, size, this.pluginName)
   }
 
-  // What the plugin printed to standard output or error, logged after each call.
+  // What the plugin printed to standard output or error, logged after each call and kept for the request's plugin logs
+  // (takeOutput).
+  private printed = ""
+
   private flushOutput(): void {
     const o = this.inst.output()
-    if (o !== "") console.error(`raiju: plugin ${this.pluginName}: ${o.trim()}`)
+    if (o !== "") {
+      console.error(`raiju: plugin ${this.pluginName}: ${o.trim()}`)
+      this.printed += o
+    }
+  }
+
+  // What the plugin printed since the last call of this, trimmed.
+  takeOutput(): string {
+    const o = this.printed
+    this.printed = ""
+    return o.trim()
   }
 
   // Replaces a trapped instance with a fresh one.
@@ -475,6 +503,16 @@ export class WasmPluginInst {
         const ev = find(f, "error")
         if (ev !== undefined && ev.startsWith("{")) {
           const ef = fields(ev)
+          // Bifrost's StreamControl on a chunk's error: skip_stream drops the chunk (log_error logs the message), and
+          // the stream goes on
+          const scRaw = find(ef, "stream_control")
+          if (stream && scRaw !== undefined && scRaw.startsWith("{")) {
+            const scf = fields(scRaw)
+            if (rawBool(scf, "skip_stream") === true) {
+              if (rawBool(scf, "log_error") === true) console.error(`raiju: plugin ${this.pluginName}: error in stream: ${errorMessageOf(ef)}`)
+              return { kind: "skip", context: ctx }
+            }
+          }
           if (!emptyError(ef)) {
             const r = errorReply(ef)
             if (!(failed && r.status === status && same(r.body, body))) return { kind: "status", status: r.status, body: r.body, context: ctx }
@@ -593,6 +631,7 @@ function start(bytes: u8[], configJson: string, limits: WasmPluginLimits | undef
     stackBytes: limits?.max_stack_bytes ?? DEFAULT_STACK,
     maxPages: limits?.max_memory_pages ?? DEFAULT_PAGES,
     fuel: limits?.max_instructions ?? DEFAULT_FUEL,
+    timeMs: limits?.max_time_ms ?? DEFAULT_TIME_MS,
   }
   const inst = try open(bytes, l)
   for (const need of ["malloc", "free", "get_name", "init"]) {
@@ -695,7 +734,7 @@ export function openWasmPlugin(path: string, configJson: string, limits: WasmPlu
   } catch (e) {
     throw new Error(`plugin file ${path}: ${e.message}`)
   }
-  const lim = limits === undefined ? "" : `${limits.max_memory_pages ?? 0},${limits.max_stack_bytes ?? 0},${limits.max_instructions ?? 0}`
+  const lim = limits === undefined ? "" : `${limits.max_memory_pages ?? 0},${limits.max_stack_bytes ?? 0},${limits.max_instructions ?? 0},${limits.max_time_ms ?? 0}`
   const key = `${path}|${size}|${mtime}|${lim}|${configJson}`
   const hit = loaded.get(key)
   if (hit !== undefined) return hit
@@ -861,6 +900,21 @@ test("a plugin that trapped is restarted, not left with a damaged stack", () => 
   }
   expect(clean).toBe(40)
   expect(p.restarts).toBe(39)
+  p.close()
+})
+
+test("a wall-clock limit stops a hook that runs too long, whatever its instruction budget", () => {
+  const p = try fixture(`{"mode":"loop"}`, { max_instructions: 2000000000, max_time_ms: 120 })
+  const t0 = Date.now()
+  let msg = ""
+  try {
+    p.preRequest("{}", CHAT_KIND, CHAT)
+  } catch (e) {
+    msg = e.message
+  }
+  const took = Date.now() - t0
+  expect(msg.includes("time limit exceeded")).toBe(true)
+  expect(took >= 110.0 && took < 5000.0).toBe(true)
   p.close()
 })
 

@@ -1,0 +1,176 @@
+diff --git a/crates/tov/src/check/builtins.rs b/crates/tov/src/check/builtins.rs
+--- a/crates/tov/src/check/builtins.rs
++++ b/crates/tov/src/check/builtins.rs
+@@ -163,6 +163,7 @@
+         "wasmMemSize" => (vec![INT], INT),
+         "wasmOutput" => (vec![INT], STR),
+         "wasmFree" => (vec![INT], VOID),
++        "wasmTimeLimit" => (vec![INT, INT], VOID),
+         "wasmError" => (vec![], STR),
+         // WebRTC (runtime/rtc.c, std/rtc)
+         "rtcStart" => {
+diff --git a/crates/tov/src/std/wasm.tov b/crates/tov/src/std/wasm.tov
+--- a/crates/tov/src/std/wasm.tov
++++ b/crates/tov/src/std/wasm.tov
+@@ -14,13 +14,15 @@
+ }
+ 
+ // Limits for one instance. A field left out takes the default: 64 KiB of operand stack, 256 pages
+-// (16 MiB) of linear memory, no instruction budget. `fuel` is the most instructions one call may
+-// execute (about 2 billion at most); a call that runs past it traps, so a loop cannot hang the
+-// process.
++// (16 MiB) of linear memory, no instruction budget, no time limit. `fuel` is the most instructions
++// one call may execute (about 2 billion at most); a call that runs past it traps, so a loop cannot
++// hang the process. `timeMs` is the most wall-clock milliseconds one call may take (checked every
++// 65536 instructions); a call that runs past it traps with "time limit exceeded".
+ export type WasmLimits = {
+   stackBytes?: int
+   maxPages?: int
+   fuel?: int
++  timeMs?: int
+ }
+ 
+ export class WasmInstance {
+@@ -67,6 +69,11 @@
+     return __native.wasmOutput(this.handle)
+   }
+ 
++  // Sets the wall-clock milliseconds one call may take (0: no limit).
++  setTimeLimit(ms: int): void {
++    __native.wasmTimeLimit(this.handle, ms)
++  }
++
+   // Releases the instance. Using it afterwards throws.
+   close(): void {
+     __native.wasmFree(this.handle)
+@@ -81,5 +88,7 @@
+     try check()
+     throw new Error("WebAssembly module failed to load")
+   }
++  const ms = limits?.timeMs ?? 0
++  if (ms > 0) __native.wasmTimeLimit(h, ms)
+   return new WasmInstance(h)
+ }
+diff --git a/runtime/tov.h b/runtime/tov.h
+--- a/runtime/tov.h
++++ b/runtime/tov.h
+@@ -970,6 +970,7 @@
+ tv_int tv_native_wasmMemSize(tv_int h);
+ tv_str tv_native_wasmOutput(tv_int h);
+ void tv_native_wasmFree(tv_int h);
++void tv_native_wasmTimeLimit(tv_int h, tv_int ms);
+ tv_str tv_native_wasmError(void);
+ /* WebRTC (runtime/rtc.c, in an archive of its own with libdatachannel: programs using std/rtc call
+  * tv_rtc_install, which sets tv_rtc_impl). The library runs threads and calls back from them; they
+diff --git a/runtime/wasm.c b/runtime/wasm.c
+--- a/runtime/wasm.c
++++ b/runtime/wasm.c
+@@ -5,8 +5,9 @@
+  * A module is loaded and instantiated in one step and named by an integer handle, like the
+  * sockets of net.c. The host reads and writes the instance's linear memory and calls exported
+  * functions with i32/i64 arguments. Limits per instance: the linear memory (pages), the operand
+- * stack, and a budget of instructions per call (WAMR's instruction metering), so a runaway loop
+- * ends with a trap instead of hanging the process.
++ * stack, a budget of instructions per call (WAMR's instruction metering), so a runaway loop
++ * ends with a trap instead of hanging the process, and a wall-clock time per call (checked by the
++ * interpreter every 65536 instructions, so a call that is slow for any reason ends too).
+  *
+  * The instance sees no host but a small WASI subset (clock, random, standard output and error
+  * captured into a buffer, empty environment and arguments, no files and no sockets) and the
+@@ -38,6 +39,7 @@
+ tv_int tv_native_wasmMemSize(tv_int h) { (void)h; return 0; }
+ tv_str tv_native_wasmOutput(tv_int h) { (void)h; return TV_EMPTY_STR; }
+ void tv_native_wasmFree(tv_int h) { (void)h; }
++void tv_native_wasmTimeLimit(tv_int h, tv_int ms) { (void)h; (void)ms; }
+ tv_str tv_native_wasmError(void) { tv_str s = tv_str_from(tv_wasm_err, strlen(tv_wasm_err)); tv_wasm_err[0] = 0; return s; }
+ 
+ #else
+@@ -59,9 +61,23 @@
+     uint8_t *code;   /* the module's bytes: the loader keeps pointers into them */
+     uint32_t stack;
+     int fuel;        /* instructions per call; <= 0 is unlimited */
++    int64_t time_ms; /* wall-clock milliseconds per call; <= 0 is unlimited */
+     char *out;       /* captured standard output and error */
+     size_t out_len;
+ } tv_wasm;
++
++/* The deadline of the call in progress (CLOCK_MONOTONIC nanoseconds; 0: none) and an instruction
++ * tick, read by WAMR's interpreter (vendor/wamr/core/iwasm/interpreter/wasm_interp_fast.c): every
++ * 65536 instructions it compares the clock with the deadline and traps with "time limit exceeded"
++ * once it has passed. Calls run one at a time on the thread that makes them. */
++int64_t tv_wasm_deadline_ns = 0;
++uint32_t tv_wasm_ticks = 0;
++
++int64_t tv_wasm_now_ns(void) {
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (int64_t)ts.tv_sec * 1000000000ll + (int64_t)ts.tv_nsec;
++}
+ 
+ static tv_wasm *tv_wasm_table[TV_WASM_MAX_INSTANCES];
+ static bool tv_wasm_ready;
+@@ -410,7 +426,15 @@
+     }
+     wasm_runtime_clear_exception(w->inst);
+     wasm_runtime_set_instruction_count_limit(w->env, w->fuel);
+-    if (!wasm_runtime_call_wasm_a(w->env, fn, nr, rv, np, av)) {
++    int64_t outer = tv_wasm_deadline_ns;
++    if (w->time_ms > 0) {
++        int64_t mine = tv_wasm_now_ns() + w->time_ms * 1000000ll;
++        /* a call made while another is in progress keeps the earlier deadline */
++        tv_wasm_deadline_ns = outer != 0 && outer < mine ? outer : mine;
++    }
++    bool ok = wasm_runtime_call_wasm_a(w->env, fn, nr, rv, np, av);
++    tv_wasm_deadline_ns = outer;
++    if (!ok) {
+         const char *ex = wasm_runtime_get_exception(w->inst);
+         tv_wasm_fail("%s", ex && *ex ? ex : "WebAssembly call failed");
+         wasm_runtime_clear_exception(w->inst);
+@@ -470,6 +494,13 @@
+     return s;
+ }
+ 
++/* Sets the wall-clock time one call of the instance may take (milliseconds; 0 or less: no limit). */
++void tv_native_wasmTimeLimit(tv_int h, tv_int ms) {
++    tv_wasm *w = tv_wasm_get(h);
++    if (!w) return;
++    w->time_ms = ms > 0 ? (ms > 86400000ll ? 86400000ll : (int64_t)ms) : 0;
++}
++
+ void tv_native_wasmFree(tv_int h) {
+     if (h <= 0 || h > TV_WASM_MAX_INSTANCES) return;
+     tv_wasm_release(tv_wasm_table[h - 1]);
+diff --git a/vendor/wamr/core/iwasm/interpreter/wasm_interp_fast.c b/vendor/wamr/core/iwasm/interpreter/wasm_interp_fast.c
+--- a/vendor/wamr/core/iwasm/interpreter/wasm_interp_fast.c
++++ b/vendor/wamr/core/iwasm/interpreter/wasm_interp_fast.c
+@@ -90,13 +90,23 @@
+     } while (0)
+ 
+ #if WASM_ENABLE_INSTRUCTION_METERING != 0
+-#define CHECK_INSTRUCTION_LIMIT()                                 \
+-    if (instructions_left == 0) {                                 \
+-        wasm_set_exception(module, "instruction limit exceeded"); \
+-        goto got_exception;                                       \
+-    }                                                             \
+-    else if (instructions_left > 0)                               \
+-        instructions_left--;
++/* Tov's wall-clock bound on a call (runtime/wasm.c): every 65536 instructions the clock is
++ * compared with the deadline of the call in progress (0: none). */
++extern int64_t tv_wasm_deadline_ns;
++extern uint32_t tv_wasm_ticks;
++extern int64_t tv_wasm_now_ns(void);
++#define CHECK_INSTRUCTION_LIMIT()                                     \
++    if (instructions_left == 0) {                                     \
++        wasm_set_exception(module, "instruction limit exceeded");     \
++        goto got_exception;                                           \
++    }                                                                 \
++    else if (instructions_left > 0)                                   \
++        instructions_left--;                                          \
++    if (tv_wasm_deadline_ns != 0 && ((++tv_wasm_ticks) & 0xFFFF) == 0 \
++        && tv_wasm_now_ns() > tv_wasm_deadline_ns) {                  \
++        wasm_set_exception(module, "time limit exceeded");            \
++        goto got_exception;                                           \
++    }
+ 
+ #else
+ #define CHECK_INSTRUCTION_LIMIT() (void)0

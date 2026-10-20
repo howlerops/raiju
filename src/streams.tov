@@ -720,6 +720,49 @@ export class BedrockEventStreamToOpenAI {
   }
 }
 
+// One frame of an event stream as it was sent: its bytes, and when it reads as a frame (ok), its string headers and text
+// payload.
+export type EventFrame = { raw: u8[], ok: bool, headers: Map<string, string>, payload: string }
+
+// Cuts a binary event stream into whole frames however its bytes arrive. Bytes that do not frame (a bad length or CRC)
+// come out as they are, so a stream is never held back or lost.
+export class EventFrames {
+  private buf: u8[] = []
+
+  push(bytes: u8[]): EventFrame[] {
+    for (const b of bytes) this.buf.push(b)
+    const out: EventFrame[] = []
+    while (this.buf.length >= 12) {
+      const total = u32(this.buf, 0)
+      const hlen = u32(this.buf, 4)
+      if (crc32(this.buf.slice(0, 8)) !== u32(this.buf, 8) || total < 16 || total > MAX_FRAME || hlen > total - 16) {
+        out.push({ raw: this.buf, ok: false, headers: new Map(), payload: "" })
+        this.buf = []
+        break
+      }
+      if (this.buf.length < total) break
+      const frame = this.buf.slice(0, total)
+      this.buf = this.buf.slice(total)
+      try {
+        if (crc32(frame.slice(0, total - 4)) !== u32(frame, total - 4)) throw new SyntaxError("bad message CRC")
+        const h = try parseHeaders(frame.slice(12, 12 + hlen))
+        const payload = try decodeText(frame.slice(12 + hlen, total - 4))
+        out.push({ raw: frame, ok: true, headers: h, payload: payload })
+      } catch (e) {
+        out.push({ raw: frame, ok: false, headers: new Map(), payload: "" })
+      }
+    }
+    return out
+  }
+
+  // What is left at the end of the stream (an unfinished frame), to be sent as it is.
+  rest(): u8[] {
+    const r = this.buf
+    this.buf = []
+    return r
+  }
+}
+
 // Builds one event stream frame. Headers are name/value pairs sent as strings.
 export function encodeEventStreamFrame(headers: Map<string, string>, payload: string): u8[] {
   let head: u8[] = []
@@ -1139,4 +1182,24 @@ test("Responses passthrough forwards the events as they came and reads the usage
   expect(p.promptTokens).toBe(7)
   expect(p.completionTokens).toBe(3)
   expect(p.end()).toBe("")
+})
+
+test("event stream frames come out whole however the bytes are cut, and bytes that do not frame pass", () => {
+  const h: Map<string, string> = new Map()
+  h.set(":event-type", "contentBlockDelta")
+  h.set(":message-type", "event")
+  const a = encodeEventStreamFrame(h, `{"n":1}`)
+  const b = encodeEventStreamFrame(h, `{"n":2}`)
+  const all = a.concat(b)
+  const fr = new EventFrames()
+  const first = fr.push(all.slice(0, 20))
+  expect(first.length).toBe(0)
+  const rest = fr.push(all.slice(20))
+  expect(rest.length).toBe(2)
+  expect(rest[0]!.ok && rest[0]!.payload === `{"n":1}` && rest[0]!.headers.get(":event-type") === "contentBlockDelta").toBe(true)
+  expect(rest[1]!.raw.length).toBe(b.length)
+  expect(fr.rest().length).toBe(0)
+  const junk = new EventFrames()
+  const j = junk.push([u8(1), u8(2), u8(3), u8(4), u8(5), u8(6), u8(7), u8(8), u8(9), u8(10), u8(11), u8(12)])
+  expect(j.length === 1 && !j[0]!.ok && j[0]!.raw.length === 12).toBe(true)
 })

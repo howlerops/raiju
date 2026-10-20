@@ -6,6 +6,7 @@ import { listJson, sessionJson, sessionSummaryJson, detailJson, uaRoute, listFil
 import { Incident } from "./holds"
 import { WsTickets } from "./wsticket"
 import { entryStatus, PluginEntry } from "./plugins"
+import { isPluginUrl, downloadPlugin } from "./plugindl"
 import { parseDatasheet } from "./pricing"
 import { deliveryLog } from "./webhooks"
 import { OtelConfig, TlsOpts, otelTls, usesGrpc, exportMetricsGrpc } from "./otel"
@@ -125,6 +126,27 @@ function limitsOf(fs: Field[], dflt: WasmLimitsSpec | undefined): WasmLimitsSpec
   }
 }
 
+// The placement a body names: the default when it names none (or null), undefined for "" (Bifrost's nil, the
+// default group). Bifrost's API takes pre_builtin and post_builtin only; any other value is refused.
+function placementOf(fs: Field[], dflt: string | undefined): { ok: bool, value: string | undefined } {
+  const raw = find(fs, "placement")
+  if (raw === undefined || isNull(raw)) return { ok: true, value: dflt }
+  const p = rawStr(fs, "placement")
+  if (p === undefined) return { ok: false, value: undefined }
+  if (p === "") return { ok: true, value: undefined }
+  if (p !== "pre_builtin" && p !== "post_builtin") return { ok: false, value: undefined }
+  return { ok: true, value: p }
+}
+
+// The order a body names (an integer), or the default when it names none (or null).
+function orderOf(fs: Field[], dflt: int | undefined): { ok: bool, value: int | undefined } {
+  const raw = find(fs, "order")
+  if (raw === undefined || isNull(raw)) return { ok: true, value: dflt }
+  const n = rawNum(fs, "order")
+  if (n === undefined || n !== Math.floor(n)) return { ok: false, value: undefined }
+  return { ok: true, value: Math.floor(n) }
+}
+
 // Why a plugin cannot be built from its config: "" when it can. Checked as enabled, so a disabled plugin is
 // still checked for its name and config.
 function badPlugin(spec: PluginSpec): string {
@@ -133,26 +155,40 @@ function badPlugin(spec: PluginSpec): string {
 }
 
 // One configured plugin as Bifrost's plugin response: its name, whether it is on, its config and its status.
-function pluginJson(sp: PluginSpec): string {
+function pluginJson(sp: PluginSpec, stats: string): string {
   const config = sp.config_json ?? ""
   const st = entryStatus({ name: sp.name, enabled: sp.enabled, configJson: config, path: sp.path, limits: sp.wasm_limits })
   const custom = (sp.path ?? "") !== ""
   const builtin = !custom && builtinPlugins().includes(sp.name)
-  return jobj([
+  const pairs: string[] = [
     jkv("name", JSON.stringify(sp.name)),
     jkv("actualName", JSON.stringify(sp.name)),
     jkv("enabled", sp.enabled === false ? "false" : "true"),
     jkv("config", config.trim() === "" ? "{}" : config),
     jkv("isCustom", builtin ? "false" : "true"),
     jkv("path", custom ? JSON.stringify(sp.path) : "null"),
-    jkv("status", jobj([jkv("name", JSON.stringify(sp.name)), jkv("status", JSON.stringify(st.status)), jkv("logs", jstrs(st.error === "" ? [] : [st.error])), jkv("types", jstrs(st.types))])),
-  ])
+  ]
+  // placement and order are left out when unset, as Bifrost's omitempty does
+  const placement = sp.placement
+  if (placement !== undefined) pairs.push(jkv("placement", JSON.stringify(placement)))
+  const order = sp.order
+  if (order !== undefined) pairs.push(jkv("order", `${order}`))
+  // the live plugin's own counters (the mocker's GetStats, which Bifrost keeps in-process only), Raiju's addition
+  if (stats !== "") pairs.push(jkv("stats", stats))
+  pairs.push(jkv("status", jobj([jkv("name", JSON.stringify(sp.name)), jkv("status", JSON.stringify(st.status)), jkv("logs", jstrs(st.error === "" ? [] : [st.error])), jkv("types", jstrs(st.types))])))
+  return jobj(pairs)
 }
 
 // The names under /api/logs/ that are routes rather than log ids.
 const LOG_ROUTE_NAMES: string[] = ["stats", "histogram", "rankings", "dashboard", "filterdata", "dropped", "sessions", "recalculate-cost", "user-agent-mappings"]
 
 // The plugins this gateway provides under Bifrost's names (the ones it implements as built-in features).
+// Bifrost's 403 for a custom plugin path while dashboard auth is off (on create, or on update).
+function pathAuthMessage(create: bool): string {
+  const what = create ? "Creating a custom plugin with a path" : "Setting a custom plugin path"
+  return `${what} requires genuine admin authentication; dashboard auth is currently disabled or unconfigured. Enable dashboard authentication first.`
+}
+
 function builtinPlugins(): string[] {
   return ["telemetry", "logging", "governance", "otel", "semanticcache", "routing"]
 }
@@ -2647,7 +2683,7 @@ export class Ops {
       if (method === "POST") return this.createPlugin(body)
       if (method !== "GET") return pluginError(405, "use GET or POST")
       const rows: string[] = []
-      for (const sp of this.store.cfg.plugins ?? []) rows.push(pluginJson(sp))
+      for (const sp of this.store.cfg.plugins ?? []) rows.push(pluginJson(sp, this.pluginStats(sp.name)))
       return okJson(jobj([jkv("plugins", jarr(rows)), jkv("count", jn(rows.length))]))
     }
     const name = pctDecode(path.slice("/api/plugins/".byteLength)) ?? ""
@@ -2656,12 +2692,49 @@ export class Ops {
     if (method === "DELETE") return this.deletePlugin(name)
     if (method !== "GET") return pluginError(405, "use GET, PUT or DELETE")
     for (const sp of this.store.cfg.plugins ?? []) {
-      if (sp.name === name) return okJson(pluginJson(sp))
+      if (sp.name === name) return okJson(pluginJson(sp, this.pluginStats(sp.name)))
     }
     return pluginError(404, "plugin not found")
   }
 
-  // POST /api/plugins: {name, enabled, config}. 201 with the plugin; 409 when the name is taken; 400 when the name
+  // /api/plugins with a plugin path that is a URL: the file is downloaded first (plugindl.tov, with Bifrost's limits and
+  // the private-address rule), then the route runs as for a local file. A download that fails is answered as Bifrost
+  // answers a plugin that failed to load (500 with its reason); a .so URL is refused as a .so file is.
+  async pluginsRouteAsync(method: string, path: string, body: string): Promise<Reply> {
+    if ((method === "POST" && path === "/api/plugins") || (method === "PUT" && path.startsWith("/api/plugins/"))) {
+      let url = ""
+      try {
+        const fs = fields(body)
+        url = (rawStr(fs, "path") ?? "").trim()
+      } catch (e) {
+        url = ""
+      }
+      const name = method === "PUT" ? pctDecode(path.slice("/api/plugins/".byteLength)) ?? "" : ""
+      if (isPluginUrl(url) && !this.authOn && !builtinPlugins().includes(name)) return pluginError(403, pathAuthMessage(method === "POST"))
+      if (isPluginUrl(url)) {
+        // a name the route answers with 404, or a built-in plugin (which takes no path), downloads nothing
+        const known = method === "POST" || (name !== "" && !name.includes("/") && !builtinPlugins().includes(name))
+        if (known && url.split("?")[0]!.toLowerCase().endsWith(".so")) return pluginError(400, "Invalid plugin configuration: Go shared-object plugins (.so) are not supported by this gateway; build the plugin as WebAssembly (.wasm)")
+        if (known) {
+          const got = await downloadPlugin(url, this.store.cfg.server?.plugin_download_private_allowlist ?? [])
+          if (got.error !== "") {
+            const msg = method === "POST" ? `Plugin was not created, it failed to load: ${got.error}` : `Plugin update was not applied, it failed to load and the previous configuration was kept: ${got.error}`
+            return { status: 500, body: errorJson(msg, "api_error", undefined), contentType: "application/json" }
+          }
+        }
+      }
+    }
+    return this.pluginsRoute(method, path, body)
+  }
+
+  // The live chain's statistics for a plugin name (this process's), or "".
+  private pluginStats(name: string): string {
+    const chain = this.engine.plugins
+    if (chain === undefined) return ""
+    return chain.statsOf(name)
+  }
+
+  // POST /api/plugins: {name, enabled, config, path, wasm_limits, placement, order}. 201 with the plugin; 409 when the name is taken; 400 when the name
   // is missing, or the config does not build (a custom plugin path must be a .wasm file that loads).
   private createPlugin(body: string): Reply {
     let fs: Field[] = []
@@ -2676,7 +2749,15 @@ export class Ops {
     for (const sp of specs) {
       if (sp.name === name) return pluginError(409, "Plugin already exists")
     }
-    const spec: PluginSpec = { name: name, enabled: rawBool(fs, "enabled") ?? false, config_json: configOf(fs, "{}"), path: pathOf(fs, undefined), wasm_limits: limitsOf(fs, undefined) }
+    const pl = placementOf(fs, undefined)
+    if (!pl.ok) return pluginError(400, "Invalid placement value. Must be 'pre_builtin' or 'post_builtin'")
+    const od = orderOf(fs, undefined)
+    if (!od.ok) return pluginError(400, "Invalid request body")
+    // a built-in plugin takes no path; a custom path needs a caller who really signed in (Bifrost refuses it while
+    // dashboard auth is off)
+    const path = builtinPlugins().includes(name) ? undefined : pathOf(fs, undefined)
+    if (path !== undefined && !this.authOn) return pluginError(403, pathAuthMessage(true))
+    const spec: PluginSpec = { name: name, enabled: rawBool(fs, "enabled") ?? false, config_json: configOf(fs, "{}"), placement: pl.value, order: od.value, path: path, wasm_limits: limitsOf(fs, undefined) }
     const bad = badPlugin(spec)
     if (bad !== "") return pluginError(400, `Invalid plugin configuration: ${bad}`)
     const next: PluginSpec[] = specs.slice()
@@ -2684,7 +2765,8 @@ export class Ops {
     return this.savePlugins(next, 201, "Plugin created successfully", spec)
   }
 
-  // PUT /api/plugins/{name}: changes the fields the body names (enabled, config). 404 when there is no such plugin.
+  // PUT /api/plugins/{name}: changes the fields the body names (enabled, config, path, wasm_limits, placement, order).
+  // A plugin that is not configured yet is created (off unless the body turns it on), as Bifrost creates the row.
   private updatePlugin(name: string, body: string): Reply {
     let fs: Field[] = []
     try {
@@ -2697,14 +2779,22 @@ export class Ops {
     for (let i = 0; i < specs.length; i++) {
       if (specs[i]!.name === name) at = i
     }
-    if (at < 0) return pluginError(404, "plugin not found")
-    const cur = specs[at]!
+    const cur: PluginSpec = at < 0 ? { name: name, enabled: false, config_json: "{}" } : specs[at]!
     const en = rawBool(fs, "enabled")
-    const spec: PluginSpec = { name: name, enabled: en === undefined ? cur.enabled !== false : en, config_json: configOf(fs, cur.config_json ?? "{}"), placement: cur.placement, order: cur.order, path: pathOf(fs, cur.path), wasm_limits: limitsOf(fs, cur.wasm_limits) }
+    // placement and order from the body, as Bifrost reads them; a body that names neither keeps the plugin's
+    const pl = placementOf(fs, cur.placement)
+    if (!pl.ok) return pluginError(400, "Invalid placement value. Must be 'pre_builtin' or 'post_builtin'")
+    const od = orderOf(fs, cur.order)
+    if (!od.ok) return pluginError(400, "Invalid request body")
+    const builtin = builtinPlugins().includes(name)
+    const asked = builtin ? undefined : pathOf(fs, undefined)
+    if (asked !== undefined && !this.authOn) return pluginError(403, pathAuthMessage(false))
+    const spec: PluginSpec = { name: name, enabled: en === undefined ? cur.enabled !== false : en, config_json: configOf(fs, cur.config_json ?? "{}"), placement: pl.value, order: od.value, path: builtin ? undefined : pathOf(fs, cur.path), wasm_limits: limitsOf(fs, cur.wasm_limits) }
     const bad = badPlugin(spec)
     if (bad !== "") return pluginError(400, `Invalid plugin configuration: ${bad}`)
     const next: PluginSpec[] = []
     for (let i = 0; i < specs.length; i++) next.push(i === at ? spec : specs[i]!)
+    if (at < 0) next.push(spec)
     return this.savePlugins(next, 200, "Plugin updated successfully", spec)
   }
 
@@ -2721,7 +2811,7 @@ export class Ops {
     const saved = this.store.setPlugins(next)
     if (saved.kind !== "ok") return { status: saved.status, body: errorJson(saved.message, "api_error", undefined), contentType: "application/json" }
     if (spec === undefined) return { status: status, body: JSON.stringify({ message: message }), contentType: "application/json" }
-    return { status: status, body: jobj([jkv("message", JSON.stringify(message)), jkv("plugin", pluginJson(spec))]), contentType: "application/json" }
+    return { status: status, body: jobj([jkv("message", JSON.stringify(message)), jkv("plugin", pluginJson(spec, ""))]), contentType: "application/json" }
   }
 
   // The window's start: start_time, or the end less period ("1h", "6h", "24h", "7d", "30d"), or 24 hours.

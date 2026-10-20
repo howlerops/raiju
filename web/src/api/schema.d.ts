@@ -2625,7 +2625,7 @@ export interface paths {
         };
         /** One configured plugin */
         get: operations["getPlugin"];
-        /** Change a configured plugin (enabled, config, path, wasm_limits); the save rebuilds the live chain */
+        /** Change a plugin (enabled, config, path, wasm_limits, placement, order), creating it when it is not configured; the save rebuilds the live chain */
         put: operations["updatePlugin"];
         post?: never;
         /** Remove a configured plugin; the save rebuilds the live chain */
@@ -6062,6 +6062,8 @@ export interface components {
             max_stack_bytes?: number;
             /** @description Most instructions one hook call may run (default 200000000); a call past it fails. */
             max_instructions?: number;
+            /** @description Most wall-clock milliseconds one hook call may take (default 5000); a call past it fails with "time limit exceeded". */
+            max_time_ms?: number;
         };
         /** @description JSON-RPC 2.0 request of the MCP protocol. */
         McpJsonRpcRequest: {
@@ -18908,9 +18910,16 @@ export interface operations {
                     name: string;
                     enabled?: boolean;
                     config?: Record<string, never>;
-                    /** @description A local .wasm file to load as a plugin (Bifrost's WebAssembly plugin ABI). Go shared objects (.so) and URLs are refused. */
+                    /** @description A local .wasm file, or an http or https URL of one (downloaded first, with Bifrost's limits and private-address rule), to load as a plugin (Bifrost's WebAssembly plugin ABI). Go shared objects (.so) are refused. A custom plugin path needs dashboard auth to be on (403 otherwise). */
                     path?: string;
                     wasm_limits?: components["schemas"]["WasmPluginLimits"];
+                    /**
+                     * @description The plugin's group in the chain (Bifrost's placement); empty or absent is post_builtin. Other values are refused with 400.
+                     * @enum {string}
+                     */
+                    placement?: "pre_builtin" | "post_builtin" | "";
+                    /** @description The plugin's position within its placement group, lower first. */
+                    order?: number;
                 };
             };
         };
@@ -18953,6 +18962,15 @@ export interface operations {
             };
             /** @description A plugin with this name is already configured */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The plugin URL could not be downloaded; nothing is created. */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -19148,9 +19166,16 @@ export interface operations {
                 "application/json": {
                     enabled?: boolean;
                     config?: Record<string, never>;
-                    /** @description A local .wasm file to load as the plugin; an empty string removes the path. */
+                    /** @description A local .wasm file, or an http or https URL of one (downloaded first), to load as the plugin; an empty string removes the path. A custom plugin path needs dashboard auth to be on (403 otherwise). */
                     path?: string;
                     wasm_limits?: components["schemas"]["WasmPluginLimits"];
+                    /**
+                     * @description The plugin's group in the chain (Bifrost's placement); empty resets it to post_builtin, absent keeps it. Other values are refused with 400.
+                     * @enum {string}
+                     */
+                    placement?: "pre_builtin" | "post_builtin" | "";
+                    /** @description The plugin's position within its placement group, lower first; absent keeps it. */
+                    order?: number;
                 };
             };
         };
@@ -19191,8 +19216,8 @@ export interface operations {
                     "application/json": components["schemas"]["ManagementErrorResponse"];
                 };
             };
-            /** @description No plugin with this name is configured */
-            404: {
+            /** @description The plugin URL could not be downloaded; the previous configuration is kept. */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
