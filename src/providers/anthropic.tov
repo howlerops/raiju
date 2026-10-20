@@ -1,5 +1,5 @@
 // Anthropic Messages API: translates OpenAI chat requests and responses.
-import { Field, fields, elements, find, quote, rawStr, isNull, build } from "../json"
+import { Field, fields, elements, find, quote, rawStr, rawNum, isNull, build, decodeString } from "../json"
 import { Target, Upstream, Translated, headers, addExtraHeaders, trimSlash } from "./types"
 import { ChatRequest, Message, ContentPart, newId, nowSeconds } from "../schemas"
 import { ProviderPromptCacheConfig } from "../config"
@@ -323,6 +323,120 @@ export function chatResponse(text: string, requestedModel: string): Translated t
   const a = try readAssistant(text)
   return { body: completionJson(a, requestedModel), promptTokens: a.promptTokens, completionTokens: a.completionTokens, served: a.served }
 }
+
+// ---- legacy text completions (POST /v1/complete) ----
+
+const HUMAN_TURN = "\n\nHuman:"
+const ASSISTANT_TURN = "\n\nAssistant:"
+
+// The prompt of a text completion: a string, or an array of strings joined by blank lines, as Bifrost reads it.
+export function textPrompt(body: Field[]): string throws SyntaxError {
+  const raw = find(body, "prompt")
+  if (raw === undefined || raw === "null") return ""
+  if (raw.startsWith("\"")) return try decodeString(raw)
+  if (!raw.startsWith("[")) throw new SyntaxError("prompt must be a string or an array of strings")
+  const parts: string[] = []
+  for (const el of try elements(raw)) {
+    if (!el.startsWith("\"")) throw new SyntaxError("prompt must be a string or an array of strings")
+    parts.push(try decodeString(el))
+  }
+  return parts.join("\n\n")
+}
+
+// The prompt in the "\n\nHuman: ...\n\nAssistant:" frame the legacy API requires. A prompt that already opens with
+// a Human turn is kept, gaining the closing Assistant turn if it lacks one; any other prompt is wrapped.
+export function framePrompt(prompt: string): string {
+  if (!prompt.startsWith(HUMAN_TURN)) return HUMAN_TURN + " " + prompt + ASSISTANT_TURN
+  let end = prompt.byteLength
+  while (end > 0 && prompt.slice(end - 1, end) === " ") end--
+  if (prompt.slice(0, end).endsWith(ASSISTANT_TURN)) return prompt
+  return prompt + ASSISTANT_TURN
+}
+
+// A text completion's stop as a list of sequences: a string becomes a one-item list. undefined when absent.
+export function stopList(body: Field[]): string | undefined {
+  const raw = find(body, "stop")
+  if (raw === undefined || raw === "null") return undefined
+  if (raw.startsWith("\"")) return "[" + raw + "]"
+  if (raw.startsWith("[")) return raw
+  return undefined
+}
+
+// A sampling field of the body as sent, or undefined when absent or null.
+export function sampling(body: Field[], key: string): string | undefined {
+  const v = find(body, key)
+  if (v === undefined || v === "null") return undefined
+  return v
+}
+
+// The legacy body for an OpenAI text completion: the framed prompt, max_tokens as max_tokens_to_sample (4096 when
+// unset), temperature, top_p, top_k and stop as stop_sequences.
+export function textBody(model: string, body: Field[]): string throws SyntaxError {
+  const parts: string[] = [`"model":${quote(model)}`, `"prompt":${quote(framePrompt(try textPrompt(body)))}`, `"max_tokens_to_sample":${sampling(body, "max_tokens") ?? `${DEFAULT_MAX_TOKENS}`}`]
+  for (const k of ["temperature", "top_p", "top_k"]) {
+    const v = sampling(body, k)
+    if (v !== undefined) parts.push(`${quote(k)}:${v}`)
+  }
+  const stop = stopList(body)
+  if (stop !== undefined) parts.push(`"stop_sequences":${stop}`)
+  return "{" + parts.join(",") + "}"
+}
+
+// Anthropic's legacy text completion call, for a POST /v1/completions request.
+export function textRequest(t: Target, body: Field[]): Upstream throws SyntaxError {
+  return { url: apiBase(t) + "/v1/complete", headers: upstreamHeaders(t), body: try textBody(t.model, body) }
+}
+
+// A legacy stop reason as an OpenAI finish reason; null when there is none.
+export function textFinish(stop: string | undefined): string {
+  if (stop === undefined || stop === "") return "null"
+  if (stop === "max_tokens") return quote("length")
+  return quote("stop")
+}
+
+// One text completion answer in OpenAI's shape.
+export function textCompletionJson(id: string, model: string, choices: string[], pt: int, ct: int): string {
+  return `{"id":${quote(id)},"object":"text_completion","created":${nowSeconds()},"model":${quote(model)},"choices":[${choices.join(",")}],` +
+    `"usage":{"prompt_tokens":${pt},"completion_tokens":${ct},"total_tokens":${pt + ct}}}`
+}
+
+// A legacy completion as an OpenAI text completion, with the model as the caller asked for it.
+export function textResponse(text: string, requestedModel: string): Translated throws SyntaxError {
+  const fs = try fields(text)
+  let pt = 0
+  let ct = 0
+  const u = find(fs, "usage")
+  if (u !== undefined && u.startsWith("{")) {
+    const uf = try fields(u)
+    pt = Math.floor(rawNum(uf, "input_tokens") ?? 0)
+    ct = Math.floor(rawNum(uf, "output_tokens") ?? 0)
+  }
+  const choice = `{"index":0,"text":${quote(rawStr(fs, "completion") ?? "")},"logprobs":null,"finish_reason":${textFinish(rawStr(fs, "stop_reason"))}}`
+  return { body: textCompletionJson(rawStr(fs, "id") ?? newId("cmpl-"), requestedModel, [choice], pt, ct), promptTokens: pt, completionTokens: ct }
+}
+
+test("a text completion becomes a legacy complete call, and its answer an OpenAI text completion", () => {
+  const t: Target = { provider: "anthropic", kind: "anthropic", model: "claude-2.1", key: { value: "sk-ant-test" }, cfg: {} }
+  const up = try textRequest(t, try fields(`{"model":"anthropic/claude-2.1","prompt":["Say hi","twice"],"temperature":0.2,"top_k":5,"stop":"END"}`))
+  expect(up.url).toBe("https://api.anthropic.com/v1/complete")
+  expect(up.headers.get("x-api-key")).toBe("sk-ant-test")
+  expect(up.body).toBe(`{"model":"claude-2.1","prompt":"\\n\\nHuman: Say hi\\n\\ntwice\\n\\nAssistant:","max_tokens_to_sample":4096,"temperature":0.2,"top_k":5,"stop_sequences":["END"]}`)
+  const kept = try textBody("m", try fields(`{"prompt":"\\n\\nHuman: hi\\n\\nAssistant: ","max_tokens":12}`))
+  expect(kept.includes(`"prompt":"\\n\\nHuman: hi\\n\\nAssistant: "`)).toBe(true)
+  expect(kept.includes(`"max_tokens_to_sample":12`)).toBe(true)
+  expect(framePrompt("\n\nHuman: hi")).toBe("\n\nHuman: hi\n\nAssistant:")
+  const r = try textResponse(`{"id":"compl_1","type":"completion","completion":" Hello!","stop_reason":"max_tokens","model":"claude-2.1","usage":{"input_tokens":7,"output_tokens":3}}`, "anthropic/claude-2.1")
+  expect(r.promptTokens).toBe(7)
+  expect(r.body.includes(`"id":"compl_1","object":"text_completion"`)).toBe(true)
+  expect(r.body.includes(`"model":"anthropic/claude-2.1","choices":[{"index":0,"text":" Hello!","logprobs":null,"finish_reason":"length"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}`)).toBe(true)
+  let bad = ""
+  try {
+    try textPrompt(try fields(`{"prompt":[1,2]}`))
+  } catch (e) {
+    bad = e.message
+  }
+  expect(bad.includes("array of strings")).toBe(true)
+})
 
 test("reasoning_effort becomes an extended-thinking budget", () => {
   const raw = `{"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high","max_tokens":4096,"temperature":0.5,"tool_choice":"required","tools":[{"type":"function","function":{"name":"f","parameters":{}}}]}`

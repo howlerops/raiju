@@ -15,6 +15,7 @@ import * as bedrockIn from "./bedrock_in"
 import { Translated, Target } from "./providers/types"
 import * as typesafe from "./providers/typesafe"
 import * as openrouter from "./providers/openrouter"
+import * as decisionNative from "./providers/decision_native"
 import * as vertex from "./providers/vertex"
 import * as providers from "./providers/index"
 import { DecisionReq, parseDecision } from "./decisions"
@@ -214,9 +215,11 @@ export async function bedrockCountTokens(engine: Engine, req: Request, id: strin
 }
 
 // Bifrost's decision API and TypeSafe's native routes. POST /v1/decisions (and /openai/v1/decisions) answers the
-// canonical decision request from TypeSafe and the custom providers on its base format; any other provider is
-// refused, as Bifrost refuses it, unless compat emulates the decision for a model the provider does not decide
-// natively (servesDecisionNatively). POST /typesafe/v1/systemone passes TypeSafe's own body through, and
+// canonical decision request on each provider's own decisions route: TypeSafe and the custom providers on its base
+// format, OpenRouter, and OpenAI, Azure, Cloudflare, Databricks, Perplexity and Ollama (decision_native.tov). Any
+// other provider is refused, as Bifrost refuses it (and OpenAI and Databricks refuse a model they do not decide),
+// unless compat emulates the decision for a model the provider does not decide natively
+// (servesDecisionNatively). POST /typesafe/v1/systemone passes TypeSafe's own body through, and
 // GET /typesafe/v1/models lists its catalog in its own shape.
 export async function decisionRoute(engine: Engine, req: Request, p: string): Promise<Response> {
   if (p === "/typesafe/v1/models") return await typesafeModels(engine, req)
@@ -239,23 +242,30 @@ export async function decisionRoute(engine: Engine, req: Request, p: string): Pr
     if (!settings.decisions) return json(400, errorJson(`decisions is not supported by ${k.provider} provider`, "invalid_request_error", "unsupported_operation"))
     return await decisionByEmulation(engine, req, decision, k.kind, body, text)
   }
-  // OpenRouter's native endpoint takes the safety identifier as "user"; TypeSafe and its custom providers do not
+  if (decisionNative.refusesModel(k.kind, k.model)) return json(400, errorJson(`decisions is not supported by ${k.provider} provider`, "invalid_request_error", "unsupported_operation"))
+  // OpenRouter's native endpoint takes the safety identifier as "user", OpenAI's as safety_identifier; TypeSafe and
+  // the systemone endpoints do not
   const user = rawStr(body, "safety_identifier")
   const mk: Build = (t) => {
     if (t.kind === "openrouter") return try openrouter.decisionUpstream(t, decision, user)
+    if (decisionNative.isNativeKind(t.kind)) return try decisionNative.decisionUpstream(t, decision, user)
     return try typesafe.systemoneUpstream(t, decision)
   }
-  const tr: Translate = (t, out, requested) => try typesafe.translateDecision(out, decision, requested)
+  const tr: Translate = (t, out, requested) => {
+    if (decisionNative.isNativeKind(t.kind)) return try decisionNative.decisionTranslate(t, out, decision, requested)
+    return try typesafe.translateDecision(out, decision, requested)
+  }
   return await engine.serve(req, "decisions", undefined, body, text, mk, tr, false)
 }
 
 // Whether a provider serves the model's decisions on its own decisions route. TypeSafe serves every model.
 // OpenRouter serves TypeSafe's models and its decision rows, which the datasheet names "...-decisions" (Raiju's
-// datasheet carries no supports_decisions flag, so the name stands in for it); its chat models are answered by
-// emulation when convert_decision_to_responses is on.
+// datasheet carries no supports_decisions flag, so the name stands in for it). The other native providers decide
+// the model families Bifrost recognises by name (decision_native.tov decidesNatively). Any other model is answered
+// by emulation when convert_decision_to_responses is on.
 export function servesDecisionNatively(kind: string, model: string): bool {
   if (typesafe.isTypesafeKind(kind)) return true
-  if (kind !== "openrouter") return false
+  if (kind !== "openrouter") return decisionNative.decidesNatively(kind, model)
   const bare = model.startsWith("~") ? model.slice(1) : model
   return bare.startsWith("typesafe/") || bare.endsWith("-decisions")
 }
@@ -265,6 +275,9 @@ export function servesDecisionNatively(kind: string, model: string): bool {
 // answer is rendered as the canonical decision, and the header says which request type the call was.
 async function decisionByEmulation(engine: Engine, req: Request, d: DecisionReq, kind: string, body: Field[], text: string): Promise<Response> {
   const mk: Build = (t) => {
+    // the emulated call reads the input as text
+    const refusal = d.refusal ?? ""
+    if (refusal !== "") throw new SyntaxError(refusal)
     const eb = try emulationBody(d, t.model)
     if (t.kind === "openai") return openai.responsesRequest(t, try fields(eb))
     const chat = try responses.toChatRequest(eb, t.model)
@@ -421,5 +434,9 @@ test("a decision is native on TypeSafe for any model, and on OpenRouter for Type
   expect(servesDecisionNatively("openrouter", "~typesafe/jev-latest")).toBe(true)
   expect(servesDecisionNatively("openrouter", "openai/gpt-6-luna-decisions")).toBe(true)
   expect(servesDecisionNatively("openrouter", "openai/gpt-4o-mini")).toBe(false)
-  expect(servesDecisionNatively("openai", "gpt-6-luna")).toBe(false)
+  expect(servesDecisionNatively("openai", "gpt-6-luna")).toBe(true)
+  expect(servesDecisionNatively("openai", "gpt-4o-mini")).toBe(false)
+  expect(servesDecisionNatively("azure", "gpt-6-luna")).toBe(false)
+  expect(servesDecisionNatively("cloudflare", "@cf/cloudflare/clef-flash")).toBe(true)
+  expect(servesDecisionNatively("gemini", "gemini-2.5-flash")).toBe(false)
 })

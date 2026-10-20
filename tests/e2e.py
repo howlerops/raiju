@@ -3425,6 +3425,123 @@ def l109_e2e(env):
         gw.terminate()
 
 
+GW_L163 = "http://127.0.0.1:18280"  # native decisions (OpenAI, Azure, Cloudflare, Perplexity, Ollama) and native text completions (Anthropic, Bedrock)
+
+
+def l163_config() -> dict:
+    """Each native decision provider on its own mock prefix, Anthropic and Bedrock on the mock root."""
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {
+            "openai": {"keys": [{"name": "oa-l163", "value": "sk-oa163", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK + "/oa163", "max_retries": 0}},
+            "azure": {"keys": [{"name": "az-l163", "value": "az-key163", "models": [], "weight": 1.0, "azure_key_config": {"endpoint": MOCK + "/az163", "api_version": "2024-10-21"}}]},
+            "cloudflare": {"keys": [{"name": "cf-l163", "value": "cf163", "models": [], "weight": 1.0, "cloudflare_key_config": {"account_id": "acc163"}}], "network_config": {"base_url": MOCK + "/cf163/client/v4", "max_retries": 0}},
+            "perplexity": {"keys": [{"name": "px-l163", "value": "pplx163", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK + "/pplx163", "max_retries": 0}},
+            "ollama": {"keys": [{"name": "ol-l163", "value": "", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK + "/ol163", "max_retries": 0}},
+            "anthropic": {"keys": [{"name": "an-l163", "value": "sk-ant-l163", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "bedrock": {"keys": [{"name": "bk-l163", "models": [], "weight": 1.0, "bedrock_key_config": {"access_key": "AKIDEXAMPLE", "secret_key": "secret", "region": "us-east-1"}}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+    }
+
+
+def l163_e2e(env):
+    """Native decisions as Bifrost sends them (OpenAI's /v1/decisions for gpt-6-luna, Azure's systemone, Cloudflare's
+    Clef with images, Perplexity's deciders, Ollama's System One models), and native text completions on
+    /v1/completions and /anthropic/v1/complete (Anthropic's legacy call, Bedrock's InvokeModel)."""
+    cfg_path = os.path.join(BUILD, "e2e.l163.json")
+    json.dump(l163_config(), open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18280", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l163.log"), "w"))
+    try:
+        wait(GW_L163 + "/health")
+        img = [{"role": "user", "content": [{"type": "input_text", "text": "Is this receipt doubled?"}, {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}]}]
+        qs = [{"type": "predicate", "name": "is_frustrated", "instructions": "Is the customer frustrated?", "criteria": {"true": "angry", "false": "calm"}},
+              {"type": "choice", "instructions": "Pick the topic", "choices": [{"value": "billing", "description": "money"}, {"value": "bug"}]},
+              {"type": "score", "name": "urgency", "levels": [{"label": "0", "description": "calm"}, {"label": "high", "description": "now"}]}]
+        dbody = {"model": "openai/gpt-6-luna", "input": "Customer message: I was double charged.", "questions": qs, "safety_identifier": "end-user-163"}
+        s, _, b = call("POST", "/v1/decisions", dbody, base=GW_L163, auth=False)
+        r = json.loads(b) if s == 200 else {}
+        ans = r.get("answers", [])
+        check("an OpenAI decision model answers through OpenAI's own /v1/decisions", s == 200 and len(ans) == 3 and ans[0] == {"type": "predicate", "name": "is_frustrated", "probability": 0.66, "confidence": 0.8}
+              and ans[1] == {"type": "choice", "choice": "billing"} and ans[2].get("score") == 1.0 and ans[2].get("legend") == {"0": "calm", "1": "high: now"}
+              and r.get("usage", {}).get("total_tokens") == 26 and r.get("model") == "gpt-6-luna-2026-09", (s, b[:400]))
+        up = [x for x in seen() if x["path"] == "/oa163/v1/decisions"]
+        sent = json.loads(up[-1]["body"]) if up else {}
+        check("the OpenAI decision body is OpenAI's: text questions, criteria folded in, the safety identifier",
+              up and up[-1]["auth"] == "Bearer sk-oa163" and sent.get("model") == "gpt-6-luna" and sent.get("input") == dbody["input"] and sent.get("safety_identifier") == "end-user-163"
+              and sent["questions"][0] == {"type": "predicate", "name": "is_frustrated", "instructions": "Is the customer frustrated? Meaning (answer: meaning): true=angry, false=calm"}
+              and sent["questions"][1] == {"type": "choice", "instructions": "Pick the topic", "choices": [{"value": "billing", "description": "money"}, {"value": "bug"}]}
+              and sent["questions"][2]["levels"] == [{"label": "0", "description": "calm"}, {"label": "high", "description": "now"}], up[-1:])
+        s, _, b = call("POST", "/v1/decisions", {**dbody, "input": img}, base=GW_L163, auth=False)
+        up = [x for x in seen() if x["path"] == "/oa163/v1/decisions"]
+        check("OpenAI reads the input's images: the messages go as sent", s == 200 and up and json.loads(up[-1]["body"])["input"] == img, (s, b[:200], up[-1:]))
+        s, _, b = call("POST", "/v1/decisions", {**dbody, "input": "please refuse this"}, base=GW_L163, auth=False)
+        check("an OpenAI refusal is kept as the answer", s == 200 and json.loads(b)["answers"][0] == {"type": "refusal", "name": "is_frustrated"}, (s, b[:300]))
+        s, _, b = call("POST", "/v1/decisions", {**dbody, "model": "openai/gpt-4o-mini"}, base=GW_L163, auth=False)
+        check("an OpenAI model without decisions is refused, as Bifrost refuses it", s == 400 and "unsupported_operation" in b and "decisions is not supported by openai provider" in b, (s, b[:200]))
+        s, _, b = call("POST", "/v1/decisions", {**dbody, "model": "openai/gpt-6-luna"}, headers={"x-bf-compat": '["convert_decision_to_responses"]'}, base=GW_L163, auth=False)
+        check("under compat an OpenAI decision model stays native", s == 200 and seen()[-1]["path"] == "/oa163/v1/decisions", (s, seen()[-1:]))
+
+        s, _, b = call("POST", "/v1/decisions", {**dbody, "model": "azure/Microsoft-Decision-1"}, base=GW_L163, auth=False)
+        up = seen()[-1]
+        check("an Azure decision goes to the Foundry systemone route with the api key", s == 200 and json.loads(b)["answers"][0].get("probability") == 0.75 and up["path"] == "/az163/providers/microsoft/v1/systemone"
+              and up["auth"] == "az-key163" and json.loads(up["body"]).get("model") == "Microsoft-Decision-1" and "is_frustrated" in json.loads(up["body"]).get("questions", {}), (s, b[:300], up))
+        n = len(seen())
+        s, _, b = call("POST", "/v1/decisions", {**dbody, "model": "azure/Microsoft-Decision-1", "input": img}, base=GW_L163, auth=False)
+        check("a text-only systemone provider refuses an input with images before the call", s == 400 and "input_image" in b and len(seen()) == n, (s, b[:200]))
+
+        s, _, b = call("POST", "/v1/decisions", {**dbody, "model": "cloudflare/@cf/cloudflare/clef-flash", "input": img}, base=GW_L163, auth=False)
+        up = seen()[-1]
+        sent = json.loads(up["body"]) if up["path"].endswith("clef-flash") else {}
+        check("a Clef decision runs on Workers AI with the images lifted out of the input", s == 200 and json.loads(b)["answers"][0].get("probability") == 0.75
+              and up["path"] == "/cf163/client/v4/accounts/acc163/ai/run/@cf/cloudflare/clef-flash" and up["auth"] == "Bearer cf163" and sent.get("model") == "clef-flash"
+              and sent.get("images") == ["data:image/png;base64,AAAA"] and sent.get("state") == [{"role": "user", "content": "Is this receipt doubled?"}], (s, b[:300], up))
+
+        s, _, b = call("POST", "/v1/decisions", {**dbody, "model": "perplexity/pplx-decider-v1.1-27b", "input": img}, base=GW_L163, auth=False)
+        up = seen()[-1]
+        sent = json.loads(up["body"]) if up["path"] == "/pplx163/v1/decisions" else {}
+        check("a Perplexity decider decides on /v1/decisions, the images kept in order with the text", s == 200 and json.loads(b)["answers"][2].get("score") == 1.5
+              and up["auth"] == "Bearer pplx163" and sent.get("state") == ["Is this receipt doubled?", {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}], (s, b[:300], up))
+
+        s, _, b = call("POST", "/v1/decisions", {**dbody, "model": "ollama/nimble", "input": img, "keep_alive": "5m"}, base=GW_L163, auth=False)
+        up = seen()[-1]
+        sent = json.loads(up["body"]) if up["path"] == "/ol163/v1/systemone" else {}
+        check("an Ollama System One model decides on /v1/systemone with raw base64 images and keep_alive", s == 200 and json.loads(b)["answers"][0].get("probability") == 0.75
+              and sent.get("images") == ["AAAA"] and sent.get("keep_alive") == "5m" and sent.get("model") == "nimble" and up["auth"] == "", (s, b[:300], up))
+
+        # native text completions
+        s, _, b = call("POST", "/v1/completions", {"model": "anthropic/claude-2.1", "prompt": "Say hi", "temperature": 0.1, "stop": "END"}, base=GW_L163, auth=False)
+        r = json.loads(b) if s == 200 else {}
+        up = seen()[-1]
+        sent = json.loads(up["body"]) if up["path"] == "/v1/complete" else {}
+        check("an Anthropic text completion goes to Anthropic's legacy /v1/complete", s == 200 and r.get("object") == "text_completion" and r["choices"][0]["text"] == "Hi from legacy claude-2.1"
+              and r["choices"][0]["finish_reason"] == "stop" and r.get("usage", {}).get("total_tokens") == 10 and up["auth"] == "sk-ant-l163"
+              and sent.get("prompt") == "\n\nHuman: Say hi\n\nAssistant:" and sent.get("max_tokens_to_sample") == 4096 and sent.get("stop_sequences") == ["END"], (s, b[:300], up))
+        s, _, b = call("POST", "/v1/completions", {"model": "anthropic/claude-2.1", "prompt": "Say hi", "stream": True}, base=GW_L163, auth=False)
+        check("Anthropic's text completions do not stream, as in Bifrost", s == 400 and "text_completion_stream is not supported by anthropic provider" in b, (s, b[:200]))
+        s, _, b = call("POST", "/v1/completions", {"model": "bedrock/anthropic.claude-v2:1", "prompt": "Say hi", "max_tokens": 30}, base=GW_L163, auth=False)
+        r = json.loads(b) if s == 200 else {}
+        up = seen()[-1]
+        check("a Bedrock Claude text completion goes to InvokeModel with the legacy body", s == 200 and r["choices"][0]["text"] == " Hi from bedrock legacy" and up["path"].endswith("/invoke")
+              and "claude-v2" in up["path"] and up["auth"].startswith("AWS4-HMAC-SHA256") and '"max_tokens_to_sample":30' in up["body"] and "Human: Say hi" in up["body"], (s, b[:300], up))
+        s, _, b = call("POST", "/v1/completions", {"model": "bedrock/mistral.mistral-7b-instruct-v0:2", "prompt": "<s>[INST] hi [/INST]", "max_tokens": 5}, base=GW_L163, auth=False)
+        r = json.loads(b) if s == 200 else {}
+        check("a Bedrock Mistral text completion reads Mistral's outputs", s == 200 and r["choices"][0]["text"] == " Hi from bedrock mistral" and r["choices"][0]["finish_reason"] == "length"
+              and '"max_tokens":5' in seen()[-1]["body"], (s, b[:300]))
+        s, _, b = call("POST", "/v1/completions", {"model": "bedrock/meta.llama3-8b-instruct-v1:0", "prompt": "hi"}, base=GW_L163, auth=False)
+        check("a Bedrock model without a text completion answer is refused", s == 400 and "unsupported model type for text completion" in b, (s, b[:200]))
+        s, _, b = call("POST", "/anthropic/v1/complete", {"model": "anthropic/claude-2.1", "prompt": "\n\nHuman: hi\n\nAssistant:", "max_tokens_to_sample": 50, "stop_sequences": ["\n\nHuman:"]}, base=GW_L163, auth=False)
+        lg = json.loads(b) if s == 200 else {}
+        up = seen()[-1]
+        sent = json.loads(up["body"]) if up["path"] == "/v1/complete" else {}
+        check("/anthropic/v1/complete is sent natively to Anthropic and answered in the legacy shape", s == 200 and lg.get("type") == "completion" and lg.get("completion") == "Hi from legacy claude-2.1"
+              and lg.get("stop_reason") == "stop_sequence" and lg.get("usage") == {"input_tokens": 6, "output_tokens": 4}
+              and sent.get("prompt") == "\n\nHuman: hi\n\nAssistant:" and sent.get("max_tokens_to_sample") == 50 and sent.get("stop_sequences") == ["\n\nHuman:"], (s, b[:300], up))
+    finally:
+        gw.terminate()
+
+
 GW_L97H = "http://127.0.0.1:18144"  # provider model lists (Bedrock, Vertex, Cloudflare), Vertex count tokens, OpenRouter decisions
 
 
@@ -10726,11 +10843,14 @@ def main():
             rs, rb = e.code, e.read().decode()
         check("POST /v1/realtime with an SDP offer is terminated the same way", rs == 400 and "invalid browser SDP offer" in rb and len(seen()) == before, (rs, rb[:200]))
 
-        # Anthropic's legacy text completion, through the messages bridge
+        # Anthropic's legacy text completion: an Anthropic model goes to Anthropic's own legacy call (L163)
         s, _, b = call("POST", "/anthropic/v1/complete", {"model": "anthropic/claude-3-haiku-20240307", "prompt": "\n\nHuman: hi\n\nAssistant:", "max_tokens_to_sample": 50, "temperature": 0.2})
         lg = jget(b) if s == 200 else {}
         up = seen()[-1]
-        check("/anthropic/v1/complete answers in the legacy shape", s == 200 and lg.get("type") == "completion" and lg.get("completion") == "Hi from claude" and lg.get("stop_reason") == "stop_sequence" and up["path"] == "/v1/messages" and '"max_tokens":50' in up["body"], (s, b[:300], up))
+        check("/anthropic/v1/complete answers in the legacy shape", s == 200 and lg.get("type") == "completion" and lg.get("completion") == "Hi from legacy claude-3-haiku-20240307" and lg.get("stop_reason") == "stop_sequence" and up["path"] == "/v1/complete" and '"max_tokens_to_sample":50' in up["body"], (s, b[:300], up))
+        s, _, b = call("POST", "/anthropic/v1/complete", {"model": "openai/gpt-4o", "prompt": "\n\nHuman: hi\n\nAssistant:", "max_tokens_to_sample": 50})
+        lg = jget(b) if s == 200 else {}
+        check("/anthropic/v1/complete for another provider's model takes the messages bridge", s == 200 and lg.get("type") == "completion" and seen()[-1]["path"] == "/v1/chat/completions", (s, b[:300], seen()[-1:]))
         s, _, b = call("POST", "/anthropic/v1/complete", {"model": "anthropic/claude-3-haiku-20240307", "prompt": "hi", "max_tokens_to_sample": 5, "stream": True})
         check("the legacy completion route streams legacy completion events", s == 200 and "event: completion" in b and "message_start" not in b, (s, b[:200]))
 
@@ -11886,6 +12006,8 @@ def main():
         l123_e2e(env)
         # decisions: the unprefixed routes, decision pricing overrides and the native-decision check under compat: their own gateway
         l109_e2e(env)
+        # L163: native decisions (OpenAI, Azure, Cloudflare, Perplexity, Ollama) and native text completions (Anthropic, Bedrock): their own gateway
+        l163_e2e(env)
         # a websocket session cap, top-level access profiles, dual credentials, stream idle cuts and oauth_key_config: their own gateways
         l112a_e2e(env)
         # retained content: content-off bodies kept as hidden objects in object storage, never served back; a store outage fails no request: their own gateway

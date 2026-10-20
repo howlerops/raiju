@@ -26,7 +26,10 @@ export type Question = {
 // the provider reads it (a string, an object, or null), raw JSON.
 // extra holds the top-level fields the request does not model (a provider's native extensions, such as a
 // Laya min_confidence). They reach the provider merged onto its body, as Bifrost forwards them.
-export type DecisionReq = { model: string, state: string, questions: Question[], extra?: Field[] }
+// input is the input as sent (raw JSON), for the providers that read it as it is (OpenAI) or read its images
+// (Cloudflare, Perplexity, Ollama). refusal is set when the input carries images: the state then holds only its
+// text, and the providers that read text only refuse the request with it, so a fallback can serve it.
+export type DecisionReq = { model: string, state: string, questions: Question[], extra?: Field[], input?: string, refusal?: string }
 
 const TYPES: string[] = ["predicate", "choice", "score"]
 const MAX_CHOICES = 255
@@ -39,26 +42,37 @@ function textLike(raw: string): bool {
   return raw === "null" || raw.startsWith("\"") || raw.startsWith("{") || raw.startsWith("[")
 }
 
+// The refusal a text-only provider gives an input with images.
+const IMAGE_REFUSAL = `decision input carries an "input_image" part, which this provider cannot read; route the request to a provider that accepts it`
+
 // The text of a message content: a string, or an array of parts. Only input_text parts can be
-// read by a text provider; any other part is refused, so a fallback can serve the request.
-function contentText(raw: string | undefined): string throws SyntaxError {
+// read by a text provider; input_image parts are left out when dropImages is set (the request then carries a
+// refusal for text-only providers), and any other part is refused, so a fallback can serve the request.
+// undefined when every part was an image.
+function contentText(raw: string | undefined, dropImages: bool): string | undefined throws SyntaxError {
   if (raw === undefined || raw === "null") return ""
   if (raw.startsWith("\"")) return try decodeString(raw)
   if (!raw.startsWith("[")) throw new SyntaxError("decision message content must be a string or an array of parts")
   const parts: string[] = []
+  let images = 0
   for (const el of try elements(raw)) {
     const pf = try fields(el)
     const type = rawStr(pf, "type") ?? ""
     if (type === "") throw new SyntaxError(`decision input carries an "untyped" part, which this provider cannot read; route the request to a provider that accepts it`)
+    if (type === "input_image" && dropImages) {
+      images++
+      continue
+    }
     if (type !== "input_text") throw new SyntaxError(`decision input carries an "${type}" part, which this provider cannot read; route the request to a provider that accepts it`)
     parts.push(rawStr(pf, "text") ?? "")
   }
+  if (parts.length === 0 && images > 0) return undefined
   return parts.join("\n")
 }
 
 // The input as the state a provider reads. A messages array becomes an array of {role, content}
-// with its text parts joined.
-export function stateOf(raw: string | undefined): string throws SyntaxError {
+// with its text parts joined. With dropImages, image parts are left out, and a message left without parts goes.
+export function stateOf(raw: string | undefined, dropImages?: bool): string throws SyntaxError {
   if (raw === undefined || raw === "null") return "null"
   if (raw.startsWith("\"") || raw.startsWith("{")) return raw
   if (!raw.startsWith("[")) throw new SyntaxError("decision input must be a string, an array of messages, or an object")
@@ -66,10 +80,24 @@ export function stateOf(raw: string | undefined): string throws SyntaxError {
   for (const el of try elements(raw)) {
     const mf = try fields(el)
     const role = rawStr(mf, "role") ?? ""
-    const content = try contentText(find(mf, "content"))
+    const content = try contentText(find(mf, "content"), dropImages === true)
+    if (content === undefined) continue
     msgs.push(`{"role":${quote(role)},"content":${quote(content)}}`)
   }
   return "[" + msgs.join(",") + "]"
+}
+
+// Whether a messages input carries an input_image part.
+export function hasImages(raw: string | undefined): bool throws SyntaxError {
+  if (raw === undefined || !raw.startsWith("[")) return false
+  for (const el of try elements(raw)) {
+    const content = find(try fields(el), "content")
+    if (content === undefined || !content.startsWith("[")) continue
+    for (const p of try elements(content)) {
+      if (rawStr(try fields(p), "type") === "input_image") return true
+    }
+  }
+  return false
 }
 
 // The name each question answers under, as Bifrost settles them: the name as sent, or
@@ -171,7 +199,9 @@ export function parseDecision(text: string): DecisionReq throws SyntaxError {
   const top = try fields(text)
   const model = rawStr(top, "model") ?? ""
   if (model === "") throw new SyntaxError("model is required")
-  const state = try stateOf(find(top, "input"))
+  const input = find(top, "input")
+  const images = try hasImages(input)
+  const state = try stateOf(input, images)
   const list = find(top, "questions")
   if (list === undefined || !list.startsWith("[")) throw new SyntaxError("questions must be a list")
   const raws = try elements(list)
@@ -185,7 +215,9 @@ export function parseDecision(text: string): DecisionReq throws SyntaxError {
     qs[i]!.name = names[i]!
   }
   const extra: Field[] = top.filter((f) => !ROUTE_FIELDS.includes(f.key))
-  return { model: model, state: state, questions: qs, extra: extra }
+  const out: DecisionReq = { model: model, state: state, questions: qs, extra: extra, input: input ?? "null" }
+  if (images) out.refusal = IMAGE_REFUSAL
+  return out
 }
 
 // One canonical answer. value is the raw JSON of the answer itself (a probability, a choice or a
@@ -248,16 +280,21 @@ test("boolean choices keep their key and flag", () => {
   expect(d.questions[0]!.choices[1]!.key).toBe("false")
 })
 
-test("messages become role and content, and other parts are refused", () => {
+test("messages become role and content, images are kept aside, and other parts are refused", () => {
   const d = try parseDecision(`{"model":"m","input":[{"role":"user","content":[{"type":"input_text","text":"a"},{"type":"input_text","text":"b"}]},{"role":"assistant","content":"c"}],"questions":[{"type":"predicate"}]}`)
   expect(d.state).toBe(`[{"role":"user","content":"a\\nb"},{"role":"assistant","content":"c"}]`)
+  expect(d.refusal).toBeUndefined()
+  const img = try parseDecision(`{"model":"m","input":[{"role":"user","content":[{"type":"input_image","image_url":"x"}]},{"role":"user","content":[{"type":"input_text","text":"t"},{"type":"input_image","image_url":"y"}]}],"questions":[{"type":"predicate"}]}`)
+  expect(img.state).toBe(`[{"role":"user","content":"t"}]`)
+  expect((img.refusal ?? "").includes(`"input_image" part`)).toBe(true)
+  expect((img.input ?? "").startsWith(`[{"role":"user"`)).toBe(true)
   let msg = ""
   try {
-    try parseDecision(`{"model":"m","input":[{"role":"user","content":[{"type":"input_image","image_url":"x"}]}],"questions":[{"type":"predicate"}]}`)
+    try parseDecision(`{"model":"m","input":[{"role":"user","content":[{"type":"input_audio","data":"x"}]}],"questions":[{"type":"predicate"}]}`)
   } catch (e) {
     msg = e.message
   }
-  expect(msg.includes(`"input_image" part`)).toBe(true)
+  expect(msg.includes(`"input_audio" part`)).toBe(true)
 })
 
 test("names: duplicates are refused, generated names avoid taken ones", () => {

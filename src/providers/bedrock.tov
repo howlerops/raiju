@@ -5,6 +5,7 @@ import { Target, Upstream, Translated, headers, addExtraHeaders, trimSlash } fro
 import { ChatRequest, ContentPart, newId, nowSeconds } from "../schemas"
 import { sha256, hmacSha256, toHex, utf8 } from "../crypto"
 import * as openai from "./openai"
+import * as anthropic from "./anthropic"
 import { BedrockKeyConfig, ProviderConfig } from "../config"
 
 // ---- SigV4 ----
@@ -480,6 +481,76 @@ export function chatRequest(t: Target, req: ChatRequest, body: Field[], autoCach
   if (usesOpenAIEndpoints(t)) return try openAIChatRequest(t, body)
   return signedRequest(t, "converse", try converseBody(req, body, autoCache, t.model))
 }
+
+// ---- legacy text completions (InvokeModel) ----
+
+function claudeText(model: string): bool {
+  return model.includes("anthropic.") || model.includes("claude")
+}
+
+// The InvokeModel body for an OpenAI text completion, as Bifrost builds it: Claude's legacy body (framed prompt,
+// max_tokens_to_sample, stop_sequences), or the plain body of Mistral's models (max_tokens, stop). Other models have
+// no text completion answer Bifrost reads, so they are refused before the call.
+export function textBody(model: string, body: Field[]): string throws SyntaxError {
+  const claude = claudeText(model)
+  if (!claude && !model.includes("mistral")) throw new SyntaxError(`unsupported model type for text completion: ${model}`)
+  const prompt = try anthropic.textPrompt(body)
+  const parts: string[] = [`"prompt":${quote(claude ? anthropic.framePrompt(prompt) : prompt)}`]
+  const max = anthropic.sampling(body, "max_tokens")
+  if (claude) parts.push(`"max_tokens_to_sample":${max ?? "4096"}`)
+  else if (max !== undefined) parts.push(`"max_tokens":${max}`)
+  for (const k of ["temperature", "top_p", "top_k"]) {
+    const v = anthropic.sampling(body, k)
+    if (v !== undefined) parts.push(`${quote(k)}:${v}`)
+  }
+  const stop = anthropic.stopList(body)
+  if (stop !== undefined) parts.push(`${claude ? "\"stop_sequences\"" : "\"stop\""}:${stop}`)
+  return "{" + parts.join(",") + "}"
+}
+
+// The text completion call: InvokeModel on the model.
+export function textRequest(t: Target, body: Field[]): Upstream throws SyntaxError {
+  return signedRequest(t, "invoke", try textBody(modelId(t), body))
+}
+
+// An InvokeModel text answer as an OpenAI text completion: Claude's {completion, stop_reason}, or Mistral's
+// outputs (one choice each, with its stop reason as sent). The body carries no usage.
+export function textResponse(text: string, model: string, requestedModel: string): Translated throws SyntaxError {
+  const fs = try fields(text)
+  const choices: string[] = []
+  if (claudeText(model)) {
+    choices.push(`{"index":0,"text":${quote(rawStr(fs, "completion") ?? "")},"logprobs":null,"finish_reason":${anthropic.textFinish(rawStr(fs, "stop_reason"))}}`)
+  } else {
+    const outs = find(fs, "outputs") ?? "[]"
+    let i = 0
+    for (const o of outs.startsWith("[") ? try elements(outs) : []) {
+      const of = try fields(o)
+      const stop = rawStr(of, "stop_reason")
+      choices.push(`{"index":${i},"text":${quote(rawStr(of, "text") ?? "")},"logprobs":null,"finish_reason":${stop === undefined ? "null" : quote(stop)}}`)
+      i++
+    }
+  }
+  return { body: anthropic.textCompletionJson(newId("cmpl-"), requestedModel, choices, 0, 0), promptTokens: 0, completionTokens: 0 }
+}
+
+test("bedrock text completions: Claude's legacy body, Mistral's plain body, others refused", () => {
+  const t: Target = { provider: "bedrock", kind: "bedrock", model: "anthropic.claude-v2:1", key: { value: "", bedrock_key_config: { access_key: "AKIDEXAMPLE", secret_key: "s", region: "us-east-1" } }, cfg: {} }
+  const up = try textRequest(t, try fields(`{"model":"bedrock/anthropic.claude-v2:1","prompt":"hi","max_tokens":20,"stop":["x"]}`))
+  expect(up.url).toBe("https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-v2%3A1/invoke")
+  expect(up.body).toBe(`{"prompt":"\\n\\nHuman: hi\\n\\nAssistant:","max_tokens_to_sample":20,"stop_sequences":["x"]}`)
+  expect(try textBody("mistral.mistral-7b-instruct-v0:2", try fields(`{"prompt":"<s>[INST] hi [/INST]","temperature":0.5,"stop":"END"}`))).toBe(`{"prompt":"<s>[INST] hi [/INST]","temperature":0.5,"stop":["END"]}`)
+  let refused = ""
+  try {
+    try textBody("meta.llama3-8b-instruct-v1:0", try fields(`{"prompt":"hi"}`))
+  } catch (e) {
+    refused = e.message
+  }
+  expect(refused).toBe("unsupported model type for text completion: meta.llama3-8b-instruct-v1:0")
+  const c = try textResponse(`{"completion":" Hello","stop_reason":"stop_sequence","stop":"x"}`, "anthropic.claude-v2:1", "bedrock/anthropic.claude-v2:1")
+  expect(c.body.includes(`"choices":[{"index":0,"text":" Hello","logprobs":null,"finish_reason":"stop"}]`)).toBe(true)
+  const m = try textResponse(`{"outputs":[{"text":"a","stop_reason":"length"},{"text":"b","stop_reason":"stop"}]}`, "mistral.mistral-7b-instruct-v0:2", "bedrock/m")
+  expect(m.body.includes(`{"index":1,"text":"b","logprobs":null,"finish_reason":"stop"}`)).toBe(true)
+})
 
 test("amz dates", () => {
   expect(amzDate(0.0)).toBe("19700101T000000Z")

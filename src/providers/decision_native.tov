@@ -1,0 +1,581 @@
+// Native decisions on the providers that serve them on their own routes, as Bifrost sends them:
+//   - OpenAI's POST /v1/decisions for its decision models (gpt-6-luna), in OpenAI's own request shape.
+//   - Azure's /providers/microsoft/v1/systemone (Microsoft-Decision-1), Perplexity's /v1/decisions (deciders)
+//     and Ollama's /v1/systemone (System One models): TypeSafe's systemone body.
+//   - Cloudflare's Clef at /ai/run/@cf/cloudflare/<model>: the systemone body plus images, in a result envelope.
+//   - Databricks' ai_decide AI Function: the systemone state and questions, answered in its own envelope.
+// The canonical request is read in decisions.tov; answers come back in its canonical response.
+import { Field, fields, elements, find, rawStr, rawNum, decodeString, quote, build } from "../json"
+import { Target, Upstream, Translated, headers, addExtraHeaders } from "./types"
+import { DecisionReq, Question, renderResponse } from "../decisions"
+import * as typesafe from "./typesafe"
+import * as openai from "./openai"
+import * as cloudflare from "./cloudflare"
+import * as databricks from "./databricks"
+
+const NATIVE_KINDS: string[] = ["openai", "azure", "cloudflare", "databricks", "perplexity", "ollama"]
+const OLLAMA_PREFIXES: string[] = ["nimble", "tev1", "clef", "laya"]
+const CLEF_NAMESPACE = "@cf/cloudflare/"
+// The ai_decide function API version, pinned so a change of Databricks' default cannot change the answer's shape.
+const DATABRICKS_DECISION_VERSION = "1.0"
+// The answer fields of the canonical answer, in its order; type and name are written first.
+const ANSWER_KEYS: string[] = ["probability", "choice", "score", "probabilities", "confidence", "legend", "answer_confidence", "action", "abstention", "abstention_threshold", "low_confidence"]
+
+// Whether the provider kind has a native decisions route here.
+export function isNativeKind(kind: string): bool {
+  return NATIVE_KINDS.includes(kind)
+}
+
+// Whether the provider decides the model on its own route, by the model families Bifrost recognises by name
+// (its compat plugin's check): TypeSafe's typesafe/ models anywhere, gpt-6-luna on OpenAI, Clef on Cloudflare,
+// deciders on Perplexity, System One models on Ollama, Microsoft's decision models on Azure, ai_decide on
+// Databricks.
+export function decidesNatively(kind: string, model: string): bool {
+  const lower = model.toLowerCase()
+  const bare = lower.startsWith("~") ? lower.slice(1) : lower
+  if (bare.startsWith("typesafe/")) return true
+  return decidesByName(kind, model)
+}
+
+function decidesByName(kind: string, model: string): bool {
+  const lower = model.toLowerCase()
+  if (kind === "openai") return (lower.startsWith("openai/") ? lower.slice(7) : lower).startsWith("gpt-6-luna")
+  if (kind === "cloudflare") return clefName(model).startsWith("clef")
+  if (kind === "perplexity") return lower.startsWith("pplx-decider")
+  if (kind === "ollama") return OLLAMA_PREFIXES.some((p) => lower.startsWith(p))
+  if (kind === "azure") return lower.startsWith("microsoft-decision")
+  if (kind === "databricks") return lower === "ai_decide"
+  return false
+}
+
+// Whether the provider refuses a decision for the model instead of sending it: OpenAI serves only its decision
+// models on /v1/decisions and Databricks only ai_decide; the other providers send every model and let the
+// upstream judge it.
+export function refusesModel(kind: string, model: string): bool {
+  return (kind === "openai" || kind === "databricks") && !decidesByName(kind, model)
+}
+
+// The bare Clef name the URL and the body both use: "@cf/cloudflare/clef-flash" is "clef-flash".
+function clefName(model: string): string {
+  return model.startsWith(CLEF_NAMESPACE) ? model.slice(CLEF_NAMESPACE.byteLength) : model
+}
+
+// ---- request side ----
+
+// A JSON value with its object keys sorted at every level, so structured text is stable.
+export function sortedJson(raw: string): string throws SyntaxError {
+  if (raw.startsWith("{")) {
+    const fs = try fields(raw)
+    fs.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
+    const out: string[] = []
+    for (const f of fs) out.push(quote(f.key) + ":" + (try sortedJson(f.raw)))
+    return "{" + out.join(",") + "}"
+  }
+  if (raw.startsWith("[")) {
+    const out: string[] = []
+    for (const el of try elements(raw)) out.push(try sortedJson(el))
+    return "[" + out.join(",") + "]"
+  }
+  return raw
+}
+
+// Decision text as plain text: a string as it is, a structured value as sorted JSON, null as nothing.
+function textOf(raw: string): string throws SyntaxError {
+  if (raw === "" || raw === "null") return ""
+  if (raw.startsWith("\"")) return try decodeString(raw)
+  return try sortedJson(raw)
+}
+
+// A predicate's criteria folded into its instructions, as emulation renders them for a chat model.
+function criteriaText(q: Question): string throws SyntaxError {
+  let out = ""
+  const sides: string[][] = [["true", q.trueSide], ["false", q.falseSide]]
+  for (const s of sides) {
+    const desc = try textOf(s[1]!)
+    if (desc === "") continue
+    out += out === "" ? " Meaning (answer: meaning): " : ", "
+    out += s[0]! + "=" + desc
+  }
+  return out
+}
+
+// One question as OpenAI reads it: text instructions and, by type, choices or levels with text descriptions.
+function openaiQuestion(q: Question): string throws SyntaxError {
+  const parts: string[] = [`"type":${quote(q.type)}`]
+  if (q.named) parts.push(`"name":${quote(q.name)}`)
+  parts.push(`"instructions":${quote(((try textOf(q.instructions)) + (try criteriaText(q))).trim())}`)
+  if (q.type === "choice") {
+    const cs: string[] = []
+    for (const c of q.choices) {
+      const value = c.bool ? c.key : quote(c.key)
+      cs.push(c.desc === "null" ? `{"value":${value}}` : `{"value":${value},"description":${quote(try textOf(c.desc))}}`)
+    }
+    parts.push(`"choices":[${cs.join(",")}]`)
+  } else if (q.type === "score") {
+    const ls: string[] = []
+    for (const l of q.levels) ls.push(l.desc === "null" ? `{"label":${quote(l.label)}}` : `{"label":${quote(l.label)},"description":${quote(try textOf(l.desc))}}`)
+    parts.push(`"levels":[${ls.join(",")}]`)
+  }
+  return "{" + parts.join(",") + "}"
+}
+
+// The body of OpenAI's POST /v1/decisions. OpenAI requires an input; a structured input goes as sorted JSON
+// text, and messages (with their images) go as sent. user is the request's safety identifier.
+export function openaiBody(d: DecisionReq, model: string, user: string | undefined): string throws SyntaxError {
+  const input = d.input ?? d.state
+  if (input === "null") throw new SyntaxError("OpenAI decisions require an input, and this request has none")
+  const wire = input.startsWith("{") ? quote(try sortedJson(input)) : input
+  const qs: string[] = []
+  for (const q of d.questions) qs.push(try openaiQuestion(q))
+  const parts: string[] = [`"model":${quote(model)}`, `"input":${wire}`, `"questions":[${qs.join(",")}]`]
+  if (user !== undefined && user !== "") parts.push(`"safety_identifier":${quote(user)}`)
+  for (const f of d.extra ?? []) {
+    if (!["model", "input", "questions", "safety_identifier"].includes(f.key)) parts.push(quote(f.key) + ":" + f.raw)
+  }
+  return "{" + parts.join(",") + "}"
+}
+
+// An image part's URL; an image part without one is refused.
+function imageUrl(pf: Field[]): string throws SyntaxError {
+  const url = rawStr(pf, "image_url") ?? ""
+  if (url === "") throw new SyntaxError("decision input carries an input_image part without an image_url")
+  return url
+}
+
+// The image parts of a messages input, in order, with the parts' raw fields.
+function imageParts(input: string): Field[][] throws SyntaxError {
+  const out: Field[][] = []
+  if (!input.startsWith("[")) return out
+  for (const el of try elements(input)) {
+    const content = find(try fields(el), "content")
+    if (content === undefined || !content.startsWith("[")) continue
+    for (const p of try elements(content)) {
+      const pf = try fields(p)
+      if (rawStr(pf, "type") === "input_image") out.push(pf)
+    }
+  }
+  return out
+}
+
+// The decision without its image refusal, for a provider that takes the images itself.
+function readsImages(d: DecisionReq): DecisionReq {
+  let dt = d
+  dt.refusal = undefined
+  return dt
+}
+
+// Perplexity's state for an input with images: the text items as strings and the images as image_url items, in
+// their order.
+export function perplexityState(input: string): string throws SyntaxError {
+  const items: string[] = []
+  for (const el of try elements(input)) {
+    const content = find(try fields(el), "content")
+    if (content === undefined || content === "null") continue
+    if (content.startsWith("\"")) {
+      items.push(content)
+      continue
+    }
+    for (const p of try elements(content)) {
+      const pf = try fields(p)
+      const type = rawStr(pf, "type") ?? ""
+      if (type === "input_image") {
+        const detail = find(pf, "detail")
+        const d = detail !== undefined && detail !== "null" ? `,"detail":${detail}` : ""
+        items.push(`{"type":"image_url","image_url":{"url":${quote(try imageUrl(pf))}${d}}}`)
+      } else if (type === "input_text") {
+        const text = find(pf, "text")
+        if (text !== undefined && text !== "null") items.push(text)
+      }
+    }
+  }
+  return "[" + items.join(",") + "]"
+}
+
+// A base64 data URL's payload, or the URL as it is.
+function base64Payload(url: string): string {
+  if (!url.startsWith("data:")) return url
+  const comma = url.indexOf(",")
+  if (comma < 0 || !url.slice(0, comma).endsWith(";base64")) return url
+  return url.slice(comma + 1)
+}
+
+// A body with fields added after the ones it has.
+function withFields(body: string, add: Field[]): string throws SyntaxError {
+  const fs = try fields(body)
+  for (const f of add) fs.push(f)
+  return build(fs)
+}
+
+// Cloudflare's Clef body: the systemone body with the bare Clef name, and the input's images as data URLs. An
+// input left with no messages once its images are taken out is sent as empty text, since Clef refuses a null state.
+export function cloudflareBody(d: DecisionReq, model: string): string throws SyntaxError {
+  const images: string[] = []
+  for (const pf of try imageParts(d.input ?? "null")) images.push(quote(try imageUrl(pf)))
+  let dt = readsImages(d)
+  if (images.length > 0 && dt.state === "[]") dt.state = `""`
+  if (images.length === 0) return try typesafe.systemoneBody(dt, clefName(model))
+  const body = try typesafe.systemoneBody(dt, clefName(model), ["images"])
+  return try withFields(body, [{ key: "images", raw: "[" + images.join(",") + "]" }])
+}
+
+// Ollama's body: the systemone body, with the input's images (raw base64) and the native images in extra params
+// in the top-level images array every question shares, and keep_alive lifted from the extra params.
+export function ollamaBody(d: DecisionReq, model: string): string throws SyntaxError {
+  const images: string[] = []
+  for (const pf of try imageParts(d.input ?? "null")) images.push(quote(base64Payload(try imageUrl(pf))))
+  const extra = d.extra ?? []
+  const native = find(extra, "images")
+  if (native !== undefined && native !== "null") {
+    if (!native.startsWith("[")) throw new SyntaxError("images must be an array of base64-encoded strings")
+    for (const el of try elements(native)) {
+      if (!el.startsWith("\"")) throw new SyntaxError("images must be an array of base64-encoded strings")
+      images.push(el)
+    }
+  }
+  const add: Field[] = []
+  if (images.length > 0) add.push({ key: "images", raw: "[" + images.join(",") + "]" })
+  const keep = find(extra, "keep_alive")
+  if (keep !== undefined && keep !== "null") {
+    if (!keep.startsWith("\"") && parseFloat(keep) === undefined) throw new SyntaxError(`keep_alive must be a duration string such as "5m" or a number of seconds`)
+    add.push({ key: "keep_alive", raw: keep })
+  }
+  const body = try typesafe.systemoneBody(readsImages(d), model, ["images", "keep_alive"])
+  if (add.length === 0) return body
+  return try withFields(body, add)
+}
+
+// Perplexity's body: the systemone body; an input with images goes as text and image_url items in order.
+export function perplexityBody(d: DecisionReq, model: string): string throws SyntaxError {
+  let dt = readsImages(d)
+  const input = d.input ?? "null"
+  if ((d.refusal ?? "") !== "") dt.state = try perplexityState(input)
+  return try typesafe.systemoneBody(dt, model)
+}
+
+// The ai_decide body: the systemone state and questions (no model), with the pinned function version. ai_decide
+// answers a null state with no answers, so an empty input is refused here.
+export function databricksBody(d: DecisionReq): string throws SyntaxError {
+  if (d.state === "null" && (d.refusal ?? "") === "") throw new SyntaxError("decision input is required")
+  const fs = try fields(try typesafe.systemoneBody(d, ""))
+  const out: Field[] = []
+  for (const f of fs) {
+    if (f.key === "model") continue
+    out.push(f)
+    if (f.key === "questions") out.push({ key: "options", raw: `{"version":${quote(DATABRICKS_DECISION_VERSION)}}` })
+  }
+  return build(out)
+}
+
+function bearerIfSet(t: Target): Map<string, string> {
+  let h = headers([["content-type", "application/json"]])
+  const v = t.key.value ?? ""
+  if (v !== "") h.set("authorization", "Bearer " + v)
+  addExtraHeaders(&h, t.cfg)
+  return h
+}
+
+// The upstream call for a decision on a native kind. user is the request's safety identifier (OpenAI's field).
+export function decisionUpstream(t: Target, d: DecisionReq, user: string | undefined): Upstream throws SyntaxError {
+  if (refusesModel(t.kind, t.model)) throw new SyntaxError(`decisions is not supported by ${t.provider} provider for model ${t.model}`)
+  if (t.kind === "openai") {
+    // OpenAI reads the images itself
+    return { url: openai.decisionsUrl(t), headers: openai.bearerHeaders(t), body: try openaiBody(readsImages(d), t.model, user) }
+  }
+  if (t.kind === "azure") {
+    const url = openai.azureDecisionUrl(t)
+    if (url.startsWith("/")) throw new SyntaxError("azure: endpoint not set")
+    return { url: url, headers: openai.azureHeaders(t), body: try typesafe.systemoneBody(d, openai.azureDeployment(t)) }
+  }
+  if (t.kind === "cloudflare") {
+    return { url: (try cloudflare.accountBase(t)) + "/ai/run/" + CLEF_NAMESPACE + clefName(t.model), headers: bearerIfSet(t), body: try cloudflareBody(d, t.model) }
+  }
+  if (t.kind === "databricks") {
+    return { url: "https://" + (try databricks.workspaceHost(t)) + "/api/2.0/ai-functions/ai-decide", headers: try databricks.bearerHeaders(t), body: try databricksBody(d) }
+  }
+  if (t.kind === "perplexity") return { url: openai.rootOf(t) + "/v1/decisions", headers: bearerIfSet(t), body: try perplexityBody(d, t.model) }
+  return { url: openai.rootOf(t) + "/v1/systemone", headers: bearerIfSet(t), body: try ollamaBody(d, t.model) }
+}
+
+// ---- response side ----
+
+// A score answer's legend, level index to description, rebuilt from the question's levels for a provider that
+// sends none: the description, with a label other than the index folded in.
+export function scoreLegend(q: Question): string throws SyntaxError {
+  const out: string[] = []
+  for (let i = 0; i < q.levels.length; i++) {
+    const l = q.levels[i]!
+    let v = l.desc
+    if (l.label !== "" && l.label !== `${i}`) {
+      if (l.desc === "null") v = quote(l.label)
+      else if (l.desc.startsWith("\"")) v = quote(l.label + ": " + (try decodeString(l.desc)))
+      else v = `{"label":${quote(l.label)},"description":${l.desc}}`
+    }
+    out.push(`${quote(`${i}`)}:${v}`)
+  }
+  return "{" + out.join(",") + "}"
+}
+
+// OpenAI's decisions answer in the canonical response. The answers come in question order: one naming another
+// question, or of another type than its question's, is an error (a refusal is kept as it is). An answer without
+// a name takes its question's, and a score answer gets the legend OpenAI does not send.
+export function openaiDecision(out: string, d: DecisionReq, requested: string): Translated throws SyntaxError {
+  const top = try fields(out)
+  const raw = find(top, "answers") ?? "[]"
+  const els = raw.startsWith("[") ? try elements(raw) : []
+  if (els.length !== d.questions.length) throw new SyntaxError(`OpenAI returned ${els.length} decision answers for ${d.questions.length} questions`)
+  const answers: string[] = []
+  for (let i = 0; i < els.length; i++) {
+    const af = try fields(els[i]!)
+    const q = d.questions[i]!
+    const name = rawStr(af, "name")
+    if (name !== undefined && q.named && name !== q.name) throw new SyntaxError(`OpenAI decision answer ${i} is named "${name}"; expected "${q.name}"`)
+    const type = rawStr(af, "type") ?? ""
+    if (type !== "refusal" && type !== q.type) throw new SyntaxError(`OpenAI answered decision question ${i} as "${type}"; expected "${q.type}"`)
+    const parts: string[] = [`"type":${quote(type)}`]
+    if (name !== undefined) parts.push(`"name":${quote(name)}`)
+    else if (q.named) parts.push(`"name":${quote(q.name)}`)
+    for (const k of ANSWER_KEYS) {
+      const v = find(af, k)
+      if (v !== undefined && v !== "null") parts.push(`${quote(k)}:${v}`)
+      else if (k === "legend" && type === "score" && q.levels.length > 0) parts.push(`"legend":${try scoreLegend(q)}`)
+    }
+    answers.push("{" + parts.join(",") + "}")
+  }
+  let prompt = 0
+  let completion = 0
+  const usage = find(top, "usage")
+  if (usage !== undefined && usage.startsWith("{")) {
+    const uf = try fields(usage)
+    prompt = Math.floor(rawNum(uf, "input_tokens") ?? 0)
+    completion = Math.floor(rawNum(uf, "output_tokens") ?? 0)
+  }
+  const model = rawStr(top, "model") ?? ""
+  return { body: renderResponse(model === "" ? requested : model, answers, prompt, completion, ""), promptTokens: prompt, completionTokens: completion }
+}
+
+// Workers AI's envelope around a Clef answer: a failed one (success false, or no result) is an error.
+function cloudflareResult(out: string): string throws SyntaxError {
+  const top = try fields(out)
+  const result = find(top, "result")
+  if (find(top, "success") !== "true" || result === undefined || !result.startsWith("{")) {
+    let msg = "cloudflare decision failed"
+    const errs = find(top, "errors")
+    if (errs !== undefined && errs.startsWith("[")) {
+      const first = (try elements(errs))[0]
+      if (first !== undefined) msg += ": " + (rawStr(try fields(first), "message") ?? "")
+    }
+    throw new SyntaxError(msg)
+  }
+  return result
+}
+
+// ai_decide's envelope in TypeSafe's answer shape: a noul's value arrives as probability. The body names no
+// model, so the requested one is reported.
+function databricksAnswers(out: string, model: string): string throws SyntaxError {
+  const resp = find(try fields(out), "response")
+  if (resp === undefined || !resp.startsWith("{")) throw new SyntaxError("databricks returned no answers")
+  const raw = find(try fields(resp), "answers") ?? "{}"
+  const answers: string[] = []
+  for (const a of raw.startsWith("{") ? try fields(raw) : []) {
+    const af = try fields(a.raw)
+    const noul = find(af, "noul")
+    const prob = find(af, "probability")
+    if ((noul === undefined || noul === "null") && prob !== undefined) af.push({ key: "noul", raw: prob })
+    answers.push(quote(a.key) + ":" + build(af))
+  }
+  return `{"model":${quote(model)},"answers":{${answers.join(",")}}}`
+}
+
+// A native kind's decision answer in the canonical response.
+export function decisionTranslate(t: Target, out: string, d: DecisionReq, requested: string): Translated throws SyntaxError {
+  if (t.kind === "openai") return try openaiDecision(out, d, requested)
+  if (t.kind === "cloudflare") return try typesafe.translateDecision(try cloudflareResult(out), d, requested)
+  if (t.kind === "databricks") return try typesafe.translateDecision(try databricksAnswers(out, t.model), d, requested)
+  return try typesafe.translateDecision(out, d, requested)
+}
+
+// ---- tests ----
+
+function q(type: string, name: string): Question {
+  return { type: type, name: name, named: name !== "", instructions: "null", trueSide: "", falseSide: "", choices: [], levels: [] }
+}
+
+test("decision models are recognised by name per provider", () => {
+  expect(decidesNatively("openai", "gpt-6-luna")).toBe(true)
+  expect(decidesNatively("openai", "openai/GPT-6-luna-2026-09-01")).toBe(true)
+  expect(decidesNatively("openai", "gpt-4o-mini")).toBe(false)
+  expect(decidesNatively("azure", "gpt-6-luna")).toBe(false)
+  expect(decidesNatively("azure", "Microsoft-Decision-1")).toBe(true)
+  expect(decidesNatively("cloudflare", "@cf/cloudflare/clef-flash")).toBe(true)
+  expect(decidesNatively("cloudflare", "clef")).toBe(true)
+  expect(decidesNatively("cloudflare", "@cf/meta/llama-3.1-8b-instruct")).toBe(false)
+  expect(decidesNatively("perplexity", "pplx-decider-v1.1-27b")).toBe(true)
+  expect(decidesNatively("perplexity", "sonar")).toBe(false)
+  expect(decidesNatively("ollama", "nimble:latest")).toBe(true)
+  expect(decidesNatively("ollama", "Laya-en")).toBe(true)
+  expect(decidesNatively("ollama", "llama3")).toBe(false)
+  expect(decidesNatively("databricks", "AI_DECIDE")).toBe(true)
+  expect(decidesNatively("databricks", "databricks-dbrx")).toBe(false)
+  expect(decidesNatively("ollama", "~typesafe/jev-latest")).toBe(true)
+  expect(refusesModel("openai", "gpt-4o")).toBe(true)
+  expect(refusesModel("openai", "gpt-6-luna")).toBe(false)
+  expect(refusesModel("databricks", "typesafe/jev")).toBe(true)
+  expect(refusesModel("perplexity", "sonar")).toBe(false)
+})
+
+test("structured text is sorted at every level", () => {
+  expect(try sortedJson(`{"b":[{"z":1,"a":2}],"a":"x"}`)).toBe(`{"a":"x","b":[{"a":2,"z":1}]}`)
+})
+
+test("an OpenAI decision body carries text questions and the input as sent", () => {
+  const d: DecisionReq = {
+    model: "openai/gpt-6-luna",
+    state: `"hi"`,
+    input: `"hi"`,
+    questions: [
+      { type: "predicate", name: "is_frustrated", named: true, instructions: `"Is it?"`, trueSide: `"angry"`, falseSide: `"calm"`, choices: [], levels: [] },
+      { type: "choice", name: "question_2", named: false, instructions: `{"b":1,"a":2}`, trueSide: "", falseSide: "", choices: [{ key: "billing", bool: false, desc: `"money"` }, { key: "true", bool: true, desc: "null" }], levels: [] },
+      { type: "score", name: "u", named: true, instructions: "null", trueSide: "", falseSide: "", choices: [], levels: [{ label: "0", desc: "null" }, { label: "high", desc: `{"k":1}` }] },
+    ],
+    extra: [{ key: "metadata", raw: `{"a":1}` }],
+  }
+  const body = try openaiBody(d, "gpt-6-luna", "user-7")
+  expect(body).toBe(`{"model":"gpt-6-luna","input":"hi","questions":[` +
+    `{"type":"predicate","name":"is_frustrated","instructions":"Is it? Meaning (answer: meaning): true=angry, false=calm"},` +
+    `{"type":"choice","instructions":"{\\"a\\":2,\\"b\\":1}","choices":[{"value":"billing","description":"money"},{"value":true}]},` +
+    `{"type":"score","name":"u","instructions":"","levels":[{"label":"0"},{"label":"high","description":"{\\"k\\":1}"}]}],` +
+    `"safety_identifier":"user-7","metadata":{"a":1}}`)
+  const structured: DecisionReq = { model: "m", state: `{"b":1}`, input: `{"b":1,"a":[2]}`, questions: [] }
+  expect((try openaiBody(structured, "m", undefined)).includes(`"input":"{\\"a\\":[2],\\"b\\":1}"`)).toBe(true)
+  let msg = ""
+  try {
+    try openaiBody({ model: "m", state: "null", input: "null", questions: [] }, "m", undefined)
+  } catch (e) {
+    msg = e.message
+  }
+  expect(msg.includes("require an input")).toBe(true)
+})
+
+test("OpenAI's answers come back canonical, named, with a legend for scores", () => {
+  const d: DecisionReq = {
+    model: "openai/gpt-6-luna",
+    state: "null",
+    questions: [
+      q("predicate", "p"),
+      q("choice", ""),
+      { type: "score", name: "s", named: true, instructions: "null", trueSide: "", falseSide: "", choices: [], levels: [{ label: "0", desc: `"calm"` }, { label: "high", desc: `"soon"` }] },
+    ],
+  }
+  const out = `{"model":"gpt-6-luna-2026","answers":[{"type":"predicate","name":null,"probability":0.7,"confidence":0.9},{"type":"refusal","name":null},{"type":"score","name":"s","score":1.2}],"usage":{"input_tokens":30,"output_tokens":4,"total_tokens":34}}`
+  const r = try openaiDecision(out, d, "openai/gpt-6-luna")
+  expect(r.promptTokens).toBe(30)
+  expect(r.completionTokens).toBe(4)
+  expect(r.body).toBe(`{"model":"gpt-6-luna-2026","answers":[{"type":"predicate","name":"p","probability":0.7,"confidence":0.9},{"type":"refusal"},{"type":"score","name":"s","score":1.2,"legend":{"0":"calm","1":"high: soon"}}],"usage":{"prompt_tokens":30,"completion_tokens":4,"total_tokens":34}}`)
+  const bad = [
+    `{"answers":[{"type":"predicate"}]}`,
+    `{"answers":[{"type":"predicate","name":"other"},{"type":"choice"},{"type":"score"}]}`,
+    `{"answers":[{"type":"score"},{"type":"choice"},{"type":"score"}]}`,
+  ]
+  for (const b of bad) {
+    let threw = false
+    try {
+      try openaiDecision(b, d, "m")
+    } catch (e) {
+      threw = true
+    }
+    expect(threw).toBe(true)
+  }
+})
+
+test("upstream routes and auth per provider", () => {
+  const d: DecisionReq = { model: "x", state: `"hi"`, input: `"hi"`, questions: [q("predicate", "p")] }
+  const oa: Target = { provider: "openai", kind: "openai", model: "gpt-6-luna", key: { value: "sk-test" }, cfg: { network_config: { base_url: "http://127.0.0.1:18099" } } }
+  const o = try decisionUpstream(oa, d, undefined)
+  expect(o.url).toBe("http://127.0.0.1:18099/v1/decisions")
+  expect(o.headers.get("authorization")).toBe("Bearer sk-test")
+  const az: Target = { provider: "azure", kind: "azure", model: "Microsoft-Decision-1", key: { value: "az-key", azure_key_config: { endpoint: "https://res.services.ai.azure.com/" } }, cfg: {} }
+  const a = try decisionUpstream(az, d, undefined)
+  expect(a.url).toBe("https://res.services.ai.azure.com/providers/microsoft/v1/systemone")
+  expect(a.headers.get("api-key")).toBe("az-key")
+  expect(a.body).toBe(`{"state":"hi","model":"Microsoft-Decision-1","questions":{"p":{"type":"noul"}}}`)
+  const cf: Target = { provider: "cloudflare", kind: "cloudflare", model: "@cf/cloudflare/clef-flash", key: { value: "", cloudflare_key_config: { account_id: "acc1" } }, cfg: {} }
+  const c = try decisionUpstream(cf, d, undefined)
+  expect(c.url).toBe("https://api.cloudflare.com/client/v4/accounts/acc1/ai/run/@cf/cloudflare/clef-flash")
+  expect(c.headers.has("authorization")).toBe(false)
+  expect(c.body.includes(`"model":"clef-flash"`)).toBe(true)
+  const db: Target = { provider: "databricks", kind: "databricks", model: "ai_decide", key: { value: "dapi-test", databricks_key_config: { workspace_url: "https://adb-1.azuredatabricks.net/" } }, cfg: {} }
+  const b = try decisionUpstream(db, d, undefined)
+  expect(b.url).toBe("https://adb-1.azuredatabricks.net/api/2.0/ai-functions/ai-decide")
+  expect(b.body).toBe(`{"state":"hi","questions":{"p":{"type":"noul"}},"options":{"version":"1.0"}}`)
+  const px: Target = { provider: "perplexity", kind: "perplexity", model: "pplx-decider-v1.1-27b", key: { value: "pplx-test" }, cfg: {} }
+  expect((try decisionUpstream(px, d, undefined)).url).toBe("https://api.perplexity.ai/v1/decisions")
+  const ol: Target = { provider: "ollama", kind: "ollama", model: "nimble", key: { value: "" }, cfg: { network_config: { base_url: "http://gpu:11434/v1/" } } }
+  const l = try decisionUpstream(ol, d, undefined)
+  expect(l.url).toBe("http://gpu:11434/v1/systemone")
+  expect(l.headers.has("authorization")).toBe(false)
+  let refused = ""
+  try {
+    try decisionUpstream({ provider: "openai", kind: "openai", model: "gpt-4o", key: { value: "k" }, cfg: {} }, d, undefined)
+  } catch (e) {
+    refused = e.message
+  }
+  expect(refused.includes("decisions is not supported by openai provider")).toBe(true)
+})
+
+test("images: Cloudflare and Ollama lift them, Perplexity keeps them in order, text-only providers refuse", () => {
+  const input = `[{"role":"user","content":[{"type":"input_text","text":"look"},{"type":"input_image","image_url":"data:image/png;base64,AAAA","detail":"low"}]},{"role":"user","content":[{"type":"input_image","image_url":"https://img.example/b.png"}]}]`
+  const d: DecisionReq = { model: "m", state: `[{"role":"user","content":"look"}]`, input: input, refusal: `decision input carries an "input_image" part`, questions: [q("predicate", "p")], extra: [{ key: "keep_alive", raw: `"5m"` }, { key: "images", raw: `["BBBB"]` }] }
+  const cfb = try cloudflareBody(d, "@cf/cloudflare/clef")
+  expect(cfb).toBe(`{"state":[{"role":"user","content":"look"}],"model":"clef","questions":{"p":{"type":"noul"}},"keep_alive":"5m","images":["data:image/png;base64,AAAA","https://img.example/b.png"]}`)
+  const ob = try ollamaBody(d, "nimble")
+  expect(ob).toBe(`{"state":[{"role":"user","content":"look"}],"model":"nimble","questions":{"p":{"type":"noul"}},"images":["AAAA","https://img.example/b.png","BBBB"],"keep_alive":"5m"}`)
+  const pb = try perplexityBody(d, "pplx-decider")
+  expect(pb.startsWith(`{"state":["look",{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA","detail":"low"}},{"type":"image_url","image_url":{"url":"https://img.example/b.png"}}],"model":"pplx-decider"`)).toBe(true)
+  const onlyImage: DecisionReq = { model: "m", state: "[]", input: `[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}]`, refusal: "r", questions: [] }
+  expect((try cloudflareBody(onlyImage, "clef")).startsWith(`{"state":"","model":"clef"`)).toBe(true)
+  let threw = false
+  try {
+    try databricksBody(d)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  let noUrl = ""
+  try {
+    try ollamaBody({ model: "m", state: "[]", input: `[{"role":"user","content":[{"type":"input_image"}]}]`, refusal: "r", questions: [] }, "nimble")
+  } catch (e) {
+    noUrl = e.message
+  }
+  expect(noUrl.includes("without an image_url")).toBe(true)
+  let ka = ""
+  try {
+    try ollamaBody({ model: "m", state: `"x"`, questions: [], extra: [{ key: "keep_alive", raw: "true" }] }, "nimble")
+  } catch (e) {
+    ka = e.message
+  }
+  expect(ka.includes("keep_alive")).toBe(true)
+})
+
+test("Cloudflare's envelope and Databricks' answers come back canonical", () => {
+  const d: DecisionReq = { model: "m", state: `"x"`, questions: [q("predicate", "p")] }
+  const cf: Target = { provider: "cloudflare", kind: "cloudflare", model: "clef-flash", key: { value: "k" }, cfg: {} }
+  const r = try decisionTranslate(cf, `{"result":{"model":"clef-flash","answers":{"p":{"type":"noul","noul":0.6}},"usage":{"input_tokens":9,"output_tokens":0}},"success":true,"errors":[]}`, d, "cloudflare/clef-flash")
+  expect(r.body).toBe(`{"model":"clef-flash","answers":[{"type":"predicate","name":"p","probability":0.6}],"usage":{"prompt_tokens":9,"completion_tokens":0,"total_tokens":9}}`)
+  let failed = ""
+  try {
+    try decisionTranslate(cf, `{"result":null,"success":false,"errors":[{"code":5007,"message":"No such model"}]}`, d, "m")
+  } catch (e) {
+    failed = e.message
+  }
+  expect(failed).toBe("cloudflare decision failed: No such model")
+  const db: Target = { provider: "databricks", kind: "databricks", model: "ai_decide", key: { value: "k" }, cfg: {} }
+  const b = try decisionTranslate(db, `{"response":{"answers":{"p":{"type":"noul","probability":0.4,"confidence":0.8}}}}`, d, "databricks/ai_decide")
+  expect(b.body).toBe(`{"model":"ai_decide","answers":[{"type":"predicate","name":"p","probability":0.4,"confidence":0.8}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`)
+  let none = ""
+  try {
+    try decisionTranslate(db, `{}`, d, "m")
+  } catch (e) {
+    none = e.message
+  }
+  expect(none).toBe("databricks returned no answers")
+})

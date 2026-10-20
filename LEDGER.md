@@ -407,9 +407,9 @@ From a triage of every partial row (work packages WP1 to WP9). Ports from 18280.
 
 | ID | Gap | Work | Owner | Status |
 |---|---|---|---|---|
-| L163 | (d) Providers | WP1: native Decision for openai, azure, cloudflare, databricks, perplexity, ollama; native legacy text completions for Anthropic and Bedrock | worker | assigned |
-| L164 | (d) Providers | WP2: provider operation gaps (xai compact, github-copilot, bedrock_mantle, sarvam, batch delete, exact OpenAI counts, replicate, cache injection points, alias overrides) | worker | todo |
-| L165 | (f) Governance | WP4: governance and RBAC API remainders, access-profile options, complexity analyzer config, load_balancer_config options | worker | todo |
-| L166 | (g) MCP | WP5a: GET /mcp heartbeats, OpenAPI import, spec_url, library, ping, per-client timeout, tool cost, instructions on Responses | worker | todo |
+| L163 | (d) Providers | WP1: native Decision for openai, azure, cloudflare, databricks, perplexity, ollama; native legacy text completions for Anthropic and Bedrock | worker | partial: native Decision requests for openai (gpt-6-luna on /v1/decisions), azure (systemone), cloudflare (Clef), databricks (ai_decide), perplexity and ollama as Bifrost sends them (`providers/decision_native.tov`), with OpenAI/Databricks refusing other models as Bifrost does; native text completions for Anthropic (/v1/complete) and Bedrock (Claude and Mistral InvokeModel), and /anthropic/v1/complete sent natively. Open: Bedrock streamed text completion; /openai/v1/decisions in OpenAI's own shape; decision rates in the datasheet |
+| L164 | (d) Providers | WP2: provider operation gaps (xai compact, github-copilot, bedrock_mantle, sarvam, batch delete, exact OpenAI counts, replicate, cache injection points, alias overrides) | worker | assigned |
+| L165 | (f) Governance | WP4: governance and RBAC API remainders, access-profile options, complexity analyzer config, load_balancer_config options | worker | assigned |
+| L166 | (g) MCP | WP5a: GET /mcp heartbeats, OpenAPI import, spec_url, library, ping, per-client timeout, tool cost, instructions on Responses | worker | assigned |
 | L167 | (g) MCP | WP5b: MCP user mode on OIDC, OAuth status states, persisted auth codes and flow state, temp tokens, dual-credential conflict check | worker | todo |
 | L168 | (h) Observability | WP7: logs, audit, retained content, webhooks, OTLP A2A histogram, cache clear across workers, logs_only redaction | worker | todo |

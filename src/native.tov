@@ -1,15 +1,15 @@
 // Drop-in SDK routes: requests in a provider's own format, forwarded with
 // governance, retries, fallbacks across keys, metrics and cost tracking.
-import { Field, fields, elements, find, quote, build, isNull, rawStr, rawBool, setField, without } from "./json"
+import { Field, fields, elements, find, quote, build, isNull, rawStr, rawBool, rawNum, setField, without } from "./json"
 import { Engine, Build, Translate, StreamSink, StreamConverter, ConverterFactory, streamable, converterKind, errorResponse, noHeaders } from "./gateway"
 import { Target, Translated, trimSlash, proxyOf, tlsOf, poolOf } from "./providers/types"
 import { ChatRequest, snapshot, newId, nowSeconds } from "./schemas"
-import { Config } from "./config"
+import { Config, providerOf } from "./config"
 import { CompatPlan, Shaped, settingsOf, withHeader, isCodingHarness, isDeepSeekModel } from "./compat"
 import { deadline } from "./deadline"
 import { secureHex } from "./crypto"
 import { handleMedia, matchRoute, providerTarget, send } from "./media"
-import { target, parseModel, timeoutMs } from "./router"
+import { target, parseModel, timeoutMs, kindOf } from "./router"
 import * as cohereIn from "./cohere_in"
 import * as genaiIn from "./genai_in"
 import * as bedrockIn from "./bedrock_in"
@@ -469,10 +469,12 @@ class LegacyCompletionStream {
   }
 }
 
-// POST /anthropic/v1/complete: Anthropic's legacy text completion, served by any provider through the
-// messages bridge. The prompt becomes one user turn (the "Human:" and "Assistant:" markers go). The answer
-// keeps the legacy shape: {id, type: "completion", completion, stop_reason, model, usage}. A streamed request
-// (with a streaming transport) streams the legacy completion events as the messages stream arrives.
+// POST /anthropic/v1/complete: Anthropic's legacy text completion. A model on an Anthropic provider is sent to
+// Anthropic's own legacy call, as Bifrost sends it (legacyNative). Any other provider serves it through the
+// messages bridge: the prompt becomes one user turn (the "Human:" and "Assistant:" markers go). The answer keeps
+// the legacy shape: {id, type: "completion", completion, stop_reason, model, usage}. A streamed request (with a
+// streaming transport) streams the legacy completion events as the messages stream arrives (Anthropic has no
+// legacy stream Bifrost reads, so streams always take the bridge).
 export async function anthropicLegacy(engine: Engine, req: Request, sink?: StreamSink): Promise<Response> {
   const text = await req.text()
   let body: Field[] = []
@@ -496,6 +498,7 @@ export async function anthropicLegacy(engine: Engine, req: Request, sink?: Strea
     const v = find(body, k)
     if (v !== undefined && v !== "null") parts.push("\"" + k + "\":" + v)
   }
+  if (!streamed && legacyNative(engine, model)) return await legacyByText(engine, req, body, model, maxTokens)
   if (streamed && sink !== undefined) {
     // the messages stream, converted as it arrives to the legacy completion events
     const lc = new LegacyCompletionStream(model)
@@ -530,6 +533,54 @@ export async function anthropicLegacy(engine: Engine, req: Request, sink?: Strea
   } catch (e) {
     return errorResponse(502, `the answer could not be read: ${e.message}`, "api_error", noHeaders())
   }
+}
+
+// Whether the legacy request's model is on an Anthropic provider, whose own legacy call serves it.
+function legacyNative(engine: Engine, model: string): bool {
+  const ref = parseModel(engine.cfg, model)
+  const p = providerOf(engine.cfg, ref.provider)
+  return (p === undefined ? ref.provider : kindOf(ref.provider, p)) === "anthropic"
+}
+
+// The legacy request as a text completion (POST /v1/completions), which sends it to Anthropic's legacy call (and a
+// fallback to its own text completions), with the answer back in the legacy shape. The prompt goes as sent.
+async function legacyByText(engine: Engine, req: Request, body: Field[], model: string, maxTokens: string): Promise<Response> {
+  const parts: string[] = ["\"model\":" + quote(model), "\"prompt\":" + quote(rawStr(body, "prompt") ?? ""), "\"max_tokens\":" + maxTokens]
+  for (const k of ["temperature", "top_p", "top_k", "fallbacks"]) {
+    const v = find(body, k)
+    if (v !== undefined && v !== "null") parts.push("\"" + k + "\":" + v)
+  }
+  const stop = find(body, "stop_sequences")
+  if (stop !== undefined && stop !== "null") parts.push("\"stop\":" + stop)
+  const r = await engine.completions(internalRequest(req, "/v1/completions", "{" + parts.join(",") + "}"))
+  if (r.status !== 200) return r
+  try {
+    return jsonBody(try legacyFromText(await r.text(), model))
+  } catch (e) {
+    return errorResponse(502, `the answer could not be read: ${e.message}`, "api_error", noHeaders())
+  }
+}
+
+// An OpenAI text completion in the legacy completion shape: the first choice's text, its finish reason as the
+// legacy stop reason, and the usage as input and output tokens.
+export function legacyFromText(text: string, model: string): string throws SyntaxError {
+  const out = try fields(text)
+  const first = (try elements(find(out, "choices") ?? "[]"))[0]
+  const cf: Field[] = first === undefined ? [] : try fields(first)
+  const stop = rawStr(cf, "finish_reason") === "length" ? "max_tokens" : "stop_sequence"
+  const fs: Field[] = [
+    { key: "id", raw: quote(rawStr(out, "id") ?? "") },
+    { key: "type", raw: quote("completion") },
+    { key: "completion", raw: quote(rawStr(cf, "text") ?? "") },
+    { key: "stop_reason", raw: quote(stop) },
+    { key: "model", raw: quote(model) },
+  ]
+  const usage = find(out, "usage")
+  if (usage !== undefined && usage.startsWith("{")) {
+    const uf = try fields(usage)
+    fs.push({ key: "usage", raw: `{"input_tokens":${Math.floor(rawNum(uf, "prompt_tokens") ?? 0)},"output_tokens":${Math.floor(rawNum(uf, "completion_tokens") ?? 0)}}` })
+  }
+  return build(fs)
 }
 
 // An internal POST to the gateway's own route, with the caller's headers (so its virtual key).
@@ -1227,4 +1278,11 @@ test("the legacy completion stream turns messages events into completion events,
   // an error event passes through
   const err = new LegacyCompletionStream("m")
   expect(err.push(`event: error\ndata: {"type":"error"}\n\n`)).toBe(`event: error\ndata: {"type":"error"}\n\n`)
+})
+
+test("a text completion answer is rendered in the legacy completion shape", () => {
+  const out = try legacyFromText(`{"id":"compl_9","object":"text_completion","model":"anthropic/claude-2.1","choices":[{"index":0,"text":" Hi","finish_reason":"length"}],"usage":{"prompt_tokens":8,"completion_tokens":2,"total_tokens":10}}`, "claude-2.1")
+  expect(out).toBe(`{"id":"compl_9","type":"completion","completion":" Hi","stop_reason":"max_tokens","model":"claude-2.1","usage":{"input_tokens":8,"output_tokens":2}}`)
+  const stop = try legacyFromText(`{"id":"x","choices":[{"text":"a","finish_reason":"stop"}]}`, "m")
+  expect(stop.includes(`"stop_reason":"stop_sequence"`)).toBe(true)
 })
