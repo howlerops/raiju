@@ -23,6 +23,9 @@ PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
 try:
     import grpc
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from grpc_details import details_of
     HAVE_GRPC = True
 except ImportError:
     HAVE_GRPC = False
@@ -207,6 +210,22 @@ class GrpcTests(unittest.TestCase):
                     self.unary(b"x", metadata=[("x-status", str(code))], timeout=10)
                 self.assertEqual(cm.exception.code(), status_of(code))
                 self.assertEqual(cm.exception.details(), "requested by x-status")
+
+    def test_status_details_decode(self):
+        # grpc-status-details-bin: a google.rpc.Status with a Struct and an ErrorInfo, read by grpcio and protobuf
+        with self.assertRaises(grpc.RpcError) as cm:
+            self.unary(b"x", metadata=[("x-status", "5"), ("x-reason", "TASK_NOT_FOUND")], timeout=10)
+        self.assertEqual(cm.exception.code(), grpc.StatusCode.NOT_FOUND)
+        st = details_of(cm.exception.trailing_metadata())
+        self.assertIsNotNone(st)
+        self.assertEqual(st["code"], 5)
+        self.assertEqual(st["message"], "requested by x-status")
+        self.assertEqual(st["details"][0], {"type": "Struct", "value": {"hint": "try later", "n": 2.0}})
+        self.assertEqual(st["details"][1], {"type": "ErrorInfo", "reason": "TASK_NOT_FOUND", "domain": "a2a-protocol.org", "metadata": {"taskId": "t-echo"}})
+        # without details there is no trailer
+        with self.assertRaises(grpc.RpcError) as cm:
+            self.unary(b"x", metadata=[("x-status", "5")], timeout=10)
+        self.assertIsNone(details_of(cm.exception.trailing_metadata()))
 
     def test_unknown_method_is_unimplemented(self):
         stub = self.channel.unary_unary("/test.Echo/Nope", request_serializer=None, response_deserializer=None)

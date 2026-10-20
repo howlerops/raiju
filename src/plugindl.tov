@@ -1,0 +1,178 @@
+// Plugins loaded from a URL, as Bifrost loads a plugin whose path starts with "http" (framework/plugins/utils.go
+// DownloadPlugin): an http or https URL only, fetched with a 120 second timeout, at most 5 redirects (each to http or
+// https), a 200 answer only, at most 200 MiB of body, and no private, loopback, link-local or metadata address unless
+// the host is in server.plugin_download_private_allowlist (Bifrost's SSRF-hardened download client). The file is kept
+// under the plugin cache directory by the URL's hash, so the chain (plugins.tov makePlugin, which is synchronous) loads
+// the copy, and the workers of a host share it.
+
+import { existsSync, mkdirSync } from "node:fs"
+import { writeFileAtomic } from "./atomicfile"
+import { targetProblem } from "./netguard"
+import { sha256, toHex, utf8 } from "./crypto"
+import { deadline } from "./deadline"
+
+// Bifrost's maxPluginDownloadBytes.
+export const MAX_PLUGIN_BYTES = 209715200
+const TIMEOUT_MS = 120000
+const MAX_REDIRECTS = 5
+
+// Whether a plugin path is a URL to download (Bifrost: a path that starts with "http").
+export function isPluginUrl(path: string | undefined): bool {
+  if (path === undefined) return false
+  const p = path.trim()
+  return p.startsWith("http")
+}
+
+// The directory the downloads are kept in (RAIJU_PLUGIN_DIR, else raiju-plugins under the temporary directory).
+export function pluginCacheDir(): string {
+  const d = process.env.RAIJU_PLUGIN_DIR ?? ""
+  if (d !== "") return d
+  return (process.env.TMPDIR ?? "/tmp") + "/raiju-plugins"
+}
+
+// The local copy of a plugin URL (its file name is the URL's SHA-256 and the extension of its path).
+export function pluginFileFor(url: string): string {
+  const u = url.trim()
+  const ext = u.split("?")[0]!.endsWith(".so") ? ".so" : ".wasm"
+  return `${pluginCacheDir()}/${toHex(sha256(utf8(u)))}${ext}`
+}
+
+// The local copy of a downloaded plugin URL, or undefined when it has not been downloaded.
+export function downloadedPlugin(url: string): string | undefined {
+  const f = pluginFileFor(url)
+  try {
+    return existsSync(f) ? f : undefined
+  } catch (e) {
+    return undefined
+  }
+}
+
+// Why a URL may not be fetched, or "": http or https only, and no private address unless the host is allowed.
+export function urlProblem(url: string, allow: string[]): string {
+  const u = URL.parse(url)
+  if (u === undefined) return `invalid plugin URL "${url}"`
+  if (u.protocol !== "http:" && u.protocol !== "https:") return `unsupported plugin URL scheme "${u.protocol.replace(":", "")}" (only http/https allowed)`
+  const p = targetProblem(url, allow)
+  return p === "" ? "" : `plugin URL "${url}" is refused: ${p} (add the host to server.plugin_download_private_allowlist to allow it)`
+}
+
+// Where a redirect goes: an absolute URL, or a path on the same origin; "" for anything else.
+export function redirectTarget(from: string, location: string): string {
+  if (location.includes("://")) return location
+  const u = URL.parse(from)
+  if (u === undefined || !location.startsWith("/")) return ""
+  return u.origin + location
+}
+
+// Reads at most max bytes of a body; undefined when it holds more (the limit Bifrost's LimitReader applies).
+export async function readCapped(body: ReadableStream | undefined, max: int): Promise<u8[] | undefined> throws Error {
+  const out: u8[] = []
+  if (body === undefined) return out
+  while (true) {
+    const r = try await body.pull()
+    const v = r.value
+    if (r.done || v === undefined) break
+    if (out.length + v.length > max) {
+      try {
+        await body.cancel()
+      } catch (e) {
+        // the source is gone already
+      }
+      return undefined
+    }
+    for (const b of v) out.push(b)
+  }
+  return out
+}
+
+// Downloads a plugin URL to its local copy (pluginFileFor). The error message is Bifrost's where it has one.
+export async function downloadPlugin(url: string, allow: string[]): Promise<{ path: string, error: string }> {
+  const start = url.trim()
+  let at = start
+  const dl = deadline(TIMEOUT_MS)
+  try {
+    for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+      const bad = urlProblem(at, allow)
+      if (bad !== "") return { path: "", error: hop === 0 ? bad : `blocked redirect: ${bad}` }
+      const res = try await fetch(at, { method: "GET", headers: { accept: "application/octet-stream", "accept-language": "en-US,en;q=0.9" }, signal: dl.controller.signal, redirect: "manual" })
+      if (res.status >= 300 && res.status < 400) {
+        const loc = res.headers.get("location") ?? ""
+        if (loc === "") return { path: "", error: `failed to download plugin: HTTP ${res.status}` }
+        const next = redirectTarget(at, loc)
+        if (next === "") return { path: "", error: `failed to download plugin: invalid redirect "${loc}"` }
+        at = next
+        continue
+      }
+      if (res.status !== 200) return { path: "", error: `failed to download plugin: HTTP ${res.status}` }
+      const body = try await readCapped(res.body, MAX_PLUGIN_BYTES)
+      if (body === undefined) return { path: "", error: `plugin at "${start}" exceeds ${MAX_PLUGIN_BYTES}-byte limit` }
+      const file = pluginFileFor(start)
+      try {
+        mkdirSync(pluginCacheDir(), { recursive: true })
+        writeFileAtomic(file, body, { mode: 420, durable: false })
+      } catch (e) {
+        return { path: "", error: `failed to write plugin to temporary file: ${e.message}` }
+      }
+      return { path: file, error: "" }
+    }
+    return { path: "", error: "too many redirects downloading plugin" }
+  } catch (e) {
+    return { path: "", error: `failed to download plugin: ${e.message}` }
+  } finally {
+    dl.finish()
+  }
+}
+
+// The plugin URLs among paths that have no local copy yet (a .so URL is left out: it cannot load here).
+export function missingPluginUrls(paths: string[]): string[] {
+  const out: string[] = []
+  for (const p of paths) {
+    const u = p.trim()
+    if (!isPluginUrl(u) || u.split("?")[0]!.toLowerCase().endsWith(".so")) continue
+    if (downloadedPlugin(u) === undefined && !out.includes(u)) out.push(u)
+  }
+  return out
+}
+
+// The plugin URLs among paths (a .so URL is left out: it cannot load here).
+function pluginUrls(paths: string[]): string[] {
+  const out: string[] = []
+  for (const p of paths) {
+    const u = p.trim()
+    if (isPluginUrl(u) && !u.split("?")[0]!.toLowerCase().endsWith(".so") && !out.includes(u)) out.push(u)
+  }
+  return out
+}
+
+// Downloads the plugin URLs among paths (all of them, as Bifrost downloads a plugin each time it loads it, or with
+// onlyMissing those that have no local copy yet): how many were fetched, and the errors.
+export async function fetchPluginUrls(paths: string[], allow: string[], onlyMissing: bool): Promise<{ fetched: int, errors: string[] }> {
+  let fetched = 0
+  const errors: string[] = []
+  for (const u of onlyMissing ? missingPluginUrls(paths) : pluginUrls(paths)) {
+    const r = await downloadPlugin(u, allow)
+    if (r.error !== "") errors.push(r.error)
+    else fetched += 1
+  }
+  return { fetched: fetched, errors: errors }
+}
+
+// ---- tests ----
+
+test("plugin URLs: http and https only, private hosts only when allowed, and a cache file per URL", () => {
+  expect(isPluginUrl("https://example.com/p.wasm")).toBe(true)
+  expect(isPluginUrl("/opt/plugins/p.wasm")).toBe(false)
+  expect(isPluginUrl(undefined)).toBe(false)
+  expect(urlProblem("https://plugins.example.com/p.wasm", [])).toBe("")
+  expect(urlProblem("ftp://plugins.example.com/p.wasm", []).includes("only http/https")).toBe(true)
+  expect(urlProblem("http://127.0.0.1:9/p.wasm", []).includes("private address")).toBe(true)
+  expect(urlProblem("http://127.0.0.1:9/p.wasm", ["127.0.0.1"])).toBe("")
+  expect(urlProblem("http://169.254.169.254/p.wasm", ["169.254.169.254"]).includes("metadata")).toBe(true)
+  const a = pluginFileFor("https://example.com/a.wasm")
+  expect(a.endsWith(".wasm") && a.startsWith(pluginCacheDir() + "/")).toBe(true)
+  expect(a === pluginFileFor("https://example.com/b.wasm")).toBe(false)
+  expect(pluginFileFor("https://example.com/a.so").endsWith(".so")).toBe(true)
+  expect(redirectTarget("https://a.example/x/p.wasm", "/y/p.wasm")).toBe("https://a.example/y/p.wasm")
+  expect(redirectTarget("https://a.example/x/p.wasm", "https://b.example/p.wasm")).toBe("https://b.example/p.wasm")
+  expect(redirectTarget("https://a.example/x/p.wasm", "p.wasm")).toBe("")
+})

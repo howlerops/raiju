@@ -4,20 +4,23 @@
 // engine. Secrets are masked on every read, and a masked value sent back
 // unchanged keeps the stored secret.
 import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs"
+import { writeFileAtomic, removeStaleTemps, writeTemp } from "./atomicfile"
 import {
   Config, GovernanceConfig, KeyConfig, ProviderConfig, VirtualKeyConfig, BudgetConfig, resolveEnv, getEnv,
   RateLimitConfig, TeamConfig, CustomerConfig, ProviderConfigRef, providerOf, AdminAuthConfig, AdminUserConfig, AccessProfile, NetworkConfig, CustomProviderConfig,
   ModelConfigGovernance, ProviderGovernance, PricingOverrideConfig, AlertsConfig, ClientConfig, providerNames, GlobalProxyConfig, CircuitPolicyConfig,
-  WebhookEndpoint, AgentConfig, AgentAuth, AgentOAuth, AgentTls, ProjectConfig, BusinessUnitConfig, RoleConfig, PermissionPair, UserAgentMapping, PluginSpec,
+  WebhookEndpoint, AgentConfig, AgentGrant, AgentAuth, AgentOAuth, AgentTls, ProjectConfig, BusinessUnitConfig, RoleConfig, PermissionPair, UserAgentMapping, PluginSpec,
   BudgetOverride, PricingSyncConfig, ComplexitySettings, ProjectMember, MemberShare, RateLimitShare, EntityDac, ProfileRole, ApiKeyConfig,
   loadRawConfig,
 } from "./config"
 import { RoutingRule, RuleTarget } from "./cel"
-import { permissionDocs, pairOfId, permissionIds, parseOverride, keyBudgetIds, expiredToDelete, ruleError, complexityProblem, complexityFrom } from "./govapi"
+import { aliasProviderProblem } from "./aliases"
+import { permissionDocs, pairOfId, permissionIds, parseOverride, keyBudgetIds, expiredToDelete, ruleError, complexityProblem, complexityFrom, emailOf, attachBinding } from "./govapi"
 import { PromptRepoConfig } from "./prompts"
 import { FeatureFlagsConfig } from "./flags"
 import { notify } from "./notify"
-import { isBuiltinRole, customRole, withRoleIds, roleIdOf, roleNameById } from "./rbac"
+import { analyzerStatus, retryWarmup, generationsJson, deleteGeneration } from "./complexity"
+import { isBuiltinRole, customRole, withRoleIds, roleIdOf, roleNameById, anyRoleName, builtinRoleName, builtinRoles } from "./rbac"
 import { DataScope, allScope, inScope, scopeOf } from "./scope"
 import { setGlobalProxy } from "./providers/types"
 import { McpClientConfig, McpUserCredential } from "./mcp"
@@ -40,7 +43,7 @@ type HasId = { id: string }
 
 // Request bodies: the server fills the id, and a missing required field is
 // caught by the store's validation instead of by JSON.parse's type check.
-type VkBody = { id?: string, name?: string, value?: string, description?: string, is_active?: bool, team_id?: string, customer_id?: string, user_id?: string, budget_id?: string, rate_limit_id?: string, provider_configs?: ProviderConfigRef[], key_ids?: string[], expires_at?: string, disable_content_logging?: bool, mcp_configs?: { mcp_client_name: string, tools_to_execute?: string[] }[] }
+type VkBody = { id?: string, name?: string, value?: string, description?: string, is_active?: bool, team_id?: string, customer_id?: string, user_id?: string, budget_id?: string, rate_limit_id?: string, provider_configs?: ProviderConfigRef[], key_ids?: string[], expires_at?: string, disable_content_logging?: bool, mcp_configs?: { mcp_client_name: string, tools_to_execute?: string[] }[], agent_grants?: AgentGrant[] }
 type BudgetBody = { id?: string, max_limit?: f64, reset_duration?: string, current_usage?: f64 }
 type RateBody = { id?: string, token_max_limit?: int, token_reset_duration?: string, request_max_limit?: int, request_reset_duration?: string }
 type NamedBody = { id?: string, name?: string, customer_id?: string, budget_id?: string, business_unit_id?: string }
@@ -51,7 +54,7 @@ type ProviderBody = { description?: string, budget?: BudgetBody, budgets?: Budge
 type PricingBody = { name?: string, scope_kind?: string, provider_id?: string, provider_key_id?: string, virtual_key_id?: string, user_id?: string, request_types?: string[], match_type?: string, pattern?: string }
 // Bifrost's projects, business units and custom roles. Projects and business units are written whole
 // (a PUT replaces the record); a role is keyed by its name.
-type ProjectBody = { id?: string, name?: string, description?: string, is_active?: bool, access_rule?: string, accounting_mode?: string, membership_mode?: string, virtual_key_ids?: string[], budget_id?: string, rate_limit_id?: string, provider_configs?: ProviderConfigRef[], split_policy?: string }
+type ProjectBody = { id?: string, name?: string, description?: string, is_active?: bool, access_rule?: string, accounting_mode?: string, membership_mode?: string, virtual_key_ids?: string[], budget_id?: string, rate_limit_id?: string, provider_configs?: ProviderConfigRef[], split_policy?: string, agent_grants?: AgentGrant[] }
 type MemberBody = { members?: { user_id?: string }[] }
 type MemberCapsBody = { budget_shares?: MemberShare[], rate_limit_shares?: RateLimitShare[] }
 type BusinessUnitBody = { id?: string, name?: string, budget_id?: string, rate_limit_id?: string, team_ids?: string[], customer_ids?: string[] }
@@ -246,14 +249,17 @@ function prepKey(k: KeyConfig, id: string, old: KeyConfig | undefined): KeyConfi
     models: k.models,
     weight: k.weight,
     aliases: k.aliases,
+    blacklisted_models: k.blacklisted_models,
     azure_key_config: k.azure_key_config,
-    vertex_key_config: vk === undefined ? undefined : { project_id: vk.project_id, region: vk.region, auth_credentials: keepOpt(vk.auth_credentials, ov?.auth_credentials) },
+    replicate_key_config: k.replicate_key_config,
+    vertex_key_config: vk === undefined ? undefined : { project_id: vk.project_id, region: vk.region, auth_credentials: keepOpt(vk.auth_credentials, ov?.auth_credentials), project_number: vk.project_number, force_single_region: vk.force_single_region },
     bedrock_key_config: bk === undefined ? undefined : {
       access_key: bk.access_key,
       secret_key: keepOpt(bk.secret_key, ob?.secret_key),
       session_token: keepOpt(bk.session_token, ob?.session_token),
       region: bk.region,
       deployments: bk.deployments,
+      project_id: bk.project_id,
     },
   }
 }
@@ -633,14 +639,17 @@ function redactKey(k: KeyConfig): KeyConfig {
     models: k.models,
     weight: k.weight,
     aliases: k.aliases,
+    blacklisted_models: k.blacklisted_models,
     azure_key_config: k.azure_key_config,
-    vertex_key_config: vx === undefined ? undefined : { project_id: vx.project_id, region: vx.region, auth_credentials: maskOpt(vx.auth_credentials) },
+    replicate_key_config: k.replicate_key_config,
+    vertex_key_config: vx === undefined ? undefined : { project_id: vx.project_id, region: vx.region, auth_credentials: maskOpt(vx.auth_credentials), project_number: vx.project_number, force_single_region: vx.force_single_region },
     bedrock_key_config: br === undefined ? undefined : {
       access_key: br.access_key,
       secret_key: maskOpt(br.secret_key),
       session_token: maskOpt(br.session_token),
       region: br.region,
       deployments: br.deployments,
+      project_id: br.project_id,
     },
   }
 }
@@ -713,6 +722,7 @@ function redactVk(vk: VirtualKeyConfig): VirtualKeyConfig {
     disable_content_logging: vk.disable_content_logging,
     expires_at: vk.expires_at,
     mcp_configs: vk.mcp_configs,
+    agent_grants: vk.agent_grants,
   }
 }
 
@@ -1172,6 +1182,9 @@ export class ConfigStore {
   constructor(readonly path: string, initial: Config) {
     this.cfg = initial
     setGlobalProxy(initial.proxy_config)
+    // temporary files a crash left between write and rename (a recent one may be another worker's save in progress)
+    removeStaleTemps(path, 600000.0)
+    removeStaleTemps(path + ".bak", 600000.0)
     try {
       if (existsSync(path)) {
         const known = fields(JSON.stringify(initial)).map((f) => f.key)
@@ -1186,8 +1199,8 @@ export class ConfigStore {
     return find(this.extras, name)
   }
 
-  // Writes the config as JSON. node:fs has no rename, so the previous file is
-  // kept as <path>.bak first; a crash mid-write leaves that copy behind.
+  // Writes the config as JSON, atomically (a temporary file renamed over it), so a crash or another worker never
+  // sees half a file. The previous file is kept as <path>.bak.
   save(): void throws Error {
     this.keepNewerAdmin()
     let text = JSON.stringify(try sealConfig(this.cfg, this.cipher), undefined, 2)
@@ -1198,9 +1211,9 @@ export class ConfigStore {
     }
     if (existsSync(this.path)) {
       const old = try readFileSync(this.path, "utf8")
-      try writeFileSync(this.path + ".bak", old)
+      try writeFileAtomic(this.path + ".bak", old)
     }
-    try writeFileSync(this.path, text + "\n")
+    try writeFileAtomic(this.path, text + "\n")
   }
 
   // A save never writes back a retained admin credential older than the one the file holds: another worker or node
@@ -1459,6 +1472,19 @@ export class ConfigStore {
     return this.commit(n, "complexity-analyzer-config")
   }
 
+  // Why keys written to a provider are refused for their aliases, as Bifrost's key routes answer "Invalid aliases":
+  // a provider override for another provider's keys (aliases.tov aliasProviderProblem). "" when they fit.
+  private aliasFault(name: string, custom: CustomProviderConfig | undefined, keys: KeyConfig[]): string {
+    const kind = custom?.base_provider_type ?? name
+    for (const k of keys) {
+      const a = k.aliases
+      if (a === undefined) continue
+      const p = aliasProviderProblem(a, kind)
+      if (p !== "") return `Invalid aliases: ${p}`
+    }
+    return ""
+  }
+
   private putProvider(name: string, np: ProviderConfig, id: string): Result {
     const ps = copyProviders(this.cfg)
     ps.set(name, np)
@@ -1473,6 +1499,8 @@ export class ConfigStore {
     const oldKeys = old?.keys ?? []
     const keys = p.keys === undefined ? oldKeys : prepKeys(p.keys, oldKeys)
     if (hasDupKeyIds(keys)) return fail(400, "duplicate key id")
+    const af = this.aliasFault(name, p.custom_provider_config, p.keys ?? [])
+    if (af !== "") return fail(400, af)
     const px = p.proxy_config
     const opx = old?.proxy_config
     return this.putProvider(name, {
@@ -1498,6 +1526,8 @@ export class ConfigStore {
     const id = k.id === undefined || k.id === "" ? randomId("key-") : k.id
     const keys = p.keys ?? []
     if (findKey(keys, id) !== undefined) return fail(409, `key ${id} already exists`)
+    const af = this.aliasFault(provider, p.custom_provider_config, [k])
+    if (af !== "") return fail(400, af)
     const next: KeyConfig[] = []
     for (const x of keys) next.push(x)
     next.push(prepKey(k, id, undefined))
@@ -1510,6 +1540,8 @@ export class ConfigStore {
     const keys = p.keys ?? []
     const old = findKey(keys, keyId)
     if (old === undefined) return fail(404, `no key ${keyId} on provider ${provider}`)
+    const af = this.aliasFault(provider, p.custom_provider_config, [k])
+    if (af !== "") return fail(400, af)
     const nk = prepKey(k, old.id ?? keyId, old)
     const next: KeyConfig[] = []
     for (const x of keys) next.push(isKey(x, keyId) ? nk : x)
@@ -1566,6 +1598,7 @@ export class ConfigStore {
       previous_value_expires_at: value === old?.value ? old?.previous_value_expires_at : undefined,
       rotated_at: old?.rotated_at,
       mcp_configs: vk.mcp_configs,
+      agent_grants: vk.agent_grants,
     }
     g.virtual_keys = putById(g.virtual_keys ?? [], next)
     return this.commit(withGov(this.cfg, g), id)
@@ -1600,6 +1633,7 @@ export class ConfigStore {
       previous_value_expires_at: grace ? rfc3339Of(now + cooldownMs) : undefined,
       rotated_at: rfc3339Of(now),
       mcp_configs: old.mcp_configs,
+      agent_grants: old.agent_grants,
     }
     g.virtual_keys = putById(g.virtual_keys ?? [], next)
     return this.commit(withGov(this.cfg, g), id)
@@ -1721,6 +1755,7 @@ export class ConfigStore {
       rate_limit_id: p.rate_limit_id,
       provider_configs: p.provider_configs,
       split_policy: p.split_policy ?? "none",
+      agent_grants: p.agent_grants,
     }
     const err = projectError(this.cfg, next)
     if (err !== "") return fail(400, err)
@@ -1904,13 +1939,15 @@ export class ConfigStore {
     return this.commit(withGov(this.cfg, g), name)
   }
 
-  // Attaches custom roles to an access profile (Bifrost's attach): each id names a custom role, and a role
-  // already attached takes the new is_default. Every user holding one of the roles holds the profile.
-  attachProfileRoles(profileId: string, roleIds: int[], isDefault: bool | undefined): Result {
+  // Attaches roles (built-in or custom, by id) to an access profile (Bifrost's attach): with apply_to_existing the
+  // role's users now hold the profile, with is_default its later users do (govapi.tov attachBinding). A role
+  // already attached takes the new settings, and its users who held the profile keep it. Returns how many users
+  // were given the profile now, through users_applied.
+  attachProfileRoles(profileId: string, roleIds: int[], isDefault: bool | undefined, apply: bool): Result {
     const g = gov(this.cfg)
     if (findById(g.access_profiles, profileId) === undefined) return fail(404, `no access profile ${profileId}`)
     for (const rid of roleIds) {
-      if (roleNameById(g.roles, rid) === undefined) return fail(400, `role_id ${rid} is not a custom role`)
+      if (anyRoleName(g.roles, rid) === undefined) return fail(400, `role_id ${rid} names no role`)
     }
     const profiles: AccessProfile[] = []
     for (const p of g.access_profiles ?? []) {
@@ -1920,7 +1957,15 @@ export class ConfigStore {
         for (const b of np.roles ?? []) {
           if (!roleIds.includes(b.role_id)) kept.push(b)
         }
-        for (const rid of roleIds) kept.push({ role_id: rid, is_default: isDefault })
+        for (const rid of roleIds) {
+          const roleName = anyRoleName(g.roles, rid) ?? ""
+          const holders = (g.users ?? []).filter((u) => u.role === roleName).map((u) => u.name)
+          let prior: ProfileRole | undefined = undefined
+          for (const b of np.roles ?? []) {
+            if (b.role_id === rid) prior = b
+          }
+          kept.push(attachBinding(rid, isDefault, apply, holders, prior))
+        }
         np.roles = kept
       }
       profiles.push(np)
@@ -2294,6 +2339,7 @@ function putGov(store: ConfigStore, coll: string, pathId: string | undefined, bo
       expires_at: b.expires_at,
       disable_content_logging: b.disable_content_logging,
       mcp_configs: b.mcp_configs,
+      agent_grants: b.agent_grants,
     }
     const r = store.upsertVirtualKey(vk)
     if (r.kind === "error") return errReply(r)
@@ -2496,7 +2542,7 @@ function teamMembers(store: ConfigStore, m: string, team: string, scope: DataSco
   if (!recordInScope(store.cfg, "teams", team, scope) || findById(g.teams, team) === undefined) return reply(404, errorBody(`no teams ${team}`))
   const out: { user_id: string, user_name: string, user_email: string, source: string }[] = []
   for (const u of g.users ?? []) {
-    if ((u.teams ?? []).includes(team)) out.push({ user_id: u.name, user_name: u.name, user_email: "", source: "manual" })
+    if ((u.teams ?? []).includes(team)) out.push({ user_id: u.name, user_name: u.name, user_email: emailOf(u), source: "manual" })
   }
   return reply(200, JSON.stringify({ members: out }))
 }
@@ -2563,6 +2609,28 @@ function rotateVkRoute(store: ConfigStore, m: string, segs: string[], body: stri
   return reply(200, JSON.stringify(out))
 }
 
+// The ids of the keys a rotate reply names (virtual_key, or each of virtual_keys): the caller revokes their MCP
+// OAuth grants (mcpissuer.tov revokeSubject), as Bifrost does in the rotation's transaction.
+export function rotatedKeyIds(replyBody: string): string[] {
+  const out: string[] = []
+  try {
+    const r = JSON.parse(replyBody) as { virtual_key?: { id: string }, virtual_keys?: { id: string }[] }
+    const one = r.virtual_key
+    if (one !== undefined) out.push(one.id)
+    for (const k of r.virtual_keys ?? []) out.push(k.id)
+  } catch (e) {
+    return out
+  }
+  return out
+}
+
+// Whether a path is a virtual-key rotate route (the collection or one key).
+export function isRotatePath(path: string): bool {
+  const segs = path.split("?")[0]!.split("/").filter((x) => x !== "")
+  if (segs[0] !== "api" || segs[1] !== "governance" || segs[2] !== "virtual-keys") return false
+  return segs.length === 4 && segs[3] === "rotate" || segs.length === 5 && segs[4] === "rotate"
+}
+
 function governanceRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, sp: URLSearchParams, scope: DataScope): ApiReply {
   const coll = segs[2] ?? ""
   if (coll === "virtual-keys" && (segs.length === 4 && segs[3] === "rotate" || segs.length === 5 && segs[4] === "rotate")) {
@@ -2579,7 +2647,7 @@ function governanceRoute(store: ConfigStore, m: string, segs: string[], body: st
   // Bifrost's RBAC routes: /api/governance/rbac/roles is /api/roles, the rest are the catalogue
   if (coll === "rbac") {
     const sub = segs[3] ?? ""
-    if (sub === "roles") return roleRoute(store, m, ["api", "roles"].concat(segs.slice(4)), body, path, scope)
+    if (sub === "roles") return roleRoute(store, m, ["api", "roles"].concat(segs.slice(4)), body, path, scope, true)
     if (sub === "resources" || sub === "operations" || sub === "permissions") return segs.length === 4 ? rbacListing(sub, m) : notFound(path)
     return notFound(path)
   }
@@ -2721,6 +2789,7 @@ function projectFrom(id: string, b: ProjectBody): ProjectConfig {
     rate_limit_id: b.rate_limit_id,
     provider_configs: b.provider_configs,
     split_policy: b.split_policy,
+    agent_grants: b.agent_grants,
   }
 }
 
@@ -2965,10 +3034,11 @@ function businessUnitFrom(id: string, b: BusinessUnitBody): BusinessUnitConfig {
   return { id: id, name: b.name ?? "", budget_id: b.budget_id, rate_limit_id: b.rate_limit_id, team_ids: b.team_ids, customer_ids: b.customer_ids }
 }
 
-// /api/roles[/{name}]: custom roles, as Bifrost's role routes name them. Built-in roles are not listed here.
-// A numeric segment names the role by its id (Bifrost's /api/governance/rbac/roles/{role_id}), answered in
-// Bifrost's shape; a name keeps the shape Raiju has always answered.
-function roleRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, scope: DataScope): ApiReply {
+// /api/roles[/{name}]: custom roles, as Bifrost's role routes name them. A numeric segment names the role by
+// its id (Bifrost's /api/governance/rbac/roles/{role_id}), answered in Bifrost's shape; a name keeps the shape
+// Raiju has always answered. Bifrost's list (system set, the /api/governance/rbac/roles path) puts the built-in
+// roles first, with their fixed ids and is_system_role; /api/roles lists the custom roles only.
+function roleRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, scope: DataScope, system: bool): ApiReply {
   if (segs.length > 4 || segs.length === 4 && segs[3] !== "permissions") return notFound(path)
   if (!scope.all && m !== "GET") return scopeDenied()
   const name = segs[2]
@@ -2977,6 +3047,11 @@ function roleRoute(store: ConfigStore, m: string, segs: string[], body: string, 
   if (name === undefined) {
     if (m === "GET") {
       const parts: string[] = []
+      if (system) {
+        for (const r of builtinRoles(RESOURCES, OPERATIONS)) {
+          if (customRole(gov(store.cfg).roles, r.name) === undefined) parts.push(roleJsonAs(r, true))
+        }
+      }
       for (const r of withRoleIds(gov(store.cfg).roles ?? [])) parts.push(roleJson(r))
       return reply(200, `{"roles":[${parts.join(",")}]}`)
     }
@@ -3022,6 +3097,8 @@ function roleView(store: ConfigStore, name: string): RoleConfig | undefined {
 // partial update: a field left out keeps its value, and a description of "" clears it. A role cannot be
 // renamed, since its users and access profiles are kept by its id.
 function roleByIdRoute(store: ConfigStore, m: string, id: int, segs: string[], body: string): ApiReply {
+  const sys = builtinRoleName(id)
+  if (sys !== undefined && customRole(gov(store.cfg).roles, sys) === undefined) return systemRoleRoute(m, sys, segs)
   const name = roleNameById(gov(store.cfg).roles, id)
   if (name === undefined) return reply(404, errorBody(`no role ${id}`))
   if (segs.length === 4) return rolePermissions(store, m, name, body)
@@ -3055,6 +3132,28 @@ function roleByIdRoute(store: ConfigStore, m: string, id: int, segs: string[], b
     if (r.kind === "error") return errReply(r)
     return reply(200, JSON.stringify({ message: "role deleted" }))
   }
+  return notAllowed(m)
+}
+
+// A built-in role by its id: GET reads it (or its pairs, at .../permissions); it cannot be changed or deleted,
+// since its rules are fixed (Bifrost lets a system role's permissions be edited; Raiju's built-in rules are not
+// pair lists, so a custom role is the way to vary them).
+function systemRoleRoute(m: string, name: string, segs: string[]): ApiReply {
+  let role: RoleConfig | undefined = undefined
+  for (const r of builtinRoles(RESOURCES, OPERATIONS)) {
+    if (r.name === name) role = r
+  }
+  if (role === undefined) return reply(404, errorBody(`no role ${name}`))
+  if (m === "GET") {
+    if (segs.length === 4) {
+      const ids = permissionIds(RESOURCES, OPERATIONS, role.permissions ?? [])
+      const docs = permissionDocs(RESOURCES, OPERATIONS).filter((d) => ids.includes(d.id))
+      return reply(200, JSON.stringify({ role: name, permissions: docs }))
+    }
+    return reply(200, `{"role":${roleJsonAs(role, true)}}`)
+  }
+  if (m === "DELETE") return reply(403, errorBody("cannot delete system role"))
+  if (m === "PUT") return reply(403, errorBody(`cannot change system role ${name}: its rules are fixed; create a custom role instead`))
   return notAllowed(m)
 }
 
@@ -3141,11 +3240,15 @@ function entityDacFrom(body: string): { list: EntityDac[], error: string } {
 
 // A custom role as the management API shows it: its id, entity_dac as Bifrost's object, dac only when set.
 function roleJson(r: RoleConfig): string {
+  return roleJsonAs(r, false)
+}
+
+function roleJsonAs(r: RoleConfig, system: bool): string {
   const parts: string[] = []
   if (r.id !== undefined) parts.push(`"id":${r.id}`)
   parts.push(`"name":${quote(r.name)}`)
   if (r.description !== undefined) parts.push(`"description":${quote(r.description)}`)
-  parts.push(`"is_system_role":false`)
+  parts.push(`"is_system_role":${system ? "true" : "false"}`)
   if (r.dac !== undefined) parts.push(`"dac":${quote(r.dac)}`)
   parts.push(`"permissions":${JSON.stringify(r.permissions ?? [])}`)
   const ed: string[] = []
@@ -3282,6 +3385,9 @@ function clientProblem(text: string): string {
       if (!raw.startsWith("[")) return `${f.key} must be a list`
     } else if (f.key === "vk_rotation_cooldown") {
       if (!raw.startsWith("\"")) return "vk_rotation_cooldown must be a duration string such as 1h"
+    } else if (f.key === "dual_credential_conflict_behavior") {
+      const v = raw.startsWith("\"") ? rawStr(fs, f.key) ?? "" : "-"
+      if (v !== "" && v !== "error" && v !== "prefer_vk" && v !== "prefer_idp") return "dual_credential_conflict_behavior must be error, prefer_vk or prefer_idp"
     } else if (f.key === "mcp_server_auth_mode") {
       if (!raw.startsWith("\"")) return "mcp_server_auth_mode must be a string"
     } else if (f.key === "oauth2_server_config") {
@@ -3359,6 +3465,14 @@ function authPlan(raw: string, cur: AdminAuthConfig | undefined): AuthPlan {
 
 // PUT /api/config: the sections Bifrost's handler takes, each given section replaced and the rest kept:
 // client_config (or client), framework_config and auth_config. Every section is checked before any is saved.
+// The name of the first MCP client whose auth_type is token_exchange, or "".
+export function exchangeClientIn(list: McpClientConfig[] | undefined): string {
+  for (const c of list ?? []) {
+    if (c.auth_type === "token_exchange") return c.name
+  }
+  return ""
+}
+
 function putConfig(store: ConfigStore, body: string): ApiReply {
   let fs: Field[] = []
   try {
@@ -3381,6 +3495,11 @@ function putConfig(store: ConfigStore, body: string): ApiReply {
     } catch (e) {
       return badBody()
     }
+  }
+  // "error" refuses exactly the requests token_exchange clients rely on, so the two cannot be set together (Bifrost's config.go)
+  const te = exchangeClientIn(store.cfg.mcp?.client_configs)
+  if (c !== undefined && c.dual_credential_conflict_behavior === "error" && te !== "") {
+    return reply(400, errorBody(`dual_credential_conflict_behavior cannot be set to 'error' while MCP client "${te}" uses auth_type 'token_exchange'; delete that client first or choose 'prefer_idp'/'prefer_vk'`))
   }
   let fp: FrameworkPlan = { kind: "ok", ps: store.cfg.pricing_sync }
   if (rawFramework !== undefined) fp = frameworkPlan(rawFramework, store.cfg.pricing_sync)
@@ -3452,7 +3571,11 @@ function vkUsers(store: ConfigStore, m: string, id: string, scope: DataScope): A
   if (vk === undefined || !recordInScope(store.cfg, "virtual-keys", id, scope)) return reply(404, errorBody(`no virtual-keys ${id}`))
   const users: { user_id: string, user_name: string, user_email: string, source: string }[] = []
   const u = vk.user_id ?? ""
-  if (u !== "") users.push({ user_id: u, user_name: u, user_email: "", source: "assigned" })
+  let email = ""
+  for (const x of gov(store.cfg).users ?? []) {
+    if (x.name === u) email = emailOf(x)
+  }
+  if (u !== "") users.push({ user_id: u, user_name: u, user_email: email, source: "assigned" })
   return reply(200, JSON.stringify({ users: users }))
 }
 
@@ -3533,6 +3656,32 @@ function complexityRoute(store: ConfigStore, m: string, segs: string[], body: st
     return reply(200, JSON.stringify({}))
   }
   if (segs.length === 3 || reset) return notAllowed(m)
+  return notFound(path)
+}
+
+// Bifrost's complexity status routes (no /api/governance alias, as in Bifrost): GET .../complexity-analyzer-status
+// and POST .../status/retry, GET .../complexity-analyzer-generations and DELETE .../generations/{namespace}. The
+// state is the semantic classifier's in this process (complexity.tov).
+function complexityStateRoute(store: ConfigStore, m: string, segs: string[], path: string, scope: DataScope): ApiReply {
+  const cx = store.cfg.complexity_router ?? {}
+  const on = cx.enabled === true
+  if (segs[2] === "complexity-analyzer-status") {
+    if (segs.length === 3) return m === "GET" ? reply(200, analyzerStatus(on, cx.classifier, cx.semantic, cx.llm)) : notAllowed(m)
+    if (segs.length === 4 && segs[3] === "retry") {
+      if (m !== "POST") return notAllowed(m)
+      if (!scope.all) return scopeDenied()
+      const r = retryWarmup(on, cx.classifier, cx.semantic, cx.llm)
+      return reply(r.status, r.body)
+    }
+    return notFound(path)
+  }
+  if (segs.length === 3) return m === "GET" ? reply(200, generationsJson(on, cx.classifier)) : notAllowed(m)
+  if (segs.length === 4) {
+    if (m !== "DELETE") return notAllowed(m)
+    if (!scope.all) return scopeDenied()
+    const r = deleteGeneration(on, cx.classifier, segs[3] ?? "")
+    return reply(r.status, r.body)
+  }
   return notFound(path)
 }
 
@@ -3631,6 +3780,7 @@ export function handleApi(store: ConfigStore, method: string, path: string, body
   if (segs.length === 0 || segs[0] !== "api") return notFound(p)
   const area = segs[1] ?? ""
   // Bifrost's /api/routing/... are the governance routes
+  if (area === "routing" && (segs[2] === "complexity-analyzer-status" || segs[2] === "complexity-analyzer-generations")) return complexityStateRoute(store, m, segs, p, sc)
   if (area === "routing" && segs.length >= 3) {
     const sub = segs[2] === "rules" ? "routing-rules" : segs[2] ?? ""
     return governanceRoute(store, m, ["api", "governance", sub].concat(segs.slice(3)), body, p, qp, sc)
@@ -3673,7 +3823,7 @@ export function handleApi(store: ConfigStore, method: string, path: string, body
   }
   if (area === "providers") return providerRoute(store, m, segs, body, p)
   if (area === "governance" && segs.length >= 3) return governanceRoute(store, m, segs, body, p, qp, sc)
-  if (area === "roles") return roleRoute(store, m, segs, body, p, sc)
+  if (area === "roles") return roleRoute(store, m, segs, body, p, sc, false)
   return notFound(p)
 }
 
@@ -3767,6 +3917,23 @@ test("PUT /api/config: framework_config and auth_config are checked, then saved,
     expect(store.cfg.governance?.auth_config?.username).toBe("ops")
     expect(handleApi(store, "PUT", "/api/config", `{"auth_config":{"is_enabled":false}}`).status).toBe(200)
     expect(store.cfg.governance?.auth_config?.username).toBeUndefined()
+  } finally {
+    cleanup(path)
+  }
+})
+
+test("PUT /api/config refuses dual_credential_conflict_behavior error while a token_exchange client exists", () => {
+  const path = tmpPath()
+  try {
+    const store = try new ConfigStore(path, { mcp: { client_configs: [{ name: "jira", connection_type: "http", connection_string: "http://127.0.0.1:1/mcp", auth_type: "token_exchange", token_exchange: { audience: "api://jira", client_id: "exch" } }] } })
+    const r = handleApi(store, "PUT", "/api/config", `{"client_config":{"dual_credential_conflict_behavior":"error"}}`)
+    expect(r.status).toBe(400)
+    expect(r.body.includes(`jira`) && r.body.includes(`uses auth_type 'token_exchange'`)).toBe(true)
+    expect(store.cfg.client?.dual_credential_conflict_behavior).toBeUndefined()
+    expect(handleApi(store, "PUT", "/api/config", `{"client_config":{"dual_credential_conflict_behavior":"prefer_idp"}}`).status).toBe(200)
+    expect(store.cfg.client?.dual_credential_conflict_behavior).toBe("prefer_idp")
+    expect(handleApi(store, "PUT", "/api/config", `{"client_config":{"dual_credential_conflict_behavior":"sometimes"}}`).status).toBe(400)
+    expect(exchangeClientIn([])).toBe("")
   } finally {
     cleanup(path)
   }
@@ -4056,6 +4223,25 @@ test("persistence: saved file parses back to the same config and keeps a backup"
   cleanup(path)
 })
 
+test("persistence: a save is atomic, and a temporary file left by a crash is cleared at startup", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  expect(statusOf(s.upsertVirtualKey({ id: "vk1", name: "x", value: "" }))).toBe(200)
+  const saved = try readFileSync(path, "utf8")
+  // a save that died before its rename: the file still holds the last complete save
+  const tmp = try writeTemp(path, "{\"half\":")
+  expect(try readFileSync(path, "utf8") === saved).toBe(true)
+  expect(existsSync(tmp)).toBe(true)
+  // a recent temporary file may be another worker's save in progress: kept
+  const again = new ConfigStore(path, {})
+  expect(existsSync(tmp)).toBe(true)
+  expect(removeStaleTemps(path, -1.0)).toBe(1)
+  expect(statusOf(again.upsertVirtualKey({ id: "vk2", name: "y", value: "" }))).toBe(200)
+  expect((try readFileSync(path, "utf8")).includes("vk2")).toBe(true)
+  expect(existsSync(tmp)).toBe(false)
+  cleanup(path)
+})
+
 test("a failed save leaves the in-memory config and version unchanged", () => {
   const s = new ConfigStore("/nonexistent-raiju-dir/config.json", {})
   const r = s.upsertProvider("openai", { keys: [{ value: "sk-abcdefghijkl" }] })
@@ -4170,6 +4356,11 @@ test("handleApi routes, methods and status codes", () => {
   expect(handleApi(s, "GET", "/api/providers/openai/keys", "").status).toBe(200)
   expect(handleApi(s, "POST", "/api/providers/openai/keys", "{\"value\":\"sk-zzzzzzzzzzzz\"}").status).toBe(201)
   expect(handleApi(s, "PUT", "/api/providers/openai/keys/nope", "{}").status).toBe(404)
+  // an alias with another provider's override is refused, as Bifrost's key routes refuse it
+  const wrong = handleApi(s, "POST", "/api/providers/openai/keys", `{"value":"sk-yyyyyyyyyyyy","aliases":{"east":{"model_id":"gpt-4o","endpoint":"https://east.example.com"}}}`)
+  expect(wrong.status).toBe(400)
+  expect(wrong.body.includes(`Invalid aliases: alias \\"east\\": azure sub-config is only valid on Azure keys`)).toBe(true)
+  expect(handleApi(s, "PUT", "/api/providers/openai", `{"keys":[{"value":"sk-abcdefghijkl","aliases":{"d":{"model_id":"x","use_deployments_endpoint":true}}}]}`).status).toBe(400)
   expect(handleApi(s, "POST", "/api/providers/nope/keys", "{\"value\":\"x\"}").status).toBe(404)
   expect(handleApi(s, "DELETE", "/api/providers/openai/keys/nope", "").status).toBe(404)
   expect(handleApi(s, "POST", "/api/providers/openai/keys/x", "{}").status).toBe(405)
@@ -4782,9 +4973,9 @@ test("roles by id: Bifrost's shape, partial updates, and access profile attachme
   expect(handleApi(s, "POST", "/api/roles", `{"name":"temp"}`).status).toBe(201)
   expect((s.cfg.governance?.roles ?? [])[1]!.id).toBe(2)
   // attach a profile to roles: an id must name a custom role, and the profile keeps the attachment on update
-  expect(s.attachProfileRoles("p-role", [7], undefined).kind).toBe("error")
-  expect(s.attachProfileRoles("p-role", [1], true).kind).toBe("ok")
-  expect(s.attachProfileRoles("p-role", [2], undefined).kind).toBe("ok")
+  expect(s.attachProfileRoles("p-role", [7], undefined, true).kind).toBe("error")
+  expect(s.attachProfileRoles("p-role", [1], true, true).kind).toBe("ok")
+  expect(s.attachProfileRoles("p-role", [2], undefined, true).kind).toBe("ok")
   const held = (s.cfg.governance?.access_profiles ?? [])[0]!.roles ?? []
   expect(held.length).toBe(2)
   expect(held[0]!.is_default).toBe(true)
@@ -4793,7 +4984,7 @@ test("roles by id: Bifrost's shape, partial updates, and access profile attachme
   expect(((s.cfg.governance?.access_profiles ?? [])[0]!.roles ?? []).length).toBe(1)
   // a role with a user on it cannot go; one that is only attached to a profile goes and takes its attachment
   expect(handleApi(s, "DELETE", "/api/roles/ops", "").status).toBe(409)
-  expect(s.attachProfileRoles("p-role", [2], undefined).kind).toBe("ok")
+  expect(s.attachProfileRoles("p-role", [2], undefined, true).kind).toBe("ok")
   expect(handleApi(s, "DELETE", "/api/roles/temp", "").status).toBe(200)
   expect(((s.cfg.governance?.access_profiles ?? [])[0]!.roles ?? []).length).toBe(1)
   expect(handleApi(s, "DELETE", "/api/governance/rbac/roles/1", "").status).toBe(409)
@@ -4813,5 +5004,61 @@ test("roles: entity_dac is read as Bifrost's object and shown the same way", () 
   expect(put.status).toBe(200)
   expect(put.body.includes(`"entity_dac":{}`)).toBe(true)
   expect(handleApi(s, "GET", "/api/roles", "").body.includes(`"name":"acct"`)).toBe(true)
+  cleanup(path)
+})
+
+test("built-in roles: listed first on Bifrost's path with fixed ids, readable by id, and fixed", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, { governance: { access_profiles: [{ id: "p-view" }] } })
+  expect(handleApi(s, "POST", "/api/roles", `{"name":"ops"}`).status).toBe(201)
+  const list = handleApi(s, "GET", "/api/governance/rbac/roles", "").body
+  expect(list.startsWith(`{"roles":[{"id":9001,"name":"admin"`)).toBe(true)
+  expect(list.includes(`"id":9003,"name":"viewer"`)).toBe(true)
+  expect(list.includes(`"is_system_role":true`)).toBe(true)
+  expect(list.includes(`{"id":1,"name":"ops","is_system_role":false`)).toBe(true)
+  // the old path keeps listing the custom roles only
+  expect(handleApi(s, "GET", "/api/roles", "").body.includes("viewer")).toBe(false)
+  const one = handleApi(s, "GET", "/api/governance/rbac/roles/9004", "")
+  expect(one.status).toBe(200)
+  expect(one.body.includes(`{"resource":"AuditLogs","operation":"View"}`)).toBe(true)
+  expect(one.body.includes(`"Create"`)).toBe(false)
+  const perms = handleApi(s, "GET", "/api/governance/rbac/roles/9004/permissions", "").body
+  expect(perms.includes(`"role":"auditor"`)).toBe(true)
+  expect(perms.includes(`"resource":"AuditLogs","operation":"View"`)).toBe(true)
+  expect(handleApi(s, "DELETE", "/api/governance/rbac/roles/9001", "").status).toBe(403)
+  expect(handleApi(s, "PUT", "/api/governance/rbac/roles/9002", `{"description":"x"}`).status).toBe(403)
+  expect(handleApi(s, "PUT", "/api/governance/rbac/roles/9002/permissions", `{"permission_ids":[1]}`).status).toBe(403)
+  // a profile attaches to a built-in role by its id
+  expect(s.attachProfileRoles("p-view", [9003], undefined, true).kind).toBe("ok")
+  expect(s.attachProfileRoles("p-view", [9100], undefined, true).kind).toBe("error")
+  cleanup(path)
+})
+
+test("rotate replies name the rotated keys", () => {
+  expect(rotatedKeyIds(`{"message":"ok","virtual_key":{"id":"vk-1","value":"sk-bf-x"}}`).join(",")).toBe("vk-1")
+  expect(rotatedKeyIds(`{"message":"ok","virtual_keys":[{"id":"a"},{"id":"b"}],"errors":{"c":"no"}}`).join(",")).toBe("a,b")
+  expect(rotatedKeyIds("not json").length).toBe(0)
+  expect(isRotatePath("/api/governance/virtual-keys/rotate")).toBe(true)
+  expect(isRotatePath("/api/governance/virtual-keys/vk-1/rotate")).toBe(true)
+  expect(isRotatePath("/api/governance/virtual-keys/vk-1")).toBe(false)
+})
+
+test("complexity status routes: disabled, warming before the first classified request, and the generation guards", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  const off = handleApi(s, "GET", "/api/routing/complexity-analyzer-status", "")
+  expect(off.status).toBe(200)
+  expect(off.body.startsWith(`{"state":"disabled","loaded":0,"total":0,"cached_phrases":0,"llm":{"state":"disabled"}`)).toBe(true)
+  expect(off.body.includes(`"decision_defaults":{"criteria":{"SIMPLE":`)).toBe(true)
+  expect(handleApi(s, "POST", "/api/routing/complexity-analyzer-status/retry", "").status).toBe(503)
+  expect(handleApi(s, "GET", "/api/routing/complexity-analyzer-generations", "").body).toBe(`{"generations":[]}`)
+  expect(handleApi(s, "DELETE", "/api/routing/complexity-analyzer-generations/other", "").status).toBe(400)
+  expect(handleApi(s, "GET", "/api/governance/complexity-analyzer-status", "").status).toBe(404)
+  expect(s.setComplexity({ enabled: true, classifier: "semantic", semantic: { embedding_model: "e", exemplars: { simple: ["hi"], medium: ["sum"], complex: ["design"] } } }).kind).toBe("ok")
+  const warm = handleApi(s, "GET", "/api/routing/complexity-analyzer-status", "").body
+  expect(warm.startsWith(`{"state":"warming","loaded":0,"total":3,"cached_phrases":0`)).toBe(true)
+  // nothing failed, so there is nothing to retry
+  expect(handleApi(s, "POST", "/api/routing/complexity-analyzer-status/retry", "").status).toBe(409)
+  expect(handleApi(s, "DELETE", "/api/routing/complexity-analyzer-generations/BifrostComplexityRouter_00", "").status).toBe(200)
   cleanup(path)
 })

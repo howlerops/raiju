@@ -28,7 +28,9 @@
  *            path      pre: moves the request to /v1/models (the host must refuse it)
  *   post   what post_hook adds: error (turns a response into a 429 error), recover (turns an error into
  *          a chat response), chunk (rewrites each stream chunk: "chunk_from" to "chunk_to"), text (the
- *          same, in a whole response as well as in each chunk)
+ *          same, in a whole response as well as in each chunk), skip (drops a stream chunk that contains
+ *          "chunk_skip", answering an error with Bifrost's stream_control skip_stream)
+ *   count  "on": post_hook also adds "x_post_n", how many whole answers this instance's post_hook has seen
  *   chunk_from, chunk_to, chunk_skip, chunk_stop   http_stream_chunk_hook: replaces chunk_from with
  *          chunk_to in each chunk, drops a chunk that contains chunk_skip, ends the stream on a chunk
  *          that contains chunk_stop. The hook is a pass-through when none is set.
@@ -168,6 +170,17 @@ static char chunk_from[32];
 static char chunk_to[32];
 static char chunk_skip[32];
 static char chunk_stop[32];
+static char count[8];
+static int count_on;
+static u32 post_calls;
+
+/* a number in decimal */
+static void put_num(buf *b, u32 v) {
+    char d[12];
+    int n = 0;
+    do { d[n++] = (char)('0' + v % 10); v /= 10; } while (v > 0);
+    while (n > 0) { char c = d[--n]; put(b, &c, 1); }
+}
 
 EXPORT("get_name") u64 plugin_get_name(void) {
     buf b = new_buf(32);
@@ -187,6 +200,8 @@ EXPORT("init") int plugin_init(u32 ptr, u32 len) {
     str_of(c, len, "chunk_to", chunk_to, sizeof chunk_to);
     str_of(c, len, "chunk_skip", chunk_skip, sizeof chunk_skip);
     str_of(c, len, "chunk_stop", chunk_stop, sizeof chunk_stop);
+    str_of(c, len, "count", count, sizeof count);
+    count_on = count[0] == 'o' && count[1] == 'n';
     return find((const u8 *)mode, slen(mode), "initfail") == 0 ? 1 : 0;
 }
 
@@ -392,6 +407,14 @@ EXPORT("post_hook") u64 plugin_post_hook(u32 ptr, u32 len) {
     }
     if (value_of(in, len, "response", &rs, &re)) {
         int is_chunk = find(in + rs, re - rs, CHAT_CHUNK) >= 0;
+        /* post=skip: a stream chunk that contains chunk_skip is dropped (an error with Bifrost's stream_control) */
+        if (is_post("skip") && is_chunk && chunk_skip[0] && find(in + rs, re - rs, chunk_skip) >= 0) {
+            b.n = 0;
+            puts_(&b, "{\"context\":");
+            if (have_ctx) put(&b, in + cs, ce - cs); else puts_(&b, "{}");
+            puts_(&b, ",\"response\":null,\"error\":{\"error\":{\"message\":\"chunk skipped\"},\"stream_control\":{\"skip_stream\":true}},\"has_error\":true,\"hook_error\":\"\"}");
+            return pack(&b);
+        }
         if ((is_post("chunk") && is_chunk) || is_post("text")) {
             /* chunk_from becomes chunk_to inside the stream chunk (text: inside a whole response too) */
             put_replaced(&b, in + rs, re - rs, chunk_from, chunk_to);
@@ -406,6 +429,13 @@ EXPORT("post_hook") u64 plugin_post_hook(u32 ptr, u32 len) {
                 puts_(&b, ":");
                 puts_(&b, tag);
                 puts_(&b, "\",");
+                /* count=on: how many whole answers this instance's post_hook has seen */
+                if (count_on && !is_chunk) {
+                    post_calls++;
+                    puts_(&b, "\"x_post_n\":");
+                    put_num(&b, post_calls);
+                    puts_(&b, ",");
+                }
                 put(&b, in + rs + cut, re - rs - cut);
             } else {
                 put(&b, in + rs, re - rs);

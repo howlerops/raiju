@@ -42,6 +42,8 @@ const OP_MATCH = 7
 // the matcher skips each start whose character is not in first.
 class Prog {
   constructor(public ops: int[], public ax: int[], public ay: int[], public setBits: int[], public setLo: int[], public setHi: int[], public setAt: int[], public first: int[], public firstHigh: bool, public filtered: bool) {}
+  // every path starts with the start-of-text assertion (a leading ^ without the m flag): only start 0 can match
+  anchored = false
 }
 
 // A text decoded once for many matches: its code points and the byte offset of each
@@ -244,7 +246,11 @@ function toProg(insts: Inst[]): Prog {
       todo.push(pc + 1)
     }
   }
-  return new Prog(ops, ax, ay, setBits, setLo, setHi, setAt, first, firstHigh, !nullable && !firstAll)
+  const prog = new Prog(ops, ax, ay, setBits, setLo, setHi, setAt, first, firstHigh, !nullable && !firstAll)
+  let pc0 = 0
+  while (pc0 < ops.length && ops[pc0]! === OP_SAVE) pc0 += 1
+  prog.anchored = pc0 < ops.length && ops[pc0]! === OP_ASSERT && ax[pc0]! === 0
+  return prog
 }
 
 // Byte offset of each code point of cps, then the byte length.
@@ -1082,11 +1088,37 @@ function startIn(lo: int[], hi: int[], i: int): bool {
 // With track set, save instructions record positions in caps and restore them when the
 // search backtracks past them, so caps holds the match's spans on return.
 function runProg(p: Prog, cps: int[], track: bool, inout caps: int[], rlo: int[], rhi: int[]): bool {
+  const found = runOn(p, cps, track, &caps, rlo, rhi)
+  // the visited bits are kept for the next run: only the words this run set are cleared
+  const sc = SCRATCH
+  for (const w of sc.touched) sc.bits[w] = 0
+  sc.touched = []
+  return found
+}
+
+// The (instruction, position) pairs already explored, kept between runs so a big program on a short text does not
+// allocate and clear its whole table each time (the allowlist patterns run once per finding).
+class Scratch {
+  bits: int[] = []
+  touched: int[] = []
+}
+
+function newScratch(): Scratch {
+  return new Scratch()
+}
+
+const SCRATCH = newScratch()
+
+function runOn(p: Prog, cps: int[], track: bool, inout caps: int[], rlo: int[], rhi: int[]): bool {
   const n = cps.length
   const stride = n + 1
-  let seen = newBits(p.ops.length * stride)
+  const sc = SCRATCH
+  const need = ((p.ops.length * stride) >> 5) + 1
+  while (sc.bits.length < need) sc.bits.push(0)
   let stk: int[] = []
   for (let start = 0; start <= n; start++) {
+    // A pattern anchored at the start of the text has nowhere else to start.
+    if (p.anchored && start > 0) break
     // With ranges given, only starts inside them are tried.
     if (rlo.length > 0 && !startIn(rlo, rhi, start)) continue
     // A start whose character cannot begin a match has no match to find.
@@ -1110,8 +1142,12 @@ function runProg(p: Prog, cps: int[], track: bool, inout caps: int[], rlo: int[]
       let pos = at
       while (true) {
         const idx = pc * stride + pos
-        if (testBit(seen, idx)) break
-        setBit(&seen, idx)
+        const wd = idx >> 5
+        const word = sc.bits[wd]!
+        const bit = 1 << (idx & 31)
+        if ((word & bit) !== 0) break
+        if (word === 0) sc.touched.push(wd)
+        sc.bits[wd] = word | bit
         const op = p.ops[pc]!
         if (op === OP_CHAR) {
           if (pos >= n || cps[pos] !== p.ax[pc]) break
@@ -1732,4 +1768,23 @@ test("testDecoded tries only the starts in the given byte ranges", () => {
   expect(re.testDecoded(d, [3], [3])).toBe(false)
   // after a two-byte character, byte 2 is the start of "a"
   expect(re.testDecoded(decodeText("éab"), [2], [2])).toBe(true)
+})
+
+test("a pattern anchored at the start tries only the start, and runs reuse the visited table", () => {
+  const re = try compileRegex("^[a-z_.-]+$")
+  expect(re.test("abc_def")).toBe(true)
+  expect(re.test("1abc")).toBe(false)
+  expect(re.test("abc1")).toBe(false)
+  // a multiline ^ is not anchored to the text's start
+  const ml = try compileRegex("(?m)^b")
+  expect(ml.test("a\nb")).toBe(true)
+  // an alternation with one anchored branch still tries every start
+  const alt = try compileRegex("^x|y")
+  expect(alt.test("aay")).toBe(true)
+  // a long run after a short one, and back: the kept table is cleared between runs
+  const big = try compileRegex("(?:alpha|beta|gamma)[0-9]{2}")
+  expect(big.test("xx gamma42")).toBe(true)
+  expect(big.test("beta4")).toBe(false)
+  expect(big.test("alpha12")).toBe(true)
+  expect(big.exec("--beta77--")!.join(",")).toBe("2,8")
 })

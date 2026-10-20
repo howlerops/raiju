@@ -6,6 +6,7 @@ import { listJson, sessionJson, sessionSummaryJson, detailJson, uaRoute, listFil
 import { Incident } from "./holds"
 import { WsTickets } from "./wsticket"
 import { entryStatus, PluginEntry } from "./plugins"
+import { isPluginUrl, downloadPlugin } from "./plugindl"
 import { parseDatasheet } from "./pricing"
 import { deliveryLog } from "./webhooks"
 import { OtelConfig, TlsOpts, otelTls, usesGrpc, exportMetricsGrpc } from "./otel"
@@ -13,17 +14,18 @@ import { OtelMetricsSettings, exportMetricsRequest, validateMetricsSettings, pus
 import { PushGatewayConfig, pushProblem, pushUrl, pushHeaders, pushInterval } from "./pushgateway"
 import { join } from "node:path"
 import { Engine } from "./gateway"
-import { CostRecalc, RecalcStatus } from "./costrecalc"
-import { issueSetupSession, validSetupSession, setupCookie, cookieValue, SETUP_COOKIE } from "./setupsession"
-import { agentSessionsOf, a2aLogJson, Filter, LogStore, LogEntry, scopedEntries, visibleTo, defaultLogStoreConfig, applyChains, gridOf, filterFrom, selectAll, selects, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, histogramDimName, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
+import { CostRecalc, RecalcStatus, readShared, requestCancel, sharedInFlight } from "./costrecalc"
+import { issueSetupSession, validSetupSession, setupCookie, cookieValue, SETUP_COOKIE, sameSecret, setupPublic } from "./setupsession"
+import { agentSessionsOf, a2aLogJson, bifrostRequestType, Filter, LogStore, LogEntry, scopedEntries, visibleTo, defaultLogStoreConfig, applyChains, gridOf, filterFrom, selectAll, selects, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, histogramDimName, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
 import { setMcpToolLog, McpToolCall } from "./mcp"
+import { McpLibrary, DEFAULT_LIBRARY_URL, DEFAULT_LIBRARY_SYNC_SECONDS, listLibrary, libraryFilterData, createLibraryEntry, deleteLibraryEntry, fetchCatalog } from "./mcplibrary"
 import { parsePolicy, policyView, policyConfigOf } from "./health"
-import { AccessProfile, AgentConfig, CircuitPolicyConfig, LogExportsConfig, VirtualKeyConfig } from "./config"
+import { AccessProfile, AgentConfig, CircuitPolicyConfig, LogExportsConfig, PermissionPair, VirtualKeyConfig } from "./config"
 import { rfc3339Of } from "./vkexpiry"
 import { flushVaultCache } from "./secrets"
 import { ConfigStore, checkAdmin, sweepExpiredKeys, sealStored, openStored, RESOURCES, OPERATIONS } from "./store"
 import { Held, KeyCtx, handleApiKeys, newKeyValue } from "./apikeys"
-import { keyBudgetIds, permissionDocs, permissionIds, creationPolicy, heldProfiles, PROPAGATED_FIELDS, propagateProfileKeys } from "./govapi"
+import { keyBudgetIds, permissionDocs, permissionIds, permissionMap, rolePairs, userObjectJson, userKeysJson, PermissionDoc, creationPolicy, heldProfiles, PROPAGATED_FIELDS, propagateProfileKeys } from "./govapi"
 
 // The quota view of one virtual key's budget and rate limit (GET /api/governance/virtual-keys/quota).
 // POST /api/governance/access-profiles/{id}/roles: the roles to attach (Bifrost's AttachRolesRequest).
@@ -31,21 +33,29 @@ type RoleAttachBody = { role_ids?: int[], is_default?: bool, apply_to_existing?:
 type QuotaBudget = { id: string, max_limit: f64, effective_max_limit: f64, reset_duration: string, current_usage: f64 }
 type QuotaRateUsage = { kind: string, used: f64, limit: f64 }
 type QuotaRate = { id: string, token_max_limit?: int, token_reset_duration?: string, request_max_limit?: int, request_reset_duration?: string, usage: QuotaRateUsage[] }
-import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, roleAllows, isBuiltinRole, customRole, provisioned, disabledNamed, roleIdOf } from "./rbac"
+// One per-model limit of a key in the quota view (Bifrost's quotaModelUsage); no provider means every provider.
+type QuotaModel = { model_name: string, provider?: string, budgets: QuotaBudget[], rate_limit?: QuotaRate }
+import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, roleAllows, isBuiltinRole, customRole, provisioned, disabledNamed, anyRoleId, userByEmail } from "./rbac"
 import { DataScope, allScope, noScope, scopeOf, inScope } from "./scope"
-import { AuditLog, AuditQuery, actionFor, maskDetail } from "./audit"
+import { AuditEvent, AuditLog, actionFor, auditListJson, auditQueryOf, maskDetail } from "./audit"
+import { isCacheId } from "./cache"
 import { AlertEngine, SampleRing, CelEngine, ScopeUsage } from "./alerts"
 import * as alerts from "./alerts"
-import { ExposedTool, SessionStore, handleMcp, rpcError } from "./mcpserver"
+import { ExposedTool, SessionStore, handleMcp, rpcError, sseStream, SSE_HEARTBEAT_MS } from "./mcpserver"
 import { isMetaTool, metaToolDefs } from "./codemode"
 import { relay } from "./passthrough"
-import { findAgent, grantAllows, endpointOf, restEndpointOf, gatewayCard, withGrpcInterface, publicBase, aggregateCard, contextOfParams, contextOfResult, refreshAll, withCard, CARD_PATH, JSON_RPC_SUFFIX, REST_PREFIX } from "./agents"
-import { Call, PushSpec, rpcCall, restCall, restRequestOf, methodOf, rpcIdOf, rpcErrorBody, rpcEvent, restEvent, restErrorBody, restErrorOfStatus, httpOfCode, codeOfRestError, relayMapped, interfacesOf, pushSpecOf, pushUpstreamParams, pushViewJson, pushListJson, pushIdOfResult, embeddedPush, rewriteEmbedded, taskIdOfResult } from "./a2a"
+import { grpcSend, upstreamCandidates, attemptVerdict, Candidate, Demotions } from "./a2agrpcup"
+import { versionSupported, paramsTo, resultTo, rpcAnswerTo } from "./a2aver"
+import { checkExtensions, allowedExtensions } from "./a2aext"
+import { agentQuery, selectedCalls, pageOf, agentStatsJson, topAgentsJson, agentHistogramJson, agentFilterDataJson, agentDetailJson, rawCapture, deleteIds } from "./agenthistory"
+import { H2Tls } from "./h2"
+import { findAgent, endpointOf, restEndpointOf, gatewayCard, withGrpcInterface, publicBase, aggregateCard, contextOfParams, contextOfResult, refreshAll, withCard, fetchCard, CARD_PATH, JSON_RPC_SUFFIX, REST_PREFIX } from "./agents"
+import { Call, PushSpec, CallCancel, StreamTap, tapped, rpcCall, restCall, restRequestOf, methodOf, rpcIdOf, rpcErrorBody, rpcEvent, restEvent, restErrorBody, restErrorOfStatus, httpOfCode, codeOfRestError, relayMapped, pushSpecOf, pushUpstreamParams, pushViewJson, pushListJson, pushIdOfResult, embeddedPush, rewriteEmbedded, taskIdOfResult } from "./a2a"
 import { PushDelivery, pushStore, mintToken, acceptPush, callbackProblem, deliverDue, configView, PENDING_PREFIX, INGRESS_SUFFIX, TOKEN_HEADER } from "./a2apush"
-import { pushShare, cardShare, cardOf, adoptCard, takePeriod, CARD_NS } from "./a2ashare"
+import { pushShare, cardShare, cardOf, adoptCard, takePeriod, CardWire, CARD_NS } from "./a2ashare"
 import { FileLease } from "./filelease"
 import { upstreamHeaders, tlsOf, withAcceptedCredential } from "./agentauth"
-import { tempTokenAllows } from "./mcpuser"
+import { tempTokenAllows, USER_HEADER, markUser, flowIdOfPath, userFlowById } from "./mcpuser"
 import * as vmcp from "./vmcp"
 import { handleProfiles } from "./profiles"
 import { ExportQueue, SinkSender } from "./exporters"
@@ -61,9 +71,10 @@ import { secureHex, utf8, sha256, toHex } from "./crypto"
 import * as b64 from "./base64"
 import * as metrics from "./metrics"
 import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, appendFileSync } from "node:fs"
+import { writeFileAtomic } from "./atomicfile"
 import { Counters, ClusterConfig, BrokerConfig, brokerUrl, syncInterval } from "./cluster"
 import { clusterState, ownerOf } from "./clusterstate"
-import { FeedRing, FeedQueue, FeedItem, feedEnvelope, gapEnvelope, resumedEnvelope, parseFeed, parseItem, parseAnswer, FEED_RING_SIZE, FEED_RING_SECONDS, FEED_QUEUE_MAX, FEED_BATCH_MS, FEED_BATCH_MAX } from "./feed"
+import { FeedRing, FeedQueue, FeedItem, feedEnvelope, feedVisible, gapEnvelope, resumedEnvelope, parseFeed, parseItem, parseAnswer, FEED_RING_SIZE, FEED_RING_SECONDS, FEED_QUEUE_MAX, FEED_BATCH_MS, FEED_BATCH_MAX } from "./feed"
 import * as cluster from "./cluster"
 import { Discoverer } from "./discovery"
 import { SocketExt } from "./realtime"
@@ -72,10 +83,10 @@ import { BROKER_ROUTE, BROKER_FEED_ROUTE } from "./broker"
 import { LockElection } from "./leader"
 import { AuthProxyConfig, ProxyKeys, checkProxyToken, headerOf, mappedRole, proxyProblem } from "./authproxy"
 import { ExportCursor, objectKey, putRequest, putBytesRequest, putObjectRequest, listRequest, deleteRequest, parseListing, expiredKey, isParquet, exportInterval, isoMs, ByteRequest } from "./exports"
-import { planWindow, maxObjectBytes } from "./audit_archive"
-import { jobRequest, MAX_ATTEMPTS } from "./retained"
+import { planWindow, maxObjectBytes, archiveIntervalMs, archiveGraceMs, closedWindows } from "./audit_archive"
+import { jobRequest, hiddenDeletes, MAX_ATTEMPTS } from "./retained"
 import { OidcConfig, Discovery, OidcFlows, Session, UiSessions, parseDiscovery, discoveryUrl, tokenRequestBody, verifyIdToken } from "./oidc"
-import { issuerOf, challengeOf, callerOf, keyById, keyUsable, serverAuthMode } from "./mcpissuer"
+import { issuerOf, challengeOf, callerOf, keyById, keyUsable, serverAuthMode, ConsentContext, vkIdentityCut } from "./mcpissuer"
 
 export type Gate = { kind: "ok", actor: string } | { kind: "deny", res: Response }
 
@@ -115,6 +126,27 @@ function limitsOf(fs: Field[], dflt: WasmLimitsSpec | undefined): WasmLimitsSpec
   }
 }
 
+// The placement a body names: the default when it names none (or null), undefined for "" (Bifrost's nil, the
+// default group). Bifrost's API takes pre_builtin and post_builtin only; any other value is refused.
+function placementOf(fs: Field[], dflt: string | undefined): { ok: bool, value: string | undefined } {
+  const raw = find(fs, "placement")
+  if (raw === undefined || isNull(raw)) return { ok: true, value: dflt }
+  const p = rawStr(fs, "placement")
+  if (p === undefined) return { ok: false, value: undefined }
+  if (p === "") return { ok: true, value: undefined }
+  if (p !== "pre_builtin" && p !== "post_builtin") return { ok: false, value: undefined }
+  return { ok: true, value: p }
+}
+
+// The order a body names (an integer), or the default when it names none (or null).
+function orderOf(fs: Field[], dflt: int | undefined): { ok: bool, value: int | undefined } {
+  const raw = find(fs, "order")
+  if (raw === undefined || isNull(raw)) return { ok: true, value: dflt }
+  const n = rawNum(fs, "order")
+  if (n === undefined || n !== Math.floor(n)) return { ok: false, value: undefined }
+  return { ok: true, value: Math.floor(n) }
+}
+
 // Why a plugin cannot be built from its config: "" when it can. Checked as enabled, so a disabled plugin is
 // still checked for its name and config.
 function badPlugin(spec: PluginSpec): string {
@@ -123,26 +155,40 @@ function badPlugin(spec: PluginSpec): string {
 }
 
 // One configured plugin as Bifrost's plugin response: its name, whether it is on, its config and its status.
-function pluginJson(sp: PluginSpec): string {
+function pluginJson(sp: PluginSpec, stats: string): string {
   const config = sp.config_json ?? ""
   const st = entryStatus({ name: sp.name, enabled: sp.enabled, configJson: config, path: sp.path, limits: sp.wasm_limits })
   const custom = (sp.path ?? "") !== ""
   const builtin = !custom && builtinPlugins().includes(sp.name)
-  return jobj([
+  const pairs: string[] = [
     jkv("name", JSON.stringify(sp.name)),
     jkv("actualName", JSON.stringify(sp.name)),
     jkv("enabled", sp.enabled === false ? "false" : "true"),
     jkv("config", config.trim() === "" ? "{}" : config),
     jkv("isCustom", builtin ? "false" : "true"),
     jkv("path", custom ? JSON.stringify(sp.path) : "null"),
-    jkv("status", jobj([jkv("name", JSON.stringify(sp.name)), jkv("status", JSON.stringify(st.status)), jkv("logs", jstrs(st.error === "" ? [] : [st.error])), jkv("types", jstrs(st.types))])),
-  ])
+  ]
+  // placement and order are left out when unset, as Bifrost's omitempty does
+  const placement = sp.placement
+  if (placement !== undefined) pairs.push(jkv("placement", JSON.stringify(placement)))
+  const order = sp.order
+  if (order !== undefined) pairs.push(jkv("order", `${order}`))
+  // the live plugin's own counters (the mocker's GetStats, which Bifrost keeps in-process only), Raiju's addition
+  if (stats !== "") pairs.push(jkv("stats", stats))
+  pairs.push(jkv("status", jobj([jkv("name", JSON.stringify(sp.name)), jkv("status", JSON.stringify(st.status)), jkv("logs", jstrs(st.error === "" ? [] : [st.error])), jkv("types", jstrs(st.types))])))
+  return jobj(pairs)
 }
 
 // The names under /api/logs/ that are routes rather than log ids.
 const LOG_ROUTE_NAMES: string[] = ["stats", "histogram", "rankings", "dashboard", "filterdata", "dropped", "sessions", "recalculate-cost", "user-agent-mappings"]
 
 // The plugins this gateway provides under Bifrost's names (the ones it implements as built-in features).
+// Bifrost's 403 for a custom plugin path while dashboard auth is off (on create, or on update).
+function pathAuthMessage(create: bool): string {
+  const what = create ? "Creating a custom plugin with a path" : "Setting a custom plugin path"
+  return `${what} requires genuine admin authentication; dashboard auth is currently disabled or unconfigured. Enable dashboard authentication first.`
+}
+
 function builtinPlugins(): string[] {
   return ["telemetry", "logging", "governance", "otel", "semanticcache", "routing"]
 }
@@ -172,6 +218,7 @@ function recalcJson(s: RecalcStatus): string {
     jkv("processed", jn(s.processed)),
     jkv("updated", jn(s.updated)),
     jkv("skipped", jn(s.skipped)),
+    jkv("unpriceable", jn(s.unpriceable ?? 0)),
     jkv("message", JSON.stringify(s.message)),
     jkv("started_at", JSON.stringify(s.started_at)),
     jkv("updated_at", JSON.stringify(s.updated_at)),
@@ -199,6 +246,33 @@ function byName(a: string, b: string): int {
   return a < b ? -1 : 1
 }
 
+// A virtual key a request names in a header other than Authorization (Bifrost's getVKFromRequest without the
+// bearer): x-bf-vk as sent, or x-api-key, x-goog-api-key or api-key with the key prefix. "" when none.
+export function headerKeyOf(h: Hdrs): string {
+  const direct = (h.get("x-bf-vk") ?? "").trim()
+  if (direct !== "") return direct
+  for (const name of ["x-api-key", "x-goog-api-key", "api-key"]) {
+    const v = (h.get(name) ?? "").trim()
+    if (v.startsWith("sk-bf-")) return v
+  }
+  return ""
+}
+
+// Whether a path is a per-user OAuth flow route (its detail or start) of a user-mode flow that belongs to this user.
+function ownUserFlow(path: string, sub: string): bool {
+  const id = flowIdOfPath(path)
+  if (id === "") return false
+  const f = userFlowById(id, Date.now())
+  return f !== undefined && (f.user_id ?? "") !== "" && f.user_id === sub
+}
+
+// The page a sign-in may return to: only the gateway's own MCP consent pages, as a path with its query.
+export function returnPath(raw: string): string {
+  if (raw.includes("//") || raw.includes("\\") || raw.includes("#")) return ""
+  if (raw.startsWith("/oauth/consent?") || raw.startsWith("/workspace/mcp-sessions/auth?")) return raw
+  return ""
+}
+
 // The names a single sign-on identity is known by in governance: its subject and its email, lower-cased.
 function ssoNames(sub: string, email: string | undefined): string[] {
   return [sub, (email ?? "").toLowerCase()]
@@ -214,13 +288,38 @@ function json(status: int, body: string): Response {
 
 // The headers of a call that do not go on to the agent: the connection's own, cookies, and the gateway's
 // credentials (the virtual key the caller logged in with is dropped by name where it came in).
-const A2A_NOT_FORWARDED: string[] = ["host", "content-length", "content-type", "content-encoding", "accept", "accept-encoding", "connection", "keep-alive", "proxy-connection", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "cookie", "x-bf-vk", "x-bf-agent-vk-id", "x-bf-agent-auth"]
+// A2A-Version is the gateway's own to send: each interface is called in the version it speaks.
+const A2A_NOT_FORWARDED: string[] = ["host", "content-length", "content-type", "content-encoding", "accept", "accept-encoding", "connection", "keep-alive", "proxy-connection", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "cookie", "x-bf-vk", "x-bf-agent-vk-id", "x-bf-agent-auth", "a2a-version"]
+
+// The largest raw body a call's log row keeps, each way (Bifrost's capture bound).
+const RAW_LIMIT: int = 1048576
 
 // What the agent answered to one call. rpc says which binding it answered in; error is set when no answer came.
-type Fwd = { status: int, text: string, ct: string, stream: ReadableStream | undefined, rpc: bool, error: string }
+// binding is the interface's binding (JSONRPC, HTTP+JSON, GRPC), method the HTTP method, grpc the gRPC status (-1 for
+// none); rawReq and rawResp are the bytes sent and received as text (tap gathers a stream's), for the log row.
+type Fwd = { status: int, text: string, ct: string, stream: ReadableStream | undefined, rpc: bool, error: string, binding: string, method: string, grpc: int, rawReq: string, rawResp: string, tap: StreamTap | undefined }
 
 function fwdFail(message: string): Fwd {
-  return { status: 0, text: "", ct: "", stream: undefined, rpc: true, error: message }
+  return { status: 0, text: "", ct: "", stream: undefined, rpc: true, error: message, binding: "", method: "POST", grpc: -1, rawReq: "", rawResp: "", tap: undefined }
+}
+
+// An answer in the caller's version (a2aver.tov): a JSON-RPC answer's result, a REST answer's body, or each event of a
+// stream.
+function translatedFwd(f: Fwd, op: string, toV03: bool): Fwd {
+  let stream = f.stream
+  let text = f.text
+  const st = f.stream
+  if (st !== undefined) stream = f.rpc ? relayMapped(st, (d: string): string => rpcAnswerTo(op, d, toV03)) : relayMapped(st, (d: string): string => resultTo(op, d, toV03))
+  else if (f.rpc) text = rpcAnswerTo(op, f.text, toV03)
+  else if (f.status >= 200 && f.status < 300 && f.text.trim() !== "") text = resultTo(op, f.text, toV03)
+  return { status: f.status, text: text, ct: f.ct, stream: stream, rpc: f.rpc, error: f.error, binding: f.binding, method: f.method, grpc: f.grpc, rawReq: f.rawReq, rawResp: f.rawResp, tap: f.tap }
+}
+
+// The binding's name in the call log (Bifrost's transports).
+function transportOf(binding: string): string {
+  if (binding === "rest") return "HTTP+JSON"
+  if (binding === "grpc") return "GRPC"
+  return "JSONRPC"
 }
 
 // A unary answer in the one shape both bindings use: failed, with the error's code and message, or the result.
@@ -304,8 +403,12 @@ function a2aCardResponse(body: string, h: Hdrs): Response {
   return new Response(body, { status: 200, headers: hs })
 }
 
-// One A2A call that reached an agent (Ops.recordA2a).
-type A2aCall = { agent: string, method: string, status: int, latencyMs: f64, context: string, vk: string | undefined, error: string }
+// One A2A call that reached an agent (Ops.recordA2a). op is the A2A operation (SendMessage, GetTask, ...) when it
+// differs from the wire method name. task is the A2A task it named or made; down and up the caller's
+// binding and the agent's; rawReq and rawResp the bytes sent and received (kept when
+// client.a2a_store_raw_request_response is on); input and output the request params and the result (kept unless
+// content logging is off for the caller).
+type A2aCall = { agent: string, method: string, status: int, latencyMs: f64, context: string, vk: string | undefined, op?: string, error: string, task?: string, down?: string, up?: string, rawReq?: string, rawResp?: string, input?: string, output?: string }
 
 // Whether an agent's answer is a JSON-RPC error object (false for a body that is not JSON).
 function rpcFailed(text: string): bool {
@@ -467,6 +570,24 @@ export async function withSecrets(c: Config): Promise<Config> {
 // The log entries since a time that a data scope may see.
 function scopedView(store: LogStore, sc: DataScope, since: f64): LogEntry[] {
   return scopedEntries(store.viewSince(since), sc)
+}
+
+// client.hidden_request_types: request log reads leave out the LLM entries of these types (Bifrost's
+// withHiddenRequestTypes); writes, deletes and the cost recalculation still see them.
+export function withoutHidden(es: LogEntry[], hidden: string[] | undefined): LogEntry[] {
+  const hs: string[] = []
+  for (const h of hidden ?? []) {
+    const t = h.trim()
+    if (t !== "" && !hs.includes(t)) hs.push(t)
+  }
+  if (hs.length === 0) return es
+  const out: LogEntry[] = []
+  for (const e of es) {
+    // Bifrost's request type names (chat_completion_stream, embedding, ...) and Raiju's op names both work
+    if (kindOf(e) === "llm" && (hs.includes(e.op) || hs.includes(bifrostRequestType(e.op, e.streamed === true)))) continue
+    out.push(e)
+  }
+  return out
 }
 
 async function getText(url: string): Promise<{ status: int, body: string }> {
@@ -687,7 +808,7 @@ export cyclic class UiHub {
     if (from !== "share" && this.shareDir !== "") this.shareBuf.push(JSON.stringify(it))
     const text = feedEnvelope(it)
     for (const c of this.clients) {
-      if (inScope(c.scope, it.team, it.bu, it.customer, it.project)) c.emit(text)
+      if (feedVisible(it, c.scope)) c.emit(text)
     }
     return true
   }
@@ -697,7 +818,7 @@ export cyclic class UiHub {
     const r = this.ring.resume(cursor)
     let n = 0
     for (const it of r.items) {
-      if (!inScope(c.scope, it.team, it.bu, it.customer, it.project)) continue
+      if (!feedVisible(it, c.scope)) continue
       c.emit(feedEnvelope(it))
       n += 1
     }
@@ -731,7 +852,7 @@ export cyclic class UiHub {
       out = lines.slice(Math.max(0, lines.length - 200)).join("\n")
     }
     try {
-      writeFileSync(this.shareFile(), out)
+      writeFileAtomic(this.shareFile(), out, { durable: false })
     } catch (e) {
       // the other workers miss this update
     }
@@ -754,7 +875,7 @@ export cyclic class UiHub {
     if (this.shareBytes <= FEED_SHARE_MAX) return
     try {
       const lines = readFileSync(f, "utf8").split("\n")
-      writeFileSync(f, lines.slice(Math.max(0, lines.length - FEED_SHARE_KEEP)).join("\n"))
+      writeFileAtomic(f, lines.slice(Math.max(0, lines.length - FEED_SHARE_KEEP)).join("\n"), { durable: false })
       this.shareBytes = 0
     } catch (e) {
       // the file keeps growing until the next try
@@ -875,6 +996,10 @@ export class Ops {
   // last fetched again because its endpoint answered as if it had moved
   cardRefreshOn = false
   cardRefreshAt: Map<string, f64> = new Map()
+  // when a card fetched on demand last failed, by agent (not asked for again for 5 s)
+  cardMissAt: Map<string, f64> = new Map()
+  // the interfaces that failed each agent's calls, tried last (a2agrpcup.tov Demotions)
+  a2aDemoted = new Demotions()
   // when each management API key was last used, by name, as this worker saw it (apikeys.tov)
   private keyUsed: Map<string, string> = new Map()
   // model parameters (GET /api/models/parameters), loaded when first asked and then daily
@@ -928,6 +1053,8 @@ export class Ops {
   oidcCfg: OidcConfig | undefined = undefined
   discovery: Discovery | undefined = undefined
   flows = new OidcFlows()
+  // where a sign-in started from an MCP consent page returns, by the sign-in's state
+  oidcReturn: Map<string, string> = new Map()
   sessions = new UiSessions(28800)
   // the /ws clients, and the virtual key that opened each live session (/v1/live/sessions)
   ui: UiHub
@@ -1026,6 +1153,7 @@ export class Ops {
       if (problem !== "") console.error(`raiju: virtual MCP ${v.name}: ${problem}`)
     }
     this.configurePricing(cfg.pricing_sync)
+    this.configureLibrary(cfg.pricing_sync)
     this.configureOtelMetrics(cfg.otel)
     this.configurePushGateway(cfg.telemetry?.push_gateway)
     this.configureAlerts(cfg.alerts)
@@ -1255,13 +1383,13 @@ export class Ops {
     const dir = this.shareDir + "/counters"
     const mine = `${process.pid}.json`
     try {
-      writeFileSync(dir + "/" + mine, c.encode())
+      writeFileAtomic(dir + "/" + mine, c.encode(), { durable: false })
       for (const f of readdirSync(dir)) {
         if (f === mine || !f.endsWith(".json")) continue
         try {
           c.merge(readFileSync(dir + "/" + f, "utf8"))
         } catch (e) {
-          // a file being written, or left half-written; the next tick reads it again
+          // a file another worker removed; the next tick reads it again
           continue
         }
       }
@@ -1276,7 +1404,7 @@ export class Ops {
       const sem = this.engine.semantic
       if (sem !== undefined) sem.syncShared(Date.now())
       try {
-        writeFileSync(`${this.shareDir}/metrics/${process.pid}.prom`, metrics.render())
+        writeFileAtomic(`${this.shareDir}/metrics/${process.pid}.prom`, metrics.render(), { durable: false })
       } catch (e) {
         // a scrape then shows this worker's last written numbers
       }
@@ -1658,6 +1786,112 @@ export class Ops {
     return { status: 200, body: JSON.stringify({ status: "success", message: "pricing synced successfully" }), contentType: "application/json" }
   }
 
+  // ---- the MCP server library (Bifrost's framework.pricing.mcp_library_url) ----
+
+  libraryTimer: int = -1
+  libraryKey = ""
+
+  // The library as its file holds it now (another worker or node may have synced it).
+  library(): McpLibrary {
+    const lib = new McpLibrary(this.store.path === "" ? "" : this.store.path + ".mcp_library.json")
+    lib.load()
+    return lib
+  }
+
+  // The library syncs in the background when a pricing_sync section turns it on (its mcp_library_url set, or
+  // the section enabled), every mcp_library_sync_interval seconds (a day when unset or negative; 0 never).
+  // The first sync runs now; later ones on the cluster leader only.
+  configureLibrary(ps: PricingSyncConfig | undefined): void {
+    const key = ps === undefined ? "" : JSON.stringify({ u: ps.mcp_library_url ?? "", i: ps.mcp_library_sync_interval ?? -1, e: ps.enabled ?? true })
+    if (key === this.libraryKey) return
+    this.libraryKey = key
+    if (this.libraryTimer >= 0) {
+      clearInterval(this.libraryTimer)
+      this.libraryTimer = -1
+    }
+    if (ps === undefined) return
+    const named = (ps.mcp_library_url ?? "") !== ""
+    if (!named && ps.enabled === false) return
+    const iv = ps.mcp_library_sync_interval ?? -1
+    if (iv === 0) return
+    const every = iv < 0 ? DEFAULT_LIBRARY_SYNC_SECONDS : iv
+    const url = named ? ps.mcp_library_url! : DEFAULT_LIBRARY_URL
+    this.backgroundLibrary(url)
+    this.libraryTimer = setInterval(() => {
+      if (this.isLeader()) this.backgroundLibrary(url)
+    }, every * 1000)
+  }
+
+  async backgroundLibrary(url: string): Promise<void> {
+    const r = await this.syncLibrary(url, true)
+    if (r.error !== "") console.error(`raiju: MCP library sync: ${r.error}`)
+  }
+
+  // One library sync: the catalog fetched (retried with backoff for a network URL when retry), upserted and saved.
+  async syncLibrary(url: string, retry: bool): Promise<{ count: int, error: string }> {
+    let last = ""
+    const tries = retry && !url.startsWith("file://") ? 4 : 1
+    for (let attempt = 0; attempt < tries; attempt++) {
+      if (attempt > 0) await new Promise<void>((resolve) => setTimeout(resolve, Math.min(10000, 1000 * Math.pow(2, attempt - 1))))
+      try {
+        const text = await fetchCatalog(url, 45000)
+        const lib = this.library()
+        const n = lib.sync(text, Date.now())
+        lib.save()
+        return { count: n, error: "" }
+      } catch (e) {
+        last = e.message
+      }
+    }
+    return { count: 0, error: `failed to fetch MCP library from ${url}: ${last}` }
+  }
+
+  // /api/mcp/library (GET a page, POST a custom entry), /api/mcp/library/filterdata, /api/mcp/library/force-sync
+  // and DELETE /api/mcp/library/{id}.
+  async libraryRoute(req: Request, path: string, body: string): Promise<Reply> {
+    const m = req.method
+    const noStore = this.store.path === ""
+    const reply = (st: int, b: string): Reply => ({ status: st, body: b, contentType: "application/json" })
+    const notAllowed = reply(405, errorJson(`method ${m} is not allowed on this route`, "invalid_request_error", undefined))
+    if (path === "/api/mcp/library") {
+      if (m === "GET") {
+        if (noStore) return reply(200, `{"servers":[],"count":0,"total_count":0,"limit":0,"offset":0}`)
+        const u = URL.parse(req.url)
+        const r = listLibrary(this.library(), u === undefined ? new URLSearchParams("") : u.searchParams)
+        return reply(r.status, r.body)
+      }
+      if (m === "POST") {
+        if (noStore) return reply(503, errorJson("MCP operations unavailable: config store is disabled", "api_error", undefined))
+        const r = createLibraryEntry(this.library(), body, Date.now())
+        return reply(r.status, r.body)
+      }
+      return notAllowed
+    }
+    if (path === "/api/mcp/library/filterdata") {
+      if (m !== "GET") return notAllowed
+      if (noStore) return reply(200, `{"categories":[],"connection_types":[],"auth_types":[],"tags":[]}`)
+      const r = libraryFilterData(this.library())
+      return reply(r.status, r.body)
+    }
+    if (path === "/api/mcp/library/force-sync") {
+      if (m !== "POST") return notAllowed
+      if (noStore) return reply(503, errorJson("config store not available", "api_error", undefined))
+      const ps = this.store.cfg.pricing_sync
+      const url = (ps?.mcp_library_url ?? "") !== "" ? ps!.mcp_library_url! : DEFAULT_LIBRARY_URL
+      const r = await this.syncLibrary(url, true)
+      if (r.error !== "") return reply(500, errorJson(`failed to sync MCP library: ${r.error}`, "api_error", undefined))
+      return reply(200, JSON.stringify({ status: "success", message: `MCP library sync completed, ${r.count} entries synced` }))
+    }
+    const segs = path.split("/")
+    if (segs.length === 5) {
+      if (m !== "DELETE") return notAllowed
+      if (noStore) return reply(503, errorJson("MCP operations unavailable: config store is disabled", "api_error", undefined))
+      const r = deleteLibraryEntry(this.library(), segs[4]!)
+      return reply(r.status, r.body)
+    }
+    return reply(404, errorJson(`no route for ${path}`, "invalid_request_error", undefined))
+  }
+
   // ---- model parameters and the writable catalog ----
 
   // GET /api/models/parameters?model=...: the parameter record for a model, as the datasheet keys it.
@@ -1745,7 +1979,7 @@ export class Ops {
     try {
       const pairs: string[] = []
       for (const k of this.catalogAttrs.keys()) pairs.push(jkv(k, this.catalogAttrs.get(k)!))
-      writeFileSync(this.catalogFile(), jobj(pairs) + "\n")
+      writeFileAtomic(this.catalogFile(), jobj(pairs) + "\n")
     } catch (e) {
       return { status: 500, body: errorJson(`could not save the catalog: ${e.message}`, "api_error", undefined), contentType: "application/json" }
     }
@@ -2171,10 +2405,10 @@ export class Ops {
     if (start >= end) return badRequest("start_time must be before end_time")
     const g = gridOf(start, end)
     if (g.n > 10000) return badRequest("too many buckets; narrow the time range")
-    const es = selectAll(scopedView(store, sc, start - 1.0), filterFrom(sp, "llm", start, end))
+    const es = selectAll(this.readView(store, sc, start - 1.0), filterFrom(sp, "llm", start, end))
     // the same span just before the window, for the rankings' trends
     const pf = filterFrom(sp, "llm", start - (end - start), start)
-    const prev = selectAll(scopedView(store, sc, pf.since - 1.0), pf)
+    const prev = selectAll(this.readView(store, sc, pf.since - 1.0), pf)
     const dim = sp.get("dimension") ?? ""
     const ranked = this.rankLimit(sp)
     if (ranked < 0) return badRequest("Invalid limit. Expected a positive integer, or all=true for no limit")
@@ -2205,6 +2439,11 @@ export class Ops {
     return { status: 404, body: errorJson(`no route ${path}`, "invalid_request_error", undefined), contentType: "application/json" }
   }
 
+  // The entries a log read may see: the caller's data scope, without client.hidden_request_types.
+  private readView(store: LogStore, sc: DataScope, since: f64): LogEntry[] {
+    return withoutHidden(scopedView(store, sc, since), this.store.cfg.client?.hidden_request_types)
+  }
+
   // GET /api/logs: the logs a filter selects, newest first unless sort_by and order say otherwise
   // (Bifrost's getLogs). Raiju's entries and total ride along with Bifrost's logs, pagination and stats.
   private logList(sp: URLSearchParams, store: LogStore, sc: DataScope): Reply {
@@ -2214,8 +2453,8 @@ export class Ops {
     if (pg.error !== "") return badRequest(pg.error)
     let f = listFilter(sp, Date.now())
     this.withAgents(sp, &f, store, sc)
-    const es = applyChains(selectAll(scopedView(store, sc, f.since - 1.0), f), f)
-    return okJson(listJson(es, pg.page, scopedView(store, sc, 0.0).length > 0))
+    const es = applyChains(selectAll(this.readView(store, sc, f.since - 1.0), f), f)
+    return okJson(listJson(es, pg.page, this.readView(store, sc, 0.0).length > 0))
   }
 
   // GET /api/logs/stats: the totals of the logs a filter selects (Bifrost's SearchStats).
@@ -2224,12 +2463,12 @@ export class Ops {
     if (bad !== "") return badRequest(`the ${bad} filter is not recorded by this gateway`)
     let f = listFilter(sp, Date.now())
     this.withAgents(sp, &f, store, sc)
-    return okJson(statsView(applyChains(selectAll(scopedView(store, sc, f.since - 1.0), f), f)))
+    return okJson(statsView(applyChains(selectAll(this.readView(store, sc, f.since - 1.0), f), f)))
   }
 
   // GET /api/logs/{id}: one log, with its bodies and raw payloads when the store kept them.
   private logById(id: string, store: LogStore, sc: DataScope): Reply {
-    for (const e of scopedView(store, sc, 0.0)) {
+    for (const e of this.readView(store, sc, 0.0)) {
       if (e.id === id && kindOf(e) === "llm") return okJson(detailJson(e))
     }
     return { status: 404, body: errorJson("log not found", "not_found_error", undefined), contentType: "application/json" }
@@ -2242,7 +2481,7 @@ export class Ops {
     const raw = summary ? rest.slice(0, rest.byteLength - "/summary".byteLength) : rest
     const sid = pctDecode(raw) ?? ""
     if (sid === "" || sid.includes("/")) return { status: 404, body: errorJson("no such route", "invalid_request_error", undefined), contentType: "application/json" }
-    const es = scopedView(store, sc, 0.0)
+    const es = this.readView(store, sc, 0.0)
     if (summary) return okJson(sessionSummaryJson(es, sid))
     const pg = pageOfQuery(sp, 500, 500)
     if (pg.error !== "") return badRequest(pg.error)
@@ -2263,11 +2502,38 @@ export class Ops {
     }
     if (ids.length === 0) return badRequest("No log IDs provided")
     const doomed: string[] = []
+    const hidden: LogEntry[] = []
     for (const e of scopedView(store, sc, 0.0)) {
-      if (kindOf(e) === "llm" && ids.includes(e.id)) doomed.push(e.id)
+      if (kindOf(e) === "llm" && ids.includes(e.id)) {
+        doomed.push(e.id)
+        if (e.content_hidden === true) hidden.push(e)
+      }
     }
     const removed = store.delete(doomed)
+    // a hidden row's content object goes with it (Bifrost's DeleteLogs); a failed delete is only reported
+    if (hidden.length > 0) this.deleteHidden(hidden)
     return okJson(JSON.stringify({ message: "Logs deleted successfully", removed: removed }))
+  }
+
+  // Deletes the retained-content objects of deleted rows, in the background: both object names (.json and
+  // .json.gz), since compress may have changed since the row was written.
+  async deleteHidden(es: LogEntry[]): Promise<void> {
+    const q = this.engine.hiddenQueue
+    if (q === undefined) return
+    for (const e of es) {
+      for (const req of hiddenDeletes(q, e.ts, e.id, Date.now())) {
+        const dl = deadline(30000)
+        try {
+          const hs: Record<string, string> = req.headers
+          const r = await fetch(req.url, { method: "DELETE", headers: hs, signal: dl.controller.signal })
+          await r.text()
+          if (r.status >= 300 && r.status !== 404) console.error(`raiju: retained content: delete of ${e.id}: HTTP ${r.status}`)
+        } catch (err) {
+          console.error(`raiju: retained content: delete of ${e.id}: ${err.message}`)
+        }
+        dl.finish()
+      }
+    }
   }
 
   // POST /api/logs/recalculate-cost: starts a background job that prices again the LLM logs the body's
@@ -2284,39 +2550,66 @@ export class Ops {
     }
     const cur = this.recalc
     if (cur !== undefined && cur.inFlight()) return { status: 409, body: recalcJson(cur.snapshot()), contentType: "application/json" }
+    // a job another worker runs (its status file is fresh) is the one in flight
+    const shared = this.recalcFile()
+    if (sharedInFlight(shared, Date.now())) return { status: 409, body: recalcJson(readShared(shared)!), contentType: "application/json" }
     const f = listFilter(recalcQuery(rb.filters), Date.now())
     const pricing = this.engine.pricing
+    // a model the current price list does not know is left as it is (unpriceable), not priced at 0
     const job = new CostRecalc(
-      (e) => (e.op === "decisions" ? pricing.decisionCost(e.provider, e.model, e.prompt_tokens, e.completion_tokens) : pricing.cost(e.provider, e.model, e.prompt_tokens, e.completion_tokens)),
+      (e) => {
+        const decision = e.op === "decisions"
+        if (pricing.priceFor(e.provider, e.model, decision) === undefined) return undefined
+        return decision ? pricing.decisionCost(e.provider, e.model, e.prompt_tokens, e.completion_tokens) : pricing.cost(e.provider, e.model, e.prompt_tokens, e.completion_tokens)
+      },
       (costs) => store.recost((e) => costs.get(e.id))
     )
     job.begin(selectAll(scopedView(store, sc, f.since - 1.0), f), Date.now())
+    if (shared !== "") job.share(shared)
     this.recalc = job
     job.start()
     return { status: 202, body: recalcJson(job.snapshot()), contentType: "application/json" }
   }
 
+  // The shared status file of the cost recalculation job when workers share state, else "".
+  private recalcFile(): string {
+    return this.shareDir === "" ? "" : this.shareDir + "/recalc-cost.json"
+  }
+
   // GET /api/logs/recalculate-cost/status: the job with ?id=, else the one in flight, else idle (Bifrost's status).
+  // A job this worker does not run is read from the shared status file, so every worker answers for it.
   private recalcStatus(sp: URLSearchParams): Reply {
-    const job = this.recalc
+    const local = this.recalc
+    const shared = readShared(this.recalcFile())
     const id = (sp.get("id") ?? "").trim()
     if (id !== "") {
-      if (job === undefined || job.id() !== id) return { status: 404, body: errorJson("Job not found", "not_found_error", undefined), contentType: "application/json" }
-      return okJson(recalcJson(job.snapshot()))
+      if (local !== undefined && local.id() === id) return okJson(recalcJson(local.snapshot()))
+      if (shared !== undefined && shared.id === id) return okJson(recalcJson(shared))
+      return { status: 404, body: errorJson("Job not found", "not_found_error", undefined), contentType: "application/json" }
     }
-    if (job === undefined || !job.inFlight()) return okJson(JSON.stringify({ status: "idle" }))
-    return okJson(recalcJson(job.snapshot()))
+    if (local !== undefined && local.inFlight()) return okJson(recalcJson(local.snapshot()))
+    if (shared !== undefined && sharedInFlight(this.recalcFile(), Date.now())) return okJson(recalcJson(shared))
+    return okJson(JSON.stringify({ status: "idle" }))
   }
 
   // POST /api/logs/recalculate-cost/cancel: stops the job with ?id= (else the one in flight) and answers with its
-  // status. Costs already written stay. A job that finished is answered as it is.
+  // status. Costs already written stay. A job that finished is answered as it is. A job another worker runs is
+  // asked to stop through the shared file; it stops before its next slice.
   private cancelRecalc(sp: URLSearchParams): Reply {
     const job = this.recalc
     const id = (sp.get("id") ?? "").trim()
-    if (job === undefined || (id !== "" && job.id() !== id) || (id === "" && !job.inFlight())) {
-      return { status: 404, body: errorJson("No recalculation job to cancel", "not_found_error", undefined), contentType: "application/json" }
+    if (job !== undefined && ((id !== "" && job.id() === id) || (id === "" && job.inFlight()))) return okJson(recalcJson(job.cancel()))
+    const file = this.recalcFile()
+    const shared = readShared(file)
+    if (shared !== undefined && (id === "" ? sharedInFlight(file, Date.now()) : shared.id === id)) {
+      if (!sharedInFlight(file, Date.now())) return okJson(recalcJson(shared))
+      requestCancel(file, shared.id)
+      let s = shared
+      s.status = "cancelled"
+      s.message = "Cancellation requested; the job stops before its next slice."
+      return okJson(recalcJson(s))
     }
-    return okJson(recalcJson(job.cancel()))
+    return { status: 404, body: errorJson("No recalculation job to cancel", "not_found_error", undefined), contentType: "application/json" }
   }
 
   // /api/logs/user-agent-mappings: the rules that name the app behind a User-Agent. Saved in the config.
@@ -2332,7 +2625,7 @@ export class Ops {
 
   // DELETE /api/cache/clear/{id} and /api/cache/clear-by-key/{key}: drops entries from the exact-match and
   // the semantic cache (Bifrost's cache handler). removed counts what went.
-  cacheClear(method: string, path: string): Reply {
+  async cacheClear(method: string, path: string): Promise<Reply> {
     if (method !== "DELETE") return { status: 405, body: errorJson("use DELETE", "invalid_request_error", undefined), contentType: "application/json" }
     const ex = this.engine.cache
     const sem = this.engine.semantic
@@ -2345,11 +2638,27 @@ export class Ops {
       if (key === "") return badRequest("Invalid cache key")
       if (ex !== undefined) removed += ex.clearKey(key)
       if (sem !== undefined) removed += sem.clearKey(key)
+      // the semantic cache's entries in an external vector store (Bifrost's DeleteAll by cache_key)
+      try {
+        removed += await this.engine.vectorClear("", key)
+      } catch (e) {
+        console.error(`raiju: vector_store clear by key: ${e.message}`)
+        return { status: 500, body: errorJson("Failed to clear cache", "api_error", undefined), contentType: "application/json" }
+      }
     } else if (rest.startsWith("clear/")) {
       const id = rest.slice("clear/".byteLength)
       if (id === "") return badRequest("Invalid cache ID")
       if (ex !== undefined) removed += ex.clearId(id)
       if (sem !== undefined && sem.clearId(id)) removed += 1
+      // a vector-store hit's id is the store's own entry id (not a hash); the store deletes it
+      if (this.engine.vstore !== undefined && !isCacheId(id)) {
+        try {
+          removed += await this.engine.vectorClear(id, "")
+        } catch (e) {
+          console.error(`raiju: vector_store clear: ${e.message}`)
+          return { status: 500, body: errorJson("Failed to clear cache", "api_error", undefined), contentType: "application/json" }
+        }
+      }
     } else {
       return { status: 404, body: errorJson("no such route", "invalid_request_error", undefined), contentType: "application/json" }
     }
@@ -2374,7 +2683,7 @@ export class Ops {
       if (method === "POST") return this.createPlugin(body)
       if (method !== "GET") return pluginError(405, "use GET or POST")
       const rows: string[] = []
-      for (const sp of this.store.cfg.plugins ?? []) rows.push(pluginJson(sp))
+      for (const sp of this.store.cfg.plugins ?? []) rows.push(pluginJson(sp, this.pluginStats(sp.name)))
       return okJson(jobj([jkv("plugins", jarr(rows)), jkv("count", jn(rows.length))]))
     }
     const name = pctDecode(path.slice("/api/plugins/".byteLength)) ?? ""
@@ -2383,12 +2692,49 @@ export class Ops {
     if (method === "DELETE") return this.deletePlugin(name)
     if (method !== "GET") return pluginError(405, "use GET, PUT or DELETE")
     for (const sp of this.store.cfg.plugins ?? []) {
-      if (sp.name === name) return okJson(pluginJson(sp))
+      if (sp.name === name) return okJson(pluginJson(sp, this.pluginStats(sp.name)))
     }
     return pluginError(404, "plugin not found")
   }
 
-  // POST /api/plugins: {name, enabled, config}. 201 with the plugin; 409 when the name is taken; 400 when the name
+  // /api/plugins with a plugin path that is a URL: the file is downloaded first (plugindl.tov, with Bifrost's limits and
+  // the private-address rule), then the route runs as for a local file. A download that fails is answered as Bifrost
+  // answers a plugin that failed to load (500 with its reason); a .so URL is refused as a .so file is.
+  async pluginsRouteAsync(method: string, path: string, body: string): Promise<Reply> {
+    if ((method === "POST" && path === "/api/plugins") || (method === "PUT" && path.startsWith("/api/plugins/"))) {
+      let url = ""
+      try {
+        const fs = fields(body)
+        url = (rawStr(fs, "path") ?? "").trim()
+      } catch (e) {
+        url = ""
+      }
+      const name = method === "PUT" ? pctDecode(path.slice("/api/plugins/".byteLength)) ?? "" : ""
+      if (isPluginUrl(url) && !this.authOn && !builtinPlugins().includes(name)) return pluginError(403, pathAuthMessage(method === "POST"))
+      if (isPluginUrl(url)) {
+        // a name the route answers with 404, or a built-in plugin (which takes no path), downloads nothing
+        const known = method === "POST" || (name !== "" && !name.includes("/") && !builtinPlugins().includes(name))
+        if (known && url.split("?")[0]!.toLowerCase().endsWith(".so")) return pluginError(400, "Invalid plugin configuration: Go shared-object plugins (.so) are not supported by this gateway; build the plugin as WebAssembly (.wasm)")
+        if (known) {
+          const got = await downloadPlugin(url, this.store.cfg.server?.plugin_download_private_allowlist ?? [])
+          if (got.error !== "") {
+            const msg = method === "POST" ? `Plugin was not created, it failed to load: ${got.error}` : `Plugin update was not applied, it failed to load and the previous configuration was kept: ${got.error}`
+            return { status: 500, body: errorJson(msg, "api_error", undefined), contentType: "application/json" }
+          }
+        }
+      }
+    }
+    return this.pluginsRoute(method, path, body)
+  }
+
+  // The live chain's statistics for a plugin name (this process's), or "".
+  private pluginStats(name: string): string {
+    const chain = this.engine.plugins
+    if (chain === undefined) return ""
+    return chain.statsOf(name)
+  }
+
+  // POST /api/plugins: {name, enabled, config, path, wasm_limits, placement, order}. 201 with the plugin; 409 when the name is taken; 400 when the name
   // is missing, or the config does not build (a custom plugin path must be a .wasm file that loads).
   private createPlugin(body: string): Reply {
     let fs: Field[] = []
@@ -2403,7 +2749,15 @@ export class Ops {
     for (const sp of specs) {
       if (sp.name === name) return pluginError(409, "Plugin already exists")
     }
-    const spec: PluginSpec = { name: name, enabled: rawBool(fs, "enabled") ?? false, config_json: configOf(fs, "{}"), path: pathOf(fs, undefined), wasm_limits: limitsOf(fs, undefined) }
+    const pl = placementOf(fs, undefined)
+    if (!pl.ok) return pluginError(400, "Invalid placement value. Must be 'pre_builtin' or 'post_builtin'")
+    const od = orderOf(fs, undefined)
+    if (!od.ok) return pluginError(400, "Invalid request body")
+    // a built-in plugin takes no path; a custom path needs a caller who really signed in (Bifrost refuses it while
+    // dashboard auth is off)
+    const path = builtinPlugins().includes(name) ? undefined : pathOf(fs, undefined)
+    if (path !== undefined && !this.authOn) return pluginError(403, pathAuthMessage(true))
+    const spec: PluginSpec = { name: name, enabled: rawBool(fs, "enabled") ?? false, config_json: configOf(fs, "{}"), placement: pl.value, order: od.value, path: path, wasm_limits: limitsOf(fs, undefined) }
     const bad = badPlugin(spec)
     if (bad !== "") return pluginError(400, `Invalid plugin configuration: ${bad}`)
     const next: PluginSpec[] = specs.slice()
@@ -2411,7 +2765,8 @@ export class Ops {
     return this.savePlugins(next, 201, "Plugin created successfully", spec)
   }
 
-  // PUT /api/plugins/{name}: changes the fields the body names (enabled, config). 404 when there is no such plugin.
+  // PUT /api/plugins/{name}: changes the fields the body names (enabled, config, path, wasm_limits, placement, order).
+  // A plugin that is not configured yet is created (off unless the body turns it on), as Bifrost creates the row.
   private updatePlugin(name: string, body: string): Reply {
     let fs: Field[] = []
     try {
@@ -2424,14 +2779,22 @@ export class Ops {
     for (let i = 0; i < specs.length; i++) {
       if (specs[i]!.name === name) at = i
     }
-    if (at < 0) return pluginError(404, "plugin not found")
-    const cur = specs[at]!
+    const cur: PluginSpec = at < 0 ? { name: name, enabled: false, config_json: "{}" } : specs[at]!
     const en = rawBool(fs, "enabled")
-    const spec: PluginSpec = { name: name, enabled: en === undefined ? cur.enabled !== false : en, config_json: configOf(fs, cur.config_json ?? "{}"), placement: cur.placement, order: cur.order, path: pathOf(fs, cur.path), wasm_limits: limitsOf(fs, cur.wasm_limits) }
+    // placement and order from the body, as Bifrost reads them; a body that names neither keeps the plugin's
+    const pl = placementOf(fs, cur.placement)
+    if (!pl.ok) return pluginError(400, "Invalid placement value. Must be 'pre_builtin' or 'post_builtin'")
+    const od = orderOf(fs, cur.order)
+    if (!od.ok) return pluginError(400, "Invalid request body")
+    const builtin = builtinPlugins().includes(name)
+    const asked = builtin ? undefined : pathOf(fs, undefined)
+    if (asked !== undefined && !this.authOn) return pluginError(403, pathAuthMessage(false))
+    const spec: PluginSpec = { name: name, enabled: en === undefined ? cur.enabled !== false : en, config_json: configOf(fs, cur.config_json ?? "{}"), placement: pl.value, order: od.value, path: builtin ? undefined : pathOf(fs, cur.path), wasm_limits: limitsOf(fs, cur.wasm_limits) }
     const bad = badPlugin(spec)
     if (bad !== "") return pluginError(400, `Invalid plugin configuration: ${bad}`)
     const next: PluginSpec[] = []
     for (let i = 0; i < specs.length; i++) next.push(i === at ? spec : specs[i]!)
+    if (at < 0) next.push(spec)
     return this.savePlugins(next, 200, "Plugin updated successfully", spec)
   }
 
@@ -2448,7 +2811,7 @@ export class Ops {
     const saved = this.store.setPlugins(next)
     if (saved.kind !== "ok") return { status: saved.status, body: errorJson(saved.message, "api_error", undefined), contentType: "application/json" }
     if (spec === undefined) return { status: status, body: JSON.stringify({ message: message }), contentType: "application/json" }
-    return { status: status, body: jobj([jkv("message", JSON.stringify(message)), jkv("plugin", pluginJson(spec))]), contentType: "application/json" }
+    return { status: status, body: jobj([jkv("message", JSON.stringify(message)), jkv("plugin", pluginJson(spec, ""))]), contentType: "application/json" }
   }
 
   // The window's start: start_time, or the end less period ("1h", "6h", "24h", "7d", "30d"), or 24 hours.
@@ -2506,7 +2869,7 @@ export class Ops {
   // GET /api/logs/filterdata: the values the log filters offer, from every entry in memory, and the
   // virtual keys and routing rules of the config.
   private logFilterData(store: LogStore, sc: DataScope): string {
-    const all = scopedView(store, sc, 0.0)
+    const all = this.readView(store, sc, 0.0)
     const llm: LogEntry[] = []
     const mcp: LogEntry[] = []
     for (const e of all) {
@@ -2622,7 +2985,7 @@ export class Ops {
       latency_ms: c.latencyMs,
       prompt_tokens: 0,
       completion_tokens: 0,
-      cost: 0.0,
+      cost: c.cost ?? 0.0,
       cache_hit: false,
       error: c.error === "" ? undefined : c.error,
       kind: "mcp",
@@ -2640,11 +3003,30 @@ export class Ops {
     f.agentSessions = agentSessionsOf(scopedView(store, sc, f.since - 1.0), names, f.since, f.until)
   }
 
-  // One A2A call that reached an agent, as a log entry of kind "a2a" under the agent's name.
+  // One A2A call that reached an agent, as a log entry of kind "a2a" under the agent's name, attributed as the caller's
+  // key is (its team, customer and user).
   recordA2a(c: A2aCall): void {
+    // the operation's duration (Bifrost's a2a.client.operation.duration); push traffic is not an agent operation
+    if (c.method !== "push_notification" && c.method !== "push_delivery") {
+      const failed = c.status >= 400 || c.error !== ""
+      metrics.observeA2a(c.op ?? c.method, c.method, c.vk ?? "", failed ? (c.status >= 400 ? "" + c.status : "_OTHER") : "", c.latencyMs / 1000.0)
+    }
     const store = this.engine.logStore
     if (store === undefined) return
     const now = Date.now()
+    let team: string | undefined = undefined
+    let customer: string | undefined = undefined
+    let user: string | undefined = undefined
+    const kid = c.vk
+    if (kid !== undefined) {
+      for (const k of this.engine.cfg.governance?.virtual_keys ?? []) {
+        if (k.id !== kid) continue
+        team = k.team_id
+        customer = k.customer_id
+        user = k.user_id
+      }
+    }
+    const opt = (v: string | undefined): string | undefined => (v === undefined || v === "" ? undefined : v)
     store.add({
       id: "a2a-" + now + "-" + Math.floor(Math.random() * 1000000000),
       ts: now,
@@ -2659,30 +3041,106 @@ export class Ops {
       cost: 0.0,
       cache_hit: false,
       virtual_key: c.vk,
+      team_id: team,
+      customer_id: customer,
+      user_id: user,
       session_id: c.context === "" ? undefined : c.context,
       error: c.error === "" ? undefined : c.error,
       kind: "a2a",
       agent_name: c.agent,
+      task_id: opt(c.task),
+      downstream_transport: opt(c.down),
+      upstream_transport: opt(c.up),
+      raw_request: rawCapture(c.rawReq ?? ""),
+      raw_response: rawCapture(c.rawResp ?? ""),
+      input: opt(c.input),
+      output: opt(c.output),
     })
   }
 
-  // GET /api/agents/history: the A2A calls the caller's scope sees, newest first (agent_names, limit, offset).
-  agentHistoryRoute(sp: URLSearchParams, sc: DataScope): Reply {
-    const names = listNames(sp.get("agent_names") ?? "")
-    const pg = pageOfQuery(sp, 50, 1000)
-    if (pg.error !== "") return badRequest(pg.error)
-    const store = this.engine.logStore
-    if (store === undefined) return okJson(`{"history":[],"total":0}`)
-    const hits: string[] = []
-    const es = scopedView(store, sc, 0.0)
-    for (let i = es.length - 1; i >= 0; i--) {
-      const e = es[i]!
-      if (kindOf(e) !== "a2a") continue
-      if (names.length > 0 && !names.includes(e.agent_name ?? "")) continue
-      hits.push(a2aLogJson(e))
+  // The names the A2A history shows for the ids its calls carry, from the governance config ("" when unknown). A user is
+  // known by name.
+  historyName(dim: string, id: string): string {
+    if (dim === "users") return id
+    const g = this.engine.cfg.governance
+    if (g === undefined) return ""
+    if (dim === "virtual_keys") {
+      for (const k of g.virtual_keys ?? []) {
+        if (k.id === id) return k.name ?? k.id
+      }
+    } else if (dim === "teams") {
+      for (const t of g.teams ?? []) {
+        if (t.id === id) return t.name
+      }
+    } else if (dim === "customers") {
+      for (const t of g.customers ?? []) {
+        if (t.id === id) return t.name
+      }
+    } else if (dim === "business_units") {
+      for (const t of g.business_units ?? []) {
+        if (t.id === id) return t.name
+      }
+    } else if (dim === "projects") {
+      for (const t of g.projects ?? []) {
+        if (t.id === id) return t.name
+      }
     }
-    const rows = hits.slice(pg.page.offset, pg.page.offset + pg.page.limit)
-    return okJson(`{"history":[${rows.join(",")}],"total":${hits.length}}`)
+    return ""
+  }
+
+  // /api/agents/history and its routes (agenthistory.tov), over the A2A calls the caller's data scope sees: GET lists them
+  // newest first ({history, total}, Bifrost's filters and Raiju's agent_names), DELETE removes the ones a body's ids name,
+  // and stats, histogram, top-agents, filterdata and {id} answer in Bifrost's shapes.
+  agentHistoryRoute(method: string, path: string, sp: URLSearchParams, body: string, sc: DataScope): Reply {
+    const segs = path.split("?")[0]!.split("/").filter((x) => x !== "")
+    const store = this.engine.logStore
+    const json503: Reply = { status: 503, body: errorJson("logs store is not available", "api_error", undefined), contentType: "application/json" }
+    if (segs.length === 3) {
+      if (method === "DELETE") {
+        if (store === undefined) return json503
+        const d = deleteIds(body)
+        if (d.error !== "") return badRequest(d.error)
+        const doomed: string[] = []
+        for (const e of scopedView(store, sc, 0.0)) {
+          if (kindOf(e) === "a2a" && d.ids.includes(e.id)) doomed.push(e.id)
+        }
+        store.delete(doomed)
+        return okJson(`{"message":"Agent logs deleted successfully"}`)
+      }
+      if (method !== "GET") return { status: 405, body: errorJson("use GET or DELETE", "invalid_request_error", undefined), contentType: "application/json" }
+      const q = agentQuery(sp)
+      if (q.error !== "") return badRequest(q.error)
+      if (store === undefined) return okJson(`{"history":[],"total":0}`)
+      const calls = selectedCalls(scopedView(store, sc, 0.0), q.filter)
+      const rows: string[] = []
+      for (const e of pageOf(calls, q.page)) rows.push(a2aLogJson(e))
+      return okJson(`{"history":[${rows.join(",")}],"total":${calls.length}}`)
+    }
+    if (segs.length !== 4) return { status: 404, body: errorJson("no such route", "not_found_error", undefined), contentType: "application/json" }
+    if (method !== "GET") return { status: 405, body: errorJson("use GET", "invalid_request_error", undefined), contentType: "application/json" }
+    if (store === undefined) return json503
+    const sub = segs[3]!
+    const names = (dim: string, id: string): string => this.historyName(dim, id)
+    if (sub === "filterdata") {
+      const dims: string[] = []
+      for (const d of (sp.get("dimensions") ?? "").split(",")) {
+        if (d.trim() !== "") dims.push(d.trim())
+      }
+      const all = selectedCalls(scopedView(store, sc, 0.0), agentQuery(new URLSearchParams("")).filter)
+      return okJson(agentFilterDataJson(all, dims, sp.get("q") ?? "", 100, names))
+    }
+    if (sub === "stats" || sub === "histogram" || sub === "top-agents") {
+      const q = agentQuery(sp)
+      if (q.error !== "") return badRequest(q.error)
+      const calls = selectedCalls(scopedView(store, sc, 0.0), q.filter)
+      if (sub === "stats") return okJson(agentStatsJson(calls))
+      if (sub === "histogram") return okJson(agentHistogramJson(calls, q.filter))
+      return okJson(topAgentsJson(calls, 10))
+    }
+    for (const e of scopedView(store, sc, 0.0)) {
+      if (kindOf(e) === "a2a" && e.id === sub) return okJson(agentDetailJson(e, names))
+    }
+    return { status: 404, body: errorJson("agent history entry not found", "not_found_error", undefined), contentType: "application/json" }
   }
 
   // ---- the A2A gateway ----
@@ -2699,12 +3157,17 @@ export class Ops {
     if (agent === undefined || agent.enabled === false) return gateRefusal(rest, 404, `no agent named ${name}`, "not_found_error", undefined)
     const vk = this.engine.gov.findKey(h)
     if (this.engine.gov.enforce && vk === undefined) return gateRefusal(rest, 401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", vk)
-    if (!grantAllows(agent, vk?.id)) return gateRefusal(rest, 403, `this key may not call the agent ${name}`, "permission_error", vk)
+    // the agent's own grants, the key's, its access profiles' and the project the call names (governance.tov agentAccess)
+    const access = this.engine.gov.agentAccess(h, agent)
+    if (!access.allowed) return gateRefusal(rest, 403, `this key may not call the agent ${name}: ${access.message}`, "permission_error", vk)
     const gate = this.engine.gov.admitTool(h)
     if (gate.kind === "denial") return gateRefusal(rest, gate.status, gate.message, gate.type, vk)
     // an agent whose card is not fetched yet has no endpoint to call: refused here, in every binding, before any
     // budget is counted (the same 503 the card route answers; the gRPC binding maps it to UNAVAILABLE)
     if ((agent.card ?? "") === "") return gateRefusal(rest, 503, `the card of ${name} has not been fetched: refresh it through /api/agents/${name}/refresh-card`, "api_error", vk)
+    // a card that requires an extension the registration does not allow cannot be relayed (Bifrost refuses to build it)
+    const xe = allowedExtensions(agent.card ?? "", agent.extension_uris ?? []).error
+    if (xe !== "") return gateRefusal(rest, 503, `the agent ${name} cannot be relayed: ${xe}`, "api_error", vk)
     if (count) {
       // the key's request and token limits count each call (admitTool checks the budgets only)
       const rls: string[] = []
@@ -2723,6 +3186,52 @@ export class Ops {
     if (a === undefined || (a.card ?? "") !== "") return a
     this.syncShared()
     return findAgent(this.engine.cfg.agents, name)
+  }
+
+  // The agent a call names with its card: a declared agent whose card was never fetched gets it now (Bifrost discovers a
+  // card on its agent's first request). A fetch that failed is not tried again for 5 s; the call is then refused 503.
+  async ensureCard(name: string): Promise<AgentConfig | undefined> {
+    const a = this.heldAgent(name)
+    if (a === undefined || a.enabled === false || (a.card ?? "") !== "") return a
+    const now = Date.now()
+    if (now - (this.cardMissAt.get(name) ?? -10000.0) < 5000.0) return a
+    try {
+      const f = await fetchCard(a.agent_card_url, a.discovery_auth, a.allow_private_network === true, a.name + "|discovery")
+      if (f.error !== "") {
+        this.cardMissAt.set(name, now)
+        console.error(`raiju: agent card of ${name}: ${f.error}`)
+        return a
+      }
+      this.installCard(name, a.agent_card_url, f.card, Math.floor(Date.now()))
+    } catch (e) {
+      this.cardMissAt.set(name, now)
+      return a
+    }
+    return findAgent(this.engine.cfg.agents, name)
+  }
+
+  // A card fetched on demand: into this process's config and the engine's at once (as adoptRemoteCard does), saved, and
+  // published to the node's other workers and the cluster.
+  installCard(name: string, url: string, card: string, at: int): void {
+    const w: CardWire = { url: url, fetched_at: at, card: card }
+    const e = adoptCard(this.engine.cfg.agents ?? [], name, w)
+    if (e !== undefined) {
+      let c = this.engine.cfg
+      c.agents = e
+      this.engine.cfg = c
+    }
+    const st = adoptCard(this.store.cfg.agents ?? [], name, w)
+    if (st !== undefined) this.store.setAgents(st)
+    this.publishCards()
+  }
+
+  // The cards of the declared agents that have none, fetched once at start by one process of the node.
+  async fetchMissingCards(): Promise<void> {
+    const missing = (this.store.cfg.agents ?? []).filter((a) => a.enabled !== false && (a.card ?? "") === "")
+    if (missing.length === 0) return
+    const dir = this.shareDir === "" ? "" : this.shareDir + "/leases"
+    if (!takePeriod(new FileLease(dir, 60000), "a2a-card-start", 60000, Math.floor(Date.now()))) return
+    for (const a of missing) await this.ensureCard(a.name)
   }
 
   // The gRPC binding's gate (a2agrpc.tov), in Bifrost's order: the gateway's public URL is set (the push ingress is
@@ -2752,19 +3261,23 @@ export class Ops {
     if (!isCard && !isRpc && !isRest) return json(404, errorJson("no such agent route", "invalid_request_error", undefined))
     if (isCard && req.method !== "GET") return json(405, errorJson("use GET for the agent card", "invalid_request_error", undefined))
     if (isRpc && req.method !== "POST") return json(405, errorJson("use POST for JSON-RPC", "invalid_request_error", undefined))
-    const agent = this.heldAgent(name)
+    const agent = await this.ensureCard(name)
     const h = snapshot(req.headers)
+    // the version a call names (A2A-Version): one the gateway does not speak is refused, after the caller's credentials
+    // are checked, before anything is counted (Bifrost: -32009 on JSON-RPC, 400 FAILED_PRECONDITION on REST)
+    if (!isCard && !versionSupported(h.get("a2a-version") ?? "")) {
+      const pre = this.a2aGate(agent, name, h, isRest, false)
+      const pr = pre.refusal
+      if (pr !== undefined) return pr
+      const vb = await req.text()
+      if (isRpc) return json(200, rpcErrorBody(rpcIdOf(vb), -32009, "this version is not supported"))
+      return json(400, `{"error":{"code":400,"status":"FAILED_PRECONDITION","message":"this version is not supported"}}`)
+    }
     const gate = this.a2aGate(agent, name, h, isRest, true)
     const refusal = gate.refusal
     if (refusal !== undefined) return refusal
     if (agent === undefined) return json(404, errorJson(`no agent named ${name}`, "not_found_error", undefined))
-    if (isCard) {
-      const card = agent.card ?? ""
-      // the gRPC interface is listed when the binding listens (Bifrost lists it under the same two settings)
-      const grpc = this.a2aGrpc
-      const served = grpc === undefined ? gatewayCard(card, base, name, true) : withGrpcInterface(gatewayCard(card, base, name, true), name, grpc.domain, grpc.port)
-      return a2aCardResponse(served, h)
-    }
+    if (isCard) return a2aCardResponse(this.servedCard(agent, agent.card ?? "", base), h)
     const body = await req.text()
     if (isRpc) {
       const routed = rpcCall(body)
@@ -2779,6 +3292,14 @@ export class Ops {
     return await this.a2aCall(agent, routed.call, "rest", "\"1\"", h, gate.vk, base)
   }
 
+  // A card as the gateway serves it for an agent (its own or its extended card): the gateway's interfaces, the gRPC one
+  // when the binding listens (Bifrost lists it under the same two settings), and the extensions the registration allows.
+  servedCard(agent: AgentConfig, card: string, base: string): string {
+    const served = gatewayCard(card, base, agent.name, true, agent.extension_uris ?? [])
+    const grpc = this.a2aGrpc
+    return grpc === undefined ? served : withGrpcInterface(served, agent.name, grpc.domain, grpc.port)
+  }
+
   // GET /agents/a2a (and .../.well-known/agent-card.json): one card for the gateway, listing the agents the
   // caller may call. Raiju's own; Bifrost has the per-agent cards only.
   async a2aAggregate(req: Request, base: string): Promise<Response> {
@@ -2788,8 +3309,7 @@ export class Ops {
     if (this.engine.gov.enforce && vk === undefined) return a2aDeny(false, 401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error")
     const gate = this.engine.gov.admitTool(h)
     if (gate.kind === "denial") return a2aDeny(false, gate.status, gate.message, gate.type)
-    const vkId = vk?.id
-    const list = (this.engine.cfg.agents ?? []).filter((a) => a.enabled !== false && (a.card ?? "") !== "" && grantAllows(a, vkId))
+    const list = (this.engine.cfg.agents ?? []).filter((a) => a.enabled !== false && (a.card ?? "") !== "" && this.engine.gov.agentAccess(h, a).allowed)
     return a2aCardResponse(aggregateCard(list, base, true), h)
   }
 
@@ -2798,6 +3318,13 @@ export class Ops {
     if (rest) return json(status, restErrorOfStatus(status, message))
     // a JSON-RPC error rides in a 200; only an agent that did not answer is a gateway error
     return json(status === 502 ? 502 : 200, rpcErrorBody(rpcId, code, message))
+  }
+
+  // A protocol error of the gateway's own (a JSON-RPC code), in the caller's binding: a REST error with the code's
+  // status, or a JSON-RPC error.
+  a2aError(rest: bool, rpcId: string, code: int, message: string): Response {
+    if (rest) return json(httpOfCode(code), restErrorBody(code, message))
+    return json(200, rpcErrorBody(rpcId, code, message))
   }
 
   // The result of a call in the caller's binding: the result object itself on REST, a JSON-RPC response on JSON-RPC.
@@ -2828,57 +3355,142 @@ export class Ops {
     return { headers: out, error: "" }
   }
 
-  // Sends one call to the agent, in the binding its card offers that the caller's binding prefers: a REST
-  // caller goes to the card's REST endpoint, else its JSON-RPC one, and the other way round. params is the call's
-  // params after any push rewriting.
-  async a2aSend(agent: AgentConfig, call: Call, params: string, binding: string, rpcId: string, h: Hdrs, accepted: { header: string, value: string } | undefined): Promise<Fwd> {
+  // Whether the call log keeps the raw bytes of each call (client.a2a_store_raw_request_response).
+  rawOn(): bool {
+    return this.engine.cfg.client?.a2a_store_raw_request_response === true
+  }
+
+  // Sends one call to the agent on the interfaces its card offers, in order (a2agrpcup.tov upstreamCandidates: the
+  // caller's binding first, then the others, newest protocol version first, the ones that failed lately last). A
+  // failure that proves the interface unusable moves the call to the next one, as Bifrost's forwardUpstream does
+  // (attemptVerdict); one that only suggests it sends later calls elsewhere first. params is the call's params after
+  // any push rewriting, in the caller's version.
+  async a2aSend(agent: AgentConfig, call: Call, params: string, binding: string, rpcId: string, h: Hdrs, accepted: { header: string, value: string } | undefined, cancel: CallCancel): Promise<Fwd> {
     const card = agent.card ?? ""
-    const rpcUrl = endpointOf(card)
-    const restUrl = restEndpointOf(card)
-    if (rpcUrl === "" && restUrl === "") return fwdFail(`the card of ${agent.name} names no endpoint`)
-    const useRest = binding === "rest" ? restUrl !== "" : rpcUrl === "" && restUrl !== ""
-    let url = rpcUrl
+    const none = `the card of ${agent.name} names no endpoint the gateway may call`
+    const list = this.a2aDemoted.order(agent.name, card, upstreamCandidates(card, agent.agent_card_url, binding, agent.allow_private_network === true))
+    let last = fwdFail(none)
+    for (const c of list) {
+      const fwd = await this.a2aSendOn(agent, c, call, params, binding, rpcId, h, accepted, cancel)
+      if (cancel.fired) return fwd
+      const rpcCode = fwd.stream === undefined && fwd.error === "" ? unaryOf(fwd).code : 0
+      const v = attemptVerdict({ binding: c.binding, method: fwd.method, status: fwd.status, ct: fwd.ct, rpcCode: rpcCode, grpcCode: fwd.grpc, error: fwd.error })
+      if (v.demote) this.a2aDemoted.demote(agent.name, card, c)
+      else if (fwd.error === "") this.a2aDemoted.restore(agent.name, card, c)
+      if (!v.retry) return fwd
+      last = fwd
+    }
+    return last
+  }
+
+  // One attempt on one interface: the params in the interface's protocol version (a2aver.tov) and the answer back in the
+  // caller's. A JSON-RPC caller speaks the version of its method names; REST and gRPC callers speak v1; the gRPC
+  // interface speaks v1.
+  async a2aSendOn(agent: AgentConfig, c: Candidate, call: Call, params: string, binding: string, rpcId: string, h: Hdrs, accepted: { header: string, value: string } | undefined, cancel: CallCancel): Promise<Fwd> {
+    const callerV03 = binding === "rpc" && call.v03
+    const upV03 = c.binding !== "GRPC" && c.v03
+    const upParams = callerV03 === upV03 ? params : paramsTo(call.op, params, upV03)
+    const upCall: Call = { op: call.op, v03: upV03, params: upParams, stream: call.stream, taskId: call.taskId, configId: call.configId }
+    const fwd = c.binding === "GRPC" ? await this.a2aSendGrpc(agent, upCall, c, rpcId, h, accepted, cancel) : await this.a2aSendHttp(agent, upCall, c, rpcId, h, accepted, cancel)
+    if (callerV03 === upV03 || fwd.error !== "") return fwd
+    return translatedFwd(fwd, call.op, callerV03)
+  }
+
+  // One attempt over JSON-RPC or REST. call is in the interface's version: its method names, its REST routes (v0.3's sit
+  // under /v1) and its A2A-Version (v1 interfaces get theirs). The caller going away aborts the request.
+  async a2aSendHttp(agent: AgentConfig, call: Call, c: Candidate, rpcId: string, h: Hdrs, accepted: { header: string, value: string } | undefined, cancel: CallCancel): Promise<Fwd> {
+    const useRest = c.binding === "HTTP+JSON"
+    let url = c.url
     let method = "POST"
     let body = ""
     if (useRest) {
-      const rr = restRequestOf({ op: call.op, v03: call.v03, params: params, stream: call.stream, taskId: call.taskId, configId: call.configId })
-      let base = restUrl
+      const rr = restRequestOf(call)
+      let base = c.url
       while (base.endsWith("/")) base = base.slice(0, base.byteLength - 1)
-      url = base + rr.path + (rr.query === "" ? "" : "?" + rr.query)
+      const path = call.v03 ? (call.op === "GetExtendedAgentCard" ? "/v1/card" : "/v1" + rr.path) : rr.path
+      url = base + path + (rr.query === "" ? "" : "?" + rr.query)
       method = rr.method
       body = rr.body
     } else {
-      // a JSON-RPC caller's method names are kept; a REST caller's go out in the names the card's version uses
-      const old = binding === "rpc" ? call.v03 : !interfacesOf(card).v1
-      body = `{"jsonrpc":"2.0","id":${rpcId},"method":${JSON.stringify(methodOf(call.op, old))},"params":${params}}`
+      body = `{"jsonrpc":"2.0","id":${rpcId},"method":${JSON.stringify(methodOf(call.op, call.v03))},"params":${call.params}}`
+    }
+    const failed = (message: string): Fwd => {
+      let f = fwdFail(message)
+      f.binding = c.binding
+      f.method = method
+      f.rpc = !useRest
+      return f
     }
     const hd = await this.a2aHeaders(agent, h, accepted, body !== "", call.stream)
-    if (hd.error !== "") return fwdFail(hd.error)
-    const hs: Record<string, string> = hd.headers
+    if (hd.error !== "") return failed(hd.error)
+    let hm = hd.headers
+    if (!call.v03) hm.set("a2a-version", c.version === "" ? "1.0" : c.version)
+    const hs: Record<string, string> = hm
     const dl = deadline(call.stream ? 300000 : 60000)
+    // a caller that went away stops the request, and a stream's body, upstream
+    cancel.on(() => {
+      dl.controller.abort(new DOMException("the caller went away", "AbortError"))
+    })
     try {
       const res = body === "" ? await fetch(url, { method: method, headers: hs, signal: dl.controller.signal, tls: tlsOf(agent.runtime_auth) }) : await fetch(url, { method: method, headers: hs, body: body, signal: dl.controller.signal, tls: tlsOf(agent.runtime_auth) })
       const ct = res.headers.get("content-type") ?? ""
-      if (call.stream && ct.includes("text/event-stream") && res.body !== undefined) {
+      const rb = res.body
+      if (call.stream && ct.includes("text/event-stream") && rb !== undefined) {
         // the stream is passed on as it arrives: the deadline no longer applies to it
         dl.finish()
-        return { status: res.status, text: "", ct: ct, stream: res.body, rpc: !useRest, error: "" }
+        let st: ReadableStream = rb
+        let tap: StreamTap | undefined = undefined
+        if (this.rawOn()) {
+          const t = new StreamTap(RAW_LIMIT)
+          tap = t
+          st = tapped(st, t, undefined, undefined)
+        }
+        return { status: res.status, text: "", ct: ct, stream: st, rpc: !useRest, error: "", binding: c.binding, method: method, grpc: -1, rawReq: body, rawResp: "", tap: tap }
       }
       const text = await res.text()
       dl.finish()
       // an endpoint that is gone or does not speak the protocol: the card may have changed
       if (res.status === 405 || res.status === 410 || res.status === 426 || (res.status === 404 && !ct.includes("json"))) this.refreshSoon(agent.name)
-      return { status: res.status, text: text, ct: ct, stream: undefined, rpc: !useRest, error: "" }
+      return { status: res.status, text: text, ct: ct, stream: undefined, rpc: !useRest, error: "", binding: c.binding, method: method, grpc: -1, rawReq: body, rawResp: text, tap: undefined }
     } catch (e) {
       dl.finish()
-      return fwdFail(`the agent did not answer: ${e.message}`)
+      return failed(`the agent did not answer: ${e.message}`)
     }
+  }
+
+  // One attempt on the agent's gRPC interface (a2agrpcup.tov): the answer comes back as a JSON-RPC answer, or an event
+  // stream of them, so every binding maps it as it maps a JSON-RPC agent's. The caller going away resets the call.
+  async a2aSendGrpc(agent: AgentConfig, call: Call, c: Candidate, rpcId: string, h: Hdrs, accepted: { header: string, value: string } | undefined, cancel: CallCancel): Promise<Fwd> {
+    const failed = (message: string): Fwd => {
+      let f = fwdFail(message)
+      f.binding = "GRPC"
+      return f
+    }
+    const hd = await this.a2aHeaders(agent, h, accepted, false, call.stream)
+    if (hd.error !== "") return failed(hd.error)
+    let md = hd.headers
+    md.set("a2a-version", c.version === "" ? "1.0" : c.version)
+    const tls: H2Tls = { ca: "", verify: true }
+    const t = tlsOf(agent.runtime_auth)
+    if (t !== undefined) {
+      const ca = t.ca
+      if (ca !== undefined) tls.ca = ca
+      if (t.rejectUnauthorized === false) tls.verify = false
+    }
+    const g = await grpcSend(c.url, tls, call, call.params, rpcId, md, cancel)
+    if (g.error !== "") return failed(`the agent did not answer: ${g.error}`)
+    const st = g.stream
+    if (st !== undefined) return { status: 200, text: "", ct: "text/event-stream", stream: st, rpc: true, error: "", binding: "GRPC", method: "POST", grpc: 0, rawReq: "", rawResp: "", tap: undefined }
+    return { status: 200, text: g.text, ct: "application/json", stream: undefined, rpc: true, error: "", binding: "GRPC", method: "POST", grpc: g.code, rawReq: "", rawResp: "", tap: undefined }
   }
 
   // One call, whatever binding it came in on: push configs are kept by the gateway (get and list are answered
   // from its store; create and delete go to the agent first), the rest is sent on and its answer brought back
-  // to the caller's binding. Every call that reached the agent is logged.
-  async a2aCall(agent: AgentConfig, call: Call, binding: string, rpcId: string, h: Hdrs, vk: VirtualKeyConfig | undefined, base: string): Promise<Response> {
+  // to the caller's binding. The extensions the caller asks for are checked first (a2aext.tov), and an extended card
+  // comes back as the gateway serves cards. Every call that reached the agent is logged, a stream's when it ends.
+  // cancel (the gRPC binding's) stops the work upstream when the caller goes away; a stream's caller that stops reading
+  // does the same.
+  async a2aCall(agent: AgentConfig, call: Call, binding: string, rpcId: string, h: Hdrs, vk: VirtualKeyConfig | undefined, base: string, cancel?: CallCancel): Promise<Response> {
     const name = agent.name
     const rest = binding === "rest"
     const started = Date.now()
@@ -2886,20 +3498,27 @@ export class Ops {
     const vkId = vk?.id
     const store = pushStore()
     const accepted = vk === undefined ? undefined : this.engine.gov.credentialHeader(h)
+    const cc = cancel ?? new CallCancel()
+    const down = transportOf(binding)
+    const keepContent = !this.engine.contentOff(h)
+    const rawOn = this.rawOn()
     let params = call.params
     let context = contextOfParams(params)
+    // the extensions the caller asks for (A2A-Extensions) against the ones the registration relays
+    const xc = checkExtensions(agent.card ?? "", agent.extension_uris ?? [], h.get("a2a-extensions"), params)
+    if (xc.code !== 0) return this.a2aError(rest, rpcId, xc.code, xc.message)
     // push configs the gateway answers itself
     if (call.op === "GetTaskPushNotificationConfig" || call.op === "ListTaskPushNotificationConfigs") {
       if (call.taskId === "") return this.a2aFail(rest, rpcId, 400, -32602, "invalid params: a task id is required")
       if (call.op === "GetTaskPushNotificationConfig") {
         const c = store.config(name, call.taskId, call.configId)
         if (c === undefined) return this.a2aFail(rest, rpcId, 404, -32001, "push notification config not found")
-        this.recordA2a({ agent: name, method: label, status: 200, latencyMs: Date.now() - started, context: context, vk: vkId, error: "" })
+        this.recordA2a({ agent: name, method: label, op: call.op, status: 200, latencyMs: Date.now() - started, context: context, vk: vkId, error: "", task: call.taskId, down: down })
         return this.a2aResult(rest, rpcId, pushViewJson(c.task, c.id, c.url, c.scheme, call.v03))
       }
       const views: string[] = []
       for (const c of store.forTask(name, call.taskId)) views.push(pushViewJson(c.task, c.id, c.url, c.scheme, call.v03))
-      this.recordA2a({ agent: name, method: label, status: 200, latencyMs: Date.now() - started, context: context, vk: vkId, error: "" })
+      this.recordA2a({ agent: name, method: label, op: call.op, status: 200, latencyMs: Date.now() - started, context: context, vk: vkId, error: "", task: call.taskId, down: down })
       return this.a2aResult(rest, rpcId, pushListJson(views, call.v03))
     }
     // a create or an embedded config: the agent gets the gateway's ingress and a token of its own for it
@@ -2936,26 +3555,38 @@ export class Ops {
     } catch (e) {
       return this.a2aFail(rest, rpcId, 500, -32603, `could not set up the push configuration: ${e.message}`)
     }
-    const fwd = await this.a2aSend(agent, call, params, binding, rpcId, h, accepted)
+    // the caller's request as the log keeps it (the gateway's ingress in place of a callback)
+    const input = keepContent ? params : ""
+    const fwd = await this.a2aSend(agent, call, params, binding, rpcId, h, accepted, cc)
+    const rawReq = rawOn ? fwd.rawReq : ""
     if (fwd.error !== "") {
       if (pendingTask !== "") store.removePending(name, pendingHash, pendingTask)
-      this.recordA2a({ agent: name, method: label, status: 502, latencyMs: Date.now() - started, context: context, vk: vkId, error: fwd.error })
+      this.recordA2a({ agent: name, method: label, op: call.op, status: 502, latencyMs: Date.now() - started, context: context, vk: vkId, error: fwd.error, task: call.taskId, down: down, up: fwd.binding, rawReq: rawReq, input: input })
       return this.a2aFail(rest, rpcId, 502, -32603, fwd.error)
     }
     const up = fwd.stream
     if (call.stream && up !== undefined) {
-      this.recordA2a({ agent: name, method: label, status: fwd.status, latencyMs: Date.now() - started, context: context, vk: vkId, error: fwd.status >= 400 ? `agent answered HTTP ${fwd.status}` : "" })
       const sh: Record<string, string> = new Map()
       sh.set("content-type", "text/event-stream")
       sh.set("cache-control", "no-cache")
       // the same binding on both sides passes the events as they are; the other maps each event's payload
-      const out = !rest && !fwd.rpc ? relayMapped(up, (d: string): string => rpcEvent(rpcId, d)) : (rest && fwd.rpc ? relayMapped(up, restEvent) : relay(up))
+      const mapped = !rest && !fwd.rpc ? relayMapped(up, (d: string): string => rpcEvent(rpcId, d)) : (rest && fwd.rpc ? relayMapped(up, restEvent) : relay(up))
+      // the call is logged when its stream ends (or its caller goes away), with what the agent streamed when kept
+      const tap = fwd.tap
+      const status = fwd.status
+      const err = status >= 400 ? `agent answered HTTP ${status}` : ""
+      const out = tapped(mapped, undefined, () => {
+        const raw = tap === undefined || tap.dropped ? "" : tap.text
+        this.recordA2a({ agent: name, method: label, op: call.op, status: status, latencyMs: Date.now() - started, context: context, vk: vkId, error: err, task: call.taskId, down: down, up: fwd.binding, rawReq: rawReq, rawResp: raw, input: input })
+      }, cc)
       return new Response(out, { status: fwd.status, headers: sh })
     }
     const u = unaryOf(fwd)
     if (context === "" && !u.failed) context = contextOfResult(u.result)
     const err = u.failed ? `agent answered ${fwd.status >= 400 ? "HTTP " + fwd.status : "a JSON-RPC error"}` : ""
-    this.recordA2a({ agent: name, method: label, status: fwd.status, latencyMs: Date.now() - started, context: context, vk: vkId, error: err })
+    let task = call.taskId
+    if (task === "" && !u.failed) task = taskIdOfResult(u.result)
+    this.recordA2a({ agent: name, method: label, op: call.op, status: fwd.status, latencyMs: Date.now() - started, context: context, vk: vkId, error: err, task: task, down: down, up: fwd.binding, rawReq: rawReq, rawResp: rawOn ? fwd.rawResp : "", input: input, output: keepContent && !u.failed ? u.result : "" })
     // an embedded config is bound to the task the send made, or dropped when it made none
     if (pendingTask !== "") {
       const tid = u.failed ? "" : taskIdOfResult(u.result)
@@ -2981,6 +3612,8 @@ export class Ops {
       store.remove(name, call.taskId, call.configId)
       return this.a2aResult(rest, rpcId, rest ? "{}" : "null")
     }
+    // the extended card is the agent's own: it is served as the gateway serves the agent's card
+    if (!u.failed && call.op === "GetExtendedAgentCard" && u.result.trim().startsWith("{")) return this.a2aResult(rest, rpcId, this.servedCard(agent, u.result.trim(), base))
     return a2aRender(rest, rpcId, fwd, u)
   }
 
@@ -3058,6 +3691,10 @@ export class Ops {
   // cardTick gives each period's turn to one of them.
   startCardRefresh(): void {
     this.cardRefreshOn = true
+    // the declared agents whose cards were never fetched get them now
+    setTimeout(() => {
+      this.fetchMissingCards()
+    }, 0)
     const secs = this.store.cfg.client?.a2a_card_refresh_seconds ?? 300
     if (secs <= 0) return
     setInterval(() => {
@@ -3425,6 +4062,12 @@ export class Ops {
     if (path === "/api/oidc/login") {
       try {
         const b = this.flows.begin(oc, d, now)
+        // a consent page that sent its user to sign in gets them back (only the gateway's own consent pages)
+        const lu = URL.parse(req.url)
+        const back = returnPath(lu === undefined ? "" : (lu.searchParams.get("return_to") ?? ""))
+        // abandoned sign-ins leave entries behind: the table is bounded as the sign-ins in flight are
+        if (this.oidcReturn.size > 10000) this.oidcReturn.clear()
+        if (back !== "") this.oidcReturn.set(b.state, back)
         const h: Record<string, string> = new Map()
         h.set("location", b.url)
         h.set("cache-control", "no-store")
@@ -3436,7 +4079,10 @@ export class Ops {
     if (path !== "/api/oidc/callback") return json(404, errorJson(`no route for ${path}`, "invalid_request_error", undefined))
     const u = URL.parse(req.url)
     const params = u === undefined ? new URLSearchParams("") : u.searchParams
-    const flow = this.flows.complete(params.get("state") ?? "", now)
+    const st = params.get("state") ?? ""
+    const backTo = this.oidcReturn.get(st) ?? "/"
+    this.oidcReturn.delete(st)
+    const flow = this.flows.complete(st, now)
     if (flow === undefined) return html(401, "<p>This sign-in link expired or was already used. <a href=\"/api/oidc/login\">Sign in again</a>.</p>")
     const th: Map<string, string> = new Map()
     th.set("content-type", "application/x-www-form-urlencoded")
@@ -3466,7 +4112,7 @@ export class Ops {
       return html(500, "<p>Could not create a session.</p>")
     }
     // the UI keeps its admin token in sessionStorage; the session token takes its place
-    return html(200, `<!doctype html><meta charset="utf-8"><title>Signed in</title><script>sessionStorage.setItem("raiju.adminToken", ${JSON.stringify(token)}); location.replace("/");</script><p>Signed in as ${(v.email ?? v.sub).replace("<", "&lt;")}.</p>`)
+    return html(200, `<!doctype html><meta charset="utf-8"><title>Signed in</title><script>sessionStorage.setItem("raiju.adminToken", ${JSON.stringify(token)}); location.replace(${JSON.stringify(backTo)});</script><p>Signed in as ${(v.email ?? v.sub).replace("<", "&lt;")}.</p>`)
   }
 
   configureAlerts(al: AlertsConfig | undefined): void {
@@ -3565,9 +4211,12 @@ export class Ops {
 
   // The /ws event for a management write that succeeded: the resource it changed, as Bifrost's
   // store_update tags (the first path segment under /api).
+  // It goes through the feed like a log event, so it reaches every worker's and node's clients and a client that
+  // resumes with since= gets the store updates it missed.
   storeUpdated(path: string): void {
     const seg = path.split("/")[2] ?? ""
-    this.ui.send(JSON.stringify({ type: "store_update", tags: [seg] }))
+    const it: FeedItem = { node: this.feedProducer(), seq: this.ui.nextSeq(), ts: Date.now(), team: "", bu: "", customer: "", project: "", data: JSON.stringify({ id: newId("su_"), tags: [seg] }), kind: "store_update" }
+    this.ui.ingest(it, "local")
   }
 
   // The single sign-on session a token names, or undefined when there is none or its user is now disabled in
@@ -3591,6 +4240,8 @@ export class Ops {
       // a single sign-on session holds a built-in role
       const role = s === undefined ? undefined : (isBuiltinRole(s.role) ? s.role : undefined)
       if (s === undefined || role === undefined) return { kind: "deny", res: denied(401, "the session expired; sign in again") }
+      // a user-mode per-user flow is opened by its own user, whatever the user's role (the route checks the user again)
+      if (req.method === "GET" && ownUserFlow(path, s.sub)) return { kind: "ok", actor: "sso:" + s.sub }
       const perm = required(req.method, path)
       if (!roleAllows(this.store.cfg.governance?.roles, role, req.method, path)) {
         this.recordChange("sso:" + s.sub, req, path, 403, "")
@@ -3598,7 +4249,7 @@ export class Ops {
       }
       return { kind: "ok", actor: "sso:" + s.sub }
     }
-    if (!this.authOn) return { kind: "ok", actor: "anonymous" }
+    if (!this.authOn) return this.setupLock(req, path)
     // a temp token (client.mcp_enable_temp_token_auth) opens the per-user consent flow it was minted for
     if (this.store.cfg.client?.mcp_enable_temp_token_auth === true && tempTokenAllows(req.headers.get("x-bifrost-temp-token") ?? "", req.method, path, Date.now())) return { kind: "ok", actor: "temp-token" }
     const v = authorize(this.rbac, snapshot(req.headers), req.method, path)
@@ -3608,6 +4259,55 @@ export class Ops {
     }
     this.recordChange("unauthenticated", req, path, v.status, "")
     return { kind: "deny", res: denied(v.status, v.message) }
+  }
+
+  // Who is consenting on an MCP OAuth consent request (Bifrost's identity resolver): the dashboard sign-in, the
+  // identity-provider user of a single sign-on session (user mode, offered while OIDC is on), and the settings that
+  // decide the modes offered.
+  // needed is false on the routes that read none of it, so they cost no credential check.
+  consentContext(req: Request, needed: bool): ConsentContext {
+    const auth = req.headers.get("authorization") ?? ""
+    let user = ""
+    let name = ""
+    if (needed && this.oidcCfg !== undefined && auth.startsWith("Bearer sk-sess-")) {
+      const s = this.liveSession(auth.slice(7))
+      if (s !== undefined) {
+        user = s.sub
+        name = s.email ?? ""
+      }
+    }
+    const disable = this.engine.cfg.client?.oauth2_server_config?.disable_vk_identity === true
+    return { signedIn: needed && (user !== "" || this.consentSignedIn(req)), enforce: this.engine.gov.enforce, userAvailable: this.oidcCfg !== undefined, disableVk: disable, user: user, userName: name, userActive: (sub: string): bool => this.userActive(sub) }
+  }
+
+  // Whether an identity-provider user may still use a user-mode grant: governance does not list the user as disabled
+  // (a SCIM deactivation, say), as for the single sign-on sessions.
+  userActive(sub: string): bool {
+    return !disabledNamed(this.rbac, ssoNames(sub, undefined))
+  }
+
+  // The identity-provider user a request's single sign-on session names, or "".
+  sessionUser(req: Request): string {
+    const auth = req.headers.get("authorization") ?? ""
+    if (!auth.startsWith("Bearer sk-sess-")) return ""
+    const s = this.liveSession(auth.slice(7))
+    return s === undefined ? "" : s.sub
+  }
+
+  // Bifrost's setup lock (SetupLockMiddleware): while no admin account exists, every /api route but the public ones
+  // needs the operator's setup_token in X-Bifrost-Setup-Token (a wrong one is a 403) or the setup session cookie that
+  // POST /api/session/setup trades it for (401 without either); the caller then acts as the admin. Bifrost locks the
+  // API even when no token is set (a 403 for everything); Raiju keeps an unlocked API until setup_token is set.
+  setupLock(req: Request, path: string): Gate {
+    const want = resolveEnv(this.store.cfg.setup_token ?? "")
+    if (want === "" || setupPublic(path)) return { kind: "ok", actor: "anonymous" }
+    const given = req.headers.get("x-bifrost-setup-token") ?? ""
+    if (given !== "") {
+      if (!sameSecret(given, want)) return { kind: "deny", res: denied(403, "invalid setup token") }
+      return { kind: "ok", actor: "setup-token" }
+    }
+    if (validSetupSession(cookieValue(req.headers.get("cookie") ?? "", SETUP_COOKIE), want, Date.now())) return { kind: "ok", actor: "setup-token" }
+    return { kind: "deny", res: denied(401, "dashboard auth is not configured; send the setup token in the X-Bifrost-Setup-Token header") }
   }
 
   // Whether a request carries a dashboard sign-in (a session token, or admin credentials): the identity a session-mode
@@ -3717,7 +4417,8 @@ export class Ops {
   // /api/users*: the reply, after saving any change through the config store.
   // GET /api/governance/virtual-keys/quota: the calling key's own budgets, rate limits and provider
   // configs with their usage. Self-service, as Bifrost's: the key in the request is the credential, and
-  // an expired key is refused. model_configs is not reported (Raiju lists them under governance).
+  // an expired key is refused. model_configs lists the key's per-model limits (governance.model_configs
+  // scoped to this key, the "*" ones left out as Bifrost does) with their budgets' and rate limit's usage.
   vkQuota(req: Request): Reply {
     const vk = this.engine.gov.findKey(snapshot(req.headers))
     if (vk === undefined) return { status: 401, body: errorJson("a valid virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", undefined), contentType: "application/json" }
@@ -3727,20 +4428,40 @@ export class Ops {
     const usage = this.engine.gov.budgetUsage()
     const limits = this.engine.gov.rateLimitUsage(now)
     const ids = keyBudgetIds(vk)
-    const budgets: QuotaBudget[] = []
-    for (const b of g?.budgets ?? []) {
-      if (!ids.includes(b.id)) continue
-      const u = usage.find((x) => x.id === b.id)
-      budgets.push({ id: b.id, max_limit: b.max_limit, effective_max_limit: u?.limit ?? b.max_limit, reset_duration: b.reset_duration, current_usage: u?.used ?? 0.0 })
+    const quotaBudgets = (want: string[]): QuotaBudget[] => {
+      const out: QuotaBudget[] = []
+      for (const b of g?.budgets ?? []) {
+        if (!want.includes(b.id)) continue
+        const u = usage.find((x) => x.id === b.id)
+        out.push({ id: b.id, max_limit: b.max_limit, effective_max_limit: u?.limit ?? b.max_limit, reset_duration: b.reset_duration, current_usage: u?.used ?? 0.0 })
+      }
+      return out
     }
-    const rateLimits: QuotaRate[] = []
-    for (const rl of g?.rate_limits ?? []) {
-      if (rl.id !== vk.rate_limit_id) continue
-      const used: QuotaRateUsage[] = limits.filter((x) => x.id === rl.id).map((x) => ({ kind: x.kind, used: x.used, limit: x.limit }))
-      rateLimits.push({ id: rl.id, token_max_limit: rl.token_max_limit, token_reset_duration: rl.token_reset_duration, request_max_limit: rl.request_max_limit, request_reset_duration: rl.request_reset_duration, usage: used })
+    const quotaRates = (want: string): QuotaRate[] => {
+      const out: QuotaRate[] = []
+      for (const rl of g?.rate_limits ?? []) {
+        if (rl.id !== want) continue
+        const used: QuotaRateUsage[] = limits.filter((x) => x.id === rl.id).map((x) => ({ kind: x.kind, used: x.used, limit: x.limit }))
+        out.push({ id: rl.id, token_max_limit: rl.token_max_limit, token_reset_duration: rl.token_reset_duration, request_max_limit: rl.request_max_limit, request_reset_duration: rl.request_reset_duration, usage: used })
+      }
+      return out
     }
-    const noModels: string[] = []
-    const body = JSON.stringify({ virtual_key_name: vk.name ?? "", is_active: vk.is_active !== false, budgets: budgets, rate_limits: rateLimits, provider_configs: vk.provider_configs ?? [], model_configs: noModels })
+    const budgets = quotaBudgets(ids)
+    const rateLimits = quotaRates(vk.rate_limit_id ?? "")
+    const models: QuotaModel[] = []
+    for (const mc of g?.model_configs ?? []) {
+      if (mc.scope !== "virtual_key" || mc.scope_id !== vk.id || mc.model_name === "*") continue
+      const bids: string[] = []
+      if (mc.budget_id !== undefined) bids.push(mc.budget_id)
+      for (const b of mc.budget_ids ?? []) {
+        if (!bids.includes(b)) bids.push(b)
+      }
+      const row: QuotaModel = { model_name: mc.model_name, provider: mc.provider, budgets: quotaBudgets(bids) }
+      const rl = quotaRates(mc.rate_limit_id ?? "")[0]
+      if (rl !== undefined) row.rate_limit = rl
+      models.push(row)
+    }
+    const body = JSON.stringify({ virtual_key_name: vk.name ?? "", is_active: vk.is_active !== false, budgets: budgets, rate_limits: rateLimits, provider_configs: vk.provider_configs ?? [], model_configs: models })
     return { status: 200, body: body, contentType: "application/json" }
   }
 
@@ -3752,8 +4473,9 @@ export class Ops {
       if (done.length > 0) console.error(`raiju: deleted ${done.length} expired virtual key${done.length === 1 ? "" : "s"}`)
       this.auditRetention()
     }, 3600000)
-    // the audit archive copies each closed window every archive interval (five minutes at least)
-    const every = Math.max(300, this.store.cfg.audit?.archive?.interval_seconds ?? 3600) * 1000
+    // the audit archive wakes every archive interval, and at least hourly (as Bifrost's job), so a window that
+    // closes just after a pass does not wait a whole interval
+    const every = Math.min(3600000.0, archiveIntervalMs(this.store.cfg.audit?.archive?.interval_seconds))
     setInterval(() => {
       this.auditArchive()
     }, every)
@@ -3772,38 +4494,44 @@ export class Ops {
     }
   }
 
-  // The archive copy: the events in each window that has closed (archive_grace_seconds before now) since
-  // the last copy go to object storage as a Bifrost-style window (audit.tov's archive layout, planWindow):
-  // parts cut at archive_max_object_bytes, gzipped when archive_compress is set, then the manifest that
-  // commits the window. The mark moves only after the manifest is stored, so a failed window is retried
-  // whole on the next pass. The first run only sets the mark, so events written before archiving was
-  // turned on are not copied. Rows are never deleted here.
+  // The archive copy, as Bifrost's: time is cut into fixed windows of archive_interval aligned to the epoch,
+  // and each window that has closed (archive_grace_period past its end) goes to object storage in order, one
+  // at a time (audit_archive.tov planWindow): parts cut at archive_max_object_bytes, gzipped when
+  // archive_compress is set, then the manifest that commits the window. The mark moves to a window's end only
+  // after its manifest is stored, so a failed window is retried whole on the next pass and later windows wait.
+  // A retried window can leave a part from the failed try that its manifest does not list (Bifrost's readers
+  // go by the manifest). The first run only sets the mark, so events written before archiving was turned on
+  // are not copied. Rows are never deleted here.
   async auditArchive(): Promise<void> {
     const log = this.audit
     const ac = this.store.cfg.audit?.archive
     if (log === undefined || ac === undefined || !ac.enabled) return
     try {
       const now = Date.now()
-      const mark = log.archiveMark()
-      if (mark === undefined) {
+      const first = log.archiveMark()
+      if (first === undefined) {
         log.setArchiveMark({ seq: log.lastSequence(), until: now })
         return
       }
-      const grace = this.store.cfg.audit?.archive_grace_seconds ?? 900
-      const end = now - grace * 1000
-      if (end <= mark.until) return
-      const w = log.exportWindow(mark.seq, end)
+      const interval = archiveIntervalMs(ac.interval_seconds)
+      const grace = archiveGraceMs(this.store.cfg.audit?.archive_grace_seconds, interval)
       const ec: LogExportsConfig = {
         enabled: ac.enabled, kind: ac.kind, bucket: ac.bucket, prefix: ac.prefix, region: ac.region, endpoint: ac.endpoint,
         access_key_id: ac.access_key_id, secret_access_key: ac.secret_access_key, session_token: ac.session_token,
         interval_seconds: ac.interval_seconds, path_style: ac.path_style, format: ac.format, retention_days: ac.retention_days,
       }
-      const plan = planWindow(ac.prefix ?? "bifrost", mark.until, end, w.body, maxObjectBytes(this.store.cfg.audit?.archive_max_object_bytes), this.store.cfg.audit?.archive_compress === true, now)
-      for (const o of plan.objects) {
-        const req = putObjectRequest(ec, o.key, o.body, o.contentType, Date.now())
-        if (!(await this.archivePut(req))) return
+      let mark = first
+      // a pass catches up on at most a day's worth of short windows; the rest wait for the next pass
+      for (const win of closedWindows(mark.until, interval, grace, now, 288)) {
+        const w = log.exportWindow(mark.seq, win.end)
+        const plan = planWindow(ac.prefix ?? "bifrost", win.start, win.end, w.body, maxObjectBytes(this.store.cfg.audit?.archive_max_object_bytes), this.store.cfg.audit?.archive_compress === true, Date.now())
+        for (const o of plan.objects) {
+          const req = putObjectRequest(ec, o.key, o.body, o.contentType, Date.now())
+          if (!(await this.archivePut(req))) return
+        }
+        mark = { seq: w.last, until: win.end }
+        log.setArchiveMark(mark)
       }
-      log.setArchiveMark({ seq: w.last, until: end })
     } catch (e) {
       console.error(`raiju: audit archive failed: ${e.message}`)
     }
@@ -3830,24 +4558,52 @@ export class Ops {
     return false
   }
 
-  // /api/users/me/permissions: the caller's custom role as (resource, operation) pairs with their ids.
-  // Built-in roles hold fixed rules (rbac.tov) and are reported by name, with no pairs.
+  // /api/users/me/permissions: the caller's role and its (resource, operation) pairs with their ids. A built-in
+  // role's fixed rules are expanded into pairs (rbac.tov builtinPairs) and it carries its fixed role_id.
   mePermissions(actor: string): Reply {
-    if (actor.startsWith("key:")) {
-      const kids = permissionIds(RESOURCES, OPERATIONS, this.heldOf(actor).pairs)
-      const kdocs = permissionDocs(RESOURCES, OPERATIONS).filter((d) => kids.includes(d.id))
-      return { status: 200, body: JSON.stringify({ user: actor, role: "api_key", built_in: false, permissions: kdocs }), contentType: "application/json" }
-    }
-    // a caller with no stored user (the legacy admin credential) is the admin
+    const me = this.mePairs(actor)
+    const ids = permissionIds(RESOURCES, OPERATIONS, me.pairs)
+    const docs = permissionDocs(RESOURCES, OPERATIONS).filter((d) => ids.includes(d.id))
+    const out: { user: string, role: string, role_id?: int, built_in: bool, permissions: PermissionDoc[] } = { user: actor, role: me.role, built_in: me.builtIn, permissions: docs }
+    if (me.roleId !== undefined) out.role_id = me.roleId
+    return { status: 200, body: JSON.stringify(out), contentType: "application/json" }
+  }
+
+  // GET /api/governance/users/me/permissions: the same pairs in Bifrost's PermissionsResponse shape, every
+  // resource with every operation set true or false.
+  mePermissionMap(actor: string): Reply {
+    return { status: 200, body: permissionMap(this.mePairs(actor).pairs, RESOURCES, OPERATIONS), contentType: "application/json" }
+  }
+
+  // The caller's role and pairs: a management API key's own permissions, else the stored user's role (a caller
+  // with no stored user, the legacy admin credential, is the admin).
+  mePairs(actor: string): { role: string, roleId?: int, builtIn: bool, pairs: PermissionPair[] } {
+    if (actor.startsWith("key:")) return { role: "api_key", builtIn: false, pairs: this.heldOf(actor).pairs }
     let role = "admin"
     for (const u of this.store.cfg.governance?.users ?? []) {
       if (u.name === actor) role = u.role
     }
-    const custom = customRole(this.store.cfg.governance?.roles ?? [], role)
-    const pairs = custom?.permissions ?? []
-    const ids = permissionIds(RESOURCES, OPERATIONS, pairs)
-    const docs = permissionDocs(RESOURCES, OPERATIONS).filter((d) => ids.includes(d.id))
-    return { status: 200, body: JSON.stringify({ user: actor, role: role, built_in: custom === undefined, permissions: docs }), contentType: "application/json" }
+    const roles = this.store.cfg.governance?.roles ?? []
+    const builtIn = customRole(roles, role) === undefined
+    return { role: role, roleId: anyRoleId(roles, role), builtIn: builtIn, pairs: rolePairs(roles, role, RESOURCES, OPERATIONS) }
+  }
+
+  // GET /api/users/email/{email} and /api/governance/users/email/{email}: the user with that (URL-encoded)
+  // address in Bifrost's UserObject shape; .../virtual-keys lists the keys assigned to the user.
+  userByEmailRoute(method: string, path: string): Reply {
+    if (method !== "GET") return { status: 405, body: errorJson(`method ${method} is not allowed on this route`, "invalid_request_error", undefined), contentType: "application/json" }
+    const segs = path.split("/").filter((s) => s !== "")
+    const at = segs[1] === "governance" ? 4 : 3
+    const raw = segs[at] ?? ""
+    const keys = segs.length === at + 2 && segs[at + 1] === "virtual-keys"
+    if (raw === "" || !(segs.length === at + 1 || keys)) return { status: 404, body: errorJson(`no route for ${path}`, "invalid_request_error", undefined), contentType: "application/json" }
+    const email = pctDecode(raw)
+    if (email === undefined || email.trim() === "") return { status: 400, body: errorJson("email must be a URL-encoded email address", "invalid_request_error", undefined), contentType: "application/json" }
+    const g = this.store.cfg.governance
+    const u = userByEmail(g?.users ?? [], email)
+    if (u === undefined) return { status: 404, body: errorJson("user not found", "not_found_error", undefined), contentType: "application/json" }
+    if (keys) return { status: 200, body: userKeysJson(u, g?.virtual_keys), contentType: "application/json" }
+    return { status: 200, body: userObjectJson(u, g?.users, g?.roles, g?.access_profiles), contentType: "application/json" }
   }
 
   // What the actor may grant to a management API key: everything for the admin and the legacy admin
@@ -3970,9 +4726,9 @@ export class Ops {
     return { status: r.status, body: r.body, contentType: "application/json" }
   }
 
-  // /api/governance/access-profiles/{id}/roles: POST attaches roles ({"role_ids": [...], "is_default": bool});
-  // DELETE .../roles/{role_id} detaches one. Every user holding one of the roles holds the profile, so the
-  // reply counts those users as users_applied.
+  // /api/governance/access-profiles/{id}/roles: POST attaches roles ({"role_ids": [...], "is_default": bool,
+  // "apply_to_existing": bool}); DELETE .../roles/{role_id} detaches one. apply_to_existing gives the role's users
+  // the profile now (counted as users_applied), is_default gives it to the role's later users.
   profileRoles(method: string, segs: string[], body: string): Reply {
     const id = segs[3] ?? ""
     if (segs.length === 5 && method === "POST") {
@@ -3984,13 +4740,15 @@ export class Ops {
       }
       const ids: int[] = b.role_ids ?? []
       if (ids.length === 0) return { status: 400, body: errorJson("role_ids is required", "invalid_request_error", undefined), contentType: "application/json" }
-      const r = this.store.attachProfileRoles(id, ids, b.is_default)
+      const apply = b.apply_to_existing === true
+      const r = this.store.attachProfileRoles(id, ids, b.is_default, apply)
       if (r.kind === "error") return { status: r.status, body: errorJson(r.message, "invalid_request_error", undefined), contentType: "application/json" }
+      // users_applied: the role's users given the profile now (apply_to_existing), as Bifrost counts them
       const g = this.store.cfg.governance
       let n = 0
       for (const u of g?.users ?? []) {
-        const rid = roleIdOf(g?.roles, u.role)
-        if (rid !== undefined && ids.includes(rid)) n += 1
+        const rid = anyRoleId(g?.roles, u.role)
+        if (apply && rid !== undefined && ids.includes(rid)) n += 1
       }
       return { status: 200, body: JSON.stringify({ message: "roles attached", users_applied: n }), contentType: "application/json" }
     }
@@ -4043,27 +4801,36 @@ export class Ops {
     } catch (e) {
       return { status: 500, body: errorJson(e.message, "api_error", undefined), contentType: "application/json" }
     }
-    if (p === "/api/audit-logs/filterdata") return { status: 200, body: JSON.stringify(log.filterData()), contentType: "application/json" }
-    // GET /api/audit-logs/{id}: one event, by its id (its sequence number), in Bifrost's {audit_log} wrapper
+    // audit.omit_ip_addresses also hides the addresses older events kept, and ip filters and search skip them
+    const omitIps = this.store.cfg.audit?.omit_ip_addresses === true
+    if (p === "/api/audit-logs/filterdata") {
+      const dims = (params.get("dimensions") ?? "").split(",").map((d) => d.trim()).filter((d) => d !== "")
+      return { status: 200, body: log.filterData(dims, params.get("q") ?? "", omitIps), contentType: "application/json" }
+    }
+    // GET /api/audit-logs/{id}: one event, by its id (its sequence number), in Bifrost's {audit_log} wrapper;
+    // GET /api/audit-logs/{id}/verify: its signature computed again and compared with the stored one
     if (p.startsWith("/api/audit-logs/")) {
-      const seq = parseInt(p.slice("/api/audit-logs/".byteLength)) ?? -1
-      const ev = seq >= 0 ? log.find(seq) : undefined
+      const rest = p.slice("/api/audit-logs/".byteLength)
+      const verify = rest.endsWith("/verify")
+      const idText = verify ? rest.slice(0, rest.byteLength - "/verify".byteLength) : rest
+      const seq = idText.includes("/") ? -1 : parseInt(idText) ?? -1
+      if (seq < 0 && verify) return badRequest("invalid audit log id")
+      let ev: AuditEvent | undefined = undefined
+      try {
+        ev = seq >= 0 ? log.findAny(seq) : undefined
+      } catch (e) {
+        return { status: 500, body: errorJson(e.message, "api_error", undefined), contentType: "application/json" }
+      }
       if (ev === undefined) return { status: 404, body: errorJson("audit log not found", "not_found_error", undefined), contentType: "application/json" }
-      return { status: 200, body: JSON.stringify({ audit_log: ev }), contentType: "application/json" }
+      if (verify) return { status: 200, body: JSON.stringify(log.verifyOne(ev)), contentType: "application/json" }
+      const shown: AuditEvent = ev
+      if (omitIps) shown.ip = undefined
+      return { status: 200, body: JSON.stringify({ audit_log: shown }), contentType: "application/json" }
     }
     if (p !== "/api/audit-logs") return { status: 404, body: errorJson(`no route for ${p}`, "invalid_request_error", undefined), contentType: "application/json" }
-    const q: AuditQuery = {}
-    const actor = params.get("actor")
-    if (actor !== undefined && actor !== "") q.actor = actor
-    const action = params.get("action")
-    if (action !== undefined && action !== "") q.action = action
-    q.since = num(params, "since")
-    q.until = num(params, "until")
-    const limit = params.get("limit")
-    if (limit !== undefined) q.limit = parseInt(limit)
-    const offset = params.get("offset")
-    if (offset !== undefined) q.offset = parseInt(offset)
-    return { status: 200, body: JSON.stringify(log.query(q)), contentType: "application/json" }
+    const lq = auditQueryOf(params, Date.now(), omitIps)
+    if (lq.error !== "") return badRequest(lq.error)
+    return { status: 200, body: auditListJson(log.query(lq.q), lq.page, lq.limit, omitIps), contentType: "application/json" }
   }
 
   // GET /api/alerts: rule states and recent transitions.
@@ -4108,7 +4875,22 @@ export class Ops {
     const challenge = iss === undefined ? undefined : challengeOf(iss)
     const caller = callerOf(iss, h.get("authorization"), Date.now())
     if (caller.kind === "error") return denied(401, caller.message, challenge)
-    if (caller.kind === "vk") {
+    // a user is named only by a user-mode token checked here (mcpuser.tov markUser), never by a header the caller sent
+    h.delete(USER_HEADER)
+    if (caller.kind !== "none" && headerKeyOf(h) !== "") {
+      // the OAuth token is the request's only identity: a virtual key header beside it is ambiguous (Bifrost)
+      return denied(401, "conflicting credentials: an OAuth token and a virtual key header were both provided; send only the OAuth token", challenge)
+    }
+    let mcpUser = ""
+    if (caller.kind === "user") {
+      // a dashboard sign-in on the same request must name the same user; a user governance disabled is refused at once
+      const su = this.sessionUser(req)
+      if (su !== "" && su !== caller.sub) return denied(401, "session user does not match the authenticated token", challenge)
+      if (!this.userActive(caller.sub)) return denied(401, "user is no longer active", challenge)
+      mcpUser = caller.sub
+      h.set(USER_HEADER, markUser(caller.sub))
+    } else if (caller.kind === "vk") {
+      if (vkIdentityCut(this.engine.cfg, this.oidcCfg !== undefined)) return denied(401, "virtual-key identity is no longer accepted; re-authenticate", challenge)
       const named = keyById(this.engine.cfg, caller.vk)
       if (!keyUsable(named, Date.now()) || named === undefined) return denied(401, "the virtual key this token names is not active", challenge)
       h.set("x-bf-vk", named.value)
@@ -4121,10 +4903,11 @@ export class Ops {
       return denied(401, "this server requires OAuth JWT authentication; header credentials are not accepted in oauth mode", challenge)
     }
     const vk = this.engine.gov.findKey(h)
-    if (this.engine.gov.enforce && vk === undefined) return denied(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", challenge)
+    // a user-mode token is an identity of its own, as an upstream-authenticated user is in Bifrost
+    if (this.engine.gov.enforce && vk === undefined && mcpUser === "") return denied(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", challenge)
     // a key's access profile may limit the tools it sees; allow_by_default opens the clients it does not name
     const allowedTools = this.engine.gov.policyFor(h)?.mcpTools
-    let tools = exposedTools(m.allToolsFor(allowedTools, vk?.mcp_configs))
+    let tools = exposedTools(m.allToolsFor(allowedTools, vk?.mcp_configs, this.engine.projectMcp(h, virtualName)))
     // code mode: the four meta-tools stand in for the code mode clients' tools, as in the tool list Bifrost serves
     // (a virtual MCP lists only its own tools)
     if (virtualName === undefined && this.engine.codeEntriesFor(m, h).length > 0) {
@@ -4150,13 +4933,15 @@ export class Ops {
       if (sid !== undefined) this.mcpSessions.delete(sid)
       return new Response(undefined, { status: 204 })
     }
-    // GET is the server-to-client stream (Bifrost's SSE handler): a connection event, and then the
-    // stream ends, since this server sends nothing on its own. Clients reopen it as they need.
+    // GET is the server-to-client stream (Bifrost's SSE handler): a connection event, then heartbeats that
+    // keep it open through proxies until the client leaves.
     if (req.method === "GET") {
       const sh: Record<string, string> = new Map()
       sh.set("content-type", "text/event-stream")
       sh.set("cache-control", "no-cache")
-      return new Response("data: {\"jsonrpc\":\"2.0\",\"method\":\"connection/opened\"}\n\n", { headers: sh })
+      sh.set("connection", "keep-alive")
+      sh.set("x-accel-buffering", "no")
+      return new Response(sseStream(SSE_HEARTBEAT_MS), { headers: sh })
     }
     if (req.method !== "POST") return json(405, errorJson("use POST for MCP requests", "invalid_request_error", undefined))
     const body = await req.text()
@@ -4182,7 +4967,7 @@ export class Ops {
           return { text: `bad arguments: ${e.message}`, isError: true }
         }
       }
-      const gate = this.engine.toolGate(m, h, real)
+      const gate = this.engine.toolGate(m, h, real, virtualName)
       if (gate.kind === "denial") return { text: gate.message, isError: true }
       const ua = try await this.engine.userAuth(real, h, false)
       if (ua.kind === "denial") return { text: ua.message, isError: true }
@@ -4197,7 +4982,7 @@ export class Ops {
     } else {
       for (const t of tools) seen.push(t.name)
     }
-    const iparts = m.instructionParts(allowedTools, vk?.mcp_configs).filter((p) => seen.some((n) => n.startsWith(p.name + "-")))
+    const iparts = m.instructionParts(allowedTools, vk?.mcp_configs, this.engine.projectMcp(h, virtualName)).filter((p) => seen.some((n) => n.startsWith(p.name + "-")))
     const instructions = m.renderInstructions(iparts)
     const r = await handleMcp(body, h.get("mcp-session-id"), tools, run, this.mcpSessions, now, instructions)
     const out: Record<string, string> = new Map()
@@ -4364,6 +5149,33 @@ test("analytics and MCP routes answer from the store and refuse what is not reco
   }
 })
 
+test("hidden_request_types leave entries out of the log reads by Bifrost type or op name", () => {
+  const entry = (id: string, op: string, streamed: bool): LogEntry => ({ id: id, ts: 1.0, request_id: id, op: op, provider: "openai", model: "m", status: 200, latency_ms: 1.0, prompt_tokens: 1, completion_tokens: 1, cost: 0.0, cache_hit: false, streamed: streamed ? true : undefined })
+  const es = [entry("a", "chat", false), entry("b", "chat", true), entry("c", "embeddings", false), entry("d", "files.upload", false)]
+  const tool: LogEntry = entry("t", "tool", false)
+  tool.kind = "mcp"
+  es.push(tool)
+  const ids = (hidden: string[] | undefined): string => withoutHidden(es, hidden).map((e) => e.id).join(",")
+  expect(ids(undefined)).toBe("a,b,c,d,t")
+  expect(ids(["chat_completion_stream"])).toBe("a,c,d,t")
+  expect(ids([" chat_completion ", "embedding", ""])).toBe("b,d,t")
+  expect(ids(["files.upload", "tool"])).toBe("a,b,c,t")
+  const dir = "/tmp/raiju-ops-hidden-" + (try secureHex(6))
+  try {
+    try mkdirSync(dir, { recursive: true })
+    const eng = new Engine({})
+    eng.logStore = try new LogStore(defaultLogStoreConfig(dir))
+    for (const e of es) eng.logStore!.add({ id: e.id, ts: Date.now() - 1000.0, request_id: e.id, op: e.op, provider: "openai", model: "m", status: 200, latency_ms: 1.0, prompt_tokens: 1, completion_tokens: 1, cost: 0.0, cache_hit: false, streamed: e.streamed, kind: e.kind })
+    const ops = new Ops(eng, new ConfigStore(dir + "/config.json", { client: { hidden_request_types: ["embedding"] } }))
+    const get = (p: string): Reply => ops.logsRoute(new Request("http://raiju.test" + p), p.split("?")[0]!, "")
+    expect(get("/api/logs").body.includes(`"total_requests":3`)).toBe(true)
+    expect(get("/api/logs/c").status).toBe(404)
+    expect(get("/api/logs/a").status).toBe(200)
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test("log histogram counts requests per bucket by status", () => {
   const dir = "/tmp/raiju-ops-hist-" + (try secureHex(6))
   try mkdirSync(dir, { recursive: true })
@@ -4390,7 +5202,7 @@ test("log histogram counts requests per bucket by status", () => {
 })
 
 function fwdOf(status: int, text: string, rpc: bool): Fwd {
-  return { status: status, text: text, ct: "", stream: undefined, rpc: rpc, error: "" }
+  return { status: status, text: text, ct: "", stream: undefined, rpc: rpc, error: "", binding: "", method: "POST", grpc: -1, rawReq: "", rawResp: "", tap: undefined }
 }
 
 test("an agent's unary answer is read the same from either binding", () => {
@@ -4446,4 +5258,25 @@ test("a refusal comes in the caller's binding, and an ETag is matched like HTTP 
   expect(tag.byteLength).toBe(34)
   h.set("if-none-match", tag)
   expect(a2aCardResponse("{}", h).status).toBe(304)
+})
+
+test("a sign-in returns only to the gateway's own consent pages", () => {
+  expect(returnPath("/oauth/consent?flow=abc")).toBe("/oauth/consent?flow=abc")
+  expect(returnPath("/workspace/mcp-sessions/auth?flow=abc&kind=headers")).toBe("/workspace/mcp-sessions/auth?flow=abc&kind=headers")
+  expect(returnPath("https://evil.example/oauth/consent?flow=abc")).toBe("")
+  expect(returnPath("//evil.example/oauth/consent?x")).toBe("")
+  expect(returnPath("/oauth/consent?flow=abc#t=x")).toBe("")
+  expect(returnPath("/api/config")).toBe("")
+  expect(returnPath("")).toBe("")
+})
+
+test("a virtual key in a header beside an OAuth token is found, a provider key is not", () => {
+  const h: Hdrs = new Map()
+  expect(headerKeyOf(h)).toBe("")
+  h.set("x-api-key", "sk-ant-provider")
+  expect(headerKeyOf(h)).toBe("")
+  h.set("api-key", "sk-bf-x")
+  expect(headerKeyOf(h)).toBe("sk-bf-x")
+  h.set("x-bf-vk", "anything")
+  expect(headerKeyOf(h)).toBe("anything")
 })

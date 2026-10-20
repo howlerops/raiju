@@ -1,0 +1,410 @@
+// google.rpc.Status in the grpc-status-details-bin trailer, and the A2A errors it carries.
+//
+// A failed gRPC call may carry its whole status (code, message and details, each detail a google.protobuf.Any)
+// in grpc-status-details-bin, base64 in the trailers. a2a-go puts a google.rpc.ErrorInfo there for every A2A
+// error (internal/grpcutil ToGRPCError): the error's reason (TASK_NOT_FOUND, ...), the domain a2a-protocol.org
+// and the metadata the error came with, after a google.protobuf.Struct for each structured detail. The reverse
+// (FromGRPCError) reads the reason back to pick the A2A error. Both directions are here, from and to the
+// JSON-RPC error object the gateway handles ({code, message, data}), with data as a2a-go writes it: a list of
+// typed details, each an object with its "@type".
+import { PbWriter, PbReader, utf8Strict } from "./protobuf"
+import { encode, decode, b64Encode, b64Decode } from "./a2apb"
+import { Field, fields, elements, find, quote, rawStr, rawNum, isNull, decodeString, build } from "./json"
+
+export const ERROR_INFO_TYPE = "type.googleapis.com/google.rpc.ErrorInfo"
+export const STRUCT_TYPE = "type.googleapis.com/google.protobuf.Struct"
+export const A2A_DOMAIN = "a2a-protocol.org"
+
+// One google.protobuf.Any: its type URL and the message bytes.
+export type PbAnyMsg = { typeUrl: string, value: u8[] }
+export type RpcStatus = { code: int, message: string, details: PbAnyMsg[] }
+export type ErrorInfo = { reason: string, domain: string, metadata: Map<string, string> }
+
+// ---- the messages ----
+
+// google.rpc.Status: 1 code, 2 message, 3 details (Any: 1 type_url, 2 value), defaults left out.
+export function encodeStatus(s: RpcStatus): u8[] {
+  const w = new PbWriter()
+  if (s.code !== 0) w.u(1, s.code)
+  if (s.message !== "") w.str(2, s.message)
+  for (const d of s.details) {
+    const a = new PbWriter()
+    if (d.typeUrl !== "") a.str(1, d.typeUrl)
+    if (d.value.length > 0) a.bytes(2, d.value)
+    w.bytes(3, a.buf)
+  }
+  return w.buf
+}
+
+export function decodeStatus(b: u8[]): RpcStatus throws Error {
+  const r = new PbReader(b)
+  let code: int = 0
+  let message = ""
+  const details: PbAnyMsg[] = []
+  while (r.more()) {
+    const k = try r.key()
+    if (k.field === 1 && k.wire === 0) {
+      code = (try r.varint()) & 0xffffffff
+    } else if (k.field === 2 && k.wire === 2) {
+      message = try utf8Strict(try r.bytes())
+    } else if (k.field === 3 && k.wire === 2) {
+      const a = new PbReader(try r.bytes())
+      let url = ""
+      let value: u8[] = []
+      while (a.more()) {
+        const ak = try a.key()
+        if (ak.field === 1 && ak.wire === 2) url = try utf8Strict(try a.bytes())
+        else if (ak.field === 2 && ak.wire === 2) value = try a.bytes()
+        else try a.skip(ak.wire)
+      }
+      details.push({ typeUrl: url, value: value })
+    } else {
+      try r.skip(k.wire)
+    }
+  }
+  return { code: code, message: message, details: details }
+}
+
+// google.rpc.ErrorInfo: 1 reason, 2 domain, 3 metadata (map<string, string>, in key order as protobuf-go's
+// deterministic encoding writes it).
+export function encodeErrorInfo(e: ErrorInfo): u8[] {
+  const w = new PbWriter()
+  if (e.reason !== "") w.str(1, e.reason)
+  if (e.domain !== "") w.str(2, e.domain)
+  const keys = e.metadata.keys()
+  keys.sort()
+  for (const k of keys) {
+    const ent = new PbWriter()
+    if (k !== "") ent.str(1, k)
+    const v = e.metadata.get(k) ?? ""
+    if (v !== "") ent.str(2, v)
+    w.bytes(3, ent.buf)
+  }
+  return w.buf
+}
+
+export function decodeErrorInfo(b: u8[]): ErrorInfo throws Error {
+  const r = new PbReader(b)
+  let reason = ""
+  let domain = ""
+  const md: Map<string, string> = new Map()
+  while (r.more()) {
+    const k = try r.key()
+    if (k.field === 1 && k.wire === 2) {
+      reason = try utf8Strict(try r.bytes())
+    } else if (k.field === 2 && k.wire === 2) {
+      domain = try utf8Strict(try r.bytes())
+    } else if (k.field === 3 && k.wire === 2) {
+      const e = new PbReader(try r.bytes())
+      let key = ""
+      let val = ""
+      while (e.more()) {
+        const ek = try e.key()
+        if (ek.field === 1 && ek.wire === 2) key = try utf8Strict(try e.bytes())
+        else if (ek.field === 2 && ek.wire === 2) val = try utf8Strict(try e.bytes())
+        else try e.skip(ek.wire)
+      }
+      md.set(key, val)
+    } else {
+      try r.skip(k.wire)
+    }
+  }
+  return { reason: reason, domain: domain, metadata: md }
+}
+
+// The trailer value: the Status bytes in base64 without padding (gRPC's binary header form; readers take both).
+export function detailsHeader(status: u8[]): string {
+  let s = b64Encode(status)
+  while (s.endsWith("=")) s = s.slice(0, s.byteLength - 1)
+  return s
+}
+
+export function statusOfHeader(v: string): RpcStatus throws Error {
+  return try decodeStatus(try b64Decode(v.trim()))
+}
+
+// ---- A2A errors ----
+
+// The reason a2a-go gives the A2A error of a JSON-RPC code (a2a.ErrorReason through internal/jsonrpc's table).
+// An unknown code is an internal error.
+export function reasonOfRpcCode(code: int): string {
+  if (code === -32700) return "PARSE_ERROR"
+  if (code === -32600) return "INVALID_REQUEST"
+  if (code === -32601) return "METHOD_NOT_FOUND"
+  if (code === -32602) return "INVALID_PARAMS"
+  if (code === -32000) return "SERVER_ERROR"
+  if (code === -32001) return "TASK_NOT_FOUND"
+  if (code === -32002) return "TASK_NOT_CANCELABLE"
+  if (code === -32003) return "PUSH_NOTIFICATION_NOT_SUPPORTED"
+  if (code === -32004) return "UNSUPPORTED_OPERATION"
+  if (code === -32005) return "CONTENT_TYPE_NOT_SUPPORTED"
+  if (code === -32006) return "INVALID_AGENT_RESPONSE"
+  if (code === -32007) return "EXTENDED_AGENT_CARD_NOT_CONFIGURED"
+  if (code === -32008) return "EXTENSION_SUPPORT_REQUIRED"
+  if (code === -32009) return "VERSION_NOT_SUPPORTED"
+  if (code === -31401) return "UNAUTHENTICATED"
+  if (code === -31403) return "UNAUTHORIZED"
+  return "INTERNAL_ERROR"
+}
+
+// a2a-go's errorMappings: the gRPC code, the JSON-RPC code of the A2A error and its reason, in its order (the
+// first match wins in both directions).
+type Mapping = { grpc: int, rpc: int }
+
+function mappings(): Mapping[] {
+  return [
+    { grpc: 5, rpc: -32001 },
+    { grpc: 9, rpc: -32002 },
+    { grpc: 9, rpc: -32004 },
+    { grpc: 3, rpc: -32602 },
+    { grpc: 13, rpc: -32603 },
+    { grpc: 16, rpc: -31401 },
+    { grpc: 7, rpc: -31403 },
+    // CANCELLED and DEADLINE_EXCEEDED are the context's errors: an internal error once in JSON-RPC
+    { grpc: 1, rpc: -32603 },
+    { grpc: 4, rpc: -32603 },
+    { grpc: 9, rpc: -32007 },
+    { grpc: 9, rpc: -32003 },
+    { grpc: 12, rpc: -32601 },
+    { grpc: 3, rpc: -32005 },
+    { grpc: 3, rpc: -32600 },
+    { grpc: 13, rpc: -32006 },
+    { grpc: 9, rpc: -32008 },
+    { grpc: 9, rpc: -32009 },
+    { grpc: 3, rpc: -32700 },
+    { grpc: 13, rpc: -32000 },
+  ]
+}
+
+const MAPPINGS = mappings()
+
+// The JSON-RPC code of a gRPC status (FromGRPCError): the mapping with the ErrorInfo's reason and the code, or
+// without a reason the first with the code. Anything else is an internal error.
+export function rpcCodeOfGrpc(code: int, reason: string): int {
+  for (const m of MAPPINGS) {
+    if (m.grpc !== code) continue
+    if (reason === "") return m.rpc
+    // the context errors carry INTERNAL_ERROR as their reason
+    const r = m.grpc === 1 || m.grpc === 4 ? "INTERNAL_ERROR" : reasonOfRpcCode(m.rpc)
+    if (r === reason) return m.rpc
+  }
+  return -32603
+}
+
+function objectFields(text: string): Field[] | undefined {
+  const t = text.trim()
+  if (!t.startsWith("{")) return undefined
+  try {
+    return fields(t)
+  } catch (e) {
+    return undefined
+  }
+}
+
+// The typed details of a JSON-RPC error's data, as a2a-go reads them (FromJSONRPCError): a list of objects, or
+// one object (A2A v0.3); each object's "@type" names it, and one without is a Struct. Each is its type URL and
+// the object without "@type".
+type Typed = { typeUrl: string, value: Field[] }
+
+function typedOf(data: string | undefined): Typed[] {
+  const out: Typed[] = []
+  if (data === undefined || isNull(data)) return out
+  const t = data.trim()
+  let items: string[] = []
+  if (t.startsWith("[")) {
+    try {
+      items = elements(t)
+    } catch (e) {
+      return out
+    }
+  } else if (t.startsWith("{")) {
+    items = [t]
+  }
+  for (const it of items) {
+    const f = objectFields(it)
+    if (f === undefined) continue
+    const ty = find(f, "@type")
+    const named = ty !== undefined && ty.trim().startsWith("\"")
+    let url = STRUCT_TYPE
+    if (named) {
+      try {
+        url = decodeString(ty ?? "")
+      } catch (e) {
+        url = STRUCT_TYPE
+      }
+    }
+    const rest: Field[] = []
+    for (const x of f) {
+      if (!(named && x.key === "@type")) rest.push(x)
+    }
+    out.push({ typeUrl: url, value: rest })
+  }
+  return out
+}
+
+// The string values of an ErrorInfo's metadata object (a2a-go keeps only the strings).
+function stringMap(raw: string | undefined): Map<string, string> {
+  const m: Map<string, string> = new Map()
+  if (raw === undefined) return m
+  const f = objectFields(raw)
+  if (f === undefined) return m
+  for (const x of f) {
+    if (!x.raw.trim().startsWith("\"")) continue
+    try {
+      m.set(x.key, decodeString(x.raw))
+    } catch (e) {
+      // not a string
+    }
+  }
+  return m
+}
+
+// The google.rpc.Status a2a-go sends for a JSON-RPC error (FromJSONRPCError, then ToGRPCError): the status code and
+// message, a Struct for the first structured detail (the error's Details), a Struct for each structured detail, then
+// the ErrorInfo with the code's reason, the A2A domain and the metadata the data's ErrorInfo carried.
+export function a2aStatusOf(grpcCode: int, message: string, rpcCode: int, data: string | undefined): u8[] throws Error {
+  const details: PbAnyMsg[] = []
+  const meta: Map<string, string> = new Map()
+  const structs: u8[][] = []
+  for (const t of typedOf(data)) {
+    if (t.typeUrl === ERROR_INFO_TYPE) {
+      const m = stringMap(find(t.value, "metadata"))
+      for (const k of m.keys()) meta.set(k, m.get(k) ?? "")
+    } else {
+      structs.push(try encode(build(t.value), "Struct"))
+    }
+  }
+  const first = structs[0]
+  if (first !== undefined) details.push({ typeUrl: STRUCT_TYPE, value: first })
+  for (const s of structs) details.push({ typeUrl: STRUCT_TYPE, value: s })
+  details.push({ typeUrl: ERROR_INFO_TYPE, value: encodeErrorInfo({ reason: reasonOfRpcCode(rpcCode), domain: A2A_DOMAIN, metadata: meta }) })
+  return encodeStatus({ code: grpcCode, message: message, details: details })
+}
+
+// The JSON-RPC error object of a gRPC status from an agent (FromGRPCError): the code its reason and status pick, its
+// message, and data with each Struct detail and an ErrorInfo (reason, domain, metadata) when the status had one.
+// details is the grpc-status-details-bin value, "" when there is none (or it does not decode).
+export function rpcErrorOfGrpc(code: int, message: string, details: string): string {
+  let reason = ""
+  let info = ""
+  const data: string[] = []
+  if (details !== "") {
+    try {
+      const st = try statusOfHeader(details)
+      for (const d of st.details) {
+        if (d.typeUrl === ERROR_INFO_TYPE) {
+          const ei = try decodeErrorInfo(d.value)
+          reason = ei.reason
+          const md: string[] = []
+          const keys = ei.metadata.keys()
+          keys.sort()
+          for (const k of keys) md.push(quote(k) + ":" + quote(ei.metadata.get(k) ?? ""))
+          info = `{"@type":${quote(ERROR_INFO_TYPE)},"reason":${quote(ei.reason)},"domain":${quote(ei.domain)}${md.length > 0 ? `,"metadata":{${md.join(",")}}` : ""}}`
+        } else if (d.typeUrl === STRUCT_TYPE) {
+          const obj = (try decode(d.value, "Struct")).trim()
+          data.push(obj === "{}" ? `{"@type":${quote(STRUCT_TYPE)}}` : `{"@type":${quote(STRUCT_TYPE)},` + obj.slice(1))
+        }
+      }
+    } catch (e) {
+      // details that do not decode are left out; the code and message stand
+    }
+  }
+  if (info !== "") data.push(info)
+  const rpc = rpcCodeOfGrpc(code, reason)
+  const msg = message === "" ? "the agent failed" : message
+  return `{"code":${rpc},"message":${quote(msg)}${data.length > 0 ? `,"data":[${data.join(",")}]` : ""}}`
+}
+
+// ---- tests ----
+
+function hex(b: u8[]): string {
+  const d = "0123456789abcdef"
+  let s = ""
+  for (const x of b) {
+    const v = int(x)
+    s += d.slice(v >> 4, (v >> 4) + 1) + d.slice(v & 15, (v & 15) + 1)
+  }
+  return s
+}
+
+test("Status and ErrorInfo encode as protobuf-go writes them, and decode back", () => {
+  const md: Map<string, string> = new Map()
+  md.set("b", "2")
+  md.set("a", "1")
+  const ei = encodeErrorInfo({ reason: "R", domain: "d", metadata: md })
+  // reason, domain, then the entries in key order
+  expect(hex(ei)).toBe("0a01521201641a060a0161120131" + "1a060a0162120132")
+  const st = encodeStatus({ code: 5, message: "nf", details: [{ typeUrl: "t", value: [u8(1)] }] })
+  expect(hex(st)).toBe("0805" + "12026e66" + "1a06" + "0a0174" + "120101")
+  const back = try decodeStatus(st)
+  expect(back.code).toBe(5)
+  expect(back.message).toBe("nf")
+  expect(back.details.length).toBe(1)
+  expect(back.details[0]!.typeUrl).toBe("t")
+  const eb = try decodeErrorInfo(ei)
+  expect(eb.reason).toBe("R")
+  expect(eb.metadata.get("a")).toBe("1")
+  expect(eb.metadata.get("b")).toBe("2")
+  // OK with nothing else is no bytes at all
+  expect(encodeStatus({ code: 0, message: "", details: [] }).length).toBe(0)
+})
+
+test("the trailer is unpadded base64 and reads back padded or not", () => {
+  const st = encodeStatus({ code: 3, message: "x", details: [] })
+  const h = detailsHeader(st)
+  expect(h.endsWith("=")).toBe(false)
+  expect((try statusOfHeader(h)).code).toBe(3)
+  expect((try statusOfHeader(h + "=")).message).toBe("x")
+})
+
+test("a JSON-RPC error becomes the status a2a-go sends: Structs, then the ErrorInfo with its reason and metadata", () => {
+  const data = `[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"X","domain":"a2a-protocol.org","metadata":{"taskId":"t1","n":3}},{"hint":"retry"}]`
+  const st = try decodeStatus(try a2aStatusOf(5, "task not found", -32001, data))
+  expect(st.code).toBe(5)
+  expect(st.message).toBe("task not found")
+  // the first Struct twice (the error's Details, then its typed detail), then the ErrorInfo
+  expect(st.details.length).toBe(3)
+  expect(st.details[0]!.typeUrl).toBe(STRUCT_TYPE)
+  expect(try decode(st.details[1]!.value, "Struct")).toBe(`{"hint":"retry"}`)
+  const ei = try decodeErrorInfo(st.details[2]!.value)
+  expect(ei.reason).toBe("TASK_NOT_FOUND")
+  expect(ei.domain).toBe(A2A_DOMAIN)
+  expect(ei.metadata.get("taskId")).toBe("t1")
+  expect(ei.metadata.has("n")).toBe(false)
+  // no data: the ErrorInfo alone; an unknown code is an internal error
+  const plain = try decodeStatus(try a2aStatusOf(13, "boom", -12345, undefined))
+  expect(plain.details.length).toBe(1)
+  expect((try decodeErrorInfo(plain.details[0]!.value)).reason).toBe("INTERNAL_ERROR")
+  // a v0.3 error's single data object is a Struct
+  const one = try decodeStatus(try a2aStatusOf(3, "bad", -32602, `{"field":"x"}`))
+  expect(one.details.length).toBe(3)
+})
+
+test("a gRPC status becomes the JSON-RPC error a2a-go reads from it", () => {
+  expect(rpcCodeOfGrpc(5, "")).toBe(-32001)
+  expect(rpcCodeOfGrpc(9, "")).toBe(-32002)
+  expect(rpcCodeOfGrpc(9, "UNSUPPORTED_OPERATION")).toBe(-32004)
+  expect(rpcCodeOfGrpc(9, "VERSION_NOT_SUPPORTED")).toBe(-32009)
+  expect(rpcCodeOfGrpc(9, "TASK_NOT_FOUND")).toBe(-32603)
+  expect(rpcCodeOfGrpc(12, "")).toBe(-32601)
+  expect(rpcCodeOfGrpc(14, "")).toBe(-32603)
+  expect(rpcCodeOfGrpc(4, "")).toBe(-32603)
+  expect(rpcCodeOfGrpc(7, "UNAUTHORIZED")).toBe(-31403)
+  expect(rpcCodeOfGrpc(3, "CONTENT_TYPE_NOT_SUPPORTED")).toBe(-32005)
+  const md: Map<string, string> = new Map()
+  md.set("taskId", "t9")
+  const st = encodeStatus({ code: 9, message: "cannot cancel", details: [
+    { typeUrl: STRUCT_TYPE, value: try encode(`{"hint":"later"}`, "Struct") },
+    { typeUrl: ERROR_INFO_TYPE, value: encodeErrorInfo({ reason: "TASK_NOT_CANCELABLE", domain: A2A_DOMAIN, metadata: md }) },
+  ] })
+  const e = rpcErrorOfGrpc(9, "cannot cancel", detailsHeader(st))
+  expect(e).toBe(`{"code":-32002,"message":"cannot cancel","data":[{"@type":"type.googleapis.com/google.protobuf.Struct","hint":"later"},{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"TASK_NOT_CANCELABLE","domain":"a2a-protocol.org","metadata":{"taskId":"t9"}}]}`)
+  expect(rpcErrorOfGrpc(5, "", "")).toBe(`{"code":-32001,"message":"the agent failed"}`)
+  // details that are not base64 protobuf leave the code and message
+  expect(rpcErrorOfGrpc(16, "who", "!!")).toBe(`{"code":-31401,"message":"who"}`)
+  // and the way back gives the same reason and metadata
+  const again = try decodeStatus(try a2aStatusOf(9, "cannot cancel", -32002, `[{"@type":"type.googleapis.com/google.protobuf.Struct","hint":"later"},{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"TASK_NOT_CANCELABLE","domain":"a2a-protocol.org","metadata":{"taskId":"t9"}}]`))
+  const ei = try decodeErrorInfo(again.details[again.details.length - 1]!.value)
+  expect(ei.reason).toBe("TASK_NOT_CANCELABLE")
+  expect(ei.metadata.get("taskId")).toBe("t9")
+})

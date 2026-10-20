@@ -1,0 +1,488 @@
+From 0ff164414e8dfacbc92f4b99c031d1e05b909744 Mon Sep 17 00:00:00 2001
+From: Raiju contributors <raiju@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 12:55:20 +0000
+Subject: [PATCH] feat: node:fs renameSync, rename, openSync, writeSync,
+ fsyncSync, fdatasyncSync, closeSync and chmodSync; writeFileSync's mode and
+ flush; Stats.mode
+
+node:fs could write a file only in place (writeFileSync truncates, then writes) and had no
+rename or fsync, so a program could not replace a file atomically: one that dies mid-write
+leaves it truncated, and a reader at that moment sees the same. The usual cure, a temporary
+file fsynced and renamed over the target and the directory fsynced, needs these calls.
+
+renameSync and rename (the callback form, run as a microtask) are POSIX rename. openSync takes
+Node's flag strings (r, r+, w, wx, w+, wx+, a, ax, a+, ax+; "r" opens a directory too) and a
+mode, with O_CLOEXEC; an unknown string is EINVAL. writeSync writes all of a string or bytes,
+retrying short writes and EINTR. fsyncSync and fdatasyncSync use F_FULLFSYNC on macOS. chmodSync
+sets a mode. writeFileSync takes { mode, flush }: with either it goes through open, write,
+fsync and close; without, it keeps its old path. Stats gains mode (st_mode). Errors carry Node's
+messages, with both paths for rename ("ENOENT: no such file or directory, rename 'a' -> 'b'")
+and the call for descriptors ("EBADF: bad file descriptor, fsync"); the error table learns
+EBADF, EXDEV and EINVAL.
+
+Tests: tests/run/native_fs_atomic.tov (17 checks): rename over an existing file, its errors, a
+file onto a directory, open/write/fsync/close and the created mode, wx and a, unknown flags, a
+directory fsynced, a closed descriptor, writeFileSync's mode and flush, chmodSync, and the
+callback form with and without an error.
+---
+ crates/tov/src/check/builtins.rs  |   6 ++
+ crates/tov/src/std/fs.tov         |  90 ++++++++++++++++++++++--
+ docs/spec.md                      |   2 +-
+ runtime/tov.c                     |  99 ++++++++++++++++++++++++++-
+ runtime/tov.h                     |   6 ++
+ tests/run/native_fs_atomic.stdout |  17 +++++
+ tests/run/native_fs_atomic.tov    | 109 ++++++++++++++++++++++++++++++
+ 7 files changed, 318 insertions(+), 11 deletions(-)
+ create mode 100644 tests/run/native_fs_atomic.stdout
+ create mode 100644 tests/run/native_fs_atomic.tov
+
+diff --git a/crates/tov/src/check/builtins.rs b/crates/tov/src/check/builtins.rs
+index 2584eb7..3a213d8 100644
+--- a/crates/tov/src/check/builtins.rs
++++ b/crates/tov/src/check/builtins.rs
+@@ -28,6 +28,12 @@ pub(super) fn native_sig(types: &mut Types, name: &str) -> Option<(Vec<TyId>, Ty
+         "mkdir" => (vec![STR, BOOL], VOID),
+         "unlink" => (vec![STR], VOID),
+         "rm" => (vec![STR, BOOL, BOOL], VOID),
++        "rename" => (vec![STR, STR], VOID),
++        "chmod" => (vec![STR, INT], VOID),
++        "open" => (vec![STR, STR, INT], INT),
++        "writeFd" => (vec![INT, STR], INT),
++        "fsync" => (vec![INT, BOOL], VOID),
++        "close" => (vec![INT], VOID),
+         "httpListen" => {
+             let p = |ty| FnParam { ty, inout: false, optional: false };
+             let handler = types.func(vec![p(STR), p(STR), p(STR), p(STR)], VOID);
+diff --git a/crates/tov/src/std/fs.tov b/crates/tov/src/std/fs.tov
+index 69f2e3e..8062ea1 100644
+--- a/crates/tov/src/std/fs.tov
++++ b/crates/tov/src/std/fs.tov
+@@ -23,11 +23,27 @@ export function readFileBytesSync(path: string): u8[] throws Error {
+   return __native.stringToBytes(data)
+ }
+ 
+-export function writeFileSync(path: string, data: string | u8[]): void throws Error {
+-  if (typeof data === "string") {
+-    __native.writeFile(path, data, false)
+-  } else {
+-    __native.writeFile(path, __native.bytesToString(data), false)
++// Options as in Node: `mode` for a file it creates (0o666 by default, less the umask),
++// `flush: true` to fsync the data before returning.
++export function writeFileSync(path: string, data: string | u8[], options?: { mode?: int, flush?: bool }): void throws Error {
++  const text = typeof data === "string" ? data : __native.bytesToString(data)
++  const flush = options?.flush ?? false
++  const mode = options?.mode ?? -1
++  if (!flush && mode < 0) {
++    __native.writeFile(path, text, false)
++    try check()
++    return
++  }
++  const fd = __native.open(path, "w", mode < 0 ? 438 : mode)
++  try check()
++  __native.writeFd(fd, text)
++  if (flush) {
++    __native.fsync(fd, false)
++  }
++  const err = __native.takeError()
++  __native.close(fd)
++  if (err !== "") {
++    throw new Error(err)
+   }
+   try check()
+ }
+@@ -62,6 +78,63 @@ export function unlinkSync(path: string): void throws Error {
+   try check()
+ }
+ 
++// fs.renameSync — POSIX rename(2): an existing `newPath` is replaced in one step, so a
++// reader sees either the old file or the new one. Both paths must be on one file system
++// (EXDEV otherwise).
++export function renameSync(oldPath: string, newPath: string): void throws Error {
++  __native.rename(oldPath, newPath)
++  try check()
++}
++
++// fs.rename — the callback form. The rename is done now; the callback runs as a microtask
++// with the error, or undefined.
++export function rename(oldPath: string, newPath: string, callback: (err: Error | undefined) => void): void {
++  __native.rename(oldPath, newPath)
++  const err = __native.takeError()
++  queueMicrotask(() => {
++    callback(err === "" ? undefined : new Error(err))
++  })
++}
++
++export function chmodSync(path: string, mode: int): void throws Error {
++  __native.chmod(path, mode)
++  try check()
++}
++
++// fs.openSync — a file descriptor. Flags as in Node: "r" (the default), "r+", "w", "wx",
++// "w+", "a", "ax", "a+"; `mode` (default 0o666, less the umask) applies to a created file.
++// "r" also opens a directory, so fsyncSync can make a rename in it durable.
++export function openSync(path: string, flags?: string, mode?: int): int throws Error {
++  const fd = __native.open(path, flags ?? "r", mode ?? 438)
++  try check()
++  return fd
++}
++
++// fs.writeSync — writes all of `data` at the descriptor's position; the bytes written.
++export function writeSync(fd: int, data: string | u8[]): int throws Error {
++  const text = typeof data === "string" ? data : __native.bytesToString(data)
++  const n = __native.writeFd(fd, text)
++  try check()
++  return n
++}
++
++// fs.fsyncSync / fs.fdatasyncSync — flush the descriptor's data (and, for fsync, its
++// metadata) to the storage device.
++export function fsyncSync(fd: int): void throws Error {
++  __native.fsync(fd, false)
++  try check()
++}
++
++export function fdatasyncSync(fd: int): void throws Error {
++  __native.fsync(fd, true)
++  try check()
++}
++
++export function closeSync(fd: int): void throws Error {
++  __native.close(fd)
++  try check()
++}
++
+ export function rmSync(path: string, options?: { recursive?: bool, force?: bool }): void throws Error {
+   const recursive = options?.recursive ?? false
+   const force = options?.force ?? false
+@@ -74,12 +147,15 @@ export class Stats {
+   // Bytes, and last-modified time in milliseconds since the epoch.
+   size: int
+   mtimeMs: f64
++  // File type and permission bits, as st_mode (mode & 0o777 is the permissions).
++  mode: int
+   private dir: bool
+ 
+-  constructor(size: int, mtimeMs: f64, dir: bool) {
++  constructor(size: int, mtimeMs: f64, dir: bool, mode?: int) {
+     this.size = size
+     this.mtimeMs = mtimeMs
+     this.dir = dir
++    this.mode = mode ?? 0
+   }
+ 
+   isFile(): bool { return !this.dir }
+@@ -90,7 +166,7 @@ export function statSync(path: string): Stats throws Error {
+   const info = __native.statInfo(path)
+   try check()
+   const p = info.split(";")
+-  return new Stats(parseInt(p[0]!) ?? 0, parseFloat(p[1]!) ?? 0, p[2] === "1")
++  return new Stats(parseInt(p[0]!) ?? 0, parseFloat(p[1]!) ?? 0, p[2] === "1", parseInt(p[3] ?? "0") ?? 0)
+ }
+ 
+ // fs.accessSync — throws when `path` isn't accessible as `mode` asks.
+diff --git a/docs/spec.md b/docs/spec.md
+index d283c84..26bc19d 100644
+--- a/docs/spec.md
++++ b/docs/spec.md
+@@ -156,7 +156,7 @@ try {
+ 
+ ## 7a. Standard library **[M3]**
+ Node's names, so existing habits work:
+-- `import { readFileSync, readFileBytesSync, writeFileSync, appendFileSync, existsSync, readdirSync, mkdirSync, rmSync, unlinkSync, statSync, accessSync } from "node:fs"` (also `"fs"`, `"std/fs"`): the synchronous API; failures throw `Error` with Node's messages (`ENOENT: no such file or directory, open 'x'`). `readdirSync` returns sorted names. `readFileBytesSync` returns the file's `u8[]` (what Node's `readFileSync` gives as a Buffer), and `writeFileSync`/`appendFileSync` take `string | u8[]`. `statSync` returns a `Stats` (`size`, `mtimeMs`, `isFile()`, `isDirectory()`); `accessSync(path, mode?)` takes Node's mode flags (0 exists, 4 read, 2 write, 1 execute).
++- `import { readFileSync, readFileBytesSync, writeFileSync, appendFileSync, existsSync, readdirSync, mkdirSync, rmSync, unlinkSync, statSync, accessSync, renameSync, rename, chmodSync, openSync, writeSync, fsyncSync, fdatasyncSync, closeSync } from "node:fs"` (also `"fs"`, `"std/fs"`): the synchronous API; failures throw `Error` with Node's messages (`ENOENT: no such file or directory, open 'x'`). `readdirSync` returns sorted names. `readFileBytesSync` returns the file's `u8[]` (what Node's `readFileSync` gives as a Buffer), and `writeFileSync`/`appendFileSync` take `string | u8[]`. `statSync` returns a `Stats` (`size`, `mtimeMs`, `mode`, `isFile()`, `isDirectory()`); `renameSync(from, to)` is POSIX rename (an existing `to` is replaced in one step) and `rename(from, to, callback)` its callback form; `openSync(path, flags?, mode?)` returns a descriptor (Node's flags: `r`, `r+`, `w`, `wx`, `w+`, `a`, `ax`, `a+`; `r` opens a directory too) for `writeSync`, `fsyncSync`, `fdatasyncSync` and `closeSync`; `writeFileSync(path, data, { mode, flush })` sets a created file's mode and fsyncs with `flush: true`; `chmodSync(path, mode)`. Together they make a durable atomic write: write a temporary file in the same directory with `flush: true`, `renameSync` it over the target, then `fsyncSync` the directory; `accessSync(path, mode?)` takes Node's mode flags (0 exists, 4 read, 2 write, 1 execute).
+ - `import * as path from "node:path"`: `join`, `resolve`, `normalize`, `basename`, `dirname`, `extname`, `isAbsolute`, `sep` (POSIX).
+ - `process.argv` (`[binary, binary, ...args]`, so `process.argv.slice(2)` are the arguments), `process.env.NAME` (`string | undefined`), `process.exit(code?)`, `process.cwd()`, `process.platform`, `process.arch`, `process.pid`, `process.stdout.write(s)`, `process.stderr.write(s)`; `console.error` / `console.warn` write to stderr.
+ - `Date.now()` and `performance.now()` (milliseconds).
+diff --git a/runtime/tov.c b/runtime/tov.c
+index 2bc9474..b0ad6a7 100644
+--- a/runtime/tov.c
++++ b/runtime/tov.c
+@@ -2626,6 +2626,9 @@ static const char *tv_errno_name(int e) {
+     case EMFILE: return "EMFILE";
+     case ENOSPC: return "ENOSPC";
+     case EROFS: return "EROFS";
++    case EBADF: return "EBADF";
++    case EXDEV: return "EXDEV";
++    case EINVAL: return "EINVAL";
+     default: return "EIO";
+     }
+ }
+@@ -2639,6 +2642,9 @@ static const char *tv_errno_text(int e) {
+     case EISDIR: return "illegal operation on a directory";
+     case ENOTEMPTY: return "directory not empty";
+     case EPERM: return "operation not permitted";
++    case EBADF: return "bad file descriptor";
++    case EXDEV: return "cross-device link not permitted";
++    case EINVAL: return "invalid argument";
+     default: return strerror(e);
+     }
+ }
+@@ -2809,7 +2815,7 @@ tv_int tv_process_pid(void) {
+ #endif
+ }
+ 
+-/* statSync's payload: "size;mtimeMs;isdir" — parsed by std/fs. */
++/* statSync's payload: "size;mtimeMs;isdir;mode" — parsed by std/fs. */
+ tv_str tv_native_statInfo(tv_str path) {
+     struct stat st;
+     if (stat(path.p->data, &st) != 0) { tv_native_fail(errno, "stat", path); return TV_EMPTY_STR; }
+@@ -2820,8 +2826,8 @@ tv_str tv_native_statInfo(tv_str path) {
+ #else
+     double ms = (double)st.st_mtim.tv_sec * 1000.0 + (double)st.st_mtim.tv_nsec / 1e6;
+ #endif
+-    char buf[96];
+-    int n = snprintf(buf, sizeof buf, "%lld;%.0f;%d", (long long)st.st_size, ms, S_ISDIR(st.st_mode) ? 1 : 0);
++    char buf[112];
++    int n = snprintf(buf, sizeof buf, "%lld;%.0f;%d;%u", (long long)st.st_size, ms, S_ISDIR(st.st_mode) ? 1 : 0, (unsigned)st.st_mode);
+     return tv_str_from(buf, (size_t)n);
+ }
+ 
+@@ -2829,6 +2835,93 @@ void tv_native_access(tv_str path, tv_int mode) {
+     if (access(path.p->data, (int)mode) != 0) tv_native_fail(errno, "access", path);
+ }
+ 
++/* "ENOENT: no such file or directory, rename 'a' -> 'b'" */
++static void tv_native_fail2(int e, const char *op, tv_str from, tv_str to) {
++    if (tv_native_err.len) return;
++    tv_native_fail(e, op, from);
++    tv_sb_push_cstr(&tv_native_err, " -> '");
++    tv_sb_push(&tv_native_err, to.p->data, (size_t)to.p->len);
++    tv_sb_push_char(&tv_native_err, '\'');
++}
++
++/* "EBADF: bad file descriptor, fsync" (Node names no path for descriptor calls) */
++static void tv_native_fail_fd(int e, const char *op) {
++    if (tv_native_err.len) return;
++    tv_sb_push_cstr(&tv_native_err, tv_errno_name(e));
++    tv_sb_push_cstr(&tv_native_err, ": ");
++    tv_sb_push_cstr(&tv_native_err, tv_errno_text(e));
++    tv_sb_push_cstr(&tv_native_err, ", ");
++    tv_sb_push_cstr(&tv_native_err, op);
++}
++
++/* rename(2): replaces an existing `to` in one step (POSIX), so readers see the old file or the new one. */
++void tv_native_rename(tv_str from, tv_str to) {
++    if (rename(from.p->data, to.p->data) != 0) tv_native_fail2(errno, "rename", from, to);
++}
++
++void tv_native_chmod(tv_str path, tv_int mode) {
++    if (chmod(path.p->data, (mode_t)mode) != 0) tv_native_fail(errno, "chmod", path);
++}
++
++#include <fcntl.h>
++
++/* openSync's flags as Node spells them; -1 for an unknown string. */
++static int tv_open_flags(const char *f) {
++    if (!strcmp(f, "r")) return O_RDONLY;
++    if (!strcmp(f, "r+") || !strcmp(f, "rs+")) return O_RDWR;
++    if (!strcmp(f, "w")) return O_WRONLY | O_CREAT | O_TRUNC;
++    if (!strcmp(f, "wx") || !strcmp(f, "xw")) return O_WRONLY | O_CREAT | O_TRUNC | O_EXCL;
++    if (!strcmp(f, "w+")) return O_RDWR | O_CREAT | O_TRUNC;
++    if (!strcmp(f, "wx+") || !strcmp(f, "xw+")) return O_RDWR | O_CREAT | O_TRUNC | O_EXCL;
++    if (!strcmp(f, "a")) return O_WRONLY | O_CREAT | O_APPEND;
++    if (!strcmp(f, "ax") || !strcmp(f, "xa")) return O_WRONLY | O_CREAT | O_APPEND | O_EXCL;
++    if (!strcmp(f, "a+")) return O_RDWR | O_CREAT | O_APPEND;
++    if (!strcmp(f, "ax+") || !strcmp(f, "xa+")) return O_RDWR | O_CREAT | O_APPEND | O_EXCL;
++    return -1;
++}
++
++/* A descriptor (closed on exec), or -1 with the error set. "r" also opens a directory, for fsyncSync on it. */
++tv_int tv_native_open(tv_str path, tv_str flags, tv_int mode) {
++    int fl = tv_open_flags(flags.p->data);
++    if (fl < 0) { tv_native_fail(EINVAL, "open", path); return -1; }
++    int fd;
++    do fd = open(path.p->data, fl | O_CLOEXEC, (mode_t)mode); while (fd < 0 && errno == EINTR);
++    if (fd < 0) { tv_native_fail(errno, "open", path); return -1; }
++    return (tv_int)fd;
++}
++
++/* Writes all of `data` (retrying short writes); the bytes written. */
++tv_int tv_native_writeFd(tv_int fd, tv_str data) {
++    size_t off = 0, len = (size_t)data.p->len;
++    while (off < len) {
++        ssize_t n = write((int)fd, data.p->data + off, len - off);
++        if (n < 0) {
++            if (errno == EINTR) continue;
++            tv_native_fail_fd(errno, "write");
++            return (tv_int)off;
++        }
++        off += (size_t)n;
++    }
++    return (tv_int)off;
++}
++
++void tv_native_fsync(tv_int fd, bool dataOnly) {
++    int r;
++#if defined(__APPLE__)
++    (void)dataOnly;
++    /* fsync on macOS stops at the drive's cache; F_FULLFSYNC reaches the medium (Node uses fsync; this is stricter). */
++    r = fcntl((int)fd, F_FULLFSYNC);
++    if (r != 0) r = fsync((int)fd);
++#else
++    r = dataOnly ? fdatasync((int)fd) : fsync((int)fd);
++#endif
++    if (r != 0) tv_native_fail_fd(errno, dataOnly ? "fdatasync" : "fsync");
++}
++
++void tv_native_close(tv_int fd) {
++    if (close((int)fd) != 0 && errno != EINTR) tv_native_fail_fd(errno, "close");
++}
++
+ _Noreturn void tv_process_exit(tv_int code) {
+     tv_out_flush();
+     exit((int)code);
+diff --git a/runtime/tov.h b/runtime/tov.h
+index 6dfe8fc..3bf5b78 100644
+--- a/runtime/tov.h
++++ b/runtime/tov.h
+@@ -671,6 +671,12 @@ struct tv_arr tv_native_readDir(tv_str path);          /* names, sorted */
+ void tv_native_mkdir(tv_str path, bool recursive);
+ void tv_native_unlink(tv_str path);
+ void tv_native_rm(tv_str path, bool recursive, bool force);
++void tv_native_rename(tv_str from, tv_str to);
++void tv_native_chmod(tv_str path, tv_int mode);
++tv_int tv_native_open(tv_str path, tv_str flags, tv_int mode); /* a descriptor, or -1 */
++tv_int tv_native_writeFd(tv_int fd, tv_str data);
++void tv_native_fsync(tv_int fd, bool dataOnly);
++void tv_native_close(tv_int fd);
+ tv_str tv_native_cwd(void);
+ struct tv_arr tv_process_argv(void);                   /* ["tov-binary-path", "program", args...] like Node's */
+ bool tv_process_env(tv_str name, tv_str *out);
+diff --git a/tests/run/native_fs_atomic.stdout b/tests/run/native_fs_atomic.stdout
+new file mode 100644
+index 0000000..44486d5
+--- /dev/null
++++ b/tests/run/native_fs_atomic.stdout
+@@ -0,0 +1,17 @@
++ok renameSync replaces the target
++ok renameSync error names both paths
++ok renameSync onto a directory fails
++ok openSync/writeSync/fsyncSync/closeSync
++ok openSync mode
++ok openSync wx on an existing file
++ok openSync a appends
++ok openSync unknown flags
++ok fsyncSync on a directory
++ok fsyncSync on a closed descriptor
++ok closeSync twice
++ok writeFileSync mode and flush
++ok chmodSync
++ok writeFileSync without options keeps the mode
++ok writeFileSync flush error
++ok rename callback
++ok rename callback error
+diff --git a/tests/run/native_fs_atomic.tov b/tests/run/native_fs_atomic.tov
+new file mode 100644
+index 0000000..e5072fc
+--- /dev/null
++++ b/tests/run/native_fs_atomic.tov
+@@ -0,0 +1,109 @@
++// node:fs rename, open/write/fsync/close, chmod and writeFileSync's mode and flush, in a
++// directory of its own under /tmp.
++import {
++  readFileSync, writeFileSync, existsSync, mkdirSync, rmSync, statSync,
++  renameSync, rename, chmodSync, openSync, writeSync, fsyncSync, fdatasyncSync, closeSync,
++} from "node:fs"
++
++function check(name: string, ok: bool, detail: string): void {
++  console.log(ok ? `ok ${name}` : `FAIL ${name}: ${detail}`)
++}
++
++function errorOf(f: () => void throws Error): string {
++  try {
++    f()
++  } catch (e) {
++    return e.message
++  }
++  return ""
++}
++
++async function main(): Promise<int> {
++  const dir = `/tmp/tov-fs-atomic-${process.pid}`
++  try {
++    rmSync(dir, { recursive: true, force: true })
++    mkdirSync(dir, { recursive: true })
++
++    // renameSync replaces an existing file
++    writeFileSync(`${dir}/a`, "old")
++    writeFileSync(`${dir}/a.tmp`, "new")
++    renameSync(`${dir}/a.tmp`, `${dir}/a`)
++    check("renameSync replaces the target", readFileSync(`${dir}/a`) === "new" && !existsSync(`${dir}/a.tmp`), readFileSync(`${dir}/a`))
++
++    // a missing source: Node's message with both paths
++    const msg = errorOf(() => { try renameSync(`${dir}/none`, `${dir}/b`) })
++    check("renameSync error names both paths", msg === `ENOENT: no such file or directory, rename '${dir}/none' -> '${dir}/b'`, msg)
++
++    // a file onto a directory fails and leaves both alone
++    mkdirSync(`${dir}/d`)
++    const dmsg = errorOf(() => { try renameSync(`${dir}/a`, `${dir}/d`) })
++    check("renameSync onto a directory fails", dmsg.startsWith("EISDIR") && readFileSync(`${dir}/a`) === "new", dmsg)
++
++    // open, write, fsync, close
++    const fd = openSync(`${dir}/c`, "w", 384)
++    const n = writeSync(fd, "hello ")
++    writeSync(fd, new TextEncoder().encode("world"))
++    fsyncSync(fd)
++    fdatasyncSync(fd)
++    closeSync(fd)
++    check("openSync/writeSync/fsyncSync/closeSync", n === 6 && readFileSync(`${dir}/c`) === "hello world", readFileSync(`${dir}/c`))
++    check("openSync mode", (statSync(`${dir}/c`).mode & 511) === 384, `${statSync(`${dir}/c`).mode & 511}`)
++
++    // "wx" refuses an existing file; "a" appends
++    const xmsg = errorOf(() => { try openSync(`${dir}/c`, "wx") })
++    check("openSync wx on an existing file", xmsg.startsWith("EEXIST: file already exists, open"), xmsg)
++    const afd = openSync(`${dir}/c`, "a")
++    writeSync(afd, "!")
++    closeSync(afd)
++    check("openSync a appends", readFileSync(`${dir}/c`) === "hello world!", readFileSync(`${dir}/c`))
++    const fmsg = errorOf(() => { try openSync(`${dir}/c`, "q") })
++    check("openSync unknown flags", fmsg.startsWith("EINVAL"), fmsg)
++
++    // a directory opens read-only and fsyncs (how a rename is made durable)
++    const dfd = openSync(dir, "r")
++    fsyncSync(dfd)
++    closeSync(dfd)
++    check("fsyncSync on a directory", true, "")
++
++    // a closed descriptor
++    const bmsg = errorOf(() => { try fsyncSync(dfd) })
++    check("fsyncSync on a closed descriptor", bmsg === "EBADF: bad file descriptor, fsync", bmsg)
++    const cmsg = errorOf(() => { try closeSync(dfd) })
++    check("closeSync twice", cmsg === "EBADF: bad file descriptor, close", cmsg)
++
++    // writeFileSync with mode and flush; chmodSync; Stats.mode
++    writeFileSync(`${dir}/e`, "secret", { mode: 384, flush: true })
++    check("writeFileSync mode and flush", readFileSync(`${dir}/e`) === "secret" && (statSync(`${dir}/e`).mode & 511) === 384, `${statSync(`${dir}/e`).mode & 511}`)
++    chmodSync(`${dir}/e`, 420)
++    check("chmodSync", (statSync(`${dir}/e`).mode & 511) === 420, `${statSync(`${dir}/e`).mode & 511}`)
++    writeFileSync(`${dir}/e`, "plain")
++    check("writeFileSync without options keeps the mode", readFileSync(`${dir}/e`) === "plain" && (statSync(`${dir}/e`).mode & 511) === 420, "")
++    const wmsg = errorOf(() => { try writeFileSync(`${dir}/nodir/f`, "x", { flush: true }) })
++    check("writeFileSync flush error", wmsg.startsWith("ENOENT: no such file or directory, open"), wmsg)
++
++    // rename's callback form
++    writeFileSync(`${dir}/g`, "g")
++    let first = ""
++    let second = ""
++    let calls = 0
++    await new Promise<void>((resolve) => {
++      rename(`${dir}/g`, `${dir}/h`, (err) => {
++        calls += 1
++        first = err === undefined ? "none" : err.message
++        rename(`${dir}/g`, `${dir}/h`, (err2) => {
++          calls += 1
++          second = err2 === undefined ? "none" : err2.message
++          resolve()
++        })
++      })
++    })
++    check("rename callback", calls === 2 && first === "none" && readFileSync(`${dir}/h`) === "g", first)
++    check("rename callback error", second.startsWith("ENOENT: no such file or directory, rename"), second)
++  } catch (e) {
++    console.log("FAIL " + e.message)
++  }
++  try {
++    rmSync(dir, { recursive: true, force: true })
++  } catch (e) {}
++  return 0
++}

@@ -3,12 +3,12 @@
 // method, the path after the prefix, the query, the body and the caller's safe headers go
 // upstream unchanged; the configured key supplies the auth. The answer comes back as it arrives.
 // Runware (/runware_passthrough) is out of scope.
-import { Config, KeyConfig, ProviderConfig, providerOf } from "./config"
+import { Config, KeyConfig, ProviderConfig, OAuthKeyConfig, providerOf } from "./config"
 import { addExtraHeaders, trimSlash, proxyOf, tlsOf, poolOf } from "./providers/types"
 import { sign } from "./providers/bedrock"
 import { pickKey, timeoutMs, kindOf } from "./router"
 import { errorJson } from "./schemas"
-import { deadline } from "./deadline"
+import { deadline, IdleWatch, idleWatch, streamIdleSeconds } from "./deadline"
 
 // One prefix: the configured provider it uses, that provider's wire kind, and the base URL
 // the remainder is appended to (empty when the key or the provider's config sets it).
@@ -164,11 +164,14 @@ export function passKey(p: ProviderConfig): KeyConfig | undefined {
 class Relay {
   ctl: ReadableStreamDefaultController | undefined = undefined
   cancelled = false
+  idle: IdleWatch | undefined = undefined
 }
 
 // The caller's stream of an upstream body; the copy runs in the background.
-export function relay(upstream: ReadableStream): ReadableStream {
+// `idle`, when given, guards each read for a silent upstream (stream_idle_timeout_in_seconds).
+export function relay(upstream: ReadableStream, idle?: IdleWatch): ReadableStream {
   const rl = new Relay()
+  rl.idle = idle
   const out = new ReadableStream({
     start: (c) => {
       rl.ctl = c
@@ -184,16 +187,21 @@ export function relay(upstream: ReadableStream): ReadableStream {
 async function copyChunks(upstream: ReadableStream, rl: Relay): Promise<void> {
   try {
     const reader = upstream.getReader()
+    const iw = rl.idle
     while (!rl.cancelled) {
+      if (iw !== undefined) iw.arm()
       const r = await reader.read()
+      if (iw !== undefined) iw.disarm()
       if (r.done) break
       const v = r.value
       const c = rl.ctl
       if (v !== undefined && c !== undefined) c.enqueue(v)
     }
   } catch (e) {
-    // the upstream broke off: the caller's body ends here
+    // the upstream broke off (or went silent): the caller's body ends here
   }
+  const done = rl.idle
+  if (done !== undefined) done.stop()
   const c = rl.ctl
   if (c !== undefined && !rl.cancelled) {
     try {
@@ -223,7 +231,8 @@ function bedrockHost(p: ProviderConfig, key: KeyConfig, service: string): { host
 
 // Serves one passthrough request. The remainder of the path and the query go upstream as they
 // were sent; the answer is streamed back when the upstream streams it.
-export async function passthroughRoute(cfg: Config, req: Request): Promise<Response> throws TypeError {
+// `mint`, when given, gives the bearer of a key with oauth_key_config and no value (the gateway's token cache).
+export async function passthroughRoute(cfg: Config, req: Request, mint?: (oc: OAuthKeyConfig, p: ProviderConfig) => Promise<{ token: string, error: string }>): Promise<Response> throws TypeError {
   const u = URL.parse(req.url)
   const path = u === undefined ? "" : u.pathname
   const hit = routeFor(path)
@@ -256,7 +265,14 @@ export async function passthroughRoute(cfg: Config, req: Request): Promise<Respo
     if (!keyless) return errorReply(404, `provider "${r.provider}" has no key`, "invalid_request_error")
   }
   const k: KeyConfig = key ?? { value: "" }
-  const keyValue = k.value ?? ""
+  let keyValue = k.value ?? ""
+  // a key with oauth_key_config and no value sends the bearer its token endpoint mints, as on the other routes
+  const oc = k.oauth_key_config
+  if (keyValue === "" && oc !== undefined && mint !== undefined && !forwardCaller) {
+    const tok = await mint(oc, p)
+    if (tok.error !== "") return errorReply(502, tok.error, "authentication_error")
+    keyValue = tok.token
+  }
 
   let body: u8[] = []
   let bodyText = ""
@@ -328,7 +344,12 @@ export async function passthroughRoute(cfg: Config, req: Request): Promise<Respo
     const st = res.body
     if (st !== undefined) {
       dl.finish()
-      return new Response(relay(st), { status: res.status, headers: rh })
+      // a silent upstream is cut after network_config.stream_idle_timeout_in_seconds (Bifrost's 120 when unset)
+      const sec = streamIdleSeconds(p.network_config?.stream_idle_timeout_in_seconds)
+      const iw = idleWatch(sec, () => {
+        dl.controller.abort(new DOMException(`no data on the stream for ${sec} seconds`, "TimeoutError"))
+      })
+      return new Response(relay(st, iw), { status: res.status, headers: rh })
     }
     const bytes = try await res.bytes()
     dl.finish()

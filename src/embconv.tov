@@ -6,7 +6,7 @@
 //
 // The bodies are those of embeddings_native.tov (Gemini's batchEmbedContents, Vertex's predict) and of cohere.tov
 // (Cohere v2 embed) and Bedrock's Cohere embed (InvokeModel, signed through the spool). Bedrock's Titan takes one
-// input per call, so it is not converted here.
+// input per call: each input becomes a body of its own (pushTitan, finishTitan), each spooled and signed apart.
 //
 // Gemini gives each input its own output size. When "dimensions" comes before the inputs they stream with it; when it
 // comes after, the inputs are held (bounded by holdMax) and written at the end. Vertex takes the size at the end of
@@ -15,11 +15,16 @@ import { Field, fields, elements, quote, rawNum, rawStr, isNull, decodeString } 
 import { JsonTokenizer, ByteOut, Compact, Tok, bytesOf, textOfBytes, T_OBJ, T_OBJ_END, T_ARR, T_ARR_END, T_KEY, T_STR, T_STRH, T_STRP, T_STRE, T_LIT } from "./jsonstream"
 import { Target } from "./providers/types"
 import * as cohere from "./providers/cohere"
+import { bedrockRequests } from "./embeddings_native"
 
 export const EMB_GEMINI = "embeddings-gemini"
 export const EMB_VERTEX = "embeddings-vertex"
 export const EMB_COHERE = "embeddings-cohere"
 export const EMB_BEDROCK = "embeddings-bedrock"
+export const EMB_TITAN = "embeddings-titan"
+
+// Bytes of one of Titan's bodies: the input they belong to (0 for the first) and the bytes.
+export type TitanPiece = { index: int, bytes: u8[] }
 
 const TS_START = 0
 const TS_KEYS = 1
@@ -62,6 +67,9 @@ export class EmbConv {
   private cur: ByteOut | undefined = undefined
   private elems: u8[][] = []
   private heldSize = 0
+  // Titan: the body being written and the pieces of every body written so far
+  private ti = -1
+  private pieces: TitanPiece[] = []
 
   constructor(readonly family: string, readonly model: string, strMax: int, readonly holdMax: int) {
     this.tk = new JsonTokenizer(strMax, 65536)
@@ -73,6 +81,38 @@ export class EmbConv {
   push(b: u8[]): u8[][] throws SyntaxError {
     for (const t of try this.tk.push(b)) try this.tok(t)
     return this.out.take()
+  }
+
+  // Titan: the next bytes of the request, as pieces of the bodies they belong to.
+  pushTitan(b: u8[]): TitanPiece[] throws SyntaxError {
+    for (const t of try this.tk.push(b)) try this.tok(t)
+    this.cut()
+    return this.takePieces()
+  }
+
+  // Titan: the end of the request; each body's end (Titan's dimensions and normalize, which come after the text in
+  // every body whatever the order of the request).
+  finishTitan(): TitanPiece[] throws SyntaxError {
+    for (const t of try this.tk.finish()) try this.tok(t)
+    if (this.ts !== TS_DONE) throw new SyntaxError("the request body must be a JSON object")
+    if (!this.begun) throw new SyntaxError("input is required")
+    this.cut()
+    const tail = this.dims === "" ? `,"normalize":true}` : `,"dimensions":${this.dims},"normalize":true}`
+    for (let i = 0; i < this.items; i++) this.pieces.push({ index: i, bytes: bytesOf(tail) })
+    return this.takePieces()
+  }
+
+  // the bytes written since the last cut belong to the body being written
+  private cut(): void {
+    for (const c of this.out.take()) {
+      if (this.ti >= 0) this.pieces.push({ index: this.ti, bytes: c })
+    }
+  }
+
+  private takePieces(): TitanPiece[] {
+    const p = this.pieces
+    this.pieces = []
+    return p
   }
 
   // The end of the request; the rest of the provider's body.
@@ -197,7 +237,15 @@ export class EmbConv {
     if (!this.begun) {
       this.begun = true
       this.holding = this.family === EMB_GEMINI && this.dims === ""
-      if (!this.holding) this.out.text(this.headText())
+      if (!this.holding && this.family !== EMB_TITAN) this.out.text(this.headText())
+    }
+    if (this.family === EMB_TITAN) {
+      // a body of its own: what was written before is the last body's
+      this.cut()
+      this.ti = this.items
+      this.items += 1
+      this.out.text(`{"inputText":"`)
+      return
     }
     if (this.holding) this.cur = new ByteOut()
     const d = this.dest()
@@ -211,6 +259,10 @@ export class EmbConv {
 
   private elemEnd(): void throws SyntaxError {
     const f = this.family
+    if (f === EMB_TITAN) {
+      this.out.byte(34)
+      return
+    }
     if (this.holding) {
       const c = this.cur
       if (c !== undefined) {
@@ -390,6 +442,57 @@ test("the Vertex and Bedrock bodies", () => {
   expect(try streamedEmb(EMB_VERTEX, v, 4, 16)).toBe(`{"instances":[{"content":"a"},{"content":"b\\n"}],"parameters":{"outputDimensionality":64}}`)
   expect(try streamedEmb(EMB_VERTEX, `{"model":"m","input":"solo"}`, 100, 16)).toBe(`{"instances":[{"content":"solo"}]}`)
   expect(try streamedEmb(EMB_BEDROCK, `{"model":"m","input":["x","y"]}`, 3, 16)).toBe(`{"texts":["x","y"],"input_type":"search_document"}`)
+})
+
+// Titan's bodies when the request arrives `step` bytes at a time
+function streamedTitan(text: string, step: int, strMax: int): string[] throws SyntaxError {
+  const c = new EmbConv(EMB_TITAN, MODEL, strMax, 1048576)
+  const outs: ByteOut[] = []
+  const add = (ps: TitanPiece[]): void => {
+    for (const p of ps) {
+      while (outs.length <= p.index) outs.push(new ByteOut())
+      outs[p.index]!.bytes(p.bytes)
+    }
+  }
+  const b = bytesOf(text)
+  let i = 0
+  while (i < b.length) {
+    const e = i + step < b.length ? i + step : b.length
+    add(try c.pushTitan(b.slice(i, e)))
+    i = e
+  }
+  add(try c.finishTitan())
+  return outs.map((o) => textOfBytes(o.all()))
+}
+
+test("Titan gets one body per input, as embeddings_native.bedrockRequests writes them", () => {
+  const t: Target = { provider: "bedrock", kind: "bedrock", model: "amazon.titan-embed-text-v2:0", key: { value: "k", bedrock_key_config: { region: "us-east-1" } }, cfg: {} }
+  const long = "a long input string for titan, ".repeat(5)
+  const texts = [
+    `{"model":"m","input":"${long}","dimensions":256}`,
+    `{"model":"m","input":["one \\"quoted\\"","${long}","three"]}`,
+    `{"model":"m","input":["x","y"],"dimensions":512,"encoding_format":"float"}`,
+    `{"dimensions":8,"model":"m","input":["z"]}`,
+  ]
+  for (const text of texts) {
+    const want = (try bedrockRequests(t, try fields(text))).map((u) => u.body)
+    for (const step of [1, 9, 100000]) {
+      for (const mx of [4, 4096]) {
+        const got = try streamedTitan(text, step, mx)
+        expect(got.length).toBe(want.length)
+        for (let k = 0; k < want.length; k++) {
+          expect(try canon(got[k]!)).toBe(try canon(want[k]!))
+        }
+      }
+    }
+  }
+  let threw = false
+  try {
+    streamedTitan(`{"model":"m","input":[]}`, 3, 16)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
 })
 
 test("an input that is refused says why", () => {

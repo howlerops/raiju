@@ -54,6 +54,9 @@ export type CompiledAllow = {
   all: bool,
   regexes: Regex[],
   stops: string[],
+  // the stopwords as a set, and their lengths: an ASCII secret is tested by its substrings of those lengths
+  stopSet: Set<string>,
+  stopLens: int[],
 }
 
 // A rule ready to run. gate is the pattern alone: test() finds the windows, exec()
@@ -125,8 +128,15 @@ function compileAllow(a: AllowRule): CompiledAllow throws SyntaxError {
   const res: Regex[] = []
   for (const s of a.regexes ?? []) res.push(try compileRegex(s))
   const stops: string[] = []
-  for (const s of a.stopwords ?? []) stops.push(s.toLowerCase())
-  return { target: a.target ?? "", all: a.all ?? false, regexes: res, stops: stops }
+  const set = new Set<string>()
+  const lens: int[] = []
+  for (const s of a.stopwords ?? []) {
+    const w = s.toLowerCase()
+    stops.push(w)
+    set.add(w)
+    if (!lens.includes(w.byteLength)) lens.push(w.byteLength)
+  }
+  return { target: a.target ?? "", all: a.all ?? false, regexes: res, stops: stops, stopSet: set, stopLens: lens }
 }
 
 // Compiles rules, or throws a SyntaxError naming the bad pattern.
@@ -442,11 +452,48 @@ function regexHit(a: CompiledAllow, target: string, inout memo: Map<string, bool
   const seen = memo.get(key)
   if (seen !== undefined) return seen
   let hit = false
+  let lowered: string | undefined = undefined
   for (const re of a.regexes) {
+    if (hit) break
+    // a pattern with required literals (an any-of set, lowercase) cannot match a target that holds none of them
+    const lits = re.literals()
+    if (lits.length > 0) {
+      const lt = lowered ?? target.toLowerCase()
+      lowered = lt
+      if (!lits.some((lc: LitCand): bool => lt.includes(lc.lit))) continue
+    }
     if (re.fits(target.byteLength) && re.test(target)) hit = true
   }
   memo.set(key, hit)
   return hit
+}
+
+// Whether a lowercased secret contains one of the allowlist's stopwords (Gitleaks' strings.Contains test). An ASCII
+// secret is checked by its substrings of the stopwords' lengths against the set (the generic rule has about 1,500
+// stopwords and a secret has tens of bytes), anything else word by word.
+function stopIn(a: CompiledAllow, low: string): bool {
+  const b = enc.encode(low)
+  let ascii = true
+  for (const c of b) {
+    if (int(c) >= 128) {
+      ascii = false
+      break
+    }
+  }
+  if (!ascii) {
+    for (const w of a.stops) {
+      if (low.includes(w)) return true
+    }
+    return false
+  }
+  const n = b.length
+  for (const len of a.stopLens) {
+    if (len === 0) return true
+    for (let i = 0; i + len <= n; i++) {
+      if (a.stopSet.has(low.slice(i, i + len))) return true
+    }
+  }
+  return false
 }
 
 // True when one allowlist covers a finding. Its regexes test the target: the secret, the
@@ -455,11 +502,7 @@ function regexHit(a: CompiledAllow, target: string, inout memo: Map<string, bool
 function allowedBy(a: CompiledAllow, secret: string, match: string, line: string, inout memo: Map<string, bool>, id: string): bool {
   const target = a.target === "match" ? match : a.target === "line" ? line : secret
   const hitRe = target !== "" && regexHit(a, target, &memo, id)
-  const low = secret.toLowerCase()
-  let hitStop = false
-  for (const w of a.stops) {
-    if (low.includes(w)) hitStop = true
-  }
+  const hitStop = a.stops.length > 0 && stopIn(a, secret.toLowerCase())
   if (a.all) {
     if (a.regexes.length === 0 && a.stops.length === 0) return false
     if (a.regexes.length > 0 && !hitRe) return false
@@ -736,4 +779,14 @@ test("an overlapping literal is found past the search chunks, after multibyte te
   const first = text.indexOf("a-a5")
   expect(r.findings[0]!.start).toBe(first)
   expect(r.findings[1]!.start).toBe(text.slice(first + 1).indexOf("a-a5") + first + 1)
+})
+
+test("stopwords of several lengths are found inside ASCII and non-ASCII secrets", () => {
+  const rules = try compileRules([{ pattern: "tok_\\S{6,}", action: "block", allow: [{ stopwords: ["Demo", "sample", "xx"] }] }])
+  expect(applyRegex("tok_abcdemo1", rules).blocked).toBe(false)
+  expect(applyRegex("tok_SAMPLE99", rules).blocked).toBe(false)
+  expect(applyRegex("tok_abxxcd", rules).blocked).toBe(false)
+  expect(applyRegex("tok_abcdef12", rules).blocked).toBe(true)
+  expect(applyRegex("tok_édemoé", rules).blocked).toBe(false)
+  expect(applyRegex("tok_éabcdé", rules).blocked).toBe(true)
 })

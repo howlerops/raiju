@@ -49,6 +49,8 @@ export type Prefix = {
   modelTo: int,
   hasStream: bool,
   stream: bool,
+  // whether the prefix holds a stream_options member
+  streamOptions: bool,
   modalities: string[],
   speech: bool,
   threadType: string,
@@ -169,13 +171,14 @@ function eachMember(b: u8[], start: int, on: (kf: int, kt: int, vf: int, vt: int
 // two Bifrost reads (generationConfig and thread); every other value is skipped, so a big message array
 // costs one pass and a field after it is simply not found.
 export function scanPrefix(b: u8[]): Prefix {
-  const p: Prefix = { model: "", hasModel: false, modelFrom: 0, modelTo: 0, hasStream: false, stream: false, modalities: [], speech: false, threadType: "" }
+  const p: Prefix = { model: "", hasModel: false, modelFrom: 0, modelTo: 0, hasStream: false, stream: false, streamOptions: false, modalities: [], speech: false, threadType: "" }
   let model = ""
   let hasModel = false
   let mf = 0
   let mt = 0
   let hasStream = false
   let stream = false
+  let streamOptions = false
   const modalities: string[] = []
   let speech = false
   let threadType = ""
@@ -196,6 +199,8 @@ export function scanPrefix(b: u8[]): Prefix {
         hasStream = true
         stream = v
       }
+    } else if (matches(b, kf, kt, "stream_options")) {
+      streamOptions = true
     } else if (matches(b, kf, kt, "generationConfig")) {
       eachMember(b, vf, (k2f, k2t, v2f, v2t) => {
         if (matches(b, k2f, k2t, "speechConfig")) speech = true
@@ -236,6 +241,7 @@ export function scanPrefix(b: u8[]): Prefix {
   p.modelTo = mt
   p.hasStream = hasStream
   p.stream = stream
+  p.streamOptions = streamOptions
   p.modalities = modalities
   p.speech = speech
   p.threadType = threadType
@@ -285,6 +291,9 @@ export class BodyTap {
 
 // A request body being sent on: the bytes already read (the prefix), the rest still to come from the client,
 // and the provider's model name to put where the caller's was.
+// A converted body of one more call: the bytes, their length and their SHA-256 (hex), for the signature.
+export type ExtraBody = { body: ReadableStream, length: int, hash: string }
+
 export class LargeBody {
   tap: BodyTap
   // the provider's name for the model (set when the target is chosen); "" sends the prefix as it came
@@ -301,8 +310,13 @@ export class LargeBody {
   passAnswer = true
   // why the conversion refused the body, when it did
   convError = ""
+  // An OpenAI-format chat or text stream asks for its usage chunk, as Bifrost asks every such stream: the prefix gets
+  // stream_options.include_usage first in the object (a stream_options the caller wrote later in the body still wins)
+  askUsage = false
   // set by the spool to remove its files when the request is over
   release: (() => void) | undefined = undefined
+  // the bodies of the calls after the first, for a provider that takes one input per call (Bedrock Titan), spooled
+  extras: ExtraBody[] = []
   constructor(readonly settings: LargeSettings, readonly prefix: u8[], readonly meta: Prefix, readonly source: ReadableStream | undefined, readonly declared: int) {
     this.tap = new BodyTap(settings.truncatedLog, settings.maxPayload)
     this.tap.see(prefix)
@@ -320,21 +334,42 @@ export class LargeBody {
     return this.declared + this.delta()
   }
 
-  // the model literal's length change, for an upstream Content-Length
+  // the model literal's length change and the inserted member, for an upstream Content-Length
   delta(): int {
-    if (this.upstreamModel === "" || !this.meta.hasModel) return 0
-    return new TextEncoder().encode(this.literal()).length - (this.meta.modelTo - this.meta.modelFrom)
+    const ins = this.inserted().length
+    if (this.upstreamModel === "" || !this.meta.hasModel) return ins
+    return ins + new TextEncoder().encode(this.literal()).length - (this.meta.modelTo - this.meta.modelFrom)
   }
 
-  // the prefix with the provider's model name where the caller's was
+  // the member put in front of the caller's (askUsage), or nothing
+  inserted(): u8[] {
+    if (!this.askUsage || this.plain || this.meta.streamOptions) return []
+    return new TextEncoder().encode(USAGE_MEMBER)
+  }
+
+  // the prefix with the provider's model name where the caller's was (and the inserted member after the brace)
   head(): u8[] {
     const m = this.meta
-    if (this.upstreamModel === "" || !m.hasModel || this.upstreamModel === m.model) return this.prefix
-    const mid = new TextEncoder().encode(this.literal())
+    const swap = !(this.upstreamModel === "" || !m.hasModel || this.upstreamModel === m.model)
+    const ins = this.inserted()
+    if (!swap && ins.length === 0) return this.prefix
+    // the object's opening brace
+    const open = ins.length === 0 ? -1 : skipWs(this.prefix, 0)
+    const mid = swap ? new TextEncoder().encode(this.literal()) : []
     const out: u8[] = []
-    for (let i = 0; i < m.modelFrom; i++) out.push(this.prefix[i]!)
-    for (const c of mid) out.push(c)
-    for (let i = m.modelTo; i < this.prefix.length; i++) out.push(this.prefix[i]!)
+    let i = 0
+    while (i < this.prefix.length) {
+      if (swap && i === m.modelFrom) {
+        for (const c of mid) out.push(c)
+        i = m.modelTo
+        continue
+      }
+      out.push(this.prefix[i]!)
+      if (i === open) {
+        for (const c of ins) out.push(c)
+      }
+      i += 1
+    }
     return out
   }
 
@@ -385,6 +420,9 @@ export class LargeBody {
     })
   }
 }
+
+// what askUsage puts in front of the caller's members
+const USAGE_MEMBER = `"stream_options":{"include_usage":true},`
 
 // The kinds of JSON route this feature serves: those that name a model in the body.
 export function largeRoute(path: string): string {
@@ -683,7 +721,7 @@ export function scanMultipart(b: u8[], boundary: string): Multipart {
 // bytes for the rewrite (the value is bare text, so LargeBody.plain is set), and the stream form field.
 export function formPrefix(b: u8[], boundary: string): Prefix {
   const mp = scanMultipart(b, boundary)
-  const p: Prefix = { model: "", hasModel: false, modelFrom: 0, modelTo: 0, hasStream: false, stream: false, modalities: [], speech: false, threadType: "" }
+  const p: Prefix = { model: "", hasModel: false, modelFrom: 0, modelTo: 0, hasStream: false, stream: false, streamOptions: false, modalities: [], speech: false, threadType: "" }
   let model = ""
   let has = false
   let mf = 0
@@ -990,4 +1028,24 @@ test("LargeBody puts the provider's model name into a form field", () => {
   lb.upstreamModel = "a-much-longer-whisper"
   expect(str(lb.head())).toBe(body.replace("openai/whisper-1", "a-much-longer-whisper"))
   expect(lb.delta()).toBe("a-much-longer-whisper".byteLength - "openai/whisper-1".byteLength)
+})
+
+test("a large stream asks for its usage chunk unless the prefix has stream_options", () => {
+  const src = ` {"model":"openai/gpt-4o","stream":true,"messages":[]}`
+  const meta = scanPrefix(bytes(src))
+  expect(meta.streamOptions).toBe(false)
+  const body = new LargeBody({ requestThreshold: 1, responseThreshold: 1, prefetch: 64, maxPayload: 1000, truncatedLog: 10 }, bytes(src), meta, undefined, src.byteLength)
+  body.askUsage = true
+  expect(str(body.head())).toBe(` {"stream_options":{"include_usage":true},"model":"openai/gpt-4o","stream":true,"messages":[]}`)
+  expect(body.contentLength()).toBe(str(body.head()).byteLength)
+  body.upstreamModel = "gpt-4o"
+  const want = ` {"stream_options":{"include_usage":true},"model":"gpt-4o","stream":true,"messages":[]}`
+  expect(str(body.head())).toBe(want)
+  expect(body.contentLength()).toBe(want.byteLength)
+  // the caller's own stream_options is left alone
+  const own = `{"model":"m","stream":true,"stream_options":{"include_usage":false},"messages":[]}`
+  const ob = new LargeBody({ requestThreshold: 1, responseThreshold: 1, prefetch: 64, maxPayload: 1000, truncatedLog: 10 }, bytes(own), scanPrefix(bytes(own)), undefined, own.byteLength)
+  ob.askUsage = true
+  expect(str(ob.head())).toBe(own)
+  expect(ob.delta()).toBe(0)
 })

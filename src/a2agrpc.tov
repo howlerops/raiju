@@ -5,16 +5,22 @@
 // its request (a2apb), runs the operation the JSON-RPC binding would run (Ops.a2aCall, binding "grpc") and encodes the
 // answer; an agent's error is a gRPC status as a2a-go maps it.
 //
-// Not built: TLS (h2c only, as Bifrost's listener); the ErrorInfo details a2a-go attaches to a status; a client's
-// cancellation ends a call only at its deadline.
+// An error the agent answered (a JSON-RPC error, whatever binding it came in) carries the details a2a-go attaches
+// to its status: a google.rpc.ErrorInfo with the A2A reason in grpc-status-details-bin (grpcstatus.tov). The
+// gateway's own refusals (no agent, no key, no grant, limits) are plain statuses, as Bifrost's are.
+//
+// A client that cancels a call (RST_STREAM, or its connection lost) cancels the call upstream: the agent's request is
+// aborted or its gRPC stream reset (ops.tov CallCancel). Not built: TLS (h2c only, as Bifrost's listener).
 import { listen, H2Header } from "./h2"
 import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs"
+import { writeFileAtomic } from "./atomicfile"
 import { grpcServe, unaryRun, serverRun, GrpcRun, GrpcCall, GrpcError, httpToGrpc, GRPC_INTERNAL, GRPC_INVALID_ARGUMENT, GRPC_NOT_FOUND, GRPC_UNIMPLEMENTED, GRPC_FAILED_PRECONDITION, GRPC_UNAUTHENTICATED, GRPC_PERMISSION_DENIED, GRPC_RESOURCE_EXHAUSTED, GRPC_UNAVAILABLE, GRPC_DEADLINE_EXCEEDED } from "./grpcwire"
 import { Ops, GrpcGate } from "./ops"
 import { requestOf, responseOf, encode, decode } from "./a2apb"
-import { rpcCall, Call, SseSplitter } from "./a2a"
+import { rpcCall, Call, CallCancel, SseSplitter } from "./a2a"
 import { Field, fields, find, rawStr, rawNum, isNull } from "./json"
 import { Hdrs } from "./schemas"
+import { a2aStatusOf, decodeStatus, decodeErrorInfo } from "./grpcstatus"
 import { AgentConfig, ServerSectionConfig, VirtualKeyConfig } from "./config"
 
 const SERVICE = "/lf.a2a.v1.A2AService/"
@@ -122,7 +128,14 @@ function resultOf(text: string, status: int): string throws GrpcError {
     if (er !== undefined && !isNull(er)) {
       const ef = envelopeOf(er) ?? []
       const code = Math.floor(rawNum(ef, "code") ?? -32603.0)
-      throw new GrpcError(grpcOfRpcCode(code), rawStr(ef, "message") ?? "the agent failed")
+      const g = new GrpcError(grpcOfRpcCode(code), rawStr(ef, "message") ?? "the agent failed")
+      // the status details a2a-go sends for an A2A error: its ErrorInfo (reason, domain, metadata) and Structs
+      try {
+        g.details = try a2aStatusOf(g.code, g.message, code, find(ef, "data"))
+      } catch (e) {
+        g.details = []
+      }
+      throw g
     }
     const res = find(fs, "result")
     if (res !== undefined && status < 400) return res
@@ -192,9 +205,9 @@ async function within<T>(p: Promise<T, Error>, deadlineMs: int | undefined): Pro
 
 // The operation through the gateway: the call as the grpc binding (the agent's card decides the names it goes out in)
 // and the answer, which the binding turns into a result or an error.
-async function answer(ops: Ops, a: Admitted, op: string, params: string): Promise<{ status: int, text: string, body: ReadableStream | undefined, ct: string }, Error> {
+async function answer(ops: Ops, a: Admitted, op: string, params: string, cancel: CallCancel): Promise<{ status: int, text: string, body: ReadableStream | undefined, ct: string }, Error> {
   const call = try callOf(op, params)
-  const r = await ops.a2aCall(a.agent, call, "grpc", "1", a.h, a.vk, a.base)
+  const r = await ops.a2aCall(a.agent, call, "grpc", "1", a.h, a.vk, a.base, cancel)
   const body = r.body
   const ct = r.headers.get("content-type") ?? ""
   if (r.status < 400 && ct.includes("text/event-stream") && body !== undefined) return { status: r.status, text: "", body: body, ct: ct }
@@ -202,13 +215,27 @@ async function answer(ops: Ops, a: Admitted, op: string, params: string): Promis
   return { status: r.status, text: text, body: undefined, ct: ct }
 }
 
-// One unary method: its request, the operation, its response.
+// The cancellation of a call: fired when the client resets its stream or its connection is lost.
+function cancelOf(call: GrpcCall): CallCancel {
+  const c = new CallCancel()
+  call.onCancel(() => c.fire())
+  return c
+}
+
+// One unary method: its request, the operation, its response. A call past its deadline stops its work upstream too.
 function unary(ops: Ops, domain: string, op: string): GrpcRun {
   return unaryRun(async (req: u8[], call: GrpcCall): Promise<u8[], Error> => {
+    await ops.ensureCard(agentOfAuthority(call.authority, domain))
     const a = try admit(ops, domain, call)
     const params = try requestJson(req, op)
-    const got = try await within(answer(ops, a, op, params), call.deadlineMs)
-    return try bytesOf(op, try resultOf(got.text, got.status))
+    const cancel = cancelOf(call)
+    try {
+      const got = try await within(answer(ops, a, op, params, cancel), call.deadlineMs)
+      return try bytesOf(op, try resultOf(got.text, got.status))
+    } catch (e) {
+      cancel.fire()
+      throw e
+    }
   })
 }
 
@@ -239,16 +266,24 @@ async function passEvents(body: ReadableStream, call: GrpcCall, op: string): Pro
 // One server-streaming method: its request, the operation, and each event of its answer.
 function streamed(ops: Ops, domain: string, op: string): GrpcRun {
   return serverRun(async (req: u8[], call: GrpcCall): Promise<void, Error> => {
+    await ops.ensureCard(agentOfAuthority(call.authority, domain))
     const a = try admit(ops, domain, call)
     const params = try requestJson(req, op)
-    const got = try await within(answer(ops, a, op, params), call.deadlineMs)
-    const body = got.body
-    if (body !== undefined) {
-      try await passEvents(body, call, op)
-      return
+    const cancel = cancelOf(call)
+    try {
+      const got = try await within(answer(ops, a, op, params, cancel), call.deadlineMs)
+      const body = got.body
+      if (body !== undefined) {
+        try await passEvents(body, call, op)
+        return
+      }
+      // an answer that is not a stream is one event
+      try await call.send(try bytesOf(op, try resultOf(got.text, got.status)))
+    } catch (e) {
+      // past the deadline, or the client gone: the agent's call stops as well
+      cancel.fire()
+      throw e
     }
-    // an answer that is not a stream is one event
-    try await call.send(try bytesOf(op, try resultOf(got.text, got.status)))
   })
 }
 
@@ -318,7 +353,7 @@ export function claimA2aGrpc(ops: Ops, host: string, server: ServerSectionConfig
 function takeLease(lease: string): bool {
   try {
     mkdirSync(lease)
-    writeFileSync(lease + "/pid", `${process.pid}`)
+    writeFileAtomic(lease + "/pid", `${process.pid}`, { durable: false })
     return true
   } catch (e) {
     // the lease is held, or was left by a holder that is gone
@@ -333,7 +368,7 @@ function takeLease(lease: string): bool {
     try {
       rmSync(lease, { recursive: true, force: true })
       mkdirSync(lease)
-      writeFileSync(lease + "/pid", `${process.pid}`)
+      writeFileAtomic(lease + "/pid", `${process.pid}`, { durable: false })
       return true
     } catch (e) {
       return false
@@ -408,6 +443,20 @@ test("an answer is its result, or the error it carries as a status", () => {
   }
   expect(code).toBe(GRPC_NOT_FOUND)
   expect(msg).toBe("task not found")
+  let reason = ""
+  let meta = ""
+  try {
+    const z = try resultOf(`{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"task not found","data":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"TASK_NOT_FOUND","domain":"a2a-protocol.org","metadata":{"taskId":"t7"}}]}}`, 200)
+  } catch (e) {
+    if (e instanceof GrpcError) {
+      const st = try decodeStatus(e.details)
+      const ei = try decodeErrorInfo(st.details[st.details.length - 1]!.value)
+      reason = ei.reason
+      meta = ei.metadata.get("taskId") ?? ""
+    }
+  }
+  expect(reason).toBe("TASK_NOT_FOUND")
+  expect(meta).toBe("t7")
   let plain: int = -1
   try {
     const y = try resultOf("upstream went away", 502)

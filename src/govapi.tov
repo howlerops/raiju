@@ -1,10 +1,10 @@
 // Management API logic that needs no store: the RBAC listings, budget overrides, the expired-key
 // cleanup, routing rule checks and the complexity analyzer config. store.tov and ops.tov route to these.
-import { AccessProfile, AdminUserConfig, BudgetOverride, ClientConfig, ComplexitySettings, GovernanceConfig, PermissionPair, RoleConfig, VirtualKeyConfig } from "./config"
+import { AccessProfile, AdminUserConfig, BudgetOverride, ClientConfig, ComplexitySettings, GovernanceConfig, PermissionPair, ProfileRole, RoleConfig, VirtualKeyConfig } from "./config"
 import { RoutingRule, compile } from "./cel"
 import { fields, Field, find } from "./json"
 import { rfc3339Ms } from "./vkexpiry"
-import { roleIdOf, withRoleIds } from "./rbac"
+import { anyRoleId, builtinRoleId, builtinPairs, customRole, isBuiltinRole, roleIdOf, withRoleIds } from "./rbac"
 
 // ---- RBAC listings ----
 
@@ -44,6 +44,73 @@ export function permissionIds(resources: string[], operations: string[], pairs: 
     if (pairs.some((p) => p.resource === d.resource && p.operation === d.operation)) out.push(d.id)
   }
   return out
+}
+
+// The (resource, operation) pairs a role holds: a built-in role's fixed rules as pairs, a custom role's own.
+export function rolePairs(roles: RoleConfig[] | undefined, role: string, resources: string[], operations: string[]): PermissionPair[] {
+  if (isBuiltinRole(role) && customRole(roles, role) === undefined) return builtinPairs(role, resources, operations)
+  return customRole(roles, role)?.permissions ?? []
+}
+
+// Bifrost's PermissionsResponse: every resource with every operation, true where the pairs hold it.
+export function permissionMap(pairs: PermissionPair[], resources: string[], operations: string[]): string {
+  const rs: string[] = []
+  for (const r of resources) {
+    const ops: string[] = []
+    for (const op of operations) {
+      const held = pairs.some((p) => p.resource === r && p.operation === op)
+      ops.push(`${JSON.stringify(op)}:${held ? "true" : "false"}`)
+    }
+    rs.push(`${JSON.stringify(r)}:{${ops.join(",")}}`)
+  }
+  return `{"permissions":{${rs.join(",")}}}`
+}
+
+// ---- users by email ----
+
+// A user in Bifrost's UserObject shape: the name is the id, the role a {id, name, is_system_role} object
+// beside role_id, and the access profiles the user holds (heldProfiles order).
+export function userObjectJson(u: AdminUserConfig, users: AdminUserConfig[] | undefined, roles: RoleConfig[] | undefined, profiles: AccessProfile[] | undefined): string {
+  const rid = anyRoleId(roles, u.role)
+  const system = builtinRoleId(u.role) !== undefined && customRole(roles, u.role) === undefined
+  const role: string[] = []
+  if (rid !== undefined) role.push(`"id":${rid}`)
+  role.push(`"name":${JSON.stringify(u.role)}`)
+  const desc = customRole(roles, u.role)?.description
+  if (desc !== undefined) role.push(`"description":${JSON.stringify(desc)}`)
+  role.push(`"is_system_role":${system ? "true" : "false"}`)
+  const held: string[] = []
+  for (const p of heldProfiles(users, roles, profiles, u.name)) held.push(`{"id":${JSON.stringify(p.id)},"name":${JSON.stringify(p.name ?? p.id)}}`)
+  const ridText = rid === undefined ? "null" : `${rid}`
+  const parts: string[] = [
+    `"id":${JSON.stringify(u.name)}`,
+    `"name":${JSON.stringify(u.name)}`,
+    `"email":${JSON.stringify(emailOf(u))}`,
+    `"role_id":${ridText}`,
+    `"role":{${role.join(",")}}`,
+    `"disabled":${u.disabled === true ? "true" : "false"}`,
+    `"teams":${JSON.stringify((u.teams ?? []).map((t) => ({ id: t })))}`,
+    `"business_units":${JSON.stringify((u.business_units ?? []).map((b) => ({ id: b })))}`,
+    `"access_profiles":[${held.join(",")}]`,
+  ]
+  return "{" + parts.join(",") + "}"
+}
+
+// A user's email: the one set on the user, else the name when it is an address (a sign-in identity), else "".
+export function emailOf(u: AdminUserConfig): string {
+  const e = u.email
+  if (e !== undefined) return e
+  return u.name.includes("@") ? u.name : ""
+}
+
+// Bifrost's UserVirtualKeyLookupResponse: the virtual keys assigned to the user (their user_id), with values.
+export function userKeysJson(u: AdminUserConfig, vks: VirtualKeyConfig[] | undefined): string {
+  const keys: string[] = []
+  for (const vk of vks ?? []) {
+    if ((vk.user_id ?? "") !== u.name) continue
+    keys.push(`{"id":${JSON.stringify(vk.id)},"name":${JSON.stringify(vk.name ?? vk.id)},"value":${JSON.stringify(vk.value)},"is_active":${vk.is_active !== false ? "true" : "false"}}`)
+  }
+  return `{"user_id":${JSON.stringify(u.name)},"email":${JSON.stringify(emailOf(u))},"virtual_keys":[${keys.join(",")}]}`
 }
 
 // ---- budget overrides ----
@@ -210,8 +277,8 @@ function userNamed(users: AdminUserConfig[] | undefined, name: string): AdminUse
 }
 
 // The ids of the access profiles a user holds, in rank order: those set on the user (access_profile_ids),
-// then those attached to the user's custom role (the profile's roles). A profile is listed once, and an id
-// that names no profile is skipped. Built-in roles hold no attachments.
+// then those attached to the user's role (the profile's roles; built-in roles have fixed ids). A profile is
+// listed once, and an id that names no profile is skipped.
 export function heldProfileIds(users: AdminUserConfig[] | undefined, roles: RoleConfig[] | undefined, profiles: AccessProfile[] | undefined, name: string): string[] {
   const out: string[] = []
   const u = userNamed(users, name)
@@ -219,15 +286,46 @@ export function heldProfileIds(users: AdminUserConfig[] | undefined, roles: Role
   for (const id of u.access_profile_ids ?? []) {
     if (profileNamed(profiles, id) !== undefined && !out.includes(id)) out.push(id)
   }
-  const rid = roleIdOf(roles, u.role)
+  const rid = anyRoleId(roles, u.role)
   if (rid !== undefined) {
     const want: int = rid
     for (const p of profiles ?? []) {
       if (out.includes(p.id)) continue
-      if ((p.roles ?? []).some((b) => b.role_id === want)) out.push(p.id)
+      if ((p.roles ?? []).some((b) => b.role_id === want && bindingReaches(b, name))) out.push(p.id)
     }
   }
   return out
+}
+
+// Whether a role attachment reaches a user of that role: every user when it records no users, else the users
+// it was applied to, and with is_default every user not in the role when it was attached.
+export function bindingReaches(b: ProfileRole, name: string): bool {
+  const users = b.users
+  if (users === undefined) return true
+  if (users.includes(name)) return true
+  return b.is_default === true && !(b.except ?? []).includes(name)
+}
+
+// The attachment of roles to a profile (Bifrost's attach): the users of those roles now (holders) are given the
+// profile with apply_to_existing; with is_default the role's later users get it too. A user who already held it
+// through an earlier attachment of the same role keeps it.
+export function attachBinding(roleId: int, isDefault: bool | undefined, apply: bool, holders: string[], prior: ProfileRole | undefined): ProfileRole {
+  const users: string[] = []
+  if (prior !== undefined) {
+    for (const h of holders) {
+      if (bindingReaches(prior, h)) users.push(h)
+    }
+  }
+  if (apply) {
+    for (const h of holders) {
+      if (!users.includes(h)) users.push(h)
+    }
+  }
+  const except: string[] = []
+  for (const h of holders) {
+    if (!users.includes(h)) except.push(h)
+  }
+  return { role_id: roleId, is_default: isDefault, users: users, except: except }
 }
 
 // The access profiles a user holds, in the order heldProfileIds gives, as the users API lists them.
@@ -369,3 +467,61 @@ test("withRoleIds keeps the ids roles have and numbers the rest after the larges
   expect(roleIdOf([{ name: "a" }], "zz")).toBeUndefined()
 })
 
+
+test("a built-in role's attachments are held by its users", () => {
+  const users: AdminUserConfig[] = [{ name: "cy", role: "viewer" }, { name: "di", role: "editor" }]
+  const profiles: AccessProfile[] = [{ id: "p-view", roles: [{ role_id: 9003 }] }]
+  expect(heldProfileIds(users, [], profiles, "cy").join(",")).toBe("p-view")
+  expect(heldProfileIds(users, [], profiles, "di").length).toBe(0)
+})
+
+test("role pairs expand built-in roles, and the permission map lists every pair", () => {
+  const roles: RoleConfig[] = [{ id: 1, name: "ops", permissions: [{ resource: "Teams", operation: "View" }] }]
+  expect(rolePairs(roles, "ops", ["Teams"], ["View"]).length).toBe(1)
+  expect(rolePairs(roles, "viewer", ["Teams", "Users"], ["View", "Create"]).map((p) => p.resource + ":" + p.operation).join(",")).toBe("Teams:View")
+  expect(rolePairs(roles, "ghost", ["Teams"], ["View"]).length).toBe(0)
+  const m = permissionMap([{ resource: "Teams", operation: "View" }], ["Teams", "Logs"], ["View", "Create"])
+  expect(m).toBe(`{"permissions":{"Teams":{"View":true,"Create":false},"Logs":{"View":false,"Create":false}}}`)
+})
+
+test("a user reads in Bifrost's UserObject shape, and its keys by email", () => {
+  const roles: RoleConfig[] = [{ id: 1, name: "ops", description: "on call" }]
+  const users: AdminUserConfig[] = [{ name: "ann", email: "ann@example.com", role: "ops", teams: ["t1"] }, { name: "bo@example.com", role: "viewer" }]
+  const profiles: AccessProfile[] = [{ id: "p1", name: "Base", roles: [{ role_id: 1 }] }]
+  const a = userObjectJson(users[0]!, users, roles, profiles)
+  expect(a).toBe(`{"id":"ann","name":"ann","email":"ann@example.com","role_id":1,"role":{"id":1,"name":"ops","description":"on call","is_system_role":false},"disabled":false,"teams":[{"id":"t1"}],"business_units":[],"access_profiles":[{"id":"p1","name":"Base"}]}`)
+  const b = userObjectJson(users[1]!, users, roles, profiles)
+  expect(b.includes(`"email":"bo@example.com","role_id":9003,"role":{"id":9003,"name":"viewer","is_system_role":true}`)).toBe(true)
+  const vks: VirtualKeyConfig[] = [{ id: "vk1", name: "mine", value: "sk-bf-a", user_id: "ann" }, { id: "vk2", value: "sk-bf-b", user_id: "zed", is_active: false }]
+  expect(userKeysJson(users[0]!, vks)).toBe(`{"user_id":"ann","email":"ann@example.com","virtual_keys":[{"id":"vk1","name":"mine","value":"sk-bf-a","is_active":true}]}`)
+  expect(userKeysJson(users[1]!, vks)).toBe(`{"user_id":"bo@example.com","email":"bo@example.com","virtual_keys":[]}`)
+})
+
+test("role attachments: apply_to_existing reaches the role's users now, is_default its later users", () => {
+  const holders = ["ana", "bo"]
+  // neither: nobody now, nobody later
+  const none = attachBinding(1, undefined, false, holders, undefined)
+  expect(bindingReaches(none, "ana")).toBe(false)
+  expect(bindingReaches(none, "zed")).toBe(false)
+  // apply only: the users now, not later ones
+  const now = attachBinding(1, undefined, true, holders, undefined)
+  expect(bindingReaches(now, "bo")).toBe(true)
+  expect(bindingReaches(now, "zed")).toBe(false)
+  // default only: later users, not the ones in the role now
+  const later = attachBinding(1, true, false, holders, undefined)
+  expect(bindingReaches(later, "ana")).toBe(false)
+  expect(bindingReaches(later, "zed")).toBe(true)
+  // both: everyone
+  const all = attachBinding(1, true, true, holders, undefined)
+  expect(bindingReaches(all, "ana") && bindingReaches(all, "zed")).toBe(true)
+  // attaching again keeps those the earlier attachment reached
+  const again = attachBinding(1, undefined, false, holders, now)
+  expect(bindingReaches(again, "ana")).toBe(true)
+  // an attachment from the config file reaches every user of the role
+  expect(bindingReaches({ role_id: 1 }, "anyone")).toBe(true)
+  const users: AdminUserConfig[] = [{ name: "ana", role: "ops" }, { name: "zed", role: "ops" }]
+  const roles: RoleConfig[] = [{ id: 1, name: "ops" }]
+  const profiles: AccessProfile[] = [{ id: "p1", roles: [later] }]
+  expect(heldProfileIds(users, roles, profiles, "ana").length).toBe(0)
+  expect(heldProfileIds(users, roles, profiles, "zed").join(",")).toBe("p1")
+})

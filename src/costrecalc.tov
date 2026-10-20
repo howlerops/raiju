@@ -1,6 +1,10 @@
 // Cost recalculation as a background job (Bifrost's cost recalculation job): the logs a filter selects are
 // priced again at the current prices, a slice at a time between timer ticks, so the request that started it
 // answers at once and a poll reports progress. A cancel stops the walk; the costs already written stay.
+// With several workers the job's status is kept in a shared file, so a poll or a cancel that reaches another
+// worker sees the same job (Bifrost keeps its jobs in the database).
+import { existsSync, readFileSync, rmSync, statSync } from "node:fs"
+import { writeFileAtomic } from "./atomicfile"
 import { LogEntry } from "./logstore"
 import { isoMs } from "./exports"
 import { newId } from "./schemas"
@@ -16,20 +20,92 @@ export type RecalcStatus = {
   processed: int,
   updated: int,
   skipped: int,
+  // the subset of skipped left unchanged because the current price list has no price for their model, so a
+  // new cost would be a wrong 0 (Bifrost's unpriceable)
+  unpriceable: int,
   message: string,
   started_at: string,
   updated_at: string,
 }
 
-// One job. price gives a log's cost at the current prices; apply writes the changed costs (by log id) to the
-// store and returns how many logs it changed.
+// A job whose status file has not moved for this long is taken as dead (its worker is gone).
+export const RECALC_STALE_MS = 120000.0
+
+// The status a shared file holds, or undefined when there is none or it does not parse.
+export function readShared(file: string): RecalcStatus | undefined {
+  if (file === "" || !existsSync(file)) return undefined
+  try {
+    return JSON.parse(readFileSync(file, "utf8")) as RecalcStatus
+  } catch (e) {
+    return undefined
+  }
+}
+
+// Whether the shared file holds a job still walking whose worker wrote it recently.
+export function sharedInFlight(file: string, nowMs: f64): bool {
+  const s = readShared(file)
+  if (s === undefined || (s.status !== "pending" && s.status !== "running")) return false
+  try {
+    return nowMs - statSync(file).mtimeMs < RECALC_STALE_MS
+  } catch (e) {
+    return false
+  }
+}
+
+// Asks the worker that runs the job with this id to stop it (it looks at every slice).
+export function requestCancel(file: string, id: string): void {
+  try {
+    writeFileAtomic(file + ".cancel", id)
+  } catch (e) {
+    console.error(`raiju: cost recalculation cancel: ${e.message}`)
+  }
+}
+
+// One job. price gives a log's cost at the current prices, or undefined when the model has no price;
+// apply writes the changed costs (by log id) to the store and returns how many logs it changed.
 export class CostRecalc {
   private st: RecalcStatus
   private rows: LogEntry[] = []
   private at: int = 0
+  // the shared status file ("" for a single process)
+  private file = ""
 
-  constructor(readonly price: (e: LogEntry) => f64, readonly apply: (costs: Map<string, f64>) => int) {
-    this.st = { id: newId("recalc-"), status: "pending", total: 0, processed: 0, updated: 0, skipped: 0, message: "", started_at: "", updated_at: "" }
+  constructor(readonly price: (e: LogEntry) => f64 | undefined, readonly apply: (costs: Map<string, f64>) => int) {
+    this.st = { id: newId("recalc-"), status: "pending", total: 0, processed: 0, updated: 0, skipped: 0, unpriceable: 0, message: "", started_at: "", updated_at: "" }
+  }
+
+  // Keeps the job's status in file, for the other workers' polls and cancels.
+  share(file: string): void {
+    this.file = file
+    try {
+      if (existsSync(file + ".cancel")) rmSync(file + ".cancel", { force: true })
+    } catch (e) {
+      // a stale request for another job is ignored anyway
+    }
+    this.persist()
+  }
+
+  private persist(): void {
+    if (this.file === "") return
+    try {
+      writeFileAtomic(this.file, JSON.stringify(this.st))
+    } catch (e) {
+      console.error(`raiju: cost recalculation status: ${e.message}`)
+    }
+  }
+
+  // Stops the job when another worker asked for it through the shared file; true when it did.
+  checkCancel(): bool {
+    if (this.file === "" || !this.inFlight()) return false
+    const f = this.file + ".cancel"
+    try {
+      if (!existsSync(f) || readFileSync(f, "utf8").trim() !== this.st.id) return false
+      rmSync(f, { force: true })
+    } catch (e) {
+      return false
+    }
+    this.cancel()
+    return true
   }
 
   // Sets the logs to walk (the scope is fixed here, as Bifrost fixes its window at enqueue).
@@ -42,6 +118,7 @@ export class CostRecalc {
     s.started_at = at
     s.updated_at = at
     this.st = s
+    this.persist()
   }
 
   // The job's status now.
@@ -65,6 +142,7 @@ export class CostRecalc {
 
   private tick(): void {
     if (!this.inFlight()) return
+    if (this.checkCancel()) return
     if (this.advance()) setTimeout(() => this.tick(), 0)
   }
 
@@ -82,9 +160,15 @@ export class CostRecalc {
     const costs: Map<string, f64> = new Map()
     let updated = 0
     let skipped = 0
+    let unpriceable = 0
     for (let i = this.at; i < end; i++) {
       const e = this.rows[i]!
       const c = this.price(e)
+      if (c === undefined) {
+        skipped += 1
+        unpriceable += 1
+        continue
+      }
       if (c === e.cost) {
         skipped += 1
         continue
@@ -98,12 +182,14 @@ export class CostRecalc {
     t.processed = end
     t.updated += updated
     t.skipped += skipped
+    t.unpriceable += unpriceable
     t.updated_at = isoMs(Date.now())
     this.st = t
     if (this.at >= this.rows.length) {
       this.finish()
       return false
     }
+    this.persist()
     return true
   }
 
@@ -116,6 +202,7 @@ export class CostRecalc {
     s.message = `Stopped early after checking ${s.processed} log(s): ${s.updated} cost value(s) recalculated, ${s.skipped} skipped.` + (s.total > s.processed ? ` ${s.total - s.processed} log(s) in the selected window were not checked.` : "")
     this.st = s
     this.rows = []
+    this.persist()
     return this.st
   }
 
@@ -124,8 +211,10 @@ export class CostRecalc {
     s.status = "completed"
     s.updated_at = isoMs(Date.now())
     s.message = `Recalculated ${s.updated} cost value(s); ${s.skipped} skipped.`
+    if (s.unpriceable > 0) s.message += ` ${s.unpriceable} of those were left unchanged because their pricing inputs were unavailable.`
     this.st = s
     this.rows = []
+    this.persist()
   }
 }
 
@@ -189,6 +278,50 @@ test("a cancel stops the walk, keeps the progress made and says what was not che
   expect(job.advance()).toBe(false)
   expect(written).toBe(RECALC_SLICE)
   expect(job.snapshot().processed).toBe(RECALC_SLICE)
+})
+
+test("a log whose model has no price now keeps its cost and counts as unpriceable", () => {
+  const written: Map<string, f64> = new Map()
+  const job = new CostRecalc((e) => (e.model === "gone" ? undefined : 3.0), (costs) => {
+    for (const k of costs.keys()) written.set(k, costs.get(k)!)
+    return costs.size
+  })
+  const a = entry("a", 1.0)
+  const b = entry("b", 1.0)
+  b.model = "gone"
+  job.begin([a, b, entry("c", 3.0)], 5000.0)
+  job.advance()
+  const s = job.snapshot()
+  expect(s.updated).toBe(1)
+  expect(s.skipped).toBe(2)
+  expect(s.unpriceable).toBe(1)
+  expect(written.has("b")).toBe(false)
+  expect(s.message).toBe("Recalculated 1 cost value(s); 2 skipped. 1 of those were left unchanged because their pricing inputs were unavailable.")
+})
+
+test("a shared job's status is in its file; another worker's cancel request stops it at the next slice", () => {
+  const file = "/tmp/raiju-recalc-test-" + newId("") + ".json"
+  try {
+    const job = new CostRecalc((e) => 9.0, (costs) => costs.size)
+    job.begin(many(RECALC_SLICE * 2, 1.0), Date.now())
+    job.share(file)
+    expect(readShared(file)!.id).toBe(job.id())
+    expect(sharedInFlight(file, Date.now())).toBe(true)
+    // a status nobody has touched for minutes is a dead job
+    expect(sharedInFlight(file, Date.now() + RECALC_STALE_MS + 1.0)).toBe(false)
+    job.advance()
+    expect(readShared(file)!.processed).toBe(RECALC_SLICE)
+    requestCancel(file, "someone-else")
+    expect(job.checkCancel()).toBe(false)
+    requestCancel(file, job.id())
+    expect(job.checkCancel()).toBe(true)
+    expect(job.snapshot().status).toBe("cancelled")
+    expect(readShared(file)!.status).toBe("cancelled")
+    expect(existsSync(file + ".cancel")).toBe(false)
+  } finally {
+    try rmSync(file, { force: true })
+    try rmSync(file + ".cancel", { force: true })
+  }
 })
 
 test("a cancel after the walk ended changes nothing", () => {

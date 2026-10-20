@@ -1,0 +1,427 @@
+// The MCP server library (Bifrost's mcp_library table and /api/mcp/library routes): a catalog of installable
+// MCP servers, synced from framework.pricing.mcp_library_url (https://getbifrost.ai/mcp-library by default)
+// and kept in <config>.mcp_library.json beside the config file. A synced row is "remote"; a row published
+// through POST /api/mcp/library is "custom" and the sync never overwrites it. DELETE hides a row (a tombstone)
+// and the sync does not bring it back. Rows are keyed by a slug made from the name.
+import { existsSync, readFileSync } from "node:fs"
+import { writeFileAtomic } from "./atomicfile"
+import { Field, fields, elements, find, rawStr, quote, isNull } from "./json"
+import { rfc3339Of } from "./vkexpiry"
+
+export const DEFAULT_LIBRARY_URL = "https://getbifrost.ai/mcp-library"
+// the library sync's cadence when mcp_library_sync_interval is unset (Bifrost's DefaultSyncInterval); 0 disables it
+export const DEFAULT_LIBRARY_SYNC_SECONDS = 86400
+
+export type LibraryEntry = {
+  id: int,
+  slug: string,
+  name: string,
+  description: string,
+  category: string,
+  connection_type: string,
+  connection_url: string,
+  // raw JSON text ("" when absent)
+  stdio_config: string,
+  auth_type: string,
+  required_header_keys: string[],
+  icon_url: string,
+  docs_url: string,
+  publisher: string,
+  tags: string[],
+  metadata: string,
+  source: string,
+  created_at: string,
+  updated_at: string,
+  deleted: bool,
+}
+
+export type LibraryReply = { status: int, body: string }
+
+const CONNECTION_TYPES: string[] = ["http", "stdio", "sse"]
+const AUTH_TYPES: string[] = ["none", "headers", "oauth", "per_user_oauth", "per_user_headers", "token_exchange"]
+const SORT_COLUMNS: string[] = ["name", "category", "publisher", "created_at", "updated_at"]
+
+function errorBody(message: string): string {
+  return JSON.stringify({ error: { message: message } })
+}
+
+function fail(status: int, message: string): LibraryReply {
+  return { status: status, body: errorBody(message) }
+}
+
+// Bifrost's Slugify: lower case, each run of characters outside [a-z0-9] as one "-", no leading or trailing "-".
+export function slugify(name: string): string {
+  let out = ""
+  let dash = false
+  for (const ch of name.toLowerCase().chars()) {
+    if (ch.byteLength === 1 && "abcdefghijklmnopqrstuvwxyz0123456789".includes(ch)) {
+      out += ch
+      dash = false
+    } else if (!dash && out !== "") {
+      out += "-"
+      dash = true
+    }
+  }
+  while (out.endsWith("-")) out = out.slice(0, out.byteLength - 1)
+  return out
+}
+
+function strList(raw: string | undefined): string[] {
+  const out: string[] = []
+  if (raw === undefined || !raw.trim().startsWith("[")) return out
+  try {
+    for (const el of elements(raw.trim())) {
+      if (!el.startsWith("\"")) continue
+      const s: string = JSON.parse(el)
+      out.push(s)
+    }
+  } catch (e) {
+    return out
+  }
+  return out
+}
+
+function rawObj(raw: string | undefined): string {
+  if (raw === undefined || isNull(raw) || !raw.trim().startsWith("{")) return ""
+  return raw.trim()
+}
+
+// An entry from the catalog's (or a create request's) JSON fields; slug, id, source and times are the caller's.
+function entryOf(fs: Field[], now: string): LibraryEntry {
+  return {
+    id: 0,
+    slug: "",
+    name: (rawStr(fs, "name") ?? "").trim(),
+    description: rawStr(fs, "description") ?? "",
+    category: rawStr(fs, "category") ?? "",
+    connection_type: rawStr(fs, "connection_type") ?? "",
+    connection_url: rawStr(fs, "connection_url") ?? "",
+    stdio_config: rawObj(find(fs, "stdio_config")),
+    auth_type: rawStr(fs, "auth_type") ?? "",
+    required_header_keys: strList(find(fs, "required_header_keys")),
+    icon_url: rawStr(fs, "icon_url") ?? "",
+    docs_url: rawStr(fs, "docs_url") ?? "",
+    publisher: rawStr(fs, "publisher") ?? "",
+    tags: strList(find(fs, "tags")),
+    metadata: rawObj(find(fs, "metadata")),
+    source: "remote",
+    created_at: now,
+    updated_at: now,
+    deleted: false,
+  }
+}
+
+function listJson(xs: string[]): string {
+  return "[" + xs.map((x: string): string => quote(x)).join(",") + "]"
+}
+
+// One entry as Bifrost's TableMCPLibrary serialises it (empty optional fields left out).
+export function entryJson(e: LibraryEntry, stored?: bool): string {
+  const parts: string[] = [`"id":${e.id}`, `"slug":${quote(e.slug)}`, `"name":${quote(e.name)}`]
+  if (e.description !== "") parts.push(`"description":${quote(e.description)}`)
+  if (e.category !== "") parts.push(`"category":${quote(e.category)}`)
+  parts.push(`"connection_type":${quote(e.connection_type)}`)
+  if (e.connection_url !== "") parts.push(`"connection_url":${quote(e.connection_url)}`)
+  if (e.stdio_config !== "") parts.push(`"stdio_config":${e.stdio_config}`)
+  if (e.auth_type !== "") parts.push(`"auth_type":${quote(e.auth_type)}`)
+  if (e.required_header_keys.length > 0) parts.push(`"required_header_keys":${listJson(e.required_header_keys)}`)
+  if (e.icon_url !== "") parts.push(`"icon_url":${quote(e.icon_url)}`)
+  if (e.docs_url !== "") parts.push(`"docs_url":${quote(e.docs_url)}`)
+  if (e.publisher !== "") parts.push(`"publisher":${quote(e.publisher)}`)
+  if (e.tags.length > 0) parts.push(`"tags":${listJson(e.tags)}`)
+  if (e.metadata !== "") parts.push(`"metadata":${e.metadata}`)
+  parts.push(`"source":${quote(e.source)}`)
+  if (stored === true && e.deleted) parts.push(`"deleted":true`)
+  parts.push(`"created_at":${quote(e.created_at)}`, `"updated_at":${quote(e.updated_at)}`)
+  return "{" + parts.join(",") + "}"
+}
+
+// The library: its rows (hidden ones included) and the next id, read from and written to its file.
+export class McpLibrary {
+  entries: LibraryEntry[] = []
+  nextId = 1
+
+  constructor(readonly file: string) {}
+
+  // Reads the file again (another worker or node may have written it). A missing or bad file is an empty library.
+  load(): void {
+    this.entries = []
+    this.nextId = 1
+    if (this.file === "" || !existsSync(this.file)) return
+    try {
+      const top = fields(readFileSync(this.file, "utf8"))
+      for (const el of elements(find(top, "entries") ?? "[]")) {
+        const fs = fields(el)
+        let e = entryOf(fs, "")
+        e.id = Math.floor(parseFloat(find(fs, "id") ?? "0") ?? 0.0)
+        e.slug = rawStr(fs, "slug") ?? slugify(e.name)
+        e.source = rawStr(fs, "source") ?? "remote"
+        e.created_at = rawStr(fs, "created_at") ?? ""
+        e.updated_at = rawStr(fs, "updated_at") ?? ""
+        e.deleted = find(fs, "deleted") === "true"
+        this.entries.push(e)
+        if (e.id >= this.nextId) this.nextId = e.id + 1
+      }
+    } catch (e) {
+      console.error(`raiju: MCP library ${this.file}: ${e.message}; starting empty`)
+      this.entries = []
+    }
+  }
+
+  save(): void throws Error {
+    if (this.file === "") return
+    const rows = this.entries.map((e: LibraryEntry): string => entryJson(e, true))
+    try writeFileAtomic(this.file, `{"entries":[${rows.join(",")}]}\n`)
+  }
+
+  private at(slug: string): int {
+    for (let i = 0; i < this.entries.length; i++) {
+      if (this.entries[i]!.slug === slug) return i
+    }
+    return -1
+  }
+
+  // Upserts the catalog's rows ("remote"), skipping custom and hidden slugs and repeats; the count upserted.
+  sync(catalog: string, nowMs: f64): int throws SyntaxError {
+    const now = rfc3339Of(nowMs)
+    const top = try fields(catalog.trim())
+    const seen: string[] = []
+    let count = 0
+    for (const el of try elements(find(top, "servers") ?? "[]")) {
+      if (!el.trim().startsWith("{")) continue
+      let e = entryOf(try fields(el.trim()), now)
+      if (e.name === "") continue
+      const slug = slugify(e.name)
+      if (slug === "" || seen.includes(slug)) continue
+      seen.push(slug)
+      const i = this.at(slug)
+      if (i >= 0) {
+        const old = this.entries[i]!
+        if (old.source === "custom" || old.deleted) continue
+        e.id = old.id
+        e.created_at = old.created_at
+      } else {
+        e.id = this.nextId
+        this.nextId += 1
+      }
+      e.slug = slug
+      if (i >= 0) this.entries[i] = e
+      else this.entries.push(e)
+      count++
+    }
+    return count
+  }
+
+  visible(): LibraryEntry[] {
+    return this.entries.filter((e) => !e.deleted)
+  }
+}
+
+function csv(v: string | undefined): string[] {
+  if (v === undefined) return []
+  return v.split(",").map((x) => x.trim()).filter((x) => x !== "")
+}
+
+function keyOf(e: LibraryEntry, col: string): string {
+  if (col === "category") return e.category
+  if (col === "publisher") return e.publisher
+  if (col === "created_at") return e.created_at
+  if (col === "updated_at") return e.updated_at
+  return e.name
+}
+
+// GET /api/mcp/library: paged (limit 25 by default, at most 100), searchable over name, description and
+// publisher, filtered by category, connection_type, auth_type (each a comma list) and tags (any of them),
+// sorted by name, category, publisher, created_at or updated_at, ascending unless order=desc.
+export function listLibrary(lib: McpLibrary, q: URLSearchParams): LibraryReply {
+  let limit = 0
+  let offset = 0
+  const ls = q.get("limit")
+  if (ls !== undefined && ls !== "") {
+    const n = parseInt(ls)
+    if (n === undefined) return fail(400, "Invalid limit parameter: must be a number")
+    if (n < 0) return fail(400, "Invalid limit parameter: must be non-negative")
+    limit = n
+  }
+  const os = q.get("offset")
+  if (os !== undefined && os !== "") {
+    const n = parseInt(os)
+    if (n === undefined) return fail(400, "Invalid offset parameter: must be a number")
+    if (n < 0) return fail(400, "Invalid offset parameter: must be non-negative")
+    offset = n
+  }
+  if (limit <= 0) limit = 25
+  else if (limit > 100) limit = 100
+  const search = (q.get("search") ?? "").toLowerCase()
+  const cats = csv(q.get("category"))
+  const types = csv(q.get("connection_type"))
+  const auths = csv(q.get("auth_type"))
+  const tags = csv(q.get("tags"))
+  let rows = lib.visible().filter((e) => {
+    if (search !== "" && !e.name.toLowerCase().includes(search) && !e.description.toLowerCase().includes(search) && !e.publisher.toLowerCase().includes(search)) return false
+    if (cats.length > 0 && !cats.includes(e.category)) return false
+    if (types.length > 0 && !types.includes(e.connection_type)) return false
+    if (auths.length > 0 && !auths.includes(e.auth_type)) return false
+    for (const t of tags) {
+      if (!e.tags.includes(t)) return false
+    }
+    return true
+  })
+  const sortBy = q.get("sort_by") ?? ""
+  const col = SORT_COLUMNS.includes(sortBy) ? sortBy : "name"
+  const desc = (q.get("order") ?? "").toLowerCase() === "desc"
+  rows.sort((a, b) => {
+    const ka = keyOf(a, col)
+    const kb = keyOf(b, col)
+    if (ka !== kb) return (ka < kb ? -1 : 1) * (desc ? -1 : 1)
+    return a.id - b.id
+  })
+  const total = rows.length
+  const page = rows.slice(Math.min(offset, total), Math.min(offset + limit, total))
+  return { status: 200, body: `{"servers":[${page.map((e: LibraryEntry): string => entryJson(e)).join(",")}],"count":${page.length},"total_count":${total},"limit":${limit},"offset":${offset}}` }
+}
+
+function distinctSorted(xs: string[]): string[] {
+  const out: string[] = []
+  for (const x of xs) {
+    if (x !== "" && !out.includes(x)) out.push(x)
+  }
+  out.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+  return out
+}
+
+// GET /api/mcp/library/filterdata: the distinct categories, connection types, auth types and tags.
+export function libraryFilterData(lib: McpLibrary): LibraryReply {
+  const rows = lib.visible()
+  const tags: string[] = []
+  for (const e of rows) {
+    for (const t of e.tags) tags.push(t)
+  }
+  return { status: 200, body: `{"categories":${listJson(distinctSorted(rows.map((e: LibraryEntry): string => e.category)))},"connection_types":${listJson(distinctSorted(rows.map((e: LibraryEntry): string => e.connection_type)))},"auth_types":${listJson(distinctSorted(rows.map((e: LibraryEntry): string => e.auth_type)))},"tags":${listJson(distinctSorted(tags))}}` }
+}
+
+// POST /api/mcp/library: publishes a custom (org-internal) server. A name whose slug is taken is a 409.
+export function createLibraryEntry(lib: McpLibrary, body: string, nowMs: f64): LibraryReply {
+  let fs: Field[] = []
+  try {
+    fs = fields(body.trim())
+  } catch (e) {
+    return fail(400, "Invalid request payload")
+  }
+  let e = entryOf(fs, rfc3339Of(nowMs))
+  if (e.name === "") return fail(400, "name is required")
+  if (e.connection_type === "http" || e.connection_type === "sse") {
+    if (e.connection_url.trim() === "") return fail(400, "connection_url is required for http/sse connection types")
+  } else if (e.connection_type === "stdio") {
+    let cmd = ""
+    if (e.stdio_config !== "") {
+      try {
+        cmd = rawStr(fields(e.stdio_config), "command") ?? ""
+      } catch (err) {
+        cmd = ""
+      }
+    }
+    if (cmd.trim() === "") return fail(400, "stdio_config.command is required for stdio connection type")
+  } else {
+    return fail(400, "connection_type must be one of: http, stdio, sse")
+  }
+  if (e.auth_type === "") e.auth_type = "none"
+  if (!AUTH_TYPES.includes(e.auth_type)) return fail(400, "invalid auth_type")
+  const slug = slugify(e.name)
+  if (slug === "") return fail(400, "name must contain at least one alphanumeric character")
+  if (lib.entries.some((x) => x.slug === slug)) return fail(409, "an MCP library server with this name already exists")
+  e.slug = slug
+  e.source = "custom"
+  e.metadata = ""
+  e.id = lib.nextId
+  lib.nextId += 1
+  lib.entries.push(e)
+  try {
+    lib.save()
+  } catch (err) {
+    lib.entries.pop()
+    return fail(500, "Failed to create MCP library entry")
+  }
+  return { status: 200, body: `{"status":"success","message":"MCP library server published successfully","entry":${entryJson(e)}}` }
+}
+
+// DELETE /api/mcp/library/{id}: hides a row (remote or custom) for good.
+export function deleteLibraryEntry(lib: McpLibrary, idText: string): LibraryReply {
+  const id = parseInt(idText)
+  if (id === undefined || id <= 0) return fail(400, "id must be a positive integer")
+  for (let i = 0; i < lib.entries.length; i++) {
+    const e = lib.entries[i]!
+    if (e.id !== id || e.deleted) continue
+    lib.entries[i]!.deleted = true
+    try {
+      lib.save()
+    } catch (err) {
+      lib.entries[i]!.deleted = false
+      return fail(500, "Failed to delete MCP library entry")
+    }
+    return { status: 200, body: `{"status":"success","message":"MCP library server removed successfully"}` }
+  }
+  return fail(404, "MCP library entry not found")
+}
+
+// The library catalog at url, fetched (http and https) or read (file://).
+export async function fetchCatalog(url: string, timeoutMs: int): Promise<string> throws Error {
+  if (url.startsWith("file://")) {
+    let path = url.slice(7)
+    if (path.startsWith("localhost/")) path = path.slice(9)
+    try {
+      return readFileSync(path, "utf8")
+    } catch (e) {
+      throw new Error(`failed to open MCP library file: ${e.message}`)
+    }
+  }
+  if (!url.startsWith("http://") && !url.startsWith("https://")) throw new Error(`MCP library URL validation failed: unsupported scheme in ${url}`)
+  const ctl = new AbortController()
+  const t = setTimeout(() => {
+    ctl.abort()
+  }, timeoutMs)
+  try {
+    const r = try await fetch(url, { signal: ctl.signal })
+    if (r.status !== 200) throw new Error(`failed to download MCP library data: HTTP ${r.status}`)
+    const text = try await r.text()
+    if (text.byteLength > 52428800) throw new Error("MCP library response exceeds 52428800 bytes")
+    return text
+  } finally {
+    clearTimeout(t)
+  }
+}
+
+test("slugs, the sync's protected rows, and paging", () => {
+  expect(slugify("  GitHub (Official) MCP! ")).toBe("github-official-mcp")
+  expect(slugify("***")).toBe("")
+  const lib = new McpLibrary("")
+  const cat = `{"servers":[{"name":"GitHub","description":"Repos","category":"dev","connection_type":"http","connection_url":"https://gh.example/mcp","auth_type":"oauth","tags":["git","code"],"metadata":{"stars":5}},
+    {"name":"Files","category":"fs","connection_type":"stdio","stdio_config":{"command":"npx","args":["fs"]},"tags":["local"]},
+    {"name":"github","connection_type":"http"},{"description":"no name"}]}`
+  expect(try lib.sync(cat, 0.0)).toBe(2)
+  expect(lib.entries.length).toBe(2)
+  expect(lib.entries[0]!.slug).toBe("github")
+  expect(lib.entries[1]!.stdio_config).toBe('{"command":"npx","args":["fs"]}')
+  // a custom row and a hidden row are not touched by the next sync
+  const made = createLibraryEntry(lib, `{"name":"Internal Wiki","connection_type":"sse","connection_url":"https://wiki.example/sse","tags":["docs"]}`, 1000.0)
+  expect(made.status).toBe(200)
+  expect(made.body.includes('"source":"custom"')).toBe(true)
+  expect(createLibraryEntry(lib, `{"name":"internal-wiki","connection_type":"http","connection_url":"x"}`, 1000.0).status).toBe(409)
+  expect(createLibraryEntry(lib, `{"name":"S","connection_type":"stdio"}`, 1000.0).status).toBe(400)
+  expect(createLibraryEntry(lib, `{"name":"S","connection_type":"grpc"}`, 1000.0).status).toBe(400)
+  expect(createLibraryEntry(lib, `{"name":"S","connection_type":"http","connection_url":"u","auth_type":"magic"}`, 1000.0).status).toBe(400)
+  expect(deleteLibraryEntry(lib, "1").status).toBe(200)
+  expect(deleteLibraryEntry(lib, "1").status).toBe(404)
+  expect(deleteLibraryEntry(lib, "x").status).toBe(400)
+  expect(try lib.sync(`{"servers":[{"name":"GitHub","connection_type":"http"},{"name":"Internal Wiki","connection_type":"http"},{"name":"Files","category":"fs2","connection_type":"stdio"}]}`, 5000.0)).toBe(1)
+  expect(lib.entries[1]!.category).toBe("fs2")
+  expect(lib.entries[1]!.id).toBe(2)
+  const page = listLibrary(lib, new URLSearchParams("limit=1&sort_by=name&order=desc"))
+  expect(page.body.includes('"count":1,"total_count":2,"limit":1,"offset":0')).toBe(true)
+  expect(page.body.includes('"name":"Internal Wiki"')).toBe(true)
+  expect(listLibrary(lib, new URLSearchParams("tags=docs")).body.includes('"total_count":1')).toBe(true)
+  expect(listLibrary(lib, new URLSearchParams("search=wiki&connection_type=sse,http")).body.includes('"total_count":1')).toBe(true)
+  expect(listLibrary(lib, new URLSearchParams("limit=-1")).status).toBe(400)
+  expect(listLibrary(lib, new URLSearchParams("offset=x")).status).toBe(400)
+  expect(libraryFilterData(lib).body).toBe('{"categories":["fs2"],"connection_types":["sse","stdio"],"auth_types":["none"],"tags":["docs"]}')
+})

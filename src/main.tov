@@ -7,14 +7,16 @@ import { startBroker } from "./broker"
 import * as path from "node:path"
 import { Config, loadConfig, loadRawConfig, resolveConfig, providerNames } from "./config"
 import { ConfigStore, ConfigCipher, cipherFromConfig, openConfig } from "./store"
-import { Engine } from "./gateway"
-import { McpManager, setAdminRenew } from "./mcp"
-import { McpUserToken } from "./mcpuser"
-import { saveUserToken, saveExchangeAdmin, setAdminPublished, setAdminRemoved, dropExchangeAdmin } from "./mcpapi"
-import { readStoredAdmin, sealAdminRow, openAdminRow } from "./store"
+import { Engine, pluginPaths } from "./gateway"
+import { fetchPluginUrls } from "./plugindl"
+import { McpManager, setAdminRenew, setSpecBaseDir } from "./mcp"
+import { McpUserToken, openFlowState } from "./mcpuser"
+import { saveUserToken, headersAuthMessage, saveExchangeAdmin, setAdminPublished, setAdminRemoved, dropExchangeAdmin } from "./mcpapi"
+import { readStoredAdmin, sealAdminRow, openAdminRow, sealStored, openStored } from "./store"
+import { setEkSeal } from "./rtsession"
 import { clusterState } from "./clusterstate"
 import { FileLease, FILE_LEASE_MS } from "./filelease"
-import { start } from "./server"
+import { start, bodyLimits, NO_BODY_LIMIT } from "./server"
 import { Ops, withSecrets } from "./ops"
 import { fromBifrost, merge } from "./guardrails_compat"
 import { warnings } from "./config_compat"
@@ -126,6 +128,8 @@ function runBroker(c: Config, host: string): int {
 
 async function main(): Promise<int> {
   const args = parseArgs(process.argv.slice(2))
+  // an OpenAPI MCP client's spec_file is read relative to the config file
+  setSpecBaseDir(path.dirname(path.resolve(args.config)))
   const loaded = loadConfigOrExit(args.config)
   if (loaded === undefined) return 1
   // Encryption at rest: the sealed secrets in the file are opened with the cipher from encryption_key
@@ -160,12 +164,17 @@ async function main(): Promise<int> {
   // and its grants. It is opened before the workers start, so every worker signs with the same key.
   const stateNote = openIssuerState(cfg, path.join(path.dirname(args.config), "mcp-oauth-state.json"), cipher)
   if (stateNote !== "") console.error(`raiju: mcp oauth: ${stateNote}`)
+  // plugins whose path is a URL are downloaded before the chain is built (plugindl.tov)
+  const pdl = await fetchPluginUrls(pluginPaths(cfg), cfg.server?.plugin_download_private_allowlist ?? [], false)
+  for (const e of pdl.errors) console.error(`raiju: plugin: ${e}`)
   const engine = new Engine(cfg)
   const ops = new Ops(engine, store)
   // refreshed per-user OAuth tokens are saved to the config file
   engine.userTokenSaved = (r) => {
     saveUserToken(store, r)
   }
+  // a tool call of a per_user_headers client whose key has submitted nothing opens a submission and names its page
+  engine.headersAuth = (client: string, vk: string, base: string): string => headersAuthMessage(store, client, vk, base)
   // token_exchange admin credentials: renewed before they expire and after a 401, and saved to the config file
   engine.adminSaved = (r) => {
     saveExchangeAdmin(store, r)
@@ -179,6 +188,16 @@ async function main(): Promise<int> {
   // the closures below take a const copy of the cipher: a mutable local captured by a closure in this async function
   // does not compile
   const sealKey: ConfigCipher | undefined = cipher
+  // the MCP OAuth flows in flight (per-user consent and admin verification) and their temp tokens, beside config.json:
+  // a restart between a consent link and its callback keeps the flow; the PKCE verifiers are sealed with the config's key
+  const flowNote = openFlowState(path.join(path.dirname(args.config), "mcp-flow-state.json"), (v: string): string => {
+    try {
+      return sealStored(sealKey, v)
+    } catch (e) {
+      return ""
+    }
+  }, (v: string): string | undefined => openStored(sealKey, v))
+  if (flowNote !== "") console.error(`raiju: mcp oauth: ${flowNote}`)
   const configPath = args.config
   engine.adminOwns = (client: string): bool => ops.ownsAdmin(client)
   engine.adminStored = (client: string): McpUserToken | undefined => readStoredAdmin(configPath, sealKey, client)
@@ -190,6 +209,15 @@ async function main(): Promise<int> {
     }
   }
   engine.adminPublish = publishAdmin
+  // the provider tokens behind realtime client secrets travel on the cluster state sealed the same way (a token that
+  // could not be sealed is not kept, so its client secret does not open)
+  setEkSeal((v: string): string => {
+    try {
+      return sealStored(sealKey, v)
+    } catch (e) {
+      return ""
+    }
+  }, (v: string): string | undefined => openStored(sealKey, v))
   setAdminPublished(publishAdmin)
   // a credential removed on another node (its client deleted, or its token exchange changed) is removed here too
   setAdminRemoved((client: string) => {
@@ -221,8 +249,6 @@ async function main(): Promise<int> {
   const server = args.server !== "" ? args.server : "bun"
   if (server === "http1" && args.workers > 1) console.error("raiju: the http1 server runs in one process; -workers needs -server bun")
   const maxBody = (cfg.client?.max_request_body_size_mb ?? 100) * 1048576
-  // large_payload_optimization: bodies over its request threshold stream to the provider, and the gateway checks the sizes
-  const lp = engine.large
   // the A2A gRPC settings (server.a2a_grpc_base_domain and a2a_grpc_port): the cards advertise the interface in every worker;
   // the listener is opened here in a single-process gateway, and in one bun worker after the fork otherwise (a2agrpc.tov)
   const grpcNote = setA2aGrpc(ops, cfg.server)
@@ -232,7 +258,9 @@ async function main(): Promise<int> {
   }
   const grpcShared = server !== "http1" && args.workers > 1
   if (!grpcShared) listenA2aGrpc(ops, args.host, cfg.server)
-  const url = server === "http1" ? startFront(engine, ops, { hostname: args.host, port: args.port, maxBodyBytes: lp === undefined ? maxBody : 1099511627776, streamThreshold: lp === undefined ? 0 : Math.max(1, lp.requestThreshold), limitBytes: lp === undefined ? 0 : maxBody }) : start(engine, ops, { port: args.port, hostname: args.host, workers: args.workers, maxBodyBytes: maxBody })
+  // (the body limits and the stream threshold are read from the config as it is when a request comes, so a reload
+  // moves them; bodyLimits in server.tov)
+  const url = server === "http1" ? startFront(engine, ops, { hostname: args.host, port: args.port, maxBodyBytes: NO_BODY_LIMIT, limits: () => bodyLimits(engine) }) : start(engine, ops, { port: args.port, hostname: args.host, workers: args.workers, maxBodyBytes: maxBody })
   // Runs once the server is up: with -workers, in every worker after the fork.
   const supervisor = process.pid
   setTimeout(() => {

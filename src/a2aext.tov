@@ -1,0 +1,179 @@
+// A2A extensions through the gateway (a registration's extension_uris; Bifrost's agent manager allowedExtensions and
+// validateExtensions).
+//
+// An agent's card declares the extensions it supports (capabilities.extensions: uri, required, params). The gateway
+// relays only those the registration allows: the served card lists the allowed ones, and an agent that requires one
+// the registration does not allow (or declares the same URI twice, or requires one without a URI, or one whose params
+// are over 64 KiB) cannot be called through the gateway. A caller asks for extensions with the A2A-Extensions header
+// (comma-separated URIs): asking for one the served card does not list is refused (-32004), leaving out one the card
+// requires is refused (-32008), and a requested extension's payload in the params' metadata is limited to 64 KiB
+// (-32602). Accepted requests go on with the header as the caller sent it.
+import { Field, fields, elements, find, rawStr, rawBool, quote, build, setField, isNull } from "./json"
+
+const MAX_PAYLOAD: int = 65536
+const MAX_URIS: int = 32
+const MAX_URI_BYTES: int = 2048
+
+function obj(raw: string | undefined): Field[] | undefined {
+  if (raw === undefined || !raw.trim().startsWith("{")) return undefined
+  try {
+    return fields(raw.trim())
+  } catch (e) {
+    return undefined
+  }
+}
+
+// Why a registration's extension_uris are refused ("" when they are not): at most 32, each an absolute URI (a scheme
+// and more) of at most 2048 bytes, no duplicates (Bifrost's normalize).
+export function extensionUrisProblem(uris: string[]): string {
+  if (uris.length > MAX_URIS) return `extension_uris cannot contain more than ${MAX_URIS} entries`
+  const seen: string[] = []
+  for (const u of uris) {
+    const colon = u.indexOf(":")
+    let schemeOk = colon > 0
+    if (schemeOk) {
+      const first = u.slice(0, 1).toLowerCase()
+      schemeOk = first >= "a" && first <= "z" && colon < u.byteLength - 1 && !u.slice(0, colon).includes("/")
+    }
+    if (!schemeOk || u.byteLength > MAX_URI_BYTES || u.includes(" ")) return "extension_uris must contain absolute URIs no longer than 2048 bytes"
+    if (seen.includes(u)) return "duplicate extension URI: " + u
+    seen.push(u)
+  }
+  return ""
+}
+
+// The registration's URIs as Bifrost stores them: sorted.
+export function sortedUris(uris: string[]): string[] {
+  return uris.slice().sort((a, b) => (a < b ? -1 : (a > b ? 1 : 0)))
+}
+
+export type Extension = { uri: string, required: bool, raw: string }
+
+// The extensions a card declares that the registration allows, as Bifrost's allowedExtensions judges them. error is
+// set when the card cannot be relayed at all.
+export function allowedExtensions(card: string, allowed: string[]): { list: Extension[], error: string } {
+  const out: Extension[] = []
+  const cf = obj(card)
+  const caps = cf === undefined ? undefined : obj(find(cf, "capabilities"))
+  const raw = caps === undefined ? undefined : find(caps, "extensions")
+  if (raw === undefined || !raw.trim().startsWith("[")) return { list: out, error: "" }
+  let items: string[] = []
+  try {
+    items = elements(raw.trim())
+  } catch (e) {
+    return { list: out, error: "" }
+  }
+  const seen: string[] = []
+  for (const it of items) {
+    const ef = obj(it)
+    if (ef === undefined) continue
+    const uri = rawStr(ef, "uri") ?? ""
+    const required = rawBool(ef, "required") === true
+    if (uri === "") {
+      if (required) return { list: [], error: "upstream agent requires an extension without a URI" }
+      continue
+    }
+    if (seen.includes(uri)) return { list: [], error: `upstream agent declares duplicate extension "${uri}"` }
+    seen.push(uri)
+    if (!allowed.includes(uri)) {
+      if (required) return { list: [], error: `upstream agent requires denied extension "${uri}"` }
+      continue
+    }
+    const params = find(ef, "params") ?? "null"
+    if (new TextEncoder().encode(params).length > MAX_PAYLOAD) {
+      if (required) return { list: [], error: `upstream agent requires untranslatable extension "${uri}"` }
+      continue
+    }
+    out.push({ uri: uri, required: required, raw: it })
+  }
+  return { list: out, error: "" }
+}
+
+// The served card's capabilities.extensions: the allowed ones only (none when the card cannot be relayed).
+export function servedExtensionsJson(card: string, allowed: string[]): string {
+  const a = allowedExtensions(card, allowed)
+  const parts: string[] = []
+  for (const e of a.list) parts.push(e.raw)
+  return "[" + parts.join(",") + "]"
+}
+
+// The URIs an A2A-Extensions header asks for (comma-separated; blanks dropped).
+export function requestedUris(header: string): string[] {
+  const out: string[] = []
+  for (const p of header.split(",")) {
+    const v = p.trim()
+    if (v !== "" && !out.includes(v)) out.push(v)
+  }
+  return out
+}
+
+// The check of one call (Bifrost's validateExtensions): code is 0 when the call may go on, else the JSON-RPC error
+// code and message. Nothing is checked when the caller asks for no extension and the card requires none.
+export function checkExtensions(card: string, allowed: string[], header: string | undefined, params: string): { code: int, message: string } {
+  const a = allowedExtensions(card, allowed)
+  const requested = requestedUris(header ?? "")
+  if (a.error !== "") return { code: -32008, message: a.error }
+  for (const e of a.list) {
+    if (e.required && !requested.includes(e.uri)) return { code: -32008, message: "extension support required" }
+  }
+  const supported: string[] = a.list.map((e) => e.uri)
+  for (const u of requested) {
+    if (!supported.includes(u)) return { code: -32004, message: "requested extension is not supported" }
+  }
+  if (requested.length > 0) {
+    const pf = obj(params)
+    const meta = pf === undefined ? undefined : obj(find(pf, "metadata"))
+    if (meta !== undefined) {
+      for (const f of meta) {
+        if (!requested.includes(f.key) || !supported.includes(f.key)) continue
+        if (new TextEncoder().encode(f.raw).length > MAX_PAYLOAD) return { code: -32602, message: "extension payload exceeds the gateway limit" }
+      }
+    }
+  }
+  return { code: 0, message: "" }
+}
+
+// ---- tests ----
+
+test("a registration's extension_uris are checked as Bifrost checks them", () => {
+  expect(extensionUrisProblem([])).toBe("")
+  expect(extensionUrisProblem(["https://ext.example/a", "urn:a2a:ext:b"])).toBe("")
+  expect(extensionUrisProblem(["not a uri"])).toBe("extension_uris must contain absolute URIs no longer than 2048 bytes")
+  expect(extensionUrisProblem(["/relative"])).toBe("extension_uris must contain absolute URIs no longer than 2048 bytes")
+  expect(extensionUrisProblem(["https://a", "https://a"])).toBe("duplicate extension URI: https://a")
+  const many: string[] = []
+  for (let i = 0; i < 33; i++) many.push(`https://e.example/${i}`)
+  expect(extensionUrisProblem(many)).toBe("extension_uris cannot contain more than 32 entries")
+  expect(sortedUris(["b:x", "a:y"]).join(",")).toBe("a:y,b:x")
+})
+
+test("the extensions a card may relay, and the cards that cannot be relayed", () => {
+  const card = `{"capabilities":{"streaming":true,"extensions":[{"uri":"https://ext.example/trace","params":{"v":1}},{"uri":"https://ext.example/secret"},{"description":"no uri"}]}}`
+  const a = allowedExtensions(card, ["https://ext.example/trace"])
+  expect(a.error).toBe("")
+  expect(a.list.map((e) => e.uri).join(",")).toBe("https://ext.example/trace")
+  expect(servedExtensionsJson(card, [])).toBe("[]")
+  expect(servedExtensionsJson(card, ["https://ext.example/trace"])).toBe(`[{"uri":"https://ext.example/trace","params":{"v":1}}]`)
+  const req = `{"capabilities":{"extensions":[{"uri":"https://ext.example/must","required":true}]}}`
+  expect(allowedExtensions(req, []).error).toBe(`upstream agent requires denied extension "https://ext.example/must"`)
+  expect(allowedExtensions(`{"capabilities":{"extensions":[{"uri":"u:a"},{"uri":"u:a"}]}}`, ["u:a"]).error).toBe(`upstream agent declares duplicate extension "u:a"`)
+  expect(allowedExtensions(`{"capabilities":{"extensions":[{"required":true}]}}`, []).error).toBe("upstream agent requires an extension without a URI")
+  expect(allowedExtensions(`{"name":"x"}`, ["u:a"]).list.length).toBe(0)
+})
+
+test("a call's requested extensions", () => {
+  const card = `{"capabilities":{"extensions":[{"uri":"u:opt"},{"uri":"u:must","required":true},{"uri":"u:denied"}]}}`
+  const allowed = ["u:opt", "u:must"]
+  expect(checkExtensions(card, allowed, undefined, "{}").code).toBe(-32008)
+  expect(checkExtensions(card, allowed, "u:must", "{}").code).toBe(0)
+  expect(checkExtensions(card, allowed, " u:must , u:opt ", "{}").code).toBe(0)
+  expect(checkExtensions(card, allowed, "u:must,u:denied", "{}").code).toBe(-32004)
+  expect(checkExtensions(card, allowed, "u:must,u:other", "{}").message).toBe("requested extension is not supported")
+  const big = "x".repeat(70000)
+  expect(checkExtensions(card, allowed, "u:must", `{"metadata":{"u:must":${quote(big)}}}`).code).toBe(-32602)
+  // metadata under a key that is not a requested extension is not limited
+  expect(checkExtensions(card, allowed, "u:must", `{"metadata":{"other":${quote(big)}}}`).code).toBe(0)
+  expect(checkExtensions(`{"name":"plain"}`, [], undefined, "{}").code).toBe(0)
+  expect(checkExtensions(`{"name":"plain"}`, [], "u:any", "{}").code).toBe(-32004)
+  expect(requestedUris("a, b,,a").join("|")).toBe("a|b")
+})

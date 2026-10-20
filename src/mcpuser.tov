@@ -1,11 +1,19 @@
 // Per-user OAuth for MCP clients of auth_type per_user_oauth (Bifrost's per-user consent). Each caller
-// (a virtual key, or an x-bf-mcp-session-id in session mode) holds its own token row per client. A caller
-// without a usable token is sent a consent link; the flow it opens is held here until the callback
-// returns, and the callback saves the row. Temp tokens (client.mcp_enable_temp_token_auth) let the link's
-// owner open the flow's start route without a dashboard session.
+// (a virtual key, an x-bf-mcp-session-id in session mode, or an identity-provider user through a user-mode MCP
+// token) holds its own token row per client. A caller without a usable token is sent a consent link; the flow it
+// opens is held here until the callback returns, and the callback saves the row. The admin's own verification of
+// an oauth client (initiate-verification, reauthorize) is a flow of mode "admin" in the same table. Temp tokens
+// (client.mcp_enable_temp_token_auth) let the link's owner open the flow's routes without a dashboard session,
+// until the flow ends.
+//
+// The flows and temp tokens are kept in a state file beside config.json (openFlowState), with each flow's PKCE
+// verifier sealed like the config's secrets and the temp tokens kept only as their SHA-256, so a restart between
+// the consent link and the callback keeps the flow, and every worker of the node sees the flows the others opened.
 import { McpAuthConfig, authorizeUrl, pkceVerifier, pkceChallenge, codeTokenRequest, tokenRequest, tokenFields } from "./mcpauth"
-import { secureHex } from "./crypto"
+import { secureHex, sha256, utf8, toHex } from "./crypto"
 import { deadline } from "./deadline"
+import { existsSync, readFileSync, unlinkSync } from "node:fs"
+import { writeFileAtomic } from "./atomicfile"
 
 // One caller's tokens for one per_user_oauth client. Exactly one of virtual_key_id and session_id is set:
 // session_id in session mode (the x-bf-mcp-session-id header), else virtual_key_id. The tokens are sealed
@@ -26,6 +34,8 @@ export type McpUserToken = {
   // with the reason
   status?: string,
   status_reason?: string,
+  // user mode: the identity-provider user the row belongs to (virtual_key_id and session_id are then "")
+  user_id?: string,
 }
 
 // A consent flow a caller opened: its state is the authorize request's state, and the link it was given
@@ -42,7 +52,19 @@ export type UserFlow = {
   temp_token: string,
   expires_at: f64,
   created_at: f64,
+  // "admin" for an admin's verification of an oauth client; unset for a caller's consent
+  mode?: string,
+  // user mode: the identity-provider user who opened the flow (virtual_key_id and session_id are then "")
+  user_id?: string,
+  // an admin flow: "pending" until its callback, "failed" when the authorization server refused it or the token
+  // request failed (the row is kept so the status route can say so)
+  status?: string,
+  updated_at?: f64,
 }
+
+// A temp token by its SHA-256: the flow it opens and the routes of its scope ("mcp_auth": the per-user OAuth
+// flow's detail and start; "mcp_headers_auth": the per-user headers flow's detail and submission).
+export type TempRow = { hash: string, flow: string, scope: string, expires_at: f64 }
 
 // A token this close to its expiry counts as expired, as TokenCache does (60 s).
 const USER_EXPIRY_MARGIN_MS: f64 = 60000.0
@@ -50,11 +72,146 @@ const FLOW_TTL_MS: f64 = 900000.0
 const TEMP_TTL_MS: f64 = 900000.0
 const FLOW_TIMEOUT_MS: int = 10000
 
-// Flows by state (the callback's key) and temp tokens by value. Process-local, as the OAuth flows of the
-// authorization code grant are.
+// Flows by state (the callback's key), temp tokens by hash, and the flows and tokens that ended (by flow id or
+// token hash, with the time), so a worker that still holds one does not write it back to the state file.
 const USER_FLOWS: Map<string, UserFlow> = new Map()
-const TEMP_TOKENS: Map<string, string> = new Map()
-const TEMP_EXPIRY: Map<string, f64> = new Map()
+const TEMP: Map<string, TempRow> = new Map()
+const GONE: Map<string, f64> = new Map()
+
+// The state file the flows are kept in ("" keeps them in memory only), and how a verifier is sealed and opened.
+type FlowFile = { flows?: UserFlow[], temp?: TempRow[], gone?: { key: string, at: f64 }[] }
+let flowFile = ""
+let flowSeal: ((v: string) => string) | undefined = undefined
+let flowOpen: ((v: string) => string | undefined) | undefined = undefined
+
+// Opens the flow state file (beside config.json) and takes the flows it holds. seal and open are the config's
+// secret sealing (store.tov sealStored and openStored with the config's cipher). Returns a note to print, or "".
+export function openFlowState(file: string, seal: (v: string) => string, open: (v: string) => string | undefined): string {
+  flowFile = file
+  flowSeal = seal
+  flowOpen = open
+  if (file === "" || !existsSync(file)) return ""
+  try {
+    adoptFlows(try JSON.parse(try readFileSync(file, "utf8")) as FlowFile)
+  } catch (e) {
+    return `the MCP flow state ${file} cannot be read; pending consent flows start over`
+  }
+  return ""
+}
+
+// Takes what the state file holds: ended flows and tokens are dropped here too, a flow not known yet is added
+// (its verifier opened), and a flow another worker changed later replaces this one.
+function adoptFlows(st: FlowFile): void {
+  for (const g of st.gone ?? []) {
+    if (!GONE.has(g.key)) GONE.set(g.key, g.at)
+    TEMP.delete(g.key)
+    for (const k of USER_FLOWS.keys()) {
+      const f = USER_FLOWS.get(k)
+      if (f !== undefined && f.id === g.key) USER_FLOWS.delete(k)
+    }
+  }
+  for (const f of st.flows ?? []) {
+    if (GONE.has(f.id)) continue
+    const have = USER_FLOWS.get(f.state)
+    if (have !== undefined && (have.updated_at ?? have.created_at) >= (f.updated_at ?? f.created_at)) continue
+    const open = flowOpen
+    const v = open === undefined ? f.verifier : open(f.verifier)
+    if (v === undefined) continue
+    const key = f.state
+    let n = f
+    n.verifier = v
+    USER_FLOWS.set(key, n)
+  }
+  for (const t of st.temp ?? []) {
+    if (!GONE.has(t.hash) && !TEMP.has(t.hash)) TEMP.set(t.hash, t)
+  }
+}
+
+// Reads the state file again (another worker may have written it).
+function syncFlows(): void {
+  if (flowFile === "" || !existsSync(flowFile)) return
+  try {
+    adoptFlows(try JSON.parse(try readFileSync(flowFile, "utf8")) as FlowFile)
+  } catch (e) {
+    return
+  }
+}
+
+// Writes the live flows (verifiers sealed, no temp token in clear), the live temp tokens and the recent ends to
+// the state file, after reading it so the other workers' flows are kept.
+function saveFlows(nowMs: f64): void {
+  if (flowFile === "") return
+  syncFlows()
+  const flows: UserFlow[] = []
+  const seal = flowSeal
+  for (const f of USER_FLOWS.values()) {
+    if (f.expires_at <= nowMs) continue
+    // a verifier that could not be sealed ("") is not written: that flow lives in this process only
+    const sv = seal === undefined ? f.verifier : seal(f.verifier)
+    if (sv === "") continue
+    let n = f
+    n.verifier = sv
+    n.temp_token = ""
+    flows.push(n)
+  }
+  const temp: TempRow[] = []
+  for (const t of TEMP.values()) {
+    if (t.expires_at > nowMs) temp.push(t)
+  }
+  const gone: { key: string, at: f64 }[] = []
+  for (const k of GONE.keys()) {
+    const at = GONE.get(k)!
+    if (at > nowMs - 2.0 * FLOW_TTL_MS) gone.push({ key: k, at: at })
+    else GONE.delete(k)
+  }
+  const st: FlowFile = { flows: flows, temp: temp, gone: gone }
+  try {
+    writeFileAtomic(flowFile, JSON.stringify(st) + "\n", { mode: 384 })
+  } catch (e) {
+    console.error(`raiju: mcp flows: could not write ${flowFile}: ${e.message}`)
+  }
+}
+
+// Ends a flow: it and its temp tokens are dropped, and the end is recorded so no worker brings them back.
+function endFlow(id: string, nowMs: f64): void {
+  for (const k of USER_FLOWS.keys()) {
+    const f = USER_FLOWS.get(k)
+    if (f !== undefined && f.id === id) USER_FLOWS.delete(k)
+  }
+  GONE.set(id, nowMs)
+  for (const k of TEMP.keys()) {
+    const t = TEMP.get(k)
+    if (t !== undefined && t.flow === id) {
+      TEMP.delete(k)
+      GONE.set(k, nowMs)
+    }
+  }
+}
+
+// Mints a temp token for a flow: the plaintext goes into the link's fragment, and only its hash is kept.
+export function mintTempToken(scope: string, flowId: string, expiresAt: f64): string throws Error {
+  const plain = try secureHex(32)
+  const hash = toHex(sha256(utf8(plain)))
+  TEMP.set(hash, { hash: hash, flow: flowId, scope: scope, expires_at: expiresAt })
+  saveFlows(Date.now())
+  return plain
+}
+
+// Ends the temp tokens of a flow (a per-user headers submission that completed), as Bifrost deletes them by resource.
+export function endTempTokens(flowId: string): void {
+  syncFlows()
+  const now = Date.now()
+  let any = false
+  for (const k of TEMP.keys()) {
+    const t = TEMP.get(k)
+    if (t !== undefined && t.flow === flowId) {
+      TEMP.delete(k)
+      GONE.set(k, now)
+      any = true
+    }
+  }
+  if (any) saveFlows(now)
+}
 
 // What a tool call needs from its caller's token at time nowMs.
 // "valid": use access_token. "refresh": expired or about to expire, and a refresh_token exists.
@@ -67,29 +224,65 @@ export function tokenAction(t: McpUserToken | undefined, nowMs: number): string 
 }
 
 // The index of a caller's row for a client in the list, or -1. Session mode keys by session_id when it is
-// set; otherwise by virtual key.
-export function userTokenIndex(list: McpUserToken[], client: string, vk: string, sessionId: string): int {
+// set; user mode by user_id; otherwise by virtual key.
+export function userTokenIndex(list: McpUserToken[], client: string, vk: string, sessionId: string, userId?: string): int {
+  const user = userId ?? ""
   for (let i = 0; i < list.length; i++) {
     const t = list[i]!
     if (t.mcp_client_name !== client) continue
-    if (sessionId !== "" && t.session_id === sessionId) return i
-    if (sessionId === "" && t.session_id === "" && vk !== "" && t.virtual_key_id === vk) return i
+    if (sessionId !== "") {
+      if (t.session_id === sessionId) return i
+      continue
+    }
+    if (user !== "") {
+      if ((t.user_id ?? "") === user) return i
+      continue
+    }
+    if (t.session_id === "" && (t.user_id ?? "") === "" && vk !== "" && t.virtual_key_id === vk) return i
   }
   return -1
 }
 
 // The row of one caller for one client, or undefined.
-export function userTokenOf(list: McpUserToken[] | undefined, client: string, vk: string, sessionId: string): McpUserToken | undefined {
+export function userTokenOf(list: McpUserToken[] | undefined, client: string, vk: string, sessionId: string, userId?: string): McpUserToken | undefined {
   const all = list ?? []
-  const i = userTokenIndex(all, client, vk, sessionId)
+  const i = userTokenIndex(all, client, vk, sessionId, userId)
   return i < 0 ? undefined : all[i]
 }
 
-// The identity a request is keyed by: the x-bf-mcp-session-id header when present, else the virtual key.
-export function identityOf(sessionHeader: string | undefined, vk: string): { vk: string, session: string } {
+// The identity a request is keyed by: the x-bf-mcp-session-id header when present, else the user of a user-mode
+// token, else the virtual key.
+export function identityOf(sessionHeader: string | undefined, vk: string, user?: string): { vk: string, session: string, user: string } {
   const s = (sessionHeader ?? "").trim()
-  if (s !== "") return { vk: "", session: s }
-  return { vk: vk, session: "" }
+  if (s !== "") return { vk: "", session: s, user: "" }
+  const u = user ?? ""
+  if (u !== "") return { vk: "", session: "", user: u }
+  return { vk: vk, session: "", user: "" }
+}
+
+// A request header that carries the user of a user-mode MCP token from the /mcp handler to the tool calls it makes.
+// The value is bound to a secret of this process, so a header a caller sends never names a user.
+export const USER_HEADER = "x-raiju-mcp-user"
+const USER_MARK = makeMark()
+
+function makeMark(): string {
+  try {
+    return secureHex(16)
+  } catch (e) {
+    return ""
+  }
+}
+
+// The header value that names a user.
+export function markUser(user: string): string {
+  return USER_MARK + ":" + user
+}
+
+// The user a header value names, or "" when it was not made by markUser in this process.
+export function userOfMark(v: string | undefined): string {
+  const s = v ?? ""
+  if (USER_MARK === "" || !s.startsWith(USER_MARK + ":")) return ""
+  return s.slice(USER_MARK.byteLength + 1)
 }
 
 // The consent wording of a tool call that needs the caller's login. The link is the flow's start URL;
@@ -107,99 +300,208 @@ export function consentLink(base: string, flowId: string, tempToken: string): st
   return tempToken === "" ? u : `${u}#t=${tempToken}`
 }
 
+// The link of a per-user headers submission: the same auth page with kind=headers, which reads the flow and
+// submits the values (Bifrost's frontend URL). The temp token rides in the fragment.
+export function headersLink(base: string, flowId: string, tempToken: string): string {
+  const u = `${base}/workspace/mcp-sessions/auth?flow=${flowId}&kind=headers`
+  return tempToken === "" ? u : `${u}#t=${tempToken}`
+}
+
 // Drops the flows and temp tokens whose time is up.
 function prune(nowMs: f64): void {
   for (const k of USER_FLOWS.keys()) {
     const f = USER_FLOWS.get(k)
     if (f !== undefined && f.expires_at <= nowMs) USER_FLOWS.delete(k)
   }
-  for (const k of TEMP_EXPIRY.keys()) {
-    const e = TEMP_EXPIRY.get(k)
-    if (e !== undefined && e <= nowMs) {
-      TEMP_EXPIRY.delete(k)
-      TEMP_TOKENS.delete(k)
-    }
+  for (const k of TEMP.keys()) {
+    const t = TEMP.get(k)
+    if (t !== undefined && t.expires_at <= nowMs) TEMP.delete(k)
   }
 }
 
 // Opens a consent flow for a caller of a per_user_oauth client. a is the client's registration (its
 // authorize endpoint and client_id, set by the admin's verification). The flow's temp token is minted when
-// tempOn is set. error says why no flow was opened.
-export function startUserFlow(a: McpAuthConfig, client: string, vk: string, sessionId: string, base: string, tempOn: bool, nowMs: f64): { flow: UserFlow | undefined, error: string } {
+// tempOn is set, except for a user-mode flow, which the user's own dashboard sign-in opens (as Bifrost). error
+// says why no flow was opened.
+export function startUserFlow(a: McpAuthConfig, client: string, vk: string, sessionId: string, base: string, tempOn: bool, nowMs: f64, userId?: string): { flow: UserFlow | undefined, error: string } {
   if ((a.client_id ?? "") === "" || (a.authorize_url ?? "") === "") return { flow: undefined, error: `MCP client ${client} is not verified yet: an admin runs initiate-verification first` }
+  syncFlows()
   prune(nowMs)
+  const user = userId ?? ""
   try {
     const state = secureHex(32)
     const id = secureHex(16)
     const verifier = pkceVerifier()
     const redirect = base + "/api/oauth/callback"
     const url = authorizeUrl(a, redirect, state, pkceChallenge(verifier))
-    const temp = tempOn ? secureHex(32) : ""
-    const flow: UserFlow = { id: id, state: state, client: client, virtual_key_id: vk, session_id: sessionId, verifier: verifier, redirect: redirect, authorize_url: url, temp_token: temp, expires_at: nowMs + FLOW_TTL_MS, created_at: nowMs }
+    let flow: UserFlow = { id: id, state: state, client: client, virtual_key_id: vk, session_id: sessionId, verifier: verifier, redirect: redirect, authorize_url: url, temp_token: "", expires_at: nowMs + FLOW_TTL_MS, created_at: nowMs, updated_at: nowMs }
+    if (user !== "") flow.user_id = user
     USER_FLOWS.set(state, flow)
-    if (temp !== "") {
-      TEMP_TOKENS.set(temp, id)
-      TEMP_EXPIRY.set(temp, nowMs + TEMP_TTL_MS)
+    if (tempOn && user === "") {
+      const plain = try secureHex(32)
+      const hash = toHex(sha256(utf8(plain)))
+      TEMP.set(hash, { hash: hash, flow: id, scope: "mcp_auth", expires_at: nowMs + TEMP_TTL_MS })
+      flow.temp_token = plain
     }
+    saveFlows(nowMs)
     return { flow: flow, error: "" }
   } catch (e) {
     return { flow: undefined, error: `could not start the flow: ${e.message}` }
   }
 }
 
-// The live flow with this id, or undefined.
-export function userFlowById(id: string, nowMs: f64): UserFlow | undefined {
-  for (const f of USER_FLOWS.values()) {
-    if (f.id === id && f.expires_at > nowMs) return f
+// Opens an admin's verification flow of an oauth client (initiate-verification or reauthorize): the state, the
+// verifier and redirect URI the callback needs, and the authorize URL. No temp token: an admin opens it from the
+// dashboard. Returns the flow.
+export function startAdminFlow(client: string, state: string, verifier: string, redirect: string, url: string, nowMs: f64): UserFlow throws Error {
+  syncFlows()
+  prune(nowMs)
+  const id = try secureHex(16)
+  const flow: UserFlow = { id: id, state: state, client: client, virtual_key_id: "", session_id: "", verifier: verifier, redirect: redirect, authorize_url: url, temp_token: "", expires_at: nowMs + FLOW_TTL_MS, created_at: nowMs, mode: "admin", status: "pending", updated_at: nowMs }
+  USER_FLOWS.set(state, flow)
+  saveFlows(nowMs)
+  return flow
+}
+
+// An admin flow by id (any status, expired included while the file keeps it), or undefined.
+export function adminFlowById(id: string): UserFlow | undefined {
+  for (let pass = 0; pass < 2; pass++) {
+    for (const f of USER_FLOWS.values()) {
+      if (f.id === id && f.mode === "admin") return f
+    }
+    if (pass === 0) syncFlows()
   }
   return undefined
 }
 
-// All live flows, for the sessions list.
-export function userFlowsLive(nowMs: f64): UserFlow[] {
+// The admin flows of a client that the table holds, newest first.
+export function adminFlowsOf(client: string): UserFlow[] {
+  syncFlows()
   const out: UserFlow[] = []
   for (const f of USER_FLOWS.values()) {
-    if (f.expires_at > nowMs) out.push(f)
+    if (f.mode === "admin" && f.client === client) out.push(f)
+  }
+  out.sort((a, b) => b.created_at - a.created_at)
+  return out
+}
+
+// The flow of a callback's state without taking it (a callback that carries an error: a per-user flow stays
+// pending so its link can be retried, as in Bifrost). undefined when unknown.
+export function peekFlow(state: string): UserFlow | undefined {
+  let f = USER_FLOWS.get(state)
+  if (f === undefined) {
+    syncFlows()
+    f = USER_FLOWS.get(state)
+  }
+  return f
+}
+
+// Marks an admin flow failed (the authorization server refused it, or the token request failed). The row stays,
+// so the status route can report it, until it expires.
+export function failAdminFlow(f: UserFlow, nowMs: f64): void {
+  let n = f
+  n.status = "failed"
+  n.updated_at = nowMs
+  USER_FLOWS.set(n.state, n)
+  saveFlows(nowMs)
+}
+
+// The live per-user flow with this id, or undefined. Admin flows are not per-user flows.
+export function userFlowById(id: string, nowMs: f64): UserFlow | undefined {
+  for (let pass = 0; pass < 2; pass++) {
+    for (const f of USER_FLOWS.values()) {
+      if (f.id === id && f.mode !== "admin" && f.expires_at > nowMs) return f
+    }
+    if (pass === 0) syncFlows()
+  }
+  return undefined
+}
+
+// All live per-user flows, for the sessions list.
+export function userFlowsLive(nowMs: f64): UserFlow[] {
+  syncFlows()
+  const out: UserFlow[] = []
+  for (const f of USER_FLOWS.values()) {
+    if (f.mode !== "admin" && f.expires_at > nowMs) out.push(f)
   }
   return out
 }
 
-// Takes the flow of a callback's state out of the table (single use). undefined when unknown or expired.
+// Takes the flow of a callback's state (single use): a per-user flow ends here with its temp tokens. An admin flow
+// is answered as it is; the callback ends it on success (endAdminFlow) or marks it failed. undefined when unknown,
+// expired or already failed.
 export function takeUserFlow(state: string, nowMs: f64): UserFlow | undefined {
-  const f = USER_FLOWS.get(state)
-  USER_FLOWS.delete(state)
-  if (f === undefined || f.expires_at <= nowMs) return undefined
+  let f = USER_FLOWS.get(state)
+  if (f === undefined) {
+    syncFlows()
+    f = USER_FLOWS.get(state)
+  }
+  if (f === undefined || f.expires_at <= nowMs || f.status === "failed") return undefined
+  if (f.mode !== "admin") {
+    endFlow(f.id, nowMs)
+    saveFlows(nowMs)
+  }
   return f
 }
 
-// Drops one pending flow by id (a revoked session's flow).
+// Ends an admin flow whose callback completed: the client is authorized now, so its row goes (as Bifrost removes it).
+export function endAdminFlow(id: string, nowMs: f64): void {
+  endFlow(id, nowMs)
+  saveFlows(nowMs)
+}
+
+// Drops one pending flow by id (a revoked session's flow), with its temp tokens.
 export function dropUserFlow(id: string): void {
-  for (const k of USER_FLOWS.keys()) {
-    const f = USER_FLOWS.get(k)
-    if (f !== undefined && f.id === id) USER_FLOWS.delete(k)
-  }
+  const now = Date.now()
+  endFlow(id, now)
+  saveFlows(now)
 }
 
 // Drops the pending flows of one caller for one client (revoke, or a new flow replacing them).
-export function forgetUserFlows(client: string, vk: string, sessionId: string): void {
-  for (const k of USER_FLOWS.keys()) {
-    const f = USER_FLOWS.get(k)
-    if (f === undefined) continue
-    if (f.client !== client) continue
-    if ((sessionId !== "" && f.session_id === sessionId) || (sessionId === "" && f.session_id === "" && f.virtual_key_id === vk)) USER_FLOWS.delete(k)
+export function forgetUserFlows(client: string, vk: string, sessionId: string, userId?: string): void {
+  syncFlows()
+  const user = userId ?? ""
+  const now = Date.now()
+  const ids: string[] = []
+  for (const f of USER_FLOWS.values()) {
+    if (f.mode === "admin" || f.client !== client) continue
+    const fu = f.user_id ?? ""
+    if (sessionId !== "") {
+      if (f.session_id === sessionId) ids.push(f.id)
+    } else if (user !== "") {
+      if (fu === user) ids.push(f.id)
+    } else if (f.session_id === "" && fu === "" && f.virtual_key_id === vk) {
+      ids.push(f.id)
+    }
   }
+  for (const id of ids) endFlow(id, now)
+  if (ids.length > 0) saveFlows(now)
 }
 
-// Whether a temp token may call a flow route: it must be live, GET, and name the flow in the path.
-// The temp token is only honoured when the caller has client.mcp_enable_temp_token_auth on (checked by the caller).
+// Whether a dashboard caller may open a flow (Bifrost's canAccessUserFlow): a user-mode flow only by its own user;
+// any other flow by anyone who passed the gate.
+export function mayOpenFlow(f: UserFlow, callerUser: string): bool {
+  const u = f.user_id ?? ""
+  if (u === "") return true
+  return callerUser !== "" && callerUser === u
+}
+
+// Whether a temp token may call a route: it must be live, and the route must be one of its scope's routes for the
+// flow it was minted for ("mcp_auth": GET the per-user OAuth flow or its start; "mcp_headers_auth": GET or PUT the
+// per-user headers flow). The temp token is only honoured when client.mcp_enable_temp_token_auth is on (checked by
+// the caller).
 export function tempTokenAllows(token: string, method: string, path: string, nowMs: f64): bool {
-  if (token === "" || method !== "GET") return false
-  const flowId = flowIdOfPath(path)
-  if (flowId === "") return false
-  const bound = TEMP_TOKENS.get(token)
-  if (bound === undefined || bound !== flowId) return false
-  const e = TEMP_EXPIRY.get(token)
-  return e !== undefined && e > nowMs
+  if (token === "") return false
+  const hash = toHex(sha256(utf8(token)))
+  let t = TEMP.get(hash)
+  if (t === undefined) {
+    syncFlows()
+    t = TEMP.get(hash)
+  }
+  if (t === undefined || t.expires_at <= nowMs) return false
+  if (t.scope === "mcp_auth") return method === "GET" && flowIdOfPath(path) === t.flow
+  if (t.scope === "mcp_headers_auth") return (method === "GET" || method === "PUT") && headersFlowIdOfPath(path) === t.flow
+  return false
 }
 
 // The flow id of /api/oauth/per-user/flows/{id} and /api/oauth/per-user/flows/{id}/start, else "".
@@ -213,11 +515,23 @@ export function flowIdOfPath(path: string): string {
   return ""
 }
 
+// The flow id of /api/mcp/per-user-headers/flows/{id}, else "".
+export function headersFlowIdOfPath(path: string): string {
+  const q = path.indexOf("?")
+  const p = q < 0 ? path : path.slice(0, q)
+  const segs = p.split("/").filter((s) => s !== "")
+  if (segs.length !== 5 || segs[0] !== "api" || segs[1] !== "mcp" || segs[2] !== "per-user-headers" || segs[3] !== "flows") return ""
+  return segs[4]!
+}
+
 // Issues a token response's tokens as a row for the caller (a fresh id, or the given row's id).
-export function rowFromTokens(json: string, nowMs: f64, client: string, vk: string, sessionId: string, id: string, oldRefresh: string): McpUserToken throws SyntaxError {
+export function rowFromTokens(json: string, nowMs: f64, client: string, vk: string, sessionId: string, id: string, oldRefresh: string, userId?: string): McpUserToken throws SyntaxError {
   const t = try tokenFields(json, nowMs)
   const refresh = t.refresh !== "" ? t.refresh : oldRefresh
-  return { id: id, mcp_client_name: client, virtual_key_id: vk, session_id: sessionId, access_token: t.access, refresh_token: refresh, token_expires_at: t.expiresAt, scopes: [], created_at: nowMs, last_refreshed_at: nowMs }
+  let row: McpUserToken = { id: id, mcp_client_name: client, virtual_key_id: vk, session_id: sessionId, access_token: t.access, refresh_token: refresh, token_expires_at: t.expiresAt, scopes: [], created_at: nowMs, last_refreshed_at: nowMs }
+  const u = userId ?? ""
+  if (u !== "") row.user_id = u
+  return row
 }
 
 // Trades a callback's code for the caller's tokens, with the flow's PKCE verifier.
@@ -233,7 +547,7 @@ export async function refreshUserRow(a: McpAuthConfig, row: McpUserToken, nowMs:
   req.refresh_token = row.refresh_token
   const tr = try tokenRequest(req)
   const text = try await postForm(tr.url, tr.headers, tr.body)
-  return try rowFromTokens(text, nowMs, row.mcp_client_name, row.virtual_key_id, row.session_id, row.id, row.refresh_token)
+  return try rowFromTokens(text, nowMs, row.mcp_client_name, row.virtual_key_id, row.session_id, row.id, row.refresh_token, row.user_id)
 }
 
 // One form POST to an authorization server under a deadline: the body of a 2xx answer, else an error.
@@ -353,3 +667,90 @@ test("rows are replaced by id and dropped by id", () => {
 function rowOf(id: string, vk: string, sid: string, expires: f64, refresh: string): McpUserToken {
   return { id: id, mcp_client_name: "m", virtual_key_id: vk, session_id: sid, access_token: "a", refresh_token: refresh, token_expires_at: expires, scopes: [], created_at: 0.0, last_refreshed_at: 0.0 }
 }
+
+test("user-mode rows are keyed by user, apart from the key and session rows", () => {
+  let u = rowOf("u3", "", "", 0.0, "")
+  u.user_id = "alice"
+  const list = [rowOf("u1", "vk1", "", 0.0, ""), u]
+  expect(userTokenOf(list, "m", "", "", "alice")!.id).toBe("u3")
+  expect(userTokenOf(list, "m", "", "", "bob")).toBe(undefined)
+  expect(userTokenOf(list, "m", "vk1", "")!.id).toBe("u1")
+  expect(identityOf(undefined, "vk1", "alice")).toEqual({ vk: "", session: "", user: "alice" })
+  expect(identityOf("s-1", "vk1", "alice")).toEqual({ vk: "", session: "s-1", user: "" })
+  expect(userOfMark(markUser("alice"))).toBe("alice")
+  expect(userOfMark("forged:alice")).toBe("")
+  expect(userOfMark(undefined)).toBe("")
+})
+
+test("a user-mode flow gets no temp token and opens for its own user only", () => {
+  const a: McpAuthConfig = { type: "oauth", client_id: "cid", authorize_url: "https://auth.example/authorize" }
+  const f = startUserFlow(a, "m", "", "", "http://gw", true, 1000.0, "alice").flow!
+  expect(f.temp_token).toBe("")
+  expect(mayOpenFlow(f, "alice")).toBe(true)
+  expect(mayOpenFlow(f, "bob")).toBe(false)
+  expect(mayOpenFlow(f, "")).toBe(false)
+  const v = startUserFlow(a, "m", "vk1", "", "http://gw", true, 1000.0).flow!
+  expect(mayOpenFlow(v, "")).toBe(true)
+  forgetUserFlows("m", "", "", "alice")
+  expect(userFlowById(f.id, 2000.0)).toBe(undefined)
+  expect(userFlowById(v.id, 2000.0) !== undefined).toBe(true)
+})
+
+test("a temp token ends with its flow, and a headers token opens only its submission", () => {
+  const a: McpAuthConfig = { type: "oauth", client_id: "cid", authorize_url: "https://auth.example/authorize" }
+  const f = startUserFlow(a, "m", "vk1", "", "http://gw", true, 1000.0).flow!
+  expect(tempTokenAllows(f.temp_token, "GET", "/api/oauth/per-user/flows/" + f.id, 2000.0)).toBe(true)
+  takeUserFlow(f.state, 2000.0)
+  expect(tempTokenAllows(f.temp_token, "GET", "/api/oauth/per-user/flows/" + f.id, 2000.0)).toBe(false)
+  const h = try mintTempToken("mcp_headers_auth", "hf-1", Date.now() + 60000.0)
+  expect(tempTokenAllows(h, "PUT", "/api/mcp/per-user-headers/flows/hf-1", Date.now())).toBe(true)
+  expect(tempTokenAllows(h, "GET", "/api/mcp/per-user-headers/flows/hf-1", Date.now())).toBe(true)
+  expect(tempTokenAllows(h, "DELETE", "/api/mcp/per-user-headers/flows/hf-1", Date.now())).toBe(false)
+  expect(tempTokenAllows(h, "GET", "/api/oauth/per-user/flows/hf-1", Date.now())).toBe(false)
+  endTempTokens("hf-1")
+  expect(tempTokenAllows(h, "PUT", "/api/mcp/per-user-headers/flows/hf-1", Date.now())).toBe(false)
+  expect(headersLink("http://gw", "hf-1", "tk")).toBe("http://gw/workspace/mcp-sessions/auth?flow=hf-1&kind=headers#t=tk")
+})
+
+test("an admin flow is found by id, marked failed, and ended on success", () => {
+  const f = try startAdminFlow("gh", "st-admin-1", "v".repeat(50), "http://gw/api/oauth/callback", "https://auth.example/authorize", Date.now())
+  expect(adminFlowById(f.id)!.status).toBe("pending")
+  expect(userFlowById(f.id, Date.now())).toBe(undefined)
+  const taken = takeUserFlow("st-admin-1", Date.now())!
+  expect(taken.mode).toBe("admin")
+  failAdminFlow(taken, Date.now())
+  expect(adminFlowById(f.id)!.status).toBe("failed")
+  expect(takeUserFlow("st-admin-1", Date.now())).toBe(undefined)
+  endAdminFlow(f.id, Date.now())
+  expect(adminFlowById(f.id)).toBe(undefined)
+})
+
+test("flows and temp tokens survive a restart through the state file, with the verifier sealed", () => {
+  const file = "/tmp/raiju-mcpflows-test-" + makeMark() + ".json"
+  // a stand-in seal: reversed and marked, so the clear value is not in the file
+  const seal = (v: string): string => "sealed:" + v.split("").reverse().join("")
+  const open = (v: string): string | undefined => v.startsWith("sealed:") ? v.slice(7).split("").reverse().join("") : undefined
+  openFlowState(file, seal, open)
+  const a: McpAuthConfig = { type: "oauth", client_id: "cid", authorize_url: "https://auth.example/authorize" }
+  const now = Date.now()
+  const f = startUserFlow(a, "m", "vk-restart", "", "http://gw", true, now).flow!
+  const text = try readFileSync(file, "utf8")
+  expect(text.includes(f.verifier)).toBe(false)
+  expect(text.includes(f.temp_token)).toBe(false)
+  // a restart: the memory is gone, and the file brings the flow and its temp token back
+  USER_FLOWS.clear()
+  TEMP.clear()
+  GONE.clear()
+  openFlowState(file, seal, open)
+  const back = userFlowById(f.id, now + 1000.0)!
+  expect(back.verifier).toBe(f.verifier)
+  expect(tempTokenAllows(f.temp_token, "GET", "/api/oauth/per-user/flows/" + f.id + "/start", now + 1000.0)).toBe(true)
+  // the callback ends it, and a worker that still held it does not bring it back
+  const taken = takeUserFlow(f.state, now + 2000.0)!
+  expect(taken.verifier).toBe(f.verifier)
+  USER_FLOWS.set(f.state, f)
+  saveFlows(now + 3000.0)
+  expect(userFlowById(f.id, now + 3000.0)).toBe(undefined)
+  openFlowState("", seal, open)
+  try unlinkSync(file)
+})

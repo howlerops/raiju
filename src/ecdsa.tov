@@ -1,0 +1,290 @@
+// ES256 signatures (ECDSA over P-256 with SHA-256, RFC 7518 section 3.4) for JWT assertions. Tov has no EC
+// library: the curve arithmetic is done here with bigint, and the nonce is derived as RFC 6979 describes
+// (HMAC-SHA256 over the key and the digest), so no random source can leak the key. The private key is an EC
+// PEM: SEC 1 (BEGIN EC PRIVATE KEY) or PKCS#8 (BEGIN PRIVATE KEY) on the P-256 curve.
+import { sha256, hmacSha256, utf8 } from "./crypto"
+import { encodeUrl, encode, decode } from "./base64"
+import { modPow } from "./jwt"
+
+const P: bigint = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffffn
+const N: bigint = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551n
+const GX: bigint = 0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296n
+const GY: bigint = 0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5n
+
+// id-ecPublicKey (1.2.840.10045.2.1) and prime256v1 (1.2.840.10045.3.1.7), as DER OBJECT IDENTIFIERs
+const EC_OID: int[] = [0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]
+const P256_OID: int[] = [0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]
+
+// ---- DER ----
+
+type Tlv = { tag: int, value: u8[], next: int }
+
+function readTlv(der: u8[], pos: int): Tlv throws SyntaxError {
+  if (pos + 2 > der.length) throw new SyntaxError("der: truncated")
+  const tag = int(der[pos]!)
+  let len = int(der[pos + 1]!)
+  let p = pos + 2
+  if (len >= 0x80) {
+    const n = len - 0x80
+    if (n < 1 || n > 4) throw new SyntaxError("der: unsupported length")
+    len = 0
+    for (let i = 0; i < n; i++) {
+      if (p >= der.length) throw new SyntaxError("der: truncated")
+      len = len * 256 + int(der[p]!)
+      p++
+    }
+  }
+  if (p + len > der.length) throw new SyntaxError("der: truncated")
+  return { tag: tag, value: der.slice(p, p + len), next: p + len }
+}
+
+function child(der: u8[], pos: int, tag: int): Tlv throws SyntaxError {
+  const t = try readTlv(der, pos)
+  if (t.tag !== tag) throw new SyntaxError(`der: expected tag ${tag}, found ${t.tag}`)
+  return t
+}
+
+function startsWith(b: u8[], prefix: int[]): bool {
+  if (b.length < prefix.length) return false
+  for (let i = 0; i < prefix.length; i++) {
+    if (int(b[i]!) !== prefix[i]!) return false
+  }
+  return true
+}
+
+function bigOf(b: u8[]): bigint {
+  let v = 0n
+  for (const x of b) v = v * 256n + BigInt(int(x))
+  return v
+}
+
+function bytesOf(x: bigint, len: int): u8[] {
+  const out: u8[] = []
+  for (let i = 0; i < len; i++) out.push(u8(0))
+  let v = x
+  for (let i = len - 1; i >= 0; i--) {
+    out[i] = u8(int(v & 0xffn))
+    v = v >> 8n
+  }
+  return out
+}
+
+// SEC 1 ECPrivateKey: SEQUENCE { version 1, privateKey OCTET STRING, [0] parameters, [1] publicKey }. The
+// curve, when named, must be P-256.
+function secOne(der: u8[]): bigint throws SyntaxError {
+  const body = (try child(der, 0, 0x30)).value
+  const ver = try child(body, 0, 0x02)
+  if (ver.value.length !== 1 || int(ver.value[0]!) !== 1) throw new SyntaxError("ec: unsupported key version")
+  const key = try child(body, ver.next, 0x04)
+  if (key.next < body.length) {
+    const params = try readTlv(body, key.next)
+    if (params.tag === 0xa0 && !startsWith(params.value, P256_OID)) throw new SyntaxError("ec: only the P-256 curve is supported (ES256)")
+  }
+  const d = bigOf(key.value)
+  if (d <= 0n || d >= N) throw new SyntaxError("ec: private key out of range")
+  return d
+}
+
+// PKCS#8 PrivateKeyInfo for an EC key: SEQUENCE { version, SEQUENCE { id-ecPublicKey, prime256v1 }, OCTET STRING }.
+function pkcs8(der: u8[]): bigint throws SyntaxError {
+  const body = (try child(der, 0, 0x30)).value
+  const ver = try child(body, 0, 0x02)
+  const alg = try child(body, ver.next, 0x30)
+  if (!startsWith(alg.value, EC_OID)) throw new SyntaxError("pkcs8: not an EC key")
+  if (!startsWith(alg.value.slice(EC_OID.length), P256_OID)) throw new SyntaxError("ec: only the P-256 curve is supported (ES256)")
+  const key = try child(body, alg.next, 0x04)
+  return try secOne(key.value)
+}
+
+// The private scalar of an EC PEM (SEC 1 or PKCS#8).
+export function ecPrivateKey(pem: string): bigint throws SyntaxError {
+  const sec = pem.includes("-----BEGIN EC PRIVATE KEY-----")
+  const p8 = pem.includes("-----BEGIN PRIVATE KEY-----")
+  if (!sec && !p8) throw new SyntaxError("private_key could not be parsed as an EC PEM for ES256")
+  const lines: string[] = []
+  for (const line of pem.split("\n")) {
+    const l = line.trim()
+    if (l === "" || l.startsWith("-----")) continue
+    lines.push(l)
+  }
+  const der = try decode(lines.join(""))
+  return sec ? try secOne(der) : try pkcs8(der)
+}
+
+// ---- P-256 ----
+
+type Pt = { x: bigint, y: bigint, z: bigint, inf: bool }
+
+const INF: Pt = { x: 0n, y: 1n, z: 0n, inf: true }
+
+function fp(a: bigint): bigint {
+  const r = a % P
+  return r < 0n ? r + P : r
+}
+
+function dbl(p: Pt): Pt {
+  if (p.inf || p.y === 0n) return INF
+  const delta = fp(p.z * p.z)
+  const gamma = fp(p.y * p.y)
+  const beta = fp(p.x * gamma)
+  const alpha = fp(3n * (p.x - delta) * (p.x + delta))
+  const x3 = fp(alpha * alpha - 8n * beta)
+  const z3 = fp((p.y + p.z) * (p.y + p.z) - gamma - delta)
+  const y3 = fp(alpha * (4n * beta - x3) - 8n * gamma * gamma)
+  return { x: x3, y: y3, z: z3, inf: false }
+}
+
+function addAffine(p: Pt, qx: bigint, qy: bigint): Pt {
+  if (p.inf) return { x: qx, y: qy, z: 1n, inf: false }
+  const z1z1 = fp(p.z * p.z)
+  const u2 = fp(qx * z1z1)
+  const s2 = fp(qy * p.z * z1z1)
+  const h = fp(u2 - p.x)
+  const r = fp(2n * (s2 - p.y))
+  if (h === 0n) {
+    if (r === 0n) return dbl(p)
+    return INF
+  }
+  const hh = fp(h * h)
+  const i = fp(4n * hh)
+  const j = fp(h * i)
+  const v = fp(p.x * i)
+  const x3 = fp(r * r - j - 2n * v)
+  const y3 = fp(r * (v - x3) - 2n * p.y * j)
+  const z3 = fp((p.z + h) * (p.z + h) - z1z1 - hh)
+  return { x: x3, y: y3, z: z3, inf: false }
+}
+
+function scalarMul(k: bigint, x: bigint, y: bigint): Pt {
+  let acc: Pt = INF
+  let bits = 0
+  let t = k
+  while (t > 0n) {
+    t = t >> 1n
+    bits++
+  }
+  for (let i = bits - 1; i >= 0; i--) {
+    acc = dbl(acc)
+    if (((k >> BigInt(i)) & 1n) === 1n) acc = addAffine(acc, x, y)
+  }
+  return acc
+}
+
+function affine(p: Pt): { x: bigint, y: bigint } | undefined {
+  if (p.inf) return undefined
+  const zi = modPow(fp(p.z), P - 2n, P)
+  const zi2 = fp(zi * zi)
+  return { x: fp(p.x * zi2), y: fp(p.y * zi2 * zi) }
+}
+
+// ---- RFC 6979 nonces and signatures ----
+
+function concat(parts: u8[][]): u8[] {
+  const out: u8[] = []
+  for (const p of parts) {
+    for (const b of p) out.push(b)
+  }
+  return out
+}
+
+// The deterministic nonce for a key and a SHA-256 digest (RFC 6979 section 3.2, qlen = hlen = 256).
+export function nonceFor(d: bigint, digest: u8[]): bigint {
+  const x = bytesOf(d, 32)
+  const h = bytesOf(bigOf(digest) % N, 32)
+  let v: u8[] = []
+  let k: u8[] = []
+  for (let i = 0; i < 32; i++) {
+    v.push(u8(1))
+    k.push(u8(0))
+  }
+  k = hmacSha256(k, concat([v, [u8(0)], x, h]))
+  v = hmacSha256(k, v)
+  k = hmacSha256(k, concat([v, [u8(1)], x, h]))
+  v = hmacSha256(k, v)
+  while (true) {
+    v = hmacSha256(k, v)
+    const t = bigOf(v)
+    if (t >= 1n && t < N) return t
+    k = hmacSha256(k, concat([v, [u8(0)]]))
+    v = hmacSha256(k, v)
+  }
+}
+
+// The raw (r, s) signature of a SHA-256 digest.
+export function signDigest(d: bigint, digest: u8[]): { r: bigint, s: bigint } {
+  const z = bigOf(digest) % N
+  let k = nonceFor(d, digest)
+  while (true) {
+    const pt = affine(scalarMul(k, GX, GY))
+    if (pt !== undefined) {
+      const r = pt.x % N
+      if (r !== 0n) {
+        const kinv = modPow(k, N - 2n, N)
+        const s = (kinv * ((z + r * d) % N)) % N
+        if (s !== 0n) return { r: r, s: s }
+      }
+    }
+    // (a zero r or s is all but impossible; the next nonce is the digest of this one)
+    k = bigOf(hmacSha256(bytesOf(k, 32), digest)) % N
+  }
+}
+
+// Base64url ES256 signature of signingInput: r and s, 32 bytes each (the JWS form, not DER).
+export function signEs256(pem: string, signingInput: string): string throws SyntaxError {
+  const d = try ecPrivateKey(pem)
+  const sig = signDigest(d, sha256(utf8(signingInput)))
+  return encodeUrl(concat([bytesOf(sig.r, 32), bytesOf(sig.s, 32)]))
+}
+
+// Whether (r, s) is a valid signature of a digest under the public key d*G (for the tests).
+function verifyWith(d: bigint, digest: u8[], r: bigint, s: bigint): bool {
+  const q = affine(scalarMul(d, GX, GY))
+  if (q === undefined) return false
+  const w = modPow(s, N - 2n, N)
+  const z = bigOf(digest) % N
+  const p1 = scalarMul((z * w) % N, GX, GY)
+  const p2 = affine(scalarMul((r * w) % N, q.x, q.y))
+  let sum: Pt = p1
+  if (p2 !== undefined) sum = addAffine(p1, p2.x, p2.y)
+  const a = affine(sum)
+  if (a === undefined) return false
+  return a.x % N === r
+}
+
+const RFC6979_D: bigint = 0xc9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721n
+
+test("RFC 6979 A.2.5: P-256 with SHA-256 over \"sample\"", () => {
+  const digest = sha256(utf8("sample"))
+  expect(nonceFor(RFC6979_D, digest)).toBe(0xa6e3c57dd01abe90086538398355dd4c3b17aa873382b0f24d6129493d8aad60n)
+  const sig = signDigest(RFC6979_D, digest)
+  expect(sig.r).toBe(0xefd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716n)
+  expect(sig.s).toBe(0xf7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8n)
+  expect(verifyWith(RFC6979_D, digest, sig.r, sig.s)).toBe(true)
+  expect(verifyWith(RFC6979_D, sha256(utf8("other")), sig.r, sig.s)).toBe(false)
+})
+
+// The RFC's key as a SEC 1 PEM, built here (a [0] parameter naming P-256).
+function rfcPem(): string {
+  const der: u8[] = []
+  for (const b of [0x30, 0x31, 0x02, 0x01, 0x01, 0x04, 0x20]) der.push(u8(b))
+  for (const b of bytesOf(RFC6979_D, 32)) der.push(b)
+  for (const b of [0xa0, 0x0a]) der.push(u8(b))
+  for (const b of P256_OID) der.push(u8(b))
+  return "-----BEGIN EC " + "PRIVATE KEY-----\n" + encode(der) + "\n-----END EC " + "PRIVATE KEY-----\n"
+}
+
+
+test("an ES256 signature over a SEC 1 PEM is the 64-byte r||s of the RFC key", () => {
+  const sig = try signEs256(rfcPem(), "sample")
+  const raw = try decode(sig)
+  expect(raw.length).toBe(64)
+  expect(bigOf(raw.slice(0, 32))).toBe(0xefd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716n)
+  expect(try ecPrivateKey(rfcPem())).toBe(RFC6979_D)
+  let bad = ""
+  try {
+    ecPrivateKey("-----BEGIN RSA " + "PRIVATE KEY-----\nAAAA\n-----END RSA " + "PRIVATE KEY-----")
+  } catch (e) {
+    bad = e.message
+  }
+  expect(bad.includes("EC PEM")).toBe(true)
+})

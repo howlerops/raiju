@@ -1,4 +1,4 @@
-.PHONY: build test unit e2e ui web web-check check openapi-check parity-count run bench tov tov-test wasm-fixture
+.PHONY: build test unit e2e smoke ui web web-check check openapi-check parity-count run bench tov tov-test wasm-fixture
 
 # Tov's async slab allocator corrupts its free lists once ~30 fetches are in
 # flight (see docs/tov-notes.md); plain malloc avoids it at the same speed.
@@ -40,14 +40,19 @@ unit: build/h2_echo
 	python3 -m unittest tests/test_gen_pricing.py
 	python3 -m unittest tests/h2_test.py
 	python3 -m unittest tests/test_crew_priors.py
+	python3 -m unittest tests/test_smoke_config.py
 
 # the HTTP/2 and gRPC echo server the h2 tests drive (tests/h2_test.py)
-build/h2_echo: tests/h2_echo.tov src/h2.tov src/hpack.tov src/grpcwire.tov src/grpc.tov
+build/h2_echo: tests/h2_echo.tov src/h2.tov src/hpack.tov src/grpcwire.tov src/grpc.tov src/grpcstatus.tov src/a2apb.tov src/protobuf.tov
 	mkdir -p build && $(TOV) build tests/h2_echo.tov -o build/h2_echo
 
 e2e:
 	python3 tests/e2e.py
 	RAIJU_SERVER=http1 python3 tests/e2e.py
+
+# opt-in: real providers, for each one with credentials in the environment (README, Real-provider smoke tests)
+smoke:
+	python3 tests/smoke.py
 
 build/mock_upstream: tests/mock_upstream.tov
 	mkdir -p build && $(TOV) build tests/mock_upstream.tov -o build/mock_upstream

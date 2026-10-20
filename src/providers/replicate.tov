@@ -22,10 +22,23 @@ export function isVersion(s: string): bool {
   return true
 }
 
-// owner/name uses /v1/models/<owner>/<name>/predictions; a version id uses /v1/predictions.
-export function predictionPath(model: string): string {
+// owner/name uses /v1/models/<owner>/<name>/predictions; a version id uses /v1/predictions. With the deployments
+// endpoint (replicate_key_config.use_deployments_endpoint, or the alias's own use_deployments_endpoint, which the
+// router puts on the key) the model is a deployment: /v1/deployments/<owner>/<name>/predictions, as Bifrost.
+export function predictionPath(model: string, deployments?: bool): string {
+  if (deployments === true) return "/v1/deployments/" + model + "/predictions"
   if (isVersion(model)) return "/v1/predictions"
   return "/v1/models/" + model + "/predictions"
+}
+
+function usesDeployments(t: Target): bool {
+  const v: bool = t.key.replicate_key_config?.use_deployments_endpoint ?? false
+  return v
+}
+
+// The prediction URL of a target, on the deployments endpoint when its key (or alias) asks for it.
+export function predictionUrl(t: Target): string {
+  return rootOf(t) + predictionPath(t.model, usesDeployments(t))
 }
 
 // The text pieces of a conversation: system text, and user and assistant text in order, and
@@ -51,8 +64,23 @@ function pieces(req: ChatRequest): Pieces {
   return { system: sys.join("\n"), prompt: parts.join("\n\n"), images: images }
 }
 
-// The POST body: {"input": {...}}. Sampling and the output limit carry over.
-export function chatBody(model: string, version: bool, req: ChatRequest): string {
+// The chat request fields Replicate's input is built from or that have no input field; any other top-level field is
+// an extra param, merged into the input as sent (Bifrost's ReplicatePredictionRequestInput ExtraParams).
+const CHAT_FIELDS: string[] = ["model", "messages", "stream", "stream_options", "temperature", "top_p", "max_tokens", "max_completion_tokens",
+  "n", "stop", "presence_penalty", "frequency_penalty", "logit_bias", "logprobs", "top_logprobs", "seed", "tools", "tool_choice",
+  "parallel_tool_calls", "response_format", "user", "reasoning_effort", "reasoning", "metadata", "store", "service_tier", "modalities",
+  "audio", "prediction", "web_search_options", "verbosity", "safety_identifier", "prompt_cache_key", "prompt_cache_retention",
+  "fallbacks", "provider", "bifrost", "raiju"]
+
+// The request's extra params: its top-level fields that are not chat fields, as sent.
+export function extraParams(body: Field[]): Field[] {
+  return body.filter((f) => !CHAT_FIELDS.includes(f.key))
+}
+
+// The POST body: {"input": {...}}. Sampling, the penalties, the seed, the reasoning effort and the output limit carry
+// over, and the extra params are merged into the input; webhook and webhook_events_filter also go on the prediction
+// itself, as Bifrost's ToReplicateChatRequest puts them.
+export function chatBody(model: string, version: bool, req: ChatRequest, body?: Field[]): string {
   const pc = pieces(req)
   const deepseek = model.toLowerCase().startsWith(DEEPSEEK)
   let prompt = pc.prompt
@@ -69,20 +97,38 @@ export function chatBody(model: string, version: bool, req: ChatRequest): string
   if (maxTokens !== undefined) input.push(`"max_tokens":${maxTokens}`)
   if (req.temperature !== undefined) input.push(`"temperature":${req.temperature}`)
   if (req.top_p !== undefined) input.push(`"top_p":${req.top_p}`)
+  const fs = body ?? []
+  for (const k of ["presence_penalty", "frequency_penalty", "seed"]) {
+    const v = find(fs, k)
+    if (v !== undefined && v !== "null") input.push(`${quote(k)}:${v}`)
+  }
+  const effort = find(fs, "reasoning_effort")
+  if (effort !== undefined && effort.startsWith("\"")) input.push(`"reasoning_effort":${effort}`)
+  const extra = extraParams(fs)
+  const top: string[] = []
+  let merged: string[] = input
+  for (const f of extra) {
+    // a field already in the input is replaced by the caller's value
+    const name = quote(f.key) + ":"
+    merged = merged.filter((p) => !p.startsWith(name))
+    merged.push(`${name}${f.raw}`)
+    if ((f.key === "webhook" && f.raw.startsWith("\"")) || (f.key === "webhook_events_filter" && f.raw.startsWith("["))) top.push(`${quote(f.key)}:${f.raw}`)
+  }
   const head = version ? `"version":${quote(model)},` : ""
-  return "{" + head + `"input":{${input.join(",")}}}`
+  const tail = top.length > 0 ? "," + top.join(",") : ""
+  return "{" + head + `"input":{${merged.join(",")}}${tail}}`
 }
 
 // The create-prediction POST. The key value is the API token.
-export function chatRequest(t: Target, req: ChatRequest): Upstream throws SyntaxError {
+export function chatRequest(t: Target, req: ChatRequest, body?: Field[]): Upstream throws SyntaxError {
   const key = t.key.value ?? ""
   if (key === "") throw new SyntaxError("replicate: the key needs a value: an API token")
   const b = t.cfg.network_config?.base_url ?? ""
   const root = b === "" ? DEFAULT_BASE : trimSlash(b)
   let h = headers([["content-type", "application/json"], ["authorization", "Bearer " + key], ["prefer", "wait"]])
   addExtraHeaders(&h, t.cfg)
-  const version = isVersion(t.model)
-  return { url: root + predictionPath(t.model), headers: h, body: chatBody(t.model, version, req) }
+  const version = isVersion(t.model) && !usesDeployments(t)
+  return { url: root + predictionPath(t.model, usesDeployments(t)), headers: h, body: chatBody(t.model, version, req, body) }
 }
 
 // The number after a log label such as "Input token count: 12", or 0.
@@ -126,7 +172,7 @@ export function chatResponse(text: string, requestedModel: string): Translated t
     throw new SyntaxError(`replicate: prediction ${status}: ${rawStr(fs, "error") ?? "no error given"}`)
   }
   if (status !== "succeeded") {
-    throw new SyntaxError(`replicate: prediction is ${status === "" ? "unknown" : status}; the wait for a synchronous answer ended first`)
+    throw new SyntaxError(`replicate: prediction is ${status === "" ? "unknown" : status} and has no URL to read it again`)
   }
   const content = try outputText(find(fs, "output"))
   const created = parseIsoUtcMs(rawStr(fs, "created_at") ?? "")
@@ -156,8 +202,8 @@ export function imageRequest(t: Target, body: Field[]): Upstream throws SyntaxEr
   const root = b === "" ? DEFAULT_BASE : trimSlash(b)
   let h = headers([["content-type", "application/json"], ["authorization", "Bearer " + key], ["prefer", "wait"]])
   addExtraHeaders(&h, t.cfg)
-  const head = isVersion(t.model) ? `"version":${quote(t.model)},` : ""
-  return { url: root + predictionPath(t.model), headers: h, body: "{" + head + `"input":{${input.join(",")}}}` }
+  const head = isVersion(t.model) && !usesDeployments(t) ? `"version":${quote(t.model)},` : ""
+  return { url: root + predictionPath(t.model, usesDeployments(t)), headers: h, body: "{" + head + `"input":{${input.join(",")}}}` }
 }
 
 // The images answer: the output URLs (one string or an array) as OpenAI's data list. A prediction
@@ -238,6 +284,13 @@ export function isSettled(text: string): bool throws SyntaxError {
   return status === "succeeded" || status === "failed" || status === "canceled" || status === ""
 }
 
+// The headers of a poll of a running prediction (its get URL): the bearer token and the extra headers.
+export function pollHeaders(t: Target): Map<string, string> {
+  let h = headers([["authorization", "Bearer " + (t.key.value ?? "")]])
+  addExtraHeaders(&h, t.cfg)
+  return h
+}
+
 // The URL a running prediction is read from (its urls.get), or "" when the answer has none.
 export function getUrlOf(text: string): string throws SyntaxError {
   const u = find(try fields(text), "urls")
@@ -288,8 +341,8 @@ export function imageEditRequest(t: Target, body: Field[], images: string[]): Up
   const root = b === "" ? DEFAULT_BASE : trimSlash(b)
   let h = headers([["content-type", "application/json"], ["authorization", "Bearer " + key], ["prefer", "wait"]])
   addExtraHeaders(&h, t.cfg)
-  const head = isVersion(t.model) ? `"version":${quote(t.model)},` : ""
-  return { url: root + predictionPath(t.model), headers: h, body: "{" + head + `"input":{${input.join(",")}}}` }
+  const head = isVersion(t.model) && !usesDeployments(t) ? `"version":${quote(t.model)},` : ""
+  return { url: root + predictionPath(t.model, usesDeployments(t)), headers: h, body: "{" + head + `"input":{${input.join(",")}}}` }
 }
 
 // The file API under the account's root: the list (one page, from its cursor) and one file.
@@ -389,6 +442,17 @@ test("chat becomes one prediction with the system text apart", () => {
   expect(up.body).toBe(`{"input":{"prompt":"hi","system_prompt":"be brief","max_tokens":5}}`)
 })
 
+test("the penalties, seed and reasoning effort carry over, and extra params are merged into the input", () => {
+  const req: ChatRequest = { model: "x", messages: [{ role: "user", content: "U" }], temperature: 0.5 }
+  const body = try fields(`{"model":"replicate/acme/m","messages":[{"role":"user","content":"U"}],"temperature":0.5,"seed":7,"presence_penalty":0.1,"reasoning_effort":"low","top_k":40,"temperature_extra":1,"webhook":"https://example.com/hook","webhook_events_filter":["completed"],"fallbacks":["x"]}`)
+  const out = chatBody("acme/m", false, req, body)
+  expect(out).toBe(`{"input":{"prompt":"U","temperature":0.5,"presence_penalty":0.1,"seed":7,"reasoning_effort":"low","top_k":40,"temperature_extra":1,"webhook":"https://example.com/hook","webhook_events_filter":["completed"]},"webhook":"https://example.com/hook","webhook_events_filter":["completed"]}`)
+  expect(extraParams(body).map((f) => f.key).join(",")).toBe("top_k,temperature_extra,webhook,webhook_events_filter")
+  // an extra param that names an input field replaces it
+  const over = chatBody("acme/m", false, req, try fields(`{"messages":[],"prompt":"raw prompt"}`))
+  expect(over).toBe(`{"input":{"temperature":0.5,"prompt":"raw prompt"}}`)
+})
+
 test("DeepSeek takes the system text in the prompt, and a version id uses /v1/predictions", () => {
   const req: ChatRequest = { model: "x", messages: [{ role: "system", content: "S" }, { role: "user", content: "U" }] }
   expect(chatBody("deepseek-ai/deepseek-r1", false, req)).toBe(`{"input":{"prompt":"S\\n\\nU"}}`)
@@ -464,4 +528,17 @@ test("a file upload answer is an OpenAI file; deployments give owner/name ids an
   expect(try deploymentsPage(`{"next":null,"results":[]}`).next).toBe("")
   const dt: Target = { provider: "replicate", kind: "replicate", model: "", key: { value: "r8_x" }, cfg: {} }
   expect(deploymentsRequest(dt).url).toBe("https://api.replicate.com/v1/deployments")
+})
+
+test("the deployments endpoint takes the model as a deployment", () => {
+  expect(predictionPath("acme/dep", true)).toBe("/v1/deployments/acme/dep/predictions")
+  expect(predictionPath("acme/model")).toBe("/v1/models/acme/model/predictions")
+  const t: Target = { provider: "replicate", kind: "replicate", model: "acme/dep", key: { value: "r", replicate_key_config: { use_deployments_endpoint: true } }, cfg: {} }
+  expect(predictionUrl(t)).toBe("https://api.replicate.com/v1/deployments/acme/dep/predictions")
+  const up = try chatRequest(t, { model: "m", messages: [{ role: "user", content: "hi" }] })
+  expect(up.url).toBe("https://api.replicate.com/v1/deployments/acme/dep/predictions")
+  expect(up.body).toBe(`{"input":{"prompt":"hi"}}`)
+  const img = try imageRequest(t, try fields(`{"prompt":"a fox"}`))
+  expect(img.url).toBe("https://api.replicate.com/v1/deployments/acme/dep/predictions")
+  expect(pollHeaders(t).get("authorization")).toBe("Bearer r")
 })

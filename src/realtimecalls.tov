@@ -11,10 +11,11 @@ import { Config } from "./config"
 import { parseModel, target } from "./router"
 import { Target, trimSlash } from "./providers/types"
 import { snapshot } from "./schemas"
-import { fields, find, rawStr, setField, build, quote } from "./json"
+import { fields, find, rawStr, setField, build, quote, without } from "./json"
 import { credentialOk, iceServers } from "./live"
 import { send } from "./media"
-import { upstreamFor } from "./realtime"
+import { upstreamFor, realtimeKind } from "./realtime"
+import { realtimeCredential, isTranscriptionSession, bareNestedModels, mintModel, mintBody, secretOf, withSecret, newEkToken, putMapping } from "./rtsession"
 import { SessionSpec, sessionHooks, sessionGuard } from "./livehooks"
 import { Exchange, establish } from "./webrtc"
 
@@ -23,47 +24,38 @@ export function callsKind(kind: string): bool {
   return kind === "openai" || kind === "azure"
 }
 
-// The model of a nested transcription object, with its provider prefix removed (a model of "openai/whisper-1"
-// goes up as "whisper-1"). The object is returned as it was when it names no model or has no prefix.
-function bareNested(cfg: Config, obj: string): string {
-  try {
-    const fs = fields(obj)
-    const m = rawStr(fs, "model")
-    if (m === undefined) return obj
-    const bare = parseModel(cfg, m).model
-    if (bare === m) return obj
-    let out = fs
-    setField(&out, "model", quote(bare))
-    return build(out)
-  } catch (e) {
-    return obj
-  }
-}
-
-// The session the provider is sent: the model the provider knows it by, and no provider prefixes on the
-// nested transcription model (StripNestedModelPrefixes). Throws when the session is not a JSON object.
+// The session the provider is sent: the model the provider knows it by, and no provider prefixes on the nested
+// transcription models (StripNestedModelPrefixes). A transcription session has no model of its own: its
+// session.audio.input.transcription.model is the routed model (Bifrost's pinRealtimeSDPTranscriptionModel). Throws when
+// the session is not a JSON object.
 export function providerSession(cfg: Config, session: string, model: string): string throws SyntaxError {
   let fs = try fields(session)
-  setField(&fs, "model", quote(model))
-  // the beta format: input_audio_transcription.model
-  const old = find(fs, "input_audio_transcription")
-  if (old !== undefined && old.trim().startsWith("{")) setField(&fs, "input_audio_transcription", bareNested(cfg, old))
-  // the GA format: audio.input.transcription.model
-  const audio = find(fs, "audio")
-  if (audio !== undefined && audio.trim().startsWith("{")) {
-    let af = try fields(audio)
-    const input = find(af, "input")
-    if (input !== undefined && input.trim().startsWith("{")) {
-      let inf = try fields(input)
-      const tr = find(inf, "transcription")
-      if (tr !== undefined && tr.trim().startsWith("{")) {
-        setField(&inf, "transcription", bareNested(cfg, tr))
-        setField(&af, "input", build(inf))
-        setField(&fs, "audio", build(af))
-      }
-    }
+  if (isTranscriptionSession(fs, false)) {
+    fs = bareNestedModels(cfg, without(fs, ["model"]))
+    let audio = try fields(find(fs, "audio") ?? "{}")
+    let input = try fields(find(audio, "input") ?? "{}")
+    let tr = try fields(find(input, "transcription") ?? "{}")
+    setField(&tr, "model", quote(model))
+    setField(&input, "transcription", build(tr))
+    setField(&audio, "input", build(input))
+    setField(&fs, "audio", build(audio))
+    return build(fs)
   }
-  return build(fs)
+  setField(&fs, "model", quote(model))
+  return build(bareNestedModels(cfg, fs))
+}
+
+// The model a call's session names, and whether it is a transcription session (whose model is its input
+// transcription's).
+function sessionModel(session: string): { model: string, transcription: bool } throws SyntaxError {
+  const fs = try fields(session)
+  if (isTranscriptionSession(fs, false)) {
+    const audio = try fields(find(fs, "audio") ?? "{}")
+    const input = try fields(find(audio, "input") ?? "{}")
+    const tr = try fields(find(input, "transcription") ?? "{}")
+    return { model: (rawStr(tr, "model") ?? "").trim(), transcription: true }
+  }
+  return { model: (rawStr(fs, "model") ?? "").trim(), transcription: false }
 }
 
 // The URL a provider's call is made at, and the headers it takes. calls is the GA route (/realtime/calls);
@@ -94,6 +86,7 @@ export async function realtimeCall(engine: Engine, req: Request, calls: bool): P
   let offer = ""
   let session = ""
   let rawModel = queryModel
+  let transcription = false
   try {
     if (ct.startsWith("multipart/form-data")) {
       const fd = await req.formData()
@@ -104,9 +97,10 @@ export async function realtimeCall(engine: Engine, req: Request, calls: bool): P
       if (typeof ses === "string") session = ses
       if (calls && session.trim() === "") return refuse(400, "session form field is required", "invalid_request_error")
       // the GA format names its model in the session; the beta format lets ?model= win
-      if (session.trim() !== "" && rawModel === "") {
-        const sm = rawStr(try fields(session), "model")
-        if (sm !== undefined) rawModel = sm.trim()
+      if (session.trim() !== "") {
+        const sm = try sessionModel(session)
+        transcription = sm.transcription
+        if (rawModel === "") rawModel = sm.model
       }
     } else {
       offer = await req.text()
@@ -115,14 +109,25 @@ export async function realtimeCall(engine: Engine, req: Request, calls: bool): P
   } catch (e) {
     return refuse(400, "failed to parse the request body", "invalid_request_error")
   }
+  // a client secret this gateway minted stands for the virtual key it was minted under, and names the model when the
+  // call does not
+  const cred = realtimeCredential(cfg, snapshot(req.headers), Date.now())
+  if (cred.refused !== "") return refuse(401, cred.refused, "authentication_error")
+  const minted = cred.mapping
+  if (rawModel === "" && minted !== undefined) {
+    rawModel = minted.provider + "/" + minted.model
+    transcription = minted.transcription
+  }
   if (rawModel === "") return refuse(400, ct.startsWith("multipart/form-data") && calls ? "session.model is required" : "model query param is required", "invalid_request_error")
-  const h = snapshot(req.headers)
+  const h = cred.headers
   if (!credentialOk(engine, h)) return refuse(401, "authentication is required for realtime sessions", "authentication_error")
   const ref = parseModel(cfg, rawModel)
   const admitted = engine.gov.admit(h, ref.provider, ref.model)
   if (admitted.kind === "denial") return refuse(admitted.status, admitted.message, admitted.type)
   const grant: Grant = admitted
-  const sel = target(cfg, ref, new Set<int>(), h.get("x-bf-api-key") ?? undefined)
+  // a client secret's call runs on the pool key that minted it, or another when that key is gone
+  let sel = target(cfg, ref, new Set<int>(), cred.pin)
+  if (sel === undefined && minted !== undefined) sel = target(cfg, ref, new Set<int>(), h.get("x-bf-api-key") ?? undefined)
   if (sel === undefined) return refuse(404, `no key is configured for ${ref.provider}/${ref.model}`, "invalid_request_error")
   const t = sel.t
   if (!callsKind(t.kind)) return refuse(400, `${ref.provider} has no realtime WebRTC API this gateway can relay`, "invalid_request_error")
@@ -135,14 +140,23 @@ export async function realtimeCall(engine: Engine, req: Request, calls: bool): P
     }
   }
   const up = callsUpstream(t, calls, body !== "")
+  const upUrl = up.url
+  const upHeaders: Map<string, string> = new Map()
+  for (const k of up.headers.keys()) upHeaders.set(k, up.headers.get(k)!)
+  // the provider's own token behind a client secret goes up instead of the pool key (a bearer, Azure's too)
+  const providerToken = cred.providerToken
+  if (providerToken !== "") {
+    upHeaders.delete("api-key")
+    upHeaders.set("authorization", "Bearer " + providerToken)
+  }
   const exchange = async (gatewayOffer: string): Promise<Exchange> => {
     // the provider is sent the gateway's offer, not the browser's
     const fd = new FormData()
     fd.append("sdp", gatewayOffer)
     if (body !== "") fd.append("session", body)
     const hs: Map<string, string> = new Map()
-    for (const k of up.headers.keys()) hs.set(k, up.headers.get(k)!)
-    const res = await send(t, { method: "POST", url: up.url, headers: hs, body: fd })
+    for (const k of upHeaders.keys()) hs.set(k, upHeaders.get(k)!)
+    const res = await send(t, { method: "POST", url: upUrl, headers: hs, body: fd })
     let text = ""
     try {
       text = await res.text()
@@ -166,6 +180,7 @@ export async function realtimeCall(engine: Engine, req: Request, calls: bool): P
     realtime: true,
     model: ref.model,
     backendModel: "",
+    transcription: transcription,
   })
   if (est.status !== 0) {
     if (est.body !== "") {
@@ -181,6 +196,83 @@ export async function realtimeCall(engine: Engine, req: Request, calls: bool): P
   return new Response(est.answer, { status: 200, headers: out })
 }
 
+// Where a provider mints a client secret: OpenAI at the route the caller used (its older /realtime/sessions and
+// /realtime/transcription_sessions too), Azure at /openai/v1/realtime/client_secrets and xAI at
+// /v1/realtime/client_secrets, as Bifrost's providers do.
+export function mintUrl(t: Target, route: string): string {
+  if (t.kind === "azure") return trimSlash(t.key.azure_key_config?.endpoint ?? t.cfg.network_config?.base_url ?? "") + "/openai/v1/realtime/client_secrets"
+  if (t.kind === "xai") return trimSlash(t.cfg.network_config?.base_url ?? "https://api.x.ai") + "/v1/realtime/client_secrets"
+  return trimSlash(t.cfg.network_config?.base_url ?? "https://api.openai.com") + route
+}
+
+// POST /v1/realtime/client_secrets, and OpenAI's /v1/realtime/sessions and /v1/realtime/transcription_sessions (route):
+// mints a client secret at the provider with a pool key, under the caller's virtual key (governance admits the model as
+// for a realtime session), and answers with the provider's answer, its token replaced by one of this gateway's own that
+// maps to it (rtsession.tov), as Bifrost's realtime_client_secrets.go does. The mint itself is not billed or logged.
+export async function realtimeMint(engine: Engine, req: Request, route: string): Promise<Response> {
+  const ct = (req.headers.get("content-type") ?? "").toLowerCase()
+  const semi = ct.indexOf(";")
+  const media = (semi >= 0 ? ct.slice(0, semi) : ct).trim()
+  if (media !== "application/json" && !media.endsWith("+json")) return refuse(400, "Content-Type must be application/json", "invalid_request_error")
+  let body = ""
+  try {
+    body = await req.text()
+  } catch (e) {
+    return refuse(400, "failed to read the request body", "invalid_request_error")
+  }
+  const mm = mintModel(body, route)
+  if (mm.error !== "") return refuse(400, mm.error, "invalid_request_error")
+  const cfg = engine.cfg
+  const h = snapshot(req.headers)
+  const ref = parseModel(cfg, mm.model)
+  const admitted = engine.gov.admit(h, ref.provider, ref.model)
+  if (admitted.kind === "denial") return refuse(admitted.status, admitted.message, admitted.type)
+  const grant: Grant = admitted
+  const sel = target(cfg, ref, new Set<int>(), h.get("x-bf-api-key") ?? undefined)
+  if (sel === undefined) return refuse(404, `no key is configured for ${ref.provider}/${ref.model}`, "invalid_request_error")
+  const t = sel.t
+  if (!realtimeKind(t.kind)) return refuse(400, `provider ${ref.provider} does not support realtime client secret creation`, "invalid_request_error")
+  if (t.kind !== "openai" && route !== "/v1/realtime/client_secrets") return refuse(400, `provider ${ref.provider} mints realtime client secrets on /v1/realtime/client_secrets only`, "invalid_request_error")
+  let upBody = ""
+  try {
+    upBody = try mintBody(cfg, t.kind, route, body, t.model)
+  } catch (e) {
+    return refuse(400, e.message, "invalid_request_error")
+  }
+  const auth = upstreamFor(t, req.headers.get("openai-beta") ?? undefined)
+  const hs: Map<string, string> = new Map()
+  for (const k of auth.headers.keys()) hs.set(k, auth.headers.get(k)!)
+  hs.set("content-type", "application/json")
+  const res = await send(t, { method: "POST", url: mintUrl(t, route), headers: hs, body: upBody })
+  let text = ""
+  try {
+    text = await res.text()
+  } catch (e) {
+    return refuse(502, "the provider's answer could not be read", "api_error")
+  }
+  if (res.status < 200 || res.status >= 300) {
+    // the provider's refusal, as it came
+    const out: Record<string, string> = {}
+    out.set("content-type", res.headers.get("content-type") ?? "application/json")
+    return new Response(text, { status: res.status, headers: out })
+  }
+  const nowMs = Date.now()
+  const sec = secretOf(text)
+  if (sec === undefined || sec.expiresAt * 1000 <= Math.floor(nowMs)) return refuse(502, "provider returned an invalid realtime client secret", "server_error")
+  let answer = ""
+  let token = ""
+  try {
+    token = try newEkToken()
+    answer = try withSecret(text, token, sec.nested)
+  } catch (e) {
+    return refuse(500, "failed to secure realtime client secret", "server_error")
+  }
+  putMapping(token, { vk: grant.vk?.id ?? "", key: t.key.id ?? t.key.name ?? "", token: sec.value, provider: ref.provider, model: ref.model, transcription: mm.transcription, expires_at: sec.expiresAt }, nowMs)
+  const out: Record<string, string> = {}
+  out.set("content-type", "application/json")
+  return new Response(answer, { status: res.status, headers: out })
+}
+
 test("the provider's session has its model and nested transcription models bare", () => {
   const cfg: Config = {}
   const s = `{"type":"realtime","model":"openai/gpt-realtime","audio":{"input":{"transcription":{"model":"openai/whisper-1","language":"en"}},"output":{"voice":"marin"}}}`
@@ -194,10 +286,12 @@ test("the provider's session has its model and nested transcription models bare"
   const b = try providerSession(cfg, `{"model":"openai/gpt-4o-realtime-preview","input_audio_transcription":{"model":"openai/whisper-1"}}`, "gpt-4o-realtime-preview")
   expect(b.includes("openai/")).toBe(false)
   expect(b.includes(`"input_audio_transcription":{"model":"whisper-1"}`)).toBe(true)
-  // a session without them is only given its model; a bare transcription model stays
-  const c = try providerSession(cfg, `{"audio":{"input":{"transcription":{"model":"whisper-1"}}}}`, "m")
+  // a session given its model keeps a bare transcription model as it is
+  const c = try providerSession(cfg, `{"model":"x","audio":{"input":{"transcription":{"model":"whisper-1"}}}}`, "m")
   expect(c.includes(`"model":"m"`)).toBe(true)
   expect(c.includes(`"model":"whisper-1"`)).toBe(true)
+  // one with only an input transcription is a transcription session (Bifrost's IsGATranscriptionSessionBody)
+  expect(try providerSession(cfg, `{"audio":{"input":{"transcription":{"model":"whisper-1"}}}}`, "m")).toBe(`{"audio":{"input":{"transcription":{"model":"m"}}}}`)
   let threw = false
   try {
     providerSession(cfg, "[1]", "m")
@@ -205,6 +299,26 @@ test("the provider's session has its model and nested transcription models bare"
     threw = true
   }
   expect(threw).toBe(true)
+})
+
+test("a transcription call's session keeps no model of its own: its input transcription has the routed one", () => {
+  const cfg: Config = {}
+  const out = try providerSession(cfg, `{"type":"transcription","audio":{"input":{"transcription":{"model":"openai/gpt-4o-transcribe","language":"en"}}}}`, "gpt-4o-transcribe")
+  expect(out).toBe(`{"type":"transcription","audio":{"input":{"transcription":{"model":"gpt-4o-transcribe","language":"en"}}}}`)
+  const sm = try sessionModel(`{"type":"transcription","audio":{"input":{"transcription":{"model":"openai/gpt-4o-transcribe"}}}}`)
+  expect(sm.model).toBe("openai/gpt-4o-transcribe")
+  expect(sm.transcription).toBe(true)
+  expect((try sessionModel(`{"type":"realtime","model":"openai/gpt-realtime"}`)).transcription).toBe(false)
+})
+
+test("client secrets are minted where each provider mints them", () => {
+  const t: Target = { provider: "openai", kind: "openai", model: "gpt-realtime", key: { value: "sk" }, cfg: { network_config: { base_url: "https://api.example.test/" } } }
+  expect(mintUrl(t, "/v1/realtime/client_secrets")).toBe("https://api.example.test/v1/realtime/client_secrets")
+  expect(mintUrl(t, "/v1/realtime/sessions")).toBe("https://api.example.test/v1/realtime/sessions")
+  const z: Target = { provider: "azure", kind: "azure", model: "gpt-realtime", key: { value: "ak", azure_key_config: { endpoint: "https://x.openai.azure.com/" } }, cfg: {} }
+  expect(mintUrl(z, "/v1/realtime/client_secrets")).toBe("https://x.openai.azure.com/openai/v1/realtime/client_secrets")
+  const x: Target = { provider: "xai", kind: "xai", model: "grok", key: { value: "xk" }, cfg: {} }
+  expect(mintUrl(x, "/v1/realtime/client_secrets")).toBe("https://api.x.ai/v1/realtime/client_secrets")
 })
 
 test("a call goes to the provider's calls route, or its beta route, with its key", () => {

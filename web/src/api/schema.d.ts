@@ -48,7 +48,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Server-to-client event stream (sends a connection event, then ends) */
+        /** Server-to-client event stream (a connection event, then a heartbeat comment every 15 s until the client leaves) */
         get: operations["getMcp"];
         put?: never;
         /** MCP server endpoint (JSON-RPC 2.0): initialize, tools/list, tools/call over the connected MCP clients */
@@ -67,7 +67,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Server-to-client event stream for one virtual MCP (sends a connection event, then ends) */
+        /** Server-to-client event stream for one virtual MCP (a connection event, then heartbeats until the client leaves) */
         get: operations["getMcpName"];
         put?: never;
         /** MCP server endpoint for one virtual MCP (its tool set, under its name) */
@@ -174,7 +174,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Start an SSO sign-in: redirects to the identity provider */
+        /**
+         * Start an SSO sign-in: redirects to the identity provider
+         * @description With return_to, the sign-in returns to that page of the gateway once it completes (only the MCP consent pages, /oauth/consent?... and /workspace/mcp-sessions/auth?..., are accepted; anything else returns to /).
+         */
         get: operations["getApiOidcLogin"];
         put?: never;
         post?: never;
@@ -1033,11 +1036,235 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** The caller's custom role as (resource, operation) pairs with their ids; built-in roles are reported by name with no pairs */
+        /** The caller's role and its (resource, operation) pairs with their ids; a built-in role's fixed rules are expanded into pairs and carry its fixed role_id (admin 9001, editor 9002, viewer 9003, auditor 9004) */
         get: operations["getApiUsersMePermissions"];
         put?: never;
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/governance/users": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The governance path (Bifrost's current one) of /api/users: List admin users (no tokens) */
+        get: operations["getApiGovernanceUsers"];
+        put?: never;
+        /** The governance path (Bifrost's current one) of /api/users: Create an admin user; its token is returned once */
+        post: operations["postApiGovernanceUsers"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/governance/users/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** The governance path (Bifrost's current one) of /api/users/{name}: Change an admin user's role or disabled flag */
+        put: operations["putApiGovernanceUsersName"];
+        post?: never;
+        /** The governance path (Bifrost's current one) of /api/users/{name}: Delete an admin user */
+        delete: operations["deleteApiGovernanceUsersName"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/governance/users/{name}/role": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The governance path (Bifrost's current one) of /api/users/{name}/role: A user's role, as {name, role} */
+        get: operations["getApiGovernanceUsersNameRole"];
+        /** The governance path (Bifrost's current one) of /api/users/{name}/role: Set a user's role ({role}); other fields in the body are applied too, as on PUT /api/users/{name} */
+        put: operations["putApiGovernanceUsersNameRole"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/governance/users/me/vk-creation-policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The governance path (Bifrost's current one) of /api/users/me/vk-creation-policy: The access profile that governs the virtual keys the caller creates */
+        get: operations["getApiGovernanceUsersMeVkCreationPolicy"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/governance/users/me/permissions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The caller's permissions in Bifrost's PermissionsResponse shape: every resource with every operation, true where the caller's role (a built-in role's fixed rules as pairs) or key holds it */
+        get: operations["getApiGovernanceUsersMePermissions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/users/email/{email}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** A user by email address, in Bifrost's UserObject shape (the name is the id; role_id and a role object, built-in roles with their fixed ids) */
+        get: operations["getApiUsersEmailEmail"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/governance/users/email/{email}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** A user by email address, in Bifrost's UserObject shape (the governance path of GET /api/users/email/{email}) */
+        get: operations["getApiGovernanceUsersEmailEmail"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/users/email/{email}/virtual-keys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The virtual keys assigned to the user with this email address (their user_id), with their values (Bifrost's UserVirtualKeyLookupResponse) */
+        get: operations["getApiUsersEmailEmailVirtualKeys"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/governance/users/email/{email}/virtual-keys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The virtual keys assigned to the user with this email address (the governance path) */
+        get: operations["getApiGovernanceUsersEmailEmailVirtualKeys"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/routing/complexity-analyzer-status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The semantic complexity classifier's readiness in Bifrost's shape (state disabled, warming, ready or failed; loaded, total, serving_previous, failure_reason, cached_phrases, storage_mode, namespace), the llm classifier's state and default prompt, and the decision tiers. Per process; the exemplars are embedded on the first classified request. */
+        get: operations["getApiRoutingComplexityAnalyzerStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/routing/complexity-analyzer-status/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Clears a failed semantic warm-up so the next classified request embeds the exemplars again (202 with the status) */
+        post: operations["postApiRoutingComplexityAnalyzerStatusRetry"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/routing/complexity-analyzer-generations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The exemplar generation this process holds, flagged active (Raiju keeps one, in memory) */
+        get: operations["getApiRoutingComplexityAnalyzerGenerations"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/routing/complexity-analyzer-generations/{namespace}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Deletes a retired generation (already gone in Raiju, so 200); the serving one is refused (409) and a name outside the scheme is 400 */
+        delete: operations["deleteApiRoutingComplexityAnalyzerGenerationsNamespace"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1455,6 +1682,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/governance/rbac/roles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Bifrost's role list: the built-in roles first (fixed ids 9001 to 9004, is_system_role true, their rules as permissions), then the custom roles */
+        get: operations["getApiGovernanceRbacRoles"];
+        put?: never;
+        /** Bifrost's path of /api/roles: Create a custom role The list puts the built-in roles first (fixed ids 9001 to 9004, is_system_role true, their rules as permissions). */
+        post: operations["postApiGovernanceRbacRoles"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/governance/rbac/roles/{role_id}": {
         parameters: {
             query?: never;
@@ -1462,7 +1707,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** One custom role by its id, as {role} */
+        /** One role by its id, as {role}; the built-in roles have fixed ids (9001 to 9004) and is_system_role true */
         get: operations["getApiGovernanceRbacRolesRoleId"];
         /** Update a custom role by its id. A partial update: a field left out keeps its value, and an empty description clears it. A role cannot be renamed. */
         put: operations["putApiGovernanceRbacRolesRoleId"];
@@ -2163,6 +2408,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/audit-logs/{id}/verify": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One audit event's signature computed again from its stored fields and compared with the stored one */
+        get: operations["verifyAuditLogSignature"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/governance/audit-logs/{id}/verify": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One audit event's signature checked (alias of /api/audit-logs/{id}/verify) */
+        get: operations["verifyGovernanceAuditLogSignature"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/governance/audit-logs": {
         parameters: {
             query?: never;
@@ -2346,7 +2625,7 @@ export interface paths {
         };
         /** One configured plugin */
         get: operations["getPlugin"];
-        /** Change a configured plugin (enabled, config, path, wasm_limits); the save rebuilds the live chain */
+        /** Change a plugin (enabled, config, path, wasm_limits, placement, order), creating it when it is not configured; the save rebuilds the live chain */
         put: operations["updatePlugin"];
         post?: never;
         /** Remove a configured plugin; the save rebuilds the live chain */
@@ -3151,6 +3430,87 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/mcp/library": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the MCP server library
+         * @description The catalog of installable MCP servers, synced from framework.pricing.mcp_library_url (pricing_sync.mcp_library_url) and kept beside the config file, with the custom servers published here. Paged (limit 25 by default, at most 100), searchable over name, description and publisher, filtered by category, connection_type and auth_type (comma lists) and tags (each one named must be carried), sorted by name, category, publisher, created_at or updated_at.
+         */
+        get: operations["getApiMcpLibrary"];
+        put?: never;
+        /**
+         * Publish a custom MCP server in the library
+         * @description An org-internal ("custom") server; the remote sync never overwrites it. Its slug is made from its name, and a taken slug is a 409.
+         */
+        post: operations["postApiMcpLibrary"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/mcp/library/filterdata": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The library's distinct categories, connection types, auth types and tags */
+        get: operations["getApiMcpLibraryFilterdata"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/mcp/library/force-sync": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Sync the MCP server library now
+         * @description Fetches the catalog from mcp_library_url (https://getbifrost.ai/mcp-library when unset; file:// URLs are read) and upserts its servers. Custom and hidden servers are left alone.
+         */
+        post: operations["postApiMcpLibraryForceSync"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/mcp/library/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Hide a library server
+         * @description Hides a remote or custom server for good; the sync does not bring it back.
+         */
+        delete: operations["deleteApiMcpLibraryId"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/mcp/openapi/preview": {
         parameters: {
             query?: never;
@@ -3162,7 +3522,7 @@ export interface paths {
         put?: never;
         /**
          * Preview an OpenAPI document as MCP tools
-         * @description Parses a JSON OpenAPI 3.x document (inline spec, or spec_url fetched now) and lists the tool each operation would make. No client is created. YAML and Swagger 2.0 are refused.
+         * @description Parses an OpenAPI 3.x or Swagger 2.0 document, JSON or YAML (inline spec, or spec_url fetched now), resolves its local $refs and lists the tool each operation would make with its flattened input schema, the operations that cannot become tools and why, and the warnings. No client is created. A fetched document comes back as spec, with the spec_url it was read from.
          */
         post: operations["postApiMcpOpenapiPreview"];
         delete?: never;
@@ -3180,7 +3540,7 @@ export interface paths {
         };
         /**
          * Get OAuth config status
-         * @description The status of an OAuth config, which is the MCP client of auth type oauth with that name. authorized when it holds a token, pending otherwise.
+         * @description The status of an OAuth config, which is the MCP client of auth type oauth with that name. authorized when it holds a token, failed when its last verification flow failed and it holds none, pending otherwise. With flow_id (the flow_id of an initiate-verification or reauthorize answer) the status is that flow's, as Bifrost's resolveOAuthFlowPollStatus answers it. pending until the callback (expired after the flow's deadline), failed when the authorization server refused it or the token request failed, and once the flow is done the config's status (authorized), or expired when it ended without one. A flow of another config is 404.
          */
         get: operations["getApiOauthConfigIdStatus"];
         put?: never;
@@ -3200,12 +3560,12 @@ export interface paths {
         };
         /**
          * Read an MCP authorization request on the consent page (the client, its redirect URI and expiry)
-         * @description The request is the one the MCP authorization server's /oauth2/authorize stored. Its consent temp token (the fragment after the hash, t=, of the consent link) is sent in the X-Bifrost-Temp-Token header. The modes offered are listed in the available_modes field, which lists "vk", and "session" for a dashboard user signed in on this request while inference auth is not enforced. The user mode is not offered (no identity provider).
+         * @description The request is the one the MCP authorization server's /oauth2/authorize stored. Its consent temp token (the fragment after the hash, t=, of the consent link) is sent in the X-Bifrost-Temp-Token header. The modes offered are listed in the available_modes field. "vk" (unless oauth2_server_config.disable_vk_identity is set while user mode is available), "session" for a dashboard user signed in on this request while inference auth is not enforced, and "user" while the gateway's OIDC sign-in is on. logged_in_user (id, name) names the identity-provider user whose single sign-on session token is sent as the Authorization bearer, so the page can offer to continue as that user; the consent page sends its user to /api/oidc/login?return_to=... to sign in.
          */
         get: operations["getApiOauth2ConsentFlowsId"];
         /**
-         * Approve an MCP authorization request with a virtual key (or as the signed-in dashboard user) and answer the client's redirect URL with a one-time code
-         * @description Body {"mode": "vk", "value": "<virtual key>"}. The key must be active and unexpired, and its current value (not a rotated one). Body {"mode": "session"} approves as the dashboard user signed in on this request: the token then names a new session id and runs without a key (refused with 401 without that sign-in, and with 400 while inference auth is enforced). The redirect URL carries code, state and iss (RFC 9207); the client exchanges the code at /oauth2/token.
+         * Approve an MCP authorization request with a virtual key, as the signed-in dashboard user or as the signed-in identity-provider user, and answer the client's redirect URL with a one-time code
+         * @description Body {"mode": "vk", "value": "<virtual key>"}. The key must be active and unexpired, and its current value (not a rotated one). A key that belongs to a user (its user_id) grants user mode for that user while user mode is available, and only to that user signed in (400 otherwise). Body {"mode": "session"} approves as the dashboard user signed in on this request: the token then names a new session id and runs without a key (refused with 401 without that sign-in, and with 400 while inference auth is enforced). Body {"mode": "user"} approves as the identity-provider user whose single sign-on session token is the Authorization bearer (400 without one): the token's sub is that user and bf_mode is user. The redirect URL carries code, state and iss (RFC 9207); the client exchanges the code at /oauth2/token.
          */
         put: operations["putApiOauth2ConsentFlowsId"];
         post?: never;
@@ -3264,7 +3624,7 @@ export interface paths {
         };
         /**
          * Read a per-user OAuth consent flow (its client, the caller it is for and its expiry)
-         * @description The flow is the consent link a caller was given. Its temp token (client.mcp_enable_temp_token_auth) is sent in the X-Bifrost-Temp-Token header in place of a dashboard session. 404 when the flow is unknown or expired.
+         * @description The flow is the consent link a caller was given. Its temp token (client.mcp_enable_temp_token_auth) is sent in the X-Bifrost-Temp-Token header in place of a dashboard session; it opens the flow until the flow ends. The answer has id, flow_mode (vk, session or user), status, mcp_client, user_id, virtual_key_id, session_id, expires_at, created_at and has_active_token. A user-mode flow (opened by a user-mode MCP token) has no temp token and opens only for its own user signed in through the gateway's OIDC sign-in, whatever that user's role (403 for anyone else). 404 when the flow is unknown or expired. Flows are kept in mcp-flow-state.json beside config.json, so a restart keeps them.
          */
         get: operations["getApiOauthPerUserFlowsId"];
         put?: never;
@@ -3304,7 +3664,7 @@ export interface paths {
         };
         /**
          * List the MCP sessions: per-user OAuth token rows, pending consent flows and per-user header credentials
-         * @description Each row has kind (token, flow or header), auth_kind (oauth or headers), auth_mode (vk or session), virtual_key_id, session_id, mcp_client, status (active, needs_reauth, pending), expires_at and created_at (epoch milliseconds), has_refresh_token and can_reauth. Tokens are never listed. Paged by limit (default 50, at most 500) and offset; kind narrows the rows.
+         * @description Each row has kind (token, flow or header), auth_kind (oauth or headers), auth_mode (vk, session or user), user_id, virtual_key_id, session_id, mcp_client, status (active, needs_reauth, pending), expires_at and created_at (epoch milliseconds), has_refresh_token and can_reauth. Tokens are never listed. Paged by limit (default 50, at most 500) and offset; kind narrows the rows.
          */
         get: operations["getApiMcpSessions"];
         put?: never;
@@ -3398,7 +3758,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Add an MCP client and connect to it */
+        /**
+         * Add an MCP client and connect to it
+         * @description An auth_type token_exchange client is refused with 400 while client.dual_credential_conflict_behavior is error (that setting refuses the requests such a client relies on), as Bifrost refuses it.
+         */
         post: operations["postApiMcpClient"];
         delete?: never;
         options?: never;
@@ -3465,7 +3828,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** OpenAPI spec of an OpenAPI-defined MCP client (none are supported: 404) */
+        /**
+         * The stored OpenAPI document of an OpenAPI-defined MCP client
+         * @description The document as it was stored: inline, or fetched from spec_url when the client was created or updated over the API. Served as application/json or application/yaml by its form. A client from config.json that names only a spec_url has no stored document (404).
+         */
         get: operations["getApiMcpClientNameOpenapiSpec"];
         put?: never;
         post?: never;
@@ -3798,7 +4164,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Attach custom roles to an access profile (Bifrost's attach). Every user holding one of the roles holds the profile; is_default is kept as given, and users_applied counts those users. */
+        /** Attach roles (built-in or custom, by id) to an access profile (Bifrost's attach). apply_to_existing gives the role's users the profile now (users_applied counts them); is_default gives it to users who take the role later. */
         post: operations["postApiGovernanceAccessProfilesIdRoles"];
         delete?: never;
         options?: never;
@@ -4043,8 +4409,97 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** The A2A calls that reached the agents, newest first */
+        /**
+         * The A2A calls that reached the agents, newest first
+         * @description Bifrost's filters (its listHistory parameters); the answer keeps Raiju's {history, total} shape.
+         */
         get: operations["getApiAgentsHistory"];
+        put?: never;
+        post?: never;
+        /** Delete history entries by id (Bifrost's deleteHistory) */
+        delete: operations["deleteApiAgentsHistory"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agents/history/stats": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Totals of the selected A2A calls (Bifrost's historyStats) */
+        get: operations["getApiAgentsHistoryStats"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agents/history/histogram": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The selected A2A calls per time bucket, success and error (Bifrost's historyHistogram) */
+        get: operations["getApiAgentsHistoryHistogram"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agents/history/top-agents": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The ten agents with the most selected calls (Bifrost's historyTopAgents) */
+        get: operations["getApiAgentsHistoryTopAgents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agents/history/filterdata": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The ids and names of the users, keys, teams, customers, business units and projects the calls carry (Bifrost's historyFilterData) */
+        get: operations["getApiAgentsHistoryFilterdata"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agents/history/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One A2A call (Bifrost's getHistoryEntry); its stored bodies have their credentials redacted */
+        get: operations["getApiAgentsHistoryById"];
         put?: never;
         post?: never;
         delete?: never;
@@ -4258,6 +4713,29 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @description One MCP server of the library (Bifrost's mcp_library row) */
+        McpLibraryEntry: {
+            id?: number;
+            slug?: string;
+            name?: string;
+            description?: string;
+            category?: string;
+            /** @enum {string} */
+            connection_type?: "http" | "stdio" | "sse";
+            connection_url?: string;
+            stdio_config?: Record<string, never>;
+            auth_type?: string;
+            required_header_keys?: string[];
+            icon_url?: string;
+            docs_url?: string;
+            publisher?: string;
+            tags?: string[];
+            metadata?: Record<string, never>;
+            /** @enum {string} */
+            source?: "remote" | "custom";
+            created_at?: string;
+            updated_at?: string;
+        };
         /** @description One role of a crew and the candidate that plays it. */
         CrewPart: {
             role: string;
@@ -4488,6 +4966,10 @@ export interface components {
             runtime_auth?: components["schemas"]["AgentUpstreamAuth"];
             /** @description Raiju-only. Lets the card URL and the agent's endpoint be private addresses (the SSRF guard refuses them otherwise, as for webhooks). */
             allow_private_network?: boolean;
+            /** @description Bifrost's tenant, kept and shown. */
+            tenant?: string;
+            /** @description The A2A extensions of the agent's card the gateway relays (absolute URIs, no duplicates; stored sorted). */
+            extension_uris?: string[];
         };
         /** @description A registration, its cached card and the gateway's endpoints. Raiju-only shape (Bifrost's agent records differ). */
         AgentRegistration: {
@@ -4501,6 +4983,8 @@ export interface components {
             discovery_auth?: components["schemas"]["AgentUpstreamAuth"];
             runtime_auth?: components["schemas"]["AgentUpstreamAuth"];
             allow_private_network?: boolean;
+            tenant?: string;
+            extension_uris?: string[];
             /** @description The agent's card as last fetched; null until it is fetched. */
             card?: {
                 [key: string]: unknown;
@@ -4563,6 +5047,14 @@ export interface components {
             timestamp?: string;
             agent_name?: string;
             method?: string;
+            /** @description Bifrost's name for method. */
+            operation?: string;
+            record_kind?: string;
+            task_id?: string;
+            /** @description The caller's binding (JSONRPC, HTTP+JSON, GRPC). */
+            downstream_transport?: string;
+            /** @description The binding the agent was called on. */
+            upstream_transport?: string;
             /** @description The A2A context the call belongs to (the session its LLM requests are logged under). */
             context_id?: string;
             virtual_key_id?: string;
@@ -4578,6 +5070,83 @@ export interface components {
             history?: components["schemas"]["AgentCallLog"][];
             total?: number;
         };
+        AgentGrant: {
+            agent_name: string;
+        };
+        AgentHistoryDeleteRequest: {
+            ids: string[];
+        };
+        AgentHistoryDeleted: {
+            message?: string;
+        };
+        AgentHistoryStats: {
+            total_entries?: number;
+            success_count?: number;
+            error_count?: number;
+            success_rate?: number;
+            average_latency?: number;
+        };
+        AgentHistoryHistogram: {
+            buckets?: {
+                /** Format: date-time */
+                timestamp?: string;
+                count?: number;
+                success?: number;
+                error?: number;
+            }[];
+            bucket_size_seconds?: number;
+        };
+        AgentTopAgents: {
+            agents?: {
+                agent_name?: string;
+                count?: number;
+                error_count?: number;
+                average_latency?: number;
+            }[];
+        };
+        AgentFilterPair: {
+            id?: string;
+            name?: string;
+        };
+        AgentHistoryFilterData: {
+            users?: components["schemas"]["AgentFilterPair"][];
+            virtual_keys?: components["schemas"]["AgentFilterPair"][];
+            teams?: components["schemas"]["AgentFilterPair"][];
+            customers?: components["schemas"]["AgentFilterPair"][];
+            business_units?: components["schemas"]["AgentFilterPair"][];
+            projects?: components["schemas"]["AgentFilterPair"][];
+        };
+        /** @description One A2A call in Bifrost's AgentLogDetail shape. */
+        AgentHistoryEntry: {
+            /** @description The bytes sent to the agent, base64 (client.a2a_store_raw_request_response). */
+            raw_request?: string;
+            /** @description The bytes the agent answered, base64. */
+            raw_response?: string;
+            id?: string;
+            /** Format: date-time */
+            timestamp?: string;
+            record_kind?: string;
+            operation?: string;
+            /** @enum {string} */
+            status?: "success" | "error";
+            agent_name?: string;
+            virtual_key_id?: string;
+            virtual_key_name?: string;
+            request_id?: string;
+            task_id?: string;
+            context_id?: string;
+            downstream_transport?: string;
+            upstream_transport?: string;
+            latency?: number;
+            status_code?: number;
+            request_body?: string;
+            response_body?: string;
+            error_details?: {
+                [key: string]: unknown;
+            };
+        } & {
+            [key: string]: unknown;
+        };
         /** @description Raiju: a reusable permission set that virtual keys reference. */
         AccessProfile: {
             id: string;
@@ -4591,6 +5160,8 @@ export interface components {
             budget_id?: string;
             rate_limit_id?: string;
             mcp_tools?: string[];
+            /** @description The A2A agents the profile grants its holders' keys. */
+            agent_grants?: components["schemas"]["AgentGrant"][];
             required_headers?: string[];
             /** Format: int64 */
             max_tokens?: number;
@@ -4602,6 +5173,8 @@ export interface components {
         /** @description Raiju: an admin user. Built-in roles or a custom role name; no token. */
         AdminUser: {
             name: string;
+            /** @description The user's email address, when set */
+            email?: string;
             role: string;
             disabled: boolean;
         };
@@ -4616,12 +5189,18 @@ export interface components {
             users: components["schemas"]["AdminUser"][];
         };
         AdminUserUpdate: {
+            /** @description An email address, unique among the users; "" clears it */
+            email?: string;
+            /** @description The role by its id (built-in roles 9001 to 9004) */
+            role_id?: number;
             role?: string;
             disabled?: boolean;
         };
         AdminUserWrite: {
             /** @description 1 to 64 chars: lower-case letters, digits, _ - @ . + */
             name: string;
+            /** @description An email address, unique among the users (compared without case) */
+            email?: string;
             role: string;
         };
         /** @description Raiju: an alert channel; secrets in config are masked. */
@@ -4739,10 +5318,23 @@ export interface components {
             prev: string;
             hash: string;
         };
+        /** @description Bifrost's audit list (audit_logs as CADF events, total, page, limit, total_pages, has_more, next_cursor), with Raiju's own events alongside */
         AuditEventPage: {
+            audit_logs?: Record<string, never>[];
             events: components["schemas"]["AuditEvent"][];
             /** Format: int64 */
             total: number;
+            page?: number;
+            limit?: number;
+            total_pages?: number;
+            has_more?: boolean;
+            next_cursor?: string;
+        };
+        /** @description One event's signature check (Bifrost's AuditVerifyResult) */
+        AuditEventVerify: {
+            valid: boolean;
+            computed: string;
+            stored: string;
         };
         /** @description Bifrost AuditVerifyResult name; Raiju shape. */
         AuditVerifyResult: {
@@ -4845,6 +5437,11 @@ export interface components {
             allowed_origins?: string[];
             prometheus_labels?: string[];
             mcp_auto_execute?: string[];
+            /**
+             * @description A request with an identity token and x-bf-vk. error cannot be set while an MCP client uses auth_type token_exchange (400), as Bifrost refuses it.
+             * @enum {string}
+             */
+            dual_credential_conflict_behavior?: "error" | "prefer_vk" | "prefer_idp";
         };
         /** @description Our counters after the merge, as the cluster encodes them. */
         ClusterCounters: {
@@ -5044,9 +5641,12 @@ export interface components {
             value?: string;
             models?: string[];
             weight?: number;
+            /** @description Request model name to the provider's model. An alias whose provider override belongs to another provider (azure, vertex, bedrock or replicate fields on another provider's key) is refused with 400 (Invalid aliases). */
             aliases?: {
                 [key: string]: string;
             };
+            /** @description Model names (alias names for aliases) this key never serves or lists; "*" blocks every model. */
+            blacklisted_models?: string[];
             use_for_batch_api?: boolean;
             azure_key_config?: {
                 [key: string]: unknown;
@@ -5465,6 +6065,8 @@ export interface components {
             max_stack_bytes?: number;
             /** @description Most instructions one hook call may run (default 200000000); a call past it fails. */
             max_instructions?: number;
+            /** @description Most wall-clock milliseconds one hook call may take (default 5000); a call past it fails with "time limit exceeded". */
+            max_time_ms?: number;
         };
         /** @description JSON-RPC 2.0 request of the MCP protocol. */
         McpJsonRpcRequest: {
@@ -5645,15 +6247,17 @@ export interface components {
             notifications: components["schemas"]["Notification"][];
             next_cursor?: string;
         };
-        /** @description Bifrost OAuth flow initiation; Raiju's field names. */
+        /** @description Bifrost OAuth flow initiation. oauth_config_id is the client's name; flow_id names the verification flow, and status_url is the route to poll (with ?flow_id= after a reauthorize, whose config may read authorized all along). */
         OAuthFlowInitiation: {
             status: string;
             oauth_config_id?: string;
+            flow_id?: string;
             authorize_url: string;
             /** Format: int64 */
             expires_at?: number;
             mcp_client_id?: string;
             complete_url: string;
+            status_url?: string;
             next_steps?: string[];
         };
         OIDCStatus: {
@@ -5706,6 +6310,8 @@ export interface components {
             budget_id?: string;
             rate_limit_id?: string;
             provider_configs?: components["schemas"]["VirtualKeyProviderConfig"][];
+            /** @description The A2A agents the project grants, combined with the caller's by access_rule. */
+            agent_grants?: components["schemas"]["AgentGrant"][];
         };
         ProjectCreated: {
             project: components["schemas"]["Project"];
@@ -5980,6 +6586,8 @@ export interface components {
                 /** @description * for every tool of the client, a list of tool names, or empty for none */
                 tools_to_execute?: string[];
             }[];
+            /** @description The registered A2A agents this key may call (Bifrost's agent_grants), besides the agents' own virtual_key_ids. */
+            agent_grants?: components["schemas"]["AgentGrant"][];
         };
         /** @description Bifrost VirtualKeyProviderConfig. */
         VirtualKeyProviderConfig: {
@@ -6179,12 +6787,14 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description text/event-stream with one connection/opened event */
+            /** @description text/event-stream: a connection/opened event, then ": heartbeat" comment lines every 15 seconds; the stream stays open until the client closes it */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "text/event-stream": string;
+                };
             };
             /** @description Authentication required, or the session or token is not valid. */
             401: {
@@ -6314,12 +6924,14 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description text/event-stream with one connection/opened event */
+            /** @description text/event-stream: a connection/opened event, then ": heartbeat" comment lines every 15 seconds; the stream stays open until the client closes it */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "text/event-stream": string;
+                };
             };
             /** @description Authentication required, or the session or token is not valid. */
             401: {
@@ -6701,7 +7313,10 @@ export interface operations {
     };
     getApiOidcLogin: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description The consent page (path and query) to come back to after the sign-in */
+                return_to?: string;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -10680,6 +11295,844 @@ export interface operations {
             };
         };
     };
+    getApiGovernanceUsers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminUserList"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiGovernanceUsers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AdminUserWrite"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminUserCreated"];
+                };
+            };
+            /** @description The body or a parameter is invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The record conflicts with an existing one. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The gateway could not save or read back the record. */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    putApiGovernanceUsersName: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the record (MCP client, virtual MCP, role, admin user, or policy) */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AdminUserUpdate"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminUser"];
+                };
+            };
+            /** @description The body or a parameter is invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No such record (or the route is not served for this input). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    deleteApiGovernanceUsersName: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the record (MCP client, virtual MCP, role, admin user, or policy) */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeletedResponse"];
+                };
+            };
+            /** @description The body or a parameter is invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No such record (or the route is not served for this input). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiGovernanceUsersNameRole: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description User name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The body or a parameter is invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No such virtual key, budget, rule, role or user. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+        };
+    };
+    putApiGovernanceUsersNameRole: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description User name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": Record<string, never>;
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The body or a parameter is invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No such virtual key, budget, rule, role or user. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+        };
+    };
+    getApiGovernanceUsersMeVkCreationPolicy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description has_access_profile is false when the caller holds no active profile; profile_name is set otherwise */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        has_access_profile: boolean;
+                        profile_name?: string;
+                    };
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiGovernanceUsersMePermissions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        permissions?: {
+                            [key: string]: {
+                                [key: string]: boolean;
+                            };
+                        };
+                    };
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+        };
+    };
+    getApiUsersEmailEmail: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The URL-encoded email address (compared without case; a user with no email whose name is the address matches too) */
+                email: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        id?: string;
+                        name?: string;
+                        email?: string;
+                        role_id?: number | null;
+                        role?: Record<string, never>;
+                        disabled?: boolean;
+                        teams?: Record<string, never>[];
+                        business_units?: Record<string, never>[];
+                        access_profiles?: Record<string, never>[];
+                    };
+                };
+            };
+            /** @description The email is not a valid URL-encoded value. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The caller's role does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No user has this email address. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+        };
+    };
+    getApiGovernanceUsersEmailEmail: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The URL-encoded email address (compared without case; a user with no email whose name is the address matches too) */
+                email: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        id?: string;
+                        name?: string;
+                        email?: string;
+                        role_id?: number | null;
+                        role?: Record<string, never>;
+                        disabled?: boolean;
+                        teams?: Record<string, never>[];
+                        business_units?: Record<string, never>[];
+                        access_profiles?: Record<string, never>[];
+                    };
+                };
+            };
+            /** @description The email is not a valid URL-encoded value. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The caller's role does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No user has this email address. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+        };
+    };
+    getApiUsersEmailEmailVirtualKeys: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The URL-encoded email address (compared without case; a user with no email whose name is the address matches too) */
+                email: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        user_id?: string;
+                        email?: string;
+                        virtual_keys?: {
+                            id?: string;
+                            name?: string;
+                            value?: string;
+                            is_active?: boolean;
+                        }[];
+                    };
+                };
+            };
+            /** @description The email is not a valid URL-encoded value. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The caller's role does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No user has this email address. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+        };
+    };
+    getApiGovernanceUsersEmailEmailVirtualKeys: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The URL-encoded email address (compared without case; a user with no email whose name is the address matches too) */
+                email: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        user_id?: string;
+                        email?: string;
+                        virtual_keys?: {
+                            id?: string;
+                            name?: string;
+                            value?: string;
+                            is_active?: boolean;
+                        }[];
+                    };
+                };
+            };
+            /** @description The email is not a valid URL-encoded value. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The caller's role does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No user has this email address. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+        };
+    };
+    getApiRoutingComplexityAnalyzerStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+        };
+    };
+    postApiRoutingComplexityAnalyzerStatusRetry: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The warm-up will be retried */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The last warm-up did not fail */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The semantic classifier is off */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+        };
+    };
+    getApiRoutingComplexityAnalyzerGenerations: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+        };
+    };
+    deleteApiRoutingComplexityAnalyzerGenerationsNamespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The generation's namespace (BifrostComplexityRouter_ then a fingerprint) */
+                namespace: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The namespace is not a complexity routing generation */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The generation is serving */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The semantic classifier is off */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+        };
+    };
     getApiRolesNamePermissions: {
         parameters: {
             query?: never;
@@ -12917,6 +14370,104 @@ export interface operations {
             };
         };
     };
+    getApiGovernanceRbacRoles: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CustomRoleList"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiGovernanceRbacRoles: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CustomRole"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CustomRole"];
+                };
+            };
+            /** @description The body or a parameter is invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The record conflicts with an existing one. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
     getApiGovernanceRbacRolesRoleId: {
         parameters: {
             query?: never;
@@ -13630,8 +15181,64 @@ export interface operations {
             query?: {
                 /** @description Only this actor */
                 actor?: string;
-                /** @description Only this action, e.g. virtual_key.create */
+                /** @description Only this action, a CADF action (create, update, delete, ...) or a Raiju action name such as virtual_key.create */
                 action?: string;
+                /** @description Page number (1 and up); the offset is (page - 1) x limit */
+                page?: number;
+                /** @description The next_cursor of the page before: the page starts after that event */
+                cursor?: string;
+                /** @description Free text, ignoring case: initiator, action, target, path, method, outcome and client address */
+                search?: string;
+                /** @description JSON array of CADF actions (create, update, delete, authenticate, access) or Raiju action names; any of them */
+                actions?: string;
+                /** @description One outcome: success (an answer below 400) or failure */
+                outcome?: string;
+                /** @description JSON array of outcomes; any of them */
+                outcomes?: string;
+                /** @description One event type; every Raiju event is activity */
+                event_type?: string;
+                /** @description JSON array of event types */
+                event_types?: string;
+                /** @description One initiator (the actor) */
+                initiator_id?: string;
+                /** @description JSON array of initiators */
+                initiator_ids?: string;
+                /** @description One initiator type: user, api_key, session or system */
+                initiator_type?: string;
+                /** @description JSON array of initiator types */
+                initiator_types?: string;
+                /** @description One target (the object acted on, else the path) */
+                target_id?: string;
+                /** @description JSON array of targets */
+                target_ids?: string;
+                /** @description One target type (provider, virtual_key, team, customer, plugin, config, ...) */
+                target_type?: string;
+                /** @description JSON array of target types */
+                target_types?: string;
+                /** @description One HTTP method */
+                request_method?: string;
+                /** @description JSON array of HTTP methods */
+                request_methods?: string;
+                /** @description One path prefix */
+                request_path?: string;
+                /** @description JSON array of path prefixes */
+                request_paths?: string;
+                /** @description One client address (ignored with omit_ip_addresses) */
+                request_ip?: string;
+                /** @description JSON array of client addresses */
+                request_ips?: string;
+                /** @description JSON array of tags; Raiju events carry none, so a tag matches nothing */
+                tags?: string;
+                /** @description At or after this time: RFC 3339 or YYYY-MM-DD */
+                start_date?: string;
+                /** @description At or before this time: RFC 3339 or YYYY-MM-DD (a date is the end of that day) */
+                end_date?: string;
+                /** @description A window ending now (30m, 24h, 7d); overrides start_date and end_date */
+                period?: string;
+                /** @description event_time (the only order) */
+                sort_by?: string;
+                /** @description desc (default) or asc */
+                sort_order?: string;
                 /** @description Epoch milliseconds, inclusive */
                 since?: number;
                 /** @description Epoch milliseconds, inclusive */
@@ -16358,7 +17965,12 @@ export interface operations {
     };
     getAuditLogsFilterData: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Comma-separated Bifrost dimensions to return (actions, outcomes, event_types, initiator_types, target_types, request_methods, initiators, targets, request_paths, request_ips, tags); all when absent */
+                dimensions?: string;
+                /** @description Keep the values that hold this text, ignoring case */
+                q?: string;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -16471,18 +18083,192 @@ export interface operations {
             };
         };
     };
+    verifyAuditLogSignature: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Event id (its sequence number) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuditEventVerify"];
+                };
+            };
+            /** @description The request is not valid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No such record (or the route is not served for this input). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    verifyGovernanceAuditLogSignature: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Event id (its sequence number) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuditEventVerify"];
+                };
+            };
+            /** @description The request is not valid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No such record (or the route is not served for this input). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
     getAuditLogs: {
         parameters: {
             query?: {
                 /** @description Actor name */
                 actor?: string;
-                /** @description Action, e.g. virtual_key.create */
+                /** @description Action: a CADF action or a Raiju action name such as virtual_key.create */
                 action?: string;
+                /** @description Page number (1 and up); the offset is (page - 1) x limit */
+                page?: number;
+                /** @description The next_cursor of the page before: the page starts after that event */
+                cursor?: string;
+                /** @description Free text, ignoring case: initiator, action, target, path, method, outcome and client address */
+                search?: string;
+                /** @description JSON array of CADF actions (create, update, delete, authenticate, access) or Raiju action names; any of them */
+                actions?: string;
+                /** @description One outcome: success (an answer below 400) or failure */
+                outcome?: string;
+                /** @description JSON array of outcomes; any of them */
+                outcomes?: string;
+                /** @description One event type; every Raiju event is activity */
+                event_type?: string;
+                /** @description JSON array of event types */
+                event_types?: string;
+                /** @description One initiator (the actor) */
+                initiator_id?: string;
+                /** @description JSON array of initiators */
+                initiator_ids?: string;
+                /** @description One initiator type: user, api_key, session or system */
+                initiator_type?: string;
+                /** @description JSON array of initiator types */
+                initiator_types?: string;
+                /** @description One target (the object acted on, else the path) */
+                target_id?: string;
+                /** @description JSON array of targets */
+                target_ids?: string;
+                /** @description One target type (provider, virtual_key, team, customer, plugin, config, ...) */
+                target_type?: string;
+                /** @description JSON array of target types */
+                target_types?: string;
+                /** @description One HTTP method */
+                request_method?: string;
+                /** @description JSON array of HTTP methods */
+                request_methods?: string;
+                /** @description One path prefix */
+                request_path?: string;
+                /** @description JSON array of path prefixes */
+                request_paths?: string;
+                /** @description One client address (ignored with omit_ip_addresses) */
+                request_ip?: string;
+                /** @description JSON array of client addresses */
+                request_ips?: string;
+                /** @description JSON array of tags; Raiju events carry none, so a tag matches nothing */
+                tags?: string;
+                /** @description At or after this time: RFC 3339 or YYYY-MM-DD */
+                start_date?: string;
+                /** @description At or before this time: RFC 3339 or YYYY-MM-DD (a date is the end of that day) */
+                end_date?: string;
+                /** @description A window ending now (30m, 24h, 7d); overrides start_date and end_date */
+                period?: string;
+                /** @description event_time (the only order) */
+                sort_by?: string;
+                /** @description desc (default) or asc */
+                sort_order?: string;
                 /** @description Epoch ms */
                 since?: string;
                 /** @description Epoch ms */
                 until?: string;
-                /** @description Rows (default 50) */
+                /** @description Rows (default 100, at most 1000) */
                 limit?: string;
                 /** @description Rows to skip */
                 offset?: string;
@@ -16493,9 +18279,11 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description OK */
+            /** @description A setup session: an HttpOnly, SameSite=Strict cookie (bifrost_setup_session) that stands in for the token for 12 hours: on POST /api/users and, under the setup lock (setup_token set, no admin yet), on every /api route. The body gives expires_at. */
             200: {
                 headers: {
+                    /** @description The setup session cookie. */
+                    "Set-Cookie"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -16542,7 +18330,12 @@ export interface operations {
     };
     getGovernanceAuditLogsFilterData: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Comma-separated Bifrost dimensions to return (actions, outcomes, event_types, initiator_types, target_types, request_methods, initiators, targets, request_paths, request_ips, tags); all when absent */
+                dimensions?: string;
+                /** @description Keep the values that hold this text, ignoring case */
+                q?: string;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -17122,9 +18915,16 @@ export interface operations {
                     name: string;
                     enabled?: boolean;
                     config?: Record<string, never>;
-                    /** @description A local .wasm file to load as a plugin (Bifrost's WebAssembly plugin ABI). Go shared objects (.so) and URLs are refused. */
+                    /** @description A local .wasm file, or an http or https URL of one (downloaded first, with Bifrost's limits and private-address rule), to load as a plugin (Bifrost's WebAssembly plugin ABI). Go shared objects (.so) are refused. A custom plugin path needs dashboard auth to be on (403 otherwise). */
                     path?: string;
                     wasm_limits?: components["schemas"]["WasmPluginLimits"];
+                    /**
+                     * @description The plugin's group in the chain (Bifrost's placement); empty or absent is post_builtin. Other values are refused with 400.
+                     * @enum {string}
+                     */
+                    placement?: "pre_builtin" | "post_builtin" | "";
+                    /** @description The plugin's position within its placement group, lower first. */
+                    order?: number;
                 };
             };
         };
@@ -17167,6 +18967,15 @@ export interface operations {
             };
             /** @description A plugin with this name is already configured */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The plugin URL could not be downloaded; nothing is created. */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -17362,9 +19171,16 @@ export interface operations {
                 "application/json": {
                     enabled?: boolean;
                     config?: Record<string, never>;
-                    /** @description A local .wasm file to load as the plugin; an empty string removes the path. */
+                    /** @description A local .wasm file, or an http or https URL of one (downloaded first), to load as the plugin; an empty string removes the path. A custom plugin path needs dashboard auth to be on (403 otherwise). */
                     path?: string;
                     wasm_limits?: components["schemas"]["WasmPluginLimits"];
+                    /**
+                     * @description The plugin's group in the chain (Bifrost's placement); empty resets it to post_builtin, absent keeps it. Other values are refused with 400.
+                     * @enum {string}
+                     */
+                    placement?: "pre_builtin" | "post_builtin" | "";
+                    /** @description The plugin's position within its placement group, lower first; absent keeps it. */
+                    order?: number;
                 };
             };
         };
@@ -17405,8 +19221,8 @@ export interface operations {
                     "application/json": components["schemas"]["ManagementErrorResponse"];
                 };
             };
-            /** @description No plugin with this name is configured */
-            404: {
+            /** @description The plugin URL could not be downloaded; the previous configuration is kept. */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -21158,6 +22974,348 @@ export interface operations {
             };
         };
     };
+    getApiMcpLibrary: {
+        parameters: {
+            query?: {
+                search?: string;
+                category?: string;
+                connection_type?: string;
+                auth_type?: string;
+                tags?: string;
+                sort_by?: "name" | "category" | "publisher" | "created_at" | "updated_at";
+                order?: "asc" | "desc";
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A page of library servers */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        servers?: components["schemas"]["McpLibraryEntry"][];
+                        count?: number;
+                        total_count?: number;
+                        limit?: number;
+                        offset?: number;
+                    };
+                };
+            };
+            /** @description The request is not valid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiMcpLibrary: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    name: string;
+                    description?: string;
+                    category?: string;
+                    /** @enum {string} */
+                    connection_type: "http" | "stdio" | "sse";
+                    connection_url?: string;
+                    stdio_config?: Record<string, never>;
+                    /** @enum {string} */
+                    auth_type?: "none" | "headers" | "oauth" | "per_user_oauth" | "per_user_headers" | "token_exchange";
+                    required_header_keys?: string[];
+                    icon_url?: string;
+                    docs_url?: string;
+                    publisher?: string;
+                    tags?: string[];
+                };
+            };
+        };
+        responses: {
+            /** @description Published */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        status?: string;
+                        message?: string;
+                        entry?: components["schemas"]["McpLibraryEntry"];
+                    };
+                };
+            };
+            /** @description The request is not valid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description A library server with this name (slug) exists already. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The library could not be synced or saved. */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The gateway runs without a config file, so it keeps no library. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiMcpLibraryFilterdata: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The facets */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        categories?: string[];
+                        connection_types?: string[];
+                        auth_types?: string[];
+                        tags?: string[];
+                    };
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiMcpLibraryForceSync: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Synced */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        status?: string;
+                        message?: string;
+                    };
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The library could not be synced or saved. */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The gateway runs without a config file, so it keeps no library. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    deleteApiMcpLibraryId: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The library server's id */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Hidden */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        status?: string;
+                        message?: string;
+                    };
+                };
+            };
+            /** @description The request is not valid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No such record (or the route is not served for this input). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The library could not be synced or saved. */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The gateway runs without a config file, so it keeps no library. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
     postApiMcpOpenapiPreview: {
         parameters: {
             query?: never;
@@ -21187,13 +23345,24 @@ export interface operations {
                         title?: string;
                         version?: string;
                         openapi_version?: string;
+                        description?: string;
+                        servers?: string[];
                         base_url?: string;
+                        operation_servers?: boolean;
+                        security_schemes?: Record<string, never>[];
                         tool_count?: number;
                         tools?: Record<string, never>[];
+                        unsupported?: Record<string, never>[];
+                        warnings?: string[];
+                        spec_size?: number;
+                        spec_hash?: string;
+                        /** @description The fetched document, when the request named a spec_url */
+                        spec?: string;
+                        spec_url?: string;
                     };
                 };
             };
-            /** @description No spec, the document is not OpenAPI 3.x JSON, or spec_url could not be fetched. */
+            /** @description No spec, the document is not an OpenAPI 3.x or Swagger 2.0 document (JSON or YAML), or spec_url could not be fetched. */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -21206,7 +23375,10 @@ export interface operations {
     };
     getApiOauthConfigIdStatus: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description A verification flow of this config, to read that flow's status */
+                flow_id?: string;
+            };
             header?: never;
             path: {
                 /** @description Name of the OAuth config (MCP client) */
@@ -21225,11 +23397,20 @@ export interface operations {
                     "application/json": {
                         id?: string;
                         /** @enum {string} */
-                        status?: "pending" | "authorized";
+                        status?: "pending" | "authorized" | "failed" | "expired";
+                        /** @description The flow asked about (with flow_id only) */
+                        flow_id?: string;
+                        /** @description The flow's own state while it is held (pending or failed; with flow_id only) */
+                        flow_status?: string;
+                        /**
+                         * Format: date-time
+                         * @description When the access token expires (authorized only, when known)
+                         */
+                        token_expires_at?: string;
                     };
                 };
             };
-            /** @description No such OAuth config. */
+            /** @description No such OAuth config, or the flow belongs to another config. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -21301,7 +23482,7 @@ export interface operations {
             content: {
                 "application/json": {
                     /** @enum {string} */
-                    mode?: "vk" | "session";
+                    mode?: "vk" | "session" | "user";
                     /** @description The virtual key's value (mode vk only) */
                     value?: string;
                 };
@@ -21454,6 +23635,15 @@ export interface operations {
                     "application/json": components["schemas"]["ManagementErrorResponse"];
                 };
             };
+            /** @description A user-mode flow of another user. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
             /** @description The flow is unknown or expired. */
             404: {
                 headers: {
@@ -21482,6 +23672,15 @@ export interface operations {
         responses: {
             /** @description OK */
             200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description A user-mode flow of another user. */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -21988,13 +24187,14 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description OK */
+            /** @description The stored document */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                    "application/json": Record<string, never>;
+                    "application/yaml": string;
                 };
             };
             /** @description Authentication required, or the session or token is not valid. */
@@ -22486,7 +24686,10 @@ export interface operations {
     getApiMcpPerUserHeadersFlowsId: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description The submission's temp token (the fragment of the link a tool call answered), when client.mcp_enable_temp_token_auth is on */
+                "X-Bifrost-Temp-Token"?: string;
+            };
             path: {
                 /** @description The submission flow's id */
                 id: string;
@@ -22563,7 +24766,10 @@ export interface operations {
     putApiMcpPerUserHeadersFlowsId: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description The submission's temp token (the fragment of the link a tool call answered), when client.mcp_enable_temp_token_auth is on */
+                "X-Bifrost-Temp-Token"?: string;
+            };
             path: {
                 /** @description The submission flow's id */
                 id: string;
@@ -24201,8 +26407,31 @@ export interface operations {
     getApiAgentsHistory: {
         parameters: {
             query?: {
-                /** @description Comma-separated agent names. */
+                /** @description Agent names; repeated or comma-separated, any matches (Bifrost's name). agent_names is taken too. */
+                agent_name?: string;
+                /** @description Comma-separated agent names (Raiju's name for agent_name). */
                 agent_names?: string;
+                /** @description The method names the calls used (message/send, SendMessage, ...); repeated or comma-separated. */
+                operation?: string;
+                virtual_key_id?: string;
+                user_id?: string;
+                team_id?: string;
+                customer_id?: string;
+                business_unit_id?: string;
+                project_id?: string;
+                /** @description success or error; repeated or comma-separated. */
+                status?: string;
+                task_id?: string;
+                context_id?: string;
+                request_id?: string;
+                /** @description Text in the agent name, operation, task, context or request id, or the error (not the bodies). */
+                search?: string;
+                /** @description RFC 3339. */
+                start_time?: string;
+                /** @description RFC 3339. */
+                end_time?: string;
+                sort_by?: "timestamp" | "latency";
+                order?: "desc" | "asc";
                 limit?: number;
                 offset?: number;
             };
@@ -24221,7 +26450,7 @@ export interface operations {
                     "application/json": components["schemas"]["AgentHistory"];
                 };
             };
-            /** @description A limit or offset is not a valid number. */
+            /** @description A limit, offset or time is not valid. */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -24241,6 +26470,425 @@ export interface operations {
             };
             /** @description The caller's role or data access scope does not cover this route. */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    deleteApiAgentsHistory: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AgentHistoryDeleteRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentHistoryDeleted"];
+                };
+            };
+            /** @description The body is not JSON, or names no ids. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The logs store is not enabled. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiAgentsHistoryStats: {
+        parameters: {
+            query?: {
+                /** @description Agent names; repeated or comma-separated, any matches (Bifrost's name). agent_names is taken too. */
+                agent_name?: string;
+                /** @description Comma-separated agent names (Raiju's name for agent_name). */
+                agent_names?: string;
+                /** @description The method names the calls used (message/send, SendMessage, ...); repeated or comma-separated. */
+                operation?: string;
+                virtual_key_id?: string;
+                user_id?: string;
+                team_id?: string;
+                customer_id?: string;
+                business_unit_id?: string;
+                project_id?: string;
+                /** @description success or error; repeated or comma-separated. */
+                status?: string;
+                task_id?: string;
+                context_id?: string;
+                request_id?: string;
+                /** @description Text in the agent name, operation, task, context or request id, or the error (not the bodies). */
+                search?: string;
+                /** @description RFC 3339. */
+                start_time?: string;
+                /** @description RFC 3339. */
+                end_time?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentHistoryStats"];
+                };
+            };
+            /** @description A parameter is not valid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The logs store is not enabled. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiAgentsHistoryHistogram: {
+        parameters: {
+            query?: {
+                /** @description Agent names; repeated or comma-separated, any matches (Bifrost's name). agent_names is taken too. */
+                agent_name?: string;
+                /** @description Comma-separated agent names (Raiju's name for agent_name). */
+                agent_names?: string;
+                /** @description The method names the calls used (message/send, SendMessage, ...); repeated or comma-separated. */
+                operation?: string;
+                virtual_key_id?: string;
+                user_id?: string;
+                team_id?: string;
+                customer_id?: string;
+                business_unit_id?: string;
+                project_id?: string;
+                /** @description success or error; repeated or comma-separated. */
+                status?: string;
+                task_id?: string;
+                context_id?: string;
+                request_id?: string;
+                /** @description Text in the agent name, operation, task, context or request id, or the error (not the bodies). */
+                search?: string;
+                /** @description RFC 3339. */
+                start_time?: string;
+                /** @description RFC 3339. */
+                end_time?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentHistoryHistogram"];
+                };
+            };
+            /** @description A parameter is not valid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The logs store is not enabled. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiAgentsHistoryTopAgents: {
+        parameters: {
+            query?: {
+                /** @description Agent names; repeated or comma-separated, any matches (Bifrost's name). agent_names is taken too. */
+                agent_name?: string;
+                /** @description Comma-separated agent names (Raiju's name for agent_name). */
+                agent_names?: string;
+                /** @description The method names the calls used (message/send, SendMessage, ...); repeated or comma-separated. */
+                operation?: string;
+                virtual_key_id?: string;
+                user_id?: string;
+                team_id?: string;
+                customer_id?: string;
+                business_unit_id?: string;
+                project_id?: string;
+                /** @description success or error; repeated or comma-separated. */
+                status?: string;
+                task_id?: string;
+                context_id?: string;
+                request_id?: string;
+                /** @description Text in the agent name, operation, task, context or request id, or the error (not the bodies). */
+                search?: string;
+                /** @description RFC 3339. */
+                start_time?: string;
+                /** @description RFC 3339. */
+                end_time?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentTopAgents"];
+                };
+            };
+            /** @description A parameter is not valid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The logs store is not enabled. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiAgentsHistoryFilterdata: {
+        parameters: {
+            query?: {
+                /** @description Comma-separated dimensions (users, virtual_keys, teams, customers, business_units, projects); all when absent. */
+                dimensions?: string;
+                /** @description Text the names must contain. */
+                q?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentHistoryFilterData"];
+                };
+            };
+            /** @description A parameter is not valid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The logs store is not enabled. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiAgentsHistoryById: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentHistoryEntry"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No call with this id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The logs store is not enabled. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

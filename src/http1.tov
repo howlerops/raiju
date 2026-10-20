@@ -266,12 +266,12 @@ function listHas(raw: string | undefined, token: string): bool {
   return false
 }
 
-// Decides an upgrade request (see listen). accept() must be called during the
-// hook: it writes the 101 and returns the WebSocket, or returns undefined after
-// answering the request. Return false to answer 426; true means the hook took
+// Decides an upgrade request (see listen). accept(protocol) must be called during
+// the hook: it writes the 101 (with Sec-WebSocket-Protocol when protocol is not
+// "") and returns the WebSocket, or returns undefined after answering the request. Return false to answer 426; true means the hook took
 // the request, and a connection it didn't accept is closed.
 // reject(status, jsonBody) answers the upgrade request with an HTTP error instead.
-export type UpgradeHandler = (req: Http1Request, accept: () => WsConnection | undefined, reject: (status: int, body: string) => void) => bool
+export type UpgradeHandler = (req: Http1Request, accept: (protocol: string) => WsConnection | undefined, reject: (status: int, body: string) => void) => bool
 
 export class Http1Parser {
   private buf: u8[] = []
@@ -760,7 +760,7 @@ cyclic class Http1Conn {
   private upgrade(req: Http1Request): void {
     const up = this.onUpgrade
     let handled = false
-    if (up !== undefined) handled = up(req, () => this.accept(req), (status, body) => this.rejectUpgrade(status, body))
+    if (up !== undefined) handled = up(req, (protocol) => this.accept(req, protocol), (status, body) => this.rejectUpgrade(status, body))
     const w = this.ws
     if (w !== undefined) {
       // bytes that came after the head are already the first frames
@@ -774,7 +774,7 @@ cyclic class Http1Conn {
 
   // The handshake. Validates the request and writes the 101; returns the
   // WebSocket, or undefined after answering the request with an error.
-  private accept(req: Http1Request): WsConnection | undefined {
+  private accept(req: Http1Request, protocol: string): WsConnection | undefined {
     const have = this.ws
     if (have !== undefined) return have
     if (this.answered || this.closed) return undefined
@@ -793,7 +793,9 @@ cyclic class Http1Conn {
       return undefined
     }
     this.answered = true
-    this.sendRaw(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${acceptKey(key)}\r\n\r\n`)
+    // the subprotocol chosen from the client's offer (a value that could split the head is never written)
+    const proto = protocol !== "" && !protocol.includes("\r") && !protocol.includes("\n") ? `Sec-WebSocket-Protocol: ${protocol}\r\n` : ""
+    this.sendRaw(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${acceptKey(key)}\r\n${proto}\r\n`)
     const writer = new WsWriter(this)
     const w = new WsConnection(new WsSink((b) => writer.write(b), () => writer.end()))
     this.ws = w
@@ -885,6 +887,12 @@ export class Http1Response {
     if (!this.headSent) this.startStream()
     if (this.bodyless()) return
     this.emit(this.version === "HTTP/1.1" ? chunk(text) : text)
+  }
+
+  // Whether the connection this response goes to has closed (a streamed body then has no reader).
+  gone(): bool {
+    const c = this.conn
+    return c === undefined || c.closed
   }
 
   // Writes a piece of a binary body (chunked for HTTP/1.1, like write()).
@@ -991,14 +999,16 @@ export class Http1Response {
 // Listens on a port and serves HTTP/1.1 through `handler`. The handler may
 // finish its response later, from async code.
 // onUpgrade (optional) takes WebSocket upgrade requests; see UpgradeHandler.
-export function listen(opts: { hostname: string, port: int, maxBodyBytes?: int, streamThreshold?: int, onUpgrade?: UpgradeHandler }, handler: Handler): TCPSocketListener<Http1Conn> {
+// thresholdOf, when given, is asked for the stream threshold at each new connection (it follows the config).
+export function listen(opts: { hostname: string, port: int, maxBodyBytes?: int, streamThreshold?: int, thresholdOf?: () => int, onUpgrade?: UpgradeHandler }, handler: Handler): TCPSocketListener<Http1Conn> {
   const maxBody = opts.maxBodyBytes ?? DEFAULT_MAX_BODY
   return Bun.listen<Http1Conn>({
     hostname: opts.hostname,
     port: opts.port,
     socket: {
       open(socket) {
-        const conn = new Http1Conn(maxBody, opts.streamThreshold)
+        const tf = opts.thresholdOf
+        const conn = new Http1Conn(maxBody, tf !== undefined ? tf() : opts.streamThreshold)
         conn.sock = socket
         conn.onUpgrade = opts.onUpgrade
         socket.data = conn
@@ -1253,7 +1263,7 @@ test("an upgrade answers 101 and hands the socket to the frames", () => {
   const conn = new Http1Conn()
   const got: string[] = []
   conn.onUpgrade = (req, accept) => {
-    const ws = accept()
+    const ws = accept("")
     if (ws === undefined) return true
     ws.onMessage = (m) => {
       if (typeof m === "string") got.push(m)
@@ -1281,6 +1291,16 @@ test("an upgrade without a hook is a 426 that closes", () => {
   expect(conn.ws).toBeUndefined()
 })
 
+test("an upgrade answers with the subprotocol the hook chose", () => {
+  const conn = new Http1Conn()
+  conn.onUpgrade = (req, accept) => {
+    accept("realtime")
+    return true
+  }
+  conn.serve(conn.parser.feed(enc.encode(upgradeRequest("13", "dGhlIHNhbXBsZSBub25jZQ=="))), (req, res) => {})
+  expect(conn.sent.join("")).toBe("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Protocol: realtime\r\n\r\n")
+})
+
 test("a hook that declines is a 426, and a bad version or key is answered by accept", () => {
   const declines = new Http1Conn()
   declines.onUpgrade = (req, accept) => false
@@ -1289,7 +1309,7 @@ test("a hook that declines is a 426, and a bad version or key is answered by acc
 
   const oldVersion = new Http1Conn()
   oldVersion.onUpgrade = (req, accept) => {
-    accept()
+    accept("")
     return true
   }
   oldVersion.serve(new Http1Parser().feed(enc.encode(upgradeRequest("8", "dGhlIHNhbXBsZSBub25jZQ=="))), (req, res) => {})
@@ -1300,7 +1320,7 @@ test("a hook that declines is a 426, and a bad version or key is answered by acc
 
   const badKey = new Http1Conn()
   badKey.onUpgrade = (req, accept) => {
-    accept()
+    accept("")
     return true
   }
   badKey.serve(new Http1Parser().feed(enc.encode(upgradeRequest("13", "not-a-key"))), (req, res) => {})
@@ -1311,7 +1331,7 @@ test("a hook that declines is a 426, and a bad version or key is answered by acc
 test("frames after an upgrade are not read as requests", () => {
   const conn = new Http1Conn()
   conn.onUpgrade = (req, accept) => {
-    accept()
+    accept("")
     return true
   }
   // "GET" is not a frame: its first byte has the reserved bit set

@@ -12,7 +12,15 @@ type UserReply = { status: int, contentType: string, body: string, sid: string }
 import { fields, elements, find, rawStr, rawBool, rawNum, quote, build, setField, isNull, decodeString } from "./json"
 import { deadline } from "./deadline"
 import { targetProblem } from "./netguard"
-import { OpenApiConfig, OpenApiCred, OpenApiDoc, OpenApiOp, OpRequest, parseSpec, inputSchema, requestFor, callOperation } from "./openapi"
+import { OpenApiConfig, OpenApiCred, OpenApiDoc, OpenApiOp, OpRequest, parseSpec, inputSchema, requestFor, callOperation, toolDescription, baseUrlOf, operationServersCover, specInstructions, specFilePath } from "./openapi"
+import { readFileSync } from "node:fs"
+
+// The folder an openapi_config.spec_file is read from (the config file's), set once at start.
+let specBaseDir = ""
+
+export function setSpecBaseDir(dir: string): void {
+  specBaseDir = dir
+}
 
 // Bifrost's client config. "http" is Streamable HTTP ("sse" uses the same POST
 // transport); "stdio" runs stdio_config.command and speaks newline-delimited
@@ -39,7 +47,8 @@ export type McpClientConfig = {
   // timeout for this server. needs_session_stickiness false (http only) connects fresh for each call.
   // require_public_target keeps every dial to a public address. allowed_extra_headers lists the request
   // headers that may be forwarded to this server on a tool call ("*" for all). tool_pricing is the cost
-  // per execution by server tool name. is_ping_available is stored; no ping health check runs.
+  // per execution by server tool name. is_ping_available false skips the ping of the periodic check (the tool
+  // list alone checks the server).
   tool_execution_timeout?: string,
   is_ping_available?: bool,
   needs_session_stickiness?: bool,
@@ -222,6 +231,23 @@ export function keyRuleAllows(keys: McpKeyConfig[] | undefined, server: string, 
   return allowByDefault
 }
 
+// The MCP access of the project a request names (Bifrost's project mcp_configs): its per-client tool lists,
+// composed with the caller's own access by its access_rule ("union" adds to it, "intersect" caps it, anything
+// else permits nothing). via is set when the call comes through a virtual MCP the project is assigned: the
+// project's part then allows the call.
+export type ProjectMcp = { rule: string, keys: McpKeyConfig[], via?: bool }
+
+// Whether a project lets the caller run server's tool, given what the caller's own rules said. A project
+// names a server by an entry (an empty list allows nothing there); a server it does not name gets nothing
+// from it.
+export function projectPass(p: ProjectMcp | undefined, server: string, tool: string, callerOk: bool): bool {
+  if (p === undefined) return callerOk
+  const projOk = p.via === true || (keyNamesClient(p.keys, server) && keyRuleAllows(p.keys, server, tool, false))
+  if (p.rule === "union") return callerOk || projOk
+  if (p.rule === "intersect") return callerOk && projOk
+  return false
+}
+
 export type McpTool = { name: string, description: string, inputSchemaRaw: string }
 
 export type RpcResult = { kind: "result", raw: string } | { kind: "error", code: int, message: string }
@@ -233,6 +259,11 @@ const CONNECT_TIMEOUT_MS = 15000
 const DEFAULT_TOOL_TIMEOUT_MS = 30000
 // A server that keeps returning a cursor is cut off here.
 const MAX_TOOL_PAGES = 100
+// Bifrost's connection checker: the cadence of a healthy client's check (when no tool_sync_interval sets one),
+// the tight one after a failed check, and the bound on each ping or listing
+const HEALTHY_CHECK_SECONDS = 600
+const UNSTABLE_CHECK_MS = 10000
+const CHECK_TIMEOUT_MS = 5000
 const EMPTY_SCHEMA = '{"type":"object","properties":{}}'
 const NAME_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
 const MAX_NAME = 64
@@ -376,7 +407,7 @@ export function chatToolName(server: string, tool: string): string {
 
 // The predicate that decides which of a session's tools a caller sees: the key's mcp_configs rules and
 // the access profile's patterns, with allow_by_default for a client neither names.
-function visibleTo(s: McpSession, policy: string[] | undefined, keys: McpKeyConfig[] | undefined): (orig: string, chat: string) => bool {
+function visibleTo(s: McpSession, policy: string[] | undefined, keys: McpKeyConfig[] | undefined, proj?: ProjectMcp): (orig: string, chat: string) => bool {
   const name = s.cfg.name
   const byDefault = s.cfg.allow_by_default === true
   const ks: McpKeyConfig[] = keys ?? []
@@ -387,7 +418,7 @@ function visibleTo(s: McpSession, policy: string[] | undefined, keys: McpKeyConf
   return (orig: string, chat: string): bool => {
     const keyOk = keys === undefined || (keyNamed ? keyRuleAllows(ks, name, orig, byDefault) : byDefault)
     const polOk = policy === undefined || (polNamed ? pol.some((p) => patternMatches(chat, p)) : byDefault)
-    return keyOk && polOk
+    return projectPass(proj, name, orig, keyOk && polOk)
   }
 }
 
@@ -714,6 +745,8 @@ export class McpSession {
   // an openapi client: its document and the base URL its calls go to
   private openapi: OpenApiDoc | undefined = undefined
   private opBase = ""
+  // base_url set the base (the operations' own servers are then not used)
+  private opExplicit = false
 
   // the config this session runs with; follow() swaps in a changed tool policy for a kept stdio process
   cfg: McpClientConfig
@@ -976,6 +1009,17 @@ export class McpSession {
     if (oc === undefined) throw new Error(`${this.cfg.name}: openapi_config is required for an openapi connection`)
     let text = oc.spec ?? ""
     const specUrl = oc.spec_url ?? ""
+    const specFile = oc.spec_file ?? ""
+    // a spec_file (config.json only) is read from the config file's folder, and must stay inside it
+    if (text === "" && specFile.trim() !== "") {
+      const p = specFilePath(specFile, specBaseDir)
+      if (p === "") throw new Error(`${this.cfg.name}: spec_file "${specFile}" resolves outside the config directory`)
+      try {
+        text = readFileSync(p, "utf8")
+      } catch (e) {
+        throw new Error(`${this.cfg.name}: spec_file "${specFile}": ${e.message}`)
+      }
+    }
     if (text === "" && specUrl !== "") {
       if (this.cfg.require_public_target === true) {
         const pr = targetProblem(specUrl, this.allow)
@@ -992,21 +1036,26 @@ export class McpSession {
         dl.finish()
       }
     }
-    if (text === "") throw new Error(`${this.cfg.name}: openapi_config needs spec or spec_url`)
-    let doc: OpenApiDoc = { title: "", version: "", openapi_version: "", description: "", servers: [], ops: [], schemes: [] }
+    if (text === "") throw new Error(`${this.cfg.name}: openapi_config needs spec, spec_file or spec_url`)
+    let doc: OpenApiDoc | undefined = undefined
     try {
-      doc = try parseSpec(text, oc.include_deprecated === true)
+      doc = try parseSpec(text, oc.include_deprecated === true, specUrl, this.cfg.name)
     } catch (e) {
       throw new Error(`${this.cfg.name}: ${e.message}`)
     }
-    let base = oc.base_url ?? ""
-    if (base === "" && doc.servers.length > 0) base = doc.servers[0]!
-    this.openapi = doc
-    this.opBase = base
+    const d = doc!
+    if (d.ops.length === 0) throw new Error(`${this.cfg.name}: no operation in the spec can be exposed as a tool`)
+    const b = baseUrlOf(d, oc.base_url ?? "")
+    if (b.base === "" && !operationServersCover(d)) throw new Error(`${this.cfg.name}: the spec declares no absolute server URL; set openapi_config.base_url`)
+    this.openapi = d
+    this.opBase = b.base
+    this.opExplicit = b.explicit
+    // the API's description serves as the server's instructions, as Bifrost's in-process server sends it
+    this.instructions = specInstructions(d)
     const ts: McpTool[] = []
     const ex: Map<string, string> = new Map()
-    for (const op of doc.ops) {
-      ts.push({ name: op.name, description: op.description, inputSchemaRaw: inputSchema(op) })
+    for (const op of d.ops) {
+      ts.push({ name: op.name, description: toolDescription(op), inputSchemaRaw: inputSchema(op) })
       if (toolAllowed(op.name, this.cfg)) ex.set(chatName(this.cfg.name, op.name), op.name)
     }
     this.tools = ts
@@ -1026,7 +1075,13 @@ export class McpSession {
     const creds: Map<string, OpenApiCred> = oc?.security_credentials ?? new Map()
     let req: OpRequest | undefined = undefined
     try {
-      req = try requestFor(op, this.opBase, argsJson, doc, creds)
+      // the client's static headers go with each call, as Bifrost's header resolver sends them
+      const conf: Map<string, string> = new Map()
+      const ch = this.cfg.headers
+      if (ch !== undefined) {
+        for (const k of ch.keys()) conf.set(k.toLowerCase(), ch.get(k)!)
+      }
+      req = try requestFor(op, this.opBase, argsJson, doc, creds, conf, this.opExplicit)
     } catch (e) {
       return { text: e.message, isError: true }
     }
@@ -1035,7 +1090,7 @@ export class McpSession {
       if (pr !== "") return { text: `${this.cfg.name}: ${pr}`, isError: true }
     }
     const r = try await callOperation(req!, this.timeoutMs, oc?.max_response_bytes ?? 0)
-    return { text: r.text, isError: r.status >= 400 }
+    return { text: r.text, isError: r.isError }
   }
 
   // Why a token_exchange client without an admin credential cannot list its tools.
@@ -1049,6 +1104,70 @@ export class McpSession {
   awaitingReverify(): bool {
     const row = this.adminRow
     return this.cfg.auth_type === "token_exchange" && row !== undefined && needsReverify(row)
+  }
+
+  // Whether calls connect fresh each time (Bifrost's per-call clients): an http client without session
+  // stickiness, and the per-user and token exchange auth types.
+  perCall(): bool {
+    const t = this.cfg.auth_type ?? ""
+    return (this.cfg.connection_type === "http" && this.cfg.needs_session_stickiness === false) || t === "per_user_oauth" || t === "per_user_headers" || t === "token_exchange"
+  }
+
+  // Re-reads the server's initialize instructions over a throwaway handshake; the live session is kept.
+  async rereadInstructions(): Promise<void> throws Error {
+    if (this.cfg.connection_type !== "http" && this.cfg.connection_type !== "sse") return
+    const sid = this.sessionId
+    const ver = this.version
+    this.sessionId = ""
+    this.version = ""
+    try {
+      const id = this.newId()
+      const raw = try await this.rpc(initializeRequest(id), id, CHECK_TIMEOUT_MS)
+      this.instructions = instructionsOf(raw)
+    } finally {
+      this.sessionId = sid
+      this.version = ver
+    }
+  }
+
+  // MCP ping (the health check of servers that offer it). Throws when the server does not answer.
+  async ping(): Promise<void> throws Error {
+    const id = this.newId()
+    try await this.rpc(`{"jsonrpc":"2.0","id":${id},"method":"ping"}`, id, CHECK_TIMEOUT_MS)
+  }
+
+  // One check of Bifrost's connection checker. A connected sticky client is pinged (unless is_ping_available is
+  // false) and its tools listed again; a failure reconnects it. A per-call client has no connection to ping: its
+  // tools are listed (a failed listing keeps them, as before) and its instructions re-read. A client that is not
+  // connected reconnects. True when the client ends up connected without an error.
+  async check(): Promise<bool> {
+    if (this.cfg.disabled === true) return true
+    if (!this.connected) {
+      await this.connect()
+      return this.connected
+    }
+    if (this.perCall()) {
+      await this.relist()
+      if (this.lastError === "") {
+        try {
+          await this.rereadInstructions()
+        } catch (e) {
+          // best effort: the installed text stays
+        }
+      }
+      return this.lastError === ""
+    }
+    try {
+      if (this.cfg.is_ping_available !== false && this.cfg.connection_type !== "openapi") try await this.ping()
+      if (this.cfg.connection_type === "openapi") try await this.loadOpenApi()
+      else try await this.listAll()
+      this.lastError = ""
+      return true
+    } catch (e) {
+      this.lastError = e.message
+    }
+    await this.connect()
+    return this.connected
   }
 
   // Lists the tools again (the periodic tool_sync_interval refresh). A failure keeps the tools it had; a
@@ -1213,7 +1332,9 @@ export class McpSession {
       this.sessionId = ""
       this.version = ""
       const initId = this.newId()
-      try await this.rpc(initializeRequest(initId), initId, CONNECT_TIMEOUT_MS, sent)
+      const initRaw = try await this.rpc(initializeRequest(initId), initId, CONNECT_TIMEOUT_MS, sent)
+      // each fresh handshake brings the server's current instructions
+      this.instructions = instructionsOf(initRaw)
       this.version = PROTOCOL
       try await this.notify(initializedNotification(), sent)
     }
@@ -1224,8 +1345,9 @@ export class McpSession {
   }
 }
 
-// One finished tool execution, for the request log (kind "mcp").
-export type McpToolCall = { server: string, tool: string, latencyMs: f64, ok: bool, error: string }
+// One finished tool execution, for the request log (kind "mcp"). cost is the tool's tool_pricing price, for a
+// call that returned (what the caller's budgets are debited).
+export type McpToolCall = { server: string, tool: string, latencyMs: f64, ok: bool, error: string, cost?: f64 }
 
 let toolLog: ((c: McpToolCall) => void) | undefined = undefined
 
@@ -1247,8 +1369,10 @@ function reportTool(c: McpToolCall): void {
 // All configured MCP servers: connects them, offers their tools to chat and routes tool calls.
 export class McpManager {
   sessions: McpSession[]
-  // the tool_sync_interval timers, one per client that has one
+  // the connection checker's timers, one per enabled client (syncTimers lists them)
   syncTimers: int[] = []
+  private checkTimers: Map<string, int> = new Map()
+  private syncGen = 0
 
   // Follows a changed config. Each client takes the session of list, which carries the new config
   // (and the tokens an OAuth flow saved); connectNew() connects those. A stdio client keeps its
@@ -1340,25 +1464,48 @@ export class McpManager {
     this.startToolSync()
   }
 
-  // Re-lists each connected client's tools every tool_sync_interval. Clears the timers it had,
-  // so a changed interval takes effect when this runs again.
+  // Bifrost's connection checker, one per enabled client: every tool_sync_interval (the client's, else the global
+  // one, else 10 minutes) the client is checked (see McpSession.check: ping, tool list, reconnect); after a failed
+  // check the next one comes in 10 seconds. Clears the timers it had, so a changed interval applies when this
+  // runs again.
   startToolSync(): void {
     this.stopToolSync()
+    this.syncGen += 1
+    const gen = this.syncGen
     for (const s of this.sessions) {
-      // the client's own interval, else the global default
-      const own = syncSeconds(s.cfg.tool_sync_interval)
-      const secs = own > 0 ? own : this.defaultSyncSecs
-      if (secs <= 0) continue
-      this.syncTimers.push(setInterval(() => {
-        syncOnce(s)
-      }, secs * 1000))
+      if (s.cfg.disabled === true) continue
+      this.scheduleCheck(s, gen, this.healthyMs(s))
     }
   }
 
-  // Clears every tool_sync_interval timer.
+  private healthyMs(s: McpSession): int {
+    const own = syncSeconds(s.cfg.tool_sync_interval)
+    const secs = own > 0 ? own : this.defaultSyncSecs > 0 ? this.defaultSyncSecs : HEALTHY_CHECK_SECONDS
+    return secs * 1000
+  }
+
+  private scheduleCheck(s: McpSession, gen: int, ms: int): void {
+    const name = s.cfg.name
+    const t = setTimeout(() => {
+      this.runCheck(s, gen)
+    }, ms)
+    this.checkTimers.set(name, t)
+    this.syncTimers = this.checkTimers.values()
+  }
+
+  private async runCheck(s: McpSession, gen: int): Promise<void> {
+    if (gen !== this.syncGen || !this.sessions.some((x) => x === s)) return
+    const ok = await s.check()
+    if (gen !== this.syncGen || !this.sessions.some((x) => x === s)) return
+    this.scheduleCheck(s, gen, ok ? this.healthyMs(s) : UNSTABLE_CHECK_MS)
+  }
+
+  // Clears every check timer.
   stopToolSync(): void {
-    for (const t of this.syncTimers) clearInterval(t)
+    for (const t of this.checkTimers.values()) clearTimeout(t)
+    this.checkTimers = new Map()
     this.syncTimers = []
+    this.syncGen += 1
   }
 
   // The chat tool definitions a key may see. policy is the key's access-profile tool patterns;
@@ -1368,12 +1515,12 @@ export class McpManager {
   // The chat tool definitions one caller may see: the access profile's patterns (policy) and the key's
   // mcp_configs (keys). Each filter judges a client it names by its entry, and a client it does not name
   // only when that client is allow_by_default. Undefined filters do not restrict.
-  allToolsFor(policy: string[] | undefined, keys?: McpKeyConfig[]): string[] {
-    if (policy === undefined && keys === undefined) return this.allTools()
+  allToolsFor(policy: string[] | undefined, keys?: McpKeyConfig[], proj?: ProjectMcp): string[] {
+    if (policy === undefined && keys === undefined && proj === undefined) return this.allTools()
     const out: string[] = []
     for (const s of this.sessions) {
       if (!s.connected || s.cfg.is_code_mode_client === true) continue
-      const pass = s.toolsWhere(visibleTo(s, policy, keys))
+      const pass = s.toolsWhere(visibleTo(s, policy, keys, proj))
       for (const t of pass) out.push(t)
     }
     return out
@@ -1382,11 +1529,11 @@ export class McpManager {
   // The servers whose instructions a caller may be sent: the connected clients that gave some and
   // that offer the caller at least one tool (a server the caller cannot reach is not heard from), by
   // name. Code mode clients are left out: their guidance rides in the stub files.
-  instructionParts(policy: string[] | undefined, keys?: McpKeyConfig[]): InstructionPart[] {
+  instructionParts(policy: string[] | undefined, keys?: McpKeyConfig[], proj?: ProjectMcp): InstructionPart[] {
     const out: InstructionPart[] = []
     for (const s of this.sessions) {
       if (!s.connected || s.cfg.is_code_mode_client === true || s.instructions === "") continue
-      if (s.toolsWhere(visibleTo(s, policy, keys)).length === 0) continue
+      if (s.toolsWhere(visibleTo(s, policy, keys, proj)).length === 0) continue
       out.push({ name: s.cfg.name, text: s.instructions, max: s.cfg.max_instructions_length ?? 0 })
     }
     out.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
@@ -1418,11 +1565,11 @@ export class McpManager {
   }
 
   // The tools of the code mode clients a caller may see, by client (the same rules as allToolsFor).
-  codeToolsFor(policy: string[] | undefined, keys?: McpKeyConfig[]): { name: string, tools: McpTool[], instructions?: string }[] {
+  codeToolsFor(policy: string[] | undefined, keys?: McpKeyConfig[], proj?: ProjectMcp): { name: string, tools: McpTool[], instructions?: string }[] {
     const out: { name: string, tools: McpTool[], instructions?: string }[] = []
     for (const s of this.sessions) {
       if (!s.connected || s.cfg.is_code_mode_client !== true) continue
-      const pass = visibleTo(s, policy, keys)
+      const pass = visibleTo(s, policy, keys, proj)
       const tools: McpTool[] = []
       for (const t of s.tools) {
         if (!toolAllowed(t.name, s.cfg)) continue
@@ -1436,22 +1583,23 @@ export class McpManager {
 
   // Whether a caller may run one chat tool ("<server>-<tool>"), by the same rules that decide which
   // tools it is offered. false when the tool is not exposed.
-  mayRun(policy: string[] | undefined, keys: McpKeyConfig[] | undefined, fullToolName: string): bool {
+  mayRun(policy: string[] | undefined, keys: McpKeyConfig[] | undefined, fullToolName: string, proj?: ProjectMcp): bool {
     for (const s of this.sessions) {
       if (!s.connected) continue
       const orig = s.original(fullToolName)
       if (orig === undefined) continue
       const name = s.cfg.name
       const byDefault = s.cfg.allow_by_default === true
+      let callerOk = true
       if (keys !== undefined) {
         const ok = keyNamesClient(keys, name) ? keyRuleAllows(keys, name, orig, byDefault) : byDefault
-        if (!ok) return false
+        if (!ok) callerOk = false
       }
       if (policy !== undefined) {
         const ok = namesClient(policy, name) ? policy.some((p) => patternMatches(fullToolName, p)) : byDefault
-        if (!ok) return false
+        if (!ok) callerOk = false
       }
-      return true
+      return projectPass(proj, name, orig, callerOk)
     }
     return false
   }
@@ -1506,7 +1654,7 @@ export class McpManager {
           reportTool({ server: s.cfg.name, tool: original, latencyMs: Date.now() - t0, ok: false, error: e.message })
           throw e
         }
-        reportTool({ server: s.cfg.name, tool: original, latencyMs: Date.now() - t0, ok: !r.isError, error: r.isError ? r.text : "" })
+        reportTool({ server: s.cfg.name, tool: original, latencyMs: Date.now() - t0, ok: !r.isError, error: r.isError ? r.text : "", cost: this.priceOf(fullToolName) })
         return r
       }
     }
@@ -1533,11 +1681,6 @@ export class McpManager {
       return { name: s.cfg.name, connected: s.connected, tools: s.exposedCount(), error: s.lastError, stdio: s.cfg.connection_type === "stdio", tools_list: s.toolStates(), state: state, credential: cred }
     })
   }
-}
-
-// One periodic tool list for a client; a failure is kept on the session, never thrown.
-async function syncOnce(s: McpSession): Promise<void> {
-  await s.relist()
 }
 
 test("instructions go to a caller for the servers that offer it a tool, within the caps", () => {
@@ -1578,12 +1721,20 @@ test("tool_sync_interval seconds and the timers it starts and clears", () => {
   expect(syncSeconds("10m")).toBe(600)
   expect(syncSeconds("1h30m")).toBe(5400)
   const m = new McpManager({ client_configs: [{ name: "fs", connection_type: "http", connection_string: "http://x/mcp", tool_sync_interval: "10m" }, { name: "git", connection_type: "http", connection_string: "http://y/mcp" }] })
+  // every enabled client gets a checker (the healthy cadence is 10 minutes without a tool_sync_interval)
   m.startToolSync()
-  expect(m.syncTimers.length).toBe(1)
+  expect(m.syncTimers.length).toBe(2)
   m.startToolSync()
-  expect(m.syncTimers.length).toBe(1)
+  expect(m.syncTimers.length).toBe(2)
   m.stopToolSync()
   expect(m.syncTimers.length).toBe(0)
+  const off = new McpManager({ client_configs: [{ name: "fs", connection_type: "http", connection_string: "http://x/mcp", disabled: true }] })
+  off.startToolSync()
+  expect(off.syncTimers.length).toBe(0)
+  // per-call clients: http without stickiness, and the per-user and token exchange auth types
+  expect(new McpSession({ name: "a", connection_type: "http", needs_session_stickiness: false }).perCall()).toBe(true)
+  expect(new McpSession({ name: "b", connection_type: "http", needs_session_stickiness: true }).perCall()).toBe(false)
+  expect(new McpSession({ name: "c", connection_type: "sse", auth_type: "per_user_oauth" }).perCall()).toBe(true)
 })
 
 test("allow_by_default and access-profile patterns decide which tools a key sees", () => {
@@ -1937,6 +2088,19 @@ test("per-client durations and virtual key allow-lists", () => {
   expect(m.mayRun(["fs-*"], undefined, "web-read")).toBe(false)
   expect(m.mayRun(undefined, undefined, "web-read")).toBe(true)
   expect(m.mayRun(undefined, undefined, "nothing-here")).toBe(false)
+  // a project's tool lists: union adds to the caller's access, intersect caps it, another rule permits nothing
+  const addWeb: ProjectMcp = { rule: "union", keys: [{ mcp_client_name: "web", tools_to_execute: ["read"] }] }
+  expect(m.mayRun(undefined, onlyFs, "web-read", addWeb)).toBe(true)
+  expect(m.mayRun(undefined, onlyFs, "web-write", addWeb)).toBe(false)
+  expect(names(m.allToolsFor(undefined, onlyFs, addWeb))).toBe("fs-read,git-read,git-write,web-read")
+  const capFs: ProjectMcp = { rule: "intersect", keys: [{ mcp_client_name: "fs", tools_to_execute: ["*"] }] }
+  expect(names(m.allToolsFor(undefined, undefined, capFs))).toBe("fs-read,fs-write")
+  expect(m.mayRun(undefined, onlyFs, "fs-write", capFs)).toBe(false)
+  expect(m.mayRun(undefined, undefined, "git-read", { rule: "intersect", keys: [] })).toBe(false)
+  expect(m.mayRun(undefined, undefined, "git-read", { rule: "intersect", keys: [], via: true })).toBe(true)
+  expect(m.mayRun(undefined, undefined, "git-read", { rule: "mystery", keys: capFs.keys })).toBe(false)
+  // a server the project names with an empty list gets nothing from it
+  expect(m.mayRun(undefined, [], "web-read", { rule: "union", keys: [{ mcp_client_name: "web", tools_to_execute: [] }] })).toBe(false)
   expect(m.priceOf("fs-read")).toBe(0.5)
   expect(m.priceOf("fs-write")).toBe(0.0)
   expect(m.priceOf("git-read")).toBe(0.0)

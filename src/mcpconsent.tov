@@ -44,8 +44,59 @@ function brandHeader(): string {
   return `<header class="top"><span class="logo" aria-hidden="true">R</span><span>Raiju <span class="muted">gateway</span></span></header>`
 }
 
-// The per-user OAuth page (Bifrost's /workspace/mcp-sessions/auth?flow={id}#t={token}): it reads the flow,
-// and its Connect button opens the upstream authorize URL that the start route answers.
+// The script helpers both pages share. The flow's temp token comes from the fragment (#t=) and is kept in the tab's
+// sessionStorage, so a page that sent its user to the gateway's own sign-in (OIDC, /api/oidc/login with return_to)
+// still has it when the user comes back without the fragment. The sign-in's session token is the one the admin UI
+// keeps (raiju.adminToken); it is sent as the Authorization of the requests that need an identity.
+function pageHelpers(): string {
+  return `
+  function tokenOf(flow, area) {
+    var hash = location.hash || "";
+    var t = hash.indexOf("#t=") === 0 ? decodeURIComponent(hash.slice(3)) : "";
+    try {
+      if (t !== "") sessionStorage.setItem("raiju." + area + "." + flow, t);
+      else t = sessionStorage.getItem("raiju." + area + "." + flow) || "";
+    } catch (e) {}
+    return t;
+  }
+  function sessionToken() {
+    try { return sessionStorage.getItem("raiju.adminToken") || ""; } catch (e) { return ""; }
+  }
+  function signIn() {
+    location.assign("/api/oidc/login?return_to=" + encodeURIComponent(location.pathname + location.search));
+  }
+  function ssoOn(cb) {
+    fetch("/api/oidc/status").then(function (r) { return r.ok ? r.json() : { enabled: false }; }).then(function (b) { cb(!!(b && b.enabled)); }, function () { cb(false); });
+  }
+  var msg = document.getElementById("msg");
+  function fail(text) { msg.textContent = text; msg.className = "status bad"; msg.setAttribute("role", "alert"); }
+  function info(text) { msg.textContent = text; msg.className = "status info"; msg.setAttribute("role", "status"); }
+  function failOf(res) {
+    return res.json().then(function (b) {
+      var m = b && b.error && b.error.message ? b.error.message : "the request failed";
+      fail(m + " (HTTP " + res.status + ")");
+    }, function () { fail("the request failed (HTTP " + res.status + ")"); });
+  }
+  // offers the gateway's sign-in when it is on, for a link that needs the user's own identity
+  function offerSignIn() {
+    ssoOn(function (on) { if (on) document.getElementById("signin").hidden = false; });
+  }
+  document.getElementById("signin-go").addEventListener("click", signIn);
+`
+}
+
+// The sign-in block both pages show when the link needs the user's own identity.
+function signInBlock(): string {
+  return `<div id="signin" hidden>
+<p>This link is for a signed-in user. Sign in with your organization's account, and you come back here.</p>
+<p><button id="signin-go" type="button">Sign in</button></p>
+</div>`
+}
+
+// The per-user page (Bifrost's /workspace/mcp-sessions/auth?flow={id}#t={token}). For a per-user OAuth flow it reads
+// the flow, and its Connect button opens the upstream authorize URL that the start route answers. With kind=headers
+// it is the per-user headers submission: it reads the flow's header names, and Save sends the values. A user-mode
+// flow carries no temp token: the user opens it signed in (the page offers the gateway's sign-in).
 export function connectPageHtml(): string {
   return `<!doctype html>
 <html lang="en">
@@ -60,53 +111,105 @@ ${pageStyle()}
 ${brandHeader()}
 <main>
 <div class="card">
-<h1>Connect an MCP client</h1>
+<h1 id="title">Connect an MCP client</h1>
 <p id="msg" class="status info" role="status">Loading the connection request...</p>
 <div id="details" hidden>
 <dl>
 <dt>MCP client</dt><dd id="client"></dd>
 <dt>For</dt><dd id="caller"></dd>
 </dl>
-<p>This client asks for its own connection to your account. The sign-in happens at the provider; this gateway stores the result for your virtual key only.</p>
-<p><button id="go" class="primary" type="button">Connect</button></p>
+<p id="what">This client asks for its own connection to your account. The sign-in happens at the provider; this gateway stores the result for your virtual key only.</p>
+<p id="connect"><button id="go" class="primary" type="button">Connect</button></p>
+<form id="hform" hidden>
+<div id="fields"></div>
+<p><button id="save" class="primary" type="submit">Save</button></p>
+</form>
 </div>
+${signInBlock()}
 </div>
 </main>
 <script>
 (function () {
-  var flow = new URLSearchParams(location.search).get("flow") || "";
-  var hash = location.hash || "";
-  var token = hash.indexOf("#t=") === 0 ? decodeURIComponent(hash.slice(3)) : "";
-  var base = "/api/oauth/per-user/flows/" + encodeURIComponent(flow);
-  var headers = token === "" ? {} : { "X-Bifrost-Temp-Token": token };
-  var msg = document.getElementById("msg");
-  function fail(text) { msg.textContent = text; msg.className = "status bad"; msg.setAttribute("role", "alert"); }
-  function failOf(res) {
-    return res.json().then(function (b) {
-      var m = b && b.error && b.error.message ? b.error.message : "the request failed";
-      fail(m + " (HTTP " + res.status + ")");
-    }, function () { fail("the request failed (HTTP " + res.status + ")"); });
+  var params = new URLSearchParams(location.search);
+  var flow = params.get("flow") || "";
+  var headersKind = params.get("kind") === "headers";
+${pageHelpers()}
+  var token = tokenOf(flow, headersKind ? "headers" : "connect");
+  var base = (headersKind ? "/api/mcp/per-user-headers/flows/" : "/api/oauth/per-user/flows/") + encodeURIComponent(flow);
+  // the temp token is the credential of a shared link; a link without one needs the user's own sign-in
+  function headers() {
+    var h = {};
+    if (token !== "") h["X-Bifrost-Temp-Token"] = token;
+    else if (sessionToken() !== "") h["Authorization"] = "Bearer " + sessionToken();
+    return h;
   }
   if (flow === "") { fail("This link has no flow. Ask for a new connection link."); return; }
-  if (token === "") { fail("This link has no sign-in token. Open the whole link, including the part after #."); return; }
-  fetch(base, { headers: headers }).then(function (res) {
-    if (!res.ok) return failOf(res);
+  if (token === "" && sessionToken() === "") {
+    fail("This link has no sign-in token. Open the whole link, including the part after #, or sign in if the link is for your account.");
+    offerSignIn();
+    return;
+  }
+  fetch(base, { headers: headers() }).then(function (res) {
+    if (!res.ok) {
+      if (res.status === 401 || res.status === 403) offerSignIn();
+      return failOf(res);
+    }
     return res.json().then(function (f) {
-      msg.textContent = "";
-      msg.className = "status info";
+      info("");
       document.getElementById("client").textContent = f.mcp_client && f.mcp_client.name ? f.mcp_client.name : "";
-      document.getElementById("caller").textContent = f.virtual_key_id ? "Virtual key " + f.virtual_key_id : "this session";
+      var who = f.user_id ? "User " + f.user_id : f.virtual_key_id ? "Virtual key " + f.virtual_key_id : f.virtual_key && f.virtual_key.id ? "Virtual key " + f.virtual_key.id : "this session";
+      document.getElementById("caller").textContent = who;
       document.getElementById("details").hidden = false;
-      document.getElementById("go").focus();
+      if (headersKind) {
+        document.getElementById("title").textContent = "Submit the MCP client's headers";
+        document.getElementById("what").textContent = "This client needs values of your own for these headers. They are checked against the server, and kept for your virtual key only.";
+        document.getElementById("connect").hidden = true;
+        var box = document.getElementById("fields");
+        (f.required_header_keys || []).forEach(function (k) {
+          var label = document.createElement("label");
+          label.textContent = k;
+          var input = document.createElement("input");
+          input.type = "password";
+          input.autocomplete = "off";
+          input.spellcheck = false;
+          input.setAttribute("data-key", k);
+          label.appendChild(input);
+          box.appendChild(label);
+        });
+        document.getElementById("hform").hidden = false;
+        var first = box.querySelector("input");
+        if (first) first.focus();
+      } else {
+        document.getElementById("go").focus();
+      }
     });
   }, function () { fail("The gateway could not be reached."); });
   document.getElementById("go").addEventListener("click", function () {
     var go = document.getElementById("go");
     go.disabled = true;
-    fetch(base + "/start", { headers: headers }).then(function (res) {
+    fetch(base + "/start", { headers: headers() }).then(function (res) {
       if (!res.ok) { go.disabled = false; return failOf(res); }
       return res.json().then(function (b) { location.assign(b.authorize_url); });
     }, function () { go.disabled = false; fail("The gateway could not be reached."); });
+  });
+  document.getElementById("hform").addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    var values = {};
+    var inputs = document.querySelectorAll("#fields input");
+    for (var i = 0; i < inputs.length; i++) {
+      var v = inputs[i].value.trim();
+      if (v !== "") values[inputs[i].getAttribute("data-key")] = v;
+    }
+    var save = document.getElementById("save");
+    save.disabled = true;
+    var h = headers();
+    h["Content-Type"] = "application/json";
+    fetch(base, { method: "PUT", headers: h, body: JSON.stringify({ headers: values }) }).then(function (res) {
+      save.disabled = false;
+      if (!res.ok) return failOf(res);
+      document.getElementById("hform").hidden = true;
+      info("The values are saved. You can close this window and run the tool again.");
+    }, function () { save.disabled = false; fail("The gateway could not be reached."); });
   });
 })();
 </script>
@@ -115,9 +218,11 @@ ${brandHeader()}
 `
 }
 
-// The authorization server's consent page (Bifrost's /oauth/consent?flow={id}#t={token}): the request's
-// client and redirect URI, and a form that takes a virtual key. Submitting it answers the redirect URL with
-// the one-time code, which the client exchanges at /oauth2/token.
+// The authorization server's consent page (Bifrost's /oauth/consent?flow={id}#t={token}): the request's client and
+// redirect URI, and the identity modes the request offers: a virtual key typed in a form, the signed-in dashboard
+// user (session mode) and the signed-in identity-provider user (user mode, with the gateway's own sign-in when the
+// user is not signed in yet). Approving answers the redirect URL with the one-time code, which the client exchanges
+// at /oauth2/token.
 export function consentPageHtml(): string {
   return `<!doctype html>
 <html lang="en">
@@ -139,8 +244,14 @@ ${brandHeader()}
 <dt>MCP client</dt><dd id="client"></dd>
 <dt>Redirects to</dt><dd id="redirect"></dd>
 </dl>
-<p>This client asks to call this gateway's MCP endpoint as a virtual key. Approve it only if you started this connection.</p>
+<p>This client asks to call this gateway's MCP endpoint in your name. Approve it only if you started this connection.</p>
 </div>
+<div id="user" hidden>
+<p id="user-what">Approve as the user signed in here. The client then acts as you.</p>
+<p><button id="go-user" class="primary" type="button">Continue as the signed-in user</button></p>
+<hr>
+</div>
+${signInBlock()}
 <form id="form" hidden>
 <label>Virtual key
 <input id="vk" name="vk" type="password" autocomplete="off" spellcheck="false" required>
@@ -157,37 +268,47 @@ ${brandHeader()}
 <script>
 (function () {
   var flow = new URLSearchParams(location.search).get("flow") || "";
-  var hash = location.hash || "";
-  var token = hash.indexOf("#t=") === 0 ? decodeURIComponent(hash.slice(3)) : "";
+${pageHelpers()}
+  var token = tokenOf(flow, "consent");
   var base = "/api/oauth2/consent/flows/" + encodeURIComponent(flow);
-  var headers = { "X-Bifrost-Temp-Token": token };
-  var msg = document.getElementById("msg");
-  function fail(text) { msg.textContent = text; msg.className = "status bad"; msg.setAttribute("role", "alert"); }
-  function failOf(res) {
-    return res.json().then(function (b) {
-      var m = b && b.error && b.error.message ? b.error.message : "the request failed";
-      fail(m + " (HTTP " + res.status + ")");
-    }, function () { fail("the request failed (HTTP " + res.status + ")"); });
+  // the temp token opens the request; a sign-in, when there is one, says who is approving it
+  function headers() {
+    var h = { "X-Bifrost-Temp-Token": token };
+    if (sessionToken() !== "") h["Authorization"] = "Bearer " + sessionToken();
+    return h;
   }
   if (flow === "" || token === "") { fail("This link is incomplete. Start the connection again from the MCP client."); return; }
-  fetch(base, { headers: headers }).then(function (res) {
+  fetch(base, { headers: headers() }).then(function (res) {
     if (!res.ok) return failOf(res);
     return res.json().then(function (r) {
-      msg.textContent = "";
-      msg.className = "status info";
+      info("");
+      var modes = r.available_modes || [];
       document.getElementById("client").textContent = r.client_name || "";
       document.getElementById("redirect").textContent = r.redirect_uri || "";
       document.getElementById("request").hidden = false;
-      document.getElementById("form").hidden = false;
-      if ((r.available_modes || []).indexOf("session") >= 0) document.getElementById("session").hidden = false;
-      document.getElementById("vk").focus();
+      if (modes.indexOf("user") >= 0) {
+        if (r.logged_in_user && r.logged_in_user.id) {
+          var name = r.logged_in_user.name || r.logged_in_user.id;
+          document.getElementById("go-user").textContent = "Continue as " + name;
+          document.getElementById("user").hidden = false;
+        } else {
+          document.getElementById("signin").hidden = false;
+        }
+      }
+      if (modes.indexOf("vk") >= 0) document.getElementById("form").hidden = false;
+      if (modes.indexOf("session") >= 0) document.getElementById("session").hidden = false;
+      if (modes.indexOf("vk") >= 0) document.getElementById("vk").focus();
+      else if (!document.getElementById("user").hidden) document.getElementById("go-user").focus();
     });
   }, function () { fail("The gateway could not be reached."); });
-  // approves the request in the given mode (vk with the key typed, or session for the signed-in user)
+  // approves the request in the given mode (vk with the key typed, session or user for the signed-in user)
   function submit(body, button) {
     button.disabled = true;
-    fetch(base, { method: "PUT", headers: { "Content-Type": "application/json", "X-Bifrost-Temp-Token": token }, body: JSON.stringify(body) }).then(function (res) {
+    var h = headers();
+    h["Content-Type"] = "application/json";
+    fetch(base, { method: "PUT", headers: h, body: JSON.stringify(body) }).then(function (res) {
       if (!res.ok) { button.disabled = false; return failOf(res); }
+      try { sessionStorage.removeItem("raiju.consent." + flow); } catch (e) {}
       return res.json().then(function (b) { location.assign(b.redirect_url); });
     }, function () { button.disabled = false; fail("The gateway could not be reached."); });
   }
@@ -199,6 +320,9 @@ ${brandHeader()}
   });
   document.getElementById("go-session").addEventListener("click", function () {
     submit({ mode: "session" }, document.getElementById("go-session"));
+  });
+  document.getElementById("go-user").addEventListener("click", function () {
+    submit({ mode: "user" }, document.getElementById("go-user"));
   });
 })();
 </script>

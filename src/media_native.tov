@@ -8,7 +8,7 @@ import { Target, headers, addExtraHeaders, trimSlash } from "./providers/types"
 import * as anthropic from "./providers/anthropic"
 import * as anthropicBeta from "./anthropic_beta"
 import * as gemini from "./providers/gemini"
-import { ChatRequest, newId, nowSeconds } from "./schemas"
+import { ChatRequest, newId, nowSeconds, errorJson } from "./schemas"
 import { decode, encode } from "./base64"
 
 // The request to send. A FormData body is a multipart upload; the caller leaves
@@ -950,9 +950,204 @@ export function transcriptText(raw: string): string throws SyntaxError {
   return out
 }
 
-// The OpenAI transcription body for a transcript in JSON form.
-export function transcriptionJson(text: string): string {
-  return `{"text":${quote(text)}}`
+// The OpenAI transcription body for a transcript in JSON form, with its usage (transcriptionUsageOf) when it has one.
+export function transcriptionJson(text: string, usage: string): string {
+  return usage === "" ? `{"text":${quote(text)}}` : `{"text":${quote(text)},"usage":${usage}}`
+}
+
+// The usage of a generateContent transcription as Bifrost reports it (convertGeminiUsageMetadataToTranscriptionUsage):
+// type tokens, the prompt and candidate token counts, the total, and the prompt's TEXT and AUDIO token counts when
+// usageMetadata splits them. "" when the answer has no usageMetadata.
+export function transcriptionUsageOf(raw: string): string throws SyntaxError {
+  const um = find(try fields(raw), "usageMetadata")
+  if (um === undefined || isNull(um)) return ""
+  const uf = try fields(um)
+  const count = (fs: Field[], k: string): int => Math.trunc(rawNum(fs, k) ?? 0.0)
+  const prompt = count(uf, "promptTokenCount")
+  const out = count(uf, "candidatesTokenCount")
+  const parts = [`"type":"tokens"`, `"input_tokens":${prompt}`]
+  const det = find(uf, "promptTokensDetails")
+  if (det !== undefined && det.startsWith("[")) {
+    const ds = try elements(det)
+    if (ds.length > 0) {
+      let text = 0
+      let audio = 0
+      for (const d of ds) {
+        const df = try fields(d)
+        const m = rawStr(df, "modality") ?? ""
+        if (m === "TEXT") text = count(df, "tokenCount")
+        else if (m === "AUDIO") audio = count(df, "tokenCount")
+      }
+      parts.push(`"input_token_details":{"text_tokens":${text},"audio_tokens":${audio}}`)
+    }
+  }
+  parts.push(`"output_tokens":${out}`)
+  parts.push(`"total_tokens":${count(uf, "totalTokenCount")}`)
+  return "{" + parts.join(",") + "}"
+}
+
+// ---- Sarvam speech and speech-to-text ----
+// Sarvam's own API, as Bifrost's sarvam provider calls it (sarvam.go, speech.go, transcription.go): text-to-speech
+// is a JSON POST answered with base64 audio, speech-to-text a multipart POST answered with the transcript. Both
+// authenticate with the api-subscription-key header.
+
+// The API root: the provider's base_url (without a trailing /v1, which chat's endpoint table appends), else Sarvam's.
+export function sarvamBase(t: Target): string {
+  const b = t.cfg.network_config?.base_url
+  if (b === undefined || b === "") return "https://api.sarvam.ai"
+  const r = trimSlash(b)
+  return r.endsWith("/v1") ? r.slice(0, r.byteLength - 3) : r
+}
+
+function sarvamHeaders(t: Target, json: bool): Map<string, string> {
+  const pairs: string[][] = []
+  if (json) pairs.push(["content-type", "application/json"])
+  let h = headers(pairs)
+  const v = t.key.value ?? ""
+  if (v !== "") h.set("api-subscription-key", v)
+  addExtraHeaders(&h, t.cfg)
+  return h
+}
+
+// The Sarvam text-to-speech options a request may carry at the top level, sent as they came (Bifrost's extra params).
+const SARVAM_SPEECH_EXTRA = ["pitch", "loudness", "temperature", "speech_sample_rate", "output_audio_codec", "enable_preprocessing", "dict_id", "enable_cached_responses"]
+
+// An OpenAI speech body as Sarvam's: input is the text, language_code (or target_language_code) the target
+// language, voice (or speaker) the speaker and speed (or pace) the pace; the Sarvam options pass through.
+export function sarvamSpeech(t: Target, body: Field[]): MediaRequest throws SyntaxError {
+  const input = rawStr(body, "input") ?? ""
+  if (input === "") throw new SyntaxError("speech input text is required")
+  const out: string[] = [`"text":${quote(input)}`]
+  const lang = rawStr(body, "target_language_code") ?? rawStr(body, "language_code") ?? ""
+  out.push(`"target_language_code":${quote(lang)}`)
+  if (t.model !== "") out.push(`"model":${quote(t.model)}`)
+  const speaker = rawStr(body, "speaker") ?? rawStr(body, "voice") ?? ""
+  if (speaker !== "") out.push(`"speaker":${quote(speaker)}`)
+  const pace = find(body, "pace") ?? find(body, "speed")
+  if (pace !== undefined && !isNull(pace)) out.push(`"pace":${pace}`)
+  for (const k of SARVAM_SPEECH_EXTRA) {
+    const v = find(body, k)
+    if (v !== undefined && !isNull(v)) out.push(`${quote(k)}:${v}`)
+  }
+  return { method: "POST", url: sarvamBase(t) + "/text-to-speech", headers: sarvamHeaders(t, true), body: "{" + out.join(",") + "}" }
+}
+
+// The audio of a text-to-speech answer: the first of its base64 audios. Its type follows output_audio_codec
+// (Sarvam's default is WAV).
+export function sarvamSpeechAudio(raw: string, codec: string): SpeechAudio throws SyntaxError {
+  const fs = try fields(raw)
+  const audios = try elements(find(fs, "audios") ?? "[]")
+  const first = audios.length > 0 ? rawStr([{ key: "a", raw: audios[0]! }], "a") ?? "" : ""
+  if (first === "") throw new SyntaxError("Sarvam text-to-speech response contained no audio")
+  const c = codec.toLowerCase()
+  const ct = c === "" || c === "wav" ? "audio/wav" : c === "mp3" ? "audio/mpeg" : "audio/" + c
+  return { bytes: try decode(first), contentType: ct }
+}
+
+// One event of a streamed Sarvam speech answer in Bifrost's shape (BifrostSpeechStreamResponse): a chunk of audio as a
+// speech.audio.delta, or the speech.audio.done that ends it.
+export function speechStreamEvent(audio: u8[], done: bool): string {
+  const type = done ? "speech.audio.done" : "speech.audio.delta"
+  return `data: {"type":"${type}","audio":${quote(encode(audio))}}\n\n`
+}
+
+// An error answer of Sarvam as an OpenAI error body (Bifrost's parseSarvamError): error.message, else detail (a string, or
+// FastAPI's list of {msg}), else the body itself; error.code is the type.
+export function sarvamError(raw: string): string {
+  let message = ""
+  let type = "api_error"
+  try {
+    const fs = fields(raw)
+    const e = find(fs, "error")
+    if (e !== undefined && !isNull(e) && e.startsWith("{")) {
+      const ef = fields(e)
+      message = rawStr(ef, "message") ?? ""
+      const code = rawStr(ef, "code") ?? ""
+      if (code !== "" && message !== "") type = code
+    }
+    if (message === "") {
+      const d = find(fs, "detail")
+      if (d !== undefined && d.startsWith("\"")) message = rawStr(fs, "detail") ?? ""
+      else if (d !== undefined && d.startsWith("[")) {
+        const msgs: string[] = []
+        for (const item of elements(d)) {
+          if (!item.startsWith("{")) continue
+          const m = rawStr(fields(item), "msg") ?? ""
+          if (m !== "") msgs.push(m)
+        }
+        message = msgs.join("; ")
+      }
+    }
+  } catch (e) {
+    message = ""
+  }
+  if (message === "") message = raw.trim() === "" ? "Sarvam request failed" : raw.trim()
+  return errorJson(message, type, undefined)
+}
+
+// The speech-to-text POST: the file goes in the "file" part (added by the caller) with these text fields: the
+// model, mode, the language (language_code, else OpenAI's language) and input_audio_codec, each when set.
+export function sarvamTranscription(t: Target, mode: string, language: string, codec: string): { request: MediaRequest, fields: string[][] } {
+  const fs: string[][] = []
+  if (t.model !== "") fs.push(["model", t.model])
+  if (mode.trim() !== "") fs.push(["mode", mode])
+  if (language.trim() !== "") fs.push(["language_code", language])
+  if (codec.trim() !== "") fs.push(["input_audio_codec", codec])
+  return { request: { method: "POST", url: sarvamBase(t) + "/speech-to-text", headers: sarvamHeaders(t, false), body: undefined }, fields: fs }
+}
+
+// A number as JSON (Sarvam's seconds are floats; a whole number keeps its form).
+function num(raw: string | undefined): string {
+  return raw === undefined || isNull(raw) ? "0" : raw
+}
+
+// Sarvam's transcript as OpenAI's transcription body, as Bifrost's ToBifrostTranscriptionResponse maps it: the
+// text, the detected language, the words with their times (from three parallel arrays), the diarized entries as
+// transcript.text.segment segments, and the duration as the latest end time.
+export function sarvamTranscriptToOpenAI(raw: string): string throws SyntaxError {
+  const fs = try fields(raw)
+  const out: string[] = [`"text":${quote(rawStr(fs, "transcript") ?? "")}`]
+  const lang = rawStr(fs, "language_code") ?? ""
+  if (lang !== "") out.push(`"language":${quote(lang)}`)
+  let maxEnd = -1.0
+  let maxRaw = ""
+  const words: string[] = []
+  const ts = find(fs, "timestamps")
+  if (ts !== undefined && ts.startsWith("{")) {
+    const tf = try fields(ts)
+    const ws = try elements(find(tf, "words") ?? "[]")
+    const starts = try elements(find(tf, "start_time_seconds") ?? "[]")
+    const ends = try elements(find(tf, "end_time_seconds") ?? "[]")
+    for (let i = 0; i < ws.length; i++) {
+      const w = rawStr([{ key: "w", raw: ws[i]! }], "w") ?? ""
+      const st = num(starts[i])
+      const en = num(ends[i])
+      const ev = parseFloat(en) ?? 0.0
+      if (ends[i] !== undefined && ev > maxEnd) {
+        maxEnd = ev
+        maxRaw = en
+      }
+      words.push(`{"word":${quote(w)},"start":${st},"end":${en}}`)
+    }
+  }
+  if (words.length > 0) out.push(`"words":[${words.join(",")}]`)
+  const segs: string[] = []
+  const dt = find(fs, "diarized_transcript")
+  if (dt !== undefined && dt.startsWith("{")) {
+    for (const e of try elements(find(try fields(dt), "entries") ?? "[]")) {
+      const ef = try fields(e)
+      const en = num(find(ef, "end_time_seconds"))
+      const ev = parseFloat(en) ?? 0.0
+      if (ev > maxEnd) {
+        maxEnd = ev
+        maxRaw = en
+      }
+      segs.push(`{"id":"","type":"transcript.text.segment","speaker":${quote(rawStr(ef, "speaker_id") ?? "")},"start":${num(find(ef, "start_time_seconds"))},"end":${en},"text":${quote(rawStr(ef, "transcript") ?? "")}}`)
+    }
+  }
+  if (segs.length > 0) out.push(`"segments":[${segs.join(",")}]`)
+  if (maxRaw !== "") out.push(`"duration":${maxRaw}`)
+  return "{" + out.join(",") + "}"
 }
 
 // ---- tests ----
@@ -1294,7 +1489,8 @@ test("gemini transcription sends the audio inline after the prompt", () => {
 test("transcript text joins the answer's text parts, skipping thoughts", () => {
   const raw = `{"candidates":[{"content":{"role":"model","parts":[{"text":"Hel","thought":true},{"text":"Hello "},{"text":"world."}]},"finishReason":"STOP"}]}`
   expect(try transcriptText(raw)).toBe("Hello world.")
-  expect(transcriptionJson("Hello world.")).toBe(`{"text":"Hello world."}`)
+  expect(transcriptionJson("Hello world.", "")).toBe(`{"text":"Hello world."}`)
+  expect(transcriptionJson("Hi", `{"type":"tokens"}`)).toBe(`{"text":"Hi","usage":{"type":"tokens"}}`)
   let none = false
   try {
     transcriptText(`{"candidates":[]}`)
@@ -1302,4 +1498,65 @@ test("transcript text joins the answer's text parts, skipping thoughts", () => {
     none = true
   }
   expect(none).toBe(true)
+})
+
+test("a Gemini transcription's usage is the one Bifrost reports, with the prompt's modalities", () => {
+  const split = `{"candidates":[{"content":{"parts":[{"text":"hi"}]}}],"usageMetadata":{"promptTokenCount":14,"candidatesTokenCount":3,"totalTokenCount":17,"promptTokensDetails":[{"modality":"TEXT","tokenCount":4},{"modality":"AUDIO","tokenCount":10}]}}`
+  expect(try transcriptionUsageOf(split)).toBe(`{"type":"tokens","input_tokens":14,"input_token_details":{"text_tokens":4,"audio_tokens":10},"output_tokens":3,"total_tokens":17}`)
+  const plain = `{"candidates":[],"usageMetadata":{"promptTokenCount":6,"candidatesTokenCount":3,"totalTokenCount":9}}`
+  expect(try transcriptionUsageOf(plain)).toBe(`{"type":"tokens","input_tokens":6,"output_tokens":3,"total_tokens":9}`)
+  expect(try transcriptionUsageOf(`{"candidates":[]}`)).toBe("")
+})
+
+const SARVAM_T: Target = { provider: "sarvam", kind: "sarvam", model: "bulbul:v2", key: { value: "sk-sv" }, cfg: {} }
+
+test("Sarvam speech: the OpenAI body as Sarvam's text-to-speech request", () => {
+  const mr = try sarvamSpeech(SARVAM_T, try fields(`{"model":"sarvam/bulbul:v2","input":"namaste","voice":"anushka","speed":1.2,"language_code":"hi-IN","pitch":0.1,"response_format":"wav"}`))
+  expect(mr.url).toBe("https://api.sarvam.ai/text-to-speech")
+  expect(mr.headers.get("api-subscription-key")).toBe("sk-sv")
+  expect(mr.body).toBe(`{"text":"namaste","target_language_code":"hi-IN","model":"bulbul:v2","speaker":"anushka","pace":1.2,"pitch":0.1}`)
+  const own = try sarvamSpeech(SARVAM_T, try fields(`{"input":"hi","speaker":"vidya","target_language_code":"en-IN","pace":0.9}`))
+  expect(own.body).toBe(`{"text":"hi","target_language_code":"en-IN","model":"bulbul:v2","speaker":"vidya","pace":0.9}`)
+  let threw = false
+  try {
+    sarvamSpeech(SARVAM_T, try fields(`{"input":""}`))
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  const base: Target = { provider: "sarvam", kind: "sarvam", model: "m", key: { value: "k" }, cfg: { network_config: { base_url: "http://127.0.0.1:18099/sv/v1/" } } }
+  expect(sarvamBase(base)).toBe("http://127.0.0.1:18099/sv")
+})
+
+test("Sarvam speech audio is the first base64 audio", () => {
+  const a = try sarvamSpeechAudio(`{"request_id":"r","audios":["UklGRg=="]}`, "")
+  expect(a.contentType).toBe("audio/wav")
+  expect(a.bytes.length).toBe(4)
+  expect((try sarvamSpeechAudio(`{"audios":["AAAA"]}`, "mp3")).contentType).toBe("audio/mpeg")
+  let threw = false
+  try {
+    sarvamSpeechAudio(`{"audios":[]}`, "")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})
+
+test("Sarvam speech-to-text: fields and the transcript as OpenAI's", () => {
+  const st = sarvamTranscription({ provider: "sarvam", kind: "sarvam", model: "saarika:v2.5", key: { value: "k" }, cfg: {} }, "transcribe", "hi-IN", "")
+  expect(st.request.url).toBe("https://api.sarvam.ai/speech-to-text")
+  expect(st.request.headers.get("api-subscription-key")).toBe("k")
+  expect(st.fields).toEqual([["model", "saarika:v2.5"], ["mode", "transcribe"], ["language_code", "hi-IN"]])
+  const body = try sarvamTranscriptToOpenAI(`{"request_id":"r","transcript":"namaste duniya","language_code":"hi-IN","timestamps":{"words":["namaste","duniya"],"start_time_seconds":[0.0,0.6],"end_time_seconds":[0.5,1.25]},"diarized_transcript":{"entries":[{"transcript":"namaste duniya","start_time_seconds":0.0,"end_time_seconds":1.5,"speaker_id":"0"}]}}`)
+  expect(body).toBe(`{"text":"namaste duniya","language":"hi-IN","words":[{"word":"namaste","start":0.0,"end":0.5},{"word":"duniya","start":0.6,"end":1.25}],"segments":[{"id":"","type":"transcript.text.segment","speaker":"0","start":0.0,"end":1.5,"text":"namaste duniya"}],"duration":1.5}`)
+  expect(try sarvamTranscriptToOpenAI(`{"transcript":"hi","language_code":null}`)).toBe(`{"text":"hi"}`)
+})
+
+test("Sarvam's streamed speech events and its errors in OpenAI's shape", () => {
+  expect(speechStreamEvent([u8(72), u8(105)], false)).toBe(`data: {"type":"speech.audio.delta","audio":"SGk="}\n\n`)
+  expect(speechStreamEvent([], true)).toBe(`data: {"type":"speech.audio.done","audio":""}\n\n`)
+  expect(sarvamError(`{"error":{"message":"bad speaker","code":"invalid_request_error"}}`)).toBe(`{"error":{"message":"bad speaker","type":"invalid_request_error"}}`)
+  expect(sarvamError(`{"detail":"Invalid API key"}`)).toBe(`{"error":{"message":"Invalid API key","type":"api_error"}}`)
+  expect(sarvamError(`{"detail":[{"msg":"text is required"},{"msg":"bad pace"}]}`)).toBe(`{"error":{"message":"text is required; bad pace","type":"api_error"}}`)
+  expect(sarvamError("upstream down")).toBe(`{"error":{"message":"upstream down","type":"api_error"}}`)
 })

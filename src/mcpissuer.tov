@@ -4,12 +4,15 @@
 // virtual key. The client then trades the one-time code (PKCE S256) for an access token and a refresh token.
 // The access token is an RS256 JWT whose sub is the virtual key's id and whose bf_mode is "vk", so a /mcp call
 // that carries it runs as that key (Bifrost's vk mode). A session-mode grant (a dashboard user consents, no key)
-// signs a token with bf_mode "session": the request runs anonymously, as Bifrost's session mode does.
+// signs a token with bf_mode "session": the request runs anonymously, as Bifrost's session mode does. A user-mode
+// grant (an identity-provider user signed in through the gateway's OIDC sign-in, oidc.tov) signs bf_mode "user"
+// with the user's subject: the request runs as that user (Bifrost's user mode, on Raiju's own identity provider).
 //
 // The signing key is the operator's PEM (client.oauth2_server_config.signing_key). Without one, a key is generated
 // at the first start and kept in the state file beside config.json (openIssuerState), so a restart and every worker
-// of the node sign with the same key. The grants (registered clients and refresh tokens) are kept there too, and
-// read back on each refresh, so a restart and a second worker see them. Codes and pending requests stay in memory.
+// of the node sign with the same key. The grants (registered clients and refresh tokens), the pending authorization
+// requests with their consent tokens, and the codes (as hashes) are kept there too, and read back when one is not
+// held in memory, so a restart and a second worker see them.
 import { Config, OAuth2ServerConfig, VirtualKeyConfig } from "./config"
 import { pkceChallenge } from "./mcpauth"
 import { secureHex, sha256, utf8, toHex } from "./crypto"
@@ -22,6 +25,7 @@ import { rfc3339 } from "./anthropic_batch"
 import { connectPageHtml, consentPageHtml } from "./mcpconsent"
 import { ConfigCipher, sealStored, openStored } from "./store"
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs"
+import { writeFileAtomic } from "./atomicfile"
 
 // The lifetimes and limits of Bifrost's defaults (mcpoauth2issuance.go and the table constants).
 const DEFAULT_CODE_TTL_S: f64 = 300.0
@@ -45,9 +49,10 @@ const SESSIONS_MAX_LIMIT = 500
 export type OAuthClientRow = { client_id: string, client_name: string, redirect_uris: string[], grant_types: string[], scope: string, created_at: f64 }
 
 // An authorization request: pending until the consent page approves it ("consented", with the identity it names),
-// then "used" once its code is exchanged. mode is "vk" (sub is the key's id) or "session" (sub is a random id).
-// code_hash is the SHA-256 of the code, which is never stored.
-export type AuthRequest = { id: string, client_id: string, redirect_uri: string, state: string, scope: string, resource: string, challenge: string, expires_at: f64, status: string, mode: string, sub: string, code_hash: string }
+// then "used" once its code is exchanged. mode is "vk" (sub is the key's id), "session" (sub is a random id) or
+// "user" (sub is the identity-provider user). code_hash is the SHA-256 of the code, which is never stored.
+// consented_at is when the consent named the identity (a key rotated after it voids the code).
+export type AuthRequest = { id: string, client_id: string, redirect_uri: string, state: string, scope: string, resource: string, challenge: string, expires_at: f64, status: string, mode: string, sub: string, code_hash: string, consented_at?: f64 }
 
 // A refresh token by its SHA-256. Rotation marks the old row revoked and issues a row of the same family; a
 // revoked row presented again revokes the whole family (RFC 9700, section 2.2.2). created_at is when the grant
@@ -60,20 +65,29 @@ export type Issuer = { issuer: string, resource: string, pem: string, kid: strin
 // What an endpoint answers. The headers that differ by route are optional.
 export type Answer = { status: int, body: string, contentType: string, location?: string, challenge?: string }
 
-// What a request's Bearer token names: a virtual key, a session (no verified identity), a rejected token, or
-// nothing (no JWT was sent).
-export type Caller = { kind: "none" } | { kind: "vk", vk: string } | { kind: "session", sub: string } | { kind: "error", message: string }
+// What a request's Bearer token names: a virtual key, a session (no verified identity), an identity-provider user,
+// a rejected token, or nothing (no JWT was sent).
+export type Caller = { kind: "none" } | { kind: "vk", vk: string } | { kind: "session", sub: string } | { kind: "user", sub: string } | { kind: "error", message: string }
 
-// The state file: the signing key (sealed with the config's cipher when there is one), the registered clients and
-// the refresh rows.
-type StateFile = { signing_key?: string, clients?: OAuthClientRow[], refresh?: RefreshRow[] }
+// A consent token by its SHA-256: the request it opens, until the request's expiry.
+type ConsentRow = { hash: string, id: string, expires_at: f64 }
+
+// The state file: the signing key (sealed with the config's cipher when there is one), the registered clients, the
+// refresh rows, the authorization requests not yet expired, and their consent tokens.
+type StateFile = { signing_key?: string, clients?: OAuthClientRow[], refresh?: RefreshRow[], requests?: AuthRequest[], consent?: ConsentRow[] }
+
+// Who is consenting, as the request's credentials show it (Bifrost's identity resolver and consent checks).
+// signedIn: a dashboard sign-in (a session token or admin credentials) or an identity-provider user is on the
+// request. enforce: inference auth is enforced. userAvailable: the gateway's OIDC sign-in is on, so user mode can
+// be offered. disableVk: oauth2_server_config.disable_vk_identity. user and userName: the signed-in identity-provider
+// user ("" when none). userActive tells whether a user may still use a user-mode grant.
+export type ConsentContext = { signedIn: bool, enforce: bool, userAvailable: bool, disableVk: bool, user: string, userName: string, userActive: (sub: string) => bool }
 
 const CLIENTS: Map<string, OAuthClientRow> = new Map()
 const REQUESTS: Map<string, AuthRequest> = new Map()
-const CODES: Map<string, string> = new Map()
 const REFRESH: Map<string, RefreshRow> = new Map()
-// The consent temp tokens: each opens one request's consent page until the request's expiry.
-const CONSENT_TOKENS: Map<string, { id: string, expires_at: f64 }> = new Map()
+// The consent temp tokens, by hash: each opens one request's consent page until the request's expiry.
+const CONSENT_TOKENS: Map<string, ConsentRow> = new Map()
 
 // The key this node signs with when the config names none: the PEM, and its sealed form for the state file.
 let generatedPem = ""
@@ -160,9 +174,24 @@ export function openIssuerState(c: Config, file: string, cipher: ConfigCipher | 
   return ""
 }
 
-// Takes what the state file holds into memory: clients and refresh rows not known yet, and a row another worker
-// revoked. Nothing is removed, so a row this worker has revoked stays revoked.
+// How far a request has gone: a later status written by another worker wins.
+function statusRank(s: string): int {
+  if (s === "used") return 2
+  if (s === "consented") return 1
+  return 0
+}
+
+// Takes what the state file holds into memory: clients, refresh rows, requests and consent tokens not known yet, a
+// row another worker revoked, and a request another worker took further. Nothing is removed, so a row this worker
+// has revoked stays revoked.
 function adoptGrants(st: StateFile): void {
+  for (const r of st.requests ?? []) {
+    const have = REQUESTS.get(r.id)
+    if (have === undefined || statusRank(r.status) > statusRank(have.status)) REQUESTS.set(r.id, r)
+  }
+  for (const c of st.consent ?? []) {
+    if (!CONSENT_TOKENS.has(c.hash)) CONSENT_TOKENS.set(c.hash, c)
+  }
   for (const cl of st.clients ?? []) {
     if (!CLIENTS.has(cl.client_id)) CLIENTS.set(cl.client_id, cl)
   }
@@ -199,10 +228,21 @@ function persistGrants(): void {
   }
   const clients: OAuthClientRow[] = []
   for (const cl of CLIENTS.values()) clients.push(cl)
-  const st: StateFile = { clients: clients, refresh: refresh }
+  // requests live until their expiry; a consent token only while its request is still pending
+  const now = Date.now()
+  const requests: AuthRequest[] = []
+  for (const r of REQUESTS.values()) {
+    if (r.expires_at > now) requests.push(r)
+  }
+  const consent: ConsentRow[] = []
+  for (const c of CONSENT_TOKENS.values()) {
+    const r = REQUESTS.get(c.id)
+    if (c.expires_at > now && r !== undefined && r.status === "pending") consent.push(c)
+  }
+  const st: StateFile = { clients: clients, refresh: refresh, requests: requests, consent: consent }
   if (sealedKey !== "") st.signing_key = sealedKey
   try {
-    writeFileSync(stateFile, JSON.stringify(st) + "\n")
+    writeFileAtomic(stateFile, JSON.stringify(st) + "\n", { mode: 384 })
   } catch (e) {
     console.error(`raiju: mcp oauth: could not write ${stateFile}: ${e.message}`)
   }
@@ -310,7 +350,8 @@ function verifyBearer(tok: string, iss: Issuer, nowMs: f64): Caller {
   const mode = rawStr(claims, "bf_mode") ?? ""
   if (mode === "vk") return { kind: "vk", vk: sub }
   if (mode === "session") return { kind: "session", sub: sub }
-  return bad(`invalid token: bf_mode ${mode} is not accepted (user identity is not available)`)
+  if (mode === "user") return { kind: "user", sub: sub }
+  return bad(`invalid token: bf_mode ${mode} is not accepted`)
 }
 
 // Whether an aud claim (a string, or an array of strings) names the resource.
@@ -440,6 +481,13 @@ export function authorize(q: URLSearchParams, iss: Issuer, nowMs: f64): Answer {
   const resource = q.get("resource") ?? ""
   if (resource !== "" && resource !== iss.resource) return refuse("invalid_target", "resource does not identify this MCP server")
   const expires = nowMs + iss.codeTtl * 1000.0
+  // requests and consent tokens past their time are dropped from memory (the state file keeps only live ones)
+  for (const k of REQUESTS.keys()) {
+    if (REQUESTS.get(k)!.expires_at <= nowMs) REQUESTS.delete(k)
+  }
+  for (const k of CONSENT_TOKENS.keys()) {
+    if (CONSENT_TOKENS.get(k)!.expires_at <= nowMs) CONSENT_TOKENS.delete(k)
+  }
   let id = ""
   let tok = ""
   try {
@@ -449,37 +497,50 @@ export function authorize(q: URLSearchParams, iss: Issuer, nowMs: f64): Answer {
     return refuse("server_error", "failed to create authorization request")
   }
   REQUESTS.set(id, { id: id, client_id: client.client_id, redirect_uri: redirect, state: state, scope: want, resource: iss.resource, challenge: challenge, expires_at: expires, status: "pending", mode: "", sub: "", code_hash: "" })
-  CONSENT_TOKENS.set(tok, { id: id, expires_at: expires })
+  const th = toHex(sha256(utf8(tok)))
+  CONSENT_TOKENS.set(th, { hash: th, id: id, expires_at: expires })
+  // written before the consent link leaves, so the page works on any worker and after a restart
+  persistGrants()
   return { status: 302, body: "", contentType: "text/plain; charset=utf-8", location: iss.issuer + "/oauth/consent?flow=" + id + "#t=" + tok }
 }
 
-// The identity modes a consent page offers (Bifrost's availableModes). "vk" is always offered. "session" is offered
-// to a signed-in dashboard user while auth is not enforced for inference: that grant carries no key. "user" needs an
-// identity provider, which Raiju does not have, so Bifrost's user mode is not offered.
-export function consentModes(signedIn: bool, enforce: bool): string[] {
-  const modes: string[] = ["vk"]
+// The identity modes a consent page offers (Bifrost's availableModes). "vk" is offered unless disable_vk_identity is
+// set while user mode is available (so a flow always keeps a usable mode). "session" is offered to a signed-in
+// dashboard user while auth is not enforced for inference: that grant carries no key. "user" is offered while the
+// gateway's OIDC sign-in is on: the grant names the signed-in identity-provider user.
+export function consentModes(signedIn: bool, enforce: bool, userAvailable?: bool, disableVk?: bool): string[] {
+  const users = userAvailable ?? false
+  const modes: string[] = []
+  if (!(users && (disableVk ?? false))) modes.push("vk")
   if (signedIn && !enforce) modes.push("session")
+  if (users) modes.push("user")
   return modes
 }
 
-// GET /api/oauth2/consent/flows/{id}: what the consent page shows for a pending request.
-export function consentDetail(id: string, token: string, nowMs: f64, modes: string[]): Answer {
+// GET /api/oauth2/consent/flows/{id}: what the consent page shows for a pending request. loggedIn names the signed-in
+// identity-provider user ("" when none), so the page can offer to continue as that user.
+export function consentDetail(id: string, token: string, nowMs: f64, modes: string[], loggedIn?: string, loggedInName?: string): Answer {
   const r = consentRequest(id, token, nowMs)
   if (r === undefined) return apiErr(401, "this consent link is invalid or has expired")
   if (r.status !== "pending") return apiErr(410, "authorization flow has already been completed")
   const client = CLIENTS.get(r.client_id)
   const name = client === undefined ? "" : client.client_name
-  return {
-    status: 200,
-    body: JSON.stringify({ redirect_uri: r.redirect_uri, client_name: name, available_modes: modes, expires_at: rfc3339(r.expires_at / 1000.0) }),
-    contentType: "application/json",
+  const user = loggedIn ?? ""
+  if (user !== "") {
+    const display = loggedInName ?? ""
+    const who = display === "" ? `{"id":${JSON.stringify(user)}}` : `{"id":${JSON.stringify(user)},"name":${JSON.stringify(display)}}`
+    const head = JSON.stringify({ redirect_uri: r.redirect_uri, client_name: name, available_modes: modes })
+    return okJson(head.slice(0, head.byteLength - 1) + `,"logged_in_user":${who},"expires_at":${JSON.stringify(rfc3339(r.expires_at / 1000.0))}}`)
   }
+  return okJson(JSON.stringify({ redirect_uri: r.redirect_uri, client_name: name, available_modes: modes, expires_at: rfc3339(r.expires_at / 1000.0) }))
 }
 
 // PUT /api/oauth2/consent/flows/{id}: approves the request, mints the one-time code and answers the redirect URL
 // with it. In mode "vk" the key is the one the token will name; in mode "session" (a signed-in dashboard user) the
-// token names a new random session id instead.
-export function consentSubmit(id: string, token: string, body: string, iss: Issuer, nowMs: f64, lookup: (value: string) => VirtualKeyConfig | undefined, modes: string[], signedIn: bool): Answer {
+// token names a new random session id instead; in mode "user" it names the signed-in identity-provider user (user).
+// A key that belongs to a user (its user_id) grants user mode for that user while user mode is available, and then
+// only to that user signed in (Bifrost's VK user upgrade).
+export function consentSubmit(id: string, token: string, body: string, iss: Issuer, nowMs: f64, lookup: (value: string) => VirtualKeyConfig | undefined, modes: string[], signedIn: bool, user?: string, userAvailable?: bool): Answer {
   const r = consentRequest(id, token, nowMs)
   if (r === undefined) return apiErr(401, "this consent link is invalid or has expired")
   if (r.status !== "pending") return apiErr(410, "authorization flow has already been completed")
@@ -489,14 +550,19 @@ export function consentSubmit(id: string, token: string, body: string, iss: Issu
   // a session grant names the signed-in user, so it needs the dashboard sign-in on this request
   if (mode === "session" && !signedIn) return apiErr(401, "session mode requires an authenticated consenting user: sign in to the dashboard first, or authorize with a virtual key")
   if (!modes.includes(mode)) return apiErr(400, `mode "${mode}" is not available`)
+  const signedUser = user ?? ""
   let sub = ""
+  let granted = mode
   if (mode === "session") {
     try {
       sub = try secureHex(32)
     } catch (e) {
       return apiErr(500, "failed to generate session token")
     }
-  } else {
+  } else if (mode === "user") {
+    if (signedUser === "") return apiErr(400, "no active session; please sign in first")
+    sub = signedUser
+  } else if (mode === "vk") {
     const value = (rawStr(fs, "value") ?? "").trim()
     if (value === "") return apiErr(400, "virtual key value is required")
     const vk = lookup(value)
@@ -504,6 +570,16 @@ export function consentSubmit(id: string, token: string, body: string, iss: Issu
     if (vk.value !== value) return apiErr(400, "this virtual key value has been rotated; use the key's current value")
     if (!keyUsable(vk, nowMs)) return apiErr(400, "virtual key is inactive or expired")
     sub = vk.id
+    const owner = vk.user_id ?? ""
+    if (owner !== "" && (userAvailable ?? false)) {
+      // a user's key: holding it is not proof of being that user while the user can sign in
+      if (signedUser === "") return apiErr(400, "this key belongs to a specific user; please sign in to continue")
+      if (signedUser !== owner) return apiErr(400, "this key belongs to a different user than the currently signed-in user")
+      granted = "user"
+      sub = owner
+    }
+  } else {
+    return apiErr(400, `unknown mode "${mode}"`)
   }
   let code = ""
   try {
@@ -512,20 +588,29 @@ export function consentSubmit(id: string, token: string, body: string, iss: Issu
     return apiErr(500, "failed to generate authorization code")
   }
   const hash = toHex(sha256(utf8(code)))
-  REQUESTS.set(id, { id: r.id, client_id: r.client_id, redirect_uri: r.redirect_uri, state: r.state, scope: r.scope, resource: r.resource, challenge: r.challenge, expires_at: r.expires_at, status: "consented", mode: mode, sub: sub, code_hash: hash })
-  CODES.set(hash, id)
-  CONSENT_TOKENS.delete(token)
+  REQUESTS.set(id, { id: r.id, client_id: r.client_id, redirect_uri: r.redirect_uri, state: r.state, scope: r.scope, resource: r.resource, challenge: r.challenge, expires_at: r.expires_at, status: "consented", mode: granted, sub: sub, code_hash: hash, consented_at: nowMs })
+  // the consent token ends with the pending state (persistGrants drops it), so the page cannot be submitted twice
+  CONSENT_TOKENS.delete(toHex(sha256(utf8(token))))
+  persistGrants()
   const url = withParams(r.redirect_uri, [["code", code], ["state", r.state], ["iss", iss.issuer]])
   return { status: 200, body: JSON.stringify({ redirect_url: url }), contentType: "application/json" }
 }
 
+// The identity checks of a refresh (Bifrost's bf_sub liveness): vkCut refuses vk-mode grants (disable_vk_identity
+// while user mode is available), and userActive tells whether a user-mode grant's user may still refresh.
+export type RefreshChecks = { vkCut: bool, userActive: (sub: string) => bool }
+
+function noChecks(): RefreshChecks {
+  return { vkCut: false, userActive: (sub: string): bool => true }
+}
+
 // POST /oauth2/token: the authorization_code grant (PKCE, bound to the request's client, redirect URI and
 // resource) and the refresh_token grant (rotation, with family revocation on reuse).
-export function tokenEndpoint(form: URLSearchParams, iss: Issuer, nowMs: f64, byId: (id: string) => VirtualKeyConfig | undefined): Answer {
+export function tokenEndpoint(form: URLSearchParams, iss: Issuer, nowMs: f64, byId: (id: string) => VirtualKeyConfig | undefined, checks?: RefreshChecks): Answer {
   const grant = form.get("grant_type") ?? ""
   try {
     if (grant === "authorization_code") return codeGrant(form, iss, nowMs, byId)
-    if (grant === "refresh_token") return refreshGrant(form, iss, nowMs, byId)
+    if (grant === "refresh_token") return refreshGrant(form, iss, nowMs, byId, checks ?? noChecks())
   } catch (e) {
     return oauthErr(500, "server_error", "failed to issue token")
   }
@@ -538,8 +623,12 @@ function codeGrant(form: URLSearchParams, iss: Issuer, nowMs: f64, byId: (id: st
   const clientId = form.get("client_id") ?? ""
   if (code === "" || verifier === "" || clientId === "") return oauthErr(400, "invalid_request", "code, code_verifier and client_id are required")
   const hash = toHex(sha256(utf8(code)))
-  const rid = CODES.get(hash)
-  const r = rid === undefined ? undefined : REQUESTS.get(rid)
+  let r = requestByCode(hash)
+  if (r === undefined || r.status !== "consented") {
+    // another worker may have consented it, or used it, since this one last read the state file
+    syncGrants()
+    r = requestByCode(hash)
+  }
   if (r === undefined || r.status !== "consented") return oauthErr(400, "invalid_grant", "authorization code not found or already used")
   if (nowMs >= r.expires_at) return oauthErr(400, "invalid_grant", "authorization code expired")
   if (r.client_id !== clientId) return oauthErr(400, "invalid_grant", "client_id mismatch")
@@ -548,14 +637,22 @@ function codeGrant(form: URLSearchParams, iss: Issuer, nowMs: f64, byId: (id: st
   if (resource !== "" && resource !== r.resource) return oauthErr(400, "invalid_grant", "resource mismatch")
   if (verifier.byteLength < 43 || verifier.byteLength > 128 || pkceChallenge(verifier) !== r.challenge) return oauthErr(400, "invalid_grant", "PKCE verification failed")
   if (r.mode === "vk" && !keyUsable(byId(r.sub), nowMs)) return oauthErr(400, "invalid_grant", "virtual key is no longer active")
+  if (r.mode === "vk" && rotatedSince(byId(r.sub), r.consented_at ?? 0.0)) return oauthErr(400, "invalid_grant", "virtual key was rotated after the consent")
   // single use: the code is spent before the tokens leave
   REQUESTS.set(r.id, { id: r.id, client_id: r.client_id, redirect_uri: r.redirect_uri, state: r.state, scope: r.scope, resource: r.resource, challenge: r.challenge, expires_at: r.expires_at, status: "used", mode: r.mode, sub: r.sub, code_hash: hash })
-  CODES.delete(hash)
   const family = try secureHex(16)
   return try issuePair(iss, family, clientId, r.mode, r.sub, r.scope, r.resource, nowMs, nowMs, 0.0)
 }
 
-function refreshGrant(form: URLSearchParams, iss: Issuer, nowMs: f64, byId: (id: string) => VirtualKeyConfig | undefined): Answer throws Error {
+// The request a code's hash names, or undefined.
+function requestByCode(hash: string): AuthRequest | undefined {
+  for (const r of REQUESTS.values()) {
+    if (r.code_hash === hash) return r
+  }
+  return undefined
+}
+
+function refreshGrant(form: URLSearchParams, iss: Issuer, nowMs: f64, byId: (id: string) => VirtualKeyConfig | undefined, checks: RefreshChecks): Answer throws Error {
   const rt = form.get("refresh_token") ?? ""
   const clientId = form.get("client_id") ?? ""
   if (rt === "" || clientId === "") return oauthErr(400, "invalid_request", "refresh_token and client_id are required")
@@ -569,7 +666,14 @@ function refreshGrant(form: URLSearchParams, iss: Issuer, nowMs: f64, byId: (id:
     return oauthErr(400, "invalid_grant", "refresh token not found or revoked")
   }
   if (row.client_id !== clientId) return oauthErr(400, "invalid_grant", "client_id mismatch")
+  if (row.mode === "vk" && checks.vkCut) return oauthErr(400, "invalid_grant", "virtual-key identity is no longer accepted; re-authenticate")
   if (row.mode === "vk" && !keyUsable(byId(row.sub), nowMs)) return oauthErr(400, "invalid_grant", "virtual key is no longer active")
+  // a grant from before the key's rotation is void on every worker and node, even one that missed the revoke
+  if (row.mode === "vk" && rotatedSince(byId(row.sub), row.created_at)) {
+    revokeFamily(row.family)
+    return oauthErr(400, "invalid_grant", "refresh token not found or revoked")
+  }
+  if (row.mode === "user" && !checks.userActive(row.sub)) return oauthErr(400, "invalid_grant", "user is no longer active")
   const resource = form.get("resource") ?? ""
   if (resource !== "" && resource !== row.resource) return oauthErr(400, "invalid_grant", "resource mismatch")
   REFRESH.set(hash, { hash: row.hash, family: row.family, client_id: row.client_id, mode: row.mode, sub: row.sub, scope: row.scope, resource: row.resource, created_at: row.created_at, used_at: row.used_at, revoked: true })
@@ -587,7 +691,7 @@ function issuePair(iss: Issuer, family: string, clientId: string, mode: string, 
   return { status: 200, body: JSON.stringify({ access_token: access, token_type: "Bearer", expires_in: iss.accessTtl, refresh_token: refresh, scope: scope }), contentType: "application/json" }
 }
 
-// An RS256 JWT: iss, aud (the resource), sub (the virtual key's id, or the session id), bf_mode (vk or session),
+// An RS256 JWT: iss, aud (the resource), sub (the virtual key's id, the session id or the user), bf_mode (vk, session or user),
 // scope, iat, nbf, exp.
 function accessToken(iss: Issuer, mode: string, sub: string, scope: string, resource: string, nowMs: f64): string throws SyntaxError {
   const now = Math.floor(nowMs / 1000.0)
@@ -607,13 +711,20 @@ function revokeFamily(family: string): void {
   persistGrants()
 }
 
-// The live request a consent token opens, bound to its flow id, or undefined.
+// The live request a consent token opens, bound to its flow id, or undefined. A request another worker took, or
+// one from before a restart, is read from the state file.
 function consentRequest(id: string, token: string, nowMs: f64): AuthRequest | undefined {
   if (token === "") return undefined
-  const bound = CONSENT_TOKENS.get(token)
+  const th = toHex(sha256(utf8(token)))
+  if (!CONSENT_TOKENS.has(th) || !REQUESTS.has(id)) syncGrants()
+  const bound = CONSENT_TOKENS.get(th)
   if (bound === undefined || bound.id !== id || nowMs >= bound.expires_at) return undefined
+  // a request another worker has since consented reads as such
+  const held = REQUESTS.get(id)
+  if (held !== undefined && held.status === "pending") syncGrants()
   const r = REQUESTS.get(id)
-  if (r === undefined || nowMs >= r.expires_at) return undefined
+  // the token ends with the pending state (Bifrost deletes it at consent): a used link is refused as unknown
+  if (r === undefined || nowMs >= r.expires_at || r.status !== "pending") return undefined
   return r
 }
 
@@ -692,6 +803,36 @@ export function grantRevoke(id: string): Answer {
   if (r === undefined || r.revoked) return apiErr(404, "session not found or already revoked")
   revokeFamily(r.family)
   return { status: 204, body: "", contentType: "application/json" }
+}
+
+// Whether the key was rotated after the moment given (epoch ms): what was minted from its old value is void.
+function rotatedSince(vk: VirtualKeyConfig | undefined, sinceMs: f64): bool {
+  if (vk === undefined) return false
+  const at = rfc3339Ms(vk.rotated_at ?? "")
+  return at !== undefined && at > sinceMs
+}
+
+// Revokes everything minted for one identity (Bifrost's RevokeOAuth2GrantsBySubject): its live refresh tokens, and
+// the consented requests whose codes are not exchanged yet, so none of them can mint a token later. A virtual key's
+// rotation calls this for the key (mode "vk"), since a grant is bound to the key's id, not to its value. Access
+// tokens already issued last until they expire, as in Bifrost. Returns how many grants and codes were revoked.
+export function revokeSubject(mode: string, sub: string): int {
+  syncGrants()
+  let n = 0
+  for (const k of REFRESH.keys()) {
+    const x = REFRESH.get(k)
+    if (x === undefined || x.revoked || x.mode !== mode || x.sub !== sub) continue
+    REFRESH.set(k, { hash: x.hash, family: x.family, client_id: x.client_id, mode: x.mode, sub: x.sub, scope: x.scope, resource: x.resource, created_at: x.created_at, used_at: x.used_at, revoked: true })
+    n += 1
+  }
+  for (const id of REQUESTS.keys()) {
+    const r = REQUESTS.get(id)
+    if (r === undefined || r.status !== "consented" || r.mode !== mode || r.sub !== sub) continue
+    REQUESTS.set(id, { id: r.id, client_id: r.client_id, redirect_uri: r.redirect_uri, state: r.state, scope: r.scope, resource: r.resource, challenge: r.challenge, expires_at: r.expires_at, status: "revoked", mode: r.mode, sub: r.sub, code_hash: r.code_hash })
+    n += 1
+  }
+  if (n > 0) persistGrants()
+  return n
 }
 
 // ---- helpers ----
@@ -829,11 +970,17 @@ function respond(a: Answer): Response {
   return new Response(a.status === 302 ? undefined : a.body, { status: a.status, headers: h })
 }
 
+// Whether vk-mode grants are cut off: disable_vk_identity, only while user mode is available (so vk is never cut
+// where it is still the offered path).
+export function vkIdentityCut(c: Config, userAvailable: bool): bool {
+  return userAvailable && c.client?.oauth2_server_config?.disable_vk_identity === true
+}
+
 // The routes of the authorization server and its pages, or undefined for any other path. lookup finds the
-// virtual key a value names (the rotation cooldown included); byId finds a key by its id. signedIn says whether
-// the request carries a dashboard sign-in, and enforce whether inference auth is enforced: both decide the
-// identity modes the consent page offers.
-export async function issuerRoute(c: Config, req: Request, path: string, lookup: (value: string) => VirtualKeyConfig | undefined, byId: (id: string) => VirtualKeyConfig | undefined, nowMs: f64, signedIn: bool, enforce: bool): Promise<Response | undefined> {
+// virtual key a value names (the rotation cooldown included); byId finds a key by its id. cc says who is consenting
+// (the dashboard sign-in, the identity-provider user, whether inference auth is enforced): it decides the identity
+// modes the consent page offers.
+export async function issuerRoute(c: Config, req: Request, path: string, lookup: (value: string) => VirtualKeyConfig | undefined, byId: (id: string) => VirtualKeyConfig | undefined, nowMs: f64, cc: ConsentContext): Promise<Response | undefined> {
   const m = req.method
   if (path === "/workspace/mcp-sessions/auth" && m === "GET") return respond(page(connectPageHtml()))
   const consentPrefix = "/api/oauth2/consent/flows/"
@@ -844,10 +991,10 @@ export async function issuerRoute(c: Config, req: Request, path: string, lookup:
     // the route is always registered, as in Bifrost: it answers 404 while the authorization server is off
     if (iss === undefined) return respond(apiErr(404, "the MCP authorization server is off: set client.mcp_server_auth_mode to both or oauth"))
     const token = req.headers.get("x-bifrost-temp-token") ?? ""
-    const modes = consentModes(signedIn, enforce)
-    if (m === "GET") return respond(consentDetail(id, token, nowMs, modes))
+    const modes = consentModes(cc.signedIn, cc.enforce, cc.userAvailable, cc.disableVk)
+    if (m === "GET") return respond(consentDetail(id, token, nowMs, modes, cc.user, cc.userName))
     const body = await req.text()
-    return respond(consentSubmit(id, token, body, iss, nowMs, lookup, modes, signedIn))
+    return respond(consentSubmit(id, token, body, iss, nowMs, lookup, modes, cc.signedIn, cc.user, cc.userAvailable))
   }
   const wellKnown = path === "/.well-known/oauth-protected-resource" || path.startsWith("/.well-known/oauth-protected-resource/") || path === "/.well-known/oauth-authorization-server" || path.startsWith("/.well-known/oauth-authorization-server/") || path === "/.well-known/jwks.json"
   const oauth = path === "/oauth2/register" || path === "/oauth2/authorize" || path === "/oauth2/token" || path === "/oauth/consent"
@@ -873,7 +1020,7 @@ export async function issuerRoute(c: Config, req: Request, path: string, lookup:
   }
   if (path === "/oauth2/token" && m === "POST") {
     const form = new URLSearchParams(await req.text())
-    return respond(tokenEndpoint(form, iss, Date.now(), byId))
+    return respond(tokenEndpoint(form, iss, Date.now(), byId, { vkCut: cc.userAvailable && cc.disableVk, userActive: cc.userActive }))
   }
   return undefined
 }
@@ -975,19 +1122,30 @@ test("a signed token is accepted for this resource while it lives, and refused f
   expect(callerOf(iss, "Bearer " + forged, 3000.0).kind).toBe("error")
 })
 
-test("a session-mode token names a session, and a user-mode token is refused", () => {
+test("a session-mode token names a session, a user-mode token a user, and another mode is refused", () => {
   const iss = testIssuer()
   const sess = try accessToken(iss, "session", "a1b2c3", "mcp", iss.resource, 3000.0)
   const got = callerOf(iss, "Bearer " + sess, 3000.0)
   expect(got.kind).toBe("session")
   if (got.kind === "session") expect(got.sub).toBe("a1b2c3")
-  expect(callerOf(iss, "Bearer " + try accessToken(iss, "user", "u-1", "mcp", iss.resource, 3000.0), 3000.0).kind).toBe("error")
+  expect(callerOf(iss, "Bearer " + try accessToken(iss, "user", "u-1", "mcp", iss.resource, 3000.0), 3000.0)).toEqual({ kind: "user", sub: "u-1" })
+  expect(callerOf(iss, "Bearer " + try accessToken(iss, "admin", "u-1", "mcp", iss.resource, 3000.0), 3000.0).kind).toBe("error")
 })
 
 test("consent offers session mode only to a signed-in user while auth is not enforced", () => {
   expect(consentModes(false, false)).toEqual(["vk"])
   expect(consentModes(true, false)).toEqual(["vk", "session"])
   expect(consentModes(true, true)).toEqual(["vk"])
+})
+
+test("user mode is offered with the identity provider, and disable_vk_identity drops vk only then", () => {
+  expect(consentModes(false, false, true, false)).toEqual(["vk", "user"])
+  expect(consentModes(true, false, true, true)).toEqual(["session", "user"])
+  expect(consentModes(false, false, false, true)).toEqual(["vk"])
+  const on: Config = { client: { oauth2_server_config: { disable_vk_identity: true } } }
+  expect(vkIdentityCut(on, true)).toBe(true)
+  expect(vkIdentityCut(on, false)).toBe(false)
+  expect(vkIdentityCut({}, true)).toBe(false)
 })
 
 // Runs the virtual-key consent and token exchange for a new client, and returns its client id, refresh token and
@@ -1144,6 +1302,109 @@ test("the issuer is off without a usable config", () => {
   expect(issuerOf({ client: { mcp_server_auth_mode: "nope" } })).toBe(undefined)
 })
 
+// Registers a client and opens an authorization request; returns the client id, the flow id, the consent token
+// and the PKCE verifier.
+function openRequest(iss: Issuer, name: string, port: string, nowMs: f64): string[] throws Error {
+  const reg = register(`{"client_name":"${name}","redirect_uris":["http://127.0.0.1:${port}/cb"]}`, iss, nowMs)
+  const cid = try clientIdOf(reg.body)
+  const verifier = "u".repeat(50)
+  const sp = new URLSearchParams("")
+  sp.set("client_id", cid)
+  sp.set("redirect_uri", `http://127.0.0.1:${port}/cb`)
+  sp.set("response_type", "code")
+  sp.set("state", "st-" + name)
+  sp.set("code_challenge", pkceChallenge(verifier))
+  sp.set("code_challenge_method", "S256")
+  const loc = authorize(sp, iss, nowMs).location!
+  return [cid, loc.slice(loc.indexOf("flow=") + 5, loc.indexOf("#t=")), loc.slice(loc.indexOf("#t=") + 3), verifier]
+}
+
+// The code of a consent answer's redirect URL.
+function codeOf(body: string): string throws SyntaxError {
+  const url = (try JSON.parse(body) as { redirect_url: string }).redirect_url
+  return url.slice(url.indexOf("code=") + 5, url.indexOf("&state="))
+}
+
+test("user mode grants a token that names the signed-in user, and the user's key upgrades to user mode", () => {
+  const iss = testIssuer()
+  const now = Date.now()
+  const o = try openRequest(iss, "user-client", "8091", now)
+  const modes = consentModes(true, false, true, false)
+  const detail = consentDetail(o[1]!, o[2]!, now, modes, "alice", "alice@example.com")
+  expect(detail.body.includes("\"logged_in_user\":{\"id\":\"alice\",\"name\":\"alice@example.com\"}")).toBe(true)
+  expect(detail.body.includes("\"available_modes\":[\"vk\",\"session\",\"user\"]")).toBe(true)
+  const none = (v: string): VirtualKeyConfig | undefined => undefined
+  expect(consentSubmit(o[1]!, o[2]!, "{\"mode\":\"user\"}", iss, now, none, modes, true, "", true).status).toBe(400)
+  const done = consentSubmit(o[1]!, o[2]!, "{\"mode\":\"user\"}", iss, now, none, modes, true, "alice", true)
+  expect(done.status).toBe(200)
+  const form = `grant_type=authorization_code&code=${try codeOf(done.body)}&code_verifier=${o[3]!}&client_id=${o[0]!}&redirect_uri=http%3A%2F%2F127.0.0.1%3A8091%2Fcb`
+  const t = tokenEndpoint(new URLSearchParams(form), iss, now, (id: string): VirtualKeyConfig | undefined => undefined)
+  expect(t.status).toBe(200)
+  const body = try JSON.parse(t.body) as { access_token: string, refresh_token: string }
+  expect(callerOf(iss, "Bearer " + body.access_token, now)).toEqual({ kind: "user", sub: "alice" })
+  // a user who is no longer active cannot refresh, and an active one can
+  const rf = `grant_type=refresh_token&refresh_token=${body.refresh_token}&client_id=${o[0]!}`
+  const gone: RefreshChecks = { vkCut: false, userActive: (sub: string): bool => false }
+  expect(tokenEndpoint(new URLSearchParams(rf), iss, now, (id: string): VirtualKeyConfig | undefined => undefined, gone).body.includes("user is no longer active")).toBe(true)
+  expect(tokenEndpoint(new URLSearchParams(rf), iss, now, (id: string): VirtualKeyConfig | undefined => undefined).status).toBe(200)
+
+  // a key that belongs to bob: refused to alice, and granted to bob as user mode
+  const o2 = try openRequest(iss, "owned-key-client", "8092", now)
+  const bobKey: VirtualKeyConfig = { id: "vk-bob", value: "sk-bf-bob-key", user_id: "bob" }
+  const lookup = (v: string): VirtualKeyConfig | undefined => v === "sk-bf-bob-key" ? bobKey : undefined
+  const vkBody = "{\"mode\":\"vk\",\"value\":\"sk-bf-bob-key\"}"
+  expect(consentSubmit(o2[1]!, o2[2]!, vkBody, iss, now, lookup, modes, false, "", true).body.includes("please sign in")).toBe(true)
+  expect(consentSubmit(o2[1]!, o2[2]!, vkBody, iss, now, lookup, modes, true, "alice", true).body.includes("different user")).toBe(true)
+  const asBob = consentSubmit(o2[1]!, o2[2]!, vkBody, iss, now, lookup, modes, true, "bob", true)
+  expect(asBob.status).toBe(200)
+  const f2 = `grant_type=authorization_code&code=${try codeOf(asBob.body)}&code_verifier=${o2[3]!}&client_id=${o2[0]!}&redirect_uri=http%3A%2F%2F127.0.0.1%3A8092%2Fcb`
+  const t2 = tokenEndpoint(new URLSearchParams(f2), iss, now, (id: string): VirtualKeyConfig | undefined => undefined)
+  const a2 = (try JSON.parse(t2.body) as { access_token: string }).access_token
+  expect(callerOf(iss, "Bearer " + a2, now)).toEqual({ kind: "user", sub: "bob" })
+})
+
+test("disable_vk_identity stops a vk grant from refreshing", () => {
+  const iss = testIssuer()
+  const g = try vkGrant(iss, "vk-cut-client", "8093", Date.now())
+  const form = `grant_type=refresh_token&refresh_token=${g[1]}&client_id=${g[0]}`
+  const byId = (id: string): VirtualKeyConfig | undefined => id === "vk-vk-cut-client" ? { id: id, value: "sk-bf-vk-cut-client" } : undefined
+  const cut: RefreshChecks = { vkCut: true, userActive: (sub: string): bool => true }
+  const r = tokenEndpoint(new URLSearchParams(form), iss, Date.now(), byId, cut)
+  expect(r.status).toBe(400)
+  expect(r.body.includes("virtual-key identity is no longer accepted")).toBe(true)
+})
+
+test("a pending request and a consented code survive a restart through the state file", () => {
+  const file = "/tmp/raiju-mcp-requests-test.json"
+  const cfg: Config = { client: { mcp_server_auth_mode: "both", oauth2_server_config: { issuer_url: "https://gw.example", signing_key: TEST_KEY } } }
+  expect(openIssuerState(cfg, file, undefined)).toBe("")
+  const iss = testIssuer()
+  const now = Date.now()
+  const o = try openRequest(iss, "restart-client", "8094", now)
+  const text = try readFileSync(file, "utf8")
+  // the consent token is kept as its hash only
+  expect(text.includes(o[2]!)).toBe(false)
+  // a restart between authorize and consent: the memory is gone, the file has the request
+  REQUESTS.clear()
+  CONSENT_TOKENS.clear()
+  expect(consentDetail(o[1]!, o[2]!, now, ["vk"]).status).toBe(200)
+  const key: VirtualKeyConfig = { id: "vk-r", value: "sk-bf-restart" }
+  const lookup = (v: string): VirtualKeyConfig | undefined => v === "sk-bf-restart" ? key : undefined
+  const done = consentSubmit(o[1]!, o[2]!, "{\"mode\":\"vk\",\"value\":\"sk-bf-restart\"}", iss, now, lookup, ["vk"], false)
+  expect(done.status).toBe(200)
+  // and a restart between consent and the token request: the code still exchanges, once
+  REQUESTS.clear()
+  CONSENT_TOKENS.clear()
+  expect(consentDetail(o[1]!, o[2]!, now, ["vk"]).status).toBe(401)
+  const form = `grant_type=authorization_code&code=${try codeOf(done.body)}&code_verifier=${o[3]!}&client_id=${o[0]!}&redirect_uri=http%3A%2F%2F127.0.0.1%3A8094%2Fcb`
+  const byId = (id: string): VirtualKeyConfig | undefined => id === "vk-r" ? key : undefined
+  expect(tokenEndpoint(new URLSearchParams(form), iss, now, byId).status).toBe(200)
+  REQUESTS.clear()
+  expect(tokenEndpoint(new URLSearchParams(form), iss, now, byId).status).toBe(400)
+  openIssuerState(off(), "", undefined)
+  try unlinkSync(file)
+})
+
 // The test issuer: the throwaway key the jwt tests use, under a fixed issuer.
 function testIssuer(): Issuer {
   return { issuer: "https://gw.example", resource: "https://gw.example/mcp", pem: TEST_KEY, kid: "test-kid", codeTtl: 300.0, accessTtl: 600.0, allowed: [] }
@@ -1182,3 +1443,52 @@ cWt/9/+cPCoc9tkxp1qhNrwQbrTKuCsbaoq29dgClLqvoXv7g/jGMFsN3k8OMTbY
 igljKrc6DaVhqHLClkHqT4YKtkbcD1PHdJxoTLpDjg/pcfmE1Jh7xAwZyK5WeDHb
 E4OKLanX+blm6HOEeyMmCSU8
 -----END PRIVATE KEY-----`
+
+test("revoking a key's grants ends its refresh tokens and its consented codes", () => {
+  const iss = testIssuer()
+  const g = try vkGrant(iss, "rot-client", "8091", 7000.0)
+  const other = try vkGrant(iss, "rot-other", "8092", 7000.0)
+  // a second request for the same key, consented but not exchanged yet
+  const reg = register(`{"client_name":"rot-late","redirect_uris":["http://127.0.0.1:8093/cb"]}`, iss, 7000.0)
+  const cid = try clientIdOf(reg.body)
+  const verifier = "r".repeat(50)
+  const sp = new URLSearchParams("")
+  sp.set("client_id", cid)
+  sp.set("redirect_uri", "http://127.0.0.1:8093/cb")
+  sp.set("response_type", "code")
+  sp.set("state", "st-late")
+  sp.set("code_challenge", pkceChallenge(verifier))
+  sp.set("code_challenge_method", "S256")
+  const loc = authorize(sp, iss, 7000.0).location!
+  const flow = loc.slice(loc.indexOf("flow=") + 5, loc.indexOf("#t="))
+  const tok = loc.slice(loc.indexOf("#t=") + 3)
+  const key: VirtualKeyConfig = { id: "vk-rot-client", value: "sk-bf-rot-client" }
+  const lookup = (v: string): VirtualKeyConfig | undefined => v === key.value ? key : undefined
+  const done = consentSubmit(flow, tok, `{"mode":"vk","value":"sk-bf-rot-client"}`, iss, 7000.0, lookup, ["vk"], false)
+  const url = try JSON.parse(done.body) as { redirect_url: string }
+  const code = url.redirect_url.slice(url.redirect_url.indexOf("code=") + 5, url.redirect_url.indexOf("&state="))
+  expect(revokeSubject("vk", "vk-rot-client")).toBe(2)
+  const byId = (id: string): VirtualKeyConfig | undefined => key
+  const refresh = new URLSearchParams(`grant_type=refresh_token&refresh_token=${g[1]!}&client_id=${g[0]!}`)
+  expect(tokenEndpoint(refresh, iss, 7100.0, byId).status).toBe(400)
+  const form = `grant_type=authorization_code&code=${code}&code_verifier=${verifier}&client_id=${cid}&redirect_uri=http%3A%2F%2F127.0.0.1%3A8093%2Fcb`
+  expect(tokenEndpoint(new URLSearchParams(form), iss, 7100.0, byId).status).toBe(400)
+  // another key's grant is untouched, and a second revoke finds nothing
+  const keep = new URLSearchParams(`grant_type=refresh_token&refresh_token=${other[1]!}&client_id=${other[0]!}`)
+  const otherKey: VirtualKeyConfig = { id: "vk-rot-other", value: "sk-bf-rot-other" }
+  expect(tokenEndpoint(keep, iss, 7100.0, (id: string): VirtualKeyConfig | undefined => otherKey).status).toBe(200)
+  expect(revokeSubject("vk", "vk-rot-client")).toBe(0)
+})
+
+test("a grant from before the key's rotation does not refresh, even where the revoke was not seen", () => {
+  const iss = testIssuer()
+  const g = try vkGrant(iss, "rot-late-client", "8094", 8000.0)
+  const rotated: VirtualKeyConfig = { id: "vk-rot-late-client", value: "sk-bf-new", rotated_at: "1970-01-01T00:00:09Z" }
+  const refresh = new URLSearchParams(`grant_type=refresh_token&refresh_token=${g[1]!}&client_id=${g[0]!}`)
+  expect(tokenEndpoint(refresh, iss, 9500.0, (id: string): VirtualKeyConfig | undefined => rotated).status).toBe(400)
+  // a key rotated before the grant was made does not void it
+  const g2 = try vkGrant(iss, "rot-early-client", "8095", 12000.0)
+  const early: VirtualKeyConfig = { id: "vk-rot-early-client", value: "sk-bf-rot-early-client", rotated_at: "1970-01-01T00:00:09Z" }
+  const r2 = new URLSearchParams(`grant_type=refresh_token&refresh_token=${g2[1]!}&client_id=${g2[0]!}`)
+  expect(tokenEndpoint(r2, iss, 12500.0, (id: string): VirtualKeyConfig | undefined => early).status).toBe(200)
+})

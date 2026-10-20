@@ -1,0 +1,599 @@
+// A2A protocol versions (a2a.tov holds the operations, ops.tov the routes).
+//
+// A caller names the version it speaks in the A2A-Version header: none (the SDK default), 1.x, or the v0.3 the gateway
+// also serves; any other is refused as Bifrost refuses it (JSON-RPC -32009, REST 400 FAILED_PRECONDITION). The gateway
+// speaks v0.3 and v1 on both sides, so a call in one version to an agent that speaks the other is translated, its
+// params on the way out and its results and events on the way back, as a2a-go's a2acompat/a2av0 converts them:
+//
+//   v0.3                                          v1
+//   parts {kind:"text", text}                     {text}
+//   {kind:"file", file:{bytes|uri,name,mimeType}} {raw|url, filename, mediaType}
+//   {kind:"data", data}                           {data} (a value that is not an object is wrapped as {value} in v0.3,
+//                                                  marked with metadata.data_part_compat)
+//   role "user" / "agent"                         "ROLE_USER" / "ROLE_AGENT"
+//   state "working", "input-required", ...        "TASK_STATE_WORKING", "TASK_STATE_INPUT_REQUIRED", ...
+//   task, message, status-update, artifact-update {task}, {message}, {statusUpdate}, {artifactUpdate} (no kind; a
+//   objects tagged with kind                       status update has no final)
+//   configuration.blocking                        configuration.returnImmediately (its negation)
+//   configuration.pushNotificationConfig          configuration.taskPushNotificationConfig
+//   push config {taskId, pushNotificationConfig:  {taskId, id, url, token, authentication:{scheme, credentials}}
+//     {id, url, token, authentication:{schemes}}}
+//   push get/delete {id, pushNotificationConfigId} {taskId, id}; list {id} -> {taskId}; a list answers an array in
+//                                                  v0.3 and {configs} in v1
+//   tasks/list snake_case keys                    ListTasks camelCase keys (lastUpdatedAfter is statusTimestampAfter)
+//
+// Each conversion leaves an object that is already in the target shape as it is, so an agent that mixes the two
+// shapes, or a caller and an agent of the same version, pass through unchanged.
+import { Field, fields, elements, find, rawBool, decodeString, quote, build, setField, without, isNull } from "./json"
+
+function obj(raw: string | undefined): Field[] | undefined {
+  if (raw === undefined || !raw.trim().startsWith("{")) return undefined
+  try {
+    return fields(raw.trim())
+  } catch (e) {
+    return undefined
+  }
+}
+
+function arr(raw: string | undefined): string[] | undefined {
+  if (raw === undefined || !raw.trim().startsWith("[")) return undefined
+  try {
+    return elements(raw.trim())
+  } catch (e) {
+    return undefined
+  }
+}
+
+function str(raw: string | undefined): string {
+  if (raw === undefined || !raw.startsWith("\"")) return ""
+  try {
+    return decodeString(raw)
+  } catch (e) {
+    return ""
+  }
+}
+
+// ---- the A2A-Version header ----
+
+// Whether the gateway speaks the version a caller names: none (the SDK applies its default), any 1.x (Bifrost's
+// strict-v1 contract), or 0.3, the older dialect the gateway serves too (an SDK client of a v0.3 interface names it).
+export function versionSupported(v: string): bool {
+  const t = v.trim()
+  if (t === "") return true
+  if (t.split(".")[0]! === "1") return true
+  return t === "0.3" || t.startsWith("0.3.")
+}
+
+// ---- states and roles ----
+
+function legacyStates(): string[] {
+  return ["submitted", "working", "input-required", "completed", "canceled", "failed", "rejected", "auth-required"]
+}
+
+// A task state in the target version. "unknown" (v0.3) is TASK_STATE_UNSPECIFIED (v1); a state neither version
+// names passes as it is.
+export function stateTo(s: string, toV03: bool): string {
+  if (toV03) {
+    if (s === "TASK_STATE_UNSPECIFIED") return "unknown"
+    if (s.startsWith("TASK_STATE_")) {
+      const l = s.slice(11).toLowerCase().replaceAll("_", "-")
+      if (legacyStates().includes(l)) return l
+    }
+    return s
+  }
+  if (s === "unknown") return "TASK_STATE_UNSPECIFIED"
+  if (legacyStates().includes(s)) return "TASK_STATE_" + s.toUpperCase().replaceAll("-", "_")
+  return s
+}
+
+function roleTo(r: string, toV03: bool): string {
+  if (toV03) {
+    if (r === "ROLE_USER") return "user"
+    if (r === "ROLE_AGENT") return "agent"
+    if (r === "ROLE_UNSPECIFIED") return ""
+    return r
+  }
+  if (r === "user") return "ROLE_USER"
+  if (r === "agent") return "ROLE_AGENT"
+  return r
+}
+
+// Whether a v1 state ends a task's updates (a2a-go's Terminal), or asks for input: a v0.3 status update is final then.
+function finalState(v1: string): bool {
+  return v1 === "TASK_STATE_COMPLETED" || v1 === "TASK_STATE_CANCELED" || v1 === "TASK_STATE_FAILED" || v1 === "TASK_STATE_REJECTED" || v1 === "TASK_STATE_INPUT_REQUIRED"
+}
+
+// ---- parts, messages, artifacts, tasks ----
+
+function partToV1(raw: string): string {
+  const fs = obj(raw)
+  if (fs === undefined) return raw
+  const kind = str(find(fs, "kind"))
+  if (kind === "") return raw
+  const meta = find(fs, "metadata")
+  const out: Field[] = []
+  if (kind === "text") {
+    out.push({ key: "text", raw: find(fs, "text") ?? "\"\"" })
+  } else if (kind === "file") {
+    const ff = obj(find(fs, "file")) ?? []
+    const bytes = find(ff, "bytes")
+    const uri = find(ff, "uri")
+    if (bytes !== undefined) out.push({ key: "raw", raw: bytes })
+    else if (uri !== undefined) out.push({ key: "url", raw: uri })
+    else out.push({ key: "data", raw: find(fs, "file") ?? "{}" })
+    const name = find(ff, "name")
+    if (name !== undefined && !isNull(name)) out.push({ key: "filename", raw: name })
+    const mt = find(ff, "mimeType")
+    if (mt !== undefined && !isNull(mt)) out.push({ key: "mediaType", raw: mt })
+  } else if (kind === "data") {
+    let data = find(fs, "data") ?? "{}"
+    const mf = obj(meta)
+    if (mf !== undefined && rawBool(mf, "data_part_compat") === true) {
+      // a value the v0.3 shape had to wrap
+      data = find(obj(data) ?? [], "value") ?? "null"
+      const rest = without(mf, ["data_part_compat"])
+      out.push({ key: "data", raw: data })
+      if (rest.length > 0) out.push({ key: "metadata", raw: build(rest) })
+      return build(out)
+    }
+    out.push({ key: "data", raw: data })
+  } else {
+    return raw
+  }
+  if (meta !== undefined && !isNull(meta)) out.push({ key: "metadata", raw: meta })
+  return build(out)
+}
+
+function partToV03(raw: string): string {
+  const fs = obj(raw)
+  if (fs === undefined || find(fs, "kind") !== undefined) return raw
+  const meta = find(fs, "metadata")
+  const out: Field[] = []
+  const text = find(fs, "text")
+  const rawBytes = find(fs, "raw")
+  const url = find(fs, "url")
+  const data = find(fs, "data")
+  if (text !== undefined) {
+    out.push({ key: "kind", raw: "\"text\"" })
+    out.push({ key: "text", raw: text })
+  } else if (rawBytes !== undefined || url !== undefined) {
+    const file: Field[] = []
+    if (rawBytes !== undefined) file.push({ key: "bytes", raw: rawBytes })
+    else file.push({ key: "uri", raw: url ?? "\"\"" })
+    const mt = find(fs, "mediaType")
+    if (mt !== undefined && !isNull(mt)) file.push({ key: "mimeType", raw: mt })
+    const name = find(fs, "filename")
+    if (name !== undefined && !isNull(name)) file.push({ key: "name", raw: name })
+    out.push({ key: "kind", raw: "\"file\"" })
+    out.push({ key: "file", raw: build(file) })
+  } else if (data !== undefined) {
+    out.push({ key: "kind", raw: "\"data\"" })
+    if (data.trim().startsWith("{")) {
+      out.push({ key: "data", raw: data })
+    } else {
+      // v0.3 data parts hold objects only: anything else is wrapped and marked
+      out.push({ key: "data", raw: `{"value":${data}}` })
+      let mf = obj(meta) ?? []
+      setField(&mf, "data_part_compat", "true")
+      out.push({ key: "metadata", raw: build(mf) })
+      return build(out)
+    }
+  } else {
+    return raw
+  }
+  if (meta !== undefined && !isNull(meta)) out.push({ key: "metadata", raw: meta })
+  return build(out)
+}
+
+function partsTo(raw: string, toV03: bool): string {
+  const items = arr(raw)
+  if (items === undefined) return raw
+  const out: string[] = []
+  for (const p of items) out.push(toV03 ? partToV03(p) : partToV1(p))
+  return "[" + out.join(",") + "]"
+}
+
+// Rewrites some members of an object: each key's value goes through its function. kind is put first (v0.3) or
+// dropped (v1), and the other members keep their order.
+function mapped(fs: Field[], kind: string, toV03: bool, drop: string[], each: (key: string, raw: string) => string): string {
+  const out: Field[] = []
+  if (toV03 && kind !== "") out.push({ key: "kind", raw: quote(kind) })
+  for (const f of fs) {
+    if (f.key === "kind" || drop.includes(f.key)) continue
+    out.push({ key: f.key, raw: each(f.key, f.raw) })
+  }
+  return build(out)
+}
+
+export function messageTo(raw: string, toV03: bool): string {
+  const fs = obj(raw)
+  if (fs === undefined) return raw
+  return mapped(fs, "message", toV03, [], (k: string, v: string): string => {
+    if (k === "role") return quote(roleTo(str(v), toV03))
+    if (k === "parts") return partsTo(v, toV03)
+    return v
+  })
+}
+
+function messagesTo(raw: string, toV03: bool): string {
+  const items = arr(raw)
+  if (items === undefined) return raw
+  const out: string[] = []
+  for (const m of items) out.push(messageTo(m, toV03))
+  return "[" + out.join(",") + "]"
+}
+
+function artifactTo(raw: string, toV03: bool): string {
+  const fs = obj(raw)
+  if (fs === undefined) return raw
+  return mapped(fs, "", toV03, [], (k: string, v: string): string => (k === "parts" ? partsTo(v, toV03) : v))
+}
+
+function statusTo(raw: string, toV03: bool): string {
+  const fs = obj(raw)
+  if (fs === undefined) return raw
+  return mapped(fs, "", toV03, [], (k: string, v: string): string => {
+    if (k === "state") return quote(stateTo(str(v), toV03))
+    if (k === "message" && !isNull(v)) return messageTo(v, toV03)
+    return v
+  })
+}
+
+export function taskTo(raw: string, toV03: bool): string {
+  const fs = obj(raw)
+  if (fs === undefined) return raw
+  return mapped(fs, "task", toV03, [], (k: string, v: string): string => {
+    if (k === "status") return statusTo(v, toV03)
+    if (k === "history") return messagesTo(v, toV03)
+    if (k === "artifacts") {
+      const items = arr(v)
+      if (items === undefined) return v
+      const out: string[] = []
+      for (const a of items) out.push(artifactTo(a, toV03))
+      return "[" + out.join(",") + "]"
+    }
+    return v
+  })
+}
+
+function statusUpdateTo(raw: string, toV03: bool): string {
+  const fs = obj(raw)
+  if (fs === undefined) return raw
+  // v1 has no final: a v0.3 caller reads it from the state, as a2a-go does
+  const st = obj(find(fs, "status")) ?? []
+  const state = stateTo(str(find(st, "state")), false)
+  let out = mapped(fs, "status-update", toV03, toV03 ? [] : ["final"], (k: string, v: string): string => (k === "status" ? statusTo(v, toV03) : v))
+  if (toV03 && find(fs, "final") === undefined) {
+    let of = obj(out) ?? []
+    setField(&of, "final", finalState(state) ? "true" : "false")
+    out = build(of)
+  }
+  return out
+}
+
+function artifactUpdateTo(raw: string, toV03: bool): string {
+  const fs = obj(raw)
+  if (fs === undefined) return raw
+  return mapped(fs, "artifact-update", toV03, [], (k: string, v: string): string => (k === "artifact" ? artifactTo(v, toV03) : v))
+}
+
+// ---- events ----
+
+// One event (a stream's payload, or the answer of a send): v1 wraps it ({task}, {message}, {statusUpdate},
+// {artifactUpdate}), v0.3 tags it with kind.
+export function eventTo(raw: string, toV03: bool): string {
+  const fs = obj(raw)
+  if (fs === undefined) return raw
+  const kind = str(find(fs, "kind"))
+  if (toV03) {
+    if (kind !== "") return raw
+    const t = find(fs, "task")
+    if (t !== undefined && fs.length === 1) return taskTo(t, true)
+    const m = find(fs, "message")
+    if (m !== undefined && fs.length === 1) return messageTo(m, true)
+    const su = find(fs, "statusUpdate")
+    if (su !== undefined) return statusUpdateTo(su, true)
+    const au = find(fs, "artifactUpdate")
+    if (au !== undefined) return artifactUpdateTo(au, true)
+    return raw
+  }
+  if (kind === "task") return `{"task":${taskTo(raw, false)}}`
+  if (kind === "message") return `{"message":${messageTo(raw, false)}}`
+  if (kind === "status-update") return `{"statusUpdate":${statusUpdateTo(raw, false)}}`
+  if (kind === "artifact-update") return `{"artifactUpdate":${artifactUpdateTo(raw, false)}}`
+  return raw
+}
+
+// ---- push configs ----
+
+// A push config's own settings (id, url, token, authentication) in the target version: v0.3 lists the schemes,
+// v1 names one.
+function pushSettingsTo(fs: Field[], toV03: bool): Field[] {
+  const out: Field[] = []
+  for (const f of fs) {
+    if (f.key !== "authentication" || isNull(f.raw)) {
+      out.push(f)
+      continue
+    }
+    const af = obj(f.raw) ?? []
+    const auth: Field[] = []
+    for (const a of af) {
+      if (toV03 && a.key === "scheme") auth.push({ key: "schemes", raw: str(a.raw) === "" ? "[]" : `[${a.raw}]` })
+      else if (!toV03 && a.key === "schemes") {
+        const items = arr(a.raw) ?? []
+        auth.push({ key: "scheme", raw: items.length > 0 ? items[0]! : "\"\"" })
+      } else auth.push(a)
+    }
+    out.push({ key: "authentication", raw: build(auth) })
+  }
+  return out
+}
+
+// A task's push config: v0.3 {taskId, pushNotificationConfig: {...}}, v1 the settings and the taskId in one object.
+export function taskPushTo(raw: string, toV03: bool): string {
+  const fs = obj(raw)
+  if (fs === undefined) return raw
+  const inner = obj(find(fs, "pushNotificationConfig"))
+  if (toV03) {
+    if (inner !== undefined) return raw
+    const settings = pushSettingsTo(without(fs, ["taskId", "tenant"]), true)
+    const out: Field[] = []
+    const tid = find(fs, "taskId")
+    if (tid !== undefined) out.push({ key: "taskId", raw: tid })
+    out.push({ key: "pushNotificationConfig", raw: build(settings) })
+    return build(out)
+  }
+  if (inner === undefined) return raw
+  let out: Field[] = []
+  for (const f of without(fs, ["pushNotificationConfig"])) out.push(f)
+  for (const f of pushSettingsTo(inner, false)) setField(&out, f.key, f.raw)
+  return build(out)
+}
+
+// A send's configuration: blocking (v0.3) is the negation of returnImmediately (v1), and the embedded push config
+// changes its key and shape (v1 names the message's task).
+function configurationTo(raw: string, taskId: string, toV03: bool): string {
+  const fs = obj(raw)
+  if (fs === undefined) return raw
+  const out: Field[] = []
+  for (const f of fs) {
+    if (toV03 && f.key === "returnImmediately") {
+      if (find(fs, "blocking") === undefined) out.push({ key: "blocking", raw: f.raw === "true" ? "false" : "true" })
+      continue
+    }
+    if (!toV03 && f.key === "blocking") {
+      if (f.raw === "true" || f.raw === "false") out.push({ key: "returnImmediately", raw: f.raw === "true" ? "false" : "true" })
+      continue
+    }
+    if (toV03 && f.key === "taskPushNotificationConfig" && !isNull(f.raw)) {
+      const pf = obj(f.raw) ?? []
+      // an older v1 draft wrapped the settings once more
+      const nested = obj(find(pf, "pushNotificationConfig"))
+      out.push({ key: "pushNotificationConfig", raw: build(pushSettingsTo(without(nested ?? pf, ["taskId", "tenant"]), true)) })
+      continue
+    }
+    if (!toV03 && f.key === "pushNotificationConfig" && !isNull(f.raw)) {
+      let pf = pushSettingsTo(obj(f.raw) ?? [], false)
+      if (taskId !== "" && find(pf, "taskId") === undefined) pf = [{ key: "taskId", raw: quote(taskId) }].concat(pf)
+      out.push({ key: "taskPushNotificationConfig", raw: build(pf) })
+      continue
+    }
+    out.push(f)
+  }
+  if (toV03 && find(fs, "blocking") === undefined && find(fs, "returnImmediately") === undefined) out.push({ key: "blocking", raw: "true" })
+  return build(out)
+}
+
+// ---- requests and answers ----
+
+function renamed(fs: Field[], pairs: string[][]): Field[] {
+  const out: Field[] = []
+  for (const f of fs) {
+    let key = f.key
+    for (const p of pairs) {
+      if (p[0]! === f.key) key = p[1]!
+    }
+    out.push({ key: key, raw: f.raw })
+  }
+  return out
+}
+
+function listTaskKeys(): string[][] {
+  return [["context_id", "contextId"], ["page_size", "pageSize"], ["page_token", "pageToken"], ["history_length", "historyLength"], ["last_updated_after", "statusTimestampAfter"], ["lastUpdatedAfter", "statusTimestampAfter"], ["include_artifacts", "includeArtifacts"], ["total_size", "totalSize"], ["next_page_token", "nextPageToken"]]
+}
+
+function flipped(pairs: string[][]): string[][] {
+  const out: string[][] = []
+  for (const p of pairs) {
+    if (p[0]! === "lastUpdatedAfter") continue
+    out.push([p[1]!, p[0]!])
+  }
+  return out
+}
+
+// A call's params (in the caller's version) as the agent's version takes them. op is the v1 operation name.
+export function paramsTo(op: string, params: string, toV03: bool): string {
+  const fs = obj(params)
+  if (fs === undefined) return params
+  if (op === "SendMessage" || op === "SendStreamingMessage") {
+    const mf = obj(find(fs, "message")) ?? []
+    const taskId = str(find(mf, "taskId"))
+    return mapped(fs, "", toV03, toV03 ? ["tenant"] : [], (k: string, v: string): string => {
+      if (k === "message") return messageTo(v, toV03)
+      if (k === "configuration" && !isNull(v)) return configurationTo(v, taskId, toV03)
+      return v
+    })
+  }
+  if (op === "CreateTaskPushNotificationConfig") return taskPushTo(params, toV03)
+  if (op === "GetTaskPushNotificationConfig" || op === "DeleteTaskPushNotificationConfig") {
+    if (toV03) {
+      if (find(fs, "pushNotificationConfigId") !== undefined) return params
+      return build([{ key: "id", raw: find(fs, "taskId") ?? "\"\"" }, { key: "pushNotificationConfigId", raw: find(fs, "id") ?? "\"\"" }])
+    }
+    if (find(fs, "pushNotificationConfigId") === undefined) return params
+    return build([{ key: "taskId", raw: find(fs, "id") ?? "\"\"" }, { key: "id", raw: find(fs, "pushNotificationConfigId") ?? "\"\"" }])
+  }
+  if (op === "ListTaskPushNotificationConfigs") {
+    if (toV03) return find(fs, "taskId") === undefined ? params : build(renamed(without(fs, ["tenant"]), [["taskId", "id"]]))
+    return find(fs, "taskId") !== undefined ? params : build(renamed(fs, [["id", "taskId"]]))
+  }
+  if (op === "ListTasks") {
+    const keys = toV03 ? flipped(listTaskKeys()) : listTaskKeys()
+    const out: Field[] = []
+    for (const f of renamed(without(fs, toV03 ? ["tenant"] : []), keys)) {
+      if (f.key === "status") out.push({ key: f.key, raw: quote(stateTo(str(f.raw), toV03)) })
+      else out.push(f)
+    }
+    return build(out)
+  }
+  if (toV03) return build(without(fs, ["tenant"]))
+  return params
+}
+
+// An operation's result (a JSON-RPC result, or a REST answer's body) in the target version.
+export function resultTo(op: string, result: string, toV03: bool): string {
+  if (op === "SendMessage" || op === "SendStreamingMessage" || op === "SubscribeToTask") return eventTo(result, toV03)
+  if (op === "GetTask" || op === "CancelTask") return taskTo(result, toV03)
+  if (op === "ListTasks") {
+    const fs = obj(result)
+    if (fs === undefined) return result
+    const keys = toV03 ? flipped(listTaskKeys()) : listTaskKeys()
+    const out: Field[] = []
+    for (const f of renamed(fs, keys)) {
+      if (f.key !== "tasks") {
+        out.push(f)
+        continue
+      }
+      const items = arr(f.raw) ?? []
+      const ts: string[] = []
+      for (const t of items) ts.push(taskTo(t, toV03))
+      out.push({ key: "tasks", raw: "[" + ts.join(",") + "]" })
+    }
+    return build(out)
+  }
+  if (op === "CreateTaskPushNotificationConfig" || op === "GetTaskPushNotificationConfig") return taskPushTo(result, toV03)
+  if (op === "ListTaskPushNotificationConfigs") {
+    if (toV03) {
+      const fs = obj(result)
+      if (fs === undefined) return result
+      const out: string[] = []
+      for (const c of arr(find(fs, "configs")) ?? []) out.push(taskPushTo(c, true))
+      return "[" + out.join(",") + "]"
+    }
+    const items = arr(result)
+    if (items === undefined) return result
+    const out: string[] = []
+    for (const c of items) out.push(taskPushTo(c, false))
+    return `{"configs":[${out.join(",")}]}`
+  }
+  if (op === "DeleteTaskPushNotificationConfig") {
+    if (toV03) return result.trim() === "{}" ? "null" : result
+    return isNull(result.trim()) ? "{}" : result
+  }
+  return result
+}
+
+// A JSON-RPC answer with its result in the target version (an error passes as it is).
+export function rpcAnswerTo(op: string, text: string, toV03: bool): string {
+  const fs = obj(text)
+  if (fs === undefined) return text
+  const res = find(fs, "result")
+  if (res === undefined) return text
+  let out = fs
+  setField(&out, "result", resultTo(op, res, toV03))
+  return build(out)
+}
+
+// ---- tests ----
+
+test("the A2A-Version a caller names: none, 1.x and 0.3 are spoken", () => {
+  expect(versionSupported("")).toBe(true)
+  expect(versionSupported("1.0")).toBe(true)
+  expect(versionSupported("1")).toBe(true)
+  expect(versionSupported(" 1.2 ")).toBe(true)
+  expect(versionSupported("0.3")).toBe(true)
+  expect(versionSupported("0.3.0")).toBe(true)
+  expect(versionSupported("0.2.5")).toBe(false)
+  expect(versionSupported("2.0")).toBe(false)
+  expect(versionSupported("10.0")).toBe(false)
+})
+
+test("states and roles between the versions", () => {
+  expect(stateTo("input-required", false)).toBe("TASK_STATE_INPUT_REQUIRED")
+  expect(stateTo("TASK_STATE_AUTH_REQUIRED", true)).toBe("auth-required")
+  expect(stateTo("unknown", false)).toBe("TASK_STATE_UNSPECIFIED")
+  expect(stateTo("TASK_STATE_UNSPECIFIED", true)).toBe("unknown")
+  expect(stateTo("TASK_STATE_WORKING", false)).toBe("TASK_STATE_WORKING")
+  expect(stateTo("working", true)).toBe("working")
+  expect(roleTo("user", false)).toBe("ROLE_USER")
+  expect(roleTo("ROLE_AGENT", true)).toBe("agent")
+})
+
+test("a v0.3 message becomes a v1 message and back", () => {
+  const v03 = `{"kind":"message","messageId":"m1","role":"user","parts":[{"kind":"text","text":"hi","metadata":{"a":1}},{"kind":"file","file":{"bytes":"aGk=","name":"x.txt","mimeType":"text/plain"}},{"kind":"file","file":{"uri":"https://f.example/x"}},{"kind":"data","data":{"k":2}},{"kind":"data","data":{"value":7},"metadata":{"data_part_compat":true}}],"contextId":"c1"}`
+  const v1 = messageTo(v03, false)
+  expect(v1).toBe(`{"messageId":"m1","role":"ROLE_USER","parts":[{"text":"hi","metadata":{"a":1}},{"raw":"aGk=","filename":"x.txt","mediaType":"text/plain"},{"url":"https://f.example/x"},{"data":{"k":2}},{"data":7}],"contextId":"c1"}`)
+  const back = messageTo(v1, true)
+  expect(back).toBe(`{"kind":"message","messageId":"m1","role":"user","parts":[{"kind":"text","text":"hi","metadata":{"a":1}},{"kind":"file","file":{"bytes":"aGk=","mimeType":"text/plain","name":"x.txt"}},{"kind":"file","file":{"uri":"https://f.example/x"}},{"kind":"data","data":{"k":2}},{"kind":"data","data":{"value":7},"metadata":{"data_part_compat":true}}],"contextId":"c1"}`)
+  // already in the target shape: unchanged parts
+  expect(messageTo(back, true)).toBe(back)
+})
+
+test("tasks and events between the versions", () => {
+  const v1task = `{"id":"t1","contextId":"c","status":{"state":"TASK_STATE_COMPLETED","message":{"messageId":"m","role":"ROLE_AGENT","parts":[{"text":"done"}]}},"artifacts":[{"artifactId":"a","parts":[{"text":"x"}]}],"history":[{"messageId":"h","role":"ROLE_USER","parts":[{"text":"q"}]}]}`
+  const v03 = taskTo(v1task, true)
+  expect(v03).toBe(`{"kind":"task","id":"t1","contextId":"c","status":{"state":"completed","message":{"kind":"message","messageId":"m","role":"agent","parts":[{"kind":"text","text":"done"}]}},"artifacts":[{"artifactId":"a","parts":[{"kind":"text","text":"x"}]}],"history":[{"kind":"message","messageId":"h","role":"user","parts":[{"kind":"text","text":"q"}]}]}`)
+  expect(taskTo(v03, false)).toBe(v1task)
+  // a send's answer and a stream's events
+  expect(eventTo(`{"task":${v1task}}`, true)).toBe(v03)
+  expect(eventTo(v03, false)).toBe(`{"task":${v1task}}`)
+  const su = eventTo(`{"statusUpdate":{"taskId":"t1","contextId":"c","status":{"state":"TASK_STATE_INPUT_REQUIRED"}}}`, true)
+  expect(su).toBe(`{"kind":"status-update","taskId":"t1","contextId":"c","status":{"state":"input-required"},"final":true}`)
+  expect(eventTo(`{"statusUpdate":{"taskId":"t1","status":{"state":"TASK_STATE_WORKING"}}}`, true).includes(`"final":false`)).toBe(true)
+  expect(eventTo(su, false)).toBe(`{"statusUpdate":{"taskId":"t1","contextId":"c","status":{"state":"TASK_STATE_INPUT_REQUIRED"}}}`)
+  expect(eventTo(`{"kind":"artifact-update","taskId":"t1","artifact":{"artifactId":"a","parts":[{"kind":"text","text":"x"}]},"lastChunk":true}`, false)).toBe(`{"artifactUpdate":{"taskId":"t1","artifact":{"artifactId":"a","parts":[{"text":"x"}]},"lastChunk":true}}`)
+  expect(eventTo(`{"message":{"messageId":"m","role":"ROLE_AGENT","parts":[]}}`, true)).toBe(`{"kind":"message","messageId":"m","role":"agent","parts":[]}`)
+  // an event already in the target shape passes
+  expect(eventTo(v03, true)).toBe(v03)
+  expect(eventTo(`{"task":${v1task}}`, false)).toBe(`{"task":${v1task}}`)
+})
+
+test("a send's params between the versions", () => {
+  const v03 = `{"message":{"kind":"message","messageId":"m","role":"user","parts":[{"kind":"text","text":"hi"}],"taskId":"t9"},"configuration":{"blocking":false,"historyLength":2,"pushNotificationConfig":{"id":"p","url":"https://cb.example/x","token":"tk","authentication":{"schemes":["Bearer"],"credentials":"c"}}}}`
+  const v1 = paramsTo("SendMessage", v03, false)
+  expect(v1).toBe(`{"message":{"messageId":"m","role":"ROLE_USER","parts":[{"text":"hi"}],"taskId":"t9"},"configuration":{"returnImmediately":true,"historyLength":2,"taskPushNotificationConfig":{"taskId":"t9","id":"p","url":"https://cb.example/x","token":"tk","authentication":{"scheme":"Bearer","credentials":"c"}}}}`)
+  const back = paramsTo("SendMessage", v1, true)
+  expect(back).toBe(`{"message":{"kind":"message","messageId":"m","role":"user","parts":[{"kind":"text","text":"hi"}],"taskId":"t9"},"configuration":{"blocking":false,"historyLength":2,"pushNotificationConfig":{"id":"p","url":"https://cb.example/x","token":"tk","authentication":{"schemes":["Bearer"],"credentials":"c"}}}}`)
+  // a v1 configuration without returnImmediately blocks
+  expect(paramsTo("SendMessage", `{"message":{"parts":[]},"configuration":{},"tenant":"t"}`, true)).toBe(`{"message":{"kind":"message","parts":[]},"configuration":{"blocking":true}}`)
+})
+
+test("push configs and their calls between the versions", () => {
+  const v03 = `{"taskId":"t","pushNotificationConfig":{"id":"p","url":"https://cb.example/x","authentication":{"schemes":["Basic"]}}}`
+  const v1 = taskPushTo(v03, false)
+  expect(v1).toBe(`{"taskId":"t","id":"p","url":"https://cb.example/x","authentication":{"scheme":"Basic"}}`)
+  expect(taskPushTo(v1, true)).toBe(v03)
+  expect(paramsTo("CreateTaskPushNotificationConfig", v03, false)).toBe(v1)
+  expect(paramsTo("GetTaskPushNotificationConfig", `{"taskId":"t","id":"p"}`, true)).toBe(`{"id":"t","pushNotificationConfigId":"p"}`)
+  expect(paramsTo("DeleteTaskPushNotificationConfig", `{"id":"t","pushNotificationConfigId":"p"}`, false)).toBe(`{"taskId":"t","id":"p"}`)
+  expect(paramsTo("ListTaskPushNotificationConfigs", `{"taskId":"t"}`, true)).toBe(`{"id":"t"}`)
+  expect(paramsTo("ListTaskPushNotificationConfigs", `{"id":"t"}`, false)).toBe(`{"taskId":"t"}`)
+  expect(resultTo("ListTaskPushNotificationConfigs", `{"configs":[${v1}],"nextPageToken":""}`, true)).toBe(`[${v03}]`)
+  expect(resultTo("ListTaskPushNotificationConfigs", `[${v03}]`, false)).toBe(`{"configs":[${v1}]}`)
+  expect(resultTo("DeleteTaskPushNotificationConfig", "{}", true)).toBe("null")
+  expect(resultTo("DeleteTaskPushNotificationConfig", "null", false)).toBe("{}")
+})
+
+test("task lists between the versions", () => {
+  expect(paramsTo("ListTasks", `{"contextId":"c","status":"working","pageSize":5,"lastUpdatedAfter":"2026-01-01T00:00:00Z"}`, false)).toBe(`{"contextId":"c","status":"TASK_STATE_WORKING","pageSize":5,"statusTimestampAfter":"2026-01-01T00:00:00Z"}`)
+  expect(paramsTo("ListTasks", `{"contextId":"c","status":"TASK_STATE_WORKING","pageSize":5,"tenant":"x"}`, true)).toBe(`{"context_id":"c","status":"working","page_size":5}`)
+  expect(resultTo("ListTasks", `{"tasks":[{"id":"t","status":{"state":"TASK_STATE_WORKING"}}],"totalSize":1,"pageSize":50,"nextPageToken":""}`, true)).toBe(`{"tasks":[{"kind":"task","id":"t","status":{"state":"working"}}],"total_size":1,"page_size":50,"next_page_token":""}`)
+})
+
+test("a JSON-RPC answer's result is translated, an error is not", () => {
+  const t = rpcAnswerTo("GetTask", `{"jsonrpc":"2.0","id":"1","result":{"id":"t","status":{"state":"TASK_STATE_FAILED"}}}`, true)
+  expect(t).toBe(`{"jsonrpc":"2.0","id":"1","result":{"kind":"task","id":"t","status":{"state":"failed"}}}`)
+  const e = `{"jsonrpc":"2.0","id":"1","error":{"code":-32001,"message":"task not found"}}`
+  expect(rpcAnswerTo("GetTask", e, true)).toBe(e)
+  expect(rpcAnswerTo("GetTask", "not json", false)).toBe("not json")
+})

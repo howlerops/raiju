@@ -1,11 +1,11 @@
 // Turns "provider/model" plus fallbacks into attempts: picks a provider config
 // and a weighted key for each, and decides what to retry.
-import { Config, KeyConfig, ProviderConfig, AliasTarget, providerOf } from "./config"
+import { Config, KeyConfig, ProviderConfig, AliasTarget, providerOf, resolveEnv } from "./config"
 import { Target } from "./providers/types"
 import { isOpenAICompatible } from "./providers/openai"
 import { Health, pickAdaptive } from "./health"
 import { datasheetProviders } from "./pricing"
-import { aliasLookup, aliasEntry, aliasProblem, resolveKeyAlias, AliasResult } from "./aliases"
+import { aliasLookup, aliasEntry, aliasProblem, aliasProviderProblem, resolveKeyAlias, AliasResult } from "./aliases"
 
 export type ModelRef = { provider: string, model: string }
 
@@ -116,12 +116,29 @@ export function aliasProblems(cfg: Config): string[] {
       if (a === undefined) continue
       const p = aliasProblem(a, cfg.client?.routing_chain_max_depth)
       if (p !== "") out.push(name + " key " + (keys[i]!.name ?? ("" + i)) + ": " + p)
+      // an override for another provider's keys (Bifrost refuses the aliases; here the override is not applied)
+      const pp = aliasProviderProblem(a, kindOf(name, ps.get(name)!))
+      if (pp !== "") out.push(name + " key " + (keys[i]!.name ?? ("" + i)) + ": " + pp + "; the override is not applied")
     }
   }
   return out
 }
 
+// Whether a key's blacklisted_models block a model (a request model name, so an alias by its name): "*" blocks every
+// model, any other entry the model by name, case-insensitively, as Bifrost's BlackList.
+export function keyBlocks(k: KeyConfig, model: string): bool {
+  const bl = k.blacklisted_models
+  if (bl === undefined || bl.length === 0) return false
+  const low = model.toLowerCase()
+  for (const b of bl) {
+    if (b === "*" || b.toLowerCase() === low) return true
+  }
+  return false
+}
+
 export function keyAllows(k: KeyConfig, model: string): bool {
+  // the blacklist wins over the allow list and the aliases
+  if (keyBlocks(k, model)) return false
   const ms = k.models
   if (ms === undefined || ms.length === 0) return true
   const a = k.aliases
@@ -130,6 +147,59 @@ export function keyAllows(k: KeyConfig, model: string): bool {
     if (m === "*" || m === model) return true
   }
   return false
+}
+
+// A provider's model listing (provider/model ids as its API lists them) through Bifrost's ListModelsPipeline, key by
+// key, the results joined: a model an alias of the key targets is listed under the alias name as well as its own; a
+// model the key blacklists is dropped (by either name); and the key's aliases its listing did not match are added
+// back. A key with a model list lists those models (minus its blacklist), as Bifrost lists a restricted allow list.
+// keys are the provider's keys; none (a keyless provider) lists the ids as they are.
+export function listingPipeline(provider: string, ids: string[], keys: KeyConfig[]): string[] {
+  if (keys.length === 0) return ids
+  const out: string[] = []
+  const seen: Set<string> = new Set()
+  const add = (name: string): void => {
+    const id = provider + "/" + name
+    if (seen.has(id.toLowerCase())) return
+    seen.add(id.toLowerCase())
+    out.push(id)
+  }
+  const pre = provider + "/"
+  for (const k of keys) {
+    const ms = (k.models ?? []).filter((m) => m !== "*")
+    if (ms.length > 0) {
+      for (const m of ms) {
+        if (!keyBlocks(k, m)) add(m)
+      }
+      continue
+    }
+    const a = k.aliases
+    const matched: Set<string> = new Set()
+    for (const id of ids) {
+      const bare = id.startsWith(pre) ? id.slice(pre.byteLength) : id
+      const names: string[] = []
+      if (a !== undefined) {
+        for (const name of a.keys()) {
+          const target = aliasLookup(a, name) ?? ""
+          if (target.toLowerCase() === bare.toLowerCase()) {
+            names.push(name)
+            matched.add(name)
+          }
+        }
+      }
+      names.push(bare)
+      for (const n of names) {
+        if (!keyBlocks(k, n)) add(n)
+      }
+    }
+    // the aliases the provider's listing did not name are still models of this key
+    if (a !== undefined) {
+      for (const name of a.keys()) {
+        if (!matched.has(name) && !keyBlocks(k, name)) add(name)
+      }
+    }
+  }
+  return out
 }
 
 // Weighted random choice among keys that serve the model, skipping excluded ones.
@@ -250,7 +320,143 @@ export function target(cfg: Config, ref: ModelRef, exclude: Set<int>, pinned: st
   if (i < 0) return undefined
   const up = resolveAlias(keys[i]!, ref.model, cfg.client?.routing_chain_max_depth)
   if (up.error !== "") return undefined
-  return { t: { provider: ref.provider, kind: kind, model: up.model, key: keys[i]!, cfg: p }, keyIndex: i }
+  const key = aliasOverrides(keys[i]!, matchedAlias(keys[i]!, ref.model), kind)
+  return { t: { provider: ref.provider, kind: kind, model: up.model, key: key, cfg: p }, keyIndex: i }
+}
+
+// The key a request to an alias is sent with: the alias's provider overrides replace the key's own settings, as
+// Bifrost's per-alias AliasConfig overrides the key-level defaults. Each applies to its provider's keys only:
+// api_version and endpoint (Azure), region, project_id, project_number and force_single_region (Vertex), region,
+// inference_profile_arn and use_openai_endpoints (Bedrock), region and project_id (Bedrock Mantle) and
+// use_deployments_endpoint (Replicate). Values written "env.NAME" are read from the environment.
+export function aliasOverrides(k: KeyConfig, a: AliasTarget | undefined, kind: string): KeyConfig {
+  if (a === undefined) return k
+  let n = k
+  if (kind === "azure") {
+    let az = n.azure_key_config ?? { endpoint: "" }
+    const ver = a.api_version
+    if (ver !== undefined && ver !== "") az.api_version = ver
+    const ep = a.endpoint
+    if (ep !== undefined && ep !== "") az.endpoint = resolveEnv(ep)
+    if ((ver !== undefined && ver !== "") || (ep !== undefined && ep !== "")) n.azure_key_config = az
+  }
+  if (kind === "vertex") {
+    const rg = a.region
+    const proj = a.project_id
+    const num = a.project_number
+    const single = a.force_single_region
+    if ((rg !== undefined && rg !== "") || (proj !== undefined && proj !== "") || (num !== undefined && num !== "") || single !== undefined) {
+      let vk = n.vertex_key_config ?? { project_id: "", region: "" }
+      if (rg !== undefined && rg !== "") vk.region = resolveEnv(rg)
+      if (proj !== undefined && proj !== "") vk.project_id = resolveEnv(proj)
+      if (num !== undefined && num !== "") vk.project_number = resolveEnv(num)
+      if (single !== undefined) vk.force_single_region = single
+      n.vertex_key_config = vk
+    }
+  }
+  if (kind === "bedrock" || kind === "bedrock_mantle") {
+    const rg = a.region
+    const arn = kind === "bedrock" ? a.inference_profile_arn : undefined
+    const oai = kind === "bedrock" ? a.use_openai_endpoints : undefined
+    // the Bedrock project (Mantle's OpenAI-Project / anthropic-workspace-id header)
+    const proj = kind === "bedrock_mantle" ? a.project_id : undefined
+    if ((rg !== undefined && rg !== "") || (arn !== undefined && arn !== "") || oai !== undefined || (proj !== undefined && proj !== "")) {
+      let bk = n.bedrock_key_config ?? {}
+      if (rg !== undefined && rg !== "") bk.region = resolveEnv(rg)
+      if (arn !== undefined && arn !== "") bk.arn = resolveEnv(arn)
+      if (oai !== undefined) bk.use_openai_endpoints = oai
+      if (proj !== undefined && proj !== "") bk.project_id = resolveEnv(proj)
+      n.bedrock_key_config = bk
+    }
+  }
+  if (kind === "replicate") {
+    const dep = a.use_deployments_endpoint
+    if (dep !== undefined) {
+      let rk = n.replicate_key_config ?? {}
+      rk.use_deployments_endpoint = dep
+      n.replicate_key_config = rk
+    }
+  }
+  return n
+}
+
+// ---- directions (Bifrost's load_balancer_config, Level 1) ----
+
+// The switches of the provider (direction) level, from health: select is direction_selection (on unless false);
+// append, reroute and prune are append_fallbacks_to_pinned, reroute_failed_directions and prune_failed_fallbacks.
+export type DirectionOpts = { select: bool, append: bool, reroute: bool, prune: bool }
+
+// The direction switches in force: none unless adaptive load balancing is on.
+export function directionOpts(cfg: Config): DirectionOpts {
+  const hc = cfg.health
+  const on = hc?.adaptive === true && hc?.direction_selection !== false
+  return { select: on, append: on && hc?.append_fallbacks_to_pinned === true, reroute: on && hc?.reroute_failed_directions === true, prune: on && hc?.prune_failed_fallbacks === true }
+}
+
+// The configured providers that can serve a model: one with a key that lists it (or lists no models, or aliases
+// it), in the config's order. A provider with no keys serves whatever it is asked (keyless).
+export function eligibleProviders(cfg: Config, model: string): string[] {
+  const out: string[] = []
+  const ps = cfg.providers
+  if (ps === undefined) return out
+  for (const name of ps.keys()) {
+    const keys = ps.get(name)!.keys ?? []
+    if (keys.length === 0 || keys.some((k) => keyAllows(k, model) && ((k.models ?? []).length > 0 || datasheetProviders(model).some((c) => configName(c) === name)))) out.push(name)
+  }
+  return out
+}
+
+// Whether a direction (provider and model) is healthy: some key that serves the model has a closed breaker and is
+// not held. A provider with no keys, or one not configured, counts as healthy (nothing says otherwise).
+export function directionHealthy(cfg: Config, ref: ModelRef, health: Health, now: f64): bool {
+  const p = providerOf(cfg, ref.provider)
+  if (p === undefined) return true
+  const keys = p.keys ?? []
+  if (keys.length === 0) return true
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i]!
+    if (!keyAllows(k, ref.model)) continue
+    const hid = healthId(ref.provider, k, i)
+    const hs = health.holds.state(hid, ref.model, now)
+    if (hs === "held" || hs === "checking") continue
+    if (health.wouldAllow(hid, now)) return true
+  }
+  return false
+}
+
+// A request's directions after the provider level (Bifrost's adaptive load balancing, Level 1). refs[0] is the
+// primary and the rest its configured fallbacks; pinned says the request (or a routing rule) named the provider.
+// A request that names none takes a healthy provider for its model, the one it resolved to when that is healthy,
+// with the other healthy ones behind its fallbacks. A pinned request is left as it is, unless append adds the
+// healthy providers for its model behind its fallbacks, or reroute replaces a broken primary with a healthy
+// provider for the same model (kept when there is none; reroute appends as append does). prune drops broken
+// directions from the fallbacks wherever the list is rebuilt.
+export function directRefs(cfg: Config, refs: ModelRef[], pinned: bool, health: Health, o: DirectionOpts, now: f64): ModelRef[] {
+  if (!o.select || refs.length === 0) return refs
+  const first = refs[0]!
+  const ok = (r: ModelRef): bool => directionHealthy(cfg, r, health, now)
+  const broken = !ok(first)
+  if (pinned && !o.append && !(o.reroute && broken)) return refs
+  const candidates = eligibleProviders(cfg, first.model).filter((n) => n !== first.provider).map((n) => ({ provider: n, model: first.model }))
+  let primary = first
+  if (broken && (!pinned || o.reroute)) {
+    for (const c of candidates) {
+      if (ok(c)) {
+        primary = c
+        break
+      }
+    }
+  }
+  const out: ModelRef[] = [primary]
+  const has = (r: ModelRef): bool => out.some((x) => x.provider === r.provider && x.model === r.model)
+  for (const f of refs.slice(1)) {
+    if (o.prune && !ok(f)) continue
+    if (!has(f)) out.push(f)
+  }
+  for (const c of candidates) {
+    if (ok(c) && !has(c)) out.push(c)
+  }
+  return out
 }
 
 // How an upstream failure is handled.
@@ -284,6 +490,65 @@ export function maxRetries(p: ProviderConfig): int {
 export function timeoutMs(p: ProviderConfig): int {
   return (p.network_config?.default_request_timeout_in_seconds ?? 30) * 1000
 }
+
+test("an alias's provider overrides replace the key's settings for its requests", () => {
+  const al: Map<string, string | AliasTarget> = new Map()
+  al.set("east", { model_id: "gpt-4o", api_version: "2025-01-01-preview", endpoint: "https://east.openai.azure.com" })
+  al.set("plain", "gpt-4o")
+  const cfg: Config = { providers: new Map() }
+  cfg.providers!.set("azure", { keys: [{ value: "k", models: ["east", "plain"], aliases: al, azure_key_config: { endpoint: "https://main.openai.azure.com", api_version: "2024-10-21" } }] })
+  const t = target(cfg, { provider: "azure", model: "east" }, new Set<int>(), undefined)!.t
+  expect(t.model).toBe("gpt-4o")
+  expect(t.key.azure_key_config!.endpoint).toBe("https://east.openai.azure.com")
+  expect(t.key.azure_key_config!.api_version).toBe("2025-01-01-preview")
+  const p = target(cfg, { provider: "azure", model: "plain" }, new Set<int>(), undefined)!.t
+  expect(p.key.azure_key_config!.endpoint).toBe("https://main.openai.azure.com")
+  // the stored key is not changed
+  expect(cfg.providers!.get("azure")!.keys![0]!.azure_key_config!.endpoint).toBe("https://main.openai.azure.com")
+  const bk = aliasOverrides({ value: "", bedrock_key_config: { region: "us-east-1" } }, { model_id: "m", region: "eu-west-1", inference_profile_arn: "arn:aws:bedrock:eu-west-1:1:application-inference-profile/x", use_openai_endpoints: true }, "bedrock")
+  expect(bk.bedrock_key_config!.region).toBe("eu-west-1")
+  expect(bk.bedrock_key_config!.arn).toBe("arn:aws:bedrock:eu-west-1:1:application-inference-profile/x")
+  expect(bk.bedrock_key_config!.use_openai_endpoints).toBe(true)
+  const vk = aliasOverrides({ vertex_key_config: { project_id: "p1", region: "us-central1" } }, { model_id: "m", project_id: "p2", region: "europe-west4" }, "vertex")
+  expect(vk.vertex_key_config!.project_id).toBe("p2")
+  expect(vk.vertex_key_config!.region).toBe("europe-west4")
+  const mk = aliasOverrides({ value: "m", bedrock_key_config: { project_id: "p-key" } }, { model_id: "m", project_id: "p-alias", region: "us-west-2" }, "bedrock_mantle")
+  expect(mk.bedrock_key_config!.project_id).toBe("p-alias")
+  expect(mk.bedrock_key_config!.region).toBe("us-west-2")
+  const rk = aliasOverrides({ value: "r" }, { model_id: "acme/dep", use_deployments_endpoint: true }, "replicate")
+  expect(rk.replicate_key_config!.use_deployments_endpoint).toBe(true)
+  // an override for another provider is not applied
+  const other = aliasOverrides({ value: "k" }, { model_id: "m", api_version: "x", use_deployments_endpoint: true }, "openai")
+  expect(other.azure_key_config).toBeUndefined()
+  expect(other.replicate_key_config).toBeUndefined()
+})
+
+test("a key's blacklist wins over its models and aliases", () => {
+  const a: Map<string, string | AliasTarget> = new Map()
+  a.set("fast", "gpt-4o-mini")
+  const k: KeyConfig = { value: "k", models: [], aliases: a, blacklisted_models: ["GPT-4o", "fast"] }
+  expect(keyAllows(k, "gpt-4o")).toBe(false)
+  expect(keyAllows(k, "fast")).toBe(false)
+  expect(keyAllows(k, "gpt-4o-mini")).toBe(true)
+  expect(keyAllows({ value: "k", models: ["x"], blacklisted_models: ["*"] }, "x")).toBe(false)
+})
+
+test("the model listing goes through each key's aliases and blacklist", () => {
+  const a: Map<string, string | AliasTarget> = new Map()
+  a.set("house", { model_id: "gpt-4o" })
+  a.set("spare", "never-listed")
+  const ids = ["openai/gpt-4o", "openai/gpt-4o-mini", "openai/old-1"]
+  const k: KeyConfig = { value: "k", models: [], aliases: a, blacklisted_models: ["old-1"] }
+  expect(listingPipeline("openai", ids, [k])).toEqual(["openai/house", "openai/gpt-4o", "openai/gpt-4o-mini", "openai/spare"])
+  // a blacklisted alias name drops the alias, not its target
+  const k2: KeyConfig = { value: "k", models: [], aliases: a, blacklisted_models: ["house", "spare"] }
+  expect(listingPipeline("openai", ids, [k2])).toEqual(["openai/gpt-4o", "openai/gpt-4o-mini", "openai/old-1"])
+  // a key with a model list lists those, minus its blacklist; keys are joined without repeats
+  const k3: KeyConfig = { value: "k", models: ["a", "b", "*"], blacklisted_models: ["b"] }
+  expect(listingPipeline("p", [], [k3, { value: "k", models: ["a", "c"] }])).toEqual(["p/a", "p/c"])
+  // a keyless provider lists as it is
+  expect(listingPipeline("p", ["p/x"], [])).toEqual(["p/x"])
+})
 
 test("parses provider-prefixed and bare models", () => {
   const cfg: Config = { providers: new Map() }
@@ -418,4 +683,50 @@ test("classifies failures and backs off", () => {
   const d = backoffMs(p, 3, undefined)
   expect(d >= 240 && d <= 360).toBe(true)
   expect(backoffMs(p, 0, "2")).toBe(2000)
+})
+
+test("directions: a broken pinned provider is rerouted, healthy ones are appended, broken fallbacks pruned", () => {
+  const cfg: Config = { providers: new Map(), health: { adaptive: true, reroute_failed_directions: true, prune_failed_fallbacks: true } }
+  cfg.providers!.set("openai", { keys: [{ name: "o", value: "1", models: ["gpt-x"] }] })
+  cfg.providers!.set("groq", { keys: [{ name: "g", value: "2", models: ["gpt-x"] }] })
+  cfg.providers!.set("mistral", { keys: [{ name: "m", value: "3", models: ["other"] }] })
+  cfg.providers!.set("azure", { keys: [{ name: "a", value: "4", models: ["gpt-x"] }] })
+  const h = new Health()
+  const now = Date.now()
+  const pin: ModelRef[] = [{ provider: "openai", model: "gpt-x" }]
+  expect(eligibleProviders(cfg, "gpt-x").join(",")).toBe("openai,groq,azure")
+  const o = directionOpts(cfg)
+  expect(o.select && o.reroute && o.prune && !o.append).toBe(true)
+  // healthy and pinned, append off: untouched
+  expect(directRefs(cfg, pin, true, h, o, now).length).toBe(1)
+  // the pinned provider's only key opens its breaker: rerouted, and the healthy ones follow
+  for (let i = 0; i < 5; i++) h.record("openai#o", false, 0.0, now)
+  expect(directionHealthy(cfg, pin[0]!, h, now)).toBe(false)
+  const r = directRefs(cfg, pin, true, h, o, now)
+  expect(r.map((x) => x.provider).join(",")).toBe("groq,azure")
+  // a broken fallback is pruned
+  for (let i = 0; i < 5; i++) h.record("azure#a", false, 0.0, now)
+  const withFb: ModelRef[] = [{ provider: "groq", model: "gpt-x" }, { provider: "azure", model: "gpt-x" }]
+  const pruned = directRefs(cfg, withFb, true, h, { select: true, append: true, reroute: false, prune: true }, now)
+  expect(pruned.map((x) => x.provider).join(",")).toBe("groq")
+  // with nothing healthy the pinned provider is kept
+  for (let i = 0; i < 5; i++) h.record("groq#g", false, 0.0, now)
+  expect(directRefs(cfg, pin, true, h, o, now).map((x) => x.provider).join(",")).toBe("openai")
+  // adaptive off: nothing changes
+  const off: Config = { providers: cfg.providers, health: { adaptive: false, reroute_failed_directions: true } }
+  expect(directionOpts(off).select).toBe(false)
+  expect(directRefs(cfg, pin, true, h, directionOpts(off), now).length).toBe(1)
+})
+
+test("directions: an unpinned request takes a healthy provider, and append gives a pinned one fallbacks", () => {
+  const cfg: Config = { providers: new Map(), health: { adaptive: true, append_fallbacks_to_pinned: true } }
+  cfg.providers!.set("openai", { keys: [{ name: "o", value: "1", models: ["gpt-x"] }] })
+  cfg.providers!.set("groq", { keys: [{ name: "g", value: "2", models: ["gpt-x"] }] })
+  const h = new Health()
+  const now = Date.now()
+  const pin: ModelRef[] = [{ provider: "openai", model: "gpt-x" }]
+  expect(directRefs(cfg, pin, true, h, directionOpts(cfg), now).map((x) => x.provider).join(",")).toBe("openai,groq")
+  h.holds.settle("openai#o", "gpt-x", "refused", "credential", "bad key", undefined, now, 0.5)
+  const un = directRefs(cfg, pin, false, h, { select: true, append: false, reroute: false, prune: false }, now)
+  expect(un.map((x) => x.provider).join(",")).toBe("groq")
 })

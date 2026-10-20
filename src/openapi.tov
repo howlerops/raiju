@@ -1,9 +1,14 @@
-// OpenAPI-defined MCP clients (Bifrost's connection_type "openapi"): each operation of a JSON OpenAPI
-// 3.x document becomes a tool, and a call sends the HTTP request the operation describes. Parameters
-// and the JSON request body are the tool's arguments; $ref is kept as written and not resolved, and
-// YAML and Swagger 2.0 documents are refused (see LIMITS in the ledger report).
+// OpenAPI-defined MCP clients (Bifrost's connection_type "openapi", framework/openapimcp): each operation of an
+// OpenAPI 3.x or Swagger 2.0 document, JSON or YAML, becomes a tool, and a call sends the HTTP request the
+// operation describes. Local $refs are resolved where they are used (a cycle is cut with a placeholder, an
+// external $ref makes only its operation unsupported); the input schema is flattened as Bifrost does (the
+// parameters and the body's properties side by side, a clash suffixed "__<in>"), normalised to the keywords
+// tool schemas take; and each call applies the security requirement of its operation (else the document's)
+// that the configured credentials satisfy.
 import { Field, fields, elements, find, rawStr, rawBool, isNull, quote } from "./json"
+import { yamlToJson } from "./yaml"
 import * as b64 from "./base64"
+import { sha256, toHex } from "./crypto"
 import { deadline } from "./deadline"
 
 // Bifrost's openapi_config. spec holds the document as text; spec_url is fetched when spec is not set.
@@ -11,132 +16,1369 @@ export type OpenApiCred = { value?: string, username?: string, password?: string
 export type OpenApiConfig = {
   spec?: string,
   spec_url?: string,
+  // config.json only: a file holding the document, relative to the config file's folder (and inside it)
+  spec_file?: string,
   base_url?: string,
   security_credentials?: Map<string, OpenApiCred>,
   include_deprecated?: bool,
   max_response_bytes?: int,
+  // server-computed when a client is saved over the API (Bifrost's ApplyMetadata)
+  spec_size?: int,
+  spec_hash?: string,
+  spec_title?: string,
+  openapi_version?: string,
+  operation_count?: int,
 }
 
-export type OpParam = { name: string, in: string, required: bool, schema: string }
-export type OpBody = { required: bool, schema: string }
-export type OpScheme = { name: string, type: string, in: string, param_name: string, scheme: string }
-export type OpenApiOp = { name: string, method: string, path: string, description: string, deprecated: bool, params: OpParam[], body?: OpBody }
-export type OpenApiDoc = { title: string, version: string, openapi_version: string, description: string, servers: string[], ops: OpenApiOp[], schemes: OpScheme[] }
+export type OpParam = { name: string, in: string, required: bool, schema: string, description: string, style: string, explode?: bool, contentType: string, unsupported: string }
+export type OpBody = { contentType: string, required: bool, description: string, schema: string, delimiters: Map<string, string> }
+export type OpScheme = { name: string, type: string, in: string, param_name: string, scheme: string, description: string, supported: bool, reason: string }
+// How one tool argument reaches the request: its place, its name there, and how it is serialised.
+export type ArgBinding = { arg: string, in: string, name: string, required: bool, explode: bool, style: string, contentType: string }
+export type OpenApiOp = {
+  name: string,
+  operationId: string,
+  method: string,
+  path: string,
+  summary: string,
+  description: string,
+  deprecated: bool,
+  params: OpParam[],
+  body?: OpBody,
+  servers: string[],
+  hasSecurity: bool,
+  security: string[][],
+  unsupported: string,
+  // the synthesized tool: its input schema, argument bindings and body binding ("flattened" or "single")
+  inputSchema: string,
+  args: ArgBinding[],
+  bodyMode: string,
+  bodyArgs: string[],
+  requiredIfSent: string[],
+  warnings: string[],
+}
+export type Unsupported = { operation_id: string, method: string, path: string, reason: string }
+export type OpenApiDoc = {
+  title: string,
+  version: string,
+  openapi_version: string,
+  description: string,
+  servers: string[],
+  // the operations that became tools
+  ops: OpenApiOp[],
+  unsupported: Unsupported[],
+  schemes: OpScheme[],
+  globalSecurity: string[][],
+  warnings: string[],
+  spec_size: int,
+  spec_hash: string,
+}
 export type OpRequest = { method: string, url: string, headers: Map<string, string>, body?: string }
 
-const METHODS: string[] = ["get", "post", "put", "patch", "delete"]
-const NAME_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+const MAX_SPEC_BYTES = 5242880
 const MAX_RESPONSE_BYTES = 65536
+const MAX_TOOL_NAME = 64
+const MIN_TOOL_BUDGET = 16
+const MAX_DESCRIPTION = 1024
+const MAX_REF_DEPTH = 32
+const MAX_NODES = 50000
+const MAX_TOOLS = 1000
+const WARN_TOOLS = 128
+const JSON_CT = "application/json"
+const FORM_CT = "application/x-www-form-urlencoded"
+const TEXT_CT = "text/plain"
+const DEFAULT_ACCEPT = "application/json, text/*;q=0.9, */*;q=0.1"
+const NAME_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+const DIGITS = "0123456789"
+const SCHEMA_KEYS: string[] = ["type", "description", "properties", "required", "additionalProperties", "enum", "items", "minItems", "maxItems", "uniqueItems", "anyOf", "oneOf", "allOf", "format", "pattern", "minLength", "maxLength", "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf", "title", "default", "nullable", "const"]
+const SWAGGER2_SCHEMA_KEYS: string[] = ["type", "format", "items", "enum", "default", "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "minLength", "maxLength", "pattern", "minItems", "maxItems", "uniqueItems", "multipleOf"]
+const EXTERNAL_REF = "external $ref is not supported"
 
-// Bifrost's tool names: the operationId, else the method and path, with each byte outside [a-zA-Z0-9_-] as "_".
-function safeName(s: string): string {
-  const bytes = new TextEncoder().encode(s)
-  let out = ""
-  for (let i = 0; i < bytes.length; i++) {
-    const c = int(bytes[i]!)
-    const ch = s.slice(i, i + 1)
-    out += c < 128 && NAME_CHARS.includes(ch) ? ch : "_"
+// ---- small helpers ----
+
+function obj(raw: string | undefined): Field[] {
+  if (raw === undefined || !raw.trim().startsWith("{")) return []
+  try {
+    return fields(raw.trim())
+  } catch (e) {
+    return []
   }
-  return out
 }
 
-// The parameters of an operation, its path-level ones first; an operation's own parameter of the same
-// name and place replaces the path-level one.
-function paramsOf(pathFields: Field[], opFields: Field[]): OpParam[] throws SyntaxError {
-  const out: OpParam[] = []
-  for (const list of [pathFields, opFields]) {
-    const raw = find(list, "parameters")
-    if (raw === undefined || !raw.startsWith("[")) continue
-    for (const el of try elements(raw)) {
-      const pf = try fields(el)
-      const name = rawStr(pf, "name") ?? ""
-      const where = rawStr(pf, "in") ?? ""
-      if (name === "" || where === "") continue
-      const schema = find(pf, "schema")
-      const p: OpParam = { name: name, in: where, required: rawBool(pf, "required") ?? (where === "path"), schema: schema === undefined || isNull(schema) ? "{\"type\":\"string\"}" : schema }
-      let at = -1
-      for (let i = 0; i < out.length; i++) {
-        if (out[i]!.name === name && out[i]!.in === where) at = i
-      }
-      if (at >= 0) out[at] = p
-      else out.push(p)
+function arr(raw: string | undefined): string[] {
+  if (raw === undefined || !raw.trim().startsWith("[")) return []
+  try {
+    return elements(raw.trim())
+  } catch (e) {
+    return []
+  }
+}
+
+// A scalar as text: a string's value, a number's or boolean's JSON text; "" for anything else.
+function str(raw: string | undefined): string {
+  if (raw === undefined) return ""
+  const t = raw.trim()
+  if (t.startsWith("\"")) {
+    try {
+      const s: string = JSON.parse(t)
+      return s
+    } catch (e) {
+      return ""
     }
   }
+  if (t === "null" || t.startsWith("{") || t.startsWith("[")) return ""
+  return t
+}
+
+function strList(raw: string | undefined): string[] {
+  const out: string[] = []
+  for (const el of arr(raw)) {
+    const s = str(el)
+    if (s !== "") out.push(s)
+  }
   return out
 }
 
-// The JSON request body schema, when the operation has one that is JSON.
-function bodyOf(opFields: Field[]): OpBody | undefined throws SyntaxError {
-  const raw = find(opFields, "requestBody")
-  if (raw === undefined || !raw.startsWith("{")) return undefined
-  const rf = try fields(raw)
-  const content = find(rf, "content")
-  if (content === undefined || !content.startsWith("{")) return undefined
-  const media = find(try fields(content), "application/json")
-  if (media === undefined || !media.startsWith("{")) return undefined
-  const schema = find(try fields(media), "schema") ?? "{}"
-  return { required: rawBool(rf, "required") ?? false, schema: schema }
+function sortedFields(fs: Field[]): Field[] {
+  const out = fs.slice(0)
+  out.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
+  return out
 }
 
-// Parses a JSON OpenAPI 3.x document. Operations marked deprecated are left out unless include_deprecated.
-export function parseSpec(text: string, includeDeprecated: bool): OpenApiDoc throws SyntaxError {
-  const root = try fields(text.trim())
-  const version = rawStr(root, "openapi") ?? ""
-  if (!version.startsWith("3.")) throw new SyntaxError(version === "" ? "the document has no openapi version (only OpenAPI 3.x JSON is supported)" : `OpenAPI ${version} is not supported (only OpenAPI 3.x JSON)`)
-  const info = try fields(find(root, "info") ?? "{}")
-  const servers: string[] = []
-  for (const sv of try elements(find(root, "servers") ?? "[]")) {
-    const u = rawStr(try fields(sv), "url") ?? ""
-    if (u !== "") servers.push(u)
+function sortStrings(xs: string[]): string[] {
+  const out = xs.slice(0)
+  out.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+  return out
+}
+
+function objText(fs: Field[]): string {
+  const parts: string[] = []
+  for (const f of fs) parts.push(quote(f.key) + ":" + f.raw)
+  return "{" + parts.join(",") + "}"
+}
+
+function put(inout fs: Field[], key: string, raw: string): void {
+  for (let i = 0; i < fs.length; i++) {
+    if (fs[i]!.key === key) {
+      fs[i] = { key: key, raw: raw }
+      return
+    }
+  }
+  fs.push({ key: key, raw: raw })
+}
+
+function has(fs: Field[], key: string): bool {
+  return find(fs, key) !== undefined
+}
+
+function union(a: string[], b: string[]): string[] {
+  const out: string[] = []
+  for (const s of a.concat(b)) {
+    if (!out.includes(s)) out.push(s)
+  }
+  return sortStrings(out)
+}
+
+function quoteList(xs: string[]): string {
+  return "[" + xs.map((x: string): string => quote(x)).join(",") + "]"
+}
+
+function lowerBase(mt: string): string {
+  const semi = mt.indexOf(";")
+  return (semi < 0 ? mt : mt.slice(0, semi)).trim().toLowerCase()
+}
+
+function isAbsoluteHttp(u: string): bool {
+  const t = u.trim()
+  const rest = t.startsWith("https://") ? t.slice(8) : t.startsWith("http://") ? t.slice(7) : ""
+  return rest !== "" && !rest.startsWith("/")
+}
+
+// The origin of an absolute http(s) URL ("https://host:port").
+function originOf(u: string): string {
+  const scheme = u.indexOf("://")
+  if (scheme < 0) return ""
+  const rest = u.slice(scheme + 3)
+  const slash = rest.indexOf("/")
+  return slash < 0 ? u : u.slice(0, scheme + 3 + slash)
+}
+
+// A relative server URL resolved against an absolute base (the spec's URL); unchanged when it cannot be.
+function resolveRelative(u: string, base: string): string {
+  if (isAbsoluteHttp(u) || !isAbsoluteHttp(base)) return u
+  if (u.startsWith("//")) return base.slice(0, base.indexOf("//")) + u
+  if (u.startsWith("/")) return originOf(base) + u
+  const q = base.indexOf("?")
+  const clean = q < 0 ? base : base.slice(0, q)
+  const origin = originOf(clean)
+  const path = clean.slice(origin.byteLength)
+  let dir = path
+  const parts = path.split("/")
+  if (parts.length > 0) {
+    parts.pop()
+    dir = parts.join("/") + "/"
+  }
+  if (!dir.startsWith("/")) dir = "/" + dir
+  const segs: string[] = []
+  for (const s of (dir + u).split("/")) {
+    if (s === ".") continue
+    if (s === "..") {
+      if (segs.length > 1) segs.pop()
+      continue
+    }
+    segs.push(s)
+  }
+  return origin + segs.join("/")
+}
+
+// The first max bytes of s, cut back to a character boundary.
+function cutUtf8(s: string, max: int): string {
+  const b = new TextEncoder().encode(s)
+  if (b.length <= max) return s
+  let cut = max
+  while (cut > 0 && (int(b[cut]!) & 192) === 128) cut--
+  return s.slice(0, cut)
+}
+
+// Percent-decodes a JSON pointer segment (a bad escape is kept as written).
+function pctDecode(s: string): string {
+  if (!s.includes("%")) return s
+  const hex = "0123456789abcdefABCDEF"
+  const bytes: u8[] = []
+  const src = new TextEncoder().encode(s)
+  let i = 0
+  while (i < src.length) {
+    const c = int(src[i]!)
+    if (c === 37 && i + 2 < src.length) {
+      const h = hex.indexOf(s.slice(i + 1, i + 2))
+      const l = hex.indexOf(s.slice(i + 2, i + 3))
+      if (h >= 0 && l >= 0) {
+        bytes.push(u8((h >= 16 ? h - 6 : h) * 16 + (l >= 16 ? l - 6 : l)))
+        i += 3
+        continue
+      }
+    }
+    bytes.push(src[i]!)
+    i++
+  }
+  try {
+    return new TextDecoder().decode(bytes)
+  } catch (e) {
+    return s
+  }
+}
+
+// ---- $ref resolution ----
+
+// Expands local JSON-pointer $refs against the document, at their point of use. Each resolve may produce at
+// most MAX_NODES nodes, so shared references cannot blow a small spec up.
+class Resolver {
+  warnings: string[] = []
+  private cache: Map<string, string> = new Map()
+  private nodes = 0
+  constructor(readonly root: string, readonly siblings: bool) {}
+
+  warn(w: string): void {
+    this.warnings.push(w)
+  }
+
+  // The node a "#/a/b/c" pointer names.
+  lookup(ref: string): string throws SyntaxError {
+    const hit = this.cache.get(ref)
+    if (hit !== undefined) return hit
+    const pointer = ref.slice(1)
+    if (pointer === "") return this.root
+    if (!pointer.startsWith("/")) throw new SyntaxError(`unsupported $ref "${ref}" (expected a JSON pointer)`)
+    let cur = this.root
+    for (const seg0 of pointer.slice(1).split("/")) {
+      const seg = pctDecode(seg0).split("~1").join("/").split("~0").join("~")
+      const t = cur.trim()
+      if (t.startsWith("{")) {
+        const next = find(try fields(t), seg)
+        if (next === undefined) throw new SyntaxError(`$ref "${ref}" does not resolve: missing "${seg}"`)
+        cur = next
+      } else if (t.startsWith("[")) {
+        const idx = parseInt(seg)
+        const els = try elements(t)
+        if (idx === undefined || idx < 0 || idx >= els.length) throw new SyntaxError(`$ref "${ref}" does not resolve: bad index "${seg}"`)
+        cur = els[idx]!
+      } else {
+        throw new SyntaxError(`$ref "${ref}" does not resolve: "${seg}" is not a container`)
+      }
+    }
+    this.cache.set(ref, cur)
+    return cur
+  }
+
+  // A copy of node with every local $ref expanded.
+  resolve(node: string): string throws SyntaxError {
+    this.nodes = 0
+    return try this.at(node, [], 0)
+  }
+
+  private at(node: string, stack: string[], depth: int): string throws SyntaxError {
+    const t = node.trim()
+    if (t.startsWith("{") || t.startsWith("[")) {
+      this.nodes++
+      if (this.nodes > MAX_NODES) throw new SyntaxError(`schema expands to more than ${MAX_NODES} nodes through shared $refs`)
+    }
+    if (t.startsWith("[")) {
+      const out: string[] = []
+      for (const el of try elements(t)) out.push(try this.at(el, stack, depth))
+      return "[" + out.join(",") + "]"
+    }
+    if (!t.startsWith("{")) return t
+    const fs = try fields(t)
+    const refRaw = find(fs, "$ref")
+    if (refRaw !== undefined && refRaw.startsWith("\"")) {
+      const ref = str(refRaw)
+      if (!ref.startsWith("#")) throw new SyntaxError(`${EXTERNAL_REF}: "${ref}"`)
+      if (stack.includes(ref)) {
+        this.warn(`recursive $ref ${ref} cut at its point of re-entry`)
+        return `{"type":"object","description":${quote("recursive reference to " + ref)}}`
+      }
+      if (depth >= MAX_REF_DEPTH) throw new SyntaxError(`$ref chain deeper than ${MAX_REF_DEPTH} at ${ref}`)
+      const target = try this.lookup(ref)
+      const inner = stack.concat([ref])
+      const resolved = try this.at(target, inner, depth + 1)
+      if (resolved.startsWith("{") && fs.length > 1) return try this.mergeSiblings(resolved, fs, stack, depth)
+      return resolved
+    }
+    const out: Field[] = []
+    for (const f of fs) {
+      // example and default data, enums and extensions are values: a $ref inside them is data
+      if (instanceKey(f.key)) {
+        out.push(f)
+        continue
+      }
+      if ((f.key === "properties" || f.key === "patternProperties") && f.raw.trim().startsWith("{")) {
+        const props: Field[] = []
+        for (const p of try fields(f.raw.trim())) props.push({ key: p.key, raw: try this.at(p.raw, stack, depth) })
+        out.push({ key: f.key, raw: objText(props) })
+        continue
+      }
+      out.push({ key: f.key, raw: try this.at(f.raw, stack, depth) })
+    }
+    return objText(out)
+  }
+
+  // The keywords beside a $ref applied to its target: from 3.1 all of them (properties and required unioned,
+  // the rest overriding), before it only summary and description.
+  private mergeSiblings(target: string, ref: Field[], stack: string[], depth: int): string throws SyntaxError {
+    let out = try fields(target)
+    for (const f of sortedFields(ref)) {
+      if (f.key === "$ref" || (!this.siblings && f.key !== "description" && f.key !== "summary")) continue
+      const v = try this.at(f.raw, stack, depth)
+      if (f.key === "properties") {
+        let merged = obj(find(out, "properties"))
+        for (const p of obj(v)) put(&merged, p.key, p.raw)
+        put(&out, "properties", objText(merged))
+      } else if (f.key === "required") {
+        put(&out, "required", quoteList(union(strList(find(out, "required")), strList(v))))
+      } else {
+        put(&out, f.key, v)
+      }
+    }
+    return objText(out)
+  }
+
+  // Follows only the node's own $ref (and ref-to-ref chains), leaving nested references in place.
+  shallow(node: string): string throws SyntaxError {
+    let cur = node
+    for (let d = 0; d <= MAX_REF_DEPTH; d++) {
+      const t = cur.trim()
+      if (!t.startsWith("{")) return t
+      const refRaw = find(try fields(t), "$ref")
+      if (refRaw === undefined || !refRaw.startsWith("\"")) return t
+      const ref = str(refRaw)
+      if (!ref.startsWith("#")) throw new SyntaxError(`${EXTERNAL_REF}: "${ref}"`)
+      cur = try this.lookup(ref)
+    }
+    throw new SyntaxError(`$ref chain deeper than ${MAX_REF_DEPTH}`)
+  }
+}
+
+function instanceKey(k: string): bool {
+  return k === "example" || k === "examples" || k === "default" || k === "enum" || k === "const" || k.startsWith("x-")
+}
+
+// ---- parsing ----
+
+type Version = { raw: string, swagger2: bool, minor: int, warnings: string[] }
+
+function detectVersion(root: Field[]): Version throws SyntaxError {
+  const sw = find(root, "swagger")
+  if (sw !== undefined) {
+    const s = str(sw)
+    if (s !== "2.0" && s !== "2") throw new SyntaxError(`unsupported swagger version "${s}" (only 2.0 is supported)`)
+    return { raw: "2.0", swagger2: true, minor: 0, warnings: [] }
+  }
+  const oa = find(root, "openapi")
+  if (oa === undefined) throw new SyntaxError("not an OpenAPI document: missing top-level \"openapi\" (3.x) or \"swagger\" (2.0) field")
+  const s = str(oa)
+  const parts = s.split(".")
+  const major = parts.length >= 2 ? parseInt(parts[0]!) : undefined
+  const minor0 = parts.length >= 2 ? parseInt(parts[1]!) : undefined
+  if (major === undefined || minor0 === undefined) throw new SyntaxError(`malformed openapi version "${s}"`)
+  if (major !== 3) throw new SyntaxError(`unsupported openapi version "${s}" (supported: Swagger 2.0, OpenAPI 3.0 to 3.2)`)
+  const warnings: string[] = []
+  let minor = minor0
+  if (minor > 2) {
+    warnings.push(`openapi ${s} is newer than the latest supported minor (3.2); parsed best-effort as 3.2`)
+    minor = 2
+  }
+  return { raw: s, swagger2: false, minor: minor, warnings: warnings }
+}
+
+// The document as JSON text: JSON as given, else YAML read into JSON.
+export function specJson(text: string): string throws SyntaxError {
+  let t = text.trim()
+  if (t.startsWith("\u{FEFF}")) t = t.slice(3).trim()
+  if (t === "") throw new SyntaxError("openapi spec is empty")
+  if (t.startsWith("{") || t.startsWith("[")) {
+    try {
+      const fs = fields(t)
+      if (fs.length >= 0) return t
+    } catch (e) {
+      throw new SyntaxError(`invalid JSON: ${e.message}`)
+    }
+  }
+  try {
+    const j = yamlToJson(text)
+    if (!j.startsWith("{")) throw new SyntaxError("invalid spec: top level must be a mapping")
+    return j
+  } catch (e) {
+    throw new SyntaxError(e.message.startsWith("invalid spec") ? e.message : `invalid YAML: ${e.message}`)
+  }
+}
+
+function parseScheme(name: string, f: Field[], swagger2: bool): OpScheme {
+  const s: OpScheme = { name: name, type: str(find(f, "type")).trim(), in: "", param_name: "", scheme: "", description: str(find(f, "description")).trim(), supported: false, reason: "" }
+  if (s.type === "apiKey") {
+    s.in = str(find(f, "in")).trim().toLowerCase()
+    s.param_name = str(find(f, "name")).trim()
+    if (s.in === "header" || s.in === "query" || s.in === "cookie") {
+      s.supported = s.param_name !== ""
+      if (!s.supported) s.reason = "apiKey scheme has no parameter name"
+    } else {
+      s.reason = `apiKey location "${s.in}" is not supported`
+    }
+  } else if (s.type === "basic") {
+    if (swagger2) {
+      s.type = "http"
+      s.scheme = "basic"
+      s.supported = true
+    } else {
+      s.reason = `security scheme type "${s.type}" is not supported`
+    }
+  } else if (s.type === "http") {
+    s.scheme = str(find(f, "scheme")).trim().toLowerCase()
+    if (s.scheme === "bearer" || s.scheme === "basic") s.supported = true
+    else s.reason = `http authentication scheme "${s.scheme}" is not supported (bearer and basic only)`
+  } else if (s.type === "oauth2" || s.type === "openIdConnect" || s.type === "mutualTLS") {
+    s.reason = `${s.type} security schemes are not supported; configure an API key or bearer/basic credential, or static headers`
+  } else {
+    s.reason = `security scheme type "${s.type}" is not supported`
+  }
+  return s
+}
+
+// Security requirements as lists of scheme names (the scopes are not needed to send a credential).
+function parseRequirements(raw: string | undefined): string[][] {
+  const out: string[][] = []
+  for (const el of arr(raw)) {
+    out.push(sortStrings(obj(el).map((f: Field): string => f.key)))
+  }
+  return out
+}
+
+function parseServers(raw: string | undefined, specUrl: string, inout warnings: string[]): string[] {
+  const out: string[] = []
+  for (const el of arr(raw)) {
+    const sf = obj(el)
+    let u = str(find(sf, "url")).trim()
+    if (u === "") continue
+    for (const v of sortedFields(obj(find(sf, "variables")))) {
+      const vf = obj(v.raw)
+      let def = str(find(vf, "default"))
+      if (def === "") {
+        const en = strList(find(vf, "enum"))
+        if (en.length > 0) def = en[0]!
+      }
+      u = u.split("{" + v.key + "}").join(def)
+    }
+    u = resolveRelative(u, specUrl)
+    if (!isAbsoluteHttp(u)) warnings.push(`server url "${u}" is relative and could not be resolved; set openapi_config.base_url`)
+    if (!out.includes(u)) out.push(u)
+  }
+  return out
+}
+
+function ignoredHeader(where: string, name: string): bool {
+  if (where.trim().toLowerCase() !== "header") return false
+  const n = name.trim().toLowerCase()
+  return n === "accept" || n === "content-type" || n === "authorization"
+}
+
+function newOp(method: string, path: string, of: Field[]): OpenApiOp {
+  return {
+    name: "",
+    operationId: str(find(of, "operationId")).trim(),
+    method: method,
+    path: path,
+    summary: str(find(of, "summary")).trim(),
+    description: str(find(of, "description")).trim(),
+    deprecated: rawBool(of, "deprecated") ?? false,
+    params: [],
+    servers: [],
+    hasSecurity: has(of, "security"),
+    security: parseRequirements(find(of, "security")),
+    unsupported: "",
+    inputSchema: "",
+    args: [],
+    bodyMode: "",
+    bodyArgs: [],
+    requiredIfSent: [],
+    warnings: [],
+  }
+}
+
+// A 3.x parameter list with its $refs resolved; error is set when one cannot be.
+function paramsV3(list: string[], res: Resolver): { params: OpParam[], error: string } {
+  const out: OpParam[] = []
+  for (const raw of list) {
+    let p: Field[] = []
+    try {
+      p = obj(try res.resolve(raw))
+    } catch (e) {
+      return { params: [], error: `parameters: ${e.message}` }
+    }
+    const name = str(find(p, "name")).trim()
+    const where = str(find(p, "in")).trim().toLowerCase()
+    if (name === "" || where === "" || ignoredHeader(where, name)) continue
+    const param: OpParam = { name: name, in: where, required: where === "path" || (rawBool(p, "required") ?? false), schema: "{\"type\":\"string\"}", description: str(find(p, "description")).trim(), style: str(find(p, "style")).trim(), explode: rawBool(p, "explode"), contentType: "", unsupported: "" }
+    let schema = find(p, "schema")
+    if (schema === undefined) {
+      const content = sortedFields(obj(find(p, "content")))
+      if (content.length > 0) {
+        schema = find(obj(content[0]!.raw), "schema")
+        param.contentType = lowerBase(content[0]!.key)
+      }
+    }
+    if (schema === "false") {
+      param.unsupported = `parameter "${name}" declares schema: false, which accepts no value`
+      param.schema = "{}"
+    } else if (schema === "true") {
+      param.schema = "{}"
+    } else if (schema !== undefined && schema.trim().startsWith("{")) {
+      param.schema = schema.trim()
+    }
+    out.push(param)
+  }
+  return { params: out, error: "" }
+}
+
+// Operation parameters over path-item ones: the same name and place is replaced, path-item order first.
+function mergeParams(pathParams: OpParam[], opParams: OpParam[]): OpParam[] {
+  const out: OpParam[] = []
+  for (const p of pathParams) {
+    if (!opParams.some((o) => o.in === p.in && o.name === p.name)) out.push(p)
+  }
+  for (const p of opParams) out.push(p)
+  return out
+}
+
+function jsonMedia(mt: string): bool {
+  const m = lowerBase(mt)
+  if (m === "text/event-stream" || m === "application/jsonl" || m === "application/json-seq" || m === "multipart/mixed") return false
+  return m === JSON_CT || m.endsWith("+json") || (m.startsWith("application/") && m.includes("json"))
+}
+
+type BodyPick = { ok: bool, contentType: string, schema: string, reason: string }
+
+// The media type of a requestBody.content this executor can send, and its schema.
+function selectBody(content: Field[]): BodyPick {
+  if (content.length === 0) return { ok: false, contentType: "", schema: "", reason: "request body declares no content" }
+  let norm: Field[] = []
+  for (const c of content) put(&norm, lowerBase(c.key), c.raw)
+  const declared = sortStrings(norm.map((f: Field): string => f.key))
+  const pick = (key: string): BodyPick => {
+    const media = obj(find(norm, key))
+    if (has(media, "itemSchema")) return { ok: false, contentType: "", schema: "", reason: `streaming request body (${key} with itemSchema) is not supported` }
+    const s = find(media, "schema")
+    if (s === "true") return { ok: true, contentType: key, schema: "{}", reason: "" }
+    if (s === "false") return { ok: false, contentType: "", schema: "", reason: `request body ${key} declares schema: false, which accepts no value` }
+    if (s === undefined || !s.trim().startsWith("{")) return { ok: true, contentType: key, schema: key === TEXT_CT ? "{\"type\":\"string\"}" : "{\"type\":\"object\"}", reason: "" }
+    return { ok: true, contentType: key, schema: s.trim(), reason: "" }
+  }
+  let first = ""
+  for (const pref of [JSON_CT, FORM_CT, TEXT_CT]) {
+    if (!has(norm, pref)) continue
+    const p = pick(pref)
+    if (p.ok) return p
+    if (first === "") first = p.reason
+  }
+  for (const key of declared) {
+    if (key !== "*/*" && !jsonMedia(key)) continue
+    const p = pick(key)
+    if (p.ok) return { ok: true, contentType: key === "*/*" ? JSON_CT : key, schema: p.schema, reason: "" }
+    if (first === "") first = p.reason
+  }
+  if (first !== "") return { ok: false, contentType: "", schema: "", reason: first }
+  for (const key of declared) {
+    if (key === "text/event-stream" || key === "application/jsonl" || key === "application/json-seq" || key === "multipart/mixed") return { ok: false, contentType: "", schema: "", reason: `streaming request body (${key}) is not supported` }
+    if (key.startsWith("multipart/") || key.startsWith("application/octet-stream") || key.startsWith("image/") || key.startsWith("audio/") || key.startsWith("video/")) {
+      return { ok: false, contentType: "", schema: "", reason: `${key} request body is not supported (multipart/binary uploads cannot be expressed as tool arguments)` }
+    }
+  }
+  return { ok: false, contentType: "", schema: "", reason: `request body content type [${declared.join(" ")}] is not supported (JSON, form-urlencoded or text/plain only)` }
+}
+
+function buildOpV3(method: string, path: string, opRaw: string, pathParams: OpParam[], pathErr: string, pathServers: string[], res: Resolver, specUrl: string, inout warnings: string[]): OpenApiOp {
+  const of = obj(opRaw)
+  const op = newOp(method, path, of)
+  const own = parseServers(find(of, "servers"), specUrl, &warnings)
+  op.servers = own.length > 0 ? own : pathServers
+  if (pathErr !== "") {
+    op.unsupported = pathErr
+    return op
+  }
+  const pr = paramsV3(arr(find(of, "parameters")), res)
+  if (pr.error !== "") {
+    op.unsupported = pr.error
+    return op
+  }
+  // a parameter that accepts no value can only be left out: optional ones leave the tool, required ones the operation
+  for (const p of mergeParams(pathParams, pr.params)) {
+    if (p.unsupported !== "") {
+      if (p.required || p.in === "path") {
+        op.unsupported = p.unsupported
+        return op
+      }
+      res.warn(`${method} ${path}: optional ${p.unsupported} left out of the tool`)
+      continue
+    }
+    op.params.push(p)
+  }
+  const rbRaw = find(of, "requestBody")
+  if (rbRaw === undefined || isNull(rbRaw)) return op
+  let rb: Field[] = []
+  let content: Field[] = []
+  try {
+    rb = obj(try res.shallow(rbRaw))
+    let firstErr = ""
+    for (const c of sortedFields(obj(find(rb, "content")))) {
+      try {
+        content.push({ key: c.key, raw: try res.resolve(c.raw) })
+      } catch (e) {
+        if (firstErr === "") firstErr = e.message
+      }
+    }
+    if (content.length === 0 && firstErr !== "") throw new SyntaxError(firstErr)
+  } catch (e) {
+    op.unsupported = `request body: ${e.message}`
+    return op
+  }
+  const required = rawBool(rb, "required") ?? false
+  const pick = selectBody(content)
+  if (!pick.ok && !required && content.length > 0 && content.every((c) => find(obj(c.raw), "schema") === "false")) {
+    res.warn(`${method} ${path}: optional request body declares schema: false and is not sent`)
+    return op
+  }
+  if (!pick.ok) {
+    op.unsupported = pick.reason
+    return op
+  }
+  op.body = { contentType: pick.contentType, required: required, description: str(find(rb, "description")).trim(), schema: pick.schema, delimiters: new Map() }
+  return op
+}
+
+const METHODS_V3: string[] = ["get", "put", "post", "delete", "patch", "head", "options", "trace"]
+const METHODS_V2: string[] = ["get", "put", "post", "delete", "patch", "head", "options"]
+
+type Parsed = { servers: string[], schemes: OpScheme[], global: string[][], ops: OpenApiOp[], warnings: string[] }
+
+function parseV3(root: Field[], v: Version, res: Resolver, specUrl: string): Parsed throws SyntaxError {
+  let warnings: string[] = []
+  const servers = parseServers(find(root, "servers"), specUrl, &warnings)
+  const schemes: OpScheme[] = []
+  for (const sf of sortedFields(obj(find(obj(find(root, "components")), "securitySchemes")))) {
+    try {
+      schemes.push(parseScheme(sf.key, obj(try res.resolve(sf.raw)), false))
+    } catch (e) {
+      warnings.push(`security scheme "${sf.key}" skipped: ${e.message}`)
+    }
   }
   const ops: OpenApiOp[] = []
-  const paths = try fields(find(root, "paths") ?? "{}")
-  for (const pf of paths) {
-    if (!pf.raw.startsWith("{")) continue
-    const pathFields = try fields(pf.raw)
-    for (const method of METHODS) {
-      const ofRaw = find(pathFields, method)
-      if (ofRaw === undefined || !ofRaw.startsWith("{")) continue
-      const of = try fields(ofRaw)
-      const deprecated = rawBool(of, "deprecated") ?? false
-      if (deprecated && !includeDeprecated) continue
-      const opId = rawStr(of, "operationId") ?? ""
-      const name = opId !== "" ? safeName(opId) : safeName(`${method}_${pf.key}`)
-      const desc = rawStr(of, "summary") ?? rawStr(of, "description") ?? ""
-      const op: OpenApiOp = { name: name, method: method.toUpperCase(), path: pf.key, description: desc, deprecated: deprecated, params: try paramsOf(pathFields, of) }
-      const body = try bodyOf(of)
-      if (body !== undefined) op.body = body
+  const methods = v.minor >= 2 ? METHODS_V3.concat(["query"]) : METHODS_V3
+  for (const pf of sortedFields(obj(find(root, "paths")))) {
+    let item: Field[] = []
+    try {
+      item = obj(try res.shallow(pf.raw))
+    } catch (e) {
+      if (e.message.startsWith(EXTERNAL_REF)) {
+        warnings.push(`path ${pf.key} skipped: ${e.message}`)
+        continue
+      }
+      throw new SyntaxError(`path ${pf.key}: ${e.message}`)
+    }
+    const pp = paramsV3(arr(find(item, "parameters")), res)
+    const pathServers = parseServers(find(item, "servers"), specUrl, &warnings)
+    for (const m of methods) {
+      const opRaw = find(item, m)
+      if (opRaw === undefined) continue
+      ops.push(buildOpV3(m.toUpperCase(), pf.key, opRaw, pp.params, pp.error, pathServers, res, specUrl, &warnings))
+    }
+    if (v.minor >= 2) {
+      for (const af of sortedFields(obj(find(item, "additionalOperations")))) {
+        ops.push(buildOpV3(af.key.toUpperCase(), pf.key, af.raw, pp.params, pp.error, pathServers, res, specUrl, &warnings))
+      }
+    }
+  }
+  return { servers: servers, schemes: schemes, global: parseRequirements(find(root, "security")), ops: ops, warnings: warnings }
+}
+
+// ---- Swagger 2.0 ----
+
+function pickScheme(schemes: string[]): string {
+  let s = ""
+  for (const x of schemes) {
+    if (x === "https") return "https"
+    if (x === "http") s = "http"
+  }
+  return s
+}
+
+// The inline schema fields of a 2.0 parameter (or items) as a schema; x-nullable becomes nullable.
+function swagger2Schema(p: Field[]): string {
+  let out: Field[] = []
+  for (const k of SWAGGER2_SCHEMA_KEYS) {
+    const v = find(p, k)
+    if (v !== undefined) put(&out, k, v)
+  }
+  const items = find(p, "items")
+  if (items !== undefined && items.trim().startsWith("{")) put(&out, "items", swagger2Schema(obj(items)))
+  if (rawBool(p, "x-nullable") === true) put(&out, "nullable", "true")
+  const desc = str(find(p, "description")).trim()
+  if (desc !== "" && !has(p, "in")) put(&out, "description", quote(desc))
+  if (!has(out, "type")) put(&out, "type", "\"string\"")
+  return objText(out)
+}
+
+function formDelimiter(format: string): string {
+  if (format === "multi") return ""
+  if (format === "ssv") return " "
+  if (format === "tsv") return "\t"
+  if (format === "pipes") return "|"
+  return ","
+}
+
+function swagger2BodyType(consumes: string[], form: bool): { ok: bool, ct: string, reason: string } {
+  if (consumes.length === 0) return { ok: true, ct: form ? FORM_CT : JSON_CT, reason: "" }
+  let hasJson = false
+  let hasForm = false
+  let hasText = false
+  let jsonType = ""
+  for (const c0 of consumes) {
+    const c = lowerBase(c0)
+    if (c.includes("json") || c === "*/*") {
+      hasJson = true
+      if (c === JSON_CT || (jsonType === "" && c !== "*/*")) jsonType = c
+    } else if (c === FORM_CT) {
+      hasForm = true
+    } else if (c.startsWith("text/plain")) {
+      hasText = true
+    }
+  }
+  if (form && hasForm) return { ok: true, ct: FORM_CT, reason: "" }
+  if (form && !hasJson) return { ok: false, ct: "", reason: `formData parameters with consumes [${consumes.join(" ")}] are not supported (multipart/binary request bodies are not supported)` }
+  if (form) return { ok: true, ct: FORM_CT, reason: "" }
+  if (hasJson) return { ok: true, ct: jsonType === "" ? JSON_CT : jsonType, reason: "" }
+  if (hasForm) return { ok: true, ct: FORM_CT, reason: "" }
+  if (hasText) return { ok: true, ct: TEXT_CT, reason: "" }
+  return { ok: false, ct: "", reason: `request body content type [${consumes.join(" ")}] is not supported (JSON, form-urlencoded or text/plain only)` }
+}
+
+// A 2.0 parameter list with its $refs resolved, the ignored header parameters left out.
+function resolveV2List(list: string[], res: Resolver): Field[][] throws SyntaxError {
+  const out: Field[][] = []
+  for (const raw of list) {
+    const p = obj(try res.resolve(raw))
+    if (ignoredHeader(str(find(p, "in")), str(find(p, "name")))) continue
+    out.push(p)
+  }
+  return out
+}
+
+function buildOpV2(method: string, path: string, opRaw: string, pathParamsRaw: string[], globalConsumes: string[], res: Resolver): OpenApiOp {
+  const of = obj(opRaw)
+  const op = newOp(method, path, of)
+  let consumes = strList(find(of, "consumes"))
+  if (consumes.length === 0) consumes = globalConsumes
+  let pathParams: Field[][] = []
+  let opParams: Field[][] = []
+  try {
+    pathParams = try resolveV2List(pathParamsRaw, res)
+    opParams = try resolveV2List(arr(find(of, "parameters")), res)
+  } catch (e) {
+    op.unsupported = `parameters: ${e.message}`
+    return op
+  }
+  const keyOf = (p: Field[]): string => str(find(p, "in")) + "\u{0}" + str(find(p, "name"))
+  const merged: Field[][] = []
+  for (const p of pathParams) {
+    if (!opParams.some((o) => keyOf(o) === keyOf(p))) merged.push(p)
+  }
+  for (const p of opParams) merged.push(p)
+  let bodyParam: Field[] | undefined = undefined
+  let formProps: Field[] = []
+  const formRequired: string[] = []
+  const delims: Map<string, string> = new Map()
+  let formSeen = false
+  for (const p of merged) {
+    const where = str(find(p, "in")).trim().toLowerCase()
+    const name = str(find(p, "name")).trim()
+    if (where === "body") {
+      if (bodyParam !== undefined) {
+        op.unsupported = "more than one body parameter (Swagger 2.0 allows one)"
+        return op
+      }
+      bodyParam = p
+    } else if (where === "formdata") {
+      formSeen = true
+      if (str(find(p, "type")) === "file") {
+        op.unsupported = "multipart/binary request body (file upload) is not supported"
+        return op
+      }
+      put(&formProps, name, swagger2Schema(p))
+      const d = formDelimiter(str(find(p, "collectionFormat")))
+      if (d !== "" && str(find(p, "type")) === "array") delims.set(name, d)
+      if (rawBool(p, "required") === true) formRequired.push(name)
+    } else if (where === "path" || where === "query" || where === "header") {
+      const cf = str(find(p, "collectionFormat"))
+      const style = cf === "ssv" ? "spaceDelimited" : cf === "tsv" ? "tabDelimited" : cf === "pipes" ? "pipeDelimited" : ""
+      op.params.push({ name: name, in: where, required: (rawBool(p, "required") ?? false) || where === "path", schema: swagger2Schema(p), description: str(find(p, "description")).trim(), style: style, explode: cf === "multi", contentType: "", unsupported: "" })
+    }
+  }
+  if (bodyParam !== undefined && formSeen) {
+    op.unsupported = "body and formData parameters together (Swagger 2.0 allows one or the other)"
+    return op
+  }
+  const bt = swagger2BodyType(consumes, formSeen)
+  if (bodyParam !== undefined) {
+    if (!bt.ok) {
+      op.unsupported = bt.reason
+      return op
+    }
+    const schema = find(bodyParam, "schema")
+    op.body = { contentType: bt.ct === FORM_CT ? JSON_CT : bt.ct, required: rawBool(bodyParam, "required") ?? false, description: str(find(bodyParam, "description")).trim(), schema: schema !== undefined && schema.trim().startsWith("{") ? schema.trim() : "{\"type\":\"object\"}", delimiters: new Map() }
+  } else if (formSeen) {
+    if (!bt.ok) {
+      op.unsupported = bt.reason
+      return op
+    }
+    const schema = formRequired.length > 0 ? `{"type":"object","properties":${objText(formProps)},"required":${quoteList(formRequired)}}` : `{"type":"object","properties":${objText(formProps)}}`
+    op.body = { contentType: FORM_CT, required: formRequired.length > 0, description: "", schema: schema, delimiters: delims }
+  }
+  return op
+}
+
+function parseSwagger2(root: Field[], res: Resolver, specUrl: string): Parsed {
+  let warnings: string[] = []
+  let host = str(find(root, "host")).trim()
+  const basePath = str(find(root, "basePath")).trim()
+  let scheme = pickScheme(strList(find(root, "schemes")))
+  // without schemes or host, the scheme and host the document was fetched from
+  if (isAbsoluteHttp(specUrl)) {
+    const origin = originOf(specUrl)
+    if (host === "") host = origin.slice(origin.indexOf("://") + 3)
+    if (scheme === "") scheme = specUrl.startsWith("https://") ? "https" : "http"
+  }
+  if (scheme === "") scheme = "https"
+  const base = basePath.endsWith("/") ? basePath.slice(0, basePath.byteLength - 1) : basePath
+  let servers: string[] = []
+  if (host !== "") servers = [`${scheme}://${host}${base}`]
+  else if (basePath !== "") {
+    servers = [basePath]
+    warnings.push(`swagger basePath "${basePath}" has no host; set openapi_config.base_url`)
+  }
+  const schemes: OpScheme[] = []
+  for (const sf of sortedFields(obj(find(root, "securityDefinitions")))) {
+    try {
+      schemes.push(parseScheme(sf.key, obj(try res.resolve(sf.raw)), true))
+    } catch (e) {
+      warnings.push(`security definition "${sf.key}" skipped: ${e.message}`)
+    }
+  }
+  const globalConsumes = strList(find(root, "consumes"))
+  const ops: OpenApiOp[] = []
+  for (const pf of sortedFields(obj(find(root, "paths")))) {
+    let item: Field[] = []
+    try {
+      item = obj(try res.shallow(pf.raw))
+    } catch (e) {
+      warnings.push(`path ${pf.key} skipped: ${e.message}`)
+      continue
+    }
+    const pathParams = arr(find(item, "parameters"))
+    for (const m of METHODS_V2) {
+      const opRaw = find(item, m)
+      if (opRaw === undefined) continue
+      const op = buildOpV2(m.toUpperCase(), pf.key, opRaw, pathParams, globalConsumes, res)
+      // an operation's own schemes override the document's, on the same host and base path
+      const own = pickScheme(strList(find(obj(opRaw), "schemes")))
+      if (own !== "" && own !== scheme && host !== "") op.servers = [`${own}://${host}${base}`]
       ops.push(op)
     }
   }
-  const schemes: OpScheme[] = []
-  const comps = find(root, "components")
-  const secRaw = comps === undefined ? undefined : find(try fields(comps), "securitySchemes")
-  if (secRaw !== undefined && secRaw.startsWith("{")) {
-    for (const sf of try fields(secRaw)) {
-      if (!sf.raw.startsWith("{")) continue
-      const f = try fields(sf.raw)
-      schemes.push({ name: sf.key, type: rawStr(f, "type") ?? "", in: rawStr(f, "in") ?? "", param_name: rawStr(f, "name") ?? "", scheme: rawStr(f, "scheme") ?? "" })
-    }
-  }
-  return { title: rawStr(info, "title") ?? "", version: rawStr(info, "version") ?? "", openapi_version: version, description: rawStr(info, "description") ?? "", servers: servers, ops: ops, schemes: schemes }
+  return { servers: servers, schemes: schemes, global: parseRequirements(find(root, "security")), ops: ops, warnings: warnings }
 }
 
-// The tool's input schema: one property per parameter, and "body" for the JSON request body.
-export function inputSchema(op: OpenApiOp): string {
-  const props: string[] = []
-  const required: string[] = []
-  for (const p of op.params) {
-    props.push(`${quote(p.name)}:${p.schema}`)
-    if (p.required) required.push(quote(p.name))
+// ---- schema normalisation and flattening ----
+
+// A copy of a schema in the 3.0-style dialect tool consumers take: 3.1 type arrays become nullable or anyOf,
+// an allOf of objects is merged, boolean exclusive bounds and readOnly properties go, and only the
+// allow-listed keywords stay.
+export function normalizeSchema(raw: string): string {
+  const t = raw.trim()
+  if (!t.startsWith("{")) return "{\"type\":\"object\"}"
+  return normalizeNode(t, 0)
+}
+
+function normalizeNode(raw: string, depth: int): string {
+  const t = raw.trim()
+  if (!t.startsWith("{") || depth > MAX_REF_DEPTH * 2) return t
+  const m = obj(t)
+  let out: Field[] = []
+  let nullable = rawBool(m, "nullable") === true || rawBool(m, "x-nullable") === true
+  const ty = find(m, "type")
+  if (ty !== undefined && ty.trim().startsWith("\"")) {
+    const s = str(ty)
+    if (s === "null") nullable = true
+    else put(&out, "type", quote(s))
+  } else if (ty !== undefined && ty.trim().startsWith("[")) {
+    const types: string[] = []
+    for (const s of strList(ty)) {
+      if (s === "null") nullable = true
+      else types.push(s)
+    }
+    if (types.length === 1) put(&out, "type", quote(types[0]!))
+    else if (types.length > 1) put(&out, "anyOf", "[" + types.map((x: string): string => `{"type":${quote(x)}}`).join(",") + "]")
   }
+  if (nullable) put(&out, "nullable", "true")
+  let allOfMerged: Field[] | undefined = undefined
+  for (const f of sortedFields(m)) {
+    const k = f.key
+    if (k === "type" || k === "nullable" || !SCHEMA_KEYS.includes(k)) continue
+    const v = f.raw.trim()
+    if (k === "exclusiveMinimum" || k === "exclusiveMaximum") {
+      if (v === "true" || v === "false") continue
+      put(&out, k, v)
+    } else if (k === "properties") {
+      const props: Field[] = []
+      for (const p of sortedFields(obj(v))) {
+        if (rawBool(obj(p.raw), "readOnly") === true) continue
+        props.push({ key: p.key, raw: normalizeNode(p.raw, depth + 1) })
+      }
+      put(&out, k, objText(props))
+    } else if (k === "items" || k === "additionalProperties") {
+      put(&out, k, v.startsWith("{") ? normalizeNode(v, depth + 1) : v)
+    } else if (k === "anyOf" || k === "oneOf" || k === "allOf") {
+      const list = arr(v).map((x: string): string => normalizeNode(x, depth + 1))
+      if (k === "allOf") {
+        const merged = mergeAllOf(list)
+        if (merged !== undefined) {
+          allOfMerged = merged
+          continue
+        }
+      }
+      put(&out, k, "[" + list.join(",") + "]")
+    } else if (k === "required") {
+      // only a list of property names is valid (required: true on a property is a common mistake)
+      if (v.startsWith("[")) put(&out, k, v)
+    } else {
+      put(&out, k, v)
+    }
+  }
+  // the allOf members fold in after the schema's own keywords: properties and required unioned (its own
+  // property wins a clash), any other keyword filling in only where the schema has none
+  if (allOfMerged !== undefined) {
+    for (const f of allOfMerged) {
+      if (f.key === "properties") {
+        let props = obj(f.raw)
+        for (const p of obj(find(out, "properties"))) put(&props, p.key, p.raw)
+        put(&out, "properties", objText(sortedFields(props)))
+      } else if (f.key === "required") {
+        put(&out, "required", quoteList(union(strList(find(out, "required")), strList(f.raw))))
+      } else if (!has(out, f.key)) {
+        put(&out, f.key, f.raw)
+      }
+    }
+  }
+  const propsRaw = find(out, "properties")
+  if (propsRaw !== undefined) {
+    if (!has(out, "type") && !has(out, "anyOf")) put(&out, "type", "\"object\"")
+    // required entries whose property went (readOnly) go too
+    const req = find(out, "required")
+    if (req !== undefined) {
+      const names = obj(propsRaw).map((p: Field): string => p.key)
+      const kept = strList(req).filter((n) => names.includes(n))
+      out = out.filter((f) => f.key !== "required")
+      if (kept.length > 0) put(&out, "required", quoteList(kept))
+    }
+  }
+  return objText(sortedFields(out))
+}
+
+function isObjectSchema(s: Field[]): bool {
+  return str(find(s, "type")) === "object" || has(s, "properties")
+}
+
+// Whether an object body cannot be flattened into its named properties without loss: it allows keys it does
+// not name (or names none), carries a oneOf/anyOf, or may be null as a whole.
+function freeForm(s: Field[]): bool {
+  if (has(s, "oneOf") || has(s, "anyOf")) return true
+  if (rawBool(s, "nullable") === true) return true
+  const props = obj(find(s, "properties"))
+  const extra = find(s, "additionalProperties")
+  if (props.length === 0) return extra !== undefined && !isNull(extra)
+  if (extra === undefined) return false
+  const e = extra.trim()
+  return e === "true" || e.startsWith("{")
+}
+
+function mergeAllOf(members: string[]): Field[] | undefined {
+  if (members.length === 0) return undefined
+  let props: Field[] = []
+  let required: string[] = []
+  let description = ""
+  for (const mraw of members) {
+    const m = obj(mraw)
+    if (!mraw.trim().startsWith("{") || !isObjectSchema(m) || freeForm(m)) return undefined
+    for (const p of obj(find(m, "properties"))) put(&props, p.key, p.raw)
+    required = union(required, strList(find(m, "required")))
+    if (description === "") description = str(find(m, "description"))
+  }
+  const out: Field[] = [{ key: "type", raw: "\"object\"" }, { key: "properties", raw: objText(sortedFields(props)) }]
+  if (required.length > 0) out.push({ key: "required", raw: quoteList(required) })
+  if (description !== "") out.push({ key: "description", raw: quote(description) })
+  return out
+}
+
+function joinDescription(desc: string, suffix: string): string {
+  const d = desc.trim()
+  return d === "" ? suffix : d + " " + suffix
+}
+
+function uniqueArg(props: Field[], name: string): string {
+  if (!has(props, name)) return name
+  for (let i = 2; ; i++) {
+    const c = `${name}_${i}`
+    if (!has(props, c)) return c
+  }
+}
+
+function explodeOf(p: OpParam): bool {
+  const e = p.explode
+  if (e !== undefined) return e
+  if (p.style === "spaceDelimited" || p.style === "pipeDelimited" || p.style === "tabDelimited" || p.style === "simple") return false
+  return p.in === "query" || p.in === "cookie"
+}
+
+// The tool's single input schema: the parameters and the body's properties as top-level arguments. The body
+// keeps plain names; a parameter whose name is taken is suffixed "__<in>". A body that is not a plain object
+// (an array, a primitive, a choice, text) travels as one "body" argument.
+function flatten(inout op: OpenApiOp): string {
+  let props: Field[] = []
+  const required: string[] = []
   const body = op.body
   if (body !== undefined) {
-    props.push(`"body":${body.schema}`)
-    if (body.required) required.push(quote("body"))
+    if (body.contentType === TEXT_CT) {
+      props.push({ key: "body", raw: `{"type":"string","description":${quote(body.description !== "" ? body.description : "Raw request body (text/plain)")}}` })
+      op.bodyMode = "single"
+      op.bodyArgs = ["body"]
+      if (body.required) required.push("body")
+    } else {
+      let schema = obj(normalizeSchema(body.schema))
+      const bodyProps = obj(find(schema, "properties"))
+      if (isObjectSchema(schema) && bodyProps.length > 0 && !freeForm(schema)) {
+        const names: string[] = []
+        for (const p of sortedFields(bodyProps)) {
+          props.push(p)
+          names.push(p.key)
+        }
+        for (const n of strList(find(schema, "required"))) {
+          if (!names.includes(n)) continue
+          if (body.required) required.push(n)
+          else op.requiredIfSent.push(n)
+        }
+        op.bodyMode = "flattened"
+        op.bodyArgs = names
+      } else {
+        if (!has(schema, "description")) put(&schema, "description", quote(body.description !== "" ? body.description : "Request body"))
+        props.push({ key: "body", raw: objText(sortedFields(schema)) })
+        op.bodyMode = "single"
+        op.bodyArgs = ["body"]
+        if (body.required) required.push("body")
+      }
+    }
   }
-  return `{"type":"object","properties":{${props.join(",")}},"required":[${required.join(",")}]}`
+  // a name shared by parameters in different places is suffixed on every side
+  for (const p of op.params) {
+    if (p.in !== "path" && p.in !== "query" && p.in !== "header" && p.in !== "cookie") {
+      op.warnings.push(`parameter "${p.name}" has unsupported location "${p.in}" and was skipped`)
+      continue
+    }
+    const shared = op.params.filter((o) => o.name === p.name).length > 1
+    const arg = has(props, p.name) || shared ? uniqueArg(props, `${p.name}__${p.in}`) : p.name
+    let schema = obj(normalizeSchema(p.schema))
+    put(&schema, "description", quote(joinDescription(p.description, `(${p.in} parameter)`)))
+    props.push({ key: arg, raw: objText(sortedFields(schema)) })
+    if (p.required) required.push(arg)
+    op.args.push({ arg: arg, in: p.in, name: p.name, required: p.required, explode: explodeOf(p), style: p.style, contentType: p.contentType })
+  }
+  const req = sortStrings(required)
+  return `{"type":"object","properties":${objText(sortedFields(props))}${req.length > 0 ? `,"required":${quoteList(req)}` : ""}}`
 }
+
+// ---- naming ----
+
+function sanitizeName(s: string): string {
+  let out = ""
+  let under = false
+  for (const ch of s.chars()) {
+    if (ch.byteLength === 1 && NAME_CHARS.includes(ch) && ch !== "_") {
+      out += ch
+      under = false
+    } else if (!under) {
+      out += "_"
+      under = true
+    }
+  }
+  while (out.startsWith("_")) out = out.slice(1)
+  while (out.endsWith("_")) out = out.slice(0, out.byteLength - 1)
+  if (out !== "" && DIGITS.includes(out.slice(0, 1))) out = "op_" + out
+  return out
+}
+
+function fallbackName(op: OpenApiOp): string {
+  let p = op.path
+  while (p.startsWith("/")) p = p.slice(1)
+  while (p.endsWith("/")) p = p.slice(0, p.byteLength - 1)
+  let out = ""
+  let i = 0
+  while (i < p.byteLength) {
+    const c = p.slice(i, i + 1)
+    if (c === "{") {
+      const close = p.slice(i).indexOf("}")
+      if (close > 0) {
+        out += "by_" + p.slice(i + 1, i + close)
+        i = i + close + 1
+        continue
+      }
+    }
+    out += c === "/" ? "_" : c
+    i++
+  }
+  if (out === "") out = "root"
+  return op.method.toLowerCase() + "_" + out
+}
+
+function truncateName(name: string, max: int): string {
+  if (max <= 0 || name.byteLength <= max) return name
+  let t = name.slice(0, max)
+  while (t.endsWith("_")) t = t.slice(0, t.byteLength - 1)
+  return t
+}
+
+// Bifrost's tool names: the sanitised operationId, else "<method>_<path>"; only [A-Za-z0-9_] stay (a hyphen
+// would clash with the gateway's "<client>-<tool>" names), a leading digit gets "op_", cut to the budget.
+export function toolName(op: OpenApiOp, budget: int): string {
+  let name = sanitizeName(op.operationId.trim() === "" ? fallbackName(op) : op.operationId)
+  if (name === "") name = sanitizeName(fallbackName(op))
+  if (name === "") name = op.method.toLowerCase() + "_op"
+  return truncateName(name, budget)
+}
+
+function dedupe(inout ops: OpenApiOp[], budget: int, inout warnings: string[]): void {
+  const count: Map<string, int> = new Map()
+  for (const o of ops) count.set(o.name, (count.get(o.name) ?? 0) + 1)
+  const taken: string[] = []
+  for (const k of count.keys()) {
+    if (count.get(k)! === 1) taken.push(k)
+  }
+  const counters: Map<string, int> = new Map()
+  for (let i = 0; i < ops.length; i++) {
+    const name = ops[i]!.name
+    if (count.get(name)! === 1) continue
+    while (true) {
+      const n = (counters.get(name) ?? 0) + 1
+      counters.set(name, n)
+      const cand = n > 1 ? truncateName(name, budget - `_${n}`.byteLength) + `_${n}` : name
+      if (taken.includes(cand)) continue
+      if (cand !== name) warnings.push(`tool name "${name}" is used by more than one operation; ${ops[i]!.method} ${ops[i]!.path} was renamed to "${cand}"`)
+      ops[i]!.name = cand
+      taken.push(cand)
+      break
+    }
+  }
+}
+
+function describe(op: OpenApiOp): string {
+  const parts: string[] = []
+  if (op.summary !== "") parts.push(op.summary)
+  if (op.description !== "" && op.description !== op.summary) {
+    let d = op.description
+    if (d.byteLength > MAX_DESCRIPTION) d = cutUtf8(d, MAX_DESCRIPTION).trim() + "…"
+    parts.push(d)
+  }
+  parts.push(op.method + " " + op.path + (op.deprecated ? " [deprecated]" : ""))
+  return parts.join("\n\n")
+}
+
+function schemeNamed(schemes: OpScheme[], name: string): OpScheme | undefined {
+  for (const s of schemes) {
+    if (s.name === name) return s
+  }
+  return undefined
+}
+
+// A warning for an operation whose every security requirement needs a scheme this executor cannot apply.
+function securityWarning(op: OpenApiOp, schemes: OpScheme[], global: string[][]): string {
+  const reqs = op.hasSecurity ? op.security : global
+  if (reqs.length === 0) return ""
+  const bad: string[] = []
+  for (const req of reqs) {
+    if (req.length === 0) return ""
+    let ok = true
+    for (const name of req) {
+      const s = schemeNamed(schemes, name)
+      if (s === undefined || !s.supported) {
+        ok = false
+        bad.push(s === undefined ? `${name} (undeclared)` : `${name} (${s.type})`)
+      }
+    }
+    if (ok) return ""
+  }
+  return `requires security scheme ${bad.join(", ")} which is not supported; calls are sent with static headers only`
+}
+
+// Parses a JSON or YAML OpenAPI 3.x or Swagger 2.0 document and makes each supported operation a tool.
+// Deprecated operations stay out unless includeDeprecated. specUrl resolves relative servers (and Swagger
+// 2.0's missing host); clientName cuts tool names so "<client>-<tool>" fits 64 characters.
+export function parseSpec(text: string, includeDeprecated: bool, specUrl?: string, clientName?: string): OpenApiDoc throws SyntaxError {
+  if (text.byteLength > MAX_SPEC_BYTES) throw new SyntaxError(`openapi spec exceeds ${MAX_SPEC_BYTES} bytes`)
+  const json = try specJson(text)
+  const root = try fields(json)
+  const v = try detectVersion(root)
+  const url = specUrl ?? ""
+  const res = new Resolver(json, !v.swagger2 && v.minor >= 1)
+  const parsed = v.swagger2 ? parseSwagger2(root, res, url) : try parseV3(root, v, res, url)
+  if (parsed.ops.length === 0) throw new SyntaxError("spec declares no operations under paths")
+  const info = obj(find(root, "info"))
+  let warnings: string[] = v.warnings.concat(parsed.warnings).concat(res.warnings)
+  const cname = clientName ?? ""
+  const budget = MAX_TOOL_NAME - cname.byteLength - 1
+  if (budget < MIN_TOOL_BUDGET) throw new SyntaxError(`client name "${cname}" is too long for OpenAPI tool names: "<client>-<tool>" must fit ${MAX_TOOL_NAME} characters, which leaves fewer than ${MIN_TOOL_BUDGET} for the tool; use a name of at most ${MAX_TOOL_NAME - 1 - MIN_TOOL_BUDGET} characters`)
+  let tools: OpenApiOp[] = []
+  const unsupported: Unsupported[] = []
+  for (const op0 of parsed.ops) {
+    let op = op0
+    if (op.unsupported !== "") {
+      unsupported.push({ operation_id: op.operationId, method: op.method, path: op.path, reason: op.unsupported })
+      continue
+    }
+    if (op.deprecated && !includeDeprecated) {
+      unsupported.push({ operation_id: op.operationId, method: op.method, path: op.path, reason: "deprecated (set openapi_config.include_deprecated to expose it)" })
+      continue
+    }
+    op.inputSchema = flatten(&op)
+    op.name = toolName(op, budget)
+    const sw = securityWarning(op, parsed.schemes, parsed.global)
+    if (sw !== "") op.warnings.push(sw)
+    tools.push(op)
+  }
+  if (tools.length > MAX_TOOLS) throw new SyntaxError(`spec yields ${tools.length} tools, above the limit of ${MAX_TOOLS}`)
+  dedupe(&tools, budget, &warnings)
+  if (tools.length > WARN_TOOLS) warnings.push(`${tools.length} tools exceed the recommended ${WARN_TOOLS}; restrict tools_to_execute so the model is not offered every operation`)
+  if (tools.length === 0) warnings.push("no operation in the spec can be exposed as a tool")
+  const bytes = new TextEncoder().encode(text)
+  return {
+    title: str(find(info, "title")).trim(),
+    version: str(find(info, "version")).trim(),
+    openapi_version: v.raw,
+    description: str(find(info, "description")).trim(),
+    servers: parsed.servers,
+    ops: tools,
+    unsupported: unsupported,
+    schemes: parsed.schemes,
+    globalSecurity: parsed.global,
+    warnings: warnings,
+    spec_size: bytes.length,
+    spec_hash: toHex(sha256(bytes)),
+  }
+}
+
+// The tool's description: its summary, description and HTTP shape.
+export function toolDescription(op: OpenApiOp): string {
+  return describe(op)
+}
+
+// The path of a spec_file under the config folder base, or "" when it is empty or leaves that folder.
+export function specFilePath(file: string, base: string): string {
+  const f = file.trim()
+  if (f === "") return ""
+  const full = f.startsWith("/") ? f : (base === "" ? "." : base) + "/" + f
+  const segs: string[] = []
+  for (const s of full.split("/")) {
+    if (s === "" || s === ".") continue
+    if (s === "..") {
+      if (segs.length === 0) return ""
+      segs.pop()
+      continue
+    }
+    segs.push(s)
+  }
+  const clean = (full.startsWith("/") ? "/" : "") + segs.join("/")
+  if (base === "") return clean
+  const bsegs = base.split("/").filter((s) => s !== "" && s !== ".")
+  const broot = (base.startsWith("/") ? "/" : "") + bsegs.join("/")
+  if (clean !== broot && !clean.startsWith(broot === "/" ? "/" : broot + "/")) return ""
+  return clean
+}
+
+// The API's description as MCP server instructions ("<title>: <description>", cut to 2000 bytes).
+export function specInstructions(doc: OpenApiDoc): string {
+  let d = doc.description.trim()
+  if (d === "") return ""
+  if (doc.title !== "") d = doc.title + ": " + d
+  if (d.byteLength > 2000) d = cutUtf8(d, 2000).trim() + "…"
+  return d
+}
+
+// The tool's input schema (flattened when the document was parsed).
+export function inputSchema(op: OpenApiOp): string {
+  return op.inputSchema
+}
+
+// The base URL calls go to: base_url when set, else the first server that is (or resolves to) an absolute
+// URL. "" when there is none; explicit says base_url decided it (operation servers are then ignored).
+export function baseUrlOf(doc: OpenApiDoc, override: string): { base: string, explicit: bool } {
+  const o = override.trim()
+  if (o !== "") return { base: o.endsWith("/") ? o.slice(0, o.byteLength - 1) : o, explicit: true }
+  for (const s of doc.servers) {
+    if (isAbsoluteHttp(s)) return { base: s.endsWith("/") ? s.slice(0, s.byteLength - 1) : s, explicit: false }
+  }
+  return { base: "", explicit: false }
+}
+
+// Whether every tool's operation names an absolute server of its own (no base URL is then needed).
+export function operationServersCover(doc: OpenApiDoc): bool {
+  if (doc.ops.length === 0) return false
+  return doc.ops.every((o) => o.servers.length > 0 && isAbsoluteHttp(o.servers[0]!))
+}
+
+// ---- requests ----
 
 const UNRESERVED = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~"
 const HEX = "0123456789ABCDEF"
@@ -159,130 +1401,639 @@ export function pctEncode(s: string): string {
   return out
 }
 
-// The decoded value of a JSON string literal (the quotes removed, escapes read).
-function strValue(raw: string): string throws SyntaxError {
-  const fs = try fields(`{"v":${raw}}`)
-  return rawStr(fs, "v") ?? ""
+// A form value: as pctEncode, with spaces as "+".
+function formEncode(s: string): string {
+  return pctEncode(s).split("%20").join("+")
 }
 
-// A JSON argument as the text a path, query or header takes: strings without quotes, other values as JSON.
-function plain(raw: string): string throws SyntaxError {
-  if (raw.startsWith("\"")) return try strValue(raw)
-  return raw
+// A JSON argument as wire text: a string's value, an array's items joined by sep, an object as JSON.
+function stringify(raw: string, sep: string): string {
+  const t = raw.trim()
+  if (t === "null") return ""
+  if (t.startsWith("\"")) return str(t)
+  if (t.startsWith("[")) return arr(t).map((x: string): string => stringify(x, sep)).join(sep)
+  return t
 }
 
-// The HTTP request one call of an operation makes. args is the tool's arguments object (JSON text).
-// Configured credentials go out with the request: apiKey in a header, query or cookie, http bearer and http basic.
-export function requestFor(op: OpenApiOp, base: string, args: string, doc: OpenApiDoc, creds: Map<string, OpenApiCred>): OpRequest throws SyntaxError {
+function delimiterOf(style: string): string {
+  if (style === "spaceDelimited") return " "
+  if (style === "pipeDelimited") return "|"
+  if (style === "tabDelimited") return "\t"
+  return ","
+}
+
+function pathValue(b: ArgBinding, raw: string): string {
+  const t = raw.trim()
+  let items: string[] = []
+  let keyed = false
+  const list = t.startsWith("[")
+  if (list) {
+    items = arr(t).map((x: string): string => pctEncode(stringify(x, ",")))
+  } else if (t.startsWith("{")) {
+    for (const f of sortedFields(obj(t))) {
+      if (b.explode) {
+        items.push(pctEncode(f.key) + "=" + pctEncode(stringify(f.raw, ",")))
+        keyed = true
+      } else {
+        items.push(pctEncode(f.key))
+        items.push(pctEncode(stringify(f.raw, ",")))
+      }
+    }
+  } else {
+    items = [pctEncode(stringify(t, ","))]
+  }
+  if (b.style === "label") return "." + items.join(b.explode ? "." : ",")
+  if (b.style === "matrix") {
+    const n = pctEncode(b.name)
+    if (keyed) return ";" + items.join(";")
+    if (list && b.explode) return ";" + n + "=" + items.join(";" + n + "=")
+    return ";" + n + "=" + items.join(",")
+  }
+  if (list) return items.join(pctEncode(delimiterOf(b.style)))
+  return items.join(",")
+}
+
+function headerValue(b: ArgBinding, raw: string): string {
+  const t = raw.trim()
+  if (t.startsWith("[")) return arr(t).map((x: string): string => stringify(x, ",")).join(delimiterOf(b.style))
+  if (t.startsWith("{")) {
+    const items: string[] = []
+    for (const f of sortedFields(obj(t))) {
+      if (b.explode) items.push(f.key + "=" + stringify(f.raw, ","))
+      else {
+        items.push(f.key)
+        items.push(stringify(f.raw, ","))
+      }
+    }
+    return items.join(",")
+  }
+  return stringify(t, ",")
+}
+
+type QPair = { k: string, v: string }
+
+function addQuery(inout q: QPair[], b: ArgBinding, raw: string): void {
+  const t = raw.trim()
+  if (t.startsWith("[")) {
+    if (b.explode) {
+      for (const x of arr(t)) q.push({ k: b.name, v: stringify(x, ",") })
+      return
+    }
+    q.push({ k: b.name, v: stringify(t, delimiterOf(b.style)) })
+    return
+  }
+  if (t.startsWith("{")) {
+    const fs = sortedFields(obj(t))
+    if (b.style === "deepObject") {
+      for (const f of fs) q.push({ k: `${b.name}[${f.key}]`, v: stringify(f.raw, ",") })
+    } else if (b.explode) {
+      for (const f of fs) q.push({ k: f.key, v: stringify(f.raw, ",") })
+    } else if (b.style === "" || b.style === "form") {
+      const parts: string[] = []
+      for (const f of fs) {
+        parts.push(f.key)
+        parts.push(stringify(f.raw, ","))
+      }
+      q.push({ k: b.name, v: parts.join(",") })
+    } else {
+      q.push({ k: b.name, v: t })
+    }
+    return
+  }
+  q.push({ k: b.name, v: stringify(t, ",") })
+}
+
+function encodeQuery(q: QPair[]): string {
+  // sorted by key, as Go's url.Values encodes them; values keep their order
+  const keys: string[] = []
+  for (const p of q) {
+    if (!keys.includes(p.k)) keys.push(p.k)
+  }
+  const parts: string[] = []
+  for (const k of sortStrings(keys)) {
+    for (const p of q) {
+      if (p.k === k) parts.push(formEncode(k) + "=" + formEncode(p.v))
+    }
+  }
+  return parts.join("&")
+}
+
+function credValue(c: OpenApiCred | undefined, basic: bool): string {
+  if (c === undefined) return ""
+  return basic ? (c.username ?? "") : (c.value ?? "")
+}
+
+// The schemes a call applies: the operation's requirements when it declares any, else the document's. The
+// first requirement whose schemes are all supported and all have a credential wins; an empty requirement
+// means anonymous calls are accepted. A header scheme counts as met when the configured headers carry it.
+export function selectSecurity(op: OpenApiOp, doc: OpenApiDoc, creds: Map<string, OpenApiCred>, configured: Map<string, string>): OpScheme[] {
+  const reqs = op.hasSecurity ? op.security : doc.globalSecurity
+  for (const req of reqs) {
+    if (req.length === 0) return []
+    const chosen: OpScheme[] = []
+    let ok = true
+    for (const name of req) {
+      const s = schemeNamed(doc.schemes, name)
+      if (s === undefined || !s.supported) {
+        ok = false
+        break
+      }
+      if (credValue(creds.get(name), s.type === "http" && s.scheme === "basic") === "") {
+        const header = s.type === "apiKey" && s.in === "header" ? s.param_name : s.type === "http" ? "authorization" : ""
+        if (header !== "" && configured.get(header.toLowerCase()) !== undefined) continue
+        ok = false
+        break
+      }
+      chosen.push(s)
+    }
+    if (ok) {
+      chosen.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+      return chosen
+    }
+  }
+  return []
+}
+
+function hasDotSegment(decoded: string): bool {
+  for (const part of decoded.split("/")) {
+    if (part === "." || part === "..") return true
+  }
+  return false
+}
+
+// The HTTP request one call of a tool makes. args is the tool's arguments object (JSON text); base the URL
+// calls go to (explicit when base_url set it); configured the client's static headers (lower-cased), which
+// go first and which a declared header parameter does not replace.
+export function requestFor(op: OpenApiOp, base: string, args: string, doc: OpenApiDoc, creds: Map<string, OpenApiCred>, configured?: Map<string, string>, explicit?: bool): OpRequest throws SyntaxError {
   const fs = try fields(args.trim() === "" ? "{}" : args.trim())
+  const conf: Map<string, string> = configured ?? new Map()
+  let root = base
+  if (explicit !== true && op.servers.length > 0) {
+    if (!isAbsoluteHttp(op.servers[0]!)) throw new SyntaxError(`operation server "${op.servers[0]!}" is relative and could not be resolved; set openapi_config.spec_url or base_url`)
+    root = op.servers[0]!
+  }
+  if (root.trim() === "") throw new SyntaxError("no base URL: the spec declares no absolute server URL; set openapi_config.base_url")
+  const schemes = selectSecurity(op, doc, creds, conf)
+  // what configuration supplies (static headers, credentials) does not have to come from the model
+  const supplied: string[] = []
+  for (const k of conf.keys()) supplied.push("header:" + k.toLowerCase())
+  for (const s of schemes) {
+    if (s.type === "apiKey") supplied.push(s.in + ":" + (s.in === "header" ? s.param_name.toLowerCase() : s.param_name))
+    else supplied.push("header:authorization")
+  }
   let path = op.path
-  const query: string[] = []
-  const headers: Map<string, string> = new Map()
-  headers.set("accept", "application/json")
-  for (const p of op.params) {
-    const raw = find(fs, p.name)
-    if (raw === undefined || isNull(raw)) {
-      if (p.required) throw new SyntaxError(`missing required argument ${p.name}`)
+  let query: QPair[] = []
+  const argHeaders: Map<string, string> = new Map()
+  const cookies: Field[] = []
+  for (const b of op.args) {
+    const raw = find(fs, b.arg)
+    const jsonParam = b.contentType !== "" && jsonMedia(b.contentType)
+    if (raw === undefined || (raw.trim() === "null" && !jsonParam)) {
+      const key = b.in + ":" + (b.in === "header" ? b.name.toLowerCase() : b.name)
+      if (b.required && !supplied.includes(key)) throw new SyntaxError(`missing required ${b.in} parameter "${b.name}"`)
       continue
     }
-    const v = try plain(raw)
-    if (p.in === "path") path = path.split(`{${p.name}}`).join(pctEncode(v))
-    else if (p.in === "query") query.push(`${pctEncode(p.name)}=${pctEncode(v)}`)
-    else if (p.in === "header") headers.set(p.name.toLowerCase(), v)
+    const value = jsonParam ? quote(raw.trim()) : raw
+    if (b.in === "path") {
+      const seg = pathValue(b, value)
+      const decoded = pctDecode(seg)
+      if (decoded === "" || hasDotSegment(decoded)) throw new SyntaxError(`invalid value "${seg}" for path parameter "${b.name}"`)
+      path = path.split(`{${b.name}}`).join(seg)
+    } else if (b.in === "query") {
+      addQuery(&query, b, value)
+    } else if (b.in === "header") {
+      const ln = b.name.toLowerCase()
+      if (ln === "host" || ln === "content-length" || ln === "transfer-encoding" || ln === "connection") throw new SyntaxError(`header parameter "${b.name}" cannot be set from tool arguments`)
+      argHeaders.set(ln, headerValue(b, value))
+    } else if (b.in === "cookie") {
+      cookies.push({ key: b.name, raw: stringify(value, ",") })
+    }
   }
+  if (path.includes("{")) throw new SyntaxError(`path "${path}" has unresolved parameters`)
+  // the body
   let body: string | undefined = undefined
-  const bodyRaw = find(fs, "body")
-  if (op.body !== undefined && bodyRaw !== undefined && !isNull(bodyRaw)) {
-    body = bodyRaw
-    headers.set("content-type", "application/json")
+  let contentType = ""
+  const ob = op.body
+  if (ob !== undefined && op.bodyMode !== "") {
+    let present = false
+    let payload = ""
+    if (op.bodyMode === "flattened") {
+      const parts: Field[] = []
+      for (const n of op.bodyArgs) {
+        const v = find(fs, n)
+        if (v !== undefined) parts.push({ key: n, raw: v.trim() })
+      }
+      present = parts.length > 0
+      payload = objText(parts)
+    } else {
+      const v = find(fs, "body")
+      present = v !== undefined
+      payload = v === undefined ? "" : v.trim()
+    }
+    if (present && !ob.required) {
+      for (const n of op.requiredIfSent) {
+        if (find(fs, n) === undefined) throw new SyntaxError(`request body field "${n}" is required when a body is sent`)
+      }
+    }
+    if (!present && ob.required) {
+      if (op.bodyMode !== "flattened") throw new SyntaxError(`missing required request body argument "body"`)
+      payload = "{}"
+      present = true
+    }
+    if (present) {
+      if (ob.contentType === FORM_CT) {
+        if (!payload.startsWith("{")) throw new SyntaxError("form request body must be an object")
+        const pairs: string[] = []
+        for (const f of sortedFields(obj(payload))) {
+          const t = f.raw.trim()
+          const d = ob.delimiters.get(f.key)
+          if (t.startsWith("[") && d === undefined) {
+            for (const x of arr(t)) pairs.push(formEncode(f.key) + "=" + formEncode(stringify(x, ",")))
+          } else {
+            pairs.push(formEncode(f.key) + "=" + formEncode(t.startsWith("[") ? arr(t).map((x: string): string => stringify(x, ",")).join(d ?? ",") : stringify(t, ",")))
+          }
+        }
+        body = pairs.join("&")
+        contentType = FORM_CT
+      } else if (ob.contentType === TEXT_CT) {
+        body = stringify(payload, "\n")
+        contentType = "text/plain; charset=utf-8"
+      } else {
+        body = payload
+        contentType = jsonMedia(ob.contentType) ? ob.contentType : JSON_CT
+      }
+    }
   }
-  if (op.body !== undefined && op.body.required && body === undefined) throw new SyntaxError("missing required argument body")
-  // credentials for the schemes the document declares
-  for (const s of doc.schemes) {
+  // headers: the static ones, then the declared parameters (not over a configured name), then the credentials
+  const headers: Map<string, string> = new Map()
+  let cookieOut: Field[] = []
+  for (const k of conf.keys()) {
+    const lk = k.toLowerCase()
+    if (lk === "host" || lk === "content-length" || lk === "transfer-encoding" || lk === "connection") continue
+    if (lk === "cookie") {
+      for (const part of conf.get(k)!.split(";")) {
+        const eq = part.indexOf("=")
+        if (eq > 0) put(&cookieOut, part.slice(0, eq).trim(), part.slice(eq + 1).trim())
+      }
+      continue
+    }
+    headers.set(lk, conf.get(k)!)
+  }
+  for (const k of argHeaders.keys()) {
+    if (headers.get(k) === undefined) headers.set(k, argHeaders.get(k)!)
+  }
+  for (const c of cookies) {
+    if (!has(cookieOut, c.key)) cookieOut.push(c)
+  }
+  const credQuery: QPair[] = []
+  for (const s of schemes) {
     const c = creds.get(s.name)
-    if (c === undefined) continue
-    const cv = c.value ?? ""
-    if (s.type === "apiKey" && cv !== "") {
-      if (s.in === "header") headers.set(s.param_name.toLowerCase(), cv)
-      else if (s.in === "query") query.push(`${pctEncode(s.param_name)}=${pctEncode(cv)}`)
-      else if (s.in === "cookie") headers.set("cookie", `${s.param_name}=${cv}`)
-    } else if (s.type === "http" && s.scheme.toLowerCase() === "bearer" && cv !== "") {
-      headers.set("authorization", `Bearer ${cv}`)
-    } else if (s.type === "http" && s.scheme.toLowerCase() === "basic") {
-      const pair = `${c.username ?? ""}:${c.password ?? ""}`
+    if (s.type === "apiKey") {
+      const v = c?.value ?? ""
+      if (s.in === "header") headers.set(s.param_name.toLowerCase(), v)
+      else if (s.in === "query") credQuery.push({ k: s.param_name, v: v })
+      else if (s.in === "cookie") put(&cookieOut, s.param_name, v)
+    } else if (s.type === "http" && s.scheme === "bearer") {
+      const tok = c?.value ?? ""
+      headers.set("authorization", tok.toLowerCase().startsWith("bearer ") ? tok : "Bearer " + tok)
+    } else if (s.type === "http" && s.scheme === "basic") {
+      const pair = `${c?.username ?? ""}:${c?.password ?? ""}`
       headers.set("authorization", "Basic " + b64.encode(new TextEncoder().encode(pair)))
     }
   }
-  const root = base.endsWith("/") ? base.slice(0, base.byteLength - 1) : base
-  const qs = query.length > 0 ? "?" + query.join("&") : ""
-  return { method: op.method, url: root + path + qs, headers: headers, body: body }
+  if (cookieOut.length > 0) headers.set("cookie", cookieOut.map((c: Field): string => `${c.key}=${c.raw}`).join("; "))
+  if (contentType !== "") headers.set("content-type", contentType)
+  if (headers.get("accept") === undefined) headers.set("accept", DEFAULT_ACCEPT)
+  // the base URL's own query and the query credentials win over the call's for their names
+  let rootUrl = root
+  const hashAt = rootUrl.indexOf("#")
+  if (hashAt >= 0) rootUrl = rootUrl.slice(0, hashAt)
+  const qAt = rootUrl.indexOf("?")
+  if (qAt >= 0) {
+    for (const part of rootUrl.slice(qAt + 1).split("&")) {
+      if (part === "") continue
+      const eq = part.indexOf("=")
+      const k = pctDecode(eq < 0 ? part : part.slice(0, eq))
+      query = query.filter((p) => p.k !== k)
+      query.push({ k: k, v: pctDecode(eq < 0 ? "" : part.slice(eq + 1)) })
+    }
+    rootUrl = rootUrl.slice(0, qAt)
+  }
+  for (const p of credQuery) {
+    query = query.filter((x) => x.k !== p.k)
+    query.push(p)
+  }
+  if (rootUrl.endsWith("/")) rootUrl = rootUrl.slice(0, rootUrl.byteLength - 1)
+  const qs = encodeQuery(query)
+  const full = rootUrl + (path === "" || path.startsWith("/") ? path : "/" + path) + (qs === "" ? "" : "?" + qs)
+  return { method: op.method, url: full, headers: headers, body: body }
 }
 
-// The status and text of an operation's answer, cut to max bytes (0 is the default cap).
-export async function callOperation(req: OpRequest, timeoutMs: int, max: int): Promise<{ status: int, text: string }> throws Error {
+function statusText(code: int): string {
+  const codes: int[] = [200, 201, 202, 204, 301, 302, 304, 400, 401, 403, 404, 405, 409, 422, 429, 500, 502, 503, 504]
+  const texts: string[] = ["OK", "Created", "Accepted", "No Content", "Moved Permanently", "Found", "Not Modified", "Bad Request", "Unauthorized", "Forbidden", "Not Found", "Method Not Allowed", "Conflict", "Unprocessable Entity", "Too Many Requests", "Internal Server Error", "Bad Gateway", "Service Unavailable", "Gateway Timeout"]
+  for (let i = 0; i < codes.length; i++) {
+    if (codes[i]! === code) return texts[i]!
+  }
+  return ""
+}
+
+function textual(ct: string): bool {
+  const c = lowerBase(ct)
+  if (c === "" || c.startsWith("text/")) return true
+  if (c.includes("json") || c.includes("xml") || c.includes("yaml")) return true
+  return c === FORM_CT || c === "application/javascript" || c === "application/x-ndjson"
+}
+
+// A tool result from an upstream answer, as Bifrost formats it: the text (cut to the cap, with a notice), a
+// binary body as a note of its type and size, and a non-2xx status as an error led by "HTTP <code> <text>".
+export function formatAnswer(status: int, contentType: string, body: u8[], max: int): { text: string, isError: bool } {
+  const cap = max > 0 ? max : MAX_RESPONSE_BYTES
+  const truncated = body.length > cap
+  const kept = truncated ? body.slice(0, cap) : body
+  let text = ""
+  let ok = textual(contentType)
+  if (ok) {
+    try {
+      text = new TextDecoder().decode(kept)
+    } catch (e) {
+      ok = lowerBase(contentType) !== ""
+      if (ok) text = ""
+    }
+  }
+  if (ok) {
+    if (truncated) text += `\n…[response truncated at ${cap} bytes]`
+  } else {
+    text = `[binary response: ${contentType}, ${truncated ? "more than " : ""}${kept.length} bytes]`
+  }
+  const line = `HTTP ${status} ${statusText(status)}`.trimEnd()
+  if (status < 200 || status >= 300) return { text: text === "" ? line : line + "\n" + text, isError: true }
+  if (body.length === 0) return { text: line, isError: false }
+  return { text: text, isError: false }
+}
+
+// Sends an operation's request and formats the answer (0 is the default cap).
+export async function callOperation(req: OpRequest, timeoutMs: int, max: int): Promise<{ status: int, text: string, isError: bool }> throws Error {
   const dl = deadline(timeoutMs)
   try {
     const hs: Record<string, string> = req.headers
     const body: string = req.body ?? ""
     let res: Response = new Response()
-    if (req.body !== undefined) {
-      res = try await fetch(req.url, { method: req.method, headers: hs, body: body, signal: dl.controller.signal })
-    } else {
-      res = try await fetch(req.url, { method: req.method, headers: hs, signal: dl.controller.signal })
+    try {
+      if (req.body !== undefined) {
+        res = try await fetch(req.url, { method: req.method, headers: hs, body: body, signal: dl.controller.signal })
+      } else {
+        res = try await fetch(req.url, { method: req.method, headers: hs, signal: dl.controller.signal })
+      }
+    } catch (e) {
+      // the query may carry a credential, and this text reaches the model
+      const q = e.message.indexOf("?")
+      return { status: 0, text: `request to upstream failed: ${q < 0 ? e.message : e.message.slice(0, q)}`, isError: true }
     }
-    const text = try await res.text()
-    const cap = max > 0 ? max : MAX_RESPONSE_BYTES
-    return { status: res.status, text: text.byteLength > cap ? text.slice(0, cap) : text }
+    const bytes = try await res.bytes()
+    const f = formatAnswer(res.status, res.headers.get("content-type") ?? "", bytes, max)
+    return { status: res.status, text: f.text, isError: f.isError }
   } finally {
     dl.finish()
   }
 }
 
-test("operations become tools with a schema", () => {
+// The preview of a document (Bifrost's PreviewResult): its info, servers, security schemes, the tools with
+// their input schemas, the operations that could not become tools and why, and the warnings.
+export function previewJson(doc: OpenApiDoc, override: string): string {
+  const b = baseUrlOf(doc, override)
+  const warnings = doc.warnings.slice(0)
+  const opServers = operationServersCover(doc)
+  if (b.base === "" && !opServers) warnings.push("the spec declares no absolute server URL; set openapi_config.base_url")
+  const schemes: string[] = doc.schemes.map((s: OpScheme): string => {
+    let j = `{"name":${quote(s.name)},"type":${quote(s.type)}`
+    if (s.in !== "") j += `,"in":${quote(s.in)}`
+    if (s.param_name !== "") j += `,"param_name":${quote(s.param_name)}`
+    if (s.scheme !== "") j += `,"scheme":${quote(s.scheme)}`
+    if (s.description !== "") j += `,"description":${quote(s.description)}`
+    j += `,"supported":${s.supported}`
+    if (s.reason !== "") j += `,"reason":${quote(s.reason)}`
+    return j + "}"
+  })
+  const tools: string[] = doc.ops.map((o: OpenApiOp): string => {
+    let j = `{"name":${quote(o.name)}`
+    if (o.operationId !== "") j += `,"operation_id":${quote(o.operationId)}`
+    j += `,"method":${quote(o.method)},"path":${quote(o.path)}`
+    if (o.summary !== "") j += `,"summary":${quote(o.summary)}`
+    j += `,"description":${quote(describe(o))}`
+    if (o.deprecated) j += `,"deprecated":true`
+    j += `,"input_schema":${o.inputSchema},"annotations":${annotations(o.method)}`
+    if (o.warnings.length > 0) j += `,"warnings":${quoteList(o.warnings)}`
+    return j + "}"
+  })
+  const uns: string[] = doc.unsupported.map((u: Unsupported): string => `{${u.operation_id !== "" ? `"operation_id":${quote(u.operation_id)},` : ""}"method":${quote(u.method)},"path":${quote(u.path)},"reason":${quote(u.reason)}}`)
+  let out = `{"title":${quote(doc.title)},"version":${quote(doc.version)},"openapi_version":${quote(doc.openapi_version)}`
+  if (doc.description !== "") out += `,"description":${quote(doc.description)}`
+  out += `,"servers":${quoteList(doc.servers)}`
+  if (b.base !== "") out += `,"base_url":${quote(b.base)}`
+  if (opServers) out += `,"operation_servers":true`
+  out += `,"security_schemes":[${schemes.join(",")}],"tools":[${tools.join(",")}],"unsupported":[${uns.join(",")}],"warnings":${quoteList(warnings)},"tool_count":${doc.ops.length},"spec_size":${doc.spec_size},"spec_hash":${quote(doc.spec_hash)}}`
+  return out
+}
+
+// MCP tool annotations from the HTTP method (Bifrost's annotationsFor).
+export function annotations(method: string): string {
+  if (method === "GET" || method === "HEAD" || method === "QUERY" || method === "OPTIONS") return `{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true}`
+  if (method === "PUT") return `{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true}`
+  if (method === "DELETE") return `{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":true}`
+  return `{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true}`
+}
+
+test("operations become tools with a flattened schema", () => {
   const spec = `{"openapi":"3.0.3","info":{"title":"Pets","version":"1.2"},"servers":[{"url":"https://api.example.com/v1/"}],
     "paths":{"/pets/{id}":{"parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
-      "get":{"operationId":"get_pet","summary":"One pet","parameters":[{"name":"verbose","in":"query","schema":{"type":"boolean"}}]},
+      "get":{"operationId":"get_pet","summary":"One pet","parameters":[{"name":"verbose","in":"query","schema":{"type":"boolean"}},{"name":"Accept","in":"header"}]},
       "delete":{"operationId":"drop pet","deprecated":true}},
-     "/pets":{"post":{"summary":"Add","requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object"}}}}}}},
-    "components":{"securitySchemes":{"key":{"type":"apiKey","in":"header","name":"X-Key"},"basic":{"type":"http","scheme":"basic"}}}}`
+     "/pets":{"post":{"summary":"Add","requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","required":["name"],"properties":{"name":{"type":"string"},"id":{"type":"integer","readOnly":true},"tag":{"type":"string","xml":{"name":"t"}}}}}}},"parameters":[{"name":"name","in":"query","schema":{"type":"string"}}]}}},
+    "components":{"securitySchemes":{"key":{"type":"apiKey","in":"header","name":"X-Key"},"basic":{"type":"http","scheme":"basic"},"oa":{"type":"oauth2"}}}}`
   const doc = try parseSpec(spec, false)
   expect(doc.title).toBe("Pets")
-  expect(doc.servers.length).toBe(1)
   expect(doc.ops.length).toBe(2)
-  expect(doc.ops[0]!.name).toBe("get_pet")
-  expect(doc.ops[0]!.params.length).toBe(2)
-  expect(doc.ops[1]!.name).toBe("post__pets")
-  expect(doc.ops[1]!.body!.required).toBe(true)
-  expect(doc.schemes.length).toBe(2)
+  expect(doc.unsupported.length).toBe(1)
+  expect(doc.unsupported[0]!.reason.startsWith("deprecated")).toBe(true)
+  expect(doc.ops[0]!.name).toBe("post_pets")
+  expect(doc.ops[1]!.name).toBe("get_pet")
+  expect(doc.ops[1]!.params.length).toBe(2)
+  expect(doc.ops[1]!.inputSchema).toBe('{"type":"object","properties":{"id":{"description":"(path parameter)","type":"string"},"verbose":{"description":"(query parameter)","type":"boolean"}},"required":["id"]}')
+  // the body's properties are arguments; readOnly and unknown keywords go; a clashing parameter is suffixed
+  expect(doc.ops[0]!.inputSchema).toBe('{"type":"object","properties":{"name":{"type":"string"},"name__query":{"description":"(query parameter)","type":"string"},"tag":{"type":"string"}},"required":["name"]}')
+  expect(doc.ops[0]!.bodyMode).toBe("flattened")
+  expect(doc.schemes.length).toBe(3)
+  expect(doc.schemes[2]!.supported).toBe(false)
   const all = try parseSpec(spec, true)
   expect(all.ops.length).toBe(3)
-  expect(inputSchema(doc.ops[0]!)).toBe('{"type":"object","properties":{"id":{"type":"string"},"verbose":{"type":"boolean"}},"required":["id"]}')
+  expect(all.ops[2]!.name).toBe("drop_pet")
   let threw = false
   try {
-    parseSpec('{"swagger":"2.0"}', false)
+    parseSpec('{"swagger":"1.2"}', false)
   } catch (e) {
     threw = true
   }
   expect(threw).toBe(true)
+  // a client name too long for tool names is refused
+  threw = false
+  try {
+    parseSpec(spec, false, "", "x".repeat(50))
+  } catch (e) {
+    threw = e.message.includes("too long")
+  }
+  expect(threw).toBe(true)
+})
+
+test("$refs resolve where used; cycles are cut and external refs cost one operation", () => {
+  const spec = `{"openapi":"3.1.0","info":{"title":"R","version":"1"},"servers":[{"url":"https://r.example"}],
+    "paths":{"/a":{"post":{"operationId":"a","parameters":[{"$ref":"#/components/parameters/Q"}],
+      "requestBody":{"$ref":"#/components/requestBodies/Node"}}},
+     "/b":{"get":{"operationId":"b","parameters":[{"$ref":"other.yaml#/P"}]}},
+     "/c":{"$ref":"#/components/pathItems/C"}},
+    "components":{"parameters":{"Q":{"name":"q","in":"query","schema":{"type":["string","null"]}}},
+      "requestBodies":{"Node":{"content":{"application/json":{"schema":{"$ref":"#/components/schemas/Node","description":"beside"}}}}},
+      "schemas":{"Node":{"type":"object","properties":{"child":{"$ref":"#/components/schemas/Node"},"name":{"type":"string","example":{"$ref":"kept"}}}}},
+      "pathItems":{"C":{"get":{"operationId":"c"}}}}}`
+  const doc = try parseSpec(spec, false)
+  expect(doc.ops.map((o) => o.name).join(",")).toBe("a,c")
+  expect(doc.unsupported.length).toBe(1)
+  expect(doc.unsupported[0]!.reason.includes("external $ref")).toBe(true)
+  const a = doc.ops[0]!
+  // 3.1 type arrays: null makes the schema nullable
+  expect(a.inputSchema.includes('"q":{"description":"(query parameter)","nullable":true,"type":"string"}')).toBe(true)
+  expect(a.inputSchema.includes('"child":{"description":"recursive reference to #/components/schemas/Node","type":"object"}')).toBe(true)
+  expect(doc.warnings.some((w) => w.includes("recursive $ref"))).toBe(true)
+})
+
+test("YAML and Swagger 2.0 documents", () => {
+  const y = `swagger: "2.0"
+info:
+  title: Legacy
+  version: "1"
+host: legacy.example
+basePath: /api/
+schemes: [http, https]
+securityDefinitions:
+  basicAuth:
+    type: basic
+  key:
+    type: apiKey
+    in: query
+    name: api_key
+security:
+  - key: []
+paths:
+  /items/{id}:
+    get:
+      operationId: getItem
+      parameters:
+        - name: id
+          in: path
+          type: integer
+        - name: tags
+          in: query
+          type: array
+          items: {type: string}
+          collectionFormat: multi
+    put:
+      operationId: putItem
+      security:
+        - basicAuth: []
+      parameters:
+        - name: id
+          in: path
+          type: integer
+        - name: body
+          in: body
+          required: true
+          schema:
+            $ref: '#/definitions/Item'
+  /upload:
+    post:
+      operationId: upload
+      consumes: [multipart/form-data]
+      parameters:
+        - {name: file, in: formData, type: file}
+definitions:
+  Item:
+    type: object
+    properties:
+      label: {type: string}
+`
+  const doc = try parseSpec(y, false)
+  expect(doc.openapi_version).toBe("2.0")
+  expect(doc.servers.join(",")).toBe("https://legacy.example/api")
+  expect(doc.ops.map((o) => o.name).join(",")).toBe("getItem,putItem")
+  expect(doc.unsupported[0]!.reason.includes("file upload")).toBe(true)
+  expect(doc.schemes[0]!.type).toBe("http")
+  expect(doc.schemes[0]!.scheme).toBe("basic")
+  const creds: Map<string, OpenApiCred> = new Map()
+  creds.set("key", { value: "k1" })
+  creds.set("basicAuth", { username: "u", password: "p" })
+  const g = try requestFor(doc.ops[0]!, "https://legacy.example/api", '{"id":7,"tags":["a","b c"]}', doc, creds)
+  expect(g.url).toBe("https://legacy.example/api/items/7?api_key=k1&tags=a&tags=b+c")
+  expect(g.headers.get("authorization")).toBeUndefined()
+  // the operation's own requirement replaces the document's
+  const p = try requestFor(doc.ops[1]!, "https://legacy.example/api", '{"id":7,"label":"x"}', doc, creds)
+  expect(p.url).toBe("https://legacy.example/api/items/7")
+  expect(p.headers.get("authorization")).toBe("Basic dTpw")
+  expect(p.body).toBe('{"label":"x"}')
+  // a YAML 3.0 document with its version written as a number
+  const y3 = try parseSpec("openapi: 3.0.1\ninfo: {title: Y, version: 1}\npaths:\n  /x:\n    get: {}\n", false)
+  expect(y3.ops[0]!.name).toBe("get_x")
 })
 
 test("calls build the URL, the query, the body and the credentials", () => {
-  const doc = try parseSpec(`{"openapi":"3.0.0","info":{"title":"t","version":"1"},"paths":{"/pets/{id}":{"get":{"operationId":"g","parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string"}},{"name":"q","in":"query","schema":{"type":"string"}}]}},"/pets":{"post":{"operationId":"p","requestBody":{"content":{"application/json":{"schema":{"type":"object"}}}}}}},"components":{"securitySchemes":{"key":{"type":"apiKey","in":"query","name":"api_key"}}}}`, false)
+  const doc = try parseSpec(`{"openapi":"3.0.0","info":{"title":"t","version":"1"},"security":[{"key":[]}],"paths":{"/pets/{id}":{"get":{"operationId":"g","parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string"}},{"name":"q","in":"query","schema":{"type":"string"}}]}},"/pets":{"post":{"operationId":"p","security":[],"requestBody":{"content":{"application/json":{"schema":{"type":"object"}}}}}},"/form":{"post":{"operationId":"f","requestBody":{"content":{"application/x-www-form-urlencoded":{"schema":{"type":"object","properties":{"a":{"type":"string"},"n":{"type":"array"}}}}}}}}},"components":{"securitySchemes":{"key":{"type":"apiKey","in":"query","name":"api_key"}}}}`, false)
   const creds: Map<string, OpenApiCred> = new Map()
   creds.set("key", { value: "k 1" })
-  const g = try requestFor(doc.ops[0]!, "https://api.example.com/v1/", '{"id":"a b","q":"x&y"}', doc, creds)
-  expect(g.url).toBe("https://api.example.com/v1/pets/a%20b?q=x%26y&api_key=k%201")
+  const byName = (n: string): OpenApiOp => doc.ops.filter((o) => o.name === n)[0]!
+  const g = try requestFor(byName("g"), "https://api.example.com/v1/", '{"id":"a b","q":"x&y"}', doc, creds)
+  expect(g.url).toBe("https://api.example.com/v1/pets/a%20b?api_key=k+1&q=x%26y")
   expect(g.method).toBe("GET")
-  const p = try requestFor(doc.ops[1]!, "https://api.example.com", '{"body":{"name":"rex"}}', doc, new Map())
+  // security: [] means anonymous: no credential goes out
+  const p = try requestFor(byName("p"), "https://api.example.com", '{"body":{"name":"rex"}}', doc, creds)
   expect(p.url).toBe("https://api.example.com/pets")
   expect(p.body).toBe('{"name":"rex"}')
   expect(p.headers.get("content-type")).toBe("application/json")
+  const f = try requestFor(byName("f"), "https://api.example.com", '{"a":"x y","n":[1,2]}', doc, creds)
+  expect(f.body).toBe("a=x+y&n=1&n=2")
   let threw = false
   try {
-    requestFor(doc.ops[0]!, "https://x", "{}", doc, creds)
+    requestFor(byName("g"), "https://x", "{}", doc, creds)
+  } catch (e) {
+    threw = e.message.includes("missing required path parameter")
+  }
+  expect(threw).toBe(true)
+  threw = false
+  try {
+    requestFor(byName("g"), "https://x", '{"id":".."}', doc, creds)
   } catch (e) {
     threw = true
   }
   expect(threw).toBe(true)
   expect(pctEncode("a/b~c")).toBe("a%2Fb~c")
+  const ans = formatAnswer(404, "application/json", new TextEncoder().encode('{"e":1}'), 0)
+  expect(ans.text).toBe('HTTP 404 Not Found\n{"e":1}')
+  expect(ans.isError).toBe(true)
+  expect(formatAnswer(204, "", [], 0).text).toBe("HTTP 204 No Content")
+  expect(formatAnswer(200, "image/png", [u8(1), u8(2)], 0).text).toBe("[binary response: image/png, 2 bytes]")
+})
+
+test("allOf merges into one object, and the preview reports tools, unsupported operations and schemes", () => {
+  const n = normalizeSchema('{"allOf":[{"type":"object","properties":{"a":{"type":"string"}},"required":["a"]},{"properties":{"b":{"type":"integer","exclusiveMinimum":true}}}],"description":"both"}')
+  expect(n).toBe('{"description":"both","properties":{"a":{"type":"string"},"b":{"type":"integer"}},"required":["a"],"type":"object"}')
+  const doc = try parseSpec(`{"openapi":"3.0.0","info":{"title":"t","version":"1"},"paths":{"/up":{"post":{"requestBody":{"content":{"multipart/form-data":{}}}}},"/x":{"get":{}}}}`, false)
+  const pv = previewJson(doc, "")
+  expect(pv.includes('"tools":[{"name":"get_x","method":"GET","path":"/x","description":"GET /x"')).toBe(true)
+  expect(pv.includes('"unsupported":[{"method":"POST","path":"/up","reason":"multipart/form-data request body is not supported')).toBe(true)
+  expect(pv.includes("set openapi_config.base_url")).toBe(true)
+  expect(previewJson(doc, "https://b.example/").includes('"base_url":"https://b.example"')).toBe(true)
+  expect(resolveRelative("/v2", "https://h.example/specs/a.json")).toBe("https://h.example/v2")
+  expect(resolveRelative("v2/", "https://h.example/specs/a.json")).toBe("https://h.example/specs/v2/")
+  expect(specFilePath("specs/pets.yaml", "/etc/raiju")).toBe("/etc/raiju/specs/pets.yaml")
+  expect(specFilePath("../secret.yaml", "/etc/raiju")).toBe("")
+  expect(specFilePath("/etc/passwd", "/etc/raiju")).toBe("")
+  expect(specFilePath("./a/../b.json", "conf")).toBe("conf/b.json")
 })

@@ -1,19 +1,23 @@
 # syntax=docker/dockerfile:1
 
 # Build stage. Tov is built from source with the patches in tov-patches/
-# (streamed response bodies), so it needs Rust and a C++ compiler (Tov builds
-# BoringSSL for TLS on first use). Debian bookworm
-# matches the glibc of the runtime image below.
+# (0001-0008: streamed bodies, child sockets, ALPN, UDP, WAMR, libdatachannel,
+# the fetch pool with nghttp2, streamed request bodies), so it needs Rust and a
+# C and C++ compiler: the vendored BoringSSL, WAMR, libdatachannel and nghttp2
+# compile on first use. The gateway imports node:* modules, which Tov links
+# through WebKitGTK's JavaScriptCore (pkg-config javascriptcoregtk-4.1). Debian
+# bookworm matches the glibc and libraries of the runtime image below.
 FROM debian:bookworm-slim AS build
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates curl git make gcc g++ libc6-dev \
+      pkg-config libjavascriptcoregtk-4.1-dev \
  && rm -rf /var/lib/apt/lists/*
 
 ENV PATH=/root/.cargo/bin:$PATH
-RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.97.0
 
 WORKDIR /src
 COPY . .
@@ -22,11 +26,17 @@ RUN scripts/build-tov.sh \
  && mkdir -p /out/app/data \
  && TOV_CFLAGS=-DTV_PLAIN_ALLOC build/tov/target/release/tov build src/main.tov -o /out/raiju
 
-# Runtime. The binary links glibc, libm and (built here, with Tov's BoringSSL
-# compiled by g++) libstdc++ dynamically; check with `ldd`. distroless/cc adds
-# libstdc++, libgcc and CA certificates for HTTPS upstreams to glibc. There is
-# no shell and no curl, so HEALTHCHECK is not possible: probe GET /health from outside.
-FROM gcr.io/distroless/cc-debian12:nonroot
+# Runtime. The binary links glibc, libstdc++ and libatomic (for the vendored C++
+# libraries) and JavaScriptCore with its GLib and ICU libraries; check with `ldd`.
+# distroless/cc has no JavaScriptCore, so this is bookworm-slim with that library
+# and CA certificates for HTTPS upstreams. No HEALTHCHECK (no curl): probe
+# GET /health from outside.
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates libjavascriptcoregtk-4.1-0 \
+ && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build --chown=65532:65532 /out/app /app
 COPY --from=build /out/raiju /usr/local/bin/raiju

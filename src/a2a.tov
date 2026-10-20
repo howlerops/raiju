@@ -7,7 +7,8 @@
 // is CancelTask, ...), results and errors included. The v0.3 method names (message/send, tasks/resubscribe,
 // tasks/pushNotificationConfig/set, ...) are accepted too and answered in the same dialect.
 //
-// Not done here: translating message shapes between protocol versions. A body is sent on as it came.
+// The message shapes of the two versions are translated by a2aver.tov when the caller and the agent's interface
+// speak different ones.
 import { Field, fields, elements, find, rawStr, rawBool, rawNum, decodeString, quote, build, setField, isNull } from "./json"
 
 // ---- operations ----
@@ -597,10 +598,122 @@ async function copyMapped(upstream: ReadableStream, rl: MapRelay, map: (data: st
     const tail = split.rest()
     if (tail !== undefined) emit(rl, map(tail))
   } catch (e) {
-    console.error(`raiju: a2a stream relay: ${e.message}`)
+    // a caller that went away aborts the upstream read: nothing to report then
+    if (!rl.cancelled) console.error(`raiju: a2a stream relay: ${e.message}`)
   }
   const c = rl.ctl
   if (c !== undefined && !rl.cancelled) {
+    try {
+      c.close()
+    } catch (e) {
+      // already closed by the caller
+    }
+  }
+}
+
+// ---- cancellation and taps ----
+
+// The cancellation of one call: the caller went away (a stream it stopped reading, a gRPC stream it reset). Each part
+// of the call that can stop the work upstream (an HTTP request's abort, a gRPC stream's reset) registers here; fire runs
+// them once, and a hook registered after that runs at once.
+export class CallCancel {
+  fired = false
+  private hooks: (() => void)[] = []
+
+  on(f: () => void): void {
+    if (this.fired) {
+      f()
+      return
+    }
+    this.hooks.push(f)
+  }
+
+  fire(): void {
+    if (this.fired) return
+    this.fired = true
+    const hs = this.hooks
+    this.hooks = []
+    for (const h of hs) h()
+  }
+}
+
+// What a stream carried, as text, up to limit bytes; past it the copy is dropped (Bifrost keeps a raw body whole or not
+// at all).
+export class StreamTap {
+  text = ""
+  dropped = false
+  private size: int = 0
+
+  constructor(readonly limit: int) {}
+
+  add(s: string): void {
+    if (this.dropped) return
+    const n = new TextEncoder().encode(s).length
+    if (this.size + n > this.limit) {
+      this.text = ""
+      this.dropped = true
+      return
+    }
+    this.size += n
+    this.text += s
+  }
+}
+
+class TapState {
+  ctl: ReadableStreamDefaultController | undefined = undefined
+  cancelled = false
+  ended = false
+  // stops the source's reader (set once the copy holds it)
+  stop: (() => void) | undefined = undefined
+}
+
+// A stream passed on as it is. tap (when given) gets a copy of the text; done runs once when the stream ends, fails or
+// the caller cancels it; a caller that cancels also fires cancel, which stops the work upstream.
+export function tapped(src: ReadableStream, tap: StreamTap | undefined, done: (() => void) | undefined, cancel: CallCancel | undefined): ReadableStream {
+  const st = new TapState()
+  const finish = (): void => {
+    if (st.ended) return
+    st.ended = true
+    if (done !== undefined) done()
+  }
+  const out = new ReadableStream({
+    start: (c) => {
+      st.ctl = c
+    },
+    cancel: () => {
+      st.cancelled = true
+      if (cancel !== undefined) cancel.fire()
+      const s = st.stop
+      if (s !== undefined) s()
+      finish()
+    },
+  })
+  copyTapped(src, st, tap, finish)
+  return out
+}
+
+async function copyTapped(src: ReadableStream, st: TapState, tap: StreamTap | undefined, finish: () => void): Promise<void> {
+  try {
+    const dec = new TextDecoder()
+    const reader = src.getReader()
+    st.stop = () => {
+      reader.cancel()
+    }
+    while (!st.cancelled) {
+      const r = await reader.read()
+      if (r.done) break
+      const v = r.value
+      if (v === undefined) continue
+      if (tap !== undefined) tap.add(dec.decode(v, { stream: true }))
+      const c = st.ctl
+      if (c !== undefined && !st.cancelled) c.enqueue(v)
+    }
+  } catch (e) {
+    // the source broke off: the caller's stream ends here
+  }
+  finish()
+  const c = st.ctl
+  if (c !== undefined && !st.cancelled) {
     try {
       c.close()
     } catch (e) {
@@ -797,7 +910,9 @@ export function taskIdOfResult(result: string): string {
 
 // ---- the card ----
 
-export type Interface = { url: string, binding: string }
+// One interface of a card. version is the protocol version it speaks: the interface's protocolVersion on a v1 card
+// ("" when it names none), the card's protocolVersion on a v0.3 card ("0.3" when it names none).
+export type Interface = { url: string, binding: string, version: string }
 
 // The interfaces a card offers: the v1 supportedInterfaces, or the v0.3 url with its additionalInterfaces.
 // binding is JSONRPC, HTTP+JSON or GRPC. v1 is true for a v1 card.
@@ -814,17 +929,19 @@ export function interfacesOf(card: string): { list: Interface[], v1: bool } {
         const u = strOf(find(f, "url"))
         if (u === "") continue
         const b = strOf(find(f, "protocolBinding"))
-        out.push({ url: u, binding: b === "" ? "JSONRPC" : b })
+        out.push({ url: u, binding: b === "" ? "JSONRPC" : b, version: strOf(find(f, "protocolVersion")).trim() })
       }
     } catch (e) {
       // no usable list
     }
     return { list: out, v1: true }
   }
+  const pv = strOf(find(cf, "protocolVersion")).trim()
+  const version = pv === "" ? "0.3" : pv
   const u = strOf(find(cf, "url"))
   if (u !== "") {
     const pt = strOf(find(cf, "preferredTransport"))
-    out.push({ url: u, binding: pt === "" ? "JSONRPC" : pt })
+    out.push({ url: u, binding: pt === "" ? "JSONRPC" : pt, version: version })
   }
   const add = find(cf, "additionalInterfaces")
   if (add !== undefined && add.startsWith("[")) {
@@ -835,13 +952,62 @@ export function interfacesOf(card: string): { list: Interface[], v1: bool } {
         const iu = strOf(find(f, "url"))
         if (iu === "") continue
         const t = strOf(find(f, "transport"))
-        out.push({ url: iu, binding: t === "" ? "JSONRPC" : t })
+        out.push({ url: iu, binding: t === "" ? "JSONRPC" : t, version: version })
       }
     } catch (e) {
       // no usable list
     }
   }
   return { list: out, v1: false }
+}
+
+// Whether an interface's protocol version is the v0.3 dialect (any 0.x), as opposed to v1.
+export function isV03Version(version: string): bool {
+  return version.startsWith("0.")
+}
+
+// Why the gateway does not call an interface of this protocol version ("" when it does): a v1 interface names 1.x,
+// as Bifrost requires of every interface it proxies, and a v0.3 card's interfaces speak 0.3 (Raiju serves that
+// dialect too and translates).
+export function versionProblem(i: Interface, v1Card: bool): string {
+  if (!v1Card) return isV03Version(i.version) ? "" : `protocolVersion ${i.version} is not one the gateway speaks`
+  if (i.version === "") return "the interface names no protocolVersion"
+  if (i.version.split(".")[0]! === "1") return ""
+  if (i.version === "0.3" || i.version.startsWith("0.3.")) return ""
+  return `protocolVersion ${i.version} is not one the gateway speaks`
+}
+
+// Orders interfaces newest protocol version first, keeping the card's order among equal versions (Bifrost sorts its
+// candidates by semver the same way).
+export function byVersion(list: Interface[]): Interface[] {
+  let out: Interface[] = []
+  for (const i of list) {
+    let at = out.length
+    for (let j = 0; j < out.length; j++) {
+      if (versionNewer(i.version, out[j]!.version)) {
+        at = j
+        break
+      }
+    }
+    out = out.slice(0, at).concat([i]).concat(out.slice(at))
+  }
+  return out
+}
+
+function versionParts(v: string): int[] {
+  const out: int[] = []
+  for (const p of v.split(".")) out.push(Math.trunc(parseInt(p) ?? 0))
+  while (out.length < 3) out.push(0)
+  return out
+}
+
+function versionNewer(a: string, b: string): bool {
+  const x = versionParts(a)
+  const y = versionParts(b)
+  for (let k = 0; k < 3; k++) {
+    if (x[k]! !== y[k]!) return x[k]! > y[k]!
+  }
+  return false
 }
 
 // The first interface of a binding, "" when the card has none.
@@ -1119,6 +1285,20 @@ test("a card's interfaces are read in both forms", () => {
   expect(interfaceUrl(`{"supportedInterfaces":[{"url":"https://a.example/rpc","protocolBinding":"JSONRPC"}]}`, "JSONRPC")).toBe("https://a.example/rpc")
   expect(interfaceUrl(`{"supportedInterfaces":[{"url":"https://a.example/rpc","protocolBinding":"JSONRPC"}]}`, "HTTP+JSON")).toBe("")
   expect(interfacesOf("nope").list.length).toBe(0)
+  expect(v1.list[0]!.version).toBe("1.0")
+  expect(v1.list[1]!.version).toBe("")
+  expect(v03.list[0]!.version).toBe("0.3")
+  expect(interfacesOf(`{"url":"https://a.example/rpc","protocolVersion":"0.3.0"}`).list[0]!.version).toBe("0.3.0")
+  expect(versionProblem(v1.list[0]!, true)).toBe("")
+  expect(versionProblem(v1.list[1]!, true)).toBe("the interface names no protocolVersion")
+  expect(versionProblem({ url: "u", binding: "JSONRPC", version: "2.0" }, true) !== "").toBe(true)
+  expect(versionProblem({ url: "u", binding: "JSONRPC", version: "0.3" }, true)).toBe("")
+  expect(versionProblem(v03.list[0]!, false)).toBe("")
+  expect(versionProblem({ url: "u", binding: "JSONRPC", version: "1.0" }, false) !== "").toBe(true)
+  expect(isV03Version("0.3.0")).toBe(true)
+  expect(isV03Version("1.0")).toBe(false)
+  const sorted = byVersion([{ url: "a", binding: "JSONRPC", version: "0.3" }, { url: "b", binding: "GRPC", version: "1.0" }, { url: "c", binding: "HTTP+JSON", version: "1.0" }, { url: "d", binding: "JSONRPC", version: "1.1" }])
+  expect(sorted.map((i) => i.url).join(",")).toBe("d,b,c,a")
   expect(cardPushes(`{"capabilities":{"pushNotifications":true}}`)).toBe(true)
   expect(cardPushes(`{"capabilities":{}}`)).toBe(false)
 })

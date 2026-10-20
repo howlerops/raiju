@@ -1,0 +1,290 @@
+// Cursor's request quirks, read the way Bifrost's cursor request parser reads them (integrations/cursor.go):
+// - tools in Cursor's flat form ({"name","description","input_schema"}, no type) or in the chat form
+//   ({"type":"function","function":{...}}) become Responses function tools;
+// - Anthropic-style tool_use and tool_result blocks inside a message's content become function_call and
+//   function_call_output items (OpenAI-style tool_call_id and function.{name,arguments} are read too); the
+//   message's other blocks stay, as a message placed before those items;
+// - a user message whose content would come out empty gets "..." (providers refuse an empty user turn).
+// A "messages" body takes the chat path; there the same blocks become tool_calls and tool messages.
+import { Field, fields, elements, find, rawStr, quote, build, setField, isNull } from "./json"
+
+// The text of a tool_result's content: a string, or the text of its blocks joined.
+function resultText(raw: string): string throws SyntaxError {
+  const t = raw.trim()
+  if (t.startsWith("\"")) return rawStr(try fields(`{"v":${t}}`), "v") ?? ""
+  if (!t.startsWith("[")) return ""
+  let out = ""
+  for (const el of try elements(t)) {
+    if (!el.trim().startsWith("{")) continue
+    out += rawStr(try fields(el), "text") ?? ""
+  }
+  return out
+}
+
+// A tool_use block's call id, name and arguments (Anthropic's id, name and input; or OpenAI's tool_call_id and function).
+function useParts(b: Field[]): { id: string, name: string, args: string } throws SyntaxError {
+  const id = rawStr(b, "id") ?? rawStr(b, "tool_call_id") ?? ""
+  let name = rawStr(b, "name") ?? ""
+  let args = ""
+  const fn = find(b, "function")
+  if (fn !== undefined && fn.trim().startsWith("{")) {
+    const ff = try fields(fn)
+    if (name === "") name = rawStr(ff, "name") ?? ""
+    args = rawStr(ff, "arguments") ?? ""
+  }
+  const input = find(b, "input")
+  if (args === "" && input !== undefined && !isNull(input)) args = input.trim()
+  return { id: id, name: name, args: args }
+}
+
+function hasToolBlocks(content: string): bool throws SyntaxError {
+  if (!content.trim().startsWith("[")) return false
+  for (const el of try elements(content)) {
+    if (!el.trim().startsWith("{")) continue
+    const ty = rawStr(try fields(el), "type") ?? ""
+    if (ty === "tool_use" || ty === "tool_result") return true
+  }
+  return false
+}
+
+// Whether a message's content would reach a provider empty: no text with something in it, no image, file or audio.
+function emptyContent(raw: string | undefined): bool throws SyntaxError {
+  if (raw === undefined || isNull(raw)) return true
+  const t = raw.trim()
+  if (t.startsWith("\"")) return (rawStr(try fields(`{"v":${t}}`), "v") ?? "").trim() === ""
+  if (!t.startsWith("[")) return false
+  for (const el of try elements(t)) {
+    if (!el.trim().startsWith("{")) continue
+    const b = try fields(el)
+    const ty = rawStr(b, "type") ?? ""
+    if (ty === "input_text" || ty === "output_text" || ty === "text") {
+      if ((rawStr(b, "text") ?? "").trim() !== "") return false
+    } else if (ty === "input_image" || ty === "input_file" || ty === "input_audio" || ty === "image" || ty === "image_url") {
+      return false
+    }
+  }
+  return true
+}
+
+// One Responses tool from Cursor's flat or chat form; a Responses tool as it is.
+function responsesTool(el: string): string throws SyntaxError {
+  if (!el.trim().startsWith("{")) return el
+  const t = try fields(el)
+  const ty = rawStr(t, "type")
+  const fn = find(t, "function")
+  if (ty === "function" && fn !== undefined && fn.trim().startsWith("{") && find(t, "name") === undefined) {
+    const ff = try fields(fn)
+    const out: Field[] = [{ key: "type", raw: `"function"` }, { key: "name", raw: quote(rawStr(ff, "name") ?? "") }]
+    for (const k of ["description", "parameters", "strict"]) {
+      const v = find(ff, k)
+      if (v !== undefined && !isNull(v)) out.push({ key: k, raw: v })
+    }
+    return build(out)
+  }
+  if (ty === undefined && find(t, "name") !== undefined) {
+    const out: Field[] = [{ key: "type", raw: `"function"` }, { key: "name", raw: quote(rawStr(t, "name") ?? "") }]
+    const d = find(t, "description")
+    if (d !== undefined && !isNull(d)) out.push({ key: "description", raw: d })
+    const s = find(t, "input_schema") ?? find(t, "parameters")
+    if (s !== undefined && !isNull(s)) out.push({ key: "parameters", raw: s })
+    return build(out)
+  }
+  return el
+}
+
+// The input items of one message: the message itself, or (with tool blocks) its other blocks as a message
+// followed by a function_call or function_call_output item per tool block.
+function inputItems(el: string): string[] throws SyntaxError {
+  if (!el.trim().startsWith("{")) return [el]
+  const m = try fields(el)
+  const ty = rawStr(m, "type") ?? "message"
+  const role = rawStr(m, "role") ?? "user"
+  const content = find(m, "content")
+  if (ty === "message" && content !== undefined && try hasToolBlocks(content)) {
+    const regular: string[] = []
+    const tools: string[] = []
+    for (const b of try elements(content)) {
+      if (!b.trim().startsWith("{")) continue
+      const bf = try fields(b)
+      const bt = rawStr(bf, "type") ?? ""
+      if (bt === "tool_use") {
+        const u = try useParts(bf)
+        tools.push(`{"type":"function_call","id":${quote(u.id)},"call_id":${quote(u.id)},"name":${quote(u.name)},"arguments":${quote(u.args)},"status":"completed"}`)
+      } else if (bt === "tool_result") {
+        const id = rawStr(bf, "tool_use_id") ?? rawStr(bf, "tool_call_id") ?? ""
+        const c = find(bf, "content")
+        const text = c === undefined || isNull(c) ? "" : try resultText(c)
+        tools.push(`{"type":"function_call_output","call_id":${quote(id)},"output":${quote(text)}}`)
+      } else {
+        // an Anthropic text block reads as the role's own text part
+        if (bt === "text") {
+          let nb = bf.slice()
+          setField(&nb, "type", role === "assistant" ? `"output_text"` : `"input_text"`)
+          regular.push(build(nb))
+        } else {
+          regular.push(b)
+        }
+      }
+    }
+    const out: string[] = []
+    if (regular.length > 0) {
+      let rest = m.slice()
+      setField(&rest, "content", `[${regular.join(",")}]`)
+      out.push(build(rest))
+    }
+    for (const t of tools) out.push(t)
+    return out
+  }
+  if (ty === "message" && role === "user" && try emptyContent(content)) {
+    let fixed = m.slice()
+    setField(&fixed, "content", `"..."`)
+    return [build(fixed)]
+  }
+  return [el]
+}
+
+// Whether a Cursor body is read through its Responses "input" (else its chat "messages"): input with items wins,
+// unless it holds no tool result while the messages do (Bifrost's cursorMergeToolResultsFromMessages).
+export function cursorUsesInput(body: Field[]): bool {
+  const input = find(body, "input")
+  const msgs = find(body, "messages")
+  if (input === undefined || isNull(input)) return false
+  const t = input.trim()
+  if (t.startsWith("\"")) return true
+  if (!t.startsWith("[") || t.slice(1).trim().startsWith("]")) return msgs === undefined
+  if (msgs === undefined) return true
+  const inputResults = t.includes("\"function_call_output\"") || t.includes("\"tool_result\"")
+  const msgResults = msgs.includes("\"tool_result\"") || msgs.includes("\"role\":\"tool\"") || msgs.includes("\"role\": \"tool\"")
+  return inputResults || !msgResults
+}
+
+// A Responses-shaped Cursor body, as Bifrost's parser reads it. A body it cannot read is returned as it was.
+export function cursorResponsesBody(text: string): string {
+  try {
+    let fs = fields(text)
+    const input = find(fs, "input")
+    if (input !== undefined && input.trim().startsWith("[")) {
+      const items: string[] = []
+      for (const el of elements(input)) {
+        for (const it of inputItems(el)) items.push(it)
+      }
+      setField(&fs, "input", `[${items.join(",")}]`)
+    }
+    const tools = find(fs, "tools")
+    if (tools !== undefined && tools.trim().startsWith("[")) {
+      const ts: string[] = []
+      for (const el of elements(tools)) ts.push(responsesTool(el))
+      setField(&fs, "tools", `[${ts.join(",")}]`)
+    }
+    return build(fs)
+  } catch (e) {
+    return text
+  }
+}
+
+// The chat messages of one Cursor message: Anthropic tool_use blocks become the assistant's tool_calls, tool_result
+// blocks become tool messages after the message's other blocks.
+function chatMessages(el: string): string[] throws SyntaxError {
+  if (!el.trim().startsWith("{")) return [el]
+  const m = try fields(el)
+  const content = find(m, "content")
+  if (content === undefined || !(try hasToolBlocks(content))) return [el]
+  const role = rawStr(m, "role") ?? "user"
+  const regular: string[] = []
+  const calls: string[] = []
+  const results: string[] = []
+  for (const b of try elements(content)) {
+    if (!b.trim().startsWith("{")) continue
+    const bf = try fields(b)
+    const bt = rawStr(bf, "type") ?? ""
+    if (bt === "tool_use") {
+      const u = try useParts(bf)
+      calls.push(`{"id":${quote(u.id)},"type":"function","function":{"name":${quote(u.name)},"arguments":${quote(u.args)}}}`)
+    } else if (bt === "tool_result") {
+      const id = rawStr(bf, "tool_use_id") ?? rawStr(bf, "tool_call_id") ?? ""
+      const c = find(bf, "content")
+      results.push(`{"role":"tool","tool_call_id":${quote(id)},"content":${quote(c === undefined || isNull(c) ? "" : try resultText(c))}}`)
+    } else {
+      regular.push(b)
+    }
+  }
+  const out: string[] = []
+  if (calls.length > 0) {
+    let a = m.slice()
+    setField(&a, "content", regular.length > 0 ? `[${regular.join(",")}]` : "null")
+    setField(&a, "tool_calls", `[${calls.join(",")}]`)
+    out.push(build(a))
+  } else if (regular.length > 0) {
+    let r = m.slice()
+    setField(&r, "content", `[${regular.join(",")}]`)
+    out.push(build(r))
+  }
+  // a tool result answers a call, so it follows the assistant turn (the rest of its user message comes after it)
+  if (role !== "assistant" && calls.length === 0 && regular.length > 0) {
+    const userMsg = out.pop()!
+    for (const r of results) out.push(r)
+    out.push(userMsg)
+  } else {
+    for (const r of results) out.push(r)
+  }
+  return out
+}
+
+// A chat-shaped Cursor body: Anthropic tool blocks in its messages become chat tool calls and tool messages.
+export function cursorChatBody(text: string): string {
+  try {
+    let fs = fields(text)
+    const msgs = find(fs, "messages")
+    if (msgs === undefined || !msgs.includes("\"tool_use\"") && !msgs.includes("\"tool_result\"")) return text
+    const out: string[] = []
+    for (const el of elements(msgs)) {
+      for (const x of chatMessages(el)) out.push(x)
+    }
+    setField(&fs, "messages", `[${out.join(",")}]`)
+    return build(fs)
+  } catch (e) {
+    return text
+  }
+}
+
+test("Cursor's flat and chat-form tools become Responses function tools", () => {
+  const got = cursorResponsesBody(`{"model":"m","input":"hi","tools":[{"name":"Shell","description":"run","input_schema":{"type":"object"}},{"type":"function","function":{"name":"Read","parameters":{"type":"object"}}},{"type":"web_search"}]}`)
+  expect(got).toBe(`{"model":"m","input":"hi","tools":[{"type":"function","name":"Shell","description":"run","parameters":{"type":"object"}},{"type":"function","name":"Read","parameters":{"type":"object"}},{"type":"web_search"}]}`)
+})
+
+test("Anthropic tool blocks in Responses input become function call items", () => {
+  const body = `{"model":"m","input":[` +
+    `{"role":"user","content":[{"type":"input_text","text":"list files"}]},` +
+    `{"role":"assistant","content":[{"type":"text","text":"running"},{"type":"tool_use","id":"toolu_1","name":"Shell","input":{"cmd":"ls"}}]},` +
+    `{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"a.txt"},{"type":"text","text":" b.txt"}]}]},` +
+    `{"role":"assistant","content":[{"type":"tool_use","tool_call_id":"call_2","function":{"name":"Read","arguments":"{\\"p\\":1}"}}]},` +
+    `{"role":"user","content":[{"type":"tool_result","tool_call_id":"call_2","content":"done"}]}]}`
+  const got = cursorResponsesBody(body)
+  expect(got).toBe(`{"model":"m","input":[` +
+    `{"role":"user","content":[{"type":"input_text","text":"list files"}]},` +
+    `{"role":"assistant","content":[{"type":"output_text","text":"running"}]},` +
+    `{"type":"function_call","id":"toolu_1","call_id":"toolu_1","name":"Shell","arguments":"{\\"cmd\\":\\"ls\\"}","status":"completed"},` +
+    `{"type":"function_call_output","call_id":"toolu_1","output":"a.txt b.txt"},` +
+    `{"type":"function_call","id":"call_2","call_id":"call_2","name":"Read","arguments":"{\\"p\\":1}","status":"completed"},` +
+    `{"type":"function_call_output","call_id":"call_2","output":"done"}]}`)
+})
+
+test("an empty user turn gets a placeholder; other bodies pass as they are", () => {
+  expect(cursorResponsesBody(`{"input":[{"role":"user","content":[{"type":"input_text","text":"  "}]},{"role":"user","content":""}]}`)).toBe(`{"input":[{"role":"user","content":"..."},{"role":"user","content":"..."}]}`)
+  expect(cursorResponsesBody(`{"input":[{"role":"user","content":[{"type":"input_image","image_url":"data:x"}]}]}`)).toBe(`{"input":[{"role":"user","content":[{"type":"input_image","image_url":"data:x"}]}]}`)
+  expect(cursorResponsesBody(`not json`)).toBe(`not json`)
+})
+
+test("Anthropic tool blocks in chat messages become tool calls and tool messages", () => {
+  const got = cursorChatBody(`{"model":"m","messages":[{"role":"assistant","content":[{"type":"text","text":"ok"},{"type":"tool_use","id":"t1","name":"Shell","input":{"c":1}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"out"},{"type":"text","text":"next"}]}]}`)
+  expect(got).toBe(`{"model":"m","messages":[{"role":"assistant","content":[{"type":"text","text":"ok"}],"tool_calls":[{"id":"t1","type":"function","function":{"name":"Shell","arguments":"{\\"c\\":1}"}}]},{"role":"tool","tool_call_id":"t1","content":"out"},{"role":"user","content":[{"type":"text","text":"next"}]}]}`)
+  expect(cursorChatBody(`{"messages":[{"role":"user","content":"hi"}]}`)).toBe(`{"messages":[{"role":"user","content":"hi"}]}`)
+})
+
+test("input is read unless it is empty or misses the tool results the messages hold", () => {
+  expect(cursorUsesInput(try fields(`{"input":"hi"}`))).toBe(true)
+  expect(cursorUsesInput(try fields(`{"messages":[]}`))).toBe(false)
+  expect(cursorUsesInput(try fields(`{"input":[],"messages":[{"role":"user","content":"x"}]}`))).toBe(false)
+  expect(cursorUsesInput(try fields(`{"input":[{"role":"user","content":"x"}],"messages":[{"role":"user","content":"x"}]}`))).toBe(true)
+  expect(cursorUsesInput(try fields(`{"input":[{"role":"user","content":"x"}],"messages":[{"role":"tool","tool_call_id":"c","content":"r"}]}`))).toBe(false)
+})

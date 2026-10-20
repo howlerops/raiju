@@ -3,7 +3,8 @@
 // in the same scope is returned if its cosine similarity clears the threshold.
 // Vectors live in memory; there is no external vector DB.
 
-import { mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkSync, rmSync } from "node:fs"
+import { appendFileSync, mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkSync, rmSync } from "node:fs"
+import { writeFileAtomic } from "./atomicfile"
 import { fields, elements, find, rawStr, rawBool, isNull, decodeString } from "./json"
 import { CacheOrigin } from "./cache"
 import { sha256, toHex, utf8 } from "./crypto"
@@ -220,6 +221,31 @@ export class VectorIndex {
 type Entry = { scope: string, key: string, body: string, contentType: string, expires: f64, origin?: CacheOrigin }
 type SharedEntry = { scope: string, v: f64[], body: string, contentType: string, expires: f64, origin?: CacheOrigin, key?: string }
 
+// The shared clear log, in the share directory beside the entry files.
+const CLEAR_LOG = "clears.log"
+
+// An entry's id as hits report it: the sha-256 of its scope and body.
+function entryHash(scope: string, body: string): string {
+  return toHex(sha256(utf8(scope + "\n" + body)))
+}
+
+// Text from lowercase hex (as toHex writes it); "" for bad hex.
+function fromHex(h: string): string {
+  const digits = "0123456789abcdef"
+  const bytes: u8[] = []
+  for (let i = 0; i + 1 < h.byteLength; i += 2) {
+    const a = digits.indexOf(h.slice(i, i + 1))
+    const b = digits.indexOf(h.slice(i + 1, i + 2))
+    if (a < 0 || b < 0) return ""
+    bytes.push(u8(a * 16 + b))
+  }
+  try {
+    return new TextDecoder().decode(bytes)
+  } catch (e) {
+    return ""
+  }
+}
+
 // Partitioned by scope. Eviction is global FIFO: the oldest insert goes first,
 // whichever scope it is in.
 export class SemanticCache {
@@ -235,6 +261,8 @@ export class SemanticCache {
   shareDir = ""
   private seen: Set<string> = new Set()
   private shareExpiry: Map<string, f64> = new Map()
+  // how much of the shared clear log (CLEAR_LOG) this worker has applied
+  private clearsRead = 0
   constructor(readonly cfg: SemanticCacheConfig) {}
 
   share(dir: string): void {
@@ -244,11 +272,20 @@ export class SemanticCache {
     } catch (e) {
       this.shareDir = ""
     }
+    // clears made before this worker joined are already in the files (their entries were deleted), and
+    // replaying them could drop entries stored since under the same key
+    try {
+      this.clearsRead = readFileSync(dir + "/" + CLEAR_LOG, "utf8").byteLength
+    } catch (e) {
+      this.clearsRead = 0
+    }
   }
 
-  // Takes in entries other workers stored since the last call, and removes expired files.
+  // Takes in entries other workers stored since the last call, applies the clears they made, and removes
+  // expired files.
   syncShared(nowMs: f64): int {
     if (this.shareDir === "") return 0
+    this.applyClears()
     let added = 0
     let names: string[] = []
     try {
@@ -325,7 +362,7 @@ export class SemanticCache {
         continue
       }
       this.hits += 1
-      return { id: toHex(sha256(utf8(scope + "\n" + e.body))), body: e.body, contentType: e.contentType, score: hit.score, origin: e.origin }
+      return { id: entryHash(scope, e.body), body: e.body, contentType: e.contentType, score: hit.score, origin: e.origin }
     }
     this.misses += 1
     return undefined
@@ -342,7 +379,7 @@ export class SemanticCache {
       this.seen.add(name)
       this.shareExpiry.set(name, expires)
       try {
-        writeFileSync(this.shareDir + "/" + name, JSON.stringify({ scope: scope, v: v, body: body, contentType: contentType, expires: expires, origin: origin, key: key ?? "" }))
+        writeFileAtomic(this.shareDir + "/" + name, JSON.stringify({ scope: scope, v: v, body: body, contentType: contentType, expires: expires, origin: origin, key: key ?? "" }), { durable: false })
       } catch (e) {
         // the shared copy is a bonus
       }
@@ -374,9 +411,34 @@ export class SemanticCache {
     return { entries: this.meta.size, partitions: this.parts.size, hits: this.hits, misses: this.misses }
   }
 
-  // Removes the entries stored under an x-bf-cache-key, in this worker's memory. Returns how many went.
-  // Other workers' copies, and the entries of an external vector store, are not touched.
+  // Removes the entries stored under an x-bf-cache-key. Returns how many went from this worker's memory.
+  // With several workers the shared files of those entries go too, and the clear is logged for the other
+  // workers, which apply it at their next sync.
   clearKey(cacheKey: string): int {
+    const n = this.dropKey(cacheKey)
+    if (this.shareDir !== "") {
+      this.removeShared((x) => (x.key ?? "") === cacheKey)
+      this.logClear("key", cacheKey)
+    }
+    return n
+  }
+
+  // Removes the entry with this id: the id a hit reports (x-bifrost-cache-id, the hash of its scope and
+  // body, the same on every worker) or the id this worker gave it ("e7"). False when this worker had none.
+  // Shared copies and the other workers' memory follow, as for clearKey.
+  clearId(id: string): bool {
+    let hash = id
+    const own = this.meta.get(id)
+    if (own !== undefined) hash = entryHash(own.scope, own.body)
+    const gone = this.dropHash(hash) > 0
+    if (this.shareDir !== "") {
+      this.removeShared((x) => entryHash(x.scope, x.body) === hash)
+      this.logClear("id", hash)
+    }
+    return gone
+  }
+
+  private dropKey(cacheKey: string): int {
     const dead: string[] = []
     for (const id of this.meta.keys()) {
       const e = this.meta.get(id)
@@ -386,11 +448,69 @@ export class SemanticCache {
     return dead.length
   }
 
-  // Removes the entry with this id (e.g. "e7", the id this worker gave it). False when there is none.
-  clearId(id: string): bool {
-    if (!this.meta.has(id)) return false
-    this.drop(id)
-    return true
+  private dropHash(hash: string): int {
+    const dead: string[] = []
+    for (const id of this.meta.keys()) {
+      const e = this.meta.get(id)
+      if (e !== undefined && entryHash(e.scope, e.body) === hash) dead.push(id)
+    }
+    for (const id of dead) this.drop(id)
+    return dead.length
+  }
+
+  // Deletes the shared entry files that match, so no worker takes them in again.
+  private removeShared(match: (x: SharedEntry) => bool): void {
+    let names: string[] = []
+    try {
+      names = readdirSync(this.shareDir)
+    } catch (e) {
+      return
+    }
+    for (const n of names) {
+      if (!n.endsWith(".json")) continue
+      try {
+        const x = JSON.parse(readFileSync(this.shareDir + "/" + n, "utf8")) as SharedEntry
+        if (match(x)) unlinkSync(this.shareDir + "/" + n)
+      } catch (e) {
+        continue
+      }
+    }
+  }
+
+  // One line per clear: "key\t<hex of the cache key>" or "id\t<entry hash>". This worker has applied it.
+  private logClear(kind: string, value: string): void {
+    const line = kind + "\t" + (kind === "key" ? toHex(utf8(value)) : value) + "\n"
+    try {
+      appendFileSync(this.shareDir + "/" + CLEAR_LOG, line)
+      this.clearsRead += line.byteLength
+    } catch (e) {
+      console.error(`raiju: semantic cache clear log: ${e.message}`)
+    }
+  }
+
+  // Applies the clears the other workers logged since the last call.
+  private applyClears(): void {
+    let text = ""
+    try {
+      text = readFileSync(this.shareDir + "/" + CLEAR_LOG, "utf8")
+    } catch (e) {
+      return
+    }
+    if (text.byteLength <= this.clearsRead) return
+    const fresh = text.slice(this.clearsRead)
+    // the last piece has no newline yet (a line being written, or ""), so it waits for the next call
+    const lines = fresh.split("\n")
+    const partial = lines[lines.length - 1]!
+    for (let i = 0; i < lines.length - 1; i++) {
+      const line = lines[i]!
+      const tab = line.indexOf("\t")
+      if (tab < 0) continue
+      const kind = line.slice(0, tab)
+      const value = line.slice(tab + 1)
+      if (kind === "id") this.dropHash(value)
+      else if (kind === "key") this.dropKey(fromHex(value))
+    }
+    this.clearsRead += fresh.byteLength - partial.byteLength
   }
 }
 
@@ -579,6 +699,35 @@ test("semantic entries are cleared by their cache key and by id", () => {
   expect(c.clearId("e2")).toBe(true)
   expect(c.clearId("e2")).toBe(false)
   expect(c.stats().entries).toBe(0)
+})
+
+test("a clear on one worker reaches the shared files and the other workers' memory", () => {
+  const dir = "/tmp/raiju-sem-clear-" + Math.floor(Math.random() * 1000000000)
+  const cfg = defaultSemanticConfig()
+  const a = new SemanticCache(cfg)
+  const b = new SemanticCache(cfg)
+  a.share(dir)
+  b.share(dir)
+  expect(a.store("s", [1.0, 0.0], "{\"k\":1}", "application/json", 1000.0, undefined, undefined, "team-a")).toBe(true)
+  expect(a.store("s", [0.0, 1.0], "{\"k\":2}", "application/json", 1000.0, undefined, undefined, "team-b")).toBe(true)
+  expect(b.syncShared(1001.0)).toBe(2)
+  // by key on a: b drops its copy at its next sync, and a new worker does not take the entry in
+  expect(a.clearKey("team-a")).toBe(1)
+  expect(b.lookup("s", [1.0, 0.0], 1002.0)?.body).toBe("{\"k\":1}")
+  b.syncShared(1003.0)
+  expect(b.lookup("s", [1.0, 0.0], 1004.0)).toBeUndefined()
+  const c = new SemanticCache(cfg)
+  c.share(dir)
+  expect(c.syncShared(1005.0)).toBe(1)
+  // by the id a hit reports, on b this time
+  const hit = a.lookup("s", [0.0, 1.0], 1006.0)!
+  expect(b.clearId(hit.id)).toBe(true)
+  a.syncShared(1007.0)
+  expect(a.lookup("s", [0.0, 1.0], 1008.0)).toBeUndefined()
+  expect(fromHex(toHex(utf8("team-é")))).toBe("team-é")
+  try {
+    rmSync(dir, { recursive: true, force: true })
+  } catch (e) {}
 })
 
 test("identity scope: per virtual key by default, shared when disabled", () => {

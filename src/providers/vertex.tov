@@ -63,21 +63,43 @@ export class TokenCache {
   }
 }
 
-// Gemini and Claude share the regional host; "global" has no region prefix.
+// The API host of a location (Bifrost's getVertexAPIHost): "global" has no region prefix, and the multi-region
+// locations "us" and "eu" are served only by their rep.googleapis.com hosts.
+export function vertexHost(region: string): string {
+  if (region === "global") return "aiplatform.googleapis.com"
+  if (region === "us" || region === "eu") return `aiplatform.${region}.rep.googleapis.com`
+  return `${region}-aiplatform.googleapis.com`
+}
+
 function host(region: string): string {
-  return region === "global" ? "aiplatform.googleapis.com" : `${region}-aiplatform.googleapis.com`
+  return vertexHost(region)
+}
+
+// Whether a model id names a tuned model's endpoint: all digits (Bifrost's IsAllDigitsASCII).
+export function isEndpointModel(model: string): bool {
+  if (model === "") return false
+  for (const c of model.chars()) {
+    if (c < "0" || c > "9") return false
+  }
+  return true
 }
 
 export function isClaude(model: string): bool {
   return model.startsWith("claude")
 }
 
-// A model's URL under a publisher ("google" or "anthropic") and method, for the named model.
+// A model's URL under a publisher ("google" or "anthropic") and method, for the named model. A tuned Gemini model (an
+// all-digit id) is an endpoint of the project, addressed by its project_number under v1beta1, as Bifrost addresses it.
 function vertexModelUrl(t: Target, publisher: string, model: string, method: string): string throws SyntaxError {
   const vk = t.key.vertex_key_config
   if (vk === undefined) throw new SyntaxError("vertex: key has no vertex_key_config")
   const b = t.cfg.network_config?.base_url
   const origin = b === undefined || b === "" ? `https://${host(vk.region)}` : trimSlash(b)
+  if (publisher === "google" && isEndpointModel(model)) {
+    const num = vk.project_number ?? ""
+    if (num === "") throw new SyntaxError("project number is not set for fine-tuned models")
+    return `${origin}/v1beta1/projects/${num}/locations/${vk.region}/endpoints/${model}:${method}`
+  }
   return `${origin}/v1/projects/${vk.project_id}/locations/${vk.region}/publishers/${publisher}/models/${model}:${method}`
 }
 
@@ -91,7 +113,9 @@ export function publisherListUrl(t: Target, publisher: string, pageToken: string
   const vk = t.key.vertex_key_config
   if (vk === undefined) throw new SyntaxError("vertex: key has no vertex_key_config")
   const b = t.cfg.network_config?.base_url
-  const origin = b === undefined || b === "" ? `https://${host(vk.region)}` : trimSlash(b)
+  // (the multi-region hosts refuse publishers.models.list: the listing stays on the standard host)
+  const lh = vk.region === "us" || vk.region === "eu" ? "aiplatform.googleapis.com" : host(vk.region)
+  const origin = b === undefined || b === "" ? `https://${lh}` : trimSlash(b)
   const more = pageToken === "" ? "" : "&pageToken=" + pctEncode(pageToken)
   return `${origin}/v1beta1/publishers/${publisher}/models?pageSize=1000${more}`
 }
@@ -113,29 +137,33 @@ export function countRequest(t: Target, generateBody: string, messagesBody: stri
 
 // The request for a chat completion. Claude models take the Anthropic Messages
 // body, without model, and the Vertex version; other models take Gemini's body.
-export function chatRequest(t: Target, req: ChatRequest, body: Field[], accessToken: string): Upstream throws SyntaxError {
+export function chatRequest(t: Target, req: ChatRequest, body: Field[], accessToken: string, autoCache?: bool): Upstream throws SyntaxError {
   let h = headers([["content-type", "application/json"], ["authorization", "Bearer " + accessToken]])
   addExtraHeaders(&h, t.cfg)
   if (isClaude(t.model)) {
-    const raw = try anthropic.messagesBody(req, body, t.model, false, false)
+    // the provider's prompt_cache: its injection points mark messages and auto_inject places the breakpoints, as on
+    // Anthropic (Gemini models have no per-block marker, so neither applies to them, as in Bifrost)
+    const raw = try anthropic.messagesBody(req, body, t.model, false, autoCache === true, t.cfg.prompt_cache)
     let fs = without(try fields(raw), ["model"])
     setField(&fs, "anthropic_version", quote(ANTHROPIC_VERSION))
     return { url: try vertexUrl(t, "anthropic", "rawPredict"), headers: h, body: build(fs) }
   }
+  if (isEndpointModel(t.model)) return { url: try vertexModelUrl(t, "google", t.model, "generateContent"), headers: h, body: try gemini.generateBody(req, body, t.model) }
   return { url: try vertexUrl(t, "google", "generateContent"), headers: h, body: try gemini.generateBody(req, body, t.model) }
 }
 
 // The streaming request: streamRawPredict (Anthropic events) for Claude models,
 // streamGenerateContent as SSE (Gemini chunks) for the rest.
-export function streamRequest(t: Target, req: ChatRequest, body: Field[], accessToken: string): Upstream throws SyntaxError {
+export function streamRequest(t: Target, req: ChatRequest, body: Field[], accessToken: string, autoCache?: bool): Upstream throws SyntaxError {
   let h = headers([["content-type", "application/json"], ["authorization", "Bearer " + accessToken]])
   addExtraHeaders(&h, t.cfg)
   if (isClaude(t.model)) {
-    const raw = try anthropic.messagesBody(req, body, t.model, true, false)
+    const raw = try anthropic.messagesBody(req, body, t.model, true, autoCache === true, t.cfg.prompt_cache)
     let fs = without(try fields(raw), ["model"])
     setField(&fs, "anthropic_version", quote(ANTHROPIC_VERSION))
     return { url: try vertexUrl(t, "anthropic", "streamRawPredict"), headers: h, body: build(fs) }
   }
+  if (isEndpointModel(t.model)) return { url: (try vertexModelUrl(t, "google", t.model, "streamGenerateContent")) + "?alt=sse", headers: h, body: try gemini.generateBody(req, body, t.model) }
   return { url: (try vertexUrl(t, "google", "streamGenerateContent")) + "?alt=sse", headers: h, body: try gemini.generateBody(req, body, t.model) }
 }
 
@@ -271,4 +299,67 @@ test("service account and key errors", () => {
     threw = true
   }
   expect(threw).toBe(true)
+})
+
+test("auto_inject marks Claude on Vertex, and leaves Gemini alone", () => {
+  const raw = `{"model":"m","messages":[{"role":"system","content":"rules"},{"role":"user","content":"hi"}]}`
+  const up = try chatRequest(target("claude-sonnet-4-5", "us-east5"), try JSON.parse(raw) as ChatRequest, try fields(raw), "tok", true)
+  expect(up.body.includes(`"system":[{"type":"text","text":"rules","cache_control":{"type":"ephemeral"}}]`)).toBe(true)
+  const g = try chatRequest(target("gemini-2.5-flash", "us-east5"), try JSON.parse(raw) as ChatRequest, try fields(raw), "tok", true)
+  expect(g.body.includes("cache_control")).toBe(false)
+})
+
+test("a tuned model (an endpoint id) is called under the project number", () => {
+  const raw = `{"model":"m","messages":[{"role":"user","content":"hi"}]}`
+  expect(isEndpointModel("1234567890")).toBe(true)
+  expect(isEndpointModel("gemini-2.5-flash")).toBe(false)
+  let t = target("1234567890", "us-central1")
+  t.key.vertex_key_config!.project_number = "987"
+  const up = try chatRequest(t, try JSON.parse(raw) as ChatRequest, try fields(raw), "tok")
+  expect(up.url).toBe("https://us-central1-aiplatform.googleapis.com/v1beta1/projects/987/locations/us-central1/endpoints/1234567890:generateContent")
+  expect(up.body).toBe(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`)
+  const st = try streamRequest(t, try JSON.parse(raw) as ChatRequest, try fields(raw), "tok")
+  expect(st.url.endsWith("/endpoints/1234567890:streamGenerateContent?alt=sse")).toBe(true)
+  let msg = ""
+  try {
+    chatRequest(target("1234567890", "us-central1"), try JSON.parse(raw) as ChatRequest, try fields(raw), "tok")
+  } catch (e) {
+    msg = e.message
+  }
+  expect(msg).toBe("project number is not set for fine-tuned models")
+})
+
+test("Claude on Vertex applies the provider's cache_control_injection_points", () => {
+  const raw = `{"model":"m","messages":[{"role":"system","content":"rules"},{"role":"user","content":"one"},{"role":"assistant","content":"two"},{"role":"user","content":"three"}]}`
+  let t = target("claude-sonnet-4-5", "us-east5")
+  t.cfg = { prompt_cache: { cache_control_injection_points: [{ location: "message", role: "system" }, { location: "message", index: -1 }] } }
+  const up = try chatRequest(t, try JSON.parse(raw) as ChatRequest, try fields(raw), "tok")
+  expect(up.body.includes(`"system":[{"type":"text","text":"rules","cache_control":{"type":"ephemeral"}}]`)).toBe(true)
+  expect(up.body.includes(`{"type":"text","text":"three","cache_control":{"type":"ephemeral"}}`)).toBe(true)
+  expect(up.body.includes(`{"type":"text","text":"one"}`)).toBe(true)
+  const st = try streamRequest(t, try JSON.parse(raw) as ChatRequest, try fields(raw), "tok")
+  expect(st.body.includes(`"text":"three","cache_control"`)).toBe(true)
+  // no points: no markers
+  const plain = try chatRequest(target("claude-sonnet-4-5", "us-east5"), try JSON.parse(raw) as ChatRequest, try fields(raw), "tok")
+  expect(plain.body.includes("cache_control")).toBe(false)
+})
+
+test("the multi-region locations use their rep hosts, and listing stays on the standard host", () => {
+  expect(try vertexUrl(target("claude-sonnet-4@20250514", "us"), "anthropic", "rawPredict")).toBe(
+    "https://aiplatform.us.rep.googleapis.com/v1/projects/my-proj/locations/us/publishers/anthropic/models/claude-sonnet-4@20250514:rawPredict")
+  expect(vertexHost("eu")).toBe("aiplatform.eu.rep.googleapis.com")
+  expect((try publisherListUrl(target("m", "us"), "google", "")).startsWith("https://aiplatform.googleapis.com/v1beta1/")).toBe(true)
+})
+
+test("a tuned model is the project's endpoint, addressed by project_number", () => {
+  const t: Target = { provider: "vertex", kind: "vertex", model: "1234567890", key: { vertex_key_config: { project_id: "my-proj", region: "us-central1", project_number: "998877" } }, cfg: {} }
+  expect(try vertexUrl(t, "google", "generateContent")).toBe("https://us-central1-aiplatform.googleapis.com/v1beta1/projects/998877/locations/us-central1/endpoints/1234567890:generateContent")
+  let refused = ""
+  try {
+    vertexUrl(target("1234567890", "us-central1"), "google", "generateContent")
+  } catch (e) {
+    refused = e.message
+  }
+  expect(refused).toBe("project number is not set for fine-tuned models")
+  expect(isEndpointModel("gemini-2.5-flash")).toBe(false)
 })

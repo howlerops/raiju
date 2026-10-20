@@ -9,6 +9,8 @@ Patch 0004 is written on top of 0003 (its hunks include the ALPN signatures), so
 patches apply in order only. Patches 0005 (WAMR) and 0006 (libdatachannel) add vendored C
 libraries (about 2.7 MB and 4.9 MB of text), which the first four do not; 0006 is applied on top of 0005.
 Patch 0008 changes the fetch and HTTP/2 code that 0007 adds, so it is applied on top of 0007.
+Patch 0009 (node:fs rename and fsync) touches the shared lists in `builtins.rs` and `tov.h` and is written on top of 0001-0008.
+Patch 0010 (WebAssembly wall-clock limit) changes `std/wasm`, `runtime/wasm.c` and the WAMR interpreter that 0005 adds, and is written on top of 0001-0009.
 
 ## Submitting upstream
 
@@ -451,7 +453,8 @@ Bun.serve({
   handler slows the sender. A body nobody reads is dropped when the request is answered (at most
   32 MiB further; past that the connection closes), and the connection serves its next request. A
   client that leaves or half-closes fails the stream. `text()`, `json()` and the others read it whole.
-  `Expect: 100-continue` is answered for a streamed body.
+  `Expect: 100-continue` is answered for a streamed body. Cancelling a body that is all in frees its
+  stream at once (`httpBodyCancel` keeps the connection it marks for reading, not the stream).
 - `Socket.pause()` (runtime/net.c) takes the socket off the read interest; `src/http1.tov` uses it for
   the same backpressure on raw sockets.
 
@@ -469,3 +472,85 @@ connection may cost the answer (HTTP/1.1 over plain TCP and HTTP/2 return it). T
 of `workers: n` each hold their own streams. `Request.body` of a request read with `text()` first is
 the empty stream. The tests (`tests/request_body_server.tov` with `request_body_client.py`,
 `request_body_fetch.tov` against `h2_server.py`, `socket_pause.tov`) are in `run.sh`.
+
+## 0009 — `node:fs` rename, descriptors and fsync (`renameSync`, `openSync`, `fsyncSync`)
+
+**Problem.** Tov's `node:fs` could write a file only in place (`writeFileSync` truncates, then writes),
+and had no `rename` or `fsync`. A program that rewrites a state file (a gateway's config.json) leaves a
+truncated or half-written file when it dies mid-write, and another process reading at that moment sees
+the same. The usual cure, a temporary file renamed over the target, needs rename and fsync.
+
+**API (Node's).**
+
+```ts
+import { renameSync, rename, openSync, writeSync, fsyncSync, fdatasyncSync, closeSync, chmodSync, writeFileSync, statSync } from "node:fs"
+
+writeFileSync(dir + "/.config.json.tmp", text, { mode: 0o600, flush: true })  // new options: mode of a created file, fsync before returning
+renameSync(dir + "/.config.json.tmp", dir + "/config.json")   // POSIX rename: replaces the target in one step
+const fd = openSync(dir, "r")                                  // "r" opens a directory too
+fsyncSync(fd)                                                  // the rename itself survives a power cut
+closeSync(fd)
+
+const f = openSync(path, "wx", 0o644)  // flags r, r+, w, wx, w+, wx+, a, ax, a+, ax+
+writeSync(f, "text or bytes")          // writes all of it; returns the bytes written
+fdatasyncSync(f)
+closeSync(f)
+rename(a, b, (err) => {})              // the callback form (runs as a microtask)
+chmodSync(path, 0o600)
+statSync(path).mode                    // st_mode: type and permission bits
+```
+
+Errors carry Node's messages: `ENOENT: no such file or directory, rename 'a' -> 'b'`,
+`EBADF: bad file descriptor, fsync`, `EEXIST: file already exists, open 'x'`.
+
+**Design.** New natives in `runtime/tov.c` (`rename`, `chmod`, `open`, `writeFd`, `fsync`, `close`):
+`open` maps Node's flag strings to `open(2)` flags with `O_CLOEXEC` (an unknown string is EINVAL),
+`writeFd` retries short writes and EINTR, `fsync` takes a data-only flag for `fdatasync` and uses
+`F_FULLFSYNC` on macOS (where plain fsync stops at the drive cache). `writeFileSync` keeps its old path
+(`fopen`) when no option is given, and goes through `open`/`write`/`fsync`/`close` when `mode` or
+`flush` is. The `statSync` payload gains `st_mode`. The error table learns EBADF, EXDEV and EINVAL.
+
+**Files.**
+- `runtime/tov.c`, `runtime/tov.h`: the natives, two-path and descriptor error messages, `st_mode` in `statInfo`.
+- `crates/tov/src/check/builtins.rs`: the signatures.
+- `crates/tov/src/std/fs.tov`: `renameSync`, `rename`, `chmodSync`, `openSync`, `writeSync`, `fsyncSync`,
+  `fdatasyncSync`, `closeSync`, `writeFileSync`'s options, `Stats.mode`.
+- `docs/spec.md`: the `node:fs` line.
+
+**Not covered.** POSIX only, as the rest of Tov's file API (Windows' rename does not replace an existing
+file). No `fs.promises`, no `readSync`/positioned writes, no `encoding` or `flag` options on
+`writeFileSync`. The test (`tests/fs_atomic.tov`, 17 checks) is in `run.sh`.
+
+## 0010 — a wall-clock limit per WebAssembly call (`std/wasm` `timeMs`)
+
+**Problem.** 0005 bounds a call by its instruction count (`fuel`), but a call that is slow for another
+reason (a budget set high, a host import that takes long) still holds the thread. A gateway that runs
+plugin hooks on its request path needs a time bound per call as well.
+
+**API.**
+
+```ts
+import { instantiate } from "std/wasm"
+
+const m = instantiate(bytes, { fuel: 200000000, timeMs: 5000 })  // the most wall-clock ms one call may take
+m.setTimeLimit(250)                                              // changes it later (0: no limit)
+m.call("pre_hook", [ptr, len])  // past the limit it throws "time limit exceeded", as a call out of fuel does
+```
+
+**Design.** `runtime/wasm.c` keeps the deadline of the call in progress (CLOCK_MONOTONIC nanoseconds) in a
+global around `wasm_runtime_call_wasm_a`; a nested call keeps the earlier deadline. WAMR's fast
+interpreter runs `CHECK_INSTRUCTION_LIMIT` on every instruction when instruction metering is on (0005
+turns it on); the macro now also counts a tick and, every 65536 instructions, compares the clock with the
+deadline and raises "time limit exceeded". With no deadline set the added cost is one compare. The limit
+is capped at one day.
+
+**Files.**
+- `runtime/wasm.c`, `runtime/tov.h`: the deadline, `tv_wasm_now_ns`, the `wasmTimeLimit` native (and its stub
+  when WAMR is not built).
+- `vendor/wamr/core/iwasm/interpreter/wasm_interp_fast.c`: the clock check in `CHECK_INSTRUCTION_LIMIT`.
+- `crates/tov/src/check/builtins.rs`: the signature.
+- `crates/tov/src/std/wasm.tov`: `WasmLimits.timeMs`, `WasmInstance.setTimeLimit`.
+
+**Not covered.** The clock is read only between instructions, so one host call that blocks is not cut
+short (the call ends at the next check after it returns). Only the fast interpreter is built, so only it
+has the check. The test (2 more checks in `tests/wasm.tov`, 24 in all) is in `run.sh`.

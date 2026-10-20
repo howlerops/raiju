@@ -1,0 +1,203 @@
+// Whole-file writes that a crash or a concurrent reader never sees half done: the data goes to a temporary file in
+// the same directory, is flushed to disk, and is renamed over the target (rename replaces it in one step), then the
+// directory is flushed so the rename itself survives a power cut. A crash before the rename leaves the old file as
+// it was, plus a temporary file that removeStaleTemps clears. Append-only logs don't need this and keep appending.
+import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs"
+import { basename, dirname } from "node:path"
+
+export type AtomicOptions = {
+  // Permission bits for a new file (an existing file keeps its own). Default 0o666 less the umask.
+  mode?: int
+  // false skips the fsyncs: still atomic for readers and crashes of the process, not for a power cut. For caches.
+  durable?: bool
+}
+
+let tempSeq = 0
+
+// The temporary files of a target start with this; the pid and a sequence number follow.
+function tempPrefix(path: string): string {
+  return "." + basename(path) + ".tmp-"
+}
+
+// Writes data to a new temporary file next to path and returns its name. Nothing is renamed yet.
+export function writeTemp(path: string, data: string | u8[], opts?: AtomicOptions): string throws Error {
+  tempSeq += 1
+  const tmp = dirname(path) + "/" + tempPrefix(path) + process.pid + "-" + tempSeq
+  let mode = opts?.mode ?? 438
+  try {
+    // keep an existing file's permissions (a secrets file stays 0600)
+    if (existsSync(path)) mode = statSync(path).mode & 511
+  } catch (e) {}
+  try {
+    writeFileSync(tmp, data, { mode: mode, flush: opts?.durable ?? true })
+  } catch (e) {
+    try {
+      unlinkSync(tmp)
+    } catch (e2) {}
+    throw e
+  }
+  return tmp
+}
+
+// Renames a temporary file from writeTemp over path, then flushes the directory when durable.
+export function commitTemp(tmp: string, path: string, durable: bool): void throws Error {
+  try {
+    renameSync(tmp, path)
+  } catch (e) {
+    try {
+      unlinkSync(tmp)
+    } catch (e2) {}
+    throw e
+  }
+  if (durable) syncDir(dirname(path))
+}
+
+// Flushes a directory's entries (a rename in it). Best effort: some file systems refuse to open or sync a directory.
+export function syncDir(dir: string): void {
+  try {
+    const fd = openSync(dir, "r")
+    try {
+      fsyncSync(fd)
+    } catch (e) {}
+    closeSync(fd)
+  } catch (e) {}
+}
+
+// Replaces path with data atomically (see the top of this file).
+export function writeFileAtomic(path: string, data: string | u8[], opts?: AtomicOptions): void throws Error {
+  const tmp = try writeTemp(path, data, opts)
+  try commitTemp(tmp, path, opts?.durable ?? true)
+}
+
+// Removes temporary files of path that a crash left behind: those older than maxAgeMs (another process may be
+// writing a newer one right now). The number removed.
+export function removeStaleTemps(path: string, maxAgeMs: f64): int {
+  const dir = dirname(path)
+  const prefix = tempPrefix(path)
+  let names: string[] = []
+  try {
+    names = readdirSync(dir)
+  } catch (e) {
+    return 0
+  }
+  const now = Date.now()
+  let removed = 0
+  for (const name of names) {
+    if (!name.startsWith(prefix)) continue
+    try {
+      if (now - statSync(dir + "/" + name).mtimeMs < maxAgeMs) continue
+      unlinkSync(dir + "/" + name)
+      removed += 1
+    } catch (e) {}
+  }
+  return removed
+}
+
+// ---- tests
+
+let testSeq = 0
+
+function testDir(): string {
+  testSeq += 1
+  const dir = "/tmp/raiju-atomicfile-test-" + process.pid + "-" + testSeq
+  try {
+    rmSync(dir, { recursive: true, force: true })
+    mkdirSync(dir, { recursive: true })
+  } catch (e) {}
+  return dir
+}
+
+function temps(dir: string): string[] {
+  try {
+    return readdirSync(dir).filter((n) => n.includes(".tmp-"))
+  } catch (e) {
+    return []
+  }
+}
+
+test("writeFileAtomic creates and replaces a file and leaves no temporary file", () => {
+  const dir = testDir()
+  const path = dir + "/config.json"
+  try writeFileAtomic(path, "{\"v\":1}\n")
+  expect(try readFileSync(path)).toBe("{\"v\":1}\n")
+  try writeFileAtomic(path, new TextEncoder().encode("{\"v\":2}\n"))
+  expect(try readFileSync(path)).toBe("{\"v\":2}\n")
+  try writeFileAtomic(path, "{\"v\":3}\n", { durable: false })
+  expect(try readFileSync(path)).toBe("{\"v\":3}\n")
+  expect(temps(dir).length).toBe(0)
+  try rmSync(dir, { recursive: true, force: true })
+})
+
+test("a crash between the write and the rename leaves the old file intact", () => {
+  const dir = testDir()
+  const path = dir + "/config.json"
+  try writeFileAtomic(path, "old\n")
+  // the process dies here: the new data is on disk under the temporary name, never renamed
+  const tmp = try writeTemp(path, "new\n")
+  expect(try readFileSync(path)).toBe("old\n")
+  expect(try readFileSync(tmp)).toBe("new\n")
+  expect(tmp.startsWith(dir + "/.config.json.tmp-")).toBe(true)
+  // a fresh temporary file may belong to a writer that is still running
+  expect(removeStaleTemps(path, 60000.0)).toBe(0)
+  expect(temps(dir).length).toBe(1)
+  // after a restart, an old one is cleared and the file is still the old one
+  expect(removeStaleTemps(path, -1.0)).toBe(1)
+  expect(temps(dir).length).toBe(0)
+  expect(try readFileSync(path)).toBe("old\n")
+  try rmSync(dir, { recursive: true, force: true })
+})
+
+test("commitTemp makes the new data visible", () => {
+  const dir = testDir()
+  const path = dir + "/state"
+  try writeFileAtomic(path, "a")
+  const tmp = try writeTemp(path, "b")
+  try commitTemp(tmp, path, true)
+  expect(try readFileSync(path)).toBe("b")
+  expect(temps(dir).length).toBe(0)
+  try rmSync(dir, { recursive: true, force: true })
+})
+
+test("an existing file keeps its permissions; a new file takes the mode", () => {
+  const dir = testDir()
+  const path = dir + "/keys"
+  try writeFileAtomic(path, "k1", { mode: 384 })
+  expect((try statSync(path)).mode & 511).toBe(384)
+  try chmodSync(path, 416)
+  try writeFileAtomic(path, "k2")
+  expect((try statSync(path)).mode & 511).toBe(416)
+  expect(try readFileSync(path)).toBe("k2")
+  try rmSync(dir, { recursive: true, force: true })
+})
+
+test("a failed write throws and leaves the target and no temporary file", () => {
+  const dir = testDir()
+  let failed = false
+  try {
+    writeFileAtomic(dir + "/missing/x.json", "x")
+  } catch (e) {
+    failed = e.message.startsWith("ENOENT")
+  }
+  expect(failed).toBe(true)
+  // a rename onto a directory fails; the temporary file is removed
+  try mkdirSync(dir + "/d")
+  let refused = false
+  try {
+    writeFileAtomic(dir + "/d", "x")
+  } catch (e) {
+    refused = true
+  }
+  expect(refused).toBe(true)
+  expect(temps(dir).length).toBe(0)
+  try rmSync(dir, { recursive: true, force: true })
+})
+
+test("removeStaleTemps only touches the target's own temporary files", () => {
+  const dir = testDir()
+  try writeFileSync(dir + "/.other.json.tmp-1-1", "x")
+  try writeFileSync(dir + "/.config.json.tmp-1-1", "x")
+  expect(removeStaleTemps(dir + "/config.json", -1.0)).toBe(1)
+  expect(existsSync(dir + "/.other.json.tmp-1-1")).toBe(true)
+  expect(removeStaleTemps(dir + "/nodir/config.json", -1.0)).toBe(0)
+  try rmSync(dir, { recursive: true, force: true })
+})

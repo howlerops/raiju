@@ -1,8 +1,10 @@
 import { listen } from "../src/http1"
-import { fields, find, rawStr } from "../src/json"
+import { fields, find, rawStr, elements } from "../src/json"
 import { sha256, utf8, toHex } from "../src/crypto"
-import { encodeUrl } from "../src/base64"
-import { liveAnswer, liveEvents, liveStats, liveReset, realtimeAnswer, realtimeTurn } from "./mock_live"
+import { encodeUrl, encode } from "../src/base64"
+import { encodeEventStreamFrame } from "../src/streams"
+import { readFileBytesSync } from "node:fs"
+import { liveAnswer, liveEvents, liveStats, liveReset, realtimeAnswer, realtimeTurn, realtimeTranscription } from "./mock_live"
 import { a2aHandle, pushV03, knowTask, resubscribeV03 } from "./mock_a2a"
 // A fake provider for end-to-end tests. Speaks enough of OpenAI, Anthropic,
 // Gemini and Bedrock to exercise translation, and fails on demand:
@@ -13,13 +15,16 @@ import { a2aHandle, pushV03, knowTask, resubscribeV03 } from "./mock_a2a"
 //   model "policy-quota" → 200 with x-quota-state: exhausted (trips a circuit policy)
 // size and sha: the request body's length and SHA-256, kept for bodies too big to keep whole (body is then its first 2000 bytes)
 // hdr: the request's x-amz-date, content-length and transfer-encoding, bar-separated (the SigV4 and framing checks of the large request tests)
-type Seen = { path: string, auth: string, body: string, team: string, tenant: string, size: int, sha: string, hdr?: string }
+// proj: the Bedrock Mantle project headers, OpenAI-Project and anthropic-workspace-id, bar-separated (L173)
+type Seen = { path: string, auth: string, body: string, team: string, tenant: string, size: int, sha: string, hdr?: string, proj?: string }
 
 const seen: Seen[] = []
 // webhook deliveries received: the path, the Standard Webhooks headers and the body
 type Hook = { path: string, id: string, timestamp: string, signature: string, event: string, body: string }
 const hooks: Hook[] = []
 let flakyCalls = 0
+// realtime client secrets minted so far (each gets its own token)
+let mints = 0
 // set by /_hidden/down: the retained-content bucket refuses its PUTs (a store outage) until /_hidden/up
 let hiddenDown = false
 // the OAuth authorization server: codes by their PKCE challenge and redirect URI, and the access token the MCP server accepts
@@ -86,12 +91,22 @@ const GEMINI_SSE = `data: {"candidates":[{"content":{"role":"model","parts":[{"t
 const ANTHROPIC_SSE = `event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":9,"output_tokens":1}}}\n\nevent: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n`
 const COHERE_SSE = `event: message-start\ndata: {"type":"message-start","id":"co_s","delta":{"message":{"role":"assistant"}}}\n\nevent: content-start\ndata: {"type":"content-start","index":0,"delta":{"message":{"content":{"type":"text","text":""}}}}\n\nevent: content-delta\ndata: {"type":"content-delta","index":0,"delta":{"message":{"content":{"text":"Hi from "}}}}\n\nevent: content-delta\ndata: {"type":"content-delta","index":0,"delta":{"message":{"content":{"text":"cohere"}}}}\n\nevent: message-end\ndata: {"type":"message-end","id":"co_s","delta":{"finish_reason":"COMPLETE","usage":{"tokens":{"input_tokens":7,"output_tokens":3}}}}\n\n`
 
+// One event frame of a Bedrock event stream (ConverseStream)
+function bedrockFrame(eventType: string, payload: string): u8[] {
+  const h: Map<string, string> = new Map()
+  h.set(":event-type", eventType)
+  h.set(":content-type", "application/json")
+  h.set(":message-type", "event")
+  return encodeEventStreamFrame(h, payload)
+}
+
 function record(req: Request, path: string, body: string): void {
   const auth = req.headers.get("authorization") ?? req.headers.get("x-api-key") ?? req.headers.get("x-goog-api-key") ?? req.headers.get("api-key") ?? ""
   const size = body.byteLength
   const big = size > 65536
   const hdr = (req.headers.get("x-amz-date") ?? "") + "|" + (req.headers.get("content-length") ?? "") + "|" + (req.headers.get("transfer-encoding") ?? "")
-  seen.push({ path: path, auth: auth, body: big ? body.slice(0, 2000) : body, team: req.headers.get("x-team") ?? "", tenant: req.headers.get("x-tenant") ?? "", size: size, sha: big ? toHex(sha256(utf8(body))) : "", hdr: hdr })
+  const proj = (req.headers.get("openai-project") ?? "") + "|" + (req.headers.get("anthropic-workspace-id") ?? "")
+  seen.push({ path: path, auth: auth, body: big ? body.slice(0, 2000) : body, team: req.headers.get("x-team") ?? "", tenant: req.headers.get("x-tenant") ?? "", size: size, sha: big ? toHex(sha256(utf8(body))) : "", hdr: hdr, proj: proj })
 }
 
 // The raw JSON text of a field of an event, or "".
@@ -255,6 +270,44 @@ function embedText(s: string): string {
 // Files answer with their record, and the deployments listing has two pages. The key is r8_e2e.
 type RepInput = { input?: { prompt?: string, num_outputs?: int } }
 
+// The L164 providers, under /l164 (their base_urls): GitHub Copilot's models and chat, Sarvam's speech, speech-to-text,
+// chat and models, Replicate chat predictions (one still running when the wait ends, and a deployment's) and two Azure
+// resources for an alias's endpoint override. Every call is recorded with its path and query.
+async function l164Mock(req: Request, path: string, lu: URL | undefined): Promise<Response> throws SyntaxError | Error {
+  const now = "2026-10-20T10:00:00.000Z"
+  const q = lu === undefined ? "" : lu.search
+  if (path === "/sarvam/speech-to-text") {
+    const fd = try await req.formData()
+    const parts: string[] = []
+    fd.forEach((value, key) => {
+      if (typeof value === "string") parts.push(key + "=" + value)
+      else parts.push(key + "=@" + value.name)
+    })
+    record(req, "/l164" + path, parts.join(";"))
+    return jsonBody(`{"request_id":"stt-1","transcript":"namaste duniya","language_code":"hi-IN","timestamps":{"words":["namaste","duniya"],"start_time_seconds":[0.0,0.6],"end_time_seconds":[0.5,1.25]}}`, 200)
+  }
+  const body = req.method === "GET" ? "" : await req.text()
+  record(req, "/l164" + path + q, body)
+  if (path === "/copilot/models") return jsonBody(`{"object":"list","data":[{"id":"gpt-4o","object":"model"},{"id":"claude-sonnet-4","object":"model"}]}`, 200)
+  if (path === "/copilot/chat/completions" || path === "/sarvam/v1/chat/completions" || path.endsWith("/chat/completions")) {
+    const who = path.startsWith("/copilot") ? "copilot" : path.startsWith("/sarvam") ? "sarvam" : path.startsWith("/azure-east") ? "azure east" : "azure main"
+    return jsonBody(`{"id":"c-l164","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"Hi from ${who}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`, 200)
+  }
+  if (path === "/vllm/v1/messages/count_tokens") return jsonBody(`{"input_tokens":31}`, 200)
+  if (path === "/cohere/v1/tokenize") return jsonBody(`{"tokens":[11,12,13,14,15],"token_strings":["be"," brief","\\n","hel","lo"]}`, 200)
+  if (path === "/cohere/v1/models") return jsonBody(`{"models":[{"name":"command-a","endpoints":["chat"]}],"next_page_token":""}`, 200)
+  if (path === "/azure-main/openai/v1/models") return jsonBody(`{"object":"list","data":[{"id":"gpt-4o","object":"model","status":"succeeded","created_at":1}]}`, 200)
+  if (path === "/sarvam/v1/models") return jsonBody(`{"object":"list","data":[{"id":"sarvam-m","object":"model"}]}`, 200)
+  if (path === "/sarvam/text-to-speech") return jsonBody(`{"request_id":"tts-1","audios":["UklGRi1zYXJ2YW0="]}`, 200)
+  if (path === "/replicate/v1/models/acme/chat/predictions") {
+    if (body.includes("slow chat")) return jsonBody(`{"id":"p-chat-1","status":"starting","created_at":"${now}","urls":{"get":"http://127.0.0.1:18099/l164/replicate/v1/predictions/p-chat-1"}}`, 201)
+    return jsonBody(`{"id":"p-chat-0","status":"succeeded","created_at":"${now}","output":["Hello ","now"]}`, 201)
+  }
+  if (path === "/replicate/v1/predictions/p-chat-1") return jsonBody(`{"id":"p-chat-1","status":"succeeded","created_at":"${now}","output":["Polled ","answer"],"logs":"Input token count: 4\nOutput token count: 2"}`, 200)
+  if (path === "/replicate/v1/deployments/acme/dep-a/predictions") return jsonBody(`{"id":"p-dep-1","status":"succeeded","created_at":"${now}","output":"from deployment"}`, 201)
+  return jsonBody(`{"error":{"message":"no such l164 route","type":"invalid_request_error"}}`, 404)
+}
+
 async function replicateMock(req: Request, path: string, lu: URL | undefined): Promise<Response> throws SyntaxError | Error {
   const body = req.method === "GET" ? "" : await req.text()
   record(req, path + (lu === undefined ? "" : lu.search), body)
@@ -326,8 +379,35 @@ function systemoneAnswers(body: string): string throws SyntaxError {
   return answers.join(",")
 }
 
+// OpenAI's native decision answers (L163), in question order: a predicate 0.66, a choice its first option, a score
+// 1.0. An input that says "refuse" gets a refusal for its first question. Unnamed questions answer with name null.
+function openaiDecisionAnswers(body: string): string throws SyntaxError {
+  const top = try fields(body)
+  const refuse = (find(top, "input") ?? "").includes("refuse")
+  const out: string[] = []
+  let i = 0
+  for (const q of try elements(find(top, "questions") ?? "[]")) {
+    const qf = try fields(q)
+    const type = rawStr(qf, "type") ?? ""
+    const name = find(qf, "name") ?? "null"
+    if (refuse && i === 0) out.push(`{"type":"refusal","name":${name}}`)
+    else if (type === "predicate") out.push(`{"type":"predicate","name":${name},"probability":0.66,"confidence":0.8}`)
+    else if (type === "choice") {
+      const first = (try elements(find(qf, "choices") ?? "[]"))[0] ?? "{}"
+      out.push(`{"type":"choice","name":${name},"choice":${find(try fields(first), "value") ?? "null"}}`)
+    } else out.push(`{"type":"score","name":${name},"score":1.0}`)
+    i++
+  }
+  return out.join(",")
+}
+
 async function mcpServer(req: Request): Promise<Response> {
   const body = await req.text()
+  // the gateway's health check pings are answered and not recorded (they come on their own schedule)
+  if (body.includes(`"method":"ping"`)) {
+    const pid = (try JSON.parse(body) as Rpc).id ?? 0
+    return new Response(`{"jsonrpc":"2.0","id":${pid},"result":{}}`, { headers: { "content-type": "application/json" } })
+  }
   record(req, "/mcp", body)
   const rpc = try JSON.parse(body) as Rpc
   const id = rpc.id ?? 0
@@ -361,6 +441,26 @@ async function sttAnswer(req: Request, path: string): Promise<Response> throws T
   if (raw.length > 65536) seen.push({ path: path, auth: req.headers.get("authorization") ?? "", body: `{"model":"${model}"}`, team: "", tenant: "", size: raw.length, sha: toHex(sha256(raw)) })
   else record(req, path, `{"model":"${model}"}`)
   const text = "transcribed by " + model
+  // a model the provider refuses
+  if (model.includes("refuse")) return new Response(`{"error":{"message":"the audio could not be decoded","type":"invalid_request_error"}}`, { status: 400, headers: { "content-type": "application/json" } })
+  // a slow stream: its first event, then the rest 1.5 s later (a gateway that buffers holds the first back)
+  if (streamed && model.includes("slow")) {
+    const first = new TextEncoder().encode(`data: {"type":"transcript.text.delta","delta":"transcribed"}\n\n`)
+    const rest = new TextEncoder().encode(`data: {"type":"transcript.text.done","text":"${text}","usage":{"type":"tokens","input_tokens":30,"output_tokens":10,"total_tokens":40}}\n\ndata: [DONE]\n\n`)
+    const stream = new ReadableStream({
+      start: async (c) => {
+        c.enqueue(first)
+        await new Promise((done) => setTimeout(done, 1500))
+        try {
+          c.enqueue(rest)
+          c.close()
+        } catch (e) {
+          // the client went away
+        }
+      },
+    })
+    return new Response(stream, { headers: { "content-type": "text/event-stream" } })
+  }
   if (streamed) {
     const sse = `data: {"type":"transcript.text.delta","delta":"transcribed"}\n\n` +
       `data: {"type":"transcript.text.done","text":"${text}","usage":{"type":"tokens","input_tokens":3,"output_tokens":1,"total_tokens":4}}\n\n` +
@@ -584,6 +684,62 @@ Bun.serve<string>({
         return new Response(`{"id":"gen-or-1","model":"openai/gpt-4o-mini","answers":{${orAnswers}},"usage":{"input_tokens":12,"output_tokens":3,"cost":0.00002}}`, { headers: { "content-type": "application/json" } })
       },
     },
+    // L163: the native decision routes of OpenAI (/oa163, key sk-oa163), Azure's Foundry systemone (/az163, api-key
+    // az-key163), Cloudflare's Clef (/cf163, account acc163, in Workers AI's envelope), Perplexity (/pplx163, with
+    // its x-request-id) and Ollama (/ol163)
+    "/oa163/v1/decisions": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/oa163/v1/decisions", body)
+        if ((req.headers.get("authorization") ?? "") !== "Bearer sk-oa163") return Response.json({ error: { message: "invalid api key", type: "invalid_request_error" } }, { status: 401 })
+        const answers = try openaiDecisionAnswers(body)
+        return new Response(`{"model":"gpt-6-luna-2026-09","answers":[${answers}],"usage":{"input_tokens":21,"output_tokens":5,"total_tokens":26}}`, { headers: { "content-type": "application/json" } })
+      },
+    },
+    "/az163/providers/microsoft/v1/systemone": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/az163/providers/microsoft/v1/systemone", body)
+        if ((req.headers.get("api-key") ?? "") !== "az-key163") return Response.json({ error: { code: "401", message: "Access denied" } }, { status: 401 })
+        const answers = try systemoneAnswers(body)
+        return new Response(`{"model":"Microsoft-Decision-1","answers":{${answers}},"usage":{"input_tokens":14,"output_tokens":0}}`, { headers: { "content-type": "application/json" } })
+      },
+    },
+    "/cf163/client/v4/accounts/acc163/ai/run/@cf/cloudflare/clef-flash": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/cf163/client/v4/accounts/acc163/ai/run/@cf/cloudflare/clef-flash", body)
+        const answers = try systemoneAnswers(body)
+        return new Response(`{"result":{"model":"clef-flash","answers":{${answers}},"usage":{"input_tokens":9,"output_tokens":0}},"success":true,"errors":[],"messages":[]}`, { headers: { "content-type": "application/json" } })
+      },
+    },
+    "/pplx163/v1/decisions": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/pplx163/v1/decisions", body)
+        const answers = try systemoneAnswers(body)
+        return new Response(`{"model":"pplx-decider-v1.1-27b","answers":{${answers}},"usage":{"input_tokens":11,"output_tokens":0}}`, { headers: { "content-type": "application/json", "x-request-id": "pplx-req-163" } })
+      },
+    },
+    "/ol163/v1/systemone": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/ol163/v1/systemone", body)
+        const answers = try systemoneAnswers(body)
+        return new Response(`{"model":"nimble","answers":{${answers}},"usage":{"input_tokens":8,"output_tokens":0}}`, { headers: { "content-type": "application/json" } })
+      },
+    },
+    // Anthropic's legacy text completion (L163): the completion names the model; a bad key is refused
+    "/v1/complete": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/v1/complete", body)
+        const m = try JSON.parse(body) as Model
+        const f = failure(m.model ?? "", req.headers.get("x-api-key") ?? "")
+        if (f !== undefined) return f
+        return Response.json({ id: "compl_e2e", type: "completion", completion: "Hi from legacy " + (m.model ?? ""), stop_reason: "stop_sequence", model: m.model ?? "", usage: { input_tokens: 6, output_tokens: 4 } })
+      },
+    },
     // Bedrock's control plane listings (SigV4 GET): foundation models and inference profiles
     "/foundation-models": {
       GET: (req) => {
@@ -660,6 +816,8 @@ Bun.serve<string>({
     },
     // Anthropic's list for a client that sends x-api-key, OpenAI's otherwise
     "/v1/models": (req) => {
+      // a Bedrock Mantle listing scoped to a project is recorded (L173); the other listings are not
+      if ((req.headers.get("openai-project") ?? "") !== "") record(req, "/v1/models", "")
       if (isAnthropic(req)) return Response.json({ data: [{ type: "model", id: "claude-sonnet-4", display_name: "Claude Sonnet 4", created_at: STAMP }], has_more: false, first_id: "claude-sonnet-4", last_id: "claude-sonnet-4" })
       return Response.json({ object: "list", data: [{ id: "m-a", object: "model", created: 1735689600 }, { id: "m-b", object: "model" }] })
     },
@@ -713,6 +871,19 @@ Bun.serve<string>({
       DELETE: (req) => {
         record(req, "/v1/files/" + req.params.id, "")
         return Response.json({ id: req.params.id, object: "file", deleted: true })
+      },
+    },
+    // a plugin served for download (the L170 checks of plugins loaded from a URL): tests/wasm/plugin.wasm, else 404
+    "/plugins/:file": {
+      GET: (req) => {
+        record(req, "/plugins/" + req.params.file, "")
+        if (req.params.file !== "plugin.wasm") return new Response("no such plugin", { status: 404 })
+        try {
+          const bytes = readFileBytesSync("tests/wasm/plugin.wasm")
+          return new Response(bytes, { headers: { "content-type": "application/wasm" } })
+        } catch (e) {
+          return new Response(`cannot read the plugin: ${e.message}`, { status: 500 })
+        }
       },
     },
     "/v1/files/:id/content": {
@@ -885,6 +1056,8 @@ Bun.serve<string>({
         // image models answer with inline image data; TTS with 16-bit mono PCM at 24 kHz
         if (body.includes(`"IMAGE"`)) return Response.json({ candidates: [{ content: { role: "model", parts: [{ inlineData: { mimeType: "image/png", data: "iVBORw0KGgo=" } }] }, finishReason: "STOP" }] })
         if (body.includes(`"AUDIO"`)) return Response.json({ candidates: [{ content: { role: "model", parts: [{ inlineData: { mimeType: "audio/L16;codec=pcm;rate=24000", data: "AAECAw==" } }] }, finishReason: "STOP" }] })
+        // speech-to-text (audio inline): the transcript, with the prompt's tokens split by modality as Gemini reports them
+        if (body.includes(`"inlineData":{"mimeType":"audio/`)) return Response.json({ candidates: [{ content: { role: "model", parts: [{ text: "Hi from gemini" }] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 14, candidatesTokenCount: 3, totalTokenCount: 17, promptTokensDetails: [{ modality: "TEXT", tokenCount: 4 }, { modality: "AUDIO", tokenCount: 10 }] } })
         if (req.params.modelAction.endsWith(":batchEmbedContents")) {
           const n = body.split(`"content"`).length - 1
           const vs: string[] = []
@@ -955,6 +1128,36 @@ Bun.serve<string>({
         return Response.json({ output: { message: { role: "assistant", content: [{ text: "Hi from bedrock" }] } }, stopReason: "end_turn", usage: { inputTokens: 8, outputTokens: 2, totalTokens: 10 } })
       },
     },
+    // ConverseStream: real AWS event-stream frames (CRCs and all). A model named "*slow*" pauses 2 s after its first
+    // text, so a test can see the first chunk arrive before the stream is over.
+    "/model/:modelId/converse-stream": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/model/" + req.params.modelId + "/converse-stream", body)
+        const first: u8[] = []
+        for (const b of bedrockFrame("messageStart", `{"role":"assistant"}`)) first.push(b)
+        for (const b of bedrockFrame("contentBlockDelta", `{"contentBlockIndex":0,"delta":{"text":"Hi from "}}`)) first.push(b)
+        const rest: u8[] = []
+        for (const b of bedrockFrame("contentBlockDelta", `{"contentBlockIndex":0,"delta":{"text":"bedrock"}}`)) rest.push(b)
+        for (const b of bedrockFrame("contentBlockStop", `{"contentBlockIndex":0}`)) rest.push(b)
+        for (const b of bedrockFrame("messageStop", `{"stopReason":"end_turn"}`)) rest.push(b)
+        for (const b of bedrockFrame("metadata", `{"usage":{"inputTokens":8,"outputTokens":2,"totalTokens":10},"metrics":{"latencyMs":1}}`)) rest.push(b)
+        const pause = req.params.modelId.includes("slow") ? 2000 : 0
+        const stream = new ReadableStream({
+          start: async (c) => {
+            c.enqueue(first)
+            if (pause > 0) await new Promise((done) => setTimeout(done, pause))
+            try {
+              c.enqueue(rest)
+              c.close()
+            } catch (e) {
+              // the client went away
+            }
+          },
+        })
+        return new Response(stream, { headers: { "content-type": "application/vnd.amazon.eventstream" } })
+      },
+    },
     "/model/:modelId/count-tokens": {
       POST: async (req) => {
         const body = await req.text()
@@ -979,6 +1182,14 @@ Bun.serve<string>({
         record(req, "/openai/v1/chat/completions", body)
         const m = try JSON.parse(body) as Model
         return Response.json({ id: "c9", object: "chat.completion", created: 1, model: m.model ?? "", choices: [{ index: 0, message: { role: "assistant", content: "Hello from " + (m.model ?? "") }, finish_reason: "stop" }], usage: { prompt_tokens: 4, completion_tokens: 5, total_tokens: 9 } })
+      },
+    },
+    // Mantle's native count_tokens route for Claude models
+    "/anthropic/v1/messages/count_tokens": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/anthropic/v1/messages/count_tokens", body)
+        return Response.json({ input_tokens: 23 })
       },
     },
     // Mantle's native Messages route for Claude models
@@ -1038,6 +1249,15 @@ Bun.serve<string>({
           sse += sev("response.completed", `{"type":"response.completed","sequence_number":${n + 1},"response":{"id":"resp_p1","status":"completed","output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":${full}}]}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`)
           return new Response(sse, { headers: { "content-type": "text/event-stream" } })
         }
+        // "json-responses" streams a JSON object in two deltas (the jsonparser checks)
+        if (body.includes(`"stream":true`) && body.includes(`"json-responses"`)) {
+          const jev = (name: string, data: string): string => `event: ${name}\ndata: ${data}\n\n`
+          const sse = jev("response.created", `{"type":"response.created","sequence_number":0,"response":{"id":"resp_j1","status":"in_progress"}}`) +
+            jev("response.output_text.delta", `{"type":"response.output_text.delta","sequence_number":1,"item_id":"msg_1","delta":${JSON.stringify(`{"a":1`)}}`) +
+            jev("response.output_text.delta", `{"type":"response.output_text.delta","sequence_number":2,"item_id":"msg_1","delta":${JSON.stringify(`,"b":2}`)}}`) +
+            jev("response.completed", `{"type":"response.completed","sequence_number":3,"response":{"id":"resp_j1","status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`)
+          return new Response(sse, { headers: { "content-type": "text/event-stream" } })
+        }
         // a streamed answer: Responses events. The compat tests' Responses-only model streams "native responses";
         // everything else (the WebSocket mode's tests) streams "Hello" with sequence numbers
         if (body.includes(`"stream":true`)) {
@@ -1075,6 +1295,15 @@ Bun.serve<string>({
         if (req.params.modelAction.endsWith(":streamRawPredict")) return new Response(ANTHROPIC_SSE, { headers: { "content-type": "text/event-stream" } })
         if (body.includes(`"IMAGE"`)) return Response.json({ candidates: [{ content: { role: "model", parts: [{ inlineData: { mimeType: "image/png", data: "iVBORw0KGgo=" } }] }, finishReason: "STOP" }] })
         return Response.json({ candidates: [{ content: { role: "model", parts: [{ text: "Hi from vertex" }] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 4, candidatesTokenCount: 3, totalTokenCount: 7 } })
+      },
+    },
+    // a tuned Vertex model: the project's endpoint, by project number (v1beta1)
+    "/v1beta1/projects/:project/locations/:location/endpoints/:endpointAction": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, `/v1beta1/projects/${req.params.project}/locations/${req.params.location}/endpoints/${req.params.endpointAction}`, body)
+        if (req.params.endpointAction.endsWith(":streamGenerateContent")) return new Response(GEMINI_SSE, { headers: { "content-type": "text/event-stream" } })
+        return Response.json({ candidates: [{ content: { role: "model", parts: [{ text: "Hi from a tuned vertex model" }] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 4, candidatesTokenCount: 6, totalTokenCount: 10 } })
       },
     },
     // an OTLP/HTTP collector
@@ -1133,9 +1362,60 @@ Bun.serve<string>({
       POST: async (req) => {
         const body = await req.text()
         record(req, "/v1/audio/speech", body)
+        if (body.includes("tts-refuse")) return new Response(`{"error":{"message":"voice not available","type":"invalid_request_error"}}`, { status: 400, headers: { "content-type": "application/json" } })
+        // stream_format sse: OpenAI's speech events
+        if (body.includes(`"stream_format":"sse"`)) {
+          return new Response(`data: {"type":"speech.audio.delta","audio":"SUQz"}\n\ndata: {"type":"speech.audio.done","usage":{"input_tokens":2,"output_tokens":5,"total_tokens":7}}\n\n`, { headers: { "content-type": "text/event-stream" } })
+        }
         // real binary (not valid UTF-8), so a text round trip would corrupt it
         const audio: u8[] = [u8(0x49), u8(0x44), u8(0x33), u8(0xff), u8(0xfb), u8(0x90), u8(0x00), u8(0x80), u8(0xc3), u8(0x28)]
         return new Response(new Blob([audio], { type: "audio/mpeg" }), { headers: { "content-type": "audio/mpeg" } })
+      },
+    },
+    // Sarvam's speech (base64 audios), its streamed speech (raw audio bytes, the second chunk 1.5 s later) and its speech-to-text
+    "/text-to-speech": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/text-to-speech", body)
+        if ((req.headers.get("api-subscription-key") ?? "") !== "sarvam-e2e-key") return new Response(`{"error":{"message":"Invalid API subscription key","code":"invalid_api_key_error"}}`, { status: 403, headers: { "content-type": "application/json" } })
+        if (body.includes(`"text":"refuse"`)) return new Response(`{"detail":[{"msg":"speaker is not valid"}]}`, { status: 422, headers: { "content-type": "application/json" } })
+        return Response.json({ request_id: "sv_1", audios: ["UklGRmF1ZGlv"] })
+      },
+    },
+    "/text-to-speech/stream": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/text-to-speech/stream", body)
+        const first: u8[] = [u8(0x52), u8(0x49), u8(0x46), u8(0x46)]
+        const rest: u8[] = [u8(0xff), u8(0x00), u8(0x7f)]
+        const stream = new ReadableStream({
+          start: async (c) => {
+            c.enqueue(first)
+            await new Promise((done) => setTimeout(done, 1500))
+            try {
+              c.enqueue(rest)
+              c.close()
+            } catch (e) {
+              // the client went away
+            }
+          },
+        })
+        return new Response(stream, { headers: { "content-type": "application/octet-stream" } })
+      },
+    },
+    "/speech-to-text": {
+      POST: async (req) => {
+        let fd = new FormData()
+        try {
+          fd = try await req.formData()
+        } catch (e) {
+          return new Response(`{"detail":"the body is not a form"}`, { status: 400, headers: { "content-type": "application/json" } })
+        }
+        const mv = fd.get("model")
+        const lv = fd.get("language_code")
+        const file = fd.get("file")
+        record(req, "/speech-to-text", JSON.stringify({ model: typeof mv === "string" ? mv : "", language_code: typeof lv === "string" ? lv : "", file: file !== undefined && typeof file !== "string" }))
+        return Response.json({ request_id: "sv_2", transcript: "namaste duniya", language_code: "hi-IN", timestamps: { words: ["namaste", "duniya"], start_time_seconds: [0.0, 1.0], end_time_seconds: [0.9, 2.5] } })
       },
     },
     "/v1/ocr": {
@@ -1157,11 +1437,39 @@ Bun.serve<string>({
         return Response.json({ id: "wx1", model_id: "ibm/granite", created: 1, choices: [{ index: 0, message: { role: "assistant", content: "Hi from watsonx" }, finish_reason: "stop" }], usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 } })
       },
     },
+    // watsonx's foundation model specs (L173), two pages, recorded with their query
+    "/ml/v1/foundation_model_specs": (req) => {
+      const lu = URL.parse(req.url)
+      const q = lu === undefined ? "" : lu.search
+      record(req, "/ml/v1/foundation_model_specs" + q, "")
+      if (q.includes("start=2")) return Response.json({ total_count: 3, limit: 2, resources: [{ model_id: "meta-llama/llama-3-3-70b-instruct" }] })
+      return Response.json({ total_count: 3, limit: 2, resources: [{ model_id: "ibm/granite-3-8b-instruct" }, { model_id: "mistralai/mistral-large" }], next: { href: "http://127.0.0.1:18099/ml/v1/foundation_model_specs?version=2024-10-08&filters=function_text_chat&limit=200&start=2" } })
+    },
+    // Bedrock InvokeModelWithResponseStream of a legacy text model (L173): "chunk" events with the model's own JSON in
+    // base64 bytes, the last with the invocation metrics (Claude's completion, else Mistral's outputs)
+    "/model/:modelId/invoke-with-response-stream": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/model/" + req.params.modelId + "/invoke-with-response-stream", body)
+        const claude = body.includes(`"max_tokens_to_sample"`)
+        const parts = claude
+          ? [`{"type":"completion","completion":" Hi from","stop_reason":null,"stop":null}`, `{"type":"completion","completion":" bedrock stream","stop_reason":"stop_sequence","stop":null,"amazon-bedrock-invocationMetrics":{"inputTokenCount":6,"outputTokenCount":4}}`]
+          : [`{"outputs":[{"text":" Hi from","stop_reason":null}]}`, `{"outputs":[{"text":" mistral stream","stop_reason":"length"}],"amazon-bedrock-invocationMetrics":{"inputTokenCount":5,"outputTokenCount":3}}`]
+        const out: u8[] = []
+        for (const p of parts) {
+          for (const b of bedrockFrame("chunk", `{"bytes":"${encode(utf8(p))}"}`)) out.push(b)
+        }
+        return new Response(out, { headers: { "content-type": "application/vnd.amazon.eventstream" } })
+      },
+    },
     // Bedrock InvokeModel (Titan embeddings)
     "/model/:modelId/invoke": {
       POST: async (req) => {
         const body = await req.text()
         record(req, "/model/" + req.params.modelId + "/invoke", body)
+        // legacy text models (L163): Claude's {completion, stop_reason}, Mistral's outputs
+        if (body.includes(`"max_tokens_to_sample"`)) return new Response(`{"completion":" Hi from bedrock legacy","stop_reason":"stop_sequence","stop":null}`, { headers: { "content-type": "application/json" } })
+        if (req.params.modelId.includes("mistral")) return new Response(`{"outputs":[{"text":" Hi from bedrock mistral","stop_reason":"length"}]}`, { headers: { "content-type": "application/json" } })
         // image models (Titan and Nova Canvas: imageGenerationConfig or an image task; Stability: prompt) answer with one image
         const imageTask = ["INPAINTING", "OUTPAINTING", "BACKGROUND_REMOVAL", "IMAGE_VARIATION"].some((t) => body.includes(`"taskType":"${t}"`))
         if (body.includes("imageGenerationConfig") || body.includes(`"prompt"`) || imageTask) return new Response(`{"images":["iVBORw0KGgo="]}`, { headers: { "content-type": "application/json" } })
@@ -1462,6 +1770,30 @@ Bun.serve<string>({
       hd.set("content-type", "audio/wav")
       return new Response("RIFF-recording-" + lp.slice(18, lp.byteLength - 8), { headers: hd })
     }
+    // realtime client secrets (OpenAI's client_secrets, and its older sessions and transcription_sessions; Azure's and
+    // xAI's client_secrets): a token of the provider's own, good for ten minutes, at the top level or under
+    // client_secret. A body naming "mintfail" gets an answer with no token, and "mintrefuse" a refusal.
+    if (req.method === "POST" && (lp === "/v1/realtime/client_secrets" || lp === "/openai/v1/realtime/client_secrets" || lp === "/v1/realtime/sessions" || lp === "/v1/realtime/transcription_sessions")) {
+      const body = await req.text()
+      record(req, lp, body)
+      mints += 1
+      const hj: Record<string, string> = new Map()
+      hj.set("content-type", "application/json")
+      if (body.includes("mintrefuse")) return new Response(`{"error":{"message":"invalid session for a client secret","type":"invalid_request_error"}}`, { status: 400, headers: hj })
+      if (body.includes("mintfail")) return Response.json({ object: "ok" })
+      const value = "ek_mock_" + mints
+      const exp = Math.floor(Date.now() / 1000.0) + 600
+      if (lp.endsWith("/client_secrets")) return new Response(`{"value":"${value}","expires_at":${exp},"session":${wsField(body, "session") === "" ? "{}" : wsField(body, "session")}}`, { headers: hj })
+      return new Response(`{"id":"sess_mint_${mints}","object":"realtime.session","client_secret":{"value":"${value}","expires_at":${exp}}}`, { headers: hj })
+    }
+    // OpenAI's exact token count of a Responses body
+    if (lp === "/v1/responses/input_tokens" && req.method === "POST") {
+      const body = await req.text()
+      record(req, lp, "POST " + body)
+      return Response.json({ object: "response.input_tokens", input_tokens: 17 })
+    }
+    // the L164 providers (see l164Mock)
+    if (lp.startsWith("/l164/")) return try await l164Mock(req, lp.slice(5), lu)
     if (lp.startsWith("/v1/responses/") || lp === "/v1/realtime/client_secrets" || lp === "/v1/realtime/sessions") {
       const body = req.method === "GET" || req.method === "DELETE" ? "" : await req.text()
       record(req, lp, req.method + " " + body)
@@ -1538,6 +1870,10 @@ Bun.serve<string>({
         for (const id of vertexIds) jobs.push(vertexJobs.get(id) ?? "")
         return jsonBody(`{"batchPredictionJobs":[${jobs.join(",")}]}`, 200)
       }
+      if (req.method === "DELETE" && tail !== "") {
+        // batchPredictionJobs.delete answers a long-running Operation (the job stays listed here)
+        return jsonBody(`{"name":"projects/proj/locations/us-central1/operations/del-1","done":true}`, 200)
+      }
       if (req.method === "POST" && tail.endsWith(":cancel")) {
         const id = tail.slice(1, tail.byteLength - 7)
         vertexJobs.set(id, (vertexJobs.get(id) ?? "").replace("JOB_STATE_SUCCEEDED", "JOB_STATE_CANCELLED"))
@@ -1597,6 +1933,12 @@ Bun.serve<string>({
       return new Response(obj, { headers: { "content-type": "application/octet-stream" } })
     }
     // the retained-content bucket: GET reads back the objects it was sent (the gateway never does)
+    // ... and DELETE removes one (a deleted log's object; recorded so a test sees the call)
+    if (lp.startsWith("/logs-hidden/") && req.method === "DELETE") {
+      record(req, lp, "")
+      cloudObjects.delete(lp.slice(1))
+      return new Response(undefined, { status: 204 })
+    }
     if (lp.startsWith("/logs-hidden/") && req.method === "GET") {
       const hobj = cloudObjects.get(lp.slice(1))
       if (hobj === undefined) return new Response("NoSuchKey", { status: 404 })
@@ -1641,6 +1983,7 @@ Bun.serve<string>({
       //   test.backend {input,output,model}  a live delegated response that completed with that usage
       //   test.rt.start              a realtime session.created
       //   test.rt.turn {...}         a realtime response (mock_live.tov realtimeTurn)
+      //   test.rt.transcribe {...}   a transcription of the caller's audio (mock_live.tov realtimeTranscription)
       //   test.hangup                the provider's connection breaks (close code 1011)
       //   session.close {mock_seconds}   a live session.closed with that many seconds (20), then the close
       let type = ""
@@ -1673,6 +2016,10 @@ Bun.serve<string>({
       }
       if (type === "test.rt.turn") {
         for (const e of realtimeTurn(text)) ws.send(e)
+        return
+      }
+      if (type === "test.rt.transcribe") {
+        for (const e of realtimeTranscription(text)) ws.send(e)
         return
       }
       if (type === "test.hangup") {

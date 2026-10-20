@@ -107,6 +107,11 @@ class WsClient:
                 break
             head += chunk
         self.status = int(head.split(b" ")[1]) if head else 0
+        self.headers = {}
+        for line in head.decode("latin-1").split("\r\n")[1:]:
+            if ":" in line:
+                k, v = line.split(":", 1)
+                self.headers[k.strip().lower()] = v.strip()
         self.closed = self.status != 101
 
     def _read(self, k):
@@ -245,7 +250,7 @@ def background(x):
     and log exporter flushes (a flush landing between a request and seen() would read as that request)."""
     if x["path"] in ("/v1/secret/data/raiju", "/_bulk", "/export-hook", "/alert-hook") or x["path"].startswith("/logs/"):
         return True
-    return x["path"].startswith("/mcp") and any(m in x.get("body", "") for m in ('"tools/list"', '"initialize"', '"notifications/'))
+    return x["path"].startswith("/mcp") and any(m in x.get("body", "") for m in ('"tools/list"', '"initialize"', '"notifications/', '"method":"ping"'))
 
 def wait_mcp_tools(base, names, tries=120):
     """Waits until the gateway's MCP clients have listed their tools. Agent mode adds them to every
@@ -2471,7 +2476,7 @@ def mcp_peruser_e2e(env):
         s, _, b = call("GET", "/api/mcp/clients", base=MCP_PU, auth=False)
         check("the sample is masked on read", s == 200 and "tenant-a-key-example" not in b and "tenant" in b, (s, b[:200]))
         s, _, b = tool("sk-bf-tenant-a")
-        check("a key with no submitted values is refused before the call", s == 401 and "not submitted" in b, (s, b[:200]))
+        check("a key with no submitted values is refused before the call", s == 401 and "Authentication required for tenant" in b and "kind=headers" in b, (s, b[:200]))
         s, _, b = call("POST", "/api/mcp/per-user-headers/flows", {"mcp_client_name": "tenant", "virtual_key_id": "vk-a"}, base=MCP_PU, auth=False)
         check("a flow opens for a key and client", s == 201 and json.loads(b)["status"] == "pending", (s, b[:200]))
         fid = json.loads(b)["id"]
@@ -2489,7 +2494,7 @@ def mcp_peruser_e2e(env):
         s, _, b = tool("sk-bf-tenant-a")
         check("the key's own values go with its tool call", s == 200 and "Sunny in Oslo" in b and sent_tenants()[-1:] == ["tenant-a-key-example"], (s, b[:200], sent_tenants()[-1:]))
         s, _, b = tool("sk-bf-tenant-b")
-        check("a second key with no values is still refused", s == 401 and "not submitted" in b, (s, b[:200]))
+        check("a second key with no values is still refused", s == 401 and "Authentication required for tenant" in b and "kind=headers" in b, (s, b[:200]))
         s, _, b = call("POST", "/api/mcp/per-user-headers/flows", {"mcp_client_name": "tenant", "virtual_key_id": "vk-b"}, base=MCP_PU, auth=False)
         fb = json.loads(b)["id"]
         s, _, b = call("PUT", "/api/mcp/per-user-headers/flows/" + fb, {"headers": {"X-Tenant": "tenant-b-key-example"}}, base=MCP_PU, auth=False)
@@ -2501,7 +2506,7 @@ def mcp_peruser_e2e(env):
         s, _, b = call("DELETE", "/api/mcp/per-user-headers/credential/" + cred_b, base=MCP_PU, auth=False)
         check("a credential can be revoked", s == 200, (s, b[:200]))
         s, _, b = tool("sk-bf-tenant-b")
-        check("a revoked credential is no longer used", s == 401 and "not submitted" in b, (s, b[:200]))
+        check("a revoked credential is no longer used", s == 401 and "Authentication required for tenant" in b and "kind=headers" in b, (s, b[:200]))
         s, _, b = tool("sk-bf-tenant-a")
         check("revoking one key leaves the others", s == 200, (s, b[:200]))
         s, _, b = call("DELETE", "/api/mcp/per-user-headers/credential/" + cred_a, base=MCP_PU, auth=False)
@@ -2624,8 +2629,8 @@ def l97c_e2e(env):
         s, _, b = api("POST", "/api/logs/user-agent-mappings", {"pattern": "internal-tool", "match_type": "starts_with", "app": "Internal Tool"})
         um = json.loads(b) if s == 200 else {}
         check("a User-Agent mapping is created", s == 200 and um.get("app") == "Internal Tool" and um.get("id", "").startswith("uam_"), (s, b[:200]))
-        s, _, b = api("POST", "/api/logs/user-agent-mappings", {"pattern": "x", "match_type": "regex", "app": "A"})
-        check("a regex mapping is refused: this gateway has no regular expression engine", s == 400 and "regex" in b, (s, b[:200]))
+        s, _, b = api("POST", "/api/logs/user-agent-mappings", {"pattern": "x(", "match_type": "regex", "app": "A"})
+        check("a regex mapping that does not compile is refused", s == 400 and "invalid regex pattern" in b, (s, b[:200]))
         s, _, b = api("POST", "/api/logs/user-agent-mappings", {"pattern": "x", "app": "A"}, who=VIC)
         check("a viewer may not add a mapping", s == 403, (s, b[:200]))
         s, _, b = api("GET", "/api/logs/user-agent-mappings")
@@ -2836,7 +2841,7 @@ def l97m_e2e(env):
         up = [x for x in seen() if x["path"] == "/v1/chat/completions"][-1]
         check("a chain rule re-routes the model before the upstream call", s == 200 and json.loads(up["body"])["model"] == "gpt-4o-mini", (s, up["body"][:200]))
         s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "stream": True, "messages": msgs}, None, base=GW_L97M_A, auth=False)
-        check("jsonparser completes a stream, and text that is not JSON ends it with an error event", "Invalid JSON in streaming response" in b and "[DONE]" in b, b[:300])
+        check("jsonparser on a stream: chunks whose text is not JSON are skipped (Bifrost's StreamControl skip) and the stream still ends", "Invalid JSON in streaming response" not in b and '"Hel"' not in b and "[DONE]" in b, b[:300])
 
         mine = ""
         for _ in range(40):
@@ -3263,7 +3268,16 @@ def l97g_e2e(env):
         st_json = json.loads(b)
         check("setup_token is reported as configured, with setup required", st_json.get("setup_token_configured") is True and st_json.get("setup_required") is True, b[:300])
         s, _, b = call("POST", "/api/users", {"name": "first", "role": "admin", "password": "first-pass-1"}, None, base=GW_L97G, auth=False)
-        check("the first admin account needs the setup token", s == 403 and "setup token" in b, (s, b[:200]))
+        check("the first admin account needs the setup token (the setup lock's 401)", s == 401 and "X-Bifrost-Setup-Token" in b, (s, b[:200]))
+        # Bifrost's setup lock: every other /api route is locked behind the token too, while no admin exists (L172)
+        s, _, b = call("GET", "/api/providers", None, None, base=GW_L97G, auth=False)
+        check("the setup lock refuses a management route without the token", s == 401 and "setup token" in b, (s, b[:200]))
+        s, _, b = call("GET", "/api/providers", None, {"x-bifrost-setup-token": "wrong"}, base=GW_L97G, auth=False)
+        check("... and with a wrong token", s == 403 and "invalid setup token" in b, (s, b[:200]))
+        s, _, b = call("GET", "/api/providers", None, {"x-bifrost-setup-token": "l97g-setup"}, base=GW_L97G, auth=False)
+        check("... and lets the token through", s == 200, (s, b[:200]))
+        s, _, b = call("GET", "/api/session/is-auth-enabled", None, None, base=GW_L97G, auth=False)
+        check("the auth state stays open under the lock", s == 200, (s, b[:200]))
         s, _, b = call("POST", "/api/users", {"name": "first", "role": "admin", "password": "first-pass-1"}, {"x-bifrost-setup-token": "l97g-setup"}, base=GW_L97G, auth=False)
         check("the first admin account is created with the setup token", s != 403, (s, b[:200]))
         s, _, b = call("GET", "/api/providers", None, None, base=GW_L97G_AUTH, auth=False)
@@ -3407,8 +3421,10 @@ def l109_e2e(env):
         dbody = {"model": "typesafe/jev-latest", "input": "Customer message: I was double charged.", "questions": [{"type": "predicate", "name": "is_frustrated", "instructions": "Is the customer frustrated?", "criteria": {"true": "angry", "false": "calm"}}]}
         s, _, b = call("POST", "/v1/decisions", dbody, base=GW_L109, auth=False)
         check("a native decision answers on /v1/decisions", s == 200 and json.loads(b)["answers"][0].get("probability") == 0.75, (s, b[:300]))
+        # (L173) these paths take OpenAI's request only, so the question goes without its criteria
+        obody = {**dbody, "questions": [{k: v for k, v in q.items() if k != "criteria"} for q in dbody["questions"]]}
         for path in ("/openai/decisions", "/openai/v1/decisions", "/litellm/decisions", "/langchain/v1/decisions", "/pydanticai/decisions"):
-            s, _, b = call("POST", path, dbody, base=GW_L109, auth=False)
+            s, _, b = call("POST", path, obody, base=GW_L109, auth=False)
             check(f"{path} serves decisions, as Bifrost mounts it", s == 200 and json.loads(b)["answers"][0].get("name") == "is_frustrated", (s, b[:200]))
         s, _, b = call("POST", "/decisions", dbody, base=GW_L109, auth=False)
         check("a bare /decisions is not a route, as in Bifrost", s != 200, (s, b[:200]))
@@ -3421,6 +3437,123 @@ def l109_e2e(env):
         s, h, b = call("POST", "/v1/decisions", {**dbody, "model": "openrouter/openai/gpt-4o-mini"}, base=GW_L109, auth=False)
         check("a model OpenRouter does not decide natively is emulated under compat, not sent to its decisions route",
               seen()[-1]["path"] == "/or/v1/chat/completions" and hdr(h, "x-bifrost-converted-request-type") != "responses", (s, seen()[-1:], b[:200]))
+    finally:
+        gw.terminate()
+
+
+GW_L163 = "http://127.0.0.1:18280"  # native decisions (OpenAI, Azure, Cloudflare, Perplexity, Ollama) and native text completions (Anthropic, Bedrock)
+
+
+def l163_config() -> dict:
+    """Each native decision provider on its own mock prefix, Anthropic and Bedrock on the mock root."""
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {
+            "openai": {"keys": [{"name": "oa-l163", "value": "sk-oa163", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK + "/oa163", "max_retries": 0}},
+            "azure": {"keys": [{"name": "az-l163", "value": "az-key163", "models": [], "weight": 1.0, "azure_key_config": {"endpoint": MOCK + "/az163", "api_version": "2024-10-21"}}]},
+            "cloudflare": {"keys": [{"name": "cf-l163", "value": "cf163", "models": [], "weight": 1.0, "cloudflare_key_config": {"account_id": "acc163"}}], "network_config": {"base_url": MOCK + "/cf163/client/v4", "max_retries": 0}},
+            "perplexity": {"keys": [{"name": "px-l163", "value": "pplx163", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK + "/pplx163", "max_retries": 0}},
+            "ollama": {"keys": [{"name": "ol-l163", "value": "", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK + "/ol163", "max_retries": 0}},
+            "anthropic": {"keys": [{"name": "an-l163", "value": "sk-ant-l163", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "bedrock": {"keys": [{"name": "bk-l163", "models": [], "weight": 1.0, "bedrock_key_config": {"access_key": "AKIDEXAMPLE", "secret_key": "secret", "region": "us-east-1"}}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+    }
+
+
+def l163_e2e(env):
+    """Native decisions as Bifrost sends them (OpenAI's /v1/decisions for gpt-6-luna, Azure's systemone, Cloudflare's
+    Clef with images, Perplexity's deciders, Ollama's System One models), and native text completions on
+    /v1/completions and /anthropic/v1/complete (Anthropic's legacy call, Bedrock's InvokeModel)."""
+    cfg_path = os.path.join(BUILD, "e2e.l163.json")
+    json.dump(l163_config(), open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18280", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l163.log"), "w"))
+    try:
+        wait(GW_L163 + "/health")
+        img = [{"role": "user", "content": [{"type": "input_text", "text": "Is this receipt doubled?"}, {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}]}]
+        qs = [{"type": "predicate", "name": "is_frustrated", "instructions": "Is the customer frustrated?", "criteria": {"true": "angry", "false": "calm"}},
+              {"type": "choice", "instructions": "Pick the topic", "choices": [{"value": "billing", "description": "money"}, {"value": "bug"}]},
+              {"type": "score", "name": "urgency", "levels": [{"label": "0", "description": "calm"}, {"label": "high", "description": "now"}]}]
+        dbody = {"model": "openai/gpt-6-luna", "input": "Customer message: I was double charged.", "questions": qs, "safety_identifier": "end-user-163"}
+        s, _, b = call("POST", "/v1/decisions", dbody, base=GW_L163, auth=False)
+        r = json.loads(b) if s == 200 else {}
+        ans = r.get("answers", [])
+        check("an OpenAI decision model answers through OpenAI's own /v1/decisions", s == 200 and len(ans) == 3 and ans[0] == {"type": "predicate", "name": "is_frustrated", "probability": 0.66, "confidence": 0.8}
+              and ans[1] == {"type": "choice", "choice": "billing"} and ans[2].get("score") == 1.0 and ans[2].get("legend") == {"0": "calm", "1": "high: now"}
+              and r.get("usage", {}).get("total_tokens") == 26 and r.get("model") == "gpt-6-luna-2026-09", (s, b[:400]))
+        up = [x for x in seen() if x["path"] == "/oa163/v1/decisions"]
+        sent = json.loads(up[-1]["body"]) if up else {}
+        check("the OpenAI decision body is OpenAI's: text questions, criteria folded in, the safety identifier",
+              up and up[-1]["auth"] == "Bearer sk-oa163" and sent.get("model") == "gpt-6-luna" and sent.get("input") == dbody["input"] and sent.get("safety_identifier") == "end-user-163"
+              and sent["questions"][0] == {"type": "predicate", "name": "is_frustrated", "instructions": "Is the customer frustrated? Meaning (answer: meaning): true=angry, false=calm"}
+              and sent["questions"][1] == {"type": "choice", "instructions": "Pick the topic", "choices": [{"value": "billing", "description": "money"}, {"value": "bug"}]}
+              and sent["questions"][2]["levels"] == [{"label": "0", "description": "calm"}, {"label": "high", "description": "now"}], up[-1:])
+        s, _, b = call("POST", "/v1/decisions", {**dbody, "input": img}, base=GW_L163, auth=False)
+        up = [x for x in seen() if x["path"] == "/oa163/v1/decisions"]
+        check("OpenAI reads the input's images: the messages go as sent", s == 200 and up and json.loads(up[-1]["body"])["input"] == img, (s, b[:200], up[-1:]))
+        s, _, b = call("POST", "/v1/decisions", {**dbody, "input": "please refuse this"}, base=GW_L163, auth=False)
+        check("an OpenAI refusal is kept as the answer", s == 200 and json.loads(b)["answers"][0] == {"type": "refusal", "name": "is_frustrated"}, (s, b[:300]))
+        s, _, b = call("POST", "/v1/decisions", {**dbody, "model": "openai/gpt-4o-mini"}, base=GW_L163, auth=False)
+        check("an OpenAI model without decisions is refused, as Bifrost refuses it", s == 400 and "unsupported_operation" in b and "decisions is not supported by openai provider" in b, (s, b[:200]))
+        s, _, b = call("POST", "/v1/decisions", {**dbody, "model": "openai/gpt-6-luna"}, headers={"x-bf-compat": '["convert_decision_to_responses"]'}, base=GW_L163, auth=False)
+        check("under compat an OpenAI decision model stays native", s == 200 and seen()[-1]["path"] == "/oa163/v1/decisions", (s, seen()[-1:]))
+
+        s, _, b = call("POST", "/v1/decisions", {**dbody, "model": "azure/Microsoft-Decision-1"}, base=GW_L163, auth=False)
+        up = seen()[-1]
+        check("an Azure decision goes to the Foundry systemone route with the api key", s == 200 and json.loads(b)["answers"][0].get("probability") == 0.75 and up["path"] == "/az163/providers/microsoft/v1/systemone"
+              and up["auth"] == "az-key163" and json.loads(up["body"]).get("model") == "Microsoft-Decision-1" and "is_frustrated" in json.loads(up["body"]).get("questions", {}), (s, b[:300], up))
+        n = len(seen())
+        s, _, b = call("POST", "/v1/decisions", {**dbody, "model": "azure/Microsoft-Decision-1", "input": img}, base=GW_L163, auth=False)
+        check("a text-only systemone provider refuses an input with images before the call", s == 400 and "input_image" in b and len(seen()) == n, (s, b[:200]))
+
+        s, _, b = call("POST", "/v1/decisions", {**dbody, "model": "cloudflare/@cf/cloudflare/clef-flash", "input": img}, base=GW_L163, auth=False)
+        up = seen()[-1]
+        sent = json.loads(up["body"]) if up["path"].endswith("clef-flash") else {}
+        check("a Clef decision runs on Workers AI with the images lifted out of the input", s == 200 and json.loads(b)["answers"][0].get("probability") == 0.75
+              and up["path"] == "/cf163/client/v4/accounts/acc163/ai/run/@cf/cloudflare/clef-flash" and up["auth"] == "Bearer cf163" and sent.get("model") == "clef-flash"
+              and sent.get("images") == ["data:image/png;base64,AAAA"] and sent.get("state") == [{"role": "user", "content": "Is this receipt doubled?"}], (s, b[:300], up))
+
+        s, _, b = call("POST", "/v1/decisions", {**dbody, "model": "perplexity/pplx-decider-v1.1-27b", "input": img}, base=GW_L163, auth=False)
+        up = seen()[-1]
+        sent = json.loads(up["body"]) if up["path"] == "/pplx163/v1/decisions" else {}
+        check("a Perplexity decider decides on /v1/decisions, the images kept in order with the text", s == 200 and json.loads(b)["answers"][2].get("score") == 1.5
+              and up["auth"] == "Bearer pplx163" and sent.get("state") == ["Is this receipt doubled?", {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}], (s, b[:300], up))
+
+        s, _, b = call("POST", "/v1/decisions", {**dbody, "model": "ollama/nimble", "input": img, "keep_alive": "5m"}, base=GW_L163, auth=False)
+        up = seen()[-1]
+        sent = json.loads(up["body"]) if up["path"] == "/ol163/v1/systemone" else {}
+        check("an Ollama System One model decides on /v1/systemone with raw base64 images and keep_alive", s == 200 and json.loads(b)["answers"][0].get("probability") == 0.75
+              and sent.get("images") == ["AAAA"] and sent.get("keep_alive") == "5m" and sent.get("model") == "nimble" and up["auth"] == "", (s, b[:300], up))
+
+        # native text completions
+        s, _, b = call("POST", "/v1/completions", {"model": "anthropic/claude-2.1", "prompt": "Say hi", "temperature": 0.1, "stop": "END"}, base=GW_L163, auth=False)
+        r = json.loads(b) if s == 200 else {}
+        up = seen()[-1]
+        sent = json.loads(up["body"]) if up["path"] == "/v1/complete" else {}
+        check("an Anthropic text completion goes to Anthropic's legacy /v1/complete", s == 200 and r.get("object") == "text_completion" and r["choices"][0]["text"] == "Hi from legacy claude-2.1"
+              and r["choices"][0]["finish_reason"] == "stop" and r.get("usage", {}).get("total_tokens") == 10 and up["auth"] == "sk-ant-l163"
+              and sent.get("prompt") == "\n\nHuman: Say hi\n\nAssistant:" and sent.get("max_tokens_to_sample") == 4096 and sent.get("stop_sequences") == ["END"], (s, b[:300], up))
+        s, _, b = call("POST", "/v1/completions", {"model": "anthropic/claude-2.1", "prompt": "Say hi", "stream": True}, base=GW_L163, auth=False)
+        check("Anthropic's text completions do not stream, as in Bifrost", s == 400 and "text_completion_stream is not supported by anthropic provider" in b, (s, b[:200]))
+        s, _, b = call("POST", "/v1/completions", {"model": "bedrock/anthropic.claude-v2:1", "prompt": "Say hi", "max_tokens": 30}, base=GW_L163, auth=False)
+        r = json.loads(b) if s == 200 else {}
+        up = seen()[-1]
+        check("a Bedrock Claude text completion goes to InvokeModel with the legacy body", s == 200 and r["choices"][0]["text"] == " Hi from bedrock legacy" and up["path"].endswith("/invoke")
+              and "claude-v2" in up["path"] and up["auth"].startswith("AWS4-HMAC-SHA256") and '"max_tokens_to_sample":30' in up["body"] and "Human: Say hi" in up["body"], (s, b[:300], up))
+        s, _, b = call("POST", "/v1/completions", {"model": "bedrock/mistral.mistral-7b-instruct-v0:2", "prompt": "<s>[INST] hi [/INST]", "max_tokens": 5}, base=GW_L163, auth=False)
+        r = json.loads(b) if s == 200 else {}
+        check("a Bedrock Mistral text completion reads Mistral's outputs", s == 200 and r["choices"][0]["text"] == " Hi from bedrock mistral" and r["choices"][0]["finish_reason"] == "length"
+              and '"max_tokens":5' in seen()[-1]["body"], (s, b[:300]))
+        s, _, b = call("POST", "/v1/completions", {"model": "bedrock/meta.llama3-8b-instruct-v1:0", "prompt": "hi"}, base=GW_L163, auth=False)
+        check("a Bedrock model without a text completion answer is refused", s == 400 and "unsupported model type for text completion" in b, (s, b[:200]))
+        s, _, b = call("POST", "/anthropic/v1/complete", {"model": "anthropic/claude-2.1", "prompt": "\n\nHuman: hi\n\nAssistant:", "max_tokens_to_sample": 50, "stop_sequences": ["\n\nHuman:"]}, base=GW_L163, auth=False)
+        lg = json.loads(b) if s == 200 else {}
+        up = seen()[-1]
+        sent = json.loads(up["body"]) if up["path"] == "/v1/complete" else {}
+        check("/anthropic/v1/complete is sent natively to Anthropic and answered in the legacy shape", s == 200 and lg.get("type") == "completion" and lg.get("completion") == "Hi from legacy claude-2.1"
+              and lg.get("stop_reason") == "stop_sequence" and lg.get("usage") == {"input_tokens": 6, "output_tokens": 4}
+              and sent.get("prompt") == "\n\nHuman: hi\n\nAssistant:" and sent.get("max_tokens_to_sample") == 50 and sent.get("stop_sequences") == ["\n\nHuman:"], (s, b[:300], up))
     finally:
         gw.terminate()
 
@@ -3553,7 +3686,8 @@ def l97q_e2e(env):
         check("replicate files are sent as multipart with the content part", len(up) > 0 and "pic.png" in up[-1]["body"] and up[-1]["auth"] == "Bearer r8_e2e", up[-1:])
         s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "replicate"}, base=GW_L97Q, auth=False)
         ids = [m["id"] for m in json.loads(b)["data"]] if s == 200 else []
-        check("replicate models: the deployments of every page, as provider/owner/name", "replicate/acme/model-a" in ids and "replicate/acme/model-b" in ids and "replicate/acme/model-c" in ids, (s, b[:300]))
+        # (L173) without use_deployments_endpoint the deployments are not read, as in Bifrost: l173_e2e lists them with it set
+        check("replicate models: no deployments are listed without use_deployments_endpoint", s == 200 and ids == [], (s, b[:300]))
         s, _, b = mp_form(GW_L97Q, "/v1/images/edits", [("model", None, "text/plain", "bedrock/stability.stable-image-inpaint-v1:0"), ("prompt", None, "text/plain", "a red fox"), ("type", None, "text/plain", "inpainting"), ("grow_mask", None, "text/plain", "5"), ("image", "in.png", "image/png", png), ("mask", "m.png", "image/png", png)])
         d = json.loads(b) if s == 200 else {}
         check("bedrock stability inpainting answers with the image", s == 200 and d.get("data", [{}])[0].get("b64_json") == "iVBORw0KGgo=", (s, b[:300]))
@@ -3739,6 +3873,11 @@ def l97l_e2e(env):
         cookie = hdr(h, "set-cookie") or ""
         check("the setup token trades for an HttpOnly setup session cookie with an expiry", s == 200 and cookie.startswith("bifrost_setup_session=") and "HttpOnly" in cookie and "SameSite=Strict" in cookie and "expires_at" in b, (s, cookie[:120], b[:200]))
         value = cookie.split(";")[0].split("=", 1)[1] if cookie != "" else ""
+        s, _, b = call("POST", "/api/plugins", {"name": "x-l170", "path": "/tmp/x-l170.wasm"}, {"cookie": "bifrost_setup_session=" + value}, base=GW_L97L_SETUP, auth=False)
+        check("a custom plugin path needs genuine admin authentication while dashboard auth is off", s == 403 and "genuine admin authentication" in b, (s, b[:200]))
+        s, _, b = call("GET", "/api/config", None, {"cookie": "bifrost_setup_session=" + value}, base=GW_L97L_SETUP, auth=False)
+        s2, _, b2 = call("GET", "/api/config", None, None, base=GW_L97L_SETUP, auth=False)
+        check("the setup session cookie opens the locked API, which is closed without it", s == 200 and s2 == 401, (s, s2, b2[:200]))
         s, _, b = call("POST", "/api/users", {"name": "first", "role": "admin", "password": "first-pass-1"}, {"cookie": "bifrost_setup_session=" + value}, base=GW_L97L_SETUP, auth=False)
         check("the setup session cookie creates the first admin without the token", s in (200, 201), (s, b[:200]))
         s, _, b = call("POST", "/api/session/setup", None, {"x-bifrost-setup-token": "l97l-setup"}, base=GW_L97L_SETUP, auth=False)
@@ -3892,7 +4031,7 @@ def l97l_e2e(env):
         blocked = l97l_chat("a forbidden-l97l word, switched on again")
         check("a switched-on plugin refuses again", s == 200 and blocked[0] == 400, (s, blocked[0]))
         s, _, b = api("PUT", "/api/plugins/nosuch-l97l", {"enabled": True})
-        check("changing a plugin that is not configured is a 404", s == 404, (s, b[:200]))
+        check("changing an unconfigured plugin this gateway does not build is refused", s == 400 and "unknown plugin" in b, (s, b[:200]))
         s, _, b = api("DELETE", "/api/plugins/blocklist")
         check("a plugin is removed", s == 200, (s, b[:200]))
         s, _, b = api("GET", "/api/plugins/blocklist")
@@ -3904,6 +4043,12 @@ def l97l_e2e(env):
         check("the removal is persisted", all(p.get("name") != "blocklist" for p in saved.get("plugins", [])), [p.get("name") for p in saved.get("plugins", [])])
         s, _, b = api("DELETE", "/api/plugins/blocklist")
         check("removing a plugin twice is a 404", s == 404, (s, b[:200]))
+        s, _, b = api("PUT", "/api/plugins/blocklist", {"config": {"words": ["forbidden-l97l"]}})
+        made = json.loads(b) if s == 200 else {}
+        check("changing a plugin that is not configured creates it, off", s == 200 and made.get("plugin", {}).get("enabled") is False, (s, b[:200]))
+        s, _, b = api("GET", "/api/plugins/blocklist")
+        check("the plugin created by a change is listed", s == 200, (s, b[:200]))
+        s, _, b = api("DELETE", "/api/plugins/blocklist")
     finally:
         gw.terminate()
         gw.wait()
@@ -4143,10 +4288,10 @@ def l116_e2e(env):
         wait(GW_L116 + "/health")
         s, _, b = api("GET", "/api/agents/echo")
         echo = json.loads(b) if s == 200 else {}
-        check("a declared agent is listed with its gateway endpoints and no card until it is fetched", s == 200 and echo.get("card") is None and echo["gateway"]["json_rpc_url"] == "https://gw.example.test/agents/a2a/echo/json-rpc", (s, b[:300]))
+        check("a declared agent is listed with its gateway endpoints", s == 200 and echo["gateway"]["json_rpc_url"] == "https://gw.example.test/agents/a2a/echo/json-rpc", (s, b[:300]))
         check("a declared agent's runtime header shows its env reference", echo.get("runtime_auth", {}).get("headers", {}).get("Authorization") == "env.E2E_L116_AGENT", b[:300])
         s, _, b = gwc("GET", "/agents/a2a/echo/.well-known/agent-card.json", None, A)
-        check("the gateway card is unavailable until the card is fetched", s == 503, (s, b[:200]))
+        check("a declared agent's card is served with no refresh-card: it is fetched at start, or on first use (L171)", s == 200 and json.loads(b).get("name") == "echo-agent", (s, b[:200]))
         s, _, b = api("POST", "/api/agents/echo/refresh-card")
         check("refresh-card fetches the card and caches it", s == 200 and json.loads(b)["card"]["name"] == "echo-agent" and json.loads(b)["card_fetched_at"] is not None, (s, b[:200]))
         s, _, b = gwc("GET", "/agents/a2a/echo/.well-known/agent-card.json", None, A)
@@ -5237,6 +5382,8 @@ def l140_e2e(env):
                     res = {"tools": [{"name": "lookup", "description": "Looks a key up", "inputSchema": {"type": "object", "properties": {"key": {"type": "string"}}}}]}
                 elif m == "tools/call":
                     res = {"content": [{"type": "text", "text": "found " + str(msg["params"]["arguments"].get("key"))}]}
+                elif m == "ping":
+                    res = {}
                 else:
                     return 200, json.dumps({"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32601, "message": "no such method"}}), "application/json"
                 return 200, json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": res}), "application/json"
@@ -5390,6 +5537,8 @@ def l147_idp():
                     res = {"tools": [{"name": "lookup", "description": "Looks a key up", "inputSchema": {"type": "object", "properties": {"key": {"type": "string"}}}}]}
                 elif m == "tools/call":
                     res = {"content": [{"type": "text", "text": "found " + str(msg["params"]["arguments"].get("key"))}]}
+                elif m == "ping":
+                    res = {}
                 else:
                     return 200, json.dumps({"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32601, "message": "no such method"}}), "application/json"
                 return 200, json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": res}), "application/json"
@@ -5638,6 +5787,196 @@ def l144_e2e(env):
         gw.terminate()
 
 
+GW_L169 = "http://127.0.0.1:18290"  # streamed transcriptions, Sarvam's audio, refused and failed audio logged, realtime and live checks
+
+def l169_config() -> dict:
+    """OpenAI and Sarvam audio through the mock, a live and realtime OpenAI key, and the log store. Virtual keys: one with
+    no limits, one that may use only some models (refused audio and live delegation checks)."""
+    import hashlib
+    def tok(t):
+        return hashlib.sha256(t.encode()).hexdigest()
+    return {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": True},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l169-logs")},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "pricing": {
+            "openai/gpt-4o-transcribe-slow": {"input_cost_per_token": 0.000002, "output_cost_per_token": 0.00001},
+            # the live session's backend models: a delegated response is billed at the rates of the model it ran on
+            "openai/gpt-back": {"input_cost_per_token": 0.000002, "output_cost_per_token": 0.000008},
+            "openai/gpt-next": {"input_cost_per_token": 0.000001, "output_cost_per_token": 0.000004},
+            # Sarvam's speech is billed by its characters at the text rate (no character rate here), its transcription by
+            # its seconds at the audio rate per second, which wins over the voice rate
+            "sarvam/bulbul:v2": {"input_cost_per_token": 0.00001, "output_cost_per_token": 0.0},
+            "sarvam/saarika:v2.5": {"input_cost_per_token": 0.0, "output_cost_per_token": 0.0, "input_cost_per_second": 0.1, "input_cost_per_audio_per_second": 0.001},
+        },
+        "providers": {
+            "openai": {"keys": [{"name": "pool-l169", "value": "sk-l169", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "sarvam": {"keys": [{"name": "sv", "value": "sarvam-e2e-key", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": tok("sk-admin-l169")}],
+            "virtual_keys": [{"id": "vk-l169", "value": "sk-bf-l169"},
+                             {"id": "vk-l169-narrow", "value": "sk-bf-l169-narrow", "provider_configs": [{"provider": "openai", "allowed_models": ["whisper-1", "gpt-live", "gpt-back", "gpt-next"]}]}],
+        },
+    }
+
+
+def l169_e2e(env):
+    """L169: a streamed transcription passes through as it arrives and is billed from its last usage; Sarvam's speech, its
+    streamed speech (/text-to-speech/stream) and its speech-to-text are served natively, the transcription billed by its
+    seconds at input_cost_per_audio_per_second; refused and failed audio calls are logged as errors; a realtime session
+    refuses a second response.create while a response runs; a live session's delegated model is checked on start and
+    on session.update and goes up bare. Its own gateway (port 18290), started and stopped here."""
+    import http.client, shutil
+    cfg_path = os.path.join(BUILD, "e2e.l169.json")
+    json.dump(l169_config(), open(cfg_path, "w"))
+    shutil.rmtree(os.path.join(BUILD, "e2e-l169-logs"), ignore_errors=True)
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18290", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l169.log"), "w"))
+    vk = {"authorization": "Bearer sk-bf-l169"}
+    narrow = {"authorization": "Bearer sk-bf-l169-narrow"}
+    adm_h = {"authorization": "Bearer sk-admin-l169"}
+
+    def rows_of(op, model=None, wait_s=4.0):
+        out = []
+        deadline = time.time() + wait_s
+        while True:
+            s, _, b = call("GET", "/api/logs", None, adm_h, base=GW_L169, auth=False)
+            rows = json.loads(b).get("logs", []) if s == 200 else []
+            out, ids = [], set()
+            for x in rows:
+                if x.get("object") != op or (model is not None and x.get("model") != model) or x.get("id") in ids:
+                    continue
+                ids.add(x.get("id"))
+                out.append(x)
+            if out or time.time() > deadline:
+                return out
+            time.sleep(0.2)
+
+    def form_body(fields, filename="talk.wav"):
+        boundary = "raiju-e2e-l169-boundary"
+        out = []
+        for k, v in fields.items():
+            out.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
+        out.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\nContent-Type: audio/wav\r\n\r\n'.encode() + b"RIFF\x00\x00\x00\x00WAVEfmt " + b"\r\n")
+        out.append(f"--{boundary}--\r\n".encode())
+        return b"".join(out), f"multipart/form-data; boundary={boundary}"
+
+    def timed_stream(path, body, ctype, headers, marker):
+        """POSTs body and reads the answer line by line: the status, how long the line holding marker took, and the whole body."""
+        conn = http.client.HTTPConnection("127.0.0.1", 18290, timeout=10)
+        t0 = time.time()
+        conn.request("POST", path, body=body, headers={"content-type": ctype, **headers})
+        r = conn.getresponse()
+        first_at = None
+        lines = []
+        while True:
+            line = r.readline()
+            if not line:
+                break
+            lines.append(line)
+            if first_at is None and marker in line:
+                first_at = time.time() - t0
+        conn.close()
+        return r.status, first_at, time.time() - t0, b"".join(lines)
+
+    try:
+        wait(GW_L169 + "/health")
+
+        # ---- a streamed transcription passes through as it arrives ----
+        body, ctype = form_body({"model": "openai/gpt-4o-transcribe-slow", "stream": "true"})
+        s, first_at, total, raw = timed_stream("/v1/audio/transcriptions", body, ctype, vk, b"transcript.text.delta")
+        check("a streamed transcription's first event reaches the caller before the provider has finished", s == 200 and first_at is not None and first_at < 1.2 and total >= 1.4 and b"transcript.text.done" in raw and b"data: [DONE]" in raw, (s, first_at, total, raw[:300]))
+        tr = rows_of("transcription", "gpt-4o-transcribe-slow")
+        check("and it is billed from the usage of its last event when it ends", len(tr) == 1 and tr[0].get("prompt_tokens") == 30 and tr[0].get("completion_tokens") == 10 and near(tr[0].get("cost"), 30 * 0.000002 + 10 * 0.00001) and tr[0].get("status") == "success", tr)
+        # OpenAI's streamed speech (stream_format sse) passes through as events too
+        s, h, b = call_bytes("POST", "/v1/audio/speech", {"model": "openai/tts-1", "input": "hi", "voice": "alloy", "stream_format": "sse"}, vk, base=GW_L169)
+        check("a streamed OpenAI speech answer comes back as its events", s == 200 and b"speech.audio.delta" in b and b"speech.audio.done" in b and "text/event-stream" in (h.get("content-type") or ""), (s, b[:200]))
+
+        # ---- refused and failed audio calls are logged as errors, charged nothing ----
+        s, _, b = mp_form(GW_L169, "/v1/audio/transcriptions", [("model", None, "text/plain", "openai/gpt-4o-transcribe"), ("file", "talk.wav", "audio/wav", b"RIFF\x00\x00\x00\x00WAVEfmt ")], narrow)
+        check("a transcription the virtual key may not use is refused", s in (401, 403) and "gpt-4o-transcribe" in b, (s, b[:200]))
+        rows = rows_of("transcription", "gpt-4o-transcribe")
+        check("and the refusal is logged as an error row with its message", len(rows) == 1 and rows[0].get("status") == "error" and "gpt-4o-transcribe" in (rows[0].get("error_details") or {}).get("message", "") and float(rows[0].get("cost") or 0) == 0.0, rows)
+        s, _, b = mp_form(GW_L169, "/v1/audio/transcriptions", [("model", None, "text/plain", "openai/whisper-refuse"), ("file", "talk.wav", "audio/wav", b"RIFF\x00\x00\x00\x00WAVEfmt ")], vk)
+        check("a transcription the provider refuses comes back with its status", s == 400 and "could not be decoded" in b, (s, b[:200]))
+        rows = rows_of("transcription", "whisper-refuse")
+        check("and it is logged as an error row of its virtual key, with the provider's message", len(rows) == 1 and rows[0].get("status") == "error" and rows[0].get("virtual_key_id") == "vk-l169" and "could not be decoded" in (rows[0].get("error_details") or {}).get("message", ""), rows)
+        s, _, b = call("POST", "/v1/audio/speech", {"model": "openai/tts-refuse", "input": "hello", "voice": "alloy"}, vk, base=GW_L169, auth=False)
+        rows = rows_of("speech", "tts-refuse")
+        check("a speech call the provider refuses is logged as an error row too", s == 400 and len(rows) == 1 and rows[0].get("status") == "error" and "voice not available" in (rows[0].get("error_details") or {}).get("message", ""), (s, rows))
+
+        # ---- Sarvam's audio, served natively ----
+        s, h, audio = call_bytes("POST", "/v1/audio/speech", {"model": "sarvam/bulbul:v2", "input": "namaste", "voice": "anushka", "language_code": "hi-IN", "speed": 1.1}, vk, base=GW_L169)
+        sent = [x for x in seen() if x["path"] == "/text-to-speech"]
+        sbody = json.loads(sent[-1]["body"]) if sent else {}
+        check("Sarvam speech is its text-to-speech: the body in Sarvam's names, the audio decoded", s == 200 and audio == b64lib.b64decode("UklGRmF1ZGlv") and sbody == {"text": "namaste", "target_language_code": "hi-IN", "model": "bulbul:v2", "speaker": "anushka", "pace": 1.1}, (s, audio[:20], sbody))
+        rows = rows_of("speech", "bulbul:v2")
+        check("and it is billed by its characters", len(rows) == 1 and rows[0].get("provider") == "sarvam" and near(rows[0].get("cost"), 7 * 0.00001), rows)
+        s, _, b = call("POST", "/v1/audio/speech", {"model": "sarvam/bulbul:v2", "input": "refuse", "voice": "x"}, vk, base=GW_L169, auth=False)
+        check("Sarvam's refusal keeps its status and message", s == 422 and "speaker is not valid" in b, (s, b[:200]))
+        s, first_at, total, raw = timed_stream("/v1/audio/speech", json.dumps({"model": "sarvam/bulbul:v2", "input": "namaste", "voice": "anushka", "stream_format": "sse"}).encode(), "application/json", vk, b"speech.audio.delta")
+        events = [json.loads(l[5:]) for l in raw.split(b"\n") if l.startswith(b"data: {")]
+        audio = b"".join(b64lib.b64decode(e.get("audio", "")) for e in events if e.get("type") == "speech.audio.delta")
+        check("Sarvam's streamed speech is its /text-to-speech/stream, each chunk of audio a speech.audio.delta as it comes", s == 200 and first_at is not None and first_at < 1.2 and total >= 1.4 and audio == bytes([0x52, 0x49, 0x46, 0x46, 0xff, 0x00, 0x7f]) and events[-1].get("type") == "speech.audio.done" and raw.rstrip().endswith(b"data: [DONE]") and any(x["path"] == "/text-to-speech/stream" for x in seen()), (s, first_at, total, raw[:300]))
+        s, _, b = mp_form(GW_L169, "/v1/audio/transcriptions", [("model", None, "text/plain", "sarvam/saarika:v2.5"), ("language", None, "text/plain", "hi-IN"), ("file", "talk.wav", "audio/wav", b"RIFF\x00\x00\x00\x00WAVEfmt ")], vk)
+        out = json.loads(b) if s == 200 else {}
+        stt_sent = [x for x in seen() if x["path"] == "/speech-to-text"]
+        check("Sarvam's speech-to-text answers in Bifrost's transcription shape", s == 200 and out.get("text") == "namaste duniya" and out.get("language") == "hi-IN" and out.get("duration") == 2.5 and [w["word"] for w in out.get("words", [])] == ["namaste", "duniya"] and stt_sent and json.loads(stt_sent[-1]["body"]) == {"model": "saarika:v2.5", "language_code": "hi-IN", "file": True}, (s, b[:300]))
+        rows = rows_of("transcription", "saarika:v2.5")
+        check("and it is billed by its seconds at input_cost_per_audio_per_second", len(rows) == 1 and near(rows[0].get("cost"), 2.5 * 0.001), rows)
+
+        # ---- realtime: a second response.create while a response runs is refused ----
+        c = WsClient("/v1/realtime?model=openai/gpt-realtime", vk, port=18290)
+        c.send(json.dumps({"type": "test.rt.start", "id": "sess_l169_rt"}))
+        ws_collect(c, lambda e: e.get("type") == "session.created")
+        c.send(json.dumps({"type": "response.create"}))
+        first = ws_collect(c, lambda e: e.get("type") == "echo")
+        c.send(json.dumps({"type": "response.create", "response": {"instructions": "again"}}))
+        refused = ws_collect(c, lambda e: e.get("type") in ("error", "echo"))
+        check("a response.create while a response is running is refused, as Bifrost does, and never reaches the provider", first and first[-1].get("type") == "echo" and refused and refused[-1].get("type") == "error" and refused[-1]["error"]["message"] == "Conversation already has an active response in progress." and refused[-1]["error"]["type"] == "invalid_request_error", (first, refused))
+        c.send(json.dumps({"type": "test.rt.turn", "id": "resp_l169", "input": 10, "output": 5}))
+        ws_collect(c, lambda e: e.get("type") == "response.done")
+        c.send(json.dumps({"type": "response.create"}))
+        again = ws_collect(c, lambda e: e.get("type") in ("error", "echo"))
+        check("once the response is done, the next response.create goes on", again and again[-1].get("type") == "echo", again)
+        c.sock.close()
+
+        # ---- live: the delegated model is checked and sent bare ----
+        def live(headers, model, sid):
+            lc = WsClient("/v1/live/sessions", headers, port=18290)
+            lc.send(json.dumps({"type": "session.start", "session": {"model": "openai/gpt-live", "mock_id": sid, "delegation": {"type": "responses", "responses": {"model": model}}}}))
+            return lc
+
+        c = live(narrow, "openai/gpt-back", "sess_l169_live")
+        evs = ws_collect(c, lambda e: e.get("type") in ("echo", "error"))
+        start = evs[-1].get("event", "") if evs else ""
+        check("a live start's delegated model goes to the provider without its provider prefix", evs and evs[-1].get("type") == "echo" and '"model":"gpt-back"' in start and "openai/gpt-back" not in start, evs)
+        c.send(json.dumps({"type": "session.update", "session": {"delegation": {"type": "responses", "responses": {"model": "anthropic/claude-sonnet"}}}}))
+        evs = ws_collect(c, lambda e: e.get("type") in ("echo", "error"))
+        check("a session.update naming another provider's model is refused and never reaches the provider", evs and evs[-1].get("type") == "error" and evs[-1]["error"]["message"] == "session.delegation.responses.model must be served by openai, the provider of session.model", evs)
+        c.send(json.dumps({"type": "session.update", "session": {"delegation": {"type": "responses", "responses": {"model": "openai/gpt-other"}}}}))
+        evs = ws_collect(c, lambda e: e.get("type") in ("echo", "error"))
+        check("a session.update naming a model the virtual key may not use is refused by governance", evs and evs[-1].get("type") == "error" and "gpt-other" in evs[-1]["error"]["message"], evs)
+        c.send(json.dumps({"type": "session.update", "session": {"delegation": {"type": "responses", "responses": {"model": "openai/gpt-next"}}}}))
+        evs = ws_collect(c, lambda e: e.get("type") in ("echo", "error"))
+        upd = evs[-1].get("event", "") if evs else ""
+        check("an allowed session.update goes on, its model bare", evs and evs[-1].get("type") == "echo" and '"model":"gpt-next"' in upd and "openai/gpt-next" not in upd, evs)
+        # a delegated response that names no model is billed under the model the update switched to
+        c.send(json.dumps({"type": "test.backend", "input": 100, "output": 10}))
+        ws_collect(c, lambda e: e.get("type") == "response.event")
+        c.send(json.dumps({"type": "session.close", "mock_seconds": 2}))
+        ws_collect(c, lambda e: e.get("type") == "session.closed")
+        lrows = [x for x in rows_of("live", wait_s=6.0) if x.get("prompt_tokens") == 100]
+        check("the delegated response after the update is billed at its model's rates", len(lrows) == 1 and near(lrows[0].get("cost"), 100 * 0.000001 + 10 * 0.000004), [(x.get("model"), x.get("prompt_tokens"), x.get("cost")) for x in lrows])
+        c = live(vk, "anthropic/claude-sonnet", "sess_l169_bad")
+        evs = ws_collect(c, lambda e: e.get("type") in ("echo", "error", "session.started"))
+        check("a live start delegating to another provider's model is refused before the provider is called", evs and evs[-1].get("type") == "error" and "must be served by openai" in evs[-1]["error"]["message"] and c.recv() is None, evs)
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
 GW_L149_A = "http://127.0.0.1:18248"  # two cluster nodes, each with its own logs folder: push configs and the relay across them
 GW_L149_B = "http://127.0.0.1:18249"
 GW_L149_W = "http://127.0.0.1:18250"  # two workers of one node: the card fetched once, served by both, fetched once per period
@@ -5751,8 +6090,13 @@ def l149_workers_e2e(env):
         return len([x for x in seen if x["path"] == "/a2a/v1/.well-known/agent-card.json"])
     try:
         wait(GW_L149_W + "/health")
-        codes = card_codes(8)
-        check("before any fetch every worker answers 503 for the card", all(c == 503 for c in codes), codes)
+        codes = []
+        for _ in range(40):
+            codes = card_codes(8)
+            if all(c == 200 for c in codes):
+                break
+            time.sleep(0.25)
+        check("with no refresh-card every worker serves the card (fetched at start or on first use, L171)", all(c == 200 for c in codes), codes)
         s, _, b = call("POST", "/api/agents/w/refresh-card", {}, L149_ADMIN, base=GW_L149_W, auth=False)
         check("the card is fetched through one worker", s == 200 and json.loads(b)["card"]["name"] == "v1-agent", (s, b[:200]))
         served = []
@@ -5768,6 +6112,220 @@ def l149_workers_e2e(env):
         check("the mock agent sees about one card fetch per refresh period, not one per worker", 2 <= n <= 5, n)
         served = card_codes(8)
         check("the workers still serve the card after the timer's fetches", all(c == 200 for c in served), served)
+    finally:
+        gw.terminate()
+        gw.wait()
+
+GW_L171 = "http://127.0.0.1:18292"  # A2A versions, interface failover, extensions, raw capture, history routes, cancellation
+
+def l171_config():
+    """The L171 gateway: the v1 and v0.3 mock agents, cards whose first interface fails (gone, refused) or speaks an unknown
+    protocol version, an agent with extensions (two declared, one allowed) and one that requires a denied extension, a slow
+    streaming agent, raw capture on, and one key (named alpha, in a team) granted all of them. No card is fetched by hand."""
+    import hashlib
+    def agent(name, card, **extra):
+        return {"name": name, "agent_card_url": MOCK + card, "allow_private_network": True, "virtual_key_ids": ["vk-l171-a"], **extra}
+    return {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": True, "a2a_external_client_url": "https://gw.example.test/", "a2a_store_raw_request_response": True, "a2a_card_refresh_seconds": 0},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l171-logs"), "content_logging": True},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "l171", "value": "sk-l171", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l171".encode()).hexdigest()}],
+            "teams": [{"id": "t-l171", "name": "Team L171"}],
+            "virtual_keys": [
+                {"id": "vk-l171-a", "name": "alpha", "value": "sk-bf-l171-a", "team_id": "t-l171"},
+                # grants of their own: the key's agent_grants, and an access profile's
+                {"id": "vk-l171-b", "name": "beta", "value": "sk-bf-l171-b", "agent_grants": [{"agent_name": "v1"}]},
+                {"id": "vk-l171-c", "name": "gamma", "value": "sk-bf-l171-c", "access_profile_ids": ["ap-l171"]},
+            ],
+            "access_profiles": [{"id": "ap-l171", "name": "research", "agent_grants": [{"agent_name": "old"}]}],
+            "projects": [{"id": "p-l171", "name": "agents-project", "membership_mode": "open", "access_rule": "union", "agent_grants": [{"agent_name": "fo"}]}],
+        },
+        "agents": [
+            agent("v1", "/a2a/v1/.well-known/agent-card.json"),
+            agent("old", "/a2a/agent/.well-known/agent-card.json"),
+            agent("fo", "/a2a/fo/.well-known/agent-card.json"),
+            agent("refused", "/a2a/refused/.well-known/agent-card.json"),
+            agent("vers", "/a2a/vers/.well-known/agent-card.json"),
+            agent("ext", "/a2a/ext/.well-known/agent-card.json", tenant="acme", extension_uris=["https://ext.example/trace"]),
+            agent("req", "/a2a/req/.well-known/agent-card.json"),
+            agent("slow", "/a2a/slow/.well-known/agent-card.json"),
+            # declared twice: neither copy is served
+            agent("twice", "/a2a/v1/.well-known/agent-card.json"),
+            agent("twice", "/a2a/v1/.well-known/agent-card.json"),
+        ],
+    }
+
+def l171_e2e(env):
+    """L171: the A2A-Version header (none, 1.x and 0.3 spoken, others refused as Bifrost refuses them), v0.3 and v1 bodies
+    translated both ways, a call moved to a card's next interface when one is gone or refuses connections, interfaces of an
+    unknown protocol version passed over, cards fetched at start, declarations reconciled (a name declared twice is not
+    served), extension_uris and tenant, raw capture, the history's stats, histogram, top agents, filter data, single entry
+    and DELETE, and a stream's caller going away cancelling the agent's stream (Bun server). Its own gateway on 18292."""
+    import shutil, http.client
+    cfg_path = os.path.join(BUILD, "e2e.l171.json")
+    json.dump(l171_config(), open(cfg_path, "w"))
+    shutil.rmtree(os.path.join(BUILD, "e2e-l171-logs"), ignore_errors=True)
+    call("GET", "/_a2a/reset", base=MOCK)
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18292", "-host", "127.0.0.1", "-config", cfg_path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l171.log"), "w"))
+    ADM = {"authorization": "Bearer sk-admin-l171"}
+    A = {"x-bf-vk": "sk-bf-l171-a"}
+    def api(method, path, body=None):
+        return call(method, path, body, ADM, base=GW_L171, auth=False)
+    def gwc(method, path, body=None, headers=None):
+        return call(method, path, body, headers, base=GW_L171, auth=False)
+    def rpc(agent, method, params, extra=None):
+        return gwc("POST", f"/agents/a2a/{agent}/json-rpc", {"jsonrpc": "2.0", "id": "9", "method": method, "params": params}, {**A, **(extra or {})})
+    def rest(agent, method, path, body=None, extra=None):
+        return gwc(method, f"/agents/a2a/{agent}/rest{path}", body, {**A, **(extra or {})})
+    def upstream(path):
+        got = json.loads(call("GET", "/_a2a/seen", base=MOCK)[2])
+        return [x for x in got if x["path"] == path or x["path"].startswith(path)]
+    def v03(text, ctx="l171-ctx"):
+        return {"message": {"kind": "message", "messageId": "m-" + text, "role": "user", "contextId": ctx, "parts": [{"kind": "text", "text": text}]}}
+    def v1(text, ctx="l171-ctx"):
+        return {"message": {"messageId": "m-" + text, "role": "ROLE_USER", "contextId": ctx, "parts": [{"text": text}]}}
+    def until(fn, tries=80):
+        for _ in range(tries):
+            v = fn()
+            if v:
+                return v
+            time.sleep(0.1)
+        return fn()
+    try:
+        wait(GW_L171 + "/health")
+        # ---- cards at start, and the declarations ----
+        def fetched():
+            s, _, b = api("GET", "/api/agents/v1")
+            return s == 200 and json.loads(b).get("card") is not None
+        check("a declared agent's card is fetched at start, with no refresh-card", until(fetched), api("GET", "/api/agents/v1")[2][:200])
+        s, _, b = gwc("GET", "/agents/a2a/twice/.well-known/agent-card.json", None, A)
+        check("a name declared twice is not served (Bifrost skips both declarations)", s == 404, (s, b[:200]))
+        # ---- A2A-Version ----
+        s, _, b = rpc("v1", "SendMessage", v1("ver-2"), {"a2a-version": "2.0"})
+        out = json.loads(b) if s == 200 else {}
+        check("a JSON-RPC call naming A2A-Version 2.0 is refused with -32009 and its id", s == 200 and out.get("error", {}).get("code") == -32009 and out.get("error", {}).get("message") == "this version is not supported" and out.get("id") == "9", (s, b[:200]))
+        s, _, b = rest("v1", "POST", "/message:send", v1("ver-2r"), {"a2a-version": "0.2"})
+        check("a REST call naming an unknown version is 400 FAILED_PRECONDITION", s == 400 and json.loads(b)["error"]["status"] == "FAILED_PRECONDITION", (s, b[:200]))
+        check("a refused version never reaches the agent", not [x for x in upstream("/a2a/v1/") if "ver-2" in x["body"]], "")
+        s, _, b = gwc("POST", "/agents/a2a/v1/json-rpc", {"jsonrpc": "2.0", "id": "9", "method": "SendMessage", "params": v1("ver-nokey")}, {"a2a-version": "2.0"})
+        check("credentials are checked before the version", s == 401, (s, b[:200]))
+        s, _, b = rpc("v1", "SendMessage", v1("ver-1"), {"a2a-version": "1.0"})
+        check("A2A-Version 1.0 is served", s == 200 and "echo: ver-1" in b, (s, b[:200]))
+        sent = [x for x in upstream("/a2a/v1/json-rpc") if "ver-1" in x["body"]]
+        check("the agent's v1 interface gets the gateway's own A2A-Version", len(sent) == 1 and sent[0]["headers"].get("a2a-version") == "1.0", sent[:1])
+        # ---- v0.3 and v1 bodies translated ----
+        s, _, b = rpc("v1", "message/send", v03("tr-1"))
+        res = json.loads(b).get("result", {}) if s == 200 else {}
+        check("a v0.3 caller of a v1 agent gets a v0.3 task: kind, plain state, kind-tagged parts", res.get("kind") == "task" and res.get("status", {}).get("state") == "completed" and res.get("artifacts", [{}])[0].get("parts", [{}])[0].get("kind") == "text", (s, b[:300]))
+        sent = [x for x in upstream("/a2a/v1/json-rpc") if "tr-1" in x["body"]]
+        body = json.loads(sent[0]["body"]) if sent else {}
+        check("the v1 agent gets the v1 method and message: SendMessage, ROLE_USER, parts without kind", body.get("method") == "SendMessage" and body.get("params", {}).get("message", {}).get("role") == "ROLE_USER" and body["params"]["message"]["parts"][0] == {"text": "tr-1"}, sent[:1])
+        s, _, b = rpc("v1", "message/stream", v03("tr-2"))
+        ev = sse_events(b) if s == 200 else []
+        kinds = [e.get("result", {}).get("kind") for e in ev]
+        check("a v0.3 caller's stream from a v1 agent comes as v0.3 events, the last update final", kinds == ["task", "status-update", "status-update"] and ev[2]["result"]["final"] is True and ev[1]["result"]["status"]["state"] == "working", (s, b[:400]))
+        s, _, b = rest("old", "POST", "/message:send", v1("tr-3"))
+        out = json.loads(b) if s == 200 else {}
+        check("a v1 REST caller of a v0.3 agent gets a v1 answer: {task}, TASK_STATE_COMPLETED, parts without kind", out.get("task", {}).get("status", {}).get("state") == "TASK_STATE_COMPLETED" and "kind" not in json.dumps(out), (s, b[:300]))
+        old_task = out.get("task", {}).get("id", "")
+        sent = [x for x in seen() if x["path"] == "/a2a/agent/json-rpc" and "tr-3" in x.get("body", "")]
+        body = json.loads(sent[0]["body"]) if sent else {}
+        check("the v0.3 agent gets message/send with a kind-tagged message", body.get("method") == "message/send" and body.get("params", {}).get("message", {}).get("parts", [{}])[0].get("kind") == "text" and body["params"]["message"].get("role") == "user", sent[:1])
+        s, _, b = rest("old", "GET", f"/tasks/{old_task}")
+        check("a v1 REST read of a v0.3 agent's task is a v1 task", s == 200 and json.loads(b).get("status", {}).get("state") == "TASK_STATE_COMPLETED" and json.loads(b).get("id") == old_task, (s, b[:200]))
+        # ---- failing over between a card's interfaces ----
+        before = len(upstream("/a2a/gone/json-rpc"))
+        s, _, b = rpc("fo", "SendMessage", v1("fo-1"))
+        check("a call to a card whose first interface is gone (404) moves to the next one", s == 200 and "echo: fo-1" in b and len(upstream("/a2a/gone/json-rpc")) == before + 1, (s, b[:200]))
+        s, _, b = rpc("fo", "SendMessage", v1("fo-2"))
+        check("later calls go to the interface that works first", s == 200 and "echo: fo-2" in b and len(upstream("/a2a/gone/json-rpc")) == before + 1, (s, b[:200], len(upstream("/a2a/gone/json-rpc"))))
+        s, _, b = rpc("refused", "SendMessage", v1("fo-3"))
+        check("a call to an interface that refuses connections moves to the next one (REST here)", s == 200 and "echo: fo-3" in b and [x for x in upstream("/a2a/v1/rest/message:send") if "fo-3" in x["body"]], (s, b[:200]))
+        s, _, b = rpc("vers", "SendMessage", v1("fo-4"))
+        check("an interface of a protocol version the gateway does not speak is never called", s == 200 and "echo: fo-4" in b and not [x for x in upstream("/a2a/gone/json-rpc") if "fo-4" in x["body"]], (s, b[:200]))
+        # ---- extensions and tenant ----
+        s, _, b = api("GET", "/api/agents/ext")
+        view = json.loads(b) if s == 200 else {}
+        check("the registration keeps its tenant and extension_uris", view.get("tenant") == "acme" and view.get("extension_uris") == ["https://ext.example/trace"], b[:300])
+        s, _, b = gwc("GET", "/agents/a2a/ext/.well-known/agent-card.json", None, A)
+        exts = json.loads(b).get("capabilities", {}).get("extensions", []) if s == 200 else None
+        check("the served card lists only the allowed extension", exts == [{"uri": "https://ext.example/trace", "params": {"v": 1}}], (s, b[:300]))
+        s, _, b = rpc("ext", "SendMessage", v1("ext-1"), {"a2a-extensions": "https://ext.example/secret"})
+        check("asking for an extension the gateway does not relay is -32004", s == 200 and json.loads(b).get("error", {}).get("code") == -32004, (s, b[:200]))
+        s, _, b = rpc("ext", "SendMessage", v1("ext-2"), {"a2a-extensions": "https://ext.example/trace"})
+        sent = [x for x in upstream("/a2a/v1/json-rpc") if "ext-2" in x["body"]]
+        check("an allowed extension goes on to the agent with the call", s == 200 and "echo: ext-2" in b and sent and sent[0]["headers"].get("a2a-extensions") == "https://ext.example/trace", (s, b[:200], sent[:1]))
+        s, _, b = rpc("req", "SendMessage", v1("ext-3"))
+        check("an agent that requires a denied extension is not relayed (503)", s == 503 and "requires denied extension" in b, (s, b[:200]))
+        # ---- grants: the key's agent_grants, an access profile's and a project's ----
+        Bk = {"x-bf-vk": "sk-bf-l171-b"}
+        Ck = {"x-bf-vk": "sk-bf-l171-c"}
+        def gcall(agent, key, extra=None):
+            return gwc("POST", f"/agents/a2a/{agent}/json-rpc", {"jsonrpc": "2.0", "id": "g", "method": "SendMessage", "params": v1("grant-" + agent)}, {**key, **(extra or {})})
+        s, _, b = gcall("v1", Bk)
+        check("a key's own agent_grants let it call the agent", s == 200 and "echo: grant-v1" in b, (s, b[:200]))
+        s, _, b = gcall("old", Bk)
+        check("a key without a grant for the agent is refused", s == 403 and "is not allowed" in b, (s, b[:200]))
+        s, _, b = gcall("old", Ck)
+        check("an access profile's agent_grants let its keys call the agent", s == 200 and "grant-old" in b, (s, b[:200]))
+        s, _, b = gcall("fo", Bk, {"x-bf-project-name": "agents-project"})
+        check("a union project's agent_grants add the agent to the caller's", s == 200 and "grant-fo" in b, (s, b[:200]))
+        s, _, b = gcall("fo", Bk)
+        check("without the project header the agent stays refused", s == 403, (s, b[:200]))
+        # ---- the history ----
+        s, _, b = api("GET", "/api/agents/history?limit=200")
+        hist = json.loads(b).get("history", []) if s == 200 else []
+        row = next((x for x in hist if x["agent_name"] == "v1" and x["method"] == "message/send"), {})
+        check("a history row names its operation, its bindings and its task", row.get("operation") == "message/send" and row.get("downstream_transport") == "JSONRPC" and row.get("upstream_transport") == "JSONRPC" and row.get("task_id", "") != "", row)
+        s, _, b = api("GET", "/api/agents/history/" + row.get("id", "none"))
+        det = json.loads(b) if s == 200 else {}
+        raw = base64.b64decode(det.get("raw_request", "")).decode() if det.get("raw_request") else ""
+        check("one entry: Bifrost's detail with the raw bytes sent (the v1 body) and received, base64", s == 200 and det.get("status") == "success" and det.get("virtual_key_name") == "alpha" and det.get("team_name") == "Team L171" and '"method":"SendMessage"' in raw and det.get("raw_response"), (s, b[:400]))
+        check("one entry keeps the caller's request body", "tr-1" in det.get("request_body", ""), det.get("request_body", "")[:200])
+        s, _, b = api("GET", "/api/agents/history/nope")
+        check("an unknown entry is 404", s == 404, (s, b[:100]))
+        s, _, b = api("GET", "/api/agents/history/stats?agent_name=v1")
+        st = json.loads(b) if s == 200 else {}
+        check("stats count the agent's calls, its successes and errors", st.get("total_entries", 0) >= 3 and st.get("success_count", 0) >= 3 and st.get("success_rate", 0) > 0 and "average_latency" in st, (s, b[:200]))
+        s, _, b = api("GET", "/api/agents/history/top-agents")
+        top = json.loads(b).get("agents", []) if s == 200 else []
+        check("top agents rank the agents by calls", top and top[0]["agent_name"] == "v1" and top[0]["count"] >= 3 and all("error_count" in x for x in top), (s, b[:300]))
+        now = time.time()
+        q = urllib.parse.urlencode({"start_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 3600)), "end_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 60))})
+        s, _, b = api("GET", "/api/agents/history/histogram?" + q)
+        hg = json.loads(b) if s == 200 else {}
+        check("the histogram buckets the calls over the asked hour, a minute wide", hg.get("bucket_size_seconds") == 60 and sum(x["count"] for x in hg.get("buckets", [])) >= 8 and len(hg.get("buckets", [])) >= 60, (s, b[:300]))
+        s, _, b = api("GET", "/api/agents/history/histogram?start_time=yesterday")
+        check("a malformed time is 400", s == 400 and "RFC3339" in b, (s, b[:200]))
+        s, _, b = api("GET", "/api/agents/history/filterdata")
+        fd = json.loads(b) if s == 200 else {}
+        check("filter data names the keys and teams the calls carry", {"id": "vk-l171-a", "name": "alpha"} in fd.get("virtual_keys", []) and {"id": "t-l171", "name": "Team L171"} in fd.get("teams", []), (s, b[:300]))
+        s, _, b = api("DELETE", "/api/agents/history", {"ids": [row.get("id", "")]})
+        s2, _, _ = api("GET", "/api/agents/history/" + row.get("id", "none"))
+        check("DELETE removes the entries its ids name", s == 200 and "deleted" in b and s2 == 404, (s, b[:200], s2))
+        s, _, b = api("DELETE", "/api/agents/history", {"ids": []})
+        check("DELETE without ids is 400", s == 400 and "No log IDs provided" in b, (s, b[:200]))
+        # ---- a stream's caller going away stops the agent's stream ----
+        if server != "http1":
+            conn = http.client.HTTPConnection("127.0.0.1", 18292, timeout=10)
+            conn.request("POST", "/agents/a2a/slow/json-rpc", json.dumps({"jsonrpc": "2.0", "id": "s1", "method": "SendStreamingMessage", "params": v1("slow-1")}), {"content-type": "application/json", **A})
+            r = conn.getresponse()
+            # the body is chunked: lines up to the first event
+            first = b""
+            for _ in range(10):
+                line = r.fp.readline()
+                if line.startswith(b"data:"):
+                    first = line
+                    break
+            conn.sock.shutdown(socket.SHUT_RDWR)
+            conn.close()
+            state = until(lambda: json.loads(call("GET", "/_a2a/slow-state", base=MOCK)[2])["cancelled"], 50)
+            st = json.loads(call("GET", "/_a2a/slow-state", base=MOCK)[2])
+            check("a stream whose caller goes away is cancelled at the agent", r.status == 200 and first.startswith(b"data:") and state and st["sent"] < 100, (r.status, first[:100], st))
     finally:
         gw.terminate()
         gw.wait()
@@ -6420,6 +6978,178 @@ def realtime_e2e(env):
         gw.wait()
         gw2.wait()
 
+def l160_e2e(env):
+    """L160: realtime client secrets minted under a virtual key and honoured as it (a WebSocket and a WebRTC call with
+    the gateway's own ek_ token, the provider's token sent upstream), transcription sessions billed per transcription at
+    the transcription rates, and a failed or cancelled response.done logged with its status. Its own gateway (port 18274)."""
+    import shutil
+    GW_E = "http://127.0.0.1:18274"
+    shutil.rmtree(os.path.join(BUILD, "e2e-l160-logs"), ignore_errors=True)
+    rt_price = {"input_cost_per_token": 0.000004, "output_cost_per_token": 0.000016, "cache_read_input_token_cost": 0.0000004, "input_cost_per_audio_token": 0.000032, "output_cost_per_audio_token": 0.000064}
+    tr_price = {"input_cost_per_token": 0.0000025, "output_cost_per_token": 0.00001, "input_cost_per_audio_token": 0.000006, "input_cost_per_second": 0.0001}
+    cfg = {"client": {"enable_logging": False, "enforce_auth_on_inference": True},
+           "providers": {"openai": {"keys": [{"id": "k-pool", "name": "pool", "value": "sk-pool", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+           "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l160-logs"), "content_logging": True},
+           "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+           "pricing": {"openai/gpt-realtime": rt_price, "openai/gpt-4o-transcribe": tr_price},
+           "governance": {"virtual_keys": [{"id": "vk-ek", "value": "sk-bf-ek"}, {"id": "vk-ek-gone", "value": "sk-bf-ek-gone"},
+                                           {"id": "vk-ek-mini", "value": "sk-bf-ek-mini", "provider_configs": [{"provider": "openai", "allowed_models": ["gpt-4o-mini"]}]}]}}
+    path = os.path.join(BUILD, "e2e.l160.json")
+    json.dump(cfg, open(path, "w"))
+    srv = os.environ.get("RAIJU_SERVER", "bun")
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18274", "-host", "127.0.0.1", "-config", path, "-server", srv], env=env, stderr=open(os.path.join(BUILD, "e2e.l160.log"), "w"))
+    VK = {"authorization": "Bearer sk-bf-ek"}
+
+    def mint(body, headers=None, route="/v1/realtime/client_secrets"):
+        s, _, b = call("POST", route, body, headers=headers if headers is not None else VK, base=GW_E)
+        return s, (json.loads(b) if b.startswith("{") else {}), b
+
+    def is_type(t):
+        return lambda ev: ev.get("type") == t
+
+    def rows_of(sid):
+        return session_rows("realtime", sid, GW_E)
+
+    try:
+        wait(GW_E + "/health")
+
+        # ---- minting: under the caller's virtual key, the provider's token replaced by the gateway's own ----
+        s, j, b = mint({"session": {"type": "realtime", "model": "openai/gpt-realtime"}})
+        ek = j.get("value", "")
+        up = [x for x in seen() if x["path"] == "/v1/realtime/client_secrets"][-1]
+        check("a client secret is minted at the provider with the pool key and the bare model", s == 200 and up["auth"] == "Bearer sk-pool" and '"model":"gpt-realtime"' in up["body"] and "openai/" not in up["body"], (s, b, up))
+        check("the caller gets the gateway's own ek_ token, not the provider's, with the provider's expiry", ek.startswith("ek_bf_") and len(ek) == 38 and "ek_mock" not in b and j.get("expires_at", 0) > time.time(), b)
+        n0 = len([x for x in seen() if "/realtime/" in x["path"]])
+        s, _, b = mint({"session": {"type": "realtime", "model": "openai/gpt-realtime"}}, headers={})
+        check("minting needs a virtual key when inference auth is on", s == 401, (s, b))
+        s, _, b = mint({"session": {"type": "realtime", "model": "openai/gpt-realtime"}}, headers={"authorization": "Bearer sk-bf-ek-mini"})
+        check("a virtual key that may not use the model mints nothing", s >= 400 and s != 502 and len([x for x in seen() if "/realtime/" in x["path"]]) == n0, (s, b))
+        s, _, b = call("POST", "/v1/realtime/client_secrets", "session=x", headers={**VK, "content-type": "text/plain"}, base=GW_E)
+        check("a mint must be JSON", s == 400 and "Content-Type must be application/json" in b, (s, b))
+        s, _, b = mint({"session": {"type": "realtime", "model": "openai/gpt-realtime-mintfail"}})
+        check("a provider answer with no token is refused, not passed on", s == 502 and "invalid realtime client secret" in b, (s, b))
+        s, _, b = mint({"session": {"type": "realtime", "model": "openai/gpt-realtime-mintrefuse"}})
+        check("a provider's refusal of a mint is passed on as it came", s == 400 and "invalid session for a client secret" in b, (s, b))
+        s, j2, b = mint({"model": "openai/gpt-realtime", "voice": "alloy"}, route="/v1/realtime/sessions")
+        up = [x for x in seen() if x["path"] == "/v1/realtime/sessions"][-1]
+        check("the older /v1/realtime/sessions mints the same way, its token nested under client_secret", s == 200 and j2.get("client_secret", {}).get("value", "").startswith("ek_bf_") and "ek_mock" not in b and '"model":"gpt-realtime"' in up["body"], (s, b, up))
+        s, j3, b = mint({"session": {"type": "realtime", "model": "openai/gpt-realtime"}}, route="/openai/v1/realtime/client_secrets")
+        check("and so does the /openai family", s == 200 and j3.get("value", "").startswith("ek_bf_"), (s, b))
+
+        # ---- a WebSocket with the minted token is the virtual key's session; the provider gets its own token ----
+        c = WsClient("/v1/realtime?model=openai/gpt-realtime", {"authorization": "Bearer " + ek}, port=18274)
+        check("a WebSocket presenting the minted token is accepted", c.status == 101, c.status)
+        c.send(json.dumps({"type": "test.rt.start", "id": "sess_ek_ws"}))
+        c.send(json.dumps({"type": "test.rt.turn", "id": "resp_ek1", "text": "good morning", "input": 100, "output": 50}))
+        ws_collect(c, is_type("response.done"))
+        c.send(json.dumps({"type": "session.update", "session": {"voice": "alloy"}}))
+        evs = ws_collect(c, is_type("echo"))
+        tag = evs[-1].get("auth", "") if evs else ""
+        check("the provider is sent the token it minted, not the pool key or the gateway's token", tag.startswith("Bearer ek_mock_") and "sk-pool" not in tag and ek not in tag and "model=gpt-realtime" in tag, tag)
+        c.sock.close()
+        rows = rows_of("sess_ek_ws")
+        check("its turn is logged and billed as the virtual key that minted the token", len(rows) == 1 and rows[0].get("virtual_key") == "vk-ek" and rows[0].get("status") == 200 and rows[0].get("prompt_tokens") == 100 and near(rows[0].get("cost"), 100 * 0.000004 + 50 * 0.000016), rows)
+
+        # the token names the model when the URL does not, and a browser may present it as a subprotocol
+        c = WsClient("/v1/realtime", {"sec-websocket-protocol": "realtime, openai-insecure-api-key." + ek}, port=18274)
+        check("a browser's subprotocol credential and no model in the URL: the token's model", c.status == 101, c.status)
+        check("the upgrade answers with the realtime subprotocol the browser offered, never the credential-bearing one", c.headers.get("sec-websocket-protocol") == "realtime", c.headers)
+        if c.status == 101:
+            c.send(json.dumps({"type": "session.update", "session": {"voice": "alloy"}}))
+            evs = ws_collect(c, is_type("echo"))
+            check("and the session goes to that model with the provider's token", evs and "model=gpt-realtime" in evs[-1].get("auth", "") and evs[-1]["auth"].startswith("Bearer ek_mock_"), evs)
+            c.sock.close()
+        c = WsClient("/v1/realtime?model=openai/gpt-realtime", {"authorization": "Bearer " + ek}, port=18274)
+        check("an upgrade that offers no subprotocol is answered with none", c.status == 101 and "sec-websocket-protocol" not in c.headers, c.headers)
+        c.sock.close()
+        c = WsClient("/v1/realtime?model=openai/gpt-realtime", {"authorization": "Bearer ek_bf_" + "0" * 32}, port=18274)
+        check("an ek_ token the gateway did not mint is no virtual key: refused when inference auth is on", c.status == 401, c.status)
+
+        # a token whose virtual key was deleted goes with it
+        s, jg, b = mint({"session": {"type": "realtime", "model": "openai/gpt-realtime"}}, headers={"authorization": "Bearer sk-bf-ek-gone"})
+        s2, _, b2 = call("DELETE", "/api/governance/virtual-keys/vk-ek-gone", base=GW_E, headers=ADMIN)
+        c = WsClient("/v1/realtime?model=openai/gpt-realtime", {"authorization": "Bearer " + jg.get("value", "")}, port=18274)
+        check("a token minted under a virtual key that is gone is refused", s == 200 and s2 in (200, 204) and c.status == 401, (s, s2, b2, c.status))
+
+        # ---- a WebRTC call with the minted token ----
+        r = rtc_client(GW_E, [{"wait": "session.created"}, {"send": {"type": "test.rt.turn", "id": "resp_ek2", "text": "hi", "input": 200, "output": 10}}, {"wait": "response.done"}],
+                       auth="Bearer " + ek, model="openai/gpt-realtime", realtime=True)
+        sent = [x for x in seen() if x["path"] == "/v1/realtime/calls"][-1]
+        check("a realtime call presenting the minted token is terminated, and the provider gets its own token", r.get("status") == 200 and r.get("opened") is True and sent["auth"].startswith("Bearer ek_mock_"), (r, sent["auth"]))
+        sid = next((e["session"]["id"] for e in r.get("events", []) if e.get("type") == "session.created"), "none")
+        rows = rows_of(sid)
+        check("the call's turn is the virtual key's, with its cost", len(rows) == 1 and rows[0].get("virtual_key") == "vk-ek" and rows[0]["metadata"].get("realtime_transport") == "webrtc" and near(rows[0].get("cost"), 200 * 0.000004 + 10 * 0.000016), rows)
+
+        # ---- transcription sessions ----
+        # a WebSocket with ?intent=transcription names its model in its first session.update; it is admitted for it
+        c = WsClient("/v1/realtime?intent=transcription", VK, port=18274)
+        check("a transcription WebSocket is upgraded before it names its model", c.status == 101, c.status)
+        c.send(json.dumps({"type": "session.update", "session": {"type": "transcription", "audio": {"input": {"transcription": {"model": "openai/gpt-4o-transcribe", "language": "en"}}}}}))
+        evs = ws_collect(c, is_type("echo"))
+        tag = evs[-1].get("auth", "") if evs else ""
+        upd = evs[-1].get("event", "") if evs else ""
+        check("the provider's transcription endpoint gets the update, its model bare", "intent=transcription" in tag and "model=" not in tag and tag.startswith("Bearer sk-pool") and '"model":"gpt-4o-transcribe"' in upd and "openai/" not in upd, (tag, upd))
+        c.send(json.dumps({"type": "test.rt.start", "id": "sess_tr_ws"}))
+        c.send(json.dumps({"type": "test.rt.transcribe", "id": "item_t1", "heard": "hello there", "input": 20, "output": 8, "audio_in": 16}))
+        ws_collect(c, is_type("conversation.item.input_audio_transcription.completed"))
+        c.send(json.dumps({"type": "test.rt.transcribe", "id": "item_t2", "heard": "and more", "seconds": 2.5}))
+        ws_collect(c, is_type("conversation.item.input_audio_transcription.completed"))
+        c.sock.close()
+        rows = rows_of("sess_tr_ws")
+        md = [x.get("metadata", {}) for x in rows]
+        check("a transcription session is a row per transcription, of its transcription model", len(rows) == 2 and [m.get("realtime_unit") for m in md] == ["transcription", "transcription"] and all(x.get("model") == "gpt-4o-transcribe" and x.get("virtual_key") == "vk-ek" for x in rows), md)
+        check("each billed at the transcription rates: audio and text tokens, or the seconds of a duration usage", rows and rows[0].get("prompt_tokens") == 20 and rows[0].get("completion_tokens") == 8 and near(rows[0].get("cost"), 16 * 0.000006 + 4 * 0.0000025 + 8 * 0.00001) and near(rows[1].get("cost"), 2.5 * 0.0001) and md[1].get("realtime_audio_seconds") == "2.5", [(x.get("prompt_tokens"), x.get("cost")) for x in rows])
+        check("and each keeps its transcript", rows and rows[0].get("output", "").strip() == "hello there" and rows[1].get("output", "").strip() == "and more", [x.get("output") for x in rows])
+
+        # a minted transcription token: no model needed, the session is the virtual key's
+        s, jt, b = mint({"session": {"type": "transcription", "audio": {"input": {"transcription": {"model": "openai/gpt-4o-transcribe"}}}}})
+        up = [x for x in seen() if x["path"] == "/v1/realtime/client_secrets"][-1]
+        check("a transcription client secret is minted with its model bare in the input transcription", s == 200 and '"type":"transcription"' in up["body"] and '"model":"gpt-4o-transcribe"' in up["body"] and "openai/" not in up["body"], (s, up["body"]))
+        c = WsClient("/v1/realtime?intent=transcription", {"authorization": "Bearer " + jt.get("value", "")}, port=18274)
+        c.send(json.dumps({"type": "test.rt.start", "id": "sess_tr_ek"}))
+        c.send(json.dumps({"type": "test.rt.transcribe", "id": "item_e1", "heard": "via token", "input": 10, "output": 4, "audio_in": 10}))
+        evs = ws_collect(c, is_type("conversation.item.input_audio_transcription.completed"))
+        c.send(json.dumps({"type": "session.update", "session": {"type": "transcription"}}))
+        evs = ws_collect(c, is_type("echo"))
+        c.sock.close()
+        rows = rows_of("sess_tr_ek")
+        check("a transcription session with a minted token is the virtual key's, on the provider's token", c.status == 101 and evs and evs[-1].get("auth", "").startswith("Bearer ek_mock_") and len(rows) == 1 and rows[0].get("virtual_key") == "vk-ek" and near(rows[0].get("cost"), 10 * 0.000006 + 4 * 0.00001), (c.status, evs[-1:] if evs else evs, rows))
+
+        # a transcription session that never names its model is ended
+        c = WsClient("/v1/realtime?intent=transcription", VK, port=18274)
+        for _ in range(16):
+            c.send(json.dumps({"type": "input_audio_buffer.append", "audio": "AAAA"}))
+        evs = ws_collect(c, is_type("error"))
+        check("a transcription session that sends 16 frames without a model is refused", evs and "16 frames" in evs[-1].get("error", {}).get("message", ""), evs)
+
+        # a transcription call over WebRTC: the session's type says so
+        r = rtc_client(GW_E, [{"wait": "session.created"}, {"send": {"type": "test.rt.transcribe", "id": "item_c1", "heard": "on a call", "input": 12, "output": 3, "audio_in": 12}}, {"wait": "conversation.item.input_audio_transcription.completed"}],
+                       auth="Bearer sk-bf-ek", model="openai/gpt-4o-transcribe", realtime=True, extra={"type": "transcription", "audio": {"input": {"transcription": {"model": "openai/gpt-4o-transcribe"}}}})
+        sent = [x for x in seen() if x["path"] == "/v1/realtime/calls"][-1]
+        sid = next((e["session"]["id"] for e in r.get("events", []) if e.get("type") == "session.created"), "none")
+        rows = rows_of(sid)
+        check("a transcription call keeps no top-level model and is billed per transcription", r.get("status") == 200 and '"model":"gpt-4o-transcribe"' in sent["body"] and "openai/" not in sent["body"] and len(rows) == 1 and rows[0]["metadata"].get("realtime_unit") == "transcription" and near(rows[0].get("cost"), 12 * 0.000006 + 3 * 0.00001), (r.get("status"), sent["body"][:300], rows))
+
+        # ---- a response.done that failed, was cancelled or is incomplete ----
+        c = WsClient("/v1/realtime?model=openai/gpt-realtime", VK, port=18274)
+        c.send(json.dumps({"type": "test.rt.start", "id": "sess_rt_status"}))
+        c.send(json.dumps({"type": "test.rt.turn", "id": "resp_f", "text": "x", "input": 30, "output": 2, "status": "failed", "error_type": "server_error", "error_message": "the model crashed"}))
+        ws_collect(c, is_type("response.done"))
+        c.send(json.dumps({"type": "test.rt.turn", "id": "resp_c", "text": "y", "input": 5, "output": 1, "status": "cancelled"}))
+        ws_collect(c, is_type("response.done"))
+        c.send(json.dumps({"type": "test.rt.turn", "id": "resp_r", "text": "z", "input": 5, "output": 1, "status": "failed", "error_type": "invalid_request_error", "error_message": "bad tool"}))
+        ws_collect(c, is_type("response.done"))
+        c.send(json.dumps({"type": "test.rt.turn", "id": "resp_i", "text": "w", "input": 5, "output": 1, "status": "incomplete"}))
+        ws_collect(c, is_type("response.done"))
+        c.sock.close()
+        rows = rows_of("sess_rt_status")
+        md = [x.get("metadata", {}) for x in rows]
+        check("a failed response.done is logged with the status of its error (500), its message, and the tokens it used", len(rows) == 4 and rows[0].get("status") == 500 and rows[0].get("error") == "the model crashed" and md[0].get("realtime_response_status") == "failed" and rows[0].get("prompt_tokens") == 30 and near(rows[0].get("cost"), 30 * 0.000004 + 2 * 0.000016), rows[:1])
+        check("a cancelled one with 499, an invalid request with 400, and an incomplete one stays 200 with its reason", [x.get("status") for x in rows] == [500, 499, 400, 200] and md[1].get("realtime_status_reason") == "turn_detected" and md[3].get("realtime_response_status") == "incomplete" and md[3].get("realtime_status_reason") == "max_output_tokens", [(x.get("status"), x.get("error"), x.get("metadata", {}).get("realtime_response_status")) for x in rows])
+    finally:
+        gw.terminate()
+        gw.wait()
+
 def headers_e2e(env):
     """Request headers reach the log rows (dimensions, logging headers, correlation ids, app, Maxim attributes);
     x-bf-async runs an SDK route as a job with its own TTL; extra_fields_placement "headers" keeps extra_fields out
@@ -6482,6 +7212,23 @@ def headers_e2e(env):
         s, _, b = api("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "extra params"}], "extra_params": {"custom_flag": True}}, headers={"x-bf-passthrough-extra-params": "true"})
         sent = json.loads(seen()[-1]["body"])
         check("x-bf-passthrough-extra-params merges extra_params into the request", s == 200 and sent.get("custom_flag") is True and "extra_params" not in sent, sent)
+        # ... on the other routes too: embeddings, Responses and the SDK routes (L172)
+        xp = {"x-bf-passthrough-extra-params": "true"}
+        for path, body, upath in [
+            ("/v1/embeddings", {"model": "openai/text-embedding-3-small", "input": "xp embed", "extra_params": {"emb_flag": 1}}, "/v1/embeddings"),
+            ("/v1/responses", {"model": "openai/gpt-4o-mini", "input": "xp responses", "metadata": {"a": "1"}, "extra_params": {"resp_flag": "on", "metadata": {"b": "2"}}}, "/v1/responses"),
+            ("/openai/v1/embeddings", {"model": "openai/text-embedding-3-small", "input": "xp sdk", "extra_params": {"sdk_flag": True}}, "/v1/embeddings"),
+        ]:
+            s, _, b = api("POST", path, body, headers=xp)
+            ups = [x for x in seen() if x["path"] == upath and "xp " in x["body"]]
+            sent = json.loads(ups[-1]["body"]) if ups else {}
+            flags = {k: v for k, v in sent.items() if k.endswith("_flag")}
+            check("x-bf-passthrough-extra-params merges extra_params on " + path, s == 200 and len(flags) == 1 and "extra_params" not in sent, (s, b[:200], sent))
+            if path == "/v1/responses":
+                check("an object in extra_params merges into the body's object", sent.get("metadata") == {"a": "1", "b": "2"}, sent)
+        s, _, b = api("POST", "/v1/embeddings", {"model": "openai/text-embedding-3-small", "input": "xp off", "extra_params": {"off_flag": 1}})
+        ups = [x for x in seen() if x["path"] == "/v1/embeddings" and "xp off" in x["body"]]
+        check("without the header extra_params is not merged", s == 200 and ups and "off_flag" not in json.loads(ups[-1]["body"]), ups[-1:])
     finally:
         gw.terminate()
 
@@ -6773,7 +7520,7 @@ def l112a_config_b():
     return {
         "client": {"enable_logging": False, "enforce_auth_on_inference": False},
         "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
-        "providers": {"openai": {"keys": [{"name": "oauth", "value": "", "models": [], "weight": 1.0,
+        "providers": {"openai": {"keys": [{"name": "oauth", "value": "", "models": [], "weight": 1.0, "use_for_batch_api": True,
                                            "oauth_key_config": {"grant_type": "client_credentials", "token_url": MOCK + "/token", "client_id": "cid-l112a", "client_secret": "csec-l112a", "scopes": ["inference.read", "inference.write"]}}],
                                  "network_config": {"base_url": MOCK, "max_retries": 0}}},
     }
@@ -6806,7 +7553,7 @@ def l112a_e2e(env):
         check("two Responses sockets are open under the session cap", all(h.status == 101 for h in held), [h.status for h in held])
         full = WsClient("/v1/responses", port=18164)
         ev = full.recv_json()
-        check("a Responses socket past the cap gets a websocket_connection_limit_reached error and a close", full.status == 101 and ev is not None and ev.get("error", {}).get("code") == "websocket_connection_limit_reached" and full.recv() is None, (full.status, ev))
+        check("a Responses socket past the cap gets Bifrost's 429 websocket_connection_limit_reached event and a close", full.status == 101 and ev is not None and ev.get("status") == 429 and ev.get("error", {}).get("code") == "websocket_connection_limit_reached" and full.recv() is None, (full.status, ev))
         held[0].close()
         time.sleep(0.5)
         again = WsClient("/v1/responses", port=18164)
@@ -6817,15 +7564,28 @@ def l112a_e2e(env):
         t0 = time.time()
         s, _, b = call("POST", "/v1/responses", {"model": "openai/gpt-4o-slow", "stream": True, "input": "hi"}, None, base=GW_L112A, auth=False)
         check("a stream silent past stream_idle_timeout_in_seconds is cut before its late chunk", "response.created" in b and "late" not in b and "response.completed" not in b and time.time() - t0 < 2.5, (s, round(time.time() - t0, 2), b[:300]))
+        t0 = time.time()
+        s, _, b = call("POST", "/openai_passthrough/v1/responses", {"model": "gpt-4o-slow", "stream": True, "input": "hi"}, None, base=GW_L112A, auth=False)
+        check("a native passthrough stream silent that long is cut too", s == 200 and "response.created" in b and "late" not in b and time.time() - t0 < 2.5, (s, round(time.time() - t0, 2), b[:300]))
 
         probe = "oauth-probe-l112a"
         s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": probe}]}, None, base=GW_L112A_B, auth=False)
         s2, _, b2 = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": probe + "-2"}]}, None, base=GW_L112A_B, auth=False)
-        mints = [x for x in seen(True) if x["path"] == "/token" and "client_id=cid-l112a" in x["body"]]
+        import base64
+        basic = "Basic " + base64.b64encode(b"cid-l112a:csec-l112a").decode()
+        mints = [x for x in seen(True) if x["path"] == "/token" and x["auth"] == basic]
         upstream = [x for x in seen(True) if probe in x["body"]]
         check("a key with oauth_key_config sends the bearer its token endpoint minted", s == 200 and upstream and upstream[0]["auth"] == "Bearer ya29.test-token", (s, upstream[:1]))
-        check("the token request names the client credentials grant and the scopes", mints and "grant_type=client_credentials" in mints[0]["body"] and "scope=inference.read%20inference.write" in mints[0]["body"], mints[:1])
-        check("the minted token is cached for the next request", s2 == 200 and len([x for x in seen(True) if x["path"] == "/token" and "client_id=cid-l112a" in x["body"]]) == len(mints) == 1, (s2, len(mints)))
+        check("the token request names the client credentials grant and the scopes, the client as Basic auth (Bifrost's default auth_style)", mints and "grant_type=client_credentials" in mints[0]["body"] and "scope=inference.read%20inference.write" in mints[0]["body"] and "client_secret" not in mints[0]["body"], mints[:1])
+        check("the minted token is cached for the next request", s2 == 200 and len([x for x in seen(True) if x["path"] == "/token" and x["auth"] == basic]) == len(mints) == 1, (s2, len(mints)))
+        # the raw passthrough and the file routes send the minted bearer too (L172)
+        s, _, b = call("POST", "/openai_passthrough/v1/chat/completions", {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": probe + "-pass"}]}, None, base=GW_L112A_B, auth=False)
+        upstream = [x for x in seen(True) if (probe + "-pass") in x["body"]]
+        check("a passthrough call with an oauth_key_config key sends the minted bearer", s == 200 and upstream and upstream[-1]["auth"] == "Bearer ya29.test-token", (s, b[:200], upstream[-1:]))
+        n_files = len([x for x in seen(True) if x["path"].startswith("/v1/files")])
+        s, _, b = call("GET", "/v1/files?provider=openai", None, None, base=GW_L112A_B, auth=False)
+        files = [x for x in seen(True) if x["path"].startswith("/v1/files")]
+        check("a file call with an oauth_key_config key sends the minted bearer", len(files) == n_files + 1 and files[-1]["auth"] == "Bearer ya29.test-token", (s, b[:200], files[-1:]))
     finally:
         gw_a.terminate()
         gw_b.terminate()
@@ -6915,6 +7675,147 @@ def l125_e2e(env):
         gw.terminate()
         gw.wait()
 
+GW_L168 = "http://127.0.0.1:18287"  # logs, audit and retained content: hidden request types, content search, regex apps, logs_only redaction
+
+
+def l168_config() -> dict:
+    # the retained bucket is the mock (its name given as a secret reference object); the keys are AWS's example values
+    return {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False, "allow_per_request_content_storage_override": True,
+                   "retain_content_in_object_storage": True, "hidden_request_types": ["embedding"]},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l168-logs"), "content_logging": True,
+                       "object_storage": {"type": "s3", "bucket": {"value": "logs-hidden", "type": "plain_text"}, "prefix": "bifrost", "region": "us-east-1", "endpoint": MOCK, "path_style": True,
+                                          "access_key_id": "AKIAIOSFODNN7EXAMPLE", "secret_access_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"}},
+        "audit": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l168-audit"), "key": "e2e-l168-audit-key-0123456789abcdef"},
+        "guardrails": {"enabled": True, "detect": ["email"], "mode": "redact", "apply_to": "both", "logs_only": True},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "s", "value": "sk-l168", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+    }
+
+
+def l168_e2e(env):
+    """L168: log reads leave out client.hidden_request_types; content_search matches prompt text; a regex user agent
+    mapping names the app; guardrails logs_only leaves live traffic raw and puts placeholders in the log; the audit
+    list takes Bifrost's filters, pages and per-event verify; a deleted hidden log's object is deleted; the cost
+    recalculation counts unpriceable logs; a resumed /ws gets the store updates it missed. Its own gateway (18287)."""
+    import shutil
+    for d in ["e2e-l168-logs", "e2e-l168-audit"]:
+        shutil.rmtree(os.path.join(BUILD, d), ignore_errors=True)
+    path = os.path.join(BUILD, "e2e.l168.json")
+    json.dump(l168_config(), open(path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18287", "-host", "127.0.0.1", "-config", path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l168.log"), "w"))
+    try:
+        wait(GW_L168 + "/health")
+        call("GET", "/_hidden/up", base=MOCK, auth=False)
+        api = lambda m, p, b=None, h=None: call(m, p, b, h, base=GW_L168, auth=False)
+        msg = lambda text: [{"role": "user", "content": text}]
+        rows = lambda q="": json.loads(api("GET", "/api/logs?limit=200" + q)[2]).get("entries", [])
+
+        # a regex user agent mapping (Bifrost's regex match_type): unanchored, case-sensitive; a bad pattern is a 400
+        s, _, b = api("POST", "/api/logs/user-agent-mappings", {"pattern": "^l168-(cli|ide)/[0-9]+", "match_type": "regex", "app": "L168 Tool"})
+        check("a regex user agent mapping is created", s == 200 and json.loads(b).get("match_type") == "regex", (s, b[:200]))
+        s, _, b = api("POST", "/api/logs/user-agent-mappings", {"pattern": "l168(", "match_type": "regex", "app": "Bad"})
+        check("a regex mapping that does not compile is refused with Bifrost's message", s == 400 and "invalid regex pattern" in b, (s, b[:200]))
+        s, _, _ = api("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": msg("l168 zebra-quartz prompt")}, {"user-agent": "l168-ide/42 (linux)"})
+        row = next((r for r in rows() if "zebra-quartz" in (r.get("input") or "")), {})
+        check("the app of a request is the regex mapping's", s == 200 and row.get("app") == "L168 Tool", (s, row.get("app"), row.get("user_agent")))
+
+        # content_search over the prompt text, ignoring case; JSON keys are not text
+        hits = json.loads(api("GET", "/api/logs?content_search=ZEBRA-QUARTZ")[2]).get("logs", [])
+        check("content_search finds a log by its prompt text", len(hits) == 1 and hits[0].get("id") == row.get("id"), [h.get("id") for h in hits])
+        hits = json.loads(api("GET", "/api/logs?content_search=messages")[2]).get("logs", [])
+        check("content_search does not match the body's keys", len(hits) == 0, [h.get("id") for h in hits])
+
+        # hidden_request_types: an embedding is logged but left out of the reads
+        s_e, _, _ = api("POST", "/v1/embeddings", {"model": "openai/text-embedding-3-small", "input": "l168 embed"})
+        time.sleep(0.2)
+        listed = rows()
+        stats = json.loads(api("GET", "/api/logs/stats")[2])
+        check("a hidden request type is answered but left out of the list and the stats", s_e == 200 and not any(r.get("object") == "embeddings" for r in listed) and stats.get("total_requests") == len(listed), (s_e, [r.get("object") for r in listed], stats.get("total_requests")))
+        stored = open(os.path.join(BUILD, "e2e-l168-logs", sorted(os.listdir(os.path.join(BUILD, "e2e-l168-logs")))[-1])).read()
+        emb_ids = [json.loads(l)["id"] for l in stored.splitlines() if l.strip() and json.loads(l).get("op") == "embeddings"]
+        check("the hidden request type is still stored, and its detail is not served", len(emb_ids) == 1 and api("GET", "/api/logs/" + emb_ids[0])[0] == 404, emb_ids)
+
+        # guardrails logs_only: the provider gets the raw prompt, the log row holds the placeholder
+        s, _, _ = api("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": msg("l168 mail jane.l168@example.com please")})
+        up = [x for x in seen() if x["path"] == "/v1/chat/completions" and "l168 mail" in x["body"]]
+        check("logs_only leaves the live request raw", s == 200 and up and "jane.l168@example.com" in up[-1]["body"], [x["body"][:200] for x in up[-1:]])
+        lrow = next((r for r in rows() if "l168 mail" in (r.get("input") or "")), {})
+        check("logs_only puts a numbered placeholder in the stored log", "[EMAIL-1]" in (lrow.get("input") or "") and "jane.l168@example.com" not in json.dumps(lrow), (lrow.get("input") or "")[:300])
+
+        # a deleted hidden log's retained object goes too (Bifrost's DeleteLogs)
+        s, _, _ = api("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": msg("l168-hidden-probe")}, {"x-bf-disable-content-logging": "true"})
+        hid = next((r for r in rows() if r.get("content_hidden") is True), {})
+        rid = hid.get("request_id") or ""
+        obj = []
+        for _ in range(30):
+            obj = [x for x in seen(True) if x["path"].startswith("/logs-hidden/") and x["path"].endswith("/" + rid + ".json") and x["body"]]
+            if obj:
+                break
+            time.sleep(0.5)
+        check("the hidden content lands in the bucket named by a secret reference object", s == 200 and len(obj) >= 1 and obj[0]["path"].startswith("/logs-hidden/bifrost/logs/"), [x["path"] for x in obj][:2])
+        s, _, b = api("DELETE", "/api/logs", {"ids": [hid.get("id")]})
+        gone = 0
+        for _ in range(20):
+            gone = call("GET", obj[0]["path"] if obj else "/logs-hidden/none", base=MOCK, auth=False)[0]
+            if gone == 404:
+                break
+            time.sleep(0.25)
+        check("deleting a hidden log deletes its object in the bucket", s == 200 and json.loads(b).get("removed") == 1 and gone == 404, (s, b[:200], gone))
+
+        # cost recalculation: a model the price list does not know is left alone and counted as unpriceable
+        api("POST", "/v1/chat/completions", {"model": "openai/l168-unpriced-model", "messages": msg("l168 unpriced")})
+        s, _, b = api("POST", "/api/logs/recalculate-cost", {})
+        job = json.loads(b) if s in (202, 409) else {}
+        st = {}
+        for _ in range(40):
+            st = json.loads(api("GET", "/api/logs/recalculate-cost/status?id=" + job.get("id", ""))[2])
+            if st.get("status") in ("completed", "cancelled"):
+                break
+            time.sleep(0.1)
+        check("the recalculation reports the unpriceable logs it left unchanged", st.get("status") == "completed" and st.get("unpriceable", 0) >= 1 and "pricing inputs were unavailable" in st.get("message", ""), st)
+
+        # the audit trail: Bifrost's CADF list with filters and pages, and one event's signature
+        s, _, b = api("GET", '/api/audit-logs?actions=["create"]&outcome=success&limit=1')
+        al = json.loads(b) if s == 200 else {}
+        ev = (al.get("audit_logs") or [{}])[0]
+        check("the audit list takes Bifrost's filters and answers its page shape", s == 200 and ev.get("action") == "create" and ev.get("outcome") == "success" and ev.get("typeURI") == "https://getbifrost.ai/schemas/auditlog.json" and al.get("limit") == 1 and "total_pages" in al and isinstance(al.get("events"), list), (s, b[:400]))
+        s, _, b = api("GET", '/api/audit-logs?outcomes=["failure"]')
+        fails = json.loads(b).get("audit_logs", []) if s == 200 else None
+        check("the outcome filter selects the failed writes", s == 200 and all(e.get("outcome") == "failure" for e in fails), (s, b[:300]))
+        s, _, b = api("GET", "/api/audit-logs?limit=1&page=1")
+        p1 = json.loads(b)
+        s2, _, b2 = api("GET", "/api/audit-logs?limit=1&cursor=" + str(p1.get("next_cursor", "")))
+        p2 = json.loads(b2) if s2 == 200 else {}
+        check("a cursor pages past the first event", s == 200 and p1.get("has_more") is True and s2 == 200 and p2.get("audit_logs") and p2["audit_logs"][0]["id"] != p1["audit_logs"][0]["id"], (b[:200], b2[:200]))
+        eid = ev.get("id", "0")
+        s, _, b = api("GET", "/api/audit-logs/" + eid + "/verify")
+        vr = json.loads(b) if s == 200 else {}
+        check("one audit event's signature verifies", s == 200 and vr.get("valid") is True and vr.get("computed") == vr.get("stored") and len(vr.get("stored", "")) == 64, (s, b[:200]))
+        s, _, b = api("GET", "/api/governance/audit-logs/999999/verify")
+        check("verifying an unknown audit event is a 404", s == 404, (s, b[:200]))
+        s, _, b = api("GET", "/api/audit-logs/filterdata?dimensions=outcomes,initiators")
+        fd = json.loads(b) if s == 200 else {}
+        check("the audit filter data has Bifrost's dimensions", s == 200 and "success" in fd.get("outcomes", []) and fd.get("initiators") and "request_paths" not in fd, (s, b[:300]))
+
+        # /ws: a client that resumes gets the store updates it missed, with the log events
+        ws = WsClient("/ws", {}, port=18287)
+        api("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": msg("l168 ws probe")})
+        evs = feed_frames(ws, "log")
+        ws.close()
+        last = evs[-1].get("id", "") if evs else ""
+        api("POST", "/api/logs/user-agent-mappings", {"pattern": "l168-ws", "match_type": "contains", "app": "WS"})
+        time.sleep(0.3)
+        wr = WsClient("/ws?since=" + last, {}, port=18287)
+        rs = feed_frames(wr, "resumed")
+        wr.close()
+        su = [o for o in rs if o.get("type") == "store_update"]
+        check("a resumed /ws gets the store update it missed, in Bifrost's shape", last != "" and su and su[-1].get("tags") == ["logs"] and rs[-1].get("type") == "resumed", (last, rs[-3:]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
 def l121_e2e(env):
     """L121: WebAssembly plugins (Bifrost's JSON ABI, on WAMR). A plugin entry whose path is a .wasm file is
     loaded: pre_hook rewrites the request the provider sees, post_hook adds a field to the answer, a short
@@ -6993,7 +7894,7 @@ def l121_e2e(env):
         s, _, b = api("POST", "/api/plugins", {"name": "gone", "path": "/no/such/plugin.wasm", "enabled": True})
         check("a plugin file that does not exist is refused", s == 400 and "plugin file" in b, (s, b[:300]))
         s, _, b = api("POST", "/api/plugins", {"name": "url", "path": "https://example.test/p.wasm", "enabled": True})
-        check("a plugin URL is refused", s == 400 and "URL" in b, (s, b[:300]))
+        check("a plugin URL that cannot be downloaded is answered as Bifrost answers a plugin that does not load", s == 500 and "Plugin was not created, it failed to load: " in b, (s, b[:300]))
         s, _, b = api("POST", "/api/plugins", {"name": "init-fails", "path": wasm, "enabled": True, "config": {"mode": "initfail"}})
         check("a plugin whose init fails is refused", s == 400 and "init returned 1" in b, (s, b[:300]))
         s, _, b = api("POST", "/api/plugins", {"name": "wasm-viewer", "path": wasm, "enabled": True}, who=vic)
@@ -7158,7 +8059,7 @@ def l130_e2e(env):
         check("http_pre_hook can answer the request itself: status, headers and body, and the provider is not called", s == 202 and h.get("x-plugin") == "pre" and json.loads(b) == {"answered": "by the plugin"} and len(seen()) == n, (s, h, b[:200]))
         setp({"mode": "rewrite", "http": "error"})
         s, h, b = raw("POST", "/v1/chat/completions", CHAT)
-        check("an error from http_pre_hook fails the request with 500 and its message", s == 500 and "http pre refused" in b.decode(), (s, b[:200]))
+        check("an error from http_pre_hook fails the request with 500 and its message as bare text, as Bifrost sends it", s == 500 and b.decode().endswith("http pre refused") and not b.decode().startswith("{") and h.get("content-type", "").startswith("text/plain"), (s, h.get("content-type"), b[:200]))
         setp({"mode": "rewrite", "http": "path"})
         s, h, b = raw("POST", "/v1/chat/completions", CHAT)
         check("a plugin that moves the request to another route is refused with 409, as Bifrost does", s == 409 and "modified by a plugin" in b.decode(), (s, b[:200]))
@@ -7430,6 +8331,448 @@ def l139_e2e(env):
         s, _, b = call("POST", "/api/plugins", {"name": "header", "enabled": True, "config": {"set_response_headers": {"X-Served-By": "raiju"}}}, adm, base=base, auth=False)
         s, h, b = whole("/anthropic/v1/messages", ANTH)
         check("with only built-in plugins the Messages route is served as before", s == 200 and anth_text(b) == "Hello from gpt-4o-mini", (s, h, b[:200]))
+    finally:
+        gw.terminate()
+GW_L159 = "http://127.0.0.1:18273"  # plugins: the built-in plugins on the provider-format routes; embedContent, Bedrock rerank, count-tokens and batch creation hooked
+
+def l159_e2e(env):
+    """L159: the built-in plugins (blocklist, maxtokens, header, mocker) on the routes that speak a provider's own
+    format (Anthropic Messages, GenAI generateContent, Bedrock Converse, Cohere chat), where Bifrost runs them because
+    those requests become chat and Responses requests: a request one of them acts on is served through chat, others in
+    the route's own format. Then the WASM test plugin (tests/wasm/plugin.wasm) on GenAI :embedContent and
+    :batchEmbedContents, /bedrock/rerank, the count-tokens routes and the batch creations. Its own gateway (18273)."""
+    import hashlib
+    base = GW_L159
+    wasm = os.path.join(ROOT, "tests", "wasm", "plugin.wasm")
+    cfg_path = os.path.join(BUILD, "e2e.l159.json")
+    adm = {"authorization": "Bearer sk-admin-l159"}
+    bedrock_key = {"models": [], "weight": 1.0, "bedrock_key_config": {"access_key": "AKIDEXAMPLE", "secret_key": "secret", "region": "us-west-2", "deployments": {"claude": "anthropic.claude-3-haiku-20240307-v1:0"}}}
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {
+            "openai": {"keys": [{"name": "pool", "value": "sk-pool-l159", "models": [], "weight": 1.0, "use_for_batch_api": True}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "bedrock": {"keys": [bedrock_key], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+        "governance": {"users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256(b"sk-admin-l159").hexdigest()}]},
+        "plugins": [
+            {"name": "blocklist", "enabled": True, "config": {"words": ["forbidden-l159"], "status": 403}},
+            {"name": "maxtokens", "enabled": True, "config": {"cap_max_tokens": 7}},
+            {"name": "mocker", "enabled": True, "config": {"rules": [{"name": "l159", "conditions": {"message_regex": "mock-me"}, "content": "mocked by l159"}]}},
+        ],
+    }
+    json.dump(cfg, open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18273", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l159.log"), "w"))
+
+    def api(method, path, body=None):
+        s, _, b = call(method, path, body, adm, base=base, auth=False)
+        if s not in (200, 201, 204):
+            raise SystemExit(f"l159: {method} {path} failed: {s} {b[:200]}")
+
+    def post(path, body, headers=None):
+        return call("POST", path, body, headers, base=base, auth=False)
+
+    def since(n, path):
+        return [u for u in seen()[n:] if u["path"] == path]
+
+    # each route's request with a text and a max_tokens of 50, and how to read the text of its answer
+    def anth(text):
+        return {"model": "openai/gpt-4o-mini", "max_tokens": 50, "messages": [{"role": "user", "content": text}]}
+
+    def gen(text):
+        return {"contents": [{"role": "user", "parts": [{"text": text}]}], "generationConfig": {"maxOutputTokens": 50}}
+
+    def conv(text):
+        return {"messages": [{"role": "user", "content": [{"text": text}]}], "inferenceConfig": {"maxTokens": 50}}
+
+    def coh(text):
+        return {"model": "openai/gpt-4o-mini", "max_tokens": 50, "messages": [{"role": "user", "content": text}]}
+
+    def anth_text(b):
+        return "".join(c.get("text", "") for c in json.loads(b).get("content", []))
+
+    def gen_text(b):
+        return "".join(p.get("text", "") for p in json.loads(b)["candidates"][0]["content"]["parts"])
+
+    def conv_text(b):
+        return "".join(c.get("text", "") for c in json.loads(b)["output"]["message"]["content"])
+
+    def coh_text(b):
+        return "".join(c.get("text", "") for c in json.loads(b).get("message", {}).get("content", []))
+
+    ROUTES = [
+        ("anthropic", "/anthropic/v1/messages", anth, anth_text),
+        ("genai", "/genai/v1beta/models/openai/gpt-4o-mini:generateContent", gen, gen_text),
+        ("bedrock converse", "/bedrock/model/openai%2Fgpt-4o-mini/converse", conv, conv_text),
+        ("cohere", "/cohere/v2/chat", coh, coh_text),
+    ]
+
+    try:
+        wait(base + "/health")
+        # ---- the built-in plugins on the provider-format routes ----
+        for name, path, mk, rd in ROUTES:
+            n = len(seen())
+            s, _, b = post(path, mk("a forbidden-l159 word"))
+            check(f"{name}: blocklist refuses a request with a blocked word, and the provider is not called", s == 403 and "blocked_content" in b and since(n, "/v1/chat/completions") == [], (s, b[:200]))
+            n = len(seen())
+            s, _, b = post(path, mk("ping"))
+            up = [json.loads(u["body"]) for u in since(n, "/v1/chat/completions")]
+            clamped = len(up) == 1 and (up[0].get("max_tokens") == 7 or up[0].get("max_completion_tokens") == 7)
+            check(f"{name}: maxtokens lowers the request's max_tokens to its cap, and the answer is in the route's format", s == 200 and clamped and rd(b) == "Hello from gpt-4o-mini", (s, b[:200], up))
+            n = len(seen())
+            s, h, b = post(path, mk("please mock-me now"))
+            check(f"{name}: a mocker rule answers in the route's format without the provider", s == 200 and rd(b) == "mocked by l159" and hdr(h, "x-bf-plugin-short-circuit") == "true" and since(n, "/v1/chat/completions") == [], (s, b[:300]))
+        # a request no built-in plugin acts on is served in the route's own format: a Bedrock model on the Messages route
+        # goes to InvokeModel with the Messages body, not through chat (which would call Converse)
+        n = len(seen())
+        s, _, b = post("/anthropic/v1/messages", {"model": "bedrock/claude", "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]})
+        paths = [u["path"] for u in seen()[n:]]
+        check("a request no built-in plugin acts on is served in the route's own format (Messages to InvokeModel)", s == 200 and any(p.endswith("/invoke") for p in paths) and not any(p.endswith("/converse") for p in paths), (s, b[:200], paths))
+        # with max_tokens over the cap the same request is served through chat, where the plugin lowers it
+        n = len(seen())
+        s, _, b = post("/anthropic/v1/messages", {"model": "bedrock/claude", "max_tokens": 50, "messages": [{"role": "user", "content": "hi"}]})
+        conv_up = [json.loads(u["body"]) for u in seen()[n:] if u["path"].endswith("/converse")]
+        check("and one maxtokens acts on goes through chat (Converse) with the cap", s == 200 and len(conv_up) == 1 and conv_up[0].get("inferenceConfig", {}).get("maxTokens") == 7, (s, b[:200], [u["path"] for u in seen()[n:]]))
+        # the header plugin's request headers go upstream on every request of these routes, on the route's own path too
+        api("POST", "/api/plugins", {"name": "header", "enabled": True, "config": {"set_request_headers": {"x-team": "team-l159"}}})
+        for name, path, mk, rd in ROUTES:
+            n = len(seen())
+            s, _, b = post(path, mk("hello"))
+            up = since(n, "/v1/chat/completions")
+            check(f"{name}: the header plugin's request headers reach the provider", s == 200 and len(up) == 1 and up[0]["team"] == "team-l159" and rd(b) == "Hello from gpt-4o-mini", (s, b[:200], up))
+        n = len(seen())
+        s, _, b = post("/anthropic/v1/messages", {"model": "bedrock/claude", "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]})
+        inv = [u for u in seen()[n:] if u["path"].endswith("/invoke")]
+        check("the header plugin keeps a request on the route's own path (Messages to InvokeModel) and sets its headers there", s == 200 and len(inv) == 1 and inv[0]["team"] == "team-l159", (s, b[:200], [u["path"] for u in seen()[n:]]))
+        s, _, b = post("/v1/embeddings", {"model": "openai/text-embedding-3-small", "input": "forbidden-l159"})
+        check("the built-in plugins stay off the other request types (embeddings), as Bifrost's", s == 200, (s, b[:200]))
+        for p in ["blocklist", "maxtokens", "mocker", "header"]:
+            api("DELETE", "/api/plugins/" + p)
+
+        # ---- the WASM test plugin on embedContent, Bedrock rerank, count-tokens and batch creation ----
+        api("POST", "/api/plugins", {"name": "w159", "enabled": True, "path": wasm, "config": {"mode": "rewrite", "from": "ping", "to": "pong", "tag": "l159"}})
+        EMB = "/genai/v1beta/models/openai/text-embedding-3-small"
+        n = len(seen())
+        s, _, b = post(EMB + ":embedContent", {"content": {"parts": [{"text": "ping one"}]}})
+        up = [json.loads(u["body"]) for u in since(n, "/v1/embeddings")]
+        check("genai embedContent: pre_hook rewrites the text the provider embeds, answered in Gemini's shape", s == 200 and len(up) == 1 and up[0].get("input") == "pong one" and "values" in json.loads(b).get("embedding", {}), (s, b[:200], up))
+        n = len(seen())
+        s, _, b = post(EMB + ":batchEmbedContents", {"requests": [{"content": {"parts": [{"text": "ping a"}]}}, {"content": {"parts": [{"text": "b"}]}}]})
+        up = [json.loads(u["body"]) for u in since(n, "/v1/embeddings")]
+        check("genai batchEmbedContents: the same, one vector per request", s == 200 and len(up) == 1 and up[0].get("input") == ["pong a", "b"] and len(json.loads(b).get("embeddings", [])) == 2, (s, b[:200], up))
+        WIRE = {"queries": [{"type": "TEXT", "textQuery": {"text": "ping"}}], "sources": [{"type": "INLINE", "inlineDocumentSource": {"type": "TEXT", "textDocument": {"text": t}}} for t in ["a", "b"]], "rerankingConfiguration": {"type": "BEDROCK_RERANKING_MODEL", "bedrockRerankingConfiguration": {"modelConfiguration": {"modelArn": "arn:aws:bedrock:us-west-2::foundation-model/cohere.rerank-v3-5:0"}, "numberOfResults": 2}}}
+        n = len(seen())
+        s, _, b = post("/bedrock/rerank", WIRE)
+        up = since(n, "/rerank")
+        check("bedrock rerank: pre_hook rewrites the query Bedrock gets, and the answer is in Bedrock's shape", s == 200 and len(up) == 1 and '"pong"' in up[0]["body"] and '"ping"' not in up[0]["body"] and json.loads(b).get("results", [{}])[0].get("relevanceScore") == 0.9, (s, b[:200], up))
+        # count-tokens: post_hook marks the count, and the rewritten request is what is counted
+        COUNTS = [
+            ("anthropic count_tokens", "/anthropic/v1/messages/count_tokens", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "ping"}]}),
+            ("openai count_tokens", "/v1/count_tokens", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "ping"}]}),
+            ("genai countTokens", "/genai/v1beta/models/openai/gpt-4o-mini:countTokens", {"contents": [{"role": "user", "parts": [{"text": "ping"}]}]}),
+            ("bedrock count-tokens", "/bedrock/model/openai%2Fgpt-4o-mini/count-tokens", {"input": {"converse": {"messages": [{"role": "user", "content": [{"text": "ping"}]}]}}}),
+        ]
+        for name, path, body in COUNTS:
+            s, _, b = post(path, body)
+            check(f"{name}: post_hook sees the count and marks it (the context from pre_hook arrived)", s == 200 and json.loads(b).get("x_wasm_plugin") == "ctx-ok:l159", (s, b[:200]))
+        n = len(seen())
+        s, _, b = post("/bedrock/model/claude/count-tokens", COUNTS[3][2])
+        up = since(n, "/model/anthropic.claude-3-haiku-20240307-v1:0/count-tokens")
+        check("bedrock count-tokens on Bedrock: the rewritten body is counted, without the model the plugins saw", s == 200 and len(up) == 1 and "pong" in up[0]["body"] and '"model"' not in up[0]["body"] and json.loads(b).get("inputTokens") == 17, (s, b[:200], up))
+        # batch creation: the requests the provider gets are the rewritten ones (the mock answers each with the model
+        # its line names), and post_hook sees the created batch
+        api("PUT", "/api/plugins/w159", {"config": {"mode": "rewrite", "from": "gpt-4o-mini", "to": "gpt-4o-l159", "tag": "l159"}})
+        n = len(seen())
+        oa = {"x-model-provider": "openai"}
+        s, _, b = post("/anthropic/v1/messages/batches", {"requests": [{"custom_id": "a", "params": {"model": "gpt-4o-mini", "max_tokens": 10, "messages": [{"role": "user", "content": "ping"}]}}]}, oa)
+        mb = json.loads(b) if s == 200 else {}
+        rs, _, rb = call("GET", f"/anthropic/v1/messages/batches/{mb.get('id', '')}/results", None, oa, base=base, auth=False)
+        check("anthropic batch create: pre_hook rewrites the batch's requests, and post_hook marks the batch", s == 200 and mb.get("type") == "message_batch" and mb.get("x_wasm_plugin") == "ctx-ok:l159" and len(since(n, "/v1/files")) == 1 and rs == 200 and "Batch reply from gpt-4o-l159" in rb, (s, b[:200], rs, rb[:300]))
+        inline = {"batch": {"displayName": "d", "inputConfig": {"requests": {"requests": [{"request": {"contents": [{"role": "user", "parts": [{"text": "ping"}]}]}, "metadata": {"key": "k1"}}]}}}}
+        n = len(seen())
+        s, _, b = post("/genai/v1beta/models/openai/gpt-4o-mini:batchGenerateContent", inline)
+        check("genai batch create: the hooks run around it, and the batch is created at the provider", s == 200 and json.loads(b).get("x_wasm_plugin") == "ctx-ok:l159" and len(since(n, "/v1/files")) == 1 and len(since(n, "/v1/batches")) == 1, (s, b[:200], [u["path"] for u in seen()[n:]]))
+        # a short-circuit error answers each of these routes, and no provider is called
+        api("PUT", "/api/plugins/w159", {"config": {"mode": "fail"}})
+        FAILS_AT = [
+            ("genai embedContent", EMB + ":embedContent", {"content": {"parts": [{"text": "x"}]}}),
+            ("bedrock rerank", "/bedrock/rerank", WIRE),
+            ("bedrock count-tokens", "/bedrock/model/claude/count-tokens", COUNTS[3][2]),
+            ("anthropic batch create", "/anthropic/v1/messages/batches", {"requests": [{"custom_id": "a", "params": {"model": "gpt-4o-mini", "max_tokens": 10, "messages": [{"role": "user", "content": "x"}]}}]}),
+            ("bedrock job create", "/bedrock/model-invocation-job", {"jobName": "l159", "modelId": "anthropic.claude-3-haiku-20240307-v1:0", "roleArn": "arn:aws:iam::123456789012:role/batch", "inputDataConfig": {"s3InputDataConfig": {"s3Uri": "s3://e2e-files/in.jsonl"}}, "outputDataConfig": {"s3OutputDataConfig": {"s3Uri": "s3://e2e-files/out/"}}}),
+        ] + [(name, path, body) for name, path, body in COUNTS]
+        for name, path, body in FAILS_AT:
+            n = len(seen())
+            s, h, b = post(path, body, {"x-model-provider": "openai"} if "batches" in path else None)
+            check(f"{name}: a short-circuit error carries its status and body, and the provider is not called", s == 418 and "plugin_blocked" in b and seen()[n:] == [], (s, b[:200], [u["path"] for u in seen()[n:]]))
+        # a batch's other calls run the hooks too, as Bifrost runs them on every batch and file request (L170)
+        n = len(seen())
+        s, _, b = call("GET", "/anthropic/v1/messages/batches", None, {"x-model-provider": "openai"}, base=base, auth=False)
+        check("listing batches runs the LLM hooks too (batch_list): the short circuit answers it", s == 418 and "plugin_blocked" in b and seen()[n:] == [], (s, b[:200]))
+    finally:
+        gw.terminate()
+
+GW_L170 = "http://127.0.0.1:18291"  # plugins: the WP6 remainder (fallback pre hooks, cache-hit post hooks, chunk skip, /mcp and Bedrock frames, batch and file hooks, mocker, jsonparser, placement)
+
+def l170_frames(raw):
+    """The payloads of a binary AWS event stream, in order."""
+    out, at = [], 0
+    while at + 12 <= len(raw):
+        total = int.from_bytes(raw[at:at + 4], "big")
+        hlen = int.from_bytes(raw[at + 4:at + 8], "big")
+        if total < 16 or at + total > len(raw):
+            break
+        out.append(raw[at + 12 + hlen:at + total - 4].decode("utf-8", "replace"))
+        at += total
+    return out
+
+def l170_e2e(env):
+    """L170: the plugin pipeline as Bifrost runs it, the WP6 remainder. The mocker (faker templates, allow_fallbacks,
+    stats, integer nanosecond latency, the provider of a bare model) and the pre hooks run again on each fallback; the
+    cache sits among the plugins (a cache hit goes through the post hooks of the pre_builtin plugins only); a post hook
+    skips a stream chunk (StreamControl); the HTTP transport hooks on /mcp and on Bedrock's binary event streams; the LLM
+    hooks on the batch and file calls; /api/plugins placement and order; jsonparser on Responses streams; telemetry's
+    user_name. Its own gateway (18291)."""
+    import hashlib, re, shutil
+    shutil.rmtree(os.path.join(BUILD, "e2e-l170-logs"), ignore_errors=True)
+    base = GW_L170
+    wasm = os.path.join(ROOT, "tests", "wasm", "plugin.wasm")
+    cfg_path = os.path.join(BUILD, "e2e.l170.json")
+    adm = {"authorization": "Bearer sk-admin-l170"}
+    mocker = {"rules": [
+        {"name": "bare", "conditions": {"providers": ["openai"], "models": ["l170-bare"]}, "responses": [{"type": "success", "content": {"message_template": "{{provider}} {{model}} {{faker.uuid}}"}}]},
+        {"name": "fbmock", "conditions": {"models": ["l170-fb"]}, "responses": [{"type": "success", "content": {"message": "mocked on the fallback"}}]},
+        {"name": "soft", "conditions": {"models": ["l170-soft"]}, "responses": [{"type": "error", "error": {"message": "soft refusal", "status_code": 503}}]},
+        {"name": "final", "conditions": {"models": ["l170-final"]}, "responses": [{"type": "error", "allow_fallbacks": False, "error": {"message": "final refusal", "status_code": 503}}]},
+        {"name": "slow", "conditions": {"models": ["l170-slow"]}, "latency": {"min": 300000000, "type": "fixed"}, "responses": [{"type": "success", "content": {"message": "slow answer"}}]},
+    ]}
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "cache": {"enabled": True, "ttl_seconds": 60},
+        "telemetry": {"user_labels_enabled": True},
+        "server": {"plugin_download_private_allowlist": ["127.0.0.1"]},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l170-logs")},
+        "otel": {"endpoint": MOCK + "/v1/traces", "service_name": "raiju-l170", "flush_ms": 100},
+        "providers": {
+            "openai": {"keys": [{"name": "pool", "value": "sk-pool-l170", "models": [], "weight": 1.0, "use_for_batch_api": True}, {"name": "bare", "value": "sk-pool-l170", "models": ["l170-bare"], "weight": 0.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "anthropic": {"keys": [{"name": "a", "value": "sk-ant-l170", "models": [], "weight": 1.0, "use_for_batch_api": True}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+        "mcp": {"client_configs": [{"name": "weather", "connection_type": "http", "connection_string": MOCK + "/mcp"}]},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256(b"sk-admin-l170").hexdigest()}, {"name": "ada-l170", "role": "viewer"}],
+            "virtual_keys": [{"id": "vk-l170", "name": "l170", "value": "sk-bf-l170", "user_id": "ada-l170"}],
+        },
+        "plugins": [{"name": "mocker", "enabled": True, "config": mocker}],
+    }
+    json.dump(cfg, open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18291", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l170.log"), "w"))
+
+    def api(method, p, body=None):
+        return call(method, p, body, adm, base=base, auth=False)
+
+    def raw(method, path, body=None, headers=None, ctype="application/json"):
+        data = None if body is None else (body if isinstance(body, bytes) else (body if isinstance(body, str) else json.dumps(body)).encode())
+        req = urllib.request.Request(base + path, data=data, method=method, headers={"content-type": ctype, **(headers or {})})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return r.status, {k.lower(): v for k, v in r.headers.items()}, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, {k.lower(): v for k, v in e.headers.items()}, e.read()
+
+    def chat(model, text="hello", **kw):
+        return raw("POST", "/v1/chat/completions", {"model": model, "messages": [{"role": "user", "content": text}], **kw})
+
+    def content(b):
+        try:
+            return json.loads(b)["choices"][0]["message"]["content"]
+        except Exception:
+            return None
+
+    def events(text):
+        out = []
+        for block in text.split("\n\n"):
+            for line in block.split("\n"):
+                if line.startswith("data:"):
+                    out.append(line[5:].strip())
+        return out
+
+    def deltas(text):
+        got = []
+        for d in events(text):
+            if d.startswith("{") and '"choices"' in d:
+                for c in json.loads(d).get("choices", []):
+                    t = c.get("delta", {}).get("content")
+                    if t:
+                        got.append(t)
+        return got
+
+    def setp(config, name="h170"):
+        s, _, b = api("PUT", "/api/plugins/" + name, {"config": config})
+        if s != 200:
+            raise SystemExit(f"l170: could not set the plugin config {config}: {s} {b[:200]}")
+
+    def chat_upstream(n):
+        return [u for u in seen()[n:] if u["path"] == "/v1/chat/completions"]
+
+    try:
+        wait(base + "/health")
+        # ---- the mocker ----
+        s, h, b = chat("l170-bare")
+        c = content(b) or ""
+        check("mocker: a bare model's provider is the one it resolves to, and the template's faker values are filled", s == 200 and re.fullmatch(r"openai l170-bare [0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", c) is not None, (s, b[:300]))
+        n = len(seen())
+        s, h, b = chat("openai/down-1", fallbacks=["openai/l170-fb"])
+        up = chat_upstream(n)
+        check("the pre hooks run again on a fallback: the mocker answers the fallback after the primary failed", s == 200 and content(b) == "mocked on the fallback" and h.get("x-bf-plugin-short-circuit") == "true" and len(up) == 1 and json.loads(up[0]["body"])["model"] == "down-1", (s, b[:300], [u["body"][:80] for u in up]))
+        n = len(seen())
+        s, h, b = chat("openai/l170-soft", fallbacks=["openai/gpt-4o-mini"])
+        up = chat_upstream(n)
+        check("a mocker error with allow_fallbacks unset is the primary's error: the fallback serves the request", s == 200 and len(up) == 1 and json.loads(up[0]["body"])["model"] == "gpt-4o-mini" and "soft refusal" not in b.decode(), (s, b[:300], len(up)))
+        n = len(seen())
+        s, h, b = chat("openai/l170-final", fallbacks=["openai/gpt-4o-mini"])
+        check("a mocker error with allow_fallbacks false is final: no fallback is tried", s == 503 and "final refusal" in b.decode() and chat_upstream(n) == [], (s, b[:300]))
+        t0 = time.time()
+        s, h, b = chat("openai/l170-slow")
+        took = time.time() - t0
+        check("mocker latency given as integer nanoseconds (300000000) delays the answer 300 ms", s == 200 and content(b) == "slow answer" and took >= 0.29, (s, took, b[:200]))
+        s, _, b = api("GET", "/api/plugins/mocker")
+        st = json.loads(b).get("stats", {}) if s == 200 else {}
+        hits = st.get("rule_hits", {})
+        check("the mocker's stats (Bifrost's GetStats) count requests, mocked requests, rule hits and the answers made", s == 200 and st.get("total_requests", 0) >= 5 and hits.get("bare") == 1 and hits.get("fbmock") == 1 and hits.get("soft") == 1 and hits.get("final") == 1 and hits.get("slow") == 1 and st.get("errors_generated") == 2 and st.get("responses_generated") == 3, (s, b[:400]))
+
+        # ---- /api/plugins: placement and order from the body ----
+        s, _, b = api("POST", "/api/plugins", {"name": "blocklist", "enabled": True, "placement": "pre_builtin", "order": 4, "config": {"words": ["nope-l170"]}})
+        pl = json.loads(b).get("plugin", {}) if s == 201 else {}
+        check("POST /api/plugins takes placement and order from the body", s == 201 and pl.get("placement") == "pre_builtin" and pl.get("order") == 4, (s, b[:300]))
+        s, _, b = api("PUT", "/api/plugins/blocklist", {"order": 2})
+        pl = json.loads(b).get("plugin", {}) if s == 200 else {}
+        check("PUT changes the order and keeps the placement it does not name", s == 200 and pl.get("order") == 2 and pl.get("placement") == "pre_builtin", (s, b[:300]))
+        s, _, b = api("PUT", "/api/plugins/blocklist", {"placement": "middle"})
+        check("a placement other than pre_builtin or post_builtin is refused with Bifrost's message", s == 400 and "Invalid placement value" in b, (s, b[:200]))
+        s, _, b = api("POST", "/api/plugins", {"name": "maxtokens", "placement": "builtin"})
+        check("builtin is not a placement the API takes", s == 400, (s, b[:200]))
+        s, _, b = api("GET", "/api/plugins/blocklist")
+        check("GET shows the placement and order", s == 200 and json.loads(b).get("placement") == "pre_builtin" and json.loads(b).get("order") == 2, (s, b[:300]))
+        api("DELETE", "/api/plugins/blocklist")
+
+        # ---- the cache among the plugins ----
+        s, _, b = api("POST", "/api/plugins", {"name": "h170", "enabled": True, "path": wasm, "placement": "pre_builtin", "config": {"mode": "rewrite", "tag": "pre", "count": "on"}})
+        check("a WebAssembly plugin is added before the cache (pre_builtin)", s == 201, (s, b[:200]))
+        s1, h1, b1 = chat("openai/gpt-4o-mini", "cache me l170 one")
+        s2, h2, b2 = chat("openai/gpt-4o-mini", "cache me l170 one")
+        n1 = json.loads(b1).get("x_post_n", -1) if s1 == 200 else -1
+        n2 = json.loads(b2).get("x_post_n", -1) if s2 == 200 else -1
+        check("a cache hit goes through the post hooks of a pre_builtin plugin (post_hook runs again on the cached answer)", s2 == 200 and h2.get("x-bf-cache") == "hit" and n1 >= 1 and n2 == n1 + 1, (h2.get("x-bf-cache"), n1, n2, b2[:200]))
+        s, _, b = api("PUT", "/api/plugins/h170", {"placement": "post_builtin"})
+        s1, h1, b1 = chat("openai/gpt-4o-mini", "cache me l170 two")
+        s2, h2, b2 = chat("openai/gpt-4o-mini", "cache me l170 two")
+        check("a post_builtin plugin (the default) is not run on a hit: the cached answer is the one its post hook made", s2 == 200 and h2.get("x-bf-cache") == "hit" and json.loads(b2).get("x_post_n") == json.loads(b1).get("x_post_n"), (h2.get("x-bf-cache"), b1[:120], b2[:120]))
+
+        # ---- a post hook skips a stream chunk (StreamControl) ----
+        setp({"mode": "rewrite", "post": "skip", "chunk_skip": "lo"})
+        s, h, b = chat("openai/gpt-4o-mini", "stream me", stream=True)
+        text = b.decode()
+        check("a chunk post_hook skips (stream_control skip_stream) is not sent, and the stream goes on to [DONE]", s == 200 and deltas(text) == ["Hel"] and events(text)[-1] == "[DONE]", (s, text[:400]))
+
+        # ---- the HTTP transport hooks on /mcp and on Bedrock's binary event streams ----
+        setp({"mode": "rewrite", "http": "rewrite", "tag": "mcp170"})
+        s, h, b = raw("POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "l170", "version": "1"}}})
+        mb = json.loads(b) if s == 200 and b[:1] == b"{" else {}
+        check("the HTTP transport hooks run on /mcp: http_pre_hook's header and http_post_hook's changes", s == 200 and h.get("x-wasm-http-post") == "mcp170" and mb.get("x_http_post") == "mcp170" and h.get("x-wasm-http-ctx") == "ok", (s, h.get("x-wasm-http-post"), b[:300]))
+        setp({"mode": "rewrite", "chunk_from": "Hel", "chunk_to": "Howdy"})
+        s, h, b = raw("POST", "/bedrock/model/openai%2Fgpt-4o-mini/converse-stream", {"messages": [{"role": "user", "content": [{"text": "hi"}]}]})
+        frames = l170_frames(b)
+        check("the chunk hook sees each frame of a Bedrock binary event stream and rewrites its payload", s == 200 and any("Howdy" in f for f in frames) and not any('"Hel"' in f for f in frames), (s, h.get("content-type"), frames[:6]))
+        setp({"mode": "rewrite", "chunk_skip": "Hel"})
+        s, h, b = raw("POST", "/bedrock/model/openai%2Fgpt-4o-mini/converse-stream", {"messages": [{"role": "user", "content": [{"text": "hi"}]}]})
+        frames = l170_frames(b)
+        check("a frame the chunk hook skips is dropped and the rest of the stream goes on", s == 200 and not any("Hel" in f for f in frames) and any('"lo"' in f for f in frames), (s, frames[:6]))
+
+        # ---- the LLM hooks on the batch and file calls ----
+        setp({"mode": "rewrite", "tag": "bf"})
+        line = json.dumps({"custom_id": "l170-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}})
+        boundary = "l170boundary"
+        form = (f'--{boundary}\r\nContent-Disposition: form-data; name="purpose"\r\n\r\nbatch\r\n--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="l170.jsonl"\r\nContent-Type: application/jsonl\r\n\r\n{line}\n\r\n--{boundary}--\r\n').encode()
+        s, h, b = raw("POST", "/v1/files", form, ctype=f"multipart/form-data; boundary={boundary}")
+        up = json.loads(b) if s == 200 else {}
+        fid = up.get("id", "")
+        check("a file upload runs the LLM hooks (file_upload): post_hook marks the answer", s == 200 and fid != "" and up.get("x_wasm_plugin") == "ctx-ok:bf", (s, b[:300]))
+        setp({"mode": "rewrite", "tag": "bf", "from": "file-l170-ghost", "to": fid})
+        n = len(seen())
+        s, h, b = raw("GET", "/v1/files/file-l170-ghost")
+        got = json.loads(b) if s == 200 else {}
+        check("a plugin's pre_hook changes a file call's id (file_retrieve): the call goes to the file it names", s == 200 and got.get("id") == fid and got.get("x_wasm_plugin") == "ctx-ok:bf" and any(u["path"] == "/v1/files/" + fid for u in seen()[n:]), (s, b[:300], [u["path"] for u in seen()[n:]]))
+        setp({"mode": "rewrite", "tag": "bf"})
+        s, h, b = raw("POST", "/v1/batches", {"input_file_id": fid, "endpoint": "/v1/chat/completions", "completion_window": "24h"})
+        bt = json.loads(b) if s == 200 else {}
+        check("an OpenAI batch creation runs the hooks (batch_create)", s == 200 and bt.get("object") == "batch" and bt.get("x_wasm_plugin") == "ctx-ok:bf", (s, b[:300]))
+        s, h, b = raw("GET", "/v1/batches?limit=5")
+        check("listing batches runs the hooks (batch_list)", s == 200 and json.loads(b).get("x_wasm_plugin") == "ctx-ok:bf", (s, b[:300]))
+        s, h, b = raw("GET", "/anthropic/v1/files", headers={"x-model-provider": "openai"})
+        check("the Anthropic SDK's file list runs the hooks too", s == 200 and json.loads(b).get("x_wasm_plugin") == "ctx-ok:bf", (s, b[:300]))
+        setp({"mode": "rewrite", "post": "error"})
+        s, h, b = raw("GET", f"/v1/files/{fid}/content")
+        check("a file's content goes to post_hook ({file_id, content_type}), which may turn it into an error", s == 429 and b"turned into an error by the plugin" in b, (s, b[:300]))
+        api("DELETE", "/api/plugins/h170")
+
+        # ---- jsonparser on a Responses stream ----
+        s, _, b = api("POST", "/api/plugins", {"name": "jsonparser", "enabled": True, "config": {"usage": "all_requests"}})
+        check("jsonparser with usage all_requests is added", s == 201, (s, b[:200]))
+        s, h, b = raw("POST", "/v1/responses", {"model": "openai/json-responses", "input": "json please", "stream": True})
+        ds = [json.loads(d).get("delta") for d in events(b.decode()) if d.startswith("{") and '"response.output_text.delta"' in d]
+        check("jsonparser completes the JSON of a Responses stream delta by delta", s == 200 and ds == ['{"a":1}', '{"a":1,"b":2}'], (s, ds, b[:400]))
+        s, h, b = raw("POST", "/v1/responses", {"model": "openai/gpt-4o-mini", "input": "plain please", "stream": True})
+        text = b.decode()
+        check("a Responses delta whose text cannot be completed is skipped, and the stream still completes", s == 200 and '"response.output_text.delta"' not in text and "response.completed" in text, (s, text[:400]))
+        api("DELETE", "/api/plugins/jsonparser")
+
+        # ---- telemetry: user_name from the admin users ----
+        s, h, b = raw("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "who am i l170"}]}, headers={"x-bf-vk": "sk-bf-l170"})
+        s, _, metrics_text = call("GET", "/metrics", base=base, auth=False)
+        check("telemetry's user_name is the name of the user the key is assigned to", s == 200 and 'user_id="ada-l170",user_name="ada-l170"' in metrics_text, [l for l in metrics_text.split("\n") if "ada-l170" in l][:2])
+
+        # ---- a plugin loaded from a URL ----
+        s, _, b = api("POST", "/api/plugins", {"name": "urlplug", "enabled": True, "path": MOCK + "/plugins/plugin.wasm", "config": {"mode": "rewrite", "tag": "url"}})
+        check("a plugin whose path is a URL is downloaded and loaded (its host is in server.plugin_download_private_allowlist)", s == 201 and json.loads(b).get("plugin", {}).get("status", {}).get("status") == "active", (s, b[:300]))
+        s, h, b = chat("openai/gpt-4o-mini", "from a url plugin l170")
+        check("the downloaded plugin runs: its post_hook marks the answer", s == 200 and json.loads(b).get("x_wasm_plugin") == "ctx-ok:url", (s, b[:200]))
+        api("DELETE", "/api/plugins/urlplug")
+        s, _, b = api("POST", "/api/plugins", {"name": "gone", "enabled": True, "path": MOCK + "/plugins/missing.wasm"})
+        check("a download that fails is answered as Bifrost answers a plugin that does not load", s == 500 and "Plugin was not created, it failed to load: failed to download plugin: HTTP 404" in b, (s, b[:300]))
+        s, _, b = api("POST", "/api/plugins", {"name": "local", "enabled": True, "path": "http://localhost:18099/plugins/plugin.wasm"})
+        check("a URL on a private host the allowlist does not name is refused", s == 500 and "private address" in b, (s, b[:300]))
+
+        # ---- a wall-clock bound on a WebAssembly call, and the plugin spans and logs ----
+        s, _, b = api("POST", "/api/plugins", {"name": "slowplug", "enabled": True, "path": wasm, "wasm_limits": {"max_instructions": 2000000000, "max_time_ms": 200}, "config": {"mode": "loop"}})
+        check("a plugin with a wall-clock limit (wasm_limits.max_time_ms) is added", s == 201, (s, b[:200]))
+        t0 = time.time()
+        s, h, b = chat("openai/gpt-4o-mini", "a slow plugin l170")
+        took = time.time() - t0
+        rid = h.get("x-request-id", "")
+        check("a hook that runs past max_time_ms is stopped by the clock (its instruction budget is far off) and skipped", s == 200 and content(b) is not None and took < 3.0, (s, took, b[:200]))
+        row = {}
+        for _ in range(20):
+            ls, _, lb = api("GET", "/api/logs/" + rid)
+            if ls == 200:
+                row = json.loads(lb)
+                if row.get("plugin_logs"):
+                    break
+            time.sleep(0.1)
+        logs = json.loads(row.get("plugin_logs") or "{}")
+        entries = logs.get("raiju-test-plugin", [])
+        check("the log row carries the plugin logs grouped by plugin (Bifrost's plugin_logs): the hook that ran out of time", any("time limit exceeded" in e.get("message", "") and e.get("level") == "error" for e in entries), row.get("plugin_logs"))
+        spans = ""
+        for _ in range(20):
+            spans = "".join(x["body"] for x in seen(traces=True) if x["path"] == "/v1/traces")
+            if "plugin.raiju-test-plugin.prehook" in spans:
+                break
+            chat("openai/gpt-4o-mini", "flush the traces l170")
+            time.sleep(0.2)
+        check("the plugin's hooks are exported as spans (plugin.<name>.prehook)", "plugin.raiju-test-plugin.prehook" in spans, spans[-300:])
+        api("DELETE", "/api/plugins/slowplug")
     finally:
         gw.terminate()
 GW_L126 = "http://127.0.0.1:18186"  # network_config pool knobs and upstream HTTP/2, against tov-patches/tests/h2_server.py origins
@@ -7736,7 +9079,13 @@ def l124_e2e(env):
         s, hs, b = l124_http(port, "POST", "/v1/chat/completions", sbody)
         b = b.decode()
         got = mine("/v1/chat/completions")
-        check("a big request that asks for a stream is streamed both ways", s == 200 and hdr(hs, "content-type") == "text/event-stream" and b.count("data: ") >= 3000 and b.rstrip().endswith("data: [DONE]") and got[-1]["size"] == len(sbody) - 7, (s, hs, len(b), got[-1]["size"], len(sbody)))
+        # (as Bifrost asks every OpenAI-format stream, the body asks for the usage chunk: stream_options goes first)
+        swant = b'{"stream_options":{"include_usage":true},' + sbody[1:].replace(b'"openai/large-stream"', b'"large-stream"', 1)
+        check("a big request that asks for a stream is streamed both ways, asking for its usage chunk", s == 200 and hdr(hs, "content-type") == "text/event-stream" and b.count("data: ") >= 3000 and b.rstrip().endswith("data: [DONE]") and got[-1]["size"] == len(swant) and got[-1]["sha"] == hashlib.sha256(swant).hexdigest(), (s, hs, len(b), got[-1]["size"], len(swant)))
+        sown = ('{"model":"openai/large-stream","stream":true,"stream_options":{"include_usage":false},"messages":[{"role":"user","content":"%s"}]}' % ("S" * 600000)).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/chat/completions", sown)
+        got = mine("/v1/chat/completions")
+        check("... and a stream_options the caller wrote is left as it is", s == 200 and got[-1]["size"] == len(sown) - 7, (s, got[-1]["size"], len(sown)))
         s, hs, b = chat({"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l124 plain"}]})
         check("a small answer is an ordinary answer, with usage", s == 200 and json.loads(b)["usage"]["total_tokens"] == 7, (s, b[:200]))
 
@@ -8158,7 +9507,7 @@ def l136_e2e(env):
         check("a 12 MiB Messages request to Vertex Claude goes to rawPredict without the model, with the Vertex version", s == 200 and row["sha"] == sha(want), (s, b[:200], row["size"], len(want)))
 
         # ---- a stream the caller asked for: the provider streams, its events are converted to chat chunks as they arrive
-        # (Bedrock's binary frames are not: its answer is read whole and replayed as a stream) ----
+        # (Bedrock's binary event-stream frames too, from ConverseStream) ----
         def sse_text(t):
             out = ""
             for line in t.split("\n"):
@@ -8173,14 +9522,14 @@ def l136_e2e(env):
             ("cohere/command-l136", "Hi from cohere", "/v2/chat"),
             ("vertex/claude-l136", "hi", vx % ("anthropic", "claude-l136:streamRawPredict")),
             ("vertex/gemini-l136", "Hi from gemini", vx % ("google", "gemini-l136:streamGenerateContent")),
-            ("bedrock/claude-l136", "Hi from bedrock", "/model/claude-l136/converse"),
+            ("bedrock/claude-l136", "Hi from bedrock", "/model/claude-l136/converse-stream"),
         ]:
             sb = ('{"model":"%s","stream":true,"stream_options":{"include_usage":true},"max_tokens":16,"messages":[{"role":"user","content":"%s"}]}' % (model, FILL(2 * MB))).encode()
             s, hs, b = l124_http(port, "POST", "/v1/chat/completions", sb, timeout=120)
             t = b.decode("utf8", "replace")
             check("a big streamed chat request to %s gets an event stream with the answer, its usage and [DONE]" % model, s == 200 and hdr(hs, "content-type") == "text/event-stream" and sse_text(t) == says and '"usage"' in t and t.rstrip().endswith("data: [DONE]"), (s, hs, t[:400]))
             row = mine(wirepath.split("?")[0])[-1]
-            check("... the provider was called with the stream variant of its API" if "converse" not in wirepath else "... Bedrock was called once, without streaming", row["size"] > 2 * MB, (wirepath, row["size"]))
+            check("... the provider was called with the stream variant of its API", row["size"] > 2 * MB, (wirepath, row["size"]))
 
         # ---- usage: the converted answer is counted in the key's budget, the request log and the metrics ----
         vk = "sk-bf-l136-budget-0123456789"
@@ -8195,7 +9544,7 @@ def l136_e2e(env):
         sb = ('{"model":"bedrock/claude-l136u","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"%s"}]}' % FILL(1 * MB)).encode()
         s, _, b = l124_http(port, "POST", "/v1/chat/completions", sb, headers={"x-bf-vk": vk})
         u3 = used()["b-l136"]
-        check("... and a replayed Bedrock stream (8 + 2 tokens)", s == 200 and abs((u3 - u2) - 10e-6) < 1e-9, (s, b[:100], u2, u3))
+        check("... and a Bedrock stream converted from its event-stream frames (8 + 2 tokens)",s == 200 and abs((u3 - u2) - 10e-6) < 1e-9, (s, b[:100], u2, u3))
         time.sleep(0.5)
         entries = logs()
         r = [e for e in entries if e.get("model") == "anthropic/claude-l136u"]
@@ -8378,6 +9727,39 @@ def l145_e2e(env):
         gw145b.wait()
 
 
+GW_L157 = "http://127.0.0.1:18271"  # large_payload_optimization with an unreachable provider: a streamed body the gateway cancels
+
+def l157_e2e(env):
+    """A request body over large_payload_optimization's threshold that never reaches its provider (the connection is refused):
+    the gateway answers 502 and cancels the body, which is all in by then. Tov patch 0008's httpBodyCancel freed the stream and
+    then read it (a use-after-free that crashed the gateway; found by tests/smoke.py's large request). The same port as
+    tests/smoke.py, which is not run under the e2e lock."""
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "large_payload_optimization": {"enabled": True, "request_threshold_bytes": 8192, "response_threshold_bytes": 1048576, "prefetch_size_bytes": 4096, "max_payload_bytes": 16777216, "truncated_log_bytes": 1024},
+        # port 1 (tcpmux) is closed: every call is refused before a byte of the body is sent
+        "providers": {"openai": {"keys": [{"name": "o", "value": "sk-" + "l157", "models": [], "weight": 1.0}], "network_config": {"base_url": "http://127.0.0.1:1", "max_retries": 0}}},
+    }
+    path = os.path.join(BUILD, "e2e.l157.json")
+    json.dump(cfg, open(path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18271", "-host", "127.0.0.1", "-config", path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l157.log"), "w"))
+    try:
+        wait(GW_L157 + "/health")
+        body = lambda n, extra="": ('{"model":"openai/gpt-4o-mini","max_tokens":8%s,"messages":[{"role":"user","content":"%s"}]}' % (extra, "x" * n)).encode()
+        got = []
+        for b in (body(9000), body(9000, ',"stream":true'), body(20000), body(100)):
+            try:
+                s = l124_http(18271, "POST", "/v1/chat/completions", b, timeout=20)[0]
+            except OSError:  # the gateway is gone
+                s = 0
+            got.append(s)
+        check("requests over the large payload threshold to an unreachable provider are 502s, and the gateway serves on", got == [502, 502, 502, 502] and gw.poll() is None, (got, gw.poll()))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
 GW_L146 = "http://127.0.0.1:18236"  # large Messages to OpenAI-format, Gemini and Cohere, and large embeddings to Gemini: converted as they stream
 GW_L146B = "http://127.0.0.1:18237"  # the same with client.max_request_body_size_mb 1: what is held is bounded by it
 
@@ -8512,6 +9894,211 @@ def l146_e2e(env):
         gwb.terminate()
 
 
+GW_L162 = "http://127.0.0.1:18278"  # L162: Bedrock streams of large requests live, large completions sent as chat, large Titan embeddings, Gemini transcription cost
+
+def l162_timed(port, path, body, timeout=180):
+    """A request whose answer is read as it arrives: (status, headers, body, seconds from the first piece holding "Hi from " to the end)."""
+    s = l124_http(port, "POST", path, body, read=False, timeout=timeout)
+    raw, first, t_end = b"", None, None
+    try:
+        while True:
+            c = s.recv(65536)
+            if not c:
+                break
+            raw += c
+            if first is None and b"Hi from " in raw.partition(b"\r\n\r\n")[2]:
+                first = time.time()
+        t_end = time.time()
+    finally:
+        s.close()
+    head, _, rest = raw.partition(b"\r\n\r\n")
+    lines = head.decode("latin1").split("\r\n")
+    status = int(lines[0].split(" ")[1]) if lines and lines[0] else 0
+    hs = {}
+    for l in lines[1:]:
+        k, _, v = l.partition(":")
+        hs[k.strip().lower()] = v.strip()
+    out = rest
+    if hs.get("transfer-encoding", "").lower() == "chunked":
+        out, data = b"", rest
+        while b"\r\n" in data:
+            line, _, data = data.partition(b"\r\n")
+            n = int(line.split(b";")[0] or b"0", 16)
+            if n == 0:
+                break
+            out += data[:n]
+            data = data[n + 2:]
+    return status, hs, out, (t_end - first) if first is not None else -1.0
+
+
+def l162_e2e(env):
+    """L162. A large chat stream and a large Messages stream to Bedrock call ConverseStream and their event-stream frames are converted
+    as they arrive (the first text reaches the caller before the provider's stream is over), the request converted while it streams
+    in, spooled, hashed and signed. A large text completion that compat sends as chat becomes the chat body as it streams in (Anthropic,
+    an OpenAI-format provider, Bedrock), whole and streamed as text_completion chunks. A large Titan embeddings request becomes one
+    signed body per input. A Gemini transcription is billed from its usageMetadata as Bifrost's computeTranscriptionCost bills it. Its
+    own gateway (18278)."""
+    import hashlib, shutil
+    logs_dir = os.path.join(BUILD, "e2e-l162-logs")
+    shutil.rmtree(logs_dir, ignore_errors=True)
+    bk = {"access_key": L136_AK, "secret_key": L136_SK, "region": "us-east-1"}
+    net = {"base_url": MOCK, "max_retries": 0}
+    cfg = {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False, "max_request_body_size_mb": 8, "compat": {}},
+        "logs_store": {"enabled": True, "dir": logs_dir, "content_logging": False},
+        # the compat datasheet rows (chatonly-mini serves chat, not text completions); prices are the built-in table
+        "pricing_sync": {"url": MOCK + "/cdatasheet", "enabled": False},
+        "large_payload_optimization": {"enabled": True, "request_threshold_bytes": 262144, "response_threshold_bytes": 1048576, "prefetch_size_bytes": 16384, "max_payload_bytes": 134217728, "truncated_log_bytes": 4096},
+        "governance": {
+            "budgets": [{"id": "b-l162", "max_limit": 100, "reset_duration": "1d"}],
+            "virtual_keys": [{"id": "vk-l162", "value": "sk-bf-l162-budget-0123456789", "budget_id": "b-l162"}],
+        },
+        "providers": {
+            "bedrock": {"keys": [{"name": "b", "models": [], "weight": 1.0, "bedrock_key_config": bk}], "network_config": net},
+            "anthropic": {"keys": [{"name": "a", "value": "sk-ant-" + "l162", "models": [], "weight": 1.0}], "network_config": net},
+            "openai": {"keys": [{"name": "o", "value": "sk-" + "l162", "models": [], "weight": 1.0}], "network_config": net},
+            "gemini": {"keys": [{"name": "g", "value": "g-" + "l162", "models": [], "weight": 1.0}], "network_config": net},
+        },
+    }
+    path = os.path.join(BUILD, "e2e.l162.json")
+    json.dump(cfg, open(path, "w"))
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18278", "-host", "127.0.0.1", "-config", path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l162.log"), "w"))
+    port = 18278
+    try:
+        wait(GW_L162 + "/health")
+        mine = lambda p_: [x for x in seen() if x["path"] == p_]
+        sha = lambda b: hashlib.sha256(b).hexdigest()
+        used = lambda: {x["id"]: x["used"] for x in json.loads(call("GET", "/api/governance/usage", base=GW_L162, auth=False)[2])["budgets"]}
+        logs = lambda: json.loads(call("GET", "/api/logs?limit=500", base=GW_L162, auth=False)[2])["entries"]
+        MB = 1048576
+        FILL = lambda n, c="F": c * n
+        converse_want = lambda n: ('{"messages":[{"role":"user","content":[{"text":"%s"}]}],"inferenceConfig":{"maxTokens":16}}' % FILL(n)).encode()
+
+        def sse_text(t):
+            out = ""
+            for line in t.split("\n"):
+                if line.startswith("data: {"):
+                    ch = json.loads(line[6:])
+                    for c in ch.get("choices", []):
+                        out += c.get("delta", {}).get("content") or c.get("text") or ""
+            return out
+
+        # ---- a 12 MiB chat stream to Bedrock: ConverseStream, its frames converted to chat chunks as they arrive ----
+        # (12 MiB is over client.max_request_body_size_mb: a buffered request would be refused)
+        body = ('{"model":"bedrock/claude-l162slow","stream":true,"stream_options":{"include_usage":true},"max_tokens":16,"messages":[{"role":"user","content":"%s"}]}' % FILL(12 * MB)).encode()
+        s, hs, b, gap = l162_timed(port, "/v1/chat/completions", body)
+        t = b.decode("utf8", "replace")
+        row = (mine("/model/claude-l162slow/converse-stream") or [{}])[-1]
+        check("a 12 MiB chat stream to Bedrock gets the converted event stream: the text, its usage and [DONE]", s == 200 and hdr(hs, "content-type") == "text/event-stream" and sse_text(t) == "Hi from bedrock" and '"usage"' in t and t.rstrip().endswith("data: [DONE]"), (s, hs, t[:400]))
+        check("... the first text reached the caller before Bedrock's stream was over (%.2f s before the end)" % gap, gap >= 1.5, gap)
+        want = converse_want(12 * MB)
+        check("... ConverseStream was called with the converted body, intact by content hash", row.get("size") == len(want) and row.get("sha") == sha(want), (row.get("size"), len(want)))
+        if row:
+            want_sig, got_sig = l136_sigv4(row, "/model/claude-l162slow/converse-stream")
+            check("... and signed over those bytes (the spool's hash)", want_sig == got_sig, (want_sig, got_sig))
+
+        # ---- a 12 MiB Messages stream to Bedrock: ConverseStream through chat, the answer as Messages events as they arrive ----
+        body = ('{"model":"bedrock/claude-l162slow","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"%s"}]}' % FILL(12 * MB)).encode()
+        s, hs, b, gap = l162_timed(port, "/anthropic/v1/messages", body)
+        t = b.decode("utf8", "replace")
+        texts = "".join(json.loads(l[6:]).get("delta", {}).get("text", "") for l in t.split("\n") if l.startswith("data: {") and "text_delta" in l)
+        row = (mine("/model/claude-l162slow/converse-stream") or [{}])[-1]
+        check("a 12 MiB Messages stream to Bedrock is answered with Messages events carrying the text", s == 200 and hdr(hs, "content-type") == "text/event-stream" and "event: message_start" in t and "event: message_stop" in t and texts == "Hi from bedrock", (s, hs, t[:400]))
+        check("... the first text reached the caller before Bedrock's stream was over (%.2f s before the end)" % gap, gap >= 1.5, gap)
+        check("... ConverseStream got the Converse body of the chat request the Messages body becomes, intact", row.get("size") == len(want) and row.get("sha") == sha(want), (row.get("size"), len(want)))
+        if row:
+            want_sig, got_sig = l136_sigv4(row, "/model/claude-l162slow/converse-stream")
+            check("... signed over its bytes", want_sig == got_sig, (want_sig, got_sig))
+        spools = [n for n in os.listdir("/tmp") if n.startswith("raiju-spool-")]
+        check("the spools are gone when the streams are over", not spools, spools)
+
+        # ---- a 12 MiB text completion that compat sends as chat (chatonly-mini serves chat only) ----
+        def comp(model, n, stream=False):
+            # (the stream flag goes in the prefix, where large_payload_optimization reads it)
+            st = '"stream":true,' if stream else ""
+            return ('{"model":"%s",%s"prompt":"%s","max_tokens":16,"echo":false}' % (model, st, FILL(n))).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/completions", comp("anthropic/chatonly-mini", 12 * MB), timeout=180)
+        row = mine("/v1/messages")[-1]
+        want = ('{"model":"chatonly-mini","messages":[{"role":"user","content":[{"type":"text","text":"%s"}]}],"max_tokens":16}' % FILL(12 * MB)).encode()
+        check("a 12 MiB text completion to Anthropic arrives as its Messages body, converted as it streams in", s == 200 and row["sha"] == sha(want), (s, b[:200], row["size"], len(want)))
+        out = json.loads(b) if s == 200 else {}
+        check("... and is answered as a text completion", out.get("object") == "text_completion" and out["choices"][0]["text"] == "Hi from claude" and out.get("usage", {}).get("prompt_tokens") == 11, b[:300])
+        s, hs, b = l124_http(port, "POST", "/v1/completions", comp("openai/chatonly-mini", 12 * MB), timeout=180)
+        row = mine("/v1/chat/completions")[-1]
+        want = ('{"model":"chatonly-mini","messages":[{"role":"user","content":"%s"}],"max_tokens":16}' % FILL(12 * MB)).encode()
+        check("a 12 MiB text completion to an OpenAI-format chat-only model goes to its chat endpoint as the chat body, intact", s == 200 and row["sha"] == sha(want) and json.loads(b).get("object") == "text_completion", (s, b[:200], row["size"], len(want)))
+        s, hs, b = l124_http(port, "POST", "/v1/completions", comp("bedrock/chatonly-mini", 12 * MB), timeout=180)
+        row = mine("/model/chatonly-mini/converse")[-1]
+        want = converse_want(12 * MB)
+        want_sig, got_sig = l136_sigv4(row, "/model/chatonly-mini/converse")
+        check("a 12 MiB text completion to Bedrock arrives as a signed Converse body, intact", s == 200 and row["sha"] == sha(want) and want_sig == got_sig and json.loads(b)["choices"][0]["text"] == "Hi from bedrock", (s, b[:200], row["size"], len(want)))
+        s, hs, b = l124_http(port, "POST", "/v1/completions", comp("anthropic/chatonly-mini", 12 * MB, stream=True), timeout=180)
+        t = b.decode("utf8", "replace")
+        row = mine("/v1/messages")[-1]
+        frames = [json.loads(l[6:]) for l in t.split("\n") if l.startswith("data: {")]
+        check("a streamed 12 MiB text completion to Anthropic streams as text_completion chunks", s == 200 and frames and all(f.get("object") == "text_completion" for f in frames) and sse_text(t) == "hi" and t.rstrip().endswith("data: [DONE]") and row["size"] > 12 * MB, (s, t[:300]))
+        hwm0 = l124_vm(gw.pid, "VmHWM")
+        s, hs, b = l124_http(port, "POST", "/v1/completions", comp("anthropic/chatonly-mini", 48 * MB), timeout=240)
+        hwm1 = l124_vm(gw.pid, "VmHWM")
+        row = mine("/v1/messages")[-1]
+        want = ('{"model":"chatonly-mini","messages":[{"role":"user","content":[{"type":"text","text":"%s"}]}],"max_tokens":16}' % FILL(48 * MB)).encode()
+        check("a 48 MiB text completion to Anthropic arrives intact, the gateway's peak memory up by under 24 MiB (%d to %d MiB)" % (hwm0, hwm1), s == 200 and row["sha"] == sha(want) and hwm1 - hwm0 < 24, (s, b[:200], hwm0, hwm1))
+
+        # ---- Titan: one signed InvokeModel body per input, each spooled ----
+        titan = "/model/amazon.titan-embed-text-v2/invoke"
+        n0 = len(mine(titan))
+        body = ('{"model":"bedrock/amazon.titan-embed-text-v2","input":"%s","dimensions":256}' % FILL(12 * MB)).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/embeddings", body, timeout=180)
+        rows = mine(titan)[n0:]
+        want = ('{"inputText":"%s","dimensions":256,"normalize":true}' % FILL(12 * MB)).encode()
+        ok = s == 200 and len(rows) == 1 and rows[0]["sha"] == sha(want)
+        check("a 12 MiB Titan embeddings request is one InvokeModel body (dimensions after the text), intact", ok, (s, b[:200], [r["size"] for r in rows], len(want)))
+        if ok:
+            want_sig, got_sig = l136_sigv4(rows[0], titan.replace(":", "%3A"))
+            check("... signed over its bytes", want_sig == got_sig, (want_sig, got_sig))
+            check("... answered as the embeddings list with Titan's token count", json.loads(b)["usage"]["prompt_tokens"] == 3 and len(json.loads(b)["data"]) == 1, b[:200])
+        n0 = len(mine(titan))
+        hwm2 = l124_vm(gw.pid, "VmHWM")
+        body = ('{"model":"bedrock/amazon.titan-embed-text-v2","input":["%s","short one","%s"],"dimensions":8}' % (FILL(12 * MB, "A"), FILL(12 * MB, "B"))).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/embeddings", body, timeout=240)
+        hwm3 = l124_vm(gw.pid, "VmHWM")
+        rows = mine(titan)[n0:]
+        wa = ('{"inputText":"%s","dimensions":8,"normalize":true}' % FILL(12 * MB, "A")).encode()
+        wb = ('{"inputText":"%s","dimensions":8,"normalize":true}' % FILL(12 * MB, "B")).encode()
+        ok = s == 200 and len(rows) == 3 and rows[0]["sha"] == sha(wa) and json.loads(rows[1]["body"]) == {"inputText": "short one", "dimensions": 8, "normalize": True} and rows[2]["sha"] == sha(wb)
+        check("a 24 MiB Titan request with three inputs is three InvokeModel calls, one body each, in order and intact", ok, (s, b[:200], [r["size"] for r in rows]))
+        if ok:
+            sigs = [l136_sigv4(rows[i], titan.replace(":", "%3A")) for i in (0, 2)]
+            check("... each signed over its own bytes", all(w == g for w, g in sigs), sigs)
+            out = json.loads(b)
+            check("... answered with three vectors and the token counts summed", len(out["data"]) == 3 and out["usage"]["prompt_tokens"] == 9, b[:200])
+        check("... with the gateway's peak memory up by under 24 MiB (%d to %d MiB)" % (hwm2, hwm3), hwm3 - hwm2 < 24, (hwm2, hwm3))
+        spools = [n for n in os.listdir("/tmp") if n.startswith("raiju-spool-")]
+        check("the Titan spools are gone when the request is over", not spools, spools)
+
+        # ---- a Gemini transcription billed from its usageMetadata (10 audio and 4 text prompt tokens, 3 output tokens) ----
+        vk = {"x-bf-vk": "sk-bf-l162-budget-0123456789"}
+        parts = [("model", None, "text/plain", "gemini/gemini-2.5-flash"), ("file", "talk.wav", "audio/wav", b"RIFF\x00\x00\x00\x00WAVEfmt ")]
+        u0 = used()["b-l162"]
+        s, _, b = mp_form(GW_L162, "/v1/audio/transcriptions", parts, vk)
+        u1 = used()["b-l162"]
+        out = json.loads(b) if s == 200 else {}
+        check("a Gemini transcription answers with the transcript and Bifrost's usage (type tokens, the prompt split by modality)", out.get("text") == "Hi from gemini" and out.get("usage") == {"type": "tokens", "input_tokens": 14, "input_token_details": {"text_tokens": 4, "audio_tokens": 10}, "output_tokens": 3, "total_tokens": 17}, (s, b[:300]))
+        # computeTranscriptionCost: audio tokens at the audio rate, text tokens at the input rate, output tokens at the output rate
+        cost = 10 * 0.000001 + 4 * 0.0000003 + 3 * 0.0000024999999999999998
+        check("... and its cost, %.3g USD, is charged to the key's budget" % cost, near(u1 - u0, cost), (u0, u1, cost))
+        s, _, b = mp_form(GW_L162, "/v1/audio/transcriptions", parts + [("response_format", None, "text/plain", "text")], vk)
+        u2 = used()["b-l162"]
+        check("a plain-text Gemini transcription is billed the same (the usage read from the answer, not the body)", s == 200 and b == "Hi from gemini" and near(u2 - u1, cost), (s, b[:100], u1, u2))
+        time.sleep(0.5)
+        rows = [e for e in logs() if e.get("model") == "gemini-2.5-flash" and e.get("op") == "transcription"]
+        check("... each logged with its tokens and cost", len(rows) == 2 and all(e.get("prompt_tokens") == 14 and e.get("completion_tokens") == 3 and near(float(e.get("cost") or 0), cost) for e in rows), [(e.get("prompt_tokens"), e.get("completion_tokens"), e.get("cost")) for e in rows])
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
 A2A_GRPC_LISTEN = 18245  # the port the listener binds (RAIJU_A2A_GRPC_LISTEN_PORT)
 A2A_GRPC_ADVERTISED = 18246  # server.a2a_grpc_port: what the cards advertise
 A2A_GRPC_DOMAIN = "gw.grpc.test"
@@ -8566,12 +10153,12 @@ def l148_run(env, workers: int, label: str, port: int):
         return [x for x in got if x["path"] == "/a2a/v1/json-rpc"]
     try:
         wait(base + "/health")
-        # before the card is fetched, a call is refused in both bindings: 503 over HTTP, UNAVAILABLE over gRPC, the same message
+        # with no refresh-card, the declared agent's card is fetched at start or on its first call (L171): a call reaches the agent
         s, _, b = gwc("POST", "/agents/a2a/grpc/json-rpc", {"jsonrpc": "2.0", "id": "1", "method": "GetTask", "params": {"id": "precard-task"}}, A)
-        check("a call before the agent's card is fetched is refused with 503 and the card's message", s == 503 and "has not been fetched" in b, (s, b[:200]))
+        check("a call before any refresh-card reaches the agent (its card is fetched at start or on first use)", s == 200 and json.loads(b).get("error", {}).get("code") == -32001, (s, b[:200]))
         pre = subprocess.run([client, "-addr", f"127.0.0.1:{A2A_GRPC_LISTEN}", "-domain", A2A_GRPC_DOMAIN, "-agent", "grpc", "-key", "sk-bf-l148-a", "-precard"], capture_output=True, text=True, timeout=120)
         pre_row = json.loads(pre.stdout.strip().splitlines()[0]) if pre.returncode == 0 and pre.stdout.strip() != "" else {}
-        check("a gRPC call before the agent's card is fetched is UNAVAILABLE with the same message", pre_row.get("code") == "UNAVAILABLE" and pre_row.get("message") == "the card of grpc has not been fetched: refresh it through /api/agents/grpc/refresh-card", (pre.returncode, pre.stdout[:200], pre.stderr[-300:], b[:200]))
+        check("a gRPC call before any refresh-card reaches the agent too (NOT_FOUND for the unknown task)", pre_row.get("code") == "NOT_FOUND", (pre.returncode, pre.stdout[:200], pre.stderr[-300:], b[:200]))
         s, _, b = api("POST", "/api/agents/grpc/refresh-card")
         check("the agent's card is fetched for the gRPC checks", s == 200, (s, b[:200]))
         s, _, b = gwc("GET", "/agents/a2a/grpc/.well-known/agent-card.json", None, A)
@@ -8612,6 +10199,11 @@ def l148_run(env, workers: int, label: str, port: int):
         check("a key without the agent's grant is PERMISSION_DENIED", row("no-grant")["code"] == "PERMISSION_DENIED", row("no-grant"))
         check("a task the agent does not have is NOT_FOUND with the agent's message", row("task-missing")["code"] == "NOT_FOUND" and row("task-missing")["message"] == "task not found", row("task-missing"))
         check("an agent's error is INTERNAL with its message", row("agent-error")["code"] == "INTERNAL" and row("agent-error")["message"] == "agent failed on request", row("agent-error"))
+        # L161: an agent's error carries the google.rpc.ErrorInfo a2a-go sends (grpc-status-details-bin); the gateway's own refusals do not
+        check("a missing task's status carries an ErrorInfo TASK_NOT_FOUND in the A2A domain", row("task-missing").get("reason") == "TASK_NOT_FOUND" and row("task-missing").get("domain") == "a2a-protocol.org", row("task-missing"))
+        check("an agent's server error carries the ErrorInfo SERVER_ERROR", row("agent-error").get("reason") == "SERVER_ERROR", row("agent-error"))
+        check("the gateway's own refusals are plain statuses, without details", all(row(n).get("reason") is None for n in ("no-key", "no-grant", "unknown-agent")), [row(n) for n in ("no-key", "no-grant")])
+        check("the SDK reads the A2A error back from the details (errors.Is a2a.ErrTaskNotFound)", row("sdk-task-missing").get("a2a") == "task-not-found" and row("sdk-task-missing")["message"] == "task not found", row("sdk-task-missing"))
         check("the key sent as x-api-key is read", row("api-key-header")["code"] == "OK", row("api-key-header"))
         sent = upstream()[before_up:]
         check("the calls reach the mock agent as JSON-RPC with the v1 method names", any(x["body"].find('"method":"SendMessage"') >= 0 for x in sent) and any(x["body"].find('"method":"CancelTask"') >= 0 for x in sent), [x["body"][:120] for x in sent[:3]])
@@ -8640,6 +10232,190 @@ def l148w_e2e(env):
         print("skip the two-worker A2A gRPC checks: http1 runs one process")
         return
     l148_run(env, 2, "l148w", 18244)
+
+
+L161_DOMAIN = "gw.l161.test"  # the L161 gateway (18276) serves A2A gRPC on 18277 under this domain
+
+def l161_sse(base, path, body, headers):
+    """The data payloads of an event stream answer, as JSON (status and payloads)."""
+    req = urllib.request.Request(base + path, data=json.dumps(body).encode(), method="POST", headers={"content-type": "application/json", "accept": "text/event-stream", **headers})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            text = r.read().decode()
+            status = r.status
+    except urllib.error.HTTPError as e:
+        return e.code, [e.read().decode()]
+    out = []
+    for ev in text.replace("\r\n", "\n").split("\n\n"):
+        data = "\n".join(l[5:].lstrip() for l in ev.split("\n") if l.startswith("data:"))
+        if data:
+            out.append(json.loads(data))
+    return status, out
+
+def l161_e2e(env):
+    """L161: an agent whose card offers only the gRPC binding (tests/a2a_grpc_agent.py, grpcio, on ports the system picks)
+    reached from the JSON-RPC, REST and gRPC bindings, unary and streaming, over h2c and over TLS; its errors come back with
+    their ErrorInfo (reason, domain, metadata) in every binding, and grpcio reads the status details the gateway sends. Its
+    own gateway on 18276, on the server under test, with its gRPC listener on 18277."""
+    import shutil
+    try:
+        import grpc
+    except ImportError:
+        print("skip the L161 checks: grpcio is not installed")
+        return
+    sys.path.insert(0, os.path.join(ROOT, "tests"))
+    from a2a_grpc_agent import fld, parse, first, message as pb_message
+    from grpc_details import details_of
+    tls_dir = os.path.join(BUILD, "e2e-tls")
+    if not os.path.exists(os.path.join(tls_dir, "srv.pem")):
+        make_tls()
+    ca = open(os.path.join(tls_dir, "ca.pem")).read()
+    agent = subprocess.Popen([sys.executable, os.path.join(ROOT, "tests/a2a_grpc_agent.py"), os.path.join(tls_dir, "srv.pem"), os.path.join(tls_dir, "srv.key")], stdout=subprocess.PIPE, stderr=open(os.path.join(BUILD, "e2e.l161-agent.log"), "w"), text=True)
+    gw = None
+    try:
+        ready = agent.stdout.readline().split()
+        check("the gRPC-only agent starts", len(ready) == 4 and ready[0] == "ready", ready)
+        if len(ready) != 4:
+            return
+        web = f"http://127.0.0.1:{ready[1]}"
+        import hashlib
+        cfg = {
+            "client": {"enable_logging": True, "enforce_auth_on_inference": True, "a2a_external_client_url": "https://gw.l161.example/"},
+            "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l161-logs")},
+            "alerts": {"enabled": False},
+            "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+            "server": {"a2a_grpc_base_domain": L161_DOMAIN, "a2a_grpc_port": 18277},
+            "providers": {"openai": {"keys": [{"name": "l161", "value": "sk-l161", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+            "governance": {
+                "users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l161".encode()).hexdigest()}],
+                "virtual_keys": [{"id": "vk-l161", "value": "sk-bf-l161"}],
+            },
+            "agents": [
+                {"name": "gonly", "agent_card_url": web + "/card", "allow_private_network": True, "virtual_key_ids": ["vk-l161"], "runtime_auth": {"type": "headers", "headers": {"x-agent-token": "tok-l161"}}},
+                {"name": "gtls", "agent_card_url": web + "/tls-card", "allow_private_network": True, "virtual_key_ids": ["vk-l161"], "runtime_auth": {"type": "headers", "headers": {"x-agent-token": "tok-l161-tls"}, "tls": {"ca_cert_pem": ca}}},
+            ],
+        }
+        cfg_path = os.path.join(BUILD, "e2e.l161.json")
+        json.dump(cfg, open(cfg_path, "w"))
+        shutil.rmtree(os.path.join(BUILD, "e2e-l161-logs"), ignore_errors=True)
+        genv = {k: v for k, v in env.items() if k != "RAIJU_A2A_GRPC_LISTEN_PORT"}
+        gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18276", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=genv, stderr=open(os.path.join(BUILD, "e2e.l161.log"), "w"))
+        base = "http://127.0.0.1:18276"
+        ADM = {"authorization": "Bearer sk-admin-l161"}
+        K = {"authorization": "Bearer sk-bf-l161"}
+        wait(base + "/health")
+        for name in ("gonly", "gtls"):
+            s, _, b = call("POST", f"/api/agents/{name}/refresh-card", None, ADM, base=base, auth=False)
+            check(f"the card of the gRPC-only agent {name} is fetched (a card with only a GRPC interface is accepted)", s == 200, (s, b[:300]))
+        def rpc(agent_name, method, params):
+            s, _, b = call("POST", f"/agents/a2a/{agent_name}/json-rpc", {"jsonrpc": "2.0", "id": "r1", "method": method, "params": params}, K, base=base, auth=False)
+            return s, (json.loads(b) if b.strip().startswith("{") else {"raw": b})
+        def rest(method, path, body=None):
+            s, _, b = call(method, "/agents/a2a/gonly/rest" + path, body, K, base=base, auth=False)
+            return s, (json.loads(b) if b.strip().startswith("{") else {"raw": b})
+        msg = lambda text: {"message": {"messageId": "m-" + text, "role": "ROLE_USER", "parts": [{"text": text}]}}
+        def info_of(details):
+            return next((d for d in details or [] if d.get("@type") == "type.googleapis.com/google.rpc.ErrorInfo"), {})
+
+        # ---- JSON-RPC in ----
+        s, r = rpc("gonly", "SendMessage", msg("hi-rpc"))
+        task = r.get("result", {}).get("task", {})
+        check("JSON-RPC SendMessage reaches the gRPC-only agent and answers its task", s == 200 and task.get("status", {}).get("state") == "TASK_STATE_COMPLETED" and "echo: hi-rpc" in json.dumps(task) and r.get("id") == "r1", (s, r))
+        tid = task.get("id", "")
+        s, evs = l161_sse(base, "/agents/a2a/gonly/json-rpc", {"jsonrpc": "2.0", "id": "s1", "method": "SendStreamingMessage", "params": msg("stream-rpc")}, K)
+        check("JSON-RPC SendStreamingMessage streams the agent's four events as JSON-RPC answers", s == 200 and len(evs) == 4 and all(isinstance(e, dict) and e.get("id") == "s1" and "result" in e for e in evs) and "statusUpdate" in evs[-1]["result"] and "COMPLETED" in json.dumps(evs[-1]), (s, evs))
+        s, r = rpc("gonly", "GetTask", {"id": tid})
+        check("JSON-RPC GetTask reads the task from the agent", s == 200 and r.get("result", {}).get("id") == tid, (s, r))
+        s, r = rpc("gonly", "GetTask", {"id": "nope-l161"})
+        e = r.get("error", {})
+        check("a missing task is the JSON-RPC error -32001 with the agent's message and its ErrorInfo (reason, metadata)", e.get("code") == -32001 and e.get("message") == "task not found" and info_of(e.get("data")).get("reason") == "TASK_NOT_FOUND" and info_of(e.get("data")).get("metadata") == {"taskId": "nope-l161"}, (s, r))
+        s, r = rpc("gonly", "SendMessage", msg("fail"))
+        e = r.get("error", {})
+        check("an agent's INTERNAL status is -32603 with its message, its Struct detail and its ErrorInfo metadata", e.get("code") == -32603 and e.get("message") == "agent failed on request" and any(d.get("hint") == "try again" for d in e.get("data", [])) and info_of(e.get("data")).get("metadata") == {"agent": "grpc-only"}, (s, r))
+        s, evs = l161_sse(base, "/agents/a2a/gonly/json-rpc", {"jsonrpc": "2.0", "id": "s2", "method": "SendStreamingMessage", "params": msg("fail-stream")}, K)
+        check("a stream that fails after an event ends with the status as a JSON-RPC error event", s == 200 and len(evs) == 2 and "result" in evs[0] and evs[1].get("error", {}).get("message") == "the stream broke", (s, evs))
+        s, r = rpc("gonly", "GetExtendedAgentCard", {})
+        check("a method the agent does not serve (UNIMPLEMENTED) is -32601", r.get("error", {}).get("code") == -32601, (s, r))
+        s, r = rpc("gonly", "message/send", {"message": {"kind": "message", "messageId": "m-v03", "role": "user", "parts": [{"kind": "text", "text": "hi-v03"}]}})
+        check("a v0.3 JSON-RPC send reaches the gRPC agent (roles and parts read as v1)", s == 200 and "echo: hi-v03" in json.dumps(r.get("result", {})), (s, r))
+
+        # ---- REST in ----
+        s, r = rest("POST", "/message:send", msg("hi-rest"))
+        check("REST message:send reaches the gRPC-only agent", s == 200 and "echo: hi-rest" in json.dumps(r), (s, r))
+        s, evs = l161_sse(base, "/agents/a2a/gonly/rest/message:stream", msg("stream-rest"), K)
+        check("REST message:stream streams the agent's events as REST payloads", s == 200 and len(evs) == 4 and isinstance(evs[0], dict) and "jsonrpc" not in evs[0] and "task" in evs[0] and "COMPLETED" in json.dumps(evs[-1]), (s, evs))
+        s, r = rest("GET", "/tasks/nope-l161")
+        check("REST: a missing task is 404 NOT_FOUND with the ErrorInfo TASK_NOT_FOUND", s == 404 and r.get("error", {}).get("status") == "NOT_FOUND" and info_of(r.get("error", {}).get("details")).get("reason") == "TASK_NOT_FOUND", (s, r))
+        s, r = rest("POST", f"/tasks/{tid}:cancel", {})
+        check("REST: a task the agent cannot cancel (FAILED_PRECONDITION, TASK_NOT_CANCELABLE) is 409", s == 409 and info_of(r.get("error", {}).get("details")).get("reason") == "TASK_NOT_CANCELABLE", (s, r))
+
+        # ---- gRPC in (grpcio) ----
+        ch = grpc.insecure_channel("127.0.0.1:18277", options=[("grpc.default_authority", "gonly." + L161_DOMAIN)])
+        md = [("authorization", "Bearer sk-bf-l161")]
+        u = lambda m: ch.unary_unary("/lf.a2a.v1.A2AService/" + m, request_serializer=None, response_deserializer=None)
+        st = lambda m: ch.unary_stream("/lf.a2a.v1.A2AService/" + m, request_serializer=None, response_deserializer=None)
+        gtid = ""
+        try:
+            resp = u("SendMessage")(fld(2, pb_message("m-grpc", "", "", 1, "hi-grpc")), metadata=md, timeout=30)
+            gtid = first(parse(first(parse(resp), 1)), 1).decode()
+            check("gRPC SendMessage through the gateway reaches the gRPC-only agent", gtid.startswith("gt-") and b"echo: hi-grpc" in resp, resp[:200])
+        except grpc.RpcError as e:
+            check("gRPC SendMessage through the gateway reaches the gRPC-only agent", False, (e.code(), e.details()))
+        try:
+            got = list(st("SendStreamingMessage")(fld(2, pb_message("m-grpcs", "", "", 1, "stream-grpc")), metadata=md, timeout=30))
+            check("gRPC SendStreamingMessage passes the agent's four StreamResponses", len(got) == 4 and sorted(parse(got[-1]).keys()) == [3], [g[:40] for g in got])
+        except grpc.RpcError as e:
+            check("gRPC SendStreamingMessage passes the agent's four StreamResponses", False, (e.code(), e.details()))
+        try:
+            got = list(st("SubscribeToTask")(fld(2, gtid), metadata=md, timeout=30))
+            check("gRPC SubscribeToTask streams the agent's events", len(got) == 2, len(got))
+        except grpc.RpcError as e:
+            check("gRPC SubscribeToTask streams the agent's events", False, (e.code(), e.details()))
+        def grpc_err(m, body):
+            try:
+                u(m)(body, metadata=md, timeout=30)
+                return None, "", None
+            except grpc.RpcError as e:
+                return e.code(), e.details(), details_of(e.trailing_metadata())
+        def ei_of(det):
+            return next((d for d in (det or {}).get("details", []) if d["type"] == "ErrorInfo"), {})
+        code, text, det = grpc_err("GetTask", fld(2, "nope-l161"))
+        ei = ei_of(det)
+        check("gRPC: a missing task is NOT_FOUND, and grpcio reads the ErrorInfo with the agent's reason and metadata", code == grpc.StatusCode.NOT_FOUND and text == "task not found" and ei.get("reason") == "TASK_NOT_FOUND" and ei.get("domain") == "a2a-protocol.org" and ei.get("metadata") == {"taskId": "nope-l161"} and det["code"] == 5, (code, text, det))
+        code, text, det = grpc_err("CancelTask", fld(2, gtid))
+        check("gRPC: a task that cannot be canceled is FAILED_PRECONDITION with TASK_NOT_CANCELABLE", code == grpc.StatusCode.FAILED_PRECONDITION and ei_of(det).get("reason") == "TASK_NOT_CANCELABLE", (code, text, det))
+        code, text, det = grpc_err("SendMessage", fld(2, pb_message("m-f", "", "", 1, "fail")))
+        structs = [d["value"] for d in (det or {}).get("details", []) if d["type"] == "Struct"]
+        check("gRPC: an agent's failure is INTERNAL with its Struct details and ErrorInfo, as a2a-go sends them", code == grpc.StatusCode.INTERNAL and text == "agent failed on request" and {"hint": "try again"} in structs and ei_of(det).get("reason") == "INTERNAL_ERROR", (code, text, det))
+        ch.close()
+        bad = grpc.insecure_channel("127.0.0.1:18277", options=[("grpc.default_authority", "nosuch." + L161_DOMAIN)])
+        try:
+            bad.unary_unary("/lf.a2a.v1.A2AService/GetTask", request_serializer=None, response_deserializer=None)(fld(2, "x"), metadata=md, timeout=10)
+            check("the gateway's own refusal (an unknown agent) carries no details", False, "answered")
+        except grpc.RpcError as e:
+            check("the gateway's own refusal (an unknown agent) carries no details", e.code() == grpc.StatusCode.NOT_FOUND and details_of(e.trailing_metadata()) is None, (e.code(), e.trailing_metadata()))
+        bad.close()
+
+        # ---- TLS ----
+        s, r = rpc("gtls", "SendMessage", msg("hi-tls"))
+        check("an agent whose gRPC interface is a bare host:port is called over TLS (ALPN h2, the agent's CA)", s == 200 and "echo: hi-tls" in json.dumps(r.get("result", {})), (s, r))
+        s, evs = l161_sse(base, "/agents/a2a/gtls/json-rpc", {"jsonrpc": "2.0", "id": "t1", "method": "SendStreamingMessage", "params": msg("stream-tls")}, K)
+        check("... and streams over TLS", s == 200 and len(evs) == 4, (s, evs))
+
+        # ---- what the agent saw, and the logs ----
+        seen = json.loads(call("GET", "/seen", base=web)[2])
+        plain = [x for x in seen if x["metadata"].get("x-agent-token") == "tok-l161"]
+        check("the agent gets the runtime credentials as metadata, and never the caller's virtual key", len(plain) >= 8 and all("sk-bf-l161" not in json.dumps(x) for x in seen), seen[:2])
+        check("the TLS agent gets its own credentials", any(x["metadata"].get("x-agent-token") == "tok-l161-tls" for x in seen), [x["metadata"] for x in seen][-2:])
+        s, _, b = call("GET", "/api/agents/history?agent_names=gonly&limit=200", None, ADM, base=base, auth=False)
+        hist = json.loads(b).get("history", []) if s == 200 else []
+        check("the calls to the gRPC-only agent are logged under its name", len(hist) >= 10 and all(x["agent_name"] == "gonly" for x in hist), (s, len(hist)))
+    finally:
+        if gw is not None:
+            gw.terminate()
+            gw.wait()
+        agent.terminate()
+        agent.wait()
 
 
 
@@ -9154,6 +10930,1075 @@ def l155_e2e(env):
     finally:
         gs.terminate()
         gs.wait()
+
+GW_L158 = "http://127.0.0.1:18272"  # atomic state files: config.json saved through a temporary file and a rename
+
+def l158_e2e(env):
+    """L158: config.json is replaced atomically. A temporary file a crash left next to it (older than ten minutes) is
+    removed at startup and a recent one is kept (another worker's save may be in progress); saves through the API leave
+    a complete file, its .bak and no temporary file, keep the file's permissions, and the file is a new inode each time
+    (a rename, not a rewrite in place)."""
+    import hashlib, shutil, stat
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    d = os.path.join(BUILD, "e2e-l158")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    cfg_path = os.path.join(d, "config.json")
+    json.dump({
+        "client": {"enforce_auth_on_inference": False},
+        "governance": {"users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l158".encode()).hexdigest()}]},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "l158", "value": "sk-l158", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+    }, open(cfg_path, "w"))
+    os.chmod(cfg_path, 0o640)
+    stale = os.path.join(d, ".config.json.tmp-1-1")
+    fresh = os.path.join(d, ".config.json.tmp-2-1")
+    open(stale, "w").write('{"half":')
+    open(fresh, "w").write('{"half":')
+    old = time.time() - 3600
+    os.utime(stale, (old, old))
+    admin = {"authorization": "Bearer sk-admin-l158"}
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18272", "-host", "127.0.0.1", "-config", cfg_path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l158.log"), "w"))
+    try:
+        wait(GW_L158 + "/health")
+        check("a temporary config file older than ten minutes is removed at startup", not os.path.exists(stale), os.listdir(d))
+        check("a recent temporary config file is kept (a save in progress)", os.path.exists(fresh), os.listdir(d))
+        os.unlink(fresh)
+        inode = os.stat(cfg_path).st_ino
+        s, b = 0, ""
+        for i in range(5):
+            s, _, b = call("POST", "/api/governance/virtual-keys", {"name": f"l158-{i}"}, admin, base=GW_L158, auth=False)
+            if s not in (200, 201):
+                break
+        check("five saves through the API succeed", s in (200, 201), (s, b[:200]))
+        names = sorted(os.listdir(d))
+        check("the saves leave config.json, its .bak and no temporary file", names == ["config.json", "config.json.bak"], names)
+        try:
+            saved = json.load(open(cfg_path))
+        except Exception as e:
+            saved = {"error": str(e)}
+        vks = [v.get("name") for v in saved.get("governance", {}).get("virtual_keys", [])]
+        check("config.json is complete and holds every saved key", all(f"l158-{i}" in vks for i in range(5)), vks)
+        check("config.json was replaced by a rename (a new inode)", os.stat(cfg_path).st_ino != inode, inode)
+        check("config.json keeps its permissions across saves", stat.S_IMODE(os.stat(cfg_path).st_mode) == 0o640, oct(os.stat(cfg_path).st_mode))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+GW_L167 = "http://127.0.0.1:18286"  # L167: MCP OAuth user mode on the OIDC sign-in, status states, flows and codes kept across restarts, temp tokens, dual credentials
+
+def l167_e2e(env, idp_state):
+    """L167, its own gateway restarted three times on one folder: dual_credential_conflict_behavior error refused with a
+    token_exchange client (both ways); the OAuth config status of a flow (flow_id: pending, failed, authorized); a per-user
+    headers submission opened by the tool call, its link and temp token; a per-user consent flow, a pending authorization
+    request and a consented code surviving restarts; user mode on the OIDC sign-in (consent, the /mcp token, the per-user
+    flow its own user opens, conflicting credentials); disable_vk_identity."""
+    import http.client, shutil, re as _re
+    folder = os.path.join(BUILD, "l167")
+    shutil.rmtree(folder, ignore_errors=True)
+    os.makedirs(folder)
+    path = os.path.join(folder, "config.json")
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    ADMIN_H = {"authorization": "Bearer admin-secret"}
+
+    def client_cfg(disable_vk=False):
+        return {"enable_logging": False, "enforce_auth_on_inference": False, "mcp_enable_temp_token_auth": True,
+                "mcp_server_auth_mode": "both", "oauth2_server_config": {"issuer_url": GW_L167, "disable_vk_identity": disable_vk}}
+
+    def config(disable_vk=False):
+        return {
+            "encryption_key": "an e2e passphrase of some length",
+            "client": client_cfg(disable_vk),
+            "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+            "providers": {"openai": {"keys": [{"name": "k", "value": "sk-k", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+            "governance": {"auth_config": {"token": "admin-secret"}, "virtual_keys": [{"id": "vk-l167-a", "value": "sk-bf-l167-a"}]},
+            "oidc": {"enabled": True, "issuer": "http://127.0.0.1:18096", "client_id": "raiju", "redirect_uri": GW_L167 + "/api/oidc/callback", "role_claim": "groups", "role_map": {"raiju-editors": "editor"}},
+            "mcp": {"tool_sync_interval": "1h", "oauth_private_allowlist": ["127.0.0.1"], "client_configs": [
+                {"name": "po", "connection_type": "http", "connection_string": MOCK + "/mcp-peruser-oauth", "auth_type": "per_user_oauth", "auth": {"type": "oauth"}},
+                {"name": "oa", "connection_type": "http", "connection_string": MOCK + "/mcp-oauth", "auth": {"type": "oauth"}},
+                {"name": "tenant", "connection_type": "http", "connection_string": MOCK + "/mcp-peruser", "auth_type": "per_user_headers", "per_user_header_keys": ["x-tenant"]},
+                {"name": "jira", "connection_type": "http", "connection_string": MOCK + "/mcp-exchange", "auth_type": "token_exchange", "token_exchange": {"audience": "api://jira", "client_id": "exch"}},
+            ]},
+        }
+
+    def start():
+        p = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18286", "-host", "127.0.0.1", "-config", path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l167.log"), "a"))
+        wait(GW_L167 + "/health")
+        return p
+
+    def restart(p, cfg=None):
+        p.terminate()
+        p.wait()
+        if cfg is not None:
+            # the file the gateway saved keeps its sealed state; only the client section changes
+            saved = json.load(open(path))
+            saved["client"] = cfg["client"]
+            json.dump(saved, open(path, "w"))
+        return start()
+
+    def api(method, p, body=None, headers=None):
+        return call(method, p, body, {**ADMIN_H, **(headers or {})}, base=GW_L167, auth=False)
+
+    def follow(url):
+        """The authorization server's redirect for an authorize URL: (path, query) of the callback."""
+        loc = ""
+        try:
+            urllib.request.build_opener(NoFollow).open(url, timeout=10)
+        except urllib.error.HTTPError as e:
+            loc = e.headers.get("location", "")
+        lu = urllib.parse.urlparse(loc)
+        return lu.path, lu.query
+
+    def sign_in(sub="alice", return_to=""):
+        """An OIDC sign-in through the mock identity provider: (callback status, page, session token)."""
+        conn = http.client.HTTPConnection("127.0.0.1", 18286, timeout=10)
+        conn.request("GET", "/api/oidc/login" + ("?return_to=" + urllib.parse.quote(return_to, safe="") if return_to else ""))
+        r = conn.getresponse(); r.read()
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(r.getheader("location") or "").query)
+        idp_state["nonce"] = q.get("nonce", [""])[0]
+        idp_state["claims"] = {"sub": sub, "email": sub + "@example.com"}
+        try:
+            s, _, page = call("GET", "/api/oidc/callback?code=abc&state=" + q.get("state", [""])[0], base=GW_L167, auth=False)
+        finally:
+            idp_state["claims"] = {}
+        m = _re.search(r'"(sk-sess-[0-9a-f]+)"', page)
+        return s, page, (m.group(1) if m else "")
+
+    def tool(key, name):
+        return call("POST", "/v1/mcp/tool/execute", {"id": "c1", "type": "function", "function": {"name": name, "arguments": "{\"city\":\"Oslo\"}"}}, {"authorization": "Bearer " + key}, base=GW_L167, auth=False)
+
+    def mcp_rpc(headers, method, params):
+        """initialize, then one JSON-RPC call on /mcp: (initialize status, call status, call body)."""
+        h = {"content-type": "application/json", **headers}
+        s, hh, _ = raw("POST", GW_L167 + "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "e2e-l167", "version": "1"}}}, h)
+        sid = {k.lower(): v for k, v in hh.items()}.get("mcp-session-id", "")
+        s2, _, b2 = raw("POST", GW_L167 + "/mcp", {"jsonrpc": "2.0", "id": 2, "method": method, "params": params}, {**h, "mcp-session-id": sid})
+        return s, s2, b2
+
+    def as_open():
+        cid = as_register(GW_L167)
+        verifier, challenge = as_pkce()
+        fid, tok = as_authorize(GW_L167, cid, challenge, "st-l167")
+        return cid, verifier, fid, tok
+
+    def consent_put(fid, tok, body, session=""):
+        h = {"content-type": "application/json", "x-bifrost-temp-token": tok}
+        if session:
+            h["authorization"] = "Bearer " + session
+        s, _, b = raw("PUT", GW_L167 + "/api/oauth2/consent/flows/" + fid, body, h)
+        return s, (json.loads(b).get("redirect_url", "") if s == 200 else b)
+
+    json.dump(config(), open(path, "w"))
+    gw = start()
+    try:
+        # dual_credential_conflict_behavior "error" and a token_exchange client cannot be set together (Bifrost's config.go and mcp.go)
+        cl = client_cfg()
+        s, _, b = api("PUT", "/api/config", {"client_config": {**cl, "dual_credential_conflict_behavior": "error"}})
+        check("l167: dual_credential_conflict_behavior error is refused while a token_exchange client exists", s == 400 and "jira" in b and "token_exchange" in b, (s, b[:300]))
+        s, _, b = api("PUT", "/api/config", {"client_config": {**cl, "dual_credential_conflict_behavior": "prefer_idp"}})
+        check("l167: prefer_idp is accepted with a token_exchange client", s == 200, (s, b[:200]))
+        s, _, b = api("DELETE", "/api/mcp/client/jira")
+        s, _, b = api("PUT", "/api/config", {"client_config": {**cl, "dual_credential_conflict_behavior": "error"}})
+        check("l167: error is accepted once no client uses token_exchange", s == 200, (s, b[:200]))
+        s, _, b = api("POST", "/api/mcp/client", {"name": "jira", "connection_type": "http", "connection_string": MOCK + "/mcp-exchange", "auth_type": "token_exchange", "token_exchange": {"audience": "api://jira", "client_id": "exch"}})
+        check("l167: a token_exchange client is refused while the behaviour is error", s == 400 and "dual_credential_conflict_behavior is 'error'" in b, (s, b[:300]))
+        s, _, b = api("PUT", "/api/config", {"client_config": cl})
+
+        # the OAuth config status: the bare form and the flow_id form, with failed and authorized
+        s, _, b = api("POST", "/api/mcp/client/oa/initiate-verification")
+        init = json.loads(b) if s == 200 else {}
+        check("l167: initiate-verification names its flow and the status URL", s == 200 and init.get("oauth_config_id") == "oa" and init.get("flow_id") and init.get("status_url") == "/api/oauth/config/oa/status", (s, b[:300]))
+        state = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(init.get("authorize_url", "")).query)).get("state", "")
+        s, _, b = api("GET", "/api/oauth/config/oa/status?flow_id=" + init.get("flow_id", ""))
+        check("l167: a flow waiting for its callback is pending", s == 200 and json.loads(b)["status"] == "pending" and json.loads(b).get("flow_status") == "pending", (s, b[:200]))
+        s, _, b = call("GET", "/api/oauth/callback?error=access_denied&state=" + state, base=GW_L167, auth=False)
+        check("l167: a refused authorization comes back to the callback", s == 400 and "refused" in b, (s, b[:200]))
+        s, _, b = api("GET", "/api/oauth/config/oa/status?flow_id=" + init.get("flow_id", ""))
+        check("l167: the refused flow reads failed", s == 200 and json.loads(b)["status"] == "failed", (s, b[:200]))
+        s, _, b = api("GET", "/api/oauth/config/oa/status")
+        check("l167: a config whose last flow failed and that holds no token reads failed", s == 200 and json.loads(b)["status"] == "failed", (s, b[:200]))
+        s, _, b = api("POST", "/api/mcp/client/oa/initiate-verification")
+        init = json.loads(b) if s == 200 else {}
+        cp, cq = follow(init.get("authorize_url", ""))
+        s, _, b = call("GET", cp + "?" + cq, base=GW_L167, auth=False)
+        check("l167: the second flow completes", s == 200 and "is authorized" in b, (s, b[:200]))
+        s, _, b = api("GET", "/api/oauth/config/oa/status")
+        check("l167: an authorized config reads authorized with its token expiry", s == 200 and json.loads(b)["status"] == "authorized" and "token_expires_at" in json.loads(b), (s, b[:200]))
+        s, _, b = api("GET", "/api/oauth/config/oa/status?flow_id=" + init.get("flow_id", ""))
+        check("l167: a completed flow reads authorized", s == 200 and json.loads(b)["status"] == "authorized", (s, b[:200]))
+        s, _, b = api("POST", "/api/mcp/client/oa/reauthorize")
+        re_init = json.loads(b) if s == 200 else {}
+        check("l167: reauthorize names a status URL with its flow", s == 200 and re_init.get("status_url") == "/api/oauth/config/oa/status?flow_id=" + re_init.get("flow_id", "-"), (s, b[:300]))
+        s, _, b = api("GET", re_init.get("status_url", "/x"))
+        check("l167: a reauthorize polls pending while the config is still authorized", s == 200 and json.loads(b)["status"] == "pending", (s, b[:200]))
+        s, _, b = api("GET", "/api/oauth/config/oa/status")
+        check("l167: the bare status of a reauthorizing config stays authorized", s == 200 and json.loads(b)["status"] == "authorized", (s, b[:200]))
+        s, _, b = api("GET", "/api/oauth/config/po/status?flow_id=" + re_init.get("flow_id", ""))
+        check("l167: another config's flow is not found", s == 404, (s, b[:200]))
+
+        # the per-user OAuth client is verified by the admin, as before
+        s, _, b = api("POST", "/api/mcp/client/po/initiate-verification")
+        cp, cq = follow(json.loads(b).get("authorize_url", "") if s == 200 else "")
+        call("GET", cp + "?" + cq, base=GW_L167, auth=False)
+        api("POST", "/api/mcp/client/po/complete-oauth")
+        wait_mcp_tools(GW_L167, ["po-get_weather"])
+
+        # per-user headers: the tool call opens the submission and names its page, with a temp token
+        s, _, b = api("POST", "/api/mcp/client/tenant/verify-headers", {"headers": {"X-Tenant": "tenant-a-key-example"}})
+        wait_mcp_tools(GW_L167, ["tenant-get_weather"])
+        s, _, b = tool("sk-bf-l167-a", "tenant-get_weather")
+        m = _re.search(r"/workspace/mcp-sessions/auth\?flow=([A-Za-z0-9_-]+)&kind=headers#t=([0-9a-f]+)", b)
+        check("l167: a key without headers is sent the submission page, with its temp token", s == 401 and m is not None and "to submit the required headers" in b, (s, b[:300]))
+        hf, ht = (m.group(1), m.group(2)) if m else ("", "")
+        s, _, b = call("GET", "/api/mcp/per-user-headers/flows/" + hf, headers={"x-bifrost-temp-token": ht}, base=GW_L167, auth=False)
+        check("l167: the temp token opens the submission", s == 200 and json.loads(b)["required_header_keys"] == ["x-tenant"], (s, b[:200]))
+        s, _, b = call("GET", "/api/mcp/per-user-headers/flows/" + hf, base=GW_L167, auth=False)
+        check("l167: without it the submission is closed", s == 401, (s, b[:200]))
+        s, _, b = call("PUT", "/api/mcp/per-user-headers/flows/" + hf, {"headers": {"X-Tenant": "tenant-a-key-example"}}, {"x-bifrost-temp-token": ht}, base=GW_L167, auth=False)
+        check("l167: the temp token submits the values", s == 200 and json.loads(b)["status"] == "success", (s, b[:200]))
+        s, _, b = call("GET", "/api/mcp/per-user-headers/flows/" + hf, headers={"x-bifrost-temp-token": ht}, base=GW_L167, auth=False)
+        check("l167: the temp token ends with the submission", s == 401, (s, b[:200]))
+        s, _, b = tool("sk-bf-l167-a", "tenant-get_weather")
+        check("l167: the submitted values go with the key's tool call", s == 200 and "Sunny in Oslo" in b, (s, b[:200]))
+        ps, ph, page = raw("GET", GW_L167 + "/workspace/mcp-sessions/auth?flow=" + hf + "&kind=headers")
+        check("l167: the auth page serves the headers submission", ps == 200 and "kind" in page and "per-user-headers/flows/" in page, (ps, page[:200]))
+
+        # a per-user consent flow and a pending authorization request, then a restart
+        s, _, b = tool("sk-bf-l167-a", "po-get_weather")
+        m = _re.search(r"flow=([0-9a-f]+)#t=([0-9a-f]+)", b)
+        check("l167: a caller without a token gets a consent link with a temp token", s == 401 and m is not None, (s, b[:300]))
+        pf, pt = (m.group(1), m.group(2)) if m else ("", "")
+        cid, verifier, fid, ftok = as_open()
+        check("l167: an authorization request is open", fid != "" and ftok != "", (fid, ftok))
+        cid_u, verifier_u, fid_u, ftok_u = as_open()
+        s, page, sess = sign_in("alice", "/oauth/consent?flow=" + fid_u)
+        check("l167: a sign-in started from the consent page returns to it", s == 200 and sess != "" and ('location.replace("/oauth/consent?flow=' + fid_u + '")') in page, (s, page[:300]))
+        s, page, _ = sign_in("alice", "https://elsewhere.example/x")
+        check("l167: a sign-in never returns to another site", s == 200 and 'location.replace("/")' in page, (s, page[:300]))
+        state_files = sorted(os.listdir(folder))
+        flows_text = open(os.path.join(folder, "mcp-flow-state.json")).read() if "mcp-flow-state.json" in state_files else ""
+        check("l167: the flows are kept beside config.json, the temp token only as its hash", "mcp-flow-state.json" in state_files and pf in flows_text and pt not in flows_text and "enc:v1:" in flows_text, state_files)
+
+        gw = restart(gw)
+        s, _, b = call("GET", "/api/oauth/per-user/flows/" + pf, headers={"x-bifrost-temp-token": pt}, base=GW_L167, auth=False)
+        check("l167: after a restart the consent flow and its temp token still open", s == 200 and json.loads(b)["virtual_key_id"] == "vk-l167-a" and json.loads(b)["flow_mode"] == "vk", (s, b[:200]))
+        s, _, b = call("GET", "/api/oauth/per-user/flows/" + pf + "/start", headers={"x-bifrost-temp-token": pt}, base=GW_L167, auth=False)
+        cp, cq = follow(json.loads(b)["authorize_url"] if s == 200 else "")
+        s, _, b = call("GET", cp + "?" + cq, base=GW_L167, auth=False)
+        check("l167: the callback of a flow from before the restart saves the caller's token", s == 200 and "for this caller" in b, (s, b[:200]))
+        s, _, b = call("GET", "/api/oauth/per-user/flows/" + pf, headers={"x-bifrost-temp-token": pt}, base=GW_L167, auth=False)
+        check("l167: the temp token ends with its flow", s == 401, (s, b[:200]))
+        s, _, b = tool("sk-bf-l167-a", "po-get_weather")
+        check("l167: the caller's tool call runs with its token", s == 200 and "Sunny in Oslo" in b, (s, b[:200]))
+        s, _, b = raw("GET", GW_L167 + "/api/oauth2/consent/flows/" + fid, headers={"x-bifrost-temp-token": ftok})
+        check("l167: after a restart the authorization request still opens on the consent page", s == 200 and "e2e-client" in b, (s, b[:200]))
+        s, vk_redirect = consent_put(fid, ftok, {"mode": "vk", "value": "sk-bf-l167-a"})
+        check("l167: the request from before the restart is approved with a key", s == 200 and "code=" in vk_redirect, (s, vk_redirect[:200]))
+        s, _, sess = sign_in("alice")
+        s, _, b = raw("GET", GW_L167 + "/api/oauth2/consent/flows/" + fid_u, headers={"x-bifrost-temp-token": ftok_u, "authorization": "Bearer " + sess})
+        d = json.loads(b) if s == 200 else {}
+        check("l167: user mode is offered to the signed-in user, who is named", s == 200 and "user" in d.get("available_modes", []) and d.get("logged_in_user", {}).get("id") == "alice", (s, b[:300]))
+        s, _, b = raw("GET", GW_L167 + "/api/oauth2/consent/flows/" + fid_u, headers={"x-bifrost-temp-token": ftok_u})
+        check("l167: without a sign-in user mode is offered with no user named", s == 200 and "user" in json.loads(b)["available_modes"] and "logged_in_user" not in json.loads(b), (s, b[:300]))
+        s, b = consent_put(fid_u, ftok_u, {"mode": "user"})
+        check("l167: user mode without a sign-in is refused", s == 400 and "sign in" in b, (s, b[:200]))
+        s, user_redirect = consent_put(fid_u, ftok_u, {"mode": "user"}, sess)
+        check("l167: the signed-in user approves in user mode", s == 200 and "code=" in user_redirect, (s, user_redirect[:200]))
+
+        gw = restart(gw)
+        s, vk_tokens = as_token(GW_L167, cid, vk_redirect, verifier)
+        check("l167: a code consented before a restart exchanges after it", s == 200 and vk_tokens.get("access_token"), (s, vk_tokens))
+        s, user_tokens = as_token(GW_L167, cid_u, user_redirect, verifier_u)
+        check("l167: the user-mode code exchanges for tokens", s == 200 and user_tokens.get("access_token"), (s, user_tokens))
+        s = as_token(GW_L167, cid, vk_redirect, verifier)[0]
+        check("l167: a code exchanges once, across the restart too", s == 400, s)
+        ut = user_tokens.get("access_token", "")
+        payload = json.loads(base64.urlsafe_b64decode(ut.split(".")[1] + "==")) if ut.count(".") == 2 else {}
+        check("l167: the user-mode token names the user", payload.get("bf_mode") == "user" and payload.get("sub") == "alice", payload)
+        s, s2, b = mcp_rpc({"authorization": "Bearer " + ut}, "tools/list", {})
+        check("l167: /mcp takes the user-mode token", s == 200 and s2 == 200 and "po-get_weather" in b, (s, s2, b[:200]))
+        s, _, b = raw("POST", GW_L167 + "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, {"content-type": "application/json", "authorization": "Bearer " + ut, "x-bf-vk": "sk-bf-l167-a"})
+        check("l167: an OAuth token with a virtual key header is refused as conflicting", s == 401 and "conflicting credentials" in b, (s, b[:200]))
+        s, s2, b = mcp_rpc({"authorization": "Bearer " + ut}, "tools/call", {"name": "po-get_weather", "arguments": {"city": "Oslo"}})
+        m = _re.search(r"flow=([0-9a-f]+)", b)
+        check("l167: the user's first call of a per-user client needs the user's own consent, with no temp token", s2 == 200 and m is not None and "#t=" not in b, (s2, b[:300]))
+        uf = m.group(1) if m else ""
+        s, _, b = call("GET", "/api/oauth/per-user/flows/" + uf, base=GW_L167, auth=False)
+        check("l167: the user's flow does not open without a sign-in", s == 401, (s, b[:200]))
+        s, _, bob = sign_in("bob")
+        s, _, b = call("GET", "/api/oauth/per-user/flows/" + uf, headers={"authorization": "Bearer " + bob}, base=GW_L167, auth=False)
+        check("l167: another user cannot open the user's flow", s in (403,), (s, b[:200]))
+        s, _, sess = sign_in("alice")
+        s, _, b = call("GET", "/api/oauth/per-user/flows/" + uf, headers={"authorization": "Bearer " + sess}, base=GW_L167, auth=False)
+        check("l167: the user opens their own flow", s == 200 and json.loads(b)["flow_mode"] == "user" and json.loads(b)["user_id"] == "alice", (s, b[:200]))
+        s, _, b = call("GET", "/api/oauth/per-user/flows/" + uf + "/start", headers={"authorization": "Bearer " + sess}, base=GW_L167, auth=False)
+        cp, cq = follow(json.loads(b)["authorize_url"] if s == 200 else "")
+        s, _, b = call("GET", cp + "?" + cq, base=GW_L167, auth=False)
+        check("l167: the callback saves the user's own token", s == 200 and "for this caller" in b, (s, b[:200]))
+        s, s2, b = mcp_rpc({"authorization": "Bearer " + ut}, "tools/call", {"name": "po-get_weather", "arguments": {"city": "Oslo"}})
+        check("l167: the user's tool call runs with the user's token", s2 == 200 and "Sunny in Oslo" in b, (s2, b[:300]))
+        s, _, b = api("GET", "/api/mcp/sessions?kind=token")
+        rows = [r for r in json.loads(b)["sessions"] if r.get("user_id") == "alice"] if s == 200 else []
+        check("l167: the sessions list shows the user's token row in user mode", len(rows) == 1 and rows[0]["auth_mode"] == "user", (s, b[:300]))
+        s, _, b = api("GET", "/api/oauth2/sessions?bf_mode=user&user_id=alice")
+        check("l167: the user-mode grant is listed by its user", s == 200 and json.loads(b)["total_count"] == 1, (s, b[:300]))
+
+        # disable_vk_identity, with user mode available: vk tokens and refreshes stop, and consent offers no vk mode
+        cfg = config(disable_vk=True)
+        gw = restart(gw, cfg)
+        s, _, b = raw("POST", GW_L167 + "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, {"content-type": "application/json", "authorization": "Bearer " + vk_tokens.get("access_token", "")})
+        check("l167: a vk-mode token is refused once virtual-key identity is disabled", s == 401 and "virtual-key identity is no longer accepted" in b, (s, b[:200]))
+        form = urllib.parse.urlencode({"grant_type": "refresh_token", "refresh_token": vk_tokens.get("refresh_token", ""), "client_id": cid})
+        s, _, b = raw("POST", GW_L167 + "/oauth2/token", form, {"content-type": "application/x-www-form-urlencoded"})
+        check("l167: a vk-mode grant no longer refreshes", s == 400 and "virtual-key identity is no longer accepted" in b, (s, b[:200]))
+        _, _, fid3, ftok3 = as_open()
+        s, _, b = raw("GET", GW_L167 + "/api/oauth2/consent/flows/" + fid3, headers={"x-bifrost-temp-token": ftok3})
+        check("l167: consent offers no vk mode", s == 200 and json.loads(b)["available_modes"] == ["user"], (s, b[:200]))
+        s, s2, b = mcp_rpc({"authorization": "Bearer " + ut}, "tools/list", {})
+        check("l167: the user-mode token still works", s == 200 and s2 == 200, (s, s2, b[:200]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
+GW_L166 = "http://127.0.0.1:18285"  # MCP management: SSE heartbeats, OpenAPI YAML/$ref/security, spec_url, library, ping, tool cost, Responses, project MCP access
+
+def l166_config():
+    """The L166 gateway: MCP servers checked every second (one pinged, one that cannot be, one per-call whose instructions
+    change), an OpenAPI client read from a YAML spec_url with priced tools, the MCP library synced from the mock, a key whose
+    team's customer holds a small budget, and an open intersect project that caps MCP access and is assigned a virtual MCP."""
+    import hashlib
+    def client(name, **kw):
+        return {"name": name, "connection_type": "http", "connection_string": MOCK + "/mcp-i/" + name, **kw}
+    return {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": True},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l166-logs")},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False, "mcp_library_url": MOCK + "/mcp-i/_library"},
+        "providers": {"openai": {"keys": [{"name": "l166", "value": "sk-l166", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "mcp": {"client_configs": [
+            client("pingy", tool_sync_interval="1s"),
+            client("noping", tool_sync_interval="1s", is_ping_available=False),
+            client("dyn", tool_sync_interval="1s", needs_session_stickiness=False),
+            {"name": "echo", "connection_type": "openapi", "tool_pricing": {"getNote": 0.25},
+             "openapi_config": {"spec_url": MOCK + "/mcp-i/_spec.yaml", "security_credentials": {"apiKey": {"value": "key-l166"}, "bearer": {"value": "tok-l166"}}}},
+            # the same document from a file beside the config (spec_file), and one that tries to leave that folder
+            {"name": "filed", "connection_type": "openapi", "openapi_config": {"spec_file": "e2e-l166-spec.yaml"}},
+            {"name": "escaped", "connection_type": "openapi", "openapi_config": {"spec_file": "../e2e-l166-spec.yaml"}},
+        ]},
+        "virtual_mcps": [{"name": "vdyn", "tools": [{"source": "dyn-lookup"}]}],
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l166".encode()).hexdigest()}],
+            "budgets": [{"id": "b-l166", "max_limit": 0.4, "reset_duration": "1d"}],
+            "customers": [{"id": "c-l166", "name": "Toolco", "budget_id": "b-l166"}],
+            "teams": [{"id": "t-l166", "name": "tools", "customer_id": "c-l166"}],
+            "virtual_keys": [{"id": "vk-l166", "value": "sk-bf-l166"}, {"id": "vk-l166-team", "value": "sk-bf-l166-team", "team_id": "t-l166"}],
+            "projects": [{"id": "p-l166", "name": "tool-proj", "membership_mode": "open", "access_rule": "intersect", "provider_configs": [{"provider": "openai"}],
+                          "mcp_configs": [{"mcp_client_name": "pingy", "tools_to_execute": ["lookup"]}], "virtual_mcps": ["vdyn"]}],
+        },
+    }
+
+def l166_e2e(env):
+    """L166: the MCP management items of WP5. GET /mcp stays open with heartbeats; OpenAPI clients from YAML with $ref, per-operation
+    security and flattened schemas, and a spec_url stored with a client created over the API (openapi-spec, preview); the MCP
+    library routes and the mcp_library_url sync; the ping health check; tool cost on the MCP log and the debit of the team's
+    customer; MCP tools and instructions on Responses requests, with instructions re-read on the periodic check; a project's
+    mcp_configs and its assigned virtual MCP. Its own gateway on 18285."""
+    import shutil, http.client
+    cfg_path = os.path.join(BUILD, "e2e.l166.json")
+    json.dump(l166_config(), open(cfg_path, "w"))
+    open(os.path.join(BUILD, "e2e-l166-spec.yaml"), "w").write(call("GET", "/mcp-i/_spec.yaml", base=MOCK)[2])
+    shutil.rmtree(os.path.join(BUILD, "e2e-l166-logs"), ignore_errors=True)
+    for f in (cfg_path + ".mcp_library.json",):
+        if os.path.exists(f):
+            os.remove(f)
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18285", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l166.log"), "w"))
+    ADM = {"authorization": "Bearer sk-admin-l166"}
+    KEY = {"x-bf-vk": "sk-bf-l166"}
+    PROJ = {**KEY, "x-bf-project-id": "p-l166"}
+    def gwc(method, path, body=None, headers=None):
+        return call(method, path, body, headers, base=GW_L166, auth=False)
+    def tool(name, args, headers=KEY):
+        s, _, b = gwc("POST", "/v1/mcp/tool/execute", {"id": "c1", "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}, headers)
+        content = json.loads(b).get("content", "") if s == 200 else b
+        return s, content
+    try:
+        wait(GW_L166 + "/health")
+        call("POST", "/_a2a/mcp-instr?name=dyn&text=Dyn+v1", base=MOCK)
+        for _ in range(120):
+            s, h, _ = gwc("POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "e2e-ready", "version": "1"}}}, KEY)
+            s, _, b = gwc("POST", "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, {**KEY, "mcp-session-id": hdr(h, "mcp-session-id") or ""})
+            if all(n in b for n in ["pingy-lookup", "noping-lookup", "dyn-lookup", "echo-getNote", "echo-addNote", "echo-missing"]):
+                break
+            time.sleep(0.25)
+        check("an OpenAPI client read from a YAML spec_url lists its operations as tools", all(n in b for n in ["echo-getNote", "echo-addNote", "echo-missing"]), b[:400])
+        for _ in range(40):
+            if "filed-getNote" in b:
+                break
+            time.sleep(0.25)
+            s, _, b = gwc("POST", "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, {**KEY, "mcp-session-id": hdr(h, "mcp-session-id") or ""})
+        st = json.loads(call("GET", "/api/mcp", None, ADM, base=GW_L166, auth=False)[2]).get("clients", [])
+        esc = [c for c in st if c["name"] == "escaped"]
+        check("a spec_file beside the config is read; one outside its folder is refused", "filed-getNote" in b and esc and not esc[0]["connected"] and "outside the config directory" in esc[0]["error"], (b[:200], esc))
+
+        # ---- GET /mcp: the stream stays open, with a heartbeat comment every 15 seconds ----
+        conn = http.client.HTTPConnection("127.0.0.1", 18285, timeout=25)
+        conn.request("GET", "/mcp", headers={**KEY, "accept": "text/event-stream"})
+        resp = conn.getresponse()
+        first = resp.readline().decode() + resp.readline().decode()
+        t0 = time.time()
+        beat = resp.readline().decode()
+        waited = time.time() - t0
+        conn.close()
+        check("GET /mcp answers an event stream that opens with connection/opened", resp.status == 200 and "text/event-stream" in (resp.getheader("content-type") or "") and '"method":"connection/opened"' in first, (resp.status, first))
+        check("the stream stays open and sends Bifrost's heartbeat comment after about 15 seconds", beat == ": heartbeat\n" and 10 < waited < 22, (beat, waited))
+
+        # ---- OpenAPI calls: the operation's request, its credentials, flattened arguments ----
+        s, c = tool("echo-getNote", {"id": "a b", "verbose": True})
+        got = json.loads(c) if s == 200 and c.startswith("{") else {}
+        check("an OpenAPI tool call sends the path parameter ($ref) and the query, with the document's apiKey security", got.get("path") == "/mcp-i/_api/notes/a%20b" and "verbose=true" in got.get("query", "") and got.get("api_key") == "key-l166" and got.get("authorization") == "", (s, c[:300]))
+        s, c = tool("echo-addNote", {"title": "groceries"})
+        got = json.loads(c) if s == 200 and c.startswith("{") else {}
+        check("an operation's own security (bearer) replaces the document's, and the body's properties are the arguments", got.get("method") == "POST" and got.get("authorization") == "Bearer tok-l166" and got.get("api_key") == "" and json.loads(got.get("body") or "{}") == {"title": "groceries"}, (s, c[:300]))
+        s, c = tool("echo-missing", {})
+        check("an upstream 404 comes back as the tool's error, led by the HTTP status", s == 200 and "HTTP 404 Not Found" in c, (s, c[:200]))
+
+        # ---- tool cost: on the MCP log, and debited from the team's customer budget (0.4) ----
+        TEAM = {"x-bf-vk": "sk-bf-l166-team"}
+        s0, _ = tool("echo-getNote", {"id": "n1"}, TEAM)
+        s1, _ = tool("echo-getNote", {"id": "n2"}, TEAM)
+        s2, c2 = tool("echo-getNote", {"id": "n3"}, TEAM)
+        check("a priced tool is refused once the team's customer budget is spent (the third call at 0.25 each)", s0 == 200 and s1 == 200 and s2 == 402, (s0, s1, s2, c2[:200]))
+        logs = []
+        for _ in range(40):
+            s, _, b = call("GET", "/api/mcp-logs?limit=50", None, ADM, base=GW_L166, auth=False)
+            logs = json.loads(b).get("logs", []) if s == 200 else []
+            if sum(1 for x in logs if x.get("tool_name") == "getNote") >= 2:
+                break
+            time.sleep(0.25)
+        priced = [x for x in logs if x.get("tool_name") == "getNote"]
+        check("the MCP log entry of a priced tool carries its cost", len(priced) >= 2 and all(abs(float(x.get("cost") or 0) - 0.25) < 1e-9 for x in priced), [(x.get("tool_name"), x.get("cost")) for x in logs][:6])
+        check("an unpriced tool's entry costs nothing", any(x.get("tool_name") == "addNote" and float(x.get("cost") or 0) == 0 for x in logs), [(x.get("tool_name"), x.get("cost")) for x in logs][:6])
+
+        # ---- spec_url sent over the API: fetched and stored with the client ----
+        s, _, b = call("POST", "/api/mcp/client", {"name": "echo2", "connection_type": "openapi", "openapi_config": {"spec_url": MOCK + "/mcp-i/_spec.yaml"}}, ADM, base=GW_L166, auth=False)
+        made = json.loads(b) if s in (200, 201) else {}
+        oc = made.get("openapi_config", {})
+        check("a client created with a spec_url stores the document and its metadata", s == 201 and oc.get("spec_url") == MOCK + "/mcp-i/_spec.yaml" and oc.get("openapi_version") == "3.0.3" and oc.get("operation_count") == 3 and oc.get("spec_title") == "Echo API", (s, b[:400]))
+        s, h, b = call("GET", "/api/mcp/client/echo2/openapi-spec", None, ADM, base=GW_L166, auth=False)
+        check("openapi-spec returns the stored YAML document as YAML", s == 200 and (hdr(h, "content-type") or "").startswith("application/yaml") and b.startswith("openapi: 3.0.3"), (s, hdr(h, "content-type"), b[:80]))
+        s, _, b = call("GET", "/api/mcp/client/echo/openapi-spec", None, ADM, base=GW_L166, auth=False)
+        check("a config.json client that names only a spec_url has no stored spec", s == 404 and "no stored spec" in b, (s, b[:200]))
+        s, _, b = call("POST", "/api/mcp/client", {"name": "badspec", "connection_type": "openapi", "openapi_config": {"spec_url": MOCK + "/mcp-i/_spec.yaml"}, "tools_to_execute": ["nope"]}, ADM, base=GW_L166, auth=False)
+        check("tools_to_execute must name tools the spec defines", s == 400 and "the spec defines no tool named nope" in b, (s, b[:200]))
+        s, _, b = call("POST", "/api/mcp/openapi/preview", {"spec_url": MOCK + "/mcp-i/_spec.yaml", "client_name": "echo"}, ADM, base=GW_L166, auth=False)
+        pv = json.loads(b) if s == 200 else {}
+        add = [t for t in pv.get("tools", []) if t["name"] == "addNote"]
+        check("the preview of a spec_url returns the fetched document, the tools and their flattened schemas", s == 200 and pv.get("spec", "").startswith("openapi:") and pv.get("tool_count") == 3 and add and add[0]["input_schema"] == {"type": "object", "properties": {"title": {"type": "string"}}, "required": ["title"]}, (s, b[:500]))
+
+        # ---- the MCP library: synced from mcp_library_url, then custom rows, hiding and force-sync ----
+        lib = {}
+        for _ in range(80):
+            s, _, b = call("GET", "/api/mcp/library", None, ADM, base=GW_L166, auth=False)
+            lib = json.loads(b) if s == 200 else {}
+            if lib.get("total_count") == 2:
+                break
+            time.sleep(0.25)
+        names = [x["name"] for x in lib.get("servers", [])]
+        check("the library syncs from mcp_library_url at start, sorted by name", names == ["Files", "GitHub"] and lib["servers"][1]["slug"] == "github" and lib["servers"][1]["source"] == "remote", lib)
+        s, _, b = call("GET", "/api/mcp/library/filterdata", None, ADM, base=GW_L166, auth=False)
+        check("library filter data lists the distinct facets", s == 200 and json.loads(b) == {"categories": ["dev", "storage"], "connection_types": ["http", "stdio"], "auth_types": ["oauth"], "tags": ["code", "git", "local"]}, (s, b))
+        s, _, b = call("POST", "/api/mcp/library", {"name": "Team Wiki", "connection_type": "sse", "connection_url": "https://wiki.example/sse", "tags": ["docs"]}, ADM, base=GW_L166, auth=False)
+        check("a custom library server is published", s == 200 and json.loads(b)["entry"]["source"] == "custom" and json.loads(b)["entry"]["auth_type"] == "none", (s, b[:300]))
+        s, _, b = call("POST", "/api/mcp/library", {"name": "team-wiki", "connection_type": "http", "connection_url": "https://x.example"}, ADM, base=GW_L166, auth=False)
+        check("a name with a taken slug is a 409", s == 409, (s, b))
+        gh = [x for x in lib.get("servers", []) if x["slug"] == "github"]
+        s, _, b = call("DELETE", "/api/mcp/library/" + str(gh[0]["id"] if gh else 0), None, ADM, base=GW_L166, auth=False)
+        check("a library row is hidden", s == 200, (s, b))
+        s, _, b = call("POST", "/api/mcp/library/force-sync", None, ADM, base=GW_L166, auth=False)
+        check("force-sync syncs the catalog again, leaving the hidden row out", s == 200 and "1 entries synced" in b, (s, b))
+        s, _, b = call("GET", "/api/mcp/library?search=wiki", None, ADM, base=GW_L166, auth=False)
+        s2, _, b2 = call("GET", "/api/mcp/library?limit=1&sort_by=name&order=desc", None, ADM, base=GW_L166, auth=False)
+        page = json.loads(b2) if s2 == 200 else {}
+        check("the library is searched and paged; the hidden row stays hidden", s == 200 and json.loads(b)["total_count"] == 1 and page.get("total_count") == 2 and page["servers"][0]["name"] == "Team Wiki" and page.get("limit") == 1, (b[:200], b2[:300]))
+
+        # ---- the ping health check, and instructions re-read on the periodic check ----
+        time.sleep(2.5)
+        pings = json.loads(call("GET", "/_a2a/mcp-pings", base=MOCK)[2])
+        check("each check pings a server that offers ping, and not one with is_ping_available false or a per-call one", pings.get("pingy", 0) >= 2 and pings.get("noping", 0) == 0 and pings.get("dyn", 0) == 0, pings)
+        call("POST", "/_a2a/mcp-instr?name=dyn&text=Dyn+v2", base=MOCK)
+        instr = ""
+        for _ in range(40):
+            s, _, b = gwc("POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "e2e", "version": "1"}}}, KEY)
+            instr = json.loads(b).get("result", {}).get("instructions", "") if s == 200 else ""
+            if "Dyn v2" in instr:
+                break
+            time.sleep(0.25)
+        check("a per-call client's instructions are re-read on the periodic check", "Dyn v2" in instr, instr)
+
+        # ---- Responses requests get the MCP tools and the servers' instructions ----
+        before = len([x for x in seen() if x["path"] == "/v1/responses"])
+        s, _, b = gwc("POST", "/v1/responses", {"model": "openai/gpt-4o-mini", "input": "hi", "instructions": "Be brief.", "tools": [{"type": "function", "name": "pingy-lookup", "parameters": {"type": "object"}}]}, KEY)
+        got = [x for x in seen() if x["path"] == "/v1/responses"]
+        sent = json.loads(got[-1]["body"]) if s == 200 and len(got) > before else {}
+        tnames = [t.get("name") for t in sent.get("tools", [])]
+        check("a Responses request is offered the MCP tools in the Responses shape, a tool it names itself kept", s == 200 and "dyn-lookup" in tnames and "echo-getNote" in tnames and tnames.count("pingy-lookup") == 1 and sent["tools"][0] == {"type": "function", "name": "pingy-lookup", "parameters": {"type": "object"}} and all("function" not in t for t in sent["tools"]), (s, tnames))
+        check("and the servers' instructions follow its own", sent.get("instructions", "").startswith("Be brief.\n\n<mcp_server name=\"dyn\">\nDyn v2\n</mcp_server>"), sent.get("instructions"))
+
+        # ---- a project's MCP access: intersect caps the tools, its virtual MCP still reaches its own ----
+        before = len([x for x in seen() if x["path"] == "/v1/chat/completions"])
+        s, _, b = gwc("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "proj-1"}]}, PROJ)
+        got = [x for x in seen() if x["path"] == "/v1/chat/completions"]
+        sent = json.loads(got[-1]["body"]) if s == 200 and len(got) > before else {}
+        tnames = [t["function"]["name"] for t in sent.get("tools", [])]
+        check("an intersect project's mcp_configs cap the tools a request is offered", s == 200 and tnames == ["pingy-lookup"], (s, tnames))
+        s, c = tool("dyn-lookup", {"q": "x"}, PROJ)
+        check("a tool the project does not allow is refused inside it", s == 403, (s, c[:200]))
+        s, c = tool("pingy-lookup", {"q": "x"}, PROJ)
+        check("a tool it allows runs", s == 200 and "found in pingy" in c, (s, c[:200]))
+        s, h, _ = gwc("POST", "/mcp/vdyn", {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "e2e", "version": "1"}}}, PROJ)
+        sid = {"mcp-session-id": hdr(h, "mcp-session-id") or ""}
+        s, _, b = gwc("POST", "/mcp/vdyn", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, {**PROJ, **sid})
+        vt = [t["name"] for t in json.loads(b).get("result", {}).get("tools", [])] if s == 200 else []
+        s, _, b = gwc("POST", "/mcp/vdyn", {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": vt[0] if vt else "lookup", "arguments": {"q": "y"}}}, {**PROJ, **sid})
+        check("the project's assigned virtual MCP still runs its tools through it", s == 200 and "found in dyn" in b and '"isError":true' not in b, (s, vt, b[:300]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
+GW_L165 = "http://127.0.0.1:18284"  # built-in role ids, user emails, quota model_configs, role attachments, complexity status, rotate revoking MCP grants
+
+def l165_e2e(env):
+    """L165 (governance and RBAC API): the built-in roles with fixed ids on Bifrost's role routes and expanded in
+    /users/me/permissions (and Bifrost's permission map on the governance path); users with email addresses and the
+    lookups by email; a built-in role set by id and attached to access profiles (apply_to_existing and is_default);
+    the quota view's model_configs; governance.complexity_analyzer_config read and the complexity status routes; and a
+    key's rotation revoking its MCP OAuth grants. Its own gateway (18284), started and stopped here."""
+    import hashlib, shutil
+    d = os.path.join(BUILD, "e2e-l165")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    cfg_path = os.path.join(d, "config.json")
+    def tok(t):
+        return hashlib.sha256(t.encode()).hexdigest()
+    json.dump({
+        "client": {"enable_logging": False, "enforce_auth_on_inference": True, "mcp_server_auth_mode": "both",
+                   "oauth2_server_config": {"issuer_url": GW_L165, "access_token_ttl": 600}},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        # adaptive load balancing's provider level: openai's only key for gpt-l165 is refused (and held), groq serves it
+        "health": {"adaptive": True, "reroute_failed_directions": True},
+        "providers": {"openai": {"keys": [{"name": "l165", "value": "sk-bad-key-l165", "models": ["gpt-l165"], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+                      "groq": {"keys": [{"name": "l165g", "value": "sk-l165-groq", "models": ["gpt-l165"], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": tok("sk-admin-l165-root")},
+                      {"name": "vi", "role": "viewer", "email": "vi@example.com", "token_sha256": tok("sk-admin-l165-view")}],
+            "access_profiles": [{"id": "p-view", "name": "Viewers"}, {"id": "p-later", "name": "Later viewers"}],
+            "budgets": [{"id": "b-vk", "max_limit": 10, "reset_duration": "1d"}, {"id": "b-mc", "max_limit": 3, "reset_duration": "1d"}],
+            "rate_limits": [{"id": "rl-mc", "request_max_limit": 5, "request_reset_duration": "1h"}],
+            "virtual_keys": [{"id": "vk-q", "name": "quota key", "value": "sk-bf-l165-q", "user_id": "vi", "budget_id": "b-vk", "provider_configs": [{"provider": "openai"}]},
+                             {"id": "vk-dir", "name": "direction key", "value": "sk-bf-l165-dir", "provider_configs": [{"provider": "openai"}, {"provider": "groq"}]}],
+            "model_configs": [{"id": "mc-4o", "model_name": "gpt-4o", "provider": "openai", "scope": "virtual_key", "scope_id": "vk-q", "budget_ids": ["b-mc"], "rate_limit_id": "rl-mc"},
+                              {"id": "mc-all", "model_name": "*", "scope": "virtual_key", "scope_id": "vk-q"}],
+            "complexity_analyzer_config": {
+                "keywords": {"simple_keywords": ["hi"], "medium_keywords": ["summarize this"], "complex_keywords": ["design a system"]},
+                "semantic": {"provider": "openai", "embedding_model": "text-embedding-3-small", "timeout": "2s"}},
+        },
+    }, open(cfg_path, "w"))
+    root = {"authorization": "Bearer sk-admin-l165-root"}
+    view = {"authorization": "Bearer sk-admin-l165-view"}
+    def api(method, p, body=None, who=root):
+        h = {"content-type": "application/json", **who}
+        return raw(method, GW_L165 + p, body, h)
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18284", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l165.log"), "w"))
+    try:
+        wait(GW_L165 + "/health")
+        # built-in roles
+        s, _, b = api("GET", "/api/governance/rbac/roles")
+        roles = json.loads(b).get("roles", []) if s == 200 else []
+        system = [(r["id"], r["name"]) for r in roles if r.get("is_system_role")]
+        check("Bifrost's role list puts the built-in roles first, with fixed ids", system == [(9001, "admin"), (9002, "editor"), (9003, "viewer"), (9004, "auditor")] and roles[0]["name"] == "admin", (s, b[:300]))
+        s, _, b = api("GET", "/api/roles")
+        check("the /api/roles list keeps the custom roles only", s == 200 and json.loads(b)["roles"] == [], (s, b[:200]))
+        s, _, b = api("GET", "/api/governance/rbac/roles/9003/permissions")
+        pairs = json.loads(b).get("permissions", []) if s == 200 else []
+        check("a built-in role's rules read as permission pairs by its id", any(p["resource"] == "Logs" and p["operation"] == "View" for p in pairs) and not any(p["operation"] == "Create" for p in pairs), (s, b[:300]))
+        s, _, b = api("DELETE", "/api/governance/rbac/roles/9001")
+        check("a built-in role cannot be deleted", s == 403 and "system role" in b, (s, b[:200]))
+        s, _, b = api("GET", "/api/users/me/permissions", who=view)
+        me = json.loads(b) if s == 200 else {}
+        ops = {p["operation"] for p in me.get("permissions", [])}
+        check("a built-in role's caller reads its rules as pairs, with the role's id", me.get("role") == "viewer" and me.get("role_id") == 9003 and me.get("built_in") is True and len(me.get("permissions", [])) > 0 and ops <= {"View", "Download"}, (s, b[:300]))
+        s, _, b = api("GET", "/api/governance/users/me/permissions", who=view)
+        pm = json.loads(b).get("permissions", {}) if s == 200 else {}
+        check("the governance path answers Bifrost's permission map", pm.get("Logs", {}).get("View") is True and pm.get("Users", {}).get("View") is False and pm.get("VirtualKeys", {}).get("Create") is False, (s, b[:300]))
+        # emails
+        s, _, b = api("POST", "/api/users", {"name": "ed", "role": "editor", "email": "ed@example.com"})
+        check("a user is created with an email address", s == 201 and json.loads(b).get("email") == "ed@example.com", (s, b[:200]))
+        s, _, b = api("POST", "/api/users", {"name": "ed2", "role": "editor", "email": "ED@example.com"})
+        check("an email address another user has is refused", s == 409, (s, b[:200]))
+        s, _, b = api("GET", "/api/governance/users/email/ed%40example.com")
+        u = json.loads(b) if s == 200 else {}
+        check("a user is found by email in Bifrost's UserObject shape", u.get("id") == "ed" and u.get("email") == "ed@example.com" and u.get("role_id") == 9002 and u.get("role", {}).get("is_system_role") is True, (s, b[:300]))
+        s, _, b = api("GET", "/api/users/email/VI%40example.com")
+        check("the old path finds a user by email, without case", s == 200 and json.loads(b).get("id") == "vi", (s, b[:200]))
+        s, _, b = api("GET", "/api/governance/users/email/nobody%40example.com")
+        check("an unknown email is 404", s == 404, (s, b[:200]))
+        s, _, b = api("GET", "/api/governance/users/email/ed%40example.com", who=view)
+        check("the email lookup needs user management", s == 403, (s, b[:200]))
+        s, _, b = api("GET", "/api/governance/users/email/vi%40example.com/virtual-keys")
+        ks = json.loads(b) if s == 200 else {}
+        check("a user's virtual keys are listed by email", ks.get("user_id") == "vi" and [k["id"] for k in ks.get("virtual_keys", [])] == ["vk-q"] and ks["virtual_keys"][0]["value"] == "sk-bf-l165-q", (s, b[:300]))
+        s, _, b = api("GET", "/api/governance/virtual-keys/vk-q/users")
+        check("a key's assigned user carries the email", s == 200 and json.loads(b)["users"][0]["user_email"] == "vi@example.com", (s, b[:200]))
+        # a built-in role by id, and access profiles attached to it
+        s, _, b = api("PUT", "/api/users/ed/role", {"role_id": 9003})
+        check("a user's built-in role is set by its id", s == 200 and json.loads(b)["role"] == "viewer", (s, b[:200]))
+        s, _, b = api("POST", "/api/governance/access-profiles/p-view/roles", {"role_ids": [9003], "apply_to_existing": True})
+        check("a profile attached to a built-in role with apply_to_existing reaches its users now", s == 200 and json.loads(b)["users_applied"] == 2, (s, b[:200]))
+        s, _, b = api("POST", "/api/governance/access-profiles/p-later/roles", {"role_ids": [9003], "is_default": True})
+        check("a default-only attachment gives nobody the profile now", s == 200 and json.loads(b)["users_applied"] == 0, (s, b[:200]))
+        s, _, b = api("GET", "/api/users/vi/access-profiles")
+        held = [p["id"] for p in json.loads(b).get("access_profiles", [])] if s == 200 else []
+        check("the role's users now hold the applied profile, not the default-only one", held == ["p-view"], (s, b[:300]))
+        s, _, b = api("POST", "/api/users", {"name": "zed", "role": "viewer"})
+        s, _, b = api("GET", "/api/users/zed/access-profiles")
+        held = [p["id"] for p in json.loads(b).get("access_profiles", [])] if s == 200 else []
+        check("a user who joins the role later holds the default profile, not the one applied before", held == ["p-later"], (s, b[:300]))
+        s, _, b = api("GET", "/api/governance/users")
+        names = [u["name"] for u in json.loads(b).get("users", [])] if s == 200 else []
+        check("Bifrost's /api/governance/users lists the users", "zed" in names and "vi" in names, (s, b[:200]))
+        s, _, b = api("PUT", "/api/governance/users/zed/role", {"role_id": 9004})
+        check("a role is set on the governance users path", s == 200 and json.loads(b)["role"] == "auditor", (s, b[:200]))
+        s, _, b = api("GET", "/api/governance/users", who=view)
+        check("the governance users path needs user management", s == 403, (s, b[:200]))
+        # quota model_configs
+        s, _, b = call("GET", "/api/governance/virtual-keys/quota", None, {"x-bf-vk": "sk-bf-l165-q"}, base=GW_L165, auth=False)
+        q = json.loads(b) if s == 200 else {}
+        mcs = q.get("model_configs", [])
+        check("the quota view lists the key's per-model limits, without the all-models one", len(mcs) == 1 and mcs[0]["model_name"] == "gpt-4o" and mcs[0]["provider"] == "openai" and mcs[0]["budgets"][0]["id"] == "b-mc" and mcs[0]["budgets"][0]["max_limit"] == 3 and mcs[0]["rate_limit"]["id"] == "rl-mc", (s, b[:400]))
+        # the complexity analyzer from governance.complexity_analyzer_config, and its status routes
+        s, _, b = api("GET", "/api/routing/complexity-analyzer-config")
+        cx = json.loads(b) if s == 200 else {}
+        check("governance.complexity_analyzer_config is read as the semantic classifier", cx.get("classifier") == "semantic" and cx.get("semantic", {}).get("exemplars", {}).get("complex") == ["design a system"] and cx.get("semantic", {}).get("timeout_ms") == 2000, (s, b[:300]))
+        s, _, b = api("GET", "/api/routing/complexity-analyzer-status")
+        st = json.loads(b) if s == 200 else {}
+        check("the analyzer status reads warming before the first classified request", st.get("state") == "warming" and st.get("total") == 3 and st.get("loaded") == 0 and "SIMPLE" in st.get("decision_defaults", {}).get("criteria", {}), (s, b[:300]))
+        s, _, b = api("POST", "/api/routing/complexity-analyzer-status/retry")
+        check("a warm-up that has not failed is not retried", s == 409, (s, b[:200]))
+        s, _, b = api("GET", "/api/routing/complexity-analyzer-generations")
+        check("no generation is held before the first warm-up", s == 200 and json.loads(b)["generations"] == [], (s, b[:200]))
+        s, _, b = api("DELETE", "/api/routing/complexity-analyzer-generations/not-a-generation")
+        check("a namespace outside the classifier's scheme is refused", s == 400, (s, b[:200]))
+        # reroute_failed_directions: a pinned provider whose only key is held goes to a healthy provider for the model
+        dir_msgs = {"model": "openai/gpt-l165", "messages": [{"role": "user", "content": "hi"}]}
+        s1, _, b1 = call("POST", "/v1/chat/completions", dir_msgs, {"x-bf-vk": "sk-bf-l165-dir"}, base=GW_L165, auth=False)
+        s, _, b = api("GET", "/api/adaptive-routing/held-keys")
+        held = [r["target"] for r in json.loads(b).get("held_keys", [])] if s == 200 else []
+        check("the refused key of the pinned provider is held", s1 == 401 and held == ["openai#l165"], (s1, b1[:200], held))
+        s, h, b = call("POST", "/v1/chat/completions", dir_msgs, {"x-bf-vk": "sk-bf-l165-dir"}, base=GW_L165, auth=False)
+        prov = {k.lower(): v for k, v in h.items()}.get("x-bifrost-provider", "")
+        check("with its direction broken, the pinned request is rerouted to a healthy provider", s == 200 and prov == "groq", (s, prov, b[:200]))
+        # a rotated key loses its MCP OAuth grants
+        cid, refresh = as_grant(GW_L165, "l165-client", "sk-bf-l165-q")
+        s, _, b = api("GET", "/api/oauth2/sessions?virtual_key_id=vk-q")
+        check("the key holds an MCP OAuth grant", refresh != "" and s == 200 and json.loads(b)["total_count"] == 1, (s, b[:200]))
+        s, _, b = api("POST", "/api/governance/virtual-keys/vk-q/rotate")
+        check("the key is rotated", s == 200, (s, b[:200]))
+        s, body = as_refresh(GW_L165, cid, refresh)
+        check("a rotated key's grant no longer refreshes", s == 400, (s, body))
+        s, _, b = api("GET", "/api/oauth2/sessions?virtual_key_id=vk-q")
+        check("the rotated key's grants are gone from the list", s == 200 and json.loads(b)["total_count"] == 0, (s, b[:200]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
+GW_L164 = "http://127.0.0.1:18282"  # L164: provider operations (tool_choice, xAI compaction, Copilot, Mantle, Sarvam, Replicate, alias overrides, cache points)
+
+def l164_config() -> dict:
+    """Providers on the mock for L164: Gemini and Cohere (tool_choice), xAI and Bedrock Mantle and Vertex (from the main
+    e2e config), GitHub Copilot, Sarvam, Replicate and two Azure resources under /l164, and Bedrock with cache injection
+    points and an alias that overrides the region."""
+    base = json.load(open(os.path.join(BUILD, "e2e.config.json")))
+    ps = base["providers"]
+    def key(name, value, **extra):
+        return {"name": name, "value": value, "models": [], "weight": 1.0, **extra}
+    vertex = dict(ps["vertex"])
+    vertex["prompt_cache"] = {"cache_control_injection_points": [{"location": "message", "role": "system"}]}
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {
+            "gemini": {"keys": [key("g", "g-key")], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "cohere": {"keys": [key("co", "co-key")], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "cohere-tok": {"keys": [key("cot", "co-key")], "custom_provider_config": {"base_provider_type": "cohere"}, "network_config": {"base_url": MOCK + "/l164/cohere", "max_retries": 0}},
+            "vllm": {"keys": [key("vl", "vl-key")], "network_config": {"base_url": MOCK + "/l164/vllm/v1", "max_retries": 0}},
+            "xai": ps["xai"],
+            "bedrock_mantle": ps["bedrock_mantle"],
+            "vertex": vertex,
+            "github-copilot": {"keys": [key("gc", "tid=l164")], "network_config": {"base_url": MOCK + "/l164/copilot", "max_retries": 0}},
+            "sarvam": {"keys": [key("sv", "sv-key")], "network_config": {"base_url": MOCK + "/l164/sarvam", "max_retries": 0}},
+            "replicate": {"keys": [key("rp", "r8_l164", aliases={"dep": {"model_id": "acme/dep-a", "use_deployments_endpoint": True}})],
+                          "network_config": {"base_url": MOCK + "/l164/replicate", "max_retries": 0, "default_request_timeout_in_seconds": 20}},
+            "azure": {"keys": [key("az", "az-l164", azure_key_config={"endpoint": MOCK + "/l164/azure-main", "api_version": "2024-10-21"},
+                                   aliases={"east": {"model_id": "gpt-4o", "endpoint": MOCK + "/l164/azure-east", "api_version": "2025-01-01-preview"}})]},
+            "bedrock": {"keys": [key("bk", "", bedrock_key_config={"access_key": "AKIDEXAMPLE", "secret_key": "secret", "region": "us-east-1"},
+                                     aliases={"eu-claude": {"model_id": "anthropic.claude-3-haiku-20240307-v1:0", "region": "eu-west-1"}})],
+                        "network_config": {"base_url": MOCK, "max_retries": 0},
+                        "prompt_cache": {"cache_control_injection_points": [{"location": "message", "index": -1}]}},
+        },
+    }
+
+def l164_e2e(env):
+    """L164: Gemini's toolConfig and Cohere's tool_choice from OpenAI's tool_choice; xAI's /v1/responses/compact;
+    GitHub Copilot's model listing (editor headers) and Responses through chat; Bedrock Mantle's listing and Claude
+    token counts; Sarvam's own text-to-speech and speech-to-text, its chat and models, and its refused text completions;
+    a Replicate chat prediction polled until it settles and an alias on the deployments endpoint; an Azure alias's
+    endpoint and api_version, a Bedrock alias's region; cache points from the injection points on Bedrock and Claude on
+    Vertex. Its own gateway, started and stopped here."""
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    cfg_path = os.path.join(BUILD, "e2e.l164.json")
+    json.dump(l164_config(), open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18282", "-host", "127.0.0.1", "-config", cfg_path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l164.log"), "w"))
+    def post(path, body, headers=None):
+        return call("POST", path, body, headers, base=GW_L164, auth=False)
+    def last(prefix):
+        rows = [x for x in seen() if x["path"].startswith(prefix)]
+        return rows[-1] if rows else {"path": "", "body": "", "auth": ""}
+    def jb(text):
+        try:
+            return json.loads(text)
+        except ValueError:
+            return {}
+    msgs = [{"role": "system", "content": "rules"}, {"role": "user", "content": "one"}, {"role": "assistant", "content": "two"}, {"role": "user", "content": "three"}]
+    tools = [{"type": "function", "function": {"name": "weather", "parameters": {"type": "object"}}}]
+    try:
+        wait(GW_L164 + "/health")
+        # tool_choice on Gemini and Cohere, as Bifrost maps it
+        s, _, b = post("/v1/chat/completions", {"model": "gemini/gemini-2.5-flash", "messages": msgs[1:2], "tools": tools, "tool_choice": "required"})
+        up = jb(last("/v1beta/models/gemini-2.5-flash")["body"])
+        check("gemini: tool_choice required is toolConfig mode ANY", s == 200 and up.get("toolConfig") == {"functionCallingConfig": {"mode": "ANY"}}, (s, b[:200], up))
+        s, _, b = post("/v1/chat/completions", {"model": "gemini/gemini-2.5-flash", "messages": msgs[1:2], "tools": tools, "tool_choice": {"type": "function", "function": {"name": "weather"}}})
+        up = jb(last("/v1beta/models/gemini-2.5-flash")["body"])
+        check("gemini: a named function is ANY with that name allowed", s == 200 and up.get("toolConfig") == {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": ["weather"]}}, (s, up))
+        s, _, b = post("/v1/chat/completions", {"model": "cohere/command-a", "messages": msgs[1:2], "tools": tools, "tool_choice": "none"})
+        up = jb(last("/v2/chat")["body"])
+        check("cohere: tool_choice none is NONE", s == 200 and up.get("tool_choice") == "NONE", (s, b[:200], up))
+        s, _, b = post("/v1/chat/completions", {"model": "cohere/command-a", "messages": msgs[1:2], "tools": tools, "tool_choice": "required"})
+        up = jb(last("/v2/chat")["body"])
+        check("cohere: tool_choice required is REQUIRED", s == 200 and up.get("tool_choice") == "REQUIRED", (s, up))
+
+        # xAI's compaction: /v1/responses/compact goes to xAI with the bare model and the key
+        s, _, b = post("/v1/responses/compact", {"model": "xai/grok-4", "input": [{"role": "user", "content": "a long conversation"}]})
+        up = last("/v1/responses/compact")
+        check("xai: /v1/responses/compact goes to xAI's compact endpoint", s == 200 and up["auth"] == "Bearer xai-key" and '"model":"grok-4"' in up["body"].replace(" ", ""), (s, b[:200], up))
+
+        # GitHub Copilot: the model listing with the editor headers, and Responses through chat
+        s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "github-copilot"}, base=GW_L164, auth=False)
+        ids = [m["id"] for m in jb(b).get("data", [])]
+        up = last("/l164/copilot/models")
+        check("github-copilot: the models are listed from the Copilot host", s == 200 and "github-copilot/gpt-4o" in ids and "github-copilot/claude-sonnet-4" in ids and up["auth"] == "Bearer tid=l164", (s, b[:300], up))
+        s, _, b = post("/v1/responses", {"model": "github-copilot/gpt-4o", "input": "hi"})
+        r = jb(b)
+        text = "".join(c.get("text", "") for o in r.get("output", []) for c in o.get("content", []) if isinstance(c, dict))
+        check("github-copilot: Responses are served through Copilot's chat", s == 200 and r.get("object") == "response" and text == "Hi from copilot" and last("/l164/copilot/")["path"] == "/l164/copilot/chat/completions", (s, b[:300]))
+
+        # Bedrock Mantle: the model listing, and exact counts for Claude models on its native count path
+        s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "bedrock_mantle"}, base=GW_L164, auth=False)
+        ids = [m["id"] for m in jb(b).get("data", [])]
+        check("bedrock_mantle: the models are listed from its /v1/models", s == 200 and "bedrock_mantle/m-a" in ids and "bedrock_mantle/m-b" in ids, (s, b[:300]))
+        s, _, b = post("/v1/count_tokens", {"model": "bedrock_mantle/anthropic.claude-haiku-4-5", "messages": msgs, "max_tokens": 9})
+        up = last("/anthropic/v1/messages/count_tokens")
+        upb = jb(up["body"])
+        check("bedrock_mantle: a Claude model is counted exactly on the native count path", s == 200 and jb(b).get("exact") is True and jb(b).get("input_tokens") == 23 and upb.get("model") == "anthropic.claude-haiku-4-5" and "max_tokens" not in upb, (s, b, up))
+        s, _, b = post("/v1/count_tokens", {"model": "bedrock_mantle/openai.gpt-oss-120b", "messages": msgs})
+        check("bedrock_mantle: other models get the estimate (Mantle has no count path for them)", s == 200 and jb(b).get("exact") is False, (s, b))
+
+        # vLLM's Anthropic-compatible count path and Cohere's tokenizer count exactly, as Bifrost counts them
+        s, _, b = post("/v1/count_tokens", {"model": "vllm/llama-3", "messages": msgs})
+        up = last("/l164/vllm/")
+        check("vllm: token counts come from its /v1/messages/count_tokens", s == 200 and jb(b).get("exact") is True and jb(b).get("input_tokens") == 31 and up["path"] == "/l164/vllm/v1/messages/count_tokens" and up["auth"] == "Bearer vl-key" and jb(up["body"]).get("model") == "llama-3", (s, b, up))
+        s, _, b = post("/v1/count_tokens", {"model": "cohere-tok/command-a", "messages": [{"role": "system", "content": "be brief"}, {"role": "user", "content": "hello"}]})
+        up = last("/l164/cohere/")
+        check("cohere: token counts come from its tokenizer", s == 200 and jb(b).get("exact") is True and jb(b).get("input_tokens") == 5 and jb(up["body"]) == {"model": "command-a", "text": "be brief\nhello"}, (s, b, up))
+
+        # /v1/responses/input_tokens with another provider's model is counted by that provider (here Vertex's Gemini)
+        s, _, b = post("/v1/responses/input_tokens", {"model": "vertex/gemini-2.5-flash", "input": "hello there"})
+        r = jb(b)
+        check("responses input_tokens counts a non-OpenAI model with its provider's count", s == 200 and r.get("object") == "response.input_tokens" and r.get("input_tokens") == 11 and r.get("exact") is True and last("/v1/projects/proj/locations/us-central1/publishers/google/models/gemini-2.5-flash")["path"].endswith(":countTokens"), (s, b))
+        # Cohere's and Azure's model listings
+        s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "cohere-tok"}, base=GW_L164, auth=False)
+        ids = [m["id"] for m in jb(b).get("data", [])]
+        check("cohere: the models are listed from its /v1/models", s == 200 and "cohere-tok/command-a" in ids and last("/l164/cohere/")["path"] == "/l164/cohere/v1/models?page_size=1000", (s, b[:300]))
+        s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "azure"}, base=GW_L164, auth=False)
+        ids = [m["id"] for m in jb(b).get("data", [])]
+        check("azure: the models are listed from the resource's /openai/v1/models", s == 200 and "azure/gpt-4o" in ids and last("/l164/azure-main/")["path"] == "/l164/azure-main/openai/v1/models" and last("/l164/azure-main/")["auth"] == "az-l164", (s, b[:300]))
+
+        # Sarvam: its own text-to-speech and speech-to-text, its chat and models, no text completions
+        s, h, b = post("/v1/audio/speech", {"model": "sarvam/bulbul:v2", "input": "namaste", "voice": "anushka", "language_code": "hi-IN", "speed": 1.1})
+        up = last("/l164/sarvam/text-to-speech")
+        upb = jb(up["body"])
+        hl = {k.lower(): v for k, v in h.items()}
+        check("sarvam: speech answers with the decoded audio", s == 200 and b == "RIFF-sarvam" and hl.get("content-type", "").startswith("audio/wav"), (s, h, b[:100]))
+        check("sarvam: speech is Sarvam's text-to-speech body", upb == {"text": "namaste", "target_language_code": "hi-IN", "model": "bulbul:v2", "speaker": "anushka", "pace": 1.1}, up)
+        s, _, b = mp_form(GW_L164, "/v1/audio/transcriptions", [("model", None, "text/plain", "sarvam/saarika:v2.5"), ("language", None, "text/plain", "hi-IN"), ("file", "a.wav", "audio/wav", b"RIFF0000WAVE")])
+        r = jb(b)
+        up = last("/l164/sarvam/speech-to-text")
+        check("sarvam: speech-to-text answers OpenAI's transcription with words and duration", s == 200 and r.get("text") == "namaste duniya" and r.get("language") == "hi-IN" and len(r.get("words", [])) == 2 and r.get("duration") == 1.25, (s, b[:300]))
+        check("sarvam: speech-to-text sends the file, model and language_code", up["body"] == "file=@a.wav;model=saarika:v2.5;language_code=hi-IN", up)
+        s, _, b = post("/v1/chat/completions", {"model": "sarvam/sarvam-m", "messages": msgs[1:2]})
+        check("sarvam: chat goes to its OpenAI-compatible endpoint", s == 200 and "Hi from sarvam" in b and last("/l164/sarvam/")["path"] == "/l164/sarvam/v1/chat/completions", (s, b[:200]))
+        s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "sarvam"}, base=GW_L164, auth=False)
+        check("sarvam: the models are listed", s == 200 and "sarvam/sarvam-m" in [m["id"] for m in jb(b).get("data", [])], (s, b[:200]))
+        s, _, b = post("/v1/completions", {"model": "sarvam/sarvam-m", "prompt": "hi"})
+        check("sarvam: text completions are refused, as Bifrost refuses them", s >= 400 and "text completions" in b, (s, b[:200]))
+
+        # Replicate: a chat prediction still running when the wait ends is polled; an alias on the deployments endpoint
+        s, _, b = post("/v1/chat/completions", {"model": "replicate/acme/chat", "messages": [{"role": "user", "content": "slow chat"}]})
+        r = jb(b)
+        polls = [x for x in seen() if x["path"] == "/l164/replicate/v1/predictions/p-chat-1"]
+        check("replicate: a running chat prediction is polled until it settles", s == 200 and (r.get("choices") or [{}])[0].get("message", {}).get("content") == "Polled answer" and r.get("usage", {}).get("prompt_tokens") == 4 and len(polls) >= 1, (s, b[:300]))
+        s, _, b = post("/v1/chat/completions", {"model": "replicate/dep", "messages": [{"role": "user", "content": "hi"}]})
+        check("replicate: an alias with use_deployments_endpoint goes to its deployment", s == 200 and "from deployment" in b and last("/l164/replicate/")["path"] == "/l164/replicate/v1/deployments/acme/dep-a/predictions", (s, b[:200]))
+
+        # alias overrides: an Azure alias's endpoint and api_version, a Bedrock alias's region
+        s, _, b = post("/v1/chat/completions", {"model": "azure/east", "messages": msgs[1:2]})
+        up = last("/l164/azure-")
+        check("azure: an alias's endpoint and api_version replace the key's", s == 200 and "Hi from azure east" in b and up["path"] == "/l164/azure-east/openai/deployments/gpt-4o/chat/completions?api-version=2025-01-01-preview", (s, b[:200], up))
+        s, _, b = post("/v1/chat/completions", {"model": "azure/gpt-4o", "messages": msgs[1:2]})
+        up = last("/l164/azure-")
+        check("azure: the key's own endpoint serves the other models", s == 200 and up["path"] == "/l164/azure-main/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21", (s, up))
+        s, _, b = post("/v1/chat/completions", {"model": "bedrock/eu-claude", "messages": msgs})
+        up = last("/model/anthropic.claude-3-haiku")
+        upb = jb(up["body"])
+        check("bedrock: an alias's region signs and routes the call", s == 200 and "/eu-west-1/bedrock/aws4_request" in up["auth"], (s, b[:200], up["auth"]))
+        last_turn = (upb.get("messages") or [{}])[-1].get("content", [])
+        check("bedrock: the injection point puts a cache point after the last message", last_turn == [{"text": "three"}, {"cachePoint": {"type": "default"}}] and "cachePoint" not in json.dumps(upb.get("system", [])), upb)
+        s, _, b = post("/v1/chat/completions", {"model": "vertex/claude-sonnet-4@20250514", "messages": msgs})
+        up = last("/v1/projects/proj/locations/us-central1/publishers/anthropic/models/claude-sonnet-4@20250514")
+        upb = jb(up["body"])
+        check("vertex: Claude gets cache_control from the injection points", s == 200 and upb.get("system") == [{"type": "text", "text": "rules", "cache_control": {"type": "ephemeral"}}], (s, b[:200], upb))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+GW_L173 = "http://127.0.0.1:18296"  # L173: provider leftovers (Bedrock text streams, OpenAI-shaped decisions, Mantle, Replicate, cache points, aliases, listings)
+
+def l173_config() -> dict:
+    """Providers on the mock for L173: Bedrock (legacy text models), OpenAI decisions (the L163 mock route), Bedrock
+    Mantle with a project and auto_inject, Anthropic with injection points (the Messages route), and Vertex (from the
+    main e2e config) with auto_inject."""
+    base = json.load(open(os.path.join(BUILD, "e2e.config.json")))
+    def key(name, value, **extra):
+        return {"name": name, "value": value, "models": [], "weight": 1.0, **extra}
+    vertex = dict(base["providers"]["vertex"])
+    vertex["prompt_cache"] = {"auto_inject": True}
+    # a tuned model by an alias that names the project number it is served under
+    vertex["keys"] = [{**vertex["keys"][0], "aliases": {"tuned": {"model_id": "1234567890", "project_number": "4321", "force_single_region": True}}}]
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {
+            "bedrock": {"keys": [key("bk", "", bedrock_key_config={"access_key": "AKIDEXAMPLE", "secret_key": "secret", "region": "us-east-1"})],
+                        "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "openai": {"keys": [key("oa", "sk-oa163")], "network_config": {"base_url": MOCK + "/oa163", "max_retries": 0}},
+            "bedrock_mantle": {"keys": [key("mk", "mantle-key", bedrock_mantle_key_config={"project_id": "proj-173"},
+                                            aliases={"scoped": {"model_id": "openai.gpt-oss-120b", "project_id": "proj-alias"}})],
+                               "network_config": {"base_url": MOCK, "max_retries": 0}, "prompt_cache": {"auto_inject": True}},
+            "anthropic": {"keys": [key("an", "sk-ant")], "network_config": {"base_url": MOCK, "max_retries": 0},
+                          "prompt_cache": {"cache_control_injection_points": [{"location": "message", "role": "user", "index": -1}]}},
+            "vertex": vertex,
+            "replicate": {"keys": [key("rp", "r8_e2e", replicate_key_config={"use_deployments_endpoint": True})], "network_config": {"base_url": MOCK + "/replicate", "max_retries": 0}},
+            "rep-plain": {"keys": [key("rpp", "r8_e2e", aliases={"house": "acme/model-a"})], "custom_provider_config": {"base_provider_type": "replicate"},
+                          "network_config": {"base_url": MOCK + "/replicate", "max_retries": 0}},
+            "watsonx": base["providers"]["watsonx"],
+            # the listing pipeline: an alias listed beside its target, a blacklisted model dropped and refused
+            "bl": {"keys": [key("blk", "sk-bl", aliases={"house": "m-a", "spare": "never-listed"}, blacklisted_models=["m-b"])],
+                   "custom_provider_config": {"base_provider_type": "openai"}, "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+    }
+
+def l173_e2e(env):
+    """L173: Bedrock's streamed text completion (InvokeModelWithResponseStream). Its own gateway, started and stopped here."""
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    cfg_path = os.path.join(BUILD, "e2e.l173.json")
+    json.dump(l173_config(), open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18296", "-host", "127.0.0.1", "-config", cfg_path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l173.log"), "w"))
+    def post(path, body, headers=None):
+        return call("POST", path, body, headers, base=GW_L173, auth=False)
+    def last(prefix):
+        rows = [x for x in seen() if x["path"].startswith(prefix)]
+        return rows[-1] if rows else {"path": "", "body": "", "auth": ""}
+    try:
+        wait(GW_L173 + "/health")
+        # Bedrock's legacy text models stream on InvokeModelWithResponseStream, framed as text completions
+        s, h, b = post("/v1/completions", {"model": "bedrock/anthropic.claude-v2:1", "prompt": "Say hi", "stream": True, "stream_options": {"include_usage": True}})
+        evs = [json.loads(l[5:]) for l in b.split("\n") if l.startswith("data:") and l[5:].strip() != "[DONE]"] if s == 200 else []
+        texts = "".join(c.get("text", "") for e in evs for c in e.get("choices", []))
+        finish = [c.get("finish_reason") for e in evs for c in e.get("choices", []) if c.get("finish_reason")]
+        usage = [e["usage"] for e in evs if isinstance(e, dict) and e.get("usage")]
+        up = last("/model/anthropic.claude-v2")
+        check("bedrock: a streamed Claude text completion goes to invoke-with-response-stream", s == 200 and up["path"].endswith("/invoke-with-response-stream") and '"max_tokens_to_sample":4096' in up["body"], (s, b[:300], up))
+        check("bedrock: the invoke stream is framed as text_completion chunks with the usage", texts == " Hi from bedrock stream" and finish == ["stop"] and all(e.get("object") == "text_completion" for e in evs if isinstance(e, dict))
+              and usage and usage[-1].get("prompt_tokens") == 6 and usage[-1].get("completion_tokens") == 4 and b.rstrip().endswith("data: [DONE]"), (b[:600]))
+        s, _, b = post("/v1/completions", {"model": "bedrock/mistral.mistral-7b-instruct-v0:2", "prompt": "<s>[INST] hi [/INST]", "stream": True})
+        evs = [json.loads(l[5:]) for l in b.split("\n") if l.startswith("data:") and l[5:].strip() != "[DONE]"] if s == 200 else []
+        texts = "".join(c.get("text", "") for e in evs for c in e.get("choices", []))
+        finish = [c.get("finish_reason") for e in evs for c in e.get("choices", []) if c.get("finish_reason")]
+        check("bedrock: a streamed Mistral text completion reads its outputs", s == 200 and texts == " Hi from mistral stream" and finish == ["length"] and not any(e.get("usage") for e in evs), (s, b[:400]))
+
+        # /openai/v1/decisions speaks OpenAI's Decisions API: its request only, a bare model is OpenAI's, its answer shape
+        qs = [{"type": "predicate", "name": "upset", "instructions": "Is the customer upset?"},
+              {"type": "choice", "instructions": "Pick the topic", "choices": [{"value": "billing", "description": "money"}, {"value": "bug"}]}]
+        dbody = {"model": "gpt-6-luna", "input": "I was double charged.", "questions": qs}
+        s, _, b = post("/openai/v1/decisions", dbody)
+        r = json.loads(b) if s == 200 else {}
+        up = last("/oa163/v1/decisions")
+        check("openai route: a bare model is OpenAI's, sent to its /v1/decisions", s == 200 and up["path"] == "/oa163/v1/decisions" and json.loads(up["body"]).get("model") == "gpt-6-luna", (s, b[:300], up))
+        ans = r.get("answers", [])
+        check("openai route: the answer is OpenAI's shape (no id, an unnamed answer with name null, OpenAI's usage names)",
+              "id" not in r and len(ans) == 2 and ans[0].get("name") == "upset" and "name" in ans[1] and ans[1]["name"] is None and ans[1].get("choice") == "billing"
+              and r.get("usage") == {"input_tokens": 21, "output_tokens": 5, "total_tokens": 26}, (s, b[:400]))
+        s, _, b = post("/v1/decisions", {**dbody, "model": "openai/gpt-6-luna"})
+        r = json.loads(b) if s == 200 else {}
+        check("the normalized /v1/decisions route keeps Bifrost's shape", s == 200 and r.get("usage", {}).get("prompt_tokens") == 21 and "name" not in r.get("answers", [{}, {}])[1], (s, b[:300]))
+        s, _, b = post("/litellm/decisions", dbody)
+        check("the SDK prefixes mount OpenAI's decisions route too", s == 200 and "input_tokens" in json.loads(b).get("usage", {}), (s, b[:300]))
+        n = len(seen())
+        s, _, b = post("/openai/v1/decisions", {**dbody, "questions": [{**qs[0], "criteria": {"true": "angry"}}]})
+        check("openai route: a field OpenAI's question does not define is refused by name", s == 400 and 'question 0 has \\"criteria\\"' in b and len(seen()) == n, (s, b[:300]))
+        s, _, b = post("/openai/v1/decisions", {**dbody, "state": "x"})
+        check("openai route: Typesafe's state is refused", s == 400 and "state is not part of OpenAI's Decisions request" in b, (s, b[:300]))
+        s, _, b = post("/openai/v1/decisions", {**dbody, "input": {"order": 1}})
+        check("openai route: a structured input is refused", s == 400 and "input must be a string or a list of messages" in b, (s, b[:300]))
+        s, _, b = post("/openai/v1/decisions", {"model": "gpt-6-luna", "questions": qs})
+        check("openai route: an input is required", s == 400 and "input is required for decision" in b, (s, b[:300]))
+
+        # Bedrock Mantle: the project header, its own Responses endpoint, auto_inject on Claude, the listing's project
+        msgs = [{"role": "system", "content": "rules"}, {"role": "user", "content": "hi"}]
+        s, _, b = post("/v1/chat/completions", {"model": "bedrock_mantle/openai.gpt-oss-120b", "messages": msgs})
+        up = last("/v1/chat/completions")
+        check("mantle: the key's project_id goes as OpenAI-Project", s == 200 and up.get("proj") == "proj-173|" and up["auth"] == "Bearer mantle-key", (s, b[:200], up))
+        s, _, b = post("/v1/chat/completions", {"model": "bedrock_mantle/scoped", "messages": msgs})
+        up = last("/v1/chat/completions")
+        check("mantle: an alias's project_id replaces the key's", s == 200 and up.get("proj") == "proj-alias|" and json.loads(up["body"]).get("model") == "openai.gpt-oss-120b", (s, b[:200], up))
+        s, _, b = post("/v1/chat/completions", {"model": "bedrock_mantle/anthropic.claude-haiku-4-5", "messages": msgs})
+        up = last("/anthropic/v1/messages")
+        upb = json.loads(up["body"]) if up["body"] else {}
+        check("mantle: Claude gets anthropic-workspace-id and auto_inject's breakpoint", s == 200 and up.get("proj") == "|proj-173"
+              and upb.get("system") == [{"type": "text", "text": "rules", "cache_control": {"type": "ephemeral"}}], (s, b[:200], up))
+        s, _, b = post("/v1/responses", {"model": "bedrock_mantle/openai.gpt-oss-120b", "input": "hi", "max_output_tokens": 20})
+        up = last("/v1/responses")
+        upb = json.loads(up["body"]) if up["body"] else {}
+        check("mantle: Responses go to Mantle's own /v1/responses with the bare model", s == 200 and json.loads(b).get("object") == "response" and upb.get("model") == "openai.gpt-oss-120b"
+              and upb.get("input") == "hi" and up.get("proj") == "proj-173|" and up["auth"] == "Bearer mantle-key", (s, b[:300], up))
+        s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "bedrock_mantle"}, base=GW_L173, auth=False)
+        up = last("/v1/models")
+        check("mantle: the listing is scoped to the key's project", s == 200 and "bedrock_mantle/m-a" in b and up.get("proj") == "proj-173|", (s, b[:200], up))
+
+        # auto_inject on Vertex Claude, and the injection points on the Anthropic Messages route
+        s, _, b = post("/v1/chat/completions", {"model": "vertex/claude-sonnet-4@20250514", "messages": msgs})
+        up = last("/v1/projects/proj/locations/us-central1/publishers/anthropic/models/claude-sonnet-4@20250514")
+        upb = json.loads(up["body"]) if up["body"] else {}
+        check("vertex: auto_inject marks Claude's prompt", s == 200 and upb.get("system") == [{"type": "text", "text": "rules", "cache_control": {"type": "ephemeral"}}], (s, b[:200], upb))
+        mbody = {"model": "anthropic/claude-sonnet-4", "max_tokens": 20, "system": "rules", "messages": [{"role": "user", "content": "one"}, {"role": "assistant", "content": "two"}, {"role": "user", "content": "three"}]}
+        s, _, b = post("/anthropic/v1/messages", mbody)
+        up = last("/v1/messages")
+        upb = json.loads(up["body"]) if up["body"] else {}
+        check("messages route: the injection point marks the last user message of the body as sent", s == 200
+              and upb.get("messages", [{}])[-1].get("content") == [{"type": "text", "text": "three", "cache_control": {"type": "ephemeral"}}]
+              and upb.get("messages", [{}])[0].get("content") == "one" and upb.get("system") == "rules", (s, b[:200], upb))
+
+        # Replicate: the deployments are listed only with use_deployments_endpoint; extra params go into the input
+        s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "replicate"}, base=GW_L173, auth=False)
+        ids = [m["id"] for m in json.loads(b).get("data", [])] if s == 200 else []
+        check("replicate: with use_deployments_endpoint the deployments of every page are listed", "replicate/acme/model-a" in ids and "replicate/acme/model-c" in ids, (s, b[:300]))
+        s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "rep-plain"}, base=GW_L173, auth=False)
+        ids = [m["id"] for m in json.loads(b).get("data", [])] if s == 200 else []
+        check("replicate: without it only the key's aliases are listed", s == 200 and ids == ["rep-plain/house"], (s, b[:300]))
+        s, _, b = post("/v1/chat/completions", {"model": "rep-plain/acme/chat-x", "messages": [{"role": "user", "content": "hi"}], "seed": 7, "top_k": 40, "webhook": "https://example.com/hook"})
+        up = last("/v1/models/acme/chat-x/predictions")
+        upb = json.loads(up["body"]) if up["body"] else {}
+        check("replicate: extra params are merged into the prediction input, the webhook also on the prediction", s == 200 and upb.get("input", {}).get("top_k") == 40
+              and upb["input"].get("seed") == 7 and upb["input"].get("prompt") == "hi" and upb.get("webhook") == "https://example.com/hook", (s, b[:200], upb))
+
+        # the listing pipeline: aliases listed beside their targets and added back, the blacklist dropping a model
+        s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "bl"}, base=GW_L173, auth=False)
+        ids = [m["id"] for m in json.loads(b).get("data", [])] if s == 200 else []
+        check("listing: an alias beside its target, an unmatched alias added, a blacklisted model gone", s == 200 and ids == ["bl/house", "bl/m-a", "bl/spare"], (s, b[:300]))
+        n = len(seen())
+        s, _, b = post("/v1/chat/completions", {"model": "bl/m-b", "messages": [{"role": "user", "content": "hi"}]})
+        check("a blacklisted model is not served by the key", s >= 400 and len(seen()) == n, (s, b[:200]))
+        s, _, b = post("/v1/chat/completions", {"model": "bl/house", "messages": [{"role": "user", "content": "hi"}]})
+        check("the alias of an allowed model is served", s == 200 and json.loads(last("/v1/chat/completions")["body"]).get("model") == "m-a", (s, b[:200]))
+
+        # watsonx: the instance's chat models, every page, with the IAM token
+        s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "watsonx"}, base=GW_L173, auth=False)
+        ids = [m["id"] for m in json.loads(b).get("data", [])] if s == 200 else []
+        up = [x for x in seen() if x["path"].startswith("/ml/v1/foundation_model_specs")]
+        check("watsonx: the foundation model specs are listed, every page", ids == ["watsonx/ibm/granite-3-8b-instruct", "watsonx/mistralai/mistral-large", "watsonx/meta-llama/llama-3-3-70b-instruct"]
+              and up and up[-1]["auth"] == "Bearer iam-token" and "filters=function_text_chat" in up[0]["path"], (s, b[:300], up[-2:]))
+
+        # alias overrides: a tuned Vertex model under the alias's project number; another provider's override is refused
+        s, _, b = post("/v1/chat/completions", {"model": "vertex/tuned", "messages": [{"role": "user", "content": "hi"}]})
+        up = last("/v1beta1/projects/")
+        check("vertex: an alias's project_number serves a tuned model from its endpoint", s == 200 and "Hi from a tuned vertex model" in b
+              and up["path"] == "/v1beta1/projects/4321/locations/us-central1/endpoints/1234567890:generateContent", (s, b[:200], up))
+        s, _, b = call("POST", "/api/providers/bl/keys", {"name": "wrong", "value": "sk-wrong", "aliases": {"east": {"model_id": "m-a", "endpoint": "https://east.example.com"}}}, base=GW_L173, auth=False)
+        check("an alias with another provider's override is refused by the key API", s == 400 and "azure sub-config is only valid on Azure keys" in b, (s, b[:300]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
+GW_L172 = "http://127.0.0.1:18294"  # L172: Vertex tuned endpoints by project_number, body limits that follow a config change
+
+def l172_config() -> dict:
+    """The L172 gateway: Vertex with a project_number (its token from the mock), and a body limit of 1 MiB."""
+    import re
+    src = open(os.path.join(ROOT, "src/jwt.tov")).read()
+    pem = re.search(r"const TEST_PKCS8 = `(.*?)`", src, re.S).group(1)
+    sa = {"type": "service_account", "client_email": "e2e@test.iam.gserviceaccount.com", "private_key": pem, "token_uri": MOCK + "/token"}
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False, "max_request_body_size_mb": 1},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {
+            "openai": {"keys": [{"name": "o-l172", "value": "sk-l172", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "vertex": {"keys": [{"name": "vx-l172", "models": [], "weight": 1.0, "vertex_key_config": {"project_id": "proj", "project_number": "998877", "force_single_region": True, "region": "us-central1", "auth_credentials": json.dumps(sa)}}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+    }
+
+def l172_e2e(env):
+    """L172: a tuned Vertex model (an all-digit id) is called at the project's endpoint by its project_number, and the
+    request body limit follows a config change on both servers. Its own gateway (18294)."""
+    cfg_path = os.path.join(BUILD, "e2e.l172.json")
+    json.dump(l172_config(), open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18294", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l172.log"), "w"))
+    try:
+        wait(GW_L172 + "/health")
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "vertex/1234567890", "messages": [{"role": "user", "content": "tuned l172"}]}, None, base=GW_L172, auth=False)
+        up = [x for x in seen(True) if "tuned l172" in x["body"]]
+        check("a tuned Vertex model goes to the project's endpoint by its project_number", s == 200 and "Hi from a tuned vertex model" in b and up and up[-1]["path"] == "/v1beta1/projects/998877/locations/us-central1/endpoints/1234567890:generateContent", (s, b[:200], up[-1:]))
+        s, _, b = call("GET", "/api/providers/vertex", None, None, base=GW_L172, auth=False)
+        check("project_number and force_single_region are kept on the key", s == 200 and '"project_number":"998877"' in b.replace(" ", "") and '"force_single_region":true' in b.replace(" ", ""), (s, b[:400]))
+
+        big = json.dumps({"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l172 limit " + "x" * 1500000}]})
+        st = declared_post(18294, "/v1/chat/completions", 1500000)
+        check("a 1.5 MB body is over a 1 MiB max_request_body_size_mb", st == 413, st)
+        s, _, b = call("PUT", "/api/config", {"client_config": {"enable_logging": False, "enforce_auth_on_inference": False, "max_request_body_size_mb": 3}}, None, base=GW_L172, auth=False)
+        check("the body limit is raised through the config API", s == 200, (s, b[:200]))
+        s, _, b = call("POST", "/v1/chat/completions", big, None, base=GW_L172, auth=False)
+        check("the servers' body limit follows the config change", s == 200 and "Hello from gpt-4o-mini" in b, (s, b[:200]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
 
 def main():
     unique_ports()
@@ -10017,7 +12862,7 @@ def main():
         check("gemini speech returns a WAV", s == 200 and audio[:4] == b"RIFF" and audio[8:12] == b"WAVE" and h.get("content-type") == "audio/wav" and struct.unpack("<I", audio[40:44])[0] == 4 and audio[44:] == bytes([0, 1, 2, 3]), (s, audio[:44]))
         # Gemini speech-to-text: the audio inline in generateContent, the transcript as OpenAI's JSON or text
         s, b = multipart("/v1/audio/transcriptions", "talk.wav", b"RIFF\x00\x00\x00\x00WAVEfmt ", {"model": "gemini/gemini-2.5-flash", "prompt": "Transcribe."})
-        check("gemini transcription returns OpenAI's JSON", s == 200 and json.loads(b) == {"text": "Hi from gemini"}, (s, b))
+        check("gemini transcription returns OpenAI's JSON, with the usage Bifrost reports", s == 200 and json.loads(b).get("text") == "Hi from gemini" and json.loads(b).get("usage", {}).get("type") == "tokens", (s, b))
         stt = seen()[-1]
         check("gemini transcription sends the audio inline", stt["path"] == "/v1beta/models/gemini-2.5-flash:generateContent" and '"inlineData":{"mimeType":"audio/wav","data":"UklGRgAAAABXQVZFZm10IA=="}' in stt["body"] and '"text":"Transcribe."' in stt["body"], stt)
         s, b = multipart("/v1/audio/transcriptions", "talk.mp3", b"ID3", {"model": "gemini/gemini-2.5-flash", "response_format": "text"})
@@ -10229,7 +13074,7 @@ def main():
         check("responses input_tokens goes to the model's provider with a bare model", s == 200 and up["path"] == "/v1/responses/input_tokens" and '"model":"gpt-4o"' in up["body"].replace(" ", ""), (s, b, up))
         s, _, b = call("POST", "/v1/realtime/client_secrets", {"session": {"type": "realtime", "model": "gpt-realtime"}})
         s2, _, b2 = call("POST", "/v1/realtime/sessions", {"model": "openai/gpt-realtime"})
-        check("realtime client_secrets and sessions pass through", s == 200 and s2 == 200 and seen()[-1]["path"] == "/v1/realtime/sessions", (s, b, s2, b2))
+        check("realtime client_secrets and sessions are minted at the provider and answered with the gateway's own token", s == 200 and s2 == 200 and seen()[-1]["path"] == "/v1/realtime/sessions" and jget(b).get("value", "").startswith("ek_bf_") and jget(b2).get("client_secret", {}).get("value", "").startswith("ek_bf_"), (s, b, s2, b2))
 
         # the unversioned /openai family, as Bifrost mounts it (without the /v1 segment)
         s, _, b = call("POST", "/openai/responses", {"model": "openai/gpt-4o", "input": "unversioned hello"})
@@ -10255,11 +13100,14 @@ def main():
             rs, rb = e.code, e.read().decode()
         check("POST /v1/realtime with an SDP offer is terminated the same way", rs == 400 and "invalid browser SDP offer" in rb and len(seen()) == before, (rs, rb[:200]))
 
-        # Anthropic's legacy text completion, through the messages bridge
+        # Anthropic's legacy text completion: an Anthropic model goes to Anthropic's own legacy call (L163)
         s, _, b = call("POST", "/anthropic/v1/complete", {"model": "anthropic/claude-3-haiku-20240307", "prompt": "\n\nHuman: hi\n\nAssistant:", "max_tokens_to_sample": 50, "temperature": 0.2})
         lg = jget(b) if s == 200 else {}
         up = seen()[-1]
-        check("/anthropic/v1/complete answers in the legacy shape", s == 200 and lg.get("type") == "completion" and lg.get("completion") == "Hi from claude" and lg.get("stop_reason") == "stop_sequence" and up["path"] == "/v1/messages" and '"max_tokens":50' in up["body"], (s, b[:300], up))
+        check("/anthropic/v1/complete answers in the legacy shape", s == 200 and lg.get("type") == "completion" and lg.get("completion") == "Hi from legacy claude-3-haiku-20240307" and lg.get("stop_reason") == "stop_sequence" and up["path"] == "/v1/complete" and '"max_tokens_to_sample":50' in up["body"], (s, b[:300], up))
+        s, _, b = call("POST", "/anthropic/v1/complete", {"model": "openai/gpt-4o", "prompt": "\n\nHuman: hi\n\nAssistant:", "max_tokens_to_sample": 50})
+        lg = jget(b) if s == 200 else {}
+        check("/anthropic/v1/complete for another provider's model takes the messages bridge", s == 200 and lg.get("type") == "completion" and seen()[-1]["path"] == "/v1/chat/completions", (s, b[:300], seen()[-1:]))
         s, _, b = call("POST", "/anthropic/v1/complete", {"model": "anthropic/claude-3-haiku-20240307", "prompt": "hi", "max_tokens_to_sample": 5, "stream": True})
         check("the legacy completion route streams legacy completion events", s == 200 and "event: completion" in b and "message_start" not in b, (s, b[:200]))
 
@@ -10269,12 +13117,33 @@ def main():
         s, _, b = call("POST", "/cursor/v1/chat/completions", '{"model":"openai/gpt-4o","input":"cursor hello"}')
         cb = jget(b) if s == 200 else {}
         check("/cursor chat with a Responses-shaped body answers a chat completion", s == 200 and cb.get("object") == "chat.completion" and cb.get("choices", [{}])[0].get("message", {}).get("role") == "assistant", (s, b[:200]))
+        # Bifrost's cursor parser fixes: flat tools, Anthropic tool blocks, empty user turns (L172)
+        cur = {"model": "openai/gpt-4o", "input": [
+            {"role": "user", "content": [{"type": "input_text", "text": "cursor tools"}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_c1", "name": "Shell", "input": {"cmd": "ls"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_c1", "content": [{"type": "text", "text": "a.txt"}]}]},
+            {"role": "user", "content": ""}],
+            "tools": [{"name": "Shell", "description": "run", "input_schema": {"type": "object"}}]}
+        s, _, b = call("POST", "/cursor/v1/chat/completions", cur)
+        up = [x for x in seen() if x["path"] == "/v1/responses" and "cursor tools" in x["body"]]
+        ub = json.loads(up[-1]["body"]) if up else {}
+        items = ub.get("input", [])
+        check("/cursor: Anthropic tool blocks become function_call items and Cursor's flat tools Responses tools", s == 200 and [i.get("type", "message") for i in items] == ["message", "function_call", "function_call_output", "message"] and items[1].get("call_id") == "toolu_c1" and items[2].get("output") == "a.txt" and items[3].get("content") == "..." and (ub.get("tools") or [None])[0] == {"type": "function", "name": "Shell", "description": "run", "parameters": {"type": "object"}}, (s, b[:200], ub))
+        s, _, b = call("POST", "/cursor/v1/chat/completions", {"model": "openai/gpt-4o", "messages": [{"role": "user", "content": "cursor chat tools"}, {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_c2", "name": "Shell", "input": {}}]}, {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_c2", "content": "ok"}]}]})
+        up = [x for x in seen() if x["path"] == "/v1/chat/completions" and "cursor chat tools" in x["body"]]
+        um = json.loads(up[-1]["body"]).get("messages", []) if up else []
+        check("/cursor: in chat messages they become tool calls and tool messages", s == 200 and len(um) == 3 and um[1].get("tool_calls", [{}])[0].get("id") == "toolu_c2" and um[2] == {"role": "tool", "tool_call_id": "toolu_c2", "content": "ok"}, (s, b[:200], um))
         s, _, b = call("GET", "/cursor/v1/models")
         check("/cursor/v1/models lists models", s == 200 and jget(b).get("object") == "list", (s, b[:200]))
 
-        # GET /mcp: the server-to-client stream (a connection event)
-        s, h, b = call("GET", "/mcp")
-        check("GET /mcp answers the connection event as an event stream", s == 200 and {k.lower(): v for k, v in h.items()}.get("content-type", "").startswith("text/event-stream") and "connection/opened" in b, (s, h, b[:200]))
+        # GET /mcp: the server-to-client stream (a connection event; it then stays open, so only the event is read)
+        import http.client
+        sc = http.client.HTTPConnection("127.0.0.1", int(GW.rsplit(":", 1)[1]), timeout=10)
+        sc.request("GET", "/mcp")
+        sr = sc.getresponse()
+        s, ct, b = sr.status, sr.getheader("content-type") or "", sr.readline().decode() if sr.status == 200 else sr.read().decode()
+        sc.close()
+        check("GET /mcp answers the connection event as an event stream", s == 200 and ct.startswith("text/event-stream") and "connection/opened" in b, (s, ct, b[:200]))
         s, _, b = call("GET", "/mcp/no-such-mcp")
         check("GET /mcp/{name} for an unknown virtual MCP is not found", s == 404, (s, b[:200]))
 
@@ -10291,6 +13160,11 @@ def main():
         check("the Vertex regional job cancels", s == 200 and seen()[-1]["path"].endswith("/batchPredictionJobs/" + vjid + ":cancel"), (s, b[:200]))
         s, _, b = call("GET", VB, None, VH)
         check("the Vertex regional jobs list", s == 200 and "batchPredictionJobs" in b, (s, b[:200]))
+        # L164: the GenAI batch delete for Vertex (Bifrost's Vertex BatchDelete): the job is deleted, answered {"done":true}
+        s, _, b = call("DELETE", "/genai/v1beta/batches/" + vjid, None, VH)
+        check("genai batch delete on Vertex deletes the job and answers done", s == 200 and jget(b) == {"done": True} and seen()[-1]["path"] == "/v1/projects/proj/locations/us-central1/batchPredictionJobs/" + vjid, (s, b[:200], seen()[-1:]))
+        s, _, b = call("DELETE", "/genai/v1beta/batches/" + vjid, None, OAI)
+        check("genai batch delete on OpenAI is refused, as Bifrost refuses it", s == 400 and "batch_delete is not supported" in b, (s, b[:200]))
         s, _, b = call("POST", "/genai/v1beta/projects/proj/locations/us-central1/cachedContents", '{"model":"publishers/google/models/gemini-2.5-flash","displayName":"regional"}', VH)
         check("the Vertex regional cached contents go to v1beta1", s == 200 and seen()[-1]["path"] == "/v1beta1/projects/proj/locations/us-central1/cachedContents" and '"displayName":"regional"' in seen()[-1]["body"], (s, b[:200]))
         BH = {"x-model-provider": "bedrock_batch"}
@@ -10314,9 +13188,16 @@ def main():
         # Token counting: exact from Anthropic, estimated elsewhere
         s, _, b = call("POST", "/anthropic/v1/messages/count_tokens", {"model": "claude-sonnet-4", "messages": [{"role": "user", "content": "hello"}]})
         check("anthropic count_tokens is exact", s == 200 and json.loads(b)["input_tokens"] == 42 and seen()[-1]["path"] == "/v1/messages/count_tokens", b)
-        s, _, b = call("POST", "/v1/count_tokens", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "hello there, how are you today?"}]})
+        s, _, b = call("POST", "/v1/count_tokens", {"model": "nvidia/llama3", "messages": [{"role": "user", "content": "hello there, how are you today?"}]})
         r = json.loads(b)
         check("count_tokens estimates for other providers", s == 200 and r["exact"] is False and 5 < r["input_tokens"] < 40, b)
+        # L164: OpenAI counts exactly through its /v1/responses/input_tokens, as Bifrost counts it
+        s, _, b = call("POST", "/v1/count_tokens", {"model": "openai/gpt-4o-mini", "messages": [{"role": "system", "content": "be brief"}, {"role": "user", "content": "hello there"}], "max_tokens": 9})
+        r = jget(b)
+        up = seen()[-1]
+        upb = json.loads(up["body"][len("POST "):]) if up["body"].startswith("POST ") else {}
+        check("openai count_tokens is exact from responses/input_tokens", s == 200 and r.get("exact") is True and r.get("input_tokens") == 17 and up["path"] == "/v1/responses/input_tokens", (s, b, up))
+        check("the input_tokens body is the chat as Responses input, without the output cap", upb.get("model") == "gpt-4o-mini" and [i.get("role") for i in upb.get("input", [])] == ["system", "user"] and "max_output_tokens" not in upb, upb)
 
         # Async jobs, polled at Bifrost's /v1/async/<op>/{id} with Bifrost's status names
         s, _, b = call("POST", "/v1/async/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "later"}]})
@@ -10432,7 +13313,9 @@ def main():
         check("the TypeSafe body is keyed by question name, with the key and the upstream model",
               bool(ts) and ts[-1]["auth"] == "Bearer ts-key" and tb.get("model") == "jev-latest" and tb["questions"]["is_frustrated"]["type"] == "noul"
               and tb["questions"]["is_frustrated"]["criteria"] == {"true": "angry", "false": "calm"} and tb["questions"]["urgency"]["criteria"] == ["can wait", "soon", None], ts[-1:])
-        s, _, b = call("POST", "/openai/v1/decisions", dbody, base=GW)
+        # (L173) the /openai/v1 path takes OpenAI's request only: no criteria
+        obody = {**dbody, "questions": [{k: v for k, v in q.items() if k != "criteria"} for q in dq]}
+        s, _, b = call("POST", "/openai/v1/decisions", obody, base=GW)
         check("the /openai/v1 path serves decisions too", s == 200 and json.loads(b)["answers"][1]["choice"] == "billing", (s, b))
         s, _, b = call("POST", "/v1/decisions", {**dbody, "min_confidence": 0.8, "fallbacks": ["openai/gpt-4o"]}, base=GW)
         ts = [x for x in seen() if x["path"] == "/ts/v1/systemone"]
@@ -11120,7 +14003,7 @@ def main():
             loc = e.headers.get("location", "")
         lu = urllib.parse.urlparse(loc)
         lq = dict(urllib.parse.parse_qsl(lu.query))
-        check("the authorization server redirects to the callback with a code and the state", lu.path == "/api/oauth/callback" and "code" in lq and lq.get("state") == init.get("oauth_config_id"), loc)
+        check("the authorization server redirects to the callback with a code and the state", lu.path == "/api/oauth/callback" and "code" in lq and lq.get("state") == dict(urllib.parse.parse_qsl(urllib.parse.urlparse(auth_url).query)).get("state") and init.get("oauth_config_id") == "authcode", loc)
         s, _, b = call("GET", lu.path + "?" + lu.query, base=GW_POL)
         check("the callback exchanges the code and reports the client authorized", s == 200 and "is authorized" in b, (s, b))
         s, _, b = call("POST", "/api/mcp/client/authcode/complete-oauth", base=GW_POL)
@@ -11372,6 +14255,8 @@ def main():
         aiortc_e2e()
         # live and realtime sessions over WebSockets and realtime calls over WebRTC: metered, guarded, admitted per turn and logged with their cost; their own gateways (ports 18200 and 18201)
         realtime_e2e(env)
+        # L160: realtime client secrets honoured as their virtual key, transcription sessions billed, failed responses logged: its own gateway (port 18274)
+        l160_e2e(env)
         # provider create and key reads, config metadata, virtual key rotation and expiry, team members: their own gateway
         l97b_e2e(env)
         # MCP key rules, tool pricing, the SSRF guard, tool groups, OAuth configs and OpenAPI clients: their own gateway
@@ -11415,10 +14300,14 @@ def main():
         l123_e2e(env)
         # decisions: the unprefixed routes, decision pricing overrides and the native-decision check under compat: their own gateway
         l109_e2e(env)
+        # L163: native decisions (OpenAI, Azure, Cloudflare, Perplexity, Ollama) and native text completions (Anthropic, Bedrock): their own gateway
+        l163_e2e(env)
         # a websocket session cap, top-level access profiles, dual credentials, stream idle cuts and oauth_key_config: their own gateways
         l112a_e2e(env)
         # retained content: content-off bodies kept as hidden objects in object storage, never served back; a store outage fails no request: their own gateway
         l125_e2e(env)
+        # L168: hidden request types, content search, regex apps, logs_only redaction, audit filters and verify, hidden deletes, /ws replay
+        l168_e2e(env)
         # streams under the built-in guard, tool names of streamed answers, legacy completion and cursor Responses streams, paced cache replays
         l107_e2e(env)
         # L131: hold-and-replay of live streams under a block-capable output guard (port 18205)
@@ -11437,12 +14326,16 @@ def main():
         # credentials, the aggregated card and the card timer (their own gateway), then MCP server instructions and the agent CLI's headers
         l134_e2e(env)
         l134b_e2e(env)
+        # L166: MCP management (SSE heartbeats, OpenAPI YAML/$ref/security and spec_url, the library, ping, tool cost, Responses, project MCP access): its own gateway
+        l166_e2e(env)
         # L138: A2A push state shared by the workers of a node, exactly-once relay across workers: their own gateway
         l138_e2e(env)
         # L148: A2A over gRPC: the lf.a2a.v1 listener, the agent named by the authority, the key from the metadata, the eleven methods (go client): their own gateway
         l148_e2e(env)
         # L148 with two bun workers: the listener opened by one of them, the cards in both
         l148w_e2e(env)
+        # L161: a gRPC-only agent reached from JSON-RPC, REST and gRPC, unary and streaming, h2c and TLS, with ErrorInfo details: its own gateway
+        l161_e2e(env)
         # MCP code mode: the meta-tools in chat requests, stubs and docs, programs over the MCP tools, the key gates on nested calls and the limits: their own gateways
         l117_e2e(env)
         # management API keys: a value shown once, a key's own permissions, the ceiling on grants, expiry, deletion and a restart: their own gateway
@@ -11458,16 +14351,27 @@ def main():
         l147_cluster_e2e(env)
         # audio billing: speech by its characters, transcriptions and translations by their usage, the log rows and the budgets: their own gateway
         l144_e2e(env)
+        # L169: streamed transcriptions, Sarvam's audio, refused and failed audio logged, a second response.create refused,
+        # live delegation checks: its own gateway (port 18290)
+        l169_e2e(env)
         # L149: push configs shared across the cluster (a callback registered on one node is answered and relayed by another), and
         # a card fetched by one worker served by both, fetched once per period: their own gateways
         l149_cluster_e2e(env)
         l149_workers_e2e(env)
+        # L171: A2A-Version, v0.3/v1 translation, interface failover and versions, extensions and tenant, raw capture, the
+        # history routes and stream cancellation: its own gateway (18292)
+        l171_e2e(env)
         # WebAssembly plugins (a .wasm path in plugins[]): rewrites, short circuits, traps, limits and the plugin API: their own gateway
         l121_e2e(env)
         # the plugin chain as Bifrost runs it: HTTP transport hooks, the LLM hooks on every request type and on streams, has_error: their own gateway
         l130_e2e(env)
         # the LLM hooks on the Anthropic Messages, Cohere, GenAI and Bedrock routes and Cursor's Responses-shaped chat: their own gateway
         l139_e2e(env)
+        # the built-in plugins on the provider-format routes; embedContent, Bedrock rerank, count-tokens and batch creation hooked: their own gateway
+        l159_e2e(env)
+        # the WP6 remainder: fallback pre hooks, cache-hit post hooks, chunk skip, /mcp and Bedrock frame hooks, batch and file
+        # hooks, the mocker's remainders, jsonparser on Responses, placement from the API, telemetry user_name: its own gateway
+        l170_e2e(env)
         # serving the web UI: the embedded build and RAIJU_UI_DIR: their own gateways
         l113_ui_e2e(env)
         # network_config pool knobs and upstream HTTP/2 (Tov patch 0007): origins from tov-patches/tests/h2_server.py, their own gateway
@@ -11482,12 +14386,31 @@ def main():
         l145_e2e(env)
         # large_payload_optimization for Messages to OpenAI-format, Gemini and Cohere, and embeddings to Gemini (L146): their own gateways
         l146_e2e(env)
+        # a large request whose provider is unreachable: the cancelled body stream (Tov patch 0008, L157): its own gateway
+        l157_e2e(env)
+        # L162: Bedrock streams of large requests converted live, large completions sent as chat and Titan embeddings streamed,
+        # Gemini transcription cost: its own gateway
+        l162_e2e(env)
         # L153: crew routing (crew/<pool> models, the task headers, the assign API, the task detail): its own gateways
         l153_e2e(env)
         # L154: crew outcomes, learning, budget pacing and the sequential layer: its own gateways
         l154_e2e(env)
         # L155: the crew metrics on /metrics and the Crews screen's reads and writes by role: its own gateways
         l155_e2e(env)
+        # L158: config.json written atomically (a temporary file renamed over it): its own gateway
+        l158_e2e(env)
+        # L164: provider operations (tool_choice, compaction, Copilot, Mantle, Sarvam, Replicate, alias overrides): its own gateway
+        l164_e2e(env)
+        # L165: built-in role ids, user emails, quota model_configs, role attachments, the complexity status routes and
+        # rotation revoking MCP grants: its own gateway (18284)
+        l165_e2e(env)
+        # L167: MCP OAuth user mode on the OIDC sign-in, the OAuth status states, flows and codes across restarts, temp tokens and dual credentials: its own gateway
+        l167_e2e(env, idp_state)
+        # L172: Vertex tuned endpoints and body limits that follow the config: its own gateway (18294)
+        l172_e2e(env)
+        # L173: provider leftovers (Bedrock text streams, OpenAI-shaped decisions, Mantle, Replicate, cache points, alias
+        # overrides, listings): its own gateway (18296)
+        l173_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

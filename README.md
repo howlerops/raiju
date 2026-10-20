@@ -218,6 +218,7 @@ make tov     # Tov with the patches in tov-patches/
 make tov-test # the patches' own tests
 make unit    # tov test, plus the Python tests (pricing, HTTP/2 and gRPC interop, crew priors)
 make e2e     # gateway against a mock upstream, on both servers
+make smoke   # opt-in: real providers, for each one with credentials in the environment (below)
 make openapi-check # docs/openapi/management.yaml against a probe gateway
 make parity-count  # recount docs/parity.md and refresh its Summary table
 make ui      # the web UI in headless Chromium against a real gateway
@@ -225,6 +226,49 @@ make web     # rebuild the web UI (web/) and embed it in src/ui_assets.tov
 make web-check # rebuild it and fail when src/ui_assets.tov or the API types would change
 make bench
 ```
+
+### CI
+
+`.github/workflows/ci.yml` runs on pull requests and pushes to `main`: it builds the patched
+compiler once (cached by Tov's revision and a hash of `tov-patches/` and `scripts/build-tov.sh`),
+then check, unit, openapi-check, web-check and the parity count in one job, e2e on Bun and on
+http1, and `make ui` in Chromium; logs are uploaded when a job fails. Pushes to `main` also build
+the Docker image (no push). `scripts/ci.sh` runs the same stages locally: `scripts/ci.sh` for all
+of them, or name some (`scripts/ci.sh check unit`; `--help` lists them). It uses `TOV` and `BUN`
+when set; with `CI_LOCK=/tmp/raiju-e2e.lock` the stages that bind fixed ports take that lock.
+
+### Real-provider smoke tests
+
+`make e2e` runs every provider against `tests/mock_upstream.tov`. `make smoke` (`tests/smoke.py`) runs
+the real ones: it starts one gateway on port 18271 with a config built from the environment and, for
+each provider that has credentials, runs a small matrix with a cheap model: chat whole and streamed,
+a tool call, embeddings where the provider has them, its native route through Raiju (OpenAI
+Responses, Anthropic Messages, GenAI generateContent for Gemini and Vertex, Bedrock Converse, Cohere v2
+chat), a request just over `large_payload_optimization`'s threshold (set to 8 KiB there, so it takes
+the streamed path), and the usage and cost of the log rows. Each check prints `ok`, `FAIL` or `skip`;
+the exit status is 1 only when a check fails, so with no credentials everything skips and it exits 0.
+Prompts are a few words and `max_tokens` is 16 to 64 (the large request is about 2,000 input tokens).
+
+| Provider | Reads | Default model (embeddings) |
+|---|---|---|
+| openai | `OPENAI_API_KEY` | gpt-4.1-nano (text-embedding-3-small) |
+| anthropic | `ANTHROPIC_API_KEY` | claude-haiku-4-5 |
+| gemini | `GEMINI_API_KEY` | gemini-2.5-flash-lite (gemini-embedding-001) |
+| mistral | `MISTRAL_API_KEY` | mistral-small-latest (mistral-embed) |
+| groq | `GROQ_API_KEY` | openai/gpt-oss-20b |
+| cohere | `COHERE_API_KEY` | command-r7b-12-2024 (embed-english-light-v3.0) |
+| xai | `XAI_API_KEY` | grok-4.20-non-reasoning |
+| openrouter | `OPENROUTER_API_KEY` | openai/gpt-4o-mini |
+| bedrock | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`, `AWS_REGION` (us-east-1) | amazon.nova-micro-v1:0 (amazon.titan-embed-text-v2:0) |
+| azure | `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT`, optional `AZURE_OPENAI_EMBED_DEPLOYMENT`, `AZURE_OPENAI_API_VERSION` (2024-10-21) | the deployments |
+| vertex | `GOOGLE_APPLICATION_CREDENTIALS` (a service account key file), `VERTEX_PROJECT` or `GOOGLE_CLOUD_PROJECT` (else the key's project), `VERTEX_REGION` (us-central1) | gemini-2.5-flash-lite (text-embedding-005) |
+
+`SMOKE_<PROVIDER>_MODEL` and `SMOKE_<PROVIDER>_EMBED_MODEL` (for example `SMOKE_OPENAI_MODEL=gpt-4o-mini`)
+replace a default; `-`, `none` or `off` turn the provider (or its embeddings) off. `SMOKE_NO_BUILD=1`
+uses the existing `build/raiju`. The config names every secret as `env.NAME`, so no key is written to
+disk (the Vertex key file's content reaches the gateway in its environment only), and printed error
+bodies have credential values masked. The gateway's own log is `build/smoke.log`. A rejected
+credential fails the chat check and skips that provider's other checks.
 
 ### The web UI
 

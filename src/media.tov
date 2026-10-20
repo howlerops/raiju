@@ -5,7 +5,7 @@
 // rest of each request goes upstream unchanged. Anthropic, Gemini, Vertex and Bedrock
 // have their own APIs: media_native.tov and media_cloud.tov build those requests and the answers
 // are converted to OpenAI's shapes here.
-import { Config, KeyConfig, ProviderConfig, providerOf } from "./config"
+import { Config, KeyConfig, ProviderConfig, OAuthKeyConfig, providerOf } from "./config"
 import { Target, headers, addExtraHeaders, trimSlash, proxyOf, tlsOf, poolOf } from "./providers/types"
 import { isOpenAICompatible, modelsRequest } from "./providers/openai"
 import * as replicate from "./providers/replicate"
@@ -33,6 +33,9 @@ export class MediaBill {
   provider = ""
   model = ""
   chars = 0
+  // the usage a native transcription read from its provider's answer (Gemini's usageMetadata), for an answer whose
+  // body cannot carry it (response_format text)
+  usage: SttUsage | undefined = undefined
   grant: Grant | undefined = undefined
   gate: (provider: string, model: string) => Response | undefined = (provider: string, model: string): Response | undefined => undefined
 
@@ -111,6 +114,44 @@ export function transcriptionUsage(body: string): SttUsage | undefined {
   }
 }
 
+// A streamed line longer than this is not read for usage.
+const LINE_CAP = 1048576
+
+// The usage of a streamed transcription, read from its events as they pass (the last event with a usage counts, as
+// transcriptionUsage reads a whole answer). Lines are cut at their newline byte, so a character split across chunks
+// is whole when its line is read.
+export class StreamUsage {
+  usage: SttUsage | undefined = undefined
+  line: u8[] = []
+
+  push(chunk: u8[]): void {
+    for (const b of chunk) {
+      if (int(b) === 10) this.take()
+      else if (this.line.length < LINE_CAP) this.line.push(b)
+    }
+  }
+
+  // The usage once the stream has ended (a last line with no newline counts too).
+  end(): SttUsage | undefined {
+    this.take()
+    return this.usage
+  }
+
+  private take(): void {
+    if (this.line.length === 0) return
+    let text = ""
+    try {
+      text = new TextDecoder().decode(this.line)
+    } catch (e) {
+      text = ""
+    }
+    this.line = []
+    if (!text.trim().startsWith("data:")) return
+    const u = transcriptionUsage(text)
+    if (u !== undefined) this.usage = u
+  }
+}
+
 // Azure's api-version when the key does not set one (as in openai.tov).
 const API_VERSION = "2024-10-21"
 
@@ -142,9 +183,6 @@ function patterns(): Pattern[] {
     { method: "DELETE", pattern: "/v1/responses/{id}", op: "responses.delete", modelIn: "none" },
     { method: "POST", pattern: "/v1/responses/{id}/cancel", op: "responses.cancel", modelIn: "none" },
     { method: "GET", pattern: "/v1/responses/{id}/input_items", op: "responses.input_items", modelIn: "none" },
-    // Realtime over REST and WebRTC: ephemeral client secrets, sessions, and SDP calls
-    { method: "POST", pattern: "/v1/realtime/client_secrets", op: "realtime.client_secrets", modelIn: "none" },
-    { method: "POST", pattern: "/v1/realtime/sessions", op: "realtime.sessions", modelIn: "json" },
     // Mistral's OCR (and OpenAI-compatible providers that offer it)
     { method: "POST", pattern: "/v1/ocr", op: "ocr", modelIn: "json" },
   ]
@@ -361,9 +399,15 @@ export async function send(t: Target, mr: native.MediaRequest): Promise<Response
     const pool = poolOf(t.cfg)
     if (body === undefined) res = try await fetch(mr.url, { method: mr.method, headers: r, signal: signal, proxy: px, tls: tls, pool: pool })
     else res = try await fetch(mr.url, { method: mr.method, headers: r, body: body, signal: signal, proxy: px, tls: tls, pool: pool })
+    const ct = res.headers.get("content-type") ?? "application/json"
+    // an event stream (a streamed transcription or speech) goes to the caller as it arrives; the deadline covers the head
+    const st = res.body
+    if (res.status === 200 && isEventStream(ct) && st !== undefined) {
+      dl.finish()
+      return new Response(pump(st, passChunk, noTail), { status: 200, headers: { "content-type": ct, "cache-control": "no-cache" } })
+    }
     const bytes = try await res.bytes()
     dl.finish()
-    const ct = res.headers.get("content-type") ?? "application/json"
     return new Response(bytes, { status: res.status, headers: { "content-type": ct } })
   } catch (e) {
     dl.finish()
@@ -371,10 +415,89 @@ export async function send(t: Target, mr: native.MediaRequest): Promise<Response
   }
 }
 
+// Whether an answer's content type is a server-sent event stream.
+export function isEventStream(contentType: string): bool {
+  return contentType.toLowerCase().trim().startsWith("text/event-stream")
+}
+
+function passChunk(c: u8[]): u8[] {
+  return c
+}
+
+function noTail(ok: bool): u8[] {
+  return []
+}
+
+// The copy of an upstream body into the caller's: the caller's stream is fed chunk by chunk (Tov's fetch body cannot
+// be handed to a Response as it is), and a caller that goes away stops the copy.
+class Pump {
+  ctl: ReadableStreamDefaultController | undefined = undefined
+  cancelled = false
+}
+
+// The caller's stream of an upstream body, copied in the background: each chunk as conv makes it (an empty one is not
+// sent), then what tail adds when the upstream body has ended (ok false when it broke off or the caller left).
+export function pump(upstream: ReadableStream, conv: (chunk: u8[]) => u8[], tail: (ok: bool) => u8[]): ReadableStream {
+  const p = new Pump()
+  const out = new ReadableStream({
+    start: (c) => {
+      p.ctl = c
+    },
+    cancel: () => {
+      p.cancelled = true
+    },
+  })
+  copyPump(upstream, p, conv, tail)
+  return out
+}
+
+async function copyPump(upstream: ReadableStream, p: Pump, conv: (chunk: u8[]) => u8[], tail: (ok: bool) => u8[]): Promise<void> {
+  let ok = true
+  try {
+    const reader = upstream.getReader()
+    while (!p.cancelled) {
+      const r = await reader.read()
+      if (r.done) break
+      const v = r.value
+      const c = p.ctl
+      if (v === undefined || c === undefined) continue
+      const out = conv(v)
+      if (out.length > 0) c.enqueue(out)
+    }
+  } catch (e) {
+    // the upstream broke off: the caller's body ends here
+    ok = false
+  }
+  const end = tail(ok && !p.cancelled)
+  const c = p.ctl
+  if (c !== undefined && !p.cancelled) {
+    try {
+      if (end.length > 0) c.enqueue(end)
+      c.close()
+    } catch (e) {
+      // already closed by the caller
+    }
+  }
+}
+
 // Serves one media, file or batch request: picks the provider, rewrites the
 // model when the body carries one, and returns the upstream response as it came.
 // A bill (audio requests) is admitted at the model, before the upstream call; a refusal is the answer.
-export async function handleMedia(cfg: Config, req: Request, route: MediaRoute, bill?: MediaBill): Promise<Response> throws TypeError {
+// A key with oauth_key_config and no value gets its bearer from `mint` (the gateway's token cache).
+export type Mint = (oc: OAuthKeyConfig, p: ProviderConfig) => Promise<{ token: string, error: string }>
+
+// The target with its minted bearer when its key has oauth_key_config and no value, or the minting error.
+async function minted(t: Target, mint: Mint | undefined): Promise<{ t: Target, error: string }> {
+  const oc = t.key.oauth_key_config
+  if ((t.key.value ?? "") !== "" || oc === undefined || mint === undefined) return { t: t, error: "" }
+  const tok = await mint(oc, t.cfg)
+  if (tok.error !== "") return { t: t, error: tok.error }
+  let n = t
+  n.key.value = tok.token
+  return { t: n, error: "" }
+}
+
+export async function handleMedia(cfg: Config, req: Request, route: MediaRoute, bill?: MediaBill, mint?: Mint): Promise<Response> throws TypeError {
   const url = try new URL(req.url)
   const sp = new URLSearchParams(url.search)
   const provider = providerFor(snapshot(req.headers), sp)
@@ -398,7 +521,7 @@ export async function handleMedia(cfg: Config, req: Request, route: MediaRoute, 
         const refused = bill.begin(mt)
         if (refused !== undefined) return refused
       }
-      if (isNative(mt.kind)) return await nativeMedia(mt, route, qs, text, undefined)
+      if (isNative(mt.kind)) return await nativeMedia(mt, route, qs, text, undefined, bill)
       body = try rewriteJsonModel(text, mt.model)
       contentType = "application/json"
     } else if (route.modelIn === "form") {
@@ -411,7 +534,7 @@ export async function handleMedia(cfg: Config, req: Request, route: MediaRoute, 
         const refused = bill.begin(t)
         if (refused !== undefined) return refused
       }
-      if (isNative(t.kind)) return await nativeMedia(t, route, qs, "", fd)
+      if (isNative(t.kind)) return await nativeMedia(t, route, qs, "", fd, bill)
       body = formWithModel(fd, t.model)
     } else {
       const pt = providerTarget(cfg, provider)
@@ -433,8 +556,12 @@ export async function handleMedia(cfg: Config, req: Request, route: MediaRoute, 
   } catch (e) {
     return errorReply(400, `invalid request body: ${e.message}`, "invalid_request_error")
   }
-  const tt: Target = t === undefined ? { provider: provider, kind: "", model: "", key: { value: "" }, cfg: {} } : t
-  if (!supported(tt.kind)) return errorReply(400, `provider "${tt.provider}" does not support ${route.op}`, "invalid_request_error")
+  const t0: Target = t === undefined ? { provider: provider, kind: "", model: "", key: { value: "" }, cfg: {} } : t
+  if (!supported(t0.kind)) return errorReply(400, `provider "${t0.provider}" does not support ${route.op}`, "invalid_request_error")
+  // files, batches and media calls send the minted bearer of an oauth_key_config key too
+  const mt0 = await minted(t0, mint)
+  if (mt0.error !== "") return errorReply(502, mt0.error, "authentication_error")
+  const tt = mt0.t
   if (route.op === "batches.results") {
     try {
       return try await openaiBatchResults(tt, routeId(route))
@@ -453,7 +580,7 @@ export async function handleMedia(cfg: Config, req: Request, route: MediaRoute, 
 // Returns undefined for a request this does not touch (under the threshold), the Request to go on with (the
 // body was small after all, or its provider needs it whole: native providers, or a model field that comes
 // after the file) or the Response (refused, or the provider's answer).
-export async function handleMediaLarge(cfg: Config, req: Request, route: MediaRoute, lp: LargeSettings, bill?: MediaBill): Promise<Response | Request | undefined> {
+export async function handleMediaLarge(cfg: Config, req: Request, route: MediaRoute, lp: LargeSettings, bill?: MediaBill, mint?: Mint): Promise<Response | Request | undefined> {
   if (req.method !== "POST") return undefined
   const dtext = req.headers.get("content-length")
   const declared = dtext === undefined ? -1 : (parseInt(dtext) ?? -1)
@@ -519,10 +646,15 @@ export async function handleMediaLarge(cfg: Config, req: Request, route: MediaRo
       return refused
     }
   }
+  const mtl = await minted(tt, mint)
+  if (mtl.error !== "") {
+    await src.cancel()
+    return errorReply(502, mtl.error, "authentication_error")
+  }
   const lg = new LargeBody(lp, ahead.head, meta, ahead.ended ? undefined : src, declared)
   lg.plain = true
   if (route.modelIn === "form") lg.upstreamModel = tt.model
-  const h = authHeaders(tt)
+  const h = authHeaders(mtl.t)
   h.set("content-type", contentType)
   // the length is declared again when the caller declared one (so the provider need not accept chunks)
   if (declared >= 0) h.set("content-length", "" + (declared + lg.delta()))
@@ -530,11 +662,17 @@ export async function handleMediaLarge(cfg: Config, req: Request, route: MediaRo
   const dl = deadline(timeoutMs(tt.cfg))
   try {
     const res = await fetch(upstreamUrl(tt, route, qs), { method: "POST", headers: hr, body: lg.stream(), signal: dl.controller.signal, proxy: proxyOf(tt.cfg), tls: tlsOf(tt.cfg), pool: poolOf(tt.cfg) })
+    const ct = res.headers.get("content-type") ?? "application/json"
+    // a streamed transcription goes to the caller as it arrives (the upload has been sent by now)
+    const st = res.body
+    if (res.status === 200 && isEventStream(ct) && st !== undefined && !lg.tap.over) {
+      dl.finish()
+      return new Response(pump(st, passChunk, noTail), { status: 200, headers: { "content-type": ct, "cache-control": "no-cache" } })
+    }
     const bytes = await res.bytes()
     dl.finish()
     // a body with no declared length that grew past max_payload_bytes cut its own upload short
     if (lg.tap.over) return errorReply(413, `request body is over the maximum payload size of ${lp.maxPayload} bytes (large_payload_optimization.max_payload_bytes)`, "invalid_request_error")
-    const ct = res.headers.get("content-type") ?? "application/json"
     return new Response(bytes, { status: res.status, headers: { "content-type": ct } })
   } catch (e) {
     dl.finish()
@@ -719,8 +857,9 @@ const uploadOrder: string[] = []
 // The model of each batch made here, which its results are converted with.
 const batchModels: Map<string, string> = new Map()
 
+// Sarvam speaks OpenAI's format for chat only: its speech and speech-to-text are its own API.
 function isNative(kind: string): bool {
-  return kind === "anthropic" || kind === "gemini" || kind === "vertex" || kind === "bedrock" || kind === "replicate"
+  return kind === "anthropic" || kind === "gemini" || kind === "vertex" || kind === "bedrock" || kind === "replicate" || kind === "sarvam"
 }
 
 function remember(id: string, content: string): void {
@@ -813,13 +952,14 @@ function filePart(form: FormData | undefined): File | undefined {
 }
 
 // Serves a media, file or batch call for an Anthropic, Gemini, Vertex or Bedrock provider.
-async function nativeMedia(t: Target, route: MediaRoute, qs: string, text: string, form: FormData | undefined): Promise<Response> {
+async function nativeMedia(t: Target, route: MediaRoute, qs: string, text: string, form: FormData | undefined, bill?: MediaBill): Promise<Response> {
   try {
     if (t.kind === "anthropic") return await anthropicMedia(t, route, qs, text, form)
     if (t.kind === "vertex") return await vertexMedia(t, route, qs, text, form)
     if (t.kind === "bedrock") return await bedrockMedia(t, route, qs, text, form)
     if (t.kind === "replicate") return await replicateMedia(t, route, qs, text, form)
-    return await geminiMedia(t, route, qs, text, form)
+    if (t.kind === "sarvam") return await sarvamMedia(t, route, text, form)
+    return await geminiMedia(t, route, qs, text, form, bill)
   } catch (e) {
     return errorReply(502, `${t.provider} answer could not be converted: ${e.message}`, "api_error")
   }
@@ -933,6 +1073,47 @@ async function imageReply(t: Target, mr: native.MediaRequest, bedrockAnswer: boo
   if (bedrockAnswer) return jsonReply(try cloud.bedrockImagesToOpenAI(raw))
   if (t.model.toLowerCase().includes("imagen")) return jsonReply(try native.imagenToOpenAI(raw))
   return jsonReply(try native.geminiImageToOpenAI(raw))
+}
+
+// Sarvam's refusal in the OpenAI error shape, with its status (a failed call stays the 502 send made).
+function sarvamFailure(status: int, raw: string): Response {
+  if (status === 502 && raw.includes("api_connection_error")) return new Response(raw, { status: 502, headers: { "content-type": "application/json" } })
+  return new Response(native.sarvamError(raw), { status: status, headers: { "content-type": "application/json" } })
+}
+
+// The bytes of a server-sent event.
+function eventBytes(s: string): u8[] {
+  return new TextEncoder().encode(s)
+}
+
+function sarvamDelta(c: u8[]): u8[] {
+  return eventBytes(native.speechStreamEvent(c, false))
+}
+
+function sarvamDone(ok: bool): u8[] {
+  return eventBytes(native.speechStreamEvent([], true) + "data: [DONE]\n\n")
+}
+
+// Sarvam's streamed speech: the raw audio as it comes, each chunk a speech.audio.delta event, then speech.audio.done and
+// [DONE] (Bifrost's SpeechStream for Sarvam). A refusal before the stream is the error answer.
+async function sarvamSpeechStream(t: Target, mr: native.MediaRequest): Promise<Response> {
+  const r: Record<string, string> = mr.headers
+  const dl = deadline(timeoutMs(t.cfg))
+  try {
+    const body = mr.body
+    const res = typeof body === "string" ? await fetch(mr.url, { method: "POST", headers: r, body: body, signal: dl.controller.signal, proxy: proxyOf(t.cfg), tls: tlsOf(t.cfg), pool: poolOf(t.cfg) }) : await fetch(mr.url, { method: "POST", headers: r, signal: dl.controller.signal, proxy: proxyOf(t.cfg), tls: tlsOf(t.cfg), pool: poolOf(t.cfg) })
+    const st = res.body
+    if (res.status !== 200 || st === undefined) {
+      const raw = await res.text()
+      dl.finish()
+      return sarvamFailure(res.status === 200 ? 502 : res.status, raw)
+    }
+    dl.finish()
+    return new Response(pump(st, sarvamDelta, sarvamDone), { status: 200, headers: { "content-type": "text/event-stream", "cache-control": "no-cache" } })
+  } catch (e) {
+    dl.finish()
+    return errorReply(502, `${t.provider} request failed: ${e.message}`, "api_connection_error")
+  }
 }
 
 // A GET to the upstream URL of a route, with the provider's auth.
@@ -1053,6 +1234,25 @@ async function vertexStore(t: Target, route: MediaRoute, qs: string, text: strin
     return jsonReply(try native.batchResultsDoc(id, try await out.text()))
   }
   return errorReply(400, `provider "${t.provider}" does not support ${route.op}`, "invalid_request_error")
+}
+
+// A Vertex batch job deleted for the GenAI batch delete route, as Bifrost's Vertex BatchDelete: the job is deleted by
+// id in the key's project and region, and the answer is {"done":true} (Bifrost's reply when the raw answer is not
+// sent back). An upstream error comes back as it came.
+export async function vertexBatchDelete(t: Target, id: string): Promise<Response> {
+  let token = ""
+  try {
+    token = try await vertexBearer(t)
+  } catch (e) {
+    return errorReply(502, `vertex authentication failed: ${e.message}`, "authentication_error")
+  }
+  try {
+    const del = await send(t, try cloud.vertexJobDelete(t, token, id))
+    if (!del.ok) return del
+  } catch (e) {
+    return errorReply(400, e.message, "invalid_request_error")
+  }
+  return jsonReply(`{"done":true}`)
 }
 
 // POST /v1/batches on Vertex: the input file's lines become Vertex instances, which are written to
@@ -1338,6 +1538,53 @@ async function bedrockBatchOutput(t: Target, c: S3Creds, bid: string): Promise<R
   let model = batchModels.get(bid) ?? ""
   if (model === "") model = try cloud.bedrockJobModel(raw)
   return jsonlReply(try cloud.bedrockResultsToOpenAI(all, model))
+}
+
+// Sarvam's speech and speech-to-text (media_native.tov builds the requests); its other media calls are refused,
+// as Bifrost refuses them.
+async function sarvamMedia(t: Target, route: MediaRoute, text: string, form: FormData | undefined): Promise<Response> throws SyntaxError | Error {
+  if (route.op === "audio.speech") {
+    let mr: native.MediaRequest | undefined = undefined
+    let codec = ""
+    let stream = false
+    try {
+      const fs = try fields(text)
+      codec = rawStr(fs, "output_audio_codec") ?? ""
+      stream = rawStr(fs, "stream_format") === "sse"
+      mr = try native.sarvamSpeech(t, fs)
+    } catch (e) {
+      return errorReply(400, e.message, "invalid_request_error")
+    }
+    if (mr === undefined) return errorReply(400, "the request needs input", "invalid_request_error")
+    // stream_format sse: Sarvam's /text-to-speech/stream, its raw audio sent on as speech.audio.delta events
+    if (stream) return await sarvamSpeechStream(t, { method: mr.method, url: mr.url + "/stream", headers: mr.headers, body: mr.body })
+    const up = await send(t, mr)
+    if (up.status !== 200) return sarvamFailure(up.status, try await up.text())
+    let audio: native.SpeechAudio | undefined = undefined
+    try {
+      audio = try native.sarvamSpeechAudio(try await up.text(), codec)
+    } catch (e) {
+      return errorReply(502, e.message, "api_error")
+    }
+    if (audio === undefined) return errorReply(502, "Sarvam text-to-speech response contained no audio", "api_error")
+    return new Response(audio.bytes, { headers: { "content-type": audio.contentType } })
+  }
+  if (route.op === "audio.transcriptions") {
+    const f = filePart(form)
+    if (f === undefined) return errorReply(400, "transcription file is required", "invalid_request_error")
+    const format = formText(form, "response_format")
+    const lang = formText(form, "language_code") !== "" ? formText(form, "language_code") : formText(form, "language")
+    const st = native.sarvamTranscription(t, formText(form, "mode"), lang, formText(form, "input_audio_codec"))
+    const fd = new FormData()
+    fd.append("file", f)
+    for (const kv of st.fields) fd.append(kv[0]!, kv[1]!)
+    const up = await send(t, { method: "POST", url: st.request.url, headers: st.request.headers, body: fd })
+    if (up.status !== 200) return sarvamFailure(up.status, try await up.text())
+    const body = try native.sarvamTranscriptToOpenAI(try await up.text())
+    if (format === "text") return new Response(rawStr(try fields(body), "text") ?? "", { headers: { "content-type": "text/plain; charset=utf-8" } })
+    return jsonReply(body)
+  }
+  return errorReply(400, `provider "${t.provider}" does not support ${route.op}`, "invalid_request_error")
 }
 
 // Replicate predictions still running when the synchronous wait ends are read again at their get URL,
@@ -1628,7 +1875,7 @@ async function anthropicBatchOutput(t: Target, bid: string): Promise<Response> t
   return jsonlReply(try native.anthropicResultsToOpenAI(try await res.text(), batchModels.get(bid) ?? ""))
 }
 
-async function geminiMedia(t: Target, route: MediaRoute, qs: string, text: string, form: FormData | undefined): Promise<Response> throws SyntaxError | Error {
+async function geminiMedia(t: Target, route: MediaRoute, qs: string, text: string, form: FormData | undefined, bill?: MediaBill): Promise<Response> throws SyntaxError | Error {
   const id = routeId(route)
   if (route.op === "files.create") {
     const f = filePart(form)
@@ -1754,9 +2001,13 @@ async function geminiMedia(t: Target, route: MediaRoute, qs: string, text: strin
     const audio = try await f.bytes()
     const up = await send(t, native.geminiTranscription(t, formText(form, "prompt"), mime, audio))
     if (!up.ok) return up
-    const transcript = try native.transcriptText(try await up.text())
+    const raw = try await up.text()
+    const transcript = try native.transcriptText(raw)
+    // the usage of the answer's usageMetadata, as Bifrost reports it, billed as computeTranscriptionCost bills it
+    const usage = try native.transcriptionUsageOf(raw)
+    if (bill !== undefined && usage !== "") bill.usage = transcriptionUsage(`{"usage":${usage}}`)
     if (format === "text") return new Response(transcript, { headers: { "content-type": "text/plain; charset=utf-8" } })
-    return jsonReply(native.transcriptionJson(transcript))
+    return jsonReply(native.transcriptionJson(transcript, usage))
   }
   if (route.op === "audio.speech") {
     let format = "wav"
@@ -2014,4 +2265,31 @@ test("a streamed transcription's usage is on its last event that has one", () =>
   expect(u.prompt).toBe(3)
   expect(u.completion).toBe(1)
   expect(transcriptionUsage("data: {\"type\":\"transcript.text.delta\",\"delta\":\"hi\"}\n\ndata: [DONE]\n\n")).toBeUndefined()
+})
+
+test("a streamed transcription's usage is read as its events pass, whatever the chunks", () => {
+  const s = "data: {\"type\":\"transcript.text.delta\",\"delta\":\"hé\"}\n\n" +
+    "data: {\"type\":\"transcript.text.done\",\"text\":\"hé\",\"usage\":{\"type\":\"tokens\",\"input_tokens\":3,\"output_tokens\":1,\"total_tokens\":4}}\n\n" +
+    "data: [DONE]"
+  const bytes = new TextEncoder().encode(s)
+  // fed three bytes at a time: lines and characters split across chunks
+  const su = new StreamUsage()
+  let i = 0
+  while (i < bytes.length) {
+    su.push(bytes.slice(i, Math.min(i + 3, bytes.length)))
+    i += 3
+  }
+  const u = su.end()!
+  expect(u.prompt).toBe(3)
+  expect(u.completion).toBe(1)
+  const none = new StreamUsage()
+  none.push(new TextEncoder().encode("event: x\ndata: {\"type\":\"transcript.text.delta\"}\n"))
+  expect(none.end()).toBeUndefined()
+  expect(isEventStream("text/event-stream; charset=utf-8")).toBe(true)
+  expect(isEventStream("application/json")).toBe(false)
+})
+
+test("sarvam is served natively", () => {
+  expect(isNative("sarvam")).toBe(true)
+  expect(isNative("groq")).toBe(false)
 })
