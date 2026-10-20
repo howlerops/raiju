@@ -65,6 +65,47 @@ function toolsJson(raw: string): string throws SyntaxError {
   return `[${specs.join(",")}]`
 }
 
+// The model listing: GET /v1/models with Bifrost's page size ({"models":[{"name":...}]}, read by openai.modelIds).
+export function modelsRequest(t: Target): Upstream {
+  return { url: `${apiBase(t)}/v1/models?page_size=1000`, headers: upstreamHeaders(t), body: "" }
+}
+
+// Bifrost counts Cohere tokens with its tokenizer: POST /v1/tokenize with the conversation's text, its parts joined
+// with newlines (cohere/count_tokens.go); the text must be 1 to 65536 characters.
+export function tokenizeRequest(t: Target, req: ChatRequest): Upstream throws SyntaxError {
+  const parts: string[] = []
+  for (const m of req.messages) {
+    const text = textOf(m.content)
+    if (text !== "") parts.push(text)
+  }
+  const text = parts.join("\n").trim()
+  let n = 0
+  for (const c of text.chars()) n += 1
+  if (n < 1 || n > 65536) throw new SyntaxError("count tokens text length must be between 1 and 65536 characters")
+  return { url: `${apiBase(t)}/v1/tokenize`, headers: upstreamHeaders(t), body: `{"model":${quote(t.model)},"text":${quote(text)}}` }
+}
+
+// The count of a tokenize answer: its tokens, else its token strings.
+export function tokenizeCount(text: string): int throws SyntaxError {
+  const fs = try fields(text)
+  const n = (try elements(find(fs, "tokens") ?? "[]")).length
+  if (n > 0) return n
+  return (try elements(find(fs, "token_strings") ?? "[]")).length
+}
+
+// OpenAI's tool_choice as Cohere's, as Bifrost maps it (cohere/chat.go): none to NONE; required, any and a named
+// function to REQUIRED (Cohere cannot pin one function). auto is left out: it is Cohere's default, and its API takes
+// only REQUIRED and NONE.
+export function toolChoice(raw: string | undefined): string | undefined throws SyntaxError {
+  if (raw === undefined || isNull(raw)) return undefined
+  let type = ""
+  if (raw.startsWith(`"`)) type = rawStr([{ key: "c", raw: raw }], "c") ?? ""
+  else if (raw.startsWith("{")) type = rawStr(try fields(raw), "type") ?? ""
+  if (type === "none") return "NONE"
+  if (type === "required" || type === "any" || type === "function") return "REQUIRED"
+  return undefined
+}
+
 // json_object for JSON mode; json_schema carries the bare schema.
 function responseFormat(body: Field[]): string | undefined throws SyntaxError {
   const rf = find(body, "response_format")
@@ -102,6 +143,8 @@ export function chatTail(req: ChatRequest, body: Field[]): string[] throws Synta
   if (stop !== undefined) out.push(`"stop_sequences":${typeof stop === "string" ? `[${quote(stop)}]` : JSON.stringify(stop)}`)
   const tools = find(body, "tools")
   if (tools !== undefined && !isNull(tools)) out.push(`"tools":${try toolsJson(tools)}`)
+  const tc = try toolChoice(find(body, "tool_choice"))
+  if (tc !== undefined) out.push(`"tool_choice":"${tc}"`)
   const rf = try responseFormat(body)
   if (rf !== undefined) out.push(`"response_format":${rf}`)
   return out
@@ -275,6 +318,36 @@ test("chat request maps messages, tools and sampling", () => {
   expect(up.body.includes(`"stop_sequences":["END"]`)).toBe(true)
   expect(up.body.includes(`"tools":[{"type":"function","function":{"name":"weather","description":"Get weather","parameters":{"type":"object"}}}]`)).toBe(true)
   expect(up.body.includes(`"response_format":{"type":"json_object"}`)).toBe(true)
+})
+
+test("tool_choice maps to Cohere's", () => {
+  expect(try toolChoice(`"none"`)).toBe("NONE")
+  expect(try toolChoice(`"required"`)).toBe("REQUIRED")
+  expect(try toolChoice(`"any"`)).toBe("REQUIRED")
+  expect(try toolChoice(`{"type":"function","function":{"name":"weather"}}`)).toBe("REQUIRED")
+  expect(try toolChoice(`"auto"`)).toBe(undefined)
+  expect(try toolChoice(undefined)).toBe(undefined)
+  const raw = `{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"w"}}],"tool_choice":"required"}`
+  const t: Target = { provider: "cohere", kind: "cohere", model: "command-a", key: { value: "ck" }, cfg: {} }
+  const up = try chatRequest(t, try JSON.parse(raw) as ChatRequest, try fields(raw))
+  expect(up.body.includes(`"tool_choice":"REQUIRED"`)).toBe(true)
+})
+
+test("token counts go to Cohere's tokenizer with the conversation's text", () => {
+  const t: Target = { provider: "cohere", kind: "cohere", model: "command-a", key: { value: "ck" }, cfg: {} }
+  const up = try tokenizeRequest(t, { model: "m", messages: [{ role: "system", content: "be brief" }, { role: "user", content: "hello" }] })
+  expect(up.url).toBe("https://api.cohere.com/v1/tokenize")
+  expect(up.headers.get("authorization")).toBe("Bearer ck")
+  expect(up.body).toBe(`{"model":"command-a","text":"be brief\\nhello"}`)
+  expect(try tokenizeCount(`{"tokens":[1,2,3],"token_strings":["a","b","c"]}`)).toBe(3)
+  expect(try tokenizeCount(`{"token_strings":["a"]}`)).toBe(1)
+  let threw = false
+  try {
+    tokenizeRequest(t, { model: "m", messages: [{ role: "user", content: " " }] })
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
 })
 
 test("chat request maps json_schema and image parts", () => {

@@ -10109,6 +10109,324 @@ def l158_e2e(env):
         gw.terminate()
         gw.wait()
 
+GW_L165 = "http://127.0.0.1:18284"  # built-in role ids, user emails, quota model_configs, role attachments, complexity status, rotate revoking MCP grants
+
+def l165_e2e(env):
+    """L165 (governance and RBAC API): the built-in roles with fixed ids on Bifrost's role routes and expanded in
+    /users/me/permissions (and Bifrost's permission map on the governance path); users with email addresses and the
+    lookups by email; a built-in role set by id and attached to access profiles (apply_to_existing and is_default);
+    the quota view's model_configs; governance.complexity_analyzer_config read and the complexity status routes; and a
+    key's rotation revoking its MCP OAuth grants. Its own gateway (18284), started and stopped here."""
+    import hashlib, shutil
+    d = os.path.join(BUILD, "e2e-l165")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    cfg_path = os.path.join(d, "config.json")
+    def tok(t):
+        return hashlib.sha256(t.encode()).hexdigest()
+    json.dump({
+        "client": {"enable_logging": False, "enforce_auth_on_inference": True, "mcp_server_auth_mode": "both",
+                   "oauth2_server_config": {"issuer_url": GW_L165, "access_token_ttl": 600}},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        # adaptive load balancing's provider level: openai's only key for gpt-l165 is refused (and held), groq serves it
+        "health": {"adaptive": True, "reroute_failed_directions": True},
+        "providers": {"openai": {"keys": [{"name": "l165", "value": "sk-bad-key-l165", "models": ["gpt-l165"], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+                      "groq": {"keys": [{"name": "l165g", "value": "sk-l165-groq", "models": ["gpt-l165"], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": tok("sk-admin-l165-root")},
+                      {"name": "vi", "role": "viewer", "email": "vi@example.com", "token_sha256": tok("sk-admin-l165-view")}],
+            "access_profiles": [{"id": "p-view", "name": "Viewers"}, {"id": "p-later", "name": "Later viewers"}],
+            "budgets": [{"id": "b-vk", "max_limit": 10, "reset_duration": "1d"}, {"id": "b-mc", "max_limit": 3, "reset_duration": "1d"}],
+            "rate_limits": [{"id": "rl-mc", "request_max_limit": 5, "request_reset_duration": "1h"}],
+            "virtual_keys": [{"id": "vk-q", "name": "quota key", "value": "sk-bf-l165-q", "user_id": "vi", "budget_id": "b-vk", "provider_configs": [{"provider": "openai"}]},
+                             {"id": "vk-dir", "name": "direction key", "value": "sk-bf-l165-dir", "provider_configs": [{"provider": "openai"}, {"provider": "groq"}]}],
+            "model_configs": [{"id": "mc-4o", "model_name": "gpt-4o", "provider": "openai", "scope": "virtual_key", "scope_id": "vk-q", "budget_ids": ["b-mc"], "rate_limit_id": "rl-mc"},
+                              {"id": "mc-all", "model_name": "*", "scope": "virtual_key", "scope_id": "vk-q"}],
+            "complexity_analyzer_config": {
+                "keywords": {"simple_keywords": ["hi"], "medium_keywords": ["summarize this"], "complex_keywords": ["design a system"]},
+                "semantic": {"provider": "openai", "embedding_model": "text-embedding-3-small", "timeout": "2s"}},
+        },
+    }, open(cfg_path, "w"))
+    root = {"authorization": "Bearer sk-admin-l165-root"}
+    view = {"authorization": "Bearer sk-admin-l165-view"}
+    def api(method, p, body=None, who=root):
+        h = {"content-type": "application/json", **who}
+        return raw(method, GW_L165 + p, body, h)
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18284", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l165.log"), "w"))
+    try:
+        wait(GW_L165 + "/health")
+        # built-in roles
+        s, _, b = api("GET", "/api/governance/rbac/roles")
+        roles = json.loads(b).get("roles", []) if s == 200 else []
+        system = [(r["id"], r["name"]) for r in roles if r.get("is_system_role")]
+        check("Bifrost's role list puts the built-in roles first, with fixed ids", system == [(9001, "admin"), (9002, "editor"), (9003, "viewer"), (9004, "auditor")] and roles[0]["name"] == "admin", (s, b[:300]))
+        s, _, b = api("GET", "/api/roles")
+        check("the /api/roles list keeps the custom roles only", s == 200 and json.loads(b)["roles"] == [], (s, b[:200]))
+        s, _, b = api("GET", "/api/governance/rbac/roles/9003/permissions")
+        pairs = json.loads(b).get("permissions", []) if s == 200 else []
+        check("a built-in role's rules read as permission pairs by its id", any(p["resource"] == "Logs" and p["operation"] == "View" for p in pairs) and not any(p["operation"] == "Create" for p in pairs), (s, b[:300]))
+        s, _, b = api("DELETE", "/api/governance/rbac/roles/9001")
+        check("a built-in role cannot be deleted", s == 403 and "system role" in b, (s, b[:200]))
+        s, _, b = api("GET", "/api/users/me/permissions", who=view)
+        me = json.loads(b) if s == 200 else {}
+        ops = {p["operation"] for p in me.get("permissions", [])}
+        check("a built-in role's caller reads its rules as pairs, with the role's id", me.get("role") == "viewer" and me.get("role_id") == 9003 and me.get("built_in") is True and len(me.get("permissions", [])) > 0 and ops <= {"View", "Download"}, (s, b[:300]))
+        s, _, b = api("GET", "/api/governance/users/me/permissions", who=view)
+        pm = json.loads(b).get("permissions", {}) if s == 200 else {}
+        check("the governance path answers Bifrost's permission map", pm.get("Logs", {}).get("View") is True and pm.get("Users", {}).get("View") is False and pm.get("VirtualKeys", {}).get("Create") is False, (s, b[:300]))
+        # emails
+        s, _, b = api("POST", "/api/users", {"name": "ed", "role": "editor", "email": "ed@example.com"})
+        check("a user is created with an email address", s == 201 and json.loads(b).get("email") == "ed@example.com", (s, b[:200]))
+        s, _, b = api("POST", "/api/users", {"name": "ed2", "role": "editor", "email": "ED@example.com"})
+        check("an email address another user has is refused", s == 409, (s, b[:200]))
+        s, _, b = api("GET", "/api/governance/users/email/ed%40example.com")
+        u = json.loads(b) if s == 200 else {}
+        check("a user is found by email in Bifrost's UserObject shape", u.get("id") == "ed" and u.get("email") == "ed@example.com" and u.get("role_id") == 9002 and u.get("role", {}).get("is_system_role") is True, (s, b[:300]))
+        s, _, b = api("GET", "/api/users/email/VI%40example.com")
+        check("the old path finds a user by email, without case", s == 200 and json.loads(b).get("id") == "vi", (s, b[:200]))
+        s, _, b = api("GET", "/api/governance/users/email/nobody%40example.com")
+        check("an unknown email is 404", s == 404, (s, b[:200]))
+        s, _, b = api("GET", "/api/governance/users/email/ed%40example.com", who=view)
+        check("the email lookup needs user management", s == 403, (s, b[:200]))
+        s, _, b = api("GET", "/api/governance/users/email/vi%40example.com/virtual-keys")
+        ks = json.loads(b) if s == 200 else {}
+        check("a user's virtual keys are listed by email", ks.get("user_id") == "vi" and [k["id"] for k in ks.get("virtual_keys", [])] == ["vk-q"] and ks["virtual_keys"][0]["value"] == "sk-bf-l165-q", (s, b[:300]))
+        s, _, b = api("GET", "/api/governance/virtual-keys/vk-q/users")
+        check("a key's assigned user carries the email", s == 200 and json.loads(b)["users"][0]["user_email"] == "vi@example.com", (s, b[:200]))
+        # a built-in role by id, and access profiles attached to it
+        s, _, b = api("PUT", "/api/users/ed/role", {"role_id": 9003})
+        check("a user's built-in role is set by its id", s == 200 and json.loads(b)["role"] == "viewer", (s, b[:200]))
+        s, _, b = api("POST", "/api/governance/access-profiles/p-view/roles", {"role_ids": [9003], "apply_to_existing": True})
+        check("a profile attached to a built-in role with apply_to_existing reaches its users now", s == 200 and json.loads(b)["users_applied"] == 2, (s, b[:200]))
+        s, _, b = api("POST", "/api/governance/access-profiles/p-later/roles", {"role_ids": [9003], "is_default": True})
+        check("a default-only attachment gives nobody the profile now", s == 200 and json.loads(b)["users_applied"] == 0, (s, b[:200]))
+        s, _, b = api("GET", "/api/users/vi/access-profiles")
+        held = [p["id"] for p in json.loads(b).get("access_profiles", [])] if s == 200 else []
+        check("the role's users now hold the applied profile, not the default-only one", held == ["p-view"], (s, b[:300]))
+        s, _, b = api("POST", "/api/users", {"name": "zed", "role": "viewer"})
+        s, _, b = api("GET", "/api/users/zed/access-profiles")
+        held = [p["id"] for p in json.loads(b).get("access_profiles", [])] if s == 200 else []
+        check("a user who joins the role later holds the default profile, not the one applied before", held == ["p-later"], (s, b[:300]))
+        s, _, b = api("GET", "/api/governance/users")
+        names = [u["name"] for u in json.loads(b).get("users", [])] if s == 200 else []
+        check("Bifrost's /api/governance/users lists the users", "zed" in names and "vi" in names, (s, b[:200]))
+        s, _, b = api("PUT", "/api/governance/users/zed/role", {"role_id": 9004})
+        check("a role is set on the governance users path", s == 200 and json.loads(b)["role"] == "auditor", (s, b[:200]))
+        s, _, b = api("GET", "/api/governance/users", who=view)
+        check("the governance users path needs user management", s == 403, (s, b[:200]))
+        # quota model_configs
+        s, _, b = call("GET", "/api/governance/virtual-keys/quota", None, {"x-bf-vk": "sk-bf-l165-q"}, base=GW_L165, auth=False)
+        q = json.loads(b) if s == 200 else {}
+        mcs = q.get("model_configs", [])
+        check("the quota view lists the key's per-model limits, without the all-models one", len(mcs) == 1 and mcs[0]["model_name"] == "gpt-4o" and mcs[0]["provider"] == "openai" and mcs[0]["budgets"][0]["id"] == "b-mc" and mcs[0]["budgets"][0]["max_limit"] == 3 and mcs[0]["rate_limit"]["id"] == "rl-mc", (s, b[:400]))
+        # the complexity analyzer from governance.complexity_analyzer_config, and its status routes
+        s, _, b = api("GET", "/api/routing/complexity-analyzer-config")
+        cx = json.loads(b) if s == 200 else {}
+        check("governance.complexity_analyzer_config is read as the semantic classifier", cx.get("classifier") == "semantic" and cx.get("semantic", {}).get("exemplars", {}).get("complex") == ["design a system"] and cx.get("semantic", {}).get("timeout_ms") == 2000, (s, b[:300]))
+        s, _, b = api("GET", "/api/routing/complexity-analyzer-status")
+        st = json.loads(b) if s == 200 else {}
+        check("the analyzer status reads warming before the first classified request", st.get("state") == "warming" and st.get("total") == 3 and st.get("loaded") == 0 and "SIMPLE" in st.get("decision_defaults", {}).get("criteria", {}), (s, b[:300]))
+        s, _, b = api("POST", "/api/routing/complexity-analyzer-status/retry")
+        check("a warm-up that has not failed is not retried", s == 409, (s, b[:200]))
+        s, _, b = api("GET", "/api/routing/complexity-analyzer-generations")
+        check("no generation is held before the first warm-up", s == 200 and json.loads(b)["generations"] == [], (s, b[:200]))
+        s, _, b = api("DELETE", "/api/routing/complexity-analyzer-generations/not-a-generation")
+        check("a namespace outside the classifier's scheme is refused", s == 400, (s, b[:200]))
+        # reroute_failed_directions: a pinned provider whose only key is held goes to a healthy provider for the model
+        dir_msgs = {"model": "openai/gpt-l165", "messages": [{"role": "user", "content": "hi"}]}
+        s1, _, b1 = call("POST", "/v1/chat/completions", dir_msgs, {"x-bf-vk": "sk-bf-l165-dir"}, base=GW_L165, auth=False)
+        s, _, b = api("GET", "/api/adaptive-routing/held-keys")
+        held = [r["target"] for r in json.loads(b).get("held_keys", [])] if s == 200 else []
+        check("the refused key of the pinned provider is held", s1 == 401 and held == ["openai#l165"], (s1, b1[:200], held))
+        s, h, b = call("POST", "/v1/chat/completions", dir_msgs, {"x-bf-vk": "sk-bf-l165-dir"}, base=GW_L165, auth=False)
+        prov = {k.lower(): v for k, v in h.items()}.get("x-bifrost-provider", "")
+        check("with its direction broken, the pinned request is rerouted to a healthy provider", s == 200 and prov == "groq", (s, prov, b[:200]))
+        # a rotated key loses its MCP OAuth grants
+        cid, refresh = as_grant(GW_L165, "l165-client", "sk-bf-l165-q")
+        s, _, b = api("GET", "/api/oauth2/sessions?virtual_key_id=vk-q")
+        check("the key holds an MCP OAuth grant", refresh != "" and s == 200 and json.loads(b)["total_count"] == 1, (s, b[:200]))
+        s, _, b = api("POST", "/api/governance/virtual-keys/vk-q/rotate")
+        check("the key is rotated", s == 200, (s, b[:200]))
+        s, body = as_refresh(GW_L165, cid, refresh)
+        check("a rotated key's grant no longer refreshes", s == 400, (s, body))
+        s, _, b = api("GET", "/api/oauth2/sessions?virtual_key_id=vk-q")
+        check("the rotated key's grants are gone from the list", s == 200 and json.loads(b)["total_count"] == 0, (s, b[:200]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
+GW_L164 = "http://127.0.0.1:18282"  # L164: provider operations (tool_choice, xAI compaction, Copilot, Mantle, Sarvam, Replicate, alias overrides, cache points)
+
+def l164_config() -> dict:
+    """Providers on the mock for L164: Gemini and Cohere (tool_choice), xAI and Bedrock Mantle and Vertex (from the main
+    e2e config), GitHub Copilot, Sarvam, Replicate and two Azure resources under /l164, and Bedrock with cache injection
+    points and an alias that overrides the region."""
+    base = json.load(open(os.path.join(BUILD, "e2e.config.json")))
+    ps = base["providers"]
+    def key(name, value, **extra):
+        return {"name": name, "value": value, "models": [], "weight": 1.0, **extra}
+    vertex = dict(ps["vertex"])
+    vertex["prompt_cache"] = {"cache_control_injection_points": [{"location": "message", "role": "system"}]}
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {
+            "gemini": {"keys": [key("g", "g-key")], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "cohere": {"keys": [key("co", "co-key")], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "cohere-tok": {"keys": [key("cot", "co-key")], "custom_provider_config": {"base_provider_type": "cohere"}, "network_config": {"base_url": MOCK + "/l164/cohere", "max_retries": 0}},
+            "vllm": {"keys": [key("vl", "vl-key")], "network_config": {"base_url": MOCK + "/l164/vllm/v1", "max_retries": 0}},
+            "xai": ps["xai"],
+            "bedrock_mantle": ps["bedrock_mantle"],
+            "vertex": vertex,
+            "github-copilot": {"keys": [key("gc", "tid=l164")], "network_config": {"base_url": MOCK + "/l164/copilot", "max_retries": 0}},
+            "sarvam": {"keys": [key("sv", "sv-key")], "network_config": {"base_url": MOCK + "/l164/sarvam", "max_retries": 0}},
+            "replicate": {"keys": [key("rp", "r8_l164", aliases={"dep": {"model_id": "acme/dep-a", "use_deployments_endpoint": True}})],
+                          "network_config": {"base_url": MOCK + "/l164/replicate", "max_retries": 0, "default_request_timeout_in_seconds": 20}},
+            "azure": {"keys": [key("az", "az-l164", azure_key_config={"endpoint": MOCK + "/l164/azure-main", "api_version": "2024-10-21"},
+                                   aliases={"east": {"model_id": "gpt-4o", "endpoint": MOCK + "/l164/azure-east", "api_version": "2025-01-01-preview"}})]},
+            "bedrock": {"keys": [key("bk", "", bedrock_key_config={"access_key": "AKIDEXAMPLE", "secret_key": "secret", "region": "us-east-1"},
+                                     aliases={"eu-claude": {"model_id": "anthropic.claude-3-haiku-20240307-v1:0", "region": "eu-west-1"}})],
+                        "network_config": {"base_url": MOCK, "max_retries": 0},
+                        "prompt_cache": {"cache_control_injection_points": [{"location": "message", "index": -1}]}},
+        },
+    }
+
+def l164_e2e(env):
+    """L164: Gemini's toolConfig and Cohere's tool_choice from OpenAI's tool_choice; xAI's /v1/responses/compact;
+    GitHub Copilot's model listing (editor headers) and Responses through chat; Bedrock Mantle's listing and Claude
+    token counts; Sarvam's own text-to-speech and speech-to-text, its chat and models, and its refused text completions;
+    a Replicate chat prediction polled until it settles and an alias on the deployments endpoint; an Azure alias's
+    endpoint and api_version, a Bedrock alias's region; cache points from the injection points on Bedrock and Claude on
+    Vertex. Its own gateway, started and stopped here."""
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    cfg_path = os.path.join(BUILD, "e2e.l164.json")
+    json.dump(l164_config(), open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18282", "-host", "127.0.0.1", "-config", cfg_path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l164.log"), "w"))
+    def post(path, body, headers=None):
+        return call("POST", path, body, headers, base=GW_L164, auth=False)
+    def last(prefix):
+        rows = [x for x in seen() if x["path"].startswith(prefix)]
+        return rows[-1] if rows else {"path": "", "body": "", "auth": ""}
+    def jb(text):
+        try:
+            return json.loads(text)
+        except ValueError:
+            return {}
+    msgs = [{"role": "system", "content": "rules"}, {"role": "user", "content": "one"}, {"role": "assistant", "content": "two"}, {"role": "user", "content": "three"}]
+    tools = [{"type": "function", "function": {"name": "weather", "parameters": {"type": "object"}}}]
+    try:
+        wait(GW_L164 + "/health")
+        # tool_choice on Gemini and Cohere, as Bifrost maps it
+        s, _, b = post("/v1/chat/completions", {"model": "gemini/gemini-2.5-flash", "messages": msgs[1:2], "tools": tools, "tool_choice": "required"})
+        up = jb(last("/v1beta/models/gemini-2.5-flash")["body"])
+        check("gemini: tool_choice required is toolConfig mode ANY", s == 200 and up.get("toolConfig") == {"functionCallingConfig": {"mode": "ANY"}}, (s, b[:200], up))
+        s, _, b = post("/v1/chat/completions", {"model": "gemini/gemini-2.5-flash", "messages": msgs[1:2], "tools": tools, "tool_choice": {"type": "function", "function": {"name": "weather"}}})
+        up = jb(last("/v1beta/models/gemini-2.5-flash")["body"])
+        check("gemini: a named function is ANY with that name allowed", s == 200 and up.get("toolConfig") == {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": ["weather"]}}, (s, up))
+        s, _, b = post("/v1/chat/completions", {"model": "cohere/command-a", "messages": msgs[1:2], "tools": tools, "tool_choice": "none"})
+        up = jb(last("/v2/chat")["body"])
+        check("cohere: tool_choice none is NONE", s == 200 and up.get("tool_choice") == "NONE", (s, b[:200], up))
+        s, _, b = post("/v1/chat/completions", {"model": "cohere/command-a", "messages": msgs[1:2], "tools": tools, "tool_choice": "required"})
+        up = jb(last("/v2/chat")["body"])
+        check("cohere: tool_choice required is REQUIRED", s == 200 and up.get("tool_choice") == "REQUIRED", (s, up))
+
+        # xAI's compaction: /v1/responses/compact goes to xAI with the bare model and the key
+        s, _, b = post("/v1/responses/compact", {"model": "xai/grok-4", "input": [{"role": "user", "content": "a long conversation"}]})
+        up = last("/v1/responses/compact")
+        check("xai: /v1/responses/compact goes to xAI's compact endpoint", s == 200 and up["auth"] == "Bearer xai-key" and '"model":"grok-4"' in up["body"].replace(" ", ""), (s, b[:200], up))
+
+        # GitHub Copilot: the model listing with the editor headers, and Responses through chat
+        s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "github-copilot"}, base=GW_L164, auth=False)
+        ids = [m["id"] for m in jb(b).get("data", [])]
+        up = last("/l164/copilot/models")
+        check("github-copilot: the models are listed from the Copilot host", s == 200 and "github-copilot/gpt-4o" in ids and "github-copilot/claude-sonnet-4" in ids and up["auth"] == "Bearer tid=l164", (s, b[:300], up))
+        s, _, b = post("/v1/responses", {"model": "github-copilot/gpt-4o", "input": "hi"})
+        r = jb(b)
+        text = "".join(c.get("text", "") for o in r.get("output", []) for c in o.get("content", []) if isinstance(c, dict))
+        check("github-copilot: Responses are served through Copilot's chat", s == 200 and r.get("object") == "response" and text == "Hi from copilot" and last("/l164/copilot/")["path"] == "/l164/copilot/chat/completions", (s, b[:300]))
+
+        # Bedrock Mantle: the model listing, and exact counts for Claude models on its native count path
+        s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "bedrock_mantle"}, base=GW_L164, auth=False)
+        ids = [m["id"] for m in jb(b).get("data", [])]
+        check("bedrock_mantle: the models are listed from its /v1/models", s == 200 and "bedrock_mantle/m-a" in ids and "bedrock_mantle/m-b" in ids, (s, b[:300]))
+        s, _, b = post("/v1/count_tokens", {"model": "bedrock_mantle/anthropic.claude-haiku-4-5", "messages": msgs, "max_tokens": 9})
+        up = last("/anthropic/v1/messages/count_tokens")
+        upb = jb(up["body"])
+        check("bedrock_mantle: a Claude model is counted exactly on the native count path", s == 200 and jb(b).get("exact") is True and jb(b).get("input_tokens") == 23 and upb.get("model") == "anthropic.claude-haiku-4-5" and "max_tokens" not in upb, (s, b, up))
+        s, _, b = post("/v1/count_tokens", {"model": "bedrock_mantle/openai.gpt-oss-120b", "messages": msgs})
+        check("bedrock_mantle: other models get the estimate (Mantle has no count path for them)", s == 200 and jb(b).get("exact") is False, (s, b))
+
+        # vLLM's Anthropic-compatible count path and Cohere's tokenizer count exactly, as Bifrost counts them
+        s, _, b = post("/v1/count_tokens", {"model": "vllm/llama-3", "messages": msgs})
+        up = last("/l164/vllm/")
+        check("vllm: token counts come from its /v1/messages/count_tokens", s == 200 and jb(b).get("exact") is True and jb(b).get("input_tokens") == 31 and up["path"] == "/l164/vllm/v1/messages/count_tokens" and up["auth"] == "Bearer vl-key" and jb(up["body"]).get("model") == "llama-3", (s, b, up))
+        s, _, b = post("/v1/count_tokens", {"model": "cohere-tok/command-a", "messages": [{"role": "system", "content": "be brief"}, {"role": "user", "content": "hello"}]})
+        up = last("/l164/cohere/")
+        check("cohere: token counts come from its tokenizer", s == 200 and jb(b).get("exact") is True and jb(b).get("input_tokens") == 5 and jb(up["body"]) == {"model": "command-a", "text": "be brief\nhello"}, (s, b, up))
+
+        # /v1/responses/input_tokens with another provider's model is counted by that provider (here Vertex's Gemini)
+        s, _, b = post("/v1/responses/input_tokens", {"model": "vertex/gemini-2.5-flash", "input": "hello there"})
+        r = jb(b)
+        check("responses input_tokens counts a non-OpenAI model with its provider's count", s == 200 and r.get("object") == "response.input_tokens" and r.get("input_tokens") == 11 and r.get("exact") is True and last("/v1/projects/proj/locations/us-central1/publishers/google/models/gemini-2.5-flash")["path"].endswith(":countTokens"), (s, b))
+        # Cohere's and Azure's model listings
+        s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "cohere-tok"}, base=GW_L164, auth=False)
+        ids = [m["id"] for m in jb(b).get("data", [])]
+        check("cohere: the models are listed from its /v1/models", s == 200 and "cohere-tok/command-a" in ids and last("/l164/cohere/")["path"] == "/l164/cohere/v1/models?page_size=1000", (s, b[:300]))
+        s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "azure"}, base=GW_L164, auth=False)
+        ids = [m["id"] for m in jb(b).get("data", [])]
+        check("azure: the models are listed from the resource's /openai/v1/models", s == 200 and "azure/gpt-4o" in ids and last("/l164/azure-main/")["path"] == "/l164/azure-main/openai/v1/models" and last("/l164/azure-main/")["auth"] == "az-l164", (s, b[:300]))
+
+        # Sarvam: its own text-to-speech and speech-to-text, its chat and models, no text completions
+        s, h, b = post("/v1/audio/speech", {"model": "sarvam/bulbul:v2", "input": "namaste", "voice": "anushka", "language_code": "hi-IN", "speed": 1.1})
+        up = last("/l164/sarvam/text-to-speech")
+        upb = jb(up["body"])
+        hl = {k.lower(): v for k, v in h.items()}
+        check("sarvam: speech answers with the decoded audio", s == 200 and b == "RIFF-sarvam" and hl.get("content-type", "").startswith("audio/wav"), (s, h, b[:100]))
+        check("sarvam: speech is Sarvam's text-to-speech body", upb == {"text": "namaste", "target_language_code": "hi-IN", "model": "bulbul:v2", "speaker": "anushka", "pace": 1.1}, up)
+        s, _, b = mp_form(GW_L164, "/v1/audio/transcriptions", [("model", None, "text/plain", "sarvam/saarika:v2.5"), ("language", None, "text/plain", "hi-IN"), ("file", "a.wav", "audio/wav", b"RIFF0000WAVE")])
+        r = jb(b)
+        up = last("/l164/sarvam/speech-to-text")
+        check("sarvam: speech-to-text answers OpenAI's transcription with words and duration", s == 200 and r.get("text") == "namaste duniya" and r.get("language") == "hi-IN" and len(r.get("words", [])) == 2 and r.get("duration") == 1.25, (s, b[:300]))
+        check("sarvam: speech-to-text sends the file, model and language_code", up["body"] == "file=@a.wav;model=saarika:v2.5;language_code=hi-IN", up)
+        s, _, b = post("/v1/chat/completions", {"model": "sarvam/sarvam-m", "messages": msgs[1:2]})
+        check("sarvam: chat goes to its OpenAI-compatible endpoint", s == 200 and "Hi from sarvam" in b and last("/l164/sarvam/")["path"] == "/l164/sarvam/v1/chat/completions", (s, b[:200]))
+        s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "sarvam"}, base=GW_L164, auth=False)
+        check("sarvam: the models are listed", s == 200 and "sarvam/sarvam-m" in [m["id"] for m in jb(b).get("data", [])], (s, b[:200]))
+        s, _, b = post("/v1/completions", {"model": "sarvam/sarvam-m", "prompt": "hi"})
+        check("sarvam: text completions are refused, as Bifrost refuses them", s >= 400 and "text completions" in b, (s, b[:200]))
+
+        # Replicate: a chat prediction still running when the wait ends is polled; an alias on the deployments endpoint
+        s, _, b = post("/v1/chat/completions", {"model": "replicate/acme/chat", "messages": [{"role": "user", "content": "slow chat"}]})
+        r = jb(b)
+        polls = [x for x in seen() if x["path"] == "/l164/replicate/v1/predictions/p-chat-1"]
+        check("replicate: a running chat prediction is polled until it settles", s == 200 and (r.get("choices") or [{}])[0].get("message", {}).get("content") == "Polled answer" and r.get("usage", {}).get("prompt_tokens") == 4 and len(polls) >= 1, (s, b[:300]))
+        s, _, b = post("/v1/chat/completions", {"model": "replicate/dep", "messages": [{"role": "user", "content": "hi"}]})
+        check("replicate: an alias with use_deployments_endpoint goes to its deployment", s == 200 and "from deployment" in b and last("/l164/replicate/")["path"] == "/l164/replicate/v1/deployments/acme/dep-a/predictions", (s, b[:200]))
+
+        # alias overrides: an Azure alias's endpoint and api_version, a Bedrock alias's region
+        s, _, b = post("/v1/chat/completions", {"model": "azure/east", "messages": msgs[1:2]})
+        up = last("/l164/azure-")
+        check("azure: an alias's endpoint and api_version replace the key's", s == 200 and "Hi from azure east" in b and up["path"] == "/l164/azure-east/openai/deployments/gpt-4o/chat/completions?api-version=2025-01-01-preview", (s, b[:200], up))
+        s, _, b = post("/v1/chat/completions", {"model": "azure/gpt-4o", "messages": msgs[1:2]})
+        up = last("/l164/azure-")
+        check("azure: the key's own endpoint serves the other models", s == 200 and up["path"] == "/l164/azure-main/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21", (s, up))
+        s, _, b = post("/v1/chat/completions", {"model": "bedrock/eu-claude", "messages": msgs})
+        up = last("/model/anthropic.claude-3-haiku")
+        upb = jb(up["body"])
+        check("bedrock: an alias's region signs and routes the call", s == 200 and "/eu-west-1/bedrock/aws4_request" in up["auth"], (s, b[:200], up["auth"]))
+        last_turn = (upb.get("messages") or [{}])[-1].get("content", [])
+        check("bedrock: the injection point puts a cache point after the last message", last_turn == [{"text": "three"}, {"cachePoint": {"type": "default"}}] and "cachePoint" not in json.dumps(upb.get("system", [])), upb)
+        s, _, b = post("/v1/chat/completions", {"model": "vertex/claude-sonnet-4@20250514", "messages": msgs})
+        up = last("/v1/projects/proj/locations/us-central1/publishers/anthropic/models/claude-sonnet-4@20250514")
+        upb = jb(up["body"])
+        check("vertex: Claude gets cache_control from the injection points", s == 200 and upb.get("system") == [{"type": "text", "text": "rules", "cache_control": {"type": "ephemeral"}}], (s, b[:200], upb))
+    finally:
+        gw.terminate()
+        gw.wait()
+
 def main():
     unique_ports()
     build()
@@ -11248,6 +11566,11 @@ def main():
         check("the Vertex regional job cancels", s == 200 and seen()[-1]["path"].endswith("/batchPredictionJobs/" + vjid + ":cancel"), (s, b[:200]))
         s, _, b = call("GET", VB, None, VH)
         check("the Vertex regional jobs list", s == 200 and "batchPredictionJobs" in b, (s, b[:200]))
+        # L164: the GenAI batch delete for Vertex (Bifrost's Vertex BatchDelete): the job is deleted, answered {"done":true}
+        s, _, b = call("DELETE", "/genai/v1beta/batches/" + vjid, None, VH)
+        check("genai batch delete on Vertex deletes the job and answers done", s == 200 and jget(b) == {"done": True} and seen()[-1]["path"] == "/v1/projects/proj/locations/us-central1/batchPredictionJobs/" + vjid, (s, b[:200], seen()[-1:]))
+        s, _, b = call("DELETE", "/genai/v1beta/batches/" + vjid, None, OAI)
+        check("genai batch delete on OpenAI is refused, as Bifrost refuses it", s == 400 and "batch_delete is not supported" in b, (s, b[:200]))
         s, _, b = call("POST", "/genai/v1beta/projects/proj/locations/us-central1/cachedContents", '{"model":"publishers/google/models/gemini-2.5-flash","displayName":"regional"}', VH)
         check("the Vertex regional cached contents go to v1beta1", s == 200 and seen()[-1]["path"] == "/v1beta1/projects/proj/locations/us-central1/cachedContents" and '"displayName":"regional"' in seen()[-1]["body"], (s, b[:200]))
         BH = {"x-model-provider": "bedrock_batch"}
@@ -11271,9 +11594,16 @@ def main():
         # Token counting: exact from Anthropic, estimated elsewhere
         s, _, b = call("POST", "/anthropic/v1/messages/count_tokens", {"model": "claude-sonnet-4", "messages": [{"role": "user", "content": "hello"}]})
         check("anthropic count_tokens is exact", s == 200 and json.loads(b)["input_tokens"] == 42 and seen()[-1]["path"] == "/v1/messages/count_tokens", b)
-        s, _, b = call("POST", "/v1/count_tokens", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "hello there, how are you today?"}]})
+        s, _, b = call("POST", "/v1/count_tokens", {"model": "nvidia/llama3", "messages": [{"role": "user", "content": "hello there, how are you today?"}]})
         r = json.loads(b)
         check("count_tokens estimates for other providers", s == 200 and r["exact"] is False and 5 < r["input_tokens"] < 40, b)
+        # L164: OpenAI counts exactly through its /v1/responses/input_tokens, as Bifrost counts it
+        s, _, b = call("POST", "/v1/count_tokens", {"model": "openai/gpt-4o-mini", "messages": [{"role": "system", "content": "be brief"}, {"role": "user", "content": "hello there"}], "max_tokens": 9})
+        r = jget(b)
+        up = seen()[-1]
+        upb = json.loads(up["body"][len("POST "):]) if up["body"].startswith("POST ") else {}
+        check("openai count_tokens is exact from responses/input_tokens", s == 200 and r.get("exact") is True and r.get("input_tokens") == 17 and up["path"] == "/v1/responses/input_tokens", (s, b, up))
+        check("the input_tokens body is the chat as Responses input, without the output cap", upb.get("model") == "gpt-4o-mini" and [i.get("role") for i in upb.get("input", [])] == ["system", "user"] and "max_output_tokens" not in upb, upb)
 
         # Async jobs, polled at Bifrost's /v1/async/<op>/{id} with Bifrost's status names
         s, _, b = call("POST", "/v1/async/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "later"}]})
@@ -12460,6 +12790,11 @@ def main():
         l155_e2e(env)
         # L158: config.json written atomically (a temporary file renamed over it): its own gateway
         l158_e2e(env)
+        # L164: provider operations (tool_choice, compaction, Copilot, Mantle, Sarvam, Replicate, alias overrides): its own gateway
+        l164_e2e(env)
+        # L165: built-in role ids, user emails, quota model_configs, role attachments, the complexity status routes and
+        # rotation revoking MCP grants: its own gateway (18284)
+        l165_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

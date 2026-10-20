@@ -267,6 +267,44 @@ function embedText(s: string): string {
 // Files answer with their record, and the deployments listing has two pages. The key is r8_e2e.
 type RepInput = { input?: { prompt?: string, num_outputs?: int } }
 
+// The L164 providers, under /l164 (their base_urls): GitHub Copilot's models and chat, Sarvam's speech, speech-to-text,
+// chat and models, Replicate chat predictions (one still running when the wait ends, and a deployment's) and two Azure
+// resources for an alias's endpoint override. Every call is recorded with its path and query.
+async function l164Mock(req: Request, path: string, lu: URL | undefined): Promise<Response> throws SyntaxError | Error {
+  const now = "2026-10-20T10:00:00.000Z"
+  const q = lu === undefined ? "" : lu.search
+  if (path === "/sarvam/speech-to-text") {
+    const fd = try await req.formData()
+    const parts: string[] = []
+    fd.forEach((value, key) => {
+      if (typeof value === "string") parts.push(key + "=" + value)
+      else parts.push(key + "=@" + value.name)
+    })
+    record(req, "/l164" + path, parts.join(";"))
+    return jsonBody(`{"request_id":"stt-1","transcript":"namaste duniya","language_code":"hi-IN","timestamps":{"words":["namaste","duniya"],"start_time_seconds":[0.0,0.6],"end_time_seconds":[0.5,1.25]}}`, 200)
+  }
+  const body = req.method === "GET" ? "" : await req.text()
+  record(req, "/l164" + path + q, body)
+  if (path === "/copilot/models") return jsonBody(`{"object":"list","data":[{"id":"gpt-4o","object":"model"},{"id":"claude-sonnet-4","object":"model"}]}`, 200)
+  if (path === "/copilot/chat/completions" || path === "/sarvam/v1/chat/completions" || path.endsWith("/chat/completions")) {
+    const who = path.startsWith("/copilot") ? "copilot" : path.startsWith("/sarvam") ? "sarvam" : path.startsWith("/azure-east") ? "azure east" : "azure main"
+    return jsonBody(`{"id":"c-l164","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"Hi from ${who}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`, 200)
+  }
+  if (path === "/vllm/v1/messages/count_tokens") return jsonBody(`{"input_tokens":31}`, 200)
+  if (path === "/cohere/v1/tokenize") return jsonBody(`{"tokens":[11,12,13,14,15],"token_strings":["be"," brief","\\n","hel","lo"]}`, 200)
+  if (path === "/cohere/v1/models") return jsonBody(`{"models":[{"name":"command-a","endpoints":["chat"]}],"next_page_token":""}`, 200)
+  if (path === "/azure-main/openai/v1/models") return jsonBody(`{"object":"list","data":[{"id":"gpt-4o","object":"model","status":"succeeded","created_at":1}]}`, 200)
+  if (path === "/sarvam/v1/models") return jsonBody(`{"object":"list","data":[{"id":"sarvam-m","object":"model"}]}`, 200)
+  if (path === "/sarvam/text-to-speech") return jsonBody(`{"request_id":"tts-1","audios":["UklGRi1zYXJ2YW0="]}`, 200)
+  if (path === "/replicate/v1/models/acme/chat/predictions") {
+    if (body.includes("slow chat")) return jsonBody(`{"id":"p-chat-1","status":"starting","created_at":"${now}","urls":{"get":"http://127.0.0.1:18099/l164/replicate/v1/predictions/p-chat-1"}}`, 201)
+    return jsonBody(`{"id":"p-chat-0","status":"succeeded","created_at":"${now}","output":["Hello ","now"]}`, 201)
+  }
+  if (path === "/replicate/v1/predictions/p-chat-1") return jsonBody(`{"id":"p-chat-1","status":"succeeded","created_at":"${now}","output":["Polled ","answer"],"logs":"Input token count: 4\nOutput token count: 2"}`, 200)
+  if (path === "/replicate/v1/deployments/acme/dep-a/predictions") return jsonBody(`{"id":"p-dep-1","status":"succeeded","created_at":"${now}","output":"from deployment"}`, 201)
+  return jsonBody(`{"error":{"message":"no such l164 route","type":"invalid_request_error"}}`, 404)
+}
+
 async function replicateMock(req: Request, path: string, lu: URL | undefined): Promise<Response> throws SyntaxError | Error {
   const body = req.method === "GET" ? "" : await req.text()
   record(req, path + (lu === undefined ? "" : lu.search), body)
@@ -1103,6 +1141,14 @@ Bun.serve<string>({
         return Response.json({ id: "c9", object: "chat.completion", created: 1, model: m.model ?? "", choices: [{ index: 0, message: { role: "assistant", content: "Hello from " + (m.model ?? "") }, finish_reason: "stop" }], usage: { prompt_tokens: 4, completion_tokens: 5, total_tokens: 9 } })
       },
     },
+    // Mantle's native count_tokens route for Claude models
+    "/anthropic/v1/messages/count_tokens": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/anthropic/v1/messages/count_tokens", body)
+        return Response.json({ input_tokens: 23 })
+      },
+    },
     // Mantle's native Messages route for Claude models
     "/anthropic/v1/messages": {
       POST: async (req) => {
@@ -1603,7 +1649,15 @@ Bun.serve<string>({
       if (lp.endsWith("/client_secrets")) return new Response(`{"value":"${value}","expires_at":${exp},"session":${wsField(body, "session") === "" ? "{}" : wsField(body, "session")}}`, { headers: hj })
       return new Response(`{"id":"sess_mint_${mints}","object":"realtime.session","client_secret":{"value":"${value}","expires_at":${exp}}}`, { headers: hj })
     }
-    if (lp.startsWith("/v1/responses/")) {
+    // OpenAI's exact token count of a Responses body
+    if (lp === "/v1/responses/input_tokens" && req.method === "POST") {
+      const body = await req.text()
+      record(req, lp, "POST " + body)
+      return Response.json({ object: "response.input_tokens", input_tokens: 17 })
+    }
+    // the L164 providers (see l164Mock)
+    if (lp.startsWith("/l164/")) return try await l164Mock(req, lp.slice(5), lu)
+    if (lp.startsWith("/v1/responses/") || lp === "/v1/realtime/client_secrets" || lp === "/v1/realtime/sessions") {
       const body = req.method === "GET" || req.method === "DELETE" ? "" : await req.text()
       record(req, lp, req.method + " " + body)
       return Response.json({ object: "ok", method: req.method, path: lp })
@@ -1678,6 +1732,10 @@ Bun.serve<string>({
         const jobs: string[] = []
         for (const id of vertexIds) jobs.push(vertexJobs.get(id) ?? "")
         return jsonBody(`{"batchPredictionJobs":[${jobs.join(",")}]}`, 200)
+      }
+      if (req.method === "DELETE" && tail !== "") {
+        // batchPredictionJobs.delete answers a long-running Operation (the job stays listed here)
+        return jsonBody(`{"name":"projects/proj/locations/us-central1/operations/del-1","done":true}`, 200)
       }
       if (req.method === "POST" && tail.endsWith(":cancel")) {
         const id = tail.slice(1, tail.byteLength - 7)

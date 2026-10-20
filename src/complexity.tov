@@ -6,7 +6,7 @@
 // The features are read with the lazy scanner in ./json, so the request body
 // is never fully decoded into a tree.
 
-import { fields, elements, find, rawStr } from "./json"
+import { Field, fields, elements, find, rawStr } from "./json"
 import { sha256, toHex, utf8 } from "./crypto"
 
 export type Tier = "SIMPLE" | "MEDIUM" | "COMPLEX"
@@ -666,17 +666,25 @@ export function nearestTier(v: f64[], vecs: f64[][], tiers: Tier[], min: f64): T
   return tiers[at]
 }
 
-// The embedded exemplars, kept between requests while their model and phrases stay the same.
+// The embedded exemplars, kept between requests while their model and phrases stay the same, and the state of
+// the warm-up that embeds them (Bifrost's semantic status): the identity a warm is under way for, and the
+// identity whose last warm failed, with the reason.
 class ExemplarIndex {
   identity: string = ""
   tiers: Tier[] = []
   vecs: f64[][] = []
+  warming: string = ""
+  failed: string = ""
+  reason: string = ""
 }
 
 const exemplarIndex = new ExemplarIndex()
 
-// Embeds the last user message(s) and takes the tier of the nearest reference phrase.
-export async function semanticTier(text: string, cfg: SemanticSettings | undefined, call: Call): Promise<Tier | undefined> {
+// The prefix of a generation's namespace (Bifrost's SemanticVectorStoreNamespace and "_").
+const GENERATION_PREFIX = "BifrostComplexityRouter_"
+
+// The model, phrases and tiers the semantic classifier embeds for a config, and the identity they make.
+function semanticSet(cfg: SemanticSettings | undefined): { model: string, phrases: string[], tiers: Tier[], identity: string } {
   const model = (cfg?.provider ?? "openai") + "/" + (cfg?.embedding_model ?? "text-embedding-3-small")
   const phrases: string[] = []
   const tiers: Tier[] = []
@@ -686,7 +694,105 @@ export async function semanticTier(text: string, cfg: SemanticSettings | undefin
       tiers.push(t)
     }
   }
-  const identity = model + "\n" + JSON.stringify(phrases)
+  return { model: model, phrases: phrases, tiers: tiers, identity: model + "\n" + JSON.stringify(phrases) }
+}
+
+// The fingerprinted namespace of the generation an identity makes.
+function generationOf(identity: string): string {
+  return GENERATION_PREFIX + toHex(sha256(utf8(identity))).slice(0, 16)
+}
+
+// Whether the router runs the semantic classifier.
+function semanticOn(enabled: bool, classifier: string | undefined): bool {
+  return enabled && classifierMode(classifier) === "semantic"
+}
+
+// GET /api/routing/complexity-analyzer-status: the semantic classifier's readiness in Bifrost's shape (state, loaded,
+// total, serving_previous, failure_reason, cached_phrases, storage_mode, namespace), with the llm classifier's state,
+// its default prompt and the decision tiers' definitions. Raiju embeds the exemplars on the first classified request,
+// with that request's credentials, so a classifier not used yet reads "warming" with nothing loaded. The state is
+// this process's.
+export function analyzerStatus(enabled: bool, classifier: string | undefined, sem: SemanticSettings | undefined, llm: LLMSettings | undefined): string {
+  const set = semanticSet(sem)
+  const ix = exemplarIndex
+  let out: Field[] = []
+  if (!semanticOn(enabled, classifier)) {
+    out = [{ key: "state", raw: "\"disabled\"" }, { key: "loaded", raw: "0" }, { key: "total", raw: "0" }, { key: "cached_phrases", raw: "0" }]
+  } else {
+    const ready = ix.identity === set.identity
+    const failed = !ready && ix.failed === set.identity && ix.warming !== set.identity
+    const state = ready ? "ready" : failed ? "failed" : "warming"
+    out.push({ key: "state", raw: JSON.stringify(state) })
+    out.push({ key: "loaded", raw: ready ? `${set.phrases.length}` : "0" })
+    out.push({ key: "total", raw: `${set.phrases.length}` })
+    // a failed warm leaves the previous generation serving
+    if (!ready && ix.identity !== "") out.push({ key: "serving_previous", raw: "true" })
+    if (failed) {
+      out.push({ key: "failure_reason", raw: JSON.stringify(ix.reason) })
+      out.push({ key: "error", raw: JSON.stringify(failureText(ix.reason)) })
+    }
+    out.push({ key: "cached_phrases", raw: `${ix.vecs.length}` })
+    if (ix.identity !== "") {
+      out.push({ key: "storage_mode", raw: "\"embedded\"" })
+      out.push({ key: "namespace", raw: JSON.stringify(generationOf(ix.identity)) })
+    }
+  }
+  const llmOn = enabled && llm !== undefined && (llm.model ?? "") !== ""
+  out.push({ key: "llm", raw: `{"state":${llmOn ? "\"ready\"" : "\"disabled\""}}` })
+  out.push({ key: "llm_default_prompt", raw: JSON.stringify(LLM_GUIDANCE) })
+  const crit: string[] = []
+  for (const t of TIERS) crit.push(`${JSON.stringify(t)}:{"definition":${JSON.stringify(tierText(t))},"signals":[],"examples":[]}`)
+  out.push({ key: "decision_defaults", raw: `{"criteria":{${crit.join(",")}}}` })
+  return "{" + out.map((f) => JSON.stringify(f.key) + ":" + f.raw).join(",") + "}"
+}
+
+function failureText(reason: string): string {
+  if (reason === "timeout") return "the embedding provider did not answer in time"
+  if (reason === "invalid_response") return "the embedding provider's answer could not be read"
+  return "the exemplars could not be embedded"
+}
+
+// POST /api/routing/complexity-analyzer-status/retry: a failed warm-up is cleared so the next classified request
+// embeds the exemplars again (202, state warming); 409 unless the last warm-up failed, 503 when the semantic
+// classifier is off.
+export function retryWarmup(enabled: bool, classifier: string | undefined, sem: SemanticSettings | undefined, llm: LLMSettings | undefined): { status: int, body: string } {
+  if (!semanticOn(enabled, classifier)) return { status: 503, body: JSON.stringify({ error: { message: "failed to retry semantic complexity warmup: semantic complexity classifier is not available" } }) }
+  const set = semanticSet(sem)
+  const ix = exemplarIndex
+  if (!(ix.failed === set.identity && ix.identity !== set.identity && ix.warming !== set.identity)) {
+    return { status: 409, body: JSON.stringify({ error: { message: "semantic complexity warmup can only be retried after a failure" } }) }
+  }
+  ix.failed = ""
+  ix.reason = ""
+  return { status: 202, body: analyzerStatus(enabled, classifier, sem, llm) }
+}
+
+// GET /api/routing/complexity-analyzer-generations: the generation this process holds (Raiju keeps one, in memory,
+// so a retired one is dropped when the next is embedded).
+export function generationsJson(enabled: bool, classifier: string | undefined): string {
+  const ix = exemplarIndex
+  if (!semanticOn(enabled, classifier) || ix.identity === "") return `{"generations":[]}`
+  return `{"generations":[{"namespace":${JSON.stringify(generationOf(ix.identity))},"active":true}]}`
+}
+
+// DELETE /api/routing/complexity-analyzer-generations/{namespace}: the serving generation is refused (409), a name
+// outside the classifier's scheme too (400); a retired generation is already gone, so its delete succeeds.
+export function deleteGeneration(enabled: bool, classifier: string | undefined, ns: string): { status: int, body: string } {
+  if (ns.trim() === "") return { status: 400, body: JSON.stringify({ error: { message: "namespace is required" } }) }
+  if (!ns.startsWith(GENERATION_PREFIX)) return { status: 400, body: JSON.stringify({ error: { message: `namespace is not a complexity routing generation: ${ns}` } }) }
+  if (!semanticOn(enabled, classifier)) return { status: 503, body: JSON.stringify({ error: { message: "semantic complexity classifier is not available" } }) }
+  const ix = exemplarIndex
+  if (ix.identity !== "" && generationOf(ix.identity) === ns) return { status: 409, body: JSON.stringify({ error: { message: "generation is currently serving classification requests" } }) }
+  return { status: 200, body: JSON.stringify({ status: "deleted", namespace: ns }) }
+}
+
+// Embeds the last user message(s) and takes the tier of the nearest reference phrase.
+export async function semanticTier(text: string, cfg: SemanticSettings | undefined, call: Call): Promise<Tier | undefined> {
+  const set = semanticSet(cfg)
+  const model = set.model
+  const phrases = set.phrases
+  const tiers = set.tiers
+  const identity = set.identity
   const ms = cfg?.timeout_ms ?? 1500
   try {
     const window = try userWindow(text, cfg?.message_history_count ?? 1)
@@ -696,7 +802,19 @@ export async function semanticTier(text: string, cfg: SemanticSettings | undefin
     const hit = tierCache.get(key, Date.now())
     if (hit !== undefined) return hit
     if (exemplarIndex.identity !== identity) {
-      const vecs = try await embedAll(phrases, model, call, ms, "warmup")
+      exemplarIndex.warming = identity
+      let vecs: f64[][] = []
+      try {
+        vecs = try await embedAll(phrases, model, call, ms, "warmup")
+      } catch (e) {
+        exemplarIndex.warming = ""
+        exemplarIndex.failed = identity
+        exemplarIndex.reason = e.message === "embedding timed out" ? "timeout" : e.message === "embedding count does not match the input" ? "invalid_response" : "unknown"
+        return undefined
+      }
+      exemplarIndex.warming = ""
+      exemplarIndex.failed = ""
+      exemplarIndex.reason = ""
       exemplarIndex.identity = identity
       exemplarIndex.tiers = tiers
       exemplarIndex.vecs = vecs
@@ -775,4 +893,33 @@ test("the cache returns a fresh entry and drops a stale one", () => {
   expect(c.get("k", 2000.0)).toBe(undefined)
   expect(cacheKey("a", "x") === cacheKey("a", "x")).toBe(true)
   expect(cacheKey("a", "x") === cacheKey("b", "x")).toBe(false)
+})
+
+test("the analyzer status follows the warm-up: failed, retried, ready, and the generation it serves", () => {
+  const sem: SemanticSettings = { embedding_model: "e1", exemplars: { simple: ["a"], medium: ["b"], complex: ["c"] } }
+  const set = semanticSet(sem)
+  exemplarIndex.identity = ""
+  exemplarIndex.vecs = []
+  exemplarIndex.failed = set.identity
+  exemplarIndex.reason = "timeout"
+  const failed = analyzerStatus(true, "semantic", sem, undefined)
+  expect(failed.startsWith(`{"state":"failed","loaded":0,"total":3,"failure_reason":"timeout"`)).toBe(true)
+  expect(retryWarmup(true, "semantic", sem, undefined).status).toBe(202)
+  expect(analyzerStatus(true, "semantic", sem, undefined).startsWith(`{"state":"warming"`)).toBe(true)
+  expect(retryWarmup(true, "semantic", sem, undefined).status).toBe(409)
+  exemplarIndex.identity = set.identity
+  exemplarIndex.vecs = [[1.0], [0.0], [0.5]]
+  const ns = generationOf(set.identity)
+  expect(ns.startsWith("BifrostComplexityRouter_")).toBe(true)
+  const ready = analyzerStatus(true, "semantic", sem, { model: "m" })
+  expect(ready.startsWith(`{"state":"ready","loaded":3,"total":3,"cached_phrases":3,"storage_mode":"embedded","namespace":"${ns}","llm":{"state":"ready"}`)).toBe(true)
+  expect(generationsJson(true, "semantic")).toBe(`{"generations":[{"namespace":"${ns}","active":true}]}`)
+  expect(deleteGeneration(true, "semantic", ns).status).toBe(409)
+  // a changed config serves the previous generation until its own warm-up is done
+  const next: SemanticSettings = { embedding_model: "e2" }
+  expect(analyzerStatus(true, "semantic", next, undefined).includes(`"serving_previous":true`)).toBe(true)
+  expect(analyzerStatus(false, "semantic", sem, undefined).startsWith(`{"state":"disabled"`)).toBe(true)
+  expect(analyzerStatus(true, "llm", sem, undefined).startsWith(`{"state":"disabled"`)).toBe(true)
+  exemplarIndex.identity = ""
+  exemplarIndex.vecs = []
 })

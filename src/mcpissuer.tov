@@ -48,7 +48,8 @@ export type OAuthClientRow = { client_id: string, client_name: string, redirect_
 // An authorization request: pending until the consent page approves it ("consented", with the identity it names),
 // then "used" once its code is exchanged. mode is "vk" (sub is the key's id) or "session" (sub is a random id).
 // code_hash is the SHA-256 of the code, which is never stored.
-export type AuthRequest = { id: string, client_id: string, redirect_uri: string, state: string, scope: string, resource: string, challenge: string, expires_at: f64, status: string, mode: string, sub: string, code_hash: string }
+// consented_at is when the consent named the identity (a key rotated after it voids the code).
+export type AuthRequest = { id: string, client_id: string, redirect_uri: string, state: string, scope: string, resource: string, challenge: string, expires_at: f64, status: string, mode: string, sub: string, code_hash: string, consented_at?: f64 }
 
 // A refresh token by its SHA-256. Rotation marks the old row revoked and issues a row of the same family; a
 // revoked row presented again revokes the whole family (RFC 9700, section 2.2.2). created_at is when the grant
@@ -513,7 +514,7 @@ export function consentSubmit(id: string, token: string, body: string, iss: Issu
     return apiErr(500, "failed to generate authorization code")
   }
   const hash = toHex(sha256(utf8(code)))
-  REQUESTS.set(id, { id: r.id, client_id: r.client_id, redirect_uri: r.redirect_uri, state: r.state, scope: r.scope, resource: r.resource, challenge: r.challenge, expires_at: r.expires_at, status: "consented", mode: mode, sub: sub, code_hash: hash })
+  REQUESTS.set(id, { id: r.id, client_id: r.client_id, redirect_uri: r.redirect_uri, state: r.state, scope: r.scope, resource: r.resource, challenge: r.challenge, expires_at: r.expires_at, status: "consented", mode: mode, sub: sub, code_hash: hash, consented_at: nowMs })
   CODES.set(hash, id)
   CONSENT_TOKENS.delete(token)
   const url = withParams(r.redirect_uri, [["code", code], ["state", r.state], ["iss", iss.issuer]])
@@ -549,6 +550,7 @@ function codeGrant(form: URLSearchParams, iss: Issuer, nowMs: f64, byId: (id: st
   if (resource !== "" && resource !== r.resource) return oauthErr(400, "invalid_grant", "resource mismatch")
   if (verifier.byteLength < 43 || verifier.byteLength > 128 || pkceChallenge(verifier) !== r.challenge) return oauthErr(400, "invalid_grant", "PKCE verification failed")
   if (r.mode === "vk" && !keyUsable(byId(r.sub), nowMs)) return oauthErr(400, "invalid_grant", "virtual key is no longer active")
+  if (r.mode === "vk" && rotatedSince(byId(r.sub), r.consented_at ?? 0.0)) return oauthErr(400, "invalid_grant", "virtual key was rotated after the consent")
   // single use: the code is spent before the tokens leave
   REQUESTS.set(r.id, { id: r.id, client_id: r.client_id, redirect_uri: r.redirect_uri, state: r.state, scope: r.scope, resource: r.resource, challenge: r.challenge, expires_at: r.expires_at, status: "used", mode: r.mode, sub: r.sub, code_hash: hash })
   CODES.delete(hash)
@@ -571,6 +573,11 @@ function refreshGrant(form: URLSearchParams, iss: Issuer, nowMs: f64, byId: (id:
   }
   if (row.client_id !== clientId) return oauthErr(400, "invalid_grant", "client_id mismatch")
   if (row.mode === "vk" && !keyUsable(byId(row.sub), nowMs)) return oauthErr(400, "invalid_grant", "virtual key is no longer active")
+  // a grant from before the key's rotation is void on every worker and node, even one that missed the revoke
+  if (row.mode === "vk" && rotatedSince(byId(row.sub), row.created_at)) {
+    revokeFamily(row.family)
+    return oauthErr(400, "invalid_grant", "refresh token not found or revoked")
+  }
   const resource = form.get("resource") ?? ""
   if (resource !== "" && resource !== row.resource) return oauthErr(400, "invalid_grant", "resource mismatch")
   REFRESH.set(hash, { hash: row.hash, family: row.family, client_id: row.client_id, mode: row.mode, sub: row.sub, scope: row.scope, resource: row.resource, created_at: row.created_at, used_at: row.used_at, revoked: true })
@@ -693,6 +700,37 @@ export function grantRevoke(id: string): Answer {
   if (r === undefined || r.revoked) return apiErr(404, "session not found or already revoked")
   revokeFamily(r.family)
   return { status: 204, body: "", contentType: "application/json" }
+}
+
+// Whether the key was rotated after the moment given (epoch ms): what was minted from its old value is void.
+function rotatedSince(vk: VirtualKeyConfig | undefined, sinceMs: f64): bool {
+  if (vk === undefined) return false
+  const at = rfc3339Ms(vk.rotated_at ?? "")
+  return at !== undefined && at > sinceMs
+}
+
+// Revokes everything minted for one identity (Bifrost's RevokeOAuth2GrantsBySubject): its live refresh tokens, and
+// the consented requests whose codes are not exchanged yet, so none of them can mint a token later. A virtual key's
+// rotation calls this for the key (mode "vk"), since a grant is bound to the key's id, not to its value. Access
+// tokens already issued last until they expire, as in Bifrost. Returns how many grants and codes were revoked.
+export function revokeSubject(mode: string, sub: string): int {
+  syncGrants()
+  let n = 0
+  for (const k of REFRESH.keys()) {
+    const x = REFRESH.get(k)
+    if (x === undefined || x.revoked || x.mode !== mode || x.sub !== sub) continue
+    REFRESH.set(k, { hash: x.hash, family: x.family, client_id: x.client_id, mode: x.mode, sub: x.sub, scope: x.scope, resource: x.resource, created_at: x.created_at, used_at: x.used_at, revoked: true })
+    n += 1
+  }
+  for (const id of REQUESTS.keys()) {
+    const r = REQUESTS.get(id)
+    if (r === undefined || r.status !== "consented" || r.mode !== mode || r.sub !== sub) continue
+    REQUESTS.set(id, { id: r.id, client_id: r.client_id, redirect_uri: r.redirect_uri, state: r.state, scope: r.scope, resource: r.resource, challenge: r.challenge, expires_at: r.expires_at, status: "revoked", mode: r.mode, sub: r.sub, code_hash: r.code_hash })
+    if (r.code_hash !== "") CODES.delete(r.code_hash)
+    n += 1
+  }
+  if (n > 0) persistGrants()
+  return n
 }
 
 // ---- helpers ----
@@ -1183,3 +1221,52 @@ cWt/9/+cPCoc9tkxp1qhNrwQbrTKuCsbaoq29dgClLqvoXv7g/jGMFsN3k8OMTbY
 igljKrc6DaVhqHLClkHqT4YKtkbcD1PHdJxoTLpDjg/pcfmE1Jh7xAwZyK5WeDHb
 E4OKLanX+blm6HOEeyMmCSU8
 -----END PRIVATE KEY-----`
+
+test("revoking a key's grants ends its refresh tokens and its consented codes", () => {
+  const iss = testIssuer()
+  const g = try vkGrant(iss, "rot-client", "8091", 7000.0)
+  const other = try vkGrant(iss, "rot-other", "8092", 7000.0)
+  // a second request for the same key, consented but not exchanged yet
+  const reg = register(`{"client_name":"rot-late","redirect_uris":["http://127.0.0.1:8093/cb"]}`, iss, 7000.0)
+  const cid = try clientIdOf(reg.body)
+  const verifier = "r".repeat(50)
+  const sp = new URLSearchParams("")
+  sp.set("client_id", cid)
+  sp.set("redirect_uri", "http://127.0.0.1:8093/cb")
+  sp.set("response_type", "code")
+  sp.set("state", "st-late")
+  sp.set("code_challenge", pkceChallenge(verifier))
+  sp.set("code_challenge_method", "S256")
+  const loc = authorize(sp, iss, 7000.0).location!
+  const flow = loc.slice(loc.indexOf("flow=") + 5, loc.indexOf("#t="))
+  const tok = loc.slice(loc.indexOf("#t=") + 3)
+  const key: VirtualKeyConfig = { id: "vk-rot-client", value: "sk-bf-rot-client" }
+  const lookup = (v: string): VirtualKeyConfig | undefined => v === key.value ? key : undefined
+  const done = consentSubmit(flow, tok, `{"mode":"vk","value":"sk-bf-rot-client"}`, iss, 7000.0, lookup, ["vk"], false)
+  const url = try JSON.parse(done.body) as { redirect_url: string }
+  const code = url.redirect_url.slice(url.redirect_url.indexOf("code=") + 5, url.redirect_url.indexOf("&state="))
+  expect(revokeSubject("vk", "vk-rot-client")).toBe(2)
+  const byId = (id: string): VirtualKeyConfig | undefined => key
+  const refresh = new URLSearchParams(`grant_type=refresh_token&refresh_token=${g[1]!}&client_id=${g[0]!}`)
+  expect(tokenEndpoint(refresh, iss, 7100.0, byId).status).toBe(400)
+  const form = `grant_type=authorization_code&code=${code}&code_verifier=${verifier}&client_id=${cid}&redirect_uri=http%3A%2F%2F127.0.0.1%3A8093%2Fcb`
+  expect(tokenEndpoint(new URLSearchParams(form), iss, 7100.0, byId).status).toBe(400)
+  // another key's grant is untouched, and a second revoke finds nothing
+  const keep = new URLSearchParams(`grant_type=refresh_token&refresh_token=${other[1]!}&client_id=${other[0]!}`)
+  const otherKey: VirtualKeyConfig = { id: "vk-rot-other", value: "sk-bf-rot-other" }
+  expect(tokenEndpoint(keep, iss, 7100.0, (id: string): VirtualKeyConfig | undefined => otherKey).status).toBe(200)
+  expect(revokeSubject("vk", "vk-rot-client")).toBe(0)
+})
+
+test("a grant from before the key's rotation does not refresh, even where the revoke was not seen", () => {
+  const iss = testIssuer()
+  const g = try vkGrant(iss, "rot-late-client", "8094", 8000.0)
+  const rotated: VirtualKeyConfig = { id: "vk-rot-late-client", value: "sk-bf-new", rotated_at: "1970-01-01T00:00:09Z" }
+  const refresh = new URLSearchParams(`grant_type=refresh_token&refresh_token=${g[1]!}&client_id=${g[0]!}`)
+  expect(tokenEndpoint(refresh, iss, 9500.0, (id: string): VirtualKeyConfig | undefined => rotated).status).toBe(400)
+  // a key rotated before the grant was made does not void it
+  const g2 = try vkGrant(iss, "rot-early-client", "8095", 12000.0)
+  const early: VirtualKeyConfig = { id: "vk-rot-early-client", value: "sk-bf-rot-early-client", rotated_at: "1970-01-01T00:00:09Z" }
+  const r2 = new URLSearchParams(`grant_type=refresh_token&refresh_token=${g2[1]!}&client_id=${g2[0]!}`)
+  expect(tokenEndpoint(r2, iss, 12500.0, (id: string): VirtualKeyConfig | undefined => early).status).toBe(200)
+})

@@ -1033,11 +1033,235 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** The caller's custom role as (resource, operation) pairs with their ids; built-in roles are reported by name with no pairs */
+        /** The caller's role and its (resource, operation) pairs with their ids; a built-in role's fixed rules are expanded into pairs and carry its fixed role_id (admin 9001, editor 9002, viewer 9003, auditor 9004) */
         get: operations["getApiUsersMePermissions"];
         put?: never;
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/governance/users": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The governance path (Bifrost's current one) of /api/users: List admin users (no tokens) */
+        get: operations["getApiGovernanceUsers"];
+        put?: never;
+        /** The governance path (Bifrost's current one) of /api/users: Create an admin user; its token is returned once */
+        post: operations["postApiGovernanceUsers"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/governance/users/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** The governance path (Bifrost's current one) of /api/users/{name}: Change an admin user's role or disabled flag */
+        put: operations["putApiGovernanceUsersName"];
+        post?: never;
+        /** The governance path (Bifrost's current one) of /api/users/{name}: Delete an admin user */
+        delete: operations["deleteApiGovernanceUsersName"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/governance/users/{name}/role": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The governance path (Bifrost's current one) of /api/users/{name}/role: A user's role, as {name, role} */
+        get: operations["getApiGovernanceUsersNameRole"];
+        /** The governance path (Bifrost's current one) of /api/users/{name}/role: Set a user's role ({role}); other fields in the body are applied too, as on PUT /api/users/{name} */
+        put: operations["putApiGovernanceUsersNameRole"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/governance/users/me/vk-creation-policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The governance path (Bifrost's current one) of /api/users/me/vk-creation-policy: The access profile that governs the virtual keys the caller creates */
+        get: operations["getApiGovernanceUsersMeVkCreationPolicy"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/governance/users/me/permissions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The caller's permissions in Bifrost's PermissionsResponse shape: every resource with every operation, true where the caller's role (a built-in role's fixed rules as pairs) or key holds it */
+        get: operations["getApiGovernanceUsersMePermissions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/users/email/{email}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** A user by email address, in Bifrost's UserObject shape (the name is the id; role_id and a role object, built-in roles with their fixed ids) */
+        get: operations["getApiUsersEmailEmail"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/governance/users/email/{email}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** A user by email address, in Bifrost's UserObject shape (the governance path of GET /api/users/email/{email}) */
+        get: operations["getApiGovernanceUsersEmailEmail"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/users/email/{email}/virtual-keys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The virtual keys assigned to the user with this email address (their user_id), with their values (Bifrost's UserVirtualKeyLookupResponse) */
+        get: operations["getApiUsersEmailEmailVirtualKeys"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/governance/users/email/{email}/virtual-keys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The virtual keys assigned to the user with this email address (the governance path) */
+        get: operations["getApiGovernanceUsersEmailEmailVirtualKeys"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/routing/complexity-analyzer-status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The semantic complexity classifier's readiness in Bifrost's shape (state disabled, warming, ready or failed; loaded, total, serving_previous, failure_reason, cached_phrases, storage_mode, namespace), the llm classifier's state and default prompt, and the decision tiers. Per process; the exemplars are embedded on the first classified request. */
+        get: operations["getApiRoutingComplexityAnalyzerStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/routing/complexity-analyzer-status/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Clears a failed semantic warm-up so the next classified request embeds the exemplars again (202 with the status) */
+        post: operations["postApiRoutingComplexityAnalyzerStatusRetry"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/routing/complexity-analyzer-generations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The exemplar generation this process holds, flagged active (Raiju keeps one, in memory) */
+        get: operations["getApiRoutingComplexityAnalyzerGenerations"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/routing/complexity-analyzer-generations/{namespace}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Deletes a retired generation (already gone in Raiju, so 200); the serving one is refused (409) and a name outside the scheme is 400 */
+        delete: operations["deleteApiRoutingComplexityAnalyzerGenerationsNamespace"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1455,6 +1679,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/governance/rbac/roles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Bifrost's role list: the built-in roles first (fixed ids 9001 to 9004, is_system_role true, their rules as permissions), then the custom roles */
+        get: operations["getApiGovernanceRbacRoles"];
+        put?: never;
+        /** Bifrost's path of /api/roles: Create a custom role The list puts the built-in roles first (fixed ids 9001 to 9004, is_system_role true, their rules as permissions). */
+        post: operations["postApiGovernanceRbacRoles"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/governance/rbac/roles/{role_id}": {
         parameters: {
             query?: never;
@@ -1462,7 +1704,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** One custom role by its id, as {role} */
+        /** One role by its id, as {role}; the built-in roles have fixed ids (9001 to 9004) and is_system_role true */
         get: operations["getApiGovernanceRbacRolesRoleId"];
         /** Update a custom role by its id. A partial update: a field left out keeps its value, and an empty description clears it. A role cannot be renamed. */
         put: operations["putApiGovernanceRbacRolesRoleId"];
@@ -3798,7 +4040,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Attach custom roles to an access profile (Bifrost's attach). Every user holding one of the roles holds the profile; is_default is kept as given, and users_applied counts those users. */
+        /** Attach roles (built-in or custom, by id) to an access profile (Bifrost's attach). apply_to_existing gives the role's users the profile now (users_applied counts them); is_default gives it to users who take the role later. */
         post: operations["postApiGovernanceAccessProfilesIdRoles"];
         delete?: never;
         options?: never;
@@ -4602,6 +4844,8 @@ export interface components {
         /** @description Raiju: an admin user. Built-in roles or a custom role name; no token. */
         AdminUser: {
             name: string;
+            /** @description The user's email address, when set */
+            email?: string;
             role: string;
             disabled: boolean;
         };
@@ -4616,12 +4860,18 @@ export interface components {
             users: components["schemas"]["AdminUser"][];
         };
         AdminUserUpdate: {
+            /** @description An email address, unique among the users; "" clears it */
+            email?: string;
+            /** @description The role by its id (built-in roles 9001 to 9004) */
+            role_id?: number;
             role?: string;
             disabled?: boolean;
         };
         AdminUserWrite: {
             /** @description 1 to 64 chars: lower-case letters, digits, _ - @ . + */
             name: string;
+            /** @description An email address, unique among the users (compared without case) */
+            email?: string;
             role: string;
         };
         /** @description Raiju: an alert channel; secrets in config are masked. */
@@ -10680,6 +10930,844 @@ export interface operations {
             };
         };
     };
+    getApiGovernanceUsers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminUserList"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiGovernanceUsers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AdminUserWrite"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminUserCreated"];
+                };
+            };
+            /** @description The body or a parameter is invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The record conflicts with an existing one. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The gateway could not save or read back the record. */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    putApiGovernanceUsersName: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the record (MCP client, virtual MCP, role, admin user, or policy) */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AdminUserUpdate"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminUser"];
+                };
+            };
+            /** @description The body or a parameter is invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No such record (or the route is not served for this input). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    deleteApiGovernanceUsersName: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the record (MCP client, virtual MCP, role, admin user, or policy) */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeletedResponse"];
+                };
+            };
+            /** @description The body or a parameter is invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No such record (or the route is not served for this input). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiGovernanceUsersNameRole: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description User name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The body or a parameter is invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No such virtual key, budget, rule, role or user. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+        };
+    };
+    putApiGovernanceUsersNameRole: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description User name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": Record<string, never>;
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The body or a parameter is invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No such virtual key, budget, rule, role or user. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+        };
+    };
+    getApiGovernanceUsersMeVkCreationPolicy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description has_access_profile is false when the caller holds no active profile; profile_name is set otherwise */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        has_access_profile: boolean;
+                        profile_name?: string;
+                    };
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiGovernanceUsersMePermissions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        permissions?: {
+                            [key: string]: {
+                                [key: string]: boolean;
+                            };
+                        };
+                    };
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+        };
+    };
+    getApiUsersEmailEmail: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The URL-encoded email address (compared without case; a user with no email whose name is the address matches too) */
+                email: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        id?: string;
+                        name?: string;
+                        email?: string;
+                        role_id?: number | null;
+                        role?: Record<string, never>;
+                        disabled?: boolean;
+                        teams?: Record<string, never>[];
+                        business_units?: Record<string, never>[];
+                        access_profiles?: Record<string, never>[];
+                    };
+                };
+            };
+            /** @description The email is not a valid URL-encoded value. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The caller's role does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No user has this email address. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+        };
+    };
+    getApiGovernanceUsersEmailEmail: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The URL-encoded email address (compared without case; a user with no email whose name is the address matches too) */
+                email: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        id?: string;
+                        name?: string;
+                        email?: string;
+                        role_id?: number | null;
+                        role?: Record<string, never>;
+                        disabled?: boolean;
+                        teams?: Record<string, never>[];
+                        business_units?: Record<string, never>[];
+                        access_profiles?: Record<string, never>[];
+                    };
+                };
+            };
+            /** @description The email is not a valid URL-encoded value. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The caller's role does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No user has this email address. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+        };
+    };
+    getApiUsersEmailEmailVirtualKeys: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The URL-encoded email address (compared without case; a user with no email whose name is the address matches too) */
+                email: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        user_id?: string;
+                        email?: string;
+                        virtual_keys?: {
+                            id?: string;
+                            name?: string;
+                            value?: string;
+                            is_active?: boolean;
+                        }[];
+                    };
+                };
+            };
+            /** @description The email is not a valid URL-encoded value. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The caller's role does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No user has this email address. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+        };
+    };
+    getApiGovernanceUsersEmailEmailVirtualKeys: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The URL-encoded email address (compared without case; a user with no email whose name is the address matches too) */
+                email: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        user_id?: string;
+                        email?: string;
+                        virtual_keys?: {
+                            id?: string;
+                            name?: string;
+                            value?: string;
+                            is_active?: boolean;
+                        }[];
+                    };
+                };
+            };
+            /** @description The email is not a valid URL-encoded value. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The caller's role does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No user has this email address. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+        };
+    };
+    getApiRoutingComplexityAnalyzerStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+        };
+    };
+    postApiRoutingComplexityAnalyzerStatusRetry: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The warm-up will be retried */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The last warm-up did not fail */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The semantic classifier is off */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+        };
+    };
+    getApiRoutingComplexityAnalyzerGenerations: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+        };
+    };
+    deleteApiRoutingComplexityAnalyzerGenerationsNamespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The generation's namespace (BifrostComplexityRouter_ then a fingerprint) */
+                namespace: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The namespace is not a complexity routing generation */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The generation is serving */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The semantic classifier is off */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+        };
+    };
     getApiRolesNamePermissions: {
         parameters: {
             query?: never;
@@ -12899,6 +13987,104 @@ export interface operations {
             };
             /** @description No such record (or the route is not served for this input). */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The record conflicts with an existing one. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiGovernanceRbacRoles: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CustomRoleList"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiGovernanceRbacRoles: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CustomRole"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CustomRole"];
+                };
+            };
+            /** @description The body or a parameter is invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };

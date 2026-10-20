@@ -18,12 +18,12 @@ import { issueSetupSession, validSetupSession, setupCookie, cookieValue, SETUP_C
 import { agentSessionsOf, a2aLogJson, Filter, LogStore, LogEntry, scopedEntries, visibleTo, defaultLogStoreConfig, applyChains, gridOf, filterFrom, selectAll, selects, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, histogramDimName, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
 import { setMcpToolLog, McpToolCall } from "./mcp"
 import { parsePolicy, policyView, policyConfigOf } from "./health"
-import { AccessProfile, AgentConfig, CircuitPolicyConfig, LogExportsConfig, VirtualKeyConfig } from "./config"
+import { AccessProfile, AgentConfig, CircuitPolicyConfig, LogExportsConfig, PermissionPair, VirtualKeyConfig } from "./config"
 import { rfc3339Of } from "./vkexpiry"
 import { flushVaultCache } from "./secrets"
 import { ConfigStore, checkAdmin, sweepExpiredKeys, sealStored, openStored, RESOURCES, OPERATIONS } from "./store"
 import { Held, KeyCtx, handleApiKeys, newKeyValue } from "./apikeys"
-import { keyBudgetIds, permissionDocs, permissionIds, creationPolicy, heldProfiles, PROPAGATED_FIELDS, propagateProfileKeys } from "./govapi"
+import { keyBudgetIds, permissionDocs, permissionIds, permissionMap, rolePairs, userObjectJson, userKeysJson, PermissionDoc, creationPolicy, heldProfiles, PROPAGATED_FIELDS, propagateProfileKeys } from "./govapi"
 
 // The quota view of one virtual key's budget and rate limit (GET /api/governance/virtual-keys/quota).
 // POST /api/governance/access-profiles/{id}/roles: the roles to attach (Bifrost's AttachRolesRequest).
@@ -31,7 +31,9 @@ type RoleAttachBody = { role_ids?: int[], is_default?: bool, apply_to_existing?:
 type QuotaBudget = { id: string, max_limit: f64, effective_max_limit: f64, reset_duration: string, current_usage: f64 }
 type QuotaRateUsage = { kind: string, used: f64, limit: f64 }
 type QuotaRate = { id: string, token_max_limit?: int, token_reset_duration?: string, request_max_limit?: int, request_reset_duration?: string, usage: QuotaRateUsage[] }
-import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, roleAllows, isBuiltinRole, customRole, provisioned, disabledNamed, roleIdOf } from "./rbac"
+// One per-model limit of a key in the quota view (Bifrost's quotaModelUsage); no provider means every provider.
+type QuotaModel = { model_name: string, provider?: string, budgets: QuotaBudget[], rate_limit?: QuotaRate }
+import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, roleAllows, isBuiltinRole, customRole, provisioned, disabledNamed, anyRoleId, userByEmail } from "./rbac"
 import { DataScope, allScope, noScope, scopeOf, inScope } from "./scope"
 import { AuditLog, AuditQuery, actionFor, maskDetail } from "./audit"
 import { AlertEngine, SampleRing, CelEngine, ScopeUsage } from "./alerts"
@@ -3741,7 +3743,8 @@ export class Ops {
   // /api/users*: the reply, after saving any change through the config store.
   // GET /api/governance/virtual-keys/quota: the calling key's own budgets, rate limits and provider
   // configs with their usage. Self-service, as Bifrost's: the key in the request is the credential, and
-  // an expired key is refused. model_configs is not reported (Raiju lists them under governance).
+  // an expired key is refused. model_configs lists the key's per-model limits (governance.model_configs
+  // scoped to this key, the "*" ones left out as Bifrost does) with their budgets' and rate limit's usage.
   vkQuota(req: Request): Reply {
     const vk = this.engine.gov.findKey(snapshot(req.headers))
     if (vk === undefined) return { status: 401, body: errorJson("a valid virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", undefined), contentType: "application/json" }
@@ -3751,20 +3754,40 @@ export class Ops {
     const usage = this.engine.gov.budgetUsage()
     const limits = this.engine.gov.rateLimitUsage(now)
     const ids = keyBudgetIds(vk)
-    const budgets: QuotaBudget[] = []
-    for (const b of g?.budgets ?? []) {
-      if (!ids.includes(b.id)) continue
-      const u = usage.find((x) => x.id === b.id)
-      budgets.push({ id: b.id, max_limit: b.max_limit, effective_max_limit: u?.limit ?? b.max_limit, reset_duration: b.reset_duration, current_usage: u?.used ?? 0.0 })
+    const quotaBudgets = (want: string[]): QuotaBudget[] => {
+      const out: QuotaBudget[] = []
+      for (const b of g?.budgets ?? []) {
+        if (!want.includes(b.id)) continue
+        const u = usage.find((x) => x.id === b.id)
+        out.push({ id: b.id, max_limit: b.max_limit, effective_max_limit: u?.limit ?? b.max_limit, reset_duration: b.reset_duration, current_usage: u?.used ?? 0.0 })
+      }
+      return out
     }
-    const rateLimits: QuotaRate[] = []
-    for (const rl of g?.rate_limits ?? []) {
-      if (rl.id !== vk.rate_limit_id) continue
-      const used: QuotaRateUsage[] = limits.filter((x) => x.id === rl.id).map((x) => ({ kind: x.kind, used: x.used, limit: x.limit }))
-      rateLimits.push({ id: rl.id, token_max_limit: rl.token_max_limit, token_reset_duration: rl.token_reset_duration, request_max_limit: rl.request_max_limit, request_reset_duration: rl.request_reset_duration, usage: used })
+    const quotaRates = (want: string): QuotaRate[] => {
+      const out: QuotaRate[] = []
+      for (const rl of g?.rate_limits ?? []) {
+        if (rl.id !== want) continue
+        const used: QuotaRateUsage[] = limits.filter((x) => x.id === rl.id).map((x) => ({ kind: x.kind, used: x.used, limit: x.limit }))
+        out.push({ id: rl.id, token_max_limit: rl.token_max_limit, token_reset_duration: rl.token_reset_duration, request_max_limit: rl.request_max_limit, request_reset_duration: rl.request_reset_duration, usage: used })
+      }
+      return out
     }
-    const noModels: string[] = []
-    const body = JSON.stringify({ virtual_key_name: vk.name ?? "", is_active: vk.is_active !== false, budgets: budgets, rate_limits: rateLimits, provider_configs: vk.provider_configs ?? [], model_configs: noModels })
+    const budgets = quotaBudgets(ids)
+    const rateLimits = quotaRates(vk.rate_limit_id ?? "")
+    const models: QuotaModel[] = []
+    for (const mc of g?.model_configs ?? []) {
+      if (mc.scope !== "virtual_key" || mc.scope_id !== vk.id || mc.model_name === "*") continue
+      const bids: string[] = []
+      if (mc.budget_id !== undefined) bids.push(mc.budget_id)
+      for (const b of mc.budget_ids ?? []) {
+        if (!bids.includes(b)) bids.push(b)
+      }
+      const row: QuotaModel = { model_name: mc.model_name, provider: mc.provider, budgets: quotaBudgets(bids) }
+      const rl = quotaRates(mc.rate_limit_id ?? "")[0]
+      if (rl !== undefined) row.rate_limit = rl
+      models.push(row)
+    }
+    const body = JSON.stringify({ virtual_key_name: vk.name ?? "", is_active: vk.is_active !== false, budgets: budgets, rate_limits: rateLimits, provider_configs: vk.provider_configs ?? [], model_configs: models })
     return { status: 200, body: body, contentType: "application/json" }
   }
 
@@ -3854,24 +3877,52 @@ export class Ops {
     return false
   }
 
-  // /api/users/me/permissions: the caller's custom role as (resource, operation) pairs with their ids.
-  // Built-in roles hold fixed rules (rbac.tov) and are reported by name, with no pairs.
+  // /api/users/me/permissions: the caller's role and its (resource, operation) pairs with their ids. A built-in
+  // role's fixed rules are expanded into pairs (rbac.tov builtinPairs) and it carries its fixed role_id.
   mePermissions(actor: string): Reply {
-    if (actor.startsWith("key:")) {
-      const kids = permissionIds(RESOURCES, OPERATIONS, this.heldOf(actor).pairs)
-      const kdocs = permissionDocs(RESOURCES, OPERATIONS).filter((d) => kids.includes(d.id))
-      return { status: 200, body: JSON.stringify({ user: actor, role: "api_key", built_in: false, permissions: kdocs }), contentType: "application/json" }
-    }
-    // a caller with no stored user (the legacy admin credential) is the admin
+    const me = this.mePairs(actor)
+    const ids = permissionIds(RESOURCES, OPERATIONS, me.pairs)
+    const docs = permissionDocs(RESOURCES, OPERATIONS).filter((d) => ids.includes(d.id))
+    const out: { user: string, role: string, role_id?: int, built_in: bool, permissions: PermissionDoc[] } = { user: actor, role: me.role, built_in: me.builtIn, permissions: docs }
+    if (me.roleId !== undefined) out.role_id = me.roleId
+    return { status: 200, body: JSON.stringify(out), contentType: "application/json" }
+  }
+
+  // GET /api/governance/users/me/permissions: the same pairs in Bifrost's PermissionsResponse shape, every
+  // resource with every operation set true or false.
+  mePermissionMap(actor: string): Reply {
+    return { status: 200, body: permissionMap(this.mePairs(actor).pairs, RESOURCES, OPERATIONS), contentType: "application/json" }
+  }
+
+  // The caller's role and pairs: a management API key's own permissions, else the stored user's role (a caller
+  // with no stored user, the legacy admin credential, is the admin).
+  mePairs(actor: string): { role: string, roleId?: int, builtIn: bool, pairs: PermissionPair[] } {
+    if (actor.startsWith("key:")) return { role: "api_key", builtIn: false, pairs: this.heldOf(actor).pairs }
     let role = "admin"
     for (const u of this.store.cfg.governance?.users ?? []) {
       if (u.name === actor) role = u.role
     }
-    const custom = customRole(this.store.cfg.governance?.roles ?? [], role)
-    const pairs = custom?.permissions ?? []
-    const ids = permissionIds(RESOURCES, OPERATIONS, pairs)
-    const docs = permissionDocs(RESOURCES, OPERATIONS).filter((d) => ids.includes(d.id))
-    return { status: 200, body: JSON.stringify({ user: actor, role: role, built_in: custom === undefined, permissions: docs }), contentType: "application/json" }
+    const roles = this.store.cfg.governance?.roles ?? []
+    const builtIn = customRole(roles, role) === undefined
+    return { role: role, roleId: anyRoleId(roles, role), builtIn: builtIn, pairs: rolePairs(roles, role, RESOURCES, OPERATIONS) }
+  }
+
+  // GET /api/users/email/{email} and /api/governance/users/email/{email}: the user with that (URL-encoded)
+  // address in Bifrost's UserObject shape; .../virtual-keys lists the keys assigned to the user.
+  userByEmailRoute(method: string, path: string): Reply {
+    if (method !== "GET") return { status: 405, body: errorJson(`method ${method} is not allowed on this route`, "invalid_request_error", undefined), contentType: "application/json" }
+    const segs = path.split("/").filter((s) => s !== "")
+    const at = segs[1] === "governance" ? 4 : 3
+    const raw = segs[at] ?? ""
+    const keys = segs.length === at + 2 && segs[at + 1] === "virtual-keys"
+    if (raw === "" || !(segs.length === at + 1 || keys)) return { status: 404, body: errorJson(`no route for ${path}`, "invalid_request_error", undefined), contentType: "application/json" }
+    const email = pctDecode(raw)
+    if (email === undefined || email.trim() === "") return { status: 400, body: errorJson("email must be a URL-encoded email address", "invalid_request_error", undefined), contentType: "application/json" }
+    const g = this.store.cfg.governance
+    const u = userByEmail(g?.users ?? [], email)
+    if (u === undefined) return { status: 404, body: errorJson("user not found", "not_found_error", undefined), contentType: "application/json" }
+    if (keys) return { status: 200, body: userKeysJson(u, g?.virtual_keys), contentType: "application/json" }
+    return { status: 200, body: userObjectJson(u, g?.users, g?.roles, g?.access_profiles), contentType: "application/json" }
   }
 
   // What the actor may grant to a management API key: everything for the admin and the legacy admin
@@ -3994,9 +4045,9 @@ export class Ops {
     return { status: r.status, body: r.body, contentType: "application/json" }
   }
 
-  // /api/governance/access-profiles/{id}/roles: POST attaches roles ({"role_ids": [...], "is_default": bool});
-  // DELETE .../roles/{role_id} detaches one. Every user holding one of the roles holds the profile, so the
-  // reply counts those users as users_applied.
+  // /api/governance/access-profiles/{id}/roles: POST attaches roles ({"role_ids": [...], "is_default": bool,
+  // "apply_to_existing": bool}); DELETE .../roles/{role_id} detaches one. apply_to_existing gives the role's users
+  // the profile now (counted as users_applied), is_default gives it to the role's later users.
   profileRoles(method: string, segs: string[], body: string): Reply {
     const id = segs[3] ?? ""
     if (segs.length === 5 && method === "POST") {
@@ -4008,13 +4059,15 @@ export class Ops {
       }
       const ids: int[] = b.role_ids ?? []
       if (ids.length === 0) return { status: 400, body: errorJson("role_ids is required", "invalid_request_error", undefined), contentType: "application/json" }
-      const r = this.store.attachProfileRoles(id, ids, b.is_default)
+      const apply = b.apply_to_existing === true
+      const r = this.store.attachProfileRoles(id, ids, b.is_default, apply)
       if (r.kind === "error") return { status: r.status, body: errorJson(r.message, "invalid_request_error", undefined), contentType: "application/json" }
+      // users_applied: the role's users given the profile now (apply_to_existing), as Bifrost counts them
       const g = this.store.cfg.governance
       let n = 0
       for (const u of g?.users ?? []) {
-        const rid = roleIdOf(g?.roles, u.role)
-        if (rid !== undefined && ids.includes(rid)) n += 1
+        const rid = anyRoleId(g?.roles, u.role)
+        if (apply && rid !== undefined && ids.includes(rid)) n += 1
       }
       return { status: 200, body: JSON.stringify({ message: "roles attached", users_applied: n }), contentType: "application/json" }
     }

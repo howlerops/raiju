@@ -29,7 +29,7 @@ import { Vault, tokenizeChatRequest, restoreCompletion } from "./guard_reversibl
 import { Target, Upstream, Translated, proxyOf, tlsOf, poolOf, RS } from "./providers/types"
 import { CompatPlan, Shaped, settingsOf, withHeader, responseToChat, chatToText, textFrame, chatSseToText, textToChatFields } from "./compat"
 import { ResponsesToChatStream, toResponse, toResponseStream } from "./responses"
-import { ModelRef, parseModel, parseModelVia, target, kindOf, classify, backoffMs, maxRetries, timeoutMs, healthId, resolveAlias, matchedAlias } from "./router"
+import { ModelRef, parseModel, parseModelVia, target, kindOf, classify, backoffMs, maxRetries, timeoutMs, healthId, resolveAlias, matchedAlias, directRefs, directionOpts } from "./router"
 import { CrewPick, crewRoute, withReasoningEffort, reasoningEffortText } from "./crew"
 import { forwardedHeaders, headerFilterOf } from "./headerfilter"
 import * as anthropicBeta from "./anthropic_beta"
@@ -50,6 +50,7 @@ import * as bedrockNative from "./providers/bedrock"
 import * as watsonx from "./providers/watsonx"
 import * as databricks from "./providers/databricks"
 import * as copilot from "./providers/githubcopilot"
+import * as replicate from "./providers/replicate"
 import * as metrics from "./metrics"
 import { TokenCache, parseServiceAccount, isClaude } from "./providers/vertex"
 import { GuardConfig, applyToChatRequest, applyToCompletion, applyToText } from "./guardrails"
@@ -1110,6 +1111,28 @@ function textAsChat(t: Target, sh: Shaped, stream: bool, canPipe: bool): Upstrea
   return try providers.chatUpstream(t, req, sh.body, false)
 }
 
+// A Replicate prediction that has not settled is read again at its get URL every 2 seconds (Bifrost's interval),
+// within the provider's timeout (the request's deadline signal ends the wait), as Bifrost polls running chat
+// predictions. An answer that has settled, or has no get URL, is returned as it came.
+async function replicatePoll(t: Target, first: string, signal: AbortSignal): Promise<{ status: int, text: string }> {
+  let cur = first
+  try {
+    while (!replicate.isSettled(cur)) {
+      const url = replicate.getUrlOf(cur)
+      if (url === "") break
+      await new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 2000))
+      const hs: Record<string, string> = replicate.pollHeaders(t)
+      const r = await fetch(url, { headers: hs, signal: signal, proxy: proxyOf(t.cfg), tls: tlsOf(t.cfg), pool: poolOf(t.cfg) })
+      const tx = await r.text()
+      if (r.status < 200 || r.status >= 300) return { status: r.status, text: tx }
+      cur = tx
+    }
+  } catch (e) {
+    return { status: 504, text: errorJson(`replicate did not finish the prediction: ${e.message}`, "api_error", undefined) }
+  }
+  return { status: 200, text: cur }
+}
+
 // Replicate's text completion: the prompt as the one user message of its chat prediction (Bifrost sends the
 // prompt as the prediction's input, and the answer comes back as a text completion).
 function replicateText(t: Target, body: Field[]): Upstream throws SyntaxError {
@@ -1968,6 +1991,12 @@ export class Engine {
               }
               text = text + RS + xt
             }
+          }
+          // a Replicate prediction still running when the synchronous wait ended is read again until it settles
+          if (t.kind === "replicate" && status >= 200 && status < 300) {
+            const polled = await replicatePoll(t, text, signal)
+            status = polled.status
+            text = polled.text
           }
           dl.finish()
           retryAfter = res.headers.get("retry-after") ?? undefined
@@ -2933,9 +2962,14 @@ export class Engine {
     }
     // a bare model name resolves through keys, then the catalog, preferring the SDK route's provider
     let refs = [parseModelVia(this.cfg, model, routeOf(op))].concat(fallbackRefs(this.cfg, body))
+    // whether the request named its provider (the model's prefix was taken off), for the provider level below
+    let pinnedDir = refs[0]!.model !== model
     if (cx !== undefined && tier !== undefined && model === (cx.model ?? "auto")) {
       const tt = tierTarget(tier, cx.tiers ?? {})
-      if (tt !== undefined) refs = [parseModel(this.cfg, tt)].concat(refs.slice(1))
+      if (tt !== undefined) {
+        refs = [parseModel(this.cfg, tt)].concat(refs.slice(1))
+        pinnedDir = refs[0]!.model !== tt
+      }
     }
     if (refs[0]!.provider === "") {
       ctx.error = "no provider for " + model
@@ -2943,15 +2977,22 @@ export class Engine {
     }
     // a circuit policy whose circuit is open sends the primary's requests to its fallback (the primary is not tried)
     const open = this.health.policyFallback(refs[0]!.provider, refs[0]!.model, Date.now())
-    if (open !== undefined) refs = [{ provider: open.fallback_provider, model: open.fallback_model }].concat(refs.slice(1))
+    if (open !== undefined) {
+      refs = [{ provider: open.fallback_provider, model: open.fallback_model }].concat(refs.slice(1))
+      pinnedDir = true
+    }
     const rules = this.rules
     if (rules !== undefined) {
       const routed = this.route(rules, op, refs, &h, body, tier)
       if (routed !== undefined) {
         refs = routed
+        pinnedDir = true
         out.set("x-bf-routing-rule", h.get("x-bf-routing-rule") ?? "")
       }
     }
+    // adaptive load balancing's provider level (load_balancer_config): healthy directions first, broken
+    // fallbacks pruned, healthy providers appended (router.tov directRefs); a pinned key keeps its provider
+    if (h.get("x-bf-api-key") === undefined && h.get("x-bf-api-key-id") === undefined) refs = directRefs(this.cfg, refs, pinnedDir, this.health, directionOpts(this.cfg), Date.now())
     const routeUs = (performance.now() - tRoute) * 1000.0
     const primary = refs[0]!
     const tGov = performance.now()
@@ -4264,7 +4305,8 @@ export class Engine {
         if (stream) throw new SyntaxError(`text_completion_stream is not supported by ${t.provider} provider`)
         return t.kind === "anthropic" ? try anthropicNative.textRequest(t, sh.body) : try bedrockNative.textRequest(t, sh.body)
       }
-      if (!providers.streamsNatively(t.kind)) throw new SyntaxError(`${t.provider} does not serve text completions`)
+      // Sarvam's OpenAI-compatible API has chat only (Bifrost refuses its text completions)
+      if (!providers.streamsNatively(t.kind) || t.kind === "sarvam") throw new SyntaxError(`${t.provider} does not serve text completions`)
       return openai.completionsRequest(t, sh.body)
     }
     const translate: Translate = (t, text, requested) => {

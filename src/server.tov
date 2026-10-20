@@ -14,6 +14,9 @@ import * as vertex from "./providers/vertex"
 import * as cloudflare from "./providers/cloudflare"
 import * as replicate from "./providers/replicate"
 import * as openrouter from "./providers/openrouter"
+import * as copilot from "./providers/githubcopilot"
+import * as cohere from "./providers/cohere"
+import * as bedrockMantle from "./providers/bedrock_mantle"
 import { bedrockIds, publisherPage, cloudflarePage, cloudflareSearchPath } from "./model_list"
 import { retrieveRequest, retrieveBody } from "./model_retrieve"
 import { fields, find, elements, rawStr, rawBool } from "./json"
@@ -30,11 +33,11 @@ import { realtimeCall, realtimeMint } from "./realtimecalls"
 import { MINT_ROUTES } from "./rtsession"
 import { sdkRoute, anthropicSdk } from "./anthropic_batch"
 import { snapshot, errorJson, Hdrs, newId } from "./schemas"
-import { handleApi, proxyWidening, Result, randomId } from "./store"
+import { handleApi, proxyWidening, Result, randomId, rotatedKeyIds, isRotatePath } from "./store"
 import { scimAuthorized, scimHandle, errorBody, ScimState, SCIM_CONTENT_TYPE } from "./scim"
 import { passthroughPath, passthroughRoute } from "./passthrough"
 import { mcpApi, oauthRoute, oauthCallback, oauthConfigRoute, openapiRoute, headersRouteAsync, exchangeRouteAsync, perUserApi, McpReply } from "./mcpapi"
-import { issuerRoute, keyById, grantsList, grantRevoke } from "./mcpissuer"
+import { issuerRoute, keyById, grantsList, grantRevoke, revokeSubject } from "./mcpissuer"
 import { promptRoute } from "./prompts"
 import { webhookApi, asyncSubmitHooked } from "./webhooks"
 import { agentApi, publicBase, CARD_PATH } from "./agents"
@@ -46,7 +49,7 @@ import { McpSession } from "./mcp"
 import { Ops, Reply, UiSocket } from "./ops"
 import { parseCursor } from "./feed"
 import { cookieValue, SETUP_COOKIE } from "./setupsession"
-import { rerank, bedrockRerank, countTokens, asyncSubmit, asyncGet, sdkAsyncSubmit, sdkAsyncPoll, decisionRoute, Dispatch } from "./extras"
+import { rerank, bedrockRerank, countTokens, responsesInputTokens, asyncSubmit, asyncGet, sdkAsyncSubmit, sdkAsyncPoll, decisionRoute, Dispatch } from "./extras"
 import { asyncPoll } from "./jobs"
 import { serveUi, uiPath, UI_CSP } from "./uiserve"
 import { TransportRun, transportStart, transportEnd, transportDone, transportSink, llmHooked } from "./pluginroute"
@@ -71,13 +74,16 @@ function upstreamModels(provider: string, kind: string, t: Target): Upstream | u
     const base = t.cfg.network_config?.base_url ?? "https://generativelanguage.googleapis.com"
     return { url: base + "/v1beta/models?pageSize=1000", headers: gemini.upstreamHeaders(t), body: "" }
   }
+  if (kind === "cohere") return cohere.modelsRequest(t)
   return undefined
 }
 
 // The kinds whose listing is not OpenAI's shape, read by nativeModelIds. Databricks lists nothing, as
 // Bifrost's does: its workspace inventory does not match the inference ids (databricks/models.go).
+// GitHub Copilot, Bedrock Mantle and Azure answer in OpenAI's shape, but their requests are their own (editor headers
+// and a minted token; the regional host and SigV4; the resource endpoint and api-key or Entra token).
 function nativeList(kind: string): bool {
-  return kind === "bedrock" || kind === "vertex" || kind === "cloudflare" || kind === "databricks" || kind === "replicate"
+  return kind === "bedrock" || kind === "vertex" || kind === "cloudflare" || kind === "databricks" || kind === "replicate" || kind === "github-copilot" || kind === "bedrock_mantle" || kind === "azure"
 }
 
 // One GET on a provider listing: the body when the answer is 2xx, else undefined.
@@ -137,10 +143,41 @@ async function bedrockPages(t: Target, path: string, field: string, idKey: strin
   return out
 }
 
+// GitHub Copilot's, Bedrock Mantle's and Azure's listings: OpenAI's list shape from their own requests. A Copilot key
+// with GitHub App credentials gets its token and host minted (and cached) as for chat, and so does an Entra ID key.
+async function ownListingIds(engine: Engine | undefined, provider: string, t: Target): Promise<string[] | undefined> throws SyntaxError | Error {
+  let lt = t
+  if (lt.kind === "github-copilot" && (lt.key.value ?? "") === "" && lt.key.github_copilot_key_config !== undefined) {
+    if (engine === undefined) return undefined
+    const tok = await engine.copilotToken(lt)
+    if (tok.error !== "") return undefined
+    lt.key.value = tok.token
+    let nc = lt.cfg.network_config ?? {}
+    nc.base_url = tok.host
+    let pc = lt.cfg
+    pc.network_config = nc
+    lt.cfg = pc
+  }
+  if (lt.kind === "azure" && (lt.key.value ?? "") === "" && lt.key.azure_key_config?.tenant_id !== undefined) {
+    // an Entra ID service principal: its token, minted (and cached) as for chat
+    if (engine === undefined) return undefined
+    const tok = await engine.entraToken(lt)
+    if (tok.error !== "") return undefined
+    lt.key.value = tok.token
+  }
+  let up = bedrockMantle.modelsRequest(lt)
+  if (lt.kind === "github-copilot") up = try copilot.modelsRequest(lt)
+  else if (lt.kind === "azure") up = openai.azureModelsRequest(lt)
+  const text = try await getListing(up)
+  if (text === undefined) return undefined
+  return try openai.modelIds(text, provider)
+}
+
 async function nativeModelIds(engine: Engine | undefined, provider: string, t: Target): Promise<string[] | undefined> {
   const ids: string[] = []
   try {
     if (t.kind === "databricks") return ids
+    if (t.kind === "github-copilot" || t.kind === "bedrock_mantle" || t.kind === "azure") return await ownListingIds(engine, provider, t)
     if (t.kind === "replicate") {
       // the account's deployments, every page: each answer's next is the full URL of the following page
       const first = replicate.deploymentsRequest(t)
@@ -427,6 +464,13 @@ function logsAnalyticsPath(path: string): bool {
   return path === "/api/logs" || path.startsWith("/api/logs/") || path.startsWith("/api/mcp-logs")
 }
 
+// The users routes' path: Bifrost's /api/governance/users[/...] (its current home for them) is /api/users[/...].
+export function usersPath(path: string): string {
+  const g = "/api/governance/users"
+  if (path === g || path.startsWith(g + "/")) return "/api/users" + path.slice(g.byteLength)
+  return path
+}
+
 // The audit trail's path, with the alias (governance/audit-logs) mapped onto audit-logs; "" for any other path.
 function auditTarget(path: string): string {
   const segs = path.split("/")
@@ -492,9 +536,12 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   const body = req.method === "GET" ? "" : await req.text()
   let r: Reply = { status: 404, body: "", contentType: "application/json" }
   if (path === "/api/users/me/permissions") r = req.method === "GET" ? ops.mePermissions(gate.actor) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
-  else if (path === "/api/users/me/vk-creation-policy") r = req.method === "GET" ? ops.vkCreationPolicy(gate.actor) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
-  else if (path.startsWith("/api/users/") && path.split("/")[4] === "access-profiles") r = ops.userProfiles(req.method, path)
-  else if (path === "/api/users" || path.startsWith("/api/users/")) r = ops.users(req.method, path, body, req.headers.get("x-bifrost-setup-token") ?? "", cookieValue(req.headers.get("cookie") ?? "", SETUP_COOKIE))
+  else if (path === "/api/governance/users/me/permissions") r = req.method === "GET" ? ops.mePermissionMap(gate.actor) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
+  // a user by email address (Bifrost's MDM lookups), on the old and the governance path
+  else if (path.startsWith("/api/users/email/") || path.startsWith("/api/governance/users/email/")) r = ops.userByEmailRoute(req.method, path)
+  else if (usersPath(path) === "/api/users/me/vk-creation-policy") r = req.method === "GET" ? ops.vkCreationPolicy(gate.actor) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
+  else if (usersPath(path).startsWith("/api/users/") && usersPath(path).split("/")[4] === "access-profiles") r = ops.userProfiles(req.method, usersPath(path))
+  else if (usersPath(path) === "/api/users" || usersPath(path).startsWith("/api/users/")) r = ops.users(req.method, usersPath(path), body, req.headers.get("x-bifrost-setup-token") ?? "", cookieValue(req.headers.get("cookie") ?? "", SETUP_COOKIE))
   else if (auditTarget(path) !== "") r = ops.auditRoute(req, auditTarget(path))
   else if (path === "/api/api-keys" || path.startsWith("/api/api-keys/")) r = ops.apiKeysRoute(req.method, path, req.url, body, gate.actor)
   // the cache clears (DELETE) and the read-only plugin listings
@@ -608,6 +655,10 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
       const qu = URL.parse(req.url)
       const a = handleApi(ops.store, req.method, qu === undefined ? path : path + qu.search, body, sc)
       r = { status: a.status, body: a.body, contentType: "application/json" }
+      // a rotated key's MCP OAuth grants go with its old value (Bifrost revokes them in the rotation)
+      if (a.status === 200 && isRotatePath(path)) {
+        for (const id of rotatedKeyIds(a.body)) revokeSubject("vk", id)
+      }
     }
   }
   ops.recordChange(gate.actor, req, path, r.status, body)
@@ -1029,6 +1080,17 @@ async function routes(engine: Engine, ops: Ops, req: Request): Promise<Response>
     if (engine.gov.enforce && engine.gov.findKey(snapshot(req.headers)) === undefined) {
       return errorResponse(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", noHeaders())
     }
+    if (media.op === "responses.input_tokens") {
+      // another provider's model is counted with that provider's count (extras.tov); an OpenAI-format one goes on
+      const text = await req.text()
+      const counted = await responsesInputTokens(engine, req, text)
+      if (counted !== undefined) return await cors(engine.cfg, req, counted)
+      const hs: Record<string, string> = new Map()
+      req.headers.forEach((v, key) => {
+        if (key !== "content-length" && key !== "transfer-encoding") hs.set(key, v)
+      })
+      return try await engine.media(new Request(req.url, { method: "POST", headers: hs, body: text }), media)
+    }
     const lk = kindOfPath(m, p)
     if (lk !== undefined) return try await llmHooked(engine, req, lk.op, async (r, s) => try await engine.media(r, media), undefined)
     return try await engine.media(req, media)
@@ -1369,4 +1431,11 @@ test("the Responses route streams through the sink when the request asks for a s
   expect(streamKind("/v1/responses")).toBe("responses")
   expect(streamsRequest("responses", `{"model":"m","stream":true}`)).toBe(true)
   expect(streamsRequest("responses", `{"model":"m"}`)).toBe(false)
+})
+
+test("the governance users path is the users path", () => {
+  expect(usersPath("/api/governance/users")).toBe("/api/users")
+  expect(usersPath("/api/governance/users/ann/role")).toBe("/api/users/ann/role")
+  expect(usersPath("/api/governance/usersx")).toBe("/api/governance/usersx")
+  expect(usersPath("/api/users/ann")).toBe("/api/users/ann")
 })

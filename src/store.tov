@@ -14,11 +14,12 @@ import {
   loadRawConfig,
 } from "./config"
 import { RoutingRule, RuleTarget } from "./cel"
-import { permissionDocs, pairOfId, permissionIds, parseOverride, keyBudgetIds, expiredToDelete, ruleError, complexityProblem, complexityFrom } from "./govapi"
+import { permissionDocs, pairOfId, permissionIds, parseOverride, keyBudgetIds, expiredToDelete, ruleError, complexityProblem, complexityFrom, emailOf, attachBinding } from "./govapi"
 import { PromptRepoConfig } from "./prompts"
 import { FeatureFlagsConfig } from "./flags"
 import { notify } from "./notify"
-import { isBuiltinRole, customRole, withRoleIds, roleIdOf, roleNameById } from "./rbac"
+import { analyzerStatus, retryWarmup, generationsJson, deleteGeneration } from "./complexity"
+import { isBuiltinRole, customRole, withRoleIds, roleIdOf, roleNameById, anyRoleName, builtinRoleName, builtinRoles } from "./rbac"
 import { DataScope, allScope, inScope, scopeOf } from "./scope"
 import { setGlobalProxy } from "./providers/types"
 import { McpClientConfig, McpUserCredential } from "./mcp"
@@ -248,6 +249,7 @@ function prepKey(k: KeyConfig, id: string, old: KeyConfig | undefined): KeyConfi
     weight: k.weight,
     aliases: k.aliases,
     azure_key_config: k.azure_key_config,
+    replicate_key_config: k.replicate_key_config,
     vertex_key_config: vk === undefined ? undefined : { project_id: vk.project_id, region: vk.region, auth_credentials: keepOpt(vk.auth_credentials, ov?.auth_credentials) },
     bedrock_key_config: bk === undefined ? undefined : {
       access_key: bk.access_key,
@@ -635,6 +637,7 @@ function redactKey(k: KeyConfig): KeyConfig {
     weight: k.weight,
     aliases: k.aliases,
     azure_key_config: k.azure_key_config,
+    replicate_key_config: k.replicate_key_config,
     vertex_key_config: vx === undefined ? undefined : { project_id: vx.project_id, region: vx.region, auth_credentials: maskOpt(vx.auth_credentials) },
     bedrock_key_config: br === undefined ? undefined : {
       access_key: br.access_key,
@@ -1908,13 +1911,15 @@ export class ConfigStore {
     return this.commit(withGov(this.cfg, g), name)
   }
 
-  // Attaches custom roles to an access profile (Bifrost's attach): each id names a custom role, and a role
-  // already attached takes the new is_default. Every user holding one of the roles holds the profile.
-  attachProfileRoles(profileId: string, roleIds: int[], isDefault: bool | undefined): Result {
+  // Attaches roles (built-in or custom, by id) to an access profile (Bifrost's attach): with apply_to_existing the
+  // role's users now hold the profile, with is_default its later users do (govapi.tov attachBinding). A role
+  // already attached takes the new settings, and its users who held the profile keep it. Returns how many users
+  // were given the profile now, through users_applied.
+  attachProfileRoles(profileId: string, roleIds: int[], isDefault: bool | undefined, apply: bool): Result {
     const g = gov(this.cfg)
     if (findById(g.access_profiles, profileId) === undefined) return fail(404, `no access profile ${profileId}`)
     for (const rid of roleIds) {
-      if (roleNameById(g.roles, rid) === undefined) return fail(400, `role_id ${rid} is not a custom role`)
+      if (anyRoleName(g.roles, rid) === undefined) return fail(400, `role_id ${rid} names no role`)
     }
     const profiles: AccessProfile[] = []
     for (const p of g.access_profiles ?? []) {
@@ -1924,7 +1929,15 @@ export class ConfigStore {
         for (const b of np.roles ?? []) {
           if (!roleIds.includes(b.role_id)) kept.push(b)
         }
-        for (const rid of roleIds) kept.push({ role_id: rid, is_default: isDefault })
+        for (const rid of roleIds) {
+          const roleName = anyRoleName(g.roles, rid) ?? ""
+          const holders = (g.users ?? []).filter((u) => u.role === roleName).map((u) => u.name)
+          let prior: ProfileRole | undefined = undefined
+          for (const b of np.roles ?? []) {
+            if (b.role_id === rid) prior = b
+          }
+          kept.push(attachBinding(rid, isDefault, apply, holders, prior))
+        }
         np.roles = kept
       }
       profiles.push(np)
@@ -2500,7 +2513,7 @@ function teamMembers(store: ConfigStore, m: string, team: string, scope: DataSco
   if (!recordInScope(store.cfg, "teams", team, scope) || findById(g.teams, team) === undefined) return reply(404, errorBody(`no teams ${team}`))
   const out: { user_id: string, user_name: string, user_email: string, source: string }[] = []
   for (const u of g.users ?? []) {
-    if ((u.teams ?? []).includes(team)) out.push({ user_id: u.name, user_name: u.name, user_email: "", source: "manual" })
+    if ((u.teams ?? []).includes(team)) out.push({ user_id: u.name, user_name: u.name, user_email: emailOf(u), source: "manual" })
   }
   return reply(200, JSON.stringify({ members: out }))
 }
@@ -2567,6 +2580,28 @@ function rotateVkRoute(store: ConfigStore, m: string, segs: string[], body: stri
   return reply(200, JSON.stringify(out))
 }
 
+// The ids of the keys a rotate reply names (virtual_key, or each of virtual_keys): the caller revokes their MCP
+// OAuth grants (mcpissuer.tov revokeSubject), as Bifrost does in the rotation's transaction.
+export function rotatedKeyIds(replyBody: string): string[] {
+  const out: string[] = []
+  try {
+    const r = JSON.parse(replyBody) as { virtual_key?: { id: string }, virtual_keys?: { id: string }[] }
+    const one = r.virtual_key
+    if (one !== undefined) out.push(one.id)
+    for (const k of r.virtual_keys ?? []) out.push(k.id)
+  } catch (e) {
+    return out
+  }
+  return out
+}
+
+// Whether a path is a virtual-key rotate route (the collection or one key).
+export function isRotatePath(path: string): bool {
+  const segs = path.split("?")[0]!.split("/").filter((x) => x !== "")
+  if (segs[0] !== "api" || segs[1] !== "governance" || segs[2] !== "virtual-keys") return false
+  return segs.length === 4 && segs[3] === "rotate" || segs.length === 5 && segs[4] === "rotate"
+}
+
 function governanceRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, sp: URLSearchParams, scope: DataScope): ApiReply {
   const coll = segs[2] ?? ""
   if (coll === "virtual-keys" && (segs.length === 4 && segs[3] === "rotate" || segs.length === 5 && segs[4] === "rotate")) {
@@ -2583,7 +2618,7 @@ function governanceRoute(store: ConfigStore, m: string, segs: string[], body: st
   // Bifrost's RBAC routes: /api/governance/rbac/roles is /api/roles, the rest are the catalogue
   if (coll === "rbac") {
     const sub = segs[3] ?? ""
-    if (sub === "roles") return roleRoute(store, m, ["api", "roles"].concat(segs.slice(4)), body, path, scope)
+    if (sub === "roles") return roleRoute(store, m, ["api", "roles"].concat(segs.slice(4)), body, path, scope, true)
     if (sub === "resources" || sub === "operations" || sub === "permissions") return segs.length === 4 ? rbacListing(sub, m) : notFound(path)
     return notFound(path)
   }
@@ -2969,10 +3004,11 @@ function businessUnitFrom(id: string, b: BusinessUnitBody): BusinessUnitConfig {
   return { id: id, name: b.name ?? "", budget_id: b.budget_id, rate_limit_id: b.rate_limit_id, team_ids: b.team_ids, customer_ids: b.customer_ids }
 }
 
-// /api/roles[/{name}]: custom roles, as Bifrost's role routes name them. Built-in roles are not listed here.
-// A numeric segment names the role by its id (Bifrost's /api/governance/rbac/roles/{role_id}), answered in
-// Bifrost's shape; a name keeps the shape Raiju has always answered.
-function roleRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, scope: DataScope): ApiReply {
+// /api/roles[/{name}]: custom roles, as Bifrost's role routes name them. A numeric segment names the role by
+// its id (Bifrost's /api/governance/rbac/roles/{role_id}), answered in Bifrost's shape; a name keeps the shape
+// Raiju has always answered. Bifrost's list (system set, the /api/governance/rbac/roles path) puts the built-in
+// roles first, with their fixed ids and is_system_role; /api/roles lists the custom roles only.
+function roleRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, scope: DataScope, system: bool): ApiReply {
   if (segs.length > 4 || segs.length === 4 && segs[3] !== "permissions") return notFound(path)
   if (!scope.all && m !== "GET") return scopeDenied()
   const name = segs[2]
@@ -2981,6 +3017,11 @@ function roleRoute(store: ConfigStore, m: string, segs: string[], body: string, 
   if (name === undefined) {
     if (m === "GET") {
       const parts: string[] = []
+      if (system) {
+        for (const r of builtinRoles(RESOURCES, OPERATIONS)) {
+          if (customRole(gov(store.cfg).roles, r.name) === undefined) parts.push(roleJsonAs(r, true))
+        }
+      }
       for (const r of withRoleIds(gov(store.cfg).roles ?? [])) parts.push(roleJson(r))
       return reply(200, `{"roles":[${parts.join(",")}]}`)
     }
@@ -3026,6 +3067,8 @@ function roleView(store: ConfigStore, name: string): RoleConfig | undefined {
 // partial update: a field left out keeps its value, and a description of "" clears it. A role cannot be
 // renamed, since its users and access profiles are kept by its id.
 function roleByIdRoute(store: ConfigStore, m: string, id: int, segs: string[], body: string): ApiReply {
+  const sys = builtinRoleName(id)
+  if (sys !== undefined && customRole(gov(store.cfg).roles, sys) === undefined) return systemRoleRoute(m, sys, segs)
   const name = roleNameById(gov(store.cfg).roles, id)
   if (name === undefined) return reply(404, errorBody(`no role ${id}`))
   if (segs.length === 4) return rolePermissions(store, m, name, body)
@@ -3059,6 +3102,28 @@ function roleByIdRoute(store: ConfigStore, m: string, id: int, segs: string[], b
     if (r.kind === "error") return errReply(r)
     return reply(200, JSON.stringify({ message: "role deleted" }))
   }
+  return notAllowed(m)
+}
+
+// A built-in role by its id: GET reads it (or its pairs, at .../permissions); it cannot be changed or deleted,
+// since its rules are fixed (Bifrost lets a system role's permissions be edited; Raiju's built-in rules are not
+// pair lists, so a custom role is the way to vary them).
+function systemRoleRoute(m: string, name: string, segs: string[]): ApiReply {
+  let role: RoleConfig | undefined = undefined
+  for (const r of builtinRoles(RESOURCES, OPERATIONS)) {
+    if (r.name === name) role = r
+  }
+  if (role === undefined) return reply(404, errorBody(`no role ${name}`))
+  if (m === "GET") {
+    if (segs.length === 4) {
+      const ids = permissionIds(RESOURCES, OPERATIONS, role.permissions ?? [])
+      const docs = permissionDocs(RESOURCES, OPERATIONS).filter((d) => ids.includes(d.id))
+      return reply(200, JSON.stringify({ role: name, permissions: docs }))
+    }
+    return reply(200, `{"role":${roleJsonAs(role, true)}}`)
+  }
+  if (m === "DELETE") return reply(403, errorBody("cannot delete system role"))
+  if (m === "PUT") return reply(403, errorBody(`cannot change system role ${name}: its rules are fixed; create a custom role instead`))
   return notAllowed(m)
 }
 
@@ -3145,11 +3210,15 @@ function entityDacFrom(body: string): { list: EntityDac[], error: string } {
 
 // A custom role as the management API shows it: its id, entity_dac as Bifrost's object, dac only when set.
 function roleJson(r: RoleConfig): string {
+  return roleJsonAs(r, false)
+}
+
+function roleJsonAs(r: RoleConfig, system: bool): string {
   const parts: string[] = []
   if (r.id !== undefined) parts.push(`"id":${r.id}`)
   parts.push(`"name":${quote(r.name)}`)
   if (r.description !== undefined) parts.push(`"description":${quote(r.description)}`)
-  parts.push(`"is_system_role":false`)
+  parts.push(`"is_system_role":${system ? "true" : "false"}`)
   if (r.dac !== undefined) parts.push(`"dac":${quote(r.dac)}`)
   parts.push(`"permissions":${JSON.stringify(r.permissions ?? [])}`)
   const ed: string[] = []
@@ -3456,7 +3525,11 @@ function vkUsers(store: ConfigStore, m: string, id: string, scope: DataScope): A
   if (vk === undefined || !recordInScope(store.cfg, "virtual-keys", id, scope)) return reply(404, errorBody(`no virtual-keys ${id}`))
   const users: { user_id: string, user_name: string, user_email: string, source: string }[] = []
   const u = vk.user_id ?? ""
-  if (u !== "") users.push({ user_id: u, user_name: u, user_email: "", source: "assigned" })
+  let email = ""
+  for (const x of gov(store.cfg).users ?? []) {
+    if (x.name === u) email = emailOf(x)
+  }
+  if (u !== "") users.push({ user_id: u, user_name: u, user_email: email, source: "assigned" })
   return reply(200, JSON.stringify({ users: users }))
 }
 
@@ -3537,6 +3610,32 @@ function complexityRoute(store: ConfigStore, m: string, segs: string[], body: st
     return reply(200, JSON.stringify({}))
   }
   if (segs.length === 3 || reset) return notAllowed(m)
+  return notFound(path)
+}
+
+// Bifrost's complexity status routes (no /api/governance alias, as in Bifrost): GET .../complexity-analyzer-status
+// and POST .../status/retry, GET .../complexity-analyzer-generations and DELETE .../generations/{namespace}. The
+// state is the semantic classifier's in this process (complexity.tov).
+function complexityStateRoute(store: ConfigStore, m: string, segs: string[], path: string, scope: DataScope): ApiReply {
+  const cx = store.cfg.complexity_router ?? {}
+  const on = cx.enabled === true
+  if (segs[2] === "complexity-analyzer-status") {
+    if (segs.length === 3) return m === "GET" ? reply(200, analyzerStatus(on, cx.classifier, cx.semantic, cx.llm)) : notAllowed(m)
+    if (segs.length === 4 && segs[3] === "retry") {
+      if (m !== "POST") return notAllowed(m)
+      if (!scope.all) return scopeDenied()
+      const r = retryWarmup(on, cx.classifier, cx.semantic, cx.llm)
+      return reply(r.status, r.body)
+    }
+    return notFound(path)
+  }
+  if (segs.length === 3) return m === "GET" ? reply(200, generationsJson(on, cx.classifier)) : notAllowed(m)
+  if (segs.length === 4) {
+    if (m !== "DELETE") return notAllowed(m)
+    if (!scope.all) return scopeDenied()
+    const r = deleteGeneration(on, cx.classifier, segs[3] ?? "")
+    return reply(r.status, r.body)
+  }
   return notFound(path)
 }
 
@@ -3635,6 +3734,7 @@ export function handleApi(store: ConfigStore, method: string, path: string, body
   if (segs.length === 0 || segs[0] !== "api") return notFound(p)
   const area = segs[1] ?? ""
   // Bifrost's /api/routing/... are the governance routes
+  if (area === "routing" && (segs[2] === "complexity-analyzer-status" || segs[2] === "complexity-analyzer-generations")) return complexityStateRoute(store, m, segs, p, sc)
   if (area === "routing" && segs.length >= 3) {
     const sub = segs[2] === "rules" ? "routing-rules" : segs[2] ?? ""
     return governanceRoute(store, m, ["api", "governance", sub].concat(segs.slice(3)), body, p, qp, sc)
@@ -3677,7 +3777,7 @@ export function handleApi(store: ConfigStore, method: string, path: string, body
   }
   if (area === "providers") return providerRoute(store, m, segs, body, p)
   if (area === "governance" && segs.length >= 3) return governanceRoute(store, m, segs, body, p, qp, sc)
-  if (area === "roles") return roleRoute(store, m, segs, body, p, sc)
+  if (area === "roles") return roleRoute(store, m, segs, body, p, sc, false)
   return notFound(p)
 }
 
@@ -4805,9 +4905,9 @@ test("roles by id: Bifrost's shape, partial updates, and access profile attachme
   expect(handleApi(s, "POST", "/api/roles", `{"name":"temp"}`).status).toBe(201)
   expect((s.cfg.governance?.roles ?? [])[1]!.id).toBe(2)
   // attach a profile to roles: an id must name a custom role, and the profile keeps the attachment on update
-  expect(s.attachProfileRoles("p-role", [7], undefined).kind).toBe("error")
-  expect(s.attachProfileRoles("p-role", [1], true).kind).toBe("ok")
-  expect(s.attachProfileRoles("p-role", [2], undefined).kind).toBe("ok")
+  expect(s.attachProfileRoles("p-role", [7], undefined, true).kind).toBe("error")
+  expect(s.attachProfileRoles("p-role", [1], true, true).kind).toBe("ok")
+  expect(s.attachProfileRoles("p-role", [2], undefined, true).kind).toBe("ok")
   const held = (s.cfg.governance?.access_profiles ?? [])[0]!.roles ?? []
   expect(held.length).toBe(2)
   expect(held[0]!.is_default).toBe(true)
@@ -4816,7 +4916,7 @@ test("roles by id: Bifrost's shape, partial updates, and access profile attachme
   expect(((s.cfg.governance?.access_profiles ?? [])[0]!.roles ?? []).length).toBe(1)
   // a role with a user on it cannot go; one that is only attached to a profile goes and takes its attachment
   expect(handleApi(s, "DELETE", "/api/roles/ops", "").status).toBe(409)
-  expect(s.attachProfileRoles("p-role", [2], undefined).kind).toBe("ok")
+  expect(s.attachProfileRoles("p-role", [2], undefined, true).kind).toBe("ok")
   expect(handleApi(s, "DELETE", "/api/roles/temp", "").status).toBe(200)
   expect(((s.cfg.governance?.access_profiles ?? [])[0]!.roles ?? []).length).toBe(1)
   expect(handleApi(s, "DELETE", "/api/governance/rbac/roles/1", "").status).toBe(409)
@@ -4836,5 +4936,61 @@ test("roles: entity_dac is read as Bifrost's object and shown the same way", () 
   expect(put.status).toBe(200)
   expect(put.body.includes(`"entity_dac":{}`)).toBe(true)
   expect(handleApi(s, "GET", "/api/roles", "").body.includes(`"name":"acct"`)).toBe(true)
+  cleanup(path)
+})
+
+test("built-in roles: listed first on Bifrost's path with fixed ids, readable by id, and fixed", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, { governance: { access_profiles: [{ id: "p-view" }] } })
+  expect(handleApi(s, "POST", "/api/roles", `{"name":"ops"}`).status).toBe(201)
+  const list = handleApi(s, "GET", "/api/governance/rbac/roles", "").body
+  expect(list.startsWith(`{"roles":[{"id":9001,"name":"admin"`)).toBe(true)
+  expect(list.includes(`"id":9003,"name":"viewer"`)).toBe(true)
+  expect(list.includes(`"is_system_role":true`)).toBe(true)
+  expect(list.includes(`{"id":1,"name":"ops","is_system_role":false`)).toBe(true)
+  // the old path keeps listing the custom roles only
+  expect(handleApi(s, "GET", "/api/roles", "").body.includes("viewer")).toBe(false)
+  const one = handleApi(s, "GET", "/api/governance/rbac/roles/9004", "")
+  expect(one.status).toBe(200)
+  expect(one.body.includes(`{"resource":"AuditLogs","operation":"View"}`)).toBe(true)
+  expect(one.body.includes(`"Create"`)).toBe(false)
+  const perms = handleApi(s, "GET", "/api/governance/rbac/roles/9004/permissions", "").body
+  expect(perms.includes(`"role":"auditor"`)).toBe(true)
+  expect(perms.includes(`"resource":"AuditLogs","operation":"View"`)).toBe(true)
+  expect(handleApi(s, "DELETE", "/api/governance/rbac/roles/9001", "").status).toBe(403)
+  expect(handleApi(s, "PUT", "/api/governance/rbac/roles/9002", `{"description":"x"}`).status).toBe(403)
+  expect(handleApi(s, "PUT", "/api/governance/rbac/roles/9002/permissions", `{"permission_ids":[1]}`).status).toBe(403)
+  // a profile attaches to a built-in role by its id
+  expect(s.attachProfileRoles("p-view", [9003], undefined, true).kind).toBe("ok")
+  expect(s.attachProfileRoles("p-view", [9100], undefined, true).kind).toBe("error")
+  cleanup(path)
+})
+
+test("rotate replies name the rotated keys", () => {
+  expect(rotatedKeyIds(`{"message":"ok","virtual_key":{"id":"vk-1","value":"sk-bf-x"}}`).join(",")).toBe("vk-1")
+  expect(rotatedKeyIds(`{"message":"ok","virtual_keys":[{"id":"a"},{"id":"b"}],"errors":{"c":"no"}}`).join(",")).toBe("a,b")
+  expect(rotatedKeyIds("not json").length).toBe(0)
+  expect(isRotatePath("/api/governance/virtual-keys/rotate")).toBe(true)
+  expect(isRotatePath("/api/governance/virtual-keys/vk-1/rotate")).toBe(true)
+  expect(isRotatePath("/api/governance/virtual-keys/vk-1")).toBe(false)
+})
+
+test("complexity status routes: disabled, warming before the first classified request, and the generation guards", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  const off = handleApi(s, "GET", "/api/routing/complexity-analyzer-status", "")
+  expect(off.status).toBe(200)
+  expect(off.body.startsWith(`{"state":"disabled","loaded":0,"total":0,"cached_phrases":0,"llm":{"state":"disabled"}`)).toBe(true)
+  expect(off.body.includes(`"decision_defaults":{"criteria":{"SIMPLE":`)).toBe(true)
+  expect(handleApi(s, "POST", "/api/routing/complexity-analyzer-status/retry", "").status).toBe(503)
+  expect(handleApi(s, "GET", "/api/routing/complexity-analyzer-generations", "").body).toBe(`{"generations":[]}`)
+  expect(handleApi(s, "DELETE", "/api/routing/complexity-analyzer-generations/other", "").status).toBe(400)
+  expect(handleApi(s, "GET", "/api/governance/complexity-analyzer-status", "").status).toBe(404)
+  expect(s.setComplexity({ enabled: true, classifier: "semantic", semantic: { embedding_model: "e", exemplars: { simple: ["hi"], medium: ["sum"], complex: ["design"] } } }).kind).toBe("ok")
+  const warm = handleApi(s, "GET", "/api/routing/complexity-analyzer-status", "").body
+  expect(warm.startsWith(`{"state":"warming","loaded":0,"total":3,"cached_phrases":0`)).toBe(true)
+  // nothing failed, so there is nothing to retry
+  expect(handleApi(s, "POST", "/api/routing/complexity-analyzer-status/retry", "").status).toBe(409)
+  expect(handleApi(s, "DELETE", "/api/routing/complexity-analyzer-generations/BifrostComplexityRouter_00", "").status).toBe(200)
   cleanup(path)
 })

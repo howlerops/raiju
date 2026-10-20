@@ -110,8 +110,36 @@ export function generateTail(req: ChatRequest, body: Field[], model?: string): s
   if (tc !== undefined) gen.push(`"thinkingConfig":${tc}`)
   if (gen.length > 0) out.push(`"generationConfig":{${gen.join(",")}}`)
   const tools = find(body, "tools")
-  if (tools !== undefined && !isNull(tools)) out.push(`"tools":${try declarations(tools)}`)
+  if (tools !== undefined && !isNull(tools)) {
+    const decl = try declarations(tools)
+    out.push(`"tools":${decl}`)
+    // Gemini rejects a functionCallingConfig without function declarations.
+    const cfg = try toolConfig(find(body, "tool_choice"))
+    if (cfg !== undefined && !decl.includes(`"functionDeclarations":[]`)) out.push(`"toolConfig":${cfg}`)
+  }
   return out
+}
+
+// OpenAI's tool_choice as Gemini's toolConfig, as Bifrost maps it (gemini/utils.go convertToolChoiceToToolConfig):
+// none to NONE, auto to AUTO, required and any to ANY, a named function to ANY with that name allowed.
+export function toolConfig(raw: string | undefined): string | undefined throws SyntaxError {
+  if (raw === undefined || isNull(raw)) return undefined
+  if (raw.startsWith(`"`)) {
+    const s = rawStr([{ key: "c", raw: raw }], "c") ?? ""
+    const mode = s === "none" ? "NONE" : (s === "any" || s === "required") ? "ANY" : "AUTO"
+    return `{"functionCallingConfig":{"mode":"${mode}"}}`
+  }
+  if (!raw.startsWith("{")) return undefined
+  const f = try fields(raw)
+  const type = rawStr(f, "type") ?? ""
+  const mode = type === "none" ? "NONE" : (type === "function" || type === "required") ? "ANY" : "AUTO"
+  let names = ""
+  const fnRaw = find(f, "function")
+  if (fnRaw !== undefined && fnRaw.startsWith("{")) {
+    const name = rawStr(try fields(fnRaw), "name") ?? ""
+    if (name !== "") names = `,"allowedFunctionNames":[${quote(name)}]`
+  }
+  return `{"functionCallingConfig":{"mode":"${mode}"${names}}}`
 }
 
 function apiBase(t: Target): string {
@@ -216,6 +244,7 @@ test("translates a chat request to generateContent", () => {
   expect(out.includes(`{"functionResponse":{"name":"weather","response":{"content":"rain"}}}`)).toBe(true)
   expect(out.includes(`"generationConfig":{"maxOutputTokens":50}`)).toBe(true)
   expect(out.includes(`"tools":[{"functionDeclarations":[{"name":"weather","parameters":{"type":"object"}}]}]`)).toBe(true)
+  expect(out.includes(`toolConfig`)).toBe(false)
 })
 
 test("translates a generateContent response", () => {
@@ -232,4 +261,21 @@ test("reasoning_effort becomes a thinking config; thoughts come back as reasonin
   const r = try chatResponse(`{"candidates":[{"content":{"parts":[{"text":"plan","thought":true},{"text":"ok"}]},"finishReason":"STOP"}]}`, "m")
   expect(r.body.includes(`"content":"ok"`)).toBe(true)
   expect(r.body.includes(`"reasoning":"plan","reasoning_content":"plan"`)).toBe(true)
+})
+
+function genWithChoice(tc: string): string throws SyntaxError {
+  const tools = `"tools":[{"type":"function","function":{"name":"weather","parameters":{"type":"object"}}}]`
+  const b = `{"model":"gemini-2.0-flash","messages":[{"role":"user","content":"hi"}],${tools},"tool_choice":${tc}}`
+  return try generateBody(try JSON.parse(b) as ChatRequest, try fields(b))
+}
+
+test("tool_choice maps to toolConfig", () => {
+  expect((try genWithChoice(`"auto"`)).includes(`"toolConfig":{"functionCallingConfig":{"mode":"AUTO"}}`)).toBe(true)
+  expect((try genWithChoice(`"none"`)).includes(`"toolConfig":{"functionCallingConfig":{"mode":"NONE"}}`)).toBe(true)
+  expect((try genWithChoice(`"required"`)).includes(`"toolConfig":{"functionCallingConfig":{"mode":"ANY"}}`)).toBe(true)
+  expect((try genWithChoice(`"any"`)).includes(`"mode":"ANY"`)).toBe(true)
+  expect((try genWithChoice(`{"type":"function","function":{"name":"weather"}}`)).includes(`"toolConfig":{"functionCallingConfig":{"mode":"ANY","allowedFunctionNames":["weather"]}}`)).toBe(true)
+  // No function declarations: no toolConfig.
+  const b = `{"model":"g","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"web_search"}],"tool_choice":"required"}`
+  expect((try generateBody(try JSON.parse(b) as ChatRequest, try fields(b))).includes("toolConfig")).toBe(false)
 })

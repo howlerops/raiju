@@ -6,7 +6,8 @@ import { ChatRequest, ContentPart, newId, nowSeconds } from "../schemas"
 import { sha256, hmacSha256, toHex, utf8 } from "../crypto"
 import * as openai from "./openai"
 import * as anthropic from "./anthropic"
-import { BedrockKeyConfig, ProviderConfig } from "../config"
+import { BedrockKeyConfig, ProviderConfig, ProviderPromptCacheConfig } from "../config"
+import { injectedIndexes } from "./anthropic"
 
 // ---- SigV4 ----
 
@@ -150,17 +151,42 @@ function toolConfig(tools: string, choice: string | undefined): string throws Sy
   return `{"tools":[${specs.join(",")}]${tc}}`
 }
 
-export function converseBody(req: ChatRequest, body: Field[], autoCache: bool, modelId?: string): string throws SyntaxError {
+// Bedrock takes cache points on Anthropic and Nova models only (Bifrost's BedrockModelSupportsCachePoints).
+export function supportsCachePoints(model: string): bool {
+  const m = model.toLowerCase()
+  return m.includes("anthropic") || m.includes("claude") || m.includes("nova")
+}
+
+// A cache point block; ttl is carried only for Bedrock's two lifetimes (Bifrost's newBedrockCachePoint).
+function cachePoint(ttl: string | undefined): string {
+  if (ttl === "5m" || ttl === "1h") return `{"cachePoint":{"type":"default","ttl":"${ttl}"}}`
+  return `{"cachePoint":{"type":"default"}}`
+}
+
+// cache (the provider's prompt_cache): its cache_control_injection_points put a cache point after each message they
+// name, as Bifrost's injection does for Bedrock (a marked system message puts one after the system blocks). Nothing is
+// injected for a model without cache points, or into a request that carries cache_control of its own.
+export function converseBody(req: ChatRequest, body: Field[], autoCache: bool, modelId?: string, cache?: ProviderPromptCacheConfig): string throws SyntaxError {
   let turns: Turn[] = []
   const system: string[] = []
+  const pts = cache?.cache_control_injection_points ?? []
+  const selfCached = (find(body, "messages") ?? "").includes("cache_control")
+  const marked = injectedIndexes(req.messages, pts, pts.length > 0 && !selfCached && supportsCachePoints(modelId ?? ""))
+  const marker = cachePoint(cache?.ttl)
+  let sysMarked = false
+  let idx = -1
   for (const m of req.messages) {
+    idx += 1
     if (m.role === "system" || m.role === "developer") {
       for (const c of contentOf(m.content)) system.push(c)
+      if (marked.has(idx)) sysMarked = true
       continue
     }
     if (m.role === "tool") {
       const text = typeof m.content === "string" ? m.content : (m.content ?? []).map((p) => p.text ?? "").join("")
-      pushTurn(&turns, "user", [`{"toolResult":{"toolUseId":${quote(m.tool_call_id ?? "")},"content":[{"text":${quote(text)}}]}}`])
+      const blocks = [`{"toolResult":{"toolUseId":${quote(m.tool_call_id ?? "")},"content":[{"text":${quote(text)}}]}}`]
+      if (marked.has(idx)) blocks.push(marker)
+      pushTurn(&turns, "user", blocks)
       continue
     }
     const role = m.role === "assistant" ? "assistant" : "user"
@@ -168,8 +194,10 @@ export function converseBody(req: ChatRequest, body: Field[], autoCache: bool, m
     for (const c of m.tool_calls ?? []) {
       content.push(`{"toolUse":{"toolUseId":${quote(c.id)},"name":${quote(c.function.name)},"input":${argsObject(c.function.arguments)}}}`)
     }
+    if (marked.has(idx) && content.length > 0) content.push(marker)
     pushTurn(&turns, role, content)
   }
+  if (sysMarked && system.length > 0 && !autoCache) system.push(marker)
   if (autoCache) {
     // cache points after the system prompt and the newest turn
     if (turns.length > 0) {
@@ -474,12 +502,12 @@ export function rerankWire(text: string): string throws SyntaxError {
 }
 
 export function streamRequest(t: Target, req: ChatRequest, body: Field[], autoCache: bool): Upstream throws SyntaxError {
-  return signedRequest(t, "converse-stream", try converseBody(req, body, autoCache, t.model))
+  return signedRequest(t, "converse-stream", try converseBody(req, body, autoCache, modelId(t), t.cfg.prompt_cache))
 }
 
 export function chatRequest(t: Target, req: ChatRequest, body: Field[], autoCache: bool): Upstream throws SyntaxError {
   if (usesOpenAIEndpoints(t)) return try openAIChatRequest(t, body)
-  return signedRequest(t, "converse", try converseBody(req, body, autoCache, t.model))
+  return signedRequest(t, "converse", try converseBody(req, body, autoCache, modelId(t), t.cfg.prompt_cache))
 }
 
 // ---- legacy text completions (InvokeModel) ----
@@ -581,6 +609,22 @@ test("converse translation", () => {
   expect(r.body.includes(`"finish_reason":"tool_calls"`)).toBe(true)
   expect(r.body.includes(`"arguments":"{\\"a\\":1}"`)).toBe(true)
   expect(r.completionTokens).toBe(6)
+})
+
+test("cache_control_injection_points put cache points after the messages they name", () => {
+  const raw = `{"model":"m","messages":[{"role":"system","content":"rules"},{"role":"user","content":"one"},{"role":"assistant","content":"two"},{"role":"user","content":"three"}]}`
+  const cache: ProviderPromptCacheConfig = { ttl: "1h", cache_control_injection_points: [{ location: "message", role: "system" }, { location: "message", index: -1 }] }
+  const out = try converseBody(try JSON.parse(raw) as ChatRequest, try fields(raw), false, "anthropic.claude-sonnet-4", cache)
+  expect(out).toBe(`{"messages":[{"role":"user","content":[{"text":"one"}]},{"role":"assistant","content":[{"text":"two"}]},{"role":"user","content":[{"text":"three"},{"cachePoint":{"type":"default","ttl":"1h"}}]}],"system":[{"text":"rules"},{"cachePoint":{"type":"default","ttl":"1h"}}],"inferenceConfig":{"maxTokens":4096}}`)
+  // a role point marks every message of that role
+  const users = try converseBody(try JSON.parse(raw) as ChatRequest, try fields(raw), false, "amazon.nova-pro-v1:0", { cache_control_injection_points: [{ role: "user" }] })
+  expect(users).toBe(`{"messages":[{"role":"user","content":[{"text":"one"},{"cachePoint":{"type":"default"}}]},{"role":"assistant","content":[{"text":"two"}]},{"role":"user","content":[{"text":"three"},{"cachePoint":{"type":"default"}}]}],"system":[{"text":"rules"}]}`)
+  // a model without cache points gets none
+  const llama = try converseBody(try JSON.parse(raw) as ChatRequest, try fields(raw), false, "meta.llama3-70b", cache)
+  expect(llama.includes("cachePoint")).toBe(false)
+  // a request with markers of its own is left alone
+  const own = `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"x","cache_control":{"type":"ephemeral"}}]}]}`
+  expect((try converseBody(try JSON.parse(own) as ChatRequest, try fields(own), false, "anthropic.claude-sonnet-4", cache)).includes("cachePoint")).toBe(false)
 })
 
 test("reasoning_effort becomes Claude thinking fields; reasoning text comes back", () => {

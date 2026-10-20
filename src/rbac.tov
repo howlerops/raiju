@@ -138,10 +138,21 @@ function editorWrites(segs: string[]): bool {
   return false
 }
 
+// Bifrost's /api/governance/users/... routes, the users' newer home.
+function governanceUsers(segs: string[]): bool {
+  return (segs[1] ?? "") === "governance" && (segs[2] ?? "") === "users"
+}
+
+// The routes every signed-in caller reads about itself: its permissions (both paths) and its key-creation policy.
+export function selfRoute(method: string, path: string): bool {
+  if (method.toUpperCase() !== "GET") return false
+  return path === "/api/users/me/permissions" || path === "/api/governance/users/me/permissions" || path === "/api/users/me/vk-creation-policy" || path === "/api/governance/users/me/vk-creation-policy"
+}
+
 // What a request needs: user management, audit logs, a write, or a read.
 export function required(method: string, path: string): Permission {
   const segs = segmentsOf(path)
-  if (isApi(segs) && (segs[1] ?? "") === "users") return "manage_users"
+  if (isApi(segs) && ((segs[1] ?? "") === "users" || governanceUsers(segs))) return "manage_users"
   const m = method.toUpperCase()
   if (m === "GET" || m === "HEAD") return isAudit(segs) ? "audit" : "read"
   return "write"
@@ -191,6 +202,7 @@ export function resourceOf(method: string, path: string): { resource: string, op
   else if (area === "crews") resource = "Crews"
   else if (area === "governance") {
     if (coll === "virtual-keys") resource = "VirtualKeys"
+    else if (coll === "users") resource = "Users"
     else if (coll === "teams") resource = "Teams"
     else if (coll === "customers") resource = "Customers"
     else if (coll === "business-units") resource = "BusinessUnits"
@@ -239,7 +251,7 @@ export function keyOf(cfg: RbacConfig, headers: Map<string, string>): ApiKeyConf
 // permissions. Keys reach only /api routes, and the caller's own permission and policy reads.
 export function keyAllows(k: ApiKeyConfig, method: string, path: string): bool {
   if (!isApi(segmentsOf(path))) return false
-  if (method.toUpperCase() === "GET" && (path === "/api/users/me/permissions" || path === "/api/users/me/vk-creation-policy")) return true
+  if (selfRoute(method, path)) return true
   const need = resourceOf(method, path)
   for (const p of k.permissions) {
     if (p.resource === need.resource && p.operation === need.op) return true
@@ -265,16 +277,16 @@ export function authorize(cfg: RbacConfig, headers: Map<string, string>, method:
   if (who.kind === "anonymous") return { kind: "error", status: 401, message: "authentication required" }
   if (who.kind === "denied") return { kind: "error", status: 401, message: who.reason }
   // every signed-in user reads their own permissions (Bifrost's /users/me/permissions)
-  if (method.toUpperCase() === "GET" && (path === "/api/users/me/permissions" || path === "/api/users/me/vk-creation-policy")) return { kind: "ok", actor: who.name }
+  if (selfRoute(method, path)) return { kind: "ok", actor: who.name }
   if (!roleAllows(cfg.roles, who.role, method, path))return { kind: "error", status: 403, message: `role ${who.role} may not ${required(method, path)} this route` }
   return { kind: "ok", actor: who.name }
 }
 
 // ---- user management ----
 
-type UserBody = { name?: string, role?: string, role_id?: int, disabled?: bool }
+type UserBody = { name?: string, email?: string, role?: string, role_id?: int, disabled?: bool }
 
-type UserView = { name: string, role: Role, disabled: bool }
+type UserView = { name: string, email?: string, role: Role, disabled: bool }
 
 const BUILT_IN_ROLES = ["admin", "editor", "viewer", "auditor"]
 
@@ -298,21 +310,122 @@ export function customRole(roles: RoleConfig[] | undefined, name: string): RoleC
   return undefined
 }
 
-// The roles with their ids. A role keeps its id; one saved without one takes the next id after the largest
-// in use, in list order, so ids stay put as roles are added and removed.
+// The built-in roles' ids (Bifrost's system roles carry ids too). They sit in a block of their own, so the
+// custom roles keep the ids they were saved with, from 1 up; a custom role never takes one of these.
+const BUILT_IN_ROLE_IDS: int[] = [9001, 9002, 9003, 9004]
+
+function reservedRoleId(id: int): bool {
+  return BUILT_IN_ROLE_IDS.includes(id)
+}
+
+// The id of a built-in role, or undefined for any other name.
+export function builtinRoleId(name: string): int | undefined {
+  for (let i = 0; i < BUILT_IN_ROLES.length; i++) {
+    if (BUILT_IN_ROLES[i] === name) return BUILT_IN_ROLE_IDS[i]
+  }
+  return undefined
+}
+
+// The built-in role with this id, or undefined.
+export function builtinRoleName(id: int): string | undefined {
+  for (let i = 0; i < BUILT_IN_ROLE_IDS.length; i++) {
+    if (BUILT_IN_ROLE_IDS[i] === id) return BUILT_IN_ROLES[i]
+  }
+  return undefined
+}
+
+// The id of any role a user may hold: a built-in role's fixed id or a custom role's id.
+export function anyRoleId(roles: RoleConfig[] | undefined, name: string): int | undefined {
+  return builtinRoleId(name) ?? roleIdOf(roles, name)
+}
+
+// The name of the role, built-in or custom, with this id.
+export function anyRoleName(roles: RoleConfig[] | undefined, id: int): string | undefined {
+  return builtinRoleName(id) ?? roleNameById(roles, id)
+}
+
+// A route each resource's fixed rules are read from: a built-in role holds a (resource, operation) pair when
+// its rules allow the operation's method on that route. RunInference and Reveal name no management route
+// (no route reveals a secret), so only the admin holds them.
+function sampleRoute(resource: string): string {
+  if (resource === "Logs") return "/api/logs"
+  if (resource === "MCPLogs") return "/api/mcp-logs"
+  if (resource === "AuditLogs") return "/api/audit-logs"
+  if (resource === "ModelProvider") return "/api/providers"
+  if (resource === "Observability") return "/api/alerting/rules"
+  if (resource === "VirtualKeys") return "/api/governance/virtual-keys"
+  if (resource === "Users") return "/api/users"
+  if (resource === "MCPGateway") return "/api/mcp/clients"
+  if (resource === "Teams") return "/api/governance/teams"
+  if (resource === "Customers") return "/api/governance/customers"
+  if (resource === "BusinessUnits") return "/api/governance/business-units"
+  if (resource === "Projects") return "/api/governance/projects"
+  if (resource === "RBAC") return "/api/roles"
+  if (resource === "AccessProfiles") return "/api/governance/access-profiles"
+  if (resource === "RoutingRules") return "/api/governance/routing-rules"
+  if (resource === "Governance") return "/api/governance/budgets"
+  if (resource === "Cluster") return "/api/cluster"
+  if (resource === "APIKeys") return "/api/api-keys"
+  if (resource === "Crews") return "/api/crews"
+  return "/api/config"
+}
+
+function opRequest(op: string, route: string): { method: string, path: string } | undefined {
+  if (op === "View" || op === "Download") return { method: "GET", path: route }
+  if (op === "Create") return { method: "POST", path: route }
+  if (op === "Update") return { method: "PUT", path: route + "/x" }
+  if (op === "Delete") return { method: "DELETE", path: route + "/x" }
+  return undefined
+}
+
+// A built-in role's fixed rules as (resource, operation) pairs over the catalog: the admin holds every pair.
+// The pairs describe the rules; requests are still judged by the rules themselves (allowed).
+export function builtinPairs(role: string, resources: string[], operations: string[]): PermissionPair[] {
+  const out: PermissionPair[] = []
+  if (!isBuiltinRole(role)) return out
+  for (const r of resources) {
+    for (const op of operations) {
+      let ok = role === "admin"
+      const rq = opRequest(op, sampleRoute(r))
+      if (!ok && rq !== undefined) ok = allowed(role, required(rq.method, rq.path), rq.path)
+      if (ok) out.push({ resource: r, operation: op })
+    }
+  }
+  return out
+}
+
+function builtinText(role: string): string {
+  if (role === "admin") return "Full access to every resource and operation"
+  if (role === "editor") return "Reads everything but users, API keys and the audit trail; writes providers and governance records"
+  if (role === "viewer") return "Reads everything but users, API keys, secrets and the audit trail; changes nothing"
+  return "Reads the request logs and the audit trail only"
+}
+
+// The built-in roles as role records: their fixed ids, all-data scope, and their rules as pairs.
+export function builtinRoles(resources: string[], operations: string[]): RoleConfig[] {
+  const out: RoleConfig[] = []
+  for (const name of BUILT_IN_ROLES) {
+    out.push({ id: builtinRoleId(name), name: name, description: builtinText(name), dac: "all-data", permissions: builtinPairs(name, resources, operations), entity_dac: [] })
+  }
+  return out
+}
+
+// The roles with their ids. A role keeps its id; one saved without one (or with a built-in role's id) takes
+// the next id after the largest in use, in list order, so ids stay put as roles are added and removed.
 export function withRoleIds(roles: RoleConfig[]): RoleConfig[] {
   let top: int = 0
   for (const r of roles) {
     const id: int = r.id ?? 0
-    if (id > top) top = id
+    if (id > top && !reservedRoleId(id)) top = id
   }
   const out: RoleConfig[] = []
   for (const r of roles) {
-    if (r.id !== undefined) {
+    if (r.id !== undefined && !reservedRoleId(r.id ?? 0)) {
       out.push(r)
       continue
     }
     top += 1
+    while (reservedRoleId(top)) top += 1
     out.push({ id: top, name: r.name, description: r.description, dac: r.dac, permissions: r.permissions, entity_dac: r.entity_dac })
   }
   return out
@@ -363,7 +476,47 @@ export function disabledNamed(cfg: RbacConfig, names: string[]): bool {
 }
 
 function view(u: UserConfig): UserView {
-  return { name: u.name, role: u.role, disabled: u.disabled === true }
+  return { name: u.name, email: u.email, role: u.role, disabled: u.disabled === true }
+}
+
+// An email address as Bifrost checks one (^[^\s@]+@[^\s@]+\.[^\s@]+$): one "@", no blanks, and a dot in
+// the domain with text on both sides of it.
+export function validEmail(s: string): bool {
+  if (s.byteLength < 5 || s.byteLength > 254) return false
+  const at = s.indexOf("@")
+  if (at < 1) return false
+  const domain = s.slice(at + 1)
+  if (domain.indexOf("@") >= 0) return false
+  for (const b of utf8(s)) {
+    const c = int(b)
+    if (c === 32 || (c >= 9 && c <= 13)) return false
+  }
+  // a dot inside the domain, with text before and after it
+  const inner = domain.slice(1, domain.byteLength - 1)
+  return domain.byteLength >= 3 && inner.indexOf(".") >= 0
+}
+
+// The user with this email address (compared without case). A user with no email whose name is the address
+// (a sign-in identity) is found by it too.
+export function userByEmail(users: UserConfig[], email: string): UserConfig | undefined {
+  const want = email.trim().toLowerCase()
+  if (want === "") return undefined
+  for (const u of users) {
+    if ((u.email ?? "").toLowerCase() === want) return u
+  }
+  for (const u of users) {
+    if (u.email === undefined && u.name === want) return u
+  }
+  return undefined
+}
+
+// Whether another user than `except` already has this email address.
+function emailTaken(users: UserConfig[], email: string, except: string): bool {
+  const want = email.toLowerCase()
+  for (const u of users) {
+    if (u.name !== except && (u.email ?? "").toLowerCase() === want) return true
+  }
+  return false
 }
 
 function parseUserBody(b: string): UserBody | undefined {
@@ -420,13 +573,16 @@ function createUser(cfg: RbacConfig, body: string): UsersReply {
   const role = b.role ?? ""
   if (!knownRole(cfg.roles, role)) return uerror(400, "role must be admin, editor, viewer, auditor or a custom role", cfg)
   if (findUser(cfg.users, name) !== undefined) return uerror(409, `user ${name} already exists`, cfg)
+  const email = (b.email ?? "").trim()
+  if (email !== "" && !validEmail(email)) return uerror(400, "email must be an email address", cfg)
+  if (email !== "" && emailTaken(cfg.users, email, "")) return uerror(409, `a user with email ${email} already exists`, cfg)
   const token = newToken()
   if (token === undefined) return uerror(500, "no secure random source; the user was not created", cfg)
   const users: UserConfig[] = []
   for (const u of cfg.users) users.push(u)
-  users.push({ name: name, role: role, token_sha256: hashToken(token), disabled: false })
+  users.push({ name: name, email: email === "" ? undefined : email, role: role, token_sha256: hashToken(token), disabled: false })
   // the token is returned here and never again
-  const out = { name: name, role: role, disabled: false, token: token }
+  const out = { name: name, email: email === "" ? undefined : email, role: role, disabled: false, token: token }
   return ureply(201, JSON.stringify(out), { users: users })
 }
 
@@ -440,15 +596,24 @@ function updateUser(cfg: RbacConfig, name: string, body: string): UsersReply {
     if (!knownRole(cfg.roles, b.role)) return uerror(400, "role must be admin, editor, viewer, auditor or a custom role", cfg)
     role = b.role
   } else if (b.role_id !== undefined) {
-    // Bifrost's AssignUserRoleRequest: the role by its id, which must name a custom role
-    const named = roleNameById(cfg.roles, b.role_id)
-    if (named === undefined) return uerror(400, `role_id ${b.role_id} is not a custom role`, cfg)
+    // Bifrost's AssignUserRoleRequest: the role by its id, built-in or custom
+    const named = anyRoleName(cfg.roles, b.role_id)
+    if (named === undefined) return uerror(400, `role_id ${b.role_id} names no role`, cfg)
     role = named
   }
   const disabled = b.disabled === undefined ? old.disabled : b.disabled
+  // an email of "" clears it
+  let email: string | undefined = old.email
+  if (b.email !== undefined) {
+    const e = b.email.trim()
+    if (e !== "" && !validEmail(e)) return uerror(400, "email must be an email address", cfg)
+    if (e !== "" && emailTaken(cfg.users, e, name)) return uerror(409, `a user with email ${e} already exists`, cfg)
+    email = e === "" ? undefined : e
+  }
   // the record keeps what it holds beyond the role: its teams, business units, projects and access profiles
   const next: UserConfig = {
     name: old.name,
+    email: email,
     role: role,
     token_sha256: old.token_sha256,
     password_sha256: old.password_sha256,
@@ -867,4 +1032,86 @@ test("the management API keys are for the admin and a custom role, not the edito
   expect(resourceOf("POST", "/api/api-keys").resource).toBe("APIKeys")
   expect(resourceOf("POST", "/api/api-keys").op).toBe("Create")
   expect(resourceOf("DELETE", "/api/api-keys/3").op).toBe("Delete")
+})
+
+function holds(pairs: PermissionPair[], resource: string, op: string): bool {
+  return pairs.some((p) => p.resource === resource && p.operation === op)
+}
+
+test("built-in roles have fixed ids, and their rules read as pairs", () => {
+  expect(builtinRoleId("admin")).toBe(9001)
+  expect(builtinRoleId("auditor")).toBe(9004)
+  expect(builtinRoleId("ops")).toBeUndefined()
+  expect(builtinRoleName(9003)).toBe("viewer")
+  expect(builtinRoleName(1)).toBeUndefined()
+  expect(anyRoleId([{ id: 1, name: "ops" }], "ops")).toBe(1)
+  expect(anyRoleName([{ id: 1, name: "ops" }], 9002)).toBe("editor")
+  const rs = ["Logs", "AuditLogs", "VirtualKeys", "Users", "APIKeys", "ModelProvider"]
+  const ops = ["View", "Create", "Update", "Delete", "Reveal", "RunInference"]
+  expect(builtinPairs("admin", rs, ops).length).toBe(36)
+  const ed = builtinPairs("editor", rs, ops)
+  expect(holds(ed, "VirtualKeys", "Create")).toBe(true)
+  expect(holds(ed, "ModelProvider", "Reveal")).toBe(false)
+  expect(holds(ed, "Users", "View")).toBe(false)
+  expect(holds(ed, "AuditLogs", "View")).toBe(false)
+  expect(holds(ed, "Logs", "Delete")).toBe(false)
+  expect(holds(ed, "VirtualKeys", "RunInference")).toBe(false)
+  const vi = builtinPairs("viewer", rs, ops)
+  expect(holds(vi, "Logs", "View")).toBe(true)
+  expect(holds(vi, "ModelProvider", "Reveal")).toBe(false)
+  expect(vi.some((p) => p.operation !== "View")).toBe(false)
+  const au = builtinPairs("auditor", rs, ops)
+  expect(au.map((p) => p.resource + ":" + p.operation).join(",")).toBe("Logs:View,AuditLogs:View")
+  expect(builtinPairs("ops", rs, ops).length).toBe(0)
+  expect(builtinRoles(rs, ops).map((r) => `${r.id ?? 0}`).join(",")).toBe("9001,9002,9003,9004")
+})
+
+test("custom role ids never take a built-in role's id", () => {
+  const out = withRoleIds([{ id: 9000, name: "a" }, { name: "b" }, { id: 9002, name: "c" }])
+  expect(out[0]!.id).toBe(9000)
+  expect(out[1]!.id).toBe(9005)
+  expect(out[2]!.id).toBe(9006)
+})
+
+test("a built-in role can be set by its id", () => {
+  const cfg: RbacConfig = { users: fixture().users, roles: [{ id: 1, name: "ops" }] }
+  const r = handleUsers(cfg, "PUT", "/api/users/ed/role", `{"role_id":9003}`)
+  expect(r.status).toBe(200)
+  expect(r.body.includes(`"role":"viewer"`)).toBe(true)
+  expect(handleUsers(cfg, "PUT", "/api/users/ed/role", `{"role_id":9100}`).status).toBe(400)
+})
+
+test("users carry an email address, unique and checked, and are found by it", () => {
+  expect(validEmail("ann@example.com")).toBe(true)
+  expect(validEmail("ann@example")).toBe(false)
+  expect(validEmail("ann example@x.io")).toBe(false)
+  expect(validEmail("@x.io")).toBe(false)
+  expect(validEmail("a@b@c.io")).toBe(false)
+  expect(validEmail("a@.io")).toBe(false)
+  const cfg0: RbacConfig = { users: fixture().users }
+  const made = handleUsers(cfg0, "POST", "/api/users", `{"name":"ann","role":"viewer","email":"Ann@Example.com"}`)
+  expect(made.status).toBe(201)
+  expect(made.body.includes(`"email":"Ann@Example.com"`)).toBe(true)
+  const cfg = made.cfg
+  expect(handleUsers(cfg, "POST", "/api/users", `{"name":"bob","role":"viewer","email":"ann@example.com"}`).status).toBe(409)
+  expect(handleUsers(cfg, "POST", "/api/users", `{"name":"bob","role":"viewer","email":"nope"}`).status).toBe(400)
+  expect(userByEmail(cfg.users, "ANN@example.com")?.name).toBe("ann")
+  expect(userByEmail(cfg.users, "zed@example.com")).toBeUndefined()
+  // a role change keeps the email; "" clears it
+  const kept = handleUsers(cfg, "PUT", "/api/users/ann", `{"role":"editor"}`)
+  expect(kept.body.includes(`"email":"Ann@Example.com"`)).toBe(true)
+  expect(handleUsers(kept.cfg, "PUT", "/api/users/vi", `{"email":"ann@example.com"}`).status).toBe(409)
+  const cleared = handleUsers(kept.cfg, "PUT", "/api/users/ann", `{"email":""}`)
+  expect(cleared.body.includes("email")).toBe(false)
+  // a sign-in identity named by its address is found by it
+  const id: RbacConfig = { users: [{ name: "zoe@example.com", role: "viewer" }] }
+  expect(userByEmail(id.users, "Zoe@example.com")?.name).toBe("zoe@example.com")
+})
+
+test("the governance users routes need user management, and the self routes are open to every caller", () => {
+  expect(required("GET", "/api/governance/users/email/a%40b.io")).toBe("manage_users")
+  expect(resourceOf("GET", "/api/governance/users/email/a%40b.io").resource).toBe("Users")
+  expect(statusOf(authorize(fixture(), hdr("Bearer sk-view-token"), "GET", "/api/governance/users/me/permissions"))).toBe(200)
+  expect(statusOf(authorize(fixture(), hdr("Bearer sk-view-token"), "GET", "/api/governance/users/email/a%40b.io"))).toBe(403)
+  expect(statusOf(authorize(fixture(), hdr("Bearer sk-root-token"), "GET", "/api/governance/users/email/a%40b.io"))).toBe(200)
 })

@@ -149,6 +149,15 @@ export function azureHeaders(t: Target): Map<string, string> {
   return h
 }
 
+// Azure's model listing: GET <endpoint>/openai/v1/models with the key's api-key (or Entra token), as Bifrost lists it.
+export function azureModelsRequest(t: Target): Upstream {
+  const az = t.key.azure_key_config
+  const endpointUrl = trimSlash(az?.endpoint ?? t.cfg.network_config?.base_url ?? "")
+  let h = azureHeaders(t)
+  h.delete("content-type")
+  return { url: endpointUrl + "/openai/v1/models", headers: h, body: "" }
+}
+
 export function chatRequest(t: Target, body: Field[]): Upstream {
   if (t.kind === "azure") return { url: azureUrl(t, "chat/completions"), headers: azureHeaders(t), body: withModel(body, t.model) }
   return { url: urlFor(t, "chat_completion", endpoint(t) + "/chat/completions"), headers: authHeaders(t), body: build(storeOff(modelFields(body, t.model), t)) }
@@ -186,6 +195,48 @@ export function rootOf(t: Target): string {
 // Bearer auth from the key when it has a value, and the provider's extra headers.
 export function bearerHeaders(t: Target): Map<string, string> {
   return authHeaders(t)
+}
+
+// The fields OpenAI's input_tokens endpoint takes; the rest of a Responses body (the output cap, sampling, store) is
+// refused there.
+const INPUT_TOKENS_FIELDS = ["input", "instructions", "tools", "tool_choice", "text", "reasoning", "parallel_tool_calls", "previous_response_id", "conversation", "truncation"]
+
+// The exact count of a Responses body: POST /v1/responses/input_tokens, as Bifrost's OpenAI CountTokens sends it.
+export function inputTokensRequest(t: Target, responsesBody: Field[]): Upstream {
+  const fs: Field[] = [{ key: "model", raw: quote(t.model) }]
+  for (const f of responsesBody) {
+    if (INPUT_TOKENS_FIELDS.includes(f.key)) fs.push(f)
+  }
+  return { url: urlFor(t, "count_tokens", endpoint(t) + "/responses/input_tokens"), headers: authHeaders(t), body: build(fs) }
+}
+
+// Bifrost counts tokens for vLLM and SGLang on their Anthropic-compatible /v1/messages/count_tokens, and for DeepSeek on
+// /anthropic/v1/messages/count_tokens (vllm.go, sgl.go, deepseek.go CountTokens).
+export function countsViaMessages(kind: string): bool {
+  return kind === "vllm" || kind === "sgl" || kind === "deepseek"
+}
+
+// The count POST for those kinds: a Messages body (built by the caller) with the model, without the fields count_tokens
+// refuses. vLLM takes a bearer token, SGLang a bearer token and anthropic-version, DeepSeek x-api-key, as Bifrost sends them.
+export function messagesCountRequest(t: Target, messagesBody: string): Upstream throws SyntaxError {
+  const e = ENDPOINTS.get(t.kind) ?? { base: "https://api.openai.com", prefix: "/v1" }
+  const b = t.cfg.network_config?.base_url
+  let root = e.base
+  if (b !== undefined && b !== "") {
+    root = trimSlash(b)
+    if (e.prefix !== "" && root.endsWith(e.prefix)) root = root.slice(0, root.byteLength - e.prefix.byteLength)
+  }
+  const path = t.kind === "deepseek" ? "/anthropic/v1/messages/count_tokens" : "/v1/messages/count_tokens"
+  let h = headers([["content-type", "application/json"]])
+  const v = t.key.value ?? ""
+  if (t.kind === "deepseek") {
+    if (v !== "") h.set("x-api-key", v)
+  } else if (v !== "") h.set("authorization", "Bearer " + v)
+  if (t.kind === "sgl") h.set("anthropic-version", "2023-06-01")
+  addExtraHeaders(&h, t.cfg)
+  let fs = without(try fields(messagesBody), ["max_tokens", "stream", "temperature"])
+  setField(&fs, "model", quote(t.model))
+  return { url: urlFor(t, "count_tokens", root + path), headers: h, body: build(fs) }
 }
 
 export function modelsRequest(t: Target): Upstream {
@@ -260,6 +311,39 @@ export function modelIds(text: string, provider: string): string[] throws Syntax
   }
   return out
 }
+
+test("the input_tokens request keeps the fields the endpoint takes", () => {
+  const t: Target = { provider: "openai", kind: "openai", model: "gpt-4o", key: { value: "sk" }, cfg: {} }
+  const up = inputTokensRequest(t, try fields(`{"model":"openai/gpt-4o","input":[{"role":"user","content":"hi"}],"max_output_tokens":5,"temperature":0.1,"tools":[]}`))
+  expect(up.url).toBe("https://api.openai.com/v1/responses/input_tokens")
+  expect(up.headers.get("authorization")).toBe("Bearer sk")
+  expect(up.body).toBe(`{"model":"gpt-4o","input":[{"role":"user","content":"hi"}],"tools":[]}`)
+})
+
+test("vLLM, SGLang and DeepSeek count on their Anthropic-compatible count path", () => {
+  expect(countsViaMessages("vllm")).toBe(true)
+  expect(countsViaMessages("groq")).toBe(false)
+  const mb = `{"model":"x","max_tokens":5,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`
+  const vl: Target = { provider: "vllm", kind: "vllm", model: "llama", key: { value: "vk" }, cfg: { network_config: { base_url: "http://gpu:8000/v1" } } }
+  const v = try messagesCountRequest(vl, mb)
+  expect(v.url).toBe("http://gpu:8000/v1/messages/count_tokens")
+  expect(v.headers.get("authorization")).toBe("Bearer vk")
+  expect(v.body).toBe(`{"model":"llama","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+  const sg = try messagesCountRequest({ provider: "sgl", kind: "sgl", model: "m", key: { value: "" }, cfg: {} }, mb)
+  expect(sg.url).toBe("http://localhost:30000/v1/messages/count_tokens")
+  expect(sg.headers.get("anthropic-version")).toBe("2023-06-01")
+  expect(sg.headers.has("authorization")).toBe(false)
+  const ds = try messagesCountRequest({ provider: "deepseek", kind: "deepseek", model: "deepseek-chat", key: { value: "dk" }, cfg: {} }, mb)
+  expect(ds.url).toBe("https://api.deepseek.com/anthropic/v1/messages/count_tokens")
+  expect(ds.headers.get("x-api-key")).toBe("dk")
+})
+
+test("Azure lists models on its v1 models route", () => {
+  const t: Target = { provider: "azure", kind: "azure", model: "", key: { value: "ak", azure_key_config: { endpoint: "https://x.openai.azure.com/" } }, cfg: {} }
+  const up = azureModelsRequest(t)
+  expect(up.url).toBe("https://x.openai.azure.com/openai/v1/models")
+  expect(up.headers.get("api-key")).toBe("ak")
+})
 
 test("rewrites model and strips gateway fields", () => {
   const t: Target = { provider: "groq", kind: "groq", model: "llama-3.3-70b", key: { value: "gk" }, cfg: {} }

@@ -136,7 +136,7 @@ function RoleForm(props: { role: Role | undefined; data: Data; onClose: () => vo
         const want = new Set([...f.querySelectorAll<HTMLInputElement>('input[name="profile"]:checked')].map((b) => b.value))
         try {
           for (const pid of want) {
-            if (!wasAttached.has(pid)) await send("POST", "/api/governance/access-profiles/" + encodeURIComponent(pid) + "/roles", { body: { role_ids: [id] } })
+            if (!wasAttached.has(pid)) await send("POST", "/api/governance/access-profiles/" + encodeURIComponent(pid) + "/roles", { body: { role_ids: [id], is_default: true, apply_to_existing: true } })
           }
           for (const pid of wasAttached) {
             if (!want.has(pid)) await send("DELETE", "/api/governance/access-profiles/" + encodeURIComponent(pid) + "/roles/" + id)

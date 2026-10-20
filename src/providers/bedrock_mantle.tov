@@ -7,7 +7,8 @@ import { Target, Upstream, Translated, headers, addExtraHeaders } from "./types"
 import * as openai from "./openai"
 import * as anthropic from "./anthropic"
 import { AwsCreds, signV4 } from "../cloud_auth"
-import { BedrockKeyConfig } from "../config"
+import { signRequest } from "./bedrock"
+import { BedrockKeyConfig, ProviderPromptCacheConfig } from "../config"
 import { ChatRequest } from "../schemas"
 
 const DEFAULT_REGION = "us-east-1"
@@ -66,10 +67,11 @@ function withModel(body: Field[], model: string): string {
   return build(fs)
 }
 
-// The OpenAI body as an Anthropic Messages body for an Anthropic-family model.
-function messagesText(body: Field[], model: string): string throws SyntaxError {
+// The OpenAI body as an Anthropic Messages body for an Anthropic-family model. The provider's prompt_cache injection
+// points mark messages, as on Anthropic.
+function messagesText(body: Field[], model: string, cache?: ProviderPromptCacheConfig): string throws SyntaxError {
   const req = try JSON.parse(build(body)) as ChatRequest
-  return try anthropic.messagesBody(req, body, model, false, false)
+  return try anthropic.messagesBody(req, body, model, false, false, cache)
 }
 
 // The chat POST at a given time. Bearer auth when the key has a value; otherwise SigV4
@@ -77,13 +79,18 @@ function messagesText(body: Field[], model: string): string throws SyntaxError {
 export function chatRequestAt(t: Target, body: Field[], nowMs: f64): Upstream throws SyntaxError {
   const sel = splitRegion(t.model)
   const anth = isAnthropicFamily(sel.model)
-  const bk = t.key.bedrock_key_config
-  const region = sel.region ?? bk?.region ?? DEFAULT_REGION
-  const at = origin(t, region)
   const path = anth ? "/anthropic/v1/messages" : `/${basePath(sel.model)}/chat/completions`
   let text = ""
-  if (anth) text = try messagesText(body, sel.model)
+  if (anth) text = try messagesText(body, sel.model, t.cfg.prompt_cache)
   else text = withModel(body, sel.model)
+  return try postAt(t, sel.region, path, text, anth, nowMs)
+}
+
+// A POST to the Mantle host of the request's region (the model's prefix, else the key's, else us-east-1).
+function postAt(t: Target, modelRegion: string | undefined, path: string, text: string, anth: bool, nowMs: f64): Upstream throws SyntaxError {
+  const bk = t.key.bedrock_key_config
+  const region = modelRegion ?? bk?.region ?? DEFAULT_REGION
+  const at = origin(t, region)
   const extra = t.cfg.network_config?.extra_headers
   const bearer = t.key.value ?? ""
   if (bearer !== "") {
@@ -111,6 +118,43 @@ export function chatRequestAt(t: Target, body: Field[], nowMs: f64): Upstream th
     }
   }
   return { url: at.sch + at.host + path, headers: h, body: text }
+}
+
+// The model listing: GET /v1/models on the key's regional host (OpenAI's list shape), as Bifrost's
+// listModelsByKey sends it: a bearer token for an API key, else the GET signed for bedrock-mantle.
+export function modelsRequestAt(t: Target, nowMs: f64): Upstream {
+  const bk = t.key.bedrock_key_config
+  const region = bk?.region ?? DEFAULT_REGION
+  const at = origin(t, region)
+  const path = "/v1/models"
+  const bearer = t.key.value ?? ""
+  let h: Map<string, string> = new Map()
+  if (bearer !== "" || (bk?.access_key ?? "") === "") h = headers([["authorization", "Bearer " + bearer]])
+  else h = signRequest("GET", { accessKey: bk?.access_key ?? "", secretKey: bk?.secret_key ?? "", sessionToken: bk?.session_token, region: region }, SIGNING_SERVICE, at.host, path, "", "", nowMs)
+  addExtraHeaders(&h, t.cfg)
+  return { url: at.sch + at.host + path, headers: h, body: "" }
+}
+
+export function modelsRequest(t: Target): Upstream {
+  return modelsRequestAt(t, Date.now())
+}
+
+// Bifrost counts tokens on Mantle for Anthropic-family models only, through the native count_tokens path on the same
+// host (bedrockmantle/counttokens.go); the OpenAI-compatible surface has no count path.
+export function countsTokens(model: string): bool {
+  return isAnthropicFamily(splitRegion(model).model)
+}
+
+// The count POST: a Messages body (built by the caller) with the bare model, without the fields count_tokens refuses.
+export function countRequestAt(t: Target, messagesBody: string, nowMs: f64): Upstream throws SyntaxError {
+  const sel = splitRegion(t.model)
+  let fs = without(try fields(messagesBody), ["max_tokens", "stream", "temperature"])
+  setField(&fs, "model", quote(sel.model))
+  return try postAt(t, sel.region, "/anthropic/v1/messages/count_tokens", build(fs), true, nowMs)
+}
+
+export function countRequest(t: Target, messagesBody: string): Upstream throws SyntaxError {
+  return try countRequestAt(t, messagesBody, Date.now())
 }
 
 export function chatRequest(t: Target, body: Field[]): Upstream throws SyntaxError {
@@ -216,4 +260,33 @@ test("mantle Messages reply is read as an Anthropic reply", () => {
   expect(r.promptTokens).toBe(5)
   expect(r.completionTokens).toBe(6)
   expect(r.body.includes(`"content":"hey"`)).toBe(true)
+})
+
+test("the model listing is a GET on the key's regional host", () => {
+  const up = modelsRequestAt(mantleTarget("", "mk", undefined), 0.0)
+  expect(up.url).toBe("https://bedrock-mantle.us-east-1.api.aws/v1/models")
+  expect(up.headers.get("authorization")).toBe("Bearer mk")
+  expect(up.body).toBe("")
+  const sg = modelsRequestAt(mantleTarget("", "", "us-west-2"), 1440938160000.0)
+  expect(sg.url).toBe("https://bedrock-mantle.us-west-2.api.aws/v1/models")
+  expect(sg.headers.get("authorization")!.startsWith("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-west-2/bedrock-mantle/aws4_request")).toBe(true)
+})
+
+test("count tokens goes to the native count path for Claude models only", () => {
+  expect(countsTokens("anthropic.claude-haiku-4-5")).toBe(true)
+  expect(countsTokens("us-west-2/anthropic.claude-haiku-4-5")).toBe(true)
+  expect(countsTokens("openai.gpt-5.5")).toBe(false)
+  const up = try countRequestAt(mantleTarget("us-west-2/anthropic.claude-haiku-4-5", "mk", undefined), `{"model":"x","max_tokens":10,"temperature":0.2,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`, 0.0)
+  expect(up.url).toBe("https://bedrock-mantle.us-west-2.api.aws/anthropic/v1/messages/count_tokens")
+  expect(up.headers.get("anthropic-version")).toBe("2023-06-01")
+  expect(up.body).toBe(`{"model":"anthropic.claude-haiku-4-5","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+})
+
+test("Claude on Mantle applies the provider's cache_control_injection_points", () => {
+  const body = try fields(`{"model":"m","messages":[{"role":"user","content":"one"},{"role":"assistant","content":"two"},{"role":"user","content":"three"}]}`)
+  let t = mantleTarget("anthropic.claude-haiku-4-5", "mk", undefined)
+  t.cfg = { prompt_cache: { cache_control_injection_points: [{ location: "message", index: -1 }] } }
+  const up = try chatRequestAt(t, body, 0.0)
+  expect(up.body.includes(`{"type":"text","text":"three","cache_control":{"type":"ephemeral"}}`)).toBe(true)
+  expect(up.body.includes(`{"type":"text","text":"one"}`)).toBe(true)
 })

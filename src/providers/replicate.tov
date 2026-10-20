@@ -22,10 +22,23 @@ export function isVersion(s: string): bool {
   return true
 }
 
-// owner/name uses /v1/models/<owner>/<name>/predictions; a version id uses /v1/predictions.
-export function predictionPath(model: string): string {
+// owner/name uses /v1/models/<owner>/<name>/predictions; a version id uses /v1/predictions. With the deployments
+// endpoint (replicate_key_config.use_deployments_endpoint, or the alias's own use_deployments_endpoint, which the
+// router puts on the key) the model is a deployment: /v1/deployments/<owner>/<name>/predictions, as Bifrost.
+export function predictionPath(model: string, deployments?: bool): string {
+  if (deployments === true) return "/v1/deployments/" + model + "/predictions"
   if (isVersion(model)) return "/v1/predictions"
   return "/v1/models/" + model + "/predictions"
+}
+
+function usesDeployments(t: Target): bool {
+  const v: bool = t.key.replicate_key_config?.use_deployments_endpoint ?? false
+  return v
+}
+
+// The prediction URL of a target, on the deployments endpoint when its key (or alias) asks for it.
+export function predictionUrl(t: Target): string {
+  return rootOf(t) + predictionPath(t.model, usesDeployments(t))
 }
 
 // The text pieces of a conversation: system text, and user and assistant text in order, and
@@ -81,8 +94,8 @@ export function chatRequest(t: Target, req: ChatRequest): Upstream throws Syntax
   const root = b === "" ? DEFAULT_BASE : trimSlash(b)
   let h = headers([["content-type", "application/json"], ["authorization", "Bearer " + key], ["prefer", "wait"]])
   addExtraHeaders(&h, t.cfg)
-  const version = isVersion(t.model)
-  return { url: root + predictionPath(t.model), headers: h, body: chatBody(t.model, version, req) }
+  const version = isVersion(t.model) && !usesDeployments(t)
+  return { url: root + predictionPath(t.model, usesDeployments(t)), headers: h, body: chatBody(t.model, version, req) }
 }
 
 // The number after a log label such as "Input token count: 12", or 0.
@@ -126,7 +139,7 @@ export function chatResponse(text: string, requestedModel: string): Translated t
     throw new SyntaxError(`replicate: prediction ${status}: ${rawStr(fs, "error") ?? "no error given"}`)
   }
   if (status !== "succeeded") {
-    throw new SyntaxError(`replicate: prediction is ${status === "" ? "unknown" : status}; the wait for a synchronous answer ended first`)
+    throw new SyntaxError(`replicate: prediction is ${status === "" ? "unknown" : status} and has no URL to read it again`)
   }
   const content = try outputText(find(fs, "output"))
   const created = parseIsoUtcMs(rawStr(fs, "created_at") ?? "")
@@ -156,8 +169,8 @@ export function imageRequest(t: Target, body: Field[]): Upstream throws SyntaxEr
   const root = b === "" ? DEFAULT_BASE : trimSlash(b)
   let h = headers([["content-type", "application/json"], ["authorization", "Bearer " + key], ["prefer", "wait"]])
   addExtraHeaders(&h, t.cfg)
-  const head = isVersion(t.model) ? `"version":${quote(t.model)},` : ""
-  return { url: root + predictionPath(t.model), headers: h, body: "{" + head + `"input":{${input.join(",")}}}` }
+  const head = isVersion(t.model) && !usesDeployments(t) ? `"version":${quote(t.model)},` : ""
+  return { url: root + predictionPath(t.model, usesDeployments(t)), headers: h, body: "{" + head + `"input":{${input.join(",")}}}` }
 }
 
 // The images answer: the output URLs (one string or an array) as OpenAI's data list. A prediction
@@ -238,6 +251,13 @@ export function isSettled(text: string): bool throws SyntaxError {
   return status === "succeeded" || status === "failed" || status === "canceled" || status === ""
 }
 
+// The headers of a poll of a running prediction (its get URL): the bearer token and the extra headers.
+export function pollHeaders(t: Target): Map<string, string> {
+  let h = headers([["authorization", "Bearer " + (t.key.value ?? "")]])
+  addExtraHeaders(&h, t.cfg)
+  return h
+}
+
 // The URL a running prediction is read from (its urls.get), or "" when the answer has none.
 export function getUrlOf(text: string): string throws SyntaxError {
   const u = find(try fields(text), "urls")
@@ -288,8 +308,8 @@ export function imageEditRequest(t: Target, body: Field[], images: string[]): Up
   const root = b === "" ? DEFAULT_BASE : trimSlash(b)
   let h = headers([["content-type", "application/json"], ["authorization", "Bearer " + key], ["prefer", "wait"]])
   addExtraHeaders(&h, t.cfg)
-  const head = isVersion(t.model) ? `"version":${quote(t.model)},` : ""
-  return { url: root + predictionPath(t.model), headers: h, body: "{" + head + `"input":{${input.join(",")}}}` }
+  const head = isVersion(t.model) && !usesDeployments(t) ? `"version":${quote(t.model)},` : ""
+  return { url: root + predictionPath(t.model, usesDeployments(t)), headers: h, body: "{" + head + `"input":{${input.join(",")}}}` }
 }
 
 // The file API under the account's root: the list (one page, from its cursor) and one file.
@@ -464,4 +484,17 @@ test("a file upload answer is an OpenAI file; deployments give owner/name ids an
   expect(try deploymentsPage(`{"next":null,"results":[]}`).next).toBe("")
   const dt: Target = { provider: "replicate", kind: "replicate", model: "", key: { value: "r8_x" }, cfg: {} }
   expect(deploymentsRequest(dt).url).toBe("https://api.replicate.com/v1/deployments")
+})
+
+test("the deployments endpoint takes the model as a deployment", () => {
+  expect(predictionPath("acme/dep", true)).toBe("/v1/deployments/acme/dep/predictions")
+  expect(predictionPath("acme/model")).toBe("/v1/models/acme/model/predictions")
+  const t: Target = { provider: "replicate", kind: "replicate", model: "acme/dep", key: { value: "r", replicate_key_config: { use_deployments_endpoint: true } }, cfg: {} }
+  expect(predictionUrl(t)).toBe("https://api.replicate.com/v1/deployments/acme/dep/predictions")
+  const up = try chatRequest(t, { model: "m", messages: [{ role: "user", content: "hi" }] })
+  expect(up.url).toBe("https://api.replicate.com/v1/deployments/acme/dep/predictions")
+  expect(up.body).toBe(`{"input":{"prompt":"hi"}}`)
+  const img = try imageRequest(t, try fields(`{"prompt":"a fox"}`))
+  expect(img.url).toBe("https://api.replicate.com/v1/deployments/acme/dep/predictions")
+  expect(pollHeaders(t).get("authorization")).toBe("Bearer r")
 })

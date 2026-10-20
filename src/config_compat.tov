@@ -35,7 +35,7 @@ function clusterFeedKeys(): string[] {
 }
 
 function governanceKeys(): string[] {
-  return ["auth_config", "users", "access_profiles", "budgets", "rate_limits", "virtual_keys", "teams", "customers", "business_units", "projects", "roles", "routing_rules", "pricing_overrides", "model_configs", "providers", "api_keys"]
+  return ["auth_config", "users", "access_profiles", "budgets", "rate_limits", "virtual_keys", "teams", "customers", "business_units", "projects", "roles", "routing_rules", "pricing_overrides", "model_configs", "providers", "api_keys", "complexity_analyzer_config"]
 }
 
 // The server section's keys: Raiju reads the A2A ones (the gRPC binding and push callbacks); the others are accepted
@@ -65,7 +65,7 @@ function providerChildKeys(section: string): string[] {
 
 // Keys of one entry in providers.<name>.keys that Raiju reads.
 function keyChildKeys(): string[] {
-  return ["id", "name", "value", "models", "weight", "aliases", "azure_key_config", "vertex_key_config", "bedrock_key_config", "bedrock_mantle_key_config", "watsonx_key_config", "cloudflare_key_config", "databricks_key_config", "github_copilot_key_config", "use_for_batch_api", "oauth_key_config"]
+  return ["id", "name", "value", "models", "weight", "aliases", "azure_key_config", "vertex_key_config", "bedrock_key_config", "bedrock_mantle_key_config", "watsonx_key_config", "cloudflare_key_config", "databricks_key_config", "github_copilot_key_config", "replicate_key_config", "use_for_batch_api", "oauth_key_config"]
 }
 
 const GEN = "is not implemented by Raiju and is ignored"
@@ -91,8 +91,6 @@ function noteTable(): Map<string, string> {
     ["client.mcp_external_client_url", GEN],
     ["client.skills_external_client_url", GEN],
     ["client.a2a_store_raw_request_response", "is not implemented: raw A2A requests and responses are not kept"],
-    // governance and mcp
-    ["governance.complexity_analyzer_config", "is not read: Raiju's complexity router is the top-level complexity_router"],
     // providers, written as providers.*
     ["providers.*.network_config.allow_private_network", "is accepted but has no effect: Raiju never blocks private provider addresses"],
   ]
@@ -778,7 +776,14 @@ function mapHealth(inout top: Field[], inout notes: string[]): void throws Synta
   const lf = try members(lbRaw)
   const on = rawBool(lf, "enabled") === true && rawBool(lf, "route_selection_enabled") !== false
   add(&hc, "adaptive", on ? "true" : "false")
-  ignored("load_balancer_config", lf, ["direction_selection_enabled", "append_fallbacks_to_pinned", "reroute_failed_directions", "prune_failed_fallbacks", "tracker_config", "bootstrap"], &notes)
+  // the provider level's switches (router.tov directRefs); the tracker's tuning and the bootstrap metrics are not read
+  const ds = find(lf, "direction_selection_enabled")
+  if (ds === "true" || ds === "false") add(&hc, "direction_selection", ds)
+  for (const k of ["append_fallbacks_to_pinned", "reroute_failed_directions", "prune_failed_fallbacks"]) {
+    const v = find(lf, k)
+    if (v === "true" || v === "false") add(&hc, k, v)
+  }
+  ignored("load_balancer_config", lf, ["tracker_config", "bootstrap"], &notes)
   put(&top, "health", hc)
 }
 
@@ -1149,8 +1154,29 @@ function mapRouting(f: Field[], pname: string, inout top: Field[], inout notes: 
   notes.push(`config: plugin "${pname}" is not loaded: Raiju's routing rules do not chain (chain_rule), and its complexity router is set under "complexity_router"`)
   ignored(path, cf, ["routing_chain_max_depth"], &notes)
   const ca = `${path}.complexity_analyzer_config`
-  const af = try members(find(cf, "complexity_analyzer_config"))
-  ignored(ca, af, ["tier_boundaries", "keywords", "semantic", "session"], &notes)
+  try mapAnalyzerSection(try members(find(cf, "complexity_analyzer_config")), ca, &top, &notes)
+}
+
+// Bifrost's governance.complexity_analyzer_config (the analyzer's home in its config store): read as the routing
+// plugin's analyzer is, into complexity_router. It is read first, so it wins over the plugin's copy; a
+// complexity_router set in the file wins over both.
+function mapGovernanceAnalyzer(inout top: Field[], inout notes: string[]): void throws SyntaxError {
+  const gov = try members(find(top, "governance"))
+  const raw = find(gov, "complexity_analyzer_config")
+  if (raw === undefined) return
+  try mapAnalyzerSection(try members(raw), "governance.complexity_analyzer_config", &top, &notes)
+  // the section is read; Raiju's governance has no such key
+  let rest: Field[] = []
+  for (const f of gov) {
+    if (f.key !== "complexity_analyzer_config") rest.push(f)
+  }
+  put(&top, "governance", rest)
+}
+
+// One complexity analyzer config (Bifrost's complexity_analyzer_config shape): tier boundaries and session
+// retention are noted, the classifier is read into complexity_router.
+function mapAnalyzerSection(af: Field[], ca: string, inout top: Field[], inout notes: string[]): void throws SyntaxError {
+  ignored(ca, af, ["tier_boundaries", "session"], &notes)
   if (find(af, "tier_boundaries") !== undefined) notes.push(`config: "${ca}.tier_boundaries" is not copied to "complexity_router": they are on a 0 to 1 scale, and Raiju's simple_max_score and complex_min_score are on its own score scale`)
   try mapComplexityAnalyzer(af, ca, &top, &notes)
 }
@@ -1169,37 +1195,72 @@ function millisRaw(raw: string | undefined): string | undefined throws SyntaxErr
   return raw
 }
 
-// The analyzer's classifier, decision model and LLM classifier, read into complexity_router. A decision classifier
-// takes the decision block; without one, an llm block is the classifier, since Bifrost uses it as the fallback of
-// the semantic classifier, which Raiju does not map. The semantic block and session retention are noted only.
+// The analyzer's classifier, read into complexity_router. A decision classifier takes the decision block. The
+// semantic classifier (Bifrost's default, on when its block is present) takes the semantic block, with the tier
+// keyword lists as its exemplars (the legacy code and technical lists join medium, reasoning joins complex).
+// Without either, an llm block is the classifier, since Bifrost uses it as the semantic classifier's fallback;
+// Raiju runs one classifier and falls back to its heuristic, so beside a semantic block the llm block is noted.
 function mapComplexityAnalyzer(af: Field[], path: string, inout top: Field[], inout notes: string[]): void throws SyntaxError {
   let classifier = ""
   const craw = strRaw(af, "classifier")
   if (craw !== undefined) classifier = try decodeString(craw)
-  if (classifier !== "" && classifier !== "decision") notes.push(`config: "${path}.classifier" is not supported by Raiju and is ignored`)
   const decision = find(af, "decision")
+  const semantic = find(af, "semantic")
   const llm = find(af, "llm")
   const useDecision = classifier === "decision" && decision !== undefined
-  const useLLM = !useDecision && llm !== undefined
+  const useSemantic = !useDecision && (classifier === "" || classifier === "semantic") && semantic !== undefined
+  const useLLM = !useDecision && !useSemantic && llm !== undefined
+  if (classifier !== "" && classifier !== "decision" && !useSemantic) notes.push(`config: "${path}.classifier" is not supported by Raiju and is ignored`)
   if (decision !== undefined && !useDecision) notes.push(`config: "${path}.decision" is not used: Raiju reads it only when classifier is "decision"`)
-  if (!useDecision && !useLLM) return
+  if (semantic !== undefined && !useSemantic) notes.push(`config: "${path}.semantic" is not used: classifier is "${classifier}"`)
+  if (llm !== undefined && useSemantic) notes.push(`config: "${path}.llm" is not used: Raiju runs the semantic classifier alone and falls back to its heuristic`)
+  if (!useSemantic) ignored(path, af, ["keywords"], &notes)
+  if (!useDecision && !useLLM && !useSemantic) return
   if (find(top, "complexity_router") !== undefined) {
     notes.push(`config: "${path}" is not copied: "complexity_router" is already set`)
     return
   }
   let cr: Field[] = []
   add(&cr, "enabled", "true")
+  let used = "llm"
   if (useDecision) {
+    used = "decision"
     add(&cr, "classifier", quote("decision"))
     const dm = try mappedModel(try members(decision), `${path}.decision`, true, &notes)
     add(&cr, "decision", dm)
+  } else if (useSemantic) {
+    used = "semantic"
+    add(&cr, "classifier", quote("semantic"))
+    add(&cr, "semantic", try mappedSemantic(try members(semantic), try members(find(af, "keywords")), path, &notes))
   } else {
     add(&cr, "classifier", quote("llm"))
     const lm = try mappedModel(try members(llm), `${path}.llm`, false, &notes)
     add(&cr, "llm", lm)
   }
   put(&top, "complexity_router", cr)
-  notes.push(`config: plugin "routing" complexity analyzer read into "complexity_router": classifier ${useDecision ? "decision" : "llm"}`)
+  notes.push(`config: complexity analyzer "${path}" read into "complexity_router": classifier ${used}`)
+}
+
+// A semantic block as Raiju's semantic settings, the tier keyword lists as the exemplars. Returns the object text.
+function mappedSemantic(sf: Field[], kw: Field[], path: string, inout notes: string[]): string throws SyntaxError {
+  let out: Field[] = []
+  add(&out, "provider", strRaw(sf, "provider"))
+  add(&out, "embedding_model", strRaw(sf, "embedding_model"))
+  const t = try millisRaw(find(sf, "timeout"))
+  // zero, in either form, means the default
+  if (t !== undefined && t !== "0") add(&out, "timeout_ms", t)
+  add(&out, "min_similarity", find(sf, "min_similarity"))
+  add(&out, "message_history_count", find(sf, "message_history_count"))
+  ignored(`${path}.semantic`, sf, ["count_toward_budgets", "vector_store"], &notes)
+  const medium = (try strings(find(kw, "medium_keywords"))).concat(try strings(find(kw, "code_keywords"))).concat(try strings(find(kw, "technical_keywords")))
+  const complex = (try strings(find(kw, "complex_keywords"))).concat(try strings(find(kw, "reasoning_keywords")))
+  let ex: Field[] = []
+  const simple = try strings(find(kw, "simple_keywords"))
+  if (simple.length > 0) add(&ex, "simple", JSON.stringify(simple))
+  if (medium.length > 0) add(&ex, "medium", JSON.stringify(medium))
+  if (complex.length > 0) add(&ex, "complex", JSON.stringify(complex))
+  if (ex.length > 0) add(&out, "exemplars", build(ex))
+  return build(out)
 }
 
 // A decision or llm block as Raiju's: provider, model, timeout (ms), and the settings of that block. Criteria are
@@ -1642,6 +1703,7 @@ export function normalize(configText: string): { text: string, notes: string[] }
   try mapScim(&top, &notes)
   try mapHealth(&top, &notes)
   try mapPricing(&top, &notes)
+  try mapGovernanceAnalyzer(&top, &notes)
   try mapPlugins(&top, &notes)
   try mapVectorStore(&top, &notes)
   return { text: build(top), notes: notes }
@@ -1924,7 +1986,8 @@ test("maps circuit_breaker_config to circuit_breaker_policies and load_balancer_
   const pols = try elements(find(top, "circuit_breaker_policies")!)
   expect(pols.length).toBe(2)
   expect(r.notes.includes(`config: "circuit_breaker_config" read as "circuit_breaker_policies"`)).toBe(true)
-  expect(r.notes.includes(`config: "load_balancer_config.direction_selection_enabled" is not supported by Raiju and is ignored`)).toBe(true)
+  expect(rawBool(h, "direction_selection")).toBe(true)
+  expect(rawBool(h, "prune_failed_fallbacks")).toBe(true)
   const lb = try normalize(`{ "load_balancer_config": { "enabled": true, "route_selection_enabled": false } }`)
   expect(rawBool(try fields(find(try fields(lb.text), "health")!), "adaptive")).toBe(false)
 })
@@ -2769,3 +2832,57 @@ test("the older client-level tool sync interval becomes the global default when 
   expect(r.notes.includes(`config: "client.mcp_tool_sync_interval" read as "mcp.tool_sync_interval"`)).toBe(true)
 })
 
+
+test("governance.complexity_analyzer_config is read: the semantic classifier with the keywords as exemplars", () => {
+  const r = try normalize(`{
+    "governance": { "budgets": [], "complexity_analyzer_config": {
+      "tier_boundaries": { "simple_medium": 0.2, "medium_complex": 0.4 },
+      "keywords": { "simple_keywords": ["hi"], "medium_keywords": ["summarize"], "complex_keywords": ["design a system"] },
+      "semantic": { "provider": "openai", "embedding_model": "text-embedding-3-small", "timeout": "2s", "min_similarity": 0.3, "message_history_count": 2, "vector_store": "embedded" },
+      "llm": { "provider": "openai", "model": "gpt-4o-mini" },
+      "session": { "enabled": true }
+    } },
+    "plugins": [ { "enabled": true, "name": "routing", "config": { "complexity_analyzer_config": { "classifier": "decision", "decision": { "provider": "typesafe", "model": "m" } } } } ]
+  }`)
+  const top = try fields(r.text)
+  const gov = try fields(find(top, "governance") ?? "{}")
+  expect(find(gov, "complexity_analyzer_config")).toBeUndefined()
+  expect(find(gov, "budgets")).toBe("[]")
+  const cr = try fields(find(top, "complexity_router") ?? "{}")
+  expect(rawStr(cr, "classifier")).toBe("semantic")
+  const sm = try fields(find(cr, "semantic") ?? "{}")
+  expect(rawStr(sm, "embedding_model")).toBe("text-embedding-3-small")
+  expect(find(sm, "timeout_ms")).toBe("2000")
+  expect(find(sm, "min_similarity")).toBe("0.3")
+  expect(find(sm, "message_history_count")).toBe("2")
+  expect(find(sm, "exemplars")).toBe(`{"simple":["hi"],"medium":["summarize"],"complex":["design a system"]}`)
+  expect(r.notes.includes(`config: "governance.complexity_analyzer_config.session" is not supported by Raiju and is ignored`)).toBe(true)
+  expect(r.notes.includes(`config: "governance.complexity_analyzer_config.semantic.vector_store" is not supported by Raiju and is ignored`)).toBe(true)
+  expect(r.notes.some((n) => n.includes(`"governance.complexity_analyzer_config.llm" is not used`))).toBe(true)
+  // the governance copy wins over the plugin's
+  expect(r.notes.includes(`config: "plugins[routing].config.complexity_analyzer_config" is not copied: "complexity_router" is already set`)).toBe(true)
+  expect((try unknownKeys(`{"governance":{"complexity_analyzer_config":{}}}`)).length).toBe(0)
+})
+
+test("the analyzer's legacy keyword lists join the medium and complex exemplars", () => {
+  const r = try normalize(`{ "governance": { "complexity_analyzer_config": {
+    "keywords": { "simple_keywords": ["hi"], "code_keywords": ["refactor"], "technical_keywords": ["kubernetes"], "reasoning_keywords": ["prove"] },
+    "semantic": { "embedding_model": "e", "timeout": 0 }
+  } } }`)
+  const cr = try fields(find(try fields(r.text), "complexity_router") ?? "{}")
+  const sm = try fields(find(cr, "semantic") ?? "{}")
+  expect(find(sm, "timeout_ms")).toBeUndefined()
+  expect(find(sm, "exemplars")).toBe(`{"simple":["hi"],"medium":["refactor","kubernetes"],"complex":["prove"]}`)
+})
+
+test("load_balancer_config: the provider level's switches are read into health", () => {
+  const r = try normalize(`{ "load_balancer_config": { "enabled": true, "direction_selection_enabled": false, "append_fallbacks_to_pinned": true, "reroute_failed_directions": true, "prune_failed_fallbacks": false, "tracker_config": {} } }`)
+  const hc = try fields(find(try fields(r.text), "health") ?? "{}")
+  expect(rawBool(hc, "adaptive")).toBe(true)
+  expect(rawBool(hc, "direction_selection")).toBe(false)
+  expect(rawBool(hc, "append_fallbacks_to_pinned")).toBe(true)
+  expect(rawBool(hc, "reroute_failed_directions")).toBe(true)
+  expect(rawBool(hc, "prune_failed_fallbacks")).toBe(false)
+  expect(r.notes.includes(`config: "load_balancer_config.tracker_config" is not supported by Raiju and is ignored`)).toBe(true)
+  expect(r.notes.some((n) => n.includes("reroute_failed_directions"))).toBe(false)
+})
