@@ -31,6 +31,7 @@ import { decode, encode } from "./base64"
 import { gcmSeal, gcmOpen, pbkdf2Sha256 } from "./aesgcm"
 import { Field, fields, find, isNull, quote, elements, decodeString, rawStr, rawBool, rawNum, build, setField, without } from "./json"
 import { secureHex, utf8, sha256, toHex } from "./crypto"
+import { Policy, Verdict, hostVerdict, urlVerdict } from "./netguard"
 import { rfc3339Ms, rfc3339Of } from "./vkexpiry"
 import { durationMs, effectiveBudgetLimit, cyclesLeft } from "./governance"
 
@@ -3474,10 +3475,54 @@ function roleJsonAs(r: RoleConfig, system: bool): string {
   return "{" + parts.join(",") + "}"
 }
 
+// Bifrost's ValidateExternalURL on a provider's base_url (handlers/providers.go): http or https, loopback always
+// allowed, link-local, unspecified and metadata addresses never, other private addresses only with
+// network_config.allow_private_network. Judged on the host as written (netguard.tov, every spelling of an address);
+// providerBaseUrlProblem also resolves a host name. "" when the URL is fine or absent.
+function baseUrlVerdict(v: Verdict): string {
+  if (v.kind === "blocked") return `Invalid base URL: link-local, unspecified and metadata addresses are not allowed (${v.detail})`
+  if (v.kind === "private") return `Invalid base URL: private IP addresses are not allowed (${v.detail}); set network_config.allow_private_network to allow them`
+  if (v.kind === "dns") return `Invalid base URL: failed to resolve hostname: ${v.detail}`
+  return ""
+}
+
+function baseUrlShape(nc: NetworkConfig | undefined): { url: string, policy: Policy, error: string } {
+  const policy: Policy = { private: nc?.allow_private_network === true, loopback: true, allow: [] }
+  const url = (nc?.base_url ?? "").trim()
+  if (url === "") return { url: "", policy: policy, error: "" }
+  const u = URL.parse(url)
+  if (u === undefined) return { url: url, policy: policy, error: "Invalid base URL: invalid URL format" }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return { url: url, policy: policy, error: `Invalid base URL: only https and http schemes are allowed, got: ${u.protocol.replace(":", "")}` }
+  if (u.hostname === "") return { url: url, policy: policy, error: "Invalid base URL: URL must have a hostname" }
+  return { url: url, policy: policy, error: "" }
+}
+
+export function baseUrlProblem(nc: NetworkConfig | undefined): string {
+  const s = baseUrlShape(nc)
+  if (s.error !== "" || s.url === "") return s.error
+  const v = hostVerdict(URL.parse(s.url)!.hostname, s.policy)
+  return v.kind === "name" ? "" : baseUrlVerdict(v)
+}
+
+// The base_url check for POST /api/providers and PUT /api/providers/{p} at save time, with the host resolved and every
+// address checked (the request is then answered by handleApi, which checks the literal again).
+export async function providerBaseUrlProblem(method: string, path: string, body: string): Promise<string> {
+  const create = method === "POST" && path === "/api/providers"
+  const update = method === "PUT" && path.startsWith("/api/providers/") && !path.slice("/api/providers/".byteLength).includes("/")
+  if (!create && !update) return ""
+  const p = parseProvider(body)
+  if (p === undefined) return ""
+  const s = baseUrlShape(p.network_config)
+  if (s.error !== "" || s.url === "") return s.error
+  return baseUrlVerdict(await urlVerdict(s.url, s.policy))
+}
+
 // Saves a provider under name from a provider body (PUT upserts, POST creates) and reads it back masked.
 function saveProvider(store: ConfigStore, name: string, body: string): ApiReply {
   const p = parseProvider(body)
   if (p === undefined) return badBody()
+  const bu = baseUrlProblem(p.network_config)
+  if (bu !== "") return reply(400, errorBody(bu))
   const r = store.upsertProvider(name, p)
   if (r.kind === "error") return errReply(r)
   const saved = providerOf(store.cfg, name)

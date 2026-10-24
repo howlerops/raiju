@@ -107,6 +107,11 @@ Changes to an `existingSecret` are not detected, so restart the deployment
 - If the config file is missing, Raiju builds providers from well-known
   variables such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`.
 - Probes: liveness on `/health`, readiness on `/ready`, port `http` (the container port).
+- Plugins whose `path` is a URL are downloaded into a private (0700) `plugin-cache` folder beside
+  `config.json`; when that folder is read-only (the chart mounts the config from a ConfigMap) they go to
+  `$TMPDIR/raiju-plugins`. With the chart's read-only root filesystem, set `RAIJU_PLUGIN_DIR` to a writable
+  volume of the gateway's user. A plain-http plugin URL needs a `sha256` pin on its entry. See
+  [SECURITY.md](../SECURITY.md) for the outbound address rules and the vendored native libraries.
 
 ## Workers vs replicas
 

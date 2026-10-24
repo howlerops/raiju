@@ -8875,14 +8875,16 @@ def l170_e2e(env):
         check("telemetry's user_name is the name of the user the key is assigned to", s == 200 and 'user_id="ada-l170",user_name="ada-l170"' in metrics_text, [l for l in metrics_text.split("\n") if "ada-l170" in l][:2])
 
         # ---- a plugin loaded from a URL ----
-        s, _, b = api("POST", "/api/plugins", {"name": "urlplug", "enabled": True, "path": MOCK + "/plugins/plugin.wasm", "config": {"mode": "rewrite", "tag": "url"}})
+        # plain http is accepted only for a plugin pinned by sha256 (L186)
+        pin = hashlib.sha256(open(wasm, "rb").read()).hexdigest()
+        s, _, b = api("POST", "/api/plugins", {"name": "urlplug", "enabled": True, "path": MOCK + "/plugins/plugin.wasm", "sha256": pin, "config": {"mode": "rewrite", "tag": "url"}})
         check("a plugin whose path is a URL is downloaded and loaded (its host is in server.plugin_download_private_allowlist)", s == 201 and json.loads(b).get("plugin", {}).get("status", {}).get("status") == "active", (s, b[:300]))
         s, h, b = chat("openai/gpt-4o-mini", "from a url plugin l170")
         check("the downloaded plugin runs: its post_hook marks the answer", s == 200 and json.loads(b).get("x_wasm_plugin") == "ctx-ok:url", (s, b[:200]))
         api("DELETE", "/api/plugins/urlplug")
-        s, _, b = api("POST", "/api/plugins", {"name": "gone", "enabled": True, "path": MOCK + "/plugins/missing.wasm"})
+        s, _, b = api("POST", "/api/plugins", {"name": "gone", "enabled": True, "path": MOCK + "/plugins/missing.wasm", "sha256": pin})
         check("a download that fails is answered as Bifrost answers a plugin that does not load", s == 500 and "Plugin was not created, it failed to load: failed to download plugin: HTTP 404" in b, (s, b[:300]))
-        s, _, b = api("POST", "/api/plugins", {"name": "local", "enabled": True, "path": "http://localhost:18099/plugins/plugin.wasm"})
+        s, _, b = api("POST", "/api/plugins", {"name": "local", "enabled": True, "path": "http://127.0.0.2:18099/plugins/plugin.wasm", "sha256": pin})
         check("a URL on a private host the allowlist does not name is refused", s == 500 and "private address" in b, (s, b[:300]))
 
         # ---- a wall-clock bound on a WebAssembly call, and the plugin spans and logs ----
@@ -12747,6 +12749,132 @@ def l174_e2e(env):
         gw.terminate()
         gw.wait()
 
+
+GW_L186 = "http://127.0.0.1:18328"  # L186: outbound safety (canonical addresses, resolved hosts, pinned plugin downloads)
+
+
+def private_hostname():
+    """A host name that resolves only to non-public addresses (this machine's own name usually does, through
+    /etc/hosts), with those addresses; (None, []) when there is none, and the checks that need it are skipped."""
+    import ipaddress
+    name = socket.gethostname()
+    try:
+        addrs = sorted({ai[4][0] for ai in socket.getaddrinfo(name, None)})
+    except OSError:
+        return None, []
+    if not addrs or any(ipaddress.ip_address(a.split("%")[0]).is_global for a in addrs):
+        return None, []
+    try:
+        ipaddress.ip_address(name)
+        return None, []
+    except ValueError:
+        return name, addrs
+
+
+def l186_e2e(env):
+    """L186: outbound safety. Numeric spellings of private and metadata addresses are refused like the dotted form
+    (webhooks, provider base_url, plugin downloads); a host name is resolved and refused when it points at a private
+    address; plugin downloads must be https unless pinned by sha256, the pin is checked on download and on load, and the
+    cache folder is private. Its own gateway (18328)."""
+    import hashlib, shutil, stat
+    base = GW_L186
+    cfg_dir = os.path.join(BUILD, "e2e-l186")
+    shutil.rmtree(cfg_dir, ignore_errors=True)
+    os.makedirs(cfg_dir)
+    cfg_path = os.path.join(cfg_dir, "config.json")
+    adm = {"authorization": "Bearer sk-admin-l186"}
+    wasm = os.path.join(ROOT, "tests", "wasm", "plugin.wasm")
+    pin = hashlib.sha256(open(wasm, "rb").read()).hexdigest()
+    port = MOCK.rsplit(":", 1)[1]
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        # the allowlist names the host localhost only: 127.0.0.1 in another spelling, or a name resolving to it, is refused
+        "server": {"plugin_download_private_allowlist": ["localhost"]},
+        "providers": {"openai": {"keys": [{"name": "o", "value": "sk-l186", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {"users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256(b"sk-admin-l186").hexdigest()}]},
+    }
+    json.dump(cfg, open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18328", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env={k: v for k, v in env.items() if k != "RAIJU_PLUGIN_DIR"}, stderr=open(os.path.join(BUILD, "e2e.l186.log"), "w"))
+
+    def api(method, p, body=None):
+        return call(method, p, body, adm, base=base, auth=False)
+
+    def plugin(name, path, sha=None):
+        body = {"name": name, "enabled": True, "path": path, "config": {"mode": "rewrite", "tag": "l186"}}
+        if sha is not None:
+            body["sha256"] = sha
+        return api("POST", "/api/plugins", body)
+
+    try:
+        wait(base + "/health")
+        local = f"http://localhost:{port}/plugins/plugin.wasm"
+
+        # ---- plugin downloads: https unless pinned, the pin checked on download and on load, a private cache ----
+        s, _, b = plugin("l186-plain", local)
+        check("a plain-http plugin URL without a sha256 pin is refused", s == 500 and "must be https" in b, (s, b[:300]))
+        s, _, b = plugin("l186-bad", local, "0" * 64)
+        check("a download that does not match its sha256 pin is refused", s == 500 and "does not match its sha256 pin" in b, (s, b[:300]))
+        s, _, b = plugin("l186-short", local, "abc")
+        check("a malformed sha256 pin is refused", s == 500 and "64 hex digits" in b, (s, b[:300]))
+        s, _, b = plugin("l186-pin", local, pin.upper())
+        made = json.loads(b).get("plugin", {}) if s == 201 else {}
+        check("a pinned plain-http plugin on an allowlisted host is downloaded and loaded", s == 201 and made.get("status", {}).get("status") == "active" and made.get("sha256") == pin, (s, b[:300]))
+        cache = os.path.join(cfg_dir, "plugin-cache")
+        files = [f for f in os.listdir(cache)] if os.path.isdir(cache) else []
+        dmode = stat.S_IMODE(os.stat(cache).st_mode) if os.path.isdir(cache) else -1
+        fmode = stat.S_IMODE(os.stat(os.path.join(cache, files[0])).st_mode) if files else -1
+        check("the download is kept in a private plugin-cache folder beside the config file (0700, the file 0600)", dmode == 0o700 and fmode == 0o600 and len(files) == 1, (oct(dmode), oct(fmode), files))
+        s, _, b = chat_l186(base, "pinned plugin l186")
+        check("the pinned plugin runs", s == 200 and json.loads(b).get("x_wasm_plugin") == "ctx-ok:l186", (s, b[:200]))
+        if files:
+            open(os.path.join(cache, files[0]), "wb").write(b"\0asm tampered")
+        s, _, b = api("GET", "/api/plugins/l186-pin")
+        st = json.loads(b).get("status", {}) if s == 200 else {}
+        check("a cached copy that no longer matches its pin is not loaded", s == 200 and st.get("status") == "error" and "does not match its sha256 pin" in b, (s, b[:600]))
+        api("DELETE", "/api/plugins/l186-pin")
+        for spelled in ["2130706433", "0x7f000001", "0177.0.0.1", "127.1", "[::ffff:127.0.0.1]"]:
+            s, _, b = plugin("l186-num", f"http://{spelled}:{port}/plugins/plugin.wasm", pin)
+            check(f"a plugin URL on {spelled} (127.0.0.1 spelled another way) is refused like 127.0.0.1", s == 500 and "private address" in b, (s, b[:300]))
+        s, _, b = plugin("l186-meta", "http://[::ffff:169.254.169.254]/p.wasm", pin)
+        check("a plugin URL on an IPv4-mapped metadata address is refused", s == 500 and "metadata" in b, (s, b[:300]))
+        name, addrs = private_hostname()
+        if name is not None:
+            s, _, b = plugin("l186-dns", f"http://{name}:{port}/plugins/plugin.wasm", pin)
+            check(f"a plugin URL whose host name resolves to a private address ({name} -> {addrs}) is refused", s == 500 and "private address" in b and name.lower() in b, (s, b[:300]))
+        else:
+            print("  skip: no host name here resolves only to private addresses")
+
+        # ---- webhooks: numeric spellings refused at save ----
+        s, _, b = api("POST", "/api/webhooks", {"name": "l186-num", "url": "https://0x7f000001/hook", "events": ["async_job.completed"]})
+        check("a webhook URL on 0x7f000001 is refused as a private address", s == 400 and "private address" in b, (s, b[:300]))
+        s, _, b = api("POST", "/api/webhooks", {"name": "l186-meta", "url": "https://[::ffff:a9fe:a9fe]/hook", "events": ["async_job.completed"], "allow_private_network": True})
+        check("a webhook URL on the metadata address in IPv6 form is refused even with allow_private_network", s == 400 and "metadata" in b, (s, b[:300]))
+
+        # ---- provider base_url through the API (Bifrost's ValidateExternalURL) ----
+        def prov(name, nc):
+            return api("PUT", "/api/providers/" + name, {"keys": [{"name": "k", "value": "sk-l186-prov", "models": [], "weight": 1.0}], "custom_provider_config": {"base_provider_type": "openai"}, "network_config": nc})
+        s, _, b = prov("l186a", {"base_url": "http://0x0a000001/v1"})
+        check("a provider base_url on a private address (10.0.0.1 in hex) is refused", s == 400 and "private IP addresses are not allowed" in b, (s, b[:300]))
+        s, _, b = prov("l186a", {"base_url": "http://0x0a000001/v1", "allow_private_network": True})
+        check("allow_private_network lets a provider base_url name a private address", s == 200, (s, b[:300]))
+        s, _, b = prov("l186b", {"base_url": "http://[::ffff:169.254.169.254]/", "allow_private_network": True})
+        check("a provider base_url on the metadata address is refused even with allow_private_network", s == 400 and "metadata" in b, (s, b[:300]))
+        s, _, b = prov("l186c", {"base_url": f"http://2130706433:{port}"})
+        check("a provider base_url on the loopback interface is allowed, as Bifrost allows it", s == 200, (s, b[:300]))
+        s, _, b = prov("l186d", {"base_url": "http://no-such-host.invalid/v1"})
+        check("a provider base_url whose host does not resolve is refused", s == 400 and "failed to resolve" in b, (s, b[:300]))
+        if name is not None and any(not a.startswith("127.") and a != "::1" for a in addrs):
+            s, _, b = prov("l186e", {"base_url": f"http://{name}/v1"})
+            check(f"a provider base_url whose host resolves to a private address is refused ({name})", s == 400 and "private IP addresses" in b, (s, b[:300]))
+        for p in ["l186a", "l186c"]:
+            api("DELETE", "/api/providers/" + p)
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
 GW_L182 = "http://127.0.0.1:18320"  # the request log store's segments, disk cap and batched writes
 
 def l182_e2e(env):
@@ -12811,6 +12939,9 @@ def l182_e2e(env):
         if gw.poll() is None:
             gw.terminate()
         gw.wait()
+
+def chat_l186(base, text):
+    return call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": text}]}, None, base=base, auth=False)
 
 
 def main():
@@ -15251,6 +15382,8 @@ def main():
         l175_e2e(env)
         # L182: the log store's batched writes, segments and disk cap: its own gateway (18320)
         l182_e2e(env)
+        # L186: outbound safety (address spellings, resolved hosts, pinned plugin downloads, provider base_url): its own gateway (18328)
+        l186_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

@@ -19286,8 +19286,10 @@ export interface operations {
                     name: string;
                     enabled?: boolean;
                     config?: Record<string, never>;
-                    /** @description A local .wasm file, or an http or https URL of one (downloaded first, with Bifrost's limits and private-address rule), to load as a plugin (Bifrost's WebAssembly plugin ABI). Go shared objects (.so) are refused. A custom plugin path needs dashboard auth to be on (403 otherwise). */
+                    /** @description A local .wasm file, or an https URL of one (downloaded first, with Bifrost's limits and private-address rule; plain http only when sha256 is set), to load as a plugin (Bifrost's WebAssembly plugin ABI). Go shared objects (.so) are refused. A custom plugin path needs dashboard auth to be on (403 otherwise). */
                     path?: string;
+                    /** @description The SHA-256 of the plugin file as 64 hex digits (Raiju). Checked on the download and each time the file is loaded; a mismatch fails the save (500 for a URL, 400 for a local file). A malformed value is refused. */
+                    sha256?: string;
                     wasm_limits?: components["schemas"]["WasmPluginLimits"];
                     /**
                      * @description The plugin's group in the chain (Bifrost's placement); empty or absent is post_builtin. Other values are refused with 400.
@@ -19542,8 +19544,10 @@ export interface operations {
                 "application/json": {
                     enabled?: boolean;
                     config?: Record<string, never>;
-                    /** @description A local .wasm file, or an http or https URL of one (downloaded first), to load as the plugin; an empty string removes the path. A custom plugin path needs dashboard auth to be on (403 otherwise). */
+                    /** @description A local .wasm file, or an https URL of one (downloaded first; plain http only when the plugin has a sha256 pin), to load as the plugin; an empty string removes the path. A custom plugin path needs dashboard auth to be on (403 otherwise). */
                     path?: string;
+                    /** @description The SHA-256 the plugin file must have (64 hex digits, Raiju); absent keeps the current pin, null or an empty string removes it. */
+                    sha256?: string;
                     wasm_limits?: components["schemas"]["WasmPluginLimits"];
                     /**
                      * @description The plugin's group in the chain (Bifrost's placement); empty resets it to post_builtin, absent keeps it. Other values are refused with 400.

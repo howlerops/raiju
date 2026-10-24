@@ -66,7 +66,13 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
   response into an error. A module that exports `http_pre_hook`, `http_post_hook` or `http_stream_chunk_hook`
   also gets Bifrost's HTTP transport hooks: before routing it can rewrite the request or answer it, after the
   response it can rewrite that, and for each event of a stream it can rewrite, drop or end (see `docs/parity.md`,
-  section Plugins).
+  section Plugins). A `path` may be a URL: it must be https unless the entry pins the file with `"sha256"`
+  (checked on download and on every load), and the copy is kept in a private `plugin-cache` folder beside the
+  config file (`RAIJU_PLUGIN_DIR` overrides).
+- **Outbound safety:** every URL a user or caller sets (A2A agents and push callbacks, webhooks, MCP servers with
+  `require_public_target`, plugin downloads, provider `base_url` through the API, exporters) is checked against
+  private and metadata addresses in every spelling, with host names resolved before each request; see
+  [SECURITY.md](SECURITY.md), which also lists the vendored native libraries and how to report a vulnerability.
 - **Enterprise:** RBAC for the management API (admin, editor, viewer, auditor;
   `/api/users`), SSO with OIDC (PKCE, groups mapped to roles), a hash-chained
   HMAC-signed audit log (`/api/audit-logs`, `/export`, `/verify`), alerting

@@ -6,7 +6,7 @@ import { listJson, sessionJson, sessionSummaryJson, detailJson, uaRoute, listFil
 import { Incident } from "./holds"
 import { WsTickets } from "./wsticket"
 import { entryStatus, PluginEntry } from "./plugins"
-import { isPluginUrl, downloadPlugin } from "./plugindl"
+import { isPluginUrl, downloadPlugin, normalPin, pinProblem } from "./plugindl"
 import { parseDatasheet } from "./pricing"
 import { deliveryLog } from "./webhooks"
 import { OtelConfig, TlsOpts, otelTls, usesGrpc, exportMetricsGrpc } from "./otel"
@@ -48,7 +48,7 @@ import * as alerts from "./alerts"
 import { ExposedTool, SessionStore, handleMcp, rpcError, sseStream, SSE_HEARTBEAT_MS } from "./mcpserver"
 import { isMetaTool, metaToolDefs } from "./codemode"
 import { relay } from "./passthrough"
-import { grpcSend, upstreamCandidates, attemptVerdict, Candidate, Demotions } from "./a2agrpcup"
+import { grpcSend, upstreamCandidates, attemptVerdict, Candidate, Demotions, candidateProblem } from "./a2agrpcup"
 import { versionSupported, paramsTo, resultTo, rpcAnswerTo } from "./a2aver"
 import { checkExtensions, allowedExtensions } from "./a2aext"
 import { mergeConfig, changedTargets, targetAuthMessage } from "./pluginmerge"
@@ -56,7 +56,7 @@ import { agentQuery, selectedCalls, pageOf, agentStatsJson, topAgentsJson, agent
 import { H2Tls } from "./h2"
 import { findAgent, endpointOf, restEndpointOf, gatewayCard, withGrpcInterface, publicBase, aggregateCard, contextOfParams, contextOfResult, refreshAll, withCard, fetchCard, CARD_PATH, JSON_RPC_SUFFIX, REST_PREFIX } from "./agents"
 import { Call, PushSpec, CallCancel, StreamTap, tapped, rpcCall, restCall, restRequestOf, methodOf, rpcIdOf, rpcErrorBody, rpcEvent, restEvent, restErrorBody, restErrorOfStatus, httpOfCode, codeOfRestError, relayMapped, pushSpecOf, pushUpstreamParams, pushViewJson, pushListJson, pushIdOfResult, embeddedPush, rewriteEmbedded, taskIdOfResult } from "./a2a"
-import { PushDelivery, pushStore, mintToken, acceptPush, callbackProblem, deliverDue, configView, PENDING_PREFIX, INGRESS_SUFFIX, TOKEN_HEADER } from "./a2apush"
+import { PushDelivery, pushStore, mintToken, acceptPush, callbackConnectProblem, deliverDue, configView, PENDING_PREFIX, INGRESS_SUFFIX, TOKEN_HEADER } from "./a2apush"
 import { pushShare, cardShare, cardOf, adoptCard, takePeriod, CardWire, CARD_NS } from "./a2ashare"
 import { FileLease } from "./filelease"
 import { upstreamHeaders, tlsOf, withAcceptedCredential } from "./agentauth"
@@ -119,6 +119,14 @@ function pathOf(fs: Field[], dflt: string | undefined): string | undefined {
   return p === "" ? undefined : p
 }
 
+// The sha256 pin a body names (lower case), dflt when it names none, undefined for null or "".
+function pinOf(fs: Field[], dflt: string | undefined): string | undefined {
+  const raw = find(fs, "sha256")
+  if (raw === undefined) return dflt
+  const p = normalPin(rawStr(fs, "sha256"))
+  return p === "" ? undefined : p
+}
+
 // The wasm_limits a body names, or dflt when it names none.
 function limitsOf(fs: Field[], dflt: WasmLimitsSpec | undefined): WasmLimitsSpec | undefined {
   const raw = find(fs, "wasm_limits")
@@ -155,14 +163,14 @@ function orderOf(fs: Field[], dflt: int | undefined): { ok: bool, value: int | u
 // Why a plugin cannot be built from its config: "" when it can. Checked as enabled, so a disabled plugin is
 // still checked for its name and config.
 function badPlugin(spec: PluginSpec): string {
-  const st = entryStatus({ name: spec.name, enabled: true, configJson: spec.config_json ?? "{}", path: spec.path, limits: spec.wasm_limits })
+  const st = entryStatus({ name: spec.name, enabled: true, configJson: spec.config_json ?? "{}", path: spec.path, limits: spec.wasm_limits, sha256: spec.sha256 })
   return st.status === "error" ? st.error : ""
 }
 
 // One configured plugin as Bifrost's plugin response: its name, whether it is on, its config and its status.
 function pluginJson(sp: PluginSpec, stats: string): string {
   const config = sp.config_json ?? ""
-  const st = entryStatus({ name: sp.name, enabled: sp.enabled, configJson: config, path: sp.path, limits: sp.wasm_limits })
+  const st = entryStatus({ name: sp.name, enabled: sp.enabled, configJson: config, path: sp.path, limits: sp.wasm_limits, sha256: sp.sha256 })
   const custom = (sp.path ?? "") !== ""
   const builtin = !custom && builtinPlugins().includes(sp.name)
   const pairs: string[] = [
@@ -178,6 +186,8 @@ function pluginJson(sp: PluginSpec, stats: string): string {
   if (placement !== undefined) pairs.push(jkv("placement", JSON.stringify(placement)))
   const order = sp.order
   if (order !== undefined) pairs.push(jkv("order", `${order}`))
+  const pin = sp.sha256
+  if (pin !== undefined && pin !== "") pairs.push(jkv("sha256", JSON.stringify(pin)))
   // the live plugin's own counters (the mocker's GetStats, which Bifrost keeps in-process only), Raiju's addition
   if (stats !== "") pairs.push(jkv("stats", stats))
   pairs.push(jkv("status", jobj([jkv("name", JSON.stringify(sp.name)), jkv("status", JSON.stringify(st.status)), jkv("logs", jstrs(st.error === "" ? [] : [st.error])), jkv("types", jstrs(st.types))])))
@@ -2951,7 +2961,18 @@ export class Ops {
         const known = method === "POST" || (name !== "" && !name.includes("/") && !builtinPlugins().includes(name))
         if (known && url.split("?")[0]!.toLowerCase().endsWith(".so")) return pluginError(400, "Invalid plugin configuration: Go shared-object plugins (.so) are not supported by this gateway; build the plugin as WebAssembly (.wasm)")
         if (known) {
-          const got = await downloadPlugin(url, this.store.cfg.server?.plugin_download_private_allowlist ?? [])
+          // the pin the body names, else (on a PUT) the plugin's own: checked on the download
+          let cur: string | undefined = undefined
+          for (const sp of this.store.cfg.plugins ?? []) {
+            if (sp.name === name) cur = sp.sha256
+          }
+          let pin: string | undefined = cur
+          try {
+            pin = pinOf(fields(body), cur)
+          } catch (e) {
+            pin = cur
+          }
+          const got = await downloadPlugin(url, this.store.cfg.server?.plugin_download_private_allowlist ?? [], pin)
           if (got.error !== "") {
             const msg = method === "POST" ? `Plugin was not created, it failed to load: ${got.error}` : `Plugin update was not applied, it failed to load and the previous configuration was kept: ${got.error}`
             return { status: 500, body: errorJson(msg, "api_error", undefined), contentType: "application/json" }
@@ -2998,7 +3019,9 @@ export class Ops {
       const moved = changedTargets("{}", config)
       if (moved.length > 0) return pluginError(403, targetAuthMessage(moved))
     }
-    const spec: PluginSpec = { name: name, enabled: rawBool(fs, "enabled") ?? false, config_json: config, placement: pl.value, order: od.value, path: path, wasm_limits: limitsOf(fs, undefined) }
+    const spec: PluginSpec = { name: name, enabled: rawBool(fs, "enabled") ?? false, config_json: config, placement: pl.value, order: od.value, path: path, wasm_limits: limitsOf(fs, undefined), sha256: pinOf(fs, undefined) }
+    const pp = pinProblem(spec.sha256)
+    if (pp !== "") return pluginError(400, `Invalid plugin configuration: ${pp}`)
     const bad = badPlugin(spec)
     if (bad !== "") return pluginError(400, `Invalid plugin configuration: ${bad}`)
     const next: PluginSpec[] = specs.slice()
@@ -3039,7 +3062,9 @@ export class Ops {
       const moved = changedTargets(stored, config)
       if (moved.length > 0) return pluginError(403, targetAuthMessage(moved))
     }
-    const spec: PluginSpec = { name: name, enabled: en === undefined ? cur.enabled !== false : en, config_json: config, placement: pl.value, order: od.value, path: builtin ? undefined : pathOf(fs, cur.path), wasm_limits: limitsOf(fs, cur.wasm_limits) }
+    const spec: PluginSpec = { name: name, enabled: en === undefined ? cur.enabled !== false : en, config_json: config, placement: pl.value, order: od.value, path: builtin ? undefined : pathOf(fs, cur.path), wasm_limits: limitsOf(fs, cur.wasm_limits), sha256: builtin ? undefined : pinOf(fs, cur.sha256) }
+    const pp = pinProblem(spec.sha256)
+    if (pp !== "") return pluginError(400, `Invalid plugin configuration: ${pp}`)
     const bad = badPlugin(spec)
     if (bad !== "") return pluginError(400, `Invalid plugin configuration: ${bad}`)
     const next: PluginSpec[] = []
@@ -3655,6 +3680,13 @@ export class Ops {
     const upV03 = c.binding !== "GRPC" && c.v03
     const upParams = callerV03 === upV03 ? params : paramsTo(call.op, params, upV03)
     const upCall: Call = { op: call.op, v03: upV03, params: upParams, stream: call.stream, taskId: call.taskId, configId: call.configId }
+    // the URL guard again at connect time, on the addresses the interface's host resolves to now (netguard.tov)
+    const guard = await candidateProblem(c.binding, c.url, agent.allow_private_network === true)
+    if (guard !== "") {
+      let f = fwdFail(`the agent's ${c.binding} interface is refused: ${guard}`)
+      f.binding = c.binding
+      return f
+    }
     const fwd = c.binding === "GRPC" ? await this.a2aSendGrpc(agent, upCall, c, rpcId, h, accepted, cancel) : await this.a2aSendHttp(agent, upCall, c, rpcId, h, accepted, cancel)
     if (callerV03 === upV03 || fwd.error !== "") return fwd
     return translatedFwd(fwd, call.op, callerV03)
@@ -3795,7 +3827,7 @@ export class Ops {
       if (call.op === "CreateTaskPushNotificationConfig") {
         const spec = pushSpecOf(call)
         if (spec.error !== "") return this.a2aFail(rest, rpcId, 400, -32602, `invalid params: ${spec.error}`)
-        const bad = callbackProblem(spec.url, this.pushPrivate())
+        const bad = await callbackConnectProblem(spec.url, this.pushPrivate())
         if (bad !== "") return this.a2aFail(rest, rpcId, 400, -32602, `invalid params: ${bad}`)
         const m = mintToken()
         params = pushUpstreamParams(call, ingress, m.token)
@@ -3805,7 +3837,7 @@ export class Ops {
         const emb = embeddedPush(params)
         if (emb !== undefined) {
           if (emb.spec.error !== "") return this.a2aFail(rest, rpcId, 400, -32602, `invalid params: ${emb.spec.error}`)
-          const bad = callbackProblem(emb.spec.url, this.pushPrivate())
+          const bad = await callbackConnectProblem(emb.spec.url, this.pushPrivate())
           if (bad !== "") return this.a2aFail(rest, rpcId, 400, -32602, `invalid params: ${bad}`)
           const m = mintToken()
           const cid = emb.spec.configId !== "" ? emb.spec.configId : secureHex(8)
