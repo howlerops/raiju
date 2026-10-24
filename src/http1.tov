@@ -303,6 +303,14 @@ export class Http1Parser {
     return this.rx
   }
 
+  // What is being read: "idle" (between requests, or nothing more is read), "head" (part of a request head has
+  // come) or "body" (a request body is arriving).
+  reading(): string {
+    if (this.stopped) return "idle"
+    if (this.phase === "head") return this.buf.length > this.pos ? "head" : "idle"
+    return "body"
+  }
+
   // The connection closed: a body still arriving will not complete.
   abort(): void {
     const q = this.rx
@@ -656,6 +664,19 @@ cyclic class Http1Conn {
   ws: WsConnection | undefined = undefined
   // set once an upgrade request has its answer (the 101 or an HTTP error)
   answered = false
+  // the server's timeouts (Http1Limits; Date.now() milliseconds): when the connection opened, its last bytes read,
+  // the first byte of the request being read, when its last response finished, and whether it has sent a request
+  openedAt = 0.0
+  lastRead = 0.0
+  headAt = 0.0
+  doneAt = 0.0
+  served = false
+  // opened over the server's connection cap: its request is answered 503
+  reject = false
+  // the server is stopping: the connection closes once its responses are out
+  draining = false
+  // its key in the server's table
+  id = 0
 
   constructor(maxBodyBytes?: int, streamThreshold?: int) {
     this.parser = new Http1Parser(maxBodyBytes, streamThreshold)
@@ -680,6 +701,15 @@ cyclic class Http1Conn {
   // that throws gets a 500 unless it already started its response.
   serve(results: Http1Result[], handler: Handler): void {
     for (const r of results) {
+      if (r.kind === "request") this.served = true
+      if (this.reject) {
+        const res = this.respond("GET", "HTTP/1.1", true)
+        const h = plainHeaders()
+        h.set("retry-after", "1")
+        res.writeHead(503, h)
+        res.end("Service Unavailable\n")
+        return
+      }
       if (r.kind === "fail") {
         const res = this.respond("GET", "HTTP/1.1", true)
         res.writeHead(r.status, plainHeaders())
@@ -687,7 +717,7 @@ cyclic class Http1Conn {
       } else if (wantsUpgrade(r.req.headers)) {
         this.upgrade(r.req)
       } else {
-        const res = this.respond(r.req.method, r.req.version, !keepAlive(r.req))
+        const res = this.respond(r.req.method, r.req.version, !keepAlive(r.req) || this.draining)
         const bq = r.req.stream
         if (bq !== undefined) {
           res.body = bq
@@ -730,6 +760,8 @@ cyclic class Http1Conn {
         return
       }
     }
+    this.doneAt = Date.now()
+    if (this.draining && this.ws === undefined) this.close()
   }
 
   sendRaw(text: string): void {
@@ -996,13 +1028,100 @@ export class Http1Response {
   }
 }
 
+// The server's limits, in milliseconds (0: none), and its cap on open connections (0: none). As on the Bun.serve
+// server (tov-patches 0012): a request head must arrive within headerMs of its first byte (a new connection: of
+// its open), a body must not go bodyMs without a byte, a connection with no request in hand closes after idleMs,
+// and a request on a connection over maxConnections is answered 503. A request being handled has no limit here.
+export type Http1Limits = { headerMs: int, idleMs: int, bodyMs: int, maxConnections: int }
+
+export const NO_LIMITS: Http1Limits = { headerMs: 0, idleMs: 0, bodyMs: 0, maxConnections: 0 }
+
+// What the limits make of a connection at `now`: "" (nothing), "close" (closed without a word) or "408" (the
+// request being read is answered 408, then the connection closes).
+export function expiry(c: Http1Conn, now: f64, lim: Http1Limits): string {
+  if (c.closed || c.ws !== undefined) return ""
+  const q = c.parser.streaming()
+  if (q !== undefined) {
+    // (a handler that stopped taking the body paused it: that is not the client's doing)
+    if (!q.paused && lim.bodyMs > 0 && now - c.lastRead > lim.bodyMs * 1.0) return "close"
+    return ""
+  }
+  if (c.queue.length > 0) return ""
+  const st = c.parser.reading()
+  if (st === "idle") {
+    if (!c.served) return lim.headerMs > 0 && now - c.openedAt > lim.headerMs * 1.0 ? "close" : ""
+    const last = c.lastRead > c.doneAt ? c.lastRead : c.doneAt
+    return lim.idleMs > 0 && now - last > lim.idleMs * 1.0 ? "close" : ""
+  }
+  if (st === "head") return lim.headerMs > 0 && now - c.headAt > lim.headerMs * 1.0 ? "408" : ""
+  return lim.bodyMs > 0 && now - c.lastRead > lim.bodyMs * 1.0 ? "408" : ""
+}
+
+// A listening server: its socket listener, and what a graceful stop needs.
+export class Http1Server {
+  conns: Map<int, Http1Conn> = new Map()
+  nextId = 0
+  sweeper = -1
+  listener: TCPSocketListener<Http1Conn> | undefined = undefined
+
+  constructor(readonly limits: Http1Limits) {}
+
+  // The connections still open (upgraded ones excepted).
+  open(): int {
+    let n = 0
+    for (const c of this.conns.values()) if (!c.closed && c.ws === undefined) n += 1
+    return n
+  }
+
+  // Stops accepting connections. Idle ones close now; the others close once their responses are out.
+  stop(): void {
+    const l = this.listener
+    if (l !== undefined) l.stop()
+    for (const c of this.conns.values()) {
+      if (c.ws !== undefined) continue
+      c.draining = true
+      if (c.queue.length === 0 && c.parser.reading() === "idle") c.close()
+    }
+  }
+
+  // Applies the limits to every connection.
+  sweep(now: f64): void {
+    for (const c of this.conns.values()) {
+      const e = expiry(c, now, this.limits)
+      if (e === "") continue
+      if (e === "408") {
+        const res = c.respond("GET", "HTTP/1.1", true)
+        res.writeHead(408, plainHeaders())
+        res.end("Request Timeout\n")
+      } else {
+        c.close()
+      }
+    }
+  }
+}
+
 // Listens on a port and serves HTTP/1.1 through `handler`. The handler may
 // finish its response later, from async code.
 // onUpgrade (optional) takes WebSocket upgrade requests; see UpgradeHandler.
 // thresholdOf, when given, is asked for the stream threshold at each new connection (it follows the config).
-export function listen(opts: { hostname: string, port: int, maxBodyBytes?: int, streamThreshold?: int, thresholdOf?: () => int, onUpgrade?: UpgradeHandler }, handler: Handler): TCPSocketListener<Http1Conn> {
+export function listen(opts: ListenOpts, handler: Handler): TCPSocketListener<Http1Conn> {
+  const srv = serve(opts, handler)
+  return srv.listener!
+}
+
+export type ListenOpts = { hostname: string, port: int, maxBodyBytes?: int, streamThreshold?: int, thresholdOf?: () => int, onUpgrade?: UpgradeHandler, limits?: Http1Limits }
+
+// listen, returning the server (for its limits and a graceful stop).
+export function serve(opts: ListenOpts, handler: Handler): Http1Server {
   const maxBody = opts.maxBodyBytes ?? DEFAULT_MAX_BODY
-  return Bun.listen<Http1Conn>({
+  const lim = opts.limits ?? NO_LIMITS
+  const srv = new Http1Server(lim)
+  if (lim.headerMs > 0 || lim.idleMs > 0 || lim.bodyMs > 0) {
+    srv.sweeper = setInterval(() => {
+      srv.sweep(Date.now())
+    }, 250)
+  }
+  srv.listener = Bun.listen<Http1Conn>({
     hostname: opts.hostname,
     port: opts.port,
     socket: {
@@ -1011,6 +1130,13 @@ export function listen(opts: { hostname: string, port: int, maxBodyBytes?: int, 
         const conn = new Http1Conn(maxBody, tf !== undefined ? tf() : opts.streamThreshold)
         conn.sock = socket
         conn.onUpgrade = opts.onUpgrade
+        const now = Date.now()
+        conn.openedAt = now
+        conn.lastRead = now
+        conn.reject = lim.maxConnections > 0 && srv.open() >= lim.maxConnections
+        conn.id = srv.nextId
+        srv.nextId += 1
+        srv.conns.set(conn.id, conn)
         socket.data = conn
       },
       data(socket, bytes) {
@@ -1021,6 +1147,9 @@ export function listen(opts: { hostname: string, port: int, maxBodyBytes?: int, 
           w.feed(bytes)
           return
         }
+        const now = Date.now()
+        if (conn.parser.reading() === "idle") conn.headAt = now
+        conn.lastRead = now
         conn.serve(conn.parser.feed(bytes), handler)
         conn.flow()
       },
@@ -1030,6 +1159,7 @@ export function listen(opts: { hostname: string, port: int, maxBodyBytes?: int, 
           const w = conn.ws
           if (w !== undefined) w.socketClosed()
           conn.detach()
+          srv.conns.delete(conn.id)
         }
         socket.data = undefined
       },
@@ -1038,6 +1168,7 @@ export function listen(opts: { hostname: string, port: int, maxBodyBytes?: int, 
       },
     },
   })
+  return srv
 }
 
 // ---- tests ----
@@ -1420,4 +1551,88 @@ test("a discarded body drops what arrives and holds nothing", () => {
   feedText(p, "efghijkl")
   expect(q.queued).toBe(0)
   expect(q.done).toBe(true)
+})
+
+test("the limits: a silent connection, a slow head, a stalled body, an idle connection", () => {
+  const lim: Http1Limits = { headerMs: 1000, idleMs: 2000, bodyMs: 1000, maxConnections: 0 }
+  // nothing sent: the header timeout runs from the open, and closes without a word
+  const silent = new Http1Conn()
+  expect(expiry(silent, 900.0, lim)).toBe("")
+  expect(expiry(silent, 1100.0, lim)).toBe("close")
+  // part of a head: 408 once the head has taken too long, however recently a byte came
+  const slow = new Http1Conn()
+  slow.headAt = 100.0
+  slow.lastRead = 1000.0
+  slow.serve(slow.parser.feed(enc.encode("GET / HTTP/1.1\r\nHost: x\r\n")), (req, res) => {})
+  expect(slow.parser.reading()).toBe("head")
+  expect(expiry(slow, 1050.0, lim)).toBe("")
+  expect(expiry(slow, 1150.0, lim)).toBe("408")
+  // a body that stopped arriving: 408 after bodyMs without a byte
+  const stalled = new Http1Conn()
+  stalled.lastRead = 500.0
+  stalled.serve(stalled.parser.feed(enc.encode("POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\nab")), (req, res) => {})
+  expect(stalled.parser.reading()).toBe("body")
+  expect(expiry(stalled, 1400.0, lim)).toBe("")
+  expect(expiry(stalled, 1600.0, lim)).toBe("408")
+  // served, then idle: closed after idleMs from the last response or read
+  const idle = new Http1Conn()
+  idle.serve(idle.parser.feed(enc.encode("GET / HTTP/1.1\r\n\r\n")), (req, res) => {
+    res.end("ok")
+  })
+  idle.lastRead = 0.0
+  idle.doneAt = 5000.0
+  expect(idle.served).toBe(true)
+  expect(idle.parser.reading()).toBe("idle")
+  expect(expiry(idle, 6900.0, lim)).toBe("")
+  expect(expiry(idle, 7100.0, lim)).toBe("close")
+  // no limits: nothing expires
+  expect(expiry(new Http1Conn(), 1000000.0, NO_LIMITS)).toBe("")
+})
+
+test("a request being handled is not timed out", () => {
+  const lim: Http1Limits = { headerMs: 1000, idleMs: 1000, bodyMs: 1000, maxConnections: 0 }
+  const c = new Http1Conn()
+  c.serve(c.parser.feed(enc.encode("GET /slow HTTP/1.1\r\n\r\n")), (req, res) => {})
+  expect(c.queue.length).toBe(1)
+  expect(expiry(c, 1000000.0, lim)).toBe("")
+})
+
+test("a connection over the cap has its request answered 503", () => {
+  const c = new Http1Conn()
+  c.reject = true
+  let ran = false
+  c.serve(c.parser.feed(enc.encode("GET / HTTP/1.1\r\n\r\n")), (req, res) => {
+    ran = true
+  })
+  const all = c.sent.join("")
+  expect(ran).toBe(false)
+  expect(all.startsWith("HTTP/1.1 503 Service Unavailable\r\n")).toBe(true)
+  expect(all.includes("retry-after: 1\r\n")).toBe(true)
+  expect(c.closed).toBe(true)
+})
+
+test("a draining connection answers with connection: close and closes after", () => {
+  const c = new Http1Conn()
+  c.draining = true
+  c.serve(c.parser.feed(enc.encode("GET / HTTP/1.1\r\n\r\n")), (req, res) => {
+    res.end("ok")
+  })
+  expect(c.sent.join("").includes("connection: close\r\n")).toBe(true)
+  expect(c.closed).toBe(true)
+  // the server's stop closes an idle connection now and marks a busy one
+  const srv = new Http1Server(NO_LIMITS)
+  const idle = new Http1Conn()
+  const busy = new Http1Conn()
+  busy.serve(busy.parser.feed(enc.encode("GET /slow HTTP/1.1\r\n\r\n")), (req, res) => {})
+  srv.conns.set(1, idle)
+  srv.conns.set(2, busy)
+  expect(srv.open()).toBe(2)
+  srv.stop()
+  expect(idle.closed).toBe(true)
+  expect(busy.closed).toBe(false)
+  expect(busy.draining).toBe(true)
+  expect(srv.open()).toBe(1)
+  busy.queue[0]!.end("done")
+  expect(busy.closed).toBe(true)
+  expect(srv.open()).toBe(0)
 })

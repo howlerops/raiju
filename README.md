@@ -163,6 +163,14 @@ small enough to send upstream.
 `-server http1` is Raiju's own HTTP/1.1 server on raw sockets. It streams too,
 but runs in one process. It stays as a fallback.
 
+Both servers stop gracefully on SIGTERM or SIGINT (every worker drains: `GET /ready` answers 503,
+the listener closes, the requests and streams in hand get up to `server.shutdown_grace_seconds`,
+25 by default, and queued exports are sent before the exit), and both time out slow clients
+(`server.header_timeout_seconds` 10, `body_timeout_seconds` 60, `idle_timeout_seconds` 60) and cap
+connections per process (`server.max_connections`, three quarters of the descriptor limit by
+default; 503 past it). `GET /health` is liveness, `GET /ready` readiness. See
+[deploy/README.md](deploy/README.md#stopping-and-slow-clients).
+
 The workers of one node share budgets, rate limits, the response and semantic
 caches and `/metrics` (summed) through `/tmp/raiju-<pid>` (the clustering CRDT, one slot per worker).
 Request-log queries are shared only when the log store is shared; otherwise each worker answers from its own log. Usage

@@ -7,9 +7,29 @@ Raiju is one binary. The image runs it as non-root on a slim Debian base
 (bookworm-slim with JavaScriptCore, which the binary links). It takes a
 Bifrost-format `config.json` from `/app/data`, and provider keys come from environment variables that the config refers to as `env.NAME`.
 
-Endpoints for probes and scraping: `GET /health` (200, `{"status":"ok"}`) and
-`GET /metrics` (Prometheus text, Bifrost metric names). The image has no
-HEALTHCHECK (there is no curl), so probe from outside the container.
+Endpoints for probes and scraping: `GET /health` (liveness: 200, `{"status":"ok"}`),
+`GET /ready` (readiness: 200 `{"status":"ready",...}`, or 503 while the process drains for a stop
+or when a store that is on could not open) and `GET /metrics` (Prometheus text, Bifrost metric
+names). The image has no HEALTHCHECK (there is no curl), so probe from outside the container.
+
+## Stopping and slow clients
+
+SIGTERM (and SIGINT) stop Raiju gracefully, in every worker: `/ready` answers 503 at once, the
+listener closes after `server.shutdown_delay_seconds` (default 0), the requests and streams in hand
+get up to `server.shutdown_grace_seconds` (default 25) from the signal, then queued exporter
+batches, retained content and trace spans are sent (about 5 s at most) and the process exits 0.
+Whatever is still open at the grace is cut. Give the orchestrator a kill timeout above the sum
+(the chart sets `terminationGracePeriodSeconds: 35`); under Kubernetes, a
+`shutdown_delay_seconds` of about 5 keeps taking connections while the endpoints update.
+
+Both servers time out slow or silent clients: a request head must arrive within
+`server.header_timeout_seconds` (default 10; a half-sent head is answered 408), a body must not
+go `server.body_timeout_seconds` (default 60) without a byte (408), and a keep-alive connection
+with no request in hand closes after `server.idle_timeout_seconds` (default 60). A request being
+handled (a slow completion, a stream) is never timed out by these. `server.max_connections` caps
+each process's open connections (default: three quarters of its descriptor limit, `ulimit -n`;
+-1 for no cap): a request on a connection past it is answered 503, and so is a connection that
+comes when the process is out of descriptors. 0 turns a timeout off. These keys are read at start.
 
 ## Docker
 
@@ -86,7 +106,7 @@ Changes to an `existingSecret` are not detected, so restart the deployment
 - The config is read once at start. Changing it means restarting the process.
 - If the config file is missing, Raiju builds providers from well-known
   variables such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`.
-- Probes: liveness and readiness on `/health`, port `http` (the container port).
+- Probes: liveness on `/health`, readiness on `/ready`, port `http` (the container port).
 
 ## Workers vs replicas
 

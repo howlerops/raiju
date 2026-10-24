@@ -11,6 +11,7 @@ libraries (about 2.7 MB and 4.9 MB of text), which the first four do not; 0006 i
 Patch 0008 changes the fetch and HTTP/2 code that 0007 adds, so it is applied on top of 0007.
 Patch 0009 (node:fs rename and fsync) touches the shared lists in `builtins.rs` and `tov.h` and is written on top of 0001-0008.
 Patch 0010 (WebAssembly wall-clock limit) changes `std/wasm`, `runtime/wasm.c` and the WAMR interpreter that 0005 adds, and is written on top of 0001-0009.
+Patch 0012 (server lifecycle) changes the HTTP server in `runtime/tov.c` and `std/http.tov`, and is written on top of 0001-0010.
 
 ## Submitting upstream
 
@@ -554,3 +555,67 @@ is capped at one day.
 **Not covered.** The clock is read only between instructions, so one host call that blocks is not cut
 short (the call ends at the next check after it returns). Only the fast interpreter is built, so only it
 has the check. The test (2 more checks in `tests/wasm.tov`, 24 in all) is in `run.sh`.
+
+## 0012 — server lifecycle: stop signals, request timeouts, a connection cap (`Bun.serve`)
+
+(Numbered 0012: 0011 is kept for the patch written alongside it. 0012 is written on top of 0001-0010.)
+
+**Problem.** A program on `Bun.serve` could not stop gracefully: in one process SIGTERM killed it at once,
+and with `workers` the supervisor killed the workers, so a deploy cut every request and stream in flight.
+The server also had no timeouts (a client that sends a head byte by byte, or opens connections and sends
+nothing, holds a descriptor forever) and no cap on connections; out of descriptors, the listener stayed
+readable and the loop spun at full CPU while connections queued unanswered.
+
+**API.**
+
+```ts
+const server = Bun.serve({
+  fetch: handler,
+  workers: 2,
+  headerTimeout: 10,    // seconds for a request head (a new connection: from its accept); 408 and close
+  bodyTimeout: 60,      // seconds a body may go without a byte; 408 and close
+  idleTimeout: 60,      // seconds a connection with no request in hand may stay open (Bun's name)
+  maxConnections: 5000, // per process; a request on a connection past it is answered 503
+})
+Bun.onStopSignal((signal) => {   // SIGTERM or SIGINT, on the loop, in every worker
+  server.stop()                  // closes the listener; idle connections close, busy ones after their request
+  const t = setInterval(() => { if (server.openConnections === 0) process.exit(0) }, 50)
+})
+Bun.fdLimit()                    // RLIMIT_NOFILE's soft limit
+```
+
+**Design.**
+- `tv_http_sweep` runs every 250 ms while a server has a timeout and connections are open (the loop's wait
+  is bounded by it). Each connection keeps the loop times of its last read, its last write progress and the
+  first byte of the request being read, and whether the input holds part of a head or of a body. A request
+  being handled (an answer pending or streaming) is never timed out: unlike Bun's `idleTimeout`, a slow
+  answer keeps its connection. Output the client does not take for `idleTimeout` ends the connection.
+- `maxConnections`: a connection accepted past it is marked; its first complete head is answered 503.
+- A spare descriptor (`/dev/null`) is kept per process: on EMFILE or ENFILE it is closed, the connection
+  taken and answered 503 at once, and the spare reopened, so the listener drains instead of spinning. The
+  same is done for `Bun.listen` (`runtime/net.c`), which closes such a connection.
+- `httpOnSignal(fn)`: a self-pipe watched by the loop; the handler writes the signal number, the loop calls
+  `fn(name)`. Each process that runs the loop arms its own pipe and handlers (a worker re-arms after the
+  fork). The supervisor still forwards SIGTERM to the workers; it now closes its copy of the listeners
+  (otherwise the port keeps accepting connections nobody serves) and exits 0 when every worker exited 0.
+- `server.openConnections` counts the process's connections of that server (upgraded ones excepted).
+
+**Files.**
+- `runtime/tov.c`, `runtime/tov.h`: the sweep, the per-connection times, the cap, the spare descriptor, the
+  signal pipe, the supervisor's listener close and exit status, and the natives `httpLimits`, `httpOpen`,
+  `httpFdLimit`, `httpOnSignal`.
+- `runtime/net.c`: the spare descriptor for `Bun.listen`.
+- `crates/tov/src/check/builtins.rs`: the signatures.
+- `crates/tov/src/std/http.tov`: the `ServeOptions` fields, `Server.openConnections`, `Bun.onStopSignal`,
+  `Bun.fdLimit`.
+- `docs/spec.md`: the serving paragraph.
+
+**Measured in Raiju.** Before: SIGTERM cut a stream at chunk 5 of 23; 301 slow or idle connections were still
+open after 45 s; out of descriptors the gateway answered 502 at full CPU. After: a stream in flight at
+SIGTERM ends whole and the process exits 0 (one process and two workers); a silent connection closes after
+the header timeout, a half-sent head or body is answered 408, an idle keep-alive connection closes after the
+idle timeout; past the cap or out of descriptors a connection is answered 503.
+
+**Not covered.** The timeouts have a 250 ms resolution. Upgraded (WebSocket) connections have no timeouts here
+and are not counted by `openConnections`. The signals watched are SIGTERM and SIGINT. The test
+(`tests/server_lifecycle.tov` driven by `tests/server_lifecycle_client.py`, 18 checks) is in `run.sh`.

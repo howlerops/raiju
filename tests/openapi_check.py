@@ -4,7 +4,7 @@
 # 1. The spec is valid OpenAPI 3.1 (openapi-spec-validator when installed) and every $ref resolves.
 # 2. Every operation in the spec is served: a gateway started here answers its method and path
 #    with something other than 405 or the generic "no route" 404.
-# 3. Every /api, /mcp, /health, /metrics and /v1/mcp/tool/execute path the source names (string
+# 3. Every /api, /mcp, /health, /ready, /metrics and /v1/mcp/tool/execute path the source names (string
 #    literals in src/*.tov) that the gateway serves is listed in the spec.
 #
 # Usage: python3 tests/openapi_check.py [path/to/raiju]   (default: build/raiju)
@@ -31,7 +31,7 @@ BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "build", "raiju")
 PORTS = [p for p in range(18190, 18200) if p != 18193]  # 18193 is the e2e UDP beacon port
 METHODS = ["GET", "POST", "PUT", "DELETE"]
 GENERIC_404 = re.compile(r"no route|no such route")
-CANDIDATE = re.compile(r'["`](/(?:api/[^"`\s]*|mcp[^"`\s]*|v1/mcp/tool/execute|health|metrics))')
+CANDIDATE = re.compile(r'["`](/(?:api/[^"`\s]*|mcp[^"`\s]*|v1/mcp/tool/execute|health|ready|metrics))')
 PARAM = re.compile(r"\{[^}]+\}")
 # Known bug, listed in the ledger's LIMITS: GET /api/mcp/virtual answers every method with 200
 # (ops.virtualView ignores the method). Remove an entry when the route rejects the other methods.

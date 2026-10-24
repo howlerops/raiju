@@ -12149,6 +12149,157 @@ def l172_e2e(env):
         gw.wait()
 
 
+def l183_config(d, logs_dir, extra_server):
+    return {
+        "client": {"enforce_auth_on_inference": False, "enable_logging": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "logs_store": {"enabled": True, "dir": logs_dir},
+        "server": extra_server,
+        "providers": {
+            "openai": {"keys": [{"name": "l183", "value": "sk-l183", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            # the mock's slow route: four SSE events 150 ms apart
+            "slowp": {"keys": [{"name": "s", "value": "sk-slow-l183", "models": [], "weight": 1.0}], "custom_provider_config": {"base_provider_type": "openai"}, "network_config": {"base_url": "http://127.0.0.1:18100", "max_retries": 0}},
+        },
+    }
+
+
+def l183_raw(port, data, timeout=6):
+    """Sends data on a new connection and reads until the server closes it: (bytes, seconds)."""
+    s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    if data:
+        s.sendall(data)
+    t = time.time()
+    out = b""
+    try:
+        while True:
+            b = s.recv(65536)
+            if not b:
+                break
+            out += b
+    except OSError:
+        pass
+    s.close()
+    return out, time.time() - t
+
+
+def l183_start(env, name, port, cfg, workers=1):
+    path = os.path.join(BUILD, f"e2e.{name}.json")
+    json.dump(cfg, open(path, "w"))
+    args = [os.path.join(BUILD, "raiju"), "-port", str(port), "-host", "127.0.0.1", "-config", path, "-server", os.environ.get("RAIJU_SERVER", "bun")]
+    if workers > 1:
+        args += ["-workers", str(workers)]
+    gw = subprocess.Popen(cwd=ROOT, args=args, env=env, stderr=open(os.path.join(BUILD, f"e2e.{name}.log"), "w"))
+    wait(f"http://127.0.0.1:{port}/health")
+    return gw
+
+
+def l183_drain(gw, port, label):
+    """A stream in flight when SIGTERM comes: /ready turns 503 at once (the listener stays open for
+    shutdown_delay_seconds), /health stays ok, then new connections are refused, the stream ends whole and the
+    process exits 0."""
+    import signal
+    body = json.dumps({"model": "slowp/slow-l183", "stream": True, "messages": [{"role": "user", "content": "drain l183"}]})
+    req = f"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n{body}".encode()
+    s = socket.create_connection(("127.0.0.1", port), timeout=10)
+    s.sendall(req)
+    first = s.recv(65536)
+    gw.send_signal(signal.SIGTERM)
+    time.sleep(0.2)
+    rs, _, rb = call("GET", "/ready", None, None, base=f"http://127.0.0.1:{port}", auth=False)
+    check(f"{label}: /ready answers 503 while draining", rs == 503 and '"listener":"draining"' in rb, (rs, rb[:300]))
+    hs, _, _ = call("GET", "/health", None, None, base=f"http://127.0.0.1:{port}", auth=False)
+    check(f"{label}: /health stays ok while draining", hs == 200, hs)
+    out = first
+    try:
+        while True:
+            b = s.recv(65536)
+            if not b:
+                break
+            out += b
+    except OSError as e:
+        out += f"<{e}>".encode()
+    s.close()
+    text = out.decode(errors="replace")
+    check(f"{label}: the stream in flight at SIGTERM ends whole", "four" in text and "[DONE]" in text, text[-300:])
+    time.sleep(1.2)
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=2).close()
+        refused = False
+    except OSError:
+        refused = True
+    check(f"{label}: after shutdown_delay_seconds new connections are refused", refused)
+    try:
+        code = gw.wait(10)
+    except subprocess.TimeoutExpired:
+        gw.kill()
+        code = None
+    check(f"{label}: the gateway exits 0 once the requests in hand are done", code == 0, code)
+
+
+def l183_e2e(env):
+    """L183: the server lifecycle on both servers (its own gateways, 18322 and 18323). GET /ready reflects the
+    listener and the stores; a slow or silent client is timed out (408 on a half-sent head or body, a silent or idle
+    connection closed); a connection over server.max_connections is answered 503; SIGTERM drains: /ready 503,
+    the listener closes after the delay, a stream in flight ends whole, the process exits 0 (and with two bun workers)."""
+    import shutil
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    d = os.path.join(BUILD, "e2e-l183")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    limits = {"shutdown_grace_seconds": 8, "shutdown_delay_seconds": 1, "header_timeout_seconds": 1, "idle_timeout_seconds": 2, "body_timeout_seconds": 1}
+    gw = l183_start(env, "l183", 18322, l183_config(d, os.path.join(d, "logs"), limits))
+    try:
+        s, _, b = call("GET", "/ready", None, None, base="http://127.0.0.1:18322", auth=False)
+        check("/ready answers 200 with each component", s == 200 and json.loads(b) == {"status": "ready", "components": {"listener": "ok", "config": "ok", "logs_store": "ok", "audit": "off"}}, (s, b))
+        r, dt = l183_raw(18322, b"")
+        check("a silent connection is closed after header_timeout_seconds", r == b"" and 0.7 < dt < 3.0, (r[:60], dt))
+        r, dt = l183_raw(18322, b"GET /health HTTP/1.1\r\nHost: x\r\n")
+        check("a half-sent request head is answered 408", r.startswith(b"HTTP/1.1 408") and 0.7 < dt < 3.0, (r[:60], dt))
+        r, dt = l183_raw(18322, b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"model\":")
+        check("a body that stops arriving is answered 408", r.startswith(b"HTTP/1.1 408") and 0.7 < dt < 3.0, (r[:60], dt))
+        r, dt = l183_raw(18322, b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+        check("an idle keep-alive connection is closed after idle_timeout_seconds", r.startswith(b"HTTP/1.1 200") and 1.7 < dt < 4.0, (r[:60], dt))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "slowp/slow-l183", "stream": True, "messages": [{"role": "user", "content": "slow l183"}]}, None, base="http://127.0.0.1:18322", auth=False)
+        check("a stream longer than the timeouts' sweep is not cut", s == 200 and "[DONE]" in b, (s, b[-200:]))
+        l183_drain(gw, 18322, server)
+    finally:
+        if gw.poll() is None:
+            gw.terminate()
+        gw.wait()
+    # the cap, and a store that could not open
+    blocker = os.path.join(d, "blocker")
+    open(blocker, "w").write("a file, so a folder under it cannot be made")
+    gw2 = l183_start(env, "l183b", 18323, l183_config(d, os.path.join(blocker, "logs"), {"max_connections": 2}))
+    try:
+        s, _, b = call("GET", "/ready", None, None, base="http://127.0.0.1:18323", auth=False)
+        check("/ready answers 503 when the request log store could not open", s == 503 and '"logs_store":"failed"' in b and "request log store" in b, (s, b[:300]))
+        held = []
+        for _ in range(2):
+            h = socket.create_connection(("127.0.0.1", 18323), timeout=5)
+            h.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+            h.recv(4096)
+            held.append(h)
+        r, _ = l183_raw(18323, b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+        check("a connection over server.max_connections is answered 503", r.startswith(b"HTTP/1.1 503"), r[:80])
+        for h in held:
+            h.close()
+        time.sleep(0.5)
+        s, _, _ = call("GET", "/health", None, None, base="http://127.0.0.1:18323", auth=False)
+        check("below server.max_connections again, requests are served", s == 200, s)
+    finally:
+        gw2.terminate()
+        gw2.wait()
+    if server != "http1":
+        gw3 = l183_start(env, "l183w", 18322, l183_config(d, os.path.join(d, "logs-w"), limits), workers=2)
+        try:
+            l183_drain(gw3, 18322, "bun, 2 workers")
+        finally:
+            if gw3.poll() is None:
+                gw3.terminate()
+            gw3.wait()
+
+
 GW_L174 = "http://127.0.0.1:18300"  # L174: inference compatibility leftovers (extra params, auto_inject, listings, counts, Vertex pools, Stability extras, mocker on Responses, stream stop reasons)
 
 def l174_config() -> dict:
@@ -14720,6 +14871,9 @@ def main():
         # every key and regex: entries, the Anthropic count route, Vertex pools, Stability extras, the mocker on
         # Responses, streamed stop reasons): its own gateway (18300)
         l174_e2e(env)
+        # L183: the server lifecycle (SIGTERM drain, /ready, header/idle/body timeouts, the connection cap; Tov patch
+        # 0012): its own gateways (18322, 18323)
+        l183_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

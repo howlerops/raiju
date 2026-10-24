@@ -1,0 +1,199 @@
+// The server's lifecycle: a graceful stop on SIGTERM or SIGINT, the connection limits, and readiness (GET /ready).
+//
+// On a stop signal each process (every worker, with -workers) marks itself draining, so /ready answers 503;
+// after server.shutdown_delay_seconds it closes its listener (new connections are refused), waits up to
+// server.shutdown_grace_seconds from the signal for the requests and streams in hand to finish, sends what is
+// queued (exporter batches, retained content, traces, shared counters) and exits. Bifrost does the same on
+// SIGINT and SIGTERM (fasthttp's Shutdown, then its cleanup with a 30 s limit).
+import { ServerSectionConfig } from "./config"
+
+export const DEFAULT_GRACE_SECONDS = 25.0
+export const DEFAULT_HEADER_TIMEOUT_SECONDS = 10.0
+export const DEFAULT_IDLE_TIMEOUT_SECONDS = 60.0
+export const DEFAULT_BODY_TIMEOUT_SECONDS = 60.0
+// what is queued gets this long to go out once the requests have finished
+export const FLUSH_MS = 5000
+
+// The limits both servers apply, in seconds (0: none), and the connection cap per process (0: none).
+export type ServerLimits = { headerSeconds: f64, idleSeconds: f64, bodySeconds: f64, maxConnections: int }
+export type StopSettings = { graceMs: int, delayMs: int }
+
+function seconds(v: f64 | undefined, dflt: f64): f64 {
+  if (v === undefined) return dflt
+  return v > 0 ? v : 0.0
+}
+
+// server.max_connections: a number caps each process's open connections; unset or 0 is three quarters of the
+// process's descriptor limit (the rest stays for upstream connections, files and the stores); -1 is no cap.
+export function maxConnections(configured: int | undefined, fdLimit: int): int {
+  const c = configured ?? 0
+  if (c > 0) return c
+  if (c < 0 || fdLimit <= 0) return 0
+  return Math.max(16, Math.floor(fdLimit * 3 / 4))
+}
+
+export function serverLimits(s: ServerSectionConfig | undefined, fdLimit: int): ServerLimits {
+  return {
+    headerSeconds: seconds(s?.header_timeout_seconds, DEFAULT_HEADER_TIMEOUT_SECONDS),
+    idleSeconds: seconds(s?.idle_timeout_seconds, DEFAULT_IDLE_TIMEOUT_SECONDS),
+    bodySeconds: seconds(s?.body_timeout_seconds, DEFAULT_BODY_TIMEOUT_SECONDS),
+    maxConnections: maxConnections(s?.max_connections, fdLimit),
+  }
+}
+
+export function stopSettings(s: ServerSectionConfig | undefined): StopSettings {
+  return {
+    graceMs: Math.round(seconds(s?.shutdown_grace_seconds, DEFAULT_GRACE_SECONDS) * 1000),
+    delayMs: Math.round(seconds(s?.shutdown_delay_seconds, 0.0) * 1000),
+  }
+}
+
+// ---- state ----
+
+export class Lifecycle {
+  draining = false
+  signal = ""
+  stoppedAt = 0.0
+  flushed = false
+}
+
+const state = new Lifecycle()
+
+export function lifecycle(): Lifecycle {
+  return state
+}
+
+// ---- readiness ----
+
+// What /ready looks at. Each component is "ok", "off" (not configured) or a problem; listener is "ok" or "draining".
+export type ReadyInput = { listener: string, config: string, logsStore: string, audit: string }
+
+// A store that is enabled must be open; "off" is fine.
+function storeState(enabled: bool, open: bool): string {
+  if (!enabled) return "off"
+  return open ? "ok" : "failed"
+}
+
+export function readyInput(draining: bool, configProblem: string, logsEnabled: bool, logsOpen: bool, auditEnabled: bool, auditOpen: bool): ReadyInput {
+  return {
+    listener: draining ? "draining" : "ok",
+    config: configProblem === "" ? "ok" : configProblem,
+    logsStore: storeState(logsEnabled, logsOpen),
+    audit: storeState(auditEnabled, auditOpen),
+  }
+}
+
+// 200 {"status":"ready"} or 503 {"status":"not_ready","reasons":[...]}, with each component's state. A config
+// that could not be saved is reported but does not take the process out of rotation (requests are still served
+// right); a draining listener or a store that is on but could not open does.
+export function readyReport(i: ReadyInput): { status: int, body: string } {
+  const reasons: string[] = []
+  if (i.listener !== "ok") reasons.push("the server is shutting down")
+  if (i.logsStore === "failed") reasons.push("the request log store could not open")
+  if (i.audit === "failed") reasons.push("the audit log could not open")
+  const comps = JSON.stringify({ listener: i.listener, config: i.config, logs_store: i.logsStore, audit: i.audit })
+  if (reasons.length === 0) return { status: 200, body: `{"status":"ready","components":${comps}}` }
+  return { status: 503, body: `{"status":"not_ready","reasons":${JSON.stringify(reasons)},"components":${comps}}` }
+}
+
+// ---- the stop ----
+
+// What the stop needs from the server it runs on.
+export type StopHooks = {
+  stopListener: () => void,
+  open: () => int,
+  flush: () => Promise<void>,
+  exit: (code: int) => void,
+}
+
+// Where a drain stands after `elapsed` ms: go on waiting, or stop (everything finished, or the grace ran out).
+export function drainDone(open: int, elapsed: f64, graceMs: int): bool {
+  return open <= 0 || elapsed >= graceMs * 1.0
+}
+
+function sleep(ms: int): Promise<void> {
+  return new Promise<void>((resolve) => {
+    setTimeout(() => resolve(), ms)
+  })
+}
+
+async function flushInto(s: Lifecycle, flush: () => Promise<void>): Promise<void> {
+  await flush()
+  s.flushed = true
+}
+
+// Starts the graceful stop (once: a second signal while draining is only noted).
+export async function beginStop(signal: string, st: StopSettings, hooks: StopHooks): Promise<void> {
+  const s = lifecycle()
+  if (s.draining) {
+    console.error(`raiju: ${signal} again: still draining`)
+    return
+  }
+  s.draining = true
+  s.signal = signal
+  const t0 = performance.now()
+  s.stoppedAt = t0
+  console.error(`raiju: ${signal}: draining (pid ${process.pid}; /ready answers 503${st.delayMs > 0 ? `, new connections are taken for ${st.delayMs} ms more` : ""}; up to ${st.graceMs} ms for the requests in hand)`)
+  if (st.delayMs > 0) await sleep(Math.min(st.delayMs, st.graceMs))
+  hooks.stopListener()
+  while (!drainDone(hooks.open(), performance.now() - t0, st.graceMs)) await sleep(50)
+  const left = hooks.open()
+  if (left > 0) console.error(`raiju: ${signal}: ${left} connection${left === 1 ? "" : "s"} still open after ${st.graceMs} ms, closed`)
+  // what is queued goes out, within FLUSH_MS
+  flushInto(s, hooks.flush)
+  const f0 = performance.now()
+  while (!s.flushed && performance.now() - f0 < FLUSH_MS * 1.0) await sleep(20)
+  console.error(`raiju: ${signal}: stopped after ${Math.round(performance.now() - t0)} ms`)
+  hooks.exit(0)
+}
+
+test("the limits default to Go-like timeouts and a cap at three quarters of the descriptors", () => {
+  const l = serverLimits(undefined, 1024)
+  expect(l.headerSeconds).toBe(10.0)
+  expect(l.idleSeconds).toBe(60.0)
+  expect(l.bodySeconds).toBe(60.0)
+  expect(l.maxConnections).toBe(768)
+  const s: ServerSectionConfig = { header_timeout_seconds: 2.5, idle_timeout_seconds: 0.0, body_timeout_seconds: -1.0, max_connections: 50 }
+  const m = serverLimits(s, 1024)
+  expect(m.headerSeconds).toBe(2.5)
+  expect(m.idleSeconds).toBe(0.0)
+  expect(m.bodySeconds).toBe(0.0)
+  expect(m.maxConnections).toBe(50)
+  expect(maxConnections(-1, 1024)).toBe(0)
+  expect(maxConnections(undefined, 0)).toBe(0)
+  expect(maxConnections(0, 20)).toBe(16)
+})
+
+test("the stop settings default to a 25 s grace and no delay", () => {
+  const d = stopSettings(undefined)
+  expect(d.graceMs).toBe(25000)
+  expect(d.delayMs).toBe(0)
+  const s: ServerSectionConfig = { shutdown_grace_seconds: 3.0, shutdown_delay_seconds: 0.5 }
+  const t = stopSettings(s)
+  expect(t.graceMs).toBe(3000)
+  expect(t.delayMs).toBe(500)
+})
+
+test("ready: ok while serving, 503 while draining or when an enabled store could not open", () => {
+  const ok = readyReport(readyInput(false, "", true, true, false, false))
+  expect(ok.status).toBe(200)
+  expect(ok.body).toBe(`{"status":"ready","components":{"listener":"ok","config":"ok","logs_store":"ok","audit":"off"}}`)
+  const dr = readyReport(readyInput(true, "", false, false, false, false))
+  expect(dr.status).toBe(503)
+  expect(dr.body.includes(`"listener":"draining"`)).toBe(true)
+  expect(dr.body.includes("shutting down")).toBe(true)
+  const ls = readyReport(readyInput(false, "", true, false, true, false))
+  expect(ls.status).toBe(503)
+  expect(ls.body.includes("request log store")).toBe(true)
+  expect(ls.body.includes("audit log")).toBe(true)
+  // a config that could not be saved is reported, not fatal
+  const cf = readyReport(readyInput(false, "save failed: EROFS", false, false, false, false))
+  expect(cf.status).toBe(200)
+  expect(cf.body.includes(`"config":"save failed: EROFS"`)).toBe(true)
+})
+
+test("a drain ends when the connections are gone or the grace has run out", () => {
+  expect(drainDone(0, 10.0, 25000)).toBe(true)
+  expect(drainDone(2, 10.0, 25000)).toBe(false)
+  expect(drainDone(2, 25000.0, 25000)).toBe(true)
+})

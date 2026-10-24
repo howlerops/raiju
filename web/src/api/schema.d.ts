@@ -21,6 +21,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ready": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Readiness check (Raiju-only): whether this process should get traffic
+         * @description Raiju-only (Bifrost has /health alone). 503 while the process drains for a stop (SIGTERM or SIGINT: from the signal until it exits, see server.shutdown_grace_seconds and shutdown_delay_seconds), or when a store that is enabled could not open (logs_store, audit). A config change that could not be saved is reported in components.config but keeps the process ready. Use /health for liveness and /ready for readiness probes. With -workers, each worker answers for itself.
+         */
+        get: operations["getReady"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/metrics": {
         parameters: {
             query?: never;
@@ -5599,6 +5619,35 @@ export interface components {
             /** @example ok */
             status: string;
         };
+        /** @description Raiju-only. GET /ready's answer. */
+        ReadyResponse: {
+            /** @enum {string} */
+            status: "ready" | "not_ready";
+            /** @description Why the process is not ready (only when status is not_ready). */
+            reasons?: string[];
+            components: {
+                /**
+                 * @description ok, or draining once a stop signal came.
+                 * @example ok
+                 */
+                listener?: string;
+                /**
+                 * @description ok, or "save failed:" and why the last config change could not be written.
+                 * @example ok
+                 */
+                config?: string;
+                /**
+                 * @description ok, off (logs_store.enabled is not set) or failed (it could not open).
+                 * @example ok
+                 */
+                logs_store?: string;
+                /**
+                 * @description ok, off (audit.enabled is not set) or failed (it could not open).
+                 * @example off
+                 */
+                audit?: string;
+            };
+        };
         HealthTargets: {
             /** @description One entry per provider target: id, state and failure counters */
             targets: {
@@ -6754,6 +6803,35 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HealthResponse"];
+                };
+            };
+        };
+    };
+    getReady: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Ready */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReadyResponse"];
+                };
+            };
+            /** @description Not ready (draining, or a store that is on could not open) */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReadyResponse"];
                 };
             };
         };

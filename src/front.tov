@@ -2,18 +2,20 @@
 // the client chunk by chunk. Every request runs through the same dispatch() as
 // the Bun.serve server; streaming chat requests get a sink that writes SSE
 // events to the socket as they arrive from the upstream.
-import { listen, Http1Request, Http1Response, BodyQueue } from "./http1"
+import { serve, Http1Request, Http1Response, BodyQueue } from "./http1"
 import { WsConnection } from "./ws"
 import { Engine, StreamSink, errorResponse, noHeaders } from "./gateway"
 import { Ops } from "./ops"
-import { dispatch, compatPath, streamKind, streamsRequest, routeStream, pathLabel, http1Upgrade, largeFront, limitedBody } from "./server"
+import { dispatch, compatPath, streamKind, streamsRequest, routeStream, pathLabel, http1Upgrade, largeFront, limitedBody, Served } from "./server"
+import { ServerLimits } from "./lifecycle"
 import { TransportRun, transportStart, transportEnd, transportDone, transportSink } from "./pluginroute"
 import * as metrics from "./metrics"
 
 // streamThreshold: request bodies over this many bytes reach the handler as a stream (0: never; large_payload_optimization).
 // limitBytes: client.max_request_body_size_mb, checked by the handler when maxBodyBytes (the parser's) is looser than it.
 // limits: both read from the current config (a new connection's threshold, each request's limit), in place of the two.
-export type FrontOptions = { hostname: string, port: int, maxBodyBytes: int, streamThreshold?: int, limitBytes?: int, limits?: () => { limit: int, threshold: int } }
+// timeouts: the servers' header, idle and body timeouts and connection cap (lifecycle.tov).
+export type FrontOptions = { hostname: string, port: int, maxBodyBytes: int, streamThreshold?: int, limitBytes?: int, limits?: () => { limit: int, threshold: int }, timeouts?: ServerLimits }
 
 function pathOf(target: string): string {
   const q = target.indexOf("?")
@@ -168,7 +170,11 @@ async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request,
   }
 }
 
-export function startFront(engine: Engine, ops: Ops, opts: FrontOptions): string {
+function ms(seconds: f64): int {
+  return seconds > 0 ? Math.max(1, Math.round(seconds * 1000)) : 0
+}
+
+export function startFront(engine: Engine, ops: Ops, opts: FrontOptions): Served {
   const host = `${opts.hostname}:${opts.port}`
   const onUpgrade = (req: Http1Request, accept: (protocol: string) => WsConnection | undefined, reject: (status: int, body: string) => void): bool => {
     // every WebSocket route, the realtime relay among them (server.tov's wsUpgrade)
@@ -176,9 +182,17 @@ export function startFront(engine: Engine, ops: Ops, opts: FrontOptions): string
   }
   const lim = opts.limits
   const thresholdOf = lim === undefined ? undefined : () => lim().threshold
-  listen({ hostname: opts.hostname, port: opts.port, maxBodyBytes: opts.maxBodyBytes, streamThreshold: opts.streamThreshold, thresholdOf: thresholdOf, onUpgrade: onUpgrade }, (req, res) => {
+  const t = opts.timeouts
+  const limits = t === undefined ? undefined : { headerMs: ms(t.headerSeconds), idleMs: ms(t.idleSeconds), bodyMs: ms(t.bodySeconds), maxConnections: t.maxConnections }
+  const srv = serve({ hostname: opts.hostname, port: opts.port, maxBodyBytes: opts.maxBodyBytes, streamThreshold: opts.streamThreshold, thresholdOf: thresholdOf, onUpgrade: onUpgrade, limits: limits }, (req, res) => {
     // runs as its own task; the response is finished from there
     handle(engine, ops, host, req, res, lim !== undefined ? lim().limit : (opts.limitBytes ?? 0))
   })
-  return `http://${host}/`
+  return {
+    url: `http://${host}/`,
+    stopListener: () => {
+      srv.stop()
+    },
+    open: (): int => srv.open(),
+  }
 }

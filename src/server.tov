@@ -56,6 +56,7 @@ import { serveUi, uiPath, UI_CSP } from "./uiserve"
 import { TransportRun, transportStart, transportEnd, transportDone, transportSink, llmHooked, storageHooked, StorageCall, storageOp, pathWithId } from "./pluginroute"
 import { kindOfPath, isInferencePath } from "./plughttp"
 import { EXTRA_PARAMS_HEADER, EXTRA_PARAMS_CARRY, mergeExtraParams, extraParamsCarry } from "./extraparams"
+import { lifecycle, readyInput, readyReport, ServerLimits } from "./lifecycle"
 
 type ModelEntry = { id: string, object: string, created: int, owned_by: string }
 
@@ -781,7 +782,20 @@ async function cors(cfg: Config, req: Request, res: Response): Promise<Response>
   return new Response(res.status === 204 ? undefined : bytes, { status: res.status, headers: h })
 }
 
-export type ServeOptions = { port: int, hostname: string, workers: int, maxBodyBytes?: int }
+export type ServeOptions = { port: int, hostname: string, workers: int, maxBodyBytes?: int, limits: ServerLimits }
+
+// A running server, for the graceful stop (lifecycle.tov): its address, closing its listener, and the connections
+// this process still holds.
+export type Served = { url: string, stopListener: () => void, open: () => int }
+
+// GET /ready: 503 while this process drains for a stop, or when a store that is on could not open; /health stays
+// the liveness answer (always ok while the process serves).
+function readyResponse(engine: Engine, ops: Ops): Response {
+  const cfg = engine.cfg
+  const saveError = ops.store.saveError
+  const r = readyReport(readyInput(lifecycle().draining, saveError === "" ? "" : `save failed: ${saveError}`, cfg.logs_store?.enabled === true, engine.logStore !== undefined, cfg.audit?.enabled === true, ops.audit !== undefined))
+  return new Response(r.body, { status: r.status, headers: { "content-type": "application/json" } })
+}
 
 // The servers' own cap, so the gateway's checks (which follow the config) decide.
 export const NO_BODY_LIMIT = 1099511627776
@@ -1111,6 +1125,7 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
     const aid = req.headers.get("x-bf-async-id") ?? ""
     if (aid !== "" && !p.startsWith("/api/")) return sdkAsyncPoll(engine.jobs, p.slice(1, p.byteLength), aid)
     if (p === "/health") return Response.json({ status: "ok" })
+    if (p === "/ready") return readyResponse(engine, ops)
     if (uiPath(p)) {
       const ui = uiResponse(p, req)
       if (ui !== undefined) return ui
@@ -1576,11 +1591,18 @@ async function bunHttp(engine: Engine, ops: Ops, req00: Request, limit: int): Pr
 
 // The Bun.serve server (the default): streamed chat answers, Tov's multi-process workers,
 // native WebSockets.
-export function start(engine: Engine, ops: Ops, opts: ServeOptions): string {
+export function start(engine: Engine, ops: Ops, opts: ServeOptions): Served {
+  const lim = opts.limits
   const server = Bun.serve<Session>({
     port: opts.port,
     hostname: opts.hostname,
     workers: opts.workers,
+    // slow or silent clients (lifecycle.tov): a head within header_timeout_seconds, a body that keeps arriving, an
+    // idle keep-alive connection closed after idle_timeout_seconds, and at most max_connections per process
+    headerTimeout: lim.headerSeconds,
+    idleTimeout: lim.idleSeconds,
+    bodyTimeout: lim.bodySeconds,
+    maxConnections: lim.maxConnections,
     // bodies over the request threshold arrive as a stream (large_payload_optimization's, or the body limit when the
     // feature is off), and the sizes are checked by the gateway against the current config, so a reload moves them
     // (client.max_request_body_size_mb, large_payload_optimization.max_payload_bytes). The server's own threshold is
@@ -1614,7 +1636,13 @@ export function start(engine: Engine, ops: Ops, opts: ServeOptions): string {
       },
     },
   })
-  return server.url.href
+  return {
+    url: server.url.href,
+    stopListener: () => {
+      server.stop()
+    },
+    open: (): int => server.openConnections,
+  }
 }
 
 test("compat paths: the unversioned OpenAI family and the Cursor prefix", () => {

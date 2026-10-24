@@ -1,5 +1,5 @@
 #!/bin/sh
-# Checks patches 0001-0010 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
+# Checks patches 0001-0010 and 0012 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
 # (or `make tov-test`). Each program prints "ok" lines and "FAIL" lines; a run passes when no line
 # fails and the expected number of "ok" lines appears.
 set -eu
@@ -132,5 +132,10 @@ expect "$OUT/socket_pause.out" 2 "Socket.pause"
 TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/fs_atomic.tov" -o "$OUT/fs_atomic" >/dev/null
 "$OUT/fs_atomic" > "$OUT/fs_atomic.out"
 expect "$OUT/fs_atomic.out" 17 "node:fs rename and fsync"
+
+# Bun.serve's timeouts and connection cap, the spare descriptor, Bun.onStopSignal with and without workers (patch 0012)
+TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/server_lifecycle.tov" -o "$OUT/server_lifecycle" >/dev/null
+python3 "$DIR/server_lifecycle_client.py" "$OUT/server_lifecycle" "$OUT" > "$OUT/server_lifecycle_client.out" || true
+expect "$OUT/server_lifecycle_client.out" 18 "Bun.serve timeouts, connection cap and graceful stop"
 
 echo "tov-patches tests passed"

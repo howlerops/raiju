@@ -1,0 +1,560 @@
+diff --git a/crates/tov/src/check/builtins.rs b/crates/tov/src/check/builtins.rs
+index 065973d..03fcd5e 100644
+--- a/crates/tov/src/check/builtins.rs
++++ b/crates/tov/src/check/builtins.rs
+@@ -41,6 +41,14 @@ pub(super) fn native_sig(types: &mut Types, name: &str) -> Option<(Vec<TyId>, Ty
+         }
+         "httpPort" => (vec![INT], INT),
+         "httpStop" => (vec![INT, BOOL], VOID),
++        "httpLimits" => (vec![INT, INT, INT, INT, INT], VOID),
++        "httpOpen" => (vec![INT], INT),
++        "httpFdLimit" => (vec![], INT),
++        "httpOnSignal" => {
++            let p = |ty| FnParam { ty, inout: false, optional: false };
++            let handler = types.func(vec![p(STR)], VOID);
++            (vec![handler], VOID)
++        }
+         "httpWorkers" => (vec![INT], VOID),
+         "urlParse" => (vec![STR, STR], str_arr),
+         "urlDecode" => (vec![STR, BOOL], STR),
+diff --git a/crates/tov/src/std/http.tov b/crates/tov/src/std/http.tov
+index 7507eb2..b1f9746 100644
+--- a/crates/tov/src/std/http.tov
++++ b/crates/tov/src/std/http.tov
+@@ -1244,6 +1244,12 @@ export class Server<T = undefined> {
+   stop(closeActiveConnections?: bool): void {
+     __native.httpStop(this.id, closeActiveConnections ?? false)
+   }
++
++  // Tov: the connections this process holds open (WebSocket ones excepted); after stop(), they
++  // close as their requests finish.
++  get openConnections(): int {
++    return __native.httpOpen(this.id)
++  }
+ }
+ 
+ /* What a handler answers with: a response, or (an async handler) a promise of one; nothing once
+@@ -1281,6 +1287,23 @@ export type ServeOptions<T = undefined> = {
+   // Bun: the most a request body may have, in bytes (default 64 MiB). A declared length over it is
+   // answered 413 at once; a chunked body that grows past it fails its stream.
+   maxRequestBodySize?: int
++  // Seconds a connection with no request in hand may stay open (Bun's name; 0 or unset: no limit).
++  // Unlike Bun's, a request being handled is never timed out: a slow answer keeps its connection.
++  idleTimeout?: number
++  // Tov: seconds a request head may take from its first byte (on a new connection, from the
++  // accept), and seconds a request body may go without a byte arriving. A request that runs out is
++  // answered 408 and its connection closed (0 or unset: no limit).
++  headerTimeout?: number
++  bodyTimeout?: number
++  // Tov: the most connections each process holds; a request on a connection over it is answered 503
++  // and the connection closed (0 or unset: no limit). Out of descriptors, a connection is answered
++  // 503 at once either way.
++  maxConnections?: int
++}
++
++function millis(seconds: number | undefined): int {
++  const s = seconds ?? 0
++  return s > 0 ? Math.max(1, Math.round(s * 1000)) : 0
+ }
+ 
+ // A route with `:name` segments or a trailing `*`.
+@@ -1512,6 +1535,7 @@ export function serve<T = undefined>(options: ServeOptions<T>): Server<T> {
+   }
+   __native.httpWorkers(options.workers ?? 1)
+   __native.httpBodyOptions(id, options.bodyStreamThreshold ?? 0, options.maxRequestBodySize ?? 0)
++  __native.httpLimits(id, millis(options.headerTimeout), millis(options.idleTimeout), millis(options.bodyTimeout), options.maxConnections ?? 0)
+   server.bound(id, __native.httpPort(id))
+   return server
+ }
+@@ -3141,4 +3165,17 @@ export class Bun {
+   static udpSocket<T = undefined>(options: UDPSocketOptions<T>): Promise<UDPSocket<T>, Error> {
+     return udpSocket(options)
+   }
++
++  // Tov: SIGTERM and SIGINT call `f` with the signal's name, on the event loop, instead of ending
++  // the process: it can stop its servers, let the requests in hand finish, and exit. With
++  // `workers`, the supervisor forwards them to every worker, and each worker calls `f`; the
++  // supervisor stops accepting connections and exits once the workers have.
++  static onStopSignal(f: (signal: string) => void): void {
++    __native.httpOnSignal(f)
++  }
++
++  // Tov: the process's limit on open descriptors (RLIMIT_NOFILE's soft limit; 0 when unlimited).
++  static fdLimit(): int {
++    return __native.httpFdLimit()
++  }
+ }
+diff --git a/docs/spec.md b/docs/spec.md
+index 26bc19d..d5bbbf8 100644
+--- a/docs/spec.md
++++ b/docs/spec.md
+@@ -194,7 +194,7 @@ const server = Bun.serve({
+ })
+ console.log(`Listening on ${server.url}`)
+ ```
+-- **Serving.** `Bun.serve` binds right away (an unusable port prints the error and exits, as an uncaught error does in Bun) and returns a `Server` (`port`, `hostname`, `url`, `stop(closeActive?)`); requests are served once the script's top level (or `main`) has finished, until every server is stopped. `workers: n` (Tov only) forks `n` processes sharing the sockets, supervised: a worker that dies is replaced, and SIGTERM/SIGINT stop them all.
++- **Serving.** `Bun.serve` binds right away (an unusable port prints the error and exits, as an uncaught error does in Bun) and returns a `Server` (`port`, `hostname`, `url`, `stop(closeActive?)`); requests are served once the script's top level (or `main`) has finished, until every server is stopped. `workers: n` (Tov only) forks `n` processes sharing the sockets, supervised: a worker that dies is replaced, and SIGTERM/SIGINT stop them all. Limits (seconds; unset or 0: none): `headerTimeout` (a request head from its first byte, or a new connection from its accept), `bodyTimeout` (a body going without a byte) — both answer 408 and close — and `idleTimeout` (a connection with no request in hand; a request being handled is never timed out, unlike Bun's); `maxConnections` (Tov) answers requests on connections past it per process with 503, and out of descriptors a connection is answered 503 at once from a spare descriptor instead of the loop spinning on the listener. `server.openConnections` (Tov) counts the process's open connections. `Bun.onStopSignal(fn)` (Tov) makes SIGTERM and SIGINT call `fn(name)` on the loop instead of ending the process (in every worker, re-armed after the fork; the supervisor forwards the signal, closes its copy of the listeners, and exits 0 once every worker has exited cleanly), so a program can `stop()` its servers, let the requests in hand finish and exit. `Bun.fdLimit()` (Tov) is the soft RLIMIT_NOFILE.
+ - **Routing** as in Bun: exact paths first, then `:param` and `/*` routes; a route is a `Response`, a handler, or an object of per-method handlers (`GET`, `POST`, ...; others fall through to `fetch`). `req.params` is typed from the route. Unmatched requests go to `fetch`, else `404`.
+ - **Handlers** return a `Response`, or (`async`) a promise of one: their type is `(req, server) => Response | Promise<Response, Error> throws Error`. A synchronous response is written at once; an async one when its promise settles, and responses on a connection still go out in request order (pipelining works either way).
+ - **Errors.** A handler that throws (or whose promise rejects) is logged to stderr and answered by `error(err)` if given, else `500 Something went wrong!`, like Bun in production.
+diff --git a/runtime/net.c b/runtime/net.c
+index c8100fe..28e0f14 100644
+--- a/runtime/net.c
++++ b/runtime/net.c
+@@ -743,6 +743,19 @@ tv_int tv_native_netBuffered(tv_int id) {
+ 
+ /* ---- listening */
+ 
++/* Out of descriptors (EMFILE), a listener stays readable and the loop would spin on it: the
++ * descriptor kept spare for this is let go to take the connection and close it. */
++static int tv_nl_spare = -1;
++
++static bool tv_nl_shed(int lfd) {
++    if (tv_nl_spare < 0) return false;
++    close(tv_nl_spare);
++    int fd = accept(lfd, NULL, NULL);
++    if (fd >= 0) close(fd);
++    tv_nl_spare = open("/dev/null", O_RDONLY | O_CLOEXEC);
++    return fd >= 0;
++}
++
+ static void tv_nl_ready(tv_io *h, bool readable, bool writable, bool broken) {
+     (void)writable; (void)broken;
+     tv_nl *l = (tv_nl *)h;
+@@ -755,6 +768,7 @@ static void tv_nl_ready(tv_io *h, bool readable, bool writable, bool broken) {
+ #endif
+         if (fd < 0) {
+             if (errno == EINTR || errno == ECONNABORTED) continue;
++            if ((errno == EMFILE || errno == ENFILE) && tv_nl_shed(l->fd)) continue;
+             return;
+         }
+ #ifndef __linux__
+@@ -789,6 +803,7 @@ static void tv_nl_ready(tv_io *h, bool readable, bool writable, bool broken) {
+ /* netListen(host, port, cert, key, onAccept) -> listener id, or -1 (the reason in takeError). */
+ tv_int tv_native_netListen(tv_str host, tv_int port, tv_str cert, tv_str key, tv_str unix_path, tv_fn on_accept) {
+     tv_net_hooks();
++    if (tv_nl_spare < 0) tv_nl_spare = open("/dev/null", O_RDONLY | O_CLOEXEC);
+     void *tls = NULL;
+     if (cert.p->len || key.p->len) {
+         if (!tv_tls_impl) { snprintf(tv_net_err, sizeof tv_net_err, "TLS isn't linked into this program"); return -1; }
+diff --git a/runtime/tov.c b/runtime/tov.c
+index c0f7c71..c54334a 100644
+--- a/runtime/tov.c
++++ b/runtime/tov.c
+@@ -3967,6 +3967,7 @@ void tv_async_run(void) {
+ #include <sys/socket.h>
+ #include <sys/mman.h>
+ #include <sys/wait.h>
++#include <sys/resource.h>
+ #if defined(__APPLE__)
+ #include <malloc/malloc.h>
+ #elif defined(__GLIBC__)
+@@ -4002,6 +4003,12 @@ typedef struct tv_http_conn {
+     struct tv_http_req *pend_head, *pend_tail;
+     int npending;
+     struct tv_http_bs *rx;   /* the request body being received as a stream (see tv_http_bs) */
++    /* the server's timeouts (tv_http_sweep): loop milliseconds of the last read, of the last write
++     * progress, and of the first byte of the request being read (or of the accept) */
++    uint64_t at_read, at_write, at_req;
++    bool wait_head;       /* the input holds part of a request head (not of a body) */
++    bool served;          /* a request was read on it */
++    bool reject;          /* accepted over the server's maxConnections: its request is answered 503 */
+ } tv_http_conn;
+ 
+ /* A request whose response isn't written yet: its handler returned a promise (it has an id for
+@@ -4058,6 +4065,9 @@ typedef struct tv_http_server {
+     bool node_errors;    /* malformed requests are answered as Node.js's http answers them */
+     int64_t stream_threshold;   /* bodies over this many bytes reach the handler as a stream (0: never) */
+     int64_t max_body;           /* the most a request body may have (0: TV_HTTP_MAX_BODY) */
++    /* (httpLimits) milliseconds a request head may take, a keep-alive connection may idle, and a body
++     * may go without a byte; the most connections this process holds (0: no limit for each) */
++    int64_t header_ms, idle_ms, body_ms, max_conns;
+ } tv_http_server;
+ 
+ #define TV_HTTP_MAX_SERVERS 64
+@@ -4066,6 +4076,7 @@ static int tv_http_nservers, tv_http_active;
+ static tv_int tv_http_want_workers = 1;
+ static int tv_http_q = -1;               /* the event loop's kqueue/epoll (created on first use) */
+ static tv_http_conn *tv_http_conns;      /* open connections (for stop) */
++static int64_t tv_http_nconns;          /* how many (maxConnections) */
+ static tv_http_conn *tv_http_cur;       /* the connection whose request is being handled */
+ static bool tv_http_keep;               /* the current request allows keep-alive */
+ static bool tv_http_head;               /* the current request is HEAD: send headers only */
+@@ -4837,11 +4848,14 @@ static bool tv_http_process(tv_http_conn *c) {
+             if (q + 2 < start + avail && q[1] == '\r' && q[2] == '\n') { hdr_end = q + 3; break; }
+             if (q + 1 < start + avail && q[1] == '\n') { hdr_end = q + 2; break; }
+         }
++        c->wait_head = true;
+         if (!hdr_end) {
+             if (avail > TV_HTTP_MAX_HEAD) tv_http_fail(c, "431 Request Header Fields Too Large");
+             break;
+         }
+         if ((size_t)(hdr_end - start) > TV_HTTP_MAX_HEAD) { tv_http_fail(c, "431 Request Header Fields Too Large"); break; }
++        /* over the server's connection cap: the request is shed */
++        if (c->reject) { tv_http_fail(c, "503 Service Unavailable"); break; }
+         /* Request line: METHOD SP TARGET SP HTTP/1.x CRLF */
+         char *line_end = memchr(start, '\n', (size_t)(hdr_end - start));
+         char *eol = line_end > start && line_end[-1] == '\r' ? line_end - 1 : line_end;
+@@ -4902,6 +4916,7 @@ static bool tv_http_process(tv_http_conn *c) {
+             if (n == 0) {
+                 tv_sb_free(&sb);
+                 if (expect && !c->continued) { tv_http_out(c, "HTTP/1.1 100 Continue\r\n\r\n", 25); c->continued = true; }
++                c->wait_head = false;
+                 break;
+             }
+             consumed = (size_t)(hdr_end - start) + (size_t)n;
+@@ -4910,12 +4925,14 @@ static bool tv_http_process(tv_http_conn *c) {
+             if (clen < 0) clen = 0;
+             if ((size_t)(in_end - hdr_end) < (size_t)clen) {
+                 if (expect && !c->continued) { tv_http_out(c, "HTTP/1.1 100 Continue\r\n\r\n", 25); c->continued = true; }
++                c->wait_head = false;
+                 break; /* body incomplete */
+             }
+             consumed = (size_t)(hdr_end - start) + (size_t)clen;
+             body = clen ? tv_str_from(hdr_end, (size_t)clen) : TV_EMPTY_STR;
+         }
+         c->continued = false;
++        c->served = true;
+         size_t mlen = (size_t)(sp1 - start);
+         tv_str method = mlen == 3 && memcmp(start, "GET", 3) == 0 ? TV_LIT(tv_lit_get) : mlen == 4 && memcmp(start, "POST", 4) == 0 ? TV_LIT(tv_lit_post) : tv_str_from(start, mlen);
+         tv_str target = tv_str_from(sp1 + 1, (size_t)(sp2 - sp1 - 1));
+@@ -4948,6 +4965,7 @@ static bool tv_http_process(tv_http_conn *c) {
+     if (pos) {
+         memmove(c->in, c->in + pos, c->in_len - pos);
+         c->in_len -= pos;
++        if (c->in_len) c->at_req = tv_loop_now();   /* what is left is the next request's start */
+     }
+     return true;
+ }
+@@ -4961,6 +4979,7 @@ static bool tv_http_flush(tv_http_conn *c) {
+             return false;
+         }
+         c->out_off += (size_t)w;
++        c->at_write = tv_loop_now();
+     }
+     c->out_off = c->out_len = 0;
+     return true;
+@@ -4975,6 +4994,7 @@ static void tv_http_close(tv_http_conn *c) { tv_http_release(c, true); }
+ /* Forgets connection c (closing its fd unless it was taken over). */
+ static void tv_http_release(tv_http_conn *c, bool close_fd) {
+     tv_http_load_add(-1);
++    tv_http_nconns--;
+     if (c->dirty) {
+         for (tv_http_conn **pp = &tv_http_dirty; *pp; pp = &(*pp)->dirty_next)
+             if (*pp == c) { *pp = c->dirty_next; break; }
+@@ -5100,16 +5120,43 @@ static void tv_http_watch_listener(tv_http_server *sv) {
+ #endif
+ }
+ 
++/* Out of descriptors (EMFILE): the listener stays readable, so the loop would spin on it. The
++ * descriptor kept spare for this is let go to take the connection, which is answered 503 and
++ * closed, and taken back. */
++static int tv_http_spare_fd = -1;
++
++static void tv_http_spare(void) {
++    if (tv_http_spare_fd < 0) tv_http_spare_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
++}
++
++static bool tv_http_shed(int lfd) {
++    if (tv_http_spare_fd < 0) return false;
++    close(tv_http_spare_fd);
++    tv_http_spare_fd = -1;
++    int fd = accept(lfd, NULL, NULL);
++    if (fd >= 0) {
++        static const char busy[] = "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nretry-after: 1\r\nconnection: close\r\n\r\n";
++        (void)!write(fd, busy, sizeof busy - 1);
++        close(fd);
++    }
++    tv_http_spare();
++    return fd >= 0;
++}
++
+ static void tv_http_accept(tv_http_server *sv) {
+     while (sv->fd >= 0 && tv_http_may_accept()) {
+         /* (close-on-exec: a child the program starts, ffmpeg say, mustn't keep its connections:
+          * on Linux, epoll keeps reporting a socket closed here while a child holds a copy) */
+ #ifdef __linux__
+         int fd = accept4(sv->fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+-        if (fd < 0) break;
+ #else
+         int fd = accept(sv->fd, NULL, NULL);
+-        if (fd < 0) break;
++#endif
++        if (fd < 0) {
++            if ((errno == EMFILE || errno == ENFILE) && tv_http_shed(sv->fd)) continue;
++            break;
++        }
++#ifndef __linux__
+         fcntl(fd, F_SETFD, FD_CLOEXEC);
+         fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+ #endif
+@@ -5121,6 +5168,9 @@ static void tv_http_accept(tv_http_server *sv) {
+         nc->fd = fd;
+         nc->srv = sv;
+         nc->want_read = true;
++        nc->at_read = nc->at_write = nc->at_req = tv_loop_now();
++        nc->reject = sv->max_conns > 0 && tv_http_nconns >= sv->max_conns;
++        tv_http_nconns++;
+         nc->next = tv_http_conns;
+         if (tv_http_conns) tv_http_conns->prev = nc;
+         tv_http_conns = nc;
+@@ -5141,6 +5191,7 @@ static bool tv_http_service(tv_http_conn *c, bool readable, bool broken) {
+     bool ok = !broken;
+     tv_http_attach(c);
+     if (readable && c->want_read) {
++        bool fresh = c->in_len == 0;
+         for (;;) {
+             if (c->in_cap - c->in_len < 4096) {
+                 size_t cap = c->in_cap ? c->in_cap * 2 : 8192;
+@@ -5160,6 +5211,8 @@ static bool tv_http_service(tv_http_conn *c, bool readable, bool broken) {
+              * would only return EAGAIN (one syscall per request saved). */
+             if (r > 0) {
+                 c->in_len += (size_t)r;
++                c->at_read = tv_loop_now();
++                if (fresh) { c->at_req = c->at_read; fresh = false; }
+                 /* (a streamed body is read a piece at a time, so the program can keep up; a big one is
+                  * recognised from its head, so not much more than the threshold is read before that) */
+                 int64_t cap = c->srv->stream_threshold > 0 ? c->srv->stream_threshold + 2 * TV_HTTP_MAX_HEAD : tv_http_maxbody(c) + TV_HTTP_MAX_HEAD;
+@@ -5215,6 +5268,7 @@ static bool tv_http_service(tv_http_conn *c, bool readable, bool broken) {
+         epoll_ctl(tv_http_q, EPOLL_CTL_MOD, c->fd, &wev);
+     }
+ #endif
++    if (want_write && !c->want_write) c->at_write = tv_loop_now();   /* (the send timeout runs from here) */
+     c->want_write = want_write;
+     c->want_read = want_read;
+     return true;
+@@ -5229,10 +5283,123 @@ static bool tv_http_alive(void) {
+         || (tv_loop_for_timers && tv_live_timers > 0);
+ }
+ 
++/* ---- stop signals (httpOnSignal): SIGTERM and SIGINT call the program's function on the loop
++ * instead of ending the process, so it can stop its servers and let the requests in hand finish.
++ * The handler writes the signal to a pipe the loop watches. Each process that runs the loop (every
++ * worker, after the fork) arms its own pipe; the supervisor keeps forwarding the signals. */
++static tv_fn tv_http_sig_fn;
++static int tv_http_sig_pipe[2] = {-1, -1};
++static pid_t tv_http_sig_pid;           /* the process the pipe was made in */
++static tv_io tv_http_sig_io;
++
++static void tv_http_sig_caught(int sig) {
++    int saved = errno;
++    unsigned char b = (unsigned char)sig;
++    (void)!write(tv_http_sig_pipe[1], &b, 1);
++    errno = saved;
++}
++
++static void tv_http_sig_ready(tv_io *h, bool readable, bool writable, bool broken) {
++    (void)h; (void)readable; (void)writable; (void)broken;
++    unsigned char buf[16];
++    ssize_t got;
++    while ((got = read(tv_http_sig_pipe[0], buf, sizeof buf)) > 0) {
++        for (ssize_t i = 0; i < got; i++) {
++            if (!tv_http_sig_fn.fn) continue;
++            const char *name = buf[i] == SIGINT ? "SIGINT" : "SIGTERM";
++            tv_str s = tv_str_from(name, strlen(name));
++            ((void (*)(void *, tv_str))tv_http_sig_fn.fn)(tv_http_sig_fn.env, s);
++            tv_str_release(s);
++            tv_run_microtasks();
++        }
++    }
++}
++
++static void tv_http_sig_arm(void) {
++    if (!tv_http_sig_fn.fn || tv_http_sig_pid == getpid()) return;
++    /* (a pipe inherited through fork is the parent's: each process reads its own) */
++    for (int i = 0; i < 2; i++) if (tv_http_sig_pipe[i] >= 0) { close(tv_http_sig_pipe[i]); tv_http_sig_pipe[i] = -1; }
++    if (pipe(tv_http_sig_pipe) != 0) return;
++    for (int i = 0; i < 2; i++) {
++        fcntl(tv_http_sig_pipe[i], F_SETFL, fcntl(tv_http_sig_pipe[i], F_GETFL) | O_NONBLOCK);
++        fcntl(tv_http_sig_pipe[i], F_SETFD, FD_CLOEXEC);
++    }
++    tv_http_sig_pid = getpid();
++    tv_http_sig_io.ready = tv_http_sig_ready;
++    tv_io_add(tv_http_sig_pipe[0], &tv_http_sig_io, true, false);   /* (it doesn't keep the loop running) */
++    struct sigaction sa;
++    memset(&sa, 0, sizeof sa);
++    sa.sa_handler = tv_http_sig_caught;
++    sa.sa_flags = SA_RESTART;
++    sigemptyset(&sa.sa_mask);
++    sigaction(SIGTERM, &sa, NULL);
++    sigaction(SIGINT, &sa, NULL);
++}
++
++void tv_native_httpOnSignal(tv_fn fn) {
++    tv_env_retain(fn.env);   /* kept for the life of the program */
++    tv_http_sig_fn = fn;
++    tv_http_sig_pid = 0;
++    tv_http_sig_arm();
++}
++
++/* ---- the servers' timeouts (httpLimits): a sweep every TV_HTTP_SWEEP_MS while a server has one */
++
++#define TV_HTTP_SWEEP_MS 250
++static bool tv_http_timeouts;           /* some server has a timeout */
++static uint64_t tv_http_sweep_due;
++
++/* A connection that ran out of time: a request that was being read is answered 408 first (best
++ * effort: the socket takes it or it is lost), then the connection closes. Runs between event
++ * batches, so closing at once is safe. */
++static void tv_http_expire(tv_http_conn *c, bool answer) {
++    if (answer) {
++        static const char late[] = "HTTP/1.1 408 Request Timeout\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
++        (void)!write(c->fd, late, sizeof late - 1);
++    }
++    tv_http_close(c);
++}
++
++/* Applies each server's limits: a request head must arrive within header_ms of its first byte (a
++ * new connection: of its accept), a body must not go body_ms without a byte, a connection with no
++ * request in hand closes after idle_ms, and output the client doesn't take for idle_ms ends the
++ * connection. A request being handled (an answer pending or streaming) has no limit here. */
++static void tv_http_sweep(uint64_t now) {
++    for (tv_http_conn *c = tv_http_conns, *next; c; c = next) {
++        next = c->next;
++        const tv_http_server *sv = c->srv;
++        if (c->taken || c->dirty) continue;
++        if (c->out_len > 0) {
++            if (sv->idle_ms && now - c->at_write > (uint64_t)sv->idle_ms) tv_http_expire(c, false);
++            continue;
++        }
++        tv_http_bs *rx = c->rx;
++        if (rx && !rx->discard && !rx->done && !rx->fail) {
++            /* (a reader that stopped taking the body paused it: that is not the client's doing) */
++            if (!rx->paused && sv->body_ms && now - c->at_read > (uint64_t)sv->body_ms) tv_http_expire(c, false);
++            continue;
++        }
++        if (c->npending > 0) continue;
++        if (c->in_len == 0) {
++            uint64_t last = c->at_read > c->at_write ? c->at_read : c->at_write;
++            if (!c->served) {
++                if (sv->header_ms && now - c->at_req > (uint64_t)sv->header_ms) tv_http_expire(c, false);
++            } else if (sv->idle_ms && now - last > (uint64_t)sv->idle_ms) {
++                tv_http_expire(c, false);
++            }
++        } else if (c->wait_head) {
++            if (sv->header_ms && now - c->at_req > (uint64_t)sv->header_ms) tv_http_expire(c, true);
++        } else if (sv->body_ms && now - c->at_read > (uint64_t)sv->body_ms) {
++            tv_http_expire(c, true);
++        }
++    }
++}
++
+ /* Runs the event loop until every server has stopped and its connections have closed; timers
+  * and microtasks run in it too. */
+ static void tv_http_loop(void) {
+     tv_loop_queue();
++    tv_http_sig_arm();
+     tv_loop_work(tv_loop_update());   /* (starting up is work: its garbage goes once idle) */
+ #ifdef TV_KQUEUE
+     struct kevent events[256];
+@@ -5271,6 +5438,10 @@ static void tv_http_loop(void) {
+         uint64_t host = tv_loop_host(now_ms, waits), idle = tv_loop_idle_due();
+         if (host && (!due || host < due)) due = host;
+         if (idle && (!due || idle < due)) due = idle;
++        if (tv_http_timeouts && tv_http_conns) {
++            if (!tv_http_sweep_due) tv_http_sweep_due = now_ms + TV_HTTP_SWEEP_MS;
++            if (!due || tv_http_sweep_due < due) due = tv_http_sweep_due;
++        }
+ #ifdef TV_KQUEUE
+         struct kevent tch;
+         int nch = 0;
+@@ -5294,6 +5465,7 @@ static void tv_http_loop(void) {
+ #endif
+         if (n < 0) { if (errno == EINTR) continue; break; }
+         tv_http_refresh_date();
++        if (tv_http_timeouts) tv_loop_update();   /* (the connections' times are read from it) */
+         if (timed) tv_fire_timers();
+         bool worked = false;
+         for (int i = 0; i < n; i++) {
+@@ -5340,6 +5512,10 @@ static void tv_http_loop(void) {
+         }
+         if (tv_io_after_batch) tv_io_after_batch();
+         if (tv_http_ngone) tv_http_flush_gone();
++        if (tv_http_sweep_due && tv_loop_update() >= tv_http_sweep_due) {
++            tv_http_sweep_due = 0;
++            tv_http_sweep(tv_loop_ms);
++        }
+         tv_run_microtasks();
+         tv_loop_run_check();
+         if (worked) tv_loop_work(tv_loop_update());
+@@ -5443,9 +5619,22 @@ static void tv_http_supervise(tv_int workers) {
+     }
+     if (!tv_http_stop_sig) return; /* every worker finished */
+     int sig = tv_http_stop_sig ? tv_http_stop_sig : SIGTERM;
++    /* the workers stop their own copies of the listeners (or die); this one's copy mustn't keep the
++     * port accepting connections nobody serves */
++    for (int i = 0; i < tv_http_nservers; i++)
++        if (tv_http_servers[i].fd >= 0) { close(tv_http_servers[i].fd); tv_http_servers[i].fd = -1; }
+     for (tv_int w = 0; w < workers; w++) if (kids[w] > 0) kill(kids[w], SIGTERM);
+-    while (waitpid(-1, NULL, 0) > 0 || errno == EINTR) {}
++    /* workers that handled the signal (onStopSignal) and exited cleanly make this a clean exit */
++    bool clean = true;
++    for (;;) {
++        int st;
++        pid_t pid = waitpid(-1, &st, 0);
++        if (pid > 0) { if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) clean = false; continue; }
++        if (errno == EINTR) continue;
++        break;
++    }
+     tv_out_flush();
++    if (clean && tv_http_sig_fn.fn) _exit(0);
+     signal(sig, SIG_DFL);
+     raise(sig);
+     _exit(128 + sig);
+@@ -5513,6 +5702,7 @@ tv_int tv_native_httpListen(tv_int port, tv_str host, tv_fn handler) {
+     getsockname(lfd, (struct sockaddr *)&ss, &len);
+     uint16_t bound = v6 ? ((struct sockaddr_in6 *)&ss)->sin6_port : ((struct sockaddr_in *)&ss)->sin_port;
+     int id = tv_http_nservers++;
++    tv_http_spare();
+     tv_env_retain(handler.env); /* kept for the life of the program */
+     tv_http_servers[id] = (tv_http_server){ .fd = lfd, .port = ntohs(bound), .handler = handler };
+     tv_http_active++;
+@@ -5540,6 +5730,33 @@ void tv_native_httpStop(tv_int id, bool force) {
+     }
+ }
+ 
++/* The server's limits (milliseconds; 0: none): see tv_http_sweep and maxConnections. */
++void tv_native_httpLimits(tv_int id, tv_int header_ms, tv_int idle_ms, tv_int body_ms, tv_int max_conns) {
++    if (id < 0 || id >= tv_http_nservers) return;
++    tv_http_server *sv = &tv_http_servers[id];
++    sv->header_ms = header_ms > 0 ? header_ms : 0;
++    sv->idle_ms = idle_ms > 0 ? idle_ms : 0;
++    sv->body_ms = body_ms > 0 ? body_ms : 0;
++    sv->max_conns = max_conns > 0 ? max_conns : 0;
++    if (sv->header_ms || sv->idle_ms || sv->body_ms) tv_http_timeouts = true;
++}
++
++/* The server's open connections in this process (upgraded ones excepted). */
++tv_int tv_native_httpOpen(tv_int id) {
++    tv_int n = 0;
++    if (id < 0 || id >= tv_http_nservers) return 0;
++    for (tv_http_conn *c = tv_http_conns; c; c = c->next)
++        if (c->srv == &tv_http_servers[id]) n++;
++    return n;
++}
++
++/* The process's soft limit on open descriptors (RLIMIT_NOFILE), or 0 when unknown. */
++tv_int tv_native_httpFdLimit(void) {
++    struct rlimit rl;
++    if (getrlimit(RLIMIT_NOFILE, &rl) != 0 || rl.rlim_cur == RLIM_INFINITY) return 0;
++    return (tv_int)rl.rlim_cur;
++}
++
+ void tv_native_httpWorkers(tv_int n) {
+     if (n > tv_http_want_workers) tv_http_want_workers = n > 1024 ? 1024 : n;
+ }
+diff --git a/runtime/tov.h b/runtime/tov.h
+index 9934563..85fe21d 100644
+--- a/runtime/tov.h
++++ b/runtime/tov.h
+@@ -719,6 +719,10 @@ tv_str tv_jp_error(tv_jp *p);
+ tv_int tv_native_httpListen(tv_int port, tv_str host, tv_fn handler);
+ tv_int tv_native_httpPort(tv_int id);
+ void tv_native_httpStop(tv_int id, bool force);
++void tv_native_httpLimits(tv_int id, tv_int header_ms, tv_int idle_ms, tv_int body_ms, tv_int max_conns);
++tv_int tv_native_httpOpen(tv_int id);
++tv_int tv_native_httpFdLimit(void);
++void tv_native_httpOnSignal(tv_fn fn);
+ void tv_native_httpWorkers(tv_int n);
+ /* URLs: parse → [protocol, hostname, port, pathname, search, hash] (empty if invalid; `base`
+  * resolves a relative input, "" for none); percent-decoding (`plus`: '+' is a space) and

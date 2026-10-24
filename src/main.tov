@@ -17,6 +17,7 @@ import { setEkSeal } from "./rtsession"
 import { clusterState } from "./clusterstate"
 import { FileLease, FILE_LEASE_MS } from "./filelease"
 import { start, bodyLimits, NO_BODY_LIMIT } from "./server"
+import { serverLimits, stopSettings, beginStop } from "./lifecycle"
 import { Ops, withSecrets } from "./ops"
 import { fromBifrost, merge } from "./guardrails_compat"
 import { warnings } from "./config_compat"
@@ -260,7 +261,24 @@ async function main(): Promise<int> {
   if (!grpcShared) listenA2aGrpc(ops, args.host, cfg.server)
   // (the body limits and the stream threshold are read from the config as it is when a request comes, so a reload
   // moves them; bodyLimits in server.tov)
-  const url = server === "http1" ? startFront(engine, ops, { hostname: args.host, port: args.port, maxBodyBytes: NO_BODY_LIMIT, limits: () => bodyLimits(engine) }) : start(engine, ops, { port: args.port, hostname: args.host, workers: args.workers, maxBodyBytes: maxBody })
+  // the header, idle and body timeouts and the connection cap (server.*; lifecycle.tov), read once at start
+  const limits = serverLimits(cfg.server, Bun.fdLimit())
+  const served = server === "http1" ? startFront(engine, ops, { hostname: args.host, port: args.port, maxBodyBytes: NO_BODY_LIMIT, limits: () => bodyLimits(engine), timeouts: limits }) : start(engine, ops, { port: args.port, hostname: args.host, workers: args.workers, maxBodyBytes: maxBody, limits: limits })
+  const url = served.url
+  // SIGTERM and SIGINT stop gracefully (lifecycle.tov): in every worker, /ready turns 503, the listener closes, the
+  // requests and streams in hand get up to server.shutdown_grace_seconds, and what is queued is sent before the exit
+  Bun.onStopSignal((sig: string) => {
+    beginStop(sig, stopSettings(engine.cfg.server), {
+      stopListener: served.stopListener,
+      open: served.open,
+      flush: async (): Promise<void> => {
+        await ops.flushForStop()
+      },
+      exit: (code: int) => {
+        process.exit(code)
+      },
+    })
+  })
   // Runs once the server is up: with -workers, in every worker after the fork.
   const supervisor = process.pid
   setTimeout(() => {

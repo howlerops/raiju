@@ -41,6 +41,7 @@ unit: build/h2_echo
 	python3 -m unittest tests/h2_test.py
 	python3 -m unittest tests/test_crew_priors.py
 	python3 -m unittest tests/test_smoke_config.py
+	python3 -m unittest tests/test_fetch_lint.py
 
 # the HTTP/2 and gRPC echo server the h2 tests drive (tests/h2_test.py)
 build/h2_echo: tests/h2_echo.tov src/h2.tov src/hpack.tov src/grpcwire.tov src/grpc.tov src/grpcstatus.tov src/a2apb.tov src/protobuf.tov
