@@ -5,7 +5,7 @@ import { aliasProblems } from "./router"
 import { configureCrews } from "./crew"
 import { startBroker } from "./broker"
 import * as path from "node:path"
-import { Config, loadConfig, loadRawConfig, resolveConfig, providerNames } from "./config"
+import { Config, loadConfig, loadRawConfig, resolveConfig, providerNames, withAppDirs } from "./config"
 import { ConfigStore, ConfigCipher, cipherFromConfig, openConfig } from "./store"
 import { Engine, pluginPaths } from "./gateway"
 import { fetchPluginUrls } from "./plugindl"
@@ -91,12 +91,15 @@ function reportConfig(file: string): void {
   }
 }
 
-// A saved config: env and secret references resolved, then swapped in.
-async function applyChange(engine: Engine, ops: Ops, store: ConfigStore, c: Config): Promise<void> {
+// A saved config (or one another worker or node saved, store.tov takeGeneration): env and secret references resolved,
+// the log folders read from the app dir, then swapped in.
+async function applyChange(engine: Engine, ops: Ops, store: ConfigStore, c: Config, appDir: string): Promise<void> {
   let resolved = c
   resolveConfig(&resolved)
-  const next = withBifrostGuardrails(await withSecrets(resolved), store, false)
+  const next = withBifrostGuardrails(withAppDirs(await withSecrets(resolved), appDir), store, false)
   engine.reload(next)
+  // the other workers learn that this one runs the generation (a management API answer waits for them, ops.settleConfig)
+  ops.ackConfig()
   // the clients added by the change connect (their OAuth tokens, if any, are in the config)
   const newMcp = engine.mcp
   if (newMcp !== undefined) await newMcp.connectNew()
@@ -129,8 +132,9 @@ function runBroker(c: Config, host: string): int {
 
 async function main(): Promise<int> {
   const args = parseArgs(process.argv.slice(2))
-  // an OpenAPI MCP client's spec_file is read relative to the config file
-  setSpecBaseDir(path.dirname(path.resolve(args.config)))
+  // an OpenAPI MCP client's spec_file is read relative to the config file, and so are the log and audit folders
+  const appDir = path.dirname(path.resolve(args.config))
+  setSpecBaseDir(appDir)
   const loaded = loadConfigOrExit(args.config)
   if (loaded === undefined) return 1
   // Encryption at rest: the sealed secrets in the file are opened with the cipher from encryption_key
@@ -155,7 +159,7 @@ async function main(): Promise<int> {
   resolveConfig(&first)
   if (args.mode === "broker") return runBroker(first, args.host)
   reportConfig(args.config)
-  const cfg = withBifrostGuardrails(await withSecrets(first), store, true)
+  const cfg = withBifrostGuardrails(withAppDirs(await withSecrets(first), appDir), store, true)
   for (const p of aliasProblems(cfg)) console.error(`raiju: config: ${p}`)
   // crew routing (crew.tov): the pools, priors and classifier are checked and loaded here, relative to the config file's folder
   const crewProblems = configureCrews(cfg, path.dirname(args.config))
@@ -170,6 +174,10 @@ async function main(): Promise<int> {
   for (const e of pdl.errors) console.error(`raiju: plugin: ${e}`)
   const engine = new Engine(cfg)
   const ops = new Ops(engine, store)
+  // a required log store or audit log that cannot open stops the start, as Bifrost's does (required: false keeps going)
+  const storage = ops.storageProblems()
+  for (const p of storage) console.error(`raiju: ${p} (set required: false to start without it)`)
+  if (storage.length > 0) return 1
   // refreshed per-user OAuth tokens are saved to the config file
   engine.userTokenSaved = (r) => {
     saveUserToken(store, r)
@@ -235,7 +243,7 @@ async function main(): Promise<int> {
   })
   setAdminRenew(async (client: string, used: string): Promise<string> => await engine.renewAdminCredential(client, used))
   store.onChange = (c) => {
-    applyChange(engine, ops, store, c)
+    applyChange(engine, ops, store, c, appDir)
   }
   const mcp = engine.mcp
   if (mcp !== undefined) {

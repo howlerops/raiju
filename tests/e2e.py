@@ -5692,6 +5692,137 @@ def l147_cluster_e2e(env):
         srv.shutdown()
         srv.server_close()
 
+GW_L185_A = "http://127.0.0.1:18326"  # L185: node A with two workers (Bun; one process on http1), then the storage checks
+GW_L185_B = "http://127.0.0.1:18327"  # L185: node B, a config file of its own (cluster.config_sync "pull")
+L185_ADMIN = {"authorization": "Bearer sk-admin-l185"}
+L185_SECRET = "e2e-l185"
+
+def l185_config(node, peer):
+    """An L185 cluster member: an admin, virtual keys vk-1 and vk-2, the shared mock as OpenAI, config_sync "pull"."""
+    import hashlib
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": True},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "l185", "value": "sk-l185", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l185".encode()).hexdigest()}],
+            "virtual_keys": [{"id": "vk-1", "value": "sk-bf-l185-one"}, {"id": "vk-2", "value": "sk-bf-l185-two"}],
+        },
+        "cluster": {"enabled": True, "node_id": node, "secret": L185_SECRET, "interval_ms": 200, "peers": [peer], "config_sync": "pull"},
+    }
+
+def l185_codes(base, key, n=24):
+    """n chat calls with virtual key value key, eight at a time on fresh connections (so both workers of a node take some)."""
+    from concurrent.futures import ThreadPoolExecutor
+    body = {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l185"}]}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        return list(ex.map(lambda _: call("POST", "/v1/chat/completions", body, {"x-bf-vk": key}, base=base, auth=False)[0], range(n)))
+
+def l185_start(env, name, port, cfg_path, extra=None):
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    return subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", str(port), "-host", "127.0.0.1", "-config", cfg_path, "-server", server] + (extra or []),
+                            env=env, stderr=open(os.path.join(BUILD, f"e2e.l185{name}.log"), "w"))
+
+def l185_e2e(env):
+    """L185: config consistency. Node A runs two workers (Bun; http1 is one process): a virtual key deleted through one is
+    refused by every worker as soon as the DELETE has answered. Node B has a config file of its own and
+    cluster.config_sync "pull": it takes A's saves from A (keeping its own cluster section), and A takes B's. The pull route
+    is signed and refuses stale or unknown requests. Then the storage checks: a required logs_store or audit folder that
+    cannot be written stops the start, required: false starts without it, and the default folders are read from the
+    app dir, not the working directory. Ports 18326 (A, then the storage gateways) and 18327 (B)."""
+    import hashlib, shutil
+    pa = os.path.join(BUILD, "e2e.l185a.json")
+    pb = os.path.join(BUILD, "e2e.l185b.json")
+    json.dump(l185_config("l185-a", GW_L185_B), open(pa, "w"))
+    json.dump(l185_config("l185-b", GW_L185_A), open(pb, "w"))
+    ga = l185_start(env, "a", 18326, pa, ["-workers", "2"])
+    gb = l185_start(env, "b", 18327, pb)
+    try:
+        wait(GW_L185_A + "/health")
+        wait(GW_L185_B + "/health")
+        time.sleep(1.0)
+        before = l185_codes(GW_L185_A, "sk-bf-l185-one")
+        check("l185: vk-1 is served by every worker of node A", all(c == 200 for c in before), before)
+        s, _, b = call("DELETE", "/api/governance/virtual-keys/vk-1", None, L185_ADMIN, base=GW_L185_A, auth=False)
+        check("l185: vk-1 is deleted through node A", s == 200, (s, b[:200]))
+        after = l185_codes(GW_L185_A, "sk-bf-l185-one")
+        check("l185: once the DELETE has answered, every worker of node A refuses vk-1", all(c == 401 for c in after), after)
+        check("l185: vk-2 still works on every worker of node A", all(c == 200 for c in l185_codes(GW_L185_A, "sk-bf-l185-two")), "")
+        # node B pulls A's save (cluster sync every 200 ms)
+        gone = l147_until(lambda: all(c == 401 for c in l185_codes(GW_L185_B, "sk-bf-l185-one", 6)), 5)
+        check("l185: node B (its own config file) refuses vk-1 after node A's save", gone, l185_codes(GW_L185_B, "sk-bf-l185-one", 6))
+        saved_b = json.load(open(pb))
+        check("l185: node B wrote the pulled config to its file and kept its own cluster section",
+              [v["id"] for v in saved_b["governance"]["virtual_keys"]] == ["vk-2"] and saved_b["cluster"]["node_id"] == "l185-b" and saved_b["cluster"]["peers"] == [GW_L185_A],
+              (saved_b.get("governance"), saved_b.get("cluster")))
+        check("l185: vk-2 still works on node B", all(c == 200 for c in l185_codes(GW_L185_B, "sk-bf-l185-two", 6)), "")
+        # the other way round: a key created on B reaches both workers of A
+        s, _, b = call("POST", "/api/governance/virtual-keys", {"id": "vk-3", "name": "three", "value": "sk-bf-l185-three"}, L185_ADMIN, base=GW_L185_B, auth=False)
+        check("l185: vk-3 is created through node B", s in (200, 201), (s, b[:200]))
+        here = l147_until(lambda: all(c == 200 for c in l185_codes(GW_L185_A, "sk-bf-l185-three")), 5)
+        check("l185: every worker of node A serves vk-3, created on node B", here, l185_codes(GW_L185_A, "sk-bf-l185-three"))
+        saved_a = json.load(open(pa))
+        check("l185: node A keeps its own cluster section", saved_a["cluster"]["node_id"] == "l185-a" and saved_a["cluster"]["peers"] == [GW_L185_B], saved_a.get("cluster"))
+        # the pull route: signed, fresh, and only for the generation the node holds (node A now holds B's save, as B wrote it)
+        sha = hashlib.sha256(open(pb, "rb").read()).hexdigest()
+        def pull(body, sig=None):
+            raw = json.dumps(body)
+            return call("POST", "/api/cluster/config", raw, {"x-raiju-cluster-sig": sig if sig is not None else cluster_sig(L185_SECRET, raw)}, base=GW_L185_A, auth=False)
+        s, _, _ = pull({"sha": sha, "ts": time.time() * 1000}, "0" * 64)
+        check("l185: an unsigned config pull is refused", s == 401, s)
+        s, _, _ = pull({"sha": sha, "ts": time.time() * 1000 - 120000})
+        check("l185: a config pull older than a minute is refused", s == 401, s)
+        s, _, _ = pull({"sha": "0" * 64, "ts": time.time() * 1000})
+        check("l185: a config pull for a generation the node does not hold is 404", s == 404, s)
+        s, _, b = pull({"sha": sha, "ts": time.time() * 1000})
+        check("l185: a signed pull for the generation node A holds answers that config text as its writer saved it", s == 200 and hashlib.sha256(b.encode()).hexdigest() == sha, (s, b[:200]))
+    finally:
+        for p in [ga, gb]:
+            p.terminate()
+            p.wait()
+    # storage: a folder that cannot be written (a file stands where it should be) stops the start
+    app = os.path.join(BUILD, "e2e-l185-app")
+    shutil.rmtree(app, ignore_errors=True)
+    os.makedirs(app)
+    open(os.path.join(app, "blocker"), "w").write("x")
+    base_cfg = {"client": {"enable_logging": True, "enforce_auth_on_inference": False}, "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+                "providers": {"openai": {"keys": [{"name": "l185", "value": "sk-l185", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}}}
+    cp = os.path.join(app, "config.json")
+    for section, extra in [("logs_store", {}), ("audit", {"key": "e2e-l185-audit"})]:
+        json.dump({**base_cfg, section: {"enabled": True, "dir": "blocker/" + section, **extra}}, open(cp, "w"))
+        p = l185_start(env, "fail-" + section, 18326, cp)
+        try:
+            code = p.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            p.terminate()
+            p.wait()
+            code = None
+        log = open(os.path.join(BUILD, f"e2e.l185fail-{section}.log")).read()
+        check(f"l185: a required {section} folder that cannot be written stops the start, naming it", code == 1 and f"raiju: {section}: " in log and "required: false" in log, (code, log[-400:]))
+    # required: false starts without the store
+    json.dump({**base_cfg, "logs_store": {"enabled": True, "dir": "blocker/logs", "required": False}}, open(cp, "w"))
+    p = l185_start(env, "soft", 18326, cp)
+    try:
+        wait(GW_L185_A + "/health")
+        s, _, _ = call("GET", "/health", base=GW_L185_A, auth=False)
+        check("l185: with required: false the gateway starts without the log store", s == 200 and p.poll() is None, s)
+    finally:
+        p.terminate()
+        p.wait()
+    # the default folders sit in the app dir (the config file's folder), whatever the working directory is (ROOT here)
+    json.dump({**base_cfg, "logs_store": {"enabled": True}, "audit": {"enabled": True, "key": "e2e-l185-audit"}}, open(cp, "w"))
+    p = l185_start(env, "appdir", 18326, cp)
+    try:
+        wait(GW_L185_A + "/health")
+        s, _, _ = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l185"}]}, base=GW_L185_A, auth=False)
+        time.sleep(0.5)
+        logs_dir = os.path.join(app, "logs")
+        files = sorted(os.listdir(logs_dir)) if os.path.isdir(logs_dir) else []
+        check("l185: the default request log and audit folders are in the app dir", s == 200 and any(f.endswith(".jsonl") for f in files) and os.path.isdir(os.path.join(logs_dir, "audit")), (s, files))
+    finally:
+        p.terminate()
+        p.wait()
+
 GW_L144 = "http://127.0.0.1:18228"  # audio billing: speech by its characters, transcriptions by their usage, budgets and the log rows
 
 
@@ -12318,7 +12449,7 @@ def l183_config(d, logs_dir, extra_server):
         "client": {"enforce_auth_on_inference": False, "enable_logging": False},
         "alerts": {"enabled": False},
         "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
-        "logs_store": {"enabled": True, "dir": logs_dir},
+        "logs_store": {"enabled": True, "dir": logs_dir, "required": False},  # required false: the gateway starts and /ready reports the store (L185)
         "server": extra_server,
         "providers": {
             "openai": {"keys": [{"name": "l183", "value": "sk-l183", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
@@ -12614,6 +12745,71 @@ def l174_e2e(env):
         check("model-catalog-resolver is accepted as built in, not reported as an unknown plugin", s == 200 and "unknown plugin" not in b and "mocker" in b, (s, b[:300]))
     finally:
         gw.terminate()
+        gw.wait()
+
+GW_L182 = "http://127.0.0.1:18320"  # the request log store's segments, disk cap and batched writes
+
+def l182_e2e(env):
+    """L182: the log store writes its rows in batches, starts a new segment of today's file once the current one is
+    over logs_store.max_file_mb, reads only the newest segments at start-up, and keeps the folder under max_disk_mb by
+    deleting the oldest segments. Its own gateway (18320), started and stopped here (twice)."""
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    logs = os.path.join(BUILD, "e2e-l182-logs")
+    __import__("shutil").rmtree(logs, ignore_errors=True)
+    os.makedirs(logs)
+    day = lambda back: time.strftime("%Y-%m-%d", time.gmtime(time.time() - back * 86400))
+    junk = "x" * (1200 * 1024) + "\n"
+    # two older days of 1.2 MB each and a first segment of today already over the 1 MB segment size: 3.6 MB in a
+    # 3 MB folder, so the oldest day goes at start-up and today's rows go to a second segment
+    for name in (f"requests-{day(2)}.jsonl", f"requests-{day(1)}.jsonl", f"requests-{day(0)}.jsonl"):
+        open(os.path.join(logs, name), "w").write(junk)
+    cfg = {"client": {"enable_logging": False, "enforce_auth_on_inference": False},
+           "logs_store": {"enabled": True, "dir": logs, "max_file_mb": 1, "max_disk_mb": 3},
+           "providers": {"openai": {"keys": [{"name": "k", "value": "sk-l182-" + "key", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK}}}}
+    cfg_path = os.path.join(BUILD, "e2e.l182.json")
+    json.dump(cfg, open(cfg_path, "w"))
+    def start(tag):
+        g = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18320", "-host", "127.0.0.1", "-config", cfg_path, "-server", server], env=env, stderr=open(os.path.join(BUILD, f"e2e.l182.{tag}.log"), "w"))
+        wait(GW_L182 + "/health")
+        return g
+    def chat(rid, stream):
+        body = {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}], "stream": stream}
+        return call("POST", "/v1/chat/completions", body, {"x-request-id": rid}, base=GW_L182, auth=False)[0]
+    seg0 = os.path.join(logs, f"requests-{day(0)}.jsonl")
+    seg1 = os.path.join(logs, f"requests-{day(0)}.1.jsonl")
+    gw = start("a")
+    try:
+        check("log store: the oldest segment goes when the folder is over max_disk_mb, the newer ones stay",
+              not os.path.exists(os.path.join(logs, f"requests-{day(2)}.jsonl")) and os.path.exists(os.path.join(logs, f"requests-{day(1)}.jsonl")), sorted(os.listdir(logs)))
+        codes = [chat("req-l182-plain", False), chat("req-l182-stream", True)]
+        s, _, b = call("GET", "/api/logs?limit=10", base=GW_L182, auth=False)
+        ids = [e["request_id"] for e in json.loads(b).get("entries", [])] if s == 200 else []
+        check("log store: rows are queryable as soon as the request ends", codes == [200, 200] and "req-l182-plain" in ids and "req-l182-stream" in ids, (codes, s, b[:300]))
+        text = ""
+        for _ in range(40):
+            text = open(seg1).read() if os.path.exists(seg1) else ""
+            if "req-l182-stream" in text:
+                break
+            time.sleep(0.05)
+        check("log store: the batch reaches disk within its interval, in a new segment once today's first is over max_file_mb",
+              "req-l182-plain" in text and "req-l182-stream" in text and "req-l182" not in open(seg0).read(), sorted(os.listdir(logs)))
+    finally:
+        gw.terminate()
+        gw.wait()
+    gw = start("b")
+    try:
+        s, _, b = call("GET", "/api/logs?limit=10", base=GW_L182, auth=False)
+        ids = [e["request_id"] for e in json.loads(b).get("entries", [])] if s == 200 else []
+        check("log store: a restart reads today's rows back from the newest segments", "req-l182-plain" in ids and "req-l182-stream" in ids, (s, b[:300]))
+        # SIGTERM right after a request: the graceful stop writes the batch before the exit (ops.flushForStop)
+        code = chat("req-l182-sigterm", False)
+        gw.terminate()
+        gw.wait(30)
+        text = open(seg1).read() if os.path.exists(seg1) else ""
+        check("log store: a row still in its batch is written when SIGTERM stops the gateway", code == 200 and gw.returncode == 0 and "req-l182-sigterm" in text, (code, gw.returncode, text[-300:]))
+    finally:
+        if gw.poll() is None:
+            gw.terminate()
         gw.wait()
 
 
@@ -14975,6 +15171,9 @@ def main():
         # L147: the token_exchange admin credential renewed once across two workers, and once across two cluster nodes (sealed through the cluster state)
         l147_workers_e2e(env)
         l147_cluster_e2e(env)
+        # L185: a config change reaches every worker before the API answers, and the other cluster node (config_sync
+        # "pull"); a log or audit folder that cannot be written stops the start; default folders in the app dir (18326, 18327)
+        l185_e2e(env)
         # audio billing: speech by its characters, transcriptions and translations by their usage, the log rows and the budgets: their own gateway
         l144_e2e(env)
         # L169: streamed transcriptions, Sarvam's audio, refused and failed audio logged, a second response.create refused,
@@ -15050,6 +15249,8 @@ def main():
         # L175: editable built-in roles, plugin PUT merge and genuine-auth check, quota per-model usage, profile audit lists,
         # vMCP reverse lookup, member usage, user budget overrides: its own gateways (18302, 18303)
         l175_e2e(env)
+        # L182: the log store's batched writes, segments and disk cap: its own gateway (18320)
+        l182_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

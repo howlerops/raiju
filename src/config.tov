@@ -698,6 +698,12 @@ export type LogsStoreConfig = {
   retention_days?: int,
   max_memory_entries?: int,
   content_logging?: bool,
+  // the start fails when the store cannot open (default true, as Bifrost's start fails); false logs and runs without it
+  required?: bool,
+  // a day's file is cut into segments of this size (MB, default 32): start-up and shared queries read only the
+  // newest ones. max_disk_mb caps all the log files together (oldest segments deleted first; 0, the default: no cap)
+  max_file_mb?: int,
+  max_disk_mb?: int,
   // where retained content goes (client.retain_content_in_object_storage); Bifrost's logs_store.object_storage
   object_storage?: LogsObjectStorage,
 }
@@ -771,8 +777,9 @@ export type SecretsConfig = {
 // retention_days deletes events older than that (0 or unset keeps them); omit_ip_addresses stops recording
 // client IPs; archive copies the events to object storage (LogExportsConfig's S3 or GCS fields) one window
 // at a time, a window ending archive_grace_seconds before now. Each window is written as parts of at most
-// archive_max_object_bytes, gzipped when archive_compress is set, then a manifest that commits it.
-export type AuditConfig = { enabled?: bool, dir?: string, key?: string, max_memory?: int, retention_days?: int, omit_ip_addresses?: bool, archive?: LogExportsConfig, archive_grace_seconds?: int, archive_max_object_bytes?: int, archive_compress?: bool }
+// archive_max_object_bytes, gzipped when archive_compress is set, then a manifest that commits it. required (default
+// true) fails the start when the log cannot open; false logs and runs without it.
+export type AuditConfig = { enabled?: bool, required?: bool, dir?: string, key?: string, max_memory?: int, retention_days?: int, omit_ip_addresses?: bool, archive?: LogExportsConfig, archive_grace_seconds?: int, archive_max_object_bytes?: int, archive_compress?: bool }
 
 // rules are metric thresholds; cel_rules are Bifrost's CEL alert rules (alertapi.tov).
 export type AlertsConfig = { enabled?: bool, interval_seconds?: int, rules?: AlertRule[], cel_rules?: CelRule[], channels?: Channel[] }
@@ -1431,11 +1438,44 @@ export function loadConfig(path: string): Config throws Error {
 // saves back, so secrets never land in the file.
 export function loadRawConfig(path: string): Config throws Error {
   if (!existsSync(path)) return fromEnv()
+  return try rawConfigOf(try readFileSync(path, "utf8"))
+}
+
+// The config as written in a file's text (loadRawConfig without the file).
+export function rawConfigOf(fileText: string): Config throws Error {
   // Bifrost's section names read as Raiju's (config_compat.tov); the file itself is untouched
-  const text = (try normalize(try readFileSync(path, "utf8"))).text
+  const text = (try normalize(fileText)).text
   let c = try JSON.parse(text) as Config
   c.plugins = try pluginSpecs(text)
   return c
+}
+
+// The request log and audit folders as absolute paths: a relative dir (and the defaults "logs" and "logs/audit") is
+// read from the app dir (the config file's folder), as Bifrost keeps its logs.db there, never from the working
+// directory. Applied to the served config only; the file keeps what was written.
+export function withAppDirs(c: Config, appDir: string): Config {
+  let n = c
+  const ls = n.logs_store
+  if (ls !== undefined) {
+    const dir = appPath(appDir, ls.dir ?? "logs")
+    let l = ls
+    l.dir = dir
+    n.logs_store = l
+  }
+  const ac = n.audit
+  if (ac !== undefined) {
+    const dir = appPath(appDir, ac.dir ?? "logs/audit")
+    let a = ac
+    a.dir = dir
+    n.audit = a
+  }
+  return n
+}
+
+function appPath(appDir: string, dir: string): string {
+  if (dir.startsWith("/")) return dir
+  const base = appDir === "" ? "." : appDir
+  return base.endsWith("/") ? base + dir : base + "/" + dir
 }
 
 // Each plugin with its config object as raw JSON text.
@@ -1545,5 +1585,26 @@ test("exporter and log export secrets resolve env references, plain values stay"
   expect(ex[0]!.sasl_password).toBe("plain")
   expect(c.log_exports!.access_key_id).toBe("")
   expect(c.log_exports!.secret_access_key).toBe("sk")
+})
+
+test("withAppDirs reads the log and audit folders from the app dir, keeping absolute ones", () => {
+  const c: Config = { logs_store: { enabled: true }, audit: { enabled: true, dir: "trail" } }
+  const r = withAppDirs(c, "/app/data")
+  expect(r.logs_store?.dir ?? "").toBe("/app/data/logs")
+  expect(r.audit?.dir ?? "").toBe("/app/data/trail")
+  const d = withAppDirs({ audit: { enabled: true } }, "/srv/")
+  expect(d.audit?.dir ?? "").toBe("/srv/logs/audit")
+  expect(d.logs_store === undefined).toBe(true)
+  const abs = withAppDirs({ logs_store: { enabled: true, dir: "/var/log/raiju" } }, "/app/data")
+  expect(abs.logs_store?.dir ?? "").toBe("/var/log/raiju")
+  // the config as written is untouched
+  expect(c.logs_store?.dir === undefined).toBe(true)
+})
+
+test("rawConfigOf reads a file's text as loadRawConfig does", () => {
+  const c = try rawConfigOf(`{"logs_store":{"enabled":true,"required":false},"plugins":[{"name":"p","config":{"a":1}}]}`)
+  expect(c.logs_store?.required).toBe(false)
+  const ps = c.plugins ?? []
+  expect(ps[0]?.config_json ?? "").toBe(`{"a":1}`)
 })
 

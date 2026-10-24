@@ -106,6 +106,11 @@ export type LogStoreConfig = {
   max_memory_entries: int,
   content_logging: bool,
   max_content_bytes: int,
+  // a day file is cut into segments of about this size (MB; default 32), so start-up and shared queries read only
+  // the newest segments, never a whole day
+  max_file_mb?: int,
+  // the log files may take this much disk (MB) in all; the oldest segments go first. 0 (the default): no cap
+  max_disk_mb?: int,
 }
 
 export type LogQuery = {
@@ -139,8 +144,19 @@ export type LogStats = {
 }
 
 export function defaultLogStoreConfig(dir: string): LogStoreConfig {
-  return { dir: dir, retention_days: 7, max_memory_entries: 10000, content_logging: false, max_content_bytes: 8192 }
+  return { dir: dir, retention_days: 7, max_memory_entries: 10000, content_logging: false, max_content_bytes: 8192, max_file_mb: DEFAULT_FILE_MB, max_disk_mb: 0 }
 }
+
+export const DEFAULT_FILE_MB = 32
+// Rows are written in batches: when this many bytes are waiting, or FLUSH_MS after the first row of a batch.
+const FLUSH_BYTES = 65536
+const FLUSH_MS = 100
+// A segment this many times the segment size (a day file from before segments, say) is not read whole at start-up.
+const LOAD_SKIP_FACTOR = 4
+// the disk cap and retention are checked this often while rows are written
+const MAINTAIN_MS = 60000
+// a failing disk is reported at most this often
+const ERROR_EVERY_MS = 10000
 
 const DAY_MS = 86400000
 
@@ -184,6 +200,55 @@ function dayOf(ms: f64): string {
 
 function fileName(ts: f64): string {
   return "requests-" + dayOf(ts) + ".jsonl"
+}
+
+// The file of segment seg of a day (YYYY-MM-DD): requests-<day>.jsonl, then requests-<day>.<seg>.jsonl.
+function segmentName(day: string, seg: int): string {
+  return seg === 0 ? "requests-" + day + ".jsonl" : "requests-" + day + "." + seg + ".jsonl"
+}
+
+type Segment = { name: string, day: int, seg: int }
+
+// The day and segment of a request log file, or undefined for any other name.
+function segmentOf(name: string): Segment | undefined {
+  if (name.byteLength < 25 || !name.startsWith("requests-") || !name.endsWith(".jsonl")) return undefined
+  const day = fileDay(name.slice(0, 19) + ".jsonl")
+  if (day === undefined) return undefined
+  if (name.byteLength === 25) return { name: name, day: day, seg: 0 }
+  // requests-YYYY-MM-DD.<n>.jsonl, n a positive number without leading zeros
+  const mid = name.slice(19, name.byteLength - 6)
+  if (mid.byteLength < 2 || !mid.startsWith(".") || mid.startsWith(".0")) return undefined
+  for (const b of new TextEncoder().encode(mid.slice(1))) {
+    if (int(b) < 48 || int(b) > 57) return undefined
+  }
+  const n = parseInt(mid.slice(1))
+  if (n === undefined || n <= 0) return undefined
+  return { name: name, day: day, seg: n }
+}
+
+// The request log files of a folder, oldest first (by day, then segment).
+function segmentsIn(dir: string): Segment[] {
+  const out: Segment[] = []
+  let names: string[] = []
+  try {
+    names = readdirSync(dir)
+  } catch (err) {
+    return out
+  }
+  for (const name of names) {
+    const s = segmentOf(name)
+    if (s !== undefined) out.push(s)
+  }
+  out.sort((a, b) => (a.day !== b.day ? a.day - b.day : a.seg - b.seg))
+  return out
+}
+
+function sizeOf(path: string): int {
+  try {
+    return statSync(path).size
+  } catch (err) {
+    return -1
+  }
 }
 
 // The day number of a requests-YYYY-MM-DD.jsonl file, or undefined for any
@@ -317,49 +382,199 @@ function matches(e: LogEntry, q: LogQuery): bool {
 }
 
 export class LogStore {
-  // With several workers, each logs to the same day file; queries then read that file
-  // (cached until it grows) so every worker answers with every worker's requests.
+  // With several workers, each logs to the same day files, row by row; queries then read the newest segments of
+  // today (cached until they grow) so every worker answers with every worker's requests.
   shared = false
   // called with each entry this store adds, after it is kept
   onAdd: ((e: LogEntry) => void) | undefined = undefined
-  private viewSize = -1
+  private viewKey = ""
   private view: LogEntry[] = []
   private ring: LogEntry[] = []
   // Where the next entry goes: once the ring is full this is the oldest slot.
   private next: int = 0
   private cap: int
+  // rows not yet written, by day (YYYY-MM-DD), oldest first
+  private pending: Map<string, string[]> = new Map()
+  private pendingBytes = 0
+  private flushTimer = -1
+  // the segment each day's rows go to, as this process last saw it
+  private segs: Map<string, int> = new Map()
+  private lastMaintain = 0.0
+  private lastError = 0.0
+  // segments past the disk cap that were deleted (as a whole), since start
+  capped: int = 0
 
   constructor(readonly cfg: LogStoreConfig) {
     this.cap = Math.max(1, cfg.max_memory_entries)
     try mkdirSync(cfg.dir, { recursive: true })
-    const today = join(cfg.dir, fileName(Date.now()))
-    if (existsSync(today)) {
-      for (const line of try readFileSync(today, "utf8").split("\n")) {
+    // the newest of today's rows, from the newest segments only: a long day is never read whole
+    const rows = this.newestRows(Math.floor(Date.now() / DAY_MS), this.cap, true)
+    for (let k = rows.length - 1; k >= 0; k--) this.remember(rows[k]!)
+    this.enforceCap()
+    // (the gateway prunes at start; the upkeep comes MAINTAIN_MS later)
+    this.lastMaintain = Date.now()
+  }
+
+  private fileBytes(): int {
+    const mb = this.cfg.max_file_mb ?? DEFAULT_FILE_MB
+    return (mb > 0 ? mb : DEFAULT_FILE_MB) * 1048576
+  }
+
+  // Up to want rows of a day, newest first, read from its newest segments. At start-up a segment far over the
+  // segment size (written before segments existed) is skipped with a note rather than read whole.
+  private newestRows(day: int, want: int, starting: bool): LogEntry[] {
+    const out: LogEntry[] = []
+    const all = segmentsIn(this.cfg.dir).filter((s) => s.day === day)
+    for (let i = all.length - 1; i >= 0 && out.length < want; i--) {
+      const path = join(this.cfg.dir, all[i]!.name)
+      if (starting && sizeOf(path) > this.fileBytes() * LOAD_SKIP_FACTOR) {
+        console.error(`logstore: ${all[i]!.name} is too large to load at start-up; its rows are kept on disk but not in /api/logs`)
+        continue
+      }
+      let lines: string[] = []
+      try {
+        lines = readFileSync(path, "utf8").split("\n")
+      } catch (err) {
+        continue
+      }
+      for (let k = lines.length - 1; k >= 0 && out.length < want; k--) {
+        const line = lines[k]!
         if (line === "") continue
         // a torn or foreign line is skipped, not fatal
         try {
-          this.remember(try JSON.parse(line) as LogEntry)
+          out.push(JSON.parse(line) as LogEntry)
         } catch (err) {
           continue
         }
       }
     }
+    return out
   }
 
-  // Appends the entry to its day's file and to memory. A failed write is
-  // reported on stderr; it must not fail the request that was logged.
+  // Keeps the entry in memory and queues it for its day's file; the file write is batched (flush) in a process alone. A failed write
+  // is counted and reported on stderr (at most every ERROR_EVERY_MS); it must not fail the request that was logged.
   add(e: LogEntry): void {
     const entry = this.prepare(e)
     this.remember(entry)
-    try {
-      appendFileSync(join(this.cfg.dir, fileName(entry.ts)), JSON.stringify(entry) + "\n")
-    } catch (err) {
-      this.dropped += 1
-      console.error(`logstore: could not write request log: ${err.message}`)
+    const line = JSON.stringify(entry) + "\n"
+    const day = dayOf(entry.ts)
+    let rows = this.pending.get(day)
+    if (rows === undefined) {
+      const fresh: string[] = []
+      rows = fresh
+    }
+    rows.push(line)
+    this.pending.set(day, rows)
+    this.pendingBytes += line.byteLength
+    // (the workers of a node read each other's rows from the files, and some decisions (a crew task's calls) need the
+    // newest at once: shared stores write each row as it comes)
+    if (this.shared || this.pendingBytes >= FLUSH_BYTES) this.flush()
+    else if (this.flushTimer < 0) {
+      this.flushTimer = setTimeout(() => {
+        this.flushTimer = -1
+        this.flush()
+      }, FLUSH_MS)
     }
     // the live feed takes each entry this process wrote (ops.tov feedPublish)
     const h = this.onAdd
     if (h !== undefined) h(entry)
+  }
+
+  // Rows waiting for the next flush.
+  pendingRows(): int {
+    let n = 0
+    for (const rows of this.pending.values()) n += rows.length
+    return n
+  }
+
+  // Writes the queued rows: one append per day, to the day's current segment (the next one once it has reached the
+  // segment size). Called by the batch timer, when a batch is full, and before anything reads or rewrites the files.
+  flush(): void {
+    if (this.pendingBytes === 0) return
+    const batch = this.pending
+    this.pending = new Map()
+    this.pendingBytes = 0
+    let rotated = false
+    for (const day of batch.keys()) {
+      const rows = batch.get(day)!
+      const seg = this.segmentFor(day)
+      if (seg.rotated) rotated = true
+      try {
+        appendFileSync(join(this.cfg.dir, segmentName(day, seg.n)), rows.join(""))
+      } catch (err) {
+        this.dropped += rows.length
+        const now = Date.now()
+        if (now - this.lastError >= ERROR_EVERY_MS) {
+          this.lastError = now
+          console.error(`logstore: could not write request log (${this.dropped} rows dropped so far): ${err.message}`)
+        }
+      }
+    }
+    const now = Date.now()
+    if (rotated || now - this.lastMaintain >= MAINTAIN_MS) this.maintain(now)
+  }
+
+  // The segment a day's next rows go to. Every worker of a node applies the same rule to the same files (the
+  // first segment under the size, counting up from the last one seen), so they agree on it without talking.
+  private segmentFor(day: string): { n: int, rotated: bool } {
+    let n = this.segs.get(day) ?? -1
+    if (n < 0) {
+      n = 0
+      for (const s of segmentsIn(this.cfg.dir)) {
+        if (s.seg > n && segmentName(day, s.seg) === s.name) n = s.seg
+      }
+    }
+    const limit = this.fileBytes()
+    let rotated = false
+    while (sizeOf(join(this.cfg.dir, segmentName(day, n))) >= limit) {
+      n += 1
+      rotated = true
+    }
+    this.segs.set(day, n)
+    return { n: n, rotated: rotated }
+  }
+
+  // The periodic upkeep while rows are written: retention by days and the disk cap.
+  private maintain(now: f64): void {
+    this.lastMaintain = now
+    try {
+      this.prune(now)
+    } catch (err) {
+      // an unreadable folder: the writes report it
+    }
+    this.enforceCap()
+  }
+
+  // logs_store.max_disk_mb: deletes the oldest segments until the files fit, never the newest one (being written).
+  // Returns how many went.
+  enforceCap(): int {
+    const mb = this.cfg.max_disk_mb ?? 0
+    if (mb <= 0) return 0
+    const limit = mb * 1048576
+    const all = segmentsIn(this.cfg.dir)
+    const sizes: int[] = []
+    let total = 0
+    for (const s of all) {
+      const n = Math.max(0, sizeOf(join(this.cfg.dir, s.name)))
+      sizes.push(n)
+      total += n
+    }
+    let removed = 0
+    for (let i = 0; i < all.length - 1 && total > limit; i++) {
+      try {
+        unlinkSync(join(this.cfg.dir, all[i]!.name))
+        total -= sizes[i]!
+        removed += 1
+      } catch (err) {
+        console.error(`logstore: could not delete ${all[i]!.name}: ${err.message}`)
+      }
+    }
+    if (removed > 0) {
+      this.capped += removed
+      this.viewKey = ""
+      console.error(`logstore: deleted ${removed} old request log file${removed === 1 ? "" : "s"} to stay under logs_store.max_disk_mb (${mb} MB)`)
+    }
+    return removed
   }
 
   // Entries that could not be written to their day file (Bifrost's /api/logs/dropped).
@@ -380,15 +595,11 @@ export class LogStore {
     }
     this.ring = keep
     this.next = keep.length % this.cap
-    this.viewSize = -1
-    let names: string[] = []
-    try {
-      names = readdirSync(this.cfg.dir)
-    } catch (err) {
-      names = []
-    }
-    for (const name of names) {
-      if (fileDay(name) === undefined) continue
+    this.viewKey = ""
+    // (queued rows are written first, so a deleted id cannot come back with them)
+    this.flush()
+    for (const sg of segmentsIn(this.cfg.dir)) {
+      const name = sg.name
       const path = join(this.cfg.dir, name)
       let lines: string[] = []
       try {
@@ -422,37 +633,21 @@ export class LogStore {
     return gone.size
   }
 
-  // The entries queries see, newest first: memory, or today's file when shared.
+  // The entries queries see, newest first: memory, or the newest segments of today when shared.
   private recent(): LogEntry[] {
     if (!this.shared) {
       const out: LogEntry[] = []
       for (let k = 0; k < this.ring.length; k++) out.push(this.newest(k))
       return out
     }
-    const file = join(this.cfg.dir, fileName(Date.now()))
-    let size = 0
-    try {
-      size = statSync(file).size
-    } catch (err) {
-      size = 0
-    }
-    if (size === this.viewSize) return this.view
-    const all: LogEntry[] = []
-    try {
-      for (const line of readFileSync(file, "utf8").split("\n")) {
-        if (line === "") continue
-        try {
-          all.push(JSON.parse(line) as LogEntry)
-        } catch (err) {
-          continue
-        }
-      }
-    } catch (err) {
-      // no file yet
-    }
-    all.reverse()
-    this.view = all.length > this.cap ? all.slice(0, this.cap) : all
-    this.viewSize = size
+    this.flush()
+    const today = Math.floor(Date.now() / DAY_MS)
+    const segs = segmentsIn(this.cfg.dir).filter((sg) => sg.day === today)
+    const last = segs.length === 0 ? "" : segs[segs.length - 1]!.name
+    const key = last === "" ? "none" : `${segs.length}:${last}:${sizeOf(join(this.cfg.dir, last))}`
+    if (key === this.viewKey) return this.view
+    this.view = this.newestRows(today, this.cap, false)
+    this.viewKey = key
     return this.view
   }
 
@@ -514,15 +709,10 @@ export class LogStore {
       this.ring[i] = n
       changed.add(e.id)
     }
-    this.viewSize = -1
-    let names: string[] = []
-    try {
-      names = readdirSync(this.cfg.dir)
-    } catch (err) {
-      return changed.size
-    }
-    for (const name of names) {
-      if (fileDay(name) === undefined) continue
+    this.viewKey = ""
+    this.flush()
+    for (const sg of segmentsIn(this.cfg.dir)) {
+      const name = sg.name
       const path = join(this.cfg.dir, name)
       let lines: string[] = []
       try {
@@ -566,13 +756,14 @@ export class LogStore {
     return changed.size
   }
 
-  // Deletes the day files older than retention_days before now; returns how many.
+  // Deletes the day files (every segment) older than retention_days before now; returns how many. It runs at start
+  // and then with the store's upkeep (every MAINTAIN_MS while rows are written).
   prune(now: f64): int throws Error {
     const cutoff = Math.floor(now / DAY_MS) - this.cfg.retention_days
     let removed = 0
     for (const name of try readdirSync(this.cfg.dir)) {
-      const day = fileDay(name)
-      if (day === undefined || day >= cutoff) continue
+      const sg = segmentOf(name)
+      if (sg === undefined || sg.day >= cutoff) continue
       try {
         unlinkSync(join(this.cfg.dir, name))
         removed += 1
@@ -1762,6 +1953,7 @@ test("the ring keeps only the newest max_memory_entries", () => {
     expect(r.total).toBe(3)
     expect(r.entries.map((e) => e.id).join(",")).toBe("e5,e4,e3")
     // the file keeps every entry; memory holds only the newest window
+    s.flush()
     const lines = try readFileSync(join(dir, fileName(1000.0)), "utf8").split("\n").filter((l) => l !== "")
     expect(lines.length).toBe(5)
   } finally {
@@ -1777,6 +1969,7 @@ test("content is dropped when logging is off and cut on a UTF-8 boundary when on
     const got = off.query({}).entries[0]!
     expect(got.input).toBeUndefined()
     expect(got.output).toBeUndefined()
+    off.flush()
     expect(try readFileSync(join(dir, fileName(1.0)), "utf8").includes("secret")).toBe(false)
 
     const onCfg = defaultLogStoreConfig(dir + "-on")
@@ -1811,6 +2004,7 @@ test("persistence: a new store on the same dir sees today's entries", () => {
     const a = try new LogStore(defaultLogStoreConfig(dir))
     a.add(sample("p1", Date.now(), "m", 200, {}))
     a.add(sample("p2", Date.now(), "m", 500, {}))
+    a.flush()
     const b = try new LogStore(defaultLogStoreConfig(dir))
     const r = b.query({})
     expect(r.total).toBe(2)
@@ -1839,6 +2033,160 @@ test("prune deletes day files past retention and keeps recent ones", () => {
     expect(existsSync(join(dir, "requests-2026-10-14.jsonl"))).toBe(true)
     expect(existsSync(join(dir, "other.txt"))).toBe(true)
     expect(try s.prune(1791979200000)).toBe(0)
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("segment names parse back to their day and number", () => {
+  expect(segmentOf("requests-2026-10-14.jsonl")!.seg).toBe(0)
+  expect(segmentOf("requests-2026-10-14.3.jsonl")!.seg).toBe(3)
+  expect(segmentOf("requests-2026-10-14.12.jsonl")!.day).toBe(Math.floor(1791936000000 / DAY_MS))
+  expect(segmentOf("requests-2026-10-14.0.jsonl")).toBeUndefined()
+  expect(segmentOf("requests-2026-10-14.01.jsonl")).toBeUndefined()
+  expect(segmentOf("requests-2026-10-14.x.jsonl")).toBeUndefined()
+  expect(segmentOf("requests-2026-02-30.1.jsonl")).toBeUndefined()
+  expect(segmentOf("requests-2026-10-14.1.jsonl.bak")).toBeUndefined()
+  expect(segmentName("2026-10-14", 0)).toBe("requests-2026-10-14.jsonl")
+  expect(segmentName("2026-10-14", 2)).toBe("requests-2026-10-14.2.jsonl")
+})
+
+test("rows are written in batches: on flush, or at once when a batch is full", () => {
+  const dir = tmpDir()
+  try {
+    const s = try new LogStore(defaultLogStoreConfig(dir))
+    const now = Date.now()
+    for (let i = 0; i < 3; i++) s.add(sample("b" + i, now, "m", 200, {}))
+    // kept in memory at once, on disk at the next flush
+    expect(s.query({}).total).toBe(3)
+    expect(s.pendingRows()).toBe(3)
+    expect(existsSync(join(dir, fileName(now)))).toBe(false)
+    s.flush()
+    expect(s.pendingRows()).toBe(0)
+    expect(try readFileSync(join(dir, fileName(now)), "utf8").split("\n").filter((l) => l !== "").length).toBe(3)
+    // a row that fills the batch is written with it, without waiting for the timer
+    s.add(sample("big", now, "m", 500, { error: "e".repeat(70000) }))
+    expect(s.pendingRows()).toBe(0)
+    expect(try readFileSync(join(dir, fileName(now)), "utf8").includes("\"big\"")).toBe(true)
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("a day goes on in a new segment once its file reaches max_file_mb, and pruning takes every segment", () => {
+  const dir = tmpDir()
+  try {
+    const cfg = defaultLogStoreConfig(dir)
+    cfg.max_file_mb = 1
+    try mkdirSync(dir, { recursive: true })
+    const now = Date.now()
+    const day = dayOf(now)
+    try writeFileSync(join(dir, segmentName(day, 0)), "x".repeat(1048576) + "\n")
+    const s = try new LogStore(cfg)
+    s.add(sample("s1", now, "m", 200, {}))
+    s.flush()
+    expect(try readFileSync(join(dir, segmentName(day, 1)), "utf8").includes("\"s1\"")).toBe(true)
+    // another process on the same folder agrees on the segment
+    const t = try new LogStore(cfg)
+    t.add(sample("s2", now, "m", 200, {}))
+    t.flush()
+    expect(try readFileSync(join(dir, segmentName(day, 1)), "utf8").includes("\"s2\"")).toBe(true)
+    // the old day's segments all go with retention
+    try writeFileSync(join(dir, "requests-2026-09-01.jsonl"), "{}\n")
+    try writeFileSync(join(dir, "requests-2026-09-01.1.jsonl"), "{}\n")
+    try writeFileSync(join(dir, "requests-2026-09-01.2.jsonl"), "{}\n")
+    expect(try s.prune(now)).toBe(3)
+    expect(existsSync(join(dir, segmentName(day, 1)))).toBe(true)
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("start-up reads only the newest segments of today, and skips one far over the segment size", () => {
+  const dir = tmpDir()
+  try {
+    try mkdirSync(dir, { recursive: true })
+    const now = Date.now()
+    const day = dayOf(now)
+    const row = (id: string): string => JSON.stringify(sample(id, now, "m", 200, {})) + "\n"
+    // a day file from before segments, five times the segment size
+    try writeFileSync(join(dir, segmentName(day, 0)), row("old") + "x".repeat(5 * 1048576) + "\n")
+    try writeFileSync(join(dir, segmentName(day, 1)), row("a") + row("b"))
+    try writeFileSync(join(dir, segmentName(day, 2)), row("c") + row("d"))
+    const cfg = defaultLogStoreConfig(dir)
+    cfg.max_file_mb = 1
+    cfg.max_memory_entries = 3
+    const s = try new LogStore(cfg)
+    expect(s.query({}).entries.map((e) => e.id).join(",")).toBe("d,c,b")
+    cfg.max_memory_entries = 10
+    const all = try new LogStore(cfg)
+    // the oversized segment is not read (its rows stay on disk)
+    expect(all.query({}).entries.map((e) => e.id).join(",")).toBe("d,c,b,a")
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("shared stores write each row at once and answer with each other's rows", () => {
+  const dir = tmpDir()
+  try {
+    const a = try new LogStore(defaultLogStoreConfig(dir))
+    const b = try new LogStore(defaultLogStoreConfig(dir))
+    a.shared = true
+    b.shared = true
+    const now = Date.now()
+    a.add(sample("w1", now, "m", 200, {}))
+    b.add(sample("w2", now, "m", 200, {}))
+    // a shared store writes each row at once: the other sees it on its next query
+    expect(b.pendingRows()).toBe(0)
+    expect(a.query({}).entries.map((e) => e.id).join(",")).toBe("w2,w1")
+    expect(b.query({}).total).toBe(2)
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("max_disk_mb deletes the oldest segments first and never the newest", () => {
+  const dir = tmpDir()
+  try {
+    try mkdirSync(dir, { recursive: true })
+    const big = "x".repeat(600 * 1024) + "\n"
+    try writeFileSync(join(dir, "requests-2026-09-01.jsonl"), big)
+    try writeFileSync(join(dir, "requests-2026-09-02.jsonl"), big)
+    try writeFileSync(join(dir, "requests-2026-09-02.1.jsonl"), big)
+    const cfg = defaultLogStoreConfig(dir)
+    cfg.max_disk_mb = 1
+    const s = try new LogStore(cfg)
+    // 1.8 MB over a 1 MB cap: the two oldest go
+    expect(s.capped).toBe(2)
+    expect(existsSync(join(dir, "requests-2026-09-01.jsonl"))).toBe(false)
+    expect(existsSync(join(dir, "requests-2026-09-02.jsonl"))).toBe(false)
+    expect(existsSync(join(dir, "requests-2026-09-02.1.jsonl"))).toBe(true)
+    // a single file over the cap is the one being written: it stays
+    const one = defaultLogStoreConfig(dir)
+    one.max_disk_mb = 1
+    try writeFileSync(join(dir, "requests-2026-09-02.1.jsonl"), big + big)
+    expect((try new LogStore(one)).capped).toBe(0)
+    // no cap by default
+    try writeFileSync(join(dir, "requests-2026-09-01.jsonl"), big)
+    expect((try new LogStore(defaultLogStoreConfig(dir))).capped).toBe(0)
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("a failed write counts the rows it dropped", () => {
+  const dir = tmpDir()
+  try {
+    const s = try new LogStore(defaultLogStoreConfig(dir))
+    // the folder is replaced by a file: appends fail
+    try rmSync(dir, { recursive: true, force: true })
+    try writeFileSync(dir, "not a folder")
+    s.add(sample("f1", Date.now(), "m", 200, {}))
+    s.add(sample("f2", Date.now(), "m", 200, {}))
+    s.flush()
+    expect(s.dropped).toBe(2)
+    expect(s.query({}).total).toBe(2)
   } finally {
     try rmSync(dir, { recursive: true, force: true })
   }

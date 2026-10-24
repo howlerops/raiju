@@ -119,9 +119,32 @@ in memory in each worker process. They are not shared:
 - Cache hits only happen within one process. More replicas mean a lower hit rate.
 - `/api/governance/budgets` and `/api/cache` report one process, not the fleet.
 
+Config changes are different: a change saved through the API is applied by every worker of the pod before the API
+answers. Other replicas apply it when they share the config file, or pull it with `cluster.config_sync: "pull"`
+(each pod's ConfigMap copy is then rewritten in memory only, as the mount is read-only). Send management traffic to one
+replica. See [docs/operations.md](../docs/operations.md) for what is shared and how to secure cluster traffic.
+
+The request log and audit folders default to `/app/data/logs` and `/app/data/logs/audit` (the app dir). If
+`logs_store` or `audit` is enabled and the folder cannot be written, the pod does not start. Mount a writable volume
+there, or set `"required": false`.
+
 Use `workers` for CPU use within a pod (about the number of cores the pod gets),
 and replicas for capacity and availability. Each new replica, including one from
 the HPA, adds another full set of per-process limits.
+
+## Memory and the request log
+
+- A worker starts at about 20 MB and settles at 40 to 60 MB under load. Each open stream adds about 170 KB
+  while it lasts, so set the memory limit from the streams a pod holds at once: 1,000 open streams on one worker
+  need about 170 MB more. `make soak` measures both on your build.
+- With `logs_store` on, a single process writes its rows in batches (every 100 ms or 64 KB); SIGTERM writes the
+  last batch before the process exits (only a hard kill loses it). With `workers` above 1, each row is written as it comes, because the
+  workers read each other's rows from the files.
+- Each day's file is cut into segments of `logs_store.max_file_mb` (default 32), and start-up reads only the
+  newest segments of today, so a restart late in a busy day stays quick.
+- `logs_store.retention_days` (default 7) removes whole days. `logs_store.max_disk_mb` (default 0, no cap)
+  also caps the folder: the oldest segments are deleted first. Set it below the volume's size; at 1,500
+  requests a second a day of rows is on the order of 100 GB.
 
 ## Limits of this packaging
 

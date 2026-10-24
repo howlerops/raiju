@@ -25,7 +25,7 @@ import { AccessProfile, AgentConfig, BudgetConfig, BudgetOverride, CircuitPolicy
 import { effectiveBudgetLimit } from "./governance"
 import { rfc3339Of } from "./vkexpiry"
 import { flushVaultCache } from "./secrets"
-import { ConfigStore, checkAdmin, sweepExpiredKeys, sealStored, openStored, RESOURCES, OPERATIONS } from "./store"
+import { ConfigStore, checkAdmin, sweepExpiredKeys, sealStored, openStored, RESOURCES, OPERATIONS, CONFIG_NS, CONFIG_KEY, ConfigGen, genOf, textSha } from "./store"
 import { Held, KeyCtx, handleApiKeys, newKeyValue } from "./apikeys"
 import { keyBudgetIds, permissionDocs, permissionIds, permissionMap, rolePairs, userObjectJson, userKeysJson, PermissionDoc, creationPolicy, heldProfiles, PROPAGATED_FIELDS, propagateProfileKeys, parseOverride } from "./govapi"
 
@@ -75,7 +75,7 @@ import { deadline } from "./deadline"
 import { secureHex, utf8, sha256, toHex } from "./crypto"
 import * as b64 from "./base64"
 import * as metrics from "./metrics"
-import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, appendFileSync } from "node:fs"
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, appendFileSync, statSync } from "node:fs"
 import { writeFileAtomic } from "./atomicfile"
 import { Counters, ClusterConfig, BrokerConfig, brokerUrl, syncInterval } from "./cluster"
 import { clusterState, ownerOf } from "./clusterstate"
@@ -622,6 +622,15 @@ async function postText(url: string, headers: Map<string, string>, body: string,
   }
 }
 
+// how long a management API change waits for the other workers to apply it (settleConfig)
+const SETTLE_MS = 2000
+
+async function pause(ms: int): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setTimeout(() => resolve(), ms)
+  })
+}
+
 async function putText(url: string, headers: Map<string, string>, body: string): Promise<{ status: int, body: string }> {
   const dl = deadline(10000)
   try {
@@ -1013,6 +1022,8 @@ export class Ops {
   // catalog attributes (PUT /api/models/catalog): "provider/model" to the attributes' JSON text
   private catalogAttrs: Map<string, string> = new Map()
   audit: AuditLog | undefined = undefined
+  // why the audit log could not open ("" when it opened or is off)
+  auditError = ""
   alerts: AlertEngine | undefined = undefined
   // Bifrost-style alert rules (CEL over a governance scope's usage)
   cel: CelEngine | undefined = undefined
@@ -1095,6 +1106,14 @@ export class Ops {
     clusterState().onChange(CARD_NS, (name: string, value: string | undefined): void => {
       this.adoptRemoteCard(name, value)
     })
+    // a config saved by another worker or node arrives as a generation (store.tov CONFIG_NS); a save made here is sent
+    // at once instead of at the next tick
+    clusterState().onChange(CONFIG_NS, (key: string, value: string | undefined): void => {
+      if (key === CONFIG_KEY) this.takeConfigGen(value)
+    })
+    store.onSaved = () => {
+      this.configSaved()
+    }
     this.loadCatalogAttrs()
     // MCP tool executions go to the request log store (kind "mcp")
     setMcpToolLog((c: McpToolCall) => {
@@ -1149,10 +1168,13 @@ export class Ops {
     if (this.audit === undefined && ac !== undefined && ac.enabled === true) {
       try {
         this.audit = new AuditLog(ac.dir ?? "logs/audit", ac.key ?? "", ac.max_memory ?? 10000)
+        this.auditError = ""
       } catch (e) {
+        this.auditError = e.message
         console.error(`raiju: audit log disabled: ${e.message}`)
       }
     }
+    if (ac === undefined || ac.enabled !== true) this.auditError = ""
     for (const v of cfg.virtual_mcps ?? []) {
       const problem = vmcp.validate(v)
       if (problem !== "") console.error(`raiju: virtual MCP ${v.name}: ${problem}`)
@@ -1293,6 +1315,7 @@ export class Ops {
 
   // GET /metrics: with several workers, every worker's series summed.
   metricsText(): string {
+    this.storeMetrics()
     if (this.shareDir === "") return metrics.render()
     const dir = this.shareDir + "/metrics"
     const mine = `${process.pid}.prom`
@@ -1355,6 +1378,13 @@ export class Ops {
     } catch (e) {
       // metrics stay per worker
     }
+    // the config generation each worker has applied (settleConfig reads them)
+    try {
+      mkdirSync(this.shareDir + "/gen", { recursive: true })
+    } catch (e) {
+      // a save then answers without waiting for the other workers
+    }
+    this.ackConfig()
     // A request counted in one worker reaches the others within two ticks; until then a
     // burst spread over several workers can pass a limit by a little (as across cluster nodes).
     this.shareTimer = setInterval(() => {
@@ -1408,6 +1438,7 @@ export class Ops {
     if (this.sweeps % 10 === 0) {
       const sem = this.engine.semantic
       if (sem !== undefined) sem.syncShared(Date.now())
+      this.storeMetrics()
       try {
         writeFileAtomic(`${this.shareDir}/metrics/${process.pid}.prom`, metrics.render(), { durable: false })
       } catch (e) {
@@ -1534,6 +1565,205 @@ export class Ops {
     this.pushLocal(c)
     this.applyRemote(c)
     return json(200, c.encode())
+  }
+
+  // The storage that is on, required and could not open: the request log store (logs_store) and the audit log, each
+  // required unless its section sets required: false. The start fails on any (main.tov), and readiness reports them.
+  storageProblems(): string[] {
+    const out: string[] = []
+    const ls = this.engine.cfg.logs_store
+    if (ls !== undefined && ls.enabled === true && ls.required !== false && this.engine.logStoreError !== "") out.push(`logs_store: ${this.engine.logStoreError}`)
+    const ac = this.engine.cfg.audit
+    if (ac !== undefined && ac.enabled === true && ac.required !== false && this.audit === undefined && this.auditError !== "") out.push(`audit: ${this.auditError}`)
+    return out
+  }
+
+  // request log entries that could not be written, counted into raiju_log_store_dropped_total before a render
+  droppedSeen: f64 = 0.0
+
+  storeMetrics(): void {
+    const ls = this.engine.logStore
+    if (ls === undefined) return
+    const total: f64 = ls.dropped
+    if (total > this.droppedSeen) metrics.inc("raiju_log_store_dropped_total", "", total - this.droppedSeen)
+    this.droppedSeen = total
+  }
+
+  // ---- config generations: a save reaches every worker of the node and the other nodes (store.tov) ----
+
+  // the newest generation heard of, a pull in flight, and the last note logged (each once per generation)
+  latestGen = ""
+  pullingGen = ""
+  genNote = ""
+
+  // After a save here: this worker's share file (and, when clustered, a sync) goes out now, so the other workers take
+  // the generation within one share tick (100 ms) and the peers within one round trip.
+  configSaved(): void {
+    const c = this.counters
+    if (c === undefined) return
+    if (this.shareDir !== "") {
+      this.pushLocal(c)
+      try {
+        writeFileAtomic(`${this.shareDir}/counters/${process.pid}.json`, c.encode(), { durable: false })
+      } catch (e) {
+        // the next share tick writes it
+      }
+    }
+    if (this.clusterCfg !== undefined) this.syncCluster()
+  }
+
+  // Notes in the share folder that this worker runs the config generation it holds (called once the engine has been
+  // rebuilt from it, main.tov applyChange).
+  ackConfig(): void {
+    if (this.shareDir === "") return
+    try {
+      writeFileAtomic(`${this.shareDir}/gen/${process.pid}`, this.store.fileSha, { durable: false })
+    } catch (e) {
+      // settleConfig then waits out its bound for this worker
+    }
+  }
+
+  // Called before a management API change is answered: waits until every other live worker of the node runs the
+  // generation just saved (their notes in the share folder), at most SETTLE_MS, so a virtual key deleted through the
+  // API is refused by every worker once the answer is out. A worker whose share file has not moved for a second is
+  // taken for gone. Other nodes take the generation at their next cluster sync and are not waited for.
+  async settleConfig(): Promise<void> {
+    if (this.shareDir === "") return
+    const sha = this.store.fileSha
+    const until = Date.now() + SETTLE_MS
+    for (;;) {
+      const late = this.workersBehind(sha)
+      if (late.length === 0) return
+      if (Date.now() >= until) {
+        console.error(`raiju: config: worker(s) ${late.join(", ")} did not apply the saved configuration within ${SETTLE_MS} ms; answering anyway`)
+        return
+      }
+      await pause(10)
+    }
+  }
+
+  // The live workers of the node (other than this one) that do not yet run generation sha (or a newer one).
+  workersBehind(sha: string): string[] {
+    const out: string[] = []
+    const dir = this.shareDir + "/counters"
+    const now = Date.now()
+    let names: string[] = []
+    try {
+      names = readdirSync(dir)
+    } catch (e) {
+      return out
+    }
+    for (const f of names) {
+      if (!f.endsWith(".json")) continue
+      const pid = f.slice(0, f.byteLength - 5)
+      if (pid === `${process.pid}`) continue
+      try {
+        if (now - statSync(dir + "/" + f).mtimeMs > 1000.0) continue
+      } catch (e) {
+        continue
+      }
+      let held = ""
+      try {
+        held = readFileSync(`${this.shareDir}/gen/${pid}`, "utf8")
+      } catch (e) {
+        held = ""
+      }
+      if (held !== sha && held !== this.store.fileSha) out.push(pid)
+    }
+    return out
+  }
+
+  // A generation saved by another worker of this node or by another node. A worker always rereads the file the node
+  // shares. Another node's save is taken per cluster.config_sync: "file" (default) rereads the file when it holds the
+  // saved text, "pull" fetches the text from a peer otherwise, and "off" ignores it.
+  takeConfigGen(value: string | undefined): void {
+    if (value === undefined) return
+    const g = genOf(value)
+    if (g === undefined) return
+    this.latestGen = g.sha
+    const sibling = g.node === cluster.nodeOf(this.nodeId)
+    const mode = sibling ? "file" : this.clusterCfg?.config_sync ?? "file"
+    if (mode === "off") return
+    const r = this.store.takeGeneration(g.sha)
+    if (r.status === "same") return
+    if (r.status === "reloaded") {
+      if (!sibling) console.error(`raiju: config: took the configuration node ${g.node} saved (shared config file)`)
+      return
+    }
+    if (r.status === "error") {
+      this.noteGen(g.sha, `raiju: config: the configuration ${sibling ? "another worker" : "node " + g.node} saved could not be applied: ${r.message}`)
+      return
+    }
+    // the file holds other text: a sibling has saved again since (its next generation follows), or this node has a file of its own
+    if (sibling) return
+    if (mode === "pull") {
+      this.pullConfig(g)
+      return
+    }
+    this.noteGen(g.sha, `raiju: config: node ${g.node} saved a configuration this node's config file does not hold, so it is not applied here (share the file between the nodes, or set cluster.config_sync to "pull")`)
+  }
+
+  private noteGen(sha: string, msg: string): void {
+    if (this.genNote === sha) return
+    this.genNote = sha
+    console.error(msg)
+  }
+
+  // cluster.config_sync "pull": the text of a generation another node saved, from the first peer that holds it (POST
+  // /api/cluster/config), written to this node's file with its own cluster section and applied. A peer's workers may
+  // take a moment to hold it, so a few rounds are tried. A newer generation heard of meanwhile wins.
+  async pullConfig(g: ConfigGen): Promise<void> {
+    const cc = this.clusterCfg
+    if (cc === undefined || this.pullingGen === g.sha) return
+    if (cluster.isBroker(cc)) {
+      this.noteGen(g.sha, `raiju: config: node ${g.node} saved a configuration, and cluster.config_sync "pull" needs peers (type "broker" has none): share the config file between the nodes`)
+      return
+    }
+    this.pullingGen = g.sha
+    try {
+      for (let round = 0; round < 5; round++) {
+        if (round > 0) await pause(300 * round)
+        if (this.latestGen !== g.sha || this.store.fileSha === g.sha) return
+        const body = JSON.stringify({ sha: g.sha, ts: Date.now() })
+        const h: Map<string, string> = new Map()
+        h.set("content-type", "application/json")
+        h.set("x-raiju-cluster-sig", cluster.sign(cc.secret, body))
+        for (const p of this.peerUrls(cc)) {
+          const r = await postText(p + "/api/cluster/config", h, body)
+          if (r.status !== 200 || textSha(r.body) !== g.sha) continue
+          if (this.latestGen !== g.sha || this.store.fileSha === g.sha) return
+          const note = this.store.adoptPulled(r.body, g.sha)
+          if (note !== "") console.error(`raiju: config: ${note}`)
+          if (this.store.fileSha === g.sha) console.error(`raiju: config: took the configuration node ${g.node} saved (pulled from ${p})`)
+          return
+        }
+      }
+      this.noteGen(g.sha, `raiju: config: node ${g.node} saved a configuration that no peer could hand over; this node keeps its own until the next save`)
+    } finally {
+      this.pullingGen = ""
+    }
+  }
+
+  // POST /api/cluster/config from a peer pulling a generation (cluster.config_sync "pull"). Signed like the sync route,
+  // over a body naming the generation and the time (a request older than a minute is refused, so a captured one does
+  // not replay); the answer is the config text as its writer saved it, secrets sealed when encryption at rest is on.
+  async clusterConfig(req: Request): Promise<Response> {
+    const cc = this.clusterCfg
+    if (cc === undefined) return json(404, errorJson("clustering is off", "invalid_request_error", undefined))
+    const body = await req.text()
+    if (!cluster.verify(cc.secret, body, req.headers.get("x-raiju-cluster-sig") ?? "")) return denied(401, "bad cluster signature")
+    let ask: { sha: string, ts: f64 } = { sha: "", ts: 0.0 }
+    try {
+      ask = try JSON.parse(body) as { sha: string, ts: f64 }
+    } catch (e) {
+      return json(400, errorJson(e.message, "invalid_request_error", undefined))
+    }
+    if (Math.abs(Date.now() - ask.ts) > 60000.0) return denied(401, "stale cluster request")
+    if (ask.sha === "" || ask.sha !== this.store.fileSha || this.store.genText === "") return json(404, errorJson("this node does not hold that configuration", "not_found_error", undefined))
+    const hs: Record<string, string> = new Map()
+    hs.set("content-type", "application/json")
+    hs.set("cache-control", "no-store")
+    return new Response(this.store.genText, { status: 200, headers: hs })
   }
 
   // ---- the live feed (/ws) across the workers of a node and the cluster (feed.tov) ----
@@ -3867,8 +4097,8 @@ export class Ops {
   }
 
   // A graceful stop (lifecycle.tov): what is queued goes out once more, whether due or not: this worker's counters
-  // to the share folder, the exporters' batches (each queue until it is empty or a send fails), retained content
-  // and the trace spans.
+  // to the share folder, the exporters' batches (each queue until it is empty or a send fails), retained content,
+  // the trace spans and the request log's batched rows.
   async flushForStop(): Promise<void> {
     if (this.shareDir !== "") this.shareTick()
     for (const q of this.engine.exportQueues) {
@@ -3887,6 +4117,9 @@ export class Ops {
     await this.flushRetained()
     const tr = this.engine.tracer
     if (tr !== undefined) this.engine.flushTraces(tr)
+    // the request log's last batch (a process alone writes its rows every 100 ms; logstore.tov)
+    const ls = this.engine.logStore
+    if (ls !== undefined) ls.flush()
   }
 
   async flushExporters(): Promise<void> {
@@ -4467,6 +4700,7 @@ export class Ops {
       const kept = this.store.cfg.audit?.omit_ip_addresses === true ? undefined : ip
       log.record(actor, a.action, a.target, m, path, status, kept, detail === "" ? undefined : detail, Date.now())
     } catch (e) {
+      metrics.inc("raiju_audit_write_errors_total", "", 1.0)
       console.error(`raiju: audit write failed: ${e.message}`)
     }
   }
@@ -5480,4 +5714,65 @@ test("a virtual key in a header beside an OAuth token is found, a provider key i
   expect(headerKeyOf(h)).toBe("sk-bf-x")
   h.set("x-bf-vk", "anything")
   expect(headerKeyOf(h)).toBe("anything")
+})
+
+test("config generations: a shared file is reread, another node's own file is left alone, and a sibling's stale one waits", () => {
+  const path = "/tmp/raiju-ops-gen-" + (try secureHex(6)) + ".json"
+  try {
+    const t1 = `{"governance":{"virtual_keys":[{"id":"vk-1","value":"sk-bf-1"}]}}`
+    try writeFileSync(path, t1)
+    const raw = try JSON.parse(t1) as Config
+    const store = new ConfigStore(path, raw)
+    const ops = new Ops(new Engine(raw), store)
+    let applied: int[] = []
+    store.onChange = (c) => {
+      applied.push((c.governance?.virtual_keys ?? []).length)
+    }
+    const me = cluster.nodeOf(ops.nodeId)
+    // another node saved, and the file is shared: reread (config_sync defaults to "file")
+    const t2 = `{"governance":{"virtual_keys":[]}}`
+    try writeFileSync(path, t2)
+    ops.takeConfigGen(JSON.stringify({ sha: textSha(t2), node: me + "-other" }))
+    expect(applied).toEqual([0])
+    expect(store.fileSha).toBe(textSha(t2))
+    // a generation this node's file does not hold: nothing is applied (no pull without config_sync "pull")
+    ops.takeConfigGen(JSON.stringify({ sha: textSha("{}"), node: me + "-other" }))
+    expect(applied).toEqual([0])
+    // a sibling worker's save that the file no longer holds (it saved again since): the next generation follows
+    ops.takeConfigGen(JSON.stringify({ sha: textSha("{}"), node: me }))
+    expect(applied).toEqual([0])
+    // a sibling worker's save the file holds is always reread
+    try writeFileSync(path, t1)
+    ops.takeConfigGen(JSON.stringify({ sha: textSha(t1), node: me }))
+    expect(applied).toEqual([0, 1])
+    // a deletion or a value that is not a generation is ignored
+    ops.takeConfigGen(undefined)
+    ops.takeConfigGen("junk")
+    expect(applied.length).toBe(2)
+  } finally {
+    try rmSync(path, { force: true })
+  }
+})
+
+test("storageProblems names a required log store or audit log that could not open, and not one with required false", () => {
+  const dir = "/tmp/raiju-ops-storage-" + (try secureHex(6))
+  try {
+    try mkdirSync(dir, { recursive: true })
+    try writeFileSync(dir + "/blocker", "x")
+    const bad: Config = { logs_store: { enabled: true, dir: dir + "/blocker/logs" }, audit: { enabled: true, dir: dir + "/blocker/audit", key: "k" } }
+    const ops = new Ops(new Engine(bad), new ConfigStore(dir + "/c.json", bad))
+    const ps = ops.storageProblems()
+    expect(ps.length).toBe(2)
+    expect(ps[0]!.startsWith("logs_store: ")).toBe(true)
+    expect(ps[1]!.startsWith("audit: ")).toBe(true)
+    const soft: Config = { logs_store: { enabled: true, required: false, dir: dir + "/blocker/logs" }, audit: { enabled: true, required: false, dir: dir + "/blocker/audit", key: "k" } }
+    const sops = new Ops(new Engine(soft), new ConfigStore(dir + "/c.json", soft))
+    expect(sops.storageProblems().length).toBe(0)
+    const good: Config = { logs_store: { enabled: true, dir: dir + "/logs" }, audit: { enabled: true, dir: dir + "/audit", key: "k" } }
+    const gops = new Ops(new Engine(good), new ConfigStore(dir + "/c.json", good))
+    expect(gops.storageProblems().length).toBe(0)
+    expect(gops.audit !== undefined && gops.engine.logStore !== undefined).toBe(true)
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
 })

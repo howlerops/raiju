@@ -11,8 +11,10 @@ import {
   ModelConfigGovernance, ProviderGovernance, PricingOverrideConfig, AlertsConfig, ClientConfig, providerNames, GlobalProxyConfig, CircuitPolicyConfig,
   WebhookEndpoint, AgentConfig, AgentGrant, AgentAuth, AgentOAuth, AgentTls, ProjectConfig, BusinessUnitConfig, RoleConfig, PermissionPair, UserAgentMapping, PluginSpec,
   BudgetOverride, PricingSyncConfig, ComplexitySettings, ProjectMember, MemberShare, RateLimitShare, EntityDac, ProfileRole, ApiKeyConfig, UserBudgetOverride,
-  loadRawConfig,
+  loadRawConfig, rawConfigOf,
 } from "./config"
+import { clusterState } from "./clusterstate"
+import { nodeOf } from "./cluster"
 import { RoutingRule, RuleTarget } from "./cel"
 import { aliasProviderProblem } from "./aliases"
 import { permissionDocs, pairOfId, permissionIds, parseOverride, keyBudgetIds, expiredToDelete, ruleError, complexityProblem, complexityFrom, emailOf, attachBinding, heldProfiles } from "./govapi"
@@ -27,8 +29,8 @@ import { McpClientConfig, McpUserCredential } from "./mcp"
 import { McpUserToken } from "./mcpuser"
 import { decode, encode } from "./base64"
 import { gcmSeal, gcmOpen, pbkdf2Sha256 } from "./aesgcm"
-import { Field, fields, find, isNull, quote, elements, decodeString, rawStr, rawBool, rawNum } from "./json"
-import { secureHex, utf8 } from "./crypto"
+import { Field, fields, find, isNull, quote, elements, decodeString, rawStr, rawBool, rawNum, build, setField, without } from "./json"
+import { secureHex, utf8, sha256, toHex } from "./crypto"
 import { rfc3339Ms, rfc3339Of } from "./vkexpiry"
 import { durationMs, effectiveBudgetLimit, cyclesLeft } from "./governance"
 
@@ -1166,10 +1168,53 @@ export function openConfig(c: Config, cipher: ConfigCipher | undefined): { cfg: 
   return { cfg: cfg, errors: errs }
 }
 
+// The config generation. Every save puts the sha256 of the text written, and the node that wrote it, on the cluster
+// state under CONFIG_NS/CONFIG_KEY. The other workers of the node get it through the share folder within two share
+// ticks, the other nodes at their next cluster sync; each takes the text as its config (takeGeneration, adopt), so a
+// deleted virtual key stops working everywhere and not only in the process that saved.
+export const CONFIG_NS = "config"
+export const CONFIG_KEY = "file"
+
+export type ConfigGen = { sha: string, node: string }
+
+// sha256 of a config text, in hex: the generation's name.
+export function textSha(text: string): string {
+  return toHex(sha256(utf8(text)))
+}
+
+// The generation carried by a cluster state value, or undefined when it does not hold one.
+export function genOf(value: string): ConfigGen | undefined {
+  try {
+    const g = try JSON.parse(value) as ConfigGen
+    if (g.sha.byteLength !== 64 || g.node === "") return undefined
+    return g
+  } catch (e) {
+    return undefined
+  }
+}
+
+// What takeGeneration did: "same" (this process holds it), "reloaded" (the file held it, now the config), "differs"
+// (the file holds other text, another node's own file) or "error" (it could not be read or opened; message says why).
+export type GenOutcome = { status: "same" | "reloaded" | "differs" | "error", message: string }
+
+// A config text pulled from another node, with this node's own cluster section put back (node_id, peers and the secret
+// stay this node's). own is the cluster section as the local file writes it, or undefined when there is none.
+export function withOwnCluster(text: string, own: string | undefined): string throws SyntaxError {
+  let fs = without(try fields(text), ["cluster", "cluster_config"])
+  if (own !== undefined) setField(&fs, "cluster", own)
+  return build(fs)
+}
+
 export class ConfigStore {
   cfg: Config
   version: int = 0
+  // the generation this process holds: sha256 of the config text it last saved, read or adopted ("" before any)
+  fileSha: string = ""
+  // that generation's text as its writer saved it (what a peer pulling it is served, see Ops.clusterConfig)
+  genText: string = ""
   onChange: ((c: Config) => void) | undefined = undefined
+  // called after every save, once the generation is on the cluster state (Ops sends it out at once)
+  onSaved: (() => void) | undefined = undefined
   // encryption at rest: the saved file seals its secrets with this cipher (set at startup)
   cipher: ConfigCipher | undefined = undefined
   // why the last change could not be saved ("" once one is): GET /ready reports it
@@ -1189,8 +1234,11 @@ export class ConfigStore {
     removeStaleTemps(path + ".bak", 600000.0)
     try {
       if (existsSync(path)) {
+        const text = readFileSync(path, "utf8")
+        this.fileSha = textSha(text)
+        this.genText = text
         const known = fields(JSON.stringify(initial)).map((f) => f.key)
-        this.extras = fields(readFileSync(path, "utf8")).filter((f) => !known.includes(f.key) && f.key !== "plugins")
+        this.extras = fields(text).filter((f) => !known.includes(f.key) && f.key !== "plugins")
       }
     } catch (e) {
       this.extras = []
@@ -1215,7 +1263,100 @@ export class ConfigStore {
       const old = try readFileSync(this.path, "utf8")
       try writeFileAtomic(this.path + ".bak", old)
     }
-    try writeFileAtomic(this.path, text + "\n")
+    const out = text + "\n"
+    try writeFileAtomic(this.path, out)
+    this.fileSha = textSha(out)
+    this.genText = out
+    // the other workers and nodes take this text as their config (takeGeneration)
+    const st = clusterState()
+    const gen: ConfigGen = { sha: this.fileSha, node: nodeOf(st.writerId()) }
+    st.put(CONFIG_NS, CONFIG_KEY, JSON.stringify(gen))
+    const f = this.onSaved
+    if (f !== undefined) f()
+  }
+
+  // A generation saved by another process. When this process holds it nothing happens; when the config file holds it
+  // (a sibling worker's save, or a file the nodes share) it becomes the config through adopt; otherwise the file holds
+  // other text and the caller decides (pull it from a peer, or leave this node's config as it is).
+  takeGeneration(sha: string): GenOutcome {
+    if (sha === this.fileSha) return { status: "same", message: "" }
+    let text = ""
+    try {
+      text = readFileSync(this.path, "utf8")
+    } catch (e) {
+      return { status: "error", message: e.message }
+    }
+    if (textSha(text) !== sha) return { status: "differs", message: "" }
+    const problem = this.adopt(text, sha, text)
+    if (problem !== "") return { status: "error", message: problem }
+    return { status: "reloaded", message: "" }
+  }
+
+  // Takes a config text another process saved as this process's config, without saving it: its sealed secrets are
+  // opened with this store's cipher, the sections Config does not model are kept, and onChange applies it. sha and
+  // writerText name the generation as its writer saved it. Returns "" or the problem (the config is then unchanged).
+  adopt(text: string, sha: string, writerText: string): string {
+    let next: Config = {}
+    try {
+      const opened = try openConfig(try rawConfigOf(text), this.cipher)
+      if (opened.errors.length > 0) return opened.errors.join("; ")
+      next = opened.cfg
+    } catch (e) {
+      return e.message
+    }
+    let extras: Field[] = []
+    try {
+      const known = fields(JSON.stringify(next)).map((f) => f.key)
+      extras = fields(text).filter((f) => !known.includes(f.key) && f.key !== "plugins")
+    } catch (e) {
+      extras = []
+    }
+    this.cfg = next
+    this.extras = extras
+    this.fileSha = sha
+    this.genText = writerText
+    this.version += 1
+    setGlobalProxy(next.proxy_config)
+    const f = this.onChange
+    if (f !== undefined) f(this.cfg)
+    return ""
+  }
+
+  // A generation pulled from a peer (cluster.config_sync "pull"): the writer's text, with this node's cluster section
+  // put back, is written to the config file and adopted. A file that cannot be written (a read-only mount) still
+  // leaves the config adopted in memory. Returns "" or the problem.
+  adoptPulled(pulled: string, sha: string): string {
+    if (textSha(pulled) !== sha) return "the text does not match the generation"
+    let merged = ""
+    try {
+      merged = try withOwnCluster(pulled, this.ownClusterRaw())
+    } catch (e) {
+      return e.message
+    }
+    let note = ""
+    try {
+      try writeFileAtomic(this.path, merged + "\n")
+    } catch (e) {
+      note = `adopted in memory only: the config file could not be written: ${e.message}`
+    }
+    const problem = this.adopt(merged + "\n", sha, pulled)
+    return problem !== "" ? problem : note
+  }
+
+  // This node's cluster section as its file writes it (secrets sealed when encryption at rest is on).
+  ownClusterRaw(): string | undefined {
+    try {
+      const raw = find(try fields(try readFileSync(this.path, "utf8")), "cluster")
+      if (raw !== undefined) return raw
+    } catch (e) {
+      // no file: the section comes from the config held
+    }
+    try {
+      const c = (try sealConfig(this.cfg, this.cipher)).cluster
+      return c === undefined ? undefined : JSON.stringify(c)
+    } catch (e) {
+      return undefined
+    }
   }
 
   // A save never writes back a retained admin credential older than the one the file holds: another worker or node
@@ -5178,4 +5319,80 @@ test("a user's budget override on a profile they hold is kept on the user, and r
   expect(s.setUserBudgetOverride("ana", "p", "b-p", undefined).kind).toBe("ok")
   expect((s.cfg.governance?.users ?? [])[0]!.budget_overrides).toBeUndefined()
   cleanup(path)
+})
+
+test("a save puts its generation on the cluster state, and a sibling store takes it from the shared file", () => {
+  const path = tmpPath()
+  try writeFileSync(path, `{"governance":{"virtual_keys":[{"id":"vk-1","value":"sk-bf-1"},{"id":"vk-2","value":"sk-bf-2"}]},"guardrails_config":{"x":1}}`)
+  const first = try loadRawConfig(path)
+  const a = new ConfigStore(path, first)
+  const b = new ConfigStore(path, first)
+  expect(a.fileSha).toBe(b.fileSha)
+  let saved = 0
+  a.onSaved = () => {
+    saved += 1
+  }
+  let applied: string[] = []
+  b.onChange = (c) => {
+    applied.push((c.governance?.virtual_keys ?? []).map((v) => v.id).join(","))
+  }
+  expect(handleApi(a, "DELETE", "/api/governance/virtual-keys/vk-1", "").status).toBe(200)
+  expect(saved).toBe(1)
+  const g = genOf(clusterState().get(CONFIG_NS, CONFIG_KEY) ?? "")
+  expect(g !== undefined && g.sha === a.fileSha).toBe(true)
+  expect(a.fileSha).toBe(textSha(try readFileSync(path, "utf8")))
+  const r = b.takeGeneration(a.fileSha)
+  expect(r.status).toBe("reloaded")
+  expect(applied).toEqual(["vk-2"])
+  expect((b.cfg.governance?.virtual_keys ?? []).length).toBe(1)
+  expect(b.version).toBe(1)
+  // the section Config does not model stays with the adopted config
+  expect(b.rawSection("guardrails_config")).toBe(`{"x":1}`)
+  // the same generation again changes nothing
+  expect(b.takeGeneration(a.fileSha).status).toBe("same")
+  expect(applied.length).toBe(1)
+  // a generation the file does not hold (another node's own file) is left to the caller
+  expect(b.takeGeneration("0".repeat(64)).status).toBe("differs")
+  // a broken file is an error, and the config held stays
+  try writeFileSync(path, "{broken")
+  expect(b.takeGeneration(textSha("{broken")).status).toBe("error")
+  expect((b.cfg.governance?.virtual_keys ?? []).length).toBe(1)
+  cleanup(path)
+})
+
+test("a pulled generation keeps this node's cluster section, is written to the file and is served as its writer saved it", () => {
+  const path = tmpPath()
+  try writeFileSync(path, `{"cluster":{"enabled":true,"node_id":"b","peers":["http://a"],"secret":"s"},"governance":{"virtual_keys":[{"id":"vk-1","value":"sk-bf-1"}]}}`)
+  const b = new ConfigStore(path, try loadRawConfig(path))
+  let applied = 0
+  b.onChange = (c) => {
+    applied += 1
+  }
+  const theirs = `{"cluster":{"enabled":true,"node_id":"a","peers":["http://b"],"secret":"s"},"governance":{"virtual_keys":[{"id":"vk-9","value":"sk-bf-9"}]}}` + "\n"
+  const sha = textSha(theirs)
+  expect(b.adoptPulled(theirs, "f".repeat(64)) !== "").toBe(true)
+  expect(applied).toBe(0)
+  expect(b.adoptPulled(theirs, sha)).toBe("")
+  expect(applied).toBe(1)
+  expect(b.fileSha).toBe(sha)
+  expect(b.genText).toBe(theirs)
+  expect(b.cfg.cluster?.node_id ?? "").toBe("b")
+  expect((b.cfg.governance?.virtual_keys ?? [])[0]?.id ?? "").toBe("vk-9")
+  const written = try loadRawConfig(path)
+  expect(written.cluster?.node_id ?? "").toBe("b")
+  expect(written.cluster?.peers ?? []).toEqual(["http://a"])
+  expect((written.governance?.virtual_keys ?? [])[0]?.id ?? "").toBe("vk-9")
+  // the generation is held now, whatever the local file's own hash
+  expect(b.takeGeneration(sha).status).toBe("same")
+  cleanup(path)
+})
+
+test("withOwnCluster swaps the cluster section (Bifrost's cluster_config too) and genOf refuses what is not a generation", () => {
+  const t = try withOwnCluster(`{"a":1,"cluster_config":{"x":1},"cluster":{"node_id":"a"}}`, `{"node_id":"b"}`)
+  expect(t).toBe(`{"a":1,"cluster":{"node_id":"b"}}`)
+  expect(try withOwnCluster(`{"a":1,"cluster":{"node_id":"a"}}`, undefined)).toBe(`{"a":1}`)
+  expect(genOf("not json") === undefined).toBe(true)
+  expect(genOf(`{"sha":"abc","node":"n"}`) === undefined).toBe(true)
+  expect(genOf(JSON.stringify({ sha: "a".repeat(64), node: "" })) === undefined).toBe(true)
+  expect(genOf(JSON.stringify({ sha: "a".repeat(64), node: "n" }))?.node ?? "").toBe("n")
 })

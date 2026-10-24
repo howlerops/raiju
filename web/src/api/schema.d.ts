@@ -133,6 +133,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/cluster/config": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * The config text of a generation this node holds, for a peer that pulls it (cluster peers only)
+         * @description Used by nodes with cluster.config_sync "pull" when another node saved a configuration their own config file does not hold. The answer is the config file text as its writer saved it (secrets sealed when encryption_key is set), whose sha256 is the generation asked for. See docs/operations.md.
+         */
+        post: operations["postApiClusterConfig"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/cluster/sync": {
         parameters: {
             query?: never;
@@ -7454,6 +7474,64 @@ export interface operations {
                 };
             };
             /** @description Clustering is off. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiClusterConfig: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description The generation, the sha256 (hex) of the config text its writer saved. */
+                    sha: string;
+                    /** @description The time of the request in epoch milliseconds; more than a minute away from the node's clock is refused. */
+                    ts: number;
+                };
+            };
+        };
+        responses: {
+            /** @description The config text of that generation. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description The body or a parameter is invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Clustering is off, or this node does not hold that generation. */
             404: {
                 headers: {
                     [name: string]: unknown;

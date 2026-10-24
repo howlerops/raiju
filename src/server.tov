@@ -1,7 +1,7 @@
 // HTTP routes: the OpenAI-shaped /v1 API, drop-in SDK routes, models,
 // metrics, health and a read-only management API.
 import { Config, VirtualKeyConfig, OAuthKeyConfig, ProviderConfig, KeyConfig, providerOf, providerNames, resolveEnv } from "./config"
-import { Engine, StreamSink, errorResponse, noHeaders } from "./gateway"
+import { Engine, LiveHead, StreamSink, errorResponse, headSink, noHeaders } from "./gateway"
 import { anthropicMessages, anthropicLegacy, cursorChat, genai, genaiSdk, bedrockModel, responsesApi, cohereChat, cohereEmbed, cohereRerank, cohereTokenize } from "./native"
 import * as genaiIn from "./genai_in"
 import { kindOf, listingPipeline, listingNeedsUpstream } from "./router"
@@ -588,6 +588,8 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   const sc = ops.scopeOfActorFor(gate.actor, resourceOf(req.method, path).resource)
   // DELETE reads its body too: DELETE /api/mcp-logs names its ids there
   const body = req.method === "GET" ? "" : await req.text()
+  // a change saved by this request is answered once the node's other workers run it (ops.settleConfig)
+  const genBefore = ops.store.fileSha
   let r: Reply = { status: 404, body: "", contentType: "application/json" }
   if (path === "/api/users/me/permissions") r = req.method === "GET" ? ops.mePermissions(gate.actor) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
   else if (path === "/api/governance/users/me/permissions") r = req.method === "GET" ? ops.mePermissionMap(gate.actor) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
@@ -733,6 +735,7 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   }
   ops.recordChange(gate.actor, req, path, r.status, body)
   if (req.method !== "GET" && r.status < 300) ops.storeUpdated(path)
+  if (ops.store.fileSha !== genBefore) await ops.settleConfig()
   const h: Record<string, string> = new Map()
   h.set("content-type", r.contentType)
   // a 204 has no body (a response with one would be refused)
@@ -763,8 +766,8 @@ const EXPOSED = "x-bifrost-request-id, x-bifrost-trace-id, x-request-id, x-bifro
 
 // Adds the CORS headers for an allowed origin. Response headers are a copy in Tov, so the
 // response is rebuilt: a streamed body stays a stream, any other body is carried as bytes.
-async function cors(cfg: Config, req: Request, res: Response): Promise<Response> {
-  const origins = cfg.client?.allowed_origins ?? []
+async function cors(engine: Engine, req: Request, res: Response): Promise<Response> {
+  const origins = engine.cfg.client?.allowed_origins ?? []
   const origin = req.headers.get("origin")
   if (origin === undefined || origins.length === 0) return res
   if (!origins.includes("*") && !origins.includes(origin)) return res
@@ -859,7 +862,7 @@ export async function largeFront(engine: Engine, req: Request): Promise<Response
   const route = largeRoute(cp)
   if (route !== "") {
     const r = await engine.largeRequest(req, route, p)
-    if (r instanceof Response) return await echoRequestId(req, await cors(engine.cfg, req, r))
+    if (r instanceof Response) return await echoRequestId(req, await cors(engine, req, r))
     return r
   }
   // a multipart upload: audio, image edits and variations, files
@@ -867,7 +870,7 @@ export async function largeFront(engine: Engine, req: Request): Promise<Response
   const mr = matchRoute("POST", cp)
   if (mr === undefined || (mr.modelIn !== "form" && mr.op !== "files.create")) return undefined
   if (engine.gov.enforce && engine.gov.findKey(snapshot(req.headers)) === undefined) {
-    return await echoRequestId(req, await cors(engine.cfg, req, errorResponse(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", noHeaders())))
+    return await echoRequestId(req, await cors(engine, req, errorResponse(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", noHeaders())))
   }
   // an audio upload is billed as its answer comes back (mediaAnswer); a request handed on whole is billed there
   const bill = billedMedia(mr.op) ? engine.mediaBill(snapshot(req.headers)) : undefined
@@ -875,7 +878,7 @@ export async function largeFront(engine: Engine, req: Request): Promise<Response
   const m = await handleMediaLarge(engine.cfg, req, mr, lp, bill, async (oc: OAuthKeyConfig, pc: ProviderConfig) => await engine.oauthToken(oc, pc))
   if (m instanceof Response) {
     const answered = bill === undefined ? m : await engine.mediaAnswer(mr, bill, m, snapshot(req.headers), started, req.headers.get("x-request-id") ?? newId("req_"))
-    return await echoRequestId(req, await cors(engine.cfg, req, answered))
+    return await echoRequestId(req, await cors(engine, req, answered))
   }
   return m
 }
@@ -1045,7 +1048,7 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
   if (dep !== undefined && m === "POST") return try await dispatch(engine, ops, await deploymentRequest(req, dep))
   // OpenAI's own decisions route (under /openai and the SDK prefixes) answers in OpenAI's shape, so it is told apart
   // before the path loses its prefix
-  if (m === "POST" && openaiDecisionPath(p)) return await cors(engine.cfg, req, await decisionRoute(engine, req, "/openai/v1/decisions"))
+  if (m === "POST" && openaiDecisionPath(p)) return await cors(engine, req, await decisionRoute(engine, req, "/openai/v1/decisions"))
   const cp = compatPath(p)
   if (cp !== p) return try await dispatch(engine, ops, await unprefixed(req, cp))
   const segs = p.split("/")
@@ -1063,13 +1066,13 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
       return errorResponse(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", noHeaders())
     }
     // a batch's creation runs the plugins' LLM hooks (Bifrost's batch_create), and so do the other batch and file calls
-    if (sr.op === "batches.create") return await cors(engine.cfg, req, try await llmHooked(engine, req, "batch_create", async (r, s) => await anthropicSdk(engine.cfg, r), undefined))
+    if (sr.op === "batches.create") return await cors(engine, req, try await llmHooked(engine, req, "batch_create", async (r, s) => await anthropicSdk(engine.cfg, r), undefined))
     const aop = storageOp(sr.op)
     if (aop !== "") {
       const call: StorageCall = { op: aop, provider: headerOr(req, "x-model-provider", "anthropic"), idKey: idKeyOf(aop), id: sr.id, pathFor: (nid: string): string => pathWithId(p, sr.id, nid) }
-      return await cors(engine.cfg, req, try await storageHooked(engine, req, call, async (r, s) => await anthropicSdk(engine.cfg, r)))
+      return await cors(engine, req, try await storageHooked(engine, req, call, async (r, s) => await anthropicSdk(engine.cfg, r)))
     }
-    return await cors(engine.cfg, req, await anthropicSdk(engine.cfg, req))
+    return await cors(engine, req, await outOfLine(anthropicSdk(engine.cfg, req)))
   }
   // the GenAI SDK's files, batches, cached contents, operations, :predict and rank
   const gop = genaiIn.genaiRoute(m, p)
@@ -1078,14 +1081,14 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
     const gsop = gop.op === "files.upload" ? "" : storageOp(gop.op)
     if (gsop !== "" && gsop !== "batch_create") {
       const call: StorageCall = { op: gsop, provider: headerOr(req, "x-model-provider", "gemini"), idKey: idKeyOf(gsop), id: gop.id, pathFor: (nid: string): string => pathWithId(p, gop.id, nid) }
-      return await cors(engine.cfg, req, try await storageHooked(engine, req, call, async (r, s) => {
+      return await cors(engine, req, try await storageHooked(engine, req, call, async (r, s) => {
         const rp = pathOfReq(r)
         const g2 = genaiIn.genaiRoute(r.method, rp)
         if (g2 === undefined) return errorResponse(404, `no route for ${r.method} ${rp}`, "invalid_request_error", noHeaders())
         return await genaiSdk(engine, r, g2.op, g2.model, g2.id)
       }))
     }
-    return await cors(engine.cfg, req, await genaiSdk(engine, req, gop.op, gop.model, gop.id))
+    return await cors(engine, req, await outOfLine(genaiSdk(engine, req, gop.op, gop.model, gop.id)))
   }
   // Bedrock's jobs and S3 files, and Vertex's regional batch and cache paths: the provider's own bodies
   const nr = nativeRoute(m, p)
@@ -1102,13 +1105,13 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
           return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
         }
       }, undefined)
-      return await cors(engine.cfg, req, hookedJob)
+      return await cors(engine, req, hookedJob)
     }
     // the other job, file and batch calls run the plugins' LLM hooks as Bifrost's batch_* and file_* requests
     const ns = nativeStorage(nr)
     if (ns !== undefined) {
       const call: StorageCall = { op: ns.op, provider: ns.provider, idKey: idKeyOf(ns.op), id: ns.id, pathFor: (nid: string): string => ns.s3 ? s3Path(nid) : pathWithId(p, ns.id, nid) }
-      return await cors(engine.cfg, req, try await storageHooked(engine, req, call, async (r, s) => {
+      return await cors(engine, req, try await storageHooked(engine, req, call, async (r, s) => {
         const rp = pathOfReq(r)
         const n2 = nativeRoute(r.method, rp)
         if (n2 === undefined) return errorResponse(404, `no route for ${r.method} ${rp}`, "invalid_request_error", noHeaders())
@@ -1119,11 +1122,11 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
         }
       }))
     }
-    return try await cors(engine.cfg, req, try await nativeCloud(engine.cfg, req, nr))
+    return try await cors(engine, req, try await nativeCloud(engine.cfg, req, nr))
   }
   const lc = contentId(p)
   if (lc !== "" && m === "GET") return await liveContent(engine, ops.liveSessions, req, lc)
-  if (m === "POST" && (p === "/v1/live/sessions" || p === "/openai/live/sessions")) return await cors(engine.cfg, req, await liveCreate(engine, ops.liveSessions, req))
+  if (m === "POST" && (p === "/v1/live/sessions" || p === "/openai/live/sessions")) return await cors(engine, req, await liveCreate(engine, ops.liveSessions, req))
   if (m === "GET" || m === "HEAD") {
     // x-bf-async-id on an inference route: poll the job that route created
     const aid = req.headers.get("x-bf-async-id") ?? ""
@@ -1135,11 +1138,11 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
       if (ui !== undefined) return ui
     }
     if (p === "/metrics") return textResponse(ops.metricsText(), "text/plain; version=0.0.4")
-    if (p === "/v1/models" || p === "/openai/v1/models") return await cors(engine.cfg, req, await listModels(engine, req))
-    if (p.startsWith("/v1/models/")) return await cors(engine.cfg, req, await retrieveModel(engine, req, p.slice(11)))
-    if (p === "/typesafe/v1/models") return await cors(engine.cfg, req, await decisionRoute(engine, req, p))
-    if (p === "/genai/v1beta/models") return await cors(engine.cfg, req, await genaiModels(engine, ""))
-    if (p.startsWith(GENAI)) return await cors(engine.cfg, req, await genaiModels(engine, p.slice(GENAI.byteLength)))
+    if (p === "/v1/models" || p === "/openai/v1/models") return await cors(engine, req, await listModels(engine, req))
+    if (p.startsWith("/v1/models/")) return await cors(engine, req, await outOfLine(retrieveModel(engine, req, p.slice(11))))
+    if (p === "/typesafe/v1/models") return await cors(engine, req, await decisionRoute(engine, req, p))
+    if (p === "/genai/v1beta/models") return await cors(engine, req, await outOfLine(genaiModels(engine, "")))
+    if (p.startsWith(GENAI)) return await cors(engine, req, await outOfLine(genaiModels(engine, p.slice(GENAI.byteLength))))
     const poll = asyncPoll(p)
     if (poll !== undefined) return asyncGet(engine.jobs, poll.op, poll.id)
     if (p === "/api/cache") return ops.check(req, p) ?? cacheView(engine)
@@ -1154,37 +1157,38 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
     if (p === "/api/health") return ops.check(req, p) ?? Response.json({ targets: engine.health.snapshot(Date.now()) })
   }
   if (m === "POST") {
-    if (CHAT_PATHS.includes(p)) return await cors(engine.cfg, req, await engine.chat(req))
+    if (CHAT_PATHS.includes(p)) return await cors(engine, req, await engine.chat(req))
     // the plugins' LLM hooks run on each of these request types (pluginroute.tov llmHooked)
-    if (p === "/v1/embeddings" || p === "/openai/v1/embeddings") return await cors(engine.cfg, req, try await llmHooked(engine, req, "embeddings", async (r, s) => await engine.embeddings(r), undefined))
-    if (p === "/v1/completions" || p === "/openai/v1/completions") return await cors(engine.cfg, req, try await llmHooked(engine, req, "completions", async (r, s) => await engine.completions(r), undefined))
-    if (p === "/v1/responses" || p === "/openai/v1/responses") return await cors(engine.cfg, req, try await llmHooked(engine, req, "responses", async (r, s) => await responsesApi(engine, r), undefined))
-    if (p === "/v1/rerank") return await cors(engine.cfg, req, try await llmHooked(engine, req, "rerank", async (r, s) => await rerank(engine, r), undefined))
-    if (p === "/v1/decisions" || p === "/openai/v1/decisions" || p === "/typesafe/v1/systemone") return await cors(engine.cfg, req, await decisionRoute(engine, req, p))
-    if (p === "/bedrock/rerank") return await cors(engine.cfg, req, await bedrockRerank(engine, req))
-    if (p === "/v1/count_tokens") return await cors(engine.cfg, req, await countTokens(engine, req, false))
-    if (p === "/anthropic/v1/messages/count_tokens") return await cors(engine.cfg, req, await countTokens(engine, req, true))
-    if (p === "/anthropic/v1/messages") return await cors(engine.cfg, req, await anthropicMessages(engine, req))
-    if (p === "/anthropic/v1/complete") return await cors(engine.cfg, req, await anthropicLegacy(engine, req))
-    if (isCursorChat(p)) return await cors(engine.cfg, req, await cursorChat(engine, req))
+    if (p === "/v1/embeddings" || p === "/openai/v1/embeddings") return await cors(engine, req, try await llmHooked(engine, req, "embeddings", async (r, s) => await engine.embeddings(r), undefined))
+    if (p === "/v1/completions" || p === "/openai/v1/completions") return await cors(engine, req, try await llmHooked(engine, req, "completions", async (r, s) => await engine.completions(r), undefined))
+    if (p === "/v1/responses" || p === "/openai/v1/responses") return await cors(engine, req, try await llmHooked(engine, req, "responses", async (r, s) => await responsesApi(engine, r), undefined))
+    if (p === "/v1/rerank") return await cors(engine, req, try await llmHooked(engine, req, "rerank", async (r, s) => await rerank(engine, r), undefined))
+    if (p === "/v1/decisions" || p === "/openai/v1/decisions" || p === "/typesafe/v1/systemone") return await cors(engine, req, await decisionRoute(engine, req, p))
+    if (p === "/bedrock/rerank") return await cors(engine, req, await bedrockRerank(engine, req))
+    if (p === "/v1/count_tokens") return await cors(engine, req, await countTokens(engine, req, false))
+    if (p === "/anthropic/v1/messages/count_tokens") return await cors(engine, req, await countTokens(engine, req, true))
+    if (p === "/anthropic/v1/messages") return await cors(engine, req, await anthropicMessages(engine, req))
+    if (p === "/anthropic/v1/complete") return await cors(engine, req, await anthropicLegacy(engine, req))
+    if (isCursorChat(p)) return await cors(engine, req, await cursorChat(engine, req))
     // a WebRTC realtime call is terminated on the gateway's own peer (realtimecalls.tov)
-    if (p === "/v1/realtime/calls") return await cors(engine.cfg, req, await realtimeCall(engine, req, true))
-    if (p === "/v1/realtime" || p === "/openai/v1/realtime") return await cors(engine.cfg, req, await realtimeCall(engine, req, false))
+    if (p === "/v1/realtime/calls") return await cors(engine, req, await realtimeCall(engine, req, true))
+    if (p === "/v1/realtime" || p === "/openai/v1/realtime") return await cors(engine, req, await realtimeCall(engine, req, false))
     // a realtime client secret is minted under the caller's virtual key and handed back as the gateway's own (rtsession.tov)
-    if (MINT_ROUTES.includes(p)) return await cors(engine.cfg, req, await realtimeMint(engine, req, p))
-    if (p === "/v1/mcp/tool/execute") return await cors(engine.cfg, req, await engine.executeTool(req))
-    if (p === "/cohere/v2/chat") return await cors(engine.cfg, req, await cohereChat(engine, req))
-    if (p === "/cohere/v2/embed") return await cors(engine.cfg, req, await cohereEmbed(engine, req))
-    if (p === "/cohere/v2/rerank") return await cors(engine.cfg, req, await cohereRerank(engine, req))
-    if (p === "/cohere/v1/tokenize") return await cors(engine.cfg, req, await cohereTokenize(engine, req))
-    if (p.startsWith(GENAI)) return await cors(engine.cfg, req, await genai(engine, req, p.slice(GENAI.byteLength)))
-    if (p.startsWith("/bedrock/model/") && segs.length === 5) return await cors(engine.cfg, req, await bedrockModel(engine, req, segs[3]!, segs[4]!))
+    if (MINT_ROUTES.includes(p)) return await cors(engine, req, await realtimeMint(engine, req, p))
+    if (p === "/v1/mcp/tool/execute") return await cors(engine, req, await engine.executeTool(req))
+    if (p === "/cohere/v2/chat") return await cors(engine, req, await cohereChat(engine, req))
+    if (p === "/cohere/v2/embed") return await cors(engine, req, await cohereEmbed(engine, req))
+    if (p === "/cohere/v2/rerank") return await cors(engine, req, await cohereRerank(engine, req))
+    if (p === "/cohere/v1/tokenize") return await cors(engine, req, await cohereTokenize(engine, req))
+    if (p.startsWith(GENAI)) return await cors(engine, req, await genai(engine, req, p.slice(GENAI.byteLength)))
+    if (p.startsWith("/bedrock/model/") && segs.length === 5) return await cors(engine, req, await bedrockModel(engine, req, segs[3]!, segs[4]!))
     if (p.startsWith("/v1/async/")) return await asyncSubmitHooked(engine.cfg.webhooks, engine.jobs, req, p, dispatcher(engine), (engine.cfg.client?.async_job_result_ttl ?? 3600) * 1000)
   }
   // the management API: providers, keys, virtual keys, budgets, rate limits, teams, customers
   if (p === "/api/cluster/sync" && m === "POST") return await ops.clusterSync(req)
   if (p === "/api/cluster/feed" && m === "POST") return await ops.clusterFeed(req)
   if (p === "/api/cluster/leader" && m === "GET") return ops.clusterLeader(req)
+  if (p === "/api/cluster/config" && m === "POST") return await ops.clusterConfig(req)
   if (p.startsWith("/api/oidc/") && m === "GET") return await ops.oidcRoute(req, p)
   // the MCP OAuth callback: the browser comes back here from the authorization server, with no session
   if (p === "/api/oauth/callback" && m === "GET") {
@@ -1201,7 +1205,7 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
   if (ia !== undefined) return ia
   // login and logout come before the gate: they are how a caller gets past it
   if (p.startsWith("/api/session/")) return await ops.sessionRoute(req, p)
-  if (p.startsWith("/api/")) return await manage(ops, req, p)
+  if (p.startsWith("/api/")) return await outOfLine(manage(ops, req, p))
   // a provider's own API, raw: the key's auth, the rest as the caller sent it (passthrough.tov)
   if (passthroughPath(p)) {
     if (engine.gov.enforce && engine.gov.findKey(snapshot(req.headers)) === undefined) {
@@ -1219,7 +1223,7 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
       // another provider's model is counted with that provider's count (extras.tov); an OpenAI-format one goes on
       const text = await req.text()
       const counted = await responsesInputTokens(engine, req, text)
-      if (counted !== undefined) return await cors(engine.cfg, req, counted)
+      if (counted !== undefined) return await cors(engine, req, counted)
       const hs: Record<string, string> = new Map()
       req.headers.forEach((v, key) => {
         if (key !== "content-length" && key !== "transfer-encoding") hs.set(key, v)
@@ -1245,7 +1249,7 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
   }
   if (m === "OPTIONS") {
     const res = new Response(undefined, { status: 204, headers: { "access-control-allow-methods": "GET, POST, PUT, DELETE, OPTIONS", "access-control-allow-headers": "*", "access-control-max-age": "86400" } })
-    return await cors(engine.cfg, req, res)
+    return await cors(engine, req, res)
   }
   return errorResponse(404, `no route for ${m} ${p}`, "invalid_request_error", noHeaders())
 }
@@ -1314,21 +1318,6 @@ function keyByValue(engine: Engine, value: string): VirtualKeyConfig | undefined
   const h: Hdrs = new Map()
   h.set("x-bf-vk", value)
   return engine.gov.findKey(h)
-}
-
-// Holds what a streamed chat answer needs before its head is known.
-class StreamHead {
-  resolve: ((r: Response) => void) | undefined = undefined
-  ctl: ReadableStreamDefaultController | undefined = undefined
-  body: ReadableStream | undefined = undefined
-  sent = false
-
-  give(r: Response): void {
-    if (this.sent) return
-    this.sent = true
-    const f = this.resolve
-    if (f !== undefined) f(r)
-  }
 }
 
 // The routes that can stream, by kind: the kind picks the handler (routeStream).
@@ -1413,7 +1402,7 @@ async function routeStreamInner(engine: Engine, req0: Request, kind: string, sin
   return await engine.chat(req, sink)
 }
 
-async function runChat(engine: Engine, req: Request, sink: StreamSink, head: StreamHead, kind: string, tr: TransportRun | undefined): Promise<void> {
+async function runChat(engine: Engine, req: Request, sink: StreamSink, head: LiveHead, kind: string, tr: TransportRun | undefined): Promise<void> {
   try {
     const r = await routeStream(engine, req, kind, sink)
     // never started streaming (an error, a cache hit, a non-streaming provider): the whole answer, through the HTTP post hooks
@@ -1421,6 +1410,8 @@ async function runChat(engine: Engine, req: Request, sink: StreamSink, head: Str
   } catch (e) {
     head.give(errorResponse(500, "internal error", "api_error", noHeaders()))
   }
+  // a stream that never opened: its body is unused (an opened one releases the head when it closes)
+  if (!sink.started) head.release()
 }
 
 // A streamed route on Bun.serve: the answer is a ReadableStream body that gets each SSE event
@@ -1429,41 +1420,15 @@ async function chatStreamed(engine: Engine, req: Request, kind: string, tr: Tran
   const text = await req.text()
   const hs: Record<string, string> = snapshot(req.headers)
   const again = new Request(req.url, { method: "POST", headers: hs, body: text })
-  if (!streamsRequest(kind, text)) return await cors(engine.cfg, req, await transportEnd(engine, tr, await routeStream(engine, again, kind)))
-  const head = new StreamHead()
-  const sink = new StreamSink(
-    (status, headers) => {
-      const b = head.body
-      const h: Record<string, string> = headers
-      if (b !== undefined) head.give(new Response(b, { status: status, headers: h }))
-    },
-    (chunk) => {
-      const c = head.ctl
-      if (c !== undefined) c.enqueue(chunk)
-    },
-    () => {
-      const c = head.ctl
-      if (c !== undefined) c.close()
-    },
-  )
-  head.body = new ReadableStream({
-    start: (c) => {
-      head.ctl = c
-    },
-    cancel: () => {
-      sink.cancelled = true
-    },
-  })
-  sink.writeBytes = (chunk) => {
-    const c = head.ctl
-    if (c !== undefined) c.enqueue(chunk)
-  }
+  if (!streamsRequest(kind, text)) return await cors(engine, req, await transportEnd(engine, tr, await routeStream(engine, again, kind)))
+  const head = new LiveHead()
+  const sink = headSink(head)
   const p = new Promise<Response>((resolve) => {
     head.resolve = resolve
   })
   // the plugins' chunk hooks see each event on its way to the client
   runChat(engine, again, transportSink(tr, sink), head, kind, tr)
-  return await cors(engine.cfg, req, await p)
+  return await cors(engine, req, await p)
 }
 
 // One request through dispatch, with the plugins' HTTP post hooks on the answer.
@@ -1565,9 +1530,16 @@ export function http1Upgrade(engine: Engine, ops: Ops, req: Request, accept: (pr
 }
 
 // One HTTP request on the Bun.serve server: the body limit, then the streamed or whole route.
+// The promise as it is. An async call awaited in place has its frame laid out inside the caller's frame, which
+// lives as long as the request (a stream's whole length); a call passed through here is its own allocation,
+// freed when it is done.
+function outOfLine<T>(p: Promise<T>): Promise<T> {
+  return p
+}
+
 async function bunHttp(engine: Engine, ops: Ops, req00: Request, limit: int): Promise<Response, TypeError> {
   let req0 = req00
-  const lf = await largeFront(engine, req00)
+  const lf = await outOfLine(largeFront(engine, req00))
   if (lf instanceof Response) return lf
   if (lf instanceof Request) req0 = lf
   const within = try await limitedBody(req0, limit)

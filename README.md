@@ -178,6 +178,12 @@ reaches the other workers within about 200 ms, so a burst spread over several
 workers can pass a limit by a few requests, as across cluster nodes. Each
 worker starts its own stdio MCP servers.
 
+A config change saved by one worker (through the API, say) is applied by every worker before the request is answered,
+so a deleted virtual key stops working on all of them at once. Cluster nodes take each other's saves when they share
+the config file, or pull them from a peer with `cluster.config_sync: "pull"`. The request log and audit folders default
+to `logs` and `logs/audit` in the app dir, and a required store that cannot open stops the start. See
+[docs/operations.md](docs/operations.md).
+
 ## Known gaps
 
 - SOCKS5 proxies: Tov's `fetch` supports HTTP proxies only. OTLP export uses plaintext h2c
@@ -218,6 +224,25 @@ catalog, telemetry, compat). Bifrost's published
 measure. Raiju's internal overhead (`x-bf-overhead-us`) was ~40 µs mean at
 5,000 RPS on a busier setup.
 
+### Memory
+
+`make soak` (`tests/soak/soak.py`) drives one worker with streamed and plain chat, slow streams held open and
+the log store on, and fails when its RSS keeps growing or an open stream costs too much. CI runs it as its own
+job. Measured on a 4-core VM (one worker, about 600 requests a second plus 100 slow streams):
+
+| | Before L182 | After |
+|---|---|---|
+| RSS growth while streaming | about 0.8 MB a second, never given back (about 2 KB per stream) | flat once warm (under 2 MB over the last 30 s) |
+| Plain chat at 3,000 RPS for 30 s: p99 / p99.9 / max | 4.6 / 20.5 / 32 ms | 2.3 / 8.7 / 19 ms |
+| Memory per open stream | about 330 KB | about 165 KB (230 KB on http1) |
+
+The leak was a reference cycle per streamed answer: the response body's callbacks reached the object that held
+the body (`gateway.tov` LiveHead, headSink). Reference counting frees no cycles, so the head now lets go of the
+body and its controller when the stream ends. Most of an open stream's memory is the frames of the async calls
+that wait on it; whole-config arguments in those calls (the config record is about 6 KB) are made through plain
+methods now, so the frames do not hold copies. Size a deployment from these figures: a worker holding 1,000 open
+streams needs about 170 MB on top of its 20 to 50 MB base.
+
 ## Development
 
 ```sh
@@ -226,6 +251,7 @@ make tov     # Tov with the patches in tov-patches/
 make tov-test # the patches' own tests
 make unit    # tov test, plus the Python tests (pricing, HTTP/2 and gRPC interop, crew priors)
 make e2e     # gateway against a mock upstream, on both servers
+make soak    # memory soak of one worker; fails when RSS grows (ports 18320-18321)
 make smoke   # opt-in: real providers, for each one with credentials in the environment (below)
 make openapi-check # docs/openapi/management.yaml against a probe gateway
 make parity-count  # recount docs/parity.md and refresh its Summary table
@@ -240,9 +266,9 @@ make bench
 `.github/workflows/ci.yml` runs on pull requests and pushes to `main`: it builds the patched
 compiler once (cached by Tov's revision and a hash of `tov-patches/` and `scripts/build-tov.sh`),
 then check, unit, openapi-check, web-check and the parity count in one job, e2e on Bun and on
-http1, and `make ui` in Chromium; logs are uploaded when a job fails. Pushes to `main` also build
+http1, `make ui` in Chromium, and the memory soak (`make soak`); logs are uploaded when a job fails. Pushes to `main` also build
 the Docker image (no push). `scripts/ci.sh` runs the same stages locally: `scripts/ci.sh` for all
-of them, or name some (`scripts/ci.sh check unit`; `--help` lists them). It uses `TOV` and `BUN`
+of them, or name some (`scripts/ci.sh check unit`; `--help` lists them; `soak` runs only when named). It uses `TOV` and `BUN`
 when set; with `CI_LOCK=/tmp/raiju-e2e.lock` the stages that bind fixed ports take that lock.
 
 ### Real-provider smoke tests

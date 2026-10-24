@@ -56,6 +56,7 @@ import { TokenCache, parseServiceAccount, isClaude } from "./providers/vertex"
 import { GuardConfig, applyToChatRequest, applyToCompletion, applyToText } from "./guardrails"
 import { RuleSet, Activation, pickTarget } from "./cel"
 import { LogStore, LogEntry, defaultLogStoreConfig } from "./logstore"
+import { dirProblem } from "./audit"
 import { isoMs } from "./exports"
 import { Tracer, Span, StageTiming, genAiAttributes, exportRequest, traceparentFor, tracesOn, TlsOpts, usesGrpc, exportSpansGrpc } from "./otel"
 import { McpManager, injectTools, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns, sanitizeName, perUserClientNames, perUserOAuthNames, tokenExchangeNames, userHeadersOf, ToolText, chatToolName, patternMatches, adminRowOf, ProjectMcp } from "./mcp"
@@ -91,8 +92,11 @@ export type Translate = (t: Target, text: string, requestedModel: string) => Tra
 type Outcome = { ok: bool, status: int, body: string, contentType: string, provider: string, model: string, promptTokens: int, completionTokens: int, attempts: int, upstreamMs: f64, direct?: bool, raw?: bool, key?: string, alias?: string, aliasName?: string, aliasFamily?: string, retryMs?: f64, served?: string, billed?: f64, pass?: Response, finish?: () => void, noBilled?: bool, shortCircuit?: bool, idle?: IdleWatch }
 
 // The answer of a large request whose events are converted as they arrive: the Response is given when the
-// provider's answer starts, and its body is fed by a StreamSink.
-class LiveHead {
+// provider's answer starts, and its body is fed by a StreamSink. The server's streamed routes use it too.
+// The body's callbacks reach this head through the sink, and the head holds the body and its controller: a cycle
+// that reference counting never frees. So each field is dropped once it is no longer needed: the body and resolve
+// when the answer is given, the controller when the stream closes (or never started).
+export class LiveHead {
   resolve: ((r: Response) => void) | undefined = undefined
   ctl: ReadableStreamDefaultController | undefined = undefined
   body: ReadableStream | undefined = undefined
@@ -102,8 +106,55 @@ class LiveHead {
     if (this.sent) return
     this.sent = true
     const f = this.resolve
+    this.resolve = undefined
+    this.body = undefined
     if (f !== undefined) f(r)
   }
+
+  // nothing more goes to the client
+  release(): void {
+    this.ctl = undefined
+    this.body = undefined
+    this.resolve = undefined
+  }
+}
+
+// The sink that feeds head's body: open gives the Response, each chunk is enqueued, and close ends the body and
+// releases the head. A run that never opens the sink must call head.release() itself when it is over.
+export function headSink(head: LiveHead): StreamSink {
+  const sink = new StreamSink(
+    (status, headers) => {
+      const b = head.body
+      const h: Record<string, string> = headers
+      if (b !== undefined) head.give(new Response(b, { status: status, headers: h }))
+    },
+    (chunk) => {
+      const c = head.ctl
+      if (c !== undefined) c.enqueue(chunk)
+    },
+    () => {
+      const c = head.ctl
+      if (c !== undefined) c.close()
+      head.release()
+    },
+  )
+  head.body = new ReadableStream({
+    start: (c) => {
+      head.ctl = c
+    },
+    cancel: () => {
+      sink.cancelled = true
+    },
+  })
+  sink.writeBytes = (chunk) => {
+    const c = head.ctl
+    if (c !== undefined) c.enqueue(chunk)
+  }
+  return sink
+}
+
+class BillLink {
+  weak bill: MediaBill | undefined = undefined
 }
 
 // Where a streamed answer goes, when the server can stream (the http1 front end).
@@ -127,7 +178,8 @@ export type EventStep =
 
 // The link from an event sink to the sink it feeds (a class, so the closures share it).
 class EventLink {
-  inner: StreamSink | undefined = undefined
+  // weak: the sink's own callbacks hold this link, so a strong reference back would be a cycle never freed
+  weak inner: StreamSink | undefined = undefined
   buf: SseBuffer = new SseBuffer()
   ended = false
   closed = false
@@ -1458,6 +1510,8 @@ export class Engine {
   guard: GuardConfig | undefined = undefined
   rules: RuleSet | undefined = undefined
   logStore: LogStore | undefined = undefined
+  // why logs_store could not open at the start ("" when it opened or is off); see Ops.storageProblems
+  logStoreError = ""
   // the live feed's hook on the request log (ops.tov sets it); a store made here gets it too
   logFeed: ((e: LogEntry) => void) | undefined = undefined
   tracer: Tracer | undefined = undefined
@@ -1580,11 +1634,15 @@ export class Engine {
     if (ls !== undefined && ls.enabled === true) {
       const d = defaultLogStoreConfig(ls.dir ?? "logs")
       try {
-        const store = new LogStore({ dir: d.dir, retention_days: ls.retention_days ?? d.retention_days, max_memory_entries: ls.max_memory_entries ?? d.max_memory_entries, content_logging: ls.content_logging ?? d.content_logging, max_content_bytes: d.max_content_bytes })
+        // a folder that cannot be written fails here, not at every request (audit.tov dirProblem)
+        const problem = dirProblem(d.dir)
+        if (problem !== "") throw new Error(problem)
+        const store = new LogStore({ dir: d.dir, retention_days: ls.retention_days ?? d.retention_days, max_memory_entries: ls.max_memory_entries ?? d.max_memory_entries, content_logging: ls.content_logging ?? d.content_logging, max_content_bytes: d.max_content_bytes, max_file_mb: ls.max_file_mb ?? d.max_file_mb, max_disk_mb: ls.max_disk_mb ?? d.max_disk_mb })
         store.prune(Date.now())
         store.onAdd = this.logFeed
         this.logStore = store
       } catch (e) {
+        this.logStoreError = e.message
         console.error(`raiju: request log store disabled: ${e.message}`)
       }
     }
@@ -1902,6 +1960,60 @@ export class Engine {
     }
   }
 
+  // The config lookups of the request path, as plain methods. Config is a record (about 6 KB): passed whole from an
+  // async function, it is copied into a slot of that function's frame, which lives as long as the request (a
+  // stream's whole length). Called through these, the copy lives on the stack for the call only.
+  providerConf(name: string): ProviderConfig | undefined {
+    // (read in place: no copy at all)
+    const ps = this.cfg.providers
+    if (ps === undefined) return undefined
+    return ps.get(name)
+  }
+
+  directSel(ref: ModelRef, key: string): { t: Target, keyIndex: int } {
+    return directTarget(this.cfg, ref, key)
+  }
+
+  targetSel(ref: ModelRef, tried: Set<int>, pinned: string | undefined): { t: Target, keyIndex: int } | undefined {
+    return target(this.cfg, ref, tried, pinned, this.health)
+  }
+
+  storeRaw(h: Hdrs, p: ProviderConfig): bool {
+    return storeRawOn(h, this.cfg, p)
+  }
+
+  echoRaw(h: Hdrs, p: ProviderConfig, which: string): bool {
+    return sendBackRaw(h, this.cfg, p, which)
+  }
+
+  refOf(model: string): ModelRef {
+    return parseModel(this.cfg, model)
+  }
+
+  refVia(model: string, route: string): ModelRef {
+    return parseModelVia(this.cfg, model, route)
+  }
+
+  fallbacksOf(body: Field[]): ModelRef[] {
+    return fallbackRefs(this.cfg, body)
+  }
+
+  directPlan(refs: ModelRef[], pinned: bool): ModelRef[] {
+    return directRefs(this.cfg, refs, pinned, this.health, directionOpts(this.cfg), Date.now())
+  }
+
+  userName(userId: string): string {
+    return userNameOf(this.cfg, userId)
+  }
+
+  injectedName(name: string): string | undefined {
+    return injectedChatName(this.cfg, name)
+  }
+
+  injectedAll(): string[] {
+    return injectedNames(this.cfg)
+  }
+
   // Tries each model in order; within one, retries transient failures with
   // backoff and moves to another key on credential errors.
   async attempt(refs: ModelRef[], h: Hdrs, build: Build, translate: Translate, streamed: bool, ctx: ReqCtx): Promise<Outcome> {
@@ -1916,7 +2028,7 @@ export class Engine {
     for (const ref of refs) {
       refIndex += 1
       const tried: Set<int> = new Set()
-      const p: ProviderConfig = providerOf(this.cfg, ref.provider) ?? {}
+      const p: ProviderConfig = this.providerConf(ref.provider) ?? {}
       // Bifrost's allowed_requests: a request type the provider does not allow is not sent; the next fallback may take it
       const rtype = requestType(ctx.op, streamed)
       if (!allowedRequest(p, rtype)) {
@@ -1942,7 +2054,7 @@ export class Engine {
       if (aff !== undefined && pinned === undefined) soft = resolveSticky(aff, h, ref.provider, ref.model, Date.now())?.keyId
       while (true) {
         // the caller's own key serves the primary provider only: a fallback never gets it
-        const sel = refIndex === 0 && direct !== undefined ? directTarget(this.cfg, ref, direct) : target(this.cfg, ref, tried, pinned ?? soft, this.health)
+        const sel = refIndex === 0 && direct !== undefined ? this.directSel(ref, direct) : this.targetSel(ref, tried, pinned ?? soft)
         if (sel === undefined && soft !== undefined) {
           soft = undefined
           continue
@@ -2077,7 +2189,7 @@ export class Engine {
           if (!got) return { ok: false, status: 503, body: errorJson("request dropped: queue is full", "request_dropped", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
           slot = true
         }
-        const storeRaw = !ctx.contentOff && storeRawOn(h, this.cfg, p)
+        const storeRaw = !ctx.contentOff && this.storeRaw(h, p)
         if (storeRaw) ctx.rawRequest = up.body
         const started = performance.now()
         let status = 0
@@ -2310,8 +2422,8 @@ export class Engine {
             // raw echo: not for streamed answers, whose body is not one JSON object
             // extra_fields_placement "headers" keeps the body as the provider's (no extra_fields)
             const inBody = this.cfg.client?.extra_fields_placement !== "headers"
-            const echoReq = inBody && !streamed && up.body !== "" && sendBackRaw(h, this.cfg, p, "request")
-            const echoResp = inBody && !streamed && sendBackRaw(h, this.cfg, p, "response")
+            const echoReq = inBody && !streamed && up.body !== "" && this.echoRaw(h, p, "request")
+            const echoResp = inBody && !streamed && this.echoRaw(h, p, "response")
             const rawBody = echoReq || echoResp ? withRawFields(tr.body, echoReq ? up.body : undefined, echoResp ? text : undefined) : tr.body
             return { ok: true, status: 200, body: rawBody, contentType: streamed ? "text/event-stream" : "application/json", provider: ref.provider, model: ref.model, promptTokens: tr.promptTokens, completionTokens: tr.completionTokens, attempts: attempts, upstreamMs: upstreamMs, raw: echoReq || echoResp, key: t.key.name ?? t.key.id ?? "", alias: aliasTo(t.key, ref.model, this.cfg.client?.routing_chain_max_depth), aliasName: aliasNameOf(t.key, ref.model), aliasFamily: aliasFamilyOf(t.key, ref.model), served: tr.served ?? "", billed: t.cfg.ignore_provider_cost === true ? undefined : tr.billed }
           } catch (e) {
@@ -3331,13 +3443,13 @@ export class Engine {
       out.set("x-bf-complexity-tier", tier ?? "MEDIUM")
     }
     // a bare model name resolves through keys, then the catalog, preferring the SDK route's provider
-    let refs = [parseModelVia(this.cfg, model, routeOf(op))].concat(fallbackRefs(this.cfg, body))
+    let refs = [this.refVia(model, routeOf(op))].concat(this.fallbacksOf(body))
     // whether the request named its provider (the model's prefix was taken off), for the provider level below
     let pinnedDir = refs[0]!.model !== model
     if (cx !== undefined && tier !== undefined && model === (cx.model ?? "auto")) {
       const tt = tierTarget(tier, cx.tiers ?? {})
       if (tt !== undefined) {
-        refs = [parseModel(this.cfg, tt)].concat(refs.slice(1))
+        refs = [this.refOf(tt)].concat(refs.slice(1))
         pinnedDir = refs[0]!.model !== tt
       }
     }
@@ -3362,7 +3474,7 @@ export class Engine {
     }
     // adaptive load balancing's provider level (load_balancer_config): healthy directions first, broken
     // fallbacks pruned, healthy providers appended (router.tov directRefs); a pinned key keeps its provider
-    if (h.get("x-bf-api-key") === undefined && h.get("x-bf-api-key-id") === undefined) refs = directRefs(this.cfg, refs, pinnedDir, this.health, directionOpts(this.cfg), Date.now())
+    if (h.get("x-bf-api-key") === undefined && h.get("x-bf-api-key-id") === undefined) refs = this.directPlan(refs, pinnedDir)
     const routeUs = (performance.now() - tRoute) * 1000.0
     const primary = refs[0]!
     const tGov = performance.now()
@@ -3417,7 +3529,7 @@ export class Engine {
     ctx.app = rl.app
     rl.userId = ctx.userId
     // the user's name from the admin users (telemetry's user_name; a user's id is its name here)
-    rl.userName = userNameOf(this.cfg, ctx.userId)
+    rl.userName = this.userName(ctx.userId)
     rl.custom = metrics.customValues(h)
     ctx.labels = rl
     // Fallbacks the key may not use are dropped.
@@ -3954,10 +4066,14 @@ export class Engine {
   mediaBill(h: Hdrs): MediaBill {
     const bill = new MediaBill()
     const gov = this.gov
+    // (the gate reaches its bill through a weak link: a closure on the bill that held the bill would never be freed)
+    const link = new BillLink()
+    link.bill = bill
     bill.gate = (provider: string, model: string): Response | undefined => {
       const a = gov.admit(h, provider, model)
       if (a.kind === "denial") return errorResponse(a.status, a.message, a.type, noHeaders())
-      bill.grant = a
+      const b = link.bill
+      if (b !== undefined) b.grant = a
       return undefined
     }
     return bill
@@ -4159,12 +4275,12 @@ export class Engine {
     const entries = this.codeEntriesFor(m, hdr)
     const exec = async (name: string, args: string): Promise<{ text: string, isError: bool }, Error> => {
       if (isMetaTool(name)) return try await this.codeMetaTool(m, hdr, name, args, ag.auto_execute)
-      const real = injectedChatName(this.cfg, name) ?? name
+      const real = this.injectedName(name) ?? name
       return try await this.mcpCall(m, hdr, real, args, undefined)
     }
     // the code mode meta-tools join the names the loop may run, and executeToolCode runs when its program
     // calls only auto-executable tools
-    const names = m.toolNames().concat(injectedNames(this.cfg))
+    const names = m.toolNames().concat(this.injectedAll())
     if (entries.length > 0) {
       for (const n of META_TOOLS) names.push(n)
     }
@@ -4427,33 +4543,7 @@ export class Engine {
   // they are converted to chat chunks as they arrive, as for an ordinary request. The Response is given at the first event.
   async largeLive(req: Request, op: string, modelBody: Field[], build: Build, translate: Translate, stream: bool, lg: LargeBody, holder: ConvRef, compat?: CompatPlan): Promise<Response> {
     const head = new LiveHead()
-    const sink = new StreamSink(
-      (status, headers) => {
-        const b = head.body
-        const h: Record<string, string> = headers
-        if (b !== undefined) head.give(new Response(b, { status: status, headers: h }))
-      },
-      (chunk) => {
-        const c = head.ctl
-        if (c !== undefined) c.enqueue(chunk)
-      },
-      () => {
-        const c = head.ctl
-        if (c !== undefined) c.close()
-      },
-    )
-    head.body = new ReadableStream({
-      start: (c) => {
-        head.ctl = c
-      },
-      cancel: () => {
-        sink.cancelled = true
-      },
-    })
-    sink.writeBytes = (chunk) => {
-      const c = head.ctl
-      if (c !== undefined) c.enqueue(chunk)
-    }
+    const sink = headSink(head)
     // (the body has been read by the time the answer starts, so include_usage is known)
     const mk: ConverterFactory = (t, requested) => {
       if (!streamable(t)) return undefined
@@ -4484,6 +4574,7 @@ export class Engine {
     } catch (e) {
       head.give(errorResponse(500, "internal error", "api_error", noHeaders()))
     }
+    if (!sink.started) head.release()
   }
 
   // The answer of a large request that is streamed back: the upstream's bytes as they come, with a truncated
@@ -4506,6 +4597,8 @@ export class Engine {
       const f = r.finish
       if (f !== undefined) f()
       const settle = ctx.settle
+      // (settle captures ctx: dropped once used, or the pair would never be freed)
+      ctx.settle = undefined
       if (settle !== undefined) {
         const u = seen.usage()
         settle(u.promptTokens, u.completionTokens, u.billed)
@@ -4650,7 +4743,7 @@ export class Engine {
       r.ctx.op = "chat"
       r.ctx.model = rawStr(body, "model") ?? ""
       // the provider the model resolves to (a bare model's default one), as Bifrost's request carries it
-      r.ctx.provider = parseModel(this.cfg, r.ctx.model).provider
+      r.ctx.provider = this.refOf(r.ctx.model).provider
       // the request as it came, for the pre hooks of each fallback
       const original = text
       const pre = chain.runPre(&r.ctx, text)
@@ -4660,7 +4753,7 @@ export class Engine {
         if (delay > 0) await sleep(delay)
         // an error that lets the fallbacks be tried (Bifrost's AllowFallbacks unset or true) is the primary attempt's: the
         // fallbacks run, each with the pre hooks again (AttemptPlugins)
-        if (pre.status >= 400 && pre.allowFallbacks !== false && fallbackRefs(this.cfg, body).length > 0) {
+        if (pre.status >= 400 && pre.allowFallbacks !== false && this.fallbacksOf(body).length > 0) {
           primaryFail = { status: pre.status, body: pre.body }
         } else {
           const post = chain.runPost(&r.ctx, pre.status, pre.body)
@@ -5227,4 +5320,66 @@ test("the user a key is assigned to is named from the admin users", () => {
   expect(userNameOf(cfg, "ada")).toBe("ada")
   expect(userNameOf(cfg, "nobody")).toBe("")
   expect(userNameOf(cfg, "")).toBe("")
+})
+
+// Weak links to what one streamed answer allocates: they read undefined once it is freed.
+class FreedProbe {
+  weak head: LiveHead | undefined = undefined
+  weak sink: StreamSink | undefined = undefined
+  weak bill: MediaBill | undefined = undefined
+}
+
+function streamOnce(p: FreedProbe, opened: bool): void {
+  const head = new LiveHead()
+  const sink = headSink(head)
+  p.head = head
+  p.sink = sink
+  if (opened) {
+    sink.open(200, new Map())
+    sink.write("data: {}\n\n")
+    sink.close()
+  } else {
+    // a run that answered without streaming (an error, a cache hit)
+    head.give(new Response("{}"))
+    head.release()
+  }
+}
+
+test("a streamed answer's head and sink are freed when the stream closes, or when it never opened", () => {
+  const p = new FreedProbe()
+  streamOnce(p, true)
+  expect(p.head === undefined).toBe(true)
+  expect(p.sink === undefined).toBe(true)
+  const q = new FreedProbe()
+  streamOnce(q, false)
+  expect(q.head === undefined).toBe(true)
+  expect(q.sink === undefined).toBe(true)
+})
+
+function hookedOnce(p: FreedProbe): void {
+  const real = new StreamSink((status, headers) => {}, (chunk) => {}, () => {})
+  const s = eventSink(real, (block) => ({ kind: "send", block: block }))
+  p.sink = s
+  s.write("data: {}\n\n")
+  s.close()
+}
+
+test("an event sink is freed with its stream (its callbacks reach it through a weak link)", () => {
+  const p = new FreedProbe()
+  hookedOnce(p)
+  expect(p.sink === undefined).toBe(true)
+})
+
+function billOnce(e: Engine, p: FreedProbe): void {
+  const bill = e.mediaBill(new Map())
+  p.bill = bill
+  expect(bill.gate("openai", "tts-1")).toBeUndefined()
+  expect(bill.grant !== undefined).toBe(true)
+}
+
+test("an audio request's bill is freed after the request (its gate reaches it through a weak link)", () => {
+  const e = new Engine({})
+  const p = new FreedProbe()
+  billOnce(e, p)
+  expect(p.bill === undefined).toBe(true)
 })

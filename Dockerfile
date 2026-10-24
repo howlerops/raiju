@@ -42,6 +42,9 @@ COPY --from=build --chown=65532:65532 /out/app /app
 COPY --from=build /out/raiju /usr/local/bin/raiju
 
 EXPOSE 8080
+# the app dir (the gateway reads its log and audit folders from -app-dir, not from here, but a relative path given
+# by hand lands somewhere writable)
+WORKDIR /app/data
 # Numeric UID so Kubernetes runAsNonRoot can verify it.
 USER 65532:65532
 

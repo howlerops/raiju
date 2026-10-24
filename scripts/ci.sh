@@ -11,6 +11,8 @@
 #   e2e-bun    tests/e2e.py on the Bun.serve server
 #   e2e-http1  tests/e2e.py on the HTTP/1.1 server
 #   ui         make ui (headless Chromium through Playwright)
+#   soak       optional, not in the default list: tests/soak/soak.py, a memory soak of one worker that fails
+#              when RSS grows (about two minutes; make soak)
 # scripts/ci.sh tov-key prints the compiler's cache key (Tov's revision, a hash of tov-patches/
 # and scripts/build-tov.sh).
 #
@@ -44,13 +46,14 @@ stage_cmd() {
     e2e-bun)   echo 'env -u RAIJU_SERVER python3 tests/e2e.py' ;;
     e2e-http1) echo 'RAIJU_SERVER=http1 python3 tests/e2e.py' ;;
     ui)        echo 'make ui TOV="$TOV"' ;;
+    soak)      echo 'make soak TOV="$TOV"' ;;
     *) return 1 ;;
   esac
 }
 
 # the stages that start gateways or mocks on fixed ports
 locked() {
-  case "$1" in openapi|e2e-bun|e2e-http1|ui) return 0 ;; *) return 1 ;; esac
+  case "$1" in openapi|e2e-bun|e2e-http1|ui|soak) return 0 ;; *) return 1 ;; esac
 }
 
 needs_tov() {
@@ -74,7 +77,7 @@ STAGES=("$@")
 [ ${#STAGES[@]} -eq 0 ] && STAGES=("${ALL[@]}")
 for s in "${STAGES[@]}"; do
   if ! stage_cmd "$s" >/dev/null; then
-    echo "ci: unknown stage '$s' (stages: ${ALL[*]})" >&2
+    echo "ci: unknown stage '$s' (stages: ${ALL[*]}, and the optional soak)" >&2
     exit 2
   fi
 done
