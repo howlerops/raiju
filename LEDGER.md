@@ -440,3 +440,14 @@ Ports from 18300.
 | L179 | (h) | WP6: logs and observability (earlier days and other nodes, logs_only reveal and HTTP providers, MCP log redaction, payload offload, enforce_vk_object_ownership) | worker | todo |
 | L180 | (c), (f) | WP7: config keys, adaptive balancing, JWT algorithms, complexity options, Gitleaks prefilter | worker | todo |
 | L181 | (d), (i) | WP8: Hugging Face backends, Gemini streamed transcription, alias fields, SCIM claim mapping and sync against mocks, aws_workload_identity against mocks, Tov patches for client certificates, disconnect signal, gRPC decompression | worker | todo |
+
+## Wave 23 production hardening (from the production-readiness audit)
+
+| ID | Gap | Work | Owner | Status |
+|---|---|---|---|---|
+| L182 | prod | Streaming memory leak and per-stream memory, latency stalls, log store start-up and size cap, a CI soak test | worker | assigned |
+| L183 | prod | Graceful SIGTERM drain, header/idle/body timeouts and a connection cap, /ready, timeouts on every fetch | worker | assigned |
+| L184 | prod | Secure defaults: /api locked like Bifrost, bounded metric labels, job ids and owners, masked-key round trip, 0600 secrets, MCP deny-by-default, WebRTC off by default | worker | assigned |
+| L185 | prod | Config consistency: every worker and node applies config changes, storage failures fail start or readiness, app-relative dirs | worker | todo |
+| L186 | prod | Outbound safety: netguard canonical IPs and connect-time DNS check, plugin downloads pinned by sha256, SECURITY.md | worker | todo |
+| L187 | prod | Deployment and docs: helm persistence, probes and limits, compose volume, Docker healthcheck and pins, image scan, generated config reference, measured numbers | worker | todo |
