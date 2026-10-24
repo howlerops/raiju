@@ -34,6 +34,8 @@ export type AgentFilter = {
   search: string,
   since: f64, // ms, -1 when not bounded
   until: f64,
+  group: bool, // group_sessions: one row per context, its earliest call
+  hydrate: bool, // hydrate: full rows, each with its events
 }
 
 export type AgentPage = { limit: int, offset: int, byLatency: bool, ascending: bool }
@@ -66,6 +68,7 @@ export function agentQuery(sp: URLSearchParams): { filter: AgentFilter, page: Ag
     teams: multi(sp, "team_id"), customers: multi(sp, "customer_id"), units: multi(sp, "business_unit_id"),
     projects: multi(sp, "project_id"), statuses: multi(sp, "status"), taskId: one(sp, "task_id"),
     contextId: one(sp, "context_id"), requestId: one(sp, "request_id"), search: one(sp, "search"), since: -1.0, until: -1.0,
+    group: truthy(one(sp, "group_sessions")), hydrate: truthy(one(sp, "hydrate")),
   }
   const page: AgentPage = { limit: HISTORY_DEFAULT_LIMIT, offset: 0, byLatency: one(sp, "sort_by") === "latency", ascending: one(sp, "order") === "asc" }
   for (const name of ["start_time", "end_time"]) {
@@ -89,6 +92,65 @@ export function agentQuery(sp: URLSearchParams): { filter: AgentFilter, page: Ag
     page.offset = Math.trunc(n)
   }
   return { filter: f, page: page, error: "" }
+}
+
+// A boolean query value as Bifrost's fasthttp GetBool reads it.
+export function truthy(v: string): bool {
+  return v === "1" || v === "t" || v === "true" || v === "y" || v === "yes"
+}
+
+// Whether session grouping applies: asked for, and no identifier search that names one group or row (Bifrost's
+// AgentLogHistoryFilter.SessionGroupingActive).
+export function groupingActive(f: AgentFilter): bool {
+  return f.group && f.contextId === "" && f.taskId === "" && f.requestId === ""
+}
+
+// The selected calls (newest first) with each context collapsed into its earliest call; calls without a context stay
+// rows of their own. children maps each kept root's id to the number of other selected calls in its context (Bifrost's
+// session_child_count).
+export function groupedCalls(calls: LogEntry[]): { rows: LogEntry[], children: Map<string, int> } {
+  const counts = new Map<string, int>()
+  const rootOf = new Map<string, string>()
+  for (const e of calls) {
+    const c = e.session_id ?? ""
+    if (c === "") continue
+    counts.set(c, (counts.get(c) ?? 0) + 1)
+    // calls are newest first, so the last one seen is the earliest
+    rootOf.set(c, e.id)
+  }
+  const rows: LogEntry[] = []
+  const children = new Map<string, int>()
+  for (const e of calls) {
+    const c = e.session_id ?? ""
+    if (c === "") {
+      rows.push(e)
+      continue
+    }
+    if (rootOf.get(c) !== e.id) continue
+    rows.push(e)
+    const n = (counts.get(c) ?? 1) - 1
+    if (n > 0) children.set(e.id, n)
+  }
+  return { rows: rows, children: children }
+}
+
+// A history row with session_child_count put first, as Bifrost's AgentLogSummary carries it (left out when zero).
+export function withChildCount(row: string, n: int): string {
+  if (n <= 0 || !row.startsWith("{")) return row
+  return `{"session_child_count":${n},` + row.slice(1)
+}
+
+// A hydrated row: the call's detail with its events. A call here is one row, a stream included (logged when it ends),
+// so the list of correlated event rows is empty.
+export function hydratedJson(detail: string): string {
+  if (!detail.endsWith("}")) return detail
+  return detail.slice(0, detail.byteLength - 1) + `,"events":[]}`
+}
+
+// GET /api/agents/history in Bifrost's AgentLogHistoryResult shape: the page's rows and its pagination.
+export function historyPageJson(rows: string[], p: AgentPage, total: int): string {
+  const pg = jobj([jkv("limit", jn(p.limit)), jkv("offset", jn(p.offset)), jkv("sort_by", quote(p.byLatency ? "latency" : "timestamp")), jkv("order", quote(p.ascending ? "asc" : "desc")), jkv("total_count", jn(total))])
+  return `{"logs":[${rows.join(",")}],"pagination":${pg}}`
 }
 
 // A call's status in Bifrost's words.
@@ -498,4 +560,29 @@ test("raw captures and delete bodies", () => {
   expect(deleteIds(`{"ids":["a","b"]}`).ids.join(",")).toBe("a,b")
   expect(deleteIds(`{"ids":[]}`).error).toBe("No log IDs provided")
   expect(deleteIds("nope").error).toBe("Invalid JSON")
+})
+
+test("the history list: Bifrost's {logs, pagination}, session grouping and hydrated rows", () => {
+  const q = agentQuery(new URLSearchParams("group_sessions=true&hydrate=1&limit=5"))
+  expect(q.filter.group).toBe(true)
+  expect(q.filter.hydrate).toBe(true)
+  expect(groupingActive(q.filter)).toBe(true)
+  expect(groupingActive(agentQuery(new URLSearchParams("group_sessions=true&context_id=c1")).filter)).toBe(false)
+  expect(agentQuery(new URLSearchParams("group_sessions=no")).filter.group).toBe(false)
+  let a = call("a", "x", "SendMessage", 200, 1000.0, 1.0)
+  a.session_id = "c1"
+  let b = call("b", "x", "GetTask", 200, 2000.0, 1.0)
+  b.session_id = "c1"
+  let c = call("c", "x", "SendMessage", 200, 3000.0, 1.0)
+  let d = call("d", "x", "GetTask", 200, 4000.0, 1.0)
+  d.session_id = "c1"
+  // newest first, as selectedCalls gives them
+  const g = groupedCalls([d, c, b, a])
+  expect(g.rows.map((e) => e.id).join(",")).toBe("c,a")
+  expect(g.children.get("a")).toBe(2)
+  expect(g.children.get("c")).toBeUndefined()
+  expect(withChildCount(`{"id":"a"}`, 2)).toBe(`{"session_child_count":2,"id":"a"}`)
+  expect(withChildCount(`{"id":"c"}`, 0)).toBe(`{"id":"c"}`)
+  expect(hydratedJson(`{"id":"a"}`)).toBe(`{"id":"a","events":[]}`)
+  expect(historyPageJson([`{"id":"a"}`], q.page, 7)).toBe(`{"logs":[{"id":"a"}],"pagination":{"limit":5,"offset":0,"sort_by":"timestamp","order":"desc","total_count":7}}`)
 })

@@ -121,6 +121,20 @@ export function effectiveBudgetLimit(b: BudgetConfig): f64 {
   return b.max_limit + o.amount
 }
 
+// One provider config of a held profile, with the user's copies of its budget and rate limit.
+type HeldProviderCap = { pc: ProviderConfigRef, budget?: string, rate?: string }
+
+// A user's override on the budget of a profile they hold, or undefined.
+function userOverride(g: GovernanceConfig, user: string, profileId: string, budgetId: string): BudgetOverride | undefined {
+  for (const u of g.users ?? []) {
+    if (u.name !== user) continue
+    for (const o of u.budget_overrides ?? []) {
+      if (o.profile_id === profileId && o.budget_id === budgetId) return o.override
+    }
+  }
+  return undefined
+}
+
 // The rate limit config with this id, or undefined.
 function rateLimitConfigOf(g: GovernanceConfig, id: string): RateLimitConfig | undefined {
   for (const r of g.rate_limits ?? []) {
@@ -210,6 +224,8 @@ export class Governance {
   // a user's own copies of the budgets and rate limits of the profiles they hold, by user name: the derived ids
   heldBudgets: Map<string, string[]> = new Map()
   heldRates: Map<string, string[]> = new Map()
+  // by user: the copies of their held profiles' provider-config budgets and rate limits
+  heldProviderCaps: Map<string, HeldProviderCap[]> = new Map()
   // the A2A agents each key's access profiles grant (its own profiles and its user's held ones), by key id
   profileAgents: Map<string, string[]> = new Map()
 
@@ -314,6 +330,7 @@ export class Governance {
   private addHeldCaps(g: GovernanceConfig, user: string, hs: AccessProfile[]): void {
     const budgets: string[] = []
     const rates: string[] = []
+    const providerCaps: HeldProviderCap[] = []
     for (const p of hs) {
       if (p.is_active === false) continue
       const b = p.budget_id
@@ -321,8 +338,21 @@ export class Governance {
         const sb = budgetConfigOf(g, b)
         const id = `${b}@user/${user}`
         if (sb !== undefined && !budgets.includes(id)) {
-          const w = new Window(effectiveBudgetLimit(sb), durationMs(sb.reset_duration))
+          // the user's override on this profile budget adds to the user's copy only (Bifrost's user budget override)
+          const uo = userOverride(g, user, p.id, b)
+          const forever = uo !== undefined && uo.mode === "forever" ? uo.amount : 0.0
+          const w = new Window(effectiveBudgetLimit(sb) + forever, durationMs(sb.reset_duration))
           w.start = Date.now()
+          if (uo !== undefined && uo.mode === "cycles") {
+            const left = cyclesLeft(uo, w.periodMs, Date.now())
+            if (left > 0) {
+              w.extra = uo.amount
+              w.extraCycles = left
+            }
+            w.extraSig = `${uo.amount}/${uo.cycles ?? 1}`
+            const cs = cycleStart(uo, w.periodMs, Date.now())
+            if (cs !== undefined) w.start = cs
+          }
           this.budgets.set(id, w)
           budgets.push(id)
         }
@@ -339,9 +369,59 @@ export class Governance {
           rates.push(id)
         }
       }
+      // the profile's provider configs: their budgets and rate limits get a copy per user too, charged on the user's
+      // requests to that provider (and its allowed models)
+      for (const pc of p.provider_configs ?? []) {
+        const pb = pc.budget_id
+        const pr = pc.rate_limit_id
+        let bid: string | undefined = undefined
+        let rid: string | undefined = undefined
+        if (pb !== undefined) {
+          const sb = budgetConfigOf(g, pb)
+          const id = `${pb}@user/${user}`
+          if (sb !== undefined) {
+            if (!this.budgets.has(id)) {
+              const w = new Window(effectiveBudgetLimit(sb), durationMs(sb.reset_duration))
+              w.start = Date.now()
+              this.budgets.set(id, w)
+            }
+            bid = id
+          }
+        }
+        if (pr !== undefined) {
+          const sl = rateLimitConfigOf(g, pr)
+          const id = `${pr}@user/${user}`
+          if (sl !== undefined) {
+            if (!this.limits.has(id)) {
+              const l = new Limits()
+              if (sl.request_max_limit !== undefined) l.requests = new Window(sl.request_max_limit, durationMs(sl.request_reset_duration ?? "1m"))
+              if (sl.token_max_limit !== undefined) l.tokens = new Window(sl.token_max_limit, durationMs(sl.token_reset_duration ?? "1m"))
+              this.limits.set(id, l)
+            }
+            rid = id
+          }
+        }
+        if (bid !== undefined || rid !== undefined) providerCaps.push({ pc: pc, budget: bid, rate: rid })
+      }
     }
     this.heldBudgets.set(user, budgets)
     this.heldRates.set(user, rates)
+    this.heldProviderCaps.set(user, providerCaps)
+  }
+
+  // The user's copies of the provider-config budgets and rate limits of the profiles they hold that apply to a
+  // request to this provider and model.
+  heldProviderLimits(user: string, provider: string, model: string): { budgets: string[], rateLimits: string[] } {
+    const budgets: string[] = []
+    const rateLimits: string[] = []
+    for (const c of this.heldProviderCaps.get(user) ?? []) {
+      if (c.pc.provider !== provider || !pcMatches(c.pc, model)) continue
+      const b = c.budget
+      if (b !== undefined && !budgets.includes(b)) budgets.push(b)
+      const r = c.rate
+      if (r !== undefined && !rateLimits.includes(r)) rateLimits.push(r)
+    }
+    return { budgets: budgets, rateLimits: rateLimits }
   }
 
   addRateLimit(r: RateLimitConfig): void {
@@ -551,6 +631,13 @@ export class Governance {
       const huid: string = vk.user_id ?? ""
       for (const id of this.heldBudgets.get(huid) ?? []) budgets.push(id)
       for (const id of this.heldRates.get(huid) ?? []) rateLimits.push(id)
+      const hp = this.heldProviderLimits(huid, provider, model)
+      for (const id of hp.budgets) {
+        if (!budgets.includes(id)) budgets.push(id)
+      }
+      for (const id of hp.rateLimits) {
+        if (!rateLimits.includes(id)) rateLimits.push(id)
+      }
       if (team !== undefined && team.budget !== undefined) budgets.push(team.budget)
       if (bu !== undefined) {
         if (bu.budget !== undefined) budgets.push(bu.budget)
@@ -1067,6 +1154,15 @@ export class Governance {
       }
     }
     return best
+  }
+
+  // When a budget window's current cycle began (rolled to now; the quota view's per-model usage counts from there), or
+  // undefined for a budget this governance does not hold.
+  budgetCycleStart(id: string, now: f64): f64 | undefined {
+    const b = this.budgets.get(id)
+    if (b === undefined) return undefined
+    b.roll(now)
+    return b.start
   }
 
   budgetUsage(): { id: string, used: f64, limit: f64 }[] {
@@ -1700,4 +1796,29 @@ test("A2A agent grants: the agent's own, the key's, its profiles' and a project'
   // a project that does not admit the caller, or is unknown, falls back to the caller's own grants
   expect(g.agentAccess(hdrs([["x-bf-vk", "sk-bf-none"], ["x-bf-project-id", "p-x"]]), calc).allowed).toBe(false)
   expect(g.agentAccess(hdrs([["x-bf-vk", "sk-bf-own"], ["x-bf-project-id", "nope"]]), calc).allowed).toBe(true)
+})
+
+test("a held profile's provider-config budgets have a copy per user, and a user's override adds to theirs", () => {
+  const cfg: Config = { governance: {
+    users: [{ name: "ana", role: "viewer", access_profile_ids: ["p"], budget_overrides: [{ profile_id: "p", budget_id: "b-p", override: { amount: 5.0, mode: "forever" } }] }, { name: "cy", role: "viewer", access_profile_ids: ["p"] }],
+    access_profiles: [{ id: "p", budget_id: "b-p", provider_configs: [{ provider: "openai", budget_id: "b-oa" }] }],
+    budgets: [{ id: "b-p", max_limit: 10.0, reset_duration: "1d" }, { id: "b-oa", max_limit: 2.0, reset_duration: "1d" }],
+    virtual_keys: [{ id: "k-a", value: "sk-bf-a", user_id: "ana" }, { id: "k-c", value: "sk-bf-c", user_id: "cy" }],
+  } }
+  const g = new Governance(cfg)
+  const ha = hdrs([["x-bf-vk", "sk-bf-a"]])
+  const a1 = g.admit(ha, "openai", "gpt-4o") as Grant
+  expect(a1.budgets.includes("b-oa@user/ana")).toBe(true)
+  // another provider is not charged to the openai config's budget
+  expect(g.heldProviderLimits("ana", "anthropic", "claude").budgets.length).toBe(0)
+  expect(g.heldProviderLimits("ana", "openai", "gpt-4o").budgets.join(",")).toBe("b-oa@user/ana")
+  g.record(a1, 0, 2.0)
+  expect((g.admit(ha, "openai", "gpt-4o") as Denial).status).toBe(402)
+  expect((g.admit(hdrs([["x-bf-vk", "sk-bf-c"]]), "openai", "gpt-4o") as Grant).kind).toBe("grant")
+  // ana's override raises her copy of the profile budget only
+  const lims = g.budgetUsage()
+  expect(lims.find((u) => u.id === "b-p@user/ana")?.limit).toBe(15.0)
+  expect(lims.find((u) => u.id === "b-p@user/cy")?.limit).toBe(10.0)
+  expect(g.budgetCycleStart("b-p@user/ana", Date.now()) !== undefined).toBe(true)
+  expect(g.budgetCycleStart("nope", Date.now())).toBeUndefined()
 })

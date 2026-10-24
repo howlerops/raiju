@@ -1,10 +1,12 @@
-"""A minimal Weaviate REST and GraphQL mock for e2e: schema classes, objects (create, replace, delete),
-and a nearVector query with cosine distance and where-filters (And of GreaterThan and Equal)."""
+"""A minimal Weaviate REST and GraphQL mock for e2e: schema classes and their properties, objects (create, replace,
+delete, batch delete by a where-filter), and a nearVector query with cosine distance and where-filters (And of
+GreaterThan and Equal)."""
 import json, math, re, sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 KEY = "wv-key"
 CLASSES = {}   # class name -> {uuid: {"vector": [...], "props": {...}}}
+PROPS = {}     # class name -> [property names]
 CALLS = []
 
 def cos(a, b):
@@ -41,10 +43,24 @@ class H(BaseHTTPRequestHandler):
             cls = body["class"]
             if cls in CLASSES: return self.reply(422, {"error": [{"message": f"class name {cls} already exists"}]})
             CLASSES[cls] = {}
+            PROPS[cls] = [p["name"] for p in body.get("properties", [])]
             return self.reply(200, body)
         if len(parts) == 3 and parts[:2] == ["v1", "schema"] and self.command == "GET":
             if parts[2] not in CLASSES: return self.reply(404, {"error": [{"message": "class not found"}]})
-            return self.reply(200, {"class": parts[2]})
+            return self.reply(200, {"class": parts[2], "properties": [{"name": n} for n in PROPS.get(parts[2], [])]})
+        if len(parts) == 4 and parts[:2] == ["v1", "schema"] and parts[3] == "properties" and self.command == "POST":
+            if parts[2] not in CLASSES: return self.reply(404, {"error": [{"message": "class not found"}]})
+            PROPS.setdefault(parts[2], []).append(body["name"])
+            return self.reply(200, body)
+        if path == "/v1/batch/objects" and self.command == "DELETE":
+            m = body["match"]
+            cls, where = m["class"], m["where"]
+            conds = where.get("operands", [where])
+            if any(c["path"][0] not in PROPS.get(cls, []) for c in conds):
+                return self.reply(422, {"error": [{"message": "no such prop"}]})
+            gone = [oid for oid, o in CLASSES.get(cls, {}).items() if all(o["props"].get(c["path"][0]) == c["valueText"] for c in conds)]
+            for oid in gone: CLASSES[cls].pop(oid)
+            return self.reply(200, {"match": m, "results": {"matches": len(gone), "successful": len(gone), "failed": 0, "limit": 10000}})
         if path == "/v1/objects" and self.command == "POST":
             cls = body["class"]
             if cls not in CLASSES: return self.reply(422, {"error": [{"message": f"class {cls} not found"}]})

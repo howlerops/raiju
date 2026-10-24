@@ -16,28 +16,32 @@ import { join } from "node:path"
 import { Engine } from "./gateway"
 import { CostRecalc, RecalcStatus, readShared, requestCancel, sharedInFlight } from "./costrecalc"
 import { issueSetupSession, validSetupSession, setupCookie, cookieValue, SETUP_COOKIE, sameSecret, setupPublic } from "./setupsession"
+import { perModelUsage, ModelSpend } from "./logstore"
 import { agentSessionsOf, a2aLogJson, bifrostRequestType, Filter, LogStore, LogEntry, scopedEntries, visibleTo, defaultLogStoreConfig, applyChains, gridOf, filterFrom, selectAll, selects, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, histogramDimName, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
 import { setMcpToolLog, McpToolCall } from "./mcp"
 import { McpLibrary, DEFAULT_LIBRARY_URL, DEFAULT_LIBRARY_SYNC_SECONDS, listLibrary, libraryFilterData, createLibraryEntry, deleteLibraryEntry, fetchCatalog } from "./mcplibrary"
 import { parsePolicy, policyView, policyConfigOf } from "./health"
-import { AccessProfile, AgentConfig, CircuitPolicyConfig, LogExportsConfig, PermissionPair, VirtualKeyConfig } from "./config"
+import { AccessProfile, AgentConfig, BudgetConfig, BudgetOverride, CircuitPolicyConfig, LogExportsConfig, PermissionPair, ProjectConfig, VirtualKeyConfig } from "./config"
+import { effectiveBudgetLimit } from "./governance"
 import { rfc3339Of } from "./vkexpiry"
 import { flushVaultCache } from "./secrets"
 import { ConfigStore, checkAdmin, sweepExpiredKeys, sealStored, openStored, RESOURCES, OPERATIONS } from "./store"
 import { Held, KeyCtx, handleApiKeys, newKeyValue } from "./apikeys"
-import { keyBudgetIds, permissionDocs, permissionIds, permissionMap, rolePairs, userObjectJson, userKeysJson, PermissionDoc, creationPolicy, heldProfiles, PROPAGATED_FIELDS, propagateProfileKeys } from "./govapi"
+import { keyBudgetIds, permissionDocs, permissionIds, permissionMap, rolePairs, userObjectJson, userKeysJson, PermissionDoc, creationPolicy, heldProfiles, PROPAGATED_FIELDS, propagateProfileKeys, parseOverride } from "./govapi"
 
 // The quota view of one virtual key's budget and rate limit (GET /api/governance/virtual-keys/quota).
 // POST /api/governance/access-profiles/{id}/roles: the roles to attach (Bifrost's AttachRolesRequest).
 type RoleAttachBody = { role_ids?: int[], is_default?: bool, apply_to_existing?: bool }
-type QuotaBudget = { id: string, max_limit: f64, effective_max_limit: f64, reset_duration: string, current_usage: f64 }
+// A budget in the quota view; source_* name the access profile that governs it (Bifrost's SourceRef), and
+// per_model_usage is the spend per model in its current cycle, from the request logs.
+type QuotaBudget = { id: string, max_limit: f64, effective_max_limit: f64, reset_duration: string, current_usage: f64, source_type?: string, source_id?: string, source_name?: string, per_model_usage?: ModelSpend[] }
 type QuotaRateUsage = { kind: string, used: f64, limit: f64 }
-type QuotaRate = { id: string, token_max_limit?: int, token_reset_duration?: string, request_max_limit?: int, request_reset_duration?: string, usage: QuotaRateUsage[] }
+type QuotaRate = { id: string, token_max_limit?: int, token_reset_duration?: string, request_max_limit?: int, request_reset_duration?: string, usage: QuotaRateUsage[], source_type?: string, source_id?: string, source_name?: string }
 // One per-model limit of a key in the quota view (Bifrost's quotaModelUsage); no provider means every provider.
 type QuotaModel = { model_name: string, provider?: string, budgets: QuotaBudget[], rate_limit?: QuotaRate }
 import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, roleAllows, isBuiltinRole, customRole, provisioned, disabledNamed, anyRoleId, userByEmail } from "./rbac"
 import { DataScope, allScope, noScope, scopeOf, inScope } from "./scope"
-import { AuditEvent, AuditLog, actionFor, auditListJson, auditQueryOf, maskDetail } from "./audit"
+import { AuditEvent, AuditLog, actionFor, auditListJson, auditQueryOf, maskDetail, profileAuditJson } from "./audit"
 import { isCacheId } from "./cache"
 import { AlertEngine, SampleRing, CelEngine, ScopeUsage } from "./alerts"
 import * as alerts from "./alerts"
@@ -47,7 +51,8 @@ import { relay } from "./passthrough"
 import { grpcSend, upstreamCandidates, attemptVerdict, Candidate, Demotions } from "./a2agrpcup"
 import { versionSupported, paramsTo, resultTo, rpcAnswerTo } from "./a2aver"
 import { checkExtensions, allowedExtensions } from "./a2aext"
-import { agentQuery, selectedCalls, pageOf, agentStatsJson, topAgentsJson, agentHistogramJson, agentFilterDataJson, agentDetailJson, rawCapture, deleteIds } from "./agenthistory"
+import { mergeConfig, changedTargets, targetAuthMessage } from "./pluginmerge"
+import { agentQuery, selectedCalls, pageOf, agentStatsJson, topAgentsJson, agentHistogramJson, agentFilterDataJson, agentDetailJson, rawCapture, deleteIds, groupingActive, groupedCalls, withChildCount, hydratedJson, historyPageJson, truthy } from "./agenthistory"
 import { H2Tls } from "./h2"
 import { findAgent, endpointOf, restEndpointOf, gatewayCard, withGrpcInterface, publicBase, aggregateCard, contextOfParams, contextOfResult, refreshAll, withCard, fetchCard, CARD_PATH, JSON_RPC_SUFFIX, REST_PREFIX } from "./agents"
 import { Call, PushSpec, CallCancel, StreamTap, tapped, rpcCall, restCall, restRequestOf, methodOf, rpcIdOf, rpcErrorBody, rpcEvent, restEvent, restErrorBody, restErrorOfStatus, httpOfCode, codeOfRestError, relayMapped, pushSpecOf, pushUpstreamParams, pushViewJson, pushListJson, pushIdOfResult, embeddedPush, rewriteEmbedded, taskIdOfResult } from "./a2a"
@@ -2757,7 +2762,13 @@ export class Ops {
     // dashboard auth is off)
     const path = builtinPlugins().includes(name) ? undefined : pathOf(fs, undefined)
     if (path !== undefined && !this.authOn) return pluginError(403, pathAuthMessage(true))
-    const spec: PluginSpec = { name: name, enabled: rawBool(fs, "enabled") ?? false, config_json: configOf(fs, "{}"), placement: pl.value, order: od.value, path: path, wasm_limits: limitsOf(fs, undefined) }
+    const config = configOf(fs, "{}")
+    // endpoints and env./vault. references need a caller who really signed in (Bifrost's genuine-auth check)
+    if (!this.authOn) {
+      const moved = changedTargets("{}", config)
+      if (moved.length > 0) return pluginError(403, targetAuthMessage(moved))
+    }
+    const spec: PluginSpec = { name: name, enabled: rawBool(fs, "enabled") ?? false, config_json: config, placement: pl.value, order: od.value, path: path, wasm_limits: limitsOf(fs, undefined) }
     const bad = badPlugin(spec)
     if (bad !== "") return pluginError(400, `Invalid plugin configuration: ${bad}`)
     const next: PluginSpec[] = specs.slice()
@@ -2789,7 +2800,16 @@ export class Ops {
     const builtin = builtinPlugins().includes(name)
     const asked = builtin ? undefined : pathOf(fs, undefined)
     if (asked !== undefined && !this.authOn) return pluginError(403, pathAuthMessage(false))
-    const spec: PluginSpec = { name: name, enabled: en === undefined ? cur.enabled !== false : en, config_json: configOf(fs, cur.config_json ?? "{}"), placement: pl.value, order: od.value, path: builtin ? undefined : pathOf(fs, cur.path), wasm_limits: limitsOf(fs, cur.wasm_limits) }
+    // the body's config is merged over the stored one (a key it leaves out is kept, a redacted placeholder keeps the
+    // stored value), as Bifrost merges it; a change of endpoint or reference needs a caller who really signed in
+    const stored = cur.config_json ?? "{}"
+    const raw = find(fs, "config")
+    const config = raw === undefined || isNull(raw) ? stored : mergeConfig(stored, raw)
+    if (!this.authOn) {
+      const moved = changedTargets(stored, config)
+      if (moved.length > 0) return pluginError(403, targetAuthMessage(moved))
+    }
+    const spec: PluginSpec = { name: name, enabled: en === undefined ? cur.enabled !== false : en, config_json: config, placement: pl.value, order: od.value, path: builtin ? undefined : pathOf(fs, cur.path), wasm_limits: limitsOf(fs, cur.wasm_limits) }
     const bad = badPlugin(spec)
     if (bad !== "") return pluginError(400, `Invalid plugin configuration: ${bad}`)
     const next: PluginSpec[] = []
@@ -3108,13 +3128,24 @@ export class Ops {
         return okJson(`{"message":"Agent logs deleted successfully"}`)
       }
       if (method !== "GET") return { status: 405, body: errorJson("use GET or DELETE", "invalid_request_error", undefined), contentType: "application/json" }
+      if (store === undefined) return json503
       const q = agentQuery(sp)
       if (q.error !== "") return badRequest(q.error)
-      if (store === undefined) return okJson(`{"history":[],"total":0}`)
-      const calls = selectedCalls(scopedView(store, sc, 0.0), q.filter)
+      // Bifrost's {logs, pagination}; group_sessions keeps each context's earliest call, hydrate answers full rows
+      let calls = selectedCalls(scopedView(store, sc, 0.0), q.filter)
+      let children = new Map<string, int>()
+      if (groupingActive(q.filter)) {
+        const g = groupedCalls(calls)
+        calls = g.rows
+        children = g.children
+      }
+      const listNames = (dim: string, id: string): string => this.historyName(dim, id)
       const rows: string[] = []
-      for (const e of pageOf(calls, q.page)) rows.push(a2aLogJson(e))
-      return okJson(`{"history":[${rows.join(",")}],"total":${calls.length}}`)
+      for (const e of pageOf(calls, q.page)) {
+        const row = q.filter.hydrate ? hydratedJson(agentDetailJson(e, listNames)) : a2aLogJson(e)
+        rows.push(withChildCount(row, children.get(e.id) ?? 0))
+      }
+      return okJson(historyPageJson(rows, q.page, calls.length))
     }
     if (segs.length !== 4) return { status: 404, body: errorJson("no such route", "not_found_error", undefined), contentType: "application/json" }
     if (method !== "GET") return { status: 405, body: errorJson("use GET", "invalid_request_error", undefined), contentType: "application/json" }
@@ -3137,8 +3168,11 @@ export class Ops {
       if (sub === "histogram") return okJson(agentHistogramJson(calls, q.filter))
       return okJson(topAgentsJson(calls, 10))
     }
+    const hydrate = truthy((sp.get("hydrate") ?? "").trim())
     for (const e of scopedView(store, sc, 0.0)) {
-      if (kindOf(e) === "a2a" && e.id === sub) return okJson(agentDetailJson(e, names))
+      if (kindOf(e) !== "a2a" || e.id !== sub) continue
+      const d = agentDetailJson(e, names)
+      return okJson(hydrate ? hydratedJson(d) : d)
     }
     return { status: 404, body: errorJson("agent history entry not found", "not_found_error", undefined), contentType: "application/json" }
   }
@@ -4451,26 +4485,69 @@ export class Ops {
     const usage = this.engine.gov.budgetUsage()
     const limits = this.engine.gov.rateLimitUsage(now)
     const ids = keyBudgetIds(vk)
-    const quotaBudgets = (want: string[]): QuotaBudget[] => {
+    // a budget's usage is read from its window: the shared one, or (suffix "@user/<name>") a held profile's copy
+    const quotaBudgets = (want: string[], suffix: string, src: AccessProfile | undefined): QuotaBudget[] => {
       const out: QuotaBudget[] = []
       for (const b of g?.budgets ?? []) {
         if (!want.includes(b.id)) continue
-        const u = usage.find((x) => x.id === b.id)
-        out.push({ id: b.id, max_limit: b.max_limit, effective_max_limit: u?.limit ?? b.max_limit, reset_duration: b.reset_duration, current_usage: u?.used ?? 0.0 })
+        const u = usage.find((x) => x.id === b.id + suffix)
+        const qb: QuotaBudget = { id: b.id, max_limit: b.max_limit, effective_max_limit: u?.limit ?? b.max_limit, reset_duration: b.reset_duration, current_usage: u?.used ?? 0.0 }
+        if (src !== undefined) {
+          qb.source_type = "access_profile"
+          qb.source_id = src.id
+          qb.source_name = src.name ?? src.id
+        }
+        out.push(qb)
       }
       return out
     }
-    const quotaRates = (want: string): QuotaRate[] => {
+    const quotaRates = (want: string, suffix: string, src: AccessProfile | undefined): QuotaRate[] => {
       const out: QuotaRate[] = []
       for (const rl of g?.rate_limits ?? []) {
         if (rl.id !== want) continue
-        const used: QuotaRateUsage[] = limits.filter((x) => x.id === rl.id).map((x) => ({ kind: x.kind, used: x.used, limit: x.limit }))
-        out.push({ id: rl.id, token_max_limit: rl.token_max_limit, token_reset_duration: rl.token_reset_duration, request_max_limit: rl.request_max_limit, request_reset_duration: rl.request_reset_duration, usage: used })
+        const used: QuotaRateUsage[] = limits.filter((x) => x.id === rl.id + suffix).map((x) => ({ kind: x.kind, used: x.used, limit: x.limit }))
+        const qr: QuotaRate = { id: rl.id, token_max_limit: rl.token_max_limit, token_reset_duration: rl.token_reset_duration, request_max_limit: rl.request_max_limit, request_reset_duration: rl.request_reset_duration, usage: used }
+        if (src !== undefined) {
+          qr.source_type = "access_profile"
+          qr.source_id = src.id
+          qr.source_name = src.name ?? src.id
+        }
+        out.push(qr)
       }
       return out
     }
-    const budgets = quotaBudgets(ids)
-    const rateLimits = quotaRates(vk.rate_limit_id ?? "")
+    // A key whose user holds access profiles is governed by them (Bifrost's access-profile quota): each held profile's
+    // budget and rate limit is listed with the profile as its source, its usage the user's own copy, and the per-model
+    // spend is the user's. The key's own budgets follow, since every held budget and the key's own are all charged.
+    const user = vk.user_id ?? ""
+    const held: AccessProfile[] = user === "" ? [] : heldProfiles(g?.users, g?.roles, g?.access_profiles, user).filter((p) => p.is_active !== false)
+    const budgets: QuotaBudget[] = []
+    const rateLimits: QuotaRate[] = []
+    const seenB: string[] = []
+    const seenR: string[] = []
+    for (const p of held) {
+      const bid = p.budget_id
+      if (bid !== undefined && !seenB.includes(bid)) {
+        seenB.push(bid)
+        for (const qb of quotaBudgets([bid], `@user/${user}`, p)) budgets.push(qb)
+      }
+      const rid = p.rate_limit_id
+      if (rid !== undefined && !seenR.includes(rid)) {
+        seenR.push(rid)
+        for (const qr of quotaRates(rid, `@user/${user}`, p)) rateLimits.push(qr)
+      }
+    }
+    for (const qb of quotaBudgets(ids, "", undefined)) budgets.push(qb)
+    for (const qr of quotaRates(vk.rate_limit_id ?? "", "", undefined)) rateLimits.push(qr)
+    // each budget's spend per model in its current cycle, from the request logs (none without a log store)
+    const ls = this.engine.logStore
+    const es: LogEntry[] = ls === undefined ? [] : ls.viewSince(0.0)
+    for (let i = 0; i < budgets.length; i++) {
+      const qb = budgets[i]!
+      const suffix = qb.source_type === undefined ? "" : `@user/${user}`
+      const start = this.engine.gov.budgetCycleStart(qb.id + suffix, now) ?? now
+      budgets[i]!.per_model_usage = perModelUsage(es, vk.id, qb.source_type === undefined ? "" : user, start, now)
+    }
     const models: QuotaModel[] = []
     for (const mc of g?.model_configs ?? []) {
       if (mc.scope !== "virtual_key" || mc.scope_id !== vk.id || mc.model_name === "*") continue
@@ -4479,8 +4556,8 @@ export class Ops {
       for (const b of mc.budget_ids ?? []) {
         if (!bids.includes(b)) bids.push(b)
       }
-      const row: QuotaModel = { model_name: mc.model_name, provider: mc.provider, budgets: quotaBudgets(bids) }
-      const rl = quotaRates(mc.rate_limit_id ?? "")[0]
+      const row: QuotaModel = { model_name: mc.model_name, provider: mc.provider, budgets: quotaBudgets(bids, "", undefined) }
+      const rl = quotaRates(mc.rate_limit_id ?? "", "", undefined)[0]
       if (rl !== undefined) row.rate_limit = rl
       models.push(row)
     }
@@ -4607,7 +4684,7 @@ export class Ops {
       if (u.name === actor) role = u.role
     }
     const roles = this.store.cfg.governance?.roles ?? []
-    const builtIn = customRole(roles, role) === undefined
+    const builtIn = isBuiltinRole(role) || customRole(roles, role) === undefined
     return { role: role, roleId: anyRoleId(roles, role), builtIn: builtIn, pairs: rolePairs(roles, role, RESOURCES, OPERATIONS) }
   }
 
@@ -4711,13 +4788,40 @@ export class Ops {
   // /api/users/{name}/access-profiles: GET lists the profiles the user holds; PUT and DELETE
   // .../{profile_id} add and remove one; PUT and DELETE .../{profile_id}/virtual-keys/{vk_id} link
   // the profile to one of the user's virtual keys.
-  userProfiles(method: string, path: string): Reply {
+  userProfiles(method: string, path: string, body: string): Reply {
     const segs = path.split("/").filter((s) => s !== "")
     const name = segs[2] ?? ""
     const pid = segs[4] ?? ""
     const notFound: Reply = { status: 404, body: errorJson(`no route for ${path}`, "invalid_request_error", undefined), contentType: "application/json" }
-    if (segs.length < 4 || segs.length > 7 || segs[3] !== "access-profiles") return notFound
+    if (segs.length < 4 || segs.length > 8 || segs[3] !== "access-profiles") return notFound
     const g = this.store.cfg.governance
+    // PUT and DELETE .../access-profiles/{profile}/budgets/{budget}/override: the user's budget override
+    if (segs.length === 8) {
+      if (segs[5] !== "budgets" || segs[7] !== "override") return notFound
+      if (method !== "PUT" && method !== "DELETE") return { status: 405, body: errorJson(`method ${method} is not allowed on this route`, "invalid_request_error", undefined), contentType: "application/json" }
+      const bid = segs[6] ?? ""
+      let o: BudgetOverride | undefined = undefined
+      if (method === "PUT") {
+        const pr = parseOverride(body)
+        if (pr.kind === "error") return badRequest(pr.message)
+        o = pr.override
+      }
+      const r = this.store.setUserBudgetOverride(name, pid, bid, o)
+      if (r.kind === "error") return { status: r.status, body: errorJson(r.message, r.status === 404 ? "not_found_error" : "invalid_request_error", undefined), contentType: "application/json" }
+      const now = Date.now()
+      const lim = this.engine.gov.budgetUsage().find((x) => x.id === `${bid}@user/${name}`)
+      let base: BudgetConfig | undefined = undefined
+      for (const b of this.store.cfg.governance?.budgets ?? []) {
+        if (b.id === bid) base = b
+      }
+      // the effective limit as the override makes it: the base, the forever amount, and a cycles amount while it runs
+      let eff = base === undefined ? 0.0 : effectiveBudgetLimit(base)
+      if (o !== undefined && o.mode === "forever") eff += o.amount
+      if (o !== undefined && o.mode === "cycles") eff += o.amount
+      const ov = o === undefined ? "null" : JSON.stringify(o)
+      const bj = base === undefined ? "null" : jobj([jkv("id", JSON.stringify(bid)), jkv("max_limit", jn(base.max_limit)), jkv("reset_duration", JSON.stringify(base.reset_duration)), jkv("current_usage", jn(lim?.used ?? 0.0)), jkv("override", ov)])
+      return okJson(jobj([jkv("user_id", JSON.stringify(name)), jkv("access_profile_id", JSON.stringify(pid)), jkv("budget", bj), jkv("effective_max_limit", jn(eff)), jkv("checked_at", JSON.stringify(isoMs(now)))]))
+    }
     if (segs.length === 4) {
       if (method !== "GET") return { status: 405, body: errorJson(`method ${method} is not allowed on this route`, "invalid_request_error", undefined), contentType: "application/json" }
       const held = heldProfiles(g?.users, g?.roles, g?.access_profiles, name)
@@ -4808,6 +4912,80 @@ export class Ops {
     const saved = this.store.setProfiles(r.profiles)
     if (saved.kind === "error") return { status: saved.status, body: errorJson(saved.message, "api_error", undefined), contentType: "application/json" }
     return { status: r.status, body: r.body, contentType: "application/json" }
+  }
+
+  // GET /api/governance/projects/{id}/members/{member_id}/usage: one member's usage (Bifrost's member usage view): each
+  // slice the member holds of the project's budgets and rate limits with what it has counted in its window, and the
+  // member's requests in the project grouped by provider and model, counted from the start of the earliest slice's
+  // cycle (all the requests the log store holds when the member has no budget slice).
+  memberUsage(path: string, sc: DataScope): Reply {
+    const segs = path.split("/").filter((s) => s !== "")
+    const pid = pctDecode(segs[3] ?? "") ?? ""
+    const mid = pctDecode(segs[5] ?? "") ?? ""
+    const nf = (what: string): Reply => ({ status: 404, body: errorJson(what, "not_found_error", undefined), contentType: "application/json" })
+    let pj: ProjectConfig | undefined = undefined
+    for (const p of this.store.cfg.governance?.projects ?? []) {
+      if (p.id === pid) pj = p
+    }
+    if (pj === undefined || !inScope(sc, "", "", "", pid)) return nf(`no project ${pid}`)
+    let user = ""
+    for (const m of pj.members ?? []) {
+      if (m.id === mid || m.user_id === mid) user = m.user_id
+    }
+    if (user === "") return nf(`no member ${mid}`)
+    const now = Date.now()
+    const suffix = `@${pid}/${user}`
+    const budgets: string[] = []
+    let since = -1.0
+    for (const u of this.engine.gov.budgetUsage()) {
+      if (!u.id.endsWith(suffix)) continue
+      const src = u.id.slice(0, u.id.byteLength - suffix.byteLength)
+      const st = this.engine.gov.budgetCycleStart(u.id, now) ?? now
+      if (since < 0.0 || st < since) since = st
+      budgets.push(jobj([jkv("source_budget_id", JSON.stringify(src)), jkv("budget_id", JSON.stringify(u.id)), jkv("max_limit", jn(u.limit)), jkv("current_usage", jn(u.used))]))
+    }
+    const rates = new Map<string, string[]>()
+    const order: string[] = []
+    for (const u of this.engine.gov.rateLimitUsage(now)) {
+      if (!u.id.endsWith(suffix)) continue
+      if (!rates.has(u.id)) order.push(u.id)
+      const cur = rates.get(u.id) ?? []
+      cur.push(jkv(u.kind + "_max_limit", jn(u.limit)))
+      cur.push(jkv(u.kind + "_current_usage", jn(u.used)))
+      rates.set(u.id, cur)
+    }
+    const limits: string[] = []
+    for (const id of order) {
+      const src = id.slice(0, id.byteLength - suffix.byteLength)
+      limits.push(jobj([jkv("source_rate_limit_id", JSON.stringify(src)), jkv("rate_limit_id", JSON.stringify(id))].concat(rates.get(id) ?? [])))
+    }
+    const ls = this.engine.logStore
+    const es: LogEntry[] = []
+    if (ls !== undefined) {
+      for (const e of ls.viewSince(0.0)) {
+        if ((e.project_id ?? "") === pid) es.push(e)
+      }
+    }
+    const spend = perModelUsage(es, "", user, since < 0.0 ? 0.0 : since, now)
+    return okJson(jobj([jkv("project_id", JSON.stringify(pid)), jkv("member_id", JSON.stringify(mid)), jkv("user_id", JSON.stringify(user)), jkv("budgets", jarr(budgets)), jkv("rate_limits", jarr(limits)), jkv("usage", JSON.stringify(spend))]))
+  }
+
+  // GET /api/governance/access-profiles/audit-logs and .../{profile_id}/audit-logs (also under /api/access-profiles, as
+  // Bifrost serves them): the access-profile changes the audit trail holds (audit.tov profileAuditJson), with
+  // limit, offset, action and user_id. An empty list while the audit log is off.
+  profileAudit(req: Request, path: string): Reply {
+    const rest = path.startsWith("/api/governance/") ? path.slice("/api/governance/".byteLength) : path.slice("/api/".byteLength)
+    const segs = rest.split("/").filter((s) => s !== "")
+    const profile = segs.length === 3 ? pctDecode(segs[1] ?? "") ?? "" : undefined
+    if (profile !== undefined && !(this.store.cfg.governance?.access_profiles ?? []).some((p) => p.id === profile)) return { status: 404, body: errorJson(`no access profile ${profile}`, "not_found_error", undefined), contentType: "application/json" }
+    const u = URL.parse(req.url)
+    const sp = u === undefined ? new URLSearchParams("") : u.searchParams
+    const limit = parseInt(sp.get("limit") ?? "") ?? 50
+    const offset = parseInt(sp.get("offset") ?? "") ?? 0
+    const log = this.audit
+    if (log === undefined) return okJson(`{"audit_logs":[],"total_count":0}`)
+    const page = log.query({ paths: ["/api/governance/access-profiles"], limit: 1000, order: "desc" })
+    return okJson(profileAuditJson(page.events, profile, (sp.get("action") ?? "").trim(), (sp.get("user_id") ?? "").trim(), limit > 0 ? Math.trunc(limit) : 50, offset > 0 ? Math.trunc(offset) : 0))
   }
 
   // GET /api/audit-logs, /api/audit-logs/export (JSONL), /api/audit-logs/verify

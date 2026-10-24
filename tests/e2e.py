@@ -273,6 +273,15 @@ def seen(traces=False):
 
 FAILS = []
 
+# The test WASM plugin's config keys (tests/wasm/plugin.c). PUT /api/plugins/{name} merges its config over the stored
+# one, as Bifrost does, so a test that sets a whole new config sends null for every key it leaves out.
+WASM_CFG_KEYS = ["mode", "from", "to", "tag", "http", "post", "count", "chunk_from", "chunk_to", "chunk_skip", "chunk_stop"]
+
+
+def whole_wasm_config(config):
+    return {**{k: None for k in WASM_CFG_KEYS}, **config}
+
+
 def check(name, cond, detail=""):
     print(("ok   " if cond else "FAIL ") + name + ("" if cond else f"\n     {detail}"))
     if not cond:
@@ -4353,9 +4362,9 @@ def l116_e2e(env):
         check("a deleted agent is gone", s == 200 and s2 == 404, (s, s2))
         s, _, b = api("GET", "/api/agents/history")
         hist = json.loads(b) if s == 200 else {}
-        check("every call that reached the agent is in the agent history, under its name", s == 200 and hist.get("total", 0) >= 5 and all(x["agent_name"] == "echo" for x in hist.get("history", [])), (s, b[:200]))
+        check("every call that reached the agent is in the agent history, under its name", s == 200 and hist.get("pagination", {}).get("total_count", 0) >= 5 and all(x["agent_name"] == "echo" for x in hist.get("logs", [])), (s, b[:200]))
         s, _, b = api("GET", "/api/agents/history?agent_names=nosuch")
-        check("the agent history filters by agent name", s == 200 and json.loads(b)["total"] == 0, (s, b[:200]))
+        check("the agent history filters by agent name", s == 200 and json.loads(b)["pagination"]["total_count"] == 0, (s, b[:200]))
         s, _, b = chat("l116-ctx", "chat-in-agent-session")
         s2, _, _ = chat("l116-other", "chat-elsewhere")
         check("LLM requests in the agent's sessions are sent", s == 200 and s2 == 200, (s, s2))
@@ -4671,7 +4680,7 @@ def l134_e2e(env):
         check("the timer fetches a changed card again and keeps it", moved, api("GET", "/api/agents/moving")[2][:300])
         # ---- the history ----
         s, _, b = api("GET", "/api/agents/history?agent_names=v1&limit=200")
-        methods = {x["method"] for x in json.loads(b)["history"]} if s == 200 else set()
+        methods = {x["method"] for x in json.loads(b)["logs"]} if s == 200 else set()
         check("pushes and their deliveries are in the agent history", {"push_notification", "push_delivery", "SendMessage", "CreateTaskPushNotificationConfig"} <= methods, methods)
     finally:
         gw.terminate()
@@ -6278,7 +6287,7 @@ def l171_e2e(env):
         check("without the project header the agent stays refused", s == 403, (s, b[:200]))
         # ---- the history ----
         s, _, b = api("GET", "/api/agents/history?limit=200")
-        hist = json.loads(b).get("history", []) if s == 200 else []
+        hist = json.loads(b).get("logs", []) if s == 200 else []
         row = next((x for x in hist if x["agent_name"] == "v1" and x["method"] == "message/send"), {})
         check("a history row names its operation, its bindings and its task", row.get("operation") == "message/send" and row.get("downstream_transport") == "JSONRPC" and row.get("upstream_transport") == "JSONRPC" and row.get("task_id", "") != "", row)
         s, _, b = api("GET", "/api/agents/history/" + row.get("id", "none"))
@@ -7929,7 +7938,7 @@ def l130_e2e(env):
         return call(method, p, body, adm, base=base, auth=False)
 
     def setp(config, name="h130"):
-        s, _, b = api("PUT", "/api/plugins/" + name, {"config": config})
+        s, _, b = api("PUT", "/api/plugins/" + name, {"config": whole_wasm_config(config)})
         if s != 200:
             raise SystemExit(f"l130: could not set the plugin config {config}: {s} {b[:200]}")
 
@@ -8158,7 +8167,7 @@ def l139_e2e(env):
     gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18217", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l139.log"), "w"))
 
     def setp(config):
-        s, _, b = call("PUT", "/api/plugins/h139", {"config": config}, adm, base=base, auth=False)
+        s, _, b = call("PUT", "/api/plugins/h139", {"config": whole_wasm_config(config)}, adm, base=base, auth=False)
         if s != 200:
             raise SystemExit(f"l139: could not set the plugin config {config}: {s} {b[:200]}")
 
@@ -8482,7 +8491,7 @@ def l159_e2e(env):
         check("bedrock count-tokens on Bedrock: the rewritten body is counted, without the model the plugins saw", s == 200 and len(up) == 1 and "pong" in up[0]["body"] and '"model"' not in up[0]["body"] and json.loads(b).get("inputTokens") == 17, (s, b[:200], up))
         # batch creation: the requests the provider gets are the rewritten ones (the mock answers each with the model
         # its line names), and post_hook sees the created batch
-        api("PUT", "/api/plugins/w159", {"config": {"mode": "rewrite", "from": "gpt-4o-mini", "to": "gpt-4o-l159", "tag": "l159"}})
+        api("PUT", "/api/plugins/w159", {"config": whole_wasm_config({"mode": "rewrite", "from": "gpt-4o-mini", "to": "gpt-4o-l159", "tag": "l159"})})
         n = len(seen())
         oa = {"x-model-provider": "openai"}
         s, _, b = post("/anthropic/v1/messages/batches", {"requests": [{"custom_id": "a", "params": {"model": "gpt-4o-mini", "max_tokens": 10, "messages": [{"role": "user", "content": "ping"}]}}]}, oa)
@@ -8494,7 +8503,7 @@ def l159_e2e(env):
         s, _, b = post("/genai/v1beta/models/openai/gpt-4o-mini:batchGenerateContent", inline)
         check("genai batch create: the hooks run around it, and the batch is created at the provider", s == 200 and json.loads(b).get("x_wasm_plugin") == "ctx-ok:l159" and len(since(n, "/v1/files")) == 1 and len(since(n, "/v1/batches")) == 1, (s, b[:200], [u["path"] for u in seen()[n:]]))
         # a short-circuit error answers each of these routes, and no provider is called
-        api("PUT", "/api/plugins/w159", {"config": {"mode": "fail"}})
+        api("PUT", "/api/plugins/w159", {"config": whole_wasm_config({"mode": "fail"})})
         FAILS_AT = [
             ("genai embedContent", EMB + ":embedContent", {"content": {"parts": [{"text": "x"}]}}),
             ("bedrock rerank", "/bedrock/rerank", WIRE),
@@ -8610,7 +8619,7 @@ def l170_e2e(env):
         return got
 
     def setp(config, name="h170"):
-        s, _, b = api("PUT", "/api/plugins/" + name, {"config": config})
+        s, _, b = api("PUT", "/api/plugins/" + name, {"config": whole_wasm_config(config)})
         if s != 200:
             raise SystemExit(f"l170: could not set the plugin config {config}: {s} {b[:200]}")
 
@@ -10315,7 +10324,7 @@ def l148_run(env, workers: int, label: str, port: int):
         grpc_ifs = [i for i in card.get("supportedInterfaces", []) if i.get("protocolBinding") == "GRPC"]
         check("the served card lists the gRPC interface under the agent's name and the advertised port", len(grpc_ifs) == 1 and grpc_ifs[0]["url"] == f"grpc.{A2A_GRPC_DOMAIN}:{A2A_GRPC_ADVERTISED}", (s, b[:300]))
         s, _, b = api("GET", "/api/agents/history?limit=200")
-        before = len(json.loads(b).get("history", [])) if s == 200 else 0
+        before = len(json.loads(b).get("logs", [])) if s == 200 else 0
         before_up = len(upstream())
         run = subprocess.run([client, "-addr", f"127.0.0.1:{A2A_GRPC_LISTEN}", "-domain", A2A_GRPC_DOMAIN, "-agent", "grpc", "-key", "sk-bf-l148-a", "-nogrant", "sk-bf-l148-b", "-push", MOCK + "/cb/push"], capture_output=True, text=True, timeout=300)
         check("the gRPC client runs to the end", run.returncode == 0, (run.returncode, run.stderr[-600:]))
@@ -10358,11 +10367,11 @@ def l148_run(env, workers: int, label: str, port: int):
         check("the calls reach the mock agent as JSON-RPC with the v1 method names", any(x["body"].find('"method":"SendMessage"') >= 0 for x in sent) and any(x["body"].find('"method":"CancelTask"') >= 0 for x in sent), [x["body"][:120] for x in sent[:3]])
         check("the agent does not get the caller's virtual key", len(sent) > 0 and all("sk-bf-l148" not in json.dumps(x) for x in sent), sent[:1])
         s, _, b = api("GET", "/api/agents/history?limit=200")
-        hist = json.loads(b).get("history", []) if s == 200 else []
+        hist = json.loads(b).get("logs", []) if s == 200 else []
         mine = [x for x in hist[: max(0, len(hist) - before)]]
         check("every call that reached the agent is logged under its name, with its method", s == 200 and len(mine) >= 8 and all(x["agent_name"] == "grpc" for x in mine) and any(x["method"] == "SendMessage" for x in mine), (s, len(mine), b[:200]))
         s, _, b = api("GET", "/api/agents/history?agent_names=grpc&limit=200")
-        check("the agent history selects the gRPC calls by name", s == 200 and json.loads(b).get("total", 0) >= 8, (s, b[:200]))
+        check("the agent history selects the gRPC calls by name", s == 200 and json.loads(b).get("pagination", {}).get("total_count", 0) >= 8, (s, b[:200]))
         s, _, _ = gwc("GET", "/health")
         check("the HTTP side of the gateway still answers", s == 200, s)
     finally:
@@ -10557,7 +10566,7 @@ def l161_e2e(env):
         check("the agent gets the runtime credentials as metadata, and never the caller's virtual key", len(plain) >= 8 and all("sk-bf-l161" not in json.dumps(x) for x in seen), seen[:2])
         check("the TLS agent gets its own credentials", any(x["metadata"].get("x-agent-token") == "tok-l161-tls" for x in seen), [x["metadata"] for x in seen][-2:])
         s, _, b = call("GET", "/api/agents/history?agent_names=gonly&limit=200", None, ADM, base=base, auth=False)
-        hist = json.loads(b).get("history", []) if s == 200 else []
+        hist = json.loads(b).get("logs", []) if s == 200 else []
         check("the calls to the gRPC-only agent are logged under its name", len(hist) >= 10 and all(x["agent_name"] == "gonly" for x in hist), (s, len(hist)))
     finally:
         if gw is not None:
@@ -12106,6 +12115,161 @@ def l173_e2e(env):
 
 
 GW_L172 = "http://127.0.0.1:18294"  # L172: Vertex tuned endpoints by project_number, body limits that follow a config change
+
+GW_L175 = "http://127.0.0.1:18302"  # L175: editable built-in roles, plugin PUT merge, quota per-model usage and profile budgets, profile audit lists, vMCP reverse lookup, member usage, user budget overrides
+GW_L175_OPEN = "http://127.0.0.1:18303"  # L175: the same gateway shape with dashboard auth off (plugin genuine-auth check)
+
+
+def l175_e2e(env):
+    """L175: the management API in Bifrost's shapes. Two gateways of its own, started and stopped here."""
+    import hashlib, shutil
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    d = os.path.join(BUILD, "e2e-l175")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    def tok(t):
+        return hashlib.sha256(t.encode()).hexdigest()
+    openai = {"keys": [{"name": "l175", "value": "sk-l175-pool", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}
+    cfg = {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": True},
+        "logs_store": {"enabled": True, "dir": os.path.join(d, "logs")},
+        "audit": {"enabled": True, "dir": os.path.join(d, "audit"), "key": "e2e-l175-audit-key-0123456789abcdef"},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": openai},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": tok("sk-admin-l175-root")},
+                      {"name": "vi", "role": "viewer", "token_sha256": tok("sk-admin-l175-view")},
+                      {"name": "ann", "role": "viewer", "access_profile_ids": ["p1"]}],
+            "access_profiles": [{"id": "p1", "name": "Base", "budget_id": "b-p", "virtual_mcps": ["dev"], "provider_configs": [{"provider": "openai", "budget_id": "b-oa"}]}],
+            "budgets": [{"id": "b-p", "max_limit": 10, "reset_duration": "1d"}, {"id": "b-oa", "max_limit": 0.000000001, "reset_duration": "1d"},
+                        {"id": "b-pj", "max_limit": 8, "reset_duration": "1d"}],
+            "virtual_keys": [{"id": "vk-ann", "name": "ann key", "value": "sk-bf-l175-ann", "user_id": "ann"},
+                             {"id": "vk-own", "name": "own key", "value": "sk-bf-l175-own"}],
+            "projects": [{"id": "pj", "name": "proj", "budget_id": "b-pj", "split_policy": "equal", "members": [{"id": "m1", "user_id": "ann"}]}],
+        },
+        "virtual_mcps": [{"name": "dev", "tools": [], "allowed_keys": ["vk-own"]}],
+    }
+    cfg_path = os.path.join(d, "config.json")
+    json.dump(cfg, open(cfg_path, "w"))
+    open_cfg = {"client": {"enable_logging": False}, "alerts": {"enabled": False}, "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False}, "providers": {"openai": openai}}
+    open_path = os.path.join(d, "open.json")
+    json.dump(open_cfg, open(open_path, "w"))
+    root = {"authorization": "Bearer sk-admin-l175-root"}
+    view = {"authorization": "Bearer sk-admin-l175-view"}
+    def api(method, p, body=None, who=root, base=GW_L175):
+        return raw(method, base + p, body, {"content-type": "application/json", **who})
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18302", "-host", "127.0.0.1", "-config", cfg_path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l175.log"), "w"))
+    gwo = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18303", "-host", "127.0.0.1", "-config", open_path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l175-open.log"), "w"))
+    try:
+        wait(GW_L175 + "/health")
+        wait(GW_L175_OPEN + "/health")
+        # ---- built-in roles are editable, as in Bifrost ----
+        s, _, b = api("GET", "/api/governance/rbac/roles/9003/permissions")
+        before = [p["id"] for p in json.loads(b).get("permissions", [])] if s == 200 else []
+        s, _, b = api("PUT", "/api/governance/rbac/roles/9003/permissions", {"permission_ids": [1]})
+        check("a built-in role's permissions are replaced by id", s == 200 and [p["resource"] + ":" + p["operation"] for p in json.loads(b).get("permissions", [])] == ["Logs:View"], (s, b[:300]))
+        s1, _, _ = api("GET", "/api/logs", who=view)
+        s2, _, b2 = api("GET", "/api/providers", who=view)
+        check("the edited viewer role is judged by its new permissions", s1 == 200 and s2 == 403, (s1, s2, b2[:200]))
+        s, _, b = api("PUT", "/api/governance/rbac/roles/9003", {"description": "read logs only"})
+        r = json.loads(b).get("role", {}) if s == 200 else {}
+        check("a built-in role's description is edited; it keeps its id and stays a system role", r.get("id") == 9003 and r.get("is_system_role") is True and r.get("description") == "read logs only", (s, b[:300]))
+        s, _, b = api("GET", "/api/governance/rbac/roles")
+        roles = json.loads(b).get("roles", []) if s == 200 else []
+        check("the role list keeps the edited role in its place", [x["id"] for x in roles[:4]] == [9001, 9002, 9003, 9004] and roles[2].get("description") == "read logs only", (s, b[:300]))
+        s, _, b = api("PUT", "/api/governance/rbac/roles/9003", {"name": "readers"})
+        check("a built-in role cannot be renamed", s == 400, (s, b[:200]))
+        s, _, b = api("DELETE", "/api/governance/rbac/roles/9003")
+        check("an edited built-in role still cannot be deleted", s == 403, (s, b[:200]))
+        s, _, _ = api("PUT", "/api/governance/rbac/roles/9003/permissions", {"permission_ids": before})
+        s2, _, _ = api("GET", "/api/providers", who=view)
+        check("the viewer's permissions are set back", s == 200 and s2 == 200, (s, s2))
+
+        # ---- plugins: PUT merges over the stored config; endpoints need a signed-in caller ----
+        s, _, b = api("POST", "/api/plugins", {"name": "blocklist", "enabled": True, "config": {"words": ["l175-a"], "note": "keep"}})
+        s2, _, b2 = api("PUT", "/api/plugins/blocklist", {"config": {"words": ["l175-b"]}})
+        s3, _, b3 = api("GET", "/api/plugins/blocklist")
+        conf = json.loads(b3).get("config", {}) if s3 == 200 else {}
+        check("a plugin PUT merges its config over the stored one, as Bifrost does", s == 201 and s2 == 200 and conf == {"words": ["l175-b"], "note": "keep"}, (s, s2, b3[:300]))
+        s, _, b = api("POST", "/api/plugins", {"name": "blocklist", "enabled": True, "config": {"words": ["x"], "headers": {"auth": "env.HOME"}}}, who={}, base=GW_L175_OPEN)
+        check("with dashboard auth off a plugin config naming an env. reference is refused", s == 403 and "headers.auth" in b and "authenticated admin session" in b, (s, b[:300]))
+        s, _, b = api("POST", "/api/plugins", {"name": "blocklist", "enabled": True, "config": {"words": ["x"]}}, who={}, base=GW_L175_OPEN)
+        s2, _, b2 = api("PUT", "/api/plugins/blocklist", {"config": {"url": "http://elsewhere.example"}}, who={}, base=GW_L175_OPEN)
+        s3, _, _ = api("PUT", "/api/plugins/blocklist", {"enabled": False}, who={}, base=GW_L175_OPEN)
+        check("with dashboard auth off a changed endpoint is refused, other changes are not", s == 201 and s2 == 403 and '"url"' not in b2 and "(url)" in b2 and s3 == 200, (s, s2, b2[:300], s3))
+
+        # ---- the quota view: profile budgets with their source, per-model usage from the logs ----
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l175 quota"}]}, {"x-bf-vk": "sk-bf-l175-ann"}, base=GW_L175, auth=False)
+        check("a request on the profile-governed key is served", s == 200, (s, b[:200]))
+        q = {}
+        for _ in range(50):
+            s, _, b = call("GET", "/api/governance/virtual-keys/quota", None, {"x-bf-vk": "sk-bf-l175-ann"}, base=GW_L175, auth=False)
+            q = json.loads(b) if s == 200 else {}
+            bud = (q.get("budgets") or [{}])[0]
+            if bud.get("per_model_usage"):
+                break
+            time.sleep(0.1)
+        bud = (q.get("budgets") or [{}])[0]
+        pm = bud.get("per_model_usage") or [{}]
+        check("the quota lists the held profile's budget with the profile as its source", bud.get("id") == "b-p" and bud.get("source_type") == "access_profile" and bud.get("source_id") == "p1" and bud.get("source_name") == "Base", q)
+        check("each budget carries its spend per model in the cycle", "gpt-4o-mini" in pm[0].get("model", "") and pm[0].get("total_requests", 0) >= 1 and "total_cost" in pm[0], pm)
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l175 quota 2"}]}, {"x-bf-vk": "sk-bf-l175-ann"}, base=GW_L175, auth=False)
+        check("the held profile's openai provider-config budget is charged to the user's copy", s == 402, (s, b[:200]))
+
+        # ---- a user's budget override on a profile budget ----
+        s, _, b = api("PUT", "/api/users/ann/access-profiles/p1/budgets/b-p/override", {"amount": 5, "mode": "forever"})
+        r = json.loads(b) if s == 200 else {}
+        check("a user's budget override is set, with the effective limit", r.get("effective_max_limit") == 15 and r.get("budget", {}).get("override", {}).get("mode") == "forever", (s, b[:300]))
+        q = {}
+        for _ in range(50):
+            s, _, b = call("GET", "/api/governance/virtual-keys/quota", None, {"x-bf-vk": "sk-bf-l175-ann"}, base=GW_L175, auth=False)
+            q = json.loads(b) if s == 200 else {}
+            if (q.get("budgets") or [{}])[0].get("effective_max_limit") == 15:
+                break
+            time.sleep(0.1)
+        check("the override raises the user's copy of the budget", (q.get("budgets") or [{}])[0].get("effective_max_limit") == 15, q)
+        s, _, b = api("PUT", "/api/governance/users/ann/access-profiles/p1/budgets/b-oa/override", {"amount": 5, "mode": "forever"})
+        check("an override on a budget the profile does not hold is 404", s == 404, (s, b[:200]))
+        s, _, b = api("DELETE", "/api/users/ann/access-profiles/p1/budgets/b-p/override")
+        check("a user's budget override is removed", s == 200 and json.loads(b).get("budget", {}).get("override") is None, (s, b[:200]))
+
+        # ---- the access-profile audit lists ----
+        api("POST", "/api/governance/access-profiles/p1/deactivate")
+        api("POST", "/api/governance/access-profiles/p1/activate")
+        s, _, b = api("GET", "/api/governance/access-profiles/p1/audit-logs")
+        r = json.loads(b) if s == 200 else {}
+        acts = [x["action"] for x in r.get("audit_logs", [])]
+        check("a profile's audit list names its changes, newest first, in Bifrost's shape", acts[:2] == ["activate", "deactivate"] and r.get("total_count", 0) >= 2 and r["audit_logs"][0].get("access_profile_id") == "p1" and r["audit_logs"][0].get("actor") == "root", (s, b[:400]))
+        s, _, b = api("GET", "/api/access-profiles/audit-logs?action=deactivate")
+        r = json.loads(b) if s == 200 else {}
+        check("the workspace audit list filters by action, on Bifrost's other path too", s == 200 and [x["action"] for x in r.get("audit_logs", [])] == ["deactivate"], (s, b[:300]))
+        s, _, b = api("GET", "/api/governance/access-profiles/nope/audit-logs")
+        check("an unknown profile's audit list is 404", s == 404, (s, b[:200]))
+
+        # ---- the virtual MCP reverse lookup ----
+        s, _, b = api("GET", "/api/mcp/virtual-mcps/dev/access-profiles")
+        check("a virtual MCP lists the access profiles that grant it and the users they reach", s == 200 and json.loads(b).get("access_profiles") == [{"id": "p1", "name": "Base", "is_active": True, "user_count": 1}], (s, b[:300]))
+        s, _, b = api("POST", "/api/mcp/virtual-mcps/dev/virtual-keys/vk-ann")
+        check("a key whose owner holds an access profile is not attached by hand (409)", s == 409, (s, b[:200]))
+
+        # ---- one project member's usage ----
+        s, _, b = api("GET", "/api/governance/projects/pj/members/m1/usage")
+        r = json.loads(b) if s == 200 else {}
+        check("a member's usage lists its slice of each project budget with its counter", r.get("user_id") == "ann" and [(x["source_budget_id"], x["max_limit"]) for x in r.get("budgets", [])] == [("b-pj", 8)] and isinstance(r.get("usage"), list), (s, b[:300]))
+        s, _, b = api("GET", "/api/governance/projects/pj/members/zed/usage")
+        check("an unknown member's usage is 404", s == 404, (s, b[:200]))
+
+        # ---- the agent history list in Bifrost's shape ----
+        s, _, b = api("GET", "/api/agents/history?group_sessions=true&hydrate=true&limit=5")
+        r = json.loads(b) if s == 200 else {}
+        check("the agent history answers {logs, pagination}", r.get("logs") == [] and r.get("pagination") == {"limit": 5, "offset": 0, "sort_by": "timestamp", "order": "desc", "total_count": 0}, (s, b[:300]))
+    finally:
+        gw.terminate()
+        gwo.terminate()
+        gw.wait()
+        gwo.wait()
+
 
 def l172_config() -> dict:
     """The L172 gateway: Vertex with a project_number (its token from the mock), and a body limit of 1 MiB."""
@@ -14052,6 +14216,11 @@ def main():
         check("weaviate: a near-duplicate from the same key is served from the store", hl(vw2).get("x-bf-cache") == "semantic-hit" and hl(vw1).get("x-bf-cache") != "semantic-hit", (vw1, vw2))
         check("weaviate: another virtual key does not see the entry (identity scoping)", hl(vw3).get("x-bf-cache") != "semantic-hit", vw3)
         check("weaviate: the schema, objects and nearVector queries reach the server", {"method": "POST", "path": "/v1/schema"} in wc and {"method": "POST", "path": "/v1/objects"} in wc and {"method": "POST", "path": "/v1/graphql"} in wc, wc[-5:])
+        # clear-by-key on Weaviate: a batch delete by the cache_key property, as Bifrost's DeleteAll
+        s, _, b = call("DELETE", "/api/cache/clear-by-key/vs-e2e", None, {}, base="http://127.0.0.1:18110", auth=False)
+        _, vw4, _ = vs_chat(18110, "openai/gpt-4o-mini", "sk-bf-a", "what is the capital of france?")
+        wc = json.loads(call("GET", "/_calls", base="http://127.0.0.1:18114")[2])
+        check("weaviate: clear-by-key deletes the key's entries in the store", s == 200 and hl(vw4).get("x-bf-cache") != "semantic-hit" and {"method": "DELETE", "path": "/v1/batch/objects"} in wc, (s, b[:200], vw4, wc[-4:]))
         _, vp1, _ = vs_chat(18111, "openai/gpt-4o-mini", "sk-bf-a", "what is the capital of france")
         _, vp2, _ = vs_chat(18111, "openai/gpt-4o-mini", "sk-bf-a", "what is the capital of france?")
         check("pinecone: a near-duplicate is served from the index", hl(vp2).get("x-bf-cache") == "semantic-hit" and hl(vp1).get("x-bf-cache") != "semantic-hit", (vp1, vp2))
@@ -14060,6 +14229,10 @@ def main():
         check("pinecone: a response with tool calls is not kept", hl(vt1).get("x-bf-cache") != "semantic-hit" and hl(vt2).get("x-bf-cache") != "semantic-hit", (vt1, vt2))
         pc = json.loads(call("GET", "/_calls", base="http://127.0.0.1:18115")[2])
         check("pinecone: upserts and queries reach the index", {"method": "POST", "path": "/vectors/upsert"} in pc and {"method": "POST", "path": "/query"} in pc, pc[-5:])
+        # clear-by-key on Pinecone: a delete by metadata filter
+        s, _, b = call("DELETE", "/api/cache/clear-by-key/vs-e2e", None, {}, base="http://127.0.0.1:18111", auth=False)
+        _, vp3, _ = vs_chat(18111, "openai/gpt-4o-mini", "sk-bf-a", "what is the capital of france?")
+        check("pinecone: clear-by-key deletes the key's entries in the index", s == 200 and hl(vp3).get("x-bf-cache") != "semantic-hit", (s, b[:200], vp3))
         _, vc1, _ = vs_chat(18112, "openai/gpt-4o-mini", "sk-bf-a", "what is the capital of france")
         _, vc2, _ = vs_chat(18112, "openai/gpt-4o-mini", "sk-bf-b", "what is the capital of france?")
         check("chromem: with disable_identity_scoping another key's entry is served", hl(vc2).get("x-bf-cache") == "semantic-hit" and hl(vc1).get("x-bf-cache") != "semantic-hit", (vc1, vc2))
@@ -14874,6 +15047,9 @@ def main():
         # L183: the server lifecycle (SIGTERM drain, /ready, header/idle/body timeouts, the connection cap; Tov patch
         # 0012): its own gateways (18322, 18323)
         l183_e2e(env)
+        # L175: editable built-in roles, plugin PUT merge and genuine-auth check, quota per-model usage, profile audit lists,
+        # vMCP reverse lookup, member usage, user budget overrides: its own gateways (18302, 18303)
+        l175_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

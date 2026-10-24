@@ -54,6 +54,11 @@ class H(BaseHTTPRequestHandler):
         if path == "/vectors/delete":
             ns = NS.get(body.get("namespace", ""), {})
             for vid in body.get("ids", []): ns.pop(vid, None)
+            # a delete by metadata filter: each field's $eq
+            flt = body.get("filter")
+            if flt:
+                for vid in [vid for vid, v in ns.items() if all(v["metadata"].get(k) == c.get("$eq") for k, c in flt.items())]:
+                    ns.pop(vid)
             return self.reply(200, {})
         return self.reply(404, {"error": {"message": "no route"}})
     do_GET = do_PUT = do_POST = do_DELETE = handle_any

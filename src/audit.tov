@@ -773,6 +773,81 @@ export function actionFor(method: string, path: string): { action: string, targe
   return generic
 }
 
+// The access-profile change an audit event records (Bifrost's per-profile audit actions: create, update, delete,
+// propagate, attach_role, detach_role, clone, activate, deactivate), with the profile it concerns; undefined for any
+// other event, or a change that was refused. A create names its profile by the body's id, else its name.
+export function profileChange(e: AuditEvent): { profile: string, action: string } | undefined {
+  if (e.status >= 300) return undefined
+  const q = e.path.indexOf("?")
+  const p = q < 0 ? e.path : e.path.slice(0, q)
+  const segs = p.split("/").filter((s) => s !== "")
+  if (segs[0] !== "api" || segs[1] !== "governance" || segs[2] !== "access-profiles") return undefined
+  const m = e.method.toUpperCase()
+  if (segs.length === 3) {
+    if (m !== "POST") return undefined
+    let id = ""
+    try {
+      const fs = fields(e.detail ?? "{}")
+      for (const f of fs) {
+        if (f.key === "id" && f.raw.startsWith("\"")) id = f.raw.slice(1, f.raw.byteLength - 1)
+      }
+      if (id === "") {
+        for (const f of fs) {
+          if (f.key === "name" && f.raw.startsWith("\"")) id = f.raw.slice(1, f.raw.byteLength - 1)
+        }
+      }
+    } catch (err) {
+      id = ""
+    }
+    return { profile: id, action: "create" }
+  }
+  const id = segs[3]!
+  if (id === "audit-logs") return undefined
+  if (segs.length === 4) {
+    if (m === "PUT" || m === "PATCH") return { profile: id, action: "update" }
+    if (m === "DELETE") return { profile: id, action: "delete" }
+    return undefined
+  }
+  const sub = segs[4]!
+  if (segs.length === 5 && m === "POST") {
+    if (sub === "propagate" || sub === "clone" || sub === "activate" || sub === "deactivate") return { profile: id, action: sub }
+    if (sub === "roles") return { profile: id, action: "attach_role" }
+  }
+  if (segs.length === 6 && sub === "roles" && m === "DELETE") return { profile: id, action: "detach_role" }
+  return undefined
+}
+
+// GET /api/governance/access-profiles/audit-logs and .../{profile_id}/audit-logs in Bifrost's AuditLogListResponse:
+// the access-profile changes of the trail (events newest first), for one profile or all, filtered by action and by
+// user_id (the user who made the change), then paged (limit, default 50, and offset).
+export function profileAuditJson(events: AuditEvent[], profile: string | undefined, action: string, user: string, limit: int, offset: int): string {
+  const rows: string[] = []
+  let total = 0
+  for (const e of events) {
+    const c = profileChange(e)
+    if (c === undefined) continue
+    if (profile !== undefined && c.profile !== profile) continue
+    if (action !== "" && c.action !== action) continue
+    const uid = initiatorTypeOf(e.actor) === "user" ? e.actor : ""
+    if (user !== "" && uid !== user) continue
+    total += 1
+    if (total <= offset || rows.length >= limit) continue
+    const parts: string[] = [
+      quote("id") + ":" + `${e.seq}`,
+      quote("access_profile_id") + ":" + (c.profile === "" ? "null" : quote(c.profile)),
+      quote("user_id") + ":" + (uid === "" ? "null" : quote(uid)),
+      quote("actor") + ":" + quote(e.actor),
+      quote("action") + ":" + quote(c.action),
+      quote("previous_values") + ":null",
+      quote("new_values") + ":" + (e.detail === undefined || e.detail === "" ? "null" : quote(e.detail)),
+      quote("metadata") + ":" + quote(`{"method":${quote(e.method)},"path":${quote(e.path)}}`),
+      quote("created_at") + ":" + quote(isoMs(e.ts)),
+    ]
+    rows.push("{" + parts.join(",") + "}")
+  }
+  return `{"audit_logs":[${rows.join(",")}],"total_count":${total}}`
+}
+
 // The JSON body with the value of every secret field replaced by "****", at any
 // depth inside objects and arrays. A body that is not a JSON object or array
 // becomes "" rather than being logged raw.
@@ -1189,4 +1264,32 @@ test("the in-memory window keeps only the newest maxMemory events", () => {
   } finally {
     try rmSync(dir, { recursive: true, force: true })
   }
+})
+
+function ev(seq: int, actor: string, method: string, path: string, status: int, detail: string | undefined): AuditEvent {
+  return { seq: seq, ts: 1760000000000.0 + seq, actor: actor, action: "api." + method.toLowerCase(), target: path, method: method, path: path, status: status, detail: detail, prev: "", hash: "", sig: "" }
+}
+
+test("access-profile changes read from the trail: Bifrost's per-profile actions and its list shape", () => {
+  const base = "/api/governance/access-profiles"
+  expect(profileChange(ev(1, "root", "POST", base, 201, `{"id":"p1","name":"P"}`))?.action).toBe("create")
+  expect(profileChange(ev(1, "root", "POST", base, 201, `{"name":"Named"}`))?.profile).toBe("Named")
+  expect(profileChange(ev(1, "root", "PUT", base + "/p1", 200, undefined))?.action).toBe("update")
+  expect(profileChange(ev(1, "root", "POST", base + "/p1/propagate", 200, undefined))?.action).toBe("propagate")
+  expect(profileChange(ev(1, "root", "POST", base + "/p1/roles", 200, undefined))?.action).toBe("attach_role")
+  expect(profileChange(ev(1, "root", "DELETE", base + "/p1/roles/9003", 200, undefined))?.action).toBe("detach_role")
+  expect(profileChange(ev(1, "root", "POST", base + "/p1/deactivate", 200, undefined))?.action).toBe("deactivate")
+  expect(profileChange(ev(1, "root", "PUT", base + "/p1", 400, undefined))).toBeUndefined()
+  expect(profileChange(ev(1, "root", "PUT", "/api/governance/teams/t1", 200, undefined))).toBeUndefined()
+  // newest first, as the trail is read
+  const es = [ev(4, "key:ci", "DELETE", base + "/p2", 200, undefined), ev(3, "ann", "PUT", base + "/p1", 200, `{"name":"Q"}`), ev(2, "root", "PUT", "/api/providers/openai", 200, undefined), ev(1, "root", "POST", base, 201, `{"id":"p1"}`)]
+  const all = profileAuditJson(es, undefined, "", "", 50, 0)
+  expect(all.endsWith(`"total_count":3}`)).toBe(true)
+  expect(all.startsWith(`{"audit_logs":[{"id":4,"access_profile_id":"p2","user_id":null,"actor":"key:ci","action":"delete","previous_values":null,"new_values":null`)).toBe(true)
+  const one = profileAuditJson(es, "p1", "", "", 50, 0)
+  expect(one.includes(`"id":3,"access_profile_id":"p1","user_id":"ann","actor":"ann","action":"update","previous_values":null,"new_values":"{\\"name\\":\\"Q\\"}"`)).toBe(true)
+  expect(one.endsWith(`"total_count":2}`)).toBe(true)
+  expect(profileAuditJson(es, "p1", "create", "", 50, 0).endsWith(`"total_count":1}`)).toBe(true)
+  expect(profileAuditJson(es, undefined, "", "ann", 50, 0).endsWith(`"total_count":1}`)).toBe(true)
+  expect(profileAuditJson(es, undefined, "", "", 1, 1).startsWith(`{"audit_logs":[{"id":3,`)).toBe(true)
 })

@@ -405,6 +405,11 @@ export function redisCreateArgs(ns: string, dim: int, tags: string[]): (string |
   return args
 }
 
+// FT.ALTER adding one TAG field to an existing index.
+export function redisAlterArgs(ns: string, tag: string): (string | u8[])[] {
+  return ["FT.ALTER", ns, "SCHEMA", "ADD", tag, "TAG"]
+}
+
 // HSET for an entry: the vector, the expiry, the payload as JSON in field p, and each
 // filter field as its own value.
 export function redisAddArgs(ns: string, id: string, v: f64[], payload: Map<string, string>, expiresMs: int, tags: string[]): (string | u8[])[] {
@@ -600,6 +605,14 @@ export class RedisStore extends VectorStore {
   async ensure(ns: string, dim: int, tags: string[]): Promise<void, Error> {
     const r = try await this.client.command(redisCreateArgs(ns, dim, tags))
     if (r.kind === "err" && !r.text.startsWith("Index already exists")) throw new Error(`redis: create ${ns}: ${r.text}`)
+    // an index made before a tag field existed (cache_key, before clear-by-key) gets it added; a field it has is a
+    // duplicate RediSearch refuses, which is fine
+    if (r.kind === "err") {
+      for (const t of tags) {
+        const a = try await this.client.command(redisAlterArgs(ns, t))
+        if (a.kind === "err" && !a.text.toLowerCase().includes("duplicate")) throw new Error(`redis: alter ${ns}: ${a.text}`)
+      }
+    }
     this.tags.set(ns, tags)
   }
 
@@ -705,6 +718,29 @@ export function weaviateWhere(filter: Cond[], nowMs: int): string {
   return `{operator:And,operands:[${ops.join(",")}]}`
 }
 
+// The batch delete of every object of a class whose fields equal the conditions (Bifrost's DeleteAll through the
+// ObjectsBatchDeleter), with the REST where-filter: one condition alone, several under And.
+export function weaviateBatchDeleteBody(cls: string, filter: Cond[]): string {
+  const ops: string[] = []
+  for (const c of filter) ops.push(`{"path":[${quote(c.key)}],"operator":"Equal","valueText":${quote(c.eq)}}`)
+  const where = ops.length === 1 ? ops[0]! : `{"operator":"And","operands":[${ops.join(",")}]}`
+  return `{"match":{"class":${quote(cls)},"where":${where}},"output":"minimal","dryRun":false}`
+}
+
+// The tags a class schema ({"properties":[{"name":...}]}) does not have yet.
+export function weaviateMissingProps(schema: string, tags: string[]): string[] {
+  const have: string[] = []
+  try {
+    for (const p of elements(find(fields(schema), "properties") ?? "[]")) {
+      const n = rawStr(fields(p), "name")
+      if (n !== undefined) have.push(n)
+    }
+  } catch (e) {
+    return []
+  }
+  return tags.filter((t) => !have.includes(t))
+}
+
 // The GraphQL query for the nearest entry within distance 1 - threshold (cosine distance).
 export function weaviateSearchQuery(cls: string, v: f64[], threshold: f64, filter: Cond[], nowMs: int): string {
   const q = `{ Get { ${cls}(nearVector: {vector: ${vectorJson(v)}, distance: ${1.0 - threshold}}, where: ${weaviateWhere(filter, nowMs)}, limit: 1) { p _additional { id distance } } } }`
@@ -760,8 +796,26 @@ export class WeaviateStore extends VectorStore {
       if (c.status < 200 || c.status >= 300) throw new Error(`weaviate: create ${cls}: HTTP ${c.status}: ${c.text}`)
     } else if (r.status < 200 || r.status >= 300) {
       throw new Error(`weaviate: schema ${cls}: HTTP ${r.status}: ${r.text}`)
+    } else {
+      // a class made before a tag property existed (cache_key, before clear-by-key) gets it added
+      for (const t of weaviateMissingProps(r.text, tags)) {
+        const a = try await this.call("POST", `/v1/schema/${cls}/properties`, `{"name":${quote(t)},"dataType":["text"],"tokenization":"field"}`)
+        if (a.status < 200 || a.status >= 300) throw new Error(`weaviate: add property ${t} to ${cls}: HTTP ${a.status}: ${a.text}`)
+      }
     }
     this.tags.set(ns, tags)
+  }
+
+  // Deletes every object matching the conditions in one batch; a class that does not exist holds nothing.
+  async deleteWhere(ns: string, filter: Cond[]): Promise<int, Error> {
+    const cls = try weaviateClass(ns)
+    try tagsFor(this.tags, ns)
+    const s = try await this.call("GET", `/v1/schema/${cls}`, "")
+    if (s.status === 404) return 0
+    const r = try await this.call("DELETE", "/v1/batch/objects", weaviateBatchDeleteBody(cls, filter))
+    if (r.status < 200 || r.status >= 300) throw new Error(`weaviate: batch delete: HTTP ${r.status}: ${r.text}`)
+    const res = try fields(find(try fields(r.text), "results") ?? "{}")
+    return Math.trunc(rawNum(res, "successful") ?? rawNum(res, "matches") ?? 0.0)
   }
 
   async add(ns: string, id: string, vector: f64[], payload: Map<string, string>, ttlMs: int): Promise<void, Error> {
@@ -827,6 +881,13 @@ export function pineconeQueryBody(ns: string, v: f64[], filter: Cond[], nowMs: i
 
 export function pineconeDeleteBody(ns: string, id: string): string {
   return `{"ids":[${quote(id)}],"namespace":${quote(ns)}}`
+}
+
+// A delete by metadata filter: each condition as $eq (Bifrost's DeleteVectorsByFilter).
+export function pineconeDeleteWhereBody(ns: string, filter: Cond[]): string {
+  const parts: string[] = []
+  for (const c of filter) parts.push(`${quote(c.key)}:{"$eq":${quote(c.eq)}}`)
+  return `{"filter":{${parts.join(",")}},"namespace":${quote(ns)}}`
 }
 
 // The best match of a query reply ({"matches":[...]}), or undefined.
@@ -895,6 +956,14 @@ export class PineconeStore extends VectorStore {
     try this.need(ns)
     const r = try await this.call("POST", "/vectors/delete", pineconeDeleteBody(ns, id))
     if (r.status < 200 || r.status >= 300) throw new Error(`pinecone: delete: HTTP ${r.status}: ${r.text}`)
+  }
+
+  // Deletes by metadata filter. Pinecone does not say how many went, as in Bifrost, so the count is 0.
+  async deleteWhere(ns: string, filter: Cond[]): Promise<int, Error> {
+    try this.need(ns)
+    const r = try await this.call("POST", "/vectors/delete", pineconeDeleteWhereBody(ns, filter))
+    if (r.status < 200 || r.status >= 300) throw new Error(`pinecone: delete by filter: HTTP ${r.status}: ${r.text}`)
+    return 0
   }
 }
 
@@ -1461,4 +1530,13 @@ test("a chromem file replays adds and deletes, skips torn lines, and drops expir
   try {
     rmSync(dir, { recursive: true, force: true })
   } catch (e) {}
+})
+
+test("clear by field on Weaviate, Pinecone and an older Redis index", () => {
+  expect(weaviateBatchDeleteBody("Sem", [{ key: "cache_key", eq: "k1" }])).toBe(`{"match":{"class":"Sem","where":{"path":["cache_key"],"operator":"Equal","valueText":"k1"}},"output":"minimal","dryRun":false}`)
+  expect(weaviateBatchDeleteBody("Sem", [{ key: "a", eq: "1" }, { key: "b", eq: "2" }]).includes(`"where":{"operator":"And","operands":[{"path":["a"]`)).toBe(true)
+  expect(weaviateMissingProps(`{"class":"Sem","properties":[{"name":"p"},{"name":"scope"}]}`, ["scope", "cache_key"]).join(",")).toBe("cache_key")
+  expect(weaviateMissingProps(`{"class":"Sem"}`, ["scope"]).join(",")).toBe("scope")
+  expect(pineconeDeleteWhereBody("ns", [{ key: "cache_key", eq: "k1" }])).toBe(`{"filter":{"cache_key":{"$eq":"k1"}},"namespace":"ns"}`)
+  expect(redisAlterArgs("sem", "cache_key").join(" ")).toBe("FT.ALTER sem SCHEMA ADD cache_key TAG")
 })

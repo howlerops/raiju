@@ -18,6 +18,8 @@ import { McpUserToken, UserFlow, userFlowById, userFlowsLive, takeUserFlow, forg
 import { OpenApiConfig, OpenApiCred, OpenApiDoc, OpenApiOp, OpScheme, Unsupported, parseSpec, inputSchema, previewJson, baseUrlOf, operationServersCover } from "./openapi"
 import { targetProblem } from "./netguard"
 import * as vmcp from "./vmcp"
+import { DataScope, inScope } from "./scope"
+import { heldProfiles } from "./govapi"
 import { Field, fields, elements, find, quote, rawStr, rawNum, rawBool, setField, build } from "./json"
 
 // The reply. action asks the lead to run a step on the live manager after sending body:
@@ -1439,12 +1441,46 @@ function virtualJson(v: vmcp.VirtualMcp, keyIds: string[]): string {
   return `{"id":${quote(v.name)},"name":${quote(v.name)},"endpoint_slug":${quote(v.name)}${desc},"enabled":true,"tools":${JSON.stringify(v.tools)},"virtual_key_ids":[${quotedKeys.join(",")}]}`
 }
 
-function listVirtuals(store: ConfigStore): McpReply {
-  const list = virtualsOf(store.cfg)
+function listVirtuals(store: ConfigStore, scope: DataScope | undefined): McpReply {
+  const list = virtualsOf(store.cfg).filter((v) => virtualVisible(store.cfg, v, scope))
   const keyIds = virtualKeyIds(store.cfg)
   const parts: string[] = []
   for (const v of list) parts.push(virtualJson(v, keyIds))
   return reply(200, `{"virtual_mcps":[${parts.join(",")}],"count":${list.length},"total_count":${list.length}}`)
+}
+
+// Data access control on virtual MCPs (Bifrost's vMCP visibility): a caller with a narrowed data scope sees a virtual
+// MCP when one of its attached keys is in that scope (the key's team or customer); one without allowed_keys is
+// attached to every key and seen by all. An unscoped caller sees every one.
+export function virtualVisible(c: Config, v: vmcp.VirtualMcp, scope: DataScope | undefined): bool {
+  if (scope === undefined || scope.all) return true
+  const keys = v.allowed_keys
+  if (keys === undefined) return true
+  for (const vk of c.governance?.virtual_keys ?? []) {
+    if (keys.includes(vk.id) && inScope(scope, vk.team_id ?? "", "", vk.customer_id ?? "", "")) return true
+  }
+  return false
+}
+
+// The reverse lookup of a virtual MCP: the access profiles that grant it (their virtual_mcps name it) and how many users
+// reach it through each, the users who hold the profile (by hand or through a role) and the users of the keys it is
+// attached to.
+export function grantingProfilesJson(c: Config, name: string): string {
+  const g = c.governance
+  const rows: string[] = []
+  for (const p of g?.access_profiles ?? []) {
+    if (!(p.virtual_mcps ?? []).includes(name)) continue
+    const users: string[] = []
+    for (const u of g?.users ?? []) {
+      if (heldProfiles(g?.users, g?.roles, g?.access_profiles, u.name).some((h) => h.id === p.id) && !users.includes(u.name)) users.push(u.name)
+    }
+    for (const vk of g?.virtual_keys ?? []) {
+      const uid = vk.user_id ?? ""
+      if (uid !== "" && (vk.access_profile_ids ?? []).includes(p.id) && !users.includes(uid)) users.push(uid)
+    }
+    rows.push(`{"id":${quote(p.id)},"name":${quote(p.name ?? p.id)},"is_active":${p.is_active === false ? "false" : "true"},"user_count":${users.length}}`)
+  }
+  return `[${rows.join(",")}]`
 }
 
 // Whether a virtual MCP name is taken by another virtual MCP or by an MCP client (they share
@@ -1545,6 +1581,12 @@ function setAttached(store: ConfigStore, id: string, vkId: string, attach: bool)
   const at = virtualIndex(list, id)
   if (at < 0) return fail(404, "virtual MCP not found")
   if (attach && !virtualKeyIds(store.cfg).includes(vkId)) return fail(404, "virtual key not found")
+  // a key whose owner holds an access profile takes its virtual MCPs from the profile (Bifrost answers 409)
+  const g = store.cfg.governance
+  for (const vk of g?.virtual_keys ?? []) {
+    const uid = vk.user_id ?? ""
+    if (vk.id === vkId && uid !== "" && heldProfiles(g?.users, g?.roles, g?.access_profiles, uid).length > 0) return fail(409, "the virtual key's owner holds an access profile; grant the virtual MCP through the profile")
+  }
   let v = list[at]!
   let keys: string[] = v.allowed_keys ?? virtualKeyIds(store.cfg)
   if (attach) {
@@ -1562,13 +1604,21 @@ function setAttached(store: ConfigStore, id: string, vkId: string, attach: bool)
   return reply(200, `{"success":true}`)
 }
 
-function virtualRoute(store: ConfigStore, m: string, segs: string[], body: string, p: string): McpReply {
+function virtualRoute(store: ConfigStore, m: string, segs: string[], body: string, p: string, scope: DataScope | undefined): McpReply {
   if (segs.length === 3) {
-    if (m === "GET") return listVirtuals(store)
+    if (m === "GET") return listVirtuals(store, scope)
     if (m === "POST") return createVirtual(store, body)
     return notAllowed(m)
   }
   const id = segs[3]!
+  // one the caller's data scope does not reach is not found, as Bifrost answers
+  const seen = virtualIndex(virtualsOf(store.cfg), id)
+  if (seen >= 0 && !virtualVisible(store.cfg, virtualsOf(store.cfg)[seen]!, scope)) return fail(404, "virtual MCP not found")
+  if (segs.length === 5 && segs[4] === "access-profiles") {
+    if (m !== "GET") return notAllowed(m)
+    if (seen < 0) return fail(404, "virtual MCP not found")
+    return reply(200, `{"access_profiles":${grantingProfilesJson(store.cfg, id)}}`)
+  }
   if (segs.length === 4) {
     if (m === "GET") {
       const at = virtualIndex(virtualsOf(store.cfg), id)
@@ -2049,7 +2099,7 @@ export async function oauthRoute(store: ConfigStore, method: string, path: strin
 // The MCP management route for method and path, or undefined when the path is not one of them.
 // The caller passes every /api/mcp path that is not handled elsewhere (the /api/mcp view and the
 // library are not).
-export function mcpApi(store: ConfigStore, method: string, path: string, body: string, publicOnly?: bool): McpReply | undefined {
+export function mcpApi(store: ConfigStore, method: string, path: string, body: string, publicOnly?: bool, scope?: DataScope): McpReply | undefined {
   const m = method.toUpperCase()
   const q = path.indexOf("?")
   const p = q < 0 ? path : path.slice(0, q)
@@ -2058,7 +2108,7 @@ export function mcpApi(store: ConfigStore, method: string, path: string, body: s
   const area = segs[2]!
   if (area === "clients") return m === "GET" ? listClients(store) : notAllowed(m)
   if (area === "client") return clientRoute(store, m, segs, body, p, publicOnly ?? false)
-  if (area === "virtual-mcps") return virtualRoute(store, m, segs, body, p)
+  if (area === "virtual-mcps") return virtualRoute(store, m, segs, body, p, scope)
   if (area === "tool-groups") return toolGroupRoute(store, m, segs, body, p)
   if (area === "per-user-headers") return headersRoute(store, m, segs, body, p)
   return undefined
@@ -2721,4 +2771,32 @@ test("a token_exchange client is refused while dual_credential_conflict_behavior
   expect(dualConflictError("token_exchange", { client: { dual_credential_conflict_behavior: "error" } }).includes("prefer_idp")).toBe(true)
   expect(dualConflictError("per_user_oauth", { client: { dual_credential_conflict_behavior: "error" } })).toBe("")
   cleanupFile(s.path)
+})
+
+test("virtual MCPs: data access scope, the granting profiles and the profile-held key rule", () => {
+  const c: Config = {
+    governance: {
+      virtual_keys: [{ id: "vk1", value: "sk-bf-1", team_id: "t1" }, { id: "vk2", value: "sk-bf-2", team_id: "t2" }, { id: "vk3", value: "sk-bf-3", user_id: "ann", access_profile_ids: ["p1"] }],
+      users: [{ name: "ann", role: "viewer", access_profile_ids: ["p1"] }, { name: "bo", role: "viewer" }],
+      access_profiles: [{ id: "p1", name: "Base", virtual_mcps: ["dev"] }, { id: "p2", virtual_mcps: ["ops"] }],
+    },
+  }
+  const none: vmcp.VirtualTool[] = []
+  c.virtual_mcps = [{ name: "dev", tools: none, allowed_keys: ["vk1"] }, { name: "ops", tools: none, allowed_keys: ["vk2"] }, { name: "open", tools: none }]
+  const s = new ConfigStore(tmpPath(), c)
+  const t1: DataScope = { all: false, teams: ["t1"], businessUnits: [], customers: [], projects: [] }
+  const list = mcpApi(s, "GET", "/api/mcp/virtual-mcps", "", false, t1)!.body
+  expect(list.includes(`"name":"dev"`)).toBe(true)
+  expect(list.includes(`"name":"open"`)).toBe(true)
+  expect(list.includes(`"name":"ops"`)).toBe(false)
+  expect(mcpApi(s, "GET", "/api/mcp/virtual-mcps/ops", "", false, t1)!.status).toBe(404)
+  expect(mcpApi(s, "DELETE", "/api/mcp/virtual-mcps/ops", "", false, t1)!.status).toBe(404)
+  expect(mcpApi(s, "GET", "/api/mcp/virtual-mcps/ops", "")!.status).toBe(200)
+  const rev = mcpApi(s, "GET", "/api/mcp/virtual-mcps/dev/access-profiles", "")!
+  expect(rev.status).toBe(200)
+  expect(rev.body).toBe(`{"access_profiles":[{"id":"p1","name":"Base","is_active":true,"user_count":1}]}`)
+  expect(mcpApi(s, "GET", "/api/mcp/virtual-mcps/open/access-profiles", "")!.body).toBe(`{"access_profiles":[]}`)
+  expect(mcpApi(s, "GET", "/api/mcp/virtual-mcps/none/access-profiles", "")!.status).toBe(404)
+  expect(mcpApi(s, "POST", "/api/mcp/virtual-mcps/dev/virtual-keys/vk3", "")!.status).toBe(409)
+  expect(mcpApi(s, "POST", "/api/mcp/virtual-mcps/dev/virtual-keys/vk2", "")!.status).toBe(200)
 })

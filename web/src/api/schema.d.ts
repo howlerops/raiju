@@ -859,7 +859,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** The calling virtual key's budgets, rate limits and provider configs with their usage (self-service: the key in the request is the credential; an expired key is refused) */
+        /**
+         * The calling virtual key's budgets, rate limits and provider configs with their usage (self-service: the key in the request is the credential; an expired key is refused)
+         * @description Each budget carries per_model_usage, its spend per model and provider in its current cycle from the request logs (Bifrost's quotaModelSpend; empty without a log store). For a key whose user holds access profiles, each held profile's budget and rate limit comes first, with source_type access_profile, source_id and source_name, its usage the user's own copy and its per-model spend the user's requests; the key's own budgets follow.
+         */
         get: operations["getApiGovernanceVirtualKeysQuota"];
         put?: never;
         post?: never;
@@ -1729,10 +1732,10 @@ export interface paths {
         };
         /** One role by its id, as {role}; the built-in roles have fixed ids (9001 to 9004) and is_system_role true */
         get: operations["getApiGovernanceRbacRolesRoleId"];
-        /** Update a custom role by its id. A partial update: a field left out keeps its value, and an empty description clears it. A role cannot be renamed. */
+        /** Update a role by its id. A partial update: a field left out keeps its value, and an empty description clears it. A role cannot be renamed. A built-in role (9001 to 9004) is edited as in Bifrost: its description, dac, entity_dac and permissions change, it keeps its id and is_system_role, and it is then judged by its permissions; the admin role must keep RBAC View and Update. */
         put: operations["putApiGovernanceRbacRolesRoleId"];
         post?: never;
-        /** Delete a custom role by its id. Refused while a user holds it; access profiles attached to it let go of it. */
+        /** Delete a custom role by its id. Refused while a user holds it; access profiles attached to it let go of it. A built-in role cannot be deleted (403). */
         delete: operations["deleteApiGovernanceRbacRolesRoleId"];
         options?: never;
         head?: never;
@@ -1746,9 +1749,9 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** The permissions of a custom role by its id, with their ids */
+        /** The permissions of a role by its id (a built-in role's as they stand), with their ids */
         get: operations["getApiGovernanceRbacRolesRoleIdPermissions"];
-        /** Replace the permissions of a custom role by its id; permission_ids are the complete list */
+        /** Replace the permissions of a role by its id; permission_ids are the complete list. A built-in role is edited too, as in Bifrost (the admin role must keep RBAC View and Update) */
         put: operations["putApiGovernanceRbacRolesRoleIdPermissions"];
         post?: never;
         delete?: never;
@@ -4422,6 +4425,141 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/governance/access-profiles/audit-logs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The access-profile changes of the audit trail, newest first (Bifrost's listAccessProfileAuditLogs)
+         * @description Read from the audit trail's events in memory: create, update, delete, propagate, attach_role, detach_role, clone, activate and deactivate, each with the profile it concerns. previous_values is null (the trail keeps the request, not the record before it); new_values is the masked request body. An empty list while the audit log is off. Also served at /api/access-profiles/audit-logs.
+         */
+        get: operations["getApiGovernanceAccessProfilesAuditLogs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/governance/access-profiles/{id}/audit-logs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One access profile's changes from the audit trail, newest first (Bifrost's listAccessProfileAuditLogsById)
+         * @description As the workspace list, for one profile. Also served at /api/access-profiles/{id}/audit-logs.
+         */
+        get: operations["getApiGovernanceAccessProfilesIdAuditLogs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/access-profiles/audit-logs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The access-profile changes of the audit trail (Bifrost's other path for /api/governance/access-profiles/audit-logs) */
+        get: operations["getApiAccessProfilesAuditLogs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/access-profiles/{id}/audit-logs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One access profile's changes (Bifrost's other path for /api/governance/access-profiles/{id}/audit-logs) */
+        get: operations["getApiAccessProfilesIdAuditLogs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/mcp/virtual-mcps/{name}/access-profiles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The access profiles that grant a virtual MCP and how many users reach it through each (Bifrost's vMCP reverse lookup)
+         * @description A profile grants the virtual MCP when its virtual_mcps name it. user_count counts the users who hold the profile (by hand or through a role) and the users of the keys it is linked to. A virtual MCP outside the caller's data access scope is 404.
+         */
+        get: operations["getApiMcpVirtualMcpsNameAccessProfiles"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/governance/projects/{id}/members/{member_id}/usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One project member's usage (Bifrost's member usage view)
+         * @description Each slice the member holds of the project's budgets and rate limits (split none or equal) with what it has counted in its current window, and the member's requests in the project summed per provider and model, counted from the start of the earliest budget slice's cycle (every request the log store holds when the member has no budget slice). member_id is the membership id or the user name.
+         */
+        get: operations["getApiGovernanceProjectsIdMembersMemberIdUsage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/users/{name}/access-profiles/{profile_id}/budgets/{budget_id}/override": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Set a user's override on the budget of an access profile they hold (Bifrost's user budget override)
+         * @description The override adds to the user's own copy of the profile budget only (forever: until removed; cycles: for that many reset windows, the current one counted). The budget must be the profile's budget_id and the user must hold the profile. Also served under /api/governance/users/{name}/....
+         */
+        put: operations["putApiUsersNameAccessProfilesProfileIdBudgetsBudgetIdOverride"];
+        post?: never;
+        /** Remove a user's override on a profile budget */
+        delete: operations["deleteApiUsersNameAccessProfilesProfileIdBudgetsBudgetIdOverride"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/agents/history": {
         parameters: {
             query?: never;
@@ -4431,7 +4569,7 @@ export interface paths {
         };
         /**
          * The A2A calls that reached the agents, newest first
-         * @description Bifrost's filters (its listHistory parameters); the answer keeps Raiju's {history, total} shape.
+         * @description Bifrost's filters and answer (its listHistory), {logs, pagination}. group_sessions=true keeps each context's earliest call (with session_child_count, the other calls in the context) unless context_id, task_id or request_id is given; hydrate=true answers each call's detail with its events.
          */
         get: operations["getApiAgentsHistory"];
         put?: never;
@@ -5086,9 +5224,86 @@ export interface components {
                 message?: string;
             } | null;
         };
+        /** @description Bifrost's AgentLogHistoryResult. With hydrate=true each row is the call's detail (AgentLogDetail) with its events (always empty here, a stream being one row); with group_sessions=true each context keeps its earliest call, with session_child_count. */
         AgentHistory: {
-            history?: components["schemas"]["AgentCallLog"][];
-            total?: number;
+            logs?: components["schemas"]["AgentCallLog"][];
+            pagination?: components["schemas"]["AgentHistoryPagination"];
+        };
+        /** @description Bifrost's AuditLogListResponse for access profiles. */
+        AccessProfileAuditLogList: {
+            audit_logs?: {
+                /** @description The audit event's id (its sequence number) */
+                id?: number;
+                access_profile_id?: string | null;
+                /** @description The user who made the change (null for an API key or the system) */
+                user_id?: string | null;
+                actor?: string;
+                action?: string;
+                previous_values?: string | null;
+                /** @description The masked request body, as JSON text */
+                new_values?: string | null;
+                /** @description The request's method and path, as JSON text */
+                metadata?: string | null;
+                /** Format: date-time */
+                created_at?: string;
+            }[];
+            total_count?: number;
+        };
+        ProjectMemberUsage: {
+            project_id?: string;
+            member_id?: string;
+            user_id?: string;
+            budgets?: {
+                source_budget_id?: string;
+                /** @description The slice's own budget (the project budget's id with @<project>/<user>) */
+                budget_id?: string;
+                max_limit?: number;
+                current_usage?: number;
+            }[];
+            rate_limits?: {
+                source_rate_limit_id?: string;
+                rate_limit_id?: string;
+                token_max_limit?: number;
+                token_current_usage?: number;
+                request_max_limit?: number;
+                request_current_usage?: number;
+            }[];
+            usage?: components["schemas"]["QuotaModelSpend"][];
+        };
+        /** @description One model's spend in a cycle, from the request logs (Bifrost's quotaModelSpend). */
+        QuotaModelSpend: {
+            model?: string;
+            provider?: string;
+            total_requests?: number;
+            total_tokens?: number;
+            total_cost?: number;
+            input_cost?: number;
+            output_cost?: number;
+            additional_cost?: number;
+        };
+        UserBudgetOverrideReply: {
+            user_id?: string;
+            access_profile_id?: string;
+            budget?: {
+                id?: string;
+                max_limit?: number;
+                reset_duration?: string;
+                /** @description The user's copy's use in its current window */
+                current_usage?: number;
+                override?: Record<string, never> | null;
+            } | null;
+            effective_max_limit?: number;
+            /** Format: date-time */
+            checked_at?: string;
+        };
+        AgentHistoryPagination: {
+            limit?: number;
+            offset?: number;
+            /** @enum {string} */
+            sort_by?: "timestamp" | "latency";
+            /** @enum {string} */
+            order?: "desc" | "asc";
+            total_count?: number;
         };
         AgentGrant: {
             agent_name: string;
@@ -26482,6 +26697,299 @@ export interface operations {
             };
         };
     };
+    getApiGovernanceAccessProfilesAuditLogs: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+                /** @description One of create, update, delete, propagate, attach_role, detach_role, clone, activate, deactivate. */
+                action?: string;
+                /** @description The user who made the change. */
+                user_id?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccessProfileAuditLogList"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiGovernanceAccessProfilesIdAuditLogs: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+                action?: string;
+                user_id?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Access profile id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccessProfileAuditLogList"];
+                };
+            };
+            /** @description No such access profile. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiAccessProfilesAuditLogs: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+                action?: string;
+                user_id?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccessProfileAuditLogList"];
+                };
+            };
+        };
+    };
+    getApiAccessProfilesIdAuditLogs: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+                action?: string;
+                user_id?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Access profile id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccessProfileAuditLogList"];
+                };
+            };
+            /** @description No such access profile. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiMcpVirtualMcpsNameAccessProfiles: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Virtual MCP name */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        access_profiles?: {
+                            id?: string;
+                            name?: string;
+                            is_active?: boolean;
+                            user_count?: number;
+                        }[];
+                    };
+                };
+            };
+            /** @description No such virtual MCP, or one the caller's data access scope does not reach. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiGovernanceProjectsIdMembersMemberIdUsage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project id */
+                id: string;
+                /** @description Membership id or user name */
+                member_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectMemberUsage"];
+                };
+            };
+            /** @description No such project or member, or a project outside the caller's data access scope. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    putApiUsersNameAccessProfilesProfileIdBudgetsBudgetIdOverride: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description User name */
+                name: string;
+                /** @description Access profile id */
+                profile_id: string;
+                /** @description The profile's budget id */
+                budget_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": Record<string, never>;
+            };
+        };
+        responses: {
+            /** @description The budget with the override, and its effective limit for the user */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UserBudgetOverrideReply"];
+                };
+            };
+            /** @description The body is invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No such user, profile or budget, the budget is not the profile's, or the user does not hold the profile. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    deleteApiUsersNameAccessProfilesProfileIdBudgetsBudgetIdOverride: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description User name */
+                name: string;
+                /** @description Access profile id */
+                profile_id: string;
+                /** @description The profile's budget id */
+                budget_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The budget without the override */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UserBudgetOverrideReply"];
+                };
+            };
+            /** @description No such user, profile or budget. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
     getApiAgentsHistory: {
         parameters: {
             query?: {
@@ -26512,6 +27020,8 @@ export interface operations {
                 order?: "desc" | "asc";
                 limit?: number;
                 offset?: number;
+                group_sessions?: boolean;
+                hydrate?: boolean;
             };
             header?: never;
             path?: never;
@@ -26548,6 +27058,15 @@ export interface operations {
             };
             /** @description The caller's role or data access scope does not cover this route. */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The logs store is not enabled. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

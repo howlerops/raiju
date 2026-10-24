@@ -10,17 +10,17 @@ import {
   RateLimitConfig, TeamConfig, CustomerConfig, ProviderConfigRef, providerOf, AdminAuthConfig, AdminUserConfig, AccessProfile, NetworkConfig, CustomProviderConfig,
   ModelConfigGovernance, ProviderGovernance, PricingOverrideConfig, AlertsConfig, ClientConfig, providerNames, GlobalProxyConfig, CircuitPolicyConfig,
   WebhookEndpoint, AgentConfig, AgentGrant, AgentAuth, AgentOAuth, AgentTls, ProjectConfig, BusinessUnitConfig, RoleConfig, PermissionPair, UserAgentMapping, PluginSpec,
-  BudgetOverride, PricingSyncConfig, ComplexitySettings, ProjectMember, MemberShare, RateLimitShare, EntityDac, ProfileRole, ApiKeyConfig,
+  BudgetOverride, PricingSyncConfig, ComplexitySettings, ProjectMember, MemberShare, RateLimitShare, EntityDac, ProfileRole, ApiKeyConfig, UserBudgetOverride,
   loadRawConfig,
 } from "./config"
 import { RoutingRule, RuleTarget } from "./cel"
 import { aliasProviderProblem } from "./aliases"
-import { permissionDocs, pairOfId, permissionIds, parseOverride, keyBudgetIds, expiredToDelete, ruleError, complexityProblem, complexityFrom, emailOf, attachBinding } from "./govapi"
+import { permissionDocs, pairOfId, permissionIds, parseOverride, keyBudgetIds, expiredToDelete, ruleError, complexityProblem, complexityFrom, emailOf, attachBinding, heldProfiles } from "./govapi"
 import { PromptRepoConfig } from "./prompts"
 import { FeatureFlagsConfig } from "./flags"
 import { notify } from "./notify"
 import { analyzerStatus, retryWarmup, generationsJson, deleteGeneration } from "./complexity"
-import { isBuiltinRole, customRole, withRoleIds, roleIdOf, roleNameById, anyRoleName, builtinRoleName, builtinRoles } from "./rbac"
+import { isBuiltinRole, customRole, customRoles, systemRole, withRoleIds, roleIdOf, roleNameById, anyRoleName, builtinRoleName, builtinRoles } from "./rbac"
 import { DataScope, allScope, inScope, scopeOf } from "./scope"
 import { setGlobalProxy } from "./providers/types"
 import { McpClientConfig, McpUserCredential } from "./mcp"
@@ -1373,6 +1373,31 @@ export class ConfigStore {
     return this.commit(withGov(this.cfg, g), "user-profiles")
   }
 
+  // Sets or clears (undefined) a user's override on the budget of an access profile the user holds (Bifrost's PUT and
+  // DELETE /api/users/{user}/access-profiles/{profile}/budgets/{budget}/override). The budget must be the profile's.
+  setUserBudgetOverride(name: string, profileId: string, budgetId: string, o: BudgetOverride | undefined): Result {
+    const g: GovernanceConfig = this.cfg.governance ?? {}
+    const p = findById(g.access_profiles, profileId)
+    if (p === undefined) return fail(404, `no access profile ${profileId}`)
+    if (findById(g.budgets, budgetId) === undefined || p.budget_id !== budgetId) return fail(404, `budget ${budgetId} is not on access profile ${profileId}`)
+    if (!(g.users ?? []).some((u) => u.name === name)) return fail(404, `no user ${name}`)
+    if (!heldProfiles(g.users, g.roles, g.access_profiles, name).some((h) => h.id === profileId)) return fail(404, `user ${name} does not hold access profile ${profileId}`)
+    const users: AdminUserConfig[] = []
+    for (const u of g.users ?? []) {
+      if (u.name !== name) {
+        users.push(u)
+        continue
+      }
+      let nu = u
+      const kept: UserBudgetOverride[] = (u.budget_overrides ?? []).filter((x) => !(x.profile_id === profileId && x.budget_id === budgetId))
+      if (o !== undefined) kept.push({ profile_id: profileId, budget_id: budgetId, override: { amount: o.amount, mode: o.mode, cycles: o.cycles, started_at: o.mode === "cycles" ? rfc3339Of(Date.now()) : undefined } })
+      nu.budget_overrides = kept.length === 0 ? undefined : kept
+      users.push(nu)
+    }
+    g.users = users
+    return this.commit(withGov(this.cfg, g), "user-budget-override")
+  }
+
   // Links or unlinks an access profile on a virtual key the user is assigned (users API).
   setVkProfile(name: string, vkId: string, profileId: string, add: bool): Result {
     const g: GovernanceConfig = this.cfg.governance ?? {}
@@ -1896,8 +1921,27 @@ export class ConfigStore {
   // Saves a custom role. Built-in role names are refused; a role's users keep it when it changes, and so
   // does its id (a new role takes the next id; see rbac.tov withRoleIds).
   upsertRole(r: RoleConfig): Result {
-    const err = roleError(r)
+    const err = roleError(r, false)
     if (err !== "") return fail(400, err)
+    return this.saveRole(r)
+  }
+
+  // Saves a built-in role's edited description, dac and permissions (Bifrost lets a system role's permissions
+  // be changed); it is kept under governance.roles by its name and keeps its fixed id.
+  editSystemRole(r: RoleConfig): Result {
+    if (!isBuiltinRole(r.name)) return fail(404, `no system role ${r.name}`)
+    const err = roleError(r, true)
+    if (err !== "") return fail(400, err)
+    if (r.name === "admin") {
+      const ps = r.permissions ?? []
+      const view = ps.some((p) => p.resource === "RBAC" && p.operation === "View")
+      const update = ps.some((p) => p.resource === "RBAC" && p.operation === "Update")
+      if (!view || !update) return fail(400, "the admin role must keep RBAC View and Update, or no one could change roles again")
+    }
+    return this.saveRole(r)
+  }
+
+  private saveRole(r: RoleConfig): Result {
     const g = gov(this.cfg)
     const prior = customRole(g.roles, r.name)
     let keep: int | undefined = undefined
@@ -1920,6 +1964,7 @@ export class ConfigStore {
 
   // Removes a custom role, unless a user still holds it. Access profiles attached to it let go of it.
   deleteRole(name: string): Result {
+    if (isBuiltinRole(name)) return fail(403, "cannot delete system role")
     const g = gov(this.cfg)
     if (customRole(g.roles, name) === undefined) return fail(404, `no role ${name}`)
     for (const u of g.users ?? []) {
@@ -2732,10 +2777,10 @@ function businessUnitError(c: Config, b: BusinessUnitConfig): string {
 }
 
 // The error for a custom role, or "". Built-in names are reserved.
-function roleError(r: RoleConfig): string {
+function roleError(r: RoleConfig, system: bool): string {
   if (r.name === "") return "role name is required"
   if (isNumeric(r.name)) return "role name cannot be a number, which is how its id is written"
-  if (isBuiltinRole(r.name)) return `${r.name} is a built-in role and cannot be changed`
+  if (isBuiltinRole(r.name) && !system) return `${r.name} is a built-in role; change it by its id`
   const dac = r.dac ?? "all-data"
   if (!DACS.includes(dac)) return `dac must be one of ${DACS.join(", ")}`
   for (const p of r.permissions ?? []) {
@@ -3047,16 +3092,18 @@ function roleRoute(store: ConfigStore, m: string, segs: string[], body: string, 
   if (!scope.all && m !== "GET") return scopeDenied()
   const name = segs[2]
   if (name !== undefined && isNumeric(name)) return roleByIdRoute(store, m, parseInt(name) ?? 0, segs, body)
+  if (name !== undefined && isBuiltinRole(name)) return systemRoleRoute(store, m, name, segs, body, false)
   if (segs.length === 4 && name !== undefined) return rolePermissions(store, m, name, body)
   if (name === undefined) {
     if (m === "GET") {
       const parts: string[] = []
       if (system) {
         for (const r of builtinRoles(RESOURCES, OPERATIONS)) {
-          if (customRole(gov(store.cfg).roles, r.name) === undefined) parts.push(roleJsonAs(r, true))
+          const cur = systemRole(gov(store.cfg).roles, r.name, RESOURCES, OPERATIONS)
+          if (cur !== undefined) parts.push(roleJsonAs(cur, true))
         }
       }
-      for (const r of withRoleIds(gov(store.cfg).roles ?? [])) parts.push(roleJson(r))
+      for (const r of customRoles(gov(store.cfg).roles)) parts.push(roleJson(r))
       return reply(200, `{"roles":[${parts.join(",")}]}`)
     }
     if (m !== "POST") return notAllowed(m)
@@ -3102,7 +3149,7 @@ function roleView(store: ConfigStore, name: string): RoleConfig | undefined {
 // renamed, since its users and access profiles are kept by its id.
 function roleByIdRoute(store: ConfigStore, m: string, id: int, segs: string[], body: string): ApiReply {
   const sys = builtinRoleName(id)
-  if (sys !== undefined && customRole(gov(store.cfg).roles, sys) === undefined) return systemRoleRoute(m, sys, segs)
+  if (sys !== undefined) return systemRoleRoute(store, m, sys, segs, body, true)
   const name = roleNameById(gov(store.cfg).roles, id)
   if (name === undefined) return reply(404, errorBody(`no role ${id}`))
   if (segs.length === 4) return rolePermissions(store, m, name, body)
@@ -3139,26 +3186,41 @@ function roleByIdRoute(store: ConfigStore, m: string, id: int, segs: string[], b
   return notAllowed(m)
 }
 
-// A built-in role by its id: GET reads it (or its pairs, at .../permissions); it cannot be changed or deleted,
-// since its rules are fixed (Bifrost lets a system role's permissions be edited; Raiju's built-in rules are not
-// pair lists, so a custom role is the way to vary them).
-function systemRoleRoute(m: string, name: string, segs: string[]): ApiReply {
-  let role: RoleConfig | undefined = undefined
-  for (const r of builtinRoles(RESOURCES, OPERATIONS)) {
-    if (r.name === name) role = r
-  }
+// A built-in role (by its id, or by name on /api/roles/{name}): GET reads it as it stands (or its pairs, at
+// .../permissions). As in Bifrost it cannot be deleted (403) but can be edited: PUT changes its description, dac,
+// entity_dac and permissions (a field left out keeps its value; it cannot be renamed), and PUT .../permissions
+// {"permission_ids": [...]} replaces its pairs. An edited role is judged by its pairs, as a custom role is.
+function systemRoleRoute(store: ConfigStore, m: string, name: string, segs: string[], body: string, wrap: bool): ApiReply {
+  const role = systemRole(gov(store.cfg).roles, name, RESOURCES, OPERATIONS)
   if (role === undefined) return reply(404, errorBody(`no role ${name}`))
-  if (m === "GET") {
-    if (segs.length === 4) {
-      const ids = permissionIds(RESOURCES, OPERATIONS, role.permissions ?? [])
-      const docs = permissionDocs(RESOURCES, OPERATIONS).filter((d) => ids.includes(d.id))
-      return reply(200, JSON.stringify({ role: name, permissions: docs }))
-    }
-    return reply(200, `{"role":${roleJsonAs(role, true)}}`)
+  if (segs.length === 4) {
+    if (m === "GET") return permissionsReply(name, role.permissions ?? [])
+    if (m !== "PUT") return notAllowed(m)
+    const ps = permissionIdsOf(body)
+    if (ps.error !== "") return reply(400, errorBody(ps.error))
+    const r = store.editSystemRole({ name: name, description: role.description, dac: role.dac, permissions: ps.pairs, entity_dac: role.entity_dac })
+    if (r.kind === "error") return errReply(r)
+    return systemRoleRoute(store, "GET", name, segs, "", wrap)
   }
+  if (m === "GET") return reply(200, wrap ? `{"role":${roleJsonAs(role, true)}}` : roleJsonAs(role, true))
   if (m === "DELETE") return reply(403, errorBody("cannot delete system role"))
-  if (m === "PUT") return reply(403, errorBody(`cannot change system role ${name}: its rules are fixed; create a custom role instead`))
-  return notAllowed(m)
+  if (m !== "PUT") return notAllowed(m)
+  const b = parseRoleBody(body)
+  if (b === undefined) return badBody()
+  if (b.name !== undefined && b.name !== name) return reply(400, errorBody("a system role cannot be renamed"))
+  const ed = entityDacFrom(body)
+  if (ed.error !== "") return reply(400, errorBody(ed.error))
+  let present = false
+  try {
+    present = find(fields(body), "entity_dac") !== undefined
+  } catch (e) {
+    present = false
+  }
+  let description: string | undefined = role.description
+  if (b.description !== undefined) description = b.description === "" ? undefined : b.description
+  const r = store.editSystemRole({ name: name, description: description, dac: b.dac ?? role.dac, permissions: b.permissions ?? role.permissions, entity_dac: present ? ed.list : role.entity_dac })
+  if (r.kind === "error") return errReply(r)
+  return systemRoleRoute(store, "GET", name, segs, "", wrap)
 }
 
 // Whether a path segment is a number (a role id): digits only, at least one.
@@ -3177,33 +3239,43 @@ function isNumeric(s: string): bool {
 function rolePermissions(store: ConfigStore, m: string, name: string, body: string): ApiReply {
   const cur = customRole(gov(store.cfg).roles, name)
   if (cur === undefined) return reply(404, errorBody(`no role ${name}`))
-  if (m === "GET") {
-    const ids = permissionIds(RESOURCES, OPERATIONS, cur.permissions ?? [])
-    const docs = permissionDocs(RESOURCES, OPERATIONS).filter((d) => ids.includes(d.id))
-    return reply(200, JSON.stringify({ role: name, permissions: docs }))
-  }
+  if (m === "GET") return permissionsReply(name, cur.permissions ?? [])
   if (m !== "PUT") return notAllowed(m)
+  const ps = permissionIdsOf(body)
+  if (ps.error !== "") return reply(400, errorBody(ps.error))
+  const r = store.upsertRole({ name: name, description: cur.description, dac: cur.dac, permissions: ps.pairs, entity_dac: cur.entity_dac })
+  if (r.kind === "error") return errReply(r)
+  return rolePermissions(store, "GET", name, "")
+}
+
+// A role's pairs with their ids, as GET .../permissions answers.
+function permissionsReply(name: string, pairs: PermissionPair[]): ApiReply {
+  const ids = permissionIds(RESOURCES, OPERATIONS, pairs)
+  const docs = permissionDocs(RESOURCES, OPERATIONS).filter((d) => ids.includes(d.id))
+  return reply(200, JSON.stringify({ role: name, permissions: docs }))
+}
+
+// The pairs a {"permission_ids": [...]} body names, or the 400 message.
+function permissionIdsOf(body: string): { pairs: PermissionPair[], error: string } {
+  const pairs: PermissionPair[] = []
   let fs: Field[] = []
   try {
     fs = fields(body)
   } catch (e) {
-    return badBody()
+    return { pairs: pairs, error: "body must be a JSON object matching the resource" }
   }
   const raw = find(fs, "permission_ids") ?? ""
-  const pairs: PermissionPair[] = []
   try {
     for (const el of elements(raw)) {
       const id = parseFloat(el)
       const pair = id === undefined ? undefined : pairOfId(RESOURCES, OPERATIONS, Math.floor(id))
-      if (pair === undefined) return reply(400, errorBody(`unknown permission id ${el}`))
+      if (pair === undefined) return { pairs: pairs, error: `unknown permission id ${el}` }
       pairs.push(pair)
     }
   } catch (e) {
-    return reply(400, errorBody("permission_ids must be a list of permission ids"))
+    return { pairs: pairs, error: "permission_ids must be a list of permission ids" }
   }
-  const r = store.upsertRole({ name: name, description: cur.description, dac: cur.dac, permissions: pairs })
-  if (r.kind === "error") return errReply(r)
-  return rolePermissions(store, "GET", name, "")
+  return { pairs: pairs, error: "" }
 }
 
 function roleFrom(name: string, b: RoleBody, entity: EntityDac[]): RoleConfig {
@@ -4735,7 +4807,7 @@ test("custom roles: built-in names are reserved, dac and permissions are checked
   expect(made.body.includes(`"dac":"team-data"`)).toBe(true)
   expect(handleApi(s, "GET", "/api/roles", "").body.includes(`"roles":[{"id":1,"name":"ops"`)).toBe(true)
   expect(handleApi(s, "GET", "/api/roles/ops", "").status).toBe(200)
-  expect(handleApi(s, "GET", "/api/roles/admin", "").status).toBe(404)
+  expect(handleApi(s, "GET", "/api/roles/admin", "").body.includes(`"id":9001,"name":"admin"`)).toBe(true)
   expect(handleApi(s, "PUT", "/api/roles/ops", `{"dac":"all-data","permissions":[{"resource":"Teams","operation":"Update"}]}`).status).toBe(200)
   expect(handleApi(s, "GET", "/api/roles/ops", "").body.includes(`"operation":"Update"`)).toBe(true)
   expect(handleApi(s, "DELETE", "/api/roles/ops", "").status).toBe(200)
@@ -5011,7 +5083,7 @@ test("roles: entity_dac is read as Bifrost's object and shown the same way", () 
   cleanup(path)
 })
 
-test("built-in roles: listed first on Bifrost's path with fixed ids, readable by id, and fixed", () => {
+test("built-in roles: listed first on Bifrost's path with fixed ids, readable by id, editable, not deletable", () => {
   const path = tmpPath()
   const s = new ConfigStore(path, { governance: { access_profiles: [{ id: "p-view" }] } })
   expect(handleApi(s, "POST", "/api/roles", `{"name":"ops"}`).status).toBe(201)
@@ -5030,8 +5102,26 @@ test("built-in roles: listed first on Bifrost's path with fixed ids, readable by
   expect(perms.includes(`"role":"auditor"`)).toBe(true)
   expect(perms.includes(`"resource":"AuditLogs","operation":"View"`)).toBe(true)
   expect(handleApi(s, "DELETE", "/api/governance/rbac/roles/9001", "").status).toBe(403)
-  expect(handleApi(s, "PUT", "/api/governance/rbac/roles/9002", `{"description":"x"}`).status).toBe(403)
-  expect(handleApi(s, "PUT", "/api/governance/rbac/roles/9002/permissions", `{"permission_ids":[1]}`).status).toBe(403)
+  // as in Bifrost a system role's permissions and description are edited; it keeps its id and its place
+  const ed = handleApi(s, "PUT", "/api/governance/rbac/roles/9002", `{"description":"x","dac":"team-data"}`)
+  expect(ed.status).toBe(200)
+  expect(ed.body.startsWith(`{"role":{"id":9002,"name":"editor","description":"x","is_system_role":true,"dac":"team-data"`)).toBe(true)
+  expect(ed.body.includes(`{"resource":"VirtualKeys","operation":"Create"}`)).toBe(true)
+  expect(handleApi(s, "PUT", "/api/governance/rbac/roles/9002", `{"name":"boss"}`).status).toBe(400)
+  const pp = handleApi(s, "PUT", "/api/governance/rbac/roles/9002/permissions", `{"permission_ids":[1]}`)
+  expect(pp.status).toBe(200)
+  expect(pp.body).toBe(`{"role":"editor","permissions":[{"id":1,"resource":"Logs","operation":"View"}]}`)
+  expect(handleApi(s, "PUT", "/api/governance/rbac/roles/9002/permissions", `{"permission_ids":[99999]}`).status).toBe(400)
+  const after = handleApi(s, "GET", "/api/governance/rbac/roles", "").body
+  expect(after.startsWith(`{"roles":[{"id":9001,"name":"admin"`)).toBe(true)
+  expect(after.includes(`{"id":9002,"name":"editor","description":"x","is_system_role":true,"dac":"team-data","permissions":[{"resource":"Logs","operation":"View"}]`)).toBe(true)
+  expect(handleApi(s, "GET", "/api/roles", "").body.includes("editor")).toBe(false)
+  expect(handleApi(s, "GET", "/api/roles/editor", "").body.includes(`"description":"x"`)).toBe(true)
+  expect(handleApi(s, "DELETE", "/api/governance/rbac/roles/9002", "").status).toBe(403)
+  expect(handleApi(s, "DELETE", "/api/roles/editor", "").status).toBe(403)
+  // a custom role cannot take a built-in name; the admin keeps the right to change roles
+  expect(handleApi(s, "POST", "/api/roles", `{"name":"viewer"}`).status).toBe(400)
+  expect(handleApi(s, "PUT", "/api/governance/rbac/roles/9001/permissions", `{"permission_ids":[1]}`).status).toBe(400)
   // a profile attaches to a built-in role by its id
   expect(s.attachProfileRoles("p-view", [9003], undefined, true).kind).toBe("ok")
   expect(s.attachProfileRoles("p-view", [9100], undefined, true).kind).toBe("error")
@@ -5064,5 +5154,28 @@ test("complexity status routes: disabled, warming before the first classified re
   // nothing failed, so there is nothing to retry
   expect(handleApi(s, "POST", "/api/routing/complexity-analyzer-status/retry", "").status).toBe(409)
   expect(handleApi(s, "DELETE", "/api/routing/complexity-analyzer-generations/BifrostComplexityRouter_00", "").status).toBe(200)
+  cleanup(path)
+})
+
+test("a user's budget override on a profile they hold is kept on the user, and refused for any other budget", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, { governance: {
+    users: [{ name: "ana", role: "viewer", access_profile_ids: ["p"] }, { name: "bo", role: "viewer" }],
+    access_profiles: [{ id: "p", budget_id: "b-p" }, { id: "q" }],
+    budgets: [{ id: "b-p", max_limit: 10.0, reset_duration: "1d" }, { id: "b-x", max_limit: 1.0, reset_duration: "1d" }],
+  } })
+  expect(s.setUserBudgetOverride("ana", "p", "b-p", { amount: 5.0, mode: "cycles", cycles: 2 }).kind).toBe("ok")
+  const ana = (s.cfg.governance?.users ?? [])[0]!
+  const o = (ana.budget_overrides ?? [])[0]!
+  expect(o.override.amount).toBe(5.0)
+  expect(o.override.started_at !== undefined).toBe(true)
+  // a second save replaces it; a clear removes it
+  expect(s.setUserBudgetOverride("ana", "p", "b-p", { amount: 7.0, mode: "forever" }).kind).toBe("ok")
+  expect(((s.cfg.governance?.users ?? [])[0]!.budget_overrides ?? []).length).toBe(1)
+  expect(s.setUserBudgetOverride("ana", "p", "b-x", { amount: 1.0, mode: "forever" }).kind).toBe("error")
+  expect(s.setUserBudgetOverride("bo", "p", "b-p", { amount: 1.0, mode: "forever" }).kind).toBe("error")
+  expect(s.setUserBudgetOverride("zed", "p", "b-p", { amount: 1.0, mode: "forever" }).kind).toBe("error")
+  expect(s.setUserBudgetOverride("ana", "p", "b-p", undefined).kind).toBe("ok")
+  expect((s.cfg.governance?.users ?? [])[0]!.budget_overrides).toBeUndefined()
   cleanup(path)
 })
