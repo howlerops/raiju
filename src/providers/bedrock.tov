@@ -7,7 +7,7 @@ import { sha256, hmacSha256, toHex, utf8 } from "../crypto"
 import * as openai from "./openai"
 import * as anthropic from "./anthropic"
 import { BedrockKeyConfig, ProviderConfig, ProviderPromptCacheConfig } from "../config"
-import { injectedIndexes } from "./anthropic"
+import { injectedIndexes, firstCacheableMessage } from "./anthropic"
 
 // ---- SigV4 ----
 
@@ -165,7 +165,9 @@ function cachePoint(ttl: string | undefined): string {
 
 // cache (the provider's prompt_cache): its cache_control_injection_points put a cache point after each message they
 // name, as Bifrost's injection does for Bedrock (a marked system message puts one after the system blocks). Nothing is
-// injected for a model without cache points, or into a request that carries cache_control of its own.
+// injected for a model without cache points, or into a request that carries cache_control of its own. autoCache
+// (auto_inject) puts one cache point after the first cacheable block of the conversation, as Bifrost's injector marks
+// it; injection points replace it.
 export function converseBody(req: ChatRequest, body: Field[], autoCache: bool, modelId?: string, cache?: ProviderPromptCacheConfig): string throws SyntaxError {
   let turns: Turn[] = []
   const system: string[] = []
@@ -173,39 +175,42 @@ export function converseBody(req: ChatRequest, body: Field[], autoCache: bool, m
   const selfCached = (find(body, "messages") ?? "").includes("cache_control")
   const marked = injectedIndexes(req.messages, pts, pts.length > 0 && !selfCached && supportsCachePoints(modelId ?? ""))
   const marker = cachePoint(cache?.ttl)
+  const autoAt = autoCache && pts.length === 0 && !selfCached ? firstCacheableMessage(req.messages) : -1
   let sysMarked = false
   let idx = -1
   for (const m of req.messages) {
     idx += 1
     if (m.role === "system" || m.role === "developer") {
-      for (const c of contentOf(m.content)) system.push(c)
+      const cs = contentOf(m.content)
+      for (let j = 0; j < cs.length; j++) {
+        system.push(cs[j]!)
+        if (j === 0 && idx === autoAt) system.push(marker)
+      }
       if (marked.has(idx)) sysMarked = true
       continue
     }
     if (m.role === "tool") {
       const text = typeof m.content === "string" ? m.content : (m.content ?? []).map((p) => p.text ?? "").join("")
       const blocks = [`{"toolResult":{"toolUseId":${quote(m.tool_call_id ?? "")},"content":[{"text":${quote(text)}}]}}`]
-      if (marked.has(idx)) blocks.push(marker)
+      if (marked.has(idx) || idx === autoAt) blocks.push(marker)
       pushTurn(&turns, "user", blocks)
       continue
     }
     const role = m.role === "assistant" ? "assistant" : "user"
-    const content = contentOf(m.content)
+    const cs = contentOf(m.content)
+    const content: string[] = []
+    for (let j = 0; j < cs.length; j++) {
+      content.push(cs[j]!)
+      // every converted part is text or an image, so the first one takes auto_inject's point
+      if (j === 0 && idx === autoAt) content.push(marker)
+    }
     for (const c of m.tool_calls ?? []) {
       content.push(`{"toolUse":{"toolUseId":${quote(c.id)},"name":${quote(c.function.name)},"input":${argsObject(c.function.arguments)}}}`)
     }
     if (marked.has(idx) && content.length > 0) content.push(marker)
     pushTurn(&turns, role, content)
   }
-  if (sysMarked && system.length > 0 && !autoCache) system.push(marker)
-  if (autoCache) {
-    // cache points after the system prompt and the newest turn
-    if (turns.length > 0) {
-      const last = turns[turns.length - 1]!
-      turns[turns.length - 1] = { role: last.role, content: last.content.concat([`{"cachePoint":{"type":"default"}}`]) }
-    }
-    if (system.length > 0) system.push(`{"cachePoint":{"type":"default"}}`)
-  }
+  if (sysMarked && system.length > 0) system.push(marker)
   const out: string[] = [`"messages":[${turns.map((t) => `{"role":"${t.role}","content":[${t.content.join(",")}]}`).join(",")}]`]
   if (system.length > 0) out.push(`"system":[${system.join(",")}]`)
   for (const p of try converseTail(req, body, modelId)) out.push(p)
@@ -345,6 +350,27 @@ function callTo(t: Target, reg: string, h: string, sch: string, path: string, bo
   }
   addExtraHeaders(&hs, t.cfg)
   return { url: sch + h + path, headers: hs, body: body }
+}
+
+// The request with a new body. One signed with SigV4 (a key's access key) is signed again for the new body, with the
+// region and service of its credential scope and the host, path and query of its URL; any other goes as it is.
+export function withBody(t: Target, up: Upstream, body: string): Upstream {
+  const auth = up.headers.get("authorization") ?? ""
+  const bk = t.key.bedrock_key_config
+  if (!auth.startsWith("AWS4-HMAC-SHA256 ") || bk === undefined) return { url: up.url, headers: up.headers, body: body }
+  const at = auth.indexOf("Credential=")
+  const rest = at < 0 ? "" : auth.slice(at + 11)
+  const end = rest.indexOf(",")
+  const scope: string[] = rest.slice(0, end < 0 ? rest.byteLength : end).split("/")
+  const u = URL.parse(up.url)
+  if (scope.length < 5 || u === undefined) return { url: up.url, headers: up.headers, body: body }
+  const q = u.search.startsWith("?") ? u.search.slice(1) : u.search
+  let hs = signRequest("POST", { accessKey: scope[0]!, secretKey: bk.secret_key ?? "", sessionToken: bk.session_token, region: scope[2]! }, scope[3]!, u.host, u.pathname, q, body, Date.now())
+  for (const k of up.headers.keys()) {
+    if (k === "authorization" || k === "x-amz-date" || k === "x-amz-security-token" || k === "content-type") continue
+    hs.set(k, up.headers.get(k)!)
+  }
+  return { url: up.url, headers: hs, body: body }
 }
 
 // A request to /model/{id}/{action} for a body that is converted while it streams in (streamconv.tov): signed
@@ -634,6 +660,37 @@ test("cache_control_injection_points put cache points after the messages they na
   // a request with markers of its own is left alone
   const own = `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"x","cache_control":{"type":"ephemeral"}}]}]}`
   expect((try converseBody(try JSON.parse(own) as ChatRequest, try fields(own), false, "anthropic.claude-sonnet-4", cache)).includes("cachePoint")).toBe(false)
+})
+
+test("a new body is signed again as the request was signed", () => {
+  const t: Target = { provider: "bedrock", kind: "bedrock", model: "anthropic.claude-v2:1", key: { value: "", bedrock_key_config: { access_key: "AKIDEXAMPLE", secret_key: "s", region: "us-east-1", session_token: "tok" } }, cfg: { network_config: { extra_headers: { "x-extra": "1" } } } }
+  const a = signedRequest(t, "converse", `{"x":1}`)
+  const b = withBody(t, a, `{"x":2}`)
+  const c = signedRequest(t, "converse", `{"x":2}`)
+  expect(b.body).toBe(`{"x":2}`)
+  expect(b.url).toBe(a.url)
+  expect(b.headers.get("x-extra")).toBe("1")
+  expect(b.headers.get("x-amz-security-token")).toBe("tok")
+  if (b.headers.get("x-amz-date") === c.headers.get("x-amz-date")) expect(b.headers.get("authorization")).toBe(c.headers.get("authorization"))
+  expect(b.headers.get("authorization") === a.headers.get("authorization")).toBe(false)
+  // a bearer key's request just takes the body
+  const k: Target = { provider: "bedrock", kind: "bedrock", model: "m", key: { value: "abk" }, cfg: {} }
+  const kb = withBody(k, signedRequest(k, "converse", "{}"), `{"y":1}`)
+  expect(kb.headers.get("authorization")).toBe("Bearer abk")
+  expect(kb.body).toBe(`{"y":1}`)
+})
+
+test("auto_inject puts one cache point after the first cacheable block", () => {
+  const raw = `{"model":"m","messages":[{"role":"system","content":"rules"},{"role":"user","content":"one"},{"role":"assistant","content":"two"},{"role":"user","content":"three"}]}`
+  const out = try converseBody(try JSON.parse(raw) as ChatRequest, try fields(raw), true, "anthropic.claude-sonnet-4")
+  expect(out).toBe(`{"messages":[{"role":"user","content":[{"text":"one"}]},{"role":"assistant","content":[{"text":"two"}]},{"role":"user","content":[{"text":"three"}]}],"system":[{"text":"rules"},{"cachePoint":{"type":"default"}}],"inferenceConfig":{"maxTokens":4096}}`)
+  const noSys = `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]},{"role":"user","content":"c"}]}`
+  const o2 = try converseBody(try JSON.parse(noSys) as ChatRequest, try fields(noSys), true, "anthropic.claude-sonnet-4", { ttl: "1h" })
+  expect(o2.startsWith(`{"messages":[{"role":"user","content":[{"text":"a"},{"cachePoint":{"type":"default","ttl":"1h"}},{"text":"b"},{"text":"c"}]}]`)).toBe(true)
+  // injection points replace it
+  const o3 = try converseBody(try JSON.parse(raw) as ChatRequest, try fields(raw), true, "anthropic.claude-sonnet-4", { cache_control_injection_points: [{ index: -1 }] })
+  expect(o3.includes(`"system":[{"text":"rules"}]`)).toBe(true)
+  expect(o3.includes(`{"text":"three"},{"cachePoint":{"type":"default"}}`)).toBe(true)
 })
 
 test("reasoning_effort becomes Claude thinking fields; reasoning text comes back", () => {

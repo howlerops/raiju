@@ -6,6 +6,7 @@ import { isOpenAICompatible } from "./providers/openai"
 import { Health, pickAdaptive } from "./health"
 import { datasheetProviders } from "./pricing"
 import { aliasLookup, aliasEntry, aliasProblem, aliasProviderProblem, resolveKeyAlias, AliasResult } from "./aliases"
+import { compileRegex, Regex } from "./regex"
 
 export type ModelRef = { provider: string, model: string }
 
@@ -112,6 +113,9 @@ export function aliasProblems(cfg: Config): string[] {
   for (const name of ps.keys()) {
     const keys = ps.get(name)!.keys ?? []
     for (let i = 0; i < keys.length; i++) {
+      // a regex: entry that cannot match (Bifrost refuses the key; here the entry never matches)
+      const rp = regexEntryProblem((keys[i]!.models ?? []).concat(keys[i]!.blacklisted_models ?? []))
+      if (rp !== "") out.push(name + " key " + (keys[i]!.name ?? ("" + i)) + ": " + rp + "; the entry never matches")
       const a = keys[i]!.aliases
       if (a === undefined) continue
       const p = aliasProblem(a, cfg.client?.routing_chain_max_depth)
@@ -124,14 +128,67 @@ export function aliasProblems(cfg: Config): string[] {
   return out
 }
 
+// Compiled regex: list entries by entry text; one that does not compile is kept as undefined.
+class EntryRegexes {
+  items: Map<string, Regex | undefined> = new Map()
+
+  get(entry: string): Regex | undefined {
+    if (this.items.has(entry)) return this.items.get(entry)
+    if (this.items.size >= 512) this.items.clear()
+    let re: Regex | undefined = undefined
+    const pat = entry.slice(6)
+    if (pat !== "" && pat !== "*") {
+      try {
+        re = compileRegex("(?i)^(?:" + pat + ")$")
+      } catch (e) {
+        re = undefined
+      }
+    }
+    this.items.set(entry, re)
+    return re
+  }
+}
+
+const entryRegexes = new EntryRegexes()
+
+// Whether a model or blacklist entry is a "regex:<pattern>" entry (Bifrost's IsRegexEntry).
+export function isRegexEntry(entry: string): bool {
+  return entry.startsWith("regex:")
+}
+
+// Whether a model list or blacklist entry names value, as Bifrost's MatchEntry: a regex: entry is a full,
+// case-insensitive match of its pattern (one that does not compile never matches), any other entry is equal
+// ignoring case.
+export function matchEntry(entry: string, value: string): bool {
+  if (!isRegexEntry(entry)) return entry.toLowerCase() === value.toLowerCase()
+  const re = entryRegexes.get(entry)
+  return re !== undefined && re.test(value)
+}
+
+// The problem with a list's regex: entries ("" when none), as Bifrost's ValidateRegexEntries: an empty pattern,
+// the bare wildcard, or a pattern that does not compile.
+export function regexEntryProblem(entries: string[]): string {
+  for (const e of entries) {
+    if (!isRegexEntry(e)) continue
+    const pat = e.slice(6)
+    if (pat === "") return `regex entry "${e}" has no pattern`
+    if (pat === "*") return `regex entry "${e}" is not a pattern; use a bare "*" to allow or block everything`
+    try {
+      compileRegex("(?i)^(?:" + pat + ")$")
+    } catch (err) {
+      return `regex entry "${e}" does not compile: ${err.message}`
+    }
+  }
+  return ""
+}
+
 // Whether a key's blacklisted_models block a model (a request model name, so an alias by its name): "*" blocks every
-// model, any other entry the model by name, case-insensitively, as Bifrost's BlackList.
+// model, any other entry the model by name, case-insensitively, or by its regex: pattern, as Bifrost's BlackList.
 export function keyBlocks(k: KeyConfig, model: string): bool {
   const bl = k.blacklisted_models
   if (bl === undefined || bl.length === 0) return false
-  const low = model.toLowerCase()
   for (const b of bl) {
-    if (b === "*" || b.toLowerCase() === low) return true
+    if (b === "*" || matchEntry(b, model)) return true
   }
   return false
 }
@@ -145,16 +202,26 @@ export function keyAllows(k: KeyConfig, model: string): bool {
   if (a !== undefined && aliasLookup(a, model) !== undefined) return true
   for (const m of ms) {
     if (m === "*" || m === model) return true
+    if (isRegexEntry(m) && matchEntry(m, model)) return true
   }
   return false
+}
+
+// Whether a key's model listing needs the provider's own listing: an open key, or a model list with a regex: entry
+// (only the provider's models can match it). A key with plain entries lists those names without asking the provider.
+export function listingNeedsUpstream(k: KeyConfig): bool {
+  const ms = (k.models ?? []).filter((m) => m !== "*")
+  return ms.length === 0 || ms.some((m) => isRegexEntry(m))
 }
 
 // A provider's model listing (provider/model ids as its API lists them) through Bifrost's ListModelsPipeline, key by
 // key, the results joined: a model an alias of the key targets is listed under the alias name as well as its own; a
 // model the key blacklists is dropped (by either name); and the key's aliases its listing did not match are added
-// back. A key with a model list lists those models (minus its blacklist), as Bifrost lists a restricted allow list.
-// keys are the provider's keys; none (a keyless provider) lists the ids as they are.
-export function listingPipeline(provider: string, ids: string[], keys: KeyConfig[]): string[] {
+// back. A key with a model list lists the provider's models its regex: entries match, then its plain entries (minus
+// its blacklist), as Bifrost lists a restricted allow list. keys are the provider's keys; none (a keyless provider)
+// lists the ids as they are. idsByKey, when given, holds each key's own listing (Bifrost lists with every key);
+// otherwise every key reads ids.
+export function listingPipeline(provider: string, ids: string[], keys: KeyConfig[], idsByKey?: string[][]): string[] {
   if (keys.length === 0) return ids
   const out: string[] = []
   const seen: Set<string> = new Set()
@@ -165,17 +232,15 @@ export function listingPipeline(provider: string, ids: string[], keys: KeyConfig
     out.push(id)
   }
   const pre = provider + "/"
-  for (const k of keys) {
+  for (let ki = 0; ki < keys.length; ki++) {
+    const k = keys[ki]!
     const ms = (k.models ?? []).filter((m) => m !== "*")
-    if (ms.length > 0) {
-      for (const m of ms) {
-        if (!keyBlocks(k, m)) add(m)
-      }
-      continue
-    }
     const a = k.aliases
     const matched: Set<string> = new Set()
-    for (const id of ids) {
+    const included: Set<string> = new Set()
+    // a plain model list does not read the listing
+    const kids: string[] = !listingNeedsUpstream(k) ? [] : idsByKey !== undefined ? (idsByKey[ki] ?? []) : ids
+    for (const id of kids) {
       const bare = id.startsWith(pre) ? id.slice(pre.byteLength) : id
       const names: string[] = []
       if (a !== undefined) {
@@ -189,8 +254,18 @@ export function listingPipeline(provider: string, ids: string[], keys: KeyConfig
       }
       names.push(bare)
       for (const n of names) {
-        if (!keyBlocks(k, n)) add(n)
+        if (keyBlocks(k, n)) continue
+        if (ms.length > 0 && !ms.some((m) => matchEntry(m, n))) continue
+        add(n)
+        included.add(n.toLowerCase())
       }
+    }
+    if (ms.length > 0) {
+      // the plain entries are models of this key whether or not the listing named them
+      for (const m of ms) {
+        if (!isRegexEntry(m) && !included.has(m.toLowerCase()) && !keyBlocks(k, m)) add(m)
+      }
+      continue
     }
     // the aliases the provider's listing did not name are still models of this key
     if (a !== undefined) {
@@ -548,6 +623,35 @@ test("the model listing goes through each key's aliases and blacklist", () => {
   expect(listingPipeline("p", [], [k3, { value: "k", models: ["a", "c"] }])).toEqual(["p/a", "p/c"])
   // a keyless provider lists as it is
   expect(listingPipeline("p", ["p/x"], [])).toEqual(["p/x"])
+})
+
+test("regex: entries in a key's model list and blacklist", () => {
+  expect(matchEntry("regex:gpt-4.*", "GPT-4o")).toBe(true)
+  expect(matchEntry("regex:gpt-4", "gpt-4o")).toBe(false)
+  expect(matchEntry("regex:(", "(")).toBe(false)
+  expect(matchEntry("GPT-4o", "gpt-4o")).toBe(true)
+  const k: KeyConfig = { value: "k", models: ["regex:gpt-4.*", "extra"], blacklisted_models: ["regex:.*-mini"] }
+  expect(keyAllows(k, "gpt-4o")).toBe(true)
+  expect(keyAllows(k, "gpt-4o-mini")).toBe(false)
+  expect(keyAllows(k, "o3")).toBe(false)
+  expect(keyAllows(k, "extra")).toBe(true)
+  const ids = ["p/gpt-4o", "p/gpt-4o-mini", "p/o3", "p/gpt-4.1"]
+  expect(listingPipeline("p", ids, [k])).toEqual(["p/gpt-4o", "p/gpt-4.1", "p/extra"])
+  expect(listingNeedsUpstream(k)).toBe(true)
+  expect(listingNeedsUpstream({ value: "k", models: ["a"] })).toBe(false)
+  expect(listingNeedsUpstream({ value: "k", models: ["*"] })).toBe(true)
+  // a regex blacklist on an open key
+  expect(listingPipeline("p", ids, [{ value: "k", models: [], blacklisted_models: ["regex:gpt-.*"] }])).toEqual(["p/o3"])
+  expect(regexEntryProblem(["a", "regex:gpt-.*"])).toBe("")
+  expect(regexEntryProblem(["regex:"])).toBe(`regex entry "regex:" has no pattern`)
+  expect(regexEntryProblem(["regex:*"]).includes("bare")).toBe(true)
+  expect(regexEntryProblem(["regex:(ab"]).includes("does not compile")).toBe(true)
+})
+
+test("each key's own listing is read and the results joined", () => {
+  const k1: KeyConfig = { value: "a", models: [] }
+  const k2: KeyConfig = { value: "b", models: [], blacklisted_models: ["y"] }
+  expect(listingPipeline("p", [], [k1, k2], [["p/x"], ["p/x", "p/y", "p/z"]])).toEqual(["p/x", "p/z"])
 })
 
 test("parses provider-prefixed and bare models", () => {

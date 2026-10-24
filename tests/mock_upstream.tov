@@ -154,7 +154,8 @@ const COMPAT_ROWS = `{
   "strict-mini": {"mode":"chat","max_output_tokens":1000,"model_parameters":[{"id":"max_tokens"},{"id":"max_completion_tokens"},{"id":"tools"},{"id":"tool_choice"},{"id":"stop"}]},
   "chatonly-mini": {"mode":"chat","max_output_tokens":4096,"model_parameters":[{"id":"max_tokens"},{"id":"temperature"},{"id":"top_p"},{"id":"stop"}]},
   "responses-only": {"mode":"responses","supported_endpoints":["/v1/responses"],"max_output_tokens":8000,"model_parameters":[{"id":"max_output_tokens"},{"id":"reasoning_effort"},{"id":"tools"},{"id":"temperature"}]},
-  "reasoning-tools": {"mode":"chat","max_output_tokens":8000,"model_parameters":[{"id":"reasoning_effort"},{"id":"tools"},{"id":"max_tokens"},{"id":"max_completion_tokens"}],"supports_reasoning_with_tool_calls":false}
+  "reasoning-tools": {"mode":"chat","max_output_tokens":8000,"model_parameters":[{"id":"reasoning_effort"},{"id":"tools"},{"id":"max_tokens"},{"id":"max_completion_tokens"}],"supports_reasoning_with_tool_calls":false},
+  "textfit-mini": {"mode":"completion","max_output_tokens":50,"supported_endpoints":["/v1/completions"],"model_parameters":[{"id":"max_tokens"},{"id":"stop"}]}
 }`
 
 function putObject(k: string, body: string): void {
@@ -350,7 +351,8 @@ async function replicateMock(req: Request, path: string, lu: URL | undefined): P
       for (let i = 0; i < n; i++) urls.push("http://127.0.0.1:18099/replicate/out/" + i + ".png")
       return Response.json({ id: id, status: "succeeded", created_at: now, output: urls })
     }
-    const pieces = ["Replicate says: ", prompt]
+    // (a large prompt is not echoed whole: its size is)
+    const pieces = ["Replicate says: ", prompt.byteLength > 65536 ? `a prompt of ${prompt.byteLength} bytes` : prompt]
     return Response.json({ id: id, status: "succeeded", created_at: now, output: pieces, logs: "Input token count: 7\nOutput token count: 4" })
   }
   return jsonBody(JSON.stringify({ detail: "not found" }), 404)
@@ -553,6 +555,11 @@ Bun.serve<string>({
         if (f !== undefined) return f
         // large_payload_optimization: "large-answer" answers with a 3 MB completion, "large-stream" with a 3 MB event stream
         if (model === "large-answer") return Response.json({ id: "cl1", object: "chat.completion", created: 1, model: model, choices: [{ index: 0, message: { role: "assistant", content: "y".repeat(3000000) }, finish_reason: "stop" }], usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 } })
+        // L174: a stream that stops for its length (the stop reason of a streamed answer is logged)
+        if (model === "l174-stream") {
+          const ck = (delta: string, finish: string) => `data: {"id":"cs174","object":"chat.completion.chunk","created":1,"model":"${model}","choices":[{"index":0,"delta":${delta},"finish_reason":${finish}}]}\n\n`
+          return new Response(ck(`{"role":"assistant","content":"cut "}`, "null") + ck(`{"content":"short"}`, "null") + ck(`{}`, `"length"`) + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } })
+        }
         if (model === "large-stream") {
           const bulk = "z".repeat(1000)
           let sse = ""
@@ -786,9 +793,9 @@ Bun.serve<string>({
         record(req, "/v1/completions", body)
         const m = try JSON.parse(body) as Model
         const model = m.model ?? ""
-        // only the L97s models have a text completion here; the others are not served (the compat tests read that)
-        if (model !== "pii-text" && model !== "block-text") return Response.json({ error: { message: `The model '${model}' does not exist`, type: "invalid_request_error", code: "model_not_found" } }, { status: 404 })
-        const parts = model === "block-text" ? ["a forbidden", " word"] : ["call 555-", "1234 now"]
+        // only the L97s models (and L178's textfit-mini) have a text completion here; the others are not served (the compat tests read that)
+        if (model !== "pii-text" && model !== "block-text" && model !== "textfit-mini") return Response.json({ error: { message: `The model '${model}' does not exist`, type: "invalid_request_error", code: "model_not_found" } }, { status: 404 })
+        const parts = model === "block-text" ? ["a forbidden", " word"] : model === "textfit-mini" ? ["Hi from ", "textfit"] : ["call 555-", "1234 now"]
         if (m.stream === true) {
           const chunk = (text: string, finish: string) => `data: {"id":"tc1","object":"text_completion","created":1,"model":"${model}","choices":[{"index":0,"text":${JSON.stringify(text)},"finish_reason":${finish}}]}\n\n`
           let sse = ""
@@ -819,6 +826,8 @@ Bun.serve<string>({
       // a Bedrock Mantle listing scoped to a project is recorded (L173); the other listings are not
       if ((req.headers.get("openai-project") ?? "") !== "") record(req, "/v1/models", "")
       if (isAnthropic(req)) return Response.json({ data: [{ type: "model", id: "claude-sonnet-4", display_name: "Claude Sonnet 4", created_at: STAMP }], has_more: false, first_id: "claude-sonnet-4", last_id: "claude-sonnet-4" })
+      // L174: the second key of a provider lists one model more (the listing is read with every key)
+      if ((req.headers.get("authorization") ?? "") === "Bearer sk-l174b") return Response.json({ object: "list", data: [{ id: "m-a", object: "model" }, { id: "m-b", object: "model" }, { id: "m-c", object: "model" }] })
       return Response.json({ object: "list", data: [{ id: "m-a", object: "model", created: 1735689600 }, { id: "m-b", object: "model" }] })
     },
     // one model: Anthropic's shape for an x-api-key client, OpenAI's otherwise. "missing" is a 404, and so is
@@ -1017,6 +1026,24 @@ Bun.serve<string>({
         const m = try JSON.parse(body) as Model
         const f = failure(m.model ?? "", req.headers.get("x-api-key") ?? "")
         if (f !== undefined) return f
+        // a slow stream (L178): its first text, then the rest 2 s later (a gateway that buffers holds the first back)
+        if (m.stream === true && (m.model ?? "").includes("l178slow")) {
+          const first = new TextEncoder().encode(`event: message_start\ndata: {"type":"message_start","message":{"id":"msg_s","usage":{"input_tokens":9,"output_tokens":1}}}\n\nevent: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi from "}}\n\n`)
+          const rest = new TextEncoder().encode(`event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"claude"}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n`)
+          const slow = new ReadableStream({
+            start: async (c) => {
+              c.enqueue(first)
+              await new Promise((done) => setTimeout(done, 2000))
+              try {
+                c.enqueue(rest)
+                c.close()
+              } catch (e) {
+                // the client went away
+              }
+            },
+          })
+          return new Response(slow, { headers: { "content-type": "text/event-stream" } })
+        }
         if (m.stream === true) {
           return new Response(`event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":9,"output_tokens":1}}}\n\nevent: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n`, { headers: { "content-type": "text/event-stream" } })
         }

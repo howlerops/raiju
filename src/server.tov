@@ -1,10 +1,10 @@
 // HTTP routes: the OpenAI-shaped /v1 API, drop-in SDK routes, models,
 // metrics, health and a read-only management API.
-import { Config, VirtualKeyConfig, OAuthKeyConfig, ProviderConfig, providerOf, providerNames, resolveEnv } from "./config"
+import { Config, VirtualKeyConfig, OAuthKeyConfig, ProviderConfig, KeyConfig, providerOf, providerNames, resolveEnv } from "./config"
 import { Engine, StreamSink, errorResponse, noHeaders } from "./gateway"
 import { anthropicMessages, anthropicLegacy, cursorChat, genai, genaiSdk, bedrockModel, responsesApi, cohereChat, cohereEmbed, cohereRerank, cohereTokenize } from "./native"
 import * as genaiIn from "./genai_in"
-import { kindOf, listingPipeline } from "./router"
+import { kindOf, listingPipeline, listingNeedsUpstream } from "./router"
 import { Target, Upstream, addExtraHeaders } from "./providers/types"
 import * as openai from "./providers/openai"
 import * as anthropic from "./providers/anthropic"
@@ -55,7 +55,7 @@ import { asyncPoll } from "./jobs"
 import { serveUi, uiPath, UI_CSP } from "./uiserve"
 import { TransportRun, transportStart, transportEnd, transportDone, transportSink, llmHooked, storageHooked, StorageCall, storageOp, pathWithId } from "./pluginroute"
 import { kindOfPath, isInferencePath } from "./plughttp"
-import { EXTRA_PARAMS_HEADER, mergeExtraParams } from "./extraparams"
+import { EXTRA_PARAMS_HEADER, EXTRA_PARAMS_CARRY, mergeExtraParams, extraParamsCarry } from "./extraparams"
 
 type ModelEntry = { id: string, object: string, created: int, owned_by: string }
 
@@ -294,23 +294,30 @@ async function nativeModelIds(engine: Engine | undefined, provider: string, t: T
   return undefined
 }
 
-// A provider's models for GET /v1/models: the keys' model lists, or the provider's own listing, through the keys'
-// aliases and blacklists (router.tov listingPipeline, Bifrost's ListModelsPipeline).
+// A provider's models for GET /v1/models: each key's model list, or the provider's own listing read with that key,
+// through the key's aliases and blacklist, the keys' results joined (router.tov listingPipeline, Bifrost's
+// ListModelsPipeline run by HandleMultipleListModelsRequests). A key whose model list is plain names lists those
+// names without asking the provider.
 async function providerModels(engine: Engine | undefined, cfg: Config, provider: string): Promise<string[]> {
   const p = providerOf(cfg, provider)
   if (p === undefined) return []
   const keys = p.keys ?? []
-  const listed = keys.some((k) => (k.models ?? []).some((m) => m !== "*"))
-  if (listed) return listingPipeline(provider, [], keys)
-  return listingPipeline(provider, await upstreamModelIds(engine, cfg, provider, p), keys)
+  if (keys.length === 0) return await upstreamModelIds(engine, provider, p, 0, { value: "" })
+  const byKey = await Promise.all(keys.map((k, i) => listingNeedsUpstream(k) ? upstreamModelIds(engine, provider, p, i, k) : Promise.resolve([] as string[])))
+  return listingPipeline(provider, [], keys, byKey)
 }
 
-// The provider's own listing (cached for five minutes), as its API names the models.
-async function upstreamModelIds(engine: Engine | undefined, cfg: Config, provider: string, p: ProviderConfig): Promise<string[]> {
-  const cachedAt = modelCache.fetchedAt.get(provider) ?? 0.0
-  if (Date.now() - cachedAt < 300000.0) return modelCache.ids.get(provider) ?? []
+// The cache slot of one key's listing.
+function listingSlot(provider: string, index: int): string {
+  return provider + "#" + index
+}
+
+// The provider's own listing read with one key (cached for five minutes per key), as its API names the models.
+async function upstreamModelIds(engine: Engine | undefined, provider: string, p: ProviderConfig, index: int, key: KeyConfig): Promise<string[]> {
+  const slot = listingSlot(provider, index)
+  const cachedAt = modelCache.fetchedAt.get(slot) ?? 0.0
+  if (Date.now() - cachedAt < 300000.0) return modelCache.ids.get(slot) ?? []
   const kind = kindOf(provider, p)
-  const key = (p.keys ?? [])[0] ?? { value: "" }
   const t: Target = { provider: provider, kind: kind, model: "", key: key, cfg: p }
   let ids: string[] = []
   if (nativeList(kind)) {
@@ -328,8 +335,8 @@ async function upstreamModelIds(engine: Engine | undefined, cfg: Config, provide
       ids = []
     }
   }
-  modelCache.ids.set(provider, ids)
-  modelCache.fetchedAt.set(provider, Date.now())
+  modelCache.ids.set(slot, ids)
+  modelCache.fetchedAt.set(slot, Date.now())
   return ids
 }
 
@@ -341,14 +348,16 @@ async function refreshModels(engine: Engine | undefined, cfg: Config, provider: 
   const p = providerOf(cfg, provider)
   if (p === undefined) return { status: 404, body: JSON.stringify({ error: { message: `no provider ${provider}`, type: "invalid_request_error" } }), contentType: "application/json" }
   const kind = kindOf(provider, p)
-  for (const key of p.keys ?? []) {
+  const keys = p.keys ?? []
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i]!
     if (keyId !== undefined && key.id !== keyId) continue
     const t: Target = { provider: provider, kind: kind, model: "", key: key, cfg: p }
     if (nativeList(kind)) {
       const nids = await nativeModelIds(engine, provider, t)
       if (nids === undefined) continue
-      modelCache.ids.set(provider, nids)
-      modelCache.fetchedAt.set(provider, Date.now())
+      modelCache.ids.set(listingSlot(provider, i), nids)
+      modelCache.fetchedAt.set(listingSlot(provider, i), Date.now())
       return { status: 200, body: JSON.stringify({ provider: provider, models: nids, total: nids.length }), contentType: "application/json" }
     }
     const up = upstreamModels(provider, kind, t)
@@ -360,8 +369,8 @@ async function refreshModels(engine: Engine | undefined, cfg: Config, provider: 
       const text = await res.text()
       if (!res.ok) continue
       const ids = await withDecisionModels(provider, t, openai.modelIds(text, provider).map((id) => id.replace(provider + "/models/", provider + "/")))
-      modelCache.ids.set(provider, ids)
-      modelCache.fetchedAt.set(provider, Date.now())
+      modelCache.ids.set(listingSlot(provider, i), ids)
+      modelCache.fetchedAt.set(listingSlot(provider, i), Date.now())
       return { status: 200, body: JSON.stringify({ provider: provider, models: ids, total: ids.length }), contentType: "application/json" }
     } catch (e) {
       continue
@@ -1336,7 +1345,8 @@ export async function routeStream(engine: Engine, req: Request, kind: string, si
 }
 
 // x-bf-passthrough-extra-params: true on an inference route (not a raw passthrough, not a large body, which never
-// gets here): the body's extra_params object is merged into the request before any route reads it (extraparams.tov).
+// gets here): the body's extra_params object is merged into the request before any route reads it (extraparams.tov),
+// and rides along (EXTRA_PARAMS_CARRY) to be merged into the provider's converted body as well, as Bifrost merges it.
 export async function withExtraParams(req: Request): Promise<Request> {
   if (req.method !== "POST" || req.headers.get(EXTRA_PARAMS_HEADER) !== "true") return req
   if ((req.headers.get("content-type") ?? "").toLowerCase().includes("multipart/")) return req
@@ -1351,8 +1361,10 @@ export async function withExtraParams(req: Request): Promise<Request> {
   }
   const hs: Record<string, string> = new Map()
   req.headers.forEach((v, k) => {
-    if (k !== "content-length" && k !== "transfer-encoding") hs.set(k, v)
+    if (k !== "content-length" && k !== "transfer-encoding" && k !== EXTRA_PARAMS_CARRY) hs.set(k, v)
   })
+  const carry = extraParamsCarry(text)
+  if (carry !== undefined) hs.set(EXTRA_PARAMS_CARRY, carry)
   return new Request(req.url, { method: "POST", headers: hs, body: mergeExtraParams(text) })
 }
 

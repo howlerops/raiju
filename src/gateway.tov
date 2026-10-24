@@ -28,7 +28,7 @@ import { OutputStreamGuard, GuardedProvider, StreamFormat } from "./guard_stream
 import { Vault, tokenizeChatRequest, restoreCompletion, tokenize, tokenizeText } from "./guard_reversible"
 import { Target, Upstream, Translated, proxyOf, tlsOf, poolOf, RS } from "./providers/types"
 import { CompatPlan, Shaped, settingsOf, withHeader, responseToChat, chatToText, textFrame, chatSseToText, textToChatFields } from "./compat"
-import { ResponsesToChatStream, toResponse, toResponseStream } from "./responses"
+import { ResponsesToChatStream, ChatToResponses, toResponse, toResponseStream } from "./responses"
 import { ModelRef, parseModel, parseModelVia, target, kindOf, classify, backoffMs, maxRetries, timeoutMs, healthId, resolveAlias, matchedAlias, directRefs, directionOpts } from "./router"
 import { CrewPick, crewRoute, withReasoningEffort, reasoningEffortText } from "./crew"
 import { forwardedHeaders, headerFilterOf } from "./headerfilter"
@@ -71,13 +71,14 @@ import { BasePlugin, PreResult, PostResult, PluginChain, PluginContext, PluginEn
 import { SseBuffer, sseData, sseWithData } from "./plughttp"
 import { SemanticCache, SemanticCacheConfig, defaultSemanticConfig, promptText, parseEmbedding, scopeKey, identityScope, hasToolCalls } from "./semcache"
 import { Deadline, deadline, IdleWatch, idleWatch, streamIdleSeconds } from "./deadline"
-import { logMetadata, correlationIds, maximAttrs, stopReasonOf, toolNamesOfBody, ToolNameStream } from "./reqlog"
+import { logMetadata, correlationIds, maximAttrs, stopReasonOf, stopReasonOfTail, toolNamesOfBody, ToolNameStream } from "./reqlog"
 import { VectorStore, openVectorStore, scopeTag } from "./vectorstore"
 import * as cloudAuth from "./cloud_auth"
 import * as oauthKey from "./oauth_key"
 import { LargeBody, LargeSettings, BodyTap, UsageTap, largeSettings, scanPrefix, usageOfText } from "./largepayload"
-import { AnyConv, ConvRef, familyFor, needsHash, newConv, upstreamFor, convertedStream, spoolConverted, spoolTitan, titanExtras } from "./largeconv"
+import { AnyConv, ConvRef, familyFor, needsHash, newConv, convFor, upstreamFor, convertedStream, spoolConverted, spoolTitan, titanExtras } from "./largeconv"
 import { EMB_TITAN } from "./embconv"
+import { EXTRA_PARAMS_HEADER, EXTRA_PARAMS_CARRY, mergeIntoUpstream } from "./extraparams"
 
 export type Build = (t: Target) => Upstream throws SyntaxError
 // a chat request for a target, from its shaped body (tc parses the same request as a typed chat)
@@ -291,6 +292,12 @@ export class StreamConverter {
     this.gen = new GenAIStream(model)
   }
 
+  // For clients of the Responses API: the chat chunks become Responses events as they arrive.
+  respOut: ChatToResponses | undefined = undefined
+  asResponses(model: string): void {
+    this.respOut = new ChatToResponses(model)
+  }
+
   asCohere(model: string): void {
     this.cohereOut = new CohereStream(model)
   }
@@ -354,6 +361,8 @@ export class StreamConverter {
     if (g !== undefined) return tail + g.end()
     const co = this.cohereOut
     if (co !== undefined) return tail + co.end()
+    const ro = this.respOut
+    if (ro !== undefined) return tail + ro.end()
     return tail
   }
 
@@ -407,7 +416,8 @@ export class StreamConverter {
     const co = this.cohereOut
     const cv = this.cv
     const iv = this.iv
-    if (st === undefined && g === undefined && co === undefined && cv === undefined && iv === undefined) return s
+    const ro = this.respOut
+    if (st === undefined && g === undefined && co === undefined && cv === undefined && iv === undefined && ro === undefined) return s
     this.pending += s
     let res = ""
     while (true) {
@@ -425,6 +435,7 @@ export class StreamConverter {
           else if (st !== undefined) res += st.push(payload)
           else if (g !== undefined) res += g.push(payload)
           else if (co !== undefined) res += co.push(payload)
+          else if (ro !== undefined) res += ro.push(payload)
         } catch (e) {
           // a malformed chunk is skipped
         }
@@ -858,6 +869,13 @@ function rawText(bytes: u8[]): string {
   } catch (e) {
     return ""
   }
+}
+
+// The text of the end of a body, which may begin inside a UTF-8 character: the leading continuation bytes are dropped.
+function tailText(bytes: u8[]): string {
+  let i = 0
+  while (i < bytes.length && i < 4 && (int(bytes[i]!) & 0xc0) === 0x80) i++
+  return rawText(i === 0 ? bytes : bytes.slice(i))
 }
 
 // Bifrost's custom_provider_config.allowed_requests: once the map is set, only the request types marked true are served.
@@ -2011,6 +2029,13 @@ export class Engine {
         let up: Upstream = { url: "", headers: new Map(), body: "" }
         try {
           up = build(t)
+          // x-bf-passthrough-extra-params: the extras go into the provider's own body, as Bifrost merges them (a body
+          // signed with SigV4 is signed again)
+          const carry = h.get(EXTRA_PARAMS_CARRY)
+          if (carry !== undefined && h.get(EXTRA_PARAMS_HEADER) === "true" && up.body !== "") {
+            const merged = mergeIntoUpstream(up.body, carry)
+            if (merged !== up.body) up = bedrockNative.withBody(t, up, merged)
+          }
         } catch (e) {
           return { ok: false, status: 400, body: errorJson(e.message, "invalid_request_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
         }
@@ -2085,6 +2110,12 @@ export class Engine {
             if ((lg !== undefined && (ctype.startsWith("text/event-stream") || (clen < 0 && streamed))) || clen > limit) {
               const tookMs = performance.now() - started
               upstreamMs += tookMs
+              // a large body whose "stream": true lay past the prefix: the event stream that answers it says it was a stream
+              if (lg !== undefined && !streamed && ctype.startsWith("text/event-stream")) {
+                tl.method = requestType(ctx.op, true)
+                ctx.labels = tl
+                ctx.streamed = true
+              }
               if (sel.keyIndex >= 0) {
                 this.health.record(healthId(ref.provider, t.key, sel.keyIndex), true, tookMs, Date.now())
                 metrics.observeKeyUp(ref.provider, t.key.id ?? "", t.key.name ?? "", true)
@@ -2185,7 +2216,12 @@ export class Engine {
               if (this.logStore !== undefined) sentNames.push(tail)
             }
             sentNames.end()
-            if (this.logStore !== undefined) ctx.toolNames = sentNames.names
+            if (this.logStore !== undefined) {
+              ctx.toolNames = sentNames.names
+              // the stop reason of the streamed answer, from the events the client was sent (Bifrost's FinishReason
+              // of the last chunk)
+              ctx.stopReason = sentNames.stop
+            }
             const fe = conv.takeFrames()
             const we = sink.writeBytes
             if (we !== undefined && fe.length > 0) we(fe)
@@ -4205,11 +4241,15 @@ export class Engine {
     // a text completion that compat sends as chat (the model's datasheet row serves chat but not text completions)
     // becomes the chat body as it streams in (textconv.tov), for any provider whose chat it can reach
     let textChat = false
+    // compat on a large text completion: the endpoint change, and the drops and fits on its parameters (applied when
+    // the body has streamed past them, CompatPlan.shapeParams)
+    let cpl: CompatPlan | undefined = undefined
     if (route === "completions" && p !== undefined) {
       const cp = new CompatPlan(withHeader(settingsOf(this.cfg.client?.compat), hs.get("x-bf-compat") ?? undefined), "completions", stream)
       if (cp.enabled) {
         await this.compatLoad(cp, [first])
         textChat = cp.routeFor(first.provider, kind, first.model) === "chat"
+        cpl = cp
       }
     }
     if (p !== undefined && (textChat || !takesBodyAsIs(route, kind))) {
@@ -4223,6 +4263,12 @@ export class Engine {
         }
       }
     }
+    // a text completion that goes as it is, but whose parameters compat may drop or fit: written again as it streams in,
+    // its prompt as it comes and its parameters through the shape at the end (textconv.tov TextShaper)
+    if (route === "completions" && family === "" && p !== undefined && takesBodyAsIs(route, kind) && cpl !== undefined && cpl.mayShape(first.provider, first.model)) family = "text-shaped"
+    // compat's shape on the parameters of a text completion: one sent as chat, or one shaped as it is (Replicate's own
+    // text route takes the caller's parameters, as the whole-body route sends them)
+    const shapePlan: CompatPlan | undefined = textChat || family === "text-shaped" ? cpl : undefined
     if (!takesBodyAsIs(route, kind) && family === "") {
       // buffered after all, up to client.max_request_body_size_mb: the ordinary path converts it
       if (declared > limit) {
@@ -4253,15 +4299,18 @@ export class Engine {
     // (a Messages stream converted to chat, Gemini, Cohere or Bedrock Converse is converted as it arrives, as a chat
     // stream is, and so is a text completion sent as chat, in text_completion chunks)
     const msgLive = route === "messages" && (family === "messages-chat" || family === "messages-gemini" || family === "messages-cohere" || family === "messages-converse")
-    const textLive = route === "completions" && family.startsWith("text-")
-    const live = family !== "" && stream && (route === "chat" || msgLive || textLive)
+    // (Replicate answers a prediction whole; a shaped text completion's answer is the provider's own, passed back as it is)
+    const textLive = route === "completions" && family.startsWith("text-") && family !== "text-replicate" && family !== "text-shaped"
+    // a Responses stream converted to chat is called as a stream too, and its chat chunks become Responses events as they arrive
+    const respLive = route === "responses"
+    const live = family !== "" && stream && (route === "chat" || msgLive || textLive || respLive)
     const wire = live || (route === "messages" && stream)
     const holder = new ConvRef()
     const autoCache = this.autoPromptCache || hs.get("x-bf-prompt-cache-auto-inject") === "true" || (p?.prompt_cache?.auto_inject ?? false)
     if (family !== "") {
       // the answer is converted back (a chat or embeddings answer), or passes as the provider's own Messages answer
       // (Bedrock and Vertex Claude)
-      lg.passAnswer = family === "messages-bedrock" || family === "messages-vertex"
+      lg.passAnswer = family === "messages-bedrock" || family === "messages-vertex" || family === "text-shaped"
       if (needsHash(family)) {
         if (this.gov.enforce && this.gov.findKey(hs) === undefined) {
           if (!ended) await src.cancel()
@@ -4269,6 +4318,10 @@ export class Engine {
         }
         // converted into a spool on disk and hashed, so the request can be signed before its first byte goes out
         const c = newConv(family, convModel, p!, autoCache, wire, limit, 4096)
+        if (shapePlan !== undefined) {
+          const cps: CompatPlan = shapePlan
+          c.setShape((fs) => try cps.shapeParams(first.provider, kind, convModel, fs))
+        }
         holder.conv = c
         const sp = family === EMB_TITAN ? await spoolTitan(lg, c) : await spoolConverted(lg, c)
         if (!sp.ok) {
@@ -4286,7 +4339,10 @@ export class Engine {
           if (t.model !== convModel) throw new SyntaxError(`${t.provider}: the keys of this provider name the model differently, which a large request converted for Bedrock cannot follow`)
         } else {
           // (a fresh converter for each target: a model alias is per key, and nothing has been read yet)
-          const c = newConv(family, t.model, t.cfg, autoCache, wire, limit, 4096)
+          // (a shaped text completion that streams asks for its usage, as the body sent as it is asks)
+          const c = convFor(family, t, autoCache, family === "text-shaped" ? stream : wire, limit, 4096)
+          const sp = shapePlan
+          if (sp !== undefined) c.setShape((fs) => try sp.shapeParams(t.provider, t.kind, t.model, fs))
           holder.conv = c
           lg.converted = convertedStream(lg, c)
         }
@@ -4296,6 +4352,9 @@ export class Engine {
         return { url: cu.url, headers: cu.headers, body: cu.body, extra: titanExtras(t, lg) }
       }
       if (!takesBodyAsIs(route, t.kind)) throw new SyntaxError(`${t.provider} needs the whole request body in memory, which large_payload_optimization does not allow: a large ${route} request goes only to a provider that takes its format as it is`)
+      // openai_config.disable_store: store false ends the chat or Responses body, as the whole-body requests force it
+      const ns: bool = t.cfg.openai_config?.disable_store ?? false
+      lg.noStore = ns && (route === "chat" || route === "responses")
       const up = route === "embeddings" ? try providers.embeddingsUpstream(t, tiny) : route === "completions" ? openai.completionsRequest(t, tiny) : route === "responses" ? openai.responsesRequest(t, tiny) : route === "messages" ? anthropicNative.nativeRequest(t, tiny) : openai.chatRequest(t, tiny)
       return { url: up.url, headers: up.headers, body: "" }
     }
@@ -4324,7 +4383,7 @@ export class Engine {
         return { body: try toMessage(tr.body, meta.model), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
       }
       if (route === "embeddings") return try providers.embeddingsTranslate(t.kind, t.model, text, requested)
-      if (route === "completions" && family !== "") {
+      if (route === "completions" && family !== "" && family !== "text-shaped") {
         // a text completion sent as chat: the chat answer as a text completion, as the whole-body route converts it
         // (a stream is converted as it arrives, in largeLive)
         if (stream && providers.streamsNatively(t.kind)) {
@@ -4347,14 +4406,14 @@ export class Engine {
     }
     const modelBody: Field[] = [{ key: "model", raw: quote(meta.model) }]
     if (meta.hasStream) modelBody.push({ key: "stream", raw: stream ? "true" : "false" })
-    if (live) return await this.largeLive(req, op, modelBody, build, translate, stream, lg, holder)
-    return await this.largeRun(req, op, modelBody, build, translate, stream, lg, undefined, undefined)
+    if (live) return await this.largeLive(req, op, modelBody, build, translate, stream, lg, holder, cpl)
+    return await this.largeRun(req, op, modelBody, build, translate, stream, lg, undefined, undefined, cpl)
   }
 
   // serve() for a large request, and what follows it: the spool removed, a body the converter refused, a body that grew
   // past max_payload_bytes.
-  async largeRun(req: Request, op: string, modelBody: Field[], build: Build, translate: Translate, stream: bool, lg: LargeBody, sink?: StreamSink, mk?: ConverterFactory): Promise<Response> {
-    const res = try await this.serve(req, op, undefined, modelBody, "", build, translate, stream, undefined, sink, mk, undefined, undefined, undefined, lg)
+  async largeRun(req: Request, op: string, modelBody: Field[], build: Build, translate: Translate, stream: bool, lg: LargeBody, sink?: StreamSink, mk?: ConverterFactory, compat?: CompatPlan): Promise<Response> {
+    const res = try await this.serve(req, op, undefined, modelBody, "", build, translate, stream, undefined, sink, mk, compat, undefined, undefined, lg)
     const release = lg.release
     if (release !== undefined) release()
     // a body the converter refused
@@ -4366,7 +4425,7 @@ export class Engine {
 
   // A large chat request that asks for a stream, to a provider whose format differs: the provider streams its events and
   // they are converted to chat chunks as they arrive, as for an ordinary request. The Response is given at the first event.
-  async largeLive(req: Request, op: string, modelBody: Field[], build: Build, translate: Translate, stream: bool, lg: LargeBody, holder: ConvRef): Promise<Response> {
+  async largeLive(req: Request, op: string, modelBody: Field[], build: Build, translate: Translate, stream: bool, lg: LargeBody, holder: ConvRef, compat?: CompatPlan): Promise<Response> {
     const head = new LiveHead()
     const sink = new StreamSink(
       (status, headers) => {
@@ -4401,23 +4460,26 @@ export class Engine {
       const hc = holder.conv
       // a Messages stream is answered as Messages events (with usage, as the whole-body route asks the provider for it)
       const messages = op === "anthropic.messages"
-      const conv = new StreamConverter(converterKind(t), requested, messages || (hc !== undefined && hc.wantsUsage()))
+      // a Responses stream ends with response.completed, which carries the usage, so the chat stream is asked for it
+      const responses = op === "responses"
+      const conv = new StreamConverter(converterKind(t), requested, messages || responses || (hc !== undefined && hc.wantsUsage()))
       // a text completion sent as chat streams as text_completion chunks
       conv.txt = op === "completions"
       if (messages) conv.asAnthropic(rawStr(modelBody, "model") ?? "")
+      if (responses) conv.asResponses(rawStr(modelBody, "model") ?? "")
       conv.stopAtFinish = quirkStopsAtFinish(t)
       return conv
     }
     const p = new Promise<Response>((resolve) => {
       head.resolve = resolve
     })
-    this.largeBackground(req, op, modelBody, build, translate, stream, lg, sink, mk, head)
+    this.largeBackground(req, op, modelBody, build, translate, stream, lg, sink, mk, head, compat)
     return await p
   }
 
-  async largeBackground(req: Request, op: string, modelBody: Field[], build: Build, translate: Translate, stream: bool, lg: LargeBody, sink: StreamSink, mk: ConverterFactory, head: LiveHead): Promise<void> {
+  async largeBackground(req: Request, op: string, modelBody: Field[], build: Build, translate: Translate, stream: bool, lg: LargeBody, sink: StreamSink, mk: ConverterFactory, head: LiveHead, compat?: CompatPlan): Promise<void> {
     try {
-      const r = await this.largeRun(req, op, modelBody, build, translate, stream, lg, sink, mk)
+      const r = await this.largeRun(req, op, modelBody, build, translate, stream, lg, sink, mk, compat)
       if (!sink.started) head.give(r)
     } catch (e) {
       head.give(errorResponse(500, "internal error", "api_error", noHeaders()))
@@ -4448,6 +4510,8 @@ export class Engine {
         const u = seen.usage()
         settle(u.promptTokens, u.completionTokens, u.billed)
       }
+      // a streamed answer's stop reason, from its last events (the kept tail, or the whole answer when it fit the head)
+      if (this.logStore !== undefined) ctx.stopReason = stopReasonOfTail(tailText(seen.total > seen.head.length ? seen.tail() : seen.head))
       if (this.logStore !== undefined && !ctx.contentOff) {
         if (lg !== undefined) ctx.input = lg.tap.previewText()
         ctx.output = keep.previewText()
@@ -4493,6 +4557,8 @@ export class Engine {
     const hs: Record<string, string> = out
     hs.set("content-type", r.contentType)
     if (r.contentType.startsWith("text/event-stream")) hs.set("cache-control", "no-cache")
+    // (the request type as the answer showed it: a stream whose flag lay past a large body's prefix)
+    if (ctx.streamed) hs.set("x-bifrost-request-type", requestType(ctx.op, true))
     return new Response(body, { status: r.status, headers: hs })
   }
 

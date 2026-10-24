@@ -14,7 +14,10 @@
 // an image block; "tool_use_id" before "content" in a tool result. Other blocks and messages are held whole.
 //
 // The messages are written where the body has them. A system prompt written before "messages" comes first in
-// the output, as in the whole-body conversion; one written after the messages stays where it stands.
+// the output, as in the whole-body conversion; one written after the messages stays where it stands (it cannot move
+// ahead of messages already sent). Within a message, the tool results come first, as the whole-body conversion writes
+// them: the message's own parts are held (up to PART_HOLD bytes) until it ends, while its tool results go out; parts
+// over that size stream in body order, so a tool result after them starts a new chat message.
 import { Field, fields, elements, find, quote, rawStr, decodeString } from "./json"
 import { JsonTokenizer, ByteOut, Compact, Tok, bytesOf, textOfBytes, T_OBJ, T_OBJ_END, T_ARR, T_ARR_END, T_KEY, T_STR, T_STRH, T_STRP, T_STRE, T_LIT } from "./jsonstream"
 import { contentText, convertMessage, blockOf, chatParams, toChatRequest } from "./providers/anthropic_in"
@@ -37,6 +40,9 @@ const MS_ROLE = 1
 const MS_CONTENT = 2
 const MS_SKIP = 3
 const MS_BLOCKS = 4
+
+// how much of a message's parts is held so its tool results can go first (a bigger part streams where it stands)
+const PART_HOLD = 65536
 
 // the top-level fields a chat body takes from a Messages body (chatParams)
 const KEPT = ["max_tokens", "temperature", "top_p", "stop_sequences", "stream", "tools", "tool_choice", "metadata"]
@@ -111,6 +117,10 @@ export class MsgToChat {
   private mtOk = false
   // a streamed string: 1 text part, 2 image data, 3 image url, 4 tool result content
   private stream = 0
+  // the open message's header and parts while they are held (po is where they are written: pend, or out once released)
+  private holding = false
+  private pend: ByteOut = new ByteOut()
+  private po: ByteOut
 
   // the output starts with the model and the opening of the messages array, which the rest is written into
   constructor(readonly model: string, readonly holdMax: int, strMax: int) {
@@ -121,6 +131,7 @@ export class MsgToChat {
     this.mcomp = new Compact(this.mrec)
     this.brec = new ByteOut()
     this.bcomp = new Compact(this.brec)
+    this.po = this.out
     this.out.text(`{"model":${quote(model)},"messages":[`)
   }
 
@@ -282,10 +293,27 @@ export class MsgToChat {
     this.calls = []
     this.cstr = false
     this.inBlock = false
+    this.holding = true
+    this.pend = new ByteOut()
+    this.po = this.pend
+  }
+
+  // The held parts go out (after the tool results already written), and the rest of the message is written as it comes.
+  private release(): void {
+    if (!this.holding) return
+    this.holding = false
+    this.po = this.out
+    const b = this.pend.all()
+    if (b.length > 0) {
+      this.sep()
+      this.out.bytes(b)
+    }
+    this.pend = new ByteOut()
   }
 
   private msgTok(t: Tok): void throws SyntaxError {
     const k = t.kind
+    if (this.holding && this.pend.size > PART_HOLD) this.release()
     if (this.recOn) {
       this.mcomp.tok(t)
       if (this.mrec.size > this.holdMax) throw new SyntaxError("a message is too large to convert while streaming: put \"role\" before \"content\" in each message (client.max_request_body_size_mb)")
@@ -395,6 +423,7 @@ export class MsgToChat {
       if (this.calls.length > 0) this.openMsg()
       this.closeMsg()
     }
+    this.release()
     this.inMsg = false
     this.hold = false
     this.recOn = false
@@ -418,8 +447,9 @@ export class MsgToChat {
   // The header of a chat message with parts or tool calls, written when the first one needs it.
   private openMsg(): void {
     if (this.open) return
-    this.sep()
-    this.out.text(`{"role":${quote(this.role)}`)
+    // (a held message takes its separator when it is released)
+    if (!this.holding) this.sep()
+    this.po.text(`{"role":${quote(this.role)}`)
     this.open = true
     this.partsOpen = false
     this.parts = 0
@@ -429,21 +459,21 @@ export class MsgToChat {
   private beginPart(): void {
     this.openMsg()
     if (!this.partsOpen) {
-      this.out.text(`,"content":[`)
+      this.po.text(`,"content":[`)
       this.partsOpen = true
       this.parts = 0
     }
-    if (this.parts > 0) this.out.byte(44)
+    if (this.parts > 0) this.po.byte(44)
     this.parts += 1
   }
 
   // The end of the open chat message: its parts, its tool calls, its closing brace.
   private closeMsg(): void {
     if (!this.open) return
-    if (this.partsOpen) this.out.byte(93)
-    else if (this.calls.length > 0) this.out.text(`,"content":null`)
-    if (this.calls.length > 0) this.out.text(`,"tool_calls":[${this.calls.join(",")}]`)
-    this.out.byte(125)
+    if (this.partsOpen) this.po.byte(93)
+    else if (this.calls.length > 0) this.po.text(`,"content":null`)
+    if (this.calls.length > 0) this.po.text(`,"tool_calls":[${this.calls.join(",")}]`)
+    this.po.byte(125)
     this.open = false
     this.partsOpen = false
     this.calls = []
@@ -473,10 +503,12 @@ export class MsgToChat {
   private blockTok(t: Tok): void throws SyntaxError {
     const k = t.kind
     if (this.stream !== 0) {
+      // (a tool result is a chat message of its own, written as it comes; a part goes where the message's parts go)
+      const o = this.stream === 4 ? this.out : this.po
       if (k === T_STRP) {
-        this.out.bytes(t.raw)
+        o.bytes(t.raw)
       } else if (k === T_STRE) {
-        this.out.text(this.stream === 1 || this.stream === 4 ? `"}` : `"}}`)
+        o.text(this.stream === 1 || this.stream === 4 ? `"}` : `"}}`)
         this.stream = 0
       }
       return
@@ -519,12 +551,12 @@ export class MsgToChat {
         this.tidOk = true
       } else if (key === "text" && k === T_STRH && this.btype === "text") {
         this.beginPart()
-        this.out.text(`{"type":"text","text":"`)
-        this.out.bytes(t.raw)
+        this.po.text(`{"type":"text","text":"`)
+        this.po.bytes(t.raw)
         this.stream = 1
         this.bStreamed = true
       } else if (key === "content" && k === T_STRH && this.btype === "tool_result" && this.tidOk) {
-        this.closeMsg()
+        if (!this.holding) this.closeMsg()
         this.sep()
         this.out.text(`{"role":"tool","tool_call_id":${quote(this.tid)},"content":"`)
         this.out.bytes(t.raw)
@@ -539,14 +571,14 @@ export class MsgToChat {
         this.mtOk = true
       } else if (key === "data" && k === T_STRH && this.btype === "image" && this.stype === "base64" && this.mtOk) {
         this.beginPart()
-        this.out.text(`{"type":"image_url","image_url":{"url":"${innerQuote("data:" + this.mtype + ";base64,")}`)
-        this.out.bytes(t.raw)
+        this.po.text(`{"type":"image_url","image_url":{"url":"${innerQuote("data:" + this.mtype + ";base64,")}`)
+        this.po.bytes(t.raw)
         this.stream = 2
         this.bStreamed = true
       } else if (key === "url" && k === T_STRH && this.btype === "image" && this.stype !== "" && this.stype !== "base64") {
         this.beginPart()
-        this.out.text(`{"type":"image_url","image_url":{"url":"`)
-        this.out.bytes(t.raw)
+        this.po.text(`{"type":"image_url","image_url":{"url":"`)
+        this.po.bytes(t.raw)
         this.stream = 3
         this.bStreamed = true
       }
@@ -563,13 +595,13 @@ export class MsgToChat {
     let results: string[] = []
     try blockOf(this.role, b, &parts, &calls, &results)
     for (const r of results) {
-      this.closeMsg()
+      if (!this.holding) this.closeMsg()
       this.sep()
       this.out.text(r)
     }
     for (const p of parts) {
       this.beginPart()
-      this.out.text(p)
+      this.po.text(p)
     }
     if (calls.length > 0) {
       this.openMsg()
@@ -648,6 +680,9 @@ function corpus(): string[] {
     `{"model":"m","messages":[]}`,
     `{"model":"m","max_tokens":5}`,
     `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"${"w".repeat(120)}"},{"type":"image","source":{"type":"base64","media_type":"image/gif","data":"${B64}"}}]},{"role":"assistant","content":"${"v".repeat(90)}"}]}`,
+    // text and an image before the tool results of a user message: the results go first, then one message with the parts
+    `{"model":"m","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"a","input":{}},{"type":"tool_use","id":"t2","name":"b","input":{}}]},{"role":"user","content":[{"type":"text","text":"before the results, long enough"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"${B64}"}},{"type":"tool_result","tool_use_id":"t1","content":"first result, a long one"},{"type":"text","text":"between them"},{"type":"tool_result","tool_use_id":"t2","content":[{"type":"text","text":"second"}]},{"type":"text","text":"after them"}]},{"role":"user","content":"next"}]}`,
+    `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"x"},{"content":"held result, its id after it","type":"tool_result","tool_use_id":"t9"}]}]}`,
   ]
 }
 
@@ -755,4 +790,11 @@ test("MsgChain without a chat converter passes the chat body through", () => {
   for (const p of try chain.push(bytesOf(`{"model":"m","messages":[{"role":"user","content":"hi there"}]}`))) out.bytes(p)
   for (const p of try chain.finish()) out.bytes(p)
   expect(textOfBytes(out.all())).toBe(`{"model":"target-model","messages":[{"role":"user","content":"hi there"}]}`)
+})
+
+test("a part over the hold limit streams where it stands, and the tool result after it starts a new message", () => {
+  const big = "p".repeat(70000)
+  const text = `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"${big}"},{"type":"tool_result","tool_use_id":"t1","content":"r"},{"type":"text","text":"after"}]}]}`
+  const got = try streamedChat(text, 4096, 4096)
+  expect(got).toBe(`{"model":"target-model","messages":[{"role":"user","content":[{"type":"text","text":"${big}"}]},{"role":"tool","tool_call_id":"t1","content":"r"},{"role":"user","content":[{"type":"text","text":"after"}]}]}`)
 })

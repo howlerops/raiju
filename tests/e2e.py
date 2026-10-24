@@ -9689,11 +9689,11 @@ def l145_e2e(env):
             row = mine(ppath)[-1]
             check("a 12 MiB image in a Responses request to %s arrives as the %s body, instructions hoisted" % (model.split("/")[0], fam), s == 200 and row["size"] == len(want) and row["sha"] == sha(want), (s, b[:200], row["size"], len(want)))
 
-        # ---- a stream the caller asked for: the answer is replayed as Responses events, as the whole-request path does ----
+        # ---- a stream the caller asked for: Anthropic is called as a stream, its events converted to Responses events (L178) ----
         sb = ('{"model":"anthropic/claude-l145","stream":true,"max_output_tokens":16,"input":"%s"}' % FILL(2 * MB)).encode()
         s, hs, b = l124_http(port, "POST", "/v1/responses", sb, timeout=120)
         t = b.decode("utf8", "replace")
-        check("a big streamed Responses request to Anthropic gets Responses events with the answer and response.completed", s == 200 and hdr(hs, "content-type") == "text/event-stream" and "response.output_text.delta" in t and "response.completed" in t and "Hi from claude" in t, (s, hs, t[:300]))
+        check("a big streamed Responses request to Anthropic gets Responses events with the answer and response.completed", s == 200 and hdr(hs, "content-type") == "text/event-stream" and "response.output_text.delta" in t and "response.completed" in t and '"delta":"hi"' in t, (s, hs, t[:300]))
 
         # ---- the gateway does not hold the body ----
         pid = gw145.pid
@@ -10094,6 +10094,155 @@ def l162_e2e(env):
         time.sleep(0.5)
         rows = [e for e in logs() if e.get("model") == "gemini-2.5-flash" and e.get("op") == "transcription"]
         check("... each logged with its tokens and cost", len(rows) == 2 and all(e.get("prompt_tokens") == 14 and e.get("completion_tokens") == 3 and near(float(e.get("cost") or 0), cost) for e in rows), [(e.get("prompt_tokens"), e.get("completion_tokens"), e.get("cost")) for e in rows])
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
+GW_L178 = "http://127.0.0.1:18308"  # L178: large Responses streams converted live, disable_store, the stream label, Replicate and compat on large completions
+
+def l178_e2e(env):
+    """L178. A large Responses stream to a provider whose format differs is called as a stream and its events become Responses
+    events as they arrive (the first text reaches the caller before the provider's stream is over), with the usage counted. A large
+    chat or Responses body to a provider with openai_config.disable_store ends with "store":false. A large body whose "stream": true
+    lies past the prefix is labelled a stream from its answer. A large text completion to Replicate becomes its prediction body as it
+    streams in, and compat's drops and fits apply to large text completions (sent as they are, or as chat). Its own gateway (18308)."""
+    import hashlib
+    net = {"base_url": MOCK, "max_retries": 0}
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False, "max_request_body_size_mb": 8, "compat": {}},
+        # the compat datasheet rows: chatonly-mini serves chat only, textfit-mini text completions with max_tokens and stop listed
+        "pricing_sync": {"url": MOCK + "/cdatasheet", "enabled": False},
+        "large_payload_optimization": {"enabled": True, "request_threshold_bytes": 262144, "response_threshold_bytes": 1048576, "prefetch_size_bytes": 16384, "max_payload_bytes": 134217728, "truncated_log_bytes": 4096},
+        "governance": {
+            "budgets": [{"id": "b-l178", "max_limit": 100, "reset_duration": "1d"}],
+            "pricing_overrides": [{"id": "po-l178", "name": "l178", "scope_kind": "global", "match_type": "wildcard", "pattern": "*", "pricing_patch": json.dumps({"input_cost_per_token": 0.000001, "output_cost_per_token": 0.000001})}],
+            "virtual_keys": [{"id": "vk-l178", "value": "sk-bf-l178-budget-0123456789", "budget_id": "b-l178"}],
+        },
+        "providers": {
+            "anthropic": {"keys": [{"name": "a", "value": "sk-ant-" + "l178", "models": [], "weight": 1.0}], "network_config": net},
+            "groq": {"keys": [{"name": "gq", "value": "gsk-" + "l178", "models": [], "weight": 1.0}], "network_config": net},
+            "openai": {"keys": [{"name": "o", "value": "sk-" + "l178", "models": [], "weight": 1.0}], "network_config": net, "openai_config": {"disable_store": True}},
+            "replicate": {"keys": [{"name": "rp", "value": "r8_e2e", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK + "/replicate", "max_retries": 0}},
+        },
+    }
+    path = os.path.join(BUILD, "e2e.l178.json")
+    json.dump(cfg, open(path, "w"))
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18308", "-host", "127.0.0.1", "-config", path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l178.log"), "w"))
+    port = 18308
+    try:
+        wait(GW_L178 + "/health")
+        mine = lambda p_: [x for x in seen() if x["path"] == p_]
+        sha = lambda b: hashlib.sha256(b).hexdigest()
+        used = lambda: {x["id"]: x["used"] for x in json.loads(call("GET", "/api/governance/usage", base=GW_L178, auth=False)[2])["budgets"]}
+        MB = 1048576
+        FILL = lambda n, c="F": c * n
+
+        def events(t):
+            out = []
+            for block in t.split("\n\n"):
+                lines = block.split("\n")
+                if lines and lines[0].startswith("event: "):
+                    data = next((l[6:] for l in lines if l.startswith("data: ")), "{}")
+                    out.append((lines[0][7:], json.loads(data)))
+            return out
+
+        def sse_text(t):
+            out = ""
+            for line in t.split("\n"):
+                if line.startswith("data: {"):
+                    ch = json.loads(line[6:])
+                    for c in ch.get("choices", []):
+                        out += c.get("delta", {}).get("content") or c.get("text") or ""
+            return out
+
+        # ---- a 12 MiB Responses stream to Anthropic: called as a stream, its events become Responses events as they arrive ----
+        # (12 MiB is over client.max_request_body_size_mb: a buffered request would be refused)
+        body = ('{"model":"anthropic/claude-l178slow","stream":true,"max_output_tokens":16,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"%s"}]}]}' % FILL(12 * MB)).encode()
+        n0 = len(mine("/v1/messages"))
+        s, hs, b, gap = l162_timed(port, "/v1/responses", body)
+        t = b.decode("utf8", "replace")
+        evs = events(t)
+        names = [e[0] for e in evs]
+        deltas = "".join(e[1].get("delta", "") for e in evs if e[0] == "response.output_text.delta")
+        done = [e[1] for e in evs if e[0] == "response.completed"]
+        check("a 12 MiB Responses stream to Anthropic is answered with Responses events carrying the text and response.completed", s == 200 and hdr(hs, "content-type") == "text/event-stream" and names[:2] == ["response.created", "response.in_progress"] and deltas == "Hi from claude" and len(done) == 1, (s, hs, t[:400]))
+        check("... with the stream's usage in response.completed", done and done[0]["response"].get("usage", {}).get("input_tokens") == 9 and done[0]["response"]["usage"].get("output_tokens") == 5, done)
+        check("... the first text reached the caller before Anthropic's stream was over (%.2f s before the end)" % gap, gap >= 1.5, gap)
+        rows = mine("/v1/messages")[n0:]
+        check("... Anthropic was called once, as a stream, with the converted body", len(rows) == 1 and rows[0]["size"] > 12 * MB and rows[0]["body"].startswith('{"model":"claude-l178slow","messages":[{"role":"user","content":[{"type":"text","text":"FFF'), [(r["size"], r["body"][:80]) for r in rows])
+        vk = {"x-bf-vk": "sk-bf-l178-budget-0123456789"}
+        u0 = used()["b-l178"]
+        s, _, b = l124_http(port, "POST", "/v1/responses", body.replace(b"claude-l178slow", b"claude-l178"), headers=vk, timeout=120)
+        u1 = used()["b-l178"]
+        check("... and a live Responses stream is counted in the key's budget from its events (9 + 5 tokens)", s == 200 and abs((u1 - u0) - 14e-6) < 1e-9, (s, b[:200], u0, u1))
+        # an OpenAI-format provider's chat stream becomes Responses events too
+        body = ('{"model":"groq/llama-l178","stream":true,"input":"%s"}' % FILL(2 * MB)).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/responses", body, timeout=120)
+        t = b.decode("utf8", "replace")
+        names = [e[0] for e in events(t)]
+        row = mine("/v1/chat/completions")[-1]
+        check("a big Responses stream to an OpenAI-format provider streams its chat chunks back as Responses events", s == 200 and "response.output_text.delta" in names and names[-1] == "response.completed" and row["size"] > 2 * MB, (s, t[:300]))
+
+        # ---- openai_config.disable_store: "store":false ends a large chat or Responses body (it outvotes the caller's) ----
+        body = ('{"model":"openai/gpt-4o-l178","store":true,"messages":[{"role":"user","content":"%s"}]}' % FILL(12 * MB)).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/chat/completions", body, timeout=120)
+        want = body.replace(b'"openai/gpt-4o-l178"', b'"gpt-4o-l178"')[:-1] + b',"store":false}'
+        row = mine("/v1/chat/completions")[-1]
+        check("a 12 MiB chat body to a provider with disable_store arrives with store false last, intact by content hash", s == 200 and row["size"] == len(want) and row["sha"] == sha(want) and row["hdr"].split("|")[1] == str(len(want)), (s, b[:200], row["size"], len(want), row["hdr"]))
+        body = ('{"model":"openai/gpt-4o-l178","input":"%s"}\n' % FILL(12 * MB)).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/responses", [body[:5000], body[5000:]], chunked=True, timeout=120)
+        want = body.replace(b'"openai/gpt-4o-l178"', b'"gpt-4o-l178"')[:-2] + b',"store":false}\n'
+        row = mine("/v1/responses")[-1]
+        check("a chunked 12 MiB Responses body to it ends with store false before its closing brace, intact", s == 200 and row["sha"] == sha(want), (s, b[:200], row["size"], len(want)))
+        body = ('{"model":"groq/llama-l178","messages":[{"role":"user","content":"%s"}]}' % FILL(2 * MB)).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/chat/completions", body, timeout=120)
+        row = mine("/v1/chat/completions")[-1]
+        check("... and a provider without it gets the body as it was", s == 200 and row["sha"] == sha(body.replace(b'"groq/llama-l178"', b'"llama-l178"')), (s, row["size"]))
+
+        # ---- the request type of a large body whose "stream": true lies past the prefix: read from its answer ----
+        body = ('{"model":"groq/llama-l178late","messages":[{"role":"user","content":"%s"}],"stream":true}' % FILL(2 * MB)).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/chat/completions", body, timeout=120)
+        t = b.decode("utf8", "replace")
+        check("a big chat body with its stream flag past the prefix streams back, labelled chat_completion_stream", s == 200 and hdr(hs, "content-type") == "text/event-stream" and hdr(hs, "x-bifrost-request-type") == "chat_completion_stream" and "data: [DONE]" in t, (s, hs, t[:200]))
+        m = call("GET", "/metrics", base=GW_L178, auth=False)[2]
+        line = [l for l in m.split("\n") if l.startswith("bifrost_upstream_requests_total{") and 'model="llama-l178late"' in l]
+        check("... and counted in the metrics under method chat_completion_stream", len(line) == 1 and 'method="chat_completion_stream"' in line[0], line)
+
+        # ---- a 12 MiB text completion to Replicate: its prediction body, written as the body streams in ----
+        def comp(model, n, extra="", stream=False, mt=16):
+            st = '"stream":true,' if stream else ""
+            return ('{"model":"%s",%s"prompt":"%s","max_tokens":%d%s}' % (model, st, FILL(n), mt, extra)).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/completions", comp("replicate/meta/llama-l178", 12 * MB, ',"echo":false'), timeout=180)
+        row = mine("/v1/models/meta/llama-l178/predictions")[-1]
+        want = ('{"input":{"prompt":"%s","max_tokens":16}}' % FILL(12 * MB)).encode()
+        out = json.loads(b) if s == 200 else {}
+        check("a 12 MiB text completion to Replicate arrives as its prediction body, intact by content hash", s == 200 and row["sha"] == sha(want), (s, b[:200], row["size"], len(want)))
+        check("... and is answered as a text completion with the prediction's output and token counts", out.get("object") == "text_completion" and out["choices"][0]["text"] == "Replicate says: a prompt of %d bytes" % (12 * MB) and out.get("usage", {}).get("prompt_tokens") == 7, b[:300])
+        s, hs, b = l124_http(port, "POST", "/v1/completions", comp("replicate/meta/llama-l178", 2 * MB, stream=True), timeout=180)
+        t = b.decode("utf8", "replace")
+        frames = [json.loads(l[6:]) for l in t.split("\n") if l.startswith("data: {")]
+        check("... a streamed one is answered as text_completion chunks", s == 200 and frames and all(f.get("object") == "text_completion" for f in frames) and sse_text(t) == "Replicate says: a prompt of %d bytes" % (2 * MB) and t.rstrip().endswith("data: [DONE]"), (s, t[:300]))
+
+        # ---- compat's drops and fits on a large text completion: sent as it is (textfit-mini), and sent as chat (chatonly-mini) ----
+        n0 = len(mine("/v1/completions"))
+        s, hs, b = l124_http(port, "POST", "/v1/completions", comp("openai/textfit-mini", 12 * MB, ',"temperature":0.5,"echo":false', mt=500), timeout=180)
+        rows = mine("/v1/completions")[n0:]
+        want = ('{"prompt":"%s","model":"textfit-mini","max_tokens":50,"echo":false}' % FILL(12 * MB)).encode()
+        check("a 12 MiB text completion has its unlisted temperature dropped and max_tokens fitted to the row's 50, the prompt intact", s == 200 and len(rows) == 1 and rows[0]["sha"] == sha(want), (s, b[:200], [r["size"] for r in rows], len(want)))
+        check("... answered by the provider as it is, with the compat header", s == 200 and json.loads(b)["choices"][0]["text"] == "Hi from textfit" and hdr(hs, "x-bifrost-dropped-compat-params") == "temperature", (hs, b[:200]))
+        s, hs, b = l124_http(port, "POST", "/v1/completions", comp("openai/textfit-mini", 2 * MB, ',"temperature":0.5', stream=True), timeout=180)
+        t = b.decode("utf8", "replace")
+        row = mine("/v1/completions")[-1]
+        want = ('{"prompt":"%s","model":"textfit-mini","stream_options":{"include_usage":true},"stream":true,"max_tokens":16}' % FILL(2 * MB)).encode()
+        check("... a streamed one asks for its usage chunk and its events pass back as they came", s == 200 and hdr(hs, "content-type") == "text/event-stream" and sse_text(t) == "Hi from textfit" and row["sha"] == sha(want), (s, t[:200], row["size"], len(want)))
+        s, hs, b = l124_http(port, "POST", "/v1/completions", comp("openai/chatonly-mini", 12 * MB, ',"seed":5', mt=9000), timeout=180)
+        row = mine("/v1/chat/completions")[-1]
+        # (the openai provider has disable_store, which ends its chat bodies)
+        want = ('{"model":"chatonly-mini","messages":[{"role":"user","content":"%s"}],"max_tokens":4096,"store":false}' % FILL(12 * MB)).encode()
+        check("a 12 MiB text completion sent as chat has seed dropped and max_tokens fitted to 4096, the prompt intact", s == 200 and row["sha"] == sha(want) and json.loads(b).get("object") == "text_completion", (s, b[:200], row["size"], len(want)))
+        check("... with the compat headers (the drop and the endpoint change)", hdr(hs, "x-bifrost-dropped-compat-params") == "seed" and hdr(hs, "x-bifrost-converted-request-type") == "chat_completion", hs)
     finally:
         gw.terminate()
         gw.wait()
@@ -11995,6 +12144,159 @@ def l172_e2e(env):
         check("the body limit is raised through the config API", s == 200, (s, b[:200]))
         s, _, b = call("POST", "/v1/chat/completions", big, None, base=GW_L172, auth=False)
         check("the servers' body limit follows the config change", s == 200 and "Hello from gpt-4o-mini" in b, (s, b[:200]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
+GW_L174 = "http://127.0.0.1:18300"  # L174: inference compatibility leftovers (extra params, auto_inject, listings, counts, Vertex pools, Stability extras, mocker on Responses, stream stop reasons)
+
+def l174_config() -> dict:
+    """The L174 gateway: Anthropic with auto_inject, Bedrock and Vertex on the mock (Vertex keeps the main e2e key, with
+    an alias pinned to its region), a provider with two keys and regex: model lists, the mocker on Responses, the
+    model-catalog-resolver entry, and the request log on."""
+    import shutil
+    base = json.load(open(os.path.join(BUILD, "e2e.config.json")))
+    logs_dir = os.path.join(BUILD, "e2e-l174-logs")
+    shutil.rmtree(logs_dir, ignore_errors=True)
+    def key(name, value, **extra):
+        return {"name": name, "value": value, "models": [], "weight": 1.0, **extra}
+    vertex = dict(base["providers"]["vertex"])
+    vertex["keys"] = [{**vertex["keys"][0], "aliases": {"pinned": {"model_id": "claude-opus-4-7", "force_single_region": True}}}]
+    return {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False},
+        "logs_store": {"enabled": True, "dir": logs_dir},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {
+            "openai": {"keys": [key("o", "sk-l174")], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "anthropic": {"keys": [key("an", "sk-ant-l174")], "network_config": {"base_url": MOCK, "max_retries": 0}, "prompt_cache": {"auto_inject": True}},
+            "bedrock": {"keys": [key("bk", "", bedrock_key_config={"access_key": "AKIDEXAMPLE", "secret_key": "secret", "region": "us-east-1"})],
+                        "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "vertex": vertex,
+            # the listing with every key: the first key's regex allow list less its regex blacklist, the second key's
+            # own listing (one model more) through its regex entry, plus a plain name
+            "lst": {"keys": [key("k1", "sk-l174a", models=["regex:m-[ab]"], blacklisted_models=["regex:.*-b"]), key("k2", "sk-l174b", models=["regex:m-c", "extra-x"])],
+                    "custom_provider_config": {"base_provider_type": "openai"}, "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+        "plugins": [
+            {"name": "mocker", "enabled": True, "config": {"rules": [{"name": "l174", "conditions": {"message_regex": "(?s).*mock-l174.*"},
+                                                                       "responses": [{"type": "success", "content": {"message": "mocked responses l174", "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}}}]}]}},
+            {"name": "model-catalog-resolver", "enabled": True},
+        ],
+    }
+
+def l174_e2e(env):
+    """L174: extra_params merged into a converted provider body, auto_inject on the first cacheable block, regex: model
+    entries and listings read with every key, the Anthropic count route for other providers, Vertex's multi-region
+    pools, Stability's extra form options, the mocker on Responses, and the stop reason of streamed answers. Its own
+    gateway (18300)."""
+    cfg_path = os.path.join(BUILD, "e2e.l174.json")
+    json.dump(l174_config(), open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18300", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l174.log"), "w"))
+    def post(path, body, headers=None):
+        return call("POST", path, body, headers, base=GW_L174, auth=False)
+    def last(prefix):
+        rows = [x for x in seen() if x["path"].startswith(prefix)]
+        return rows[-1] if rows else {"path": "", "body": "", "auth": ""}
+    def jb(text):
+        try:
+            return json.loads(text)
+        except Exception:
+            return {}
+    try:
+        wait(GW_L174 + "/health")
+        msgs = [{"role": "user", "content": "first l174"}, {"role": "assistant", "content": "a"}, {"role": "user", "content": "last l174"}]
+        EP = {"x-bf-passthrough-extra-params": "true"}
+
+        # x-bf-passthrough-extra-params: the extras reach the converted provider body (Anthropic, Bedrock)
+        s, _, b = post("/v1/chat/completions", {"model": "anthropic/claude-sonnet-4", "messages": msgs, "extra_params": {"top_k": 7, "metadata": {"user_id": "u-174"}}}, EP)
+        upb = jb(last("/v1/messages")["body"])
+        check("extra params: Anthropic's converted body gets the extras (top_k, metadata)", s == 200 and upb.get("top_k") == 7 and upb.get("metadata", {}).get("user_id") == "u-174" and "extra_params" not in upb, (s, b[:200], upb))
+        s, _, b = post("/v1/chat/completions", {"model": "anthropic/claude-sonnet-4", "messages": msgs, "extra_params": {"top_k": 7}})
+        upb = jb(last("/v1/messages")["body"])
+        check("extra params: without the header nothing is merged", s == 200 and "top_k" not in upb, (s, b[:200], upb))
+        s, _, b = post("/v1/chat/completions", {"model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0", "messages": msgs, "extra_params": {"additionalModelRequestFields": {"top_k": 9}, "performanceConfig": {"latency": "optimized"}}}, EP)
+        up = last("/model/anthropic.claude-3-haiku")
+        upb = jb(up["body"])
+        check("extra params: Bedrock's Converse body gets the extras, signed again", s == 200 and upb.get("additionalModelRequestFields", {}).get("top_k") == 9 and upb.get("performanceConfig") == {"latency": "optimized"}
+              and up["path"].endswith("/converse") and up["auth"].startswith("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/"), (s, b[:200], up))
+
+        # auto_inject: the first cacheable block, not the newest turn
+        s, _, b = post("/v1/chat/completions", {"model": "anthropic/claude-sonnet-4", "messages": msgs})
+        upb = jb(last("/v1/messages")["body"])
+        ms = upb.get("messages", [])
+        check("auto_inject marks the first cacheable block of the conversation", s == 200 and len(ms) == 3 and ms[0].get("content") == [{"type": "text", "text": "first l174", "cache_control": {"type": "ephemeral"}}]
+              and "cache_control" not in json.dumps(ms[1:]), (s, b[:200], upb))
+        s, _, b = post("/v1/chat/completions", {"model": "anthropic/claude-sonnet-4", "messages": [{"role": "system", "content": "rules l174"}] + msgs})
+        upb = jb(last("/v1/messages")["body"])
+        check("auto_inject marks the system prompt when it comes first, and nothing else", s == 200 and upb.get("system") == [{"type": "text", "text": "rules l174", "cache_control": {"type": "ephemeral"}}]
+              and "cache_control" not in json.dumps(upb.get("messages", [])), (s, b[:200], upb))
+
+        # the model listing: every key's own listing, regex: entries in the allow lists and blacklists
+        s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "lst"}, base=GW_L174, auth=False)
+        ids = [m["id"] for m in jb(b).get("data", [])]
+        check("listing: each key lists with its own credentials, regex: entries match, results joined", s == 200 and ids == ["lst/m-a", "lst/m-c", "lst/extra-x"], (s, b[:300]))
+        s, _, b = post("/v1/chat/completions", {"model": "lst/m-c", "messages": msgs})
+        check("routing: a regex: model entry picks the key that allows the model", s == 200 and last("/v1/chat/completions")["auth"] == "Bearer sk-l174b", (s, b[:200], last("/v1/chat/completions")["auth"]))
+        n = len(seen())
+        s, _, b = post("/v1/chat/completions", {"model": "lst/m-b", "messages": msgs})
+        check("routing: a model a regex: blacklist entry names is refused without a call", s != 200 and len([x for x in seen()[n:] if x["path"] == "/v1/chat/completions"]) == 0, (s, b[:200]))
+
+        # the Anthropic count route for a provider that is not Anthropic: counted by that provider, in Anthropic's shape
+        s, _, b = post("/anthropic/v1/messages/count_tokens", {"model": "vertex/gemini-2.5-flash", "messages": [{"role": "user", "content": "count l174"}]})
+        up = last("/v1/projects/")
+        check("count_tokens: the Anthropic route counts a Gemini model on Vertex exactly, in Anthropic's shape", s == 200 and jb(b) == {"input_tokens": 11} and up["path"].endswith(":countTokens"), (s, b[:200], up["path"]))
+
+        # Vertex: a multi-region-only model is promoted to its region's pool; force_single_region keeps the region
+        s, _, b = post("/v1/chat/completions", {"model": "vertex/claude-opus-4-7", "messages": msgs, "stream": True})
+        up = last("/v1/projects/")
+        check("vertex: a multi-region-only model goes to its region's pool", s == 200 and up["path"] == "/v1/projects/proj/locations/us/publishers/anthropic/models/claude-opus-4-7:streamRawPredict", (s, b[:200], up["path"]))
+        s, _, b = post("/v1/chat/completions", {"model": "vertex/pinned", "messages": msgs, "stream": True})
+        up = last("/v1/projects/")
+        check("vertex: an alias's force_single_region keeps the configured region", s == 200 and up["path"] == "/v1/projects/proj/locations/us-central1/publishers/anthropic/models/claude-opus-4-7:streamRawPredict", (s, b[:200], up["path"]))
+
+        # Stability edits: the form's options outside Bifrost's named list go into the body as the form sent them
+        png = bytes.fromhex("89504e470d0a1a0a")
+        s, _, b = mp_form(GW_L174, "/v1/images/edits", [("model", None, "text/plain", "bedrock/stability.stable-image-inpaint-v1:0"), ("prompt", None, "text/plain", "a red fox"), ("type", None, "text/plain", "inpainting"),
+                                                        ("grow_mask", None, "text/plain", "5"), ("safety_tolerance", None, "text/plain", "2"), ("select_prompt", None, "text/plain", "sky"), ("image", "in.png", "image/png", png), ("mask", "m.png", "image/png", png)])
+        stb = jb(last("/model/stability.stable-image-inpaint")["body"])
+        check("stability edits: extra form options pass through (Bifrost's ExtraParams), named ones stay typed", s == 200 and stb.get("grow_mask") == 5 and stb.get("safety_tolerance") == "2" and stb.get("select_prompt") == "sky" and "mask" in stb, (s, b[:200], {k: v for k, v in stb.items() if k not in ("image", "mask")}))
+
+        # the mocker answers Responses requests in Responses' shape
+        n = len(seen())
+        s, h, b = post("/v1/responses", {"model": "openai/gpt-4o-mini", "input": "please mock-l174"})
+        r = jb(b)
+        text = "".join(c.get("text", "") for o in r.get("output", []) for c in o.get("content", []) if isinstance(c, dict))
+        check("mocker: a Responses request is answered in Responses' shape with no upstream call", s == 200 and r.get("object") == "response" and text == "mocked responses l174"
+              and r.get("usage", {}).get("input_tokens") == 3 and {k.lower(): v for k, v in h.items()}.get("x-bf-plugin-short-circuit") == "true" and len([x for x in seen()[n:] if x["path"].startswith("/v1/responses")]) == 0, (s, b[:300]))
+        s, h, b = post("/v1/responses", {"model": "openai/gpt-4o-mini", "input": [{"role": "user", "content": [{"type": "input_text", "text": "mock-l174 streamed"}]}], "stream": True})
+        check("mocker: a streamed Responses request gets one response.completed event", s == 200 and "event: response.completed" in b and "mocked responses l174" in b, (s, b[:300]))
+        s, _, b = post("/v1/responses", {"model": "openai/gpt-4o-mini", "input": "not mocked"})
+        check("mocker: a Responses request no rule matches goes upstream", s == 200 and "mocked" not in b and last("/v1/responses")["path"] == "/v1/responses", (s, b[:200]))
+
+        # the stop reason of a streamed answer is logged (from the events the client was sent)
+        s, _, b = post("/v1/chat/completions", {"model": "openai/l174-stream", "messages": msgs, "stream": True})
+        n0 = len([e for e in jb(call("GET", "/api/logs?limit=100", base=GW_L174, auth=False)[2]).get("entries", []) if e.get("model") == "anthropic/claude-sonnet-4"])
+        s2, _, b2 = post("/v1/chat/completions", {"model": "anthropic/claude-sonnet-4", "messages": [{"role": "user", "content": "stream stop l174"}], "stream": True})
+        # the rows are written when each stream ends: wait for both (the list is newest first)
+        entries, sr, sa = [], [], []
+        for _ in range(50):
+            entries = jb(call("GET", "/api/logs?limit=100", base=GW_L174, auth=False)[2]).get("entries", [])
+            sr = [e.get("stop_reason") for e in entries if e.get("model") == "openai/l174-stream"]
+            ant = [e.get("stop_reason") for e in entries if e.get("model") == "anthropic/claude-sonnet-4"]
+            sa = ant[:1] if len(ant) > n0 else []
+            if sr and sa and sa[0]:
+                break
+            time.sleep(0.1)
+        check("logs: a streamed answer's stop reason is recorded", s == 200 and "data: [DONE]" in b and sr == ["length"], (s, sr, [(e.get("model"), e.get("stop_reason")) for e in entries[:6]]))
+        check("logs: a converted stream's stop reason is the one the client was sent", s2 == 200 and sa == ["stop"], (s2, sa))
+        s, _, b = call("GET", "/api/logs?stop_reasons=length", base=GW_L174, auth=False)
+        check("logs: the stop_reasons filter finds the streamed answer", s == 200 and any(e.get("model") == "openai/l174-stream" for e in jb(b).get("entries", [])), (s, b[:200]))
+
+        # the model-catalog-resolver entry is built in: no unknown plugin
+        s, _, b = call("GET", "/api/plugins", base=GW_L174, auth=False)
+        check("model-catalog-resolver is accepted as built in, not reported as an unknown plugin", s == 200 and "unknown plugin" not in b and "mocker" in b, (s, b[:300]))
     finally:
         gw.terminate()
         gw.wait()
@@ -14391,6 +14693,9 @@ def main():
         # L162: Bedrock streams of large requests converted live, large completions sent as chat and Titan embeddings streamed,
         # Gemini transcription cost: its own gateway
         l162_e2e(env)
+        # L178: large Responses streams converted live, disable_store, the stream label from the answer, Replicate and compat on
+        # large completions: its own gateway (18308)
+        l178_e2e(env)
         # L153: crew routing (crew/<pool> models, the task headers, the assign API, the task detail): its own gateways
         l153_e2e(env)
         # L154: crew outcomes, learning, budget pacing and the sequential layer: its own gateways
@@ -14411,6 +14716,10 @@ def main():
         # L173: provider leftovers (Bedrock text streams, OpenAI-shaped decisions, Mantle, Replicate, cache points, alias
         # overrides, listings): its own gateway (18296)
         l173_e2e(env)
+        # L174: inference compatibility leftovers (extra params on converted bodies, auto_inject placement, listings with
+        # every key and regex: entries, the Anthropic count route, Vertex pools, Stability extras, the mocker on
+        # Responses, streamed stop reasons): its own gateway (18300)
+        l174_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

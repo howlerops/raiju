@@ -313,6 +313,9 @@ export class LargeBody {
   // An OpenAI-format chat or text stream asks for its usage chunk, as Bifrost asks every such stream: the prefix gets
   // stream_options.include_usage first in the object (a stream_options the caller wrote later in the body still wins)
   askUsage = false
+  // openai_config.disable_store: "store":false goes last in the object, so it wins over a store the caller wrote anywhere
+  // in the body (the last of two equal keys is the one a JSON reader keeps), as Bifrost forces store=false
+  noStore = false
   // set by the spool to remove its files when the request is over
   release: (() => void) | undefined = undefined
   // the bodies of the calls after the first, for a provider that takes one input per call (Bedrock Titan), spooled
@@ -336,7 +339,7 @@ export class LargeBody {
 
   // the model literal's length change and the inserted member, for an upstream Content-Length
   delta(): int {
-    const ins = this.inserted().length
+    const ins = this.inserted().length + this.appended().length
     if (this.upstreamModel === "" || !this.meta.hasModel) return ins
     return ins + new TextEncoder().encode(this.literal()).length - (this.meta.modelTo - this.meta.modelFrom)
   }
@@ -345,6 +348,12 @@ export class LargeBody {
   inserted(): u8[] {
     if (!this.askUsage || this.plain || this.meta.streamOptions) return []
     return new TextEncoder().encode(USAGE_MEMBER)
+  }
+
+  // the member put after the caller's last one (noStore), or nothing
+  appended(): u8[] {
+    if (!this.noStore || this.plain) return []
+    return new TextEncoder().encode(STORE_MEMBER)
   }
 
   // the prefix with the provider's model name where the caller's was (and the inserted member after the brace)
@@ -374,44 +383,63 @@ export class LargeBody {
   }
 
   // The whole body as a stream: the (rewritten) prefix, then the rest as the client sends it. Reading stops
-  // with an error when the body goes over max_payload_bytes.
+  // with an error when the body goes over max_payload_bytes. With a member to append, the last bytes are held back
+  // (with any whitespace-only chunks after them) until the body ends, so the member goes in before the closing brace.
   stream(): ReadableStream {
     const conv = this.converted
     if (conv !== undefined) return conv
-    let first = true
     const self = this
+    const tail = this.appended()
+    const st = new TailHold()
     return new ReadableStream({
       async pull(c) {
-        if (first) {
-          first = false
-          c.enqueue(self.head())
+        if (!st.started) {
+          st.started = true
+          const h = self.head()
+          if (tail.length === 0) {
+            c.enqueue(h)
+            return
+          }
+          // (held until the next bytes come: a pull that enqueues nothing is not called again)
+          st.held = h
+        }
+        while (true) {
+          const src = self.source
+          let chunk: u8[] | undefined = undefined
+          if (src !== undefined) {
+            try {
+              const r = await src.pull()
+              chunk = r.value
+              if (r.done) chunk = undefined
+            } catch (e) {
+              c.error(e)
+              return
+            }
+          }
+          const v = chunk
+          if (v === undefined) {
+            if (tail.length > 0) c.enqueue(withMember(st.held, tail))
+            c.close()
+            return
+          }
+          if (!self.tap.see(v)) {
+            c.error(new Error("the request body is over max_payload_bytes"))
+            if (src !== undefined) await src.cancel()
+            return
+          }
+          if (tail.length === 0) {
+            c.enqueue(v)
+            return
+          }
+          if (allSpace(v)) {
+            for (const b of v) st.held.push(b)
+            continue
+          }
+          const out = st.held
+          st.held = v
+          c.enqueue(out)
           return
         }
-        const src = self.source
-        if (src === undefined) {
-          c.close()
-          return
-        }
-        let chunk: u8[] | undefined = undefined
-        try {
-          const r = await src.pull()
-          chunk = r.value
-          if (r.done) chunk = undefined
-        } catch (e) {
-          c.error(e)
-          return
-        }
-        const v = chunk
-        if (v === undefined) {
-          c.close()
-          return
-        }
-        if (!self.tap.see(v)) {
-          c.error(new Error("the request body is over max_payload_bytes"))
-          await src.cancel()
-          return
-        }
-        c.enqueue(v)
       },
       cancel() {
         const src = self.source
@@ -420,6 +448,33 @@ export class LargeBody {
     })
   }
 }
+
+// The last bytes of a body held back from the stream, for a member that goes before its closing brace.
+class TailHold {
+  started = false
+  held: u8[] = []
+}
+
+function allSpace(b: u8[]): bool {
+  for (const c of b) {
+    if (!isWs(int(c))) return false
+  }
+  return true
+}
+
+// The bytes with the member put in front of their last closing brace (unchanged when there is none).
+export function withMember(b: u8[], member: u8[]): u8[] {
+  let at = b.length - 1
+  while (at >= 0 && int(b[at]!) !== 125) at -= 1
+  if (at < 0) return b
+  const out: u8[] = b.slice(0, at)
+  for (const c of member) out.push(c)
+  for (let i = at; i < b.length; i++) out.push(b[i]!)
+  return out
+}
+
+// what noStore puts after the caller's members
+const STORE_MEMBER = `,"store":false`
 
 // what askUsage puts in front of the caller's members
 const USAGE_MEMBER = `"stream_options":{"include_usage":true},`
@@ -1048,4 +1103,20 @@ test("a large stream asks for its usage chunk unless the prefix has stream_optio
   ob.askUsage = true
   expect(str(ob.head())).toBe(own)
   expect(ob.delta()).toBe(0)
+})
+
+test("disable_store: store false goes before the body's last brace, and the length counts it", () => {
+  expect(str(withMember(bytes(`{"model":"m","input":"x"}`), bytes(`,"store":false`)))).toBe(`{"model":"m","input":"x","store":false}`)
+  // trailing whitespace stays after the brace; a caller's store earlier in the body is outvoted by the later key
+  expect(str(withMember(bytes(`{"store":true,"a":{"b":1}} \n`), bytes(`,"store":false`)))).toBe(`{"store":true,"a":{"b":1},"store":false} \n`)
+  expect(str(withMember(bytes(`no brace`), bytes(`,"x":1`)))).toBe(`no brace`)
+  const src = `{"model":"openai/gpt-4o","input":"hi"}`
+  const body = new LargeBody({ requestThreshold: 1, responseThreshold: 1, prefetch: 64, maxPayload: 1000, truncatedLog: 10 }, bytes(src), scanPrefix(bytes(src)), undefined, src.byteLength)
+  expect(body.delta()).toBe(0)
+  body.noStore = true
+  body.upstreamModel = "gpt-4o"
+  expect(body.contentLength()).toBe(`{"model":"gpt-4o","input":"hi","store":false}`.byteLength)
+  // a form body has no JSON members
+  body.plain = true
+  expect(body.appended().length).toBe(0)
 })

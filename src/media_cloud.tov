@@ -14,6 +14,7 @@ import { encode } from "./base64"
 import { S3Creds, AwsRequest, s3Call, awsCall, canonicalQuery } from "./exports"
 import { AssumedCreds, credsCache, parseIsoUtcMs, xmlTag } from "./cloud_auth"
 import { BedrockKeyConfig } from "./config"
+import { mergeFields } from "./extraparams"
 
 // Bearer tokens for Vertex calls, by service account. media.tov fetches into it.
 export const VERTEX_TOKENS: TokenCache = new TokenCache()
@@ -175,6 +176,12 @@ export function stabilityFormFields(): string[] {
   return ["select_prompt", "search_prompt", "grow_mask", "style_preset", "creativity", "control_strength", "aspect_ratio", "fidelity", "style_strength", "composition_fidelity", "change_strength", "left", "right", "up", "down"]
 }
 
+// The images/edits form fields Bifrost reads itself (its imageEditParamsKnownFields); every other text field of the form
+// is an extra param, which Bifrost's edit route always passes to the provider.
+export function editKnownField(key: string): bool {
+  return ["model", "prompt", "fallbacks", "image", "image[]", "image_url", "image_url[]", "images", "mask", "type", "background", "input_fidelity", "n", "output_compression", "output_format", "partial_images", "quality", "response_format", "size", "user", "negative_prompt", "seed", "num_inference_steps", "upscale_factor", "target_megapixels", "aspect_ratio", "stream"].includes(key)
+}
+
 // The Stability task a form's type names (Bifrost's getStabilityAITaskTypeFromParams), or "".
 function stabilityType(kind: string): string {
   const k = kind.toLowerCase()
@@ -253,6 +260,11 @@ function optStr(ed: native.EditInput, key: string): string {
 // the fields the task takes are set; style transfer takes an init image and a style image.
 export function stabilityEditBody(task: string, ed: native.EditInput): string throws SyntaxError {
   const fs: string[] = []
+  // the form options the task took by name; the others are passed on as they came (Bifrost's ExtraParams)
+  const took: string[] = []
+  const take = (k: string): void => {
+    took.push(k)
+  }
   if (task === "") throw new SyntaxError("cannot determine the Stability task from the type or the model name")
   if (task === "style-transfer") {
     if (ed.images.length !== 2) throw new SyntaxError("style-transfer requires exactly two images: init_image and style_image")
@@ -267,45 +279,68 @@ export function stabilityEditBody(task: string, ed: native.EditInput): string th
   if (ed.seed !== undefined && taskTakes(task, "seed")) fs.push(`"seed":${ed.seed}`)
   if (ed.mask !== undefined && taskTakes(task, "mask")) fs.push(`"mask":${quote(encode(ed.mask))}`)
   if (ed.outputFormat !== "") fs.push(`"output_format":${quote(ed.outputFormat)}`)
-  if (taskTakes(task, "style_preset") && optStr(ed, "style_preset") !== "") fs.push(`"style_preset":${quote(optStr(ed, "style_preset"))}`)
+  if (taskTakes(task, "style_preset") && optStr(ed, "style_preset") !== "") {
+    fs.push(`"style_preset":${quote(optStr(ed, "style_preset"))}`)
+    take("style_preset")
+  }
   if (taskTakes(task, "grow_mask")) {
     const g = try optInt(ed, "grow_mask")
     if (g !== undefined) fs.push(`"grow_mask":${g}`)
+    take("grow_mask")
   }
   if (taskTakes(task, "outpaint")) {
     for (const k of ["left", "right", "up", "down"]) {
       const v = try optInt(ed, k)
       if (v !== undefined) fs.push(`"${k}":${v}`)
+      take(k)
     }
   }
   if (taskTakes(task, "creativity")) {
     const c = try optNum(ed, "creativity")
     if (c !== undefined) fs.push(`"creativity":${c}`)
+    take("creativity")
   }
   if (task === "recolor") {
     if (optStr(ed, "select_prompt") === "") throw new SyntaxError("select_prompt is required for stability ai recolor task")
     fs.push(`"select_prompt":${quote(optStr(ed, "select_prompt"))}`)
+    take("select_prompt")
   }
   if (task === "search-replace") {
     if (optStr(ed, "search_prompt") === "") throw new SyntaxError("search_prompt is required for stability ai search-replace task")
     fs.push(`"search_prompt":${quote(optStr(ed, "search_prompt"))}`)
+    take("search_prompt")
   }
   if (taskTakes(task, "control")) {
     const c = try optNum(ed, "control_strength")
     if (c !== undefined) fs.push(`"control_strength":${c}`)
+    take("control_strength")
   }
   if (taskTakes(task, "style_guide")) {
     if (optStr(ed, "aspect_ratio") !== "") fs.push(`"aspect_ratio":${quote(optStr(ed, "aspect_ratio"))}`)
     const f = try optNum(ed, "fidelity")
     if (f !== undefined) fs.push(`"fidelity":${f}`)
+    take("fidelity")
   }
   if (taskTakes(task, "style_transfer")) {
     for (const k of ["style_strength", "composition_fidelity", "change_strength"]) {
       const v = try optNum(ed, k)
       if (v !== undefined) fs.push(`"${k}":${v}`)
+      take(k)
     }
   }
-  return "{" + fs.join(",") + "}"
+  // the form's other options (Bifrost's ExtraParams, which its edit route always passes on), as the strings the form
+  // sent, merged as Bifrost merges extra params: a key the body has is replaced, new keys go last in sorted order
+  const rest: Field[] = []
+  const m = ed.extra
+  if (m !== undefined) {
+    for (const k of m.keys()) {
+      if (editKnownField(k) || took.includes(k)) continue
+      rest.push({ key: k, raw: quote(m.get(k)!) })
+    }
+  }
+  const body = "{" + fs.join(",") + "}"
+  if (rest.length === 0) return body
+  return build(try mergeFields(try fields(body), rest))
 }
 
 // The InvokeModel request for a Stability edit: the task from the form's type, else from the model id.
@@ -1235,10 +1270,14 @@ test("stability edits: the task comes from the type or the model, and each task 
   ed.seed = 7
   const ex: Map<string, string> = new Map()
   ex.set("grow_mask", "5")
-  ex.set("select_prompt", "ignored")
+  ex.set("select_prompt", "not this task's")
+  ex.set("safety_tolerance", "2")
+  ex.set("aspect_ratio", "16:9")
   ed.extra = ex
+  // an option the task does not take, and one outside Bifrost's list, pass as the form sent them (Bifrost's
+  // ExtraParams, new keys last in sorted order); aspect_ratio is a field Bifrost reads itself, so it does not
   const body = try stabilityEditBody("inpaint", ed)
-  expect(body).toBe(`{"image":"${encode(img)}","prompt":"a red fox","negative_prompt":"blur","seed":7,"mask":"${encode(msk)}","grow_mask":5}`)
+  expect(body).toBe(`{"image":"${encode(img)}","prompt":"a red fox","negative_prompt":"blur","seed":7,"mask":"${encode(msk)}","grow_mask":5,"safety_tolerance":"2","select_prompt":"not this task's"}`)
   const up = try bedrockImageEdit(st, bdEdit("", undefined))
   expect((up.body as string).startsWith(`{"image":"${encode(img)}","prompt":"a red fox"`)).toBe(true)
   expect(up.url).toBe("https://bedrock-runtime.us-east-1.amazonaws.com/model/stability.stable-image-inpaint-v1%3A0/invoke")

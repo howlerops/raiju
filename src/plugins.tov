@@ -7,7 +7,7 @@
 // httpChunk in reverse for each chunk of a streamed answer (it can rewrite or drop the chunk, or end the
 // stream). pluginroute.tov calls them from the servers.
 
-import { Field, fields, find, elements, rawStr, rawNum, isNull, quote, build, setField } from "./json"
+import { Field, fields, find, elements, rawStr, rawNum, rawBool, isNull, quote, build, setField } from "./json"
 import { errorJson, newId, nowSeconds } from "./schemas"
 import { compileRegex } from "./regex"
 import { deltaText } from "./guard_stream"
@@ -15,6 +15,7 @@ import { WasmPluginInst, WasmPluginLimits, openWasmPlugin } from "./wasmplugin"
 import { isPluginUrl, downloadedPlugin } from "./plugindl"
 import { HttpReq, HttpResp, LlmKind, CHAT_KIND, kindOfOp, emptyReq, httpReqJson, httpRespJson, applyHttpReq, applyHttpResp, respFromJson } from "./plughttp"
 import { utf8 } from "./crypto"
+import * as responses from "./responses"
 
 // Hooks take the context by inout: plugins add headers and share values
 // through ctx.headers and ctx.values, which parameters can't change. trace collects the
@@ -852,8 +853,9 @@ function byPriority(rules: MockRule[]): MockRule[] {
 function messageText(body: string): string {
   let out = ""
   try {
-    const raw = find(try fields(body), "messages")
-    if (raw === undefined) return ""
+    const bf = try fields(body)
+    const raw = find(bf, "messages")
+    if (raw === undefined) return inputText(bf)
     for (const el of try elements(raw)) {
       const mf = try fields(el)
       const c = rawStr(mf, "content")
@@ -870,6 +872,51 @@ function messageText(body: string): string {
     return out
   }
   return out
+}
+
+// The text of a Responses request's input (Bifrost's mocker reads the input messages' content): a string input, or
+// each item's string content and its text parts, one per line.
+function inputText(bf: Field[]): string throws SyntaxError {
+  const raw = find(bf, "input")
+  if (raw === undefined || isNull(raw)) return ""
+  if (raw.startsWith("\"")) return (rawStr(bf, "input") ?? "") + "\n"
+  if (!raw.startsWith("[")) return ""
+  let out = ""
+  for (const el of try elements(raw)) {
+    if (!el.startsWith("{")) continue
+    const mf = try fields(el)
+    const c = rawStr(mf, "content")
+    if (c !== undefined) out += c + "\n"
+    const parts = find(mf, "content")
+    if (c === undefined && parts !== undefined && parts.startsWith("[")) {
+      for (const p of try elements(parts)) {
+        const t = p.startsWith("{") ? rawStr(try fields(p), "text") : undefined
+        if (t !== undefined) out += t + "\n"
+      }
+    }
+  }
+  return out
+}
+
+// A mocked chat completion as a Responses answer, for a short circuit on the Responses route, as Bifrost's mocker
+// answers a Responses request: the response object, or for a streamed request the one response.completed event it
+// sends. An error answer, or a body that is not a chat completion (a rule's raw response), stays as it is.
+export function asResponses(pre: PreResult, body: string): PreResult {
+  if (pre.kind !== "short_circuit" || pre.status >= 400) return pre
+  try {
+    const bf = try fields(body)
+    const cf = try fields(pre.body)
+    if (rawStr(cf, "object") !== "chat.completion") return pre
+    const model = rawStr(cf, "model") ?? rawStr(bf, "model") ?? ""
+    const resp = try responses.toResponse(pre.body, model, body)
+    if (rawBool(bf, "stream") === true) {
+      const ev = `{"type":"response.completed","sequence_number":0,"response":${resp}}`
+      return { kind: "short_circuit", status: pre.status, body: `event: response.completed\ndata: ${ev}\n\n`, contentType: "text/event-stream", allowFallbacks: pre.allowFallbacks }
+    }
+    return { kind: "short_circuit", status: pre.status, body: resp, contentType: "application/json", allowFallbacks: pre.allowFallbacks }
+  } catch (e) {
+    return pre
+  }
 }
 
 // The request's provider and its model without the provider: the provider the gateway resolved for it (ctx.provider, so a
@@ -973,6 +1020,11 @@ export class MockerPlugin extends BasePlugin {
     return "mocker"
   }
 
+  // Bifrost's mocker answers chat and Responses requests (and the routes served as them).
+  handlesOp(op: string): bool {
+    return op === "chat" || op === "responses"
+  }
+
   // A rule that matches the request (its probability aside), or a default behaviour that answers. Bifrost's mocker runs
   // on chat and Responses requests, which the Anthropic, GenAI, Bedrock and Cohere chat routes become.
   appliesNative(ctx: PluginContext, chat: string): bool {
@@ -998,6 +1050,11 @@ export class MockerPlugin extends BasePlugin {
   }
 
   preRequest(inout ctx: PluginContext, body: string): PreResult {
+    const pre = this.decide(&ctx, body)
+    return ctx.op === "responses" ? asResponses(pre, body) : pre
+  }
+
+  private decide(inout ctx: PluginContext, body: string): PreResult {
     this.totalRequests += 1
     for (const r of byPriority(this.config.rules)) {
       if (r.enabled === false) continue
@@ -2197,6 +2254,42 @@ test("mocker conditions match provider, model and message regex", () => {
   if (rg.kind === "short_circuit") expect(rg.body.includes(`"content":"gpt"`)).toBe(true)
   let miss = mockCtx("openai/gpt-4o")
   expect(p.preRequest(&miss, `{"messages":[{"role":"user","content":"bye"}]}`).kind).toBe("continue")
+})
+
+test("mocker answers Responses requests in Responses' shape, matching their input", () => {
+  const cfg = try JSON.parse(`{"rules":[
+    {"name":"r","responses":[{"type":"success","content":{"message":"mocked {{model}}","usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}}],"conditions":{"message_regex":"(?s).*refund.*"}},
+    {"name":"e","responses":[{"type":"error","error":{"message":"nope","status_code":429}}],"conditions":{"message_regex":"(?s).*denied.*"}}
+  ]}`) as MockerConfig
+  const p = new MockerPlugin(cfg)
+  expect(p.handlesOp("responses")).toBe(true)
+  let c = mockCtx("openai/gpt-4o")
+  c.op = "responses"
+  const r = p.preRequest(&c, `{"model":"openai/gpt-4o","input":"I want a refund"}`)
+  expect(r.kind).toBe("short_circuit")
+  if (r.kind === "short_circuit") {
+    expect(r.body.includes(`"object":"response"`)).toBe(true)
+    expect(r.body.includes(`"text":"mocked gpt-4o"`)).toBe(true)
+    expect(r.body.includes(`"input_tokens":3`)).toBe(true)
+    expect(r.contentType).toBe("application/json")
+  }
+  // input items with text parts, streamed: one response.completed event
+  let s = mockCtx("openai/gpt-4o")
+  s.op = "responses"
+  const rs = p.preRequest(&s, `{"model":"openai/gpt-4o","stream":true,"input":[{"role":"user","content":[{"type":"input_text","text":"refund please"}]}]}`)
+  if (rs.kind === "short_circuit") {
+    expect(rs.body.startsWith(`event: response.completed\ndata: {"type":"response.completed","sequence_number":0,"response":{`)).toBe(true)
+    expect(rs.contentType).toBe("text/event-stream")
+  }
+  expect(rs.kind).toBe("short_circuit")
+  // errors keep the error shape; a request no rule matches passes
+  let e = mockCtx("openai/gpt-4o")
+  e.op = "responses"
+  const re = p.preRequest(&e, `{"model":"openai/gpt-4o","input":"access denied"}`)
+  if (re.kind === "short_circuit") expect(re.status).toBe(429)
+  let m = mockCtx("openai/gpt-4o")
+  m.op = "responses"
+  expect(p.preRequest(&m, `{"model":"openai/gpt-4o","input":"hello"}`).kind).toBe("continue")
 })
 
 test("mocker error responses carry status_code, and default_behavior applies when nothing matches", () => {
