@@ -76,6 +76,15 @@ The larger ones:
 - Cluster: MCP client configs are per node.
 - Upstream: offer tov-patches/upstream to Tov.
 
+## Owner decisions after wave 22 (2026-10-24)
+
+1. /api is locked by default like Bifrost: with no admin user and no setup_token it answers 403 (reverses the L97g choice to keep it open).
+2. MCP is denied by default for a virtual key with no mcp_configs, as Bifrost does.
+3. Realtime WebRTC calls are off by default (explicit enable); WebSocket realtime is unaffected.
+4. Built-in role permissions (admin, editor, viewer, auditor) are editable, as in Bifrost.
+5. Kept as Raiju's design (rows close as "differs by design"): the JSON config file and JSONL log store (no sqlite, postgres or clickhouse stores); CEL routing rules, complexity_router settings and its heuristic scorer; reporting 4 of Bifrost's 10 latency overhead components.
+6. Production hardening and the remaining parity work run interleaved.
+
 ## Owner decisions after wave 14 (2026-10-17)
 
 1. **Dynamic plugins:** WASM plugins on WAMR, added to the Tov runtime as a patch (L121). No
