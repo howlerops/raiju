@@ -1835,6 +1835,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/scim/provisioning-token": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rotate the SCIM provisioning token; the new token is returned once and the old one stops working
+         * @description Replaces scim_config.config.provisioningToken (an env. reference included) with a new random token. The identity provider's SCIM connector must be given the new token. Refused with 400 while scim_config.enabled is not true.
+         */
+        post: operations["postApiScimProvisioningToken"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/users/{name}": {
         parameters: {
             query?: never;
@@ -6826,7 +6846,7 @@ export interface components {
         UpdateConfigRequest: {
             client_config?: components["schemas"]["ClientConfig"];
             client?: components["schemas"]["ClientConfig"];
-            /** @description Bifrost framework_config: pricing_url (empty resets to the default), pricing_sync_interval (seconds), model_parameters_url (read, not used) */
+            /** @description Bifrost framework_config: pricing_url (empty resets to the default), pricing_sync_interval (seconds), model_parameters_url (empty resets to the default), live_models_sync_interval (seconds: 0 off, else at least 60) */
             framework_config?: Record<string, never>;
             /** @description Bifrost auth_config: is_enabled, admin_username, admin_password (<redacted> keeps the stored one), disable_auth_on_inference */
             auth_config?: Record<string, never>;
@@ -15407,6 +15427,66 @@ export interface operations {
             };
             /** @description The record conflicts with an existing one. */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The gateway could not save or read back the record. */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiScimProvisioningToken: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @description The new bearer token for /scim/v2, shown only here. */
+                        token: string;
+                        message: string;
+                    };
+                };
+            };
+            /** @description The body or a parameter is invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -27929,12 +28009,13 @@ export interface operations {
                     "application/json": components["schemas"]["ManagementErrorResponse"];
                 };
             };
-            /** @description The key has no grant for this agent, or its budget or rate limit is used up. */
+            /** @description The key has no grant for this agent (Bifrost's card handler answers the bare text Forbidden), or its budget is used up (a JSON error). */
             403: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
+                    "text/plain": string;
                     "application/json": components["schemas"]["ManagementErrorResponse"];
                 };
             };
@@ -27976,7 +28057,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The agent's JSON-RPC answer (a result or an error object), or its event stream. */
+            /** @description The agent's JSON-RPC answer (a result or an error object), or its event stream. A key without a grant for the agent gets the JSON-RPC error -31403 here, as Bifrost's governance refuses it, with the request's id, the governance message and data holding a google.rpc.ErrorInfo (reason UNAUTHORIZED, domain a2a-protocol.org, metadata agentName, requestId, requestType, timestamp). */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -28008,7 +28089,7 @@ export interface operations {
                     "application/json": components["schemas"]["ManagementErrorResponse"];
                 };
             };
-            /** @description The key has no grant for this agent, or its budget or rate limit is used up. */
+            /** @description The key's budget is used up. A key without a grant for the agent is answered in a 200 with the JSON-RPC error -31403 (see 200). */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -28144,13 +28225,15 @@ export interface operations {
                     "application/json": components["schemas"]["ManagementErrorResponse"];
                 };
             };
-            /** @description The key has no grant for this agent, or its budget or rate limit is used up. */
+            /** @description The key has no grant for this agent (PERMISSION_DENIED with a google.rpc.ErrorInfo of reason UNAUTHORIZED in details, as Bifrost's governance refuses it), or its budget is used up. */
             403: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
                 };
             };
             /** @description No agent has this name, or it is disabled. */
@@ -28234,13 +28317,15 @@ export interface operations {
                     "application/json": components["schemas"]["ManagementErrorResponse"];
                 };
             };
-            /** @description The key has no grant for this agent, or its budget or rate limit is used up. */
+            /** @description The key has no grant for this agent (PERMISSION_DENIED with a google.rpc.ErrorInfo of reason UNAUTHORIZED in details, as Bifrost's governance refuses it), or its budget is used up. */
             403: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
                 };
             };
             /** @description No agent has this name, or it is disabled. */
@@ -28317,13 +28402,15 @@ export interface operations {
                     "application/json": components["schemas"]["ManagementErrorResponse"];
                 };
             };
-            /** @description The key has no grant for this agent, or its budget or rate limit is used up. */
+            /** @description The key has no grant for this agent (PERMISSION_DENIED with a google.rpc.ErrorInfo of reason UNAUTHORIZED in details, as Bifrost's governance refuses it), or its budget is used up. */
             403: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
                 };
             };
             /** @description No agent has this name, or it is disabled. */

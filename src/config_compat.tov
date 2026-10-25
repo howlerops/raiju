@@ -66,7 +66,7 @@ function providerChildKeys(section: string): string[] {
 
 // Keys of one entry in providers.<name>.keys that Raiju reads.
 function keyChildKeys(): string[] {
-  return ["id", "name", "value", "models", "weight", "aliases", "blacklisted_models", "azure_key_config", "vertex_key_config", "bedrock_key_config", "bedrock_mantle_key_config", "watsonx_key_config", "cloudflare_key_config", "databricks_key_config", "github_copilot_key_config", "replicate_key_config", "use_for_batch_api", "oauth_key_config"]
+  return ["id", "name", "value", "models", "weight", "aliases", "blacklisted_models", "azure_key_config", "vertex_key_config", "bedrock_key_config", "bedrock_mantle_key_config", "watsonx_key_config", "cloudflare_key_config", "databricks_key_config", "github_copilot_key_config", "replicate_key_config", "use_for_batch_api", "use_anthropic_endpoints", "oauth_key_config"]
 }
 
 const GEN = "is not implemented by Raiju and is ignored"
@@ -287,6 +287,21 @@ function clientNames(mf: Field[]): Map<string, string> throws SyntaxError {
     const id = rawStr(cf, "client_id")
     const name = rawStr(cf, "name")
     if (id !== undefined && name !== undefined) out.set(id, name)
+  }
+  return out
+}
+
+// The Raiju name (endpoint_slug, else name) of each of mcp.virtual_mcps (else mcp.tool_groups) by its Bifrost id, so an
+// access profile's virtual_mcp_id can name it.
+function virtualMcpIds(top: Field[]): Map<string, string> throws SyntaxError {
+  const out: Map<string, string> = new Map()
+  const mf = try members(find(top, "mcp"))
+  const list = find(mf, "virtual_mcps") ?? find(mf, "tool_groups")
+  for (const el of try items(list)) {
+    const f = try members(el)
+    const id = find(f, "id")
+    const name = rawStr(f, "endpoint_slug") ?? rawStr(f, "name")
+    if (id !== undefined && !isNull(id) && name !== undefined && name !== "") out.set(id.trim(), name)
   }
   return out
 }
@@ -699,8 +714,65 @@ function mapCluster(inout top: Field[], inout notes: string[]): void throws Synt
   put(&top, "cluster", out)
 }
 
-// scim_config becomes Raiju's scim_config (the switch and the provisioning token, scim.tov), and its authProxy
-// becomes auth_proxy: Bifrost's camelCase names, Raiju's snake_case. The SSO provider settings are not read.
+// The claim settings of scim_config.config that Raiju reads (claimsync.tov), kept under their Bifrost names.
+const SCIM_CLAIM_KEYS = ["claimsSyncMode", "roleResolutionStrategy", "userIdField", "rolesField", "teamIdsField", "attributeRoleMappings", "attributeTeamMappings", "attributeBusinessUnitMappings", "attributeAccessProfileMappings", "attributeProjectMappings"]
+
+// The sign-in settings each provider's config carries (they become the oidc section).
+const SCIM_SSO_KEYS = ["issuerUrl", "clientId", "clientSecret", "tenantId", "cloud", "serverUrl", "realm", "domain", "scopes", "additionalScopes"]
+
+function strOf(fs: Field[], key: string): string throws SyntaxError {
+  const r = strRaw(fs, key)
+  return r === undefined ? "" : try decodeString(r)
+}
+
+// The OIDC issuer of a scim_config provider: Okta's and the generic provider's issuerUrl, Entra's tenant on its cloud's
+// login host, Keycloak's realm under its server, Zitadel's domain, Google's accounts host. "" when the provider has no
+// OIDC sign-in here (SailPoint) or its settings are missing.
+export function scimIssuer(provider: string, cf: Field[]): string throws SyntaxError {
+  if (provider === "okta" || provider === "generic") return try strOf(cf, "issuerUrl")
+  if (provider === "entra") {
+    const tenant = try strOf(cf, "tenantId")
+    if (tenant === "") return ""
+    const cloud = try strOf(cf, "cloud")
+    const host = cloud === "gcc-high" || cloud === "dod" ? "https://login.microsoftonline.us" : "https://login.microsoftonline.com"
+    return `${host}/${tenant}/v2.0`
+  }
+  if (provider === "keycloak") {
+    let server = try strOf(cf, "serverUrl")
+    while (server.endsWith("/")) server = server.slice(0, server.byteLength - 1)
+    const realm = try strOf(cf, "realm")
+    return server === "" || realm === "" ? "" : `${server}/realms/${realm}`
+  }
+  if (provider === "zitadel") {
+    const d = try strOf(cf, "domain")
+    return d === "" ? "" : "https://" + d
+  }
+  if (provider === "google") return "https://accounts.google.com"
+  return ""
+}
+
+// The oidc section a scim_config provider's sign-in settings make: the issuer, client and scopes (generic's scopes
+// replace the defaults, Okta's additionalScopes add to them). The redirect URI is left out: the gateway's own
+// /api/oidc/callback on the host the sign-in came to.
+function scimOidc(provider: string, cf: Field[]): Field[] | undefined throws SyntaxError {
+  const issuer = try scimIssuer(provider, cf)
+  const client = strRaw(cf, "clientId")
+  if (issuer === "" || client === undefined) return undefined
+  let out: Field[] = []
+  add(&out, "enabled", "true")
+  add(&out, "issuer", quote(issuer))
+  add(&out, "client_id", client)
+  add(&out, "client_secret", strRaw(cf, "clientSecret"))
+  const scopes = find(cf, "scopes")
+  const extra = (try items(find(cf, "additionalScopes"))).filter((e) => e.startsWith("\""))
+  if (scopes !== undefined && scopes.startsWith("[")) add(&out, "scopes", scopes)
+  else if (extra.length > 0) add(&out, "scopes", "[" + [`"openid"`, `"profile"`, `"email"`].concat(extra).join(",") + "]")
+  return out
+}
+
+// scim_config becomes Raiju's scim_config: the switch, the provider, the provisioning token (scim.tov), the claim
+// settings (claimsync.tov) and trusted_networks. The provider's sign-in settings become the oidc section when the
+// config has none, and its authProxy becomes auth_proxy: Bifrost's camelCase names, Raiju's snake_case.
 function mapScim(inout top: Field[], inout notes: string[]): void throws SyntaxError {
   const raw = find(top, "scim_config")
   if (raw === undefined) return
@@ -710,21 +782,37 @@ function mapScim(inout top: Field[], inout notes: string[]): void throws SyntaxE
   const cf = try members(find(sf, "config"))
   let sout: Field[] = []
   add(&sout, "enabled", on ? "true" : "false")
+  const provRaw = strRaw(sf, "provider")
+  add(&sout, "provider", provRaw)
+  let cout: Field[] = []
   const tok = strRaw(cf, "provisioningToken")
   if (tok !== undefined) {
     if (tok.includes("vault.") || tok.includes("aws-sm.")) notes.push(`config: "scim_config.config.provisioningToken" uses a secret reference, which Raiju does not resolve; use env.VAR_NAME`)
-    else add(&sout, "config", build([{ key: "provisioningToken", raw: tok }]))
+    else add(&cout, "provisioningToken", tok)
   }
+  for (const k of SCIM_CLAIM_KEYS) add(&cout, k, find(cf, k))
+  if (cout.length > 0) add(&sout, "config", build(cout))
+  const tn = find(sf, "trusted_networks")
+  add(&sout, "trusted_networks", tn)
   put(&top, "scim_config", sout)
   if (!on) {
     if (find(cf, "authProxy") !== undefined) notes.push(`config: "scim_config" is off, so its authProxy is off too`)
     return
   }
   for (const f of sf) {
-    if (f.key !== "enabled" && f.key !== "config") notes.push(`config: "scim_config.${f.key}" is not supported by Raiju and is ignored`)
+    if (f.key !== "enabled" && f.key !== "config" && f.key !== "provider" && f.key !== "trusted_networks") notes.push(`config: "scim_config.${f.key}" is not supported by Raiju and is ignored`)
   }
+  if (tn !== undefined) notes.push(`config: "scim_config.trusted_networks" is kept but changes nothing: Raiju's identity-provider discovery calls have no private-address guard to bypass`)
+  const provider = provRaw === undefined ? "" : try decodeString(provRaw)
+  const sso = try scimOidc(provider, cf)
+  if (sso !== undefined) {
+    const have = find(top, "oidc")
+    if (have === undefined) setField(&top, "oidc", build(sso))
+    else if (have !== build(sso)) notes.push(`config: "oidc" is set, so the sign-in settings of "scim_config.config" are not used`)
+  } else if (on && provider !== "" && find(cf, "clientId") !== undefined) notes.push(`config: "scim_config" provider ${provider} has no OIDC sign-in settings Raiju can use; sign-in stays as the oidc section says`)
   for (const f of cf) {
-    if (f.key !== "authProxy" && f.key !== "provisioningToken") notes.push(`config: "scim_config.config.${f.key}" is not supported by Raiju and is ignored`)
+    if (f.key === "authProxy" || f.key === "provisioningToken" || SCIM_CLAIM_KEYS.includes(f.key) || SCIM_SSO_KEYS.includes(f.key)) continue
+    notes.push(`config: "scim_config.config.${f.key}" is not supported by Raiju and is ignored`)
   }
   const apRaw = find(cf, "authProxy")
   if (apRaw === undefined) return
@@ -773,11 +861,13 @@ function mapHealth(inout top: Field[], inout notes: string[]): void throws Synta
   let hc: Field[] = []
   notes.push(`config: "load_balancer_config" read as "health.adaptive"`)
   const lf = try members(lbRaw)
-  const on = rawBool(lf, "enabled") === true && rawBool(lf, "route_selection_enabled") !== false
-  add(&hc, "adaptive", on ? "true" : "false")
-  // the provider level's switches (router.tov directRefs); the tracker's tuning and the bootstrap metrics are not read
+  add(&hc, "adaptive", rawBool(lf, "enabled") === true ? "true" : "false")
+  // the provider level's switches (router.tov directRefs) and the key level's (route_selection: static weights when
+  // off, holds kept); the tracker's tuning and the bootstrap metrics are not read
   const ds = find(lf, "direction_selection_enabled")
   if (ds === "true" || ds === "false") add(&hc, "direction_selection", ds)
+  const rs = find(lf, "route_selection_enabled")
+  if (rs === "true" || rs === "false") add(&hc, "route_selection", rs)
   for (const k of ["append_fallbacks_to_pinned", "reroute_failed_directions", "prune_failed_fallbacks"]) {
     const v = find(lf, k)
     if (v === "true" || v === "false") add(&hc, k, v)
@@ -793,12 +883,25 @@ function mapPricing(inout top: Field[], inout notes: string[]): void throws Synt
   const praw = find(fw, "pricing")
   if (praw === undefined) return
   const pf = try members(praw)
-  ignored("framework.pricing", pf, ["model_parameters_url", "live_models_sync_interval"], &notes)
   const url = strRaw(pf, "pricing_url")
   const iv = find(pf, "pricing_sync_interval")
   const lib = strRaw(pf, "mcp_library_url")
   const libIv = find(pf, "mcp_library_sync_interval")
-  if (url === undefined && iv === undefined && lib === undefined && libIv === undefined) return
+  const mpu = strRaw(pf, "model_parameters_url")
+  let live = find(pf, "live_models_sync_interval")
+  if (live !== undefined && isNull(live)) live = undefined
+  if (live !== undefined) {
+    const lv = rawNum(pf, "live_models_sync_interval")
+    // Bifrost's floor: 0 turns the refresher off, any other value is at least 60 seconds
+    if (lv === undefined || lv < 0.0) {
+      notes.push(`config: framework.pricing.live_models_sync_interval must be a number of seconds; the default (3600) applies`)
+      live = undefined
+    } else if (lv > 0.0 && lv < 60.0) {
+      notes.push(`config: framework.pricing.live_models_sync_interval ${lv} is under the minimum of 60 seconds; 60 applies`)
+      live = "60"
+    }
+  }
+  if (url === undefined && iv === undefined && lib === undefined && libIv === undefined && mpu === undefined && live === undefined) return
   if (find(top, "pricing_sync") !== undefined) {
     notes.push(`config: "framework.pricing" is ignored: "pricing_sync" is set, and it wins`)
     return
@@ -809,6 +912,8 @@ function mapPricing(inout top: Field[], inout notes: string[]): void throws Synt
   add(&out, "interval_seconds", iv)
   add(&out, "mcp_library_url", lib)
   add(&out, "mcp_library_sync_interval", libIv)
+  add(&out, "model_parameters_url", mpu === `""` ? undefined : mpu)
+  add(&out, "live_models_sync_interval", live)
   put(&top, "pricing_sync", out)
 }
 
@@ -1176,10 +1281,10 @@ function mapGovernanceAnalyzer(inout top: Field[], inout notes: string[]): void 
   put(&top, "governance", rest)
 }
 
-// One complexity analyzer config (Bifrost's complexity_analyzer_config shape): tier boundaries and session
-// retention are noted, the classifier is read into complexity_router.
+// One complexity analyzer config (Bifrost's complexity_analyzer_config shape): tier boundaries are noted, the
+// classifier and session retention are read into complexity_router.
 function mapAnalyzerSection(af: Field[], ca: string, inout top: Field[], inout notes: string[]): void throws SyntaxError {
-  ignored(ca, af, ["tier_boundaries", "session"], &notes)
+  ignored(ca, af, ["tier_boundaries"], &notes)
   if (find(af, "tier_boundaries") !== undefined) notes.push(`config: "${ca}.tier_boundaries" is not copied to "complexity_router": they are on a 0 to 1 scale, and Raiju's simple_max_score and complex_min_score are on its own score scale`)
   try mapComplexityAnalyzer(af, ca, &top, &notes)
 }
@@ -1201,8 +1306,9 @@ function millisRaw(raw: string | undefined): string | undefined throws SyntaxErr
 // The analyzer's classifier, read into complexity_router. A decision classifier takes the decision block. The
 // semantic classifier (Bifrost's default, on when its block is present) takes the semantic block, with the tier
 // keyword lists as its exemplars (the legacy code and technical lists join medium, reasoning joins complex).
-// Without either, an llm block is the classifier, since Bifrost uses it as the semantic classifier's fallback;
-// Raiju runs one classifier and falls back to its heuristic, so beside a semantic block the llm block is noted.
+// Without either, an llm block is the classifier. Beside a semantic block, the llm or decision block is the semantic
+// classifier's fallback when semantic.fallback names it (Bifrost's LLMFallbackEnabled), and is noted otherwise; with no
+// fallback Raiju's heuristic answers. session (tier retention) is copied.
 function mapComplexityAnalyzer(af: Field[], path: string, inout top: Field[], inout notes: string[]): void throws SyntaxError {
   let classifier = ""
   const craw = strRaw(af, "classifier")
@@ -1213,10 +1319,17 @@ function mapComplexityAnalyzer(af: Field[], path: string, inout top: Field[], in
   const useDecision = classifier === "decision" && decision !== undefined
   const useSemantic = !useDecision && (classifier === "" || classifier === "semantic") && semantic !== undefined
   const useLLM = !useDecision && !useSemantic && llm !== undefined
+  let fallback = ""
+  if (useSemantic) {
+    const fr = strRaw(try members(semantic), "fallback")
+    if (fr !== undefined) fallback = (try decodeString(fr)).trim().toLowerCase()
+  }
+  const llmFallback = useSemantic && fallback === "llm" && llm !== undefined
+  const decisionFallback = useSemantic && fallback === "decision" && decision !== undefined
   if (classifier !== "" && classifier !== "decision" && !useSemantic) notes.push(`config: "${path}.classifier" is not supported by Raiju and is ignored`)
-  if (decision !== undefined && !useDecision) notes.push(`config: "${path}.decision" is not used: Raiju reads it only when classifier is "decision"`)
+  if (decision !== undefined && !useDecision && !decisionFallback) notes.push(`config: "${path}.decision" is not used: Raiju reads it only when classifier is "decision" or semantic.fallback is "decision"`)
   if (semantic !== undefined && !useSemantic) notes.push(`config: "${path}.semantic" is not used: classifier is "${classifier}"`)
-  if (llm !== undefined && useSemantic) notes.push(`config: "${path}.llm" is not used: Raiju runs the semantic classifier alone and falls back to its heuristic`)
+  if (llm !== undefined && useSemantic && !llmFallback) notes.push(`config: "${path}.llm" is not used: semantic.fallback does not name it, so Raiju's heuristic answers when the semantic classifier names no tier`)
   if (!useSemantic) ignored(path, af, ["keywords"], &notes)
   if (!useDecision && !useLLM && !useSemantic) return
   if (find(top, "complexity_router") !== undefined) {
@@ -1235,10 +1348,18 @@ function mapComplexityAnalyzer(af: Field[], path: string, inout top: Field[], in
     used = "semantic"
     add(&cr, "classifier", quote("semantic"))
     add(&cr, "semantic", try mappedSemantic(try members(semantic), try members(find(af, "keywords")), path, &notes))
+    if (llmFallback) add(&cr, "llm", try mappedModel(try members(llm), `${path}.llm`, false, &notes))
+    if (decisionFallback) add(&cr, "decision", try mappedModel(try members(decision), `${path}.decision`, true, &notes))
   } else {
     add(&cr, "classifier", quote("llm"))
     const lm = try mappedModel(try members(llm), `${path}.llm`, false, &notes)
     add(&cr, "llm", lm)
+  }
+  // session tier retention: {enabled}
+  const sess = find(af, "session")
+  if (sess !== undefined && !isNull(sess)) {
+    const en = rawBool(try members(sess), "enabled")
+    if (en !== undefined) add(&cr, "session", `{"enabled":${en ? "true" : "false"}}`)
   }
   put(&top, "complexity_router", cr)
   notes.push(`config: complexity analyzer "${path}" read into "complexity_router": classifier ${used}`)
@@ -1254,7 +1375,10 @@ function mappedSemantic(sf: Field[], kw: Field[], path: string, inout notes: str
   if (t !== undefined && t !== "0") add(&out, "timeout_ms", t)
   add(&out, "min_similarity", find(sf, "min_similarity"))
   add(&out, "message_history_count", find(sf, "message_history_count"))
-  ignored(`${path}.semantic`, sf, ["count_toward_budgets", "vector_store"], &notes)
+  add(&out, "fallback", strRaw(sf, "fallback"))
+  const cb = find(sf, "count_toward_budgets")
+  if (cb === "true" || cb === "false") add(&out, "count_toward_budgets", cb)
+  add(&out, "vector_store", strRaw(sf, "vector_store"))
   const medium = (try strings(find(kw, "medium_keywords"))).concat(try strings(find(kw, "code_keywords"))).concat(try strings(find(kw, "technical_keywords")))
   const complex = (try strings(find(kw, "complex_keywords"))).concat(try strings(find(kw, "reasoning_keywords")))
   let ex: Field[] = []
@@ -1279,6 +1403,8 @@ function mappedModel(bf: Field[], path: string, decisionBlock: bool, inout notes
   } else {
     add(&out, "prompt", strRaw(bf, "prompt"))
     add(&out, "message_history_count", find(bf, "message_history_count"))
+    const cb = find(bf, "count_toward_budgets")
+    if (cb === "true" || cb === "false") add(&out, "count_toward_budgets", cb)
   }
   return build(out)
 }
@@ -1630,7 +1756,7 @@ function rateLimitOf(rf: Field[], inout rates: string[]): string | undefined thr
 // provider config keeps the provider's models, weight and first budget or rate limit. Deny-by-default
 // (allow_all_providers false) is written as a deny of every model, since Raiju allows every model of a
 // profile's provider when no list says otherwise. What Raiju cannot express is noted.
-function mapAccessProfiles(inout top: Field[], inout notes: string[]): void throws SyntaxError {
+function mapAccessProfiles(inout top: Field[], vmIds: Map<string, string>, inout notes: string[]): void throws SyntaxError {
   const raw = find(top, "access_profiles")
   if (raw === undefined) return
   top = without(top, ["access_profiles"])
@@ -1708,9 +1834,20 @@ function mapAccessProfiles(inout top: Field[], inout notes: string[]): void thro
     if (rawBool(pf, "calendar_aligned") === true) notes.push(`config: access profile "${name}" calendar_aligned is not applied`)
     let vms: string[] = []
     for (const vel of try items(find(pf, "virtual_mcps"))) {
-      const vn = rawStr(try members(vel), "virtual_mcp_name")
-      if (vn !== undefined) vms.push(vn)
-      else notes.push(`config: access profile "${name}" virtual_mcp_id is not applied: use virtual_mcp_name`)
+      const vf = try members(vel)
+      // virtual_mcp_id wins over virtual_mcp_name when both are set, as in Bifrost; it names one of mcp.virtual_mcps
+      const vid = find(vf, "virtual_mcp_id")
+      if (vid !== undefined && !isNull(vid)) {
+        const byId = vmIds.get(vid.trim())
+        if (byId !== undefined) {
+          if (!vms.includes(byId)) vms.push(byId)
+        } else {
+          notes.push(`config: access profile "${name}" virtual_mcp_id ${vid.trim()} names no virtual MCP in mcp.virtual_mcps; it is not granted`)
+        }
+        continue
+      }
+      const vn = rawStr(vf, "virtual_mcp_name")
+      if (vn !== undefined && !vms.includes(vn)) vms.push(vn)
     }
     if (find(pf, "virtual_mcps") !== undefined) add(&out, "virtual_mcps", quotedArray(vms))
     // the agents the profile grants (Bifrost Enterprise's agent_grants, [{agent_name}]), as they are
@@ -1755,8 +1892,9 @@ export function normalize(configText: string): { text: string, notes: string[] }
   try mapRoleDac(&top)
   try mapStorageRefs(&top)
   try mapClient(&top, &notes)
+  const vmIds = try virtualMcpIds(top)
   try mapMcp(&top, &notes)
-  try mapAccessProfiles(&top, &notes)
+  try mapAccessProfiles(&top, vmIds, &notes)
   try mapAlerting(&top, &notes)
   try mapAudit(&top, &notes)
   try mapCluster(&top, &notes)
@@ -2044,19 +2182,51 @@ test("passes cluster discovery through and maps scim_config's authProxy", () => 
   const sc = try fields(find(try fields(r.text), "scim_config")!)
   expect(rawBool(sc, "enabled")).toBe(true)
   expect(find(sc, "config")).toBe(undefined)
-  expect(r.notes.includes(`config: "scim_config.config.clientId" is not supported by Raiju and is ignored`)).toBe(true)
+  // an Okta client with no issuer makes no sign-in settings
+  expect(r.notes.includes(`config: "scim_config" provider okta has no OIDC sign-in settings Raiju can use; sign-in stays as the oidc section says`)).toBe(true)
+  expect(find(try fields(r.text), "oidc")).toBe(undefined)
   const off = try normalize(`{ "scim_config": { "enabled": false, "config": { "authProxy": { "enabled": true, "provider": "generic" } } } }`)
   expect(find(try fields(off.text), "auth_proxy")).toBe(undefined)
   expect(rawBool(try fields(find(try fields(off.text), "scim_config")!), "enabled")).toBe(false)
 })
 
-test("maps scim_config's provisioning token as the switch's config, and notes the rest", () => {
-  const r = try normalize(`{ "scim_config": { "enabled": true, "provider": "entra", "config": { "provisioningToken": "env.SCIM_TOKEN", "claimsSyncMode": "scim" } } }`)
-  const sc = try fields(find(try fields(r.text), "scim_config")!)
+test("maps scim_config's provisioning token, provider, claim settings and trusted networks, and notes the rest", () => {
+  const r = try normalize(`{ "scim_config": { "enabled": true, "provider": "entra", "trusted_networks": [{ "cidr": "10.0.0.0/8" }], "config": { "provisioningToken": "env.SCIM_TOKEN", "claimsSyncMode": "scim",
+    "attributeRoleMappings": [{ "attribute": "roles", "value": "Admins", "role": "admin" }], "bulkSyncInterval": "12h" } } }`)
+  const top = try fields(r.text)
+  const sc = try fields(find(top, "scim_config")!)
   expect(rawBool(sc, "enabled")).toBe(true)
-  expect(find(try fields(find(sc, "config")!), "provisioningToken")).toBe(`"env.SCIM_TOKEN"`)
-  expect(r.notes.includes(`config: "scim_config.config.claimsSyncMode" is not supported by Raiju and is ignored`)).toBe(true)
-  expect(r.notes.includes(`config: "scim_config.provider" is not supported by Raiju and is ignored`)).toBe(true)
+  expect(rawStr(sc, "provider")).toBe("entra")
+  const cf = try fields(find(sc, "config")!)
+  expect(find(cf, "provisioningToken")).toBe(`"env.SCIM_TOKEN"`)
+  expect(rawStr(cf, "claimsSyncMode")).toBe("scim")
+  expect(find(cf, "attributeRoleMappings")).toBe(`[{ "attribute": "roles", "value": "Admins", "role": "admin" }]`)
+  expect(find(sc, "trusted_networks")).toBe(`[{ "cidr": "10.0.0.0/8" }]`)
+  expect(r.notes.includes(`config: "scim_config.config.claimsSyncMode" is not supported by Raiju and is ignored`)).toBe(false)
+  expect(r.notes.includes(`config: "scim_config.config.bulkSyncInterval" is not supported by Raiju and is ignored`)).toBe(true)
+  expect(r.notes.some((n) => n.startsWith(`config: "scim_config.trusted_networks" is kept but changes nothing`))).toBe(true)
+})
+
+test("a scim_config provider's sign-in settings become the oidc section", () => {
+  const entra = try normalize(`{ "scim_config": { "enabled": true, "provider": "entra", "config": { "tenantId": "t-1", "clientId": "c-1", "clientSecret": "env.ENTRA_SECRET", "cloud": "gcc-high" } } }`)
+  const o = try fields(find(try fields(entra.text), "oidc")!)
+  expect(rawBool(o, "enabled")).toBe(true)
+  expect(rawStr(o, "issuer")).toBe("https://login.microsoftonline.us/t-1/v2.0")
+  expect(rawStr(o, "client_id")).toBe("c-1")
+  expect(rawStr(o, "client_secret")).toBe("env.ENTRA_SECRET")
+  const kc = try normalize(`{ "scim_config": { "enabled": true, "provider": "keycloak", "config": { "serverUrl": "https://kc.example.com/", "realm": "prod", "clientId": "raiju", "clientSecret": "s" } } }`)
+  expect(rawStr(try fields(find(try fields(kc.text), "oidc")!), "issuer")).toBe("https://kc.example.com/realms/prod")
+  const okta = try normalize(`{ "scim_config": { "enabled": true, "provider": "okta", "config": { "issuerUrl": "https://acme.okta.com/oauth2/default", "clientId": "o", "clientSecret": "s", "additionalScopes": ["groups"] } } }`)
+  const ok = try fields(find(try fields(okta.text), "oidc")!)
+  expect(find(ok, "scopes")).toBe(`["openid","profile","email","groups"]`)
+  expect(rawStr(try fields(find(try fields((try normalize(`{ "scim_config": { "enabled": true, "provider": "google", "config": { "domain": "acme.com", "clientId": "g" } } }`)).text), "oidc")!), "issuer")).toBe("https://accounts.google.com")
+  // an oidc section of its own wins
+  const own = try normalize(`{ "oidc": { "enabled": true, "issuer": "https://idp.example.com", "client_id": "mine", "redirect_uri": "https://gw/api/oidc/callback" }, "scim_config": { "enabled": true, "provider": "zitadel", "config": { "domain": "z.example.com", "clientId": "z" } } }`)
+  expect(rawStr(try fields(find(try fields(own.text), "oidc")!), "client_id")).toBe("mine")
+  expect(own.notes.includes(`config: "oidc" is set, so the sign-in settings of "scim_config.config" are not used`)).toBe(true)
+  // read again (the saved file), the settings it made raise no note
+  const again = try normalize(entra.text)
+  expect(again.notes.some((n) => n.includes(`"oidc" is set`))).toBe(false)
 })
 
 test("maps circuit_breaker_config to circuit_breaker_policies and load_balancer_config to health", () => {
@@ -2081,7 +2251,10 @@ test("maps circuit_breaker_config to circuit_breaker_policies and load_balancer_
   expect(rawBool(h, "direction_selection")).toBe(true)
   expect(rawBool(h, "prune_failed_fallbacks")).toBe(true)
   const lb = try normalize(`{ "load_balancer_config": { "enabled": true, "route_selection_enabled": false } }`)
-  expect(rawBool(try fields(find(try fields(lb.text), "health")!), "adaptive")).toBe(false)
+  // route selection off keeps adaptive balancing (holds, the provider level) and turns off adaptive key weights only
+  const lbh = try fields(find(try fields(lb.text), "health")!)
+  expect(rawBool(lbh, "adaptive")).toBe(true)
+  expect(rawBool(lbh, "route_selection")).toBe(false)
 })
 
 test("framework.pricing's MCP library keys reach pricing_sync", () => {
@@ -2099,7 +2272,16 @@ test("reads framework.pricing as pricing_sync and keeps framework", () => {
   expect(find(ps, "interval_seconds")).toBe("3600")
   expect(find(try fields(r.text), "framework")).toBeDefined()
   expect(r.notes.includes(`config: "framework.pricing" read as "pricing_sync"`)).toBe(true)
-  expect(r.notes.includes(`config: "framework.pricing.model_parameters_url" is not supported by Raiju and is ignored`)).toBe(true)
+  expect(rawStr(ps, "model_parameters_url")).toBe("https://p.example")
+  expect(r.notes.some((n) => n.includes("model_parameters_url"))).toBe(false)
+  // live_models_sync_interval: 0 is kept (the refresher off), a value under 60 s is raised to 60
+  const off = try fields(find(try fields((try normalize(`{ "framework": { "pricing": { "live_models_sync_interval": 0 } } }`)).text), "pricing_sync")!)
+  expect(find(off, "live_models_sync_interval")).toBe("0")
+  const low = try normalize(`{ "framework": { "pricing": { "live_models_sync_interval": 10, "model_parameters_url": "" } } }`)
+  const lps = try fields(find(try fields(low.text), "pricing_sync")!)
+  expect(find(lps, "live_models_sync_interval")).toBe("60")
+  expect(find(lps, "model_parameters_url")).toBeUndefined()
+  expect(low.notes.some((n) => n.includes("under the minimum of 60 seconds"))).toBe(true)
 })
 
 test("maps mcp.virtual_mcps to virtual_mcps with Raiju tool sources", () => {
@@ -2969,12 +3151,46 @@ test("governance.complexity_analyzer_config is read: the semantic classifier wit
   expect(find(sm, "min_similarity")).toBe("0.3")
   expect(find(sm, "message_history_count")).toBe("2")
   expect(find(sm, "exemplars")).toBe(`{"simple":["hi"],"medium":["summarize"],"complex":["design a system"]}`)
-  expect(r.notes.includes(`config: "governance.complexity_analyzer_config.session" is not supported by Raiju and is ignored`)).toBe(true)
-  expect(r.notes.includes(`config: "governance.complexity_analyzer_config.semantic.vector_store" is not supported by Raiju and is ignored`)).toBe(true)
+  // session retention and the semantic storage mode are copied
+  expect(find(cr, "session")).toBe(`{"enabled":true}`)
+  expect(rawStr(sm, "vector_store")).toBe("embedded")
+  expect(r.notes.some((n) => n.includes("session"))).toBe(false)
+  // no fallback named: the llm block is noted, not copied
   expect(r.notes.some((n) => n.includes(`"governance.complexity_analyzer_config.llm" is not used`))).toBe(true)
+  expect(find(cr, "llm")).toBeUndefined()
   // the governance copy wins over the plugin's
   expect(r.notes.includes(`config: "plugins[routing].config.complexity_analyzer_config" is not copied: "complexity_router" is already set`)).toBe(true)
   expect((try unknownKeys(`{"governance":{"complexity_analyzer_config":{}}}`)).length).toBe(0)
+})
+
+test("an access profile's virtual_mcp_id names a virtual MCP by its id, and wins over the name", () => {
+  const r = try normalize(`{
+    "mcp": { "client_configs": [ { "client_id": "c-git", "name": "git", "connection_type": "http", "connection_string": "https://g.example/mcp" } ],
+      "virtual_mcps": [ { "id": 7, "name": "dev", "endpoint_slug": "dev-tools", "enabled": true, "tools": [] }, { "id": 8, "name": "ops", "enabled": true, "tools": [] } ] },
+    "access_profiles": [ { "name": "Team", "allow_all_providers": true, "virtual_mcps": [ { "virtual_mcp_id": 7 }, { "virtual_mcp_name": "ops" }, { "virtual_mcp_id": 8, "virtual_mcp_name": "dev" }, { "virtual_mcp_id": 99 } ] } ]
+  }`)
+  const gov = try fields(find(try fields(r.text), "governance") ?? "{}")
+  const ap = try fields((try elements(find(gov, "access_profiles") ?? "[]"))[0]!)
+  expect(find(ap, "virtual_mcps")).toBe(`["dev-tools","ops"]`)
+  expect(r.notes.includes(`config: access profile "Team" virtual_mcp_id 99 names no virtual MCP in mcp.virtual_mcps; it is not granted`)).toBe(true)
+})
+
+test("the semantic fallback brings its llm block, with the budgets flags and the vector store mode", () => {
+  const r = try normalize(`{ "governance": { "complexity_analyzer_config": {
+    "semantic": { "provider": "openai", "embedding_model": "e", "fallback": "llm", "count_toward_budgets": true, "vector_store": "vector_store" },
+    "llm": { "provider": "openai", "model": "gpt-4o-mini", "count_toward_budgets": false },
+    "session": { "enabled": false }
+  } } }`)
+  const cr = try fields(find(try fields(r.text), "complexity_router") ?? "{}")
+  const sm = try fields(find(cr, "semantic") ?? "{}")
+  expect(rawStr(sm, "fallback")).toBe("llm")
+  expect(find(sm, "count_toward_budgets")).toBe("true")
+  expect(rawStr(sm, "vector_store")).toBe("vector_store")
+  const lm = try fields(find(cr, "llm") ?? "{}")
+  expect(rawStr(lm, "model")).toBe("gpt-4o-mini")
+  expect(find(lm, "count_toward_budgets")).toBe("false")
+  expect(find(cr, "session")).toBe(`{"enabled":false}`)
+  expect(r.notes.some((n) => n.includes("is not used"))).toBe(false)
 })
 
 test("the analyzer's legacy keyword lists join the medium and complex exemplars", () => {

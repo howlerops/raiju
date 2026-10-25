@@ -1,7 +1,7 @@
 // Management-side state shared by both servers: who may use /api (RBAC), the
 // audit log of changes, the alerting loop, the gateway's own MCP server and
 // cluster counters. One instance per process; rebuilt parts follow config changes.
-import { Config, AlertsConfig, LogExportsConfig, LogExporterConfig, PricingSyncConfig, providerNames, getEnv, resolveEnv, PluginSpec, WasmLimitsSpec } from "./config"
+import { Config, AlertsConfig, LogExportsConfig, LogExporterConfig, PricingSyncConfig, providerNames, getEnv, resolveEnv, PluginSpec, WasmLimitsSpec, AdminUserConfig } from "./config"
 import { listJson, sessionJson, sessionSummaryJson, detailJson, uaRoute, listFilter, unsupportedFilter, pageOfQuery, pctDecode, Page, timeOf } from "./logapi"
 import { Incident } from "./holds"
 import { WsTickets } from "./wsticket"
@@ -25,7 +25,8 @@ import { AccessProfile, AgentConfig, BudgetConfig, BudgetOverride, CircuitPolicy
 import { effectiveBudgetLimit } from "./governance"
 import { rfc3339Of } from "./vkexpiry"
 import { flushVaultCache } from "./secrets"
-import { ConfigStore, checkAdmin, sweepExpiredKeys, sealStored, openStored, RESOURCES, OPERATIONS, CONFIG_NS, CONFIG_KEY, ConfigGen, genOf, textSha } from "./store"
+import { ConfigStore, checkAdmin, sweepExpiredKeys, sealStored, openStored, RESOURCES, OPERATIONS, CONFIG_NS, CONFIG_KEY, ConfigGen, genOf, textSha, randomId } from "./store"
+import { mergedClaims, ruleAttributes, resolveRole, resolveGrants, appliedUser, findUser, Directory } from "./claimsync"
 import { Held, KeyCtx, handleApiKeys, newKeyValue } from "./apikeys"
 import { keyBudgetIds, permissionDocs, permissionIds, permissionMap, rolePairs, userObjectJson, userKeysJson, PermissionDoc, creationPolicy, heldProfiles, PROPAGATED_FIELDS, propagateProfileKeys, parseOverride } from "./govapi"
 
@@ -39,7 +40,7 @@ type QuotaRateUsage = { kind: string, used: f64, limit: f64 }
 type QuotaRate = { id: string, token_max_limit?: int, token_reset_duration?: string, request_max_limit?: int, request_reset_duration?: string, usage: QuotaRateUsage[], source_type?: string, source_id?: string, source_name?: string }
 // One per-model limit of a key in the quota view (Bifrost's quotaModelUsage); no provider means every provider.
 type QuotaModel = { model_name: string, provider?: string, budgets: QuotaBudget[], rate_limit?: QuotaRate }
-import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, roleAllows, isBuiltinRole, customRole, provisioned, disabledNamed, anyRoleId, userByEmail } from "./rbac"
+import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, roleAllows, isBuiltinRole, customRole, provisioned, disabledNamed, anyRoleId, userByEmail, systemRole, customRoles } from "./rbac"
 import { DataScope, allScope, noScope, scopeOf, inScope } from "./scope"
 import { AuditEvent, AuditLog, actionFor, auditListJson, auditQueryOf, maskDetail, profileAuditJson } from "./audit"
 import { isCacheId } from "./cache"
@@ -55,7 +56,7 @@ import { mergeConfig, changedTargets, targetAuthMessage } from "./pluginmerge"
 import { agentQuery, selectedCalls, pageOf, agentStatsJson, topAgentsJson, agentHistogramJson, agentFilterDataJson, agentDetailJson, rawCapture, deleteIds, groupingActive, groupedCalls, withChildCount, hydratedJson, historyPageJson, truthy } from "./agenthistory"
 import { H2Tls } from "./h2"
 import { findAgent, endpointOf, restEndpointOf, gatewayCard, withGrpcInterface, publicBase, aggregateCard, contextOfParams, contextOfResult, refreshAll, withCard, fetchCard, CARD_PATH, JSON_RPC_SUFFIX, REST_PREFIX } from "./agents"
-import { Call, PushSpec, CallCancel, StreamTap, tapped, rpcCall, restCall, restRequestOf, methodOf, rpcIdOf, rpcErrorBody, rpcEvent, restEvent, restErrorBody, restErrorOfStatus, httpOfCode, codeOfRestError, relayMapped, pushSpecOf, pushUpstreamParams, pushViewJson, pushListJson, pushIdOfResult, embeddedPush, rewriteEmbedded, taskIdOfResult } from "./a2a"
+import { Call, PushSpec, CallCancel, StreamTap, tapped, rpcCall, restCall, restRequestOf, methodOf, rpcIdOf, rpcErrorBody, rpcEvent, restEvent, restErrorBody, restErrorOfStatus, httpOfCode, codeOfRestError, relayMapped, pushSpecOf, pushUpstreamParams, pushViewJson, pushListJson, pushIdOfResult, embeddedPush, rewriteEmbedded, taskIdOfResult, requestTypeOf, unauthorizedInfo, grantDeniedRpc, grantDeniedRest } from "./a2a"
 import { PushDelivery, pushStore, mintToken, acceptPush, callbackConnectProblem, deliverDue, configView, PENDING_PREFIX, INGRESS_SUFFIX, TOKEN_HEADER } from "./a2apush"
 import { pushShare, cardShare, cardOf, adoptCard, takePeriod, CardWire, CARD_NS } from "./a2ashare"
 import { FileLease } from "./filelease"
@@ -289,6 +290,16 @@ export function returnPath(raw: string): string {
 }
 
 // The names a single sign-on identity is known by in governance: its subject and its email, lower-cased.
+// The OIDC settings of one sign-in: a configured redirect URI as it is, else the gateway's own callback on the
+// host the request came to (the oidc section scim_config's settings make carries none).
+function withRedirect(oc: OidcConfig, reqUrl: string): OidcConfig {
+  if ((oc.redirect_uri ?? "") !== "") return oc
+  const u = URL.parse(reqUrl)
+  let n = oc
+  n.redirect_uri = (u === undefined ? "" : u.origin) + "/api/oidc/callback"
+  return n
+}
+
 function ssoNames(sub: string, email: string | undefined): string[] {
   return [sub, (email ?? "").toLowerCase()]
 }
@@ -388,13 +399,31 @@ function a2aDeny(rest: bool, status: int, message: string, type: string): Respon
   return new Response(restErrorOfStatus(status, message), { status: status, headers: h })
 }
 
+// What the gate decided (Ops.a2aGate): refusal is the answer when a check failed. grant marks a refusal by the agent's
+// grants, which the protocol bindings answer as A2A's permission error (-31403) once the call is read.
+type A2aGate = { refusal: Response | undefined, vk: VirtualKeyConfig | undefined, status: int, message: string, grant: bool }
+
 // The refusal of a gate check: the answer in the caller's binding, with its status and message for the gRPC binding.
-function gateRefusal(rest: bool, status: int, message: string, type: string, vk: VirtualKeyConfig | undefined): { refusal: Response | undefined, vk: VirtualKeyConfig | undefined, status: int, message: string } {
-  return { refusal: a2aDeny(rest, status, message, type), vk: vk, status: status, message: message }
+function gateRefusal(rest: bool, status: int, message: string, type: string, vk: VirtualKeyConfig | undefined): A2aGate {
+  return { refusal: a2aDeny(rest, status, message, type), vk: vk, status: status, message: message, grant: false }
 }
 
-// The answer of the gRPC binding's gate (Ops.a2aGrpcGate): status 0 when the call may go on.
-export type GrpcGate = { status: int, message: string, agent: AgentConfig | undefined, vk: VirtualKeyConfig | undefined, base: string }
+// The answer of the gRPC binding's gate (Ops.a2aGrpcGate): status 0 when the call may go on. grant: refused by the
+// agent's grants (PERMISSION_DENIED with the UNAUTHORIZED ErrorInfo, as a2a-go sends ErrUnauthorized).
+export type GrpcGate = { status: int, message: string, agent: AgentConfig | undefined, vk: VirtualKeyConfig | undefined, base: string, grant: bool }
+
+// A refused grant on the agent's card: Bifrost's card handler answers http.Error with the status text.
+function forbiddenText(): Response {
+  const h: Record<string, string> = new Map()
+  h.set("content-type", "text/plain; charset=utf-8")
+  h.set("x-content-type-options", "nosniff")
+  return new Response("Forbidden\n", { status: 403, headers: h })
+}
+
+// The RFC 3339 time (seconds, UTC) a2a-go stamps on an error's ErrorInfo.
+function errorStamp(): string {
+  return isoMs(Date.now()).slice(0, 19) + "Z"
+}
 
 // Whether an If-None-Match value names the tag.
 function etagMatches(header: string, tag: string): bool {
@@ -1029,6 +1058,7 @@ export class Ops {
   // model parameters (GET /api/models/parameters), loaded when first asked and then daily
   private params: Map<string, string> = new Map()
   private paramsAt: f64 = -1.0
+  private paramsUrl = ""
   // catalog attributes (PUT /api/models/catalog): "provider/model" to the attributes' JSON text
   private catalogAttrs: Map<string, string> = new Map()
   audit: AuditLog | undefined = undefined
@@ -1077,6 +1107,8 @@ export class Ops {
   sweeping = false
   sending = false
   oidcCfg: OidcConfig | undefined = undefined
+  // the oidc section as configured (before env. references are read), to tell a changed one
+  oidcKey: string = ""
   discovery: Discovery | undefined = undefined
   flows = new OidcFlows()
   // where a sign-in started from an MCP consent page returns, by the sign-in's state
@@ -1201,11 +1233,21 @@ export class Ops {
     this.configureRetained()
     this.configureExporters(cfg.exporters ?? [])
     const oc = cfg.oidc
-    const same = oc !== undefined && this.oidcCfg !== undefined && JSON.stringify(oc) === JSON.stringify(this.oidcCfg)
+    const key = oc === undefined ? "" : JSON.stringify(oc)
+    const same = oc !== undefined && this.oidcCfg !== undefined && key === this.oidcKey
     if (!same) {
       this.discovery = undefined
-      this.oidcCfg = oc !== undefined && oc.enabled ? oc : undefined
-      if (oc !== undefined) this.sessions = new UiSessions(oc.session_ttl_seconds ?? 28800)
+      this.oidcKey = key
+      // the issuer, client and secret may be env. references (scim_config's settings allow them)
+      let ro = oc
+      if (ro !== undefined) {
+        ro.issuer = resolveEnv(ro.issuer)
+        ro.client_id = resolveEnv(ro.client_id)
+        const sec = ro.client_secret
+        if (sec !== undefined) ro.client_secret = resolveEnv(sec)
+      }
+      this.oidcCfg = ro !== undefined && ro.enabled ? ro : undefined
+      if (ro !== undefined) this.sessions = new UiSessions(ro.session_ttl_seconds ?? 28800)
     }
   }
 
@@ -2157,16 +2199,27 @@ export class Ops {
 
   private async loadParams(): Promise<void> {
     const now = Date.now()
-    if (this.paramsAt >= 0.0 && now - this.paramsAt < 86400000.0) return
+    const ps = this.store.cfg.pricing_sync
+    // framework.pricing.model_parameters_url, else the datasheet's /model-parameters; a file:// URL is read from disk
+    const url = ps === undefined ? "" : (ps.model_parameters_url ?? (trimSlash(ps.url ?? "https://getbifrost.ai/datasheet") + "/model-parameters"))
+    // a changed URL is read now
+    if (this.paramsAt >= 0.0 && now - this.paramsAt < 86400000.0 && url === this.paramsUrl) return
     if (this.params.size === 0) this.params = fallbackParams()
     this.paramsAt = now
-    const ps = this.store.cfg.pricing_sync
+    this.paramsUrl = url
     if (ps === undefined) return
-    const base = trimSlash(ps.url ?? "https://getbifrost.ai/datasheet")
     try {
-      const r = await getText(base + "/model-parameters")
-      if (r.status !== 200) throw new Error(`HTTP ${r.status}`)
-      const next = parseParams(r.body)
+      let body = ""
+      if (url.startsWith("file://")) {
+        let path = url.slice(7)
+        if (path.startsWith("localhost/")) path = path.slice(9)
+        body = try readFileSync(path, "utf8")
+      } else {
+        const r = await getText(url)
+        if (r.status !== 200) throw new Error(`HTTP ${r.status}`)
+        body = r.body
+      }
+      const next = parseParams(body)
       if (next.size > 0) this.params = next
     } catch (e) {
       console.error(`raiju: model parameters: ${e.message}`)
@@ -2474,7 +2527,7 @@ export class Ops {
   adaptiveIncidents(): Reply {
     const now = Date.now()
     const rows: string[] = []
-    for (const inc of this.engine.health.holds.incidentList()) {
+    for (const inc of this.engine.health.holds.allIncidents()) {
       if (inc.resolvedAt > 0) continue
       rows.push(JSON.stringify(incidentRow(inc, now)))
     }
@@ -2511,7 +2564,7 @@ export class Ops {
     const offset = offsetRaw === undefined ? 0 : parseInt(offsetRaw) ?? 0
     if (offset < 0) return badRequest("offset must not be negative")
     const matched: { inc: Incident, status: string, dur: f64 }[] = []
-    for (const inc of this.engine.health.holds.incidentList()) {
+    for (const inc of this.engine.health.holds.allIncidents()) {
       const end = inc.resolvedAt > 0 ? inc.resolvedAt : now
       if (end < from || inc.openedAt > to) continue
       const st = incidentStatus(inc)
@@ -3442,13 +3495,17 @@ export class Ops {
   // The checks every call under /agents/a2a/{name} passes: the agent is registered and enabled, the caller's
   // virtual key (required when auth is enforced), the agent's grants, and the key's budgets. count also takes
   // the key's request and token limits (a call does; discovery does not). refusal is the answer when one fails.
-  a2aGate(agent: AgentConfig | undefined, name: string, h: Hdrs, rest: bool, count: bool): { refusal: Response | undefined, vk: VirtualKeyConfig | undefined, status: int, message: string } {
+  a2aGate(agent: AgentConfig | undefined, name: string, h: Hdrs, rest: bool, count: bool): A2aGate {
     if (agent === undefined || agent.enabled === false) return gateRefusal(rest, 404, `no agent named ${name}`, "not_found_error", undefined)
     const vk = this.engine.gov.findKey(h)
     if (this.engine.gov.enforce && vk === undefined) return gateRefusal(rest, 401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", vk)
-    // the agent's own grants, the key's, its access profiles' and the project the call names (governance.tov agentAccess)
+    // the agent's own grants, the key's, its access profiles' and the project the call names (governance.tov agentAccess):
+    // Bifrost's governance refuses in its PreA2AHook with its own message; the bindings answer it as A2A's -31403
     const access = this.engine.gov.agentAccess(h, agent)
-    if (!access.allowed) return gateRefusal(rest, 403, `this key may not call the agent ${name}: ${access.message}`, "permission_error", vk)
+    if (!access.allowed) {
+      const r = gateRefusal(rest, 403, access.message, "permission_error", vk)
+      return { refusal: r.refusal, vk: vk, status: 403, message: access.message, grant: true }
+    }
     const gate = this.engine.gov.admitTool(h)
     if (gate.kind === "denial") return gateRefusal(rest, gate.status, gate.message, gate.type, vk)
     // an agent whose card is not fetched yet has no endpoint to call: refused here, in every binding, before any
@@ -3464,7 +3521,21 @@ export class Ops {
       const limited = this.engine.gov.checkLimits(vk, [], rls)
       if (limited.kind === "denial") return gateRefusal(rest, limited.status, limited.message, limited.type, vk)
     }
-    return { refusal: undefined, vk: vk, status: 200, message: "" }
+    return { refusal: undefined, vk: vk, status: 200, message: "", grant: false }
+  }
+
+  // A refused grant on a protocol call, once the call is read (Bifrost's governance decides in the A2A plugin pipeline,
+  // after the SDK decoded the request): JSON-RPC error -31403 in a 200, REST 403 PERMISSION_DENIED, each with the
+  // UNAUTHORIZED ErrorInfo naming the agent, the request type and the request id.
+  grantDenied(rest: bool, agent: string, call: Call, rpcId: string, message: string, h: Hdrs): Response {
+    const info = this.grantInfo(agent, call.op, h, rest ? call.taskId : "")
+    if (rest) return json(403, grantDeniedRest(message, info))
+    return json(200, grantDeniedRpc(rpcId, message, info))
+  }
+
+  // The ErrorInfo of a refused grant for an operation (a2a.tov unauthorizedInfo), also sent by the gRPC binding.
+  grantInfo(agent: string, op: string, h: Hdrs, taskId: string): string {
+    return unauthorizedInfo(agent, requestTypeOf(op), h.get("x-request-id") ?? newId("req_"), taskId, errorStamp())
   }
 
   // The agent a call names, as this worker serves it. A worker that does not hold the agent's card yet first reads the
@@ -3528,13 +3599,13 @@ export class Ops {
   // even where auth is not enforced, as Bifrost does), then a2aGate. status is 0 when the call may go on.
   a2aGrpcGate(name: string, h: Hdrs, presented: bool): GrpcGate {
     const base = publicBase(this.engine.cfg.client?.a2a_external_client_url, "")
-    if (base === "") return { status: 503, message: "agent gateway disabled: configure client.a2a_external_client_url", agent: undefined, vk: undefined, base: base }
+    if (base === "") return { status: 503, message: "agent gateway disabled: configure client.a2a_external_client_url", agent: undefined, vk: undefined, base: base, grant: false }
     const agent = this.heldAgent(name)
-    if (agent === undefined || agent.enabled === false) return { status: 404, message: "agent not found", agent: undefined, vk: undefined, base: base }
-    if (presented && this.engine.gov.findKey(h) === undefined) return { status: 401, message: "authentication required", agent: agent, vk: undefined, base: base }
+    if (agent === undefined || agent.enabled === false) return { status: 404, message: "agent not found", agent: undefined, vk: undefined, base: base, grant: false }
+    if (presented && this.engine.gov.findKey(h) === undefined) return { status: 401, message: "authentication required", agent: agent, vk: undefined, base: base, grant: false }
     const gate = this.a2aGate(agent, name, h, false, true)
-    if (gate.refusal !== undefined) return { status: gate.status, message: gate.message, agent: agent, vk: gate.vk, base: base }
-    return { status: 0, message: "", agent: agent, vk: gate.vk, base: base }
+    if (gate.refusal !== undefined) return { status: gate.status, message: gate.message, agent: agent, vk: gate.vk, base: base, grant: gate.grant }
+    return { status: 0, message: "", agent: agent, vk: gate.vk, base: base, grant: false }
   }
 
   // The routes under /agents/a2a/{name}: the agent's card (GET .../.well-known/agent-card.json), its JSON-RPC
@@ -3557,14 +3628,17 @@ export class Ops {
     if (!isCard && !versionSupported(h.get("a2a-version") ?? "")) {
       const pre = this.a2aGate(agent, name, h, isRest, false)
       const pr = pre.refusal
-      if (pr !== undefined) return pr
+      // (the grants are decided later, in the call's plugin phase)
+      if (pr !== undefined && !pre.grant) return pr
       const vb = await req.text()
       if (isRpc) return json(200, rpcErrorBody(rpcIdOf(vb), -32009, "this version is not supported"))
       return json(400, `{"error":{"code":400,"status":"FAILED_PRECONDITION","message":"this version is not supported"}}`)
     }
     const gate = this.a2aGate(agent, name, h, isRest, true)
     const refusal = gate.refusal
-    if (refusal !== undefined) return refusal
+    // a refused grant on the card is Bifrost's card handler's bare 403; on a call it is answered once the call is read
+    if (refusal !== undefined && gate.grant && isCard) return forbiddenText()
+    if (refusal !== undefined && !gate.grant) return refusal
     if (agent === undefined) return json(404, errorJson(`no agent named ${name}`, "not_found_error", undefined))
     if (isCard) return a2aCardResponse(this.servedCard(agent, agent.card ?? "", base), h)
     const body = await req.text()
@@ -3572,12 +3646,14 @@ export class Ops {
       const routed = rpcCall(body)
       const id = rpcIdOf(body)
       if (routed.kind === "fail") return json(routed.status, rpcErrorBody(id, routed.code, routed.message))
+      if (gate.grant) return this.grantDenied(false, name, routed.call, id, gate.message, h)
       return await this.a2aCall(agent, routed.call, "rpc", id, h, gate.vk, base)
     }
     const qi = req.url.indexOf("?")
     const query = qi < 0 ? "" : req.url.slice(qi + 1, req.url.byteLength)
     const routed = restCall(req.method, rest.slice(REST_PREFIX.byteLength, rest.byteLength), query, body)
     if (routed.kind === "fail") return a2aDeny(true, routed.status, routed.message, "invalid_request_error")
+    if (gate.grant) return this.grantDenied(true, name, routed.call, "", gate.message, h)
     return await this.a2aCall(agent, routed.call, "rest", "\"1\"", h, gate.vk, base)
   }
 
@@ -4152,6 +4228,43 @@ export class Ops {
     // the request log's last batch (a process alone writes its rows every 100 ms; logstore.tov)
     const ls = this.engine.logStore
     if (ls !== undefined) ls.flush()
+    this.saveAdaptive()
+  }
+
+  // ---- held keys and incidents across restarts ----
+
+  // Where the holds and incidents of adaptive load balancing are kept between runs ("" with no config file).
+  adaptivePath(): string {
+    return this.store.path === "" ? "" : this.store.path + ".adaptive.json"
+  }
+
+  // Holds and incidents survive a restart, as in Bifrost (its regional leader writes the held keys every 30 seconds
+  // and a starting node restores them): they are restored now from <config>.adaptive.json, and written there every
+  // 30 seconds by the leader, and at a graceful stop, while adaptive load balancing is on.
+  startAdaptiveStore(): void {
+    const path = this.adaptivePath()
+    if (path === "") return
+    if (this.engine.cfg.health?.adaptive === true && existsSync(path)) {
+      try {
+        const n = this.engine.health.holds.restore(readFileSync(path, "utf8"), Date.now())
+        if (n > 0) console.error(`raiju: restored ${n} held key${n === 1 ? "" : "s"} from ${path}`)
+      } catch (e) {
+        console.error(`raiju: held keys: ${e.message}`)
+      }
+    }
+    setInterval(() => {
+      if (this.isLeader()) this.saveAdaptive()
+    }, 30000)
+  }
+
+  saveAdaptive(): void {
+    const path = this.adaptivePath()
+    if (path === "" || this.engine.cfg.health?.adaptive !== true) return
+    try {
+      writeFileAtomic(path, this.engine.health.holds.snapshot(Date.now()), { durable: false })
+    } catch (e) {
+      console.error(`raiju: held keys: ${e.message}`)
+    }
   }
 
   async flushExporters(): Promise<void> {
@@ -4373,11 +4486,75 @@ export class Ops {
     }
   }
 
+  // What a sign-in's claims change when the identity provider is configured through scim_config (a provider set):
+  // the user is found or created, its role decided (no default role) and its memberships resynced (claimsync.tov).
+  // With SCIM provisioning on and claimsSyncMode "scim", a user SCIM has not pushed is refused and a pushed one signs
+  // in with the role SCIM gave. "none" leaves the sign-in to the oidc section's own role rules (also when that section
+  // sets role_map or default_role).
+  syncSignIn(sub: string, email: string | undefined, payload: string): { kind: "none" } | { kind: "role", role: string } | { kind: "refuse", reason: string } {
+    const sc = this.store.cfg.scim_config
+    if (sc === undefined || sc.enabled !== true || (sc.provider ?? "") === "") return { kind: "none" }
+    // an oidc section with role rules of its own (role_map, default_role) keeps deciding the role, as before
+    const own = this.oidcCfg
+    if (own !== undefined && (own.role_map !== undefined || own.default_role !== undefined)) return { kind: "none" }
+    const c = sc.config ?? {}
+    const g = this.store.cfg.governance ?? {}
+    let users = g.users ?? []
+    const at = findUser(users, sub, email)
+    const scimOnly = resolveEnv(c.provisioningToken ?? "") !== "" && c.claimsSyncMode === "scim"
+    if (scimOnly) {
+      if (at < 0) return { kind: "refuse", reason: "Provisioning is managed by SCIM: your identity provider has not pushed this user yet" }
+      const r = users[at]!.role
+      if (r === "") return { kind: "refuse", reason: "what SCIM last sent for this user maps to no role" }
+      return { kind: "role", role: r }
+    }
+    const roles = g.roles
+    const names: string[] = ["admin", "editor", "viewer", "auditor"]
+    for (const r of customRoles(roles)) names.push(r.name)
+    const count = (r: string): int => {
+      const s = systemRole(roles, r, RESOURCES, OPERATIONS)
+      if (s !== undefined) return (s.permissions ?? []).length
+      const cr = customRole(roles, r)
+      if (cr === undefined) return -1
+      return (cr.permissions ?? []).length
+    }
+    const current = at >= 0 ? users[at]!.role : undefined
+    const claims = mergedClaims(payload, ruleAttributes(c), at >= 0 ? users[at]!.claims : undefined)
+    const d = resolveRole(claims, c, names, count, current)
+    if (d.kind === "refuse") {
+      if (d.remove && at >= 0) {
+        // the claims took the role away: the account stays, with no role until a sign-in maps one again
+        let u = users[at]!
+        u.role = ""
+        u.claims = claims
+        users[at] = u
+        this.store.setUsers(users)
+        this.storeUpdated("/api/users")
+      }
+      return { kind: "refuse", reason: d.reason }
+    }
+    const role = d.kind === "set" ? d.role : (current ?? "")
+    const dir: Directory = { teams: g.teams ?? [], businessUnits: g.business_units ?? [], projects: g.projects ?? [], profiles: g.access_profiles ?? [] }
+    const grants = resolveGrants(claims, c, dir, (p: string): string => randomId(p))
+    const lower = (email ?? "").toLowerCase()
+    const base: AdminUserConfig = at >= 0 ? users[at]! : { name: lower !== "" ? lower : sub, email: email, role: role }
+    const next = appliedUser(base, role, claims, grants, c)
+    if (at >= 0) users[at] = next
+    else users.push(next)
+    const saved = this.store.setClaimSync(users, (g.teams ?? []).concat(grants.newTeams), (g.business_units ?? []).concat(grants.newBusinessUnits))
+    if (saved.kind !== "ok") return { kind: "refuse", reason: "the user could not be saved: " + saved.message }
+    this.storeUpdated("/api/users")
+    if (grants.newTeams.length > 0) this.storeUpdated("/api/governance/teams")
+    if (grants.newBusinessUnits.length > 0) this.storeUpdated("/api/governance/business-units")
+    return { kind: "role", role: role }
+  }
+
   // GET /api/oidc/status, /api/oidc/login, /api/oidc/callback: open routes.
   async oidcRoute(req: Request, path: string): Promise<Response> {
-    const oc = this.oidcCfg
-    if (path === "/api/oidc/status") return json(200, `{"enabled":${oc !== undefined}}`)
-    if (oc === undefined) return json(404, errorJson("SSO is off", "invalid_request_error", undefined))
+    const oc0 = this.oidcCfg
+    if (path === "/api/oidc/status") return json(200, `{"enabled":${oc0 !== undefined}}`)
+    if (oc0 === undefined) return json(404, errorJson("SSO is off", "invalid_request_error", undefined))
+    const oc = withRedirect(oc0, req.url)
     const d = await this.disc(oc)
     if (d === undefined) return json(502, errorJson("could not read the identity provider's discovery document", "api_error", undefined))
     const now = Date.now()
@@ -4427,9 +4604,16 @@ export class Ops {
       this.recordChange("sso:" + v.sub, req, path, 403, "")
       return html(403, "<p>This account is disabled. Ask an administrator to enable it.</p>")
     }
+    // an identity provider configured through scim_config: its claims decide the role and the memberships
+    const synced = this.syncSignIn(v.sub, v.email, v.claims)
+    if (synced.kind === "refuse") {
+      this.recordChange("sso:" + v.sub, req, path, 403, "")
+      return html(403, `<p>Sign-in refused: ${synced.reason.replace("<", "&lt;")}</p>`)
+    }
+    const role = synced.kind === "role" ? synced.role : v.role
     let token = ""
     try {
-      token = this.sessions.create(v.sub, v.role, Date.now(), v.email)
+      token = this.sessions.create(v.sub, role, Date.now(), v.email)
     } catch (e) {
       return html(500, "<p>Could not create a session.</p>")
     }

@@ -49,10 +49,92 @@ export type RegexRule = {
   skip_line_containing?: string[],
 }
 
+// An Aho-Corasick automaton over lowercase ASCII literals: one pass over a lowercased text finds every occurrence of
+// all of them, overlapping ones included. An allowlist pattern that is an alternation of many branches, each holding a
+// literal (regex.tov wideLiterals), is tried only from the starts its literals' occurrences can reach.
+export class LitMatcher {
+  // the transitions (node * 128 + byte, the failure links folded in), and the literals that end at each node
+  private next: int[] = []
+  private outs: int[][] = []
+  readonly lens: int[] = []
+
+  constructor(lits: string[]) {
+    this.addNode()
+    for (const lit of lits) {
+      const b = enc.encode(lit)
+      let s = 0
+      for (const x of b) {
+        const c = int(x) & 127
+        let t = this.next[s * 128 + c]!
+        if (t <= 0) {
+          t = this.addNode()
+          this.next[s * 128 + c] = t
+        }
+        s = t
+      }
+      this.outs[s]!.push(this.lens.length)
+      this.lens.push(b.length)
+    }
+    // breadth first: each node's missing transitions take its failure node's, and its outputs gain the failure node's
+    const fail: int[] = []
+    for (let i = 0; i < this.outs.length; i++) fail.push(0)
+    const queue: int[] = []
+    for (let c = 0; c < 128; c++) {
+      const t = this.next[c]!
+      if (t > 0) queue.push(t)
+    }
+    let head = 0
+    while (head < queue.length) {
+      const s = queue[head]!
+      head += 1
+      for (let c = 0; c < 128; c++) {
+        const t = this.next[s * 128 + c]!
+        const via = this.next[fail[s]! * 128 + c]!
+        if (t > 0) {
+          fail[t] = via
+          for (const o of this.outs[via]!) this.outs[t]!.push(o)
+          queue.push(t)
+        } else {
+          this.next[s * 128 + c] = via
+        }
+      }
+    }
+  }
+
+  private addNode(): int {
+    const id = this.outs.length
+    this.outs.push([])
+    for (let c = 0; c < 128; c++) this.next.push(0)
+    return id
+  }
+
+  // Every occurrence in a lowercased text: its start byte and the literal's index, in pairs. A byte past ASCII
+  // matches no literal.
+  search(low: u8[]): int[] {
+    const out: int[] = []
+    let s = 0
+    for (let i = 0; i < low.length; i++) {
+      const c = int(low[i]!)
+      if (c >= 128) {
+        s = 0
+        continue
+      }
+      s = this.next[s * 128 + c]!
+      for (const o of this.outs[s]!) {
+        out.push(i + 1 - this.lens[o]!)
+        out.push(o)
+      }
+    }
+    return out
+  }
+}
+
 export type CompiledAllow = {
   target: string,
   all: bool,
   regexes: Regex[],
+  // for each regex: the automaton of its wide literal set, when it has no narrow one (else undefined)
+  matchers: (LitMatcher | undefined)[],
   stops: string[],
   // the stopwords as a set, and their lengths: an ASCII secret is tested by its substrings of those lengths
   stopSet: Set<string>,
@@ -126,7 +208,13 @@ function kindOf(r: RegexRule): string {
 // Compiles one allowlist, or throws a SyntaxError naming the bad pattern.
 function compileAllow(a: AllowRule): CompiledAllow throws SyntaxError {
   const res: Regex[] = []
-  for (const s of a.regexes ?? []) res.push(try compileRegex(s))
+  const ms: (LitMatcher | undefined)[] = []
+  for (const s of a.regexes ?? []) {
+    const re = try compileRegex(s)
+    res.push(re)
+    const wide = re.wideLiterals()
+    ms.push(re.literals().length === 0 && wide.length > 0 ? new LitMatcher(wide.map((l: LitCand): string => l.lit)) : undefined)
+  }
   const stops: string[] = []
   const set = new Set<string>()
   const lens: int[] = []
@@ -136,7 +224,7 @@ function compileAllow(a: AllowRule): CompiledAllow throws SyntaxError {
     set.add(w)
     if (!lens.includes(w.byteLength)) lens.push(w.byteLength)
   }
-  return { target: a.target ?? "", all: a.all ?? false, regexes: res, stops: stops, stopSet: set, stopLens: lens }
+  return { target: a.target ?? "", all: a.all ?? false, regexes: res, matchers: ms, stops: stops, stopSet: set, stopLens: lens }
 }
 
 // Compiles rules, or throws a SyntaxError naming the bad pattern.
@@ -453,8 +541,10 @@ function regexHit(a: CompiledAllow, target: string, inout memo: Map<string, bool
   if (seen !== undefined) return seen
   let hit = false
   let lowered: string | undefined = undefined
-  for (const re of a.regexes) {
+  for (let ri = 0; ri < a.regexes.length; ri++) {
     if (hit) break
+    const re = a.regexes[ri]!
+    if (!re.fits(target.byteLength)) continue
     // a pattern with required literals (an any-of set, lowercase) cannot match a target that holds none of them
     const lits = re.literals()
     if (lits.length > 0) {
@@ -462,10 +552,45 @@ function regexHit(a: CompiledAllow, target: string, inout memo: Map<string, bool
       lowered = lt
       if (!lits.some((lc: LitCand): bool => lt.includes(lc.lit))) continue
     }
-    if (re.fits(target.byteLength) && re.test(target)) hit = true
+    const m = a.matchers[ri]
+    if (m !== undefined) {
+      // an alternation of many literal branches: only the starts that reach an occurrence of a branch's literal
+      if (allowStarts(re, m, target)) hit = true
+      continue
+    }
+    if (re.test(target)) hit = true
   }
   memo.set(key, hit)
   return hit
+}
+
+// Whether re matches target, trying only the starts that can reach an occurrence of one of its wide literals: every
+// match holds one of them at some byte p, and starts at or after the earliest start that literal's byte bound and
+// character set allow (earliestStart), so the starts from there to p are the only ones needed.
+function allowStarts(re: Regex, m: LitMatcher, target: string): bool {
+  const b = enc.encode(target)
+  const low: u8[] = []
+  for (const x of b) {
+    const c = int(x)
+    low.push(u8(c >= 65 && c <= 90 ? c + 32 : c))
+  }
+  const occ = m.search(low)
+  if (occ.length === 0) return false
+  const wide = re.wideLiterals()
+  const lo: int[] = []
+  const hi: int[] = []
+  for (let i = 0; i + 1 < occ.length; i += 2) {
+    const p = occ[i]!
+    lo.push(earliestStart(b, p, wide[occ[i + 1]!]!))
+    hi.push(p)
+  }
+  return re.testDecoded(decodeText(target), lo, hi)
+}
+
+// Whether an allowlist's regexes match a target, through the same prefilters a scan uses (for the tests).
+export function allowRegexMatches(a: CompiledAllow, target: string): bool {
+  let memo: Map<string, bool> = new Map()
+  return regexHit(a, target, &memo, "probe")
 }
 
 // Whether a lowercased secret contains one of the allowlist's stopwords (Gitleaks' strings.Contains test). An ASCII
@@ -779,6 +904,16 @@ test("an overlapping literal is found past the search chunks, after multibyte te
   const first = text.indexOf("a-a5")
   expect(r.findings[0]!.start).toBe(first)
   expect(r.findings[1]!.start).toBe(text.slice(first + 1).indexOf("a-a5") + first + 1)
+})
+
+test("the literal automaton finds every occurrence of every literal, overlapping ones included", () => {
+  const m = new LitMatcher(["he", "she", "his", "hers", "aa"])
+  const occ = m.search(enc.encode("ushers aaa hé"))
+  const pairs: string[] = []
+  for (let i = 0; i < occ.length; i += 2) pairs.push(`${occ[i]!}:${occ[i + 1]!}`)
+  // "she" at 1, "he" at 2, "hers" at 2, "aa" at 7 and 8; "h" before a multibyte character starts nothing
+  expect(pairs.join(" ")).toBe("1:1 2:0 2:3 7:4 8:4")
+  expect(new LitMatcher([]).search(enc.encode("anything")).length).toBe(0)
 })
 
 test("stopwords of several lengths are found inside ASCII and non-ASCII secrets", () => {

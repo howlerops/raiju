@@ -14,6 +14,16 @@
 // the cluster. Circuit incidents (noteOpen) stay on the node that opened the circuit.
 // Pure: every call takes `now` in milliseconds.
 import { FailureClass, holdWaitMs, holdsKey, holdsAllModels } from "./refusal"
+import { clusterState } from "./clusterstate"
+
+// the replicated-state namespace of the circuit incidents, and where the numbers of other processes' incidents start
+// (so they never meet this process's own)
+const CIRCUIT_NS = "adaptive-circuit-incidents"
+const PEER_ID_BASE = 1000000000
+
+// A circuit incident as it travels to the other processes, and an incident as a snapshot keeps it.
+type CircuitWire = { node: string, id: int, target: string, provider: string, keyId: string, reason: string, openedAt: f64, resolvedAt: f64 }
+type IncidentWire = { id: int, target: string, provider: string, keyId: string, model: string, cls: string, reason: string, openedAt: f64, resolvedAt: f64, recovering: bool }
 
 // a key released this recently keeps its rung when it is held again for the same reason
 const RECENT_MS = 600000.0
@@ -166,6 +176,9 @@ export class HoldBook {
   // the open incident of each hold ("h:" + target) or circuit ("c:" + id)
   private open: Map<string, Incident> = new Map()
   private seq: int = 0
+  // the numbers given here to the other processes' circuit incidents, by their replicated key
+  private peerIds: Map<string, int> = new Map()
+  private peerSeq: int = 0
 
   constructor(node?: string) {
     this.node = node ?? "node"
@@ -216,6 +229,26 @@ export class HoldBook {
     if (this.state(id, model, now) !== "due") return false
     this.claim(id, model, now)
     return true
+  }
+
+  // A request pinned to the key (x-bf-api-key) is sent whatever its holds say, and its answer settles them as a check
+  // does (Bifrost: "any other request that reaches the key, for example one pinned to it, settles the hold the same
+  // way a check does"): a refusal climbs the ladder, a 5xx holds again on the same rung, a served answer releases.
+  // It claims every hold on the key and model that no check is in flight for. False when there is none to claim.
+  claimPinned(id: string, model: string, now: f64): bool {
+    let any = false
+    for (const k of scopesOf(id, model)) {
+      const h = this.holds.get(k)
+      if (h === undefined) continue
+      if (h.claimBy !== "" && now - h.claimAt < PROBE_TIMEOUT_MS) continue
+      h.claimBy = this.node
+      h.claimAt = now
+      this.bump(h, now)
+      const inc = this.open.get("h:" + k)
+      if (inc !== undefined) inc.recovering = true
+      any = true
+    }
+    return any
   }
 
   // The time a request for this key and model has to wait for: the latest next check of its holds (0 when none).
@@ -322,15 +355,99 @@ export class HoldBook {
     if (id.indexOf("#") < 0) return
     const parts = splitId(id)
     this.openIncident("c:" + id, id, parts.provider, parts.keyId, "", "failures", "failures opened the circuit", now)
+    const inc = this.open.get("c:" + id)
+    if (inc !== undefined) this.shareCircuit(inc)
   }
 
   noteClose(id: string, now: f64): void {
+    const inc = this.open.get("c:" + id)
     this.resolve("c:" + id, now)
+    if (inc !== undefined) this.shareCircuit(inc)
   }
 
-  // Every incident kept, oldest first.
+  // Every incident kept here, oldest first.
   incidentList(): Incident[] {
     return this.incidents
+  }
+
+  // A circuit incident goes to the other processes of the cluster (and the other workers of this node) through the
+  // replicated state (clusterstate.tov), under this process's writer id and its own number. Hold incidents need no
+  // such copy: every node derives them from the same hold writes.
+  private shareCircuit(inc: Incident): void {
+    const w: CircuitWire = { node: this.node, id: inc.id, target: inc.target, provider: inc.provider, keyId: inc.keyId, reason: inc.reason, openedAt: inc.openedAt, resolvedAt: inc.resolvedAt }
+    clusterState().put(CIRCUIT_NS, this.node + ":" + inc.id, JSON.stringify(w))
+  }
+
+  // The circuit incidents the other processes opened, as incidents numbered here (the same incident keeps its number).
+  peerCircuits(): Incident[] {
+    const out: Incident[] = []
+    const st = clusterState()
+    const keys = st.keys(CIRCUIT_NS)
+    keys.sort()
+    for (const k of keys) {
+      if (k.startsWith(this.node + ":")) continue
+      const v = st.get(CIRCUIT_NS, k)
+      if (v === undefined) continue
+      try {
+        const w = JSON.parse(v) as CircuitWire
+        let n = this.peerIds.get(k)
+        if (n === undefined) {
+          this.peerSeq += 1
+          n = PEER_ID_BASE + this.peerSeq
+          this.peerIds.set(k, n)
+        }
+        const inc = new Incident(n, w.target, w.provider, w.keyId, "", "failures", w.reason, w.openedAt)
+        inc.resolvedAt = w.resolvedAt
+        out.push(inc)
+      } catch (e) {
+        continue
+      }
+    }
+    return out
+  }
+
+  // Every incident the cluster knows of: this process's, and the circuits the others opened.
+  allIncidents(): Incident[] {
+    return this.incidents.concat(this.peerCircuits())
+  }
+
+  // The holds (with the releases still kept) and the incidents as JSON, for keeping them across a restart.
+  snapshot(now: f64): string {
+    const incs: IncidentWire[] = this.incidents.map((i: Incident): IncidentWire => ({ id: i.id, target: i.target, provider: i.provider, keyId: i.keyId, model: i.model, cls: i.cls, reason: i.reason, openedAt: i.openedAt, resolvedAt: i.resolvedAt, recovering: i.recovering }))
+    return JSON.stringify({ holds: this.wire(now), incidents: incs })
+  }
+
+  // Restores a snapshot written before a restart: its incidents first (a circuit incident left open is resolved now,
+  // since circuits start closed), then its holds, merged as a peer's would be. A snapshot that cannot be read changes
+  // nothing. Returns how many holds were restored.
+  restore(text: string, now: f64): int {
+    try {
+      const snap = JSON.parse(text) as { holds?: HoldWire[], incidents?: IncidentWire[] }
+      const holds = snap.holds ?? []
+      for (const h of holds) {
+        if (holdProblem(h) !== "") return 0
+      }
+      for (const w of snap.incidents ?? []) {
+        const inc = new Incident(w.id, w.target, w.provider, w.keyId, w.model, w.cls, w.reason, w.openedAt)
+        inc.resolvedAt = w.resolvedAt
+        inc.recovering = w.recovering
+        if (inc.resolvedAt <= 0.0) {
+          if (w.cls === "failures") inc.resolvedAt = now
+          else this.open.set("h:" + w.target, inc)
+        }
+        if (w.id > this.seq) this.seq = w.id
+        this.incidents.push(inc)
+      }
+      this.merge(holds, now)
+      // a hold incident with no hold left behind it is resolved
+      for (const k of this.open.keys()) {
+        if (k.startsWith("h:") && !this.holds.has(k.slice(2))) this.resolve(k, now)
+      }
+      this.prune()
+      return this.holds.size
+    } catch (e) {
+      return 0
+    }
   }
 
   // What this node sends the others: its live holds and the releases still kept.
@@ -450,6 +567,7 @@ export class HoldBook {
     const first = this.incidents.find((x: Incident) => x.resolvedAt > 0.0)
     if (first === undefined) return
     this.incidents = this.incidents.filter((x: Incident) => x !== first)
+    if (first.cls === "failures") clusterState().del(CIRCUIT_NS, this.node + ":" + first.id)
   }
 }
 
@@ -670,4 +788,62 @@ test("a release is forgotten once it is old, and a bad hold is refused by holdPr
   expect(holdProblem(wireOf(new Hold("p#k", "p", "k", "m", "rate_limit", "x", 0.0, 30000.0, 0, "a"), false, 1, "a", 0.0))).toBe("")
   expect(holdProblem(wireOf(new Hold("p#k", "p", "k", "m", "rate_limit", "x", 0.0, -5.0, 0, "a"), false, 1, "a", 0.0))).toBe("hold has a negative or out-of-range number")
   expect(holdProblem(wireOf(new Hold("p#k", "p", "k", "m", "rate_limit", "x", 0.0, 30000.0, 0, "a"), false, 0, "a", 0.0))).toBe("hold has a bad write count")
+})
+
+test("a request pinned to a held key settles the hold as a check does", () => {
+  const b = new HoldBook("n1")
+  b.settle("p#k", "", "refused", "credential", "bad key", undefined, 0.0, 0.5)
+  // pinned before the wait is over: its refusal climbs the ladder
+  expect(b.claimPinned("p#k", "m", 1000.0)).toBe(true)
+  b.settle("p#k", "m", "refused", "credential", "bad key", undefined, 1000.0, 0.5)
+  expect(b.list(1000.0)[0]!.h.rung).toBe(1)
+  // a pinned request while a check is in flight leaves it alone
+  b.claimPinned("p#k", "m", 2000.0)
+  expect(b.claimPinned("p#k", "m", 2500.0)).toBe(false)
+  // a served pinned request releases the key
+  b.settle("p#k", "m", "ok", "unknown", "", undefined, 3000.0, 0.5)
+  expect(b.list(3000.0).length).toBe(0)
+  expect(b.claimPinned("p#k", "m", 4000.0)).toBe(false)
+})
+
+test("holds and incidents survive a restart through a snapshot", () => {
+  const a = new HoldBook("n1")
+  a.settle("p#k", "", "refused", "credential", "bad key", undefined, 1000.0, 0.5)
+  a.settle("q#k", "m", "refused", "rate_limit", "slow", undefined, 1000.0, 0.5)
+  a.settle("q#k", "m", "ok", "unknown", "", undefined, 2000.0, 0.5)
+  a.noteOpen("r#k", 2500.0)
+  const snap = a.snapshot(3000.0)
+  const b = new HoldBook("n1")
+  expect(b.restore(snap, 4000.0)).toBe(1)
+  expect(b.state("p#k", "m", 4000.0)).toBe("held")
+  expect(b.list(4000.0)[0]!.h.reason).toBe("bad key")
+  const incs = b.incidentList()
+  expect(incs.length).toBe(3)
+  // the hold's incident stays open and is not opened twice; the released one stays resolved; the circuit (closed
+  // again after a restart) is resolved at the restore
+  expect(incs.filter((i) => i.resolvedAt === 0.0).length).toBe(1)
+  expect(incs.find((i) => i.target === "r#k")!.resolvedAt).toBe(4000.0)
+  b.settle("p#k", "m", "ok", "unknown", "", undefined, 5000.0, 0.5)
+  expect(b.incidentList().filter((i) => i.resolvedAt === 0.0).length).toBe(0)
+  // a snapshot that cannot be read changes nothing
+  expect(new HoldBook("n1").restore("not json", 0.0)).toBe(0)
+})
+
+test("circuit incidents reach the other processes through the replicated state", () => {
+  const a = new HoldBook("node-a-l180")
+  const b = new HoldBook("node-b-l180")
+  a.noteOpen("p#k1", 1000.0)
+  // both books share this process's replicated state here, as two nodes do after a sync
+  const seen = b.peerCircuits().filter((i) => i.target === "p#k1")
+  expect(seen.length).toBe(1)
+  expect(seen[0]!.resolvedAt).toBe(0.0)
+  expect(seen[0]!.id >= PEER_ID_BASE).toBe(true)
+  expect(b.allIncidents().some((i) => i.target === "p#k1")).toBe(true)
+  // a's own incident is not listed twice on a
+  expect(a.allIncidents().filter((i) => i.target === "p#k1").length).toBe(1)
+  a.noteClose("p#k1", 2000.0)
+  const after = b.peerCircuits().filter((i) => i.target === "p#k1")
+  expect(after[0]!.resolvedAt).toBe(2000.0)
+  // the same incident keeps its number
+  expect(after[0]!.id).toBe(seen[0]!.id)
 })

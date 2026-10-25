@@ -1,0 +1,457 @@
+// What an identity provider's sign-in changes, as Bifrost's identity sync applies its claims
+// (docs/enterprise/how-identity-sync-works.mdx): the role from the attribute mappings for roles (or the roles claim),
+// teams, business units, projects and access profiles from their mappings, a memory of the last value of each claim
+// the rules read (a token that leaves a claim out changes nothing), memberships an admin added kept apart from the
+// ones the claims gave, and claimsSyncMode "scim" (SCIM provisioning on) making SCIM the only source. Pure: the
+// caller reads the token, saves the result and creates the session.
+import { fields, elements, find, decodeString, isNull } from "./json"
+import { AdminUserConfig, ScimProviderConfig, ScimAttributeRule, SyncedGrants, TeamConfig, BusinessUnitConfig, ProjectConfig, AccessProfile } from "./config"
+
+export type Claims = Map<string, string[]>
+
+// The scalar values of one JSON value: a string, number or boolean as one value, an array's scalar elements, none
+// for null or an object.
+function scalars(raw: string): string[] throws SyntaxError {
+  const out: string[] = []
+  const r = raw.trim()
+  if (r.startsWith("\"")) out.push(try decodeString(r))
+  else if (r.startsWith("[")) {
+    for (const el of try elements(r)) {
+      const e = el.trim()
+      if (e.startsWith("\"")) out.push(try decodeString(e))
+      else if (e !== "null" && !e.startsWith("{") && !e.startsWith("[")) out.push(e)
+    }
+  } else if (r !== "null" && !r.startsWith("{")) out.push(r)
+  return out
+}
+
+// The values of a claim at a dot path of the token's payload ("realm_access.roles"), or undefined when the claim is
+// absent. A claim present as null or an empty array is present with no values.
+export function claimValues(payload: string, path: string): string[] | undefined {
+  try {
+    let cur = payload
+    // the whole path as one key first (a claim may carry dots in its name), then segment by segment
+    const whole = find(try fields(cur), path)
+    if (whole !== undefined) return try scalars(whole)
+    for (const seg of path.split(".")) {
+      if (!cur.trim().startsWith("{")) return undefined
+      const v = find(try fields(cur), seg)
+      if (v === undefined) return undefined
+      cur = v
+    }
+    return try scalars(cur)
+  } catch (e) {
+    return undefined
+  }
+}
+
+// A glob ("bifrost-*") against a value, both lower-cased by the caller.
+function glob(p: string, s: string): bool {
+  const star = p.indexOf("*")
+  if (star < 0) return p === s
+  const head = p.slice(0, star)
+  if (!s.startsWith(head)) return false
+  const rest = p.slice(star + 1)
+  let tail = s.slice(head.byteLength)
+  while (true) {
+    if (glob(rest, tail)) return true
+    if (tail === "") return false
+    tail = tail.slice(1)
+  }
+}
+
+// Bifrost's value match: without regard to case; "*" matches any non-empty value; other "*" are globs.
+export function valueMatches(pattern: string, v: string): bool {
+  if (pattern === "*") return v !== ""
+  return glob(pattern.toLowerCase(), v.toLowerCase())
+}
+
+function rulesOf(c: ScimProviderConfig): ScimAttributeRule[][] {
+  return [c.attributeRoleMappings ?? [], c.attributeTeamMappings ?? [], c.attributeBusinessUnitMappings ?? [], c.attributeAccessProfileMappings ?? [], c.attributeProjectMappings ?? []]
+}
+
+export function rolesField(c: ScimProviderConfig): string {
+  const f = c.rolesField ?? ""
+  return f === "" ? "roles" : f
+}
+
+export function teamIdsField(c: ScimProviderConfig): string {
+  const f = c.teamIdsField ?? ""
+  return f === "" ? "groups" : f
+}
+
+// The claims the rules read: the roles and team ids claims and every mapping's attribute.
+export function ruleAttributes(c: ScimProviderConfig): string[] {
+  const out: string[] = [rolesField(c), teamIdsField(c)]
+  for (const rs of rulesOf(c)) {
+    for (const r of rs) {
+      if (!out.includes(r.attribute)) out.push(r.attribute)
+    }
+  }
+  return out
+}
+
+// The claims a sign-in applies: each attribute the token carries replaces the remembered value, even when empty; one
+// it leaves out keeps the remembered value.
+export function mergedClaims(payload: string, attrs: string[], remembered: Claims | undefined): Claims {
+  const out: Claims = new Map()
+  for (const a of attrs) {
+    const v = claimValues(payload, a)
+    if (v !== undefined) out.set(a, v)
+    else if (remembered !== undefined) {
+      const old = remembered.get(a)
+      if (old !== undefined) out.set(a, old)
+    }
+  }
+  return out
+}
+
+export type RoleDecision = { kind: "set", role: string } | { kind: "keep" } | { kind: "refuse", reason: string, remove: bool }
+
+// The role among several: the first by list order ("order"), else the one with the most permissions, ties by order.
+// count is -1 for a role that does not exist.
+function pick(roles: string[], strategy: string, count: (role: string) => int): string {
+  if (strategy === "order") return roles[0]!
+  let best = roles[0]!
+  let top = count(best)
+  for (const r of roles) {
+    const n = count(r)
+    if (n > top) {
+      best = r
+      top = n
+    }
+  }
+  return best
+}
+
+// The user's role from the claims (Bifrost has no default role): a matching attribute mapping for roles, or with
+// none configured the roles claim naming a role (without regard to case). A sign-in that resolves no role is refused;
+// the current role is removed when the claims say so (a mapped attribute with no matching value, a role that does not
+// exist, a roles claim naming none), kept when they say nothing about it.
+export function resolveRole(claims: Claims, c: ScimProviderConfig, roleNames: string[], count: (role: string) => int, current: string | undefined): RoleDecision {
+  const strategy = c.roleResolutionStrategy ?? "highestPermissionCount"
+  const rules = c.attributeRoleMappings ?? []
+  if (rules.length > 0) {
+    let present = false
+    const hits: string[] = []
+    for (const r of rules) {
+      const vals = claims.get(r.attribute)
+      if (vals === undefined) continue
+      present = true
+      if (vals.some((v) => valueMatches(r.value, v))) hits.push(r.role ?? "")
+    }
+    if (hits.length === 0) {
+      if (!present) return { kind: "refuse", reason: "the sign-in carries none of the attributes the role mappings read", remove: false }
+      return { kind: "refuse", reason: "no attribute mapping for roles matches this user", remove: true }
+    }
+    const role = pick(hits, strategy, count)
+    if (count(role) < 0) return { kind: "refuse", reason: `the mapped role ${role} does not exist`, remove: true }
+    return { kind: "set", role: role }
+  }
+  const vals = claims.get(rolesField(c))
+  if (vals === undefined || vals.length === 0) {
+    if (current !== undefined && current !== "") return { kind: "keep" }
+    return { kind: "refuse", reason: "no role: map an attribute or group to a role", remove: false }
+  }
+  const named: string[] = []
+  for (const v of vals) {
+    for (const r of roleNames) {
+      if (r.toLowerCase() === v.toLowerCase() && !named.includes(r)) named.push(r)
+    }
+  }
+  if (named.length === 0) return { kind: "refuse", reason: "the roles claim names no role", remove: true }
+  return { kind: "set", role: pick(named, strategy, count) }
+}
+
+// What the claims grant besides the role: team, business unit, project and access profile ids, and the teams and
+// business units created for rules that name missing ones (projects are never created, a profile must exist).
+export type Grants = { teams: string[], business_units: string[], projects: string[], access_profile_ids: string[], newTeams: TeamConfig[], newBusinessUnits: BusinessUnitConfig[] }
+
+export type Directory = { teams: TeamConfig[], businessUnits: BusinessUnitConfig[], projects: ProjectConfig[], profiles: AccessProfile[] }
+
+function named(id: string, name: string, key: string): bool {
+  return id === key || name.toLowerCase() === key.toLowerCase()
+}
+
+function teamId(ts: TeamConfig[], key: string): string | undefined {
+  for (const t of ts) {
+    if (named(t.id, t.name, key)) return t.id
+  }
+  return undefined
+}
+
+function buId(bs: BusinessUnitConfig[], key: string): string | undefined {
+  for (const b of bs) {
+    if (named(b.id, b.name, key)) return b.id
+  }
+  return undefined
+}
+
+function projectId(ps: ProjectConfig[], key: string): string | undefined {
+  for (const p of ps) {
+    if (named(p.id, p.name, key)) return p.id
+  }
+  return undefined
+}
+
+function profileByName(ps: AccessProfile[], key: string): string | undefined {
+  for (const p of ps) {
+    if (p.id === key || (p.name ?? "").toLowerCase() === key.toLowerCase()) return p.id
+  }
+  return undefined
+}
+
+function addOnce(inout xs: string[], x: string): void {
+  if (!xs.includes(x)) xs.push(x)
+}
+
+// The names each rule of a list grants for these claims: the rule's target on a match, or with "*" (and no target)
+// each value of the claim.
+function namesOf(claims: Claims, rules: ScimAttributeRule[], target: (r: ScimAttributeRule) => string): string[] {
+  let out: string[] = []
+  for (const r of rules) {
+    const vals = claims.get(r.attribute) ?? []
+    const t = target(r)
+    if (r.value === "*" && t === "") {
+      for (const v of vals) {
+        if (v !== "") addOnce(&out, v)
+      }
+      continue
+    }
+    if (t !== "" && vals.some((v) => valueMatches(r.value, v))) addOnce(&out, t)
+  }
+  return out
+}
+
+// The grants of the claims. Teams: the attribute team mappings, or with none the team ids claim (each value a
+// team, by id or name). Missing teams and business units are created with mint's ids.
+export function resolveGrants(claims: Claims, c: ScimProviderConfig, d: Directory, mint: (prefix: string) => string): Grants {
+  const g: Grants = { teams: [], business_units: [], projects: [], access_profile_ids: [], newTeams: [], newBusinessUnits: [] }
+  let teamNames: string[] = []
+  const tr = c.attributeTeamMappings ?? []
+  if (tr.length > 0) teamNames = namesOf(claims, tr, (r) => r.team ?? "")
+  else {
+    for (const v of claims.get(teamIdsField(c)) ?? []) {
+      if (v !== "") addOnce(&teamNames, v)
+    }
+  }
+  let teams = d.teams
+  for (const n of teamNames) {
+    let id = teamId(teams, n)
+    if (id === undefined) {
+      const t: TeamConfig = { id: mint("team-"), name: n }
+      teams.push(t)
+      g.newTeams.push(t)
+      id = t.id
+    }
+    addOnce(&g.teams, id!)
+  }
+  let bus = d.businessUnits
+  for (const n of namesOf(claims, c.attributeBusinessUnitMappings ?? [], (r) => r.business_unit ?? r.businessUnit ?? "")) {
+    let id = buId(bus, n)
+    if (id === undefined) {
+      const b: BusinessUnitConfig = { id: mint("bu-"), name: n }
+      bus.push(b)
+      g.newBusinessUnits.push(b)
+      id = b.id
+    }
+    addOnce(&g.business_units, id!)
+  }
+  for (const n of namesOf(claims, c.attributeProjectMappings ?? [], (r) => r.project ?? "")) {
+    const id = projectId(d.projects, n)
+    if (id !== undefined) addOnce(&g.projects, id)
+  }
+  for (const n of namesOf(claims, c.attributeAccessProfileMappings ?? [], (r) => r.accessProfile ?? "")) {
+    const id = profileByName(d.profiles, n)
+    if (id !== undefined) addOnce(&g.access_profile_ids, id)
+  }
+  return g
+}
+
+// A list after a sync: the entries the last sync gave are replaced by this one's; the rest (an admin's) are kept.
+// An admin's entry the claims now grant becomes the claims' (it follows them from then on).
+function resynced(have: string[] | undefined, oldSynced: string[] | undefined, now: string[]): string[] {
+  const old = oldSynced ?? []
+  let out: string[] = []
+  for (const x of have ?? []) {
+    if (!old.includes(x)) addOnce(&out, x)
+  }
+  for (const x of now) addOnce(&out, x)
+  return out
+}
+
+// Whether the claims say anything about a kind of grant: a claim one of its rules reads is present (a sign-in whose
+// token leaves them all out, with nothing remembered, leaves that kind as it was).
+function speaks(claims: Claims, attrs: string[]): bool {
+  for (const a of attrs) {
+    if (claims.has(a)) return true
+  }
+  return false
+}
+
+function attrsOf(rules: ScimAttributeRule[]): string[] {
+  return rules.map((r) => r.attribute)
+}
+
+// The user after a sign-in that resolved a role (or kept it): the role, the claims remembered, and each kind of
+// membership resynced from the grants when the claims speak about it.
+export function appliedUser(u: AdminUserConfig, role: string, claims: Claims, g: Grants, c: ScimProviderConfig): AdminUserConfig {
+  const old: SyncedGrants = u.synced ?? {}
+  const tr = c.attributeTeamMappings ?? []
+  const onTeams = speaks(claims, tr.length > 0 ? attrsOf(tr) : [teamIdsField(c)])
+  const onBus = speaks(claims, attrsOf(c.attributeBusinessUnitMappings ?? []))
+  const onProjects = speaks(claims, attrsOf(c.attributeProjectMappings ?? []))
+  const onProfiles = speaks(claims, attrsOf(c.attributeAccessProfileMappings ?? []))
+  const teams = onTeams ? resynced(u.teams, old.teams, g.teams) : u.teams
+  const bus = onBus ? resynced(u.business_units, old.business_units, g.business_units) : u.business_units
+  const projects = onProjects ? resynced(u.projects, old.projects, g.projects) : u.projects
+  const profiles = onProfiles ? resynced(u.access_profile_ids, old.access_profile_ids, g.access_profile_ids) : u.access_profile_ids
+  const s: SyncedGrants = {
+    teams: onTeams ? g.teams : old.teams,
+    business_units: onBus ? g.business_units : old.business_units,
+    projects: onProjects ? g.projects : old.projects,
+    access_profile_ids: onProfiles ? g.access_profile_ids : old.access_profile_ids,
+  }
+  let n = u
+  n.role = role
+  n.claims = claims
+  n.teams = teams
+  n.business_units = bus
+  n.projects = projects
+  n.access_profile_ids = profiles
+  n.synced = s
+  return n
+}
+
+// The user named by a sign-in: by name (the subject or the address) or by email, without regard to case.
+export function findUser(users: AdminUserConfig[], sub: string, email: string | undefined): int {
+  const e = (email ?? "").toLowerCase()
+  for (let i = 0; i < users.length; i++) {
+    const u = users[i]!
+    if (u.name === sub) return i
+    if (e !== "" && (u.name.toLowerCase() === e || (u.email ?? "").toLowerCase() === e)) return i
+  }
+  return -1
+}
+
+// ---- tests ----
+
+const PAYLOAD = `{"sub":"u-1","email":"Ana@Example.com","groups":["eng","Platform-Admins"],"realm_access":{"roles":["dev"]},"dept":"Research","flags":null,"level":3}`
+
+function counts(role: string): int {
+  if (role === "admin") return 100
+  if (role === "editor") return 50
+  if (role === "viewer") return 10
+  if (role === "auditor") return 2
+  return -1
+}
+
+const ROLES = ["admin", "editor", "viewer", "auditor"]
+
+test("claims at dot paths, arrays, scalars, null and absent", () => {
+  expect(claimValues(PAYLOAD, "groups")!.join(",")).toBe("eng,Platform-Admins")
+  expect(claimValues(PAYLOAD, "realm_access.roles")!.join(",")).toBe("dev")
+  expect(claimValues(PAYLOAD, "dept")!.join(",")).toBe("Research")
+  expect(claimValues(PAYLOAD, "level")!.join(",")).toBe("3")
+  expect(claimValues(PAYLOAD, "flags")!.length).toBe(0)
+  expect(claimValues(PAYLOAD, "missing") === undefined).toBe(true)
+  expect(claimValues(PAYLOAD, "realm_access.nope") === undefined).toBe(true)
+})
+
+test("value matching: case, the wildcard and globs", () => {
+  expect(valueMatches("platform-admins", "Platform-Admins")).toBe(true)
+  expect(valueMatches("*", "x")).toBe(true)
+  expect(valueMatches("*", "")).toBe(false)
+  expect(valueMatches("bifrost-*", "Bifrost-Dev")).toBe(true)
+  expect(valueMatches("bifrost-*", "other")).toBe(false)
+  expect(valueMatches("*-admins", "platform-admins")).toBe(true)
+})
+
+test("roles: mappings by permissions or order, refusals that keep or remove the role", () => {
+  const c: ScimProviderConfig = { attributeRoleMappings: [{ attribute: "groups", value: "eng", role: "viewer" }, { attribute: "groups", value: "platform-admins", role: "admin" }] }
+  const cl = mergedClaims(PAYLOAD, ruleAttributes(c), undefined)
+  const d = resolveRole(cl, c, ROLES, counts, undefined)
+  expect(d.kind === "set" && d.role === "admin").toBe(true)
+  let ordered = c
+  ordered.roleResolutionStrategy = "order"
+  const o = resolveRole(cl, ordered, ROLES, counts, undefined)
+  expect(o.kind === "set" && o.role === "viewer").toBe(true)
+  // the attribute is there but nothing matches: refused, role removed
+  const miss: ScimProviderConfig = { attributeRoleMappings: [{ attribute: "groups", value: "ops", role: "editor" }] }
+  const m = resolveRole(mergedClaims(PAYLOAD, ruleAttributes(miss), undefined), miss, ROLES, counts, "viewer")
+  expect(m.kind === "refuse" && m.remove).toBe(true)
+  // none of the attributes: refused, role kept
+  const none: ScimProviderConfig = { attributeRoleMappings: [{ attribute: "team", value: "x", role: "editor" }] }
+  const n = resolveRole(mergedClaims(PAYLOAD, ruleAttributes(none), undefined), none, ROLES, counts, "viewer")
+  expect(n.kind === "refuse" && !n.remove).toBe(true)
+  // a mapped role that does not exist
+  const ghost: ScimProviderConfig = { attributeRoleMappings: [{ attribute: "dept", value: "research", role: "ghost" }] }
+  const gr = resolveRole(mergedClaims(PAYLOAD, ruleAttributes(ghost), undefined), ghost, ROLES, counts, undefined)
+  expect(gr.kind === "refuse" && gr.remove).toBe(true)
+})
+
+test("roles without mappings: the roles claim names a role, no claim keeps a current role", () => {
+  const c: ScimProviderConfig = { rolesField: "realm_access.roles" }
+  const p = `{"sub":"s","realm_access":{"roles":["Editor","offline"]}}`
+  const d = resolveRole(mergedClaims(p, ruleAttributes(c), undefined), c, ROLES, counts, undefined)
+  expect(d.kind === "set" && d.role === "editor").toBe(true)
+  const empty = mergedClaims(`{"sub":"s"}`, ruleAttributes(c), undefined)
+  expect(resolveRole(empty, c, ROLES, counts, "viewer").kind).toBe("keep")
+  expect(resolveRole(empty, c, ROLES, counts, undefined).kind).toBe("refuse")
+  const other = resolveRole(mergedClaims(`{"realm_access":{"roles":["nobody"]}}`, ruleAttributes(c), undefined), c, ROLES, counts, "viewer")
+  expect(other.kind === "refuse" && other.remove).toBe(true)
+})
+
+test("memory: a claim left out keeps its last value, a present one replaces it even when empty", () => {
+  const remembered: Claims = new Map()
+  remembered.set("dept", ["Sales"])
+  remembered.set("groups", ["old"])
+  const cl = mergedClaims(`{"groups":[]}`, ["dept", "groups"], remembered)
+  expect(cl.get("dept")!.join(",")).toBe("Sales")
+  expect(cl.get("groups")!.length).toBe(0)
+})
+
+test("grants: teams from the mappings or the team ids claim, business units created, projects and profiles must exist", () => {
+  const d: Directory = { teams: [{ id: "team-eng", name: "eng" }], businessUnits: [], projects: [{ id: "p1", name: "Apollo" }], profiles: [{ id: "ap1", name: "standard" }] }
+  let n = 0
+  const mint = (prefix: string): string => {
+    n += 1
+    return prefix + n
+  }
+  const plain: ScimProviderConfig = {}
+  const g0 = resolveGrants(mergedClaims(PAYLOAD, ruleAttributes(plain), undefined), plain, d, mint)
+  expect(g0.teams.join(",")).toBe("team-eng,team-1")
+  expect(g0.newTeams.length).toBe(1)
+  const c: ScimProviderConfig = {
+    attributeTeamMappings: [{ attribute: "dept", value: "research", team: "eng" }],
+    attributeBusinessUnitMappings: [{ attribute: "dept", value: "*" }],
+    attributeProjectMappings: [{ attribute: "groups", value: "eng", project: "apollo" }, { attribute: "groups", value: "eng", project: "missing" }],
+    attributeAccessProfileMappings: [{ attribute: "groups", value: "platform-*", accessProfile: "Standard" }],
+  }
+  const g = resolveGrants(mergedClaims(PAYLOAD, ruleAttributes(c), undefined), c, d, mint)
+  expect(g.teams.join(",")).toBe("team-eng")
+  expect(g.business_units.join(",")).toBe("bu-2")
+  expect(g.newBusinessUnits[0]!.name).toBe("Research")
+  expect(g.projects.join(",")).toBe("p1")
+  expect(g.access_profile_ids.join(",")).toBe("ap1")
+})
+
+test("a sign-in resyncs what claims gave and keeps what an admin added", () => {
+  const c: ScimProviderConfig = { attributeTeamMappings: [{ attribute: "groups", value: "*" }] }
+  const synced: SyncedGrants = { teams: ["t-old"] }
+  const u: AdminUserConfig = { name: "ana", role: "viewer", teams: ["t-manual", "t-old"], synced: synced }
+  const g: Grants = { teams: ["t-new", "t-manual"], business_units: [], projects: [], access_profile_ids: [], newTeams: [], newBusinessUnits: [] }
+  const cl: Claims = new Map()
+  cl.set("groups", ["x"])
+  const n = appliedUser(u, "editor", cl, g, c)
+  expect(n.role).toBe("editor")
+  expect((n.teams ?? []).join(",")).toBe("t-manual,t-new")
+  expect((n.synced?.teams ?? []).join(",")).toBe("t-new,t-manual")
+  // claims that say nothing about teams leave them alone
+  const nothing: Claims = new Map()
+  const quiet = appliedUser(u, "viewer", nothing, g, c)
+  expect((quiet.teams ?? []).join(",")).toBe("t-manual,t-old")
+  expect(findUser([u, { name: "bob", email: "Bob@x.io", role: "viewer" }], "sub-9", "bob@X.io")).toBe(1)
+  expect(findUser([u], "ana", undefined)).toBe(0)
+  expect(findUser([u], "zed", "zed@x.io")).toBe(-1)
+})

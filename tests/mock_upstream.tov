@@ -16,7 +16,7 @@ import { a2aHandle, pushV03, knowTask, resubscribeV03 } from "./mock_a2a"
 // size and sha: the request body's length and SHA-256, kept for bodies too big to keep whole (body is then its first 2000 bytes)
 // hdr: the request's x-amz-date, content-length and transfer-encoding, bar-separated (the SigV4 and framing checks of the large request tests)
 // proj: the Bedrock Mantle project headers, OpenAI-Project and anthropic-workspace-id, bar-separated (L173)
-type Seen = { path: string, auth: string, body: string, team: string, tenant: string, size: int, sha: string, hdr?: string, proj?: string }
+type Seen = { path: string, auth: string, body: string, team: string, tenant: string, size: int, sha: string, hdr?: string, proj?: string, ver?: string }
 
 const seen: Seen[] = []
 // webhook deliveries received: the path, the Standard Webhooks headers and the body
@@ -106,7 +106,7 @@ function record(req: Request, path: string, body: string): void {
   const big = size > 65536
   const hdr = (req.headers.get("x-amz-date") ?? "") + "|" + (req.headers.get("content-length") ?? "") + "|" + (req.headers.get("transfer-encoding") ?? "")
   const proj = (req.headers.get("openai-project") ?? "") + "|" + (req.headers.get("anthropic-workspace-id") ?? "")
-  seen.push({ path: path, auth: auth, body: big ? body.slice(0, 2000) : body, team: req.headers.get("x-team") ?? "", tenant: req.headers.get("x-tenant") ?? "", size: size, sha: big ? toHex(sha256(utf8(body))) : "", hdr: hdr, proj: proj })
+  seen.push({ path: path, auth: auth, body: big ? body.slice(0, 2000) : body, team: req.headers.get("x-team") ?? "", tenant: req.headers.get("x-tenant") ?? "", size: size, sha: big ? toHex(sha256(utf8(body))) : "", hdr: hdr, proj: proj, ver: req.headers.get("anthropic-version") ?? "" })
 }
 
 // The raw JSON text of a field of an event, or "".
@@ -131,6 +131,8 @@ function failure(model: string, auth: string): Response | undefined {
   if (auth.includes("bad-key")) return Response.json({ error: { message: "invalid api key", type: "auth" } }, { status: 401 })
   if (model.startsWith("down-")) return Response.json({ error: { message: "upstream down", type: "server" } }, { status: 500 })
   if (model.startsWith("limited-")) return new Response('{"error":{"message":"rate limited","type":"rate_limit"}}', { status: 429, headers: { "content-type": "application/json", "retry-after-ms": "2500" } })
+  // L180: a Google-shaped rate limit whose RetryInfo detail asks for 42 s (the header says 3 s; the body wins)
+  if (model === "l180-retryinfo") return new Response('{"error":{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"42s"}]}}', { status: 429, headers: { "content-type": "application/json", "retry-after": "3" } })
   if (model.startsWith("flaky-")) {
     flakyCalls += 1
     if (flakyCalls % 2 === 1) return Response.json({ error: { message: "overloaded", type: "server" } }, { status: 503 })
@@ -553,12 +555,19 @@ Bun.serve<string>({
         const model = m.model ?? ""
         const f = failure(model, req.headers.get("authorization") ?? "")
         if (f !== undefined) return f
+        // L180: a key named "l180-slow" answers 300 ms late (the provider level ranks providers by measured latency)
+        if ((req.headers.get("authorization") ?? "").includes("l180-slow")) await new Promise((done) => setTimeout(done, 300))
         // large_payload_optimization: "large-answer" answers with a 3 MB completion, "large-stream" with a 3 MB event stream
         if (model === "large-answer") return Response.json({ id: "cl1", object: "chat.completion", created: 1, model: model, choices: [{ index: 0, message: { role: "assistant", content: "y".repeat(3000000) }, finish_reason: "stop" }], usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 } })
         // L174: a stream that stops for its length (the stop reason of a streamed answer is logged)
         if (model === "l174-stream") {
           const ck = (delta: string, finish: string) => `data: {"id":"cs174","object":"chat.completion.chunk","created":1,"model":"${model}","choices":[{"index":0,"delta":${delta},"finish_reason":${finish}}]}\n\n`
           return new Response(ck(`{"role":"assistant","content":"cut "}`, "null") + ck(`{"content":"short"}`, "null") + ck(`{}`, `"length"`) + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } })
+        }
+        // L176: a stream that breaks after its first chunk with an error event (the post hooks see the error)
+        if (model === "l176-broken") {
+          const bk = `data: {"id":"cs176","object":"chat.completion.chunk","created":1,"model":"${model}","choices":[{"index":0,"delta":{"role":"assistant","content":"Hel"},"finish_reason":null}]}\n\n`
+          return new Response(bk + `data: {"error":{"message":"upstream broke","type":"server_error"}}\n\n`, { headers: { "content-type": "text/event-stream" } })
         }
         if (model === "large-stream") {
           const bulk = "z".repeat(1000)
@@ -1079,6 +1088,10 @@ Bun.serve<string>({
           return new Response(op, { headers: { "content-type": "application/json" } })
         }
         if (action.endsWith(":predict")) return Response.json({ predictions: [{ bytesBase64Encoded: "iVBORw0KGgo=" }] })
+        // a streamed transcription (audio inline): the transcript in two chunks, the usage on the last
+        if (action.endsWith(":streamGenerateContent") && body.includes(`"inlineData":{"mimeType":"audio/`)) {
+          return new Response(`data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Hi from "}]}}]}\r\n\r\ndata: {"candidates":[{"content":{"role":"model","parts":[{"text":"gemini stream"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":14,"candidatesTokenCount":4,"totalTokenCount":18}}\r\n\r\n`, { headers: { "content-type": "text/event-stream" } })
+        }
         if (action.endsWith(":streamGenerateContent")) return new Response(GEMINI_SSE, { headers: { "content-type": "text/event-stream" } })
         // image models answer with inline image data; TTS with 16-bit mono PCM at 24 kHz
         if (body.includes(`"IMAGE"`)) return Response.json({ candidates: [{ content: { role: "model", parts: [{ inlineData: { mimeType: "image/png", data: "iVBORw0KGgo=" } }] }, finishReason: "STOP" }] })
@@ -1320,6 +1333,23 @@ Bun.serve<string>({
           return new Response(sse, { headers: { "content-type": "text/event-stream" } })
         }
         return new Response(`{"id":"resp_1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"native responses","annotations":[]}]}],"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}`, { headers: { "content-type": "application/json" } })
+      },
+    },
+    // GCP's Security Token Service and IAM Credentials, for Vertex keys federated from an AWS identity (L181)
+    "/wif/sts": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/wif/sts", body)
+        if (!body.includes("subject_token=") || !body.includes("GetCallerIdentity")) return Response.json({ error: "invalid_grant", error_description: "no subject token" }, { status: 400 })
+        return Response.json({ access_token: "fed-token-l181", issued_token_type: "urn:ietf:params:oauth:token-type:access_token", token_type: "Bearer", expires_in: 3600 })
+      },
+    },
+    "/wif/impersonate": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/wif/impersonate", body)
+        if (req.headers.get("authorization") !== "Bearer fed-token-l181") return Response.json({ error: { code: 401, message: "bad federated token" } }, { status: 401 })
+        return Response.json({ accessToken: "ya29.impersonated-l181", expireTime: "2099-01-01T00:00:00Z" })
       },
     },
     // Google's OAuth token endpoint, for Vertex service-account auth

@@ -1,19 +1,80 @@
-// ES256 signatures (ECDSA over P-256 with SHA-256, RFC 7518 section 3.4) for JWT assertions. Tov has no EC
-// library: the curve arithmetic is done here with bigint, and the nonce is derived as RFC 6979 describes
-// (HMAC-SHA256 over the key and the digest), so no random source can leak the key. The private key is an EC
-// PEM: SEC 1 (BEGIN EC PRIVATE KEY) or PKCS#8 (BEGIN PRIVATE KEY) on the P-256 curve.
-import { sha256, hmacSha256, utf8 } from "./crypto"
+// ES256, ES384 and ES512 signatures (ECDSA over P-256, P-384 and P-521 with SHA-256, SHA-384 and SHA-512, RFC 7518
+// section 3.4) for JWT assertions. Tov has no EC library: the curve arithmetic is done here with bigint, and the
+// nonce is derived as RFC 6979 describes (HMAC over the key and the digest), so no random source can leak the key.
+// The private key is an EC PEM: SEC 1 (BEGIN EC PRIVATE KEY) or PKCS#8 (BEGIN PRIVATE KEY) on the algorithm's curve.
+import { sha256, sha384, sha512, hmacSha256, hmacSha384, hmacSha512, utf8 } from "./crypto"
 import { encodeUrl, encode, decode } from "./base64"
 import { modPow } from "./jwt"
 
-const P: bigint = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffffn
-const N: bigint = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551n
-const GX: bigint = 0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296n
-const GY: bigint = 0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5n
+// A short Weierstrass curve with a = -3 (every NIST prime curve), its order, base point and DER name.
+type Curve = { name: string, p: bigint, n: bigint, gx: bigint, gy: bigint, oid: int[], bytes: int, qlen: int }
 
-// id-ecPublicKey (1.2.840.10045.2.1) and prime256v1 (1.2.840.10045.3.1.7), as DER OBJECT IDENTIFIERs
+// id-ecPublicKey (1.2.840.10045.2.1) as a DER OBJECT IDENTIFIER
 const EC_OID: int[] = [0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]
-const P256_OID: int[] = [0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]
+
+function p256(): Curve {
+  return {
+    name: "P-256",
+    p: 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffffn,
+    n: 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551n,
+    gx: 0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296n,
+    gy: 0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5n,
+    // prime256v1 (1.2.840.10045.3.1.7)
+    oid: [0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07],
+    bytes: 32,
+    qlen: 256,
+  }
+}
+
+function p384(): Curve {
+  return {
+    name: "P-384",
+    p: 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffffn,
+    n: 0xffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973n,
+    gx: 0xaa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab7n,
+    gy: 0x3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5fn,
+    // secp384r1 (1.3.132.0.34)
+    oid: [0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x22],
+    bytes: 48,
+    qlen: 384,
+  }
+}
+
+function p521(): Curve {
+  return {
+    name: "P-521",
+    p: 0x01ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffn,
+    n: 0x01fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffa51868783bf2f966b7fcc0148f709a5d03bb5c9b8899c47aebb6fb71e91386409n,
+    gx: 0x00c6858e06b70404e9cd9e3ecb662395b4429c648139053fb521f828af606b4d3dbaa14b5e77efe75928fe1dc127a2ffa8de3348b3c1856a429bf97e7e31c2e5bd66n,
+    gy: 0x011839296a789a3bc0045c8a5fb42c7d1bd998f54449579b446817afbd17273e662c97ee72995ef42640c550b9013fad0761353c7086a272c24088be94769fd16650n,
+    // secp521r1 (1.3.132.0.35)
+    oid: [0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x23],
+    bytes: 66,
+    qlen: 521,
+  }
+}
+
+const CURVES: Curve[] = [p256(), p384(), p521()]
+
+// The curve and hash size an ES algorithm names (ES256, ES384, ES512).
+function curveFor(alg: string): Curve throws SyntaxError {
+  if (alg === "ES256") return CURVES[0]!
+  if (alg === "ES384") return CURVES[1]!
+  if (alg === "ES512") return CURVES[2]!
+  throw new SyntaxError(`ecdsa: unknown algorithm ${alg}`)
+}
+
+function hashOf(c: Curve, data: u8[]): u8[] {
+  if (c.bytes === 48) return sha384(data)
+  if (c.bytes === 66) return sha512(data)
+  return sha256(data)
+}
+
+function hmacOf(c: Curve, key: u8[], data: u8[]): u8[] {
+  if (c.bytes === 48) return hmacSha384(key, data)
+  if (c.bytes === 66) return hmacSha512(key, data)
+  return hmacSha256(key, data)
+}
 
 // ---- DER ----
 
@@ -52,6 +113,14 @@ function startsWith(b: u8[], prefix: int[]): bool {
   return true
 }
 
+// The curve a DER OBJECT IDENTIFIER (at the start of b) names, or undefined.
+function curveByOid(b: u8[]): Curve | undefined {
+  for (const c of CURVES) {
+    if (startsWith(b, c.oid)) return c
+  }
+  return undefined
+}
+
 function bigOf(b: u8[]): bigint {
   let v = 0n
   for (const x of b) v = v * 256n + BigInt(int(x))
@@ -69,38 +138,45 @@ function bytesOf(x: bigint, len: int): u8[] {
   return out
 }
 
-// SEC 1 ECPrivateKey: SEQUENCE { version 1, privateKey OCTET STRING, [0] parameters, [1] publicKey }. The
-// curve, when named, must be P-256.
-function secOne(der: u8[]): bigint throws SyntaxError {
+// An EC private key: its scalar and the curve its PEM names (undefined when it names none).
+export type EcKey = { d: bigint, curve: string }
+
+// SEC 1 ECPrivateKey: SEQUENCE { version 1, privateKey OCTET STRING, [0] parameters, [1] publicKey }.
+function secOne(der: u8[], named: Curve | undefined): EcKey throws SyntaxError {
   const body = (try child(der, 0, 0x30)).value
   const ver = try child(body, 0, 0x02)
   if (ver.value.length !== 1 || int(ver.value[0]!) !== 1) throw new SyntaxError("ec: unsupported key version")
   const key = try child(body, ver.next, 0x04)
+  let curve = named
   if (key.next < body.length) {
     const params = try readTlv(body, key.next)
-    if (params.tag === 0xa0 && !startsWith(params.value, P256_OID)) throw new SyntaxError("ec: only the P-256 curve is supported (ES256)")
+    if (params.tag === 0xa0) {
+      curve = curveByOid(params.value)
+      if (curve === undefined) throw new SyntaxError("ec: only the P-256, P-384 and P-521 curves are supported")
+    }
   }
   const d = bigOf(key.value)
-  if (d <= 0n || d >= N) throw new SyntaxError("ec: private key out of range")
-  return d
+  if (curve !== undefined && (d <= 0n || d >= curve.n)) throw new SyntaxError("ec: private key out of range")
+  return { d: d, curve: curve !== undefined ? curve.name : "" }
 }
 
-// PKCS#8 PrivateKeyInfo for an EC key: SEQUENCE { version, SEQUENCE { id-ecPublicKey, prime256v1 }, OCTET STRING }.
-function pkcs8(der: u8[]): bigint throws SyntaxError {
+// PKCS#8 PrivateKeyInfo for an EC key: SEQUENCE { version, SEQUENCE { id-ecPublicKey, curve }, OCTET STRING }.
+function pkcs8(der: u8[]): EcKey throws SyntaxError {
   const body = (try child(der, 0, 0x30)).value
   const ver = try child(body, 0, 0x02)
   const alg = try child(body, ver.next, 0x30)
   if (!startsWith(alg.value, EC_OID)) throw new SyntaxError("pkcs8: not an EC key")
-  if (!startsWith(alg.value.slice(EC_OID.length), P256_OID)) throw new SyntaxError("ec: only the P-256 curve is supported (ES256)")
+  const curve = curveByOid(alg.value.slice(EC_OID.length))
+  if (curve === undefined) throw new SyntaxError("ec: only the P-256, P-384 and P-521 curves are supported")
   const key = try child(body, alg.next, 0x04)
-  return try secOne(key.value)
+  return try secOne(key.value, curve)
 }
 
-// The private scalar of an EC PEM (SEC 1 or PKCS#8).
-export function ecPrivateKey(pem: string): bigint throws SyntaxError {
+// The private scalar and curve of an EC PEM (SEC 1 or PKCS#8).
+export function ecPrivateKey(pem: string): EcKey throws SyntaxError {
   const sec = pem.includes("-----BEGIN EC PRIVATE KEY-----")
   const p8 = pem.includes("-----BEGIN PRIVATE KEY-----")
-  if (!sec && !p8) throw new SyntaxError("private_key could not be parsed as an EC PEM for ES256")
+  if (!sec && !p8) throw new SyntaxError("private_key could not be parsed as an EC PEM")
   const lines: string[] = []
   for (const line of pem.split("\n")) {
     const l = line.trim()
@@ -108,54 +184,56 @@ export function ecPrivateKey(pem: string): bigint throws SyntaxError {
     lines.push(l)
   }
   const der = try decode(lines.join(""))
-  return sec ? try secOne(der) : try pkcs8(der)
+  return sec ? try secOne(der, undefined) : try pkcs8(der)
 }
 
-// ---- P-256 ----
+// ---- curve arithmetic (Jacobian coordinates, a = -3) ----
 
 type Pt = { x: bigint, y: bigint, z: bigint, inf: bool }
 
 const INF: Pt = { x: 0n, y: 1n, z: 0n, inf: true }
 
-function fp(a: bigint): bigint {
-  const r = a % P
-  return r < 0n ? r + P : r
+function fp(a: bigint, p: bigint): bigint {
+  const r = a % p
+  return r < 0n ? r + p : r
 }
 
-function dbl(p: Pt): Pt {
-  if (p.inf || p.y === 0n) return INF
-  const delta = fp(p.z * p.z)
-  const gamma = fp(p.y * p.y)
-  const beta = fp(p.x * gamma)
-  const alpha = fp(3n * (p.x - delta) * (p.x + delta))
-  const x3 = fp(alpha * alpha - 8n * beta)
-  const z3 = fp((p.y + p.z) * (p.y + p.z) - gamma - delta)
-  const y3 = fp(alpha * (4n * beta - x3) - 8n * gamma * gamma)
+function dbl(c: Curve, pt: Pt): Pt {
+  if (pt.inf || pt.y === 0n) return INF
+  const P = c.p
+  const delta = fp(pt.z * pt.z, P)
+  const gamma = fp(pt.y * pt.y, P)
+  const beta = fp(pt.x * gamma, P)
+  const alpha = fp(3n * (pt.x - delta) * (pt.x + delta), P)
+  const x3 = fp(alpha * alpha - 8n * beta, P)
+  const z3 = fp((pt.y + pt.z) * (pt.y + pt.z) - gamma - delta, P)
+  const y3 = fp(alpha * (4n * beta - x3) - 8n * gamma * gamma, P)
   return { x: x3, y: y3, z: z3, inf: false }
 }
 
-function addAffine(p: Pt, qx: bigint, qy: bigint): Pt {
-  if (p.inf) return { x: qx, y: qy, z: 1n, inf: false }
-  const z1z1 = fp(p.z * p.z)
-  const u2 = fp(qx * z1z1)
-  const s2 = fp(qy * p.z * z1z1)
-  const h = fp(u2 - p.x)
-  const r = fp(2n * (s2 - p.y))
+function addAffine(c: Curve, pt: Pt, qx: bigint, qy: bigint): Pt {
+  if (pt.inf) return { x: qx, y: qy, z: 1n, inf: false }
+  const P = c.p
+  const z1z1 = fp(pt.z * pt.z, P)
+  const u2 = fp(qx * z1z1, P)
+  const s2 = fp(qy * pt.z * z1z1, P)
+  const h = fp(u2 - pt.x, P)
+  const r = fp(2n * (s2 - pt.y), P)
   if (h === 0n) {
-    if (r === 0n) return dbl(p)
+    if (r === 0n) return dbl(c, pt)
     return INF
   }
-  const hh = fp(h * h)
-  const i = fp(4n * hh)
-  const j = fp(h * i)
-  const v = fp(p.x * i)
-  const x3 = fp(r * r - j - 2n * v)
-  const y3 = fp(r * (v - x3) - 2n * p.y * j)
-  const z3 = fp((p.z + h) * (p.z + h) - z1z1 - hh)
+  const hh = fp(h * h, P)
+  const i = fp(4n * hh, P)
+  const j = fp(h * i, P)
+  const v = fp(pt.x * i, P)
+  const x3 = fp(r * r - j - 2n * v, P)
+  const y3 = fp(r * (v - x3) - 2n * pt.y * j, P)
+  const z3 = fp((pt.z + h) * (pt.z + h) - z1z1 - hh, P)
   return { x: x3, y: y3, z: z3, inf: false }
 }
 
-function scalarMul(k: bigint, x: bigint, y: bigint): Pt {
+function scalarMul(c: Curve, k: bigint, x: bigint, y: bigint): Pt {
   let acc: Pt = INF
   let bits = 0
   let t = k
@@ -164,17 +242,17 @@ function scalarMul(k: bigint, x: bigint, y: bigint): Pt {
     bits++
   }
   for (let i = bits - 1; i >= 0; i--) {
-    acc = dbl(acc)
-    if (((k >> BigInt(i)) & 1n) === 1n) acc = addAffine(acc, x, y)
+    acc = dbl(c, acc)
+    if (((k >> BigInt(i)) & 1n) === 1n) acc = addAffine(c, acc, x, y)
   }
   return acc
 }
 
-function affine(p: Pt): { x: bigint, y: bigint } | undefined {
-  if (p.inf) return undefined
-  const zi = modPow(fp(p.z), P - 2n, P)
-  const zi2 = fp(zi * zi)
-  return { x: fp(p.x * zi2), y: fp(p.y * zi2 * zi) }
+function affine(c: Curve, pt: Pt): { x: bigint, y: bigint } | undefined {
+  if (pt.inf) return undefined
+  const zi = modPow(fp(pt.z, c.p), c.p - 2n, c.p)
+  const zi2 = fp(zi * zi, c.p)
+  return { x: fp(pt.x * zi2, c.p), y: fp(pt.y * zi2 * zi, c.p) }
 }
 
 // ---- RFC 6979 nonces and signatures ----
@@ -187,71 +265,105 @@ function concat(parts: u8[][]): u8[] {
   return out
 }
 
-// The deterministic nonce for a key and a SHA-256 digest (RFC 6979 section 3.2, qlen = hlen = 256).
-export function nonceFor(d: bigint, digest: u8[]): bigint {
-  const x = bytesOf(d, 32)
-  const h = bytesOf(bigOf(digest) % N, 32)
+// RFC 6979 bits2int: the leftmost qlen bits of b as an integer.
+function bits2int(c: Curve, b: u8[]): bigint {
+  const v = bigOf(b)
+  const vlen = b.length * 8
+  return vlen > c.qlen ? v >> BigInt(vlen - c.qlen) : v
+}
+
+// The deterministic nonce for a key and a digest (RFC 6979 section 3.2).
+function nonceOn(c: Curve, d: bigint, digest: u8[]): bigint {
+  const rlen: int = Math.ceil(c.qlen / 8)
+  const x = bytesOf(d, rlen)
+  const h = bytesOf(bits2int(c, digest) % c.n, rlen)
+  const hlen = digest.length
   let v: u8[] = []
   let k: u8[] = []
-  for (let i = 0; i < 32; i++) {
+  for (let i = 0; i < hlen; i++) {
     v.push(u8(1))
     k.push(u8(0))
   }
-  k = hmacSha256(k, concat([v, [u8(0)], x, h]))
-  v = hmacSha256(k, v)
-  k = hmacSha256(k, concat([v, [u8(1)], x, h]))
-  v = hmacSha256(k, v)
+  k = hmacOf(c, k, concat([v, [u8(0)], x, h]))
+  v = hmacOf(c, k, v)
+  k = hmacOf(c, k, concat([v, [u8(1)], x, h]))
+  v = hmacOf(c, k, v)
   while (true) {
-    v = hmacSha256(k, v)
-    const t = bigOf(v)
-    if (t >= 1n && t < N) return t
-    k = hmacSha256(k, concat([v, [u8(0)]]))
-    v = hmacSha256(k, v)
+    let t: u8[] = []
+    while (t.length * 8 < c.qlen) {
+      v = hmacOf(c, k, v)
+      t = t.concat(v)
+    }
+    const cand = bits2int(c, t)
+    if (cand >= 1n && cand < c.n) return cand
+    k = hmacOf(c, k, concat([v, [u8(0)]]))
+    v = hmacOf(c, k, v)
   }
 }
 
-// The raw (r, s) signature of a SHA-256 digest.
-export function signDigest(d: bigint, digest: u8[]): { r: bigint, s: bigint } {
-  const z = bigOf(digest) % N
-  let k = nonceFor(d, digest)
+// The deterministic P-256 nonce for a key and a SHA-256 digest.
+export function nonceFor(d: bigint, digest: u8[]): bigint {
+  return nonceOn(CURVES[0]!, d, digest)
+}
+
+function signOn(c: Curve, d: bigint, digest: u8[]): { r: bigint, s: bigint } {
+  const z = bits2int(c, digest) % c.n
+  let k = nonceOn(c, d, digest)
   while (true) {
-    const pt = affine(scalarMul(k, GX, GY))
+    const pt = affine(c, scalarMul(c, k, c.gx, c.gy))
     if (pt !== undefined) {
-      const r = pt.x % N
+      const r = pt.x % c.n
       if (r !== 0n) {
-        const kinv = modPow(k, N - 2n, N)
-        const s = (kinv * ((z + r * d) % N)) % N
+        const kinv = modPow(k, c.n - 2n, c.n)
+        const s = (kinv * ((z + r * d) % c.n)) % c.n
         if (s !== 0n) return { r: r, s: s }
       }
     }
     // (a zero r or s is all but impossible; the next nonce is the digest of this one)
-    k = bigOf(hmacSha256(bytesOf(k, 32), digest)) % N
+    k = bits2int(c, hmacOf(c, bytesOf(k, c.bytes), digest)) % c.n
   }
 }
 
-// Base64url ES256 signature of signingInput: r and s, 32 bytes each (the JWS form, not DER).
+// The raw (r, s) P-256 signature of a SHA-256 digest.
+export function signDigest(d: bigint, digest: u8[]): { r: bigint, s: bigint } {
+  return signOn(CURVES[0]!, d, digest)
+}
+
+// Base64url ES256, ES384 or ES512 signature of signingInput: r and s at the curve's size each (the JWS form, not
+// DER). The key must be on the curve the algorithm names, as Bifrost checks it.
+export function signEs(alg: string, pem: string, signingInput: string): string throws SyntaxError {
+  const c = try curveFor(alg)
+  const key = try ecPrivateKey(pem)
+  if (key.curve !== "" && key.curve !== c.name) throw new SyntaxError(`signing_algorithm ${alg} needs a ${c.name} key; private_key is on ${key.curve}`)
+  if (key.d <= 0n || key.d >= c.n) throw new SyntaxError("ec: private key out of range")
+  const sig = signOn(c, key.d, hashOf(c, utf8(signingInput)))
+  return encodeUrl(concat([bytesOf(sig.r, c.bytes), bytesOf(sig.s, c.bytes)]))
+}
+
+// Base64url ES256 signature of signingInput.
 export function signEs256(pem: string, signingInput: string): string throws SyntaxError {
-  const d = try ecPrivateKey(pem)
-  const sig = signDigest(d, sha256(utf8(signingInput)))
-  return encodeUrl(concat([bytesOf(sig.r, 32), bytesOf(sig.s, 32)]))
+  return try signEs("ES256", pem, signingInput)
 }
 
 // Whether (r, s) is a valid signature of a digest under the public key d*G (for the tests).
-function verifyWith(d: bigint, digest: u8[], r: bigint, s: bigint): bool {
-  const q = affine(scalarMul(d, GX, GY))
+function verifyWith(c: Curve, d: bigint, digest: u8[], r: bigint, s: bigint): bool {
+  const q = affine(c, scalarMul(c, d, c.gx, c.gy))
   if (q === undefined) return false
-  const w = modPow(s, N - 2n, N)
-  const z = bigOf(digest) % N
-  const p1 = scalarMul((z * w) % N, GX, GY)
-  const p2 = affine(scalarMul((r * w) % N, q.x, q.y))
+  const w = modPow(s, c.n - 2n, c.n)
+  const z = bits2int(c, digest) % c.n
+  const p1 = scalarMul(c, (z * w) % c.n, c.gx, c.gy)
+  const p2 = affine(c, scalarMul(c, (r * w) % c.n, q.x, q.y))
   let sum: Pt = p1
-  if (p2 !== undefined) sum = addAffine(p1, p2.x, p2.y)
-  const a = affine(sum)
+  if (p2 !== undefined) sum = addAffine(c, p1, p2.x, p2.y)
+  const a = affine(c, sum)
   if (a === undefined) return false
-  return a.x % N === r
+  return a.x % c.n === r
 }
 
 const RFC6979_D: bigint = 0xc9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721n
+// RFC 6979 A.2.6 and A.2.7 keys (P-384 and P-521)
+const RFC6979_D384: bigint = 0x6b9d3dad2e1b8c1c05b19875b6659f4de23c3b667bf297ba9aa47740787137d896d5724e4c70a825f872c9ea60d2edf5n
+const RFC6979_D521: bigint = 0x0fad06daa62ba3b25d2fb40133da757205de67f5bb0018fee8c86e1b68c7e75caa896eb32f1f47c70855836a6d16fcc1466f6d8fbec67db89ec0c08b0e996b83538n
 
 test("RFC 6979 A.2.5: P-256 with SHA-256 over \"sample\"", () => {
   const digest = sha256(utf8("sample"))
@@ -259,27 +371,66 @@ test("RFC 6979 A.2.5: P-256 with SHA-256 over \"sample\"", () => {
   const sig = signDigest(RFC6979_D, digest)
   expect(sig.r).toBe(0xefd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716n)
   expect(sig.s).toBe(0xf7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8n)
-  expect(verifyWith(RFC6979_D, digest, sig.r, sig.s)).toBe(true)
-  expect(verifyWith(RFC6979_D, sha256(utf8("other")), sig.r, sig.s)).toBe(false)
+  expect(verifyWith(CURVES[0]!, RFC6979_D, digest, sig.r, sig.s)).toBe(true)
+  expect(verifyWith(CURVES[0]!, RFC6979_D, sha256(utf8("other")), sig.r, sig.s)).toBe(false)
 })
 
-// The RFC's key as a SEC 1 PEM, built here (a [0] parameter naming P-256).
-function rfcPem(): string {
-  const der: u8[] = []
-  for (const b of [0x30, 0x31, 0x02, 0x01, 0x01, 0x04, 0x20]) der.push(u8(b))
-  for (const b of bytesOf(RFC6979_D, 32)) der.push(b)
-  for (const b of [0xa0, 0x0a]) der.push(u8(b))
-  for (const b of P256_OID) der.push(u8(b))
-  return "-----BEGIN EC " + "PRIVATE KEY-----\n" + encode(der) + "\n-----END EC " + "PRIVATE KEY-----\n"
+test("RFC 6979 A.2.6 and A.2.7: P-384 with SHA-384 and P-521 with SHA-512 over \"sample\"", () => {
+  const c384 = CURVES[1]!
+  const d384 = sha384(utf8("sample"))
+  const s384 = signOn(c384, RFC6979_D384, d384)
+  expect(s384.r).toBe(0x94edbb92a5ecb8aad4736e56c691916b3f88140666ce9fa73d64c4ea95ad133c81a648152e44acf96e36dd1e80fabe46n)
+  expect(s384.s).toBe(0x99ef4aeb15f178cea1fe40db2603138f130e740a19624526203b6351d0a3a94fa329c145786e679e7b82c71a38628ac8n)
+  expect(verifyWith(c384, RFC6979_D384, d384, s384.r, s384.s)).toBe(true)
+  const c521 = CURVES[2]!
+  const d521 = sha512(utf8("sample"))
+  const s521 = signOn(c521, RFC6979_D521, d521)
+  expect(s521.r).toBe(0xc328fafcbd79dd77850370c46325d987cb525569fb63c5d3bc53950e6d4c5f174e25a1ee9017b5d450606add152b534931d7d4e8455cc91f9b15bf05ec36e377fan)
+  expect(s521.s).toBe(0x617cce7cf5064806c467f678d3b4080d6f1cc50af26ca209417308281b68af282623eaa63e5b5c0723d8b8c37ff0777b1a20f8ccb1dccc43997f1ee0e44da4a67an)
+  expect(verifyWith(c521, RFC6979_D521, d521, s521.r, s521.s)).toBe(true)
+})
+
+// A test key as a SEC 1 PEM, built here (a [0] parameter naming the curve).
+function secPem(c: Curve, d: bigint): string {
+  const inner: u8[] = []
+  for (const b of [0x02, 0x01, 0x01, 0x04, c.bytes]) inner.push(u8(b))
+  for (const b of bytesOf(d, c.bytes)) inner.push(b)
+  inner.push(u8(0xa0))
+  inner.push(u8(c.oid.length))
+  for (const b of c.oid) inner.push(u8(b))
+  const der: u8[] = [u8(0x30)]
+  if (inner.length >= 0x80) der.push(u8(0x81))
+  der.push(u8(inner.length))
+  return "-----BEGIN EC " + "PRIVATE KEY-----\n" + encode(der.concat(inner)) + "\n-----END EC " + "PRIVATE KEY-----\n"
 }
 
+// The same key as PKCS#8 (the curve in the AlgorithmIdentifier, none in the inner SEC 1 key).
+function pkcs8Pem(c: Curve, d: bigint): string {
+  const sec: u8[] = []
+  for (const b of [0x02, 0x01, 0x01, 0x04, c.bytes]) sec.push(u8(b))
+  for (const b of bytesOf(d, c.bytes)) sec.push(b)
+  const secDer = [u8(0x30), u8(sec.length)].concat(sec)
+  const algBody: u8[] = []
+  for (const b of EC_OID) algBody.push(u8(b))
+  for (const b of c.oid) algBody.push(u8(b))
+  const body: u8[] = [u8(0x02), u8(0x01), u8(0x00), u8(0x30), u8(algBody.length)]
+  for (const b of algBody) body.push(b)
+  body.push(u8(0x04))
+  body.push(u8(secDer.length))
+  for (const b of secDer) body.push(b)
+  const der: u8[] = [u8(0x30)]
+  if (body.length >= 0x80) der.push(u8(0x81))
+  der.push(u8(body.length))
+  return "-----BEGIN " + "PRIVATE KEY-----\n" + encode(der.concat(body)) + "\n-----END " + "PRIVATE KEY-----\n"
+}
 
 test("an ES256 signature over a SEC 1 PEM is the 64-byte r||s of the RFC key", () => {
-  const sig = try signEs256(rfcPem(), "sample")
+  const pem = secPem(CURVES[0]!, RFC6979_D)
+  const sig = try signEs256(pem, "sample")
   const raw = try decode(sig)
   expect(raw.length).toBe(64)
   expect(bigOf(raw.slice(0, 32))).toBe(0xefd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716n)
-  expect(try ecPrivateKey(rfcPem())).toBe(RFC6979_D)
+  expect((try ecPrivateKey(pem)).d).toBe(RFC6979_D)
   let bad = ""
   try {
     ecPrivateKey("-----BEGIN RSA " + "PRIVATE KEY-----\nAAAA\n-----END RSA " + "PRIVATE KEY-----")
@@ -287,4 +438,22 @@ test("an ES256 signature over a SEC 1 PEM is the 64-byte r||s of the RFC key", (
     bad = e.message
   }
   expect(bad.includes("EC PEM")).toBe(true)
+})
+
+test("ES384 and ES512 sign with SEC 1 and PKCS#8 keys on their own curve, and refuse a key on another", () => {
+  const s384 = try decode(try signEs("ES384", secPem(CURVES[1]!, RFC6979_D384), "sample"))
+  expect(s384.length).toBe(96)
+  expect(bigOf(s384.slice(0, 48))).toBe(0x94edbb92a5ecb8aad4736e56c691916b3f88140666ce9fa73d64c4ea95ad133c81a648152e44acf96e36dd1e80fabe46n)
+  const p8 = try decode(try signEs("ES384", pkcs8Pem(CURVES[1]!, RFC6979_D384), "sample"))
+  expect(bigOf(p8.slice(48))).toBe(0x99ef4aeb15f178cea1fe40db2603138f130e740a19624526203b6351d0a3a94fa329c145786e679e7b82c71a38628ac8n)
+  const s521 = try decode(try signEs("ES512", pkcs8Pem(CURVES[2]!, RFC6979_D521), "sample"))
+  expect(s521.length).toBe(132)
+  expect(bigOf(s521.slice(0, 66))).toBe(0xc328fafcbd79dd77850370c46325d987cb525569fb63c5d3bc53950e6d4c5f174e25a1ee9017b5d450606add152b534931d7d4e8455cc91f9b15bf05ec36e377fan)
+  let wrong = ""
+  try {
+    signEs("ES384", secPem(CURVES[0]!, RFC6979_D), "sample")
+  } catch (e) {
+    wrong = e.message
+  }
+  expect(wrong).toBe("signing_algorithm ES384 needs a P-384 key; private_key is on P-256")
 })

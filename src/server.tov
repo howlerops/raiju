@@ -18,7 +18,7 @@ import * as copilot from "./providers/githubcopilot"
 import * as cohere from "./providers/cohere"
 import * as bedrockMantle from "./providers/bedrock_mantle"
 import * as watsonx from "./providers/watsonx"
-import { bedrockIds, publisherPage, cloudflarePage, cloudflareSearchPath } from "./model_list"
+import { bedrockIds, publisherPage, cloudflarePage, cloudflareSearchPath, liveModelsSeconds, liveModelsDelayMs, listingFresh, DEFAULT_LIVE_MODELS_SECONDS, MIN_LIVE_MODELS_SECONDS } from "./model_list"
 import { retrieveRequest, retrieveBody } from "./model_retrieve"
 import { fields, find, elements, rawStr, rawBool } from "./json"
 import * as metrics from "./metrics"
@@ -53,19 +53,76 @@ import { cookieValue, SETUP_COOKIE } from "./setupsession"
 import { rerank, bedrockRerank, countTokens, responsesInputTokens, asyncSubmit, asyncGet, sdkAsyncSubmit, sdkAsyncPoll, decisionRoute, openaiDecisionPath, Dispatch } from "./extras"
 import { asyncPoll } from "./jobs"
 import { serveUi, uiPath, UI_CSP } from "./uiserve"
-import { TransportRun, transportStart, transportEnd, transportDone, transportSink, llmHooked, storageHooked, StorageCall, storageOp, pathWithId } from "./pluginroute"
+import { TransportRun, transportStart, transportEnd, transportDone, transportSink, llmHooked, storageHooked, StorageCall, storageOp, storageIdKey, pathWithId } from "./pluginroute"
 import { kindOfPath, isInferencePath } from "./plughttp"
 import { EXTRA_PARAMS_HEADER, EXTRA_PARAMS_CARRY, mergeExtraParams, extraParamsCarry } from "./extraparams"
 import { lifecycle, readyInput, readyReport, ServerLimits } from "./lifecycle"
 
 type ModelEntry = { id: string, object: string, created: int, owned_by: string }
 
+// Each key's own model listing, per worker (Bifrost's live model cache, per process): when it was fetched, and what
+// the key and its provider's base URL were then, so an edited key is listed again.
 class ModelCache {
   ids: Map<string, string[]> = new Map()
   fetchedAt: Map<string, f64> = new Map()
+  sig: Map<string, string> = new Map()
+  timer: int = -1
+
+  put(slot: string, sig: string, ids: string[]): void {
+    this.ids.set(slot, ids)
+    this.fetchedAt.set(slot, Date.now())
+    this.sig.set(slot, sig)
+  }
 }
 
 const modelCache = new ModelCache()
+
+// What a key's listing depends on: the key itself and where its provider is reached.
+function listingSig(p: ProviderConfig, key: KeyConfig): string {
+  return JSON.stringify({ k: key, b: p.network_config?.base_url ?? "" })
+}
+
+// The refresher interval in force (framework.pricing.live_models_sync_interval, model_list.tov liveModelsSeconds).
+function liveSeconds(cfg: Config): int {
+  return liveModelsSeconds(cfg.pricing_sync?.live_models_sync_interval)
+}
+
+// Reads every provider key's model listing again, in the background (Bifrost's RefreshAllLiveModels). Each worker
+// keeps its own copy, so each refreshes it.
+async function refreshAllListings(engine: Engine): Promise<void> {
+  for (const provider of providerNames(engine.cfg)) {
+    const p = providerOf(engine.cfg, provider)
+    if (p === undefined) continue
+    const keys = p.keys ?? []
+    if (keys.length === 0) {
+      await upstreamModelIds(engine, provider, p, 0, { value: "" }, true)
+      continue
+    }
+    for (let i = 0; i < keys.length; i++) {
+      if (listingNeedsUpstream(keys[i]!)) await upstreamModelIds(engine, provider, p, i, keys[i]!, true)
+    }
+  }
+}
+
+// Starts the background listing refresher: every live_models_sync_interval seconds, jittered by 10 percent, read
+// again at each turn so a config change applies from the next one (0 pauses it; it looks again a minute later).
+export function startLiveModelRefresher(engine: Engine): void {
+  if (modelCache.timer >= 0) return
+  listingTurn(engine)
+}
+
+function listingTurn(engine: Engine): void {
+  const secs = liveSeconds(engine.cfg)
+  const delay = secs === 0 ? MIN_LIVE_MODELS_SECONDS * 1000.0 : liveModelsDelayMs(secs, Math.random())
+  modelCache.timer = setTimeout(() => {
+    listingRun(engine)
+  }, delay)
+}
+
+async function listingRun(engine: Engine): Promise<void> {
+  if (liveSeconds(engine.cfg) > 0) await refreshAllListings(engine)
+  listingTurn(engine)
+}
 
 function upstreamModels(provider: string, kind: string, t: Target): Upstream | undefined {
   if (openai.isOpenAICompatible(kind)) return openai.modelsRequest(t)
@@ -313,16 +370,19 @@ function listingSlot(provider: string, index: int): string {
   return provider + "#" + index
 }
 
-// The provider's own listing read with one key (cached for five minutes per key), as its API names the models.
-async function upstreamModelIds(engine: Engine | undefined, provider: string, p: ProviderConfig, index: int, key: KeyConfig): Promise<string[]> {
+// The provider's own listing read with one key, as its API names the models. It is cached for the refresher's
+// interval (model_list.tov listingFresh); force reads it again (the refresher). A failed read keeps the last good
+// listing and is tried again within five minutes.
+async function upstreamModelIds(engine: Engine | undefined, provider: string, p: ProviderConfig, index: int, key: KeyConfig, force?: bool): Promise<string[]> {
   const slot = listingSlot(provider, index)
-  const cachedAt = modelCache.fetchedAt.get(slot) ?? 0.0
-  if (Date.now() - cachedAt < 300000.0) return modelCache.ids.get(slot) ?? []
+  const sig = listingSig(p, key)
+  const secs = engine === undefined ? DEFAULT_LIVE_MODELS_SECONDS : liveSeconds(engine.cfg)
+  if (force !== true && modelCache.sig.get(slot) === sig && listingFresh(modelCache.fetchedAt.get(slot), Date.now(), secs)) return modelCache.ids.get(slot) ?? []
   const kind = kindOf(provider, p)
   const t: Target = { provider: provider, kind: kind, model: "", key: key, cfg: p }
-  let ids: string[] = []
+  let ids: string[] | undefined = undefined
   if (nativeList(kind)) {
-    ids = (await nativeModelIds(engine, provider, t)) ?? []
+    ids = await nativeModelIds(engine, provider, t)
   } else {
     const up = upstreamModels(provider, kind, t)
     if (up === undefined) return []
@@ -333,11 +393,17 @@ async function upstreamModelIds(engine: Engine | undefined, provider: string, p:
       const text = await res.text()
       if (res.ok) ids = await withDecisionModels(provider, t, openai.modelIds(text, provider).map((id) => id.replace(provider + "/models/", provider + "/")))
     } catch (e) {
-      ids = []
+      ids = undefined
     }
   }
-  modelCache.ids.set(slot, ids)
-  modelCache.fetchedAt.set(slot, Date.now())
+  if (ids === undefined) {
+    const last = modelCache.sig.get(slot) === sig ? (modelCache.ids.get(slot) ?? []) : []
+    modelCache.put(slot, sig, last)
+    // stale in five minutes, whatever the interval (with the refresher off, it is kept until refreshed on demand)
+    if (secs > 0) modelCache.fetchedAt.set(slot, Date.now() - Math.max(0.0, secs * 1200.0 - 300000.0))
+    return last
+  }
+  modelCache.put(slot, sig, ids)
   return ids
 }
 
@@ -357,8 +423,7 @@ async function refreshModels(engine: Engine | undefined, cfg: Config, provider: 
     if (nativeList(kind)) {
       const nids = await nativeModelIds(engine, provider, t)
       if (nids === undefined) continue
-      modelCache.ids.set(listingSlot(provider, i), nids)
-      modelCache.fetchedAt.set(listingSlot(provider, i), Date.now())
+      modelCache.put(listingSlot(provider, i), listingSig(p, key), nids)
       return { status: 200, body: JSON.stringify({ provider: provider, models: nids, total: nids.length }), contentType: "application/json" }
     }
     const up = upstreamModels(provider, kind, t)
@@ -370,8 +435,7 @@ async function refreshModels(engine: Engine | undefined, cfg: Config, provider: 
       const text = await res.text()
       if (!res.ok) continue
       const ids = await withDecisionModels(provider, t, openai.modelIds(text, provider).map((id) => id.replace(provider + "/models/", provider + "/")))
-      modelCache.ids.set(listingSlot(provider, i), ids)
-      modelCache.fetchedAt.set(listingSlot(provider, i), Date.now())
+      modelCache.put(listingSlot(provider, i), listingSig(p, key), ids)
       return { status: 200, body: JSON.stringify({ provider: provider, models: ids, total: ids.length }), contentType: "application/json" }
     } catch (e) {
       continue
@@ -1264,9 +1328,9 @@ function headerOr(r: Request, name: string, dflt: string): string {
   return v === "" ? dflt : v
 }
 
-// The member a batch or file request's id goes in.
+// The member a batch, file, Responses lifecycle or cached content request's id goes in.
 function idKeyOf(op: string): string {
-  return op.startsWith("file_") ? "file_id" : "batch_id"
+  return storageIdKey(op)
 }
 
 // A request's path.
@@ -1293,7 +1357,7 @@ function s3Path(id: string): string {
 }
 
 // The Bifrost request a native cloud call is (Bedrock's model invocation jobs and S3 files, Vertex's batch prediction
-// jobs; Vertex's cached contents are not batch or file calls), or undefined. s3: the id is the object's s3:// URI.
+// jobs and cached contents), or undefined. s3: the id is the object's s3:// URI.
 function nativeStorage(nr: NativeRoute): { op: string, provider: string, id: string, s3: bool } | undefined {
   if (nr.kind === "bedrock.list") return { op: "batch_list", provider: "bedrock", id: "", s3: false }
   if (nr.kind === "bedrock.get") return { op: "batch_retrieve", provider: "bedrock", id: nr.id, s3: false }
@@ -1312,6 +1376,12 @@ function nativeStorage(nr: NativeRoute): { op: string, provider: string, id: str
   if (nr.kind === "vertex.get") return { op: "batch_retrieve", provider: "vertex", id: nr.id, s3: false }
   if (nr.kind === "vertex.cancel") return { op: "batch_cancel", provider: "vertex", id: nr.id, s3: false }
   if (nr.kind === "vertex.delete") return { op: "batch_delete", provider: "vertex", id: nr.id, s3: false }
+  // Vertex's regional cached contents (Bifrost's cached_content_* requests, the id as their name)
+  if (nr.kind === "vertex.cache.create") return { op: "cached_content_create", provider: "vertex", id: "", s3: false }
+  if (nr.kind === "vertex.cache.list") return { op: "cached_content_list", provider: "vertex", id: "", s3: false }
+  if (nr.kind === "vertex.cache.get") return { op: "cached_content_retrieve", provider: "vertex", id: nr.id, s3: false }
+  if (nr.kind === "vertex.cache.update") return { op: "cached_content_update", provider: "vertex", id: nr.id, s3: false }
+  if (nr.kind === "vertex.cache.delete") return { op: "cached_content_delete", provider: "vertex", id: nr.id, s3: false }
   return undefined
 }
 

@@ -42,6 +42,18 @@ export type PluginSpan = { name: string, startMs: f64, durUs: f64, error: string
 export class PluginTrace {
   spans: PluginSpan[] = []
   logs: PluginLogEntry[] = []
+  // A route whose post hooks run after its handler wrote the request's log row sets defer: the handler then leaves the
+  // export of the request's trace to done (held in onDone), which the route calls once its post hooks have run, so their
+  // spans are exported with the rest of the trace.
+  defer = false
+  onDone: ((tr: PluginTrace) => void) | undefined = undefined
+
+  // Exports the trace the handler held back, once (the trace is passed in, so the callback holds no link back to it).
+  done(): void {
+    const f = this.onDone
+    this.onDone = undefined
+    if (f !== undefined) f(this)
+  }
 
   // A hook's span; with accumulate, a span of the same name already recorded grows by this duration.
   span(name: string, startMs: f64, durUs: f64, error: string, accumulate: bool): void {
@@ -421,8 +433,18 @@ export class PluginChain {
   // The post hooks for one chunk of a streamed answer, in reverse for the plugins whose preRequest ran. The
   // run's record of them stays until finish.
   runPostChunk(inout ctx: PluginContext, chunk: string): PostOutcome {
+    return this.chunkFrom(&ctx, 200, chunk)
+  }
+
+  // The post hooks on an error event in a stream (Bifrost calls PostLLMHook with the stream's error): the plugins get it
+  // as an error with its status and may change it or recover from it (a status below 400 is a chunk to send instead).
+  runPostChunkError(inout ctx: PluginContext, status: int, chunk: string): PostOutcome {
+    return this.chunkFrom(&ctx, status, chunk)
+  }
+
+  private chunkFrom(inout ctx: PluginContext, start: int, chunk: string): PostOutcome {
     const ran = (ctx.values.get(RAN_KEY) ?? "").split(",")
-    let status = 200
+    let status = start
     let cur = chunk
     for (let i = this.plugins.length - 1; i >= 0; i--) {
       if (!ran.includes(`${i}`)) continue
@@ -449,9 +471,34 @@ export class PluginChain {
   // Stops at the first short-circuit. Later plugins' preRequest hooks don't run. Only the plugins that
   // handle the request's type (ctx.op) take part.
   runPre(inout ctx: PluginContext, body: string): PreResult {
-    const ran: string[] = []
+    return this.preRange(&ctx, body, 0, this.plugins.length, [])
+  }
+
+  // The pre hooks of the plugins before the cache (pre_builtin and builtin), the first part of a chat request's
+  // pre hooks: the cache is looked up with the request as they left it (Bifrost's cache is a builtin plugin).
+  runPreBeforeCache(inout ctx: PluginContext, body: string): PreResult {
+    return this.preRange(&ctx, body, 0, this.cacheAt(), [])
+  }
+
+  // The pre hooks of the post_builtin plugins, run once the cache missed; the plugins whose hooks ran before stay
+  // recorded, so the post hooks run for all of them.
+  runPreAfterCache(inout ctx: PluginContext, body: string): PreResult {
+    const before = ctx.values.get(RAN_KEY) ?? ""
+    return this.preRange(&ctx, body, this.cacheAt(), this.plugins.length, before === "" ? [] : before.split(","))
+  }
+
+  // Whether any plugin after the cache takes part in a request type (runPreAfterCache has work to do).
+  hasAfterCache(op: string): bool {
+    for (let i = this.cacheAt(); i < this.plugins.length; i++) {
+      if (this.plugins[i]!.handlesOp(op)) return true
+    }
+    return false
+  }
+
+  private preRange(inout ctx: PluginContext, body: string, from: int, to: int, ran0: string[]): PreResult {
+    const ran: string[] = ran0.slice()
     let cur = body
-    for (let i = 0; i < this.plugins.length; i++) {
+    for (let i = from; i < to; i++) {
       if (!this.plugins[i]!.handlesOp(ctx.op)) continue
       const r = safePre(this.plugins[i]!, &ctx, cur)
       if (r === undefined) continue
@@ -2691,6 +2738,16 @@ test("the plugins that handle a request type are the only ones that see it", () 
   chain.runPre(&ctx, `{}`)
   chain.runPost(&ctx, 200, `{}`)
   expect(traceOf(ctx)).toBe("pre:w post:w:200")
+})
+
+test("an error event in a stream reaches the chunk post hooks as an error, with its status", () => {
+  const chain = new PluginChain([new HttpRecorder("a", "mark"), new HttpRecorder("b", "")])
+  let ctx = ctxFor("m")
+  chain.runPre(&ctx, `{}`)
+  const o = chain.runPostChunkError(&ctx, 500, `{"error":{"message":"broke"}}`)
+  expect(o.status).toBe(500)
+  expect(o.body).toBe(`{"error":{"message":"broke"}}+a`)
+  expect(traceOf(ctx)).toBe("pre:a pre:b chunk:b:500 chunk:a:500")
 })
 
 test("the post hooks of a stream run per chunk for the plugins whose pre hook ran, until finish", () => {

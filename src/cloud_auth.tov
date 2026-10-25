@@ -1,7 +1,7 @@
 // Cloud credentials beyond static keys: Microsoft Entra ID client-credentials tokens
 // for Azure, AWS STS AssumeRole credentials for Bedrock, and a small token cache that
 // keeps both until shortly before they expire.
-import { fields, rawStr, rawNum } from "./json"
+import { fields, rawStr, rawNum, find } from "./json"
 import { Upstream, headers } from "./providers/types"
 import { utf8, sha256, hmacSha256, toHex } from "./crypto"
 import { amzDate } from "./providers/bedrock"
@@ -92,6 +92,118 @@ export function signV4(creds: AwsCreds, region: string, service: string, host: s
   }
   out.set("authorization", `AWS4-HMAC-SHA256 Credential=${creds.accessKey}/${scope}, SignedHeaders=${signed}, Signature=${signature}`)
   return out
+}
+
+// ---- GCP workload identity federation from an AWS identity (Vertex's aws_workload_identity) ----
+// As Bifrost's vertex/awsfederation.go: an STS GetCallerIdentity request is signed with the workload's AWS
+// credentials (not sent: GCP replays it), exchanged at the GCP Security Token Service for a federated token, and,
+// with a service account to impersonate, exchanged again at IAM Credentials for that account's access token.
+
+export const GCP_STS_TOKEN_URL = "https://sts.googleapis.com/v1/token"
+export const GCP_IAM_CREDENTIALS_URL = "https://iamcredentials.googleapis.com"
+export const AWS_SUBJECT_TOKEN_TYPE = "urn:ietf:params:aws:token-type:aws4_request"
+const CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+const GET_CALLER_IDENTITY = "Action=GetCallerIdentity&Version=2011-06-15"
+const EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+// The regional STS host of the region's partition (GCP replays the request there).
+export function awsStsHost(region: string): string {
+  if (region.startsWith("cn-")) return "sts." + region + ".amazonaws.com.cn"
+  return "sts." + region + ".amazonaws.com"
+}
+
+function signedHeader(key: string, value: string): string {
+  return `{"key":${JSON.stringify(key)},"value":${JSON.stringify(value)}}`
+}
+
+// The subject token: the signed GetCallerIdentity POST (no body, the query fixed), its headers bound to the workload
+// identity provider by x-goog-cloud-target-resource, serialized as GCP expects ({headers, method, url}, keys and
+// headers sorted) and percent-encoded.
+export function awsSubjectToken(creds: AwsCreds, region: string, audience: string, nowMs: f64): string {
+  const host = awsStsHost(region)
+  const date = amzDate(nowMs)
+  const day = date.slice(0, 8)
+  const hs: string[][] = [["host", host], ["x-amz-date", date], ["x-goog-cloud-target-resource", audience]]
+  const token = creds.sessionToken
+  if (token !== undefined && token !== "") hs.push(["x-amz-security-token", token])
+  hs.sort((a, b) => (a[0]! < b[0]! ? -1 : a[0]! > b[0]! ? 1 : 0))
+  const canonicalHeaders = hs.map((h) => `${h[0]!}:${h[1]!}\n`).join("")
+  const signed = hs.map((h) => h[0]!).join(";")
+  const canonical = `POST\n/\n${GET_CALLER_IDENTITY}\n${canonicalHeaders}\n${signed}\n${EMPTY_SHA256}`
+  const scope = `${day}/${region}/sts/aws4_request`
+  const toSign = `AWS4-HMAC-SHA256\n${date}\n${scope}\n${toHex(sha256(utf8(canonical)))}`
+  const kDate = hmacSha256(utf8("AWS4" + creds.secretKey), utf8(day))
+  const kSigning = hmacSha256(hmacSha256(hmacSha256(kDate, utf8(region)), utf8("sts")), utf8("aws4_request"))
+  const signature = toHex(hmacSha256(kSigning, utf8(toSign)))
+  // Go's canonical header names, then host, sorted by key as Bifrost sorts them
+  const out: string[][] = [["Authorization", `AWS4-HMAC-SHA256 Credential=${creds.accessKey}/${scope}, SignedHeaders=${signed}, Signature=${signature}`], ["X-Amz-Date", date], ["X-Goog-Cloud-Target-Resource", audience]]
+  if (token !== undefined && token !== "") out.push(["X-Amz-Security-Token", token])
+  out.push(["host", host])
+  out.sort((a, b) => (a[0]! < b[0]! ? -1 : a[0]! > b[0]! ? 1 : 0))
+  const json = `{"headers":[${out.map((h) => signedHeader(h[0]!, h[1]!)).join(",")}],"method":"POST","url":${JSON.stringify("https://" + host + "?" + GET_CALLER_IDENTITY)}}`
+  // url.QueryEscape: a space is a plus
+  return pctEncode(json).split("%20").join("+")
+}
+
+// The token exchange at the GCP Security Token Service (RFC 8693, as Google's externalaccount sends it).
+export function gcpStsRequest(tokenUrl: string, audience: string, subjectTokenType: string, subjectToken: string): Upstream {
+  const pairs: string[][] = [["audience", audience], ["grant_type", "urn:ietf:params:oauth:grant-type:token-exchange"], ["requested_token_type", "urn:ietf:params:oauth:token-type:access_token"], ["scope", CLOUD_PLATFORM_SCOPE], ["subject_token", subjectToken], ["subject_token_type", subjectTokenType]]
+  // form encoding, keys in order (url.Values.Encode); the subject token, encoded already, is encoded again
+  const body = pairs.map((p) => p[0]! + "=" + pctEncode(p[1]!)).join("&")
+  return { url: tokenUrl, headers: headers([["content-type", "application/x-www-form-urlencoded"]]), body: body }
+}
+
+// The service account impersonation at IAM Credentials: the federated token buys the account's access token for the
+// lifetime asked (3600 s by default).
+export function impersonationRequest(url: string, federatedToken: string, lifetimeSeconds: int): Upstream {
+  const life = lifetimeSeconds > 0 ? lifetimeSeconds : 3600
+  return { url: url, headers: headers([["content-type", "application/json"], ["authorization", "Bearer " + federatedToken]]), body: `{"lifetime":"${life}s","scope":["${CLOUD_PLATFORM_SCOPE}"]}` }
+}
+
+// IAM Credentials' URL for a service account's generateAccessToken.
+export function impersonationUrl(base: string, email: string): string {
+  return `${base}/v1/projects/-/serviceAccounts/${pctEncode(email)}:generateAccessToken`
+}
+
+// The access token of an impersonation answer ({accessToken, expireTime}).
+export function parseImpersonation(text: string, nowMs: f64): { token: string, expiresAtMs: f64 } throws SyntaxError {
+  const fs = try fields(text)
+  const tok = rawStr(fs, "accessToken")
+  if (tok === undefined || tok === "") {
+    const err = find(fs, "error")
+    throw new SyntaxError(err !== undefined ? "the service account impersonation was refused: " + err : "the service account impersonation answered with no token")
+  }
+  const exp = parseIsoUtcMs(rawStr(fs, "expireTime") ?? "") ?? (nowMs + 3600000.0)
+  return { token: tok, expiresAtMs: exp }
+}
+
+// An AWS external_account credentials file (gcloud iam workload-identity-pools create-cred-config --aws): its
+// audience, token URL, impersonation URL and lifetime. undefined for any other credentials.
+export type ExternalAccount = { audience: string, subjectTokenType: string, tokenUrl: string, impersonationUrl: string, lifetimeSeconds: int }
+
+export function awsExternalAccount(text: string | undefined): ExternalAccount | undefined throws SyntaxError {
+  if (text === undefined || !text.trim().startsWith("{")) return undefined
+  const fs = try fields(text)
+  if (rawStr(fs, "type") !== "external_account") return undefined
+  const src = find(fs, "credential_source")
+  const env = src === undefined || !src.startsWith("{") ? "" : rawStr(try fields(src), "environment_id") ?? ""
+  if (!env.startsWith("aws")) return undefined
+  if (env !== "aws1") throw new SyntaxError(`vertex aws federation: unsupported aws credential source version "${env}"`)
+  const aud = rawStr(fs, "audience") ?? ""
+  if (aud === "") throw new SyntaxError("vertex aws federation: external_account json is missing audience")
+  let life = 0
+  const imp = find(fs, "service_account_impersonation")
+  if (imp !== undefined && imp.startsWith("{")) {
+    const raw = find(try fields(imp), "token_lifetime_seconds")
+    if (raw !== undefined) {
+      const n = parseInt(raw)
+      if (n === undefined) throw new SyntaxError(`vertex aws federation: service_account_impersonation.token_lifetime_seconds must be a json integer, got ${raw}`)
+      life = n
+    }
+  }
+  const stt = rawStr(fs, "subject_token_type") ?? ""
+  const tu = rawStr(fs, "token_url") ?? ""
+  return { audience: aud, subjectTokenType: stt === "" ? AWS_SUBJECT_TOKEN_TYPE : stt, tokenUrl: tu === "" ? GCP_STS_TOKEN_URL : tu, impersonationUrl: rawStr(fs, "service_account_impersonation_url") ?? "", lifetimeSeconds: life }
 }
 
 // ---- STS AssumeRole ----
@@ -231,6 +343,53 @@ test("entra token response", () => {
     threw = e.message.includes("bad secret")
   }
   expect(threw).toBe(true)
+})
+
+const WIF_AUDIENCE = "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/aws"
+
+test("aws subject token: a signed GetCallerIdentity request as GCP replays it", () => {
+  const tok = awsSubjectToken({ accessKey: "AKIDEXAMPLE", secretKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY" }, "us-east-1", WIF_AUDIENCE, 1440938160000.0)
+  // the signature an independent SigV4 computation gives for the same request
+  expect(tok.includes("Signature%3D44ed1da29c1e4f0c4ead0211c5fac4792051b62748a0e5695c1af48808e6f678")).toBe(true)
+  expect(tok.startsWith("%7B%22headers%22%3A%5B%7B%22key%22%3A%22Authorization%22%2C%22value%22%3A%22AWS4-HMAC-SHA256+Credential%3DAKIDEXAMPLE%2F20150830%2Fus-east-1%2Fsts%2Faws4_request%2C+SignedHeaders%3Dhost%3Bx-amz-date%3Bx-goog-cloud-target-resource%2C+")).toBe(true)
+  expect(tok.endsWith("%7B%22key%22%3A%22host%22%2C%22value%22%3A%22sts.us-east-1.amazonaws.com%22%7D%5D%2C%22method%22%3A%22POST%22%2C%22url%22%3A%22https%3A%2F%2Fsts.us-east-1.amazonaws.com%3FAction%3DGetCallerIdentity%26Version%3D2011-06-15%22%7D")).toBe(true)
+  // a session token is signed and sent; China regions use their partition's host
+  const st = awsSubjectToken({ accessKey: "AKIDEXAMPLE", secretKey: "s", sessionToken: "tok/1" }, "cn-north-1", WIF_AUDIENCE, 1440938160000.0)
+  expect(st.includes("x-amz-security-token")).toBe(true)
+  expect(st.includes("X-Amz-Security-Token%22%2C%22value%22%3A%22tok%2F1")).toBe(true)
+  expect(st.includes("sts.cn-north-1.amazonaws.com.cn")).toBe(true)
+})
+
+test("the GCP token exchange and the impersonation requests", () => {
+  const sts = gcpStsRequest(GCP_STS_TOKEN_URL, WIF_AUDIENCE, AWS_SUBJECT_TOKEN_TYPE, "%7B%22a%22+b%7D")
+  expect(sts.url).toBe("https://sts.googleapis.com/v1/token")
+  expect(sts.body).toBe("audience=%2F%2Fiam.googleapis.com%2Fprojects%2F1%2Flocations%2Fglobal%2FworkloadIdentityPools%2Fp%2Fproviders%2Faws&grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange&requested_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcloud-platform&subject_token=%257B%2522a%2522%2Bb%257D&subject_token_type=urn%3Aietf%3Aparams%3Aaws%3Atoken-type%3Aaws4_request")
+  const url = impersonationUrl(GCP_IAM_CREDENTIALS_URL, "vertex@proj.iam.gserviceaccount.com")
+  expect(url).toBe("https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/vertex%40proj.iam.gserviceaccount.com:generateAccessToken")
+  const imp = impersonationRequest(url, "fed-tok", 0)
+  expect(imp.headers.get("authorization")).toBe("Bearer fed-tok")
+  expect(imp.body).toBe(`{"lifetime":"3600s","scope":["https://www.googleapis.com/auth/cloud-platform"]}`)
+  expect(impersonationRequest(url, "t", 900).body.startsWith(`{"lifetime":"900s"`)).toBe(true)
+  const r = try parseImpersonation(`{"accessToken":"ya29.x","expireTime":"2015-08-30T12:36:00Z"}`, 0.0)
+  expect(r.token).toBe("ya29.x")
+  expect(r.expiresAtMs).toBe(1440938160000.0)
+})
+
+test("an AWS external_account credentials file", () => {
+  const j = `{"type":"external_account","audience":"${WIF_AUDIENCE}","subject_token_type":"urn:ietf:params:aws:token-type:aws4_request","token_url":"http://mock/v1/token","service_account_impersonation_url":"http://mock/v1/projects/-/serviceAccounts/sa@p.iam.gserviceaccount.com:generateAccessToken","service_account_impersonation":{"token_lifetime_seconds":1200},"credential_source":{"environment_id":"aws1","regional_cred_verification_url":"https://sts.{region}.amazonaws.com?Action=GetCallerIdentity&Version=2011-06-15"}}`
+  const ea = (try awsExternalAccount(j))!
+  expect(ea.audience).toBe(WIF_AUDIENCE)
+  expect(ea.tokenUrl).toBe("http://mock/v1/token")
+  expect(ea.lifetimeSeconds).toBe(1200)
+  expect((try awsExternalAccount(`{"type":"service_account","client_email":"a"}`)) === undefined).toBe(true)
+  expect((try awsExternalAccount(`{"type":"external_account","audience":"x","credential_source":{"file":"/t"}}`)) === undefined).toBe(true)
+  let threw = ""
+  try {
+    awsExternalAccount(`{"type":"external_account","audience":"x","credential_source":{"environment_id":"aws2"}}`)
+  } catch (e) {
+    threw = e.message
+  }
+  expect(threw.includes("unsupported aws credential source version")).toBe(true)
 })
 
 test("iso 8601 expiry", () => {

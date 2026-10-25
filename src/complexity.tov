@@ -8,6 +8,7 @@
 
 import { Field, fields, elements, find, rawStr } from "./json"
 import { sha256, toHex, utf8 } from "./crypto"
+import { VectorStore, Hit, Cond } from "./vectorstore"
 
 export type Tier = "SIMPLE" | "MEDIUM" | "COMPLEX"
 
@@ -432,9 +433,74 @@ export function classifierMode(name: string | undefined): Classifier {
 }
 
 export type DecisionSettings = { provider?: string, model?: string, timeout_ms?: int, previous_message_count?: int }
-export type LLMSettings = { provider?: string, model?: string, timeout_ms?: int, prompt?: string, message_history_count?: int }
+// count_toward_budgets: the classifier's own call is charged to the caller's budgets (Bifrost's default: not charged)
+export type LLMSettings = { provider?: string, model?: string, timeout_ms?: int, prompt?: string, message_history_count?: int, count_toward_budgets?: bool }
 export type Exemplars = { simple?: string[], medium?: string[], complex?: string[] }
-export type SemanticSettings = { provider?: string, embedding_model?: string, timeout_ms?: int, min_similarity?: f64, message_history_count?: int, exemplars?: Exemplars }
+// fallback: what classifies when the semantic classifier names no tier ("none", the default, leaves it to the heuristic;
+// "llm" asks the llm block, "decision" the decision block). vector_store: "embedded" (the default) keeps the exemplar
+// vectors in memory; "vector_store" keeps them in the configured vector store (in memory when none is set).
+export type SemanticSettings = { provider?: string, embedding_model?: string, timeout_ms?: int, min_similarity?: f64, message_history_count?: int, exemplars?: Exemplars, fallback?: string, count_toward_budgets?: bool, vector_store?: string }
+
+// ---- session tier retention (Bifrost's complexity session) ----
+
+// a session's tier is kept for a day after its last request
+export const SESSION_TTL_MS = 86400000.0
+// the sessions kept per process; the least recently used go first
+const SESSION_MAX = 10000
+
+export function tierRank(t: Tier): int {
+  if (t === "SIMPLE") return 1
+  if (t === "MEDIUM") return 2
+  return 3
+}
+
+// The highest tier each session has reached (keyed by the session and the caller it belongs to). A session never
+// steps down: the tier routed is the higher of the one held and the one just classified, and every request
+// renews the entry. Per process.
+export class SessionTiers {
+  private items: Map<string, { tier: Tier, at: f64 }> = new Map()
+
+  // The tier held for a session, or undefined when none is held (or it expired). refresh renews it.
+  get(key: string, now: f64, refresh: bool): Tier | undefined {
+    const e = this.items.get(key)
+    if (e === undefined) return undefined
+    if (now - e.at > SESSION_TTL_MS) {
+      this.items.delete(key)
+      return undefined
+    }
+    if (refresh) this.touch(key, e.tier, now)
+    return e.tier
+  }
+
+  // Keeps the higher of the held tier and the proposed one, and says which it was.
+  resolve(key: string, proposed: Tier, now: f64): { tier: Tier, held: bool } {
+    const prev = this.get(key, now, false)
+    const tier = prev !== undefined && tierRank(prev) > tierRank(proposed) ? prev : proposed
+    this.touch(key, tier, now)
+    return { tier: tier, held: tier !== proposed }
+  }
+
+  private touch(key: string, tier: Tier, now: f64): void {
+    this.items.delete(key)
+    if (this.items.size >= SESSION_MAX) {
+      const oldest = this.items.keys()[0]
+      if (oldest !== undefined) this.items.delete(oldest)
+    }
+    this.items.set(key, { tier: tier, at: now })
+  }
+}
+
+// Whether a chat request continues a turn rather than asking something new: its last message is a tool result.
+// Such a request takes its session's tier without being classified (Bifrost's tool continuation).
+export function isContinuation(chatBody: string): bool {
+  try {
+    const read = try readMessages(chatBody)
+    const last = read.msgs[read.msgs.length - 1]
+    return last !== undefined && (last.role === "tool" || last.role === "function")
+  } catch (e) {
+    return false
+  }
+}
 
 const TIERS: Tier[] = ["SIMPLE", "MEDIUM", "COMPLEX"]
 const DECISION_QUESTION = "What is the task complexity of the latest human request? Choose the tier whose definition, signals, and examples best describe it."
@@ -676,7 +742,14 @@ class ExemplarIndex {
   warming: string = ""
   failed: string = ""
   reason: string = ""
+  // where the vectors are searched: "embedded" (here) or "vector_store" (the configured store, under the namespace)
+  mode: string = "embedded"
+  // whether the config asked for the vector store when the exemplars were warmed
+  storeWanted = false
 }
+
+// exemplars in a vector store are kept this long (they are written again when the generation is next warmed)
+const EXEMPLAR_TTL_MS = 315360000000
 
 const exemplarIndex = new ExemplarIndex()
 
@@ -733,7 +806,7 @@ export function analyzerStatus(enabled: bool, classifier: string | undefined, se
     }
     out.push({ key: "cached_phrases", raw: `${ix.vecs.length}` })
     if (ix.identity !== "") {
-      out.push({ key: "storage_mode", raw: "\"embedded\"" })
+      out.push({ key: "storage_mode", raw: JSON.stringify(ix.mode) })
       out.push({ key: "namespace", raw: JSON.stringify(generationOf(ix.identity)) })
     }
   }
@@ -786,13 +859,49 @@ export function deleteGeneration(enabled: bool, classifier: string | undefined, 
   return { status: 200, body: JSON.stringify({ status: "deleted", namespace: ns }) }
 }
 
-// Embeds the last user message(s) and takes the tier of the nearest reference phrase.
-export async function semanticTier(text: string, cfg: SemanticSettings | undefined, call: Call): Promise<Tier | undefined> {
+// Writes a generation's exemplars to the vector store under its namespace, each with its tier. False when the store
+// refuses them, and the vectors held here answer instead.
+async function storeExemplars(store: VectorStore, ns: string, phrases: string[], tiers: Tier[], vecs: f64[][]): Promise<bool> {
+  try {
+    if (vecs.length === 0) return false
+    try await store.ensure(ns, vecs[0]!.length, ["tier"])
+    for (let i = 0; i < vecs.length; i++) {
+      const pl: Map<string, string> = new Map()
+      pl.set("tier", tiers[i]!)
+      pl.set("phrase", phrases[i]!)
+      try await store.add(ns, ns + "-" + i, vecs[i]!, pl, EXEMPLAR_TTL_MS)
+    }
+    return true
+  } catch (e) {
+    console.error(`raiju: complexity exemplars in the vector store: ${e.message}; searching them in memory`)
+    return false
+  }
+}
+
+// The tier of the nearest exemplar the vector store holds at or above min, or undefined when none is that close;
+// a store that fails gives "error", and the vectors held here answer.
+async function storeNearest(store: VectorStore, ns: string, v: f64[], min: f64): Promise<Tier | "error" | undefined> {
+  try {
+    const hit = try await store.search(ns, v, min, [])
+    if (hit === undefined) return undefined
+    const t = asTier(hit.payload.get("tier") ?? "")
+    return t === undefined ? "error" : t
+  } catch (e) {
+    return "error"
+  }
+}
+
+// Embeds the last user message(s) and takes the tier of the nearest reference phrase. With vector_store
+// "vector_store" and a store given, the exemplars are kept and searched there.
+export async function semanticTier(text: string, cfg: SemanticSettings | undefined, call: Call, store?: VectorStore): Promise<Tier | undefined> {
   const set = semanticSet(cfg)
   const model = set.model
   const phrases = set.phrases
   const tiers = set.tiers
+  const useStore = (cfg?.vector_store ?? "").trim().toLowerCase() === "vector_store"
   const identity = set.identity
+  // switching where the exemplars are kept warms them again
+  const wantStore = useStore && store !== undefined
   const ms = cfg?.timeout_ms ?? 1500
   try {
     const window = try userWindow(text, cfg?.message_history_count ?? 1)
@@ -801,7 +910,7 @@ export async function semanticTier(text: string, cfg: SemanticSettings | undefin
     const key = cacheKey("semantic|" + identity, input)
     const hit = tierCache.get(key, Date.now())
     if (hit !== undefined) return hit
-    if (exemplarIndex.identity !== identity) {
+    if (exemplarIndex.identity !== identity || exemplarIndex.storeWanted !== wantStore) {
       exemplarIndex.warming = identity
       let vecs: f64[][] = []
       try {
@@ -818,9 +927,22 @@ export async function semanticTier(text: string, cfg: SemanticSettings | undefin
       exemplarIndex.identity = identity
       exemplarIndex.tiers = tiers
       exemplarIndex.vecs = vecs
+      exemplarIndex.mode = "embedded"
+      exemplarIndex.storeWanted = wantStore
+      if (wantStore && store !== undefined && await storeExemplars(store, generationOf(identity), phrases, tiers, vecs)) exemplarIndex.mode = "vector_store"
     }
     const v = (try await embedAll([input], model, call, ms, "request"))[0]!
-    const tier = nearestTier(v, exemplarIndex.vecs, exemplarIndex.tiers, cfg?.min_similarity ?? 0.0)
+    const min = cfg?.min_similarity ?? 0.0
+    let tier: Tier | undefined = undefined
+    let searched = false
+    if (exemplarIndex.mode === "vector_store" && store !== undefined) {
+      const st = await storeNearest(store, generationOf(identity), v, min)
+      if (st !== "error") {
+        tier = st
+        searched = true
+      }
+    }
+    if (!searched) tier = nearestTier(v, exemplarIndex.vecs, exemplarIndex.tiers, min)
     if (tier !== undefined) tierCache.put(key, tier, Date.now())
     return tier
   } catch (e) {
@@ -920,6 +1042,40 @@ test("the analyzer status follows the warm-up: failed, retried, ready, and the g
   expect(analyzerStatus(true, "semantic", next, undefined).includes(`"serving_previous":true`)).toBe(true)
   expect(analyzerStatus(false, "semantic", sem, undefined).startsWith(`{"state":"disabled"`)).toBe(true)
   expect(analyzerStatus(true, "llm", sem, undefined).startsWith(`{"state":"disabled"`)).toBe(true)
+  // exemplars kept in the vector store say so
+  exemplarIndex.identity = set.identity
+  exemplarIndex.mode = "vector_store"
+  expect(analyzerStatus(true, "semantic", sem, undefined).includes(`"storage_mode":"vector_store"`)).toBe(true)
+  exemplarIndex.mode = "embedded"
   exemplarIndex.identity = ""
   exemplarIndex.vecs = []
+})
+
+test("a session keeps the highest tier it reached for a day after its last request", () => {
+  const s = new SessionTiers()
+  expect(s.get("k", 0.0, false)).toBeUndefined()
+  // the first request sets the tier
+  expect(s.resolve("k", "MEDIUM", 1000.0).tier).toBe("MEDIUM")
+  expect(s.resolve("k", "MEDIUM", 1000.0).held).toBe(false)
+  // a simpler request later is held at MEDIUM
+  const down = s.resolve("k", "SIMPLE", 2000.0)
+  expect(down.tier).toBe("MEDIUM")
+  expect(down.held).toBe(true)
+  // a harder one raises it
+  expect(s.resolve("k", "COMPLEX", 3000.0).tier).toBe("COMPLEX")
+  expect(s.get("k", 3000.0 + SESSION_TTL_MS - 1.0, true)).toBe("COMPLEX")
+  // renewed by that read: still held a day after it
+  expect(s.get("k", 3000.0 + SESSION_TTL_MS + 10.0, false)).toBe("COMPLEX")
+  // a day of silence lets it go
+  expect(s.get("k", 3000.0 + 3.0 * SESSION_TTL_MS, false)).toBeUndefined()
+  expect(s.resolve("k", "SIMPLE", 3000.0 + 3.0 * SESSION_TTL_MS).tier).toBe("SIMPLE")
+  // sessions are apart
+  expect(s.get("other", 3000.0, false)).toBeUndefined()
+  expect(tierRank("SIMPLE") < tierRank("MEDIUM") && tierRank("MEDIUM") < tierRank("COMPLEX")).toBe(true)
+})
+
+test("a request whose last message is a tool result continues a turn", () => {
+  expect(isContinuation(`{"messages":[{"role":"user","content":"weather?"},{"role":"assistant","content":null},{"role":"tool","tool_call_id":"c1","content":"sunny"}]}`)).toBe(true)
+  expect(isContinuation(`{"messages":[{"role":"user","content":"hi"}]}`)).toBe(false)
+  expect(isContinuation(`not json`)).toBe(false)
 })

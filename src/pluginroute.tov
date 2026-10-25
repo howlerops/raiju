@@ -62,8 +62,9 @@ function responseOf(r: HttpResp): Response {
 }
 
 // Runs the plugins' HTTP pre hooks on a request, before it is routed. A request that no hook looks at (no
-// plugin with a transport hook, a route that is not an inference route, a body over HOOK_BODY_LIMIT) comes back
-// as it was. The handlers that run later find the hooks' run through the x-bf-plugin-run header.
+// plugin with a transport hook, a route that is not an inference route) comes back as it was; a body over
+// HOOK_BODY_LIMIT is handed to the hooks empty. The handlers that run later find the hooks' run through the
+// x-bf-plugin-run header.
 export async function transportStart(engine: Engine, req: Request): Promise<TransportStart> {
   const chain = chainOf(engine)
   const u = URL.parse(req.url)
@@ -72,10 +73,11 @@ export async function transportStart(engine: Engine, req: Request): Promise<Tran
   if (chain === undefined || u === undefined || req.method === "OPTIONS" || !chain.hasHttp() || !isInferencePath(path)) return { response: undefined, request: req, tr: undefined, body: "" }
   const hs = snapshot(req.headers)
   hs.delete(RUN_HEADER)
-  // a body declared bigger than hooks take is not read here (a large upload goes on as it is)
-  if ((parseFloat(hs.get("content-length") ?? "0") ?? 0.0) > HOOK_BODY_LIMIT) return { response: undefined, request: req, tr: undefined, body: "" }
+  // a body declared bigger than hooks take is not read here (a large upload goes on as it streams in); the hooks still
+  // run, with an empty body, as Bifrost runs them on a large payload
+  const declaredLarge = (parseFloat(hs.get("content-length") ?? "0") ?? 0.0) > HOOK_BODY_LIMIT
   let bytes: u8[] = []
-  if (req.method !== "GET" && req.method !== "HEAD") {
+  if (!declaredLarge && req.method !== "GET" && req.method !== "HEAD") {
     try {
       bytes = await req.bytes()
     } catch (e) {
@@ -84,12 +86,12 @@ export async function transportStart(engine: Engine, req: Request): Promise<Tran
   }
   const search = u.search.startsWith("?") ? u.search.slice(1) : u.search
   const origin = u.origin
-  if (bytes.length > HOOK_BODY_LIMIT) return { response: undefined, request: rebuild(origin, path, search, req.method, hs, bytes, undefined), tr: undefined, body: "" }
+  const large = declaredLarge || bytes.length > HOOK_BODY_LIMIT
   let hr = emptyReq(req.method, path)
   hr.headers = hs
   hr.query = queryMap(search)
   hr.rawQuery = search
-  hr.body = bytes
+  hr.body = large ? [] : bytes
   const rid = hs.get("x-request-id") ?? newId("req_")
   const run = new PluginRun({ requestId: rid, op: "http", model: "", provider: "", headers: new Map(), values: new Map(), trace: new PluginTrace() })
   const method0 = hr.method
@@ -114,7 +116,23 @@ export async function transportStart(engine: Engine, req: Request): Promise<Tran
   for (const k of hr.headers.keys()) nh.set(k, hr.headers.get(k)!)
   nh.set(RUN_HEADER, id)
   const qs = hr.queryEdited ? queryString(hr.query) : hr.rawQuery
+  // a large body the hooks did not replace (they saw it empty) goes on as it came: still streaming when it was not read
+  if (large && hr.body.length === 0) {
+    const src = req.body
+    if (declaredLarge && src !== undefined) return { response: undefined, request: rebuildStream(origin, hr.path, qs, hr.method, nh, src), tr: tr, body: "" }
+    return { response: undefined, request: rebuild(origin, hr.path, qs, hr.method, nh, bytes, undefined), tr: tr, body: "" }
+  }
   return { response: undefined, request: rebuild(origin, hr.path, qs, hr.method, nh, hr.body, undefined), tr: tr, body: text(hr.body) }
+}
+
+// A request whose body is still streaming in: the headers as the hooks left them, its declared length kept (the large
+// payload path reads it).
+function rebuildStream(origin: string, path: string, query: string, method: string, headers: Map<string, string>, body: ReadableStream): Request {
+  const hs: Map<string, string> = new Map()
+  for (const k of headers.keys()) {
+    if (k !== "transfer-encoding") hs.set(k, headers.get(k)!)
+  }
+  return new Request(origin + path + (query === "" ? "" : "?" + query), { method: method, headers: hs, body: body })
 }
 
 // An error answered with its message as the whole body (fasthttp's default text type).
@@ -167,9 +185,12 @@ export async function transportEnd(engine: Engine, tr: TransportRun | undefined,
   if (ct.startsWith("application/vnd.amazon.eventstream") && res.status < 400) {
     return new Response(framesWhole(tr, bytes), { status: res.status, headers: snapshotRecord(res.headers) })
   }
-  if (bytes.length > HOOK_BODY_LIMIT) return new Response(bytes, { status: res.status, headers: snapshotRecord(res.headers) })
-  let hr: HttpResp = { status: res.status, headers: snapshot(res.headers), body: bytes }
+  // a large answer goes to the hooks with an empty body (as Bifrost skips a large response's body): their status and
+  // headers apply, and a body they set replaces it
+  const large = bytes.length > HOOK_BODY_LIMIT
+  let hr: HttpResp = { status: res.status, headers: snapshot(res.headers), body: large ? [] : bytes }
   tr.chain.runHttpPost(&tr.run.ctx, req, &hr)
+  if (large && hr.body.length === 0) hr.body = bytes
   return responseOf(hr)
 }
 
@@ -402,11 +423,19 @@ export async function llmHooked(engine: Engine, req: Request, op: string, handle
   run.ctx.provider = parseModel(engine.cfg, model).provider
   // the request log and the trace of the handler's request read the plugin spans and logs from here (TRACE_HEADER)
   const tid = traceFor(engine, run)
+  // the post hooks run after the handler wrote the log row: the request's trace waits for them (PluginTrace.defer)
+  const pt = run.ctx.trace
+  if (pt !== undefined) pt.defer = true
   try {
     if (tid !== "") hs.set(TRACE_HEADER, tid)
     return try await hookedRun(engine, chain, run, k, req, hs, body, fd, origin, path, qs, handler, sink)
   } finally {
     if (tid !== "") engine.pluginTraces.delete(tid)
+    // the trace goes out with the post hooks' spans (a log row still to come, as a stream's, exports at once)
+    if (pt !== undefined) {
+      pt.defer = false
+      pt.done()
+    }
   }
 }
 
@@ -507,11 +536,24 @@ export type StorageCall = { op: string, provider: string, idKey: string, id: str
 // the request's provider with no model), the id, the query's fields, a JSON body's fields, and an upload's text fields
 // with the file's filename and content_type (the bytes are not passed, as Bifrost does not serialise them). Which
 // fields came from the query and which from the body is kept, so a plugin's change goes back where the field came from.
-export type StorageRequest = { json: string, fromQuery: string[], fromBody: string[], jsonBody: bool }
+// A JSON body that names its model (a cached content's creation) shows it as "provider/model"; bodyModel marks it, and
+// the model a plugin leaves there goes back into the body.
+export type StorageRequest = { json: string, fromQuery: string[], fromBody: string[], jsonBody: bool, bodyModel: bool }
+
+// A JSON body's model, "" when it names none.
+function bodyModelOf(body: string): string {
+  if (!body.trimStart().startsWith("{")) return ""
+  try {
+    return rawStr(fields(body), "model") ?? ""
+  } catch (e) {
+    return ""
+  }
+}
 
 export function storageRequest(call: StorageCall, query: string, body: string, form: FormData | undefined): StorageRequest {
   let fs: Field[] = []
-  setField(&fs, "model", quote(call.provider + "/"))
+  const bm = form === undefined ? bodyModelOf(body) : ""
+  setField(&fs, "model", quote(call.provider + "/" + bm))
   if (call.idKey !== "" && call.id !== "") setField(&fs, call.idKey, quote(call.id))
   const fromQuery: string[] = []
   const qm = queryMap(query)
@@ -542,7 +584,7 @@ export function storageRequest(call: StorageCall, query: string, body: string, f
       // a body that is not JSON goes on as it came; the plugins see the rest of the call
     }
   }
-  return { json: build(fs), fromQuery: fromQuery, fromBody: fromBody, jsonBody: jsonBody }
+  return { json: build(fs), fromQuery: fromQuery, fromBody: fromBody, jsonBody: jsonBody, bodyModel: bm !== "" && jsonBody }
 }
 
 // A form's text fields (as JSON values) and its first file's name and type.
@@ -568,6 +610,12 @@ export function storageChange(call: StorageCall, sr: StorageRequest, changed: st
   const id = call.idKey === "" ? call.id : (rawStr(nf, call.idKey) ?? call.id)
   const query: Map<string, string> = new Map()
   const body: Field[] = []
+  if (sr.bodyModel) {
+    // the model the plugin left, without the provider it reaches the plugins with
+    const m = rawStr(nf, "model") ?? ""
+    const pre = call.provider + "/"
+    body.push({ key: "model", raw: quote(m.startsWith(pre) ? m.slice(pre.byteLength) : m) })
+  }
   for (const f of nf) {
     if (f.key === "model" || f.key === "provider" || f.key === call.idKey || f.key === "filename" || f.key === "content_type") continue
     if (isNull(f.raw)) continue
@@ -629,6 +677,11 @@ export async function storageHooked(engine: Engine, req: Request, call: StorageC
   }
   const res = try await handler(next, undefined)
   if (call.op === "file_content" && res.status < 400) return await contentPost(chain, run, id, res)
+  // a stored response replayed as a stream (GET /v1/responses/{id}?stream=true) goes on as it streams
+  if (res.status < 400 && (res.headers.get("content-type") ?? "").startsWith("text/event-stream")) {
+    chain.finish(&run.ctx)
+    return res
+  }
   return await postProcess(chain, run, CHAT_LIKE, res)
 }
 
@@ -646,7 +699,25 @@ export function storageOp(op: string): string {
   if (op === "batches.cancel") return "batch_cancel"
   if (op === "batches.results") return "batch_results"
   if (op === "batches.delete") return "batch_delete"
+  // the Responses lifecycle (media.tov) and GenAI's cached contents (genai_in.tov)
+  if (op === "responses.retrieve") return "responses_retrieve"
+  if (op === "responses.delete") return "responses_delete"
+  if (op === "responses.cancel") return "responses_cancel"
+  if (op === "responses.input_items") return "responses_input_items"
+  if (op === "cached.create") return "cached_content_create"
+  if (op === "cached.list") return "cached_content_list"
+  if (op === "cached.retrieve") return "cached_content_retrieve"
+  if (op === "cached.update") return "cached_content_update"
+  if (op === "cached.delete") return "cached_content_delete"
   return ""
+}
+
+// The member a storage call's id goes in: Bifrost's request field for the type.
+export function storageIdKey(op: string): string {
+  if (op.startsWith("file_")) return "file_id"
+  if (op.startsWith("responses_")) return "response_id"
+  if (op.startsWith("cached_content_")) return op === "cached_content_create" || op === "cached_content_list" ? "" : "name"
+  return "batch_id"
 }
 
 // A path segment's text with %XX escapes undone.
@@ -882,7 +953,8 @@ test("post hooks run on each chunk of a stream, and a chunk turned into an error
   const s = llmStreamSink(chain, run, collector(c))
   s.write(`data: {"n":1}\n\nevent: e\ndata: {"n":2}\n\ndata: {"error":{"message":"up"}}\n\ndata: [DONE]\n\n`)
   s.close()
-  expect(c.out).toEqual([`data: {"n":1,"m":1}\n\n`, `event: e\ndata: {"n":2,"m":1}\n\n`, `data: {"error":{"message":"up"}}\n\n`, `data: [DONE]\n\n`])
+  // the stream's error event goes through the post hooks too (as an error), so the plugin's change reaches it
+  expect(c.out).toEqual([`data: {"n":1,"m":1}\n\n`, `event: e\ndata: {"n":2,"m":1}\n\n`, `data: {"error":{"message":"up","m":1}}\n\n`, `data: [DONE]\n\n`])
   const bad = new PluginChain([new ChunkTest("bad")])
   const run2 = new PluginRun({ requestId: "r", op: "chat", model: "m", provider: "", headers: new Map(), values: new Map() })
   bad.runPre(&run2.ctx, `{}`)
@@ -950,7 +1022,33 @@ test("a batch or file call is a request of its type: the id, the query and the b
   expect(up.json.startsWith(`{"model":"openai/","purpose":"batch","filename":"in.jsonl"`)).toBe(true)
   expect(storageOp("files.create")).toBe("file_upload")
   expect(storageOp("batches.results")).toBe("batch_results")
-  expect(storageOp("cached.list")).toBe("")
+  expect(storageOp("cached.list")).toBe("cached_content_list")
+  expect(storageOp("responses.input_items")).toBe("responses_input_items")
+  expect(storageOp("responses.input_tokens")).toBe("")
+  expect(storageIdKey("responses_cancel")).toBe("response_id")
+  expect(storageIdKey("cached_content_update")).toBe("name")
+  expect(storageIdKey("cached_content_create")).toBe("")
+  expect(storageIdKey("file_delete")).toBe("file_id")
+  expect(storageIdKey("batch_cancel")).toBe("batch_id")
+  // a Responses lifecycle call is its provider, its response id and the query's fields
+  const rr = storageRequest(callFor("responses_retrieve", "response_id", "resp_1", "/v1/responses/resp_1"), "include=x", "", undefined)
+  expect(rr.json).toBe(`{"model":"openai/","response_id":"resp_1","include":"x"}`)
+})
+
+test("a cached content's creation shows its model as provider/model, and a plugin's model goes back into the body", () => {
+  const call: StorageCall = { op: "cached_content_create", provider: "gemini", idKey: "", id: "", pathFor: (nid: string): string => "/genai/v1beta/cachedContents" }
+  const sr = storageRequest(call, "", `{"model":"models/gemini-2.0-flash","ttl":"60s"}`, undefined)
+  expect(sr.json).toBe(`{"model":"gemini/models/gemini-2.0-flash","ttl":"60s"}`)
+  expect(sr.bodyModel).toBe(true)
+  const ch = try storageChange(call, sr, `{"model":"gemini/models/gemini-2.5-flash","ttl":"120s"}`)
+  expect(build(ch.body)).toBe(`{"model":"models/gemini-2.5-flash","ttl":"120s"}`)
+  // an update's body names no model: none is added
+  const up: StorageCall = { op: "cached_content_update", provider: "gemini", idKey: "name", id: "c1", pathFor: (nid: string): string => "/genai/v1beta/cachedContents/" + nid }
+  const su = storageRequest(up, "", `{"ttl":"60s"}`, undefined)
+  expect(su.json).toBe(`{"model":"gemini/","name":"c1","ttl":"60s"}`)
+  const cu = try storageChange(up, su, `{"model":"gemini/","name":"c2","ttl":"90s"}`)
+  expect(build(cu.body)).toBe(`{"ttl":"90s"}`)
+  expect(cu.id).toBe("c2")
 })
 
 test("a plugin's change to a batch or file call goes back where each field came from", () => {

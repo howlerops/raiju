@@ -931,6 +931,107 @@ export function geminiTranscription(t: Target, prompt: string, mime: string, aud
   return { method: "POST", url: `${geminiBase(t)}/v1beta/models/${t.model}:generateContent`, headers: geminiHeaders(t, true), body: payload }
 }
 
+// The streamed form (Bifrost's Gemini TranscriptionStream): the same body to streamGenerateContent?alt=sse.
+export function geminiTranscriptionStream(t: Target, prompt: string, mime: string, audio: u8[]): MediaRequest {
+  let mr = geminiTranscription(t, prompt, mime, audio)
+  mr.url = `${geminiBase(t)}/v1beta/models/${t.model}:streamGenerateContent?alt=sse`
+  let h = mr.headers
+  h.set("accept", "text/event-stream")
+  h.set("cache-control", "no-cache")
+  mr.headers = h
+  return mr
+}
+
+// Gemini's transcription events as Bifrost streams them: each chunk's candidate text a transcript.text.delta event,
+// then transcript.text.done with the whole text and the token usage of the last chunk that reported one (type tokens:
+// prompt, candidate and total counts, as extractGeminiUsageMetadata reads them), then [DONE]. An error chunk ends the
+// stream with an error event and no [DONE].
+export class GeminiTranscriptStream {
+  line: u8[] = []
+  text: string = ""
+  usage: string = ""
+  failed: bool = false
+
+  // The events of the complete lines in this chunk.
+  push(chunk: u8[]): string {
+    let out = ""
+    for (const b of chunk) {
+      if (int(b) === 10) out += this.take()
+      else this.line.push(b)
+    }
+    return out
+  }
+
+  // The events left when the upstream ends: the last line, then the done event and [DONE] (none after an error).
+  end(): string {
+    let out = this.take()
+    if (this.failed) return out
+    const u = this.usage === "" ? `{"type":"tokens"}` : this.usage
+    out += `data: {"type":"transcript.text.done","text":${quote(this.text)},"usage":${u}}\n\n`
+    return out + "data: [DONE]\n\n"
+  }
+
+  private take(): string {
+    if (this.line.length === 0 || this.failed) {
+      this.line = []
+      return ""
+    }
+    let s = ""
+    try {
+      s = new TextDecoder().decode(this.line)
+    } catch (e) {
+      s = ""
+    }
+    this.line = []
+    const l = s.trim()
+    if (!l.startsWith("data:")) return ""
+    const payload = l.slice(5).trim()
+    if (payload === "" || payload === "[DONE]") return ""
+    try {
+      return try this.event(payload)
+    } catch (e) {
+      // a chunk that is not JSON is skipped, as Bifrost skips it
+      return ""
+    }
+  }
+
+  private event(payload: string): string throws SyntaxError {
+    const fs = try fields(payload)
+    const err = find(fs, "error")
+    if (err !== undefined && !isNull(err)) {
+      this.failed = true
+      const ef = try fields(err)
+      return `data: ${errorJson(rawStr(ef, "message") ?? "gemini api error", rawStr(ef, "status") ?? "api_error", undefined)}\n\n`
+    }
+    let delta = ""
+    let finished = false
+    const cands = try elements(find(fs, "candidates") ?? "[]")
+    if (cands.length > 0) {
+      const c = try fields(cands[0]!)
+      const content = find(c, "content")
+      if (content !== undefined && !isNull(content)) {
+        for (const p of try elements(find(try fields(content), "parts") ?? "[]")) delta += rawStr(try fields(p), "text") ?? ""
+      }
+      finished = (rawStr(c, "finishReason") ?? "") !== ""
+    }
+    const um = find(fs, "usageMetadata")
+    const hasUsage = um !== undefined && !isNull(um)
+    if (cands.length > 0 && (finished || hasUsage)) {
+      let uf: Field[] = []
+      if (hasUsage) uf = try fields(um!)
+      const count = (k: string): int => Math.trunc(rawNum(uf, k) ?? 0.0)
+      this.usage = `{"type":"tokens","input_tokens":${count("promptTokenCount")},"output_tokens":${count("candidatesTokenCount")},"total_tokens":${count("totalTokenCount")}}`
+    }
+    if (delta === "") return ""
+    this.text += delta
+    return `data: {"type":"transcript.text.delta","delta":${quote(delta)}}\n\n`
+  }
+}
+
+export function transcriptStream(): GeminiTranscriptStream {
+  return new GeminiTranscriptStream()
+}
+
 // The transcript of a generateContent answer: the text parts of its first candidate,
 // without thought summaries.
 export function transcriptText(raw: string): string throws SyntaxError {
@@ -1559,4 +1660,27 @@ test("Sarvam's streamed speech events and its errors in OpenAI's shape", () => {
   expect(sarvamError(`{"detail":"Invalid API key"}`)).toBe(`{"error":{"message":"Invalid API key","type":"api_error"}}`)
   expect(sarvamError(`{"detail":[{"msg":"text is required"},{"msg":"bad pace"}]}`)).toBe(`{"error":{"message":"text is required; bad pace","type":"api_error"}}`)
   expect(sarvamError("upstream down")).toBe(`{"error":{"message":"upstream down","type":"api_error"}}`)
+})
+
+test("Gemini's streamed transcription: delta events, the done event with the last usage, then [DONE]", () => {
+  const req = geminiTranscriptionStream(GEMINI_TTS, "", "audio/wav", [72, 105])
+  expect(req.url).toBe("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:streamGenerateContent?alt=sse")
+  expect(req.headers.get("accept")).toBe("text/event-stream")
+  expect(req.headers.get("x-goog-api-key")).toBe(GEMINI_TTS.key.value ?? "")
+  const s = transcriptStream()
+  const enc = new TextEncoder()
+  const a = `data: {"candidates":[{"content":{"parts":[{"text":"Hel"}]}}]}\r\n\r\n`
+  const b = `data: {"candidates":[{"content":{"parts":[{"text":"lo"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":2,"totalTokenCount":9}}\r\n\r\n`
+  // a chunk boundary inside a line is held until the line ends
+  const whole = enc.encode(a + b)
+  expect(s.push(whole.slice(0, 30))).toBe("")
+  expect(s.push(whole.slice(30))).toBe(`data: {"type":"transcript.text.delta","delta":"Hel"}\n\ndata: {"type":"transcript.text.delta","delta":"lo"}\n\n`)
+  expect(s.end()).toBe(`data: {"type":"transcript.text.done","text":"Hello","usage":{"type":"tokens","input_tokens":7,"output_tokens":2,"total_tokens":9}}\n\ndata: [DONE]\n\n`)
+  // an error chunk ends the stream with an error event and no [DONE]
+  const e = transcriptStream()
+  expect(e.push(enc.encode(`data: {"error":{"code":400,"message":"bad audio","status":"INVALID_ARGUMENT"}}\n`))).toBe(`data: {"error":{"message":"bad audio","type":"INVALID_ARGUMENT"}}\n\n`)
+  expect(e.end()).toBe("")
+  // no usage reported: the done event says tokens and nothing more
+  const n = transcriptStream()
+  expect(n.end()).toBe(`data: {"type":"transcript.text.done","text":"","usage":{"type":"tokens"}}\n\ndata: [DONE]\n\n`)
 })

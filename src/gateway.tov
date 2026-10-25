@@ -11,7 +11,7 @@ import { GenAIStream } from "./genai_in"
 import { ConverseStream, InvokeStream } from "./bedrock_in"
 import { StreamState, toMessage } from "./providers/anthropic_in"
 import { AffinityStore, resolveSticky, sessionId, sessionTtl, affinityMode } from "./affinity"
-import { Tier, tierTarget, overrideTier } from "./complexity"
+import { Tier, tierTarget, overrideTier, SessionTiers } from "./complexity"
 import * as cplx from "./complexity"
 import { parseDecision } from "./decisions"
 import * as typesafe from "./providers/typesafe"
@@ -27,6 +27,9 @@ import { ToolGuard, compileToolGuards, checkToolCall } from "./guard_mcp"
 import { OutputStreamGuard, GuardedProvider, StreamFormat } from "./guard_stream"
 import { Vault, tokenizeChatRequest, restoreCompletion, tokenize, tokenizeText } from "./guard_reversible"
 import { Target, Upstream, Translated, proxyOf, tlsOf, poolOf, RS } from "./providers/types"
+import { anthropicRoute } from "./providers/anthropic_route"
+import * as vertexWif from "./vertexwif"
+import { mantleSurface } from "./providers/bedrock_mantle"
 import { CompatPlan, Shaped, settingsOf, withHeader, responseToChat, chatToText, textFrame, chatSseToText, textToChatFields } from "./compat"
 import { ResponsesToChatStream, ChatToResponses, toResponse, toResponseStream } from "./responses"
 import { ModelRef, parseModel, parseModelVia, target, kindOf, classify, backoffMs, maxRetries, timeoutMs, healthId, resolveAlias, matchedAlias, directRefs, directionOpts } from "./router"
@@ -34,14 +37,14 @@ import { CrewPick, crewRoute, withReasoningEffort, reasoningEffortText } from ".
 import { forwardedHeaders, headerFilterOf } from "./headerfilter"
 import * as anthropicBeta from "./anthropic_beta"
 import { Health, BreakerConfig, defaultBreakerConfig, parsePolicy } from "./health"
-import { errorParts, classifyFailure, holdsKey } from "./refusal"
+import { errorParts, classifyFailure, holdsKey, retryInfoMs } from "./refusal"
 import { Governance, Grant, Denial, directKeyFrom, Attribution, noAttribution } from "./governance"
 import { Pricing, PriceRow, CostParts, SttUsage } from "./pricing"
 import { MediaRoute, MediaBill, handleMedia, transcriptionUsage, billedMedia, StreamUsage, pump, isEventStream } from "./media"
 import { SocketGate } from "./ws"
 import { ResponseCache, CacheOrigin, cacheKey, keyScope, parseTtl } from "./cache"
 import { appOf } from "./logapi"
-import { sha256, toHex, utf8 } from "./crypto"
+import { sha256, toHex, utf8, secureHex } from "./crypto"
 import { completionToSse } from "./sse"
 import * as providers from "./providers/index"
 import * as openai from "./providers/openai"
@@ -241,7 +244,15 @@ export function eventSink(real: StreamSink, onEvent: (block: string) => EventSte
 export function llmStreamSink(chain: PluginChain, run: PluginRun, real: StreamSink): StreamSink {
   return eventSink(real, (block) => {
     const data = sseData(block)
-    if (data === undefined || !data.startsWith("{") || data.startsWith("{\"error\"")) return { kind: "send", block: block }
+    if (data === undefined || !data.startsWith("{")) return { kind: "send", block: block }
+    if (data.startsWith("{\"error\"")) {
+      // the stream's error reaches the post hooks as an error (Bifrost's PostLLMHook with the stream's BifrostError): a
+      // plugin may change it, drop it, or recover with a chunk that is sent in its place
+      const oe = chain.runPostChunkError(&run.ctx, 500, data)
+      if (oe.skip === true) return { kind: "drop" }
+      if (oe.body === data) return { kind: "send", block: block }
+      return { kind: "send", block: sseWithData(block, oe.body) }
+    }
     const o = chain.runPostChunk(&run.ctx, data)
     // a chunk a plugin skipped (StreamControl) is not sent, and the stream goes on
     if (o.skip === true) return { kind: "drop" }
@@ -544,6 +555,18 @@ export class StreamConverter {
   }
 }
 
+// A random hex token from the kernel source ("" when it cannot be read, which turns the marker it serves off).
+function randomToken(): string {
+  try {
+    return secureHex(32)
+  } catch (e) {
+    return ""
+  }
+}
+
+// The header that marks a classifier's own call as not charged to the caller's budgets (Engine.classifierToken).
+const NO_CHARGE_HEADER = "x-raiju-classifier-call"
+
 // The chat body with its only message's text replaced, or undefined when there isn't exactly
 // one message with string content.
 // "provider/model" split at the first slash; a bare name has no provider.
@@ -845,9 +868,8 @@ function pluginLogsOf(c: ReqCtx): string | undefined {
 }
 
 // A request's plugin spans (plugin.<name>.<hook>) as stages of its trace; plugin_span_filter applies to them.
-function pluginStagesOf(c: ReqCtx): StageTiming[] {
+function traceStages(tr: PluginTrace | undefined): StageTiming[] {
   const out: StageTiming[] = []
-  const tr = c.pluginTrace
   if (tr === undefined) return out
   for (const s of tr.spans) out.push({ name: s.name, startMs: s.startMs, durUs: s.durUs })
   return out
@@ -1226,6 +1248,8 @@ export class AttemptPlugins {
   noStore = false
   // the error a short circuit of the primary's pre hooks gave, to be tried against the fallbacks (allow_fallbacks)
   primaryFail: { status: int, body: string } | undefined = undefined
+  // the post_builtin plugins' pre hooks are still to run for the primary attempt (afterCache)
+  late = false
 
   constructor(readonly chain: PluginChain, readonly run: PluginRun, readonly original: string, body: Field[], text: string) {
     this.body = body
@@ -1248,6 +1272,7 @@ export class AttemptPlugins {
   stepAt(i: int, ref: ModelRef, prev: { status: int, body: string }): RefStep {
     const pf = this.primaryFail
     if (i === 0) {
+      if (pf === undefined && this.late) return this.afterCache()
       if (pf === undefined) return { kind: "go" }
       // the primary's short circuit is its attempt's error: the post hooks see it, then the fallbacks are tried
       this.primaryFail = undefined
@@ -1272,6 +1297,29 @@ export class AttemptPlugins {
       if (pre.allowFallbacks === false) return { kind: "final", status: post.status, body: post.body }
       return { kind: "fail", status: post.status, body: post.body }
     }
+    try {
+      this.body = fields(pre.body)
+    } catch (e) {
+      return { kind: "fail", status: 500, body: errorJson(`a plugin produced an invalid request: ${e.message}`, "api_error", undefined) }
+    }
+    this.text = pre.body
+    this.typed = new LazyChat(pre.body)
+    return { kind: "go" }
+  }
+
+  // The post_builtin plugins' pre hooks at the start of the primary attempt, once the cache missed (Bifrost runs them
+  // after its builtin plugins, the cache among them, so a cache hit never reaches them and they do not change its key).
+  private afterCache(): RefStep {
+    this.late = false
+    const pre = this.chain.runPreAfterCache(&this.run.ctx, this.text)
+    if (pre.kind === "short_circuit") {
+      this.delayMs = parseInt(this.run.ctx.values.get("mock_latency_ms") ?? "0") ?? 0
+      const post = this.chain.runPost(&this.run.ctx, pre.status, pre.body)
+      if (post.status < 400) return { kind: "answer", status: post.status, body: post.body }
+      if (pre.allowFallbacks === false) return { kind: "final", status: post.status, body: post.body }
+      return { kind: "fail", status: post.status, body: post.body }
+    }
+    if (pre.body === this.text) return { kind: "go" }
     try {
       this.body = fields(pre.body)
     } catch (e) {
@@ -1548,6 +1596,13 @@ export class Engine {
   logRequests = true
   affinity: AffinityStore | undefined = undefined
   complexity: ComplexitySettings | undefined = undefined
+  // where the semantic classifier keeps its exemplars when its vector_store is "vector_store"
+  cxStore: VectorStore | undefined = undefined
+  // the highest complexity tier each session reached (complexity_router.session)
+  sessionTiers = new SessionTiers()
+  // marks a classifier's own call that is not charged to the caller's budgets (count_toward_budgets off); a random
+  // value per process, so a caller cannot send it
+  classifierToken = randomToken()
   agent: AgentConfig | undefined = undefined
   // set by the alerting loop when alerts are on
   samples: SampleRing | undefined = undefined
@@ -1709,7 +1764,17 @@ export class Engine {
       this.affinity = new AffinityStore({ enabled: true, ttl_ms: (sa.ttl_seconds ?? 3600) * 1000, max_sessions: sa.max_sessions ?? 100000 })
     }
     const cx = cfg.complexity_router
-    if (cx !== undefined && cx.enabled !== false) this.complexity = cx
+    if (cx !== undefined && cx.enabled !== false) {
+      this.complexity = cx
+      // the semantic classifier's exemplars in the configured vector store (semantic.vector_store "vector_store")
+      if ((cx.semantic?.vector_store ?? "").trim().toLowerCase() === "vector_store" && cfg.vector_store !== undefined && cfg.vector_store.enabled !== false) {
+        try {
+          this.cxStore = openVectorStore(cfg.vector_store)
+        } catch (e) {
+          console.error(`raiju: vector_store for the complexity exemplars: ${e.message}; keeping them in memory`)
+        }
+      }
+    }
     // injected tools run in the agent loop, so they are auto-executed like mcp_auto_execute names
     const auto = (cfg.client?.mcp_auto_execute ?? []).concat(autoExecutePatterns(cfg.mcp?.client_configs ?? [])).concat(injectedNames(cfg))
     if (auto.length > 0) this.agent = { max_depth: cfg.client?.mcp_agent_depth ?? 10, auto_execute: auto, parallel: true }
@@ -1911,20 +1976,63 @@ export class Engine {
   async tierFor(req: Request, text: string, cx: ComplexitySettings): Promise<{ tier: Tier, mechanism: string, score: f64 | undefined }> {
     const mode = cplx.classifierMode(cx.classifier)
     if (mode === "heuristic") return this.heuristicTier(text, cx)
+    // a classifier's own calls are charged to the caller's budgets only with count_toward_budgets (the decision
+    // model's always are, as in Bifrost)
+    const llmCharged = cx.llm?.count_toward_budgets === true
+    const decisionCall = async (b: string, ph: string): Promise<string | undefined> => await this.classifierCall(req, "/v1/decisions", b, ph, true)
+    const llmCall = async (b: string, ph: string): Promise<string | undefined> => await this.classifierCall(req, "/v1/chat/completions", b, ph, llmCharged)
     let t: Tier | undefined = undefined
-    if (mode === "decision") t = await cplx.decisionTier(text, cx.decision, async (b: string, ph: string) => await this.classifierCall(req, "/v1/decisions", b, ph))
-    else if (mode === "llm") t = await cplx.llmTier(text, cx.llm, async (b: string, ph: string) => await this.classifierCall(req, "/v1/chat/completions", b, ph))
-    else t = await cplx.semanticTier(text, cx.semantic, async (b: string, ph: string) => await this.classifierCall(req, "/v1/embeddings", b, ph))
+    if (mode === "decision") t = await cplx.decisionTier(text, cx.decision, decisionCall)
+    else if (mode === "llm") t = await cplx.llmTier(text, cx.llm, llmCall)
+    else {
+      const semCharged = cx.semantic?.count_toward_budgets === true
+      t = await cplx.semanticTier(text, cx.semantic, async (b: string, ph: string) => await this.classifierCall(req, "/v1/embeddings", b, ph, semCharged), this.cxStore)
+      if (t !== undefined) return { tier: t, mechanism: mode, score: undefined }
+      // semantic.fallback: the llm or decision block classifies when the semantic classifier names no tier
+      const fb = (cx.semantic?.fallback ?? "").trim().toLowerCase()
+      if (fb === "llm") {
+        const lt = await cplx.llmTier(text, cx.llm, llmCall)
+        if (lt !== undefined) return { tier: lt, mechanism: "llm", score: undefined }
+      } else if (fb === "decision") {
+        const dt = await cplx.decisionTier(text, cx.decision, decisionCall)
+        if (dt !== undefined) return { tier: dt, mechanism: "decision", score: undefined }
+      }
+    }
     if (t !== undefined) return { tier: t, mechanism: mode, score: undefined }
     return this.heuristicTier(text, cx)
   }
 
+  // The tier routed for a chat request under complexity_router.session (Bifrost's session tier retention): the
+  // request's session (x-bf-session-id and the like, scoped to its virtual key and user) never steps down a tier
+  // within a day of its last request. A held COMPLEX, and a tool continuation, take the session's tier without being
+  // classified; otherwise the classified tier is raised to the held one, and the mechanism reads "session" when the
+  // session decided it.
+  async sessionTier(req: Request, h: Hdrs, text: string, cx: ComplexitySettings): Promise<{ tier: Tier, mechanism: string, score: f64 | undefined }> {
+    const sid = cx.session?.enabled === true ? sessionId(h) : undefined
+    if (sid === undefined) return await this.tierFor(req, text, cx)
+    // the key names the caller by a digest, so no credential is held
+    const key = toHex(sha256(utf8((h.get("x-bf-vk") ?? h.get("authorization") ?? h.get("x-api-key") ?? "") + "\n" + (h.get("x-bf-user-id") ?? "") + "\n" + sid)))
+    const now = Date.now()
+    const held = this.sessionTiers.get(key, now, false)
+    if (held !== undefined && (held === "COMPLEX" || cplx.isContinuation(text))) {
+      this.sessionTiers.get(key, now, true)
+      return { tier: held, mechanism: "session", score: undefined }
+    }
+    const d = await this.tierFor(req, text, cx)
+    const r = this.sessionTiers.resolve(key, d.tier, now)
+    if (r.held) return { tier: r.tier, mechanism: "session", score: undefined }
+    return d
+  }
+
   // A classifier's own call, answered by the route it names with the caller's headers. The chat
   // call is marked with a forced tier, so it is not classified in turn. undefined when it fails.
-  async classifierCall(req: Request, route: string, body: string, phase: string): Promise<string | undefined> {
+  // A call not charged carries the process's no-charge marker, and its cost is kept off the caller's budgets.
+  async classifierCall(req: Request, route: string, body: string, phase: string, charged: bool): Promise<string | undefined> {
     try {
       const hs: Record<string, string> = snapshot(req.headers)
       hs.set("x-bf-complexity-tier", "MEDIUM")
+      if (charged) hs.delete(NO_CHARGE_HEADER)
+      else if (this.classifierToken !== "") hs.set(NO_CHARGE_HEADER, this.classifierToken)
       const inner = new Request("http://raiju.internal" + route, { method: "POST", headers: hs, body: body })
       let res: Response = new Response(undefined, { status: 500 })
       if (route === "/v1/decisions") {
@@ -2061,6 +2169,9 @@ export class Engine {
         }
         if (sel === undefined) break
         let t = sel.t
+        // a request pinned to a key goes to it even while it is held; under adaptive load balancing its answer settles
+        // the hold as a check does (holds.tov claimPinned)
+        if (pinned !== undefined && sel.keyIndex >= 0 && this.cfg.health?.adaptive === true) this.health.holds.claimPinned(healthId(ref.provider, t.key, sel.keyIndex), ref.model, Date.now())
         let tl = ctx.labels
         tl.provider = ref.provider
         tl.model = ref.model
@@ -2138,6 +2249,12 @@ export class Engine {
           }
           t.key.value = tok.token
         }
+        // another wire for this attempt, as Bifrost picks it per request: Claude on Azure and use_anthropic_endpoints
+        // go as Anthropic Messages, and a Bedrock key's OpenAI-family models go to its Mantle surface
+        const ra = matchedAlias(t.key, ref.model)
+        const viaAnthropic = anthropicRoute(t, ra, ref.model)
+        if (viaAnthropic !== undefined) t = viaAnthropic
+        else if (t.kind === "bedrock" && mantleSurface(t, ra, ref.model)) t.kind = "bedrock_mantle"
         let up: Upstream = { url: "", headers: new Map(), body: "" }
         try {
           up = build(t)
@@ -2155,7 +2272,11 @@ export class Engine {
         // The Messages route forwards the caller's own anthropic-beta, as Bifrost's Anthropic integration does.
         const providerBeta: string = up.headers.get("anthropic-beta") ?? ""
         for (const k of extra.keys()) up.headers.set(k, extra.get(k)!)
-        for (const k of ctx.upstreamHeaders.keys()) up.headers.set(k, ctx.upstreamHeaders.get(k)!)
+        // a chat request's plugin headers as its pre hooks left them for this attempt (those of a post_builtin plugin or a
+        // fallback's pre hooks are set after the request reached serve)
+        const ahh = ctx.attemptHook
+        const plugHeaders = ahh !== undefined ? ahh.run.ctx.headers : ctx.upstreamHeaders
+        for (const k of plugHeaders.keys()) up.headers.set(k, plugHeaders.get(k)!)
         if (anthropicBeta.filtered(t.kind, t.model)) {
           const callerBeta: string = ctx.op === "anthropic.messages" ? (h.get("anthropic-beta") ?? "") : ""
           const beta = anthropicBeta.betaValue(t.kind, t.model, [providerBeta, up.headers.get("anthropic-beta") ?? "", callerBeta], t.cfg.network_config)
@@ -2376,6 +2497,11 @@ export class Engine {
           dl.finish()
           retryAfter = res.headers.get("retry-after") ?? undefined
           hintMs = retryHintMs(res.headers.get("retry-after-ms") ?? undefined, retryAfter)
+          // a google.rpc.RetryInfo detail in the error body is the provider's own answer, and wins over the headers
+          if (status < 200 || status >= 300) {
+            const bodyHint = retryInfoMs(text)
+            if (bodyHint !== undefined) hintMs = bodyHint
+          }
         } catch (e) {
           live?.finish()
           status = 0
@@ -2511,6 +2637,7 @@ export class Engine {
     this.jsonStreamOn = fresh.jsonStreamOn
     this.logRequests = fresh.logRequests
     this.complexity = fresh.complexity
+    this.cxStore = fresh.cxStore
     this.guardProviders = fresh.guardProviders
     this.localRules = fresh.localRules
     this.logRules = fresh.logRules
@@ -3264,6 +3391,14 @@ export class Engine {
   }
 
   async vertexToken(t: Target): Promise<{ token: string, error: string }> {
+    // a token federated from the workload's AWS identity (vertexwif.tov), when the key asks for one
+    let plan: vertexWif.WifPlan | undefined = undefined
+    try {
+      plan = vertexWif.planOf(t.key.vertex_key_config)
+    } catch (e) {
+      return { token: "", error: `vertex authentication failed: ${e.message}` }
+    }
+    if (plan !== undefined) return await vertexWif.federatedToken(plan)
     const now = Math.floor(Date.now() / 1000)
     try {
       const sa = parseServiceAccount(t.key.vertex_key_config?.auth_credentials)
@@ -3424,6 +3559,9 @@ export class Engine {
     const op = ctx.op
     const started = ctx.started
     let h = h0
+    // a classifier's own call that is not charged (count_toward_budgets off): the marker is checked, then taken off
+    const noCharge = this.classifierToken !== "" && h.get(NO_CHARGE_HEADER) === this.classifierToken
+    h.delete(NO_CHARGE_HEADER)
     const rid = ctx.rid
     let out: Hdrs = new Map()
     out.set("x-bifrost-request-id", rid)
@@ -3455,7 +3593,7 @@ export class Engine {
         tier = forced
         mechanism = "override"
       } else {
-        const d = await this.tierFor(req, text, cx)
+        const d = await this.sessionTier(req, h, text, cx)
         tier = d.tier
         mechanism = d.mechanism
         ctx.complexityScore = d.score
@@ -3504,7 +3642,8 @@ export class Engine {
       ctx.error = admitted.message
       return errorResponse(admitted.status, admitted.message, admitted.type, out)
     }
-    const grant: Grant = admitted
+    // a classifier's uncharged call: its cost stays off the caller's budgets (its rate limits still count it)
+    const grant: Grant = noCharge ? { kind: "grant", vk: admitted.vk, budgets: [], rateLimits: admitted.rateLimits, attr: admitted.attr } : admitted
     ctx.virtualKey = grant.vk?.id ?? ""
     ctx.userId = grant.vk?.user_id ?? ""
     ctx.provider = primary.provider
@@ -3987,9 +4126,18 @@ export class Engine {
       if (ov !== undefined) span.setNum("bifrost.overhead.duration_ms", ov / 1000.0)
       if (!ok) span.fail(c.error === "" ? `HTTP ${c.status}` : c.error)
       span.end(Date.now())
-      tracer.addStages(span, c.stages.concat(pluginStagesOf(c)))
-      tracer.finish(span)
-      if (tracer.shouldFlush(Date.now())) this.flushTraces(tracer)
+      // a hooked route whose post hooks are still to run exports the trace once they have (PluginTrace.done), with
+      // their spans
+      const pt = c.pluginTrace
+      const baseStages = c.stages
+      // (the trace reaches the callback as its argument: a closure held by pt that held pt would never be freed)
+      const finishTrace = (tr: PluginTrace | undefined): void => {
+        tracer.addStages(span, baseStages.concat(traceStages(tr)))
+        tracer.finish(span)
+        if (tracer.shouldFlush(Date.now())) this.flushTraces(tracer)
+      }
+      if (pt !== undefined && pt.defer) pt.onDone = finishTrace
+      else finishTrace(pt)
     }
   }
 
@@ -4814,7 +4962,8 @@ export class Engine {
       r.ctx.provider = this.refOf(r.ctx.model).provider
       // the request as it came, for the pre hooks of each fallback
       const original = text
-      const pre = chain.runPre(&r.ctx, text)
+      // the plugins before the cache now; the post_builtin ones once the cache missed (AttemptPlugins.afterCache)
+      const pre = chain.runPreBeforeCache(&r.ctx, text)
       let primaryFail: { status: int, body: string } | undefined = undefined
       if (pre.kind === "short_circuit") {
         const delay = parseInt(r.ctx.values.get("mock_latency_ms") ?? "0") ?? 0
@@ -4842,6 +4991,7 @@ export class Engine {
       }
       const ah = new AttemptPlugins(chain, r, original, body, text)
       ah.primaryFail = primaryFail
+      ah.late = pre.kind === "continue" && chain.hasAfterCache("chat")
       hook = ah
     }
     // The typed request is only needed to translate for non-OpenAI providers.
@@ -5381,6 +5531,31 @@ test("a cache hit goes through the post hooks of the plugins before the cache on
   expect(before.onHit(`{"cached":1}`).body).toBe(`{"cached":1}!`)
   const after = attemptHookFor("openai/a")
   expect(after.onHit(`{"cached":1}`).body).toBe(`{"cached":1}`)
+})
+
+test("a post_builtin plugin's pre hook runs at the primary attempt, after the cache lookup, and its post hook still runs", () => {
+  // the probe is post_builtin (rank 2): the pre hooks before the cache run none, the primary attempt runs it
+  const chain = new PluginChain([new AttemptProbe()])
+  chain.ranks = [2]
+  const run = new PluginRun({ requestId: "r", op: "chat", model: "openai/a", provider: "", headers: new Map(), values: new Map() })
+  const original = `{"model":"openai/a","messages":[]}`
+  const first = chain.runPreBeforeCache(&run.ctx, original)
+  expect(first.kind === "continue" && first.body === original).toBe(true)
+  expect(run.ctx.values.get("trace") ?? "").toBe("")
+  expect(chain.hasAfterCache("chat")).toBe(true)
+  const ah = new AttemptPlugins(chain, run, original, try fields(original), original)
+  ah.late = true
+  expect(ah.stepAt(0, { provider: "openai", model: "a" }, { status: 0, body: "" }).kind).toBe("go")
+  expect(rawStr(ah.body, "seen")).toBe("openai/a")
+  expect(ah.late).toBe(false)
+  expect(chain.runPost(&run.ctx, 200, "{}").body).toBe("{}!")
+  // its short circuit answers the primary attempt, through the post hooks
+  const run2 = new PluginRun({ requestId: "r2", op: "chat", model: "openai/mock-ok", provider: "", headers: new Map(), values: new Map() })
+  chain.runPreBeforeCache(&run2.ctx, `{}`)
+  const ah2 = new AttemptPlugins(chain, run2, `{}`, [], `{}`)
+  ah2.late = true
+  const s = ah2.stepAt(0, { provider: "openai", model: "mock-ok" }, { status: 0, body: "" })
+  expect(s.kind === "answer" && s.body === `{"mock":true}!`).toBe(true)
 })
 
 test("the user a key is assigned to is named from the admin users", () => {

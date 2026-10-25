@@ -1,0 +1,184 @@
+// Anthropic Messages served by other providers, as Bifrost routes them: Claude on Azure (the resource's
+// /anthropic/v1/messages, picked by the model's family), and the Anthropic-compatible endpoints of Fireworks,
+// DeepSeek, SGLang and vLLM when the key or the alias sets use_anthropic_endpoints. The attempt's target becomes an
+// Anthropic one (kind "anthropic", the route's base, its own auth headers), so the request is built, streamed and
+// translated as Anthropic's while the provider stays the configured one for keys, pricing and logs.
+import { Target, trimSlash } from "./types"
+import { AliasTarget } from "../config"
+import * as openai from "./openai"
+
+// Bifrost's anthropic-version default for Claude on Azure (AzureAnthropicAPIVersionDefault) and SGLang.
+export const ANTHROPIC_VERSION = "2023-06-01"
+
+// Bifrost's isOSeriesModel: "o" and one digit, alone or before "-", after any "provider/" or ":" prefix.
+function oSeries(model: string): bool {
+  let name = model
+  for (const sep of ["/", ":"]) {
+    let at = name.indexOf(sep)
+    while (at >= 0) {
+      name = name.slice(at + 1)
+      at = name.indexOf(sep)
+    }
+  }
+  if (name.byteLength < 2 || !name.startsWith("o") || !"0123456789".includes(name.slice(1, 2))) return false
+  return name.byteLength === 2 || name.slice(2, 3) === "-"
+}
+
+// The family one model name shows by its substrings (Bifrost's IsAnthropicModel, IsOpenAIModel, ... in
+// ResolveFamily's order), or "" when it shows none.
+export function familyOfName(s: string): string {
+  if (s.includes("anthropic.") || s.includes("claude")) return "anthropic"
+  if (s.includes("gpt-") || s.includes("text-embedding-") || oSeries(s)) return "openai"
+  if (s.includes("mistral") || s.includes("codestral")) return "mistral"
+  if (s.toLowerCase().includes("imagen")) return "imagen"
+  if (s.includes("veo")) return "veo"
+  if (s.includes("gemini")) return "gemini"
+  if (s.includes("gemma")) return "gemma"
+  if (s.includes("llama")) return "llama"
+  if (s.includes("nova")) return "nova"
+  if (s.includes("titan")) return "titan"
+  if (s.includes("cohere")) return "cohere"
+  return ""
+}
+
+// Bifrost's ResolveFamily: an alias's model_family when set, else the first of its model_name, model_id and alias
+// name that shows a family; with no alias, the request's model.
+export function resolveFamily(model: string, alias: AliasTarget | undefined, aliasName: string): string {
+  if (alias === undefined) return familyOfName(model)
+  const fam = alias.model_family ?? ""
+  if (fam !== "") return fam
+  const cands: string[] = []
+  const name = alias.model_name
+  if (name !== undefined) cands.push(name)
+  cands.push(alias.model_id)
+  cands.push(aliasName)
+  for (const c of cands) {
+    const f = familyOfName(c)
+    if (f !== "") return f
+  }
+  return ""
+}
+
+// Bifrost's ResolveUseAnthropicEndpoints: the alias's use_anthropic_endpoints wins over the key's.
+export function usesAnthropicEndpoints(t: Target, alias: AliasTarget | undefined): bool {
+  const a = alias?.use_anthropic_endpoints
+  if (a !== undefined) return a
+  return t.key.use_anthropic_endpoints === true
+}
+
+// The kinds whose keys take use_anthropic_endpoints (Bifrost's fireworks, deepseek, sgl and vllm keys).
+export const ANTHROPIC_ENDPOINT_KINDS = ["fireworks", "deepseek", "sgl", "vllm"]
+
+// The Anthropic target an attempt is sent as, or undefined when the provider's own wire applies. alias is the
+// alias the request model matched on the key (aliasName is that request model). For Azure the key's value is the
+// API key, or the Entra token the gateway put there.
+export function anthropicRoute(t: Target, alias: AliasTarget | undefined, aliasName: string): Target | undefined {
+  let base = ""
+  const auth: Map<string, string> = new Map()
+  const v = t.key.value ?? ""
+  if (t.kind === "azure") {
+    if (resolveFamily(t.model, alias, aliasName) !== "anthropic") return undefined
+    const az = t.key.azure_key_config
+    const ep = trimSlash(az?.endpoint ?? t.cfg.network_config?.base_url ?? "")
+    if (ep === "") return undefined
+    base = ep + "/anthropic"
+    // getAzureAuthHeaders: an Entra token as a bearer, an API key as x-api-key on the Anthropic route
+    if (az?.tenant_id !== undefined) auth.set("authorization", "Bearer " + v)
+    else if (v !== "") auth.set("x-api-key", v)
+    const ver = alias?.anthropic_version ?? ""
+    auth.set("anthropic-version", ver !== "" ? ver : ANTHROPIC_VERSION)
+  } else if (ANTHROPIC_ENDPOINT_KINDS.includes(t.kind)) {
+    if (!usesAnthropicEndpoints(t, alias)) return undefined
+    const root = openai.rootOf(t)
+    // DeepSeek serves Messages under /anthropic and takes x-api-key; the others take a bearer token at the root,
+    // SGLang with anthropic-version (fireworks.go, deepseek.go, sgl.go, vllm.go anthropicHeaders)
+    if (t.kind === "deepseek") {
+      base = root + "/anthropic"
+      if (v !== "") auth.set("x-api-key", v)
+    } else {
+      base = root
+      if (v !== "") auth.set("authorization", "Bearer " + v)
+      if (t.kind === "sgl") auth.set("anthropic-version", ANTHROPIC_VERSION)
+    }
+  } else return undefined
+  // Azure's deployment for the model is the name its Anthropic route takes
+  const model = t.kind === "azure" ? openai.azureDeployment(t) : t.model
+  let n = t
+  n.kind = "anthropic"
+  n.model = model
+  let cfg = n.cfg
+  let nc = cfg.network_config ?? {}
+  nc.base_url = base
+  cfg.network_config = nc
+  n.cfg = cfg
+  n.anthropicAuth = auth
+  return n
+}
+
+function authOf(t: Target, k: string): string {
+  const a = t.anthropicAuth
+  if (a === undefined) return ""
+  return a.get(k) ?? ""
+}
+
+test("families as Bifrost's substring checks read them", () => {
+  expect(familyOfName("claude-sonnet-4-5")).toBe("anthropic")
+  expect(familyOfName("anthropic.claude-3-haiku")).toBe("anthropic")
+  expect(familyOfName("gpt-4o")).toBe("openai")
+  expect(familyOfName("openai/o3")).toBe("openai")
+  expect(familyOfName("o4-mini")).toBe("openai")
+  expect(familyOfName("co1")).toBe("")
+  expect(familyOfName("o3x")).toBe("")
+  expect(familyOfName("gemini-2.5-flash")).toBe("gemini")
+  expect(familyOfName("deployment-123")).toBe("")
+  // an alias: model_family wins, then model_name, model_id and the alias name in that order
+  expect(resolveFamily("dep-1", { model_id: "dep-1", model_family: "anthropic" }, "best")).toBe("anthropic")
+  expect(resolveFamily("dep-1", { model_id: "dep-1", model_name: "claude-opus-4-8" }, "best")).toBe("anthropic")
+  expect(resolveFamily("claude-x", { model_id: "claude-x", model_name: "gpt-4o" }, "claude-alias")).toBe("openai")
+  expect(resolveFamily("dep-1", { model_id: "dep-1" }, "my-claude")).toBe("anthropic")
+  expect(resolveFamily("dep-1", { model_id: "dep-1" }, "plain")).toBe("")
+})
+
+test("Claude on Azure goes to the resource's Anthropic route with its headers", () => {
+  const t: Target = { provider: "azure", kind: "azure", model: "claude-sonnet-4-5", key: { value: "az-key", azure_key_config: { endpoint: "https://res.services.ai.azure.com/" } }, cfg: {} }
+  const r = anthropicRoute(t, undefined, "claude-sonnet-4-5")!
+  expect(r.kind).toBe("anthropic")
+  expect(r.provider).toBe("azure")
+  expect(r.cfg.network_config?.base_url ?? "").toBe("https://res.services.ai.azure.com/anthropic")
+  expect(authOf(r, "x-api-key")).toBe("az-key")
+  expect(authOf(r, "anthropic-version")).toBe("2023-06-01")
+  // an OpenAI model stays on Azure's OpenAI route
+  let gt = t
+  gt.model = "gpt-4o"
+  expect(anthropicRoute(gt, undefined, "gpt-4o") === undefined).toBe(true)
+  // an alias names the family and the anthropic-version; an Entra token goes as a bearer
+  const en: Target = { provider: "azure", kind: "azure", model: "dep-77", key: { value: "entra-tok", azure_key_config: { endpoint: "https://res.services.ai.azure.com", tenant_id: "t", client_id: "c", client_secret: "s" } }, cfg: {} }
+  const ra = anthropicRoute(en, { model_id: "dep-77", model_family: "anthropic", anthropic_version: "2024-01-01" }, "best")!
+  expect(ra.model).toBe("dep-77")
+  expect(authOf(ra, "authorization")).toBe("Bearer entra-tok")
+  expect(authOf(ra, "x-api-key") !== "").toBe(false)
+  expect(authOf(ra, "anthropic-version")).toBe("2024-01-01")
+})
+
+test("use_anthropic_endpoints: Fireworks, DeepSeek, SGLang and vLLM on their Messages routes", () => {
+  const fw: Target = { provider: "fireworks", kind: "fireworks", model: "accounts/fireworks/models/kimi", key: { value: "fw", use_anthropic_endpoints: true }, cfg: {} }
+  const f = anthropicRoute(fw, undefined, "m")!
+  expect(f.cfg.network_config?.base_url ?? "").toBe("https://api.fireworks.ai/inference")
+  expect(authOf(f, "authorization")).toBe("Bearer fw")
+  expect(authOf(f, "anthropic-version") !== "").toBe(false)
+  // the alias's setting wins over the key's
+  expect(anthropicRoute(fw, { model_id: "m", use_anthropic_endpoints: false }, "m") === undefined).toBe(true)
+  const ds: Target = { provider: "deepseek", kind: "deepseek", model: "deepseek-chat", key: { value: "dk" }, cfg: { network_config: { base_url: "http://mock/v1" } } }
+  expect(anthropicRoute(ds, undefined, "deepseek-chat") === undefined).toBe(true)
+  const d = anthropicRoute(ds, { model_id: "deepseek-chat", use_anthropic_endpoints: true }, "x")!
+  expect(d.cfg.network_config?.base_url ?? "").toBe("http://mock/anthropic")
+  expect(authOf(d, "x-api-key")).toBe("dk")
+  const sg: Target = { provider: "sgl", kind: "sgl", model: "qwen", key: { value: "", use_anthropic_endpoints: true }, cfg: { network_config: { base_url: "http://sgl:30000" } } }
+  const s = anthropicRoute(sg, undefined, "qwen")!
+  expect(s.cfg.network_config?.base_url ?? "").toBe("http://sgl:30000")
+  expect(authOf(s, "anthropic-version")).toBe("2023-06-01")
+  expect(authOf(s, "authorization") !== "").toBe(false)
+  // a provider without Anthropic endpoints is left alone
+  const oa: Target = { provider: "openai", kind: "openai", model: "claude-like", key: { value: "k", use_anthropic_endpoints: true }, cfg: {} }
+  expect(anthropicRoute(oa, undefined, "x") === undefined).toBe(true)
+})

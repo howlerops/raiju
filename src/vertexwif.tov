@@ -1,0 +1,110 @@
+// A Vertex key's GCP token federated from the workload's AWS identity, as Bifrost's vertex/awsfederation.go gets it:
+// from aws_workload_identity, or from gcloud's AWS external_account file in auth_credentials (its own token and
+// impersonation URLs). The AWS credentials are the environment's (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
+// AWS_SESSION_TOKEN), with aws_role_arn assumed first; the signing region is aws_region, else AWS_REGION or
+// AWS_DEFAULT_REGION. Tokens are cached by their settings until a minute before they expire, for the chat path and
+// the media, file and batch routes alike.
+import { VertexKeyConfig, resolveEnv, getEnv } from "./config"
+import * as cloudAuth from "./cloud_auth"
+import { deadline } from "./deadline"
+
+const TOKENS: cloudAuth.TokenCache<string> = cloudAuth.stringCache()
+const ROLES: cloudAuth.TokenCache<cloudAuth.AssumedCreds> = cloudAuth.credsCache()
+
+// What a key's settings make of the flow: the audience, the URLs, the lifetime and the AWS side.
+export type WifPlan = { audience: string, subjectTokenType: string, tokenUrl: string, impersonationUrl: string, lifetimeSeconds: int, region: string, roleArn: string }
+
+// The plan of a key, or undefined when it federates nothing (aws_workload_identity first, then an AWS
+// external_account file, as Bifrost picks them).
+export function planOf(vk: VertexKeyConfig | undefined): WifPlan | undefined throws SyntaxError {
+  const wi = vk?.aws_workload_identity
+  const audience = resolveEnv(wi?.audience ?? "")
+  if (audience !== "") {
+    const email = resolveEnv(wi?.service_account_email ?? "")
+    return {
+      audience: audience,
+      subjectTokenType: cloudAuth.AWS_SUBJECT_TOKEN_TYPE,
+      tokenUrl: cloudAuth.GCP_STS_TOKEN_URL,
+      impersonationUrl: email === "" ? "" : cloudAuth.impersonationUrl(cloudAuth.GCP_IAM_CREDENTIALS_URL, email),
+      lifetimeSeconds: wi?.token_lifetime_seconds ?? 0,
+      region: resolveEnv(wi?.aws_region ?? ""),
+      roleArn: resolveEnv(wi?.aws_role_arn ?? ""),
+    }
+  }
+  const ea = try cloudAuth.awsExternalAccount(vk?.auth_credentials)
+  if (ea === undefined) return undefined
+  return { audience: ea.audience, subjectTokenType: ea.subjectTokenType, tokenUrl: ea.tokenUrl, impersonationUrl: ea.impersonationUrl, lifetimeSeconds: ea.lifetimeSeconds, region: "", roleArn: "" }
+}
+
+async function post(url: string, hs: Map<string, string>, body: string): Promise<{ status: int, text: string }> throws Error {
+  const h: Record<string, string> = hs
+  const dl = deadline(10000)
+  try {
+    const res = await fetch(url, { method: "POST", headers: h, body: body, signal: dl.controller.signal })
+    const text = await res.text()
+    dl.finish()
+    return { status: res.status, text: text }
+  } catch (e) {
+    dl.finish()
+    throw e
+  }
+}
+
+// The federated (or impersonated) access token for a plan; error set when a step fails.
+export async function federatedToken(p: WifPlan): Promise<{ token: string, error: string }> {
+  const now = Date.now()
+  const key = ["aws-wif", p.audience, p.tokenUrl, p.impersonationUrl, p.region, p.roleArn, "" + p.lifetimeSeconds].join("|")
+  const cached = TOKENS.get(key, now)
+  if (cached !== undefined) return { token: cached, error: "" }
+  const ak = getEnv("AWS_ACCESS_KEY_ID") ?? ""
+  const sk = getEnv("AWS_SECRET_ACCESS_KEY") ?? ""
+  if (ak === "" || sk === "") return { token: "", error: "vertex aws federation: no AWS credentials (set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY)" }
+  let region = p.region
+  if (region === "") region = getEnv("AWS_REGION") ?? getEnv("AWS_DEFAULT_REGION") ?? ""
+  if (region === "") return { token: "", error: "vertex aws federation: aws region could not be determined (set aws_region in the key config or AWS_REGION in the environment)" }
+  let creds: cloudAuth.AwsCreds = { accessKey: ak, secretKey: sk, sessionToken: getEnv("AWS_SESSION_TOKEN") }
+  try {
+    if (p.roleArn !== "") {
+      const rk = p.roleArn + "|" + region
+      let ac = ROLES.get(rk, now)
+      if (ac === undefined) {
+        const up = cloudAuth.assumeRoleRequest(creds, region, p.roleArn, undefined, "bifrost-vertex-federation", 3600, now)
+        const r = await post(up.url, up.headers, up.body)
+        const got = cloudAuth.parseAssumeRole(r.text)
+        ROLES.put(rk, got, got.expiresAtMs)
+        ac = got
+      }
+      creds = { accessKey: ac!.accessKey, secretKey: ac!.secretKey, sessionToken: ac!.sessionToken }
+    }
+    const subject = cloudAuth.awsSubjectToken(creds, region, p.audience, now)
+    const sts = cloudAuth.gcpStsRequest(p.tokenUrl, p.audience, p.subjectTokenType, subject)
+    const r1 = await post(sts.url, sts.headers, sts.body)
+    if (r1.status !== 200) throw new Error(`the GCP token exchange answered ${r1.status}: ${r1.text.slice(0, 300)}`)
+    let tok = cloudAuth.parseTokenResponse(r1.text, now)
+    if (p.impersonationUrl !== "") {
+      const ir = cloudAuth.impersonationRequest(p.impersonationUrl, tok.token, p.lifetimeSeconds)
+      const r2 = await post(ir.url, ir.headers, ir.body)
+      if (r2.status !== 200) throw new Error(`the service account impersonation answered ${r2.status}: ${r2.text.slice(0, 300)}`)
+      tok = cloudAuth.parseImpersonation(r2.text, now)
+    }
+    TOKENS.put(key, tok.token, tok.expiresAtMs)
+    return { token: tok.token, error: "" }
+  } catch (e) {
+    return { token: "", error: `vertex aws federation failed: ${e.message}` }
+  }
+}
+
+test("a key's federation plan: aws_workload_identity first, then an AWS external_account file", () => {
+  const none = try planOf({ project_id: "p", region: "us-central1", auth_credentials: `{"type":"service_account","client_email":"a","private_key":"k"}` })
+  expect(none === undefined).toBe(true)
+  const wi = (try planOf({ project_id: "p", region: "us-central1", aws_workload_identity: { audience: "//iam.googleapis.com/x", service_account_email: "sa@p.iam.gserviceaccount.com", token_lifetime_seconds: 1800, aws_region: "eu-west-1" } }))!
+  expect(wi.tokenUrl).toBe("https://sts.googleapis.com/v1/token")
+  expect(wi.impersonationUrl).toBe("https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/sa%40p.iam.gserviceaccount.com:generateAccessToken")
+  expect(wi.lifetimeSeconds).toBe(1800)
+  expect(wi.region).toBe("eu-west-1")
+  // no service account: the federated token itself is used
+  expect((try planOf({ project_id: "p", region: "r", aws_workload_identity: { audience: "//iam.googleapis.com/x" } }))!.impersonationUrl).toBe("")
+  const ea = (try planOf({ project_id: "p", region: "r", auth_credentials: `{"type":"external_account","audience":"//iam/y","token_url":"http://m/v1/token","credential_source":{"environment_id":"aws1"}}` }))!
+  expect(ea.audience).toBe("//iam/y")
+  expect(ea.tokenUrl).toBe("http://m/v1/token")
+})
