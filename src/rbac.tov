@@ -152,7 +152,8 @@ export function selfRoute(method: string, path: string): bool {
 // What a request needs: user management, audit logs, a write, or a read.
 export function required(method: string, path: string): Permission {
   const segs = segmentsOf(path)
-  if (isApi(segs) && ((segs[1] ?? "") === "users" || governanceUsers(segs))) return "manage_users"
+  // the SCIM provisioning token is user management too
+  if (isApi(segs) && ((segs[1] ?? "") === "users" || (segs[1] ?? "") === "scim" || governanceUsers(segs))) return "manage_users"
   const m = method.toUpperCase()
   if (m === "GET" || m === "HEAD") return isAudit(segs) ? "audit" : "read"
   return "write"
@@ -189,7 +190,7 @@ export function resourceOf(method: string, path: string): { resource: string, op
   const area = segs[1] ?? ""
   const coll = segs[2] ?? ""
   let resource = "Settings"
-  if (area === "users") resource = "Users"
+  if (area === "users" || area === "scim") resource = "Users"
   else if (area === "audit-logs") resource = "AuditLogs"
   else if (area === "logs") resource = "Logs"
   else if (area === "mcp-logs") resource = "MCPLogs"
@@ -200,6 +201,7 @@ export function resourceOf(method: string, path: string): { resource: string, op
   else if (area === "roles") resource = "RBAC"
   else if (area === "api-keys") resource = "APIKeys"
   else if (area === "crews") resource = "Crews"
+  else if (area === "access-profiles") resource = "AccessProfiles"
   else if (area === "governance") {
     if (coll === "virtual-keys") resource = "VirtualKeys"
     else if (coll === "users") resource = "Users"
@@ -218,13 +220,15 @@ export function resourceOf(method: string, path: string): { resource: string, op
 
 // Whether a role may make this request. A built-in role keeps its fixed rules; a custom role needs its
 // (resource, operation) pair and only reaches the management API. Unknown roles are refused.
+// A built-in role whose permissions were edited (an entry under governance.roles with its name) is judged by its
+// pairs like a custom role, except that the admin keeps the routes outside /api.
 export function roleAllows(roles: RoleConfig[] | undefined, role: string, method: string, path: string): bool {
   const r = customRole(roles, role)
   if (r === undefined) {
     if (!isBuiltinRole(role)) return false
     return allowed(role, required(method, path), path)
   }
-  if (!isApi(segmentsOf(path))) return false
+  if (!isApi(segmentsOf(path))) return role === "admin"
   const need = resourceOf(method, path)
   for (const p of r.permissions ?? []) {
     if (p.resource === need.resource && p.operation === need.op) return true
@@ -410,16 +414,41 @@ export function builtinRoles(resources: string[], operations: string[]): RoleCon
   return out
 }
 
+// A built-in role as it stands: its edited entry under governance.roles when it has one (description, dac and
+// pairs as saved), else its defaults.
+export function systemRole(roles: RoleConfig[] | undefined, name: string, resources: string[], operations: string[]): RoleConfig | undefined {
+  const id = builtinRoleId(name)
+  if (id === undefined) return undefined
+  const e = customRole(roles, name)
+  if (e !== undefined) return { id: id, name: name, description: e.description ?? builtinText(name), dac: e.dac ?? "all-data", permissions: e.permissions ?? [], entity_dac: e.entity_dac ?? [] }
+  for (const r of builtinRoles(resources, operations)) {
+    if (r.name === name) return r
+  }
+  return undefined
+}
+
+// The custom roles only: entries that edit a built-in role are left out.
+export function customRoles(roles: RoleConfig[] | undefined): RoleConfig[] {
+  return withRoleIds(roles ?? []).filter((r) => !isBuiltinRole(r.name))
+}
+
 // The roles with their ids. A role keeps its id; one saved without one (or with a built-in role's id) takes
 // the next id after the largest in use, in list order, so ids stay put as roles are added and removed.
 export function withRoleIds(roles: RoleConfig[]): RoleConfig[] {
   let top: int = 0
   for (const r of roles) {
+    if (isBuiltinRole(r.name)) continue
     const id: int = r.id ?? 0
     if (id > top && !reservedRoleId(id)) top = id
   }
   const out: RoleConfig[] = []
   for (const r of roles) {
+    // an edited built-in role keeps its fixed id
+    const fixed = builtinRoleId(r.name)
+    if (fixed !== undefined) {
+      out.push({ id: fixed, name: r.name, description: r.description, dac: r.dac, permissions: r.permissions, entity_dac: r.entity_dac })
+      continue
+    }
     if (r.id !== undefined && !reservedRoleId(r.id ?? 0)) {
       out.push(r)
       continue
@@ -623,6 +652,7 @@ function updateUser(cfg: RbacConfig, name: string, body: string): UsersReply {
     business_units: old.business_units,
     projects: old.projects,
     access_profile_ids: old.access_profile_ids,
+    budget_overrides: old.budget_overrides,
   }
   if (isActiveAdmin(old) && !isActiveAdmin(next) && otherActiveAdmins(cfg.users, name) === 0) {
     return uerror(409, LAST_ADMIN, cfg)
@@ -1114,4 +1144,27 @@ test("the governance users routes need user management, and the self routes are 
   expect(statusOf(authorize(fixture(), hdr("Bearer sk-view-token"), "GET", "/api/governance/users/me/permissions"))).toBe(200)
   expect(statusOf(authorize(fixture(), hdr("Bearer sk-view-token"), "GET", "/api/governance/users/email/a%40b.io"))).toBe(403)
   expect(statusOf(authorize(fixture(), hdr("Bearer sk-root-token"), "GET", "/api/governance/users/email/a%40b.io"))).toBe(200)
+})
+
+test("an edited built-in role keeps its id and is judged by its saved pairs", () => {
+  const roles: RoleConfig[] = [{ name: "ops" }, { name: "viewer", permissions: [{ resource: "Logs", operation: "View" }] }, { id: 3, name: "admin", permissions: [] }]
+  const ids = withRoleIds(roles)
+  expect(ids[0]!.id).toBe(1)
+  expect(ids[1]!.id).toBe(9003)
+  expect(ids[2]!.id).toBe(9001)
+  expect(customRoles(roles).map((r) => r.name).join(",")).toBe("ops")
+  expect(roleAllows(roles, "viewer", "GET", "/api/logs")).toBe(true)
+  expect(roleAllows(roles, "viewer", "GET", "/api/providers")).toBe(false)
+  // the unedited editor keeps its rules; the admin keeps the routes outside /api
+  expect(roleAllows(roles, "editor", "GET", "/api/providers")).toBe(true)
+  expect(roleAllows(roles, "admin", "GET", "/api/providers")).toBe(false)
+  expect(roleAllows(roles, "admin", "GET", "/v1/models")).toBe(true)
+  const rs = ["Logs", "ModelProvider"]
+  const ops = ["View", "Update"]
+  const vi = systemRole(roles, "viewer", rs, ops)
+  expect(vi?.id).toBe(9003)
+  expect(vi?.dac).toBe("all-data")
+  expect((vi?.permissions ?? []).length).toBe(1)
+  expect((systemRole(roles, "editor", rs, ops)?.permissions ?? []).length).toBe(3)
+  expect(systemRole(roles, "ops", rs, ops)).toBeUndefined()
 })

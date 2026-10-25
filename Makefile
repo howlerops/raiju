@@ -1,4 +1,4 @@
-.PHONY: build test unit e2e smoke ui web web-check check openapi-check parity-count run bench tov tov-test wasm-fixture
+.PHONY: build test unit e2e soak smoke ui web web-check check openapi-check parity-count run bench tov tov-test wasm-fixture config-doc config-doc-check deploy-check
 
 # Tov's async slab allocator corrupts its free lists once ~30 fetches are in
 # flight (see docs/tov-notes.md); plain malloc avoids it at the same speed.
@@ -31,6 +31,18 @@ check:
 openapi-check: build
 	python3 tests/openapi_check.py build/raiju
 
+# docs/config-reference.md from the config types in src/ and config_compat.tov's key lists (scripts/gen_config_doc.py)
+config-doc:
+	python3 scripts/gen_config_doc.py
+
+# fails when docs/config-reference.md would change, or a top-level key has no description
+config-doc-check:
+	python3 scripts/gen_config_doc.py --check
+
+# the Dockerfile, docker-compose.yml and the Helm chart (helm lint and helm template; needs helm, or HELM=path)
+deploy-check:
+	python3 -m unittest -v tests/test_deploy.py
+
 # recount the status column of docs/parity.md and rewrite its Summary table
 parity-count:
 	python3 scripts/parity_count.py --write
@@ -41,10 +53,18 @@ unit: build/h2_echo
 	python3 -m unittest tests/h2_test.py
 	python3 -m unittest tests/test_crew_priors.py
 	python3 -m unittest tests/test_smoke_config.py
+	python3 -m unittest tests/test_fetch_lint.py
+	python3 -m unittest tests/test_gen_config_doc.py
+	python3 -m unittest tests/test_deploy.py
 
 # the HTTP/2 and gRPC echo server the h2 tests drive (tests/h2_test.py)
 build/h2_echo: tests/h2_echo.tov src/h2.tov src/hpack.tov src/grpcwire.tov src/grpc.tov src/grpcstatus.tov src/a2apb.tov src/protobuf.tov
 	mkdir -p build && $(TOV) build tests/h2_echo.tov -o build/h2_echo
+
+# memory soak of one worker: streamed and plain chat with the log store on; fails when RSS grows
+# (tests/soak/soak.py --help; fixed ports 18320-18321, so run it under the e2e lock on a shared machine)
+soak:
+	python3 tests/soak/soak.py
 
 e2e:
 	python3 tests/e2e.py

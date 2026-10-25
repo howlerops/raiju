@@ -2,6 +2,11 @@
 
 replicaCount: 1
 
+# The Deployment's update strategy. Empty: Recreate when the data volume is a
+# ReadWriteOnce claim (the new pod cannot mount it while the old one runs),
+# RollingUpdate otherwise.
+strategy: {}
+
 image:
   # Build the image from the repo root (`docker build -t raiju .`), push it to a
   # registry, and set repository to that registry path.
@@ -14,16 +19,18 @@ imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
-# Passed to the gateway as -workers. Each worker is a process with its own
-# in-memory budgets, rate limits, cache and metrics (see deploy/README.md).
+# Passed to the gateway as -workers. The workers of a pod share budgets, rate
+# limits, the caches and /metrics through /tmp/raiju-<pid> (the /tmp emptyDir
+# below); about one worker per core the pod gets. See deploy/README.md.
 workers: 1
 
 # Port the gateway listens on inside the pod (-port) and the Service targets.
 port: 8080
 
-# The whole config.json, as a YAML map. Rendered into a ConfigMap and mounted at
-# /app/data/config.json. Do not put secrets here: refer to them as "env.NAME"
-# and set NAME in providerSecrets (or an existing Secret).
+# The whole config.json, as a YAML map. Rendered into a ConfigMap, which an
+# init container copies to /app/data/config.json on the data volume (see
+# configMode). Do not put secrets here: refer to them as "env.NAME" and set NAME
+# in providerSecrets (or an existing Secret).
 config:
   client:
     enable_logging: true
@@ -50,12 +57,61 @@ config:
   cache:
     enabled: false
 
+# How the ConfigMap's config.json reaches the data volume:
+#   ifAbsent  copied only when /app/data/config.json does not exist yet. Changes
+#             made through the API or the web UI are saved there and survive
+#             restarts; later changes to `config` apply only to a fresh volume.
+#   always    copied at every pod start (config as code): `config` is the source
+#             of truth, and API or UI changes last until the pod restarts.
+configMode: ifAbsent
+
+# The data volume at /app/data (the -app-dir). Raiju writes config.json (and
+# config.json.bak) on every API or UI change, the MCP OAuth signing key and
+# grants (mcp-oauth-state.json), MCP flows in flight (mcp-flow-state.json), and,
+# when enabled, the request log (logs/) and the audit log (logs/audit/). An
+# enabled log or audit store whose folder cannot be written stops the start.
+persistence:
+  # true: a PersistentVolumeClaim (or existingClaim). false: an emptyDir, so the
+  # state is lost when the pod goes (stateless use; pair it with configMode: always).
+  enabled: true
+  existingClaim: ""
+  storageClass: ""
+  # ReadWriteOnce allows one replica (the Deployment then uses the Recreate
+  # strategy). Several replicas need ReadWriteMany storage that they share (with
+  # cluster.config_sync "file") or persistence.enabled=false (each pod its own
+  # emptyDir, with cluster.config_sync "pull"); see deploy/README.md.
+  accessModes:
+    - ReadWriteOnce
+  size: 1Gi
+  # Keep the claim when the release is uninstalled (it holds the config and keys).
+  keep: true
+  annotations: {}
+
+# /tmp is an emptyDir (the root filesystem is read-only): the workers' share
+# folder (/tmp/raiju-<pid>-<random>). Downloaded plugins go to plugin-cache/ on
+# the data volume.
+tmp:
+  sizeLimit: 256Mi
+
 # Provider API keys, as a map of environment variable name to value. Rendered
 # into a Secret and injected with envFrom, so config's "env.NAME" resolves.
 # Names must be valid environment variable names. Values are stored in the
 # Secret and in the Helm release history: for production, prefer existingSecret.
+# The management API is locked until an admin exists: add BIFROST_SETUP_TOKEN
+# here (or to existingSecret) and create the first admin with it
+# (POST /api/users with the token in X-Bifrost-Setup-Token).
 providerSecrets: {}
 #  OPENAI_API_KEY: sk-...
+#  BIFROST_SETUP_TOKEN: <a long random value>
+
+# The setup token, from a Secret (preferred to providerSecrets): with no admin
+# user and no token, /api and the dashboard answer 403. Create the Secret, e.g.
+#   kubectl create secret generic raiju-setup --from-literal=BIFROST_SETUP_TOKEN=$(openssl rand -hex 16)
+# then POST /api/users with the token in X-Bifrost-Setup-Token to create the
+# first admin. It is injected as BIFROST_SETUP_TOKEN.
+setupToken:
+  existingSecret: ""
+  key: BIFROST_SETUP_TOKEN
 
 # Name of a Secret that already exists in the namespace. Its keys are injected
 # with envFrom. When set, providerSecrets is not rendered.
@@ -66,20 +122,60 @@ service:
   port: 8080
   annotations: {}
 
+# A worker settles at 40 to 60 MB under load and each open stream adds about
+# 170 KB while it lasts (`make soak` measures your build). Per pod, plan for
+# workers x (64 MiB + open streams x 0.17 MiB) with headroom; the limit below
+# holds about 2,000 open streams on one worker. Raise it with more workers or
+# more concurrent streams.
 resources:
   requests:
     cpu: 250m
-    memory: 64Mi
+    memory: 128Mi
   limits:
-    memory: 256Mi
+    memory: 512Mi
 
+# The init container that copies config.json (a shell and cp).
+initResources:
+  requests:
+    cpu: 10m
+    memory: 16Mi
+  limits:
+    memory: 64Mi
+
+# Before SIGTERM, the pod sleeps this long in a preStop hook while it still
+# serves, so the Service's endpoints and the load balancers drop it first.
+# 0 turns the hook off.
+preStopSleepSeconds: 5
+
+# Seconds Kubernetes waits, from the preStop hook, before it kills the pod. Raiju drains on SIGTERM: /ready answers
+# 503, the listener closes after server.shutdown_delay_seconds (0 by default), the requests in hand get up to
+# server.shutdown_grace_seconds (25 by default), and queued exports get about 5 s. The chart refuses a value that
+# does not cover preStopSleepSeconds plus those three.
+terminationGracePeriodSeconds: 40
+
+# liveness on /health (the process answers), readiness on /ready (503 while it
+# drains, or when a store that is on could not open)
 probes:
   liveness:
     initialDelaySeconds: 5
     periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
   readiness:
     initialDelaySeconds: 2
     periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 2
+
+# Several replicas as one Raiju cluster (they share usage, state and config
+# changes). It adds a headless Service, <fullname>-peers, that config.cluster
+# can discover with {"discovery": {"enabled": true, "type": "dns", "dns_names":
+# ["<fullname>-peers"]}}. The cluster itself is config: set config.cluster
+# (enabled, secret as "env.NAME", discovery). When config.cluster.enabled is
+# true and config_sync is unset, the chart sets it: "file" when the replicas
+# share a ReadWriteMany volume, "pull" otherwise (docs/operations.md).
+peers:
+  headlessService: false
 
 podAnnotations: {}
 
@@ -94,8 +190,9 @@ serviceMonitor:
   interval: 30s
   labels: {}
 
-# Scales on CPU. Replicas do not share state, so budgets and rate limits are
-# enforced per pod, not across the fleet.
+# Scales on CPU. Replicas share budgets and rate limits only as a Raiju
+# cluster (config.cluster); otherwise each pod enforces its own. Several
+# replicas need persistence that allows them (see persistence).
 autoscaling:
   enabled: false
   minReplicas: 2
@@ -110,6 +207,9 @@ podSecurityContext:
   runAsNonRoot: true
   runAsUser: 65532
   runAsGroup: 65532
+  # a new volume is made writable for the image's user
+  fsGroup: 65532
+  fsGroupChangePolicy: OnRootMismatch
   seccompProfile:
     type: RuntimeDefault
 

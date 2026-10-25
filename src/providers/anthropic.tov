@@ -137,26 +137,56 @@ export function injectedIndexes(messages: Message[], points: { location?: string
   return out
 }
 
-// autoCache marks the system prompt and the newest turn as cache breakpoints,
-// so repeated prefixes (agents, long chats) are billed at cache-read rates. cache (the
-// provider's prompt_cache) sets the lifetime and adds the injection points.
+// The message auto_inject marks, as Bifrost's chatInjectionTargets places it: the first message with a non-empty
+// string content or a text or image part (the start of the prefix an agent loop replays every turn, so the cached
+// region stays stable). -1 when none.
+export function firstCacheableMessage(messages: Message[]): int {
+  for (let i = 0; i < messages.length; i++) {
+    const c = messages[i]!.content
+    if (c === undefined) continue
+    if (typeof c === "string") {
+      if (c !== "") return i
+      continue
+    }
+    for (const p of c) {
+      if (p.type === "text" || p.type === "image_url") return i
+    }
+  }
+  return -1
+}
+
+// The first converted block a marker means something on (text or an image), or -1.
+function firstCacheableBlock(blocks: string[]): int throws SyntaxError {
+  for (let i = 0; i < blocks.length; i++) {
+    const t = rawStr(try fields(blocks[i]!), "type") ?? ""
+    if (t === "text" || t === "image") return i
+  }
+  return -1
+}
+
+// autoCache (auto_inject) marks the first cacheable block of the conversation as a cache breakpoint, as Bifrost's
+// injector does, so a repeated prefix (agents, long chats) is billed at cache-read rates. cache (the provider's
+// prompt_cache) sets the lifetime, and its injection points replace auto_inject. A request that carries
+// cache_control of its own gets neither.
 export function messagesBody(req: ChatRequest, body: Field[], model: string, stream: bool, autoCache: bool, cache?: ProviderPromptCacheConfig): string throws SyntaxError {
   const marker = cacheMarker(cache?.ttl)
   const selfCached = (find(body, "messages") ?? "").includes("cache_control")
-  const marked = injectedIndexes(req.messages, cache?.cache_control_injection_points ?? [], !selfCached)
+  const points = cache?.cache_control_injection_points ?? []
+  const marked = injectedIndexes(req.messages, points, !selfCached)
+  const autoAt = autoCache && points.length === 0 && !selfCached ? firstCacheableMessage(req.messages) : -1
   let sysMarked = false
   let turns: Turn[] = []
   let idx = -1
   for (const m of req.messages) {
     idx += 1
     if (m.role === "system" || m.role === "developer") {
-      if (marked.has(idx)) sysMarked = true
+      if (marked.has(idx) || idx === autoAt) sysMarked = true
       continue
     }
     if (m.role === "tool") {
       const text = m.content === undefined ? "" : (typeof m.content === "string" ? m.content : m.content.map((p) => p.text ?? "").join(""))
       let tr = `{"type":"tool_result","tool_use_id":${quote(m.tool_call_id ?? "")},"content":${quote(text)}}`
-      if (marked.has(idx)) tr = cached(tr, marker)
+      if (marked.has(idx) || idx === autoAt) tr = cached(tr, marker)
       pushTurn(&turns, "user", [tr])
       continue
     }
@@ -169,18 +199,16 @@ export function messagesBody(req: ChatRequest, body: Field[], model: string, str
       }
     }
     if (marked.has(idx) && blocks.length > 0) blocks[blocks.length - 1] = cached(blocks[blocks.length - 1]!, marker)
+    if (idx === autoAt) {
+      const at = try firstCacheableBlock(blocks)
+      if (at >= 0) blocks[at] = cached(blocks[at]!, marker)
+    }
     pushTurn(&turns, role, blocks)
-  }
-  if (autoCache && turns.length > 0) {
-    const last = turns[turns.length - 1]!
-    const blocks = last.blocks.slice()
-    blocks[blocks.length - 1] = cached(blocks[blocks.length - 1]!, marker)
-    turns[turns.length - 1] = { role: last.role, blocks: blocks }
   }
   const parts: string[] = [`"model":${quote(model)}`]
   const sys = systemText(req.messages)
   if (sys !== "") {
-    if (autoCache || sysMarked) parts.push(`"system":[${cached(`{"type":"text","text":${quote(sys)}}`, marker)}]`)
+    if (sysMarked) parts.push(`"system":[${cached(`{"type":"text","text":${quote(sys)}}`, marker)}]`)
     else parts.push(`"system":${quote(sys)}`)
   }
   parts.push(`"messages":[${turns.map((t) => `{"role":"${t.role}","content":[${t.blocks.join(",")}]}`).join(",")}]`)
@@ -225,6 +253,14 @@ function apiBase(t: Target): string {
 }
 
 export function upstreamHeaders(t: Target): Map<string, string> {
+  const own = t.anthropicAuth
+  if (own !== undefined) {
+    // another provider's Anthropic route (anthropic_route.tov): its own auth and version headers
+    let o = headers([["content-type", "application/json"]])
+    for (const k of own.keys()) o.set(k, own.get(k)!)
+    addExtraHeaders(&o, t.cfg)
+    return o
+  }
   let h = headers([["content-type", "application/json"], ["anthropic-version", "2023-06-01"]])
   const v = t.key.value ?? ""
   if (v !== "") h.set("x-api-key", v)
@@ -588,12 +624,31 @@ test("prompt cache injection points mark messages, with the 1h lifetime", () => 
   expect(kept.includes(`"content":[{"type":"text","text":"x"}]}]`)).toBe(true)
 })
 
-test("auto prompt caching marks system and the newest turn", () => {
+test("auto prompt caching marks the first cacheable block, as Bifrost's injector", () => {
   const raw = `{"model":"m","messages":[{"role":"system","content":"long rules"},{"role":"user","content":"a"},{"role":"assistant","content":"b"},{"role":"user","content":"c"}]}`
   const out = try messagesBody(try JSON.parse(raw) as ChatRequest, try fields(raw), "m", false, true)
   expect(out.includes(`"system":[{"type":"text","text":"long rules","cache_control":{"type":"ephemeral"}}]`)).toBe(true)
-  expect(out.includes(`{"role":"user","content":[{"type":"text","text":"c","cache_control":{"type":"ephemeral"}}]}`)).toBe(true)
+  expect(out.includes(`{"role":"user","content":[{"type":"text","text":"c"}]}`)).toBe(true)
   expect(out.includes(`{"type":"text","text":"a"}`)).toBe(true)
+  // no system prompt: the first user message's first text part, not the newest turn
+  const raw2 = `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"a1"},{"type":"text","text":"a2"}]},{"role":"assistant","content":"b"},{"role":"user","content":"c"}]}`
+  const out2 = try messagesBody(try JSON.parse(raw2) as ChatRequest, try fields(raw2), "m", false, true, { ttl: "1h" })
+  expect(out2.includes(`[{"type":"text","text":"a1","cache_control":{"type":"ephemeral","ttl":"1h"}},{"type":"text","text":"a2"}]`)).toBe(true)
+  expect(out2.includes(`"system"`)).toBe(false)
+  expect(out2.includes(`{"role":"user","content":[{"type":"text","text":"c"}]}`)).toBe(true)
+  // an empty first message is skipped
+  const raw3 = `{"model":"m","messages":[{"role":"user","content":""},{"role":"assistant","content":"b"}]}`
+  const out3 = try messagesBody(try JSON.parse(raw3) as ChatRequest, try fields(raw3), "m", false, true)
+  expect(out3.includes(`{"type":"text","text":"b","cache_control":{"type":"ephemeral"}}`)).toBe(true)
+  // injection points replace auto_inject
+  const out4 = try messagesBody(try JSON.parse(raw) as ChatRequest, try fields(raw), "m", false, true, { cache_control_injection_points: [{ index: -1 }] })
+  expect(out4.includes(`"system":"long rules"`)).toBe(true)
+  expect(out4.includes(`{"type":"text","text":"c","cache_control":{"type":"ephemeral"}}`)).toBe(true)
+  // a caller's own marker turns auto_inject off
+  const raw5 = `{"model":"m","messages":[{"role":"system","content":"r"},{"role":"user","content":[{"type":"text","text":"x","cache_control":{"type":"ephemeral"}}]}]}`
+  const out5 = try messagesBody(try JSON.parse(raw5) as ChatRequest, try fields(raw5), "m", false, true)
+  expect(out5.includes(`"system":"r"`)).toBe(true)
+  expect(firstCacheableMessage((try JSON.parse(raw) as ChatRequest).messages)).toBe(0)
 })
 
 test("a Messages body as sent gets the provider's injection points, or auto_inject's first block", () => {

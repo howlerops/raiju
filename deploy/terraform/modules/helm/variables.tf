@@ -56,7 +56,7 @@ variable "image_pull_secrets" {
 }
 
 variable "replicas" {
-  description = "Pod count (chart replicaCount). Each pod has its own budgets, rate limits and cache."
+  description = "Pod count (chart replicaCount). Each pod has its own budgets, rate limits and cache unless config.cluster joins them. With more than one, each pod keeps its data in an emptyDir and takes the config at every start (no PersistentVolumeClaim)."
   type        = number
   default     = 1
 
@@ -130,8 +130,8 @@ variable "resources" {
     limits   = optional(map(string), {})
   })
   default = {
-    requests = { cpu = "250m", memory = "64Mi" }
-    limits   = { memory = "256Mi" }
+    requests = { cpu = "250m", memory = "128Mi" }
+    limits   = { memory = "1Gi" }
   }
 }
 
@@ -163,4 +163,10 @@ variable "timeout" {
   description = "Seconds Helm waits for the release to become ready."
   type        = number
   default     = 300
+}
+
+variable "setup_token_secret_name" {
+  description = "Name of a Secret in the namespace with a BIFROST_SETUP_TOKEN key (chart setupToken.existingSecret). The management API is locked until an admin exists; create the first one with POST /api/users and this token in X-Bifrost-Setup-Token."
+  type        = string
+  default     = null
 }

@@ -1,34 +1,40 @@
 // raiju: an LLM gateway. Flags follow Bifrost's: -port, -host, -app-dir
 // (which holds config.json), plus -config <file> and -workers <n>. -mode broker runs the
-// cluster broker instead of a gateway (cluster_config.type "broker").
+// cluster broker instead of a gateway (cluster_config.type "broker"). -healthcheck [path] probes a
+// gateway running on this host (the -host and -port given) and exits 0 when it answers 2xx.
 import { aliasProblems } from "./router"
 import { configureCrews } from "./crew"
 import { startBroker } from "./broker"
 import * as path from "node:path"
-import { Config, loadConfig, loadRawConfig, resolveConfig, providerNames } from "./config"
+import { Config, loadConfig, loadRawConfig, resolveConfig, providerNames, withAppDirs } from "./config"
 import { ConfigStore, ConfigCipher, cipherFromConfig, openConfig } from "./store"
 import { Engine, pluginPaths } from "./gateway"
-import { fetchPluginUrls } from "./plugindl"
+import { fetchPluginUrls, setPluginCacheBase } from "./plugindl"
 import { McpManager, setAdminRenew, setSpecBaseDir } from "./mcp"
 import { McpUserToken, openFlowState } from "./mcpuser"
 import { saveUserToken, headersAuthMessage, saveExchangeAdmin, setAdminPublished, setAdminRemoved, dropExchangeAdmin } from "./mcpapi"
 import { readStoredAdmin, sealAdminRow, openAdminRow, sealStored, openStored } from "./store"
 import { setEkSeal } from "./rtsession"
 import { clusterState } from "./clusterstate"
+import { McpShare, CLIENT_NS, diskConfig, saveShared, pullsConfig } from "./mcpshare"
 import { FileLease, FILE_LEASE_MS } from "./filelease"
-import { start, bodyLimits, NO_BODY_LIMIT } from "./server"
-import { Ops, withSecrets } from "./ops"
+import { start, bodyLimits, NO_BODY_LIMIT, startLiveModelRefresher } from "./server"
+import { serverLimits, stopSettings, beginStop } from "./lifecycle"
+import { Ops, withSecrets, makeShareDir } from "./ops"
 import { fromBifrost, merge } from "./guardrails_compat"
 import { warnings } from "./config_compat"
 import { existsSync, readFileSync } from "node:fs"
 import { startFront } from "./front"
 import { openIssuerState } from "./mcpissuer"
 import { setA2aGrpc, listenA2aGrpc, claimA2aGrpc } from "./a2agrpc"
+import { healthcheckUrl, runHealthcheck } from "./healthcheck"
 
-type Args = { port: int, host: string, config: string, workers: int, server: string, mode: string }
+// healthcheck: the path -healthcheck probes ("" when the flag is not given)
+type Args = { port: int, host: string, config: string, workers: int, server: string, mode: string, healthcheck: string }
 
 function parseArgs(argv: string[]): Args {
-  const a: Args = { port: 8080, host: "0.0.0.0", config: "", workers: 1, server: process.env.RAIJU_SERVER ?? "", mode: process.env.RAIJU_MODE ?? "" }
+  // the bind address defaults to the loopback, as Bifrost's (localhost, BIFROST_HOST overrides); containers pass -host 0.0.0.0
+  const a: Args = { port: 8080, host: process.env.BIFROST_HOST ?? "127.0.0.1", config: "", workers: 1, server: process.env.RAIJU_SERVER ?? "", mode: process.env.RAIJU_MODE ?? "", healthcheck: "" }
   const envPort = process.env.PORT
   if (envPort !== undefined) a.port = parseInt(envPort) ?? 8080
   const envConfig = process.env.RAIJU_CONFIG
@@ -46,6 +52,11 @@ function parseArgs(argv: string[]): Args {
     else if (flag === "-workers") a.workers = parseInt(v) ?? a.workers
     else if (flag === "-server") a.server = v
     else if (flag === "-mode") a.mode = v
+    else if (flag === "-healthcheck") {
+      // the path is optional: /health unless the next argument is one
+      a.healthcheck = v.startsWith("/") ? v : "/health"
+      if (!v.startsWith("/")) continue
+    }
     else continue
     i += 1
   }
@@ -90,12 +101,15 @@ function reportConfig(file: string): void {
   }
 }
 
-// A saved config: env and secret references resolved, then swapped in.
-async function applyChange(engine: Engine, ops: Ops, store: ConfigStore, c: Config): Promise<void> {
+// A saved config (or one another worker or node saved, store.tov takeGeneration): env and secret references resolved,
+// the log folders read from the app dir, then swapped in.
+async function applyChange(engine: Engine, ops: Ops, store: ConfigStore, c: Config, appDir: string): Promise<void> {
   let resolved = c
   resolveConfig(&resolved)
-  const next = withBifrostGuardrails(await withSecrets(resolved), store, false)
+  const next = withBifrostGuardrails(withAppDirs(await withSecrets(resolved), appDir), store, false)
   engine.reload(next)
+  // the other workers learn that this one runs the generation (a management API answer waits for them, ops.settleConfig)
+  ops.ackConfig()
   // the clients added by the change connect (their OAuth tokens, if any, are in the config)
   const newMcp = engine.mcp
   if (newMcp !== undefined) await newMcp.connectNew()
@@ -103,7 +117,23 @@ async function applyChange(engine: Engine, ops: Ops, store: ConfigStore, c: Conf
   engine.mcp?.startToolSync()
   // a new or renewed token_exchange admin credential sets the next renewal
   engine.scheduleAdminRenewal()
+  // a token_exchange client added without an authorization_server_url has its token endpoint discovered now
+  await discoverTokenEndpoint(engine)
   ops.configure(next)
+}
+
+// Discovers the identity provider's token endpoint (oidc.issuer) when a token_exchange client names no
+// authorization_server_url, so a discovery problem shows at start and the first exchange does not wait for it.
+async function discoverTokenEndpoint(engine: Engine): Promise<void> {
+  const issuer = engine.cfg.oidc?.issuer ?? ""
+  const needs = (engine.cfg.mcp?.client_configs ?? []).filter((c) => c.auth_type === "token_exchange" && c.disabled !== true && (c.token_exchange?.authorization_server_url ?? "") === "")
+  if (needs.length === 0) return
+  if (issuer === "") {
+    console.error(`raiju: mcp ${needs[0]!.name}: token_exchange names no authorization_server_url and oidc.issuer is not set`)
+    return
+  }
+  const ep = await engine.idp.tokenEndpoint(issuer)
+  if (ep === "") console.error(`raiju: mcp: the token endpoint of ${issuer} could not be discovered; token exchanges will try again`)
 }
 
 async function startStdio(mcp: McpManager): Promise<void> {
@@ -128,8 +158,15 @@ function runBroker(c: Config, host: string): int {
 
 async function main(): Promise<int> {
   const args = parseArgs(process.argv.slice(2))
-  // an OpenAPI MCP client's spec_file is read relative to the config file
-  setSpecBaseDir(path.dirname(path.resolve(args.config)))
+  if (args.healthcheck !== "") {
+    // the Docker HEALTHCHECK: no config is read and nothing is started
+    process.exit(await runHealthcheck(healthcheckUrl(args.host, args.port, args.healthcheck)))
+  }
+  // an OpenAPI MCP client's spec_file is read relative to the config file, and so are the log and audit folders
+  const appDir = path.dirname(path.resolve(args.config))
+  setSpecBaseDir(appDir)
+  // downloaded plugins are kept in a private plugin-cache folder beside the config file (RAIJU_PLUGIN_DIR overrides)
+  setPluginCacheBase(appDir)
   const loaded = loadConfigOrExit(args.config)
   if (loaded === undefined) return 1
   // Encryption at rest: the sealed secrets in the file are opened with the cipher from encryption_key
@@ -154,7 +191,7 @@ async function main(): Promise<int> {
   resolveConfig(&first)
   if (args.mode === "broker") return runBroker(first, args.host)
   reportConfig(args.config)
-  const cfg = withBifrostGuardrails(await withSecrets(first), store, true)
+  const cfg = withBifrostGuardrails(withAppDirs(await withSecrets(first), appDir), store, true)
   for (const p of aliasProblems(cfg)) console.error(`raiju: config: ${p}`)
   // crew routing (crew.tov): the pools, priors and classifier are checked and loaded here, relative to the config file's folder
   const crewProblems = configureCrews(cfg, path.dirname(args.config))
@@ -169,12 +206,16 @@ async function main(): Promise<int> {
   for (const e of pdl.errors) console.error(`raiju: plugin: ${e}`)
   const engine = new Engine(cfg)
   const ops = new Ops(engine, store)
+  // a required log store or audit log that cannot open stops the start, as Bifrost's does (required: false keeps going)
+  const storage = ops.storageProblems()
+  for (const p of storage) console.error(`raiju: ${p} (set required: false to start without it)`)
+  if (storage.length > 0) return 1
   // refreshed per-user OAuth tokens are saved to the config file
   engine.userTokenSaved = (r) => {
     saveUserToken(store, r)
   }
   // a tool call of a per_user_headers client whose key has submitted nothing opens a submission and names its page
-  engine.headersAuth = (client: string, vk: string, base: string): string => headersAuthMessage(store, client, vk, base)
+  engine.headersAuth = (client: string, vk: string, session: string, user: string, base: string): string => headersAuthMessage(store, client, vk, session, user, base)
   // token_exchange admin credentials: renewed before they expire and after a 401, and saved to the config file
   engine.adminSaved = (r) => {
     saveExchangeAdmin(store, r)
@@ -183,8 +224,10 @@ async function main(): Promise<int> {
   // that node at a time (the lease in the supervisor's share folder, shared by its workers). The renewed credential is
   // read back from the config file by the other workers, and sent to the other nodes through the cluster state with
   // its tokens sealed (every node must hold the same encryption_key for them to open it)
-  // (process.pid is the supervisor's here, before the workers fork; ops.startLocalShare names the same folder)
-  if (args.workers > 1 && args.server !== "http1") engine.adminLease = new FileLease("/tmp/raiju-" + process.pid + "/leases", FILE_LEASE_MS)
+  // The node's share folder is made here, in the supervisor before the workers fork, so every worker names the same
+  // private folder (ops.startLocalShare)
+  const shareDir = args.workers > 1 && args.server !== "http1" ? makeShareDir(process.pid) : ""
+  if (shareDir !== "") engine.adminLease = new FileLease(shareDir + "/leases", FILE_LEASE_MS)
   // the closures below take a const copy of the cipher: a mutable local captured by a closure in this async function
   // does not compile
   const sealKey: ConfigCipher | undefined = cipher
@@ -233,11 +276,53 @@ async function main(): Promise<int> {
     engine.adoptRemoteAdmin(row)
   })
   setAdminRenew(async (client: string, used: string): Promise<string> => await engine.renewAdminCredential(client, used))
+  // MCP client configs are shared across the cluster (mcpshare.tov): a save that changed them puts the changed clients
+  // on the cluster state and deletes the removed ones; a change another node wrote is applied to the config as the
+  // file holds it now and saved here (that save is not sent back)
+  const share = new McpShare(store.cfg)
   store.onChange = (c) => {
-    applyChange(engine, ops, store, c)
+    const ch = share.changes(c)
+    // with cluster.config_sync "pull" the whole config travels as a generation (store.tov), so the clients need not
+    if (!pullsConfig(engine.cfg)) {
+      for (const p of ch.put) {
+        try {
+          clusterState().put(CLIENT_NS, p.name, sealStored(sealKey, p.json))
+        } catch (e) {
+          console.error(`raiju: mcp ${p.name}: the client config could not be sent to the other nodes: ${e.message}`)
+        }
+      }
+      for (const name of ch.del) clusterState().del(CLIENT_NS, name)
+    }
+    applyChange(engine, ops, store, c, appDir)
   }
+  clusterState().onChange(CLIENT_NS, (name: string, value: string | undefined) => {
+    // a pulled config generation carries the clients already
+    if (pullsConfig(engine.cfg)) return
+    let json: string | undefined = undefined
+    if (value !== undefined) {
+      json = openStored(sealKey, value)
+      if (json === undefined) {
+        console.error(`raiju: mcp ${name}: a client config from another node could not be opened (every node needs the same encryption_key)`)
+        return
+      }
+    }
+    try {
+      const disk = diskConfig(configPath, sealKey)
+      const next = share.applied(disk ?? store.cfg, name, json)
+      // the file holds it already (a worker of this node saved it, or the nodes share the file): the config
+      // generation of that save makes this process reread it (ops.takeConfigGen), so it is not applied twice
+      if (next === undefined) return
+      const err = saveShared(store, next)
+      if (err !== "") console.error(`raiju: mcp ${name}: a client config from another node could not be saved: ${err}`)
+    } catch (e) {
+      console.error(`raiju: mcp ${name}: a client config from another node was refused: ${e.message}`)
+    }
+  })
   const mcp = engine.mcp
   if (mcp !== undefined) {
+    // the identity provider's token endpoint, for the token_exchange clients that name none, is discovered now
+    // rather than on the first exchange
+    await discoverTokenEndpoint(engine)
     // an admin credential that ran out while the gateway was down is renewed before the clients connect
     await engine.renewDueAdmins()
     await mcp.connectAll()
@@ -260,12 +345,29 @@ async function main(): Promise<int> {
   if (!grpcShared) listenA2aGrpc(ops, args.host, cfg.server)
   // (the body limits and the stream threshold are read from the config as it is when a request comes, so a reload
   // moves them; bodyLimits in server.tov)
-  const url = server === "http1" ? startFront(engine, ops, { hostname: args.host, port: args.port, maxBodyBytes: NO_BODY_LIMIT, limits: () => bodyLimits(engine) }) : start(engine, ops, { port: args.port, hostname: args.host, workers: args.workers, maxBodyBytes: maxBody })
+  // the header, idle and body timeouts and the connection cap (server.*; lifecycle.tov), read once at start
+  const limits = serverLimits(cfg.server, Bun.fdLimit())
+  const served = server === "http1" ? startFront(engine, ops, { hostname: args.host, port: args.port, maxBodyBytes: NO_BODY_LIMIT, limits: () => bodyLimits(engine), timeouts: limits }) : start(engine, ops, { port: args.port, hostname: args.host, workers: args.workers, maxBodyBytes: maxBody, limits: limits })
+  const url = served.url
+  // SIGTERM and SIGINT stop gracefully (lifecycle.tov): in every worker, /ready turns 503, the listener closes, the
+  // requests and streams in hand get up to server.shutdown_grace_seconds, and what is queued is sent before the exit
+  Bun.onStopSignal((sig: string) => {
+    beginStop(sig, stopSettings(engine.cfg.server), {
+      stopListener: served.stopListener,
+      open: served.open,
+      flush: async (): Promise<void> => {
+        await ops.flushForStop()
+      },
+      exit: (code: int) => {
+        process.exit(code)
+      },
+    })
+  })
   // Runs once the server is up: with -workers, in every worker after the fork.
   const supervisor = process.pid
   setTimeout(() => {
     if (process.pid !== supervisor) {
-      ops.startLocalShare(supervisor)
+      ops.startLocalShare(shareDir)
       ops.startA2aRelay()
       // the card timer runs in every worker; one of them per node takes each period's turn (ops.cardTick)
       ops.startCardRefresh()
@@ -278,7 +380,15 @@ async function main(): Promise<int> {
     }
     // each worker starts its own stdio MCP servers
     if (mcp !== undefined) startStdio(mcp)
+    // and keeps its own model listings fresh (framework.pricing.live_models_sync_interval); the supervisor of a
+    // multi-worker Bun server serves no requests
+    if (process.pid !== supervisor || server === "http1" || args.workers <= 1) {
+      startLiveModelRefresher(engine)
+      // held keys and incidents from the last run, and kept for the next (ops.startAdaptiveStore)
+      ops.startAdaptiveStore()
+    }
   }, 0)
+  for (const w of ops.startupWarnings()) console.error(`raiju: warning: ${w}`)
   console.error(`raiju listening on ${url} (${providers.length} providers: ${providers.join(", ")}; ${args.workers} worker${args.workers === 1 ? "" : "s"})`)
   return 0
 }

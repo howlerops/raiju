@@ -1,10 +1,10 @@
 // HTTP routes: the OpenAI-shaped /v1 API, drop-in SDK routes, models,
 // metrics, health and a read-only management API.
-import { Config, VirtualKeyConfig, OAuthKeyConfig, ProviderConfig, providerOf, providerNames, resolveEnv } from "./config"
-import { Engine, StreamSink, errorResponse, noHeaders } from "./gateway"
+import { Config, VirtualKeyConfig, OAuthKeyConfig, ProviderConfig, KeyConfig, providerOf, providerNames, resolveEnv } from "./config"
+import { Engine, LiveHead, StreamSink, errorResponse, headSink, noHeaders } from "./gateway"
 import { anthropicMessages, anthropicLegacy, cursorChat, genai, genaiSdk, bedrockModel, responsesApi, cohereChat, cohereEmbed, cohereRerank, cohereTokenize } from "./native"
 import * as genaiIn from "./genai_in"
-import { kindOf, listingPipeline } from "./router"
+import { kindOf, listingPipeline, listingNeedsUpstream } from "./router"
 import { Target, Upstream, addExtraHeaders } from "./providers/types"
 import * as openai from "./providers/openai"
 import * as anthropic from "./providers/anthropic"
@@ -18,7 +18,7 @@ import * as copilot from "./providers/githubcopilot"
 import * as cohere from "./providers/cohere"
 import * as bedrockMantle from "./providers/bedrock_mantle"
 import * as watsonx from "./providers/watsonx"
-import { bedrockIds, publisherPage, cloudflarePage, cloudflareSearchPath } from "./model_list"
+import { bedrockIds, publisherPage, cloudflarePage, cloudflareSearchPath, liveModelsSeconds, liveModelsDelayMs, listingFresh, DEFAULT_LIVE_MODELS_SECONDS, MIN_LIVE_MODELS_SECONDS } from "./model_list"
 import { retrieveRequest, retrieveBody } from "./model_retrieve"
 import { fields, find, elements, rawStr, rawBool } from "./json"
 import * as metrics from "./metrics"
@@ -34,7 +34,7 @@ import { realtimeCall, realtimeMint } from "./realtimecalls"
 import { MINT_ROUTES } from "./rtsession"
 import { sdkRoute, anthropicSdk } from "./anthropic_batch"
 import { snapshot, errorJson, Hdrs, newId } from "./schemas"
-import { handleApi, proxyWidening, Result, randomId, rotatedKeyIds, isRotatePath } from "./store"
+import { handleApi, proxyWidening, Result, randomId, rotatedKeyIds, isRotatePath, providerBaseUrlProblem } from "./store"
 import { scimAuthorized, scimHandle, errorBody, ScimState, SCIM_CONTENT_TYPE } from "./scim"
 import { passthroughPath, passthroughRoute } from "./passthrough"
 import { mcpApi, oauthRoute, oauthCallback, oauthConfigRoute, openapiRoute, inlineSpecUrl, headersRouteAsync, exchangeRouteAsync, perUserApi, McpReply } from "./mcpapi"
@@ -51,20 +51,78 @@ import { Ops, Reply, UiSocket } from "./ops"
 import { parseCursor } from "./feed"
 import { cookieValue, SETUP_COOKIE } from "./setupsession"
 import { rerank, bedrockRerank, countTokens, responsesInputTokens, asyncSubmit, asyncGet, sdkAsyncSubmit, sdkAsyncPoll, decisionRoute, openaiDecisionPath, Dispatch } from "./extras"
-import { asyncPoll } from "./jobs"
+import { asyncPoll, jobOwner } from "./jobs"
 import { serveUi, uiPath, UI_CSP } from "./uiserve"
-import { TransportRun, transportStart, transportEnd, transportDone, transportSink, llmHooked, storageHooked, StorageCall, storageOp, pathWithId } from "./pluginroute"
+import { TransportRun, transportStart, transportEnd, transportDone, transportSink, llmHooked, storageHooked, StorageCall, storageOp, storageIdKey, pathWithId } from "./pluginroute"
 import { kindOfPath, isInferencePath } from "./plughttp"
-import { EXTRA_PARAMS_HEADER, mergeExtraParams } from "./extraparams"
+import { EXTRA_PARAMS_HEADER, EXTRA_PARAMS_CARRY, mergeExtraParams, extraParamsCarry } from "./extraparams"
+import { lifecycle, readyInput, readyReport, ServerLimits } from "./lifecycle"
 
 type ModelEntry = { id: string, object: string, created: int, owned_by: string }
 
+// Each key's own model listing, per worker (Bifrost's live model cache, per process): when it was fetched, and what
+// the key and its provider's base URL were then, so an edited key is listed again.
 class ModelCache {
   ids: Map<string, string[]> = new Map()
   fetchedAt: Map<string, f64> = new Map()
+  sig: Map<string, string> = new Map()
+  timer: int = -1
+
+  put(slot: string, sig: string, ids: string[]): void {
+    this.ids.set(slot, ids)
+    this.fetchedAt.set(slot, Date.now())
+    this.sig.set(slot, sig)
+  }
 }
 
 const modelCache = new ModelCache()
+
+// What a key's listing depends on: the key itself and where its provider is reached.
+function listingSig(p: ProviderConfig, key: KeyConfig): string {
+  return JSON.stringify({ k: key, b: p.network_config?.base_url ?? "" })
+}
+
+// The refresher interval in force (framework.pricing.live_models_sync_interval, model_list.tov liveModelsSeconds).
+function liveSeconds(cfg: Config): int {
+  return liveModelsSeconds(cfg.pricing_sync?.live_models_sync_interval)
+}
+
+// Reads every provider key's model listing again, in the background (Bifrost's RefreshAllLiveModels). Each worker
+// keeps its own copy, so each refreshes it.
+async function refreshAllListings(engine: Engine): Promise<void> {
+  for (const provider of providerNames(engine.cfg)) {
+    const p = providerOf(engine.cfg, provider)
+    if (p === undefined) continue
+    const keys = p.keys ?? []
+    if (keys.length === 0) {
+      await upstreamModelIds(engine, provider, p, 0, { value: "" }, true)
+      continue
+    }
+    for (let i = 0; i < keys.length; i++) {
+      if (listingNeedsUpstream(keys[i]!)) await upstreamModelIds(engine, provider, p, i, keys[i]!, true)
+    }
+  }
+}
+
+// Starts the background listing refresher: every live_models_sync_interval seconds, jittered by 10 percent, read
+// again at each turn so a config change applies from the next one (0 pauses it; it looks again a minute later).
+export function startLiveModelRefresher(engine: Engine): void {
+  if (modelCache.timer >= 0) return
+  listingTurn(engine)
+}
+
+function listingTurn(engine: Engine): void {
+  const secs = liveSeconds(engine.cfg)
+  const delay = secs === 0 ? MIN_LIVE_MODELS_SECONDS * 1000.0 : liveModelsDelayMs(secs, Math.random())
+  modelCache.timer = setTimeout(() => {
+    listingRun(engine)
+  }, delay)
+}
+
+async function listingRun(engine: Engine): Promise<void> {
+  if (liveSeconds(engine.cfg) > 0) await refreshAllListings(engine)
+  listingTurn(engine)
+}
 
 function upstreamModels(provider: string, kind: string, t: Target): Upstream | undefined {
   if (openai.isOpenAICompatible(kind)) return openai.modelsRequest(t)
@@ -294,27 +352,37 @@ async function nativeModelIds(engine: Engine | undefined, provider: string, t: T
   return undefined
 }
 
-// A provider's models for GET /v1/models: the keys' model lists, or the provider's own listing, through the keys'
-// aliases and blacklists (router.tov listingPipeline, Bifrost's ListModelsPipeline).
+// A provider's models for GET /v1/models: each key's model list, or the provider's own listing read with that key,
+// through the key's aliases and blacklist, the keys' results joined (router.tov listingPipeline, Bifrost's
+// ListModelsPipeline run by HandleMultipleListModelsRequests). A key whose model list is plain names lists those
+// names without asking the provider.
 async function providerModels(engine: Engine | undefined, cfg: Config, provider: string): Promise<string[]> {
   const p = providerOf(cfg, provider)
   if (p === undefined) return []
   const keys = p.keys ?? []
-  const listed = keys.some((k) => (k.models ?? []).some((m) => m !== "*"))
-  if (listed) return listingPipeline(provider, [], keys)
-  return listingPipeline(provider, await upstreamModelIds(engine, cfg, provider, p), keys)
+  if (keys.length === 0) return await upstreamModelIds(engine, provider, p, 0, { value: "" })
+  const byKey = await Promise.all(keys.map((k, i) => listingNeedsUpstream(k) ? upstreamModelIds(engine, provider, p, i, k) : Promise.resolve([] as string[])))
+  return listingPipeline(provider, [], keys, byKey)
 }
 
-// The provider's own listing (cached for five minutes), as its API names the models.
-async function upstreamModelIds(engine: Engine | undefined, cfg: Config, provider: string, p: ProviderConfig): Promise<string[]> {
-  const cachedAt = modelCache.fetchedAt.get(provider) ?? 0.0
-  if (Date.now() - cachedAt < 300000.0) return modelCache.ids.get(provider) ?? []
+// The cache slot of one key's listing.
+function listingSlot(provider: string, index: int): string {
+  return provider + "#" + index
+}
+
+// The provider's own listing read with one key, as its API names the models. It is cached for the refresher's
+// interval (model_list.tov listingFresh); force reads it again (the refresher). A failed read keeps the last good
+// listing and is tried again within five minutes.
+async function upstreamModelIds(engine: Engine | undefined, provider: string, p: ProviderConfig, index: int, key: KeyConfig, force?: bool): Promise<string[]> {
+  const slot = listingSlot(provider, index)
+  const sig = listingSig(p, key)
+  const secs = engine === undefined ? DEFAULT_LIVE_MODELS_SECONDS : liveSeconds(engine.cfg)
+  if (force !== true && modelCache.sig.get(slot) === sig && listingFresh(modelCache.fetchedAt.get(slot), Date.now(), secs)) return modelCache.ids.get(slot) ?? []
   const kind = kindOf(provider, p)
-  const key = (p.keys ?? [])[0] ?? { value: "" }
   const t: Target = { provider: provider, kind: kind, model: "", key: key, cfg: p }
-  let ids: string[] = []
+  let ids: string[] | undefined = undefined
   if (nativeList(kind)) {
-    ids = (await nativeModelIds(engine, provider, t)) ?? []
+    ids = await nativeModelIds(engine, provider, t)
   } else {
     const up = upstreamModels(provider, kind, t)
     if (up === undefined) return []
@@ -325,11 +393,17 @@ async function upstreamModelIds(engine: Engine | undefined, cfg: Config, provide
       const text = await res.text()
       if (res.ok) ids = await withDecisionModels(provider, t, openai.modelIds(text, provider).map((id) => id.replace(provider + "/models/", provider + "/")))
     } catch (e) {
-      ids = []
+      ids = undefined
     }
   }
-  modelCache.ids.set(provider, ids)
-  modelCache.fetchedAt.set(provider, Date.now())
+  if (ids === undefined) {
+    const last = modelCache.sig.get(slot) === sig ? (modelCache.ids.get(slot) ?? []) : []
+    modelCache.put(slot, sig, last)
+    // stale in five minutes, whatever the interval (with the refresher off, it is kept until refreshed on demand)
+    if (secs > 0) modelCache.fetchedAt.set(slot, Date.now() - Math.max(0.0, secs * 1200.0 - 300000.0))
+    return last
+  }
+  modelCache.put(slot, sig, ids)
   return ids
 }
 
@@ -341,14 +415,15 @@ async function refreshModels(engine: Engine | undefined, cfg: Config, provider: 
   const p = providerOf(cfg, provider)
   if (p === undefined) return { status: 404, body: JSON.stringify({ error: { message: `no provider ${provider}`, type: "invalid_request_error" } }), contentType: "application/json" }
   const kind = kindOf(provider, p)
-  for (const key of p.keys ?? []) {
+  const keys = p.keys ?? []
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i]!
     if (keyId !== undefined && key.id !== keyId) continue
     const t: Target = { provider: provider, kind: kind, model: "", key: key, cfg: p }
     if (nativeList(kind)) {
       const nids = await nativeModelIds(engine, provider, t)
       if (nids === undefined) continue
-      modelCache.ids.set(provider, nids)
-      modelCache.fetchedAt.set(provider, Date.now())
+      modelCache.put(listingSlot(provider, i), listingSig(p, key), nids)
       return { status: 200, body: JSON.stringify({ provider: provider, models: nids, total: nids.length }), contentType: "application/json" }
     }
     const up = upstreamModels(provider, kind, t)
@@ -360,8 +435,7 @@ async function refreshModels(engine: Engine | undefined, cfg: Config, provider: 
       const text = await res.text()
       if (!res.ok) continue
       const ids = await withDecisionModels(provider, t, openai.modelIds(text, provider).map((id) => id.replace(provider + "/models/", provider + "/")))
-      modelCache.ids.set(provider, ids)
-      modelCache.fetchedAt.set(provider, Date.now())
+      modelCache.put(listingSlot(provider, i), listingSig(p, key), ids)
       return { status: 200, body: JSON.stringify({ provider: provider, models: ids, total: ids.length }), contentType: "application/json" }
     } catch (e) {
       continue
@@ -440,17 +514,33 @@ async function listModels(engine: Engine, req: Request): Promise<Response> {
 async function timed(path: string, method: string, t0: f64, reqBytes: f64, headers: Headers, p: Promise<Response, TypeError>): Promise<Response, TypeError> {
   const res = try await p
   const len = parseFloat(res.headers.get("content-length") ?? "0") ?? 0.0
-  metrics.observeHttp(pathLabel(path), method, res.status, (performance.now() - t0) / 1000.0, reqBytes, len, metrics.httpCustomValues(headers))
+  metrics.observeHttp(httpPathLabel(path, res.status), method, res.status, (performance.now() - t0) / 1000.0, reqBytes, len, metrics.httpCustomValues(headers))
   return res
 }
 
-// A bounded path label: ids (segments with digits, or past the fourth) become {id}.
+// The path label of one answered request. A path no route serves (404, 405, 501) is "other", and so is a management
+// path the gate refused (401, 403: the route is not looked up before the gate, and the audit log keeps the path), so
+// requests to made-up paths add no series; the label values are capped as a backstop (metrics.bounded).
+export function httpPathLabel(path: string, status: int): string {
+  if (status === 404 || status === 405 || status === 501) return metrics.OTHER_LABEL
+  if ((status === 401 || status === 403) && path.startsWith("/api/")) return metrics.OTHER_LABEL
+  // a failed request keeps three segments: made-up names past them (a model in the path) add no series
+  if (status >= 400) return pathLabelAt(path, 3)
+  return pathLabel(path)
+}
+
+// A bounded path label: ids (segments with digits, longer than 40 bytes, or past the fourth) become {id}.
 export function pathLabel(path: string): string {
+  return pathLabelAt(path, 4)
+}
+
+// pathLabel with the segments past keep made {id} too.
+function pathLabelAt(path: string, keep: int): string {
   const segs = path.split("/")
   const out: string[] = []
   for (let i = 0; i < segs.length; i++) {
     const s = segs[i]!
-    let id = i > 4
+    let id = i > keep || s.byteLength > 40
     for (const ch of s.chars()) {
       if (ch >= "0" && ch <= "9") id = true
     }
@@ -467,6 +557,45 @@ test("path labels hide ids", () => {
   expect(pathLabel("/genai/v1beta/models/gemini-2.5-flash:generateContent")).toBe("/genai/v1beta/models/{id}")
   expect(pathLabel("/bedrock/model/a/b/c/converse")).toBe("/bedrock/model/a/b/{id}/{id}")
 })
+
+test("unrouted paths and junk label values stay within a fixed set", () => {
+  metrics.resetBounds()
+  expect(httpPathLabel("/abcdef", 404)).toBe("other")
+  expect(httpPathLabel("/v1/chat/completions", 405)).toBe("other")
+  expect(httpPathLabel("/v1/chat/completions", 401)).toBe("/v1/chat/completions")
+  expect(httpPathLabel("/api/made-up-route", 403)).toBe("other")
+  expect(httpPathLabel("/api/providers", 200)).toBe("/api/providers")
+  expect(httpPathLabel("/genai/v1beta/models/made-up:generateContent", 502)).toBe("/genai/v1beta/models/{id}")
+  expect(pathLabel("/api/x/" + "a".repeat(41))).toBe("/api/x/{id}")
+  // 10,000 junk requests (random paths that some route answered, and random model names) add at most the cap
+  for (let i = 0; i < 3000; i++) {
+    const junk = "p" + "abcdefghij".slice(i % 10, i % 10 + 1) + Math.floor(Math.random() * 1000000000)
+    metrics.observeHttp(httpPathLabel("/genai/v1beta/models/" + junk + "x", 200), "BREW" + i, 200, 0.001, 0.0, 0.0, [])
+    metrics.inc("raiju_test_junk_total", metrics.labels("openai", junk, "success"), 1.0)
+    let l = metrics.newLabels("openai", junk, "chat")
+    metrics.observeRequest(l, { ok: true, status: 200, errorType: "", retries: 0.0 }, 0.01)
+  }
+  const text = metrics.render()
+  let junkSeries = 0
+  let upstreamJunk = 0
+  for (const line of text.split("\n")) {
+    if (line.startsWith("raiju_test_junk_total{")) junkSeries += 1
+    if (line.startsWith("bifrost_upstream_requests_total{") && line.includes(`model="p`)) upstreamJunk += 1
+  }
+  // 3,000 distinct models made at most the cap of series, plus the one that folds the rest
+  expect(junkSeries <= metrics.MAX_LABEL_VALUES + 1).toBe(true)
+  expect(upstreamJunk <= metrics.MAX_LABEL_VALUES).toBe(true)
+  expect(text.includes(`model="other"`)).toBe(true)
+  expect(text.includes(`method="OTHER"`)).toBe(true)
+  expect(text.includes("BREW")).toBe(false)
+  metrics.resetBounds()
+})
+
+// The owner of the async jobs a request submits or polls (jobs.tov jobOwner): its virtual key, else its credential.
+function requestOwner(engine: Engine, req: Request): string {
+  const h = snapshot(req.headers)
+  return jobOwner(engine.gov.findKey(h)?.id ?? "", h)
+}
 
 // Runs an internal request (an async job) through the same handlers as live traffic.
 function dispatcher(engine: Engine): Dispatch {
@@ -578,13 +707,15 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   const sc = ops.scopeOfActorFor(gate.actor, resourceOf(req.method, path).resource)
   // DELETE reads its body too: DELETE /api/mcp-logs names its ids there
   const body = req.method === "GET" ? "" : await req.text()
+  // a change saved by this request is answered once the node's other workers run it (ops.settleConfig)
+  const genBefore = ops.store.fileSha
   let r: Reply = { status: 404, body: "", contentType: "application/json" }
   if (path === "/api/users/me/permissions") r = req.method === "GET" ? ops.mePermissions(gate.actor) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
   else if (path === "/api/governance/users/me/permissions") r = req.method === "GET" ? ops.mePermissionMap(gate.actor) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
   // a user by email address (Bifrost's MDM lookups), on the old and the governance path
   else if (path.startsWith("/api/users/email/") || path.startsWith("/api/governance/users/email/")) r = ops.userByEmailRoute(req.method, path)
   else if (usersPath(path) === "/api/users/me/vk-creation-policy") r = req.method === "GET" ? ops.vkCreationPolicy(gate.actor) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
-  else if (usersPath(path).startsWith("/api/users/") && usersPath(path).split("/")[4] === "access-profiles") r = ops.userProfiles(req.method, usersPath(path))
+  else if (usersPath(path).startsWith("/api/users/") && usersPath(path).split("/")[4] === "access-profiles") r = ops.userProfiles(req.method, usersPath(path), body)
   else if (usersPath(path) === "/api/users" || usersPath(path).startsWith("/api/users/")) r = ops.users(req.method, usersPath(path), body, req.headers.get("x-bifrost-setup-token") ?? "", cookieValue(req.headers.get("cookie") ?? "", SETUP_COOKIE))
   else if (auditTarget(path) !== "") r = ops.auditRoute(req, auditTarget(path))
   else if (path === "/api/api-keys" || path.startsWith("/api/api-keys/")) r = ops.apiKeysRoute(req.method, path, req.url, body, gate.actor)
@@ -592,6 +723,10 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   else if (path.startsWith("/api/cache/")) r = await ops.cacheClear(req.method, path)
   else if (path === "/api/plugins" || path.startsWith("/api/plugins/")) r = await ops.pluginsRouteAsync(req.method, path, body)
   else if (path === "/api/mcp/virtual") r = req.method === "GET" ? ops.virtualView() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
+  // one project member's usage: its slices with their counters and its requests by provider and model
+  else if (req.method === "GET" && path.startsWith("/api/governance/projects/") && path.endsWith("/usage") && path.split("/").length === 8 && path.split("/")[5] === "members") r = ops.memberUsage(path, sc)
+  // the access-profile audit lists (Bifrost serves them on both paths)
+  else if (req.method === "GET" && (path.startsWith("/api/governance/access-profiles/") || path.startsWith("/api/access-profiles/")) && path.endsWith("/audit-logs") && path.split("/").length <= 6) r = ops.profileAudit(req, path)
   else if (path === "/api/governance/access-profiles" || path.startsWith("/api/governance/access-profiles/")) r = ops.profiles(req.method, path, body)
   else if (path.startsWith("/api/alerting/")) {
     const ar = alertingRoute(ops.store.cfg.alerts ?? {}, { usage: (t, id) => ops.engine.gov.scopeUsage(t, id, Date.now()), history: () => ops.cel?.history() ?? [] }, req.method, req.url.slice(req.url.indexOf("/api/")), body)
@@ -620,7 +755,7 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   else if (path === "/api/models/base" || path === "/api/models/details") r = ops.catalogView(req, path)
   else if (path === "/api/circuit-breaker/state") r = req.method === "GET" ? ops.circuitView() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
   // the request-log analytics and the MCP logs (ops.logsRoute)
-  else if (logsAnalyticsPath(path)) r = ops.logsRoute(req, path, body, sc)
+  else if (logsAnalyticsPath(path)) r = ops.logsRoute(req, path, body, sc, req.method === "GET" && ops.mayReveal(gate.actor))
   else if (path === "/api/circuit-breaker/policies" || path.startsWith("/api/circuit-breaker/policies/")) r = ops.circuitPoliciesRoute(req.method, path, body)
   else if (path === "/api/circuit-breaker/reset") r = req.method === "POST" ? ops.circuitReset(body) : { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
   // adaptive load balancing: the keys held out of rotation, their incidents, and releasing them
@@ -691,7 +826,7 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
     // a user-mode flow opens for the identity-provider user of the caller's single sign-on session only
     const ssoUser = gate.actor.startsWith("sso:") ? gate.actor.slice(4) : ""
     if (oa === undefined) oa = perUserApi(ops.store, req.method, mu === undefined ? path : path + mu.search, body, mu === undefined ? "" : mu.origin, ssoUser)
-    if (oa === undefined) oa = await headersRouteAsync(ops.store, req.method, path, body)
+    if (oa === undefined) oa = await headersRouteAsync(ops.store, req.method, path, body, ssoUser)
     if (oa === undefined) oa = await exchangeRouteAsync(ops.store, ops.engine.idp, req.method, path, body)
     if (oa === undefined) oa = await openapiRoute(req.method, path, body, !ops.authOn)
     // an openapi client sent with a spec_url keeps the document it names (fetched now, as Bifrost stores it)
@@ -702,14 +837,16 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
       mbody = il.body
     }
     // with dashboard auth off, clients registered here must reach public addresses only
-    const mr = oa ?? mcpApi(ops.store, req.method, path, mbody, !ops.authOn)
+    const mr = oa ?? mcpApi(ops.store, req.method, path, mbody, !ops.authOn, sc)
     if (mr !== undefined) {
       r = { status: mr.status, body: mr.body, contentType: mr.contentType ?? "application/json" }
       if (mr.status === 200 && mr.action !== undefined) r = await mcpAction(ops, mr.action, mr.id ?? "", r)
     } else {
       // the query (search, paging, is_active) reaches the handlers that read it
       const qu = URL.parse(req.url)
-      const a = handleApi(ops.store, req.method, qu === undefined ? path : path + qu.search, body, sc)
+      // a provider's base_url, with its host resolved now (Bifrost's ValidateExternalURL)
+      const bu = await providerBaseUrlProblem(req.method, path, body)
+      const a = bu !== "" ? { status: 400, body: JSON.stringify({ error: { message: bu } }) } : handleApi(ops.store, req.method, qu === undefined ? path : path + qu.search, body, sc)
       r = { status: a.status, body: a.body, contentType: "application/json" }
       // a rotated key's MCP OAuth grants go with its old value (Bifrost revokes them in the rotation)
       if (a.status === 200 && isRotatePath(path)) {
@@ -719,8 +856,11 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   }
   ops.recordChange(gate.actor, req, path, r.status, body)
   if (req.method !== "GET" && r.status < 300) ops.storeUpdated(path)
+  if (ops.store.fileSha !== genBefore) await ops.settleConfig()
   const h: Record<string, string> = new Map()
   h.set("content-type", r.contentType)
+  // a log detail that reveals a logs_only mapping is not cached (Bifrost marks the reveal response no-store)
+  if (req.method === "GET" && r.status === 200 && (path.startsWith("/api/logs/") || path.startsWith("/api/mcp-logs/")) && r.body.includes(`"redaction_mapping":`)) h.set("cache-control", "no-store")
   // a 204 has no body (a response with one would be refused)
   return new Response(r.status === 204 ? undefined : r.body, { status: r.status, headers: h })
 }
@@ -749,8 +889,8 @@ const EXPOSED = "x-bifrost-request-id, x-bifrost-trace-id, x-request-id, x-bifro
 
 // Adds the CORS headers for an allowed origin. Response headers are a copy in Tov, so the
 // response is rebuilt: a streamed body stays a stream, any other body is carried as bytes.
-async function cors(cfg: Config, req: Request, res: Response): Promise<Response> {
-  const origins = cfg.client?.allowed_origins ?? []
+async function cors(engine: Engine, req: Request, res: Response): Promise<Response> {
+  const origins = engine.cfg.client?.allowed_origins ?? []
   const origin = req.headers.get("origin")
   if (origin === undefined || origins.length === 0) return res
   if (!origins.includes("*") && !origins.includes(origin)) return res
@@ -772,7 +912,20 @@ async function cors(cfg: Config, req: Request, res: Response): Promise<Response>
   return new Response(res.status === 204 ? undefined : bytes, { status: res.status, headers: h })
 }
 
-export type ServeOptions = { port: int, hostname: string, workers: int, maxBodyBytes?: int }
+export type ServeOptions = { port: int, hostname: string, workers: int, maxBodyBytes?: int, limits: ServerLimits }
+
+// A running server, for the graceful stop (lifecycle.tov): its address, closing its listener, and the connections
+// this process still holds.
+export type Served = { url: string, stopListener: () => void, open: () => int }
+
+// GET /ready: 503 while this process drains for a stop, or when a store that is on could not open; /health stays
+// the liveness answer (always ok while the process serves).
+function readyResponse(engine: Engine, ops: Ops): Response {
+  const cfg = engine.cfg
+  const saveError = ops.store.saveError
+  const r = readyReport(readyInput(lifecycle().draining, saveError === "" ? "" : `save failed: ${saveError}`, cfg.logs_store?.enabled === true, engine.logStore !== undefined, cfg.audit?.enabled === true, ops.audit !== undefined))
+  return new Response(r.body, { status: r.status, headers: { "content-type": "application/json" } })
+}
 
 // The servers' own cap, so the gateway's checks (which follow the config) decide.
 export const NO_BODY_LIMIT = 1099511627776
@@ -832,7 +985,7 @@ export async function largeFront(engine: Engine, req: Request): Promise<Response
   const route = largeRoute(cp)
   if (route !== "") {
     const r = await engine.largeRequest(req, route, p)
-    if (r instanceof Response) return await echoRequestId(req, await cors(engine.cfg, req, r))
+    if (r instanceof Response) return await echoRequestId(req, await cors(engine, req, r))
     return r
   }
   // a multipart upload: audio, image edits and variations, files
@@ -840,7 +993,7 @@ export async function largeFront(engine: Engine, req: Request): Promise<Response
   const mr = matchRoute("POST", cp)
   if (mr === undefined || (mr.modelIn !== "form" && mr.op !== "files.create")) return undefined
   if (engine.gov.enforce && engine.gov.findKey(snapshot(req.headers)) === undefined) {
-    return await echoRequestId(req, await cors(engine.cfg, req, errorResponse(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", noHeaders())))
+    return await echoRequestId(req, await cors(engine, req, errorResponse(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", noHeaders())))
   }
   // an audio upload is billed as its answer comes back (mediaAnswer); a request handed on whole is billed there
   const bill = billedMedia(mr.op) ? engine.mediaBill(snapshot(req.headers)) : undefined
@@ -848,7 +1001,7 @@ export async function largeFront(engine: Engine, req: Request): Promise<Response
   const m = await handleMediaLarge(engine.cfg, req, mr, lp, bill, async (oc: OAuthKeyConfig, pc: ProviderConfig) => await engine.oauthToken(oc, pc))
   if (m instanceof Response) {
     const answered = bill === undefined ? m : await engine.mediaAnswer(mr, bill, m, snapshot(req.headers), started, req.headers.get("x-request-id") ?? newId("req_"))
-    return await echoRequestId(req, await cors(engine.cfg, req, answered))
+    return await echoRequestId(req, await cors(engine, req, answered))
   }
   return m
 }
@@ -1012,13 +1165,13 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
   if (m === "POST" && (req.headers.get("x-bf-async") ?? "") !== "" && !p.startsWith("/api/") && !p.startsWith("/v1/async/") && p !== "/mcp" && !p.startsWith("/agents/a2a/")) {
     const again: Dispatch = async (r) => try await dispatch(engine, ops, r)
     const route = compatPath(p)
-    return await sdkAsyncSubmit(engine.jobs, req, again, route.slice(1, route.byteLength))
+    return await sdkAsyncSubmit(engine.jobs, req, again, route.slice(1, route.byteLength), requestOwner(engine, req))
   }
   const dep = deploymentRoute(p)
   if (dep !== undefined && m === "POST") return try await dispatch(engine, ops, await deploymentRequest(req, dep))
   // OpenAI's own decisions route (under /openai and the SDK prefixes) answers in OpenAI's shape, so it is told apart
   // before the path loses its prefix
-  if (m === "POST" && openaiDecisionPath(p)) return await cors(engine.cfg, req, await decisionRoute(engine, req, "/openai/v1/decisions"))
+  if (m === "POST" && openaiDecisionPath(p)) return await cors(engine, req, await decisionRoute(engine, req, "/openai/v1/decisions"))
   const cp = compatPath(p)
   if (cp !== p) return try await dispatch(engine, ops, await unprefixed(req, cp))
   const segs = p.split("/")
@@ -1036,13 +1189,13 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
       return errorResponse(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", noHeaders())
     }
     // a batch's creation runs the plugins' LLM hooks (Bifrost's batch_create), and so do the other batch and file calls
-    if (sr.op === "batches.create") return await cors(engine.cfg, req, try await llmHooked(engine, req, "batch_create", async (r, s) => await anthropicSdk(engine.cfg, r), undefined))
+    if (sr.op === "batches.create") return await cors(engine, req, try await llmHooked(engine, req, "batch_create", async (r, s) => await anthropicSdk(engine.cfg, r), undefined))
     const aop = storageOp(sr.op)
     if (aop !== "") {
       const call: StorageCall = { op: aop, provider: headerOr(req, "x-model-provider", "anthropic"), idKey: idKeyOf(aop), id: sr.id, pathFor: (nid: string): string => pathWithId(p, sr.id, nid) }
-      return await cors(engine.cfg, req, try await storageHooked(engine, req, call, async (r, s) => await anthropicSdk(engine.cfg, r)))
+      return await cors(engine, req, try await storageHooked(engine, req, call, async (r, s) => await anthropicSdk(engine.cfg, r)))
     }
-    return await cors(engine.cfg, req, await anthropicSdk(engine.cfg, req))
+    return await cors(engine, req, await outOfLine(anthropicSdk(engine.cfg, req)))
   }
   // the GenAI SDK's files, batches, cached contents, operations, :predict and rank
   const gop = genaiIn.genaiRoute(m, p)
@@ -1051,14 +1204,14 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
     const gsop = gop.op === "files.upload" ? "" : storageOp(gop.op)
     if (gsop !== "" && gsop !== "batch_create") {
       const call: StorageCall = { op: gsop, provider: headerOr(req, "x-model-provider", "gemini"), idKey: idKeyOf(gsop), id: gop.id, pathFor: (nid: string): string => pathWithId(p, gop.id, nid) }
-      return await cors(engine.cfg, req, try await storageHooked(engine, req, call, async (r, s) => {
+      return await cors(engine, req, try await storageHooked(engine, req, call, async (r, s) => {
         const rp = pathOfReq(r)
         const g2 = genaiIn.genaiRoute(r.method, rp)
         if (g2 === undefined) return errorResponse(404, `no route for ${r.method} ${rp}`, "invalid_request_error", noHeaders())
         return await genaiSdk(engine, r, g2.op, g2.model, g2.id)
       }))
     }
-    return await cors(engine.cfg, req, await genaiSdk(engine, req, gop.op, gop.model, gop.id))
+    return await cors(engine, req, await outOfLine(genaiSdk(engine, req, gop.op, gop.model, gop.id)))
   }
   // Bedrock's jobs and S3 files, and Vertex's regional batch and cache paths: the provider's own bodies
   const nr = nativeRoute(m, p)
@@ -1075,13 +1228,13 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
           return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
         }
       }, undefined)
-      return await cors(engine.cfg, req, hookedJob)
+      return await cors(engine, req, hookedJob)
     }
     // the other job, file and batch calls run the plugins' LLM hooks as Bifrost's batch_* and file_* requests
     const ns = nativeStorage(nr)
     if (ns !== undefined) {
       const call: StorageCall = { op: ns.op, provider: ns.provider, idKey: idKeyOf(ns.op), id: ns.id, pathFor: (nid: string): string => ns.s3 ? s3Path(nid) : pathWithId(p, ns.id, nid) }
-      return await cors(engine.cfg, req, try await storageHooked(engine, req, call, async (r, s) => {
+      return await cors(engine, req, try await storageHooked(engine, req, call, async (r, s) => {
         const rp = pathOfReq(r)
         const n2 = nativeRoute(r.method, rp)
         if (n2 === undefined) return errorResponse(404, `no route for ${r.method} ${rp}`, "invalid_request_error", noHeaders())
@@ -1092,28 +1245,29 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
         }
       }))
     }
-    return try await cors(engine.cfg, req, try await nativeCloud(engine.cfg, req, nr))
+    return try await cors(engine, req, try await nativeCloud(engine.cfg, req, nr))
   }
   const lc = contentId(p)
   if (lc !== "" && m === "GET") return await liveContent(engine, ops.liveSessions, req, lc)
-  if (m === "POST" && (p === "/v1/live/sessions" || p === "/openai/live/sessions")) return await cors(engine.cfg, req, await liveCreate(engine, ops.liveSessions, req))
+  if (m === "POST" && (p === "/v1/live/sessions" || p === "/openai/live/sessions")) return await cors(engine, req, await liveCreate(engine, ops.liveSessions, req))
   if (m === "GET" || m === "HEAD") {
     // x-bf-async-id on an inference route: poll the job that route created
     const aid = req.headers.get("x-bf-async-id") ?? ""
-    if (aid !== "" && !p.startsWith("/api/")) return sdkAsyncPoll(engine.jobs, p.slice(1, p.byteLength), aid)
+    if (aid !== "" && !p.startsWith("/api/")) return sdkAsyncPoll(engine.jobs, p.slice(1, p.byteLength), aid, requestOwner(engine, req))
     if (p === "/health") return Response.json({ status: "ok" })
+    if (p === "/ready") return readyResponse(engine, ops)
     if (uiPath(p)) {
       const ui = uiResponse(p, req)
       if (ui !== undefined) return ui
     }
     if (p === "/metrics") return textResponse(ops.metricsText(), "text/plain; version=0.0.4")
-    if (p === "/v1/models" || p === "/openai/v1/models") return await cors(engine.cfg, req, await listModels(engine, req))
-    if (p.startsWith("/v1/models/")) return await cors(engine.cfg, req, await retrieveModel(engine, req, p.slice(11)))
-    if (p === "/typesafe/v1/models") return await cors(engine.cfg, req, await decisionRoute(engine, req, p))
-    if (p === "/genai/v1beta/models") return await cors(engine.cfg, req, await genaiModels(engine, ""))
-    if (p.startsWith(GENAI)) return await cors(engine.cfg, req, await genaiModels(engine, p.slice(GENAI.byteLength)))
+    if (p === "/v1/models" || p === "/openai/v1/models") return await cors(engine, req, await listModels(engine, req))
+    if (p.startsWith("/v1/models/")) return await cors(engine, req, await outOfLine(retrieveModel(engine, req, p.slice(11))))
+    if (p === "/typesafe/v1/models") return await cors(engine, req, await decisionRoute(engine, req, p))
+    if (p === "/genai/v1beta/models") return await cors(engine, req, await outOfLine(genaiModels(engine, "")))
+    if (p.startsWith(GENAI)) return await cors(engine, req, await outOfLine(genaiModels(engine, p.slice(GENAI.byteLength))))
     const poll = asyncPoll(p)
-    if (poll !== undefined) return asyncGet(engine.jobs, poll.op, poll.id)
+    if (poll !== undefined) return asyncGet(engine.jobs, poll.op, poll.id, requestOwner(engine, req))
     if (p === "/api/cache") return ops.check(req, p) ?? cacheView(engine)
     if (p === "/api/logs" || p === "/api/logs/stats") {
       const cs = ops.checkScope(req, p)
@@ -1126,37 +1280,38 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
     if (p === "/api/health") return ops.check(req, p) ?? Response.json({ targets: engine.health.snapshot(Date.now()) })
   }
   if (m === "POST") {
-    if (CHAT_PATHS.includes(p)) return await cors(engine.cfg, req, await engine.chat(req))
+    if (CHAT_PATHS.includes(p)) return await cors(engine, req, await engine.chat(req))
     // the plugins' LLM hooks run on each of these request types (pluginroute.tov llmHooked)
-    if (p === "/v1/embeddings" || p === "/openai/v1/embeddings") return await cors(engine.cfg, req, try await llmHooked(engine, req, "embeddings", async (r, s) => await engine.embeddings(r), undefined))
-    if (p === "/v1/completions" || p === "/openai/v1/completions") return await cors(engine.cfg, req, try await llmHooked(engine, req, "completions", async (r, s) => await engine.completions(r), undefined))
-    if (p === "/v1/responses" || p === "/openai/v1/responses") return await cors(engine.cfg, req, try await llmHooked(engine, req, "responses", async (r, s) => await responsesApi(engine, r), undefined))
-    if (p === "/v1/rerank") return await cors(engine.cfg, req, try await llmHooked(engine, req, "rerank", async (r, s) => await rerank(engine, r), undefined))
-    if (p === "/v1/decisions" || p === "/openai/v1/decisions" || p === "/typesafe/v1/systemone") return await cors(engine.cfg, req, await decisionRoute(engine, req, p))
-    if (p === "/bedrock/rerank") return await cors(engine.cfg, req, await bedrockRerank(engine, req))
-    if (p === "/v1/count_tokens") return await cors(engine.cfg, req, await countTokens(engine, req, false))
-    if (p === "/anthropic/v1/messages/count_tokens") return await cors(engine.cfg, req, await countTokens(engine, req, true))
-    if (p === "/anthropic/v1/messages") return await cors(engine.cfg, req, await anthropicMessages(engine, req))
-    if (p === "/anthropic/v1/complete") return await cors(engine.cfg, req, await anthropicLegacy(engine, req))
-    if (isCursorChat(p)) return await cors(engine.cfg, req, await cursorChat(engine, req))
+    if (p === "/v1/embeddings" || p === "/openai/v1/embeddings") return await cors(engine, req, try await llmHooked(engine, req, "embeddings", async (r, s) => await engine.embeddings(r), undefined))
+    if (p === "/v1/completions" || p === "/openai/v1/completions") return await cors(engine, req, try await llmHooked(engine, req, "completions", async (r, s) => await engine.completions(r), undefined))
+    if (p === "/v1/responses" || p === "/openai/v1/responses") return await cors(engine, req, try await llmHooked(engine, req, "responses", async (r, s) => await responsesApi(engine, r), undefined))
+    if (p === "/v1/rerank") return await cors(engine, req, try await llmHooked(engine, req, "rerank", async (r, s) => await rerank(engine, r), undefined))
+    if (p === "/v1/decisions" || p === "/openai/v1/decisions" || p === "/typesafe/v1/systemone") return await cors(engine, req, await decisionRoute(engine, req, p))
+    if (p === "/bedrock/rerank") return await cors(engine, req, await bedrockRerank(engine, req))
+    if (p === "/v1/count_tokens") return await cors(engine, req, await countTokens(engine, req, false))
+    if (p === "/anthropic/v1/messages/count_tokens") return await cors(engine, req, await countTokens(engine, req, true))
+    if (p === "/anthropic/v1/messages") return await cors(engine, req, await anthropicMessages(engine, req))
+    if (p === "/anthropic/v1/complete") return await cors(engine, req, await anthropicLegacy(engine, req))
+    if (isCursorChat(p)) return await cors(engine, req, await cursorChat(engine, req))
     // a WebRTC realtime call is terminated on the gateway's own peer (realtimecalls.tov)
-    if (p === "/v1/realtime/calls") return await cors(engine.cfg, req, await realtimeCall(engine, req, true))
-    if (p === "/v1/realtime" || p === "/openai/v1/realtime") return await cors(engine.cfg, req, await realtimeCall(engine, req, false))
+    if (p === "/v1/realtime/calls") return await cors(engine, req, await realtimeCall(engine, req, true))
+    if (p === "/v1/realtime" || p === "/openai/v1/realtime") return await cors(engine, req, await realtimeCall(engine, req, false))
     // a realtime client secret is minted under the caller's virtual key and handed back as the gateway's own (rtsession.tov)
-    if (MINT_ROUTES.includes(p)) return await cors(engine.cfg, req, await realtimeMint(engine, req, p))
-    if (p === "/v1/mcp/tool/execute") return await cors(engine.cfg, req, await engine.executeTool(req))
-    if (p === "/cohere/v2/chat") return await cors(engine.cfg, req, await cohereChat(engine, req))
-    if (p === "/cohere/v2/embed") return await cors(engine.cfg, req, await cohereEmbed(engine, req))
-    if (p === "/cohere/v2/rerank") return await cors(engine.cfg, req, await cohereRerank(engine, req))
-    if (p === "/cohere/v1/tokenize") return await cors(engine.cfg, req, await cohereTokenize(engine, req))
-    if (p.startsWith(GENAI)) return await cors(engine.cfg, req, await genai(engine, req, p.slice(GENAI.byteLength)))
-    if (p.startsWith("/bedrock/model/") && segs.length === 5) return await cors(engine.cfg, req, await bedrockModel(engine, req, segs[3]!, segs[4]!))
-    if (p.startsWith("/v1/async/")) return await asyncSubmitHooked(engine.cfg.webhooks, engine.jobs, req, p, dispatcher(engine), (engine.cfg.client?.async_job_result_ttl ?? 3600) * 1000)
+    if (MINT_ROUTES.includes(p)) return await cors(engine, req, await realtimeMint(engine, req, p))
+    if (p === "/v1/mcp/tool/execute") return await cors(engine, req, await engine.executeTool(req))
+    if (p === "/cohere/v2/chat") return await cors(engine, req, await cohereChat(engine, req))
+    if (p === "/cohere/v2/embed") return await cors(engine, req, await cohereEmbed(engine, req))
+    if (p === "/cohere/v2/rerank") return await cors(engine, req, await cohereRerank(engine, req))
+    if (p === "/cohere/v1/tokenize") return await cors(engine, req, await cohereTokenize(engine, req))
+    if (p.startsWith(GENAI)) return await cors(engine, req, await genai(engine, req, p.slice(GENAI.byteLength)))
+    if (p.startsWith("/bedrock/model/") && segs.length === 5) return await cors(engine, req, await bedrockModel(engine, req, segs[3]!, segs[4]!))
+    if (p.startsWith("/v1/async/")) return await asyncSubmitHooked(engine.cfg.webhooks, engine.jobs, req, p, dispatcher(engine), (engine.cfg.client?.async_job_result_ttl ?? 3600) * 1000, requestOwner(engine, req))
   }
   // the management API: providers, keys, virtual keys, budgets, rate limits, teams, customers
   if (p === "/api/cluster/sync" && m === "POST") return await ops.clusterSync(req)
   if (p === "/api/cluster/feed" && m === "POST") return await ops.clusterFeed(req)
   if (p === "/api/cluster/leader" && m === "GET") return ops.clusterLeader(req)
+  if (p === "/api/cluster/config" && m === "POST") return await ops.clusterConfig(req)
   if (p.startsWith("/api/oidc/") && m === "GET") return await ops.oidcRoute(req, p)
   // the MCP OAuth callback: the browser comes back here from the authorization server, with no session
   if (p === "/api/oauth/callback" && m === "GET") {
@@ -1173,7 +1328,7 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
   if (ia !== undefined) return ia
   // login and logout come before the gate: they are how a caller gets past it
   if (p.startsWith("/api/session/")) return await ops.sessionRoute(req, p)
-  if (p.startsWith("/api/")) return await manage(ops, req, p)
+  if (p.startsWith("/api/")) return await outOfLine(manage(ops, req, p))
   // a provider's own API, raw: the key's auth, the rest as the caller sent it (passthrough.tov)
   if (passthroughPath(p)) {
     if (engine.gov.enforce && engine.gov.findKey(snapshot(req.headers)) === undefined) {
@@ -1191,7 +1346,7 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
       // another provider's model is counted with that provider's count (extras.tov); an OpenAI-format one goes on
       const text = await req.text()
       const counted = await responsesInputTokens(engine, req, text)
-      if (counted !== undefined) return await cors(engine.cfg, req, counted)
+      if (counted !== undefined) return await cors(engine, req, counted)
       const hs: Record<string, string> = new Map()
       req.headers.forEach((v, key) => {
         if (key !== "content-length" && key !== "transfer-encoding") hs.set(key, v)
@@ -1217,7 +1372,7 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
   }
   if (m === "OPTIONS") {
     const res = new Response(undefined, { status: 204, headers: { "access-control-allow-methods": "GET, POST, PUT, DELETE, OPTIONS", "access-control-allow-headers": "*", "access-control-max-age": "86400" } })
-    return await cors(engine.cfg, req, res)
+    return await cors(engine, req, res)
   }
   return errorResponse(404, `no route for ${m} ${p}`, "invalid_request_error", noHeaders())
 }
@@ -1230,9 +1385,9 @@ function headerOr(r: Request, name: string, dflt: string): string {
   return v === "" ? dflt : v
 }
 
-// The member a batch or file request's id goes in.
+// The member a batch, file, Responses lifecycle or cached content request's id goes in.
 function idKeyOf(op: string): string {
-  return op.startsWith("file_") ? "file_id" : "batch_id"
+  return storageIdKey(op)
 }
 
 // A request's path.
@@ -1259,7 +1414,7 @@ function s3Path(id: string): string {
 }
 
 // The Bifrost request a native cloud call is (Bedrock's model invocation jobs and S3 files, Vertex's batch prediction
-// jobs; Vertex's cached contents are not batch or file calls), or undefined. s3: the id is the object's s3:// URI.
+// jobs and cached contents), or undefined. s3: the id is the object's s3:// URI.
 function nativeStorage(nr: NativeRoute): { op: string, provider: string, id: string, s3: bool } | undefined {
   if (nr.kind === "bedrock.list") return { op: "batch_list", provider: "bedrock", id: "", s3: false }
   if (nr.kind === "bedrock.get") return { op: "batch_retrieve", provider: "bedrock", id: nr.id, s3: false }
@@ -1278,6 +1433,12 @@ function nativeStorage(nr: NativeRoute): { op: string, provider: string, id: str
   if (nr.kind === "vertex.get") return { op: "batch_retrieve", provider: "vertex", id: nr.id, s3: false }
   if (nr.kind === "vertex.cancel") return { op: "batch_cancel", provider: "vertex", id: nr.id, s3: false }
   if (nr.kind === "vertex.delete") return { op: "batch_delete", provider: "vertex", id: nr.id, s3: false }
+  // Vertex's regional cached contents (Bifrost's cached_content_* requests, the id as their name)
+  if (nr.kind === "vertex.cache.create") return { op: "cached_content_create", provider: "vertex", id: "", s3: false }
+  if (nr.kind === "vertex.cache.list") return { op: "cached_content_list", provider: "vertex", id: "", s3: false }
+  if (nr.kind === "vertex.cache.get") return { op: "cached_content_retrieve", provider: "vertex", id: nr.id, s3: false }
+  if (nr.kind === "vertex.cache.update") return { op: "cached_content_update", provider: "vertex", id: nr.id, s3: false }
+  if (nr.kind === "vertex.cache.delete") return { op: "cached_content_delete", provider: "vertex", id: nr.id, s3: false }
   return undefined
 }
 
@@ -1286,21 +1447,6 @@ function keyByValue(engine: Engine, value: string): VirtualKeyConfig | undefined
   const h: Hdrs = new Map()
   h.set("x-bf-vk", value)
   return engine.gov.findKey(h)
-}
-
-// Holds what a streamed chat answer needs before its head is known.
-class StreamHead {
-  resolve: ((r: Response) => void) | undefined = undefined
-  ctl: ReadableStreamDefaultController | undefined = undefined
-  body: ReadableStream | undefined = undefined
-  sent = false
-
-  give(r: Response): void {
-    if (this.sent) return
-    this.sent = true
-    const f = this.resolve
-    if (f !== undefined) f(r)
-  }
 }
 
 // The routes that can stream, by kind: the kind picks the handler (routeStream).
@@ -1336,7 +1482,8 @@ export async function routeStream(engine: Engine, req: Request, kind: string, si
 }
 
 // x-bf-passthrough-extra-params: true on an inference route (not a raw passthrough, not a large body, which never
-// gets here): the body's extra_params object is merged into the request before any route reads it (extraparams.tov).
+// gets here): the body's extra_params object is merged into the request before any route reads it (extraparams.tov),
+// and rides along (EXTRA_PARAMS_CARRY) to be merged into the provider's converted body as well, as Bifrost merges it.
 export async function withExtraParams(req: Request): Promise<Request> {
   if (req.method !== "POST" || req.headers.get(EXTRA_PARAMS_HEADER) !== "true") return req
   if ((req.headers.get("content-type") ?? "").toLowerCase().includes("multipart/")) return req
@@ -1351,8 +1498,10 @@ export async function withExtraParams(req: Request): Promise<Request> {
   }
   const hs: Record<string, string> = new Map()
   req.headers.forEach((v, k) => {
-    if (k !== "content-length" && k !== "transfer-encoding") hs.set(k, v)
+    if (k !== "content-length" && k !== "transfer-encoding" && k !== EXTRA_PARAMS_CARRY) hs.set(k, v)
   })
+  const carry = extraParamsCarry(text)
+  if (carry !== undefined) hs.set(EXTRA_PARAMS_CARRY, carry)
   return new Request(req.url, { method: "POST", headers: hs, body: mergeExtraParams(text) })
 }
 
@@ -1382,7 +1531,7 @@ async function routeStreamInner(engine: Engine, req0: Request, kind: string, sin
   return await engine.chat(req, sink)
 }
 
-async function runChat(engine: Engine, req: Request, sink: StreamSink, head: StreamHead, kind: string, tr: TransportRun | undefined): Promise<void> {
+async function runChat(engine: Engine, req: Request, sink: StreamSink, head: LiveHead, kind: string, tr: TransportRun | undefined): Promise<void> {
   try {
     const r = await routeStream(engine, req, kind, sink)
     // never started streaming (an error, a cache hit, a non-streaming provider): the whole answer, through the HTTP post hooks
@@ -1390,6 +1539,8 @@ async function runChat(engine: Engine, req: Request, sink: StreamSink, head: Str
   } catch (e) {
     head.give(errorResponse(500, "internal error", "api_error", noHeaders()))
   }
+  // a stream that never opened: its body is unused (an opened one releases the head when it closes)
+  if (!sink.started) head.release()
 }
 
 // A streamed route on Bun.serve: the answer is a ReadableStream body that gets each SSE event
@@ -1398,41 +1549,15 @@ async function chatStreamed(engine: Engine, req: Request, kind: string, tr: Tran
   const text = await req.text()
   const hs: Record<string, string> = snapshot(req.headers)
   const again = new Request(req.url, { method: "POST", headers: hs, body: text })
-  if (!streamsRequest(kind, text)) return await cors(engine.cfg, req, await transportEnd(engine, tr, await routeStream(engine, again, kind)))
-  const head = new StreamHead()
-  const sink = new StreamSink(
-    (status, headers) => {
-      const b = head.body
-      const h: Record<string, string> = headers
-      if (b !== undefined) head.give(new Response(b, { status: status, headers: h }))
-    },
-    (chunk) => {
-      const c = head.ctl
-      if (c !== undefined) c.enqueue(chunk)
-    },
-    () => {
-      const c = head.ctl
-      if (c !== undefined) c.close()
-    },
-  )
-  head.body = new ReadableStream({
-    start: (c) => {
-      head.ctl = c
-    },
-    cancel: () => {
-      sink.cancelled = true
-    },
-  })
-  sink.writeBytes = (chunk) => {
-    const c = head.ctl
-    if (c !== undefined) c.enqueue(chunk)
-  }
+  if (!streamsRequest(kind, text)) return await cors(engine, req, await transportEnd(engine, tr, await routeStream(engine, again, kind)))
+  const head = new LiveHead()
+  const sink = headSink(head)
   const p = new Promise<Response>((resolve) => {
     head.resolve = resolve
   })
   // the plugins' chunk hooks see each event on its way to the client
   runChat(engine, again, transportSink(tr, sink), head, kind, tr)
-  return await cors(engine.cfg, req, await p)
+  return await cors(engine, req, await p)
 }
 
 // One request through dispatch, with the plugins' HTTP post hooks on the answer.
@@ -1534,9 +1659,16 @@ export function http1Upgrade(engine: Engine, ops: Ops, req: Request, accept: (pr
 }
 
 // One HTTP request on the Bun.serve server: the body limit, then the streamed or whole route.
+// The promise as it is. An async call awaited in place has its frame laid out inside the caller's frame, which
+// lives as long as the request (a stream's whole length); a call passed through here is its own allocation,
+// freed when it is done.
+function outOfLine<T>(p: Promise<T>): Promise<T> {
+  return p
+}
+
 async function bunHttp(engine: Engine, ops: Ops, req00: Request, limit: int): Promise<Response, TypeError> {
   let req0 = req00
-  const lf = await largeFront(engine, req00)
+  const lf = await outOfLine(largeFront(engine, req00))
   if (lf instanceof Response) return lf
   if (lf instanceof Request) req0 = lf
   const within = try await limitedBody(req0, limit)
@@ -1564,11 +1696,18 @@ async function bunHttp(engine: Engine, ops: Ops, req00: Request, limit: int): Pr
 
 // The Bun.serve server (the default): streamed chat answers, Tov's multi-process workers,
 // native WebSockets.
-export function start(engine: Engine, ops: Ops, opts: ServeOptions): string {
+export function start(engine: Engine, ops: Ops, opts: ServeOptions): Served {
+  const lim = opts.limits
   const server = Bun.serve<Session>({
     port: opts.port,
     hostname: opts.hostname,
     workers: opts.workers,
+    // slow or silent clients (lifecycle.tov): a head within header_timeout_seconds, a body that keeps arriving, an
+    // idle keep-alive connection closed after idle_timeout_seconds, and at most max_connections per process
+    headerTimeout: lim.headerSeconds,
+    idleTimeout: lim.idleSeconds,
+    bodyTimeout: lim.bodySeconds,
+    maxConnections: lim.maxConnections,
     // bodies over the request threshold arrive as a stream (large_payload_optimization's, or the body limit when the
     // feature is off), and the sizes are checked by the gateway against the current config, so a reload moves them
     // (client.max_request_body_size_mb, large_payload_optimization.max_payload_bytes). The server's own threshold is
@@ -1602,7 +1741,13 @@ export function start(engine: Engine, ops: Ops, opts: ServeOptions): string {
       },
     },
   })
-  return server.url.href
+  return {
+    url: server.url.href,
+    stopListener: () => {
+      server.stop()
+    },
+    open: (): int => server.openConnections,
+  }
 }
 
 test("compat paths: the unversioned OpenAI family and the Cursor prefix", () => {

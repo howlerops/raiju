@@ -1,57 +1,65 @@
 // Management-side state shared by both servers: who may use /api (RBAC), the
 // audit log of changes, the alerting loop, the gateway's own MCP server and
 // cluster counters. One instance per process; rebuilt parts follow config changes.
-import { Config, AlertsConfig, LogExportsConfig, LogExporterConfig, PricingSyncConfig, providerNames, getEnv, resolveEnv, PluginSpec, WasmLimitsSpec } from "./config"
-import { listJson, sessionJson, sessionSummaryJson, detailJson, uaRoute, listFilter, unsupportedFilter, pageOfQuery, pctDecode, Page, timeOf } from "./logapi"
+import { Config, AlertsConfig, LogExportsConfig, LogExporterConfig, PricingSyncConfig, providerNames, getEnv, resolveEnv, PluginSpec, WasmLimitsSpec, AdminUserConfig } from "./config"
+import { listJson, sessionJson, sessionSummaryJson, detailJson, withMapping, phaseMapping, uaRoute, listFilter, unsupportedFilter, pageOfQuery, pctDecode, Page, timeOf } from "./logapi"
 import { Incident } from "./holds"
 import { WsTickets } from "./wsticket"
 import { entryStatus, PluginEntry } from "./plugins"
-import { isPluginUrl, downloadPlugin } from "./plugindl"
+import { isPluginUrl, downloadPlugin, normalPin, pinProblem } from "./plugindl"
 import { parseDatasheet } from "./pricing"
 import { deliveryLog } from "./webhooks"
 import { OtelConfig, TlsOpts, otelTls, usesGrpc, exportMetricsGrpc } from "./otel"
 import { OtelMetricsSettings, exportMetricsRequest, validateMetricsSettings, pushIntervalSeconds } from "./otel_metrics"
 import { PushGatewayConfig, pushProblem, pushUrl, pushHeaders, pushInterval } from "./pushgateway"
 import { join } from "node:path"
-import { Engine } from "./gateway"
+import { Engine, logsOnlyText } from "./gateway"
+import { Vault } from "./guard_reversible"
 import { CostRecalc, RecalcStatus, readShared, requestCancel, sharedInFlight } from "./costrecalc"
 import { issueSetupSession, validSetupSession, setupCookie, cookieValue, SETUP_COOKIE, sameSecret, setupPublic } from "./setupsession"
-import { agentSessionsOf, a2aLogJson, bifrostRequestType, Filter, LogStore, LogEntry, scopedEntries, visibleTo, defaultLogStoreConfig, applyChains, gridOf, filterFrom, selectAll, selects, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, histogramDimName, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
+import { perModelUsage, ModelSpend } from "./logstore"
+import { agentSessionsOf, a2aLogJson, bifrostRequestType, Filter, LogStore, LogEntry, scopedEntries, visibleTo, defaultLogStoreConfig, publicEntry, applyChains, gridOf, filterFrom, selectAll, selects, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, histogramDimName, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
 import { setMcpToolLog, McpToolCall } from "./mcp"
 import { McpLibrary, DEFAULT_LIBRARY_URL, DEFAULT_LIBRARY_SYNC_SECONDS, listLibrary, libraryFilterData, createLibraryEntry, deleteLibraryEntry, fetchCatalog } from "./mcplibrary"
 import { parsePolicy, policyView, policyConfigOf } from "./health"
-import { AccessProfile, AgentConfig, CircuitPolicyConfig, LogExportsConfig, PermissionPair, VirtualKeyConfig } from "./config"
+import { AccessProfile, AgentConfig, BudgetConfig, BudgetOverride, CircuitPolicyConfig, LogExportsConfig, PermissionPair, ProjectConfig, VirtualKeyConfig } from "./config"
+import { effectiveBudgetLimit } from "./governance"
 import { rfc3339Of } from "./vkexpiry"
 import { flushVaultCache } from "./secrets"
-import { ConfigStore, checkAdmin, sweepExpiredKeys, sealStored, openStored, RESOURCES, OPERATIONS } from "./store"
+import { ConfigStore, checkAdmin, sweepExpiredKeys, sealStored, openStored, RESOURCES, OPERATIONS, CONFIG_NS, CONFIG_KEY, ConfigGen, genOf, textSha, randomId } from "./store"
+import { mergedClaims, ruleAttributes, resolveRole, resolveGrants, appliedUser, findUser, Directory } from "./claimsync"
 import { Held, KeyCtx, handleApiKeys, newKeyValue } from "./apikeys"
-import { keyBudgetIds, permissionDocs, permissionIds, permissionMap, rolePairs, userObjectJson, userKeysJson, PermissionDoc, creationPolicy, heldProfiles, PROPAGATED_FIELDS, propagateProfileKeys } from "./govapi"
+import { keyBudgetIds, permissionDocs, permissionIds, permissionMap, rolePairs, userObjectJson, userKeysJson, PermissionDoc, creationPolicy, heldProfiles, PROPAGATED_FIELDS, propagateProfileKeys, parseOverride } from "./govapi"
 
 // The quota view of one virtual key's budget and rate limit (GET /api/governance/virtual-keys/quota).
 // POST /api/governance/access-profiles/{id}/roles: the roles to attach (Bifrost's AttachRolesRequest).
 type RoleAttachBody = { role_ids?: int[], is_default?: bool, apply_to_existing?: bool }
-type QuotaBudget = { id: string, max_limit: f64, effective_max_limit: f64, reset_duration: string, current_usage: f64 }
+// A budget in the quota view; source_* name the access profile that governs it (Bifrost's SourceRef), and
+// per_model_usage is the spend per model in its current cycle, from the request logs.
+type QuotaBudget = { id: string, max_limit: f64, effective_max_limit: f64, reset_duration: string, current_usage: f64, source_type?: string, source_id?: string, source_name?: string, per_model_usage?: ModelSpend[] }
 type QuotaRateUsage = { kind: string, used: f64, limit: f64 }
-type QuotaRate = { id: string, token_max_limit?: int, token_reset_duration?: string, request_max_limit?: int, request_reset_duration?: string, usage: QuotaRateUsage[] }
+type QuotaRate = { id: string, token_max_limit?: int, token_reset_duration?: string, request_max_limit?: int, request_reset_duration?: string, usage: QuotaRateUsage[], source_type?: string, source_id?: string, source_name?: string }
 // One per-model limit of a key in the quota view (Bifrost's quotaModelUsage); no provider means every provider.
 type QuotaModel = { model_name: string, provider?: string, budgets: QuotaBudget[], rate_limit?: QuotaRate }
-import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, roleAllows, isBuiltinRole, customRole, provisioned, disabledNamed, anyRoleId, userByEmail } from "./rbac"
+import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, roleAllows, isBuiltinRole, customRole, provisioned, disabledNamed, anyRoleId, userByEmail, systemRole, customRoles } from "./rbac"
 import { DataScope, allScope, noScope, scopeOf, inScope } from "./scope"
-import { AuditEvent, AuditLog, actionFor, auditListJson, auditQueryOf, maskDetail } from "./audit"
+import { AuditEvent, AuditLog, actionFor, auditListJson, auditQueryOf, maskDetail, profileAuditJson } from "./audit"
 import { isCacheId } from "./cache"
 import { AlertEngine, SampleRing, CelEngine, ScopeUsage } from "./alerts"
 import * as alerts from "./alerts"
 import { ExposedTool, SessionStore, handleMcp, rpcError, sseStream, SSE_HEARTBEAT_MS } from "./mcpserver"
 import { isMetaTool, metaToolDefs } from "./codemode"
 import { relay } from "./passthrough"
-import { grpcSend, upstreamCandidates, attemptVerdict, Candidate, Demotions } from "./a2agrpcup"
+import { grpcSend, upstreamCandidates, attemptVerdict, Candidate, Demotions, candidateProblem } from "./a2agrpcup"
 import { versionSupported, paramsTo, resultTo, rpcAnswerTo } from "./a2aver"
 import { checkExtensions, allowedExtensions } from "./a2aext"
-import { agentQuery, selectedCalls, pageOf, agentStatsJson, topAgentsJson, agentHistogramJson, agentFilterDataJson, agentDetailJson, rawCapture, deleteIds } from "./agenthistory"
+import { mergeConfig, changedTargets, targetAuthMessage } from "./pluginmerge"
+import { agentQuery, selectedCalls, pageOf, agentStatsJson, topAgentsJson, agentHistogramJson, agentFilterDataJson, agentDetailJson, rawCapture, deleteIds, groupingActive, groupedCalls, withChildCount, hydratedJson, historyPageJson, truthy } from "./agenthistory"
 import { H2Tls } from "./h2"
 import { findAgent, endpointOf, restEndpointOf, gatewayCard, withGrpcInterface, publicBase, aggregateCard, contextOfParams, contextOfResult, refreshAll, withCard, fetchCard, CARD_PATH, JSON_RPC_SUFFIX, REST_PREFIX } from "./agents"
-import { Call, PushSpec, CallCancel, StreamTap, tapped, rpcCall, restCall, restRequestOf, methodOf, rpcIdOf, rpcErrorBody, rpcEvent, restEvent, restErrorBody, restErrorOfStatus, httpOfCode, codeOfRestError, relayMapped, pushSpecOf, pushUpstreamParams, pushViewJson, pushListJson, pushIdOfResult, embeddedPush, rewriteEmbedded, taskIdOfResult } from "./a2a"
-import { PushDelivery, pushStore, mintToken, acceptPush, callbackProblem, deliverDue, configView, PENDING_PREFIX, INGRESS_SUFFIX, TOKEN_HEADER } from "./a2apush"
+import { Call, PushSpec, CallCancel, StreamTap, tapped, rpcCall, restCall, restRequestOf, methodOf, rpcIdOf, rpcErrorBody, rpcEvent, restEvent, restErrorBody, restErrorOfStatus, httpOfCode, codeOfRestError, relayMapped, pushSpecOf, pushUpstreamParams, pushViewJson, pushListJson, pushIdOfResult, embeddedPush, rewriteEmbedded, taskIdOfResult, requestTypeOf, unauthorizedInfo, grantDeniedRpc, grantDeniedRest } from "./a2a"
+import { objectOwners } from "./objowner"
+import { PushDelivery, pushStore, mintToken, acceptPush, callbackConnectProblem, deliverDue, configView, PENDING_PREFIX, INGRESS_SUFFIX, TOKEN_HEADER } from "./a2apush"
 import { pushShare, cardShare, cardOf, adoptCard, takePeriod, CardWire, CARD_NS } from "./a2ashare"
 import { FileLease } from "./filelease"
 import { upstreamHeaders, tlsOf, withAcceptedCredential } from "./agentauth"
@@ -70,7 +78,7 @@ import { deadline } from "./deadline"
 import { secureHex, utf8, sha256, toHex } from "./crypto"
 import * as b64 from "./base64"
 import * as metrics from "./metrics"
-import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, appendFileSync } from "node:fs"
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, appendFileSync, chmodSync, statSync } from "node:fs"
 import { writeFileAtomic } from "./atomicfile"
 import { Counters, ClusterConfig, BrokerConfig, brokerUrl, syncInterval } from "./cluster"
 import { clusterState, ownerOf } from "./clusterstate"
@@ -114,6 +122,14 @@ function pathOf(fs: Field[], dflt: string | undefined): string | undefined {
   return p === "" ? undefined : p
 }
 
+// The sha256 pin a body names (lower case), dflt when it names none, undefined for null or "".
+function pinOf(fs: Field[], dflt: string | undefined): string | undefined {
+  const raw = find(fs, "sha256")
+  if (raw === undefined) return dflt
+  const p = normalPin(rawStr(fs, "sha256"))
+  return p === "" ? undefined : p
+}
+
 // The wasm_limits a body names, or dflt when it names none.
 function limitsOf(fs: Field[], dflt: WasmLimitsSpec | undefined): WasmLimitsSpec | undefined {
   const raw = find(fs, "wasm_limits")
@@ -150,14 +166,14 @@ function orderOf(fs: Field[], dflt: int | undefined): { ok: bool, value: int | u
 // Why a plugin cannot be built from its config: "" when it can. Checked as enabled, so a disabled plugin is
 // still checked for its name and config.
 function badPlugin(spec: PluginSpec): string {
-  const st = entryStatus({ name: spec.name, enabled: true, configJson: spec.config_json ?? "{}", path: spec.path, limits: spec.wasm_limits })
+  const st = entryStatus({ name: spec.name, enabled: true, configJson: spec.config_json ?? "{}", path: spec.path, limits: spec.wasm_limits, sha256: spec.sha256 })
   return st.status === "error" ? st.error : ""
 }
 
 // One configured plugin as Bifrost's plugin response: its name, whether it is on, its config and its status.
 function pluginJson(sp: PluginSpec, stats: string): string {
   const config = sp.config_json ?? ""
-  const st = entryStatus({ name: sp.name, enabled: sp.enabled, configJson: config, path: sp.path, limits: sp.wasm_limits })
+  const st = entryStatus({ name: sp.name, enabled: sp.enabled, configJson: config, path: sp.path, limits: sp.wasm_limits, sha256: sp.sha256 })
   const custom = (sp.path ?? "") !== ""
   const builtin = !custom && builtinPlugins().includes(sp.name)
   const pairs: string[] = [
@@ -173,6 +189,8 @@ function pluginJson(sp: PluginSpec, stats: string): string {
   if (placement !== undefined) pairs.push(jkv("placement", JSON.stringify(placement)))
   const order = sp.order
   if (order !== undefined) pairs.push(jkv("order", `${order}`))
+  const pin = sp.sha256
+  if (pin !== undefined && pin !== "") pairs.push(jkv("sha256", JSON.stringify(pin)))
   // the live plugin's own counters (the mocker's GetStats, which Bifrost keeps in-process only), Raiju's addition
   if (stats !== "") pairs.push(jkv("stats", stats))
   pairs.push(jkv("status", jobj([jkv("name", JSON.stringify(sp.name)), jkv("status", JSON.stringify(st.status)), jkv("logs", jstrs(st.error === "" ? [] : [st.error])), jkv("types", jstrs(st.types))])))
@@ -274,6 +292,16 @@ export function returnPath(raw: string): string {
 }
 
 // The names a single sign-on identity is known by in governance: its subject and its email, lower-cased.
+// The OIDC settings of one sign-in: a configured redirect URI as it is, else the gateway's own callback on the
+// host the request came to (the oidc section scim_config's settings make carries none).
+function withRedirect(oc: OidcConfig, reqUrl: string): OidcConfig {
+  if ((oc.redirect_uri ?? "") !== "") return oc
+  const u = URL.parse(reqUrl)
+  let n = oc
+  n.redirect_uri = (u === undefined ? "" : u.origin) + "/api/oidc/callback"
+  return n
+}
+
 function ssoNames(sub: string, email: string | undefined): string[] {
   return [sub, (email ?? "").toLowerCase()]
 }
@@ -373,13 +401,31 @@ function a2aDeny(rest: bool, status: int, message: string, type: string): Respon
   return new Response(restErrorOfStatus(status, message), { status: status, headers: h })
 }
 
+// What the gate decided (Ops.a2aGate): refusal is the answer when a check failed. grant marks a refusal by the agent's
+// grants, which the protocol bindings answer as A2A's permission error (-31403) once the call is read.
+type A2aGate = { refusal: Response | undefined, vk: VirtualKeyConfig | undefined, status: int, message: string, grant: bool }
+
 // The refusal of a gate check: the answer in the caller's binding, with its status and message for the gRPC binding.
-function gateRefusal(rest: bool, status: int, message: string, type: string, vk: VirtualKeyConfig | undefined): { refusal: Response | undefined, vk: VirtualKeyConfig | undefined, status: int, message: string } {
-  return { refusal: a2aDeny(rest, status, message, type), vk: vk, status: status, message: message }
+function gateRefusal(rest: bool, status: int, message: string, type: string, vk: VirtualKeyConfig | undefined): A2aGate {
+  return { refusal: a2aDeny(rest, status, message, type), vk: vk, status: status, message: message, grant: false }
 }
 
-// The answer of the gRPC binding's gate (Ops.a2aGrpcGate): status 0 when the call may go on.
-export type GrpcGate = { status: int, message: string, agent: AgentConfig | undefined, vk: VirtualKeyConfig | undefined, base: string }
+// The answer of the gRPC binding's gate (Ops.a2aGrpcGate): status 0 when the call may go on. grant: refused by the
+// agent's grants (PERMISSION_DENIED with the UNAUTHORIZED ErrorInfo, as a2a-go sends ErrUnauthorized).
+export type GrpcGate = { status: int, message: string, agent: AgentConfig | undefined, vk: VirtualKeyConfig | undefined, base: string, grant: bool }
+
+// A refused grant on the agent's card: Bifrost's card handler answers http.Error with the status text.
+function forbiddenText(): Response {
+  const h: Record<string, string> = new Map()
+  h.set("content-type", "text/plain; charset=utf-8")
+  h.set("x-content-type-options", "nosniff")
+  return new Response("Forbidden\n", { status: 403, headers: h })
+}
+
+// The RFC 3339 time (seconds, UTC) a2a-go stamps on an error's ErrorInfo.
+function errorStamp(): string {
+  return isoMs(Date.now()).slice(0, 19) + "Z"
+}
 
 // Whether an If-None-Match value names the tag.
 function etagMatches(header: string, tag: string): bool {
@@ -492,6 +538,9 @@ function okJson(body: string): Reply {
 function badRequest(message: string): Reply {
   return { status: 400, body: errorJson(message, "invalid_request_error", undefined), contentType: "application/json" }
 }
+
+// The answer of a locked /api with no setup token configured (Bifrost's words, with Raiju's ways to set one).
+export const LOCKED_MESSAGE = "dashboard auth is not configured and no setup token is set; set setup_token in config.json (or the BIFROST_SETUP_TOKEN env var) and restart the gateway"
 
 // challenge is the WWW-Authenticate value of a 401 (the MCP authorization server's, when it is on).
 function denied(status: int, message: string, challenge?: string): Response {
@@ -615,6 +664,15 @@ async function postText(url: string, headers: Map<string, string>, body: string,
     dl.finish()
     return { status: 0, body: e.message }
   }
+}
+
+// how long a management API change waits for the other workers to apply it (settleConfig)
+const SETTLE_MS = 2000
+
+async function pause(ms: int): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setTimeout(() => resolve(), ms)
+  })
 }
 
 async function putText(url: string, headers: Map<string, string>, body: string): Promise<{ status: int, body: string }> {
@@ -1005,9 +1063,12 @@ export class Ops {
   // model parameters (GET /api/models/parameters), loaded when first asked and then daily
   private params: Map<string, string> = new Map()
   private paramsAt: f64 = -1.0
+  private paramsUrl = ""
   // catalog attributes (PUT /api/models/catalog): "provider/model" to the attributes' JSON text
   private catalogAttrs: Map<string, string> = new Map()
   audit: AuditLog | undefined = undefined
+  // why the audit log could not open ("" when it opened or is off)
+  auditError = ""
   alerts: AlertEngine | undefined = undefined
   // Bifrost-style alert rules (CEL over a governance scope's usage)
   cel: CelEngine | undefined = undefined
@@ -1051,6 +1112,8 @@ export class Ops {
   sweeping = false
   sending = false
   oidcCfg: OidcConfig | undefined = undefined
+  // the oidc section as configured (before env. references are read), to tell a changed one
+  oidcKey: string = ""
   discovery: Discovery | undefined = undefined
   flows = new OidcFlows()
   // where a sign-in started from an MCP consent page returns, by the sign-in's state
@@ -1090,6 +1153,14 @@ export class Ops {
     clusterState().onChange(CARD_NS, (name: string, value: string | undefined): void => {
       this.adoptRemoteCard(name, value)
     })
+    // a config saved by another worker or node arrives as a generation (store.tov CONFIG_NS); a save made here is sent
+    // at once instead of at the next tick
+    clusterState().onChange(CONFIG_NS, (key: string, value: string | undefined): void => {
+      if (key === CONFIG_KEY) this.takeConfigGen(value)
+    })
+    store.onSaved = () => {
+      this.configSaved()
+    }
     this.loadCatalogAttrs()
     // MCP tool executions go to the request log store (kind "mcp")
     setMcpToolLog((c: McpToolCall) => {
@@ -1114,12 +1185,23 @@ export class Ops {
       }
     }
     ps.open = (v: string): string => openStored(this.store.cipher, v) ?? ""
+    // a log row's logs_only reveal mapping is sealed the same way
+    this.engine.sealLog = (v: string): string => {
+      try {
+        return sealStored(this.store.cipher, v)
+      } catch (e) {
+        return ""
+      }
+    }
     ps.openSecret = (v: string): string | undefined => openStored(this.store.cipher, v)
     // push configs and agent cards travel on the cluster state (a2ashare.tov); a card is sent when it changes
     pushShare()
     const cards = cardShare()
     for (const a of cfg.agents ?? []) cards.publish(a.name, a.agent_card_url, a.card ?? "", a.card_fetched_at ?? 0)
     if (ps.dir === "" && lsw !== undefined && lsw.enabled === true) ps.persistTo(join(lsw.dir ?? "logs", "a2a-push.jsonl"))
+    // the virtual key that created each provider file and batch (client.enforce_vk_object_ownership), kept the same way
+    const owners = objectOwners()
+    if (owners.dir === "" && lsw !== undefined && lsw.enabled === true) owners.useDir(join(lsw.dir ?? "logs", "provider-objects"))
     const gov = cfg.governance
     const users: UserConfig[] = gov?.users ?? []
     const auth = gov?.auth_config
@@ -1144,10 +1226,13 @@ export class Ops {
     if (this.audit === undefined && ac !== undefined && ac.enabled === true) {
       try {
         this.audit = new AuditLog(ac.dir ?? "logs/audit", ac.key ?? "", ac.max_memory ?? 10000)
+        this.auditError = ""
       } catch (e) {
+        this.auditError = e.message
         console.error(`raiju: audit log disabled: ${e.message}`)
       }
     }
+    if (ac === undefined || ac.enabled !== true) this.auditError = ""
     for (const v of cfg.virtual_mcps ?? []) {
       const problem = vmcp.validate(v)
       if (problem !== "") console.error(`raiju: virtual MCP ${v.name}: ${problem}`)
@@ -1164,11 +1249,21 @@ export class Ops {
     this.configureRetained()
     this.configureExporters(cfg.exporters ?? [])
     const oc = cfg.oidc
-    const same = oc !== undefined && this.oidcCfg !== undefined && JSON.stringify(oc) === JSON.stringify(this.oidcCfg)
+    const key = oc === undefined ? "" : JSON.stringify(oc)
+    const same = oc !== undefined && this.oidcCfg !== undefined && key === this.oidcKey
     if (!same) {
       this.discovery = undefined
-      this.oidcCfg = oc !== undefined && oc.enabled ? oc : undefined
-      if (oc !== undefined) this.sessions = new UiSessions(oc.session_ttl_seconds ?? 28800)
+      this.oidcKey = key
+      // the issuer, client and secret may be env. references (scim_config's settings allow them)
+      let ro = oc
+      if (ro !== undefined) {
+        ro.issuer = resolveEnv(ro.issuer)
+        ro.client_id = resolveEnv(ro.client_id)
+        const sec = ro.client_secret
+        if (sec !== undefined) ro.client_secret = resolveEnv(sec)
+      }
+      this.oidcCfg = ro !== undefined && ro.enabled ? ro : undefined
+      if (ro !== undefined) this.sessions = new UiSessions(ro.session_ttl_seconds ?? 28800)
     }
   }
 
@@ -1288,6 +1383,7 @@ export class Ops {
 
   // GET /metrics: with several workers, every worker's series summed.
   metricsText(): string {
+    this.storeMetrics()
     if (this.shareDir === "") return metrics.render()
     const dir = this.shareDir + "/metrics"
     const mine = `${process.pid}.prom`
@@ -1313,12 +1409,12 @@ export class Ops {
   shareTimer: int = -1
   sweeps = 0
 
-  // Called in each worker after the fork. Usage counters gossip through files in a
-  // directory named after the supervisor (the same CRDT merge as clustering), and the
-  // response cache keeps its entries there too.
-  startLocalShare(supervisorPid: int): void {
-    this.shareDir = `/tmp/raiju-${supervisorPid}`
-    removeStaleShares()
+  // Called in each worker after the fork. Usage counters gossip through files in the node's share folder, which the
+  // supervisor made before the fork (makeShareDir: private and unpredictable), with the same CRDT merge as clustering,
+  // and the response cache keeps its entries there too. dir is "" when the folder could not be made.
+  startLocalShare(dir: string): void {
+    if (dir === "") return
+    this.shareDir = dir
     try {
       mkdirSync(this.shareDir + "/counters", { recursive: true })
     } catch (e) {
@@ -1350,6 +1446,13 @@ export class Ops {
     } catch (e) {
       // metrics stay per worker
     }
+    // the config generation each worker has applied (settleConfig reads them)
+    try {
+      mkdirSync(this.shareDir + "/gen", { recursive: true })
+    } catch (e) {
+      // a save then answers without waiting for the other workers
+    }
+    this.ackConfig()
     // A request counted in one worker reaches the others within two ticks; until then a
     // burst spread over several workers can pass a limit by a little (as across cluster nodes).
     this.shareTimer = setInterval(() => {
@@ -1403,6 +1506,7 @@ export class Ops {
     if (this.sweeps % 10 === 0) {
       const sem = this.engine.semantic
       if (sem !== undefined) sem.syncShared(Date.now())
+      this.storeMetrics()
       try {
         writeFileAtomic(`${this.shareDir}/metrics/${process.pid}.prom`, metrics.render(), { durable: false })
       } catch (e) {
@@ -1529,6 +1633,205 @@ export class Ops {
     this.pushLocal(c)
     this.applyRemote(c)
     return json(200, c.encode())
+  }
+
+  // The storage that is on, required and could not open: the request log store (logs_store) and the audit log, each
+  // required unless its section sets required: false. The start fails on any (main.tov), and readiness reports them.
+  storageProblems(): string[] {
+    const out: string[] = []
+    const ls = this.engine.cfg.logs_store
+    if (ls !== undefined && ls.enabled === true && ls.required !== false && this.engine.logStoreError !== "") out.push(`logs_store: ${this.engine.logStoreError}`)
+    const ac = this.engine.cfg.audit
+    if (ac !== undefined && ac.enabled === true && ac.required !== false && this.audit === undefined && this.auditError !== "") out.push(`audit: ${this.auditError}`)
+    return out
+  }
+
+  // request log entries that could not be written, counted into raiju_log_store_dropped_total before a render
+  droppedSeen: f64 = 0.0
+
+  storeMetrics(): void {
+    const ls = this.engine.logStore
+    if (ls === undefined) return
+    const total: f64 = ls.dropped
+    if (total > this.droppedSeen) metrics.inc("raiju_log_store_dropped_total", "", total - this.droppedSeen)
+    this.droppedSeen = total
+  }
+
+  // ---- config generations: a save reaches every worker of the node and the other nodes (store.tov) ----
+
+  // the newest generation heard of, a pull in flight, and the last note logged (each once per generation)
+  latestGen = ""
+  pullingGen = ""
+  genNote = ""
+
+  // After a save here: this worker's share file (and, when clustered, a sync) goes out now, so the other workers take
+  // the generation within one share tick (100 ms) and the peers within one round trip.
+  configSaved(): void {
+    const c = this.counters
+    if (c === undefined) return
+    if (this.shareDir !== "") {
+      this.pushLocal(c)
+      try {
+        writeFileAtomic(`${this.shareDir}/counters/${process.pid}.json`, c.encode(), { durable: false })
+      } catch (e) {
+        // the next share tick writes it
+      }
+    }
+    if (this.clusterCfg !== undefined) this.syncCluster()
+  }
+
+  // Notes in the share folder that this worker runs the config generation it holds (called once the engine has been
+  // rebuilt from it, main.tov applyChange).
+  ackConfig(): void {
+    if (this.shareDir === "") return
+    try {
+      writeFileAtomic(`${this.shareDir}/gen/${process.pid}`, this.store.fileSha, { durable: false })
+    } catch (e) {
+      // settleConfig then waits out its bound for this worker
+    }
+  }
+
+  // Called before a management API change is answered: waits until every other live worker of the node runs the
+  // generation just saved (their notes in the share folder), at most SETTLE_MS, so a virtual key deleted through the
+  // API is refused by every worker once the answer is out. A worker whose share file has not moved for a second is
+  // taken for gone. Other nodes take the generation at their next cluster sync and are not waited for.
+  async settleConfig(): Promise<void> {
+    if (this.shareDir === "") return
+    const sha = this.store.fileSha
+    const until = Date.now() + SETTLE_MS
+    for (;;) {
+      const late = this.workersBehind(sha)
+      if (late.length === 0) return
+      if (Date.now() >= until) {
+        console.error(`raiju: config: worker(s) ${late.join(", ")} did not apply the saved configuration within ${SETTLE_MS} ms; answering anyway`)
+        return
+      }
+      await pause(10)
+    }
+  }
+
+  // The live workers of the node (other than this one) that do not yet run generation sha (or a newer one).
+  workersBehind(sha: string): string[] {
+    const out: string[] = []
+    const dir = this.shareDir + "/counters"
+    const now = Date.now()
+    let names: string[] = []
+    try {
+      names = readdirSync(dir)
+    } catch (e) {
+      return out
+    }
+    for (const f of names) {
+      if (!f.endsWith(".json")) continue
+      const pid = f.slice(0, f.byteLength - 5)
+      if (pid === `${process.pid}`) continue
+      try {
+        if (now - statSync(dir + "/" + f).mtimeMs > 1000.0) continue
+      } catch (e) {
+        continue
+      }
+      let held = ""
+      try {
+        held = readFileSync(`${this.shareDir}/gen/${pid}`, "utf8")
+      } catch (e) {
+        held = ""
+      }
+      if (held !== sha && held !== this.store.fileSha) out.push(pid)
+    }
+    return out
+  }
+
+  // A generation saved by another worker of this node or by another node. A worker always rereads the file the node
+  // shares. Another node's save is taken per cluster.config_sync: "file" (default) rereads the file when it holds the
+  // saved text, "pull" fetches the text from a peer otherwise, and "off" ignores it.
+  takeConfigGen(value: string | undefined): void {
+    if (value === undefined) return
+    const g = genOf(value)
+    if (g === undefined) return
+    this.latestGen = g.sha
+    const sibling = g.node === cluster.nodeOf(this.nodeId)
+    const mode = sibling ? "file" : this.clusterCfg?.config_sync ?? "file"
+    if (mode === "off") return
+    const r = this.store.takeGeneration(g.sha)
+    if (r.status === "same") return
+    if (r.status === "reloaded") {
+      if (!sibling) console.error(`raiju: config: took the configuration node ${g.node} saved (shared config file)`)
+      return
+    }
+    if (r.status === "error") {
+      this.noteGen(g.sha, `raiju: config: the configuration ${sibling ? "another worker" : "node " + g.node} saved could not be applied: ${r.message}`)
+      return
+    }
+    // the file holds other text: a sibling has saved again since (its next generation follows), or this node has a file of its own
+    if (sibling) return
+    if (mode === "pull") {
+      this.pullConfig(g)
+      return
+    }
+    this.noteGen(g.sha, `raiju: config: node ${g.node} saved a configuration this node's config file does not hold, so it is not applied here (share the file between the nodes, or set cluster.config_sync to "pull")`)
+  }
+
+  private noteGen(sha: string, msg: string): void {
+    if (this.genNote === sha) return
+    this.genNote = sha
+    console.error(msg)
+  }
+
+  // cluster.config_sync "pull": the text of a generation another node saved, from the first peer that holds it (POST
+  // /api/cluster/config), written to this node's file with its own cluster section and applied. A peer's workers may
+  // take a moment to hold it, so a few rounds are tried. A newer generation heard of meanwhile wins.
+  async pullConfig(g: ConfigGen): Promise<void> {
+    const cc = this.clusterCfg
+    if (cc === undefined || this.pullingGen === g.sha) return
+    if (cluster.isBroker(cc)) {
+      this.noteGen(g.sha, `raiju: config: node ${g.node} saved a configuration, and cluster.config_sync "pull" needs peers (type "broker" has none): share the config file between the nodes`)
+      return
+    }
+    this.pullingGen = g.sha
+    try {
+      for (let round = 0; round < 5; round++) {
+        if (round > 0) await pause(300 * round)
+        if (this.latestGen !== g.sha || this.store.fileSha === g.sha) return
+        const body = JSON.stringify({ sha: g.sha, ts: Date.now() })
+        const h: Map<string, string> = new Map()
+        h.set("content-type", "application/json")
+        h.set("x-raiju-cluster-sig", cluster.sign(cc.secret, body))
+        for (const p of this.peerUrls(cc)) {
+          const r = await postText(p + "/api/cluster/config", h, body)
+          if (r.status !== 200 || textSha(r.body) !== g.sha) continue
+          if (this.latestGen !== g.sha || this.store.fileSha === g.sha) return
+          const note = this.store.adoptPulled(r.body, g.sha)
+          if (note !== "") console.error(`raiju: config: ${note}`)
+          if (this.store.fileSha === g.sha) console.error(`raiju: config: took the configuration node ${g.node} saved (pulled from ${p})`)
+          return
+        }
+      }
+      this.noteGen(g.sha, `raiju: config: node ${g.node} saved a configuration that no peer could hand over; this node keeps its own until the next save`)
+    } finally {
+      this.pullingGen = ""
+    }
+  }
+
+  // POST /api/cluster/config from a peer pulling a generation (cluster.config_sync "pull"). Signed like the sync route,
+  // over a body naming the generation and the time (a request older than a minute is refused, so a captured one does
+  // not replay); the answer is the config text as its writer saved it, secrets sealed when encryption at rest is on.
+  async clusterConfig(req: Request): Promise<Response> {
+    const cc = this.clusterCfg
+    if (cc === undefined) return json(404, errorJson("clustering is off", "invalid_request_error", undefined))
+    const body = await req.text()
+    if (!cluster.verify(cc.secret, body, req.headers.get("x-raiju-cluster-sig") ?? "")) return denied(401, "bad cluster signature")
+    let ask: { sha: string, ts: f64 } = { sha: "", ts: 0.0 }
+    try {
+      ask = try JSON.parse(body) as { sha: string, ts: f64 }
+    } catch (e) {
+      return json(400, errorJson(e.message, "invalid_request_error", undefined))
+    }
+    if (Math.abs(Date.now() - ask.ts) > 60000.0) return denied(401, "stale cluster request")
+    if (ask.sha === "" || ask.sha !== this.store.fileSha || this.store.genText === "") return json(404, errorJson("this node does not hold that configuration", "not_found_error", undefined))
+    const hs: Record<string, string> = new Map()
+    hs.set("content-type", "application/json")
+    hs.set("cache-control", "no-store")
+    return new Response(this.store.genText, { status: 200, headers: hs })
   }
 
   // ---- the live feed (/ws) across the workers of a node and the cluster (feed.tov) ----
@@ -1912,16 +2215,27 @@ export class Ops {
 
   private async loadParams(): Promise<void> {
     const now = Date.now()
-    if (this.paramsAt >= 0.0 && now - this.paramsAt < 86400000.0) return
+    const ps = this.store.cfg.pricing_sync
+    // framework.pricing.model_parameters_url, else the datasheet's /model-parameters; a file:// URL is read from disk
+    const url = ps === undefined ? "" : (ps.model_parameters_url ?? (trimSlash(ps.url ?? "https://getbifrost.ai/datasheet") + "/model-parameters"))
+    // a changed URL is read now
+    if (this.paramsAt >= 0.0 && now - this.paramsAt < 86400000.0 && url === this.paramsUrl) return
     if (this.params.size === 0) this.params = fallbackParams()
     this.paramsAt = now
-    const ps = this.store.cfg.pricing_sync
+    this.paramsUrl = url
     if (ps === undefined) return
-    const base = trimSlash(ps.url ?? "https://getbifrost.ai/datasheet")
     try {
-      const r = await getText(base + "/model-parameters")
-      if (r.status !== 200) throw new Error(`HTTP ${r.status}`)
-      const next = parseParams(r.body)
+      let body = ""
+      if (url.startsWith("file://")) {
+        let path = url.slice(7)
+        if (path.startsWith("localhost/")) path = path.slice(9)
+        body = try readFileSync(path, "utf8")
+      } else {
+        const r = await getText(url)
+        if (r.status !== 200) throw new Error(`HTTP ${r.status}`)
+        body = r.body
+      }
+      const next = parseParams(body)
       if (next.size > 0) this.params = next
     } catch (e) {
       console.error(`raiju: model parameters: ${e.message}`)
@@ -2107,7 +2421,7 @@ export class Ops {
     if (path === "/api/session/setup") {
       if (m !== "POST") return json(405, errorJson("use POST", "invalid_request_error", undefined))
       if (this.authOn) return json(409, errorJson("the setup lock is not active", "invalid_request_error", undefined))
-      const token = resolveEnv(this.store.cfg.setup_token ?? "")
+      const token = this.setupToken()
       const given = req.headers.get("x-bifrost-setup-token") ?? ""
       if (token === "" || given !== token) return json(403, errorJson("invalid setup token", "invalid_request_error", undefined))
       try {
@@ -2125,7 +2439,7 @@ export class Ops {
       if (m !== "GET") return json(405, errorJson("use GET", "invalid_request_error", undefined))
       const valid = bearer !== "" && this.liveSession(bearer) !== undefined
       const enforced = this.store.cfg.client?.enforce_auth_on_inference ?? false
-      return json(200, JSON.stringify({ is_auth_enabled: this.authOn, has_valid_token: valid, auth_type: this.authOn ? "basic" : "none", inference_auth_enforced: enforced, setup_required: !this.authOn, setup_token_configured: resolveEnv(this.store.cfg.setup_token ?? "") !== "" }))
+      return json(200, JSON.stringify({ is_auth_enabled: this.authOn, has_valid_token: valid, auth_type: this.authOn ? "basic" : "none", inference_auth_enforced: enforced, setup_required: !this.authOn, setup_token_configured: this.setupToken() !== "" }))
     }
     if (path === "/api/session/login") {
       if (m !== "POST") return json(405, errorJson("use POST", "invalid_request_error", undefined))
@@ -2229,7 +2543,7 @@ export class Ops {
   adaptiveIncidents(): Reply {
     const now = Date.now()
     const rows: string[] = []
-    for (const inc of this.engine.health.holds.incidentList()) {
+    for (const inc of this.engine.health.holds.allIncidents()) {
       if (inc.resolvedAt > 0) continue
       rows.push(JSON.stringify(incidentRow(inc, now)))
     }
@@ -2266,7 +2580,7 @@ export class Ops {
     const offset = offsetRaw === undefined ? 0 : parseInt(offsetRaw) ?? 0
     if (offset < 0) return badRequest("offset must not be negative")
     const matched: { inc: Incident, status: string, dur: f64 }[] = []
-    for (const inc of this.engine.health.holds.incidentList()) {
+    for (const inc of this.engine.health.holds.allIncidents()) {
       const end = inc.resolvedAt > 0 ? inc.resolvedAt : now
       if (end < from || inc.openedAt > to) continue
       const st = incidentStatus(inc)
@@ -2375,11 +2689,12 @@ export class Ops {
   // The request-log analytics (Bifrost's /api/logs/histogram*, rankings, dashboard, filterdata,
   // dropped) and the MCP logs (/api/mcp-logs*). Every reply is JSON. Dimensions Raiju does not record
   // (user, app, user agent) are refused with a 400.
-  logsRoute(req: Request, path: string, body: string, scope?: DataScope): Reply {
+  logsRoute(req: Request, path: string, body: string, scope?: DataScope, reveal?: bool): Reply {
     const m = req.method
     const store = this.engine.logStore
     const sc: DataScope = scope ?? allScope()
-    if (path.startsWith("/api/mcp-logs")) return this.mcpLogsRoute(req, path, body, store, sc)
+    const rv = reveal === true
+    if (path.startsWith("/api/mcp-logs")) return this.mcpLogsRoute(req, path, body, store, sc, rv)
     const u = URL.parse(req.url)
     const sp = u === undefined ? new URLSearchParams("") : u.searchParams
     const now = Date.now()
@@ -2399,7 +2714,7 @@ export class Ops {
     if (path === "/api/logs/filterdata") return okJson(this.logFilterData(store, sc))
     // GET /api/logs/{id}: one log (the names of the other /api/logs routes are not ids)
     const seg = path.slice("/api/logs/".byteLength)
-    if (seg !== "" && !seg.includes("/") && !LOG_ROUTE_NAMES.includes(seg)) return this.logById(seg, store, sc)
+    if (seg !== "" && !seg.includes("/") && !LOG_ROUTE_NAMES.includes(seg)) return this.logById(seg, store, sc, rv)
     const end = epochParam(sp.get("end_time") ?? undefined, now)
     const start = this.windowStart(sp, end)
     if (start >= end) return badRequest("start_time must be before end_time")
@@ -2467,9 +2782,10 @@ export class Ops {
   }
 
   // GET /api/logs/{id}: one log, with its bodies and raw payloads when the store kept them.
-  private logById(id: string, store: LogStore, sc: DataScope): Reply {
+  // reveal: the caller holds Logs:Reveal, so a logs_only row's mapping is added (redaction_mapping).
+  private logById(id: string, store: LogStore, sc: DataScope, reveal: bool): Reply {
     for (const e of this.readView(store, sc, 0.0)) {
-      if (e.id === id && kindOf(e) === "llm") return okJson(detailJson(e))
+      if (e.id === id && kindOf(e) === "llm") return okJson(withMapping(detailJson(e), reveal ? this.openedMapping(e) : ""))
     }
     return { status: 404, body: errorJson("log not found", "not_found_error", undefined), contentType: "application/json" }
   }
@@ -2716,7 +3032,18 @@ export class Ops {
         const known = method === "POST" || (name !== "" && !name.includes("/") && !builtinPlugins().includes(name))
         if (known && url.split("?")[0]!.toLowerCase().endsWith(".so")) return pluginError(400, "Invalid plugin configuration: Go shared-object plugins (.so) are not supported by this gateway; build the plugin as WebAssembly (.wasm)")
         if (known) {
-          const got = await downloadPlugin(url, this.store.cfg.server?.plugin_download_private_allowlist ?? [])
+          // the pin the body names, else (on a PUT) the plugin's own: checked on the download
+          let cur: string | undefined = undefined
+          for (const sp of this.store.cfg.plugins ?? []) {
+            if (sp.name === name) cur = sp.sha256
+          }
+          let pin: string | undefined = cur
+          try {
+            pin = pinOf(fields(body), cur)
+          } catch (e) {
+            pin = cur
+          }
+          const got = await downloadPlugin(url, this.store.cfg.server?.plugin_download_private_allowlist ?? [], pin)
           if (got.error !== "") {
             const msg = method === "POST" ? `Plugin was not created, it failed to load: ${got.error}` : `Plugin update was not applied, it failed to load and the previous configuration was kept: ${got.error}`
             return { status: 500, body: errorJson(msg, "api_error", undefined), contentType: "application/json" }
@@ -2757,7 +3084,15 @@ export class Ops {
     // dashboard auth is off)
     const path = builtinPlugins().includes(name) ? undefined : pathOf(fs, undefined)
     if (path !== undefined && !this.authOn) return pluginError(403, pathAuthMessage(true))
-    const spec: PluginSpec = { name: name, enabled: rawBool(fs, "enabled") ?? false, config_json: configOf(fs, "{}"), placement: pl.value, order: od.value, path: path, wasm_limits: limitsOf(fs, undefined) }
+    const config = configOf(fs, "{}")
+    // endpoints and env./vault. references need a caller who really signed in (Bifrost's genuine-auth check)
+    if (!this.authOn) {
+      const moved = changedTargets("{}", config)
+      if (moved.length > 0) return pluginError(403, targetAuthMessage(moved))
+    }
+    const spec: PluginSpec = { name: name, enabled: rawBool(fs, "enabled") ?? false, config_json: config, placement: pl.value, order: od.value, path: path, wasm_limits: limitsOf(fs, undefined), sha256: pinOf(fs, undefined) }
+    const pp = pinProblem(spec.sha256)
+    if (pp !== "") return pluginError(400, `Invalid plugin configuration: ${pp}`)
     const bad = badPlugin(spec)
     if (bad !== "") return pluginError(400, `Invalid plugin configuration: ${bad}`)
     const next: PluginSpec[] = specs.slice()
@@ -2789,7 +3124,18 @@ export class Ops {
     const builtin = builtinPlugins().includes(name)
     const asked = builtin ? undefined : pathOf(fs, undefined)
     if (asked !== undefined && !this.authOn) return pluginError(403, pathAuthMessage(false))
-    const spec: PluginSpec = { name: name, enabled: en === undefined ? cur.enabled !== false : en, config_json: configOf(fs, cur.config_json ?? "{}"), placement: pl.value, order: od.value, path: builtin ? undefined : pathOf(fs, cur.path), wasm_limits: limitsOf(fs, cur.wasm_limits) }
+    // the body's config is merged over the stored one (a key it leaves out is kept, a redacted placeholder keeps the
+    // stored value), as Bifrost merges it; a change of endpoint or reference needs a caller who really signed in
+    const stored = cur.config_json ?? "{}"
+    const raw = find(fs, "config")
+    const config = raw === undefined || isNull(raw) ? stored : mergeConfig(stored, raw)
+    if (!this.authOn) {
+      const moved = changedTargets(stored, config)
+      if (moved.length > 0) return pluginError(403, targetAuthMessage(moved))
+    }
+    const spec: PluginSpec = { name: name, enabled: en === undefined ? cur.enabled !== false : en, config_json: config, placement: pl.value, order: od.value, path: builtin ? undefined : pathOf(fs, cur.path), wasm_limits: limitsOf(fs, cur.wasm_limits), sha256: builtin ? undefined : pinOf(fs, cur.sha256) }
+    const pp = pinProblem(spec.sha256)
+    if (pp !== "") return pluginError(400, `Invalid plugin configuration: ${pp}`)
     const bad = badPlugin(spec)
     if (bad !== "") return pluginError(400, `Invalid plugin configuration: ${bad}`)
     const next: PluginSpec[] = []
@@ -2900,7 +3246,7 @@ export class Ops {
 
   // The MCP logs: GET lists, a single entry by id, and the stats, filter menus, histograms and top
   // tools; DELETE removes entries by id.
-  private mcpLogsRoute(req: Request, path: string, body: string, store: LogStore | undefined, sc: DataScope): Reply {
+  private mcpLogsRoute(req: Request, path: string, body: string, store: LogStore | undefined, sc: DataScope, reveal: bool): Reply {
     if (store === undefined) return { status: 404, body: errorJson("request logs are off; enable logs_store in the config", "invalid_request_error", undefined), contentType: "application/json" }
     const u = URL.parse(req.url)
     const sp = u === undefined ? new URLSearchParams("") : u.searchParams
@@ -2945,7 +3291,7 @@ export class Ops {
     const id = path.slice("/api/mcp-logs/".byteLength)
     if (id !== "" && !id.includes("/")) {
       for (const e of scopedView(store, sc, 0.0)) {
-        if (e.id === id && kindOf(e) === "mcp") return okJson(mcpLogJson(e))
+        if (e.id === id && kindOf(e) === "mcp") return okJson(withMapping(mcpLogJson(e), reveal ? this.openedMapping(e) : ""))
       }
       return { status: 404, body: errorJson("MCP log not found", "not_found_error", undefined), contentType: "application/json" }
     }
@@ -2970,11 +3316,34 @@ export class Ops {
   }
 
   // A tool call made through the MCP clients, as a log entry of kind "mcp".
+  // A row's reveal mapping, opened ("" when it has none or it cannot be opened here).
+  openedMapping(e: LogEntry): string {
+    const m = e.redaction_mapping
+    if (m === undefined || m === "") return ""
+    return openStored(this.store.cipher, m) ?? ""
+  }
+
+  // Whether the actor may see logs_only reveal mappings (Bifrost's Logs:Reveal; the admin holds it, and a custom or
+  // edited built-in role can be given it).
+  mayReveal(actor: string): bool {
+    return this.mePairs(actor).pairs.some((p) => p.resource === "Logs" && p.operation === "Reveal")
+  }
+
   recordMcp(c: McpToolCall): void {
     const store = this.engine.logStore
     if (store === undefined) return
     const now = Date.now()
+    // logs_only: the stored error carries placeholders, and their originals stay with the row for reveal (output phase)
+    let err = c.error
+    let mapping = ""
+    const eng = this.engine
+    if (err !== "" && (eng.logGuard !== undefined || eng.logRules.size > 0)) {
+      const vault = new Vault()
+      err = logsOnlyText(err, eng.logGuard, eng.logRules.values(), vault)
+      if (vault.count > 0) mapping = phaseMapping(vault.items, [], [err])
+    }
     store.add({
+      redaction_mapping: mapping === "" ? undefined : eng.sealLog(mapping),
       id: "mcp-" + now + "-" + Math.floor(Math.random() * 1000000000),
       ts: now,
       request_id: "",
@@ -2987,7 +3356,7 @@ export class Ops {
       completion_tokens: 0,
       cost: c.cost ?? 0.0,
       cache_hit: false,
-      error: c.error === "" ? undefined : c.error,
+      error: err === "" ? undefined : err,
       kind: "mcp",
       tool: c.tool,
       server: c.server,
@@ -3108,13 +3477,24 @@ export class Ops {
         return okJson(`{"message":"Agent logs deleted successfully"}`)
       }
       if (method !== "GET") return { status: 405, body: errorJson("use GET or DELETE", "invalid_request_error", undefined), contentType: "application/json" }
+      if (store === undefined) return json503
       const q = agentQuery(sp)
       if (q.error !== "") return badRequest(q.error)
-      if (store === undefined) return okJson(`{"history":[],"total":0}`)
-      const calls = selectedCalls(scopedView(store, sc, 0.0), q.filter)
+      // Bifrost's {logs, pagination}; group_sessions keeps each context's earliest call, hydrate answers full rows
+      let calls = selectedCalls(scopedView(store, sc, 0.0), q.filter)
+      let children = new Map<string, int>()
+      if (groupingActive(q.filter)) {
+        const g = groupedCalls(calls)
+        calls = g.rows
+        children = g.children
+      }
+      const listNames = (dim: string, id: string): string => this.historyName(dim, id)
       const rows: string[] = []
-      for (const e of pageOf(calls, q.page)) rows.push(a2aLogJson(e))
-      return okJson(`{"history":[${rows.join(",")}],"total":${calls.length}}`)
+      for (const e of pageOf(calls, q.page)) {
+        const row = q.filter.hydrate ? hydratedJson(agentDetailJson(e, listNames)) : a2aLogJson(e)
+        rows.push(withChildCount(row, children.get(e.id) ?? 0))
+      }
+      return okJson(historyPageJson(rows, q.page, calls.length))
     }
     if (segs.length !== 4) return { status: 404, body: errorJson("no such route", "not_found_error", undefined), contentType: "application/json" }
     if (method !== "GET") return { status: 405, body: errorJson("use GET", "invalid_request_error", undefined), contentType: "application/json" }
@@ -3137,8 +3517,11 @@ export class Ops {
       if (sub === "histogram") return okJson(agentHistogramJson(calls, q.filter))
       return okJson(topAgentsJson(calls, 10))
     }
+    const hydrate = truthy((sp.get("hydrate") ?? "").trim())
     for (const e of scopedView(store, sc, 0.0)) {
-      if (kindOf(e) === "a2a" && e.id === sub) return okJson(agentDetailJson(e, names))
+      if (kindOf(e) !== "a2a" || e.id !== sub) continue
+      const d = agentDetailJson(e, names)
+      return okJson(hydrate ? hydratedJson(d) : d)
     }
     return { status: 404, body: errorJson("agent history entry not found", "not_found_error", undefined), contentType: "application/json" }
   }
@@ -3153,13 +3536,17 @@ export class Ops {
   // The checks every call under /agents/a2a/{name} passes: the agent is registered and enabled, the caller's
   // virtual key (required when auth is enforced), the agent's grants, and the key's budgets. count also takes
   // the key's request and token limits (a call does; discovery does not). refusal is the answer when one fails.
-  a2aGate(agent: AgentConfig | undefined, name: string, h: Hdrs, rest: bool, count: bool): { refusal: Response | undefined, vk: VirtualKeyConfig | undefined, status: int, message: string } {
+  a2aGate(agent: AgentConfig | undefined, name: string, h: Hdrs, rest: bool, count: bool): A2aGate {
     if (agent === undefined || agent.enabled === false) return gateRefusal(rest, 404, `no agent named ${name}`, "not_found_error", undefined)
     const vk = this.engine.gov.findKey(h)
     if (this.engine.gov.enforce && vk === undefined) return gateRefusal(rest, 401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", vk)
-    // the agent's own grants, the key's, its access profiles' and the project the call names (governance.tov agentAccess)
+    // the agent's own grants, the key's, its access profiles' and the project the call names (governance.tov agentAccess):
+    // Bifrost's governance refuses in its PreA2AHook with its own message; the bindings answer it as A2A's -31403
     const access = this.engine.gov.agentAccess(h, agent)
-    if (!access.allowed) return gateRefusal(rest, 403, `this key may not call the agent ${name}: ${access.message}`, "permission_error", vk)
+    if (!access.allowed) {
+      const r = gateRefusal(rest, 403, access.message, "permission_error", vk)
+      return { refusal: r.refusal, vk: vk, status: 403, message: access.message, grant: true }
+    }
     const gate = this.engine.gov.admitTool(h)
     if (gate.kind === "denial") return gateRefusal(rest, gate.status, gate.message, gate.type, vk)
     // an agent whose card is not fetched yet has no endpoint to call: refused here, in every binding, before any
@@ -3175,7 +3562,21 @@ export class Ops {
       const limited = this.engine.gov.checkLimits(vk, [], rls)
       if (limited.kind === "denial") return gateRefusal(rest, limited.status, limited.message, limited.type, vk)
     }
-    return { refusal: undefined, vk: vk, status: 200, message: "" }
+    return { refusal: undefined, vk: vk, status: 200, message: "", grant: false }
+  }
+
+  // A refused grant on a protocol call, once the call is read (Bifrost's governance decides in the A2A plugin pipeline,
+  // after the SDK decoded the request): JSON-RPC error -31403 in a 200, REST 403 PERMISSION_DENIED, each with the
+  // UNAUTHORIZED ErrorInfo naming the agent, the request type and the request id.
+  grantDenied(rest: bool, agent: string, call: Call, rpcId: string, message: string, h: Hdrs): Response {
+    const info = this.grantInfo(agent, call.op, h, rest ? call.taskId : "")
+    if (rest) return json(403, grantDeniedRest(message, info))
+    return json(200, grantDeniedRpc(rpcId, message, info))
+  }
+
+  // The ErrorInfo of a refused grant for an operation (a2a.tov unauthorizedInfo), also sent by the gRPC binding.
+  grantInfo(agent: string, op: string, h: Hdrs, taskId: string): string {
+    return unauthorizedInfo(agent, requestTypeOf(op), h.get("x-request-id") ?? newId("req_"), taskId, errorStamp())
   }
 
   // The agent a call names, as this worker serves it. A worker that does not hold the agent's card yet first reads the
@@ -3239,13 +3640,13 @@ export class Ops {
   // even where auth is not enforced, as Bifrost does), then a2aGate. status is 0 when the call may go on.
   a2aGrpcGate(name: string, h: Hdrs, presented: bool): GrpcGate {
     const base = publicBase(this.engine.cfg.client?.a2a_external_client_url, "")
-    if (base === "") return { status: 503, message: "agent gateway disabled: configure client.a2a_external_client_url", agent: undefined, vk: undefined, base: base }
+    if (base === "") return { status: 503, message: "agent gateway disabled: configure client.a2a_external_client_url", agent: undefined, vk: undefined, base: base, grant: false }
     const agent = this.heldAgent(name)
-    if (agent === undefined || agent.enabled === false) return { status: 404, message: "agent not found", agent: undefined, vk: undefined, base: base }
-    if (presented && this.engine.gov.findKey(h) === undefined) return { status: 401, message: "authentication required", agent: agent, vk: undefined, base: base }
+    if (agent === undefined || agent.enabled === false) return { status: 404, message: "agent not found", agent: undefined, vk: undefined, base: base, grant: false }
+    if (presented && this.engine.gov.findKey(h) === undefined) return { status: 401, message: "authentication required", agent: agent, vk: undefined, base: base, grant: false }
     const gate = this.a2aGate(agent, name, h, false, true)
-    if (gate.refusal !== undefined) return { status: gate.status, message: gate.message, agent: agent, vk: gate.vk, base: base }
-    return { status: 0, message: "", agent: agent, vk: gate.vk, base: base }
+    if (gate.refusal !== undefined) return { status: gate.status, message: gate.message, agent: agent, vk: gate.vk, base: base, grant: gate.grant }
+    return { status: 0, message: "", agent: agent, vk: gate.vk, base: base, grant: false }
   }
 
   // The routes under /agents/a2a/{name}: the agent's card (GET .../.well-known/agent-card.json), its JSON-RPC
@@ -3268,14 +3669,17 @@ export class Ops {
     if (!isCard && !versionSupported(h.get("a2a-version") ?? "")) {
       const pre = this.a2aGate(agent, name, h, isRest, false)
       const pr = pre.refusal
-      if (pr !== undefined) return pr
+      // (the grants are decided later, in the call's plugin phase)
+      if (pr !== undefined && !pre.grant) return pr
       const vb = await req.text()
       if (isRpc) return json(200, rpcErrorBody(rpcIdOf(vb), -32009, "this version is not supported"))
       return json(400, `{"error":{"code":400,"status":"FAILED_PRECONDITION","message":"this version is not supported"}}`)
     }
     const gate = this.a2aGate(agent, name, h, isRest, true)
     const refusal = gate.refusal
-    if (refusal !== undefined) return refusal
+    // a refused grant on the card is Bifrost's card handler's bare 403; on a call it is answered once the call is read
+    if (refusal !== undefined && gate.grant && isCard) return forbiddenText()
+    if (refusal !== undefined && !gate.grant) return refusal
     if (agent === undefined) return json(404, errorJson(`no agent named ${name}`, "not_found_error", undefined))
     if (isCard) return a2aCardResponse(this.servedCard(agent, agent.card ?? "", base), h)
     const body = await req.text()
@@ -3283,12 +3687,14 @@ export class Ops {
       const routed = rpcCall(body)
       const id = rpcIdOf(body)
       if (routed.kind === "fail") return json(routed.status, rpcErrorBody(id, routed.code, routed.message))
+      if (gate.grant) return this.grantDenied(false, name, routed.call, id, gate.message, h)
       return await this.a2aCall(agent, routed.call, "rpc", id, h, gate.vk, base)
     }
     const qi = req.url.indexOf("?")
     const query = qi < 0 ? "" : req.url.slice(qi + 1, req.url.byteLength)
     const routed = restCall(req.method, rest.slice(REST_PREFIX.byteLength, rest.byteLength), query, body)
     if (routed.kind === "fail") return a2aDeny(true, routed.status, routed.message, "invalid_request_error")
+    if (gate.grant) return this.grantDenied(true, name, routed.call, "", gate.message, h)
     return await this.a2aCall(agent, routed.call, "rest", "\"1\"", h, gate.vk, base)
   }
 
@@ -3391,6 +3797,13 @@ export class Ops {
     const upV03 = c.binding !== "GRPC" && c.v03
     const upParams = callerV03 === upV03 ? params : paramsTo(call.op, params, upV03)
     const upCall: Call = { op: call.op, v03: upV03, params: upParams, stream: call.stream, taskId: call.taskId, configId: call.configId }
+    // the URL guard again at connect time, on the addresses the interface's host resolves to now (netguard.tov)
+    const guard = await candidateProblem(c.binding, c.url, agent.allow_private_network === true)
+    if (guard !== "") {
+      let f = fwdFail(`the agent's ${c.binding} interface is refused: ${guard}`)
+      f.binding = c.binding
+      return f
+    }
     const fwd = c.binding === "GRPC" ? await this.a2aSendGrpc(agent, upCall, c, rpcId, h, accepted, cancel) : await this.a2aSendHttp(agent, upCall, c, rpcId, h, accepted, cancel)
     if (callerV03 === upV03 || fwd.error !== "") return fwd
     return translatedFwd(fwd, call.op, callerV03)
@@ -3531,7 +3944,7 @@ export class Ops {
       if (call.op === "CreateTaskPushNotificationConfig") {
         const spec = pushSpecOf(call)
         if (spec.error !== "") return this.a2aFail(rest, rpcId, 400, -32602, `invalid params: ${spec.error}`)
-        const bad = callbackProblem(spec.url, this.pushPrivate())
+        const bad = await callbackConnectProblem(spec.url, this.pushPrivate())
         if (bad !== "") return this.a2aFail(rest, rpcId, 400, -32602, `invalid params: ${bad}`)
         const m = mintToken()
         params = pushUpstreamParams(call, ingress, m.token)
@@ -3541,7 +3954,7 @@ export class Ops {
         const emb = embeddedPush(params)
         if (emb !== undefined) {
           if (emb.spec.error !== "") return this.a2aFail(rest, rpcId, 400, -32602, `invalid params: ${emb.spec.error}`)
-          const bad = callbackProblem(emb.spec.url, this.pushPrivate())
+          const bad = await callbackConnectProblem(emb.spec.url, this.pushPrivate())
           if (bad !== "") return this.a2aFail(rest, rpcId, 400, -32602, `invalid params: ${bad}`)
           const m = mintToken()
           const cid = emb.spec.configId !== "" ? emb.spec.configId : secureHex(8)
@@ -3832,6 +4245,69 @@ export class Ops {
     }, 1000)
   }
 
+  // A graceful stop (lifecycle.tov): what is queued goes out once more, whether due or not: this worker's counters
+  // to the share folder, the exporters' batches (each queue until it is empty or a send fails), retained content,
+  // the trace spans and the request log's batched rows.
+  async flushForStop(): Promise<void> {
+    if (this.shareDir !== "") this.shareTick()
+    for (const q of this.engine.exportQueues) {
+      const sender = this.exporterSenders.get(q.cfg.id)
+      if (sender === undefined) continue
+      for (let i = 0; i < 100 && q.size() > 0; i++) {
+        const batch = q.take(Date.now())
+        if (batch.length === 0) break
+        const st = await sender.send(batch)
+        if (st === 0 || st === 429 || st >= 500) {
+          q.requeue(batch)
+          break
+        }
+      }
+    }
+    await this.flushRetained()
+    const tr = this.engine.tracer
+    if (tr !== undefined) this.engine.flushTraces(tr)
+    // the request log's last batch (a process alone writes its rows every 100 ms; logstore.tov)
+    const ls = this.engine.logStore
+    if (ls !== undefined) ls.flush()
+    this.saveAdaptive()
+  }
+
+  // ---- held keys and incidents across restarts ----
+
+  // Where the holds and incidents of adaptive load balancing are kept between runs ("" with no config file).
+  adaptivePath(): string {
+    return this.store.path === "" ? "" : this.store.path + ".adaptive.json"
+  }
+
+  // Holds and incidents survive a restart, as in Bifrost (its regional leader writes the held keys every 30 seconds
+  // and a starting node restores them): they are restored now from <config>.adaptive.json, and written there every
+  // 30 seconds by the leader, and at a graceful stop, while adaptive load balancing is on.
+  startAdaptiveStore(): void {
+    const path = this.adaptivePath()
+    if (path === "") return
+    if (this.engine.cfg.health?.adaptive === true && existsSync(path)) {
+      try {
+        const n = this.engine.health.holds.restore(readFileSync(path, "utf8"), Date.now())
+        if (n > 0) console.error(`raiju: restored ${n} held key${n === 1 ? "" : "s"} from ${path}`)
+      } catch (e) {
+        console.error(`raiju: held keys: ${e.message}`)
+      }
+    }
+    setInterval(() => {
+      if (this.isLeader()) this.saveAdaptive()
+    }, 30000)
+  }
+
+  saveAdaptive(): void {
+    const path = this.adaptivePath()
+    if (path === "" || this.engine.cfg.health?.adaptive !== true) return
+    try {
+      writeFileAtomic(path, this.engine.health.holds.snapshot(Date.now()), { durable: false })
+    } catch (e) {
+      console.error(`raiju: held keys: ${e.message}`)
+    }
+  }
+
   async flushExporters(): Promise<void> {
     if (this.sending) return
     this.sending = true
@@ -4017,7 +4493,7 @@ export class Ops {
       this.exporting = false
       return
     }
-    const batch = this.cursor.pending(entries.map((e) => JSON.stringify(e)), entries.map((e) => e.ts), now)
+    const batch = this.cursor.pending(entries.map((e) => JSON.stringify(publicEntry(e))), entries.map((e) => e.ts), now)
     if (batch === undefined) return
     this.exporting = true
     const put = putRequest(ec, objectKey(ec, batch.startMs, batch.endMs, this.nodeId), batch.body, now)
@@ -4051,11 +4527,75 @@ export class Ops {
     }
   }
 
+  // What a sign-in's claims change when the identity provider is configured through scim_config (a provider set):
+  // the user is found or created, its role decided (no default role) and its memberships resynced (claimsync.tov).
+  // With SCIM provisioning on and claimsSyncMode "scim", a user SCIM has not pushed is refused and a pushed one signs
+  // in with the role SCIM gave. "none" leaves the sign-in to the oidc section's own role rules (also when that section
+  // sets role_map or default_role).
+  syncSignIn(sub: string, email: string | undefined, payload: string): { kind: "none" } | { kind: "role", role: string } | { kind: "refuse", reason: string } {
+    const sc = this.store.cfg.scim_config
+    if (sc === undefined || sc.enabled !== true || (sc.provider ?? "") === "") return { kind: "none" }
+    // an oidc section with role rules of its own (role_map, default_role) keeps deciding the role, as before
+    const own = this.oidcCfg
+    if (own !== undefined && (own.role_map !== undefined || own.default_role !== undefined)) return { kind: "none" }
+    const c = sc.config ?? {}
+    const g = this.store.cfg.governance ?? {}
+    let users = g.users ?? []
+    const at = findUser(users, sub, email)
+    const scimOnly = resolveEnv(c.provisioningToken ?? "") !== "" && c.claimsSyncMode === "scim"
+    if (scimOnly) {
+      if (at < 0) return { kind: "refuse", reason: "Provisioning is managed by SCIM: your identity provider has not pushed this user yet" }
+      const r = users[at]!.role
+      if (r === "") return { kind: "refuse", reason: "what SCIM last sent for this user maps to no role" }
+      return { kind: "role", role: r }
+    }
+    const roles = g.roles
+    const names: string[] = ["admin", "editor", "viewer", "auditor"]
+    for (const r of customRoles(roles)) names.push(r.name)
+    const count = (r: string): int => {
+      const s = systemRole(roles, r, RESOURCES, OPERATIONS)
+      if (s !== undefined) return (s.permissions ?? []).length
+      const cr = customRole(roles, r)
+      if (cr === undefined) return -1
+      return (cr.permissions ?? []).length
+    }
+    const current = at >= 0 ? users[at]!.role : undefined
+    const claims = mergedClaims(payload, ruleAttributes(c), at >= 0 ? users[at]!.claims : undefined)
+    const d = resolveRole(claims, c, names, count, current)
+    if (d.kind === "refuse") {
+      if (d.remove && at >= 0) {
+        // the claims took the role away: the account stays, with no role until a sign-in maps one again
+        let u = users[at]!
+        u.role = ""
+        u.claims = claims
+        users[at] = u
+        this.store.setUsers(users)
+        this.storeUpdated("/api/users")
+      }
+      return { kind: "refuse", reason: d.reason }
+    }
+    const role = d.kind === "set" ? d.role : (current ?? "")
+    const dir: Directory = { teams: g.teams ?? [], businessUnits: g.business_units ?? [], projects: g.projects ?? [], profiles: g.access_profiles ?? [] }
+    const grants = resolveGrants(claims, c, dir, (p: string): string => randomId(p))
+    const lower = (email ?? "").toLowerCase()
+    const base: AdminUserConfig = at >= 0 ? users[at]! : { name: lower !== "" ? lower : sub, email: email, role: role }
+    const next = appliedUser(base, role, claims, grants, c)
+    if (at >= 0) users[at] = next
+    else users.push(next)
+    const saved = this.store.setClaimSync(users, (g.teams ?? []).concat(grants.newTeams), (g.business_units ?? []).concat(grants.newBusinessUnits))
+    if (saved.kind !== "ok") return { kind: "refuse", reason: "the user could not be saved: " + saved.message }
+    this.storeUpdated("/api/users")
+    if (grants.newTeams.length > 0) this.storeUpdated("/api/governance/teams")
+    if (grants.newBusinessUnits.length > 0) this.storeUpdated("/api/governance/business-units")
+    return { kind: "role", role: role }
+  }
+
   // GET /api/oidc/status, /api/oidc/login, /api/oidc/callback: open routes.
   async oidcRoute(req: Request, path: string): Promise<Response> {
-    const oc = this.oidcCfg
-    if (path === "/api/oidc/status") return json(200, `{"enabled":${oc !== undefined}}`)
-    if (oc === undefined) return json(404, errorJson("SSO is off", "invalid_request_error", undefined))
+    const oc0 = this.oidcCfg
+    if (path === "/api/oidc/status") return json(200, `{"enabled":${oc0 !== undefined}}`)
+    if (oc0 === undefined) return json(404, errorJson("SSO is off", "invalid_request_error", undefined))
+    const oc = withRedirect(oc0, req.url)
     const d = await this.disc(oc)
     if (d === undefined) return json(502, errorJson("could not read the identity provider's discovery document", "api_error", undefined))
     const now = Date.now()
@@ -4105,9 +4645,16 @@ export class Ops {
       this.recordChange("sso:" + v.sub, req, path, 403, "")
       return html(403, "<p>This account is disabled. Ask an administrator to enable it.</p>")
     }
+    // an identity provider configured through scim_config: its claims decide the role and the memberships
+    const synced = this.syncSignIn(v.sub, v.email, v.claims)
+    if (synced.kind === "refuse") {
+      this.recordChange("sso:" + v.sub, req, path, 403, "")
+      return html(403, `<p>Sign-in refused: ${synced.reason.replace("<", "&lt;")}</p>`)
+    }
+    const role = synced.kind === "role" ? synced.role : v.role
     let token = ""
     try {
-      token = this.sessions.create(v.sub, v.role, Date.now(), v.email)
+      token = this.sessions.create(v.sub, role, Date.now(), v.email)
     } catch (e) {
       return html(500, "<p>Could not create a session.</p>")
     }
@@ -4294,13 +4841,34 @@ export class Ops {
     return s === undefined ? "" : s.sub
   }
 
+  // The operator's setup token: setup_token (env.NAME allowed), else the BIFROST_SETUP_TOKEN environment variable, as
+  // Bifrost's resolveSetupToken reads them. "" when neither is set.
+  setupToken(): string {
+    const configured = resolveEnv(this.store.cfg.setup_token ?? "").trim()
+    if (configured !== "") return configured
+    return (process.env.BIFROST_SETUP_TOKEN ?? "").trim()
+  }
+
+  // The start-up warnings about open surfaces (Bifrost prints the first as a banner): /api is locked until an admin
+  // exists, and inference is open to anyone who reaches the port while auth is not enforced on it.
+  startupWarnings(): string[] {
+    const out: string[] = []
+    if (!this.authOn) {
+      if (this.setupToken() !== "") out.push("no admin account is configured: /api is locked until one is created; send the setup token in the X-Bifrost-Setup-Token header (POST /api/users creates the first admin)")
+      else out.push("no admin account and no setup token are configured: /api is locked (403); set setup_token in config.json (or the BIFROST_SETUP_TOKEN env var) and restart to finish setup")
+    }
+    if (!this.engine.gov.enforce) out.push("inference is not authenticated (client.enforce_auth_on_inference is off): anyone who reaches this port can use the provider keys")
+    return out
+  }
+
   // Bifrost's setup lock (SetupLockMiddleware): while no admin account exists, every /api route but the public ones
-  // needs the operator's setup_token in X-Bifrost-Setup-Token (a wrong one is a 403) or the setup session cookie that
-  // POST /api/session/setup trades it for (401 without either); the caller then acts as the admin. Bifrost locks the
-  // API even when no token is set (a 403 for everything); Raiju keeps an unlocked API until setup_token is set.
+  // needs the operator's setup token in X-Bifrost-Setup-Token (a wrong one is a 403) or the setup session cookie that
+  // POST /api/session/setup trades it for (401 without either); the caller then acts as the admin. With no setup
+  // token configured the API is locked outright (a 403 for everything but the public routes), as in Bifrost.
   setupLock(req: Request, path: string): Gate {
-    const want = resolveEnv(this.store.cfg.setup_token ?? "")
-    if (want === "" || setupPublic(path)) return { kind: "ok", actor: "anonymous" }
+    if (setupPublic(path)) return { kind: "ok", actor: "anonymous" }
+    const want = this.setupToken()
+    if (want === "") return { kind: "deny", res: denied(403, LOCKED_MESSAGE) }
     const given = req.headers.get("x-bifrost-setup-token") ?? ""
     if (given !== "") {
       if (!sameSecret(given, want)) return { kind: "deny", res: denied(403, "invalid setup token") }
@@ -4410,6 +4978,7 @@ export class Ops {
       const kept = this.store.cfg.audit?.omit_ip_addresses === true ? undefined : ip
       log.record(actor, a.action, a.target, m, path, status, kept, detail === "" ? undefined : detail, Date.now())
     } catch (e) {
+      metrics.inc("raiju_audit_write_errors_total", "", 1.0)
       console.error(`raiju: audit write failed: ${e.message}`)
     }
   }
@@ -4428,26 +4997,69 @@ export class Ops {
     const usage = this.engine.gov.budgetUsage()
     const limits = this.engine.gov.rateLimitUsage(now)
     const ids = keyBudgetIds(vk)
-    const quotaBudgets = (want: string[]): QuotaBudget[] => {
+    // a budget's usage is read from its window: the shared one, or (suffix "@user/<name>") a held profile's copy
+    const quotaBudgets = (want: string[], suffix: string, src: AccessProfile | undefined): QuotaBudget[] => {
       const out: QuotaBudget[] = []
       for (const b of g?.budgets ?? []) {
         if (!want.includes(b.id)) continue
-        const u = usage.find((x) => x.id === b.id)
-        out.push({ id: b.id, max_limit: b.max_limit, effective_max_limit: u?.limit ?? b.max_limit, reset_duration: b.reset_duration, current_usage: u?.used ?? 0.0 })
+        const u = usage.find((x) => x.id === b.id + suffix)
+        const qb: QuotaBudget = { id: b.id, max_limit: b.max_limit, effective_max_limit: u?.limit ?? b.max_limit, reset_duration: b.reset_duration, current_usage: u?.used ?? 0.0 }
+        if (src !== undefined) {
+          qb.source_type = "access_profile"
+          qb.source_id = src.id
+          qb.source_name = src.name ?? src.id
+        }
+        out.push(qb)
       }
       return out
     }
-    const quotaRates = (want: string): QuotaRate[] => {
+    const quotaRates = (want: string, suffix: string, src: AccessProfile | undefined): QuotaRate[] => {
       const out: QuotaRate[] = []
       for (const rl of g?.rate_limits ?? []) {
         if (rl.id !== want) continue
-        const used: QuotaRateUsage[] = limits.filter((x) => x.id === rl.id).map((x) => ({ kind: x.kind, used: x.used, limit: x.limit }))
-        out.push({ id: rl.id, token_max_limit: rl.token_max_limit, token_reset_duration: rl.token_reset_duration, request_max_limit: rl.request_max_limit, request_reset_duration: rl.request_reset_duration, usage: used })
+        const used: QuotaRateUsage[] = limits.filter((x) => x.id === rl.id + suffix).map((x) => ({ kind: x.kind, used: x.used, limit: x.limit }))
+        const qr: QuotaRate = { id: rl.id, token_max_limit: rl.token_max_limit, token_reset_duration: rl.token_reset_duration, request_max_limit: rl.request_max_limit, request_reset_duration: rl.request_reset_duration, usage: used }
+        if (src !== undefined) {
+          qr.source_type = "access_profile"
+          qr.source_id = src.id
+          qr.source_name = src.name ?? src.id
+        }
+        out.push(qr)
       }
       return out
     }
-    const budgets = quotaBudgets(ids)
-    const rateLimits = quotaRates(vk.rate_limit_id ?? "")
+    // A key whose user holds access profiles is governed by them (Bifrost's access-profile quota): each held profile's
+    // budget and rate limit is listed with the profile as its source, its usage the user's own copy, and the per-model
+    // spend is the user's. The key's own budgets follow, since every held budget and the key's own are all charged.
+    const user = vk.user_id ?? ""
+    const held: AccessProfile[] = user === "" ? [] : heldProfiles(g?.users, g?.roles, g?.access_profiles, user).filter((p) => p.is_active !== false)
+    const budgets: QuotaBudget[] = []
+    const rateLimits: QuotaRate[] = []
+    const seenB: string[] = []
+    const seenR: string[] = []
+    for (const p of held) {
+      const bid = p.budget_id
+      if (bid !== undefined && !seenB.includes(bid)) {
+        seenB.push(bid)
+        for (const qb of quotaBudgets([bid], `@user/${user}`, p)) budgets.push(qb)
+      }
+      const rid = p.rate_limit_id
+      if (rid !== undefined && !seenR.includes(rid)) {
+        seenR.push(rid)
+        for (const qr of quotaRates(rid, `@user/${user}`, p)) rateLimits.push(qr)
+      }
+    }
+    for (const qb of quotaBudgets(ids, "", undefined)) budgets.push(qb)
+    for (const qr of quotaRates(vk.rate_limit_id ?? "", "", undefined)) rateLimits.push(qr)
+    // each budget's spend per model in its current cycle, from the request logs (none without a log store)
+    const ls = this.engine.logStore
+    const es: LogEntry[] = ls === undefined ? [] : ls.viewSince(0.0)
+    for (let i = 0; i < budgets.length; i++) {
+      const qb = budgets[i]!
+      const suffix = qb.source_type === undefined ? "" : `@user/${user}`
+      const start = this.engine.gov.budgetCycleStart(qb.id + suffix, now) ?? now
+      budgets[i]!.per_model_usage = perModelUsage(es, vk.id, qb.source_type === undefined ? "" : user, start, now)
+    }
     const models: QuotaModel[] = []
     for (const mc of g?.model_configs ?? []) {
       if (mc.scope !== "virtual_key" || mc.scope_id !== vk.id || mc.model_name === "*") continue
@@ -4456,8 +5068,8 @@ export class Ops {
       for (const b of mc.budget_ids ?? []) {
         if (!bids.includes(b)) bids.push(b)
       }
-      const row: QuotaModel = { model_name: mc.model_name, provider: mc.provider, budgets: quotaBudgets(bids) }
-      const rl = quotaRates(mc.rate_limit_id ?? "")[0]
+      const row: QuotaModel = { model_name: mc.model_name, provider: mc.provider, budgets: quotaBudgets(bids, "", undefined) }
+      const rl = quotaRates(mc.rate_limit_id ?? "", "", undefined)[0]
       if (rl !== undefined) row.rate_limit = rl
       models.push(row)
     }
@@ -4584,7 +5196,7 @@ export class Ops {
       if (u.name === actor) role = u.role
     }
     const roles = this.store.cfg.governance?.roles ?? []
-    const builtIn = customRole(roles, role) === undefined
+    const builtIn = isBuiltinRole(role) || customRole(roles, role) === undefined
     return { role: role, roleId: anyRoleId(roles, role), builtIn: builtIn, pairs: rolePairs(roles, role, RESOURCES, OPERATIONS) }
   }
 
@@ -4688,13 +5300,40 @@ export class Ops {
   // /api/users/{name}/access-profiles: GET lists the profiles the user holds; PUT and DELETE
   // .../{profile_id} add and remove one; PUT and DELETE .../{profile_id}/virtual-keys/{vk_id} link
   // the profile to one of the user's virtual keys.
-  userProfiles(method: string, path: string): Reply {
+  userProfiles(method: string, path: string, body: string): Reply {
     const segs = path.split("/").filter((s) => s !== "")
     const name = segs[2] ?? ""
     const pid = segs[4] ?? ""
     const notFound: Reply = { status: 404, body: errorJson(`no route for ${path}`, "invalid_request_error", undefined), contentType: "application/json" }
-    if (segs.length < 4 || segs.length > 7 || segs[3] !== "access-profiles") return notFound
+    if (segs.length < 4 || segs.length > 8 || segs[3] !== "access-profiles") return notFound
     const g = this.store.cfg.governance
+    // PUT and DELETE .../access-profiles/{profile}/budgets/{budget}/override: the user's budget override
+    if (segs.length === 8) {
+      if (segs[5] !== "budgets" || segs[7] !== "override") return notFound
+      if (method !== "PUT" && method !== "DELETE") return { status: 405, body: errorJson(`method ${method} is not allowed on this route`, "invalid_request_error", undefined), contentType: "application/json" }
+      const bid = segs[6] ?? ""
+      let o: BudgetOverride | undefined = undefined
+      if (method === "PUT") {
+        const pr = parseOverride(body)
+        if (pr.kind === "error") return badRequest(pr.message)
+        o = pr.override
+      }
+      const r = this.store.setUserBudgetOverride(name, pid, bid, o)
+      if (r.kind === "error") return { status: r.status, body: errorJson(r.message, r.status === 404 ? "not_found_error" : "invalid_request_error", undefined), contentType: "application/json" }
+      const now = Date.now()
+      const lim = this.engine.gov.budgetUsage().find((x) => x.id === `${bid}@user/${name}`)
+      let base: BudgetConfig | undefined = undefined
+      for (const b of this.store.cfg.governance?.budgets ?? []) {
+        if (b.id === bid) base = b
+      }
+      // the effective limit as the override makes it: the base, the forever amount, and a cycles amount while it runs
+      let eff = base === undefined ? 0.0 : effectiveBudgetLimit(base)
+      if (o !== undefined && o.mode === "forever") eff += o.amount
+      if (o !== undefined && o.mode === "cycles") eff += o.amount
+      const ov = o === undefined ? "null" : JSON.stringify(o)
+      const bj = base === undefined ? "null" : jobj([jkv("id", JSON.stringify(bid)), jkv("max_limit", jn(base.max_limit)), jkv("reset_duration", JSON.stringify(base.reset_duration)), jkv("current_usage", jn(lim?.used ?? 0.0)), jkv("override", ov)])
+      return okJson(jobj([jkv("user_id", JSON.stringify(name)), jkv("access_profile_id", JSON.stringify(pid)), jkv("budget", bj), jkv("effective_max_limit", jn(eff)), jkv("checked_at", JSON.stringify(isoMs(now)))]))
+    }
     if (segs.length === 4) {
       if (method !== "GET") return { status: 405, body: errorJson(`method ${method} is not allowed on this route`, "invalid_request_error", undefined), contentType: "application/json" }
       const held = heldProfiles(g?.users, g?.roles, g?.access_profiles, name)
@@ -4712,7 +5351,7 @@ export class Ops {
   users(method: string, path: string, body: string, setupToken: string, setupSession: string): Reply {
     // Bifrost's setup gate: while no admin exists, the first account needs the operator's setup_token, given
     // as the header or as a setup session from POST /api/session/setup
-    const want = resolveEnv(this.store.cfg.setup_token ?? "")
+    const want = this.setupToken()
     if (method === "POST" && !this.authOn && want !== "" && setupToken !== want && !validSetupSession(setupSession, want, Date.now())) {
       return { status: 403, body: errorJson("the setup token is required to create the first admin account", "invalid_request_error", undefined), contentType: "application/json" }
     }
@@ -4785,6 +5424,80 @@ export class Ops {
     const saved = this.store.setProfiles(r.profiles)
     if (saved.kind === "error") return { status: saved.status, body: errorJson(saved.message, "api_error", undefined), contentType: "application/json" }
     return { status: r.status, body: r.body, contentType: "application/json" }
+  }
+
+  // GET /api/governance/projects/{id}/members/{member_id}/usage: one member's usage (Bifrost's member usage view): each
+  // slice the member holds of the project's budgets and rate limits with what it has counted in its window, and the
+  // member's requests in the project grouped by provider and model, counted from the start of the earliest slice's
+  // cycle (all the requests the log store holds when the member has no budget slice).
+  memberUsage(path: string, sc: DataScope): Reply {
+    const segs = path.split("/").filter((s) => s !== "")
+    const pid = pctDecode(segs[3] ?? "") ?? ""
+    const mid = pctDecode(segs[5] ?? "") ?? ""
+    const nf = (what: string): Reply => ({ status: 404, body: errorJson(what, "not_found_error", undefined), contentType: "application/json" })
+    let pj: ProjectConfig | undefined = undefined
+    for (const p of this.store.cfg.governance?.projects ?? []) {
+      if (p.id === pid) pj = p
+    }
+    if (pj === undefined || !inScope(sc, "", "", "", pid)) return nf(`no project ${pid}`)
+    let user = ""
+    for (const m of pj.members ?? []) {
+      if (m.id === mid || m.user_id === mid) user = m.user_id
+    }
+    if (user === "") return nf(`no member ${mid}`)
+    const now = Date.now()
+    const suffix = `@${pid}/${user}`
+    const budgets: string[] = []
+    let since = -1.0
+    for (const u of this.engine.gov.budgetUsage()) {
+      if (!u.id.endsWith(suffix)) continue
+      const src = u.id.slice(0, u.id.byteLength - suffix.byteLength)
+      const st = this.engine.gov.budgetCycleStart(u.id, now) ?? now
+      if (since < 0.0 || st < since) since = st
+      budgets.push(jobj([jkv("source_budget_id", JSON.stringify(src)), jkv("budget_id", JSON.stringify(u.id)), jkv("max_limit", jn(u.limit)), jkv("current_usage", jn(u.used))]))
+    }
+    const rates = new Map<string, string[]>()
+    const order: string[] = []
+    for (const u of this.engine.gov.rateLimitUsage(now)) {
+      if (!u.id.endsWith(suffix)) continue
+      if (!rates.has(u.id)) order.push(u.id)
+      const cur = rates.get(u.id) ?? []
+      cur.push(jkv(u.kind + "_max_limit", jn(u.limit)))
+      cur.push(jkv(u.kind + "_current_usage", jn(u.used)))
+      rates.set(u.id, cur)
+    }
+    const limits: string[] = []
+    for (const id of order) {
+      const src = id.slice(0, id.byteLength - suffix.byteLength)
+      limits.push(jobj([jkv("source_rate_limit_id", JSON.stringify(src)), jkv("rate_limit_id", JSON.stringify(id))].concat(rates.get(id) ?? [])))
+    }
+    const ls = this.engine.logStore
+    const es: LogEntry[] = []
+    if (ls !== undefined) {
+      for (const e of ls.viewSince(0.0)) {
+        if ((e.project_id ?? "") === pid) es.push(e)
+      }
+    }
+    const spend = perModelUsage(es, "", user, since < 0.0 ? 0.0 : since, now)
+    return okJson(jobj([jkv("project_id", JSON.stringify(pid)), jkv("member_id", JSON.stringify(mid)), jkv("user_id", JSON.stringify(user)), jkv("budgets", jarr(budgets)), jkv("rate_limits", jarr(limits)), jkv("usage", JSON.stringify(spend))]))
+  }
+
+  // GET /api/governance/access-profiles/audit-logs and .../{profile_id}/audit-logs (also under /api/access-profiles, as
+  // Bifrost serves them): the access-profile changes the audit trail holds (audit.tov profileAuditJson), with
+  // limit, offset, action and user_id. An empty list while the audit log is off.
+  profileAudit(req: Request, path: string): Reply {
+    const rest = path.startsWith("/api/governance/") ? path.slice("/api/governance/".byteLength) : path.slice("/api/".byteLength)
+    const segs = rest.split("/").filter((s) => s !== "")
+    const profile = segs.length === 3 ? pctDecode(segs[1] ?? "") ?? "" : undefined
+    if (profile !== undefined && !(this.store.cfg.governance?.access_profiles ?? []).some((p) => p.id === profile)) return { status: 404, body: errorJson(`no access profile ${profile}`, "not_found_error", undefined), contentType: "application/json" }
+    const u = URL.parse(req.url)
+    const sp = u === undefined ? new URLSearchParams("") : u.searchParams
+    const limit = parseInt(sp.get("limit") ?? "") ?? 50
+    const offset = parseInt(sp.get("offset") ?? "") ?? 0
+    const log = this.audit
+    if (log === undefined) return okJson(`{"audit_logs":[],"total_count":0}`)
+    const page = log.query({ paths: ["/api/governance/access-profiles"], limit: 1000, order: "desc" })
+    return okJson(profileAuditJson(page.events, profile, (sp.get("action") ?? "").trim(), (sp.get("user_id") ?? "").trim(), limit > 0 ? Math.trunc(limit) : 50, offset > 0 ? Math.trunc(offset) : 0))
   }
 
   // GET /api/audit-logs, /api/audit-logs/export (JSONL), /api/audit-logs/verify
@@ -4907,7 +5620,7 @@ export class Ops {
     if (this.engine.gov.enforce && vk === undefined && mcpUser === "") return denied(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", challenge)
     // a key's access profile may limit the tools it sees; allow_by_default opens the clients it does not name
     const allowedTools = this.engine.gov.policyFor(h)?.mcpTools
-    let tools = exposedTools(m.allToolsFor(allowedTools, vk?.mcp_configs, this.engine.projectMcp(h, virtualName)))
+    let tools = exposedTools(m.allToolsFor(allowedTools, this.engine.keyMcp(h, virtualName), this.engine.projectMcp(h, virtualName)))
     // code mode: the four meta-tools stand in for the code mode clients' tools, as in the tool list Bifrost serves
     // (a virtual MCP lists only its own tools)
     if (virtualName === undefined && this.engine.codeEntriesFor(m, h).length > 0) {
@@ -4982,7 +5695,7 @@ export class Ops {
     } else {
       for (const t of tools) seen.push(t.name)
     }
-    const iparts = m.instructionParts(allowedTools, vk?.mcp_configs, this.engine.projectMcp(h, virtualName)).filter((p) => seen.some((n) => n.startsWith(p.name + "-")))
+    const iparts = m.instructionParts(allowedTools, this.engine.keyMcp(h, virtualName), this.engine.projectMcp(h, virtualName)).filter((p) => seen.some((n) => n.startsWith(p.name + "-")))
     const instructions = m.renderInstructions(iparts)
     const r = await handleMcp(body, h.get("mcp-session-id"), tools, run, this.mcpSessions, now, instructions)
     const out: Record<string, string> = new Map()
@@ -4993,14 +5706,57 @@ export class Ops {
   }
 }
 
+// The folder share directories are made in ($TMPDIR, else /tmp).
+function shareBase(): string {
+  const t = process.env.TMPDIR ?? ""
+  return t === "" ? "/tmp" : t
+}
+
+// The supervisor pid a share directory name carries: raiju-<pid>-<random hex>, or the older raiju-<pid>. undefined
+// for any other name.
+export function sharePid(name: string): int | undefined {
+  if (!name.startsWith("raiju-")) return undefined
+  let rest = name.slice(6)
+  const dash = rest.indexOf("-")
+  if (dash >= 0) {
+    const tag = rest.slice(dash + 1)
+    if (tag.byteLength !== 16) return undefined
+    for (const ch of tag.chars()) {
+      if (!"0123456789abcdef".includes(ch)) return undefined
+    }
+    rest = rest.slice(0, dash)
+  }
+  const pid = parseInt(rest)
+  if (pid === undefined || "" + pid !== rest) return undefined
+  return pid
+}
+
+// The node's share folder, made by the supervisor before its workers fork: raiju-<pid>-<16 random hex digits> under
+// $TMPDIR (or /tmp). The random part makes the name unpredictable, and mkdir refuses a name that already exists (a
+// planted folder or symlink), so another local user can neither pre-create it nor redirect it; it is then made
+// private (0700), which keeps the shared counters, cache entries and metrics from other users. "" when it cannot be
+// made (the workers then keep their state to themselves).
+export function makeShareDir(supervisorPid: int): string {
+  removeStaleShares()
+  try {
+    const dir = `${shareBase()}/raiju-${supervisorPid}-${try secureHex(16)}`
+    mkdirSync(dir)
+    chmodSync(dir, 448)
+    return dir
+  } catch (e) {
+    console.error(`raiju: can't share state between workers: ${e.message}`)
+    return ""
+  }
+}
+
 // Share directories of gateways that are no longer running (their supervisor's pid is gone).
 function removeStaleShares(): void {
+  const base = shareBase()
   try {
-    for (const d of readdirSync("/tmp")) {
-      if (!d.startsWith("raiju-")) continue
-      const pid = parseInt(d.slice(6))
-      if (pid === undefined || "" + pid !== d.slice(6)) continue
-      if (!existsSync(`/proc/${pid}`)) rmSync("/tmp/" + d, { recursive: true, force: true })
+    for (const d of readdirSync(base)) {
+      const pid = sharePid(d)
+      if (pid === undefined) continue
+      if (!existsSync(`/proc/${pid}`)) rmSync(base + "/" + d, { recursive: true, force: true })
     }
   } catch (e) {
     // best effort
@@ -5048,6 +5804,66 @@ test("circuit view lists only the circuits that are not closed", () => {
   expect(ops.circuitView().body).toBe(`{"circuits":{}}`)
   for (let i = 0; i < 20; i++) eng.health.record("openai#k1", false, 100.0, Date.now())
   expect(ops.circuitView().body.includes("\"openai#k1\":\"open\"")).toBe(true)
+})
+
+// An Ops whose engine and store both hold cfg, as at start.
+function lockFor(cfg: Config): Ops throws Error {
+  const path = "/tmp/raiju-ops-lock-" + (try secureHex(6)) + ".json"
+  return new Ops(new Engine(cfg), new ConfigStore(path, cfg))
+}
+
+function gateStatus(ops: Ops, path: string, hs: Record<string, string>): int {
+  const g = ops.gate(new Request("http://gw" + path, { method: "GET", headers: hs }), path)
+  return g.kind === "ok" ? 200 : g.res.status
+}
+
+test("/api is locked without an admin: 403 with no setup token, the token or its session opens it", () => {
+  const none: Record<string, string> = new Map()
+  // no admin and no setup token: everything but the public routes is refused (the old default left it open)
+  let lockOps = try lockFor({})
+  if ((process.env.BIFROST_SETUP_TOKEN ?? "") === "") {
+    expect(gateStatus(lockOps, "/api/providers", none)).toBe(403)
+    expect(gateStatus(lockOps, "/api/config", none)).toBe(403)
+    expect(lockOps.startupWarnings()[0]!.includes("no setup token")).toBe(true)
+  }
+  expect(gateStatus(lockOps, "/api/session/is-auth-enabled", none)).toBe(200)
+  expect(gateStatus(lockOps, "/api/version", none)).toBe(200)
+  expect(lockOps.startupWarnings().some((w) => w.includes("inference is not authenticated"))).toBe(true)
+  // a setup token: missing 401, wrong 403, right opens it
+  lockOps = try lockFor({ setup_token: "s3cret-setup" })
+  expect(gateStatus(lockOps, "/api/providers", none)).toBe(401)
+  const wrong: Record<string, string> = new Map()
+  wrong.set("x-bifrost-setup-token", "nope")
+  expect(gateStatus(lockOps, "/api/providers", wrong)).toBe(403)
+  const right: Record<string, string> = new Map()
+  right.set("x-bifrost-setup-token", "s3cret-setup")
+  expect(gateStatus(lockOps, "/api/providers", right)).toBe(200)
+  // client.whitelisted_routes stay open, as Bifrost's whitelist
+  lockOps = try lockFor({ client: { whitelisted_routes: ["/api/models"] } })
+  expect(gateStatus(lockOps, "/api/models", none)).toBe(200)
+  // once an admin exists the setup token no longer opens anything
+  lockOps = try lockFor({ setup_token: "s3cret-setup", governance: { auth_config: { token: "admin-tok" } } })
+  expect(gateStatus(lockOps, "/api/providers", right)).toBe(401)
+  const admin: Record<string, string> = new Map()
+  admin.set("authorization", "Bearer admin-tok")
+  expect(gateStatus(lockOps, "/api/providers", admin)).toBe(200)
+  expect(lockOps.startupWarnings().some((w) => w.includes("/api is locked"))).toBe(false)
+})
+
+test("the worker share folder is private, unpredictable and its stale copies are recognized", () => {
+  expect(sharePid("raiju-123")).toBe(123)
+  expect(sharePid("raiju-123-0123456789abcdef")).toBe(123)
+  expect(sharePid("raiju-123-0123")).toBeUndefined()
+  expect(sharePid("raiju-123-0123456789abcdeZ")).toBeUndefined()
+  expect(sharePid("raiju-plugins")).toBeUndefined()
+  expect(sharePid("raiju-store-ab.json")).toBeUndefined()
+  const a = makeShareDir(process.pid)
+  const b = makeShareDir(process.pid)
+  expect(a !== "" && b !== "" && a !== b).toBe(true)
+  expect(sharePid(a.slice(a.indexOf("raiju-")))).toBe(process.pid)
+  expect((try statSync(a)).mode & 511).toBe(448)
+  try rmSync(a, { recursive: true, force: true })
+  try rmSync(b, { recursive: true, force: true })
 })
 
 test("circuit reset closes one circuit by id, or all of them", () => {
@@ -5144,6 +5960,31 @@ test("analytics and MCP routes answer from the store and refuse what is not reco
     expect(mcp.body.includes(`"status":"error"`)).toBe(true)
     // the LLM views leave the MCP entry out
     expect(get("/api/logs/dashboard").body.includes(`"total_requests":1`)).toBe(true)
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("logs_only MCP tool errors keep placeholders, and the reveal mapping shows only to a caller holding Logs:Reveal", () => {
+  const dir = "/tmp/raiju-ops-reveal-" + (try secureHex(6))
+  try {
+    try mkdirSync(dir, { recursive: true })
+    const eng = new Engine({ guardrails: { enabled: true, detect: ["email"], mode: "redact", apply_to: "both", logs_only: true } })
+    eng.logStore = try new LogStore(defaultLogStoreConfig(dir))
+    const ops = new Ops(eng, new ConfigStore("/tmp/raiju-ops-reveal.json", { governance: { users: [{ name: "vi", role: "viewer" }] } }))
+    ops.recordMcp({ server: "crm", tool: "lookup", latencyMs: 3.0, ok: false, error: "no account for jane.r@example.com" })
+    const list = ops.logsRoute(new Request("http://raiju.test/api/mcp-logs"), "/api/mcp-logs", "")
+    expect(list.body.includes("jane.r@example.com")).toBe(false)
+    expect(list.body.includes("[EMAIL-1]")).toBe(true)
+    const e = eng.logStore!.viewSince(0.0)[0]!
+    const p = "/api/mcp-logs/" + e.id
+    const hidden = ops.logsRoute(new Request("http://raiju.test" + p), p, "", undefined, false)
+    expect(hidden.body.includes("redaction_mapping")).toBe(false)
+    const shown = ops.logsRoute(new Request("http://raiju.test" + p), p, "", undefined, true)
+    expect(shown.body.includes(`"redaction_mapping":{"output":{"EMAIL-1":"jane.r@example.com"}}`)).toBe(true)
+    // the admin (and the legacy admin credential) holds Logs:Reveal; a viewer does not
+    expect(ops.mayReveal("admin")).toBe(true)
+    expect(ops.mayReveal("vi")).toBe(false)
   } finally {
     try rmSync(dir, { recursive: true, force: true })
   }
@@ -5279,4 +6120,65 @@ test("a virtual key in a header beside an OAuth token is found, a provider key i
   expect(headerKeyOf(h)).toBe("sk-bf-x")
   h.set("x-bf-vk", "anything")
   expect(headerKeyOf(h)).toBe("anything")
+})
+
+test("config generations: a shared file is reread, another node's own file is left alone, and a sibling's stale one waits", () => {
+  const path = "/tmp/raiju-ops-gen-" + (try secureHex(6)) + ".json"
+  try {
+    const t1 = `{"governance":{"virtual_keys":[{"id":"vk-1","value":"sk-bf-1"}]}}`
+    try writeFileSync(path, t1)
+    const raw = try JSON.parse(t1) as Config
+    const store = new ConfigStore(path, raw)
+    const ops = new Ops(new Engine(raw), store)
+    let applied: int[] = []
+    store.onChange = (c) => {
+      applied.push((c.governance?.virtual_keys ?? []).length)
+    }
+    const me = cluster.nodeOf(ops.nodeId)
+    // another node saved, and the file is shared: reread (config_sync defaults to "file")
+    const t2 = `{"governance":{"virtual_keys":[]}}`
+    try writeFileSync(path, t2)
+    ops.takeConfigGen(JSON.stringify({ sha: textSha(t2), node: me + "-other" }))
+    expect(applied).toEqual([0])
+    expect(store.fileSha).toBe(textSha(t2))
+    // a generation this node's file does not hold: nothing is applied (no pull without config_sync "pull")
+    ops.takeConfigGen(JSON.stringify({ sha: textSha("{}"), node: me + "-other" }))
+    expect(applied).toEqual([0])
+    // a sibling worker's save that the file no longer holds (it saved again since): the next generation follows
+    ops.takeConfigGen(JSON.stringify({ sha: textSha("{}"), node: me }))
+    expect(applied).toEqual([0])
+    // a sibling worker's save the file holds is always reread
+    try writeFileSync(path, t1)
+    ops.takeConfigGen(JSON.stringify({ sha: textSha(t1), node: me }))
+    expect(applied).toEqual([0, 1])
+    // a deletion or a value that is not a generation is ignored
+    ops.takeConfigGen(undefined)
+    ops.takeConfigGen("junk")
+    expect(applied.length).toBe(2)
+  } finally {
+    try rmSync(path, { force: true })
+  }
+})
+
+test("storageProblems names a required log store or audit log that could not open, and not one with required false", () => {
+  const dir = "/tmp/raiju-ops-storage-" + (try secureHex(6))
+  try {
+    try mkdirSync(dir, { recursive: true })
+    try writeFileSync(dir + "/blocker", "x")
+    const bad: Config = { logs_store: { enabled: true, dir: dir + "/blocker/logs" }, audit: { enabled: true, dir: dir + "/blocker/audit", key: "k" } }
+    const ops = new Ops(new Engine(bad), new ConfigStore(dir + "/c.json", bad))
+    const ps = ops.storageProblems()
+    expect(ps.length).toBe(2)
+    expect(ps[0]!.startsWith("logs_store: ")).toBe(true)
+    expect(ps[1]!.startsWith("audit: ")).toBe(true)
+    const soft: Config = { logs_store: { enabled: true, required: false, dir: dir + "/blocker/logs" }, audit: { enabled: true, required: false, dir: dir + "/blocker/audit", key: "k" } }
+    const sops = new Ops(new Engine(soft), new ConfigStore(dir + "/c.json", soft))
+    expect(sops.storageProblems().length).toBe(0)
+    const good: Config = { logs_store: { enabled: true, dir: dir + "/logs" }, audit: { enabled: true, dir: dir + "/audit", key: "k" } }
+    const gops = new Ops(new Engine(good), new ConfigStore(dir + "/c.json", good))
+    expect(gops.storageProblems().length).toBe(0)
+    expect(gops.audit !== undefined && gops.engine.logStore !== undefined).toBe(true)
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
 })

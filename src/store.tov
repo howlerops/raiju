@@ -3,32 +3,36 @@
 // config file and handed to the lead through onChange, which rebuilds the
 // engine. Secrets are masked on every read, and a masked value sent back
 // unchanged keeps the stored secret.
-import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs"
-import { writeFileAtomic, removeStaleTemps, writeTemp } from "./atomicfile"
+import { readFileSync, writeFileSync, existsSync, unlinkSync, statSync, chmodSync } from "node:fs"
+import { writeFileAtomic, removeStaleTemps, writeTemp, PRIVATE_FILE } from "./atomicfile"
 import {
   Config, GovernanceConfig, KeyConfig, ProviderConfig, VirtualKeyConfig, BudgetConfig, resolveEnv, getEnv,
   RateLimitConfig, TeamConfig, CustomerConfig, ProviderConfigRef, providerOf, AdminAuthConfig, AdminUserConfig, AccessProfile, NetworkConfig, CustomProviderConfig,
   ModelConfigGovernance, ProviderGovernance, PricingOverrideConfig, AlertsConfig, ClientConfig, providerNames, GlobalProxyConfig, CircuitPolicyConfig,
   WebhookEndpoint, AgentConfig, AgentGrant, AgentAuth, AgentOAuth, AgentTls, ProjectConfig, BusinessUnitConfig, RoleConfig, PermissionPair, UserAgentMapping, PluginSpec,
-  BudgetOverride, PricingSyncConfig, ComplexitySettings, ProjectMember, MemberShare, RateLimitShare, EntityDac, ProfileRole, ApiKeyConfig,
-  loadRawConfig,
+  BudgetOverride, PricingSyncConfig, ComplexitySettings, BedrockKeyConfig, ProjectMember, MemberShare, RateLimitShare, EntityDac, ProfileRole, ApiKeyConfig, UserBudgetOverride, VertexAwsWorkloadIdentity,
+  loadRawConfig, rawConfigOf,
 } from "./config"
+import { clusterState } from "./clusterstate"
+import { nodeOf } from "./cluster"
 import { RoutingRule, RuleTarget } from "./cel"
 import { aliasProviderProblem } from "./aliases"
-import { permissionDocs, pairOfId, permissionIds, parseOverride, keyBudgetIds, expiredToDelete, ruleError, complexityProblem, complexityFrom, emailOf, attachBinding } from "./govapi"
+import { oauthKeyProblem } from "./oauth_key"
+import { permissionDocs, pairOfId, permissionIds, parseOverride, keyBudgetIds, expiredToDelete, ruleError, complexityProblem, complexityFrom, emailOf, attachBinding, heldProfiles } from "./govapi"
 import { PromptRepoConfig } from "./prompts"
 import { FeatureFlagsConfig } from "./flags"
 import { notify } from "./notify"
 import { analyzerStatus, retryWarmup, generationsJson, deleteGeneration } from "./complexity"
-import { isBuiltinRole, customRole, withRoleIds, roleIdOf, roleNameById, anyRoleName, builtinRoleName, builtinRoles } from "./rbac"
+import { isBuiltinRole, customRole, customRoles, systemRole, withRoleIds, roleIdOf, roleNameById, anyRoleName, builtinRoleName, builtinRoles } from "./rbac"
 import { DataScope, allScope, inScope, scopeOf } from "./scope"
 import { setGlobalProxy } from "./providers/types"
 import { McpClientConfig, McpUserCredential } from "./mcp"
 import { McpUserToken } from "./mcpuser"
 import { decode, encode } from "./base64"
 import { gcmSeal, gcmOpen, pbkdf2Sha256 } from "./aesgcm"
-import { Field, fields, find, isNull, quote, elements, decodeString, rawStr, rawBool, rawNum } from "./json"
-import { secureHex, utf8 } from "./crypto"
+import { Field, fields, find, isNull, quote, elements, decodeString, rawStr, rawBool, rawNum, build, setField, without } from "./json"
+import { secureHex, utf8, sha256, toHex } from "./crypto"
+import { Policy, Verdict, hostVerdict, urlVerdict } from "./netguard"
 import { rfc3339Ms, rfc3339Of } from "./vkexpiry"
 import { durationMs, effectiveBudgetLimit, cyclesLeft } from "./governance"
 
@@ -118,6 +122,24 @@ function keepOpt(incoming: string | undefined, existing: string | undefined): st
   if (incoming === undefined) return existing
   return keepSecret(incoming, existing)
 }
+
+// Whether a value is in maskSecret's shape ("****", or four characters, "…", four characters): a masked value that
+// matched no stored secret must not be saved as if it were the secret.
+export function looksMasked(v: string | undefined): bool {
+  if (v === undefined) return false
+  if (v === "****") return true
+  return v.includes("…") && v.byteLength === 4 + "…".byteLength + 4
+}
+
+// The secrets of a key that are still masked after prepKey: masked values that matched no stored key.
+function maskedLeft(k: KeyConfig): bool {
+  return looksMasked(k.value) || looksMasked(k.vertex_key_config?.auth_credentials) || looksMasked(k.bedrock_key_config?.secret_key) || looksMasked(k.bedrock_key_config?.session_token)
+    || looksMasked(k.azure_key_config?.client_secret) || looksMasked(k.bedrock_mantle_key_config?.secret_key) || looksMasked(k.bedrock_mantle_key_config?.session_token)
+    || looksMasked(k.watsonx_key_config?.api_key) || looksMasked(k.databricks_key_config?.client_secret) || looksMasked(k.github_copilot_key_config?.private_key)
+    || looksMasked(k.oauth_key_config?.client_secret) || looksMasked(k.oauth_key_config?.private_key)
+}
+
+const MASKED_KEY = "a key value is masked but matches no stored key: send the real value, or the key's id with its masked value to keep it"
 
 // Provider names: lower-case letters, digits, "_" and "-", 1 to 64 bytes.
 export function validProviderName(name: string): bool {
@@ -235,41 +257,135 @@ function hasDupKeyIds(keys: KeyConfig[]): bool {
   return false
 }
 
-// The stored form of a key: its id, and the stored secrets when the request
-// sent them masked or left them out.
+// The stored form of a key: its id, and the stored secrets when the request sent them masked or left them out. The
+// whole key is kept, every per-key block with it (azure, vertex, bedrock, bedrock_mantle, watsonx, cloudflare,
+// databricks, github_copilot, replicate and oauth_key_config); a secret inside a block that comes back masked keeps
+// the stored value (keyWithSecrets).
 function prepKey(k: KeyConfig, id: string, old: KeyConfig | undefined): KeyConfig {
-  const bk = k.bedrock_key_config
-  const ob = old?.bedrock_key_config
-  const vk = k.vertex_key_config
-  const ov = old?.vertex_key_config
-  return {
-    id: id,
-    name: k.name,
-    value: keepOpt(k.value, old?.value),
-    models: k.models,
-    weight: k.weight,
-    aliases: k.aliases,
-    blacklisted_models: k.blacklisted_models,
-    azure_key_config: k.azure_key_config,
-    replicate_key_config: k.replicate_key_config,
-    vertex_key_config: vk === undefined ? undefined : { project_id: vk.project_id, region: vk.region, auth_credentials: keepOpt(vk.auth_credentials, ov?.auth_credentials), project_number: vk.project_number, force_single_region: vk.force_single_region },
-    bedrock_key_config: bk === undefined ? undefined : {
-      access_key: bk.access_key,
-      secret_key: keepOpt(bk.secret_key, ob?.secret_key),
-      session_token: keepOpt(bk.session_token, ob?.session_token),
-      region: bk.region,
-      deployments: bk.deployments,
-      project_id: bk.project_id,
-    },
-  }
+  const kept = keyWithSecrets(k, old, true)
+  let n = kept
+  n.id = id
+  return n
 }
 
-// Gives every key an id, keeping the stored secrets of keys sent back masked.
+// Each secret of a key, masked (restore false: for reads) or restored from the stored key when it came back masked or
+// was left out (restore true: for writes). Settings that are not secrets pass as they are. (Every value is read from
+// k before the copies are changed: records are values.)
+function keyWithSecrets(k: KeyConfig, old: KeyConfig | undefined, restore: bool): KeyConfig {
+  const sec = (v: string | undefined, prev: string | undefined): string | undefined => restore ? keepOpt(v, prev) : maskOpt(v)
+  const value = sec(k.value, old?.value)
+  const az = k.azure_key_config
+  const azSecret = az === undefined ? undefined : sec(az.client_secret, old?.azure_key_config?.client_secret)
+  const vx = k.vertex_key_config
+  const vxCreds = vx === undefined ? undefined : sec(vx.auth_credentials, old?.vertex_key_config?.auth_credentials)
+  const bk = k.bedrock_key_config
+  const bkNew = bk === undefined ? undefined : bedrockSecrets(bk, old?.bedrock_key_config, restore)
+  const bm = k.bedrock_mantle_key_config
+  const bmNew = bm === undefined ? undefined : bedrockSecrets(bm, old?.bedrock_mantle_key_config, restore)
+  const wx = k.watsonx_key_config
+  const wxKey = wx === undefined ? "" : (sec(wx.api_key, old?.watsonx_key_config?.api_key) ?? "")
+  const db = k.databricks_key_config
+  const dbSecret = db === undefined ? undefined : sec(db.client_secret, old?.databricks_key_config?.client_secret)
+  const gc = k.github_copilot_key_config
+  const gcKey = gc === undefined ? "" : (sec(gc.private_key, old?.github_copilot_key_config?.private_key) ?? "")
+  const oc = k.oauth_key_config
+  const prev = old?.oauth_key_config
+  const ocSecret = oc === undefined ? undefined : sec(oc.client_secret, prev?.client_secret)
+  const ocKey = oc === undefined ? undefined : sec(oc.private_key, prev?.private_key)
+  // extra parameters can carry credentials, as Bifrost treats them
+  let ocExtra: Map<string, string> | undefined = undefined
+  const ex = oc?.extra_params
+  if (ex !== undefined) {
+    const out: Map<string, string> = new Map()
+    const pe = prev?.extra_params
+    for (const name of ex.keys()) {
+      let pv: string | undefined = undefined
+      if (pe !== undefined) pv = pe.get(name)
+      out.set(name, sec(ex.get(name), pv) ?? "")
+    }
+    ocExtra = out
+  }
+  let n = k
+  n.value = value
+  if (az !== undefined) {
+    let a = az
+    a.client_secret = azSecret
+    n.azure_key_config = a
+  }
+  if (vx !== undefined) {
+    // aws_workload_identity's role ARN is masked on reads, as Bifrost's Redacted masks it
+    const wi: VertexAwsWorkloadIdentity | undefined = vx.aws_workload_identity
+    let v = vx
+    v.auth_credentials = vxCreds
+    if (wi !== undefined) {
+      const arn = sec(wi.aws_role_arn, old?.vertex_key_config?.aws_workload_identity?.aws_role_arn)
+      let w = wi
+      w.aws_role_arn = arn
+      v.aws_workload_identity = w
+    }
+    n.vertex_key_config = v
+  }
+  if (bkNew !== undefined) n.bedrock_key_config = bkNew
+  if (bmNew !== undefined) n.bedrock_mantle_key_config = bmNew
+  if (wx !== undefined) {
+    let w = wx
+    w.api_key = wxKey
+    n.watsonx_key_config = w
+  }
+  if (db !== undefined) {
+    let d = db
+    d.client_secret = dbSecret
+    n.databricks_key_config = d
+  }
+  if (gc !== undefined) {
+    let g = gc
+    g.private_key = gcKey
+    n.github_copilot_key_config = g
+  }
+  if (oc !== undefined) {
+    let o = oc
+    o.client_secret = ocSecret
+    o.private_key = ocKey
+    if (ocExtra !== undefined) o.extra_params = ocExtra
+    n.oauth_key_config = o
+  }
+  return n
+}
+
+function bedrockSecrets(b: BedrockKeyConfig, old: BedrockKeyConfig | undefined, restore: bool): BedrockKeyConfig {
+  const sk = restore ? keepOpt(b.secret_key, old?.secret_key) : maskOpt(b.secret_key)
+  const st = restore ? keepOpt(b.session_token, old?.session_token) : maskOpt(b.session_token)
+  let n = b
+  n.secret_key = sk
+  n.session_token = st
+  return n
+}
+
+// The stored key a key sent back stands for: by id, else by name, else the key at the same position when that one
+// has neither an id nor a name to match by (a GET of a hand-written config, sent back with its keys in order).
+function oldKeyFor(k: KeyConfig, i: int, old: KeyConfig[]): KeyConfig | undefined {
+  const id = k.id ?? ""
+  if (id !== "") return findKey(old, id)
+  const name = k.name ?? ""
+  if (name !== "") {
+    const byName = findKey(old, name)
+    if (byName !== undefined) return byName
+  }
+  const at = old[i]
+  if (name === "" && at !== undefined && (at.id ?? "") === "" && (at.name ?? "") === "") return at
+  return undefined
+}
+
+// Gives every key an id, keeping the stored secrets of keys sent back masked. A key that matches a stored one keeps
+// that key's id (so a GET then PUT changes no id).
 function prepKeys(keys: KeyConfig[], old: KeyConfig[]): KeyConfig[] {
   const out: KeyConfig[] = []
-  for (const k of keys) {
-    const id = k.id === undefined || k.id === "" ? randomId("key-") : k.id
-    out.push(prepKey(k, id, findKey(old, id)))
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i]!
+    const prev = oldKeyFor(k, i, old)
+    const given = k.id ?? ""
+    const id = given !== "" ? given : (prev?.id ?? "") !== "" ? prev!.id! : randomId("key-")
+    out.push(prepKey(k, id, prev))
   }
   return out
 }
@@ -628,30 +744,12 @@ function customerUsers(c: Config, id: string): string {
   return ""
 }
 
-// Masked copies for reads.
+// Masked copies for reads: the whole key, every block with its secrets masked (keyWithSecrets).
 function redactKey(k: KeyConfig): KeyConfig {
-  const br = k.bedrock_key_config
-  const vx = k.vertex_key_config
-  return {
-    id: k.id,
-    name: k.name,
-    value: maskOpt(k.value),
-    models: k.models,
-    weight: k.weight,
-    aliases: k.aliases,
-    blacklisted_models: k.blacklisted_models,
-    azure_key_config: k.azure_key_config,
-    replicate_key_config: k.replicate_key_config,
-    vertex_key_config: vx === undefined ? undefined : { project_id: vx.project_id, region: vx.region, auth_credentials: maskOpt(vx.auth_credentials), project_number: vx.project_number, force_single_region: vx.force_single_region },
-    bedrock_key_config: br === undefined ? undefined : {
-      access_key: br.access_key,
-      secret_key: maskOpt(br.secret_key),
-      session_token: maskOpt(br.session_token),
-      region: br.region,
-      deployments: br.deployments,
-      project_id: br.project_id,
-    },
-  }
+  let out = keyWithSecrets(k, undefined, false)
+  // the effective id (a hand-written key without one is addressed by its name), so a GET then PUT finds the key
+  out.id = k.id ?? k.name
+  return out
 }
 
 // The whole provider with its secrets masked, so settings added later survive a GET then PUT.
@@ -748,7 +846,13 @@ function redactConfig(c: Config): Config {
     n.governance = g
   }
   // the SCIM provisioning token is masked too (an env. reference shows as written)
-  if (sc !== undefined && tok !== undefined) n.scim_config = { enabled: sc.enabled, config: { provisioningToken: maskSecret(tok) } }
+  if (sc !== undefined && tok !== undefined) {
+    let ms = sc
+    let mc = sc.config ?? {}
+    mc.provisioningToken = maskSecret(tok)
+    ms.config = mc
+    n.scim_config = ms
+  }
   return n
 }
 
@@ -1166,12 +1270,57 @@ export function openConfig(c: Config, cipher: ConfigCipher | undefined): { cfg: 
   return { cfg: cfg, errors: errs }
 }
 
+// The config generation. Every save puts the sha256 of the text written, and the node that wrote it, on the cluster
+// state under CONFIG_NS/CONFIG_KEY. The other workers of the node get it through the share folder within two share
+// ticks, the other nodes at their next cluster sync; each takes the text as its config (takeGeneration, adopt), so a
+// deleted virtual key stops working everywhere and not only in the process that saved.
+export const CONFIG_NS = "config"
+export const CONFIG_KEY = "file"
+
+export type ConfigGen = { sha: string, node: string }
+
+// sha256 of a config text, in hex: the generation's name.
+export function textSha(text: string): string {
+  return toHex(sha256(utf8(text)))
+}
+
+// The generation carried by a cluster state value, or undefined when it does not hold one.
+export function genOf(value: string): ConfigGen | undefined {
+  try {
+    const g = try JSON.parse(value) as ConfigGen
+    if (g.sha.byteLength !== 64 || g.node === "") return undefined
+    return g
+  } catch (e) {
+    return undefined
+  }
+}
+
+// What takeGeneration did: "same" (this process holds it), "reloaded" (the file held it, now the config), "differs"
+// (the file holds other text, another node's own file) or "error" (it could not be read or opened; message says why).
+export type GenOutcome = { status: "same" | "reloaded" | "differs" | "error", message: string }
+
+// A config text pulled from another node, with this node's own cluster section put back (node_id, peers and the secret
+// stay this node's). own is the cluster section as the local file writes it, or undefined when there is none.
+export function withOwnCluster(text: string, own: string | undefined): string throws SyntaxError {
+  let fs = without(try fields(text), ["cluster", "cluster_config"])
+  if (own !== undefined) setField(&fs, "cluster", own)
+  return build(fs)
+}
+
 export class ConfigStore {
   cfg: Config
   version: int = 0
+  // the generation this process holds: sha256 of the config text it last saved, read or adopted ("" before any)
+  fileSha: string = ""
+  // that generation's text as its writer saved it (what a peer pulling it is served, see Ops.clusterConfig)
+  genText: string = ""
   onChange: ((c: Config) => void) | undefined = undefined
+  // called after every save, once the generation is on the cluster state (Ops sends it out at once)
+  onSaved: (() => void) | undefined = undefined
   // encryption at rest: the saved file seals its secrets with this cipher (set at startup)
   cipher: ConfigCipher | undefined = undefined
+  // why the last change could not be saved ("" once one is): GET /ready reports it
+  saveError = ""
 
   // `initial` should be the config as written in the file (env.NAME references
   // unresolved), so save() writes the references and not their values.
@@ -1187,8 +1336,11 @@ export class ConfigStore {
     removeStaleTemps(path + ".bak", 600000.0)
     try {
       if (existsSync(path)) {
+        const text = readFileSync(path, "utf8")
+        this.fileSha = textSha(text)
+        this.genText = text
         const known = fields(JSON.stringify(initial)).map((f) => f.key)
-        this.extras = fields(readFileSync(path, "utf8")).filter((f) => !known.includes(f.key) && f.key !== "plugins")
+        this.extras = fields(text).filter((f) => !known.includes(f.key) && f.key !== "plugins")
       }
     } catch (e) {
       this.extras = []
@@ -1211,9 +1363,103 @@ export class ConfigStore {
     }
     if (existsSync(this.path)) {
       const old = try readFileSync(this.path, "utf8")
-      try writeFileAtomic(this.path + ".bak", old)
+      // the backup holds every secret the config held: private, whatever an older version left it as
+      try writeFileAtomic(this.path + ".bak", old, { mode: PRIVATE_FILE, exact: true })
     }
-    try writeFileAtomic(this.path, text + "\n")
+    const out = text + "\n"
+    try writeFileAtomic(this.path, out)
+    this.fileSha = textSha(out)
+    this.genText = out
+    // the other workers and nodes take this text as their config (takeGeneration)
+    const st = clusterState()
+    const gen: ConfigGen = { sha: this.fileSha, node: nodeOf(st.writerId()) }
+    st.put(CONFIG_NS, CONFIG_KEY, JSON.stringify(gen))
+    const f = this.onSaved
+    if (f !== undefined) f()
+  }
+
+  // A generation saved by another process. When this process holds it nothing happens; when the config file holds it
+  // (a sibling worker's save, or a file the nodes share) it becomes the config through adopt; otherwise the file holds
+  // other text and the caller decides (pull it from a peer, or leave this node's config as it is).
+  takeGeneration(sha: string): GenOutcome {
+    if (sha === this.fileSha) return { status: "same", message: "" }
+    let text = ""
+    try {
+      text = readFileSync(this.path, "utf8")
+    } catch (e) {
+      return { status: "error", message: e.message }
+    }
+    if (textSha(text) !== sha) return { status: "differs", message: "" }
+    const problem = this.adopt(text, sha, text)
+    if (problem !== "") return { status: "error", message: problem }
+    return { status: "reloaded", message: "" }
+  }
+
+  // Takes a config text another process saved as this process's config, without saving it: its sealed secrets are
+  // opened with this store's cipher, the sections Config does not model are kept, and onChange applies it. sha and
+  // writerText name the generation as its writer saved it. Returns "" or the problem (the config is then unchanged).
+  adopt(text: string, sha: string, writerText: string): string {
+    let next: Config = {}
+    try {
+      const opened = try openConfig(try rawConfigOf(text), this.cipher)
+      if (opened.errors.length > 0) return opened.errors.join("; ")
+      next = opened.cfg
+    } catch (e) {
+      return e.message
+    }
+    let extras: Field[] = []
+    try {
+      const known = fields(JSON.stringify(next)).map((f) => f.key)
+      extras = fields(text).filter((f) => !known.includes(f.key) && f.key !== "plugins")
+    } catch (e) {
+      extras = []
+    }
+    this.cfg = next
+    this.extras = extras
+    this.fileSha = sha
+    this.genText = writerText
+    this.version += 1
+    setGlobalProxy(next.proxy_config)
+    const f = this.onChange
+    if (f !== undefined) f(this.cfg)
+    return ""
+  }
+
+  // A generation pulled from a peer (cluster.config_sync "pull"): the writer's text, with this node's cluster section
+  // put back, is written to the config file and adopted. A file that cannot be written (a read-only mount) still
+  // leaves the config adopted in memory. Returns "" or the problem.
+  adoptPulled(pulled: string, sha: string): string {
+    if (textSha(pulled) !== sha) return "the text does not match the generation"
+    let merged = ""
+    try {
+      merged = try withOwnCluster(pulled, this.ownClusterRaw())
+    } catch (e) {
+      return e.message
+    }
+    let note = ""
+    try {
+      try writeFileAtomic(this.path, merged + "\n")
+    } catch (e) {
+      note = `adopted in memory only: the config file could not be written: ${e.message}`
+    }
+    const problem = this.adopt(merged + "\n", sha, pulled)
+    return problem !== "" ? problem : note
+  }
+
+  // This node's cluster section as its file writes it (secrets sealed when encryption at rest is on).
+  ownClusterRaw(): string | undefined {
+    try {
+      const raw = find(try fields(try readFileSync(this.path, "utf8")), "cluster")
+      if (raw !== undefined) return raw
+    } catch (e) {
+      // no file: the section comes from the config held
+    }
+    try {
+      const c = (try sealConfig(this.cfg, this.cipher)).cluster
+      return c === undefined ? undefined : JSON.stringify(c)
+    } catch (e) {
+      return undefined
+    }
   }
 
   // A save never writes back a retained admin credential older than the one the file holds: another worker or node
@@ -1257,8 +1503,10 @@ export class ConfigStore {
       this.save()
     } catch (e) {
       this.cfg = prev
+      this.saveError = e.message
       return fail(500, `could not save config: ${e.message}`)
     }
+    this.saveError = ""
     this.version += 1
     setGlobalProxy(next.proxy_config)
     // the dashboard hears of every saved change (notify.tov)
@@ -1338,6 +1586,26 @@ export class ConfigStore {
     return this.commit(withGov(this.cfg, g), "users")
   }
 
+  // Replaces the users, teams and business units a sign-in's claims changed, as one save (claimsync.tov).
+  setClaimSync(users: AdminUserConfig[], teams: TeamConfig[], bus: BusinessUnitConfig[]): Result {
+    let g: GovernanceConfig = this.cfg.governance ?? {}
+    g.users = users
+    g.teams = teams
+    g.business_units = bus
+    return this.commit(withGov(this.cfg, g), "claim-sync")
+  }
+
+  // Replaces the SCIM provisioning token (the identity provider's connector must be given the new one).
+  setScimToken(token: string): Result {
+    let sc = this.cfg.scim_config ?? {}
+    let c = sc.config ?? {}
+    c.provisioningToken = token
+    sc.config = c
+    let n: Config = this.cfg
+    n.scim_config = sc
+    return this.commit(n, "scim-token")
+  }
+
   // Replaces the users and teams a SCIM request changed, as one save (scim.tov).
   setScim(users: AdminUserConfig[], teams: TeamConfig[]): Result {
     let g: GovernanceConfig = this.cfg.governance ?? {}
@@ -1367,6 +1635,31 @@ export class ConfigStore {
     if (!found) return fail(404, `no user ${name}`)
     g.users = users
     return this.commit(withGov(this.cfg, g), "user-profiles")
+  }
+
+  // Sets or clears (undefined) a user's override on the budget of an access profile the user holds (Bifrost's PUT and
+  // DELETE /api/users/{user}/access-profiles/{profile}/budgets/{budget}/override). The budget must be the profile's.
+  setUserBudgetOverride(name: string, profileId: string, budgetId: string, o: BudgetOverride | undefined): Result {
+    const g: GovernanceConfig = this.cfg.governance ?? {}
+    const p = findById(g.access_profiles, profileId)
+    if (p === undefined) return fail(404, `no access profile ${profileId}`)
+    if (findById(g.budgets, budgetId) === undefined || p.budget_id !== budgetId) return fail(404, `budget ${budgetId} is not on access profile ${profileId}`)
+    if (!(g.users ?? []).some((u) => u.name === name)) return fail(404, `no user ${name}`)
+    if (!heldProfiles(g.users, g.roles, g.access_profiles, name).some((h) => h.id === profileId)) return fail(404, `user ${name} does not hold access profile ${profileId}`)
+    const users: AdminUserConfig[] = []
+    for (const u of g.users ?? []) {
+      if (u.name !== name) {
+        users.push(u)
+        continue
+      }
+      let nu = u
+      const kept: UserBudgetOverride[] = (u.budget_overrides ?? []).filter((x) => !(x.profile_id === profileId && x.budget_id === budgetId))
+      if (o !== undefined) kept.push({ profile_id: profileId, budget_id: budgetId, override: { amount: o.amount, mode: o.mode, cycles: o.cycles, started_at: o.mode === "cycles" ? rfc3339Of(Date.now()) : undefined } })
+      nu.budget_overrides = kept.length === 0 ? undefined : kept
+      users.push(nu)
+    }
+    g.users = users
+    return this.commit(withGov(this.cfg, g), "user-budget-override")
   }
 
   // Links or unlinks an access profile on a virtual key the user is assigned (users API).
@@ -1485,6 +1778,18 @@ export class ConfigStore {
     return ""
   }
 
+  // Why keys are refused for their oauth_key_config, as Bifrost's key routes check it on save (a jwt_bearer key needs
+  // its issuer and audience, and a private key that fits its signing_algorithm). "" when they fit.
+  private oauthFault(keys: KeyConfig[]): string {
+    for (const k of keys) {
+      const oc = k.oauth_key_config
+      if (oc === undefined) continue
+      const p = oauthKeyProblem(oc, true)
+      if (p !== "") return p
+    }
+    return ""
+  }
+
   private putProvider(name: string, np: ProviderConfig, id: string): Result {
     const ps = copyProviders(this.cfg)
     ps.set(name, np)
@@ -1499,8 +1804,12 @@ export class ConfigStore {
     const oldKeys = old?.keys ?? []
     const keys = p.keys === undefined ? oldKeys : prepKeys(p.keys, oldKeys)
     if (hasDupKeyIds(keys)) return fail(400, "duplicate key id")
+    if (keys.some((k) => maskedLeft(k))) return fail(400, MASKED_KEY)
+    if (looksMasked(p.proxy_config?.password) && (old?.proxy_config?.password === undefined || p.proxy_config?.password !== maskSecret(old?.proxy_config?.password ?? ""))) return fail(400, "proxy_config.password is masked but matches no stored password: send the real value")
     const af = this.aliasFault(name, p.custom_provider_config, p.keys ?? [])
     if (af !== "") return fail(400, af)
+    const of = p.keys === undefined ? "" : this.oauthFault(keys)
+    if (of !== "") return fail(400, of)
     const px = p.proxy_config
     const opx = old?.proxy_config
     return this.putProvider(name, {
@@ -1528,9 +1837,13 @@ export class ConfigStore {
     if (findKey(keys, id) !== undefined) return fail(409, `key ${id} already exists`)
     const af = this.aliasFault(provider, p.custom_provider_config, [k])
     if (af !== "") return fail(400, af)
+    const nk = prepKey(k, id, undefined)
+    const of = this.oauthFault([nk])
+    if (of !== "") return fail(400, of)
     const next: KeyConfig[] = []
     for (const x of keys) next.push(x)
-    next.push(prepKey(k, id, undefined))
+    if (maskedLeft(nk)) return fail(400, MASKED_KEY)
+    next.push(nk)
     return this.putProvider(provider, withKeys(p, next), id)
   }
 
@@ -1543,6 +1856,9 @@ export class ConfigStore {
     const af = this.aliasFault(provider, p.custom_provider_config, [k])
     if (af !== "") return fail(400, af)
     const nk = prepKey(k, old.id ?? keyId, old)
+    const of = this.oauthFault([nk])
+    if (of !== "") return fail(400, of)
+    if (maskedLeft(nk)) return fail(400, MASKED_KEY)
     const next: KeyConfig[] = []
     for (const x of keys) next.push(isKey(x, keyId) ? nk : x)
     return this.putProvider(provider, withKeys(p, next), keyId)
@@ -1569,6 +1885,7 @@ export class ConfigStore {
     const value = vk.value === undefined || vk.value === ""
       ? (old?.value ?? newVkValue())
       : keepSecret(vk.value, old?.value)
+    if (looksMasked(value)) return fail(400, "the virtual key value is masked but matches no stored key: send the real value, or leave it out to keep it")
     for (const other of g.virtual_keys ?? []) {
       if (other.value === value && other.id !== id) return fail(409, "another virtual key has this value")
     }
@@ -1892,8 +2209,27 @@ export class ConfigStore {
   // Saves a custom role. Built-in role names are refused; a role's users keep it when it changes, and so
   // does its id (a new role takes the next id; see rbac.tov withRoleIds).
   upsertRole(r: RoleConfig): Result {
-    const err = roleError(r)
+    const err = roleError(r, false)
     if (err !== "") return fail(400, err)
+    return this.saveRole(r)
+  }
+
+  // Saves a built-in role's edited description, dac and permissions (Bifrost lets a system role's permissions
+  // be changed); it is kept under governance.roles by its name and keeps its fixed id.
+  editSystemRole(r: RoleConfig): Result {
+    if (!isBuiltinRole(r.name)) return fail(404, `no system role ${r.name}`)
+    const err = roleError(r, true)
+    if (err !== "") return fail(400, err)
+    if (r.name === "admin") {
+      const ps = r.permissions ?? []
+      const view = ps.some((p) => p.resource === "RBAC" && p.operation === "View")
+      const update = ps.some((p) => p.resource === "RBAC" && p.operation === "Update")
+      if (!view || !update) return fail(400, "the admin role must keep RBAC View and Update, or no one could change roles again")
+    }
+    return this.saveRole(r)
+  }
+
+  private saveRole(r: RoleConfig): Result {
     const g = gov(this.cfg)
     const prior = customRole(g.roles, r.name)
     let keep: int | undefined = undefined
@@ -1916,6 +2252,7 @@ export class ConfigStore {
 
   // Removes a custom role, unless a user still holds it. Access profiles attached to it let go of it.
   deleteRole(name: string): Result {
+    if (isBuiltinRole(name)) return fail(403, "cannot delete system role")
     const g = gov(this.cfg)
     if (customRole(g.roles, name) === undefined) return fail(404, `no role ${name}`)
     for (const u of g.users ?? []) {
@@ -2728,10 +3065,10 @@ function businessUnitError(c: Config, b: BusinessUnitConfig): string {
 }
 
 // The error for a custom role, or "". Built-in names are reserved.
-function roleError(r: RoleConfig): string {
+function roleError(r: RoleConfig, system: bool): string {
   if (r.name === "") return "role name is required"
   if (isNumeric(r.name)) return "role name cannot be a number, which is how its id is written"
-  if (isBuiltinRole(r.name)) return `${r.name} is a built-in role and cannot be changed`
+  if (isBuiltinRole(r.name) && !system) return `${r.name} is a built-in role; change it by its id`
   const dac = r.dac ?? "all-data"
   if (!DACS.includes(dac)) return `dac must be one of ${DACS.join(", ")}`
   for (const p of r.permissions ?? []) {
@@ -3043,16 +3380,18 @@ function roleRoute(store: ConfigStore, m: string, segs: string[], body: string, 
   if (!scope.all && m !== "GET") return scopeDenied()
   const name = segs[2]
   if (name !== undefined && isNumeric(name)) return roleByIdRoute(store, m, parseInt(name) ?? 0, segs, body)
+  if (name !== undefined && isBuiltinRole(name)) return systemRoleRoute(store, m, name, segs, body, false)
   if (segs.length === 4 && name !== undefined) return rolePermissions(store, m, name, body)
   if (name === undefined) {
     if (m === "GET") {
       const parts: string[] = []
       if (system) {
         for (const r of builtinRoles(RESOURCES, OPERATIONS)) {
-          if (customRole(gov(store.cfg).roles, r.name) === undefined) parts.push(roleJsonAs(r, true))
+          const cur = systemRole(gov(store.cfg).roles, r.name, RESOURCES, OPERATIONS)
+          if (cur !== undefined) parts.push(roleJsonAs(cur, true))
         }
       }
-      for (const r of withRoleIds(gov(store.cfg).roles ?? [])) parts.push(roleJson(r))
+      for (const r of customRoles(gov(store.cfg).roles)) parts.push(roleJson(r))
       return reply(200, `{"roles":[${parts.join(",")}]}`)
     }
     if (m !== "POST") return notAllowed(m)
@@ -3098,7 +3437,7 @@ function roleView(store: ConfigStore, name: string): RoleConfig | undefined {
 // renamed, since its users and access profiles are kept by its id.
 function roleByIdRoute(store: ConfigStore, m: string, id: int, segs: string[], body: string): ApiReply {
   const sys = builtinRoleName(id)
-  if (sys !== undefined && customRole(gov(store.cfg).roles, sys) === undefined) return systemRoleRoute(m, sys, segs)
+  if (sys !== undefined) return systemRoleRoute(store, m, sys, segs, body, true)
   const name = roleNameById(gov(store.cfg).roles, id)
   if (name === undefined) return reply(404, errorBody(`no role ${id}`))
   if (segs.length === 4) return rolePermissions(store, m, name, body)
@@ -3135,26 +3474,41 @@ function roleByIdRoute(store: ConfigStore, m: string, id: int, segs: string[], b
   return notAllowed(m)
 }
 
-// A built-in role by its id: GET reads it (or its pairs, at .../permissions); it cannot be changed or deleted,
-// since its rules are fixed (Bifrost lets a system role's permissions be edited; Raiju's built-in rules are not
-// pair lists, so a custom role is the way to vary them).
-function systemRoleRoute(m: string, name: string, segs: string[]): ApiReply {
-  let role: RoleConfig | undefined = undefined
-  for (const r of builtinRoles(RESOURCES, OPERATIONS)) {
-    if (r.name === name) role = r
-  }
+// A built-in role (by its id, or by name on /api/roles/{name}): GET reads it as it stands (or its pairs, at
+// .../permissions). As in Bifrost it cannot be deleted (403) but can be edited: PUT changes its description, dac,
+// entity_dac and permissions (a field left out keeps its value; it cannot be renamed), and PUT .../permissions
+// {"permission_ids": [...]} replaces its pairs. An edited role is judged by its pairs, as a custom role is.
+function systemRoleRoute(store: ConfigStore, m: string, name: string, segs: string[], body: string, wrap: bool): ApiReply {
+  const role = systemRole(gov(store.cfg).roles, name, RESOURCES, OPERATIONS)
   if (role === undefined) return reply(404, errorBody(`no role ${name}`))
-  if (m === "GET") {
-    if (segs.length === 4) {
-      const ids = permissionIds(RESOURCES, OPERATIONS, role.permissions ?? [])
-      const docs = permissionDocs(RESOURCES, OPERATIONS).filter((d) => ids.includes(d.id))
-      return reply(200, JSON.stringify({ role: name, permissions: docs }))
-    }
-    return reply(200, `{"role":${roleJsonAs(role, true)}}`)
+  if (segs.length === 4) {
+    if (m === "GET") return permissionsReply(name, role.permissions ?? [])
+    if (m !== "PUT") return notAllowed(m)
+    const ps = permissionIdsOf(body)
+    if (ps.error !== "") return reply(400, errorBody(ps.error))
+    const r = store.editSystemRole({ name: name, description: role.description, dac: role.dac, permissions: ps.pairs, entity_dac: role.entity_dac })
+    if (r.kind === "error") return errReply(r)
+    return systemRoleRoute(store, "GET", name, segs, "", wrap)
   }
+  if (m === "GET") return reply(200, wrap ? `{"role":${roleJsonAs(role, true)}}` : roleJsonAs(role, true))
   if (m === "DELETE") return reply(403, errorBody("cannot delete system role"))
-  if (m === "PUT") return reply(403, errorBody(`cannot change system role ${name}: its rules are fixed; create a custom role instead`))
-  return notAllowed(m)
+  if (m !== "PUT") return notAllowed(m)
+  const b = parseRoleBody(body)
+  if (b === undefined) return badBody()
+  if (b.name !== undefined && b.name !== name) return reply(400, errorBody("a system role cannot be renamed"))
+  const ed = entityDacFrom(body)
+  if (ed.error !== "") return reply(400, errorBody(ed.error))
+  let present = false
+  try {
+    present = find(fields(body), "entity_dac") !== undefined
+  } catch (e) {
+    present = false
+  }
+  let description: string | undefined = role.description
+  if (b.description !== undefined) description = b.description === "" ? undefined : b.description
+  const r = store.editSystemRole({ name: name, description: description, dac: b.dac ?? role.dac, permissions: b.permissions ?? role.permissions, entity_dac: present ? ed.list : role.entity_dac })
+  if (r.kind === "error") return errReply(r)
+  return systemRoleRoute(store, "GET", name, segs, "", wrap)
 }
 
 // Whether a path segment is a number (a role id): digits only, at least one.
@@ -3173,33 +3527,43 @@ function isNumeric(s: string): bool {
 function rolePermissions(store: ConfigStore, m: string, name: string, body: string): ApiReply {
   const cur = customRole(gov(store.cfg).roles, name)
   if (cur === undefined) return reply(404, errorBody(`no role ${name}`))
-  if (m === "GET") {
-    const ids = permissionIds(RESOURCES, OPERATIONS, cur.permissions ?? [])
-    const docs = permissionDocs(RESOURCES, OPERATIONS).filter((d) => ids.includes(d.id))
-    return reply(200, JSON.stringify({ role: name, permissions: docs }))
-  }
+  if (m === "GET") return permissionsReply(name, cur.permissions ?? [])
   if (m !== "PUT") return notAllowed(m)
+  const ps = permissionIdsOf(body)
+  if (ps.error !== "") return reply(400, errorBody(ps.error))
+  const r = store.upsertRole({ name: name, description: cur.description, dac: cur.dac, permissions: ps.pairs, entity_dac: cur.entity_dac })
+  if (r.kind === "error") return errReply(r)
+  return rolePermissions(store, "GET", name, "")
+}
+
+// A role's pairs with their ids, as GET .../permissions answers.
+function permissionsReply(name: string, pairs: PermissionPair[]): ApiReply {
+  const ids = permissionIds(RESOURCES, OPERATIONS, pairs)
+  const docs = permissionDocs(RESOURCES, OPERATIONS).filter((d) => ids.includes(d.id))
+  return reply(200, JSON.stringify({ role: name, permissions: docs }))
+}
+
+// The pairs a {"permission_ids": [...]} body names, or the 400 message.
+function permissionIdsOf(body: string): { pairs: PermissionPair[], error: string } {
+  const pairs: PermissionPair[] = []
   let fs: Field[] = []
   try {
     fs = fields(body)
   } catch (e) {
-    return badBody()
+    return { pairs: pairs, error: "body must be a JSON object matching the resource" }
   }
   const raw = find(fs, "permission_ids") ?? ""
-  const pairs: PermissionPair[] = []
   try {
     for (const el of elements(raw)) {
       const id = parseFloat(el)
       const pair = id === undefined ? undefined : pairOfId(RESOURCES, OPERATIONS, Math.floor(id))
-      if (pair === undefined) return reply(400, errorBody(`unknown permission id ${el}`))
+      if (pair === undefined) return { pairs: pairs, error: `unknown permission id ${el}` }
       pairs.push(pair)
     }
   } catch (e) {
-    return reply(400, errorBody("permission_ids must be a list of permission ids"))
+    return { pairs: pairs, error: "permission_ids must be a list of permission ids" }
   }
-  const r = store.upsertRole({ name: name, description: cur.description, dac: cur.dac, permissions: pairs })
-  if (r.kind === "error") return errReply(r)
-  return rolePermissions(store, "GET", name, "")
+  return { pairs: pairs, error: "" }
 }
 
 function roleFrom(name: string, b: RoleBody, entity: EntityDac[]): RoleConfig {
@@ -3257,10 +3621,54 @@ function roleJsonAs(r: RoleConfig, system: bool): string {
   return "{" + parts.join(",") + "}"
 }
 
+// Bifrost's ValidateExternalURL on a provider's base_url (handlers/providers.go): http or https, loopback always
+// allowed, link-local, unspecified and metadata addresses never, other private addresses only with
+// network_config.allow_private_network. Judged on the host as written (netguard.tov, every spelling of an address);
+// providerBaseUrlProblem also resolves a host name. "" when the URL is fine or absent.
+function baseUrlVerdict(v: Verdict): string {
+  if (v.kind === "blocked") return `Invalid base URL: link-local, unspecified and metadata addresses are not allowed (${v.detail})`
+  if (v.kind === "private") return `Invalid base URL: private IP addresses are not allowed (${v.detail}); set network_config.allow_private_network to allow them`
+  if (v.kind === "dns") return `Invalid base URL: failed to resolve hostname: ${v.detail}`
+  return ""
+}
+
+function baseUrlShape(nc: NetworkConfig | undefined): { url: string, policy: Policy, error: string } {
+  const policy: Policy = { private: nc?.allow_private_network === true, loopback: true, allow: [] }
+  const url = (nc?.base_url ?? "").trim()
+  if (url === "") return { url: "", policy: policy, error: "" }
+  const u = URL.parse(url)
+  if (u === undefined) return { url: url, policy: policy, error: "Invalid base URL: invalid URL format" }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return { url: url, policy: policy, error: `Invalid base URL: only https and http schemes are allowed, got: ${u.protocol.replace(":", "")}` }
+  if (u.hostname === "") return { url: url, policy: policy, error: "Invalid base URL: URL must have a hostname" }
+  return { url: url, policy: policy, error: "" }
+}
+
+export function baseUrlProblem(nc: NetworkConfig | undefined): string {
+  const s = baseUrlShape(nc)
+  if (s.error !== "" || s.url === "") return s.error
+  const v = hostVerdict(URL.parse(s.url)!.hostname, s.policy)
+  return v.kind === "name" ? "" : baseUrlVerdict(v)
+}
+
+// The base_url check for POST /api/providers and PUT /api/providers/{p} at save time, with the host resolved and every
+// address checked (the request is then answered by handleApi, which checks the literal again).
+export async function providerBaseUrlProblem(method: string, path: string, body: string): Promise<string> {
+  const create = method === "POST" && path === "/api/providers"
+  const update = method === "PUT" && path.startsWith("/api/providers/") && !path.slice("/api/providers/".byteLength).includes("/")
+  if (!create && !update) return ""
+  const p = parseProvider(body)
+  if (p === undefined) return ""
+  const s = baseUrlShape(p.network_config)
+  if (s.error !== "" || s.url === "") return s.error
+  return baseUrlVerdict(await urlVerdict(s.url, s.policy))
+}
+
 // Saves a provider under name from a provider body (PUT upserts, POST creates) and reads it back masked.
 function saveProvider(store: ConfigStore, name: string, body: string): ApiReply {
   const p = parseProvider(body)
   if (p === undefined) return badBody()
+  const bu = baseUrlProblem(p.network_config)
+  if (bu !== "") return reply(400, errorBody(bu))
   const r = store.upsertProvider(name, p)
   if (r.kind === "error") return errReply(r)
   const saved = providerOf(store.cfg, name)
@@ -3406,8 +3814,9 @@ function digitsOnly(s: string): bool {
 }
 
 // The framework_config section (Bifrost's TableFrameworkConfig): pricing_url and pricing_sync_interval
-// become pricing_sync. An empty pricing_url resets to the default; model_parameters_url is read and
-// not used (Raiju serves its parameters from the embedded table or the pricing datasheet).
+// become pricing_sync. An empty pricing_url resets to the default; model_parameters_url (empty resets to the
+// default) and live_models_sync_interval (0 off, else at least 60 seconds) are kept as Bifrost's handler keeps them.
+// The section's other settings (the MCP library sync) are kept.
 type FrameworkPlan = { kind: "ok", ps: PricingSyncConfig | undefined } | { kind: "error", message: string }
 
 function frameworkPlan(raw: string, cur: PricingSyncConfig | undefined): FrameworkPlan {
@@ -3429,8 +3838,26 @@ function frameworkPlan(raw: string, cur: PricingSyncConfig | undefined): Framewo
     if (iv <= 0.0) return { kind: "error", message: "pricing_sync_interval must be positive" }
     interval = Math.floor(iv)
   }
-  if (url === undefined && interval === undefined && cur?.enabled === undefined) return { kind: "ok", ps: undefined }
-  return { kind: "ok", ps: { url: url, interval_seconds: interval, enabled: cur?.enabled } }
+  let mpu: string | undefined = cur?.model_parameters_url
+  const gm = rawStr(fs, "model_parameters_url")
+  if (find(fs, "model_parameters_url") !== undefined && gm === undefined && !isNull(find(fs, "model_parameters_url")!)) return { kind: "error", message: "model_parameters_url must be a string" }
+  if (gm !== undefined) mpu = gm.trim() === "" ? undefined : gm.trim()
+  if (mpu !== undefined && !mpu.startsWith("https://") && !mpu.startsWith("http://") && !mpu.startsWith("file://")) return { kind: "error", message: "model_parameters_url must be an http, https or file URL" }
+  let live: int | undefined = cur?.live_models_sync_interval
+  const lv = rawNum(fs, "live_models_sync_interval")
+  if (find(fs, "live_models_sync_interval") !== undefined && lv === undefined && !isNull(find(fs, "live_models_sync_interval")!)) return { kind: "error", message: "live_models_sync_interval must be a number of seconds" }
+  if (lv !== undefined) {
+    if (lv < 0.0) return { kind: "error", message: "live models sync interval cannot be negative" }
+    if (lv > 0.0 && lv < 60.0) return { kind: "error", message: "live models sync interval must be 0 (disabled) or at least 60 seconds" }
+    live = Math.floor(lv)
+  }
+  if (url === undefined && interval === undefined && cur?.enabled === undefined && mpu === undefined && live === undefined && cur?.mcp_library_url === undefined && cur?.mcp_library_sync_interval === undefined) return { kind: "ok", ps: undefined }
+  let ps: PricingSyncConfig = cur ?? {}
+  ps.url = url
+  ps.interval_seconds = interval
+  ps.model_parameters_url = mpu
+  ps.live_models_sync_interval = live
+  return { kind: "ok", ps: ps }
 }
 
 // The auth_config section (Bifrost's auth config, as PUT /api/config takes it): admin_username and
@@ -3532,7 +3959,7 @@ function putConfig(store: ConfigStore, body: string): ApiReply {
     status: "success",
     message: "config updated successfully",
     client: store.cfg.client ?? {},
-    framework_config: { pricing_url: pf?.url ?? "", pricing_sync_interval: pf?.interval_seconds ?? 0 },
+    framework_config: { pricing_url: pf?.url ?? "", pricing_sync_interval: pf?.interval_seconds ?? 0, model_parameters_url: pf?.model_parameters_url ?? "", live_models_sync_interval: pf?.live_models_sync_interval ?? 3600 },
     auth_config: { admin_username: au?.username ?? "", is_enabled: au?.username !== undefined, disable_auth_on_inference: store.cfg.client?.enforce_auth_on_inference === false },
   })
   return reply(200, view)
@@ -3796,6 +4223,21 @@ export function handleApi(store: ConfigStore, method: string, path: string, body
     if (m === "PUT") return putConfig(store, body)
     return m === "GET" ? reply(200, store.redacted()) : notAllowed(m)
   }
+  // POST /api/scim/provisioning-token: a new SCIM provisioning token, shown once; the old one stops working
+  if (area === "scim") {
+    if (segs.length !== 3 || segs[2] !== "provisioning-token") return notFound(p)
+    if (m !== "POST") return notAllowed(m)
+    if (store.cfg.scim_config?.enabled !== true) return reply(400, errorBody("SCIM is not enabled (scim_config.enabled)"))
+    let tok = ""
+    try {
+      tok = "scim-" + secureHex(32)
+    } catch (e) {
+      return reply(500, errorBody("no random source for the token"))
+    }
+    const r = store.setScimToken(tok)
+    if (r.kind === "error") return errReply(r)
+    return reply(200, JSON.stringify({ token: tok, message: "Give this token to your identity provider's SCIM connector now; it is not shown again." }))
+  }
   if (area === "version") {
     if (segs.length !== 2) return notFound(p)
     return m === "GET" ? reply(200, JSON.stringify(RAIJU_VERSION)) : notAllowed(m)
@@ -3905,6 +4347,19 @@ test("PUT /api/config: framework_config and auth_config are checked, then saved,
     expect(store.cfg.pricing_sync?.interval_seconds).toBe(7200)
     expect(handleApi(store, "PUT", "/api/config", `{"framework_config":{"pricing_url":""}}`).status).toBe(200)
     expect(store.cfg.pricing_sync?.url).toBeUndefined()
+    // model_parameters_url and live_models_sync_interval (0 off, else at least 60 s), as Bifrost's handler checks them
+    const low = handleApi(store, "PUT", "/api/config", `{"framework_config":{"live_models_sync_interval":30}}`)
+    expect(low.status).toBe(400)
+    expect(low.body.includes("live models sync interval must be 0 (disabled) or at least 60 seconds")).toBe(true)
+    expect(handleApi(store, "PUT", "/api/config", `{"framework_config":{"model_parameters_url":"ftp://x"}}`).status).toBe(400)
+    const lm = handleApi(store, "PUT", "/api/config", `{"framework_config":{"model_parameters_url":"https://params.example/mp.json","live_models_sync_interval":0}}`)
+    expect(lm.status).toBe(200)
+    expect(lm.body.includes(`"live_models_sync_interval":0`)).toBe(true)
+    expect(store.cfg.pricing_sync?.model_parameters_url).toBe("https://params.example/mp.json")
+    expect(store.cfg.pricing_sync?.live_models_sync_interval).toBe(0)
+    expect(store.cfg.pricing_sync?.interval_seconds).toBe(7200)
+    expect(handleApi(store, "PUT", "/api/config", `{"framework_config":{"model_parameters_url":""}}`).status).toBe(200)
+    expect(store.cfg.pricing_sync?.model_parameters_url).toBeUndefined()
 
     // a redacted password keeps the stored one; disable_auth_on_inference sets client.enforce_auth_on_inference
     expect(handleApi(store, "PUT", "/api/config", `{"auth_config":{"admin_username":"root","admin_password":"<redacted>","disable_auth_on_inference":true}}`).status).toBe(200)
@@ -4142,6 +4597,54 @@ test("a masked key value sent back keeps the stored secret", () => {
   cleanup(path)
 })
 
+test("a GET then PUT of a provider whose keys have no id keeps every stored secret", () => {
+  const path = tmpPath()
+  const ps: Map<string, ProviderConfig> = new Map()
+  // a hand-written (Bifrost-style) config: keys with a name and no id, and one with neither
+  ps.set("openai", { keys: [{ name: "openai-1", value: "sk-REAL-openai-0001-3456", models: [], weight: 1.0 }, { name: "openai-2", value: "sk-REAL-openai-0002-7890", weight: 1.0 }] })
+  ps.set("anon", { keys: [{ value: "sk-REAL-anon-key-0003-1111" }] })
+  const s = new ConfigStore(path, { providers: ps })
+  for (const name of ["openai", "anon"]) {
+    const got = handleApi(s, "GET", "/api/providers/" + name, "")
+    expect(got.status).toBe(200)
+    expect(got.body.includes("sk-REAL")).toBe(false)
+    // the client sends the masked provider back with one setting changed
+    const put = handleApi(s, "PUT", "/api/providers/" + name, got.body.replace(`"keys"`, `"send_back_raw_response":true,"keys"`))
+    expect(put.status).toBe(200)
+  }
+  const ok = providerOf(s.cfg, "openai")!.keys!
+  expect(ok.length).toBe(2)
+  expect(ok[0]!.value).toBe("sk-REAL-openai-0001-3456")
+  expect(ok[1]!.value).toBe("sk-REAL-openai-0002-7890")
+  // the id the GET showed is the one kept
+  expect(ok[0]!.id).toBe("openai-1")
+  expect(providerOf(s.cfg, "anon")!.keys![0]!.value).toBe("sk-REAL-anon-key-0003-1111")
+  expect((try readFileSync(path, "utf8")).includes("…")).toBe(false)
+  // a masked value that matches no stored key is refused, not saved as the key
+  const bad = s.upsertProvider("openai", { keys: [{ name: "new-key", value: "sk-R…3456" }] })
+  expect(statusOf(bad)).toBe(400)
+  expect(statusOf(s.upsertProvider("openai", { keys: [{ id: "openai-1", value: "sk-X…9999" }] }))).toBe(400)
+  expect(statusOf(s.addKey("openai", { name: "short", value: "****" }))).toBe(400)
+  expect(statusOf(s.updateKey("openai", "openai-2", { value: "sk-R…0000" }))).toBe(400)
+  expect(statusOf(s.upsertVirtualKey({ id: "vk-m", name: "m", value: "sk-b…abcd" }))).toBe(400)
+  expect(providerOf(s.cfg, "openai")!.keys![0]!.value).toBe("sk-REAL-openai-0001-3456")
+  cleanup(path)
+})
+
+test("the config file and its backup are written private (0600)", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  expect(statusOf(s.upsertProvider("openai", { keys: [{ id: "k", value: "sk-REAL-private-0001" }] }))).toBe(200)
+  expect((try statSync(path)).mode & 511).toBe(384)
+  // a backup an older version wrote world-readable is made private on the next save
+  try writeFileSync(path + ".bak", "{}")
+  try chmodSync(path + ".bak", 420)
+  expect(statusOf(s.upsertProvider("anthropic", { keys: [{ id: "a", value: "sk-REAL-private-0002" }] }))).toBe(200)
+  expect((try statSync(path + ".bak")).mode & 511).toBe(384)
+  expect((try statSync(path)).mode & 511).toBe(384)
+  cleanup(path)
+})
+
 test("virtual keys: generated id and value format, masked update, refs and duplicates", () => {
   const path = tmpPath()
   const s = new ConfigStore(path, {})
@@ -4362,6 +4865,11 @@ test("handleApi routes, methods and status codes", () => {
   expect(wrong.body.includes(`Invalid aliases: alias \\"east\\": azure sub-config is only valid on Azure keys`)).toBe(true)
   expect(handleApi(s, "PUT", "/api/providers/openai", `{"keys":[{"value":"sk-abcdefghijkl","aliases":{"d":{"model_id":"x","use_deployments_endpoint":true}}}]}`).status).toBe(400)
   expect(handleApi(s, "POST", "/api/providers/nope/keys", "{\"value\":\"x\"}").status).toBe(404)
+  // a jwt_bearer key with no audience is refused on save, as Bifrost's key routes refuse it
+  const noAud = handleApi(s, "POST", "/api/providers/openai/keys", `{"value":"","oauth_key_config":{"grant_type":"jwt_bearer","token_url":"https://auth.example.test/token","private_key":"env.SIGNING_KEY","issuer":"svc"}}`)
+  expect(noAud.status).toBe(400)
+  expect(noAud.body.includes("oauth_key_config.audience is required for the jwt_bearer grant")).toBe(true)
+  expect(handleApi(s, "POST", "/api/providers/openai/keys", `{"value":"","oauth_key_config":{"grant_type":"jwt_bearer","token_url":"https://auth.example.test/token","private_key":"env.SIGNING_KEY","issuer":"svc","audience":"aud","signing_algorithm":"PS384"}}`).status).toBe(201)
   expect(handleApi(s, "DELETE", "/api/providers/openai/keys/nope", "").status).toBe(404)
   expect(handleApi(s, "POST", "/api/providers/openai/keys/x", "{}").status).toBe(405)
 
@@ -4615,7 +5123,8 @@ test("per-user MCP header values are sealed at rest", () => {
   const cipher = cipherFor("a passphrase of sixteen bytes")
   const hs: Map<string, string> = new Map()
   hs.set("x-tenant-key", "tenant-a-key-example")
-  const c: Config = { mcp: { user_credentials: [{ id: "uc1", mcp_client_name: "m", virtual_key_id: "vk1", headers: hs, updated_at: 1.0 }] } }
+  const uc: McpUserCredential = { id: "uc1", mcp_client_name: "m", virtual_key_id: "vk1", headers: hs, updated_at: 1.0 }
+  const c: Config = { mcp: { user_credentials: [uc] } }
   const text = JSON.stringify(try sealConfig(c, cipher))
   expect(text.includes("tenant-a-key-example")).toBe(false)
   expect(text.includes("enc:v1:")).toBe(true)
@@ -4731,7 +5240,7 @@ test("custom roles: built-in names are reserved, dac and permissions are checked
   expect(made.body.includes(`"dac":"team-data"`)).toBe(true)
   expect(handleApi(s, "GET", "/api/roles", "").body.includes(`"roles":[{"id":1,"name":"ops"`)).toBe(true)
   expect(handleApi(s, "GET", "/api/roles/ops", "").status).toBe(200)
-  expect(handleApi(s, "GET", "/api/roles/admin", "").status).toBe(404)
+  expect(handleApi(s, "GET", "/api/roles/admin", "").body.includes(`"id":9001,"name":"admin"`)).toBe(true)
   expect(handleApi(s, "PUT", "/api/roles/ops", `{"dac":"all-data","permissions":[{"resource":"Teams","operation":"Update"}]}`).status).toBe(200)
   expect(handleApi(s, "GET", "/api/roles/ops", "").body.includes(`"operation":"Update"`)).toBe(true)
   expect(handleApi(s, "DELETE", "/api/roles/ops", "").status).toBe(200)
@@ -5007,7 +5516,7 @@ test("roles: entity_dac is read as Bifrost's object and shown the same way", () 
   cleanup(path)
 })
 
-test("built-in roles: listed first on Bifrost's path with fixed ids, readable by id, and fixed", () => {
+test("built-in roles: listed first on Bifrost's path with fixed ids, readable by id, editable, not deletable", () => {
   const path = tmpPath()
   const s = new ConfigStore(path, { governance: { access_profiles: [{ id: "p-view" }] } })
   expect(handleApi(s, "POST", "/api/roles", `{"name":"ops"}`).status).toBe(201)
@@ -5026,8 +5535,26 @@ test("built-in roles: listed first on Bifrost's path with fixed ids, readable by
   expect(perms.includes(`"role":"auditor"`)).toBe(true)
   expect(perms.includes(`"resource":"AuditLogs","operation":"View"`)).toBe(true)
   expect(handleApi(s, "DELETE", "/api/governance/rbac/roles/9001", "").status).toBe(403)
-  expect(handleApi(s, "PUT", "/api/governance/rbac/roles/9002", `{"description":"x"}`).status).toBe(403)
-  expect(handleApi(s, "PUT", "/api/governance/rbac/roles/9002/permissions", `{"permission_ids":[1]}`).status).toBe(403)
+  // as in Bifrost a system role's permissions and description are edited; it keeps its id and its place
+  const ed = handleApi(s, "PUT", "/api/governance/rbac/roles/9002", `{"description":"x","dac":"team-data"}`)
+  expect(ed.status).toBe(200)
+  expect(ed.body.startsWith(`{"role":{"id":9002,"name":"editor","description":"x","is_system_role":true,"dac":"team-data"`)).toBe(true)
+  expect(ed.body.includes(`{"resource":"VirtualKeys","operation":"Create"}`)).toBe(true)
+  expect(handleApi(s, "PUT", "/api/governance/rbac/roles/9002", `{"name":"boss"}`).status).toBe(400)
+  const pp = handleApi(s, "PUT", "/api/governance/rbac/roles/9002/permissions", `{"permission_ids":[1]}`)
+  expect(pp.status).toBe(200)
+  expect(pp.body).toBe(`{"role":"editor","permissions":[{"id":1,"resource":"Logs","operation":"View"}]}`)
+  expect(handleApi(s, "PUT", "/api/governance/rbac/roles/9002/permissions", `{"permission_ids":[99999]}`).status).toBe(400)
+  const after = handleApi(s, "GET", "/api/governance/rbac/roles", "").body
+  expect(after.startsWith(`{"roles":[{"id":9001,"name":"admin"`)).toBe(true)
+  expect(after.includes(`{"id":9002,"name":"editor","description":"x","is_system_role":true,"dac":"team-data","permissions":[{"resource":"Logs","operation":"View"}]`)).toBe(true)
+  expect(handleApi(s, "GET", "/api/roles", "").body.includes("editor")).toBe(false)
+  expect(handleApi(s, "GET", "/api/roles/editor", "").body.includes(`"description":"x"`)).toBe(true)
+  expect(handleApi(s, "DELETE", "/api/governance/rbac/roles/9002", "").status).toBe(403)
+  expect(handleApi(s, "DELETE", "/api/roles/editor", "").status).toBe(403)
+  // a custom role cannot take a built-in name; the admin keeps the right to change roles
+  expect(handleApi(s, "POST", "/api/roles", `{"name":"viewer"}`).status).toBe(400)
+  expect(handleApi(s, "PUT", "/api/governance/rbac/roles/9001/permissions", `{"permission_ids":[1]}`).status).toBe(400)
   // a profile attaches to a built-in role by its id
   expect(s.attachProfileRoles("p-view", [9003], undefined, true).kind).toBe("ok")
   expect(s.attachProfileRoles("p-view", [9100], undefined, true).kind).toBe("error")
@@ -5061,4 +5588,154 @@ test("complexity status routes: disabled, warming before the first classified re
   expect(handleApi(s, "POST", "/api/routing/complexity-analyzer-status/retry", "").status).toBe(409)
   expect(handleApi(s, "DELETE", "/api/routing/complexity-analyzer-generations/BifrostComplexityRouter_00", "").status).toBe(200)
   cleanup(path)
+})
+
+test("a user's budget override on a profile they hold is kept on the user, and refused for any other budget", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, { governance: {
+    users: [{ name: "ana", role: "viewer", access_profile_ids: ["p"] }, { name: "bo", role: "viewer" }],
+    access_profiles: [{ id: "p", budget_id: "b-p" }, { id: "q" }],
+    budgets: [{ id: "b-p", max_limit: 10.0, reset_duration: "1d" }, { id: "b-x", max_limit: 1.0, reset_duration: "1d" }],
+  } })
+  expect(s.setUserBudgetOverride("ana", "p", "b-p", { amount: 5.0, mode: "cycles", cycles: 2 }).kind).toBe("ok")
+  const ana = (s.cfg.governance?.users ?? [])[0]!
+  const o = (ana.budget_overrides ?? [])[0]!
+  expect(o.override.amount).toBe(5.0)
+  expect(o.override.started_at !== undefined).toBe(true)
+  // a second save replaces it; a clear removes it
+  expect(s.setUserBudgetOverride("ana", "p", "b-p", { amount: 7.0, mode: "forever" }).kind).toBe("ok")
+  expect(((s.cfg.governance?.users ?? [])[0]!.budget_overrides ?? []).length).toBe(1)
+  expect(s.setUserBudgetOverride("ana", "p", "b-x", { amount: 1.0, mode: "forever" }).kind).toBe("error")
+  expect(s.setUserBudgetOverride("bo", "p", "b-p", { amount: 1.0, mode: "forever" }).kind).toBe("error")
+  expect(s.setUserBudgetOverride("zed", "p", "b-p", { amount: 1.0, mode: "forever" }).kind).toBe("error")
+  expect(s.setUserBudgetOverride("ana", "p", "b-p", undefined).kind).toBe("ok")
+  expect((s.cfg.governance?.users ?? [])[0]!.budget_overrides).toBeUndefined()
+  cleanup(path)
+})
+
+test("a save puts its generation on the cluster state, and a sibling store takes it from the shared file", () => {
+  const path = tmpPath()
+  try writeFileSync(path, `{"governance":{"virtual_keys":[{"id":"vk-1","value":"sk-bf-1"},{"id":"vk-2","value":"sk-bf-2"}]},"guardrails_config":{"x":1}}`)
+  const first = try loadRawConfig(path)
+  const a = new ConfigStore(path, first)
+  const b = new ConfigStore(path, first)
+  expect(a.fileSha).toBe(b.fileSha)
+  let saved = 0
+  a.onSaved = () => {
+    saved += 1
+  }
+  let applied: string[] = []
+  b.onChange = (c) => {
+    applied.push((c.governance?.virtual_keys ?? []).map((v) => v.id).join(","))
+  }
+  expect(handleApi(a, "DELETE", "/api/governance/virtual-keys/vk-1", "").status).toBe(200)
+  expect(saved).toBe(1)
+  const g = genOf(clusterState().get(CONFIG_NS, CONFIG_KEY) ?? "")
+  expect(g !== undefined && g.sha === a.fileSha).toBe(true)
+  expect(a.fileSha).toBe(textSha(try readFileSync(path, "utf8")))
+  const r = b.takeGeneration(a.fileSha)
+  expect(r.status).toBe("reloaded")
+  expect(applied).toEqual(["vk-2"])
+  expect((b.cfg.governance?.virtual_keys ?? []).length).toBe(1)
+  expect(b.version).toBe(1)
+  // the section Config does not model stays with the adopted config
+  expect(b.rawSection("guardrails_config")).toBe(`{"x":1}`)
+  // the same generation again changes nothing
+  expect(b.takeGeneration(a.fileSha).status).toBe("same")
+  expect(applied.length).toBe(1)
+  // a generation the file does not hold (another node's own file) is left to the caller
+  expect(b.takeGeneration("0".repeat(64)).status).toBe("differs")
+  // a broken file is an error, and the config held stays
+  try writeFileSync(path, "{broken")
+  expect(b.takeGeneration(textSha("{broken")).status).toBe("error")
+  expect((b.cfg.governance?.virtual_keys ?? []).length).toBe(1)
+  cleanup(path)
+})
+
+test("a pulled generation keeps this node's cluster section, is written to the file and is served as its writer saved it", () => {
+  const path = tmpPath()
+  try writeFileSync(path, `{"cluster":{"enabled":true,"node_id":"b","peers":["http://a"],"secret":"s"},"governance":{"virtual_keys":[{"id":"vk-1","value":"sk-bf-1"}]}}`)
+  const b = new ConfigStore(path, try loadRawConfig(path))
+  let applied = 0
+  b.onChange = (c) => {
+    applied += 1
+  }
+  const theirs = `{"cluster":{"enabled":true,"node_id":"a","peers":["http://b"],"secret":"s"},"governance":{"virtual_keys":[{"id":"vk-9","value":"sk-bf-9"}]}}` + "\n"
+  const sha = textSha(theirs)
+  expect(b.adoptPulled(theirs, "f".repeat(64)) !== "").toBe(true)
+  expect(applied).toBe(0)
+  expect(b.adoptPulled(theirs, sha)).toBe("")
+  expect(applied).toBe(1)
+  expect(b.fileSha).toBe(sha)
+  expect(b.genText).toBe(theirs)
+  expect(b.cfg.cluster?.node_id ?? "").toBe("b")
+  expect((b.cfg.governance?.virtual_keys ?? [])[0]?.id ?? "").toBe("vk-9")
+  const written = try loadRawConfig(path)
+  expect(written.cluster?.node_id ?? "").toBe("b")
+  expect(written.cluster?.peers ?? []).toEqual(["http://a"])
+  expect((written.governance?.virtual_keys ?? [])[0]?.id ?? "").toBe("vk-9")
+  // the generation is held now, whatever the local file's own hash
+  expect(b.takeGeneration(sha).status).toBe("same")
+  cleanup(path)
+})
+
+test("withOwnCluster swaps the cluster section (Bifrost's cluster_config too) and genOf refuses what is not a generation", () => {
+  const t = try withOwnCluster(`{"a":1,"cluster_config":{"x":1},"cluster":{"node_id":"a"}}`, `{"node_id":"b"}`)
+  expect(t).toBe(`{"a":1,"cluster":{"node_id":"b"}}`)
+  expect(try withOwnCluster(`{"a":1,"cluster":{"node_id":"a"}}`, undefined)).toBe(`{"a":1}`)
+  expect(genOf("not json") === undefined).toBe(true)
+  expect(genOf(`{"sha":"abc","node":"n"}`) === undefined).toBe(true)
+  expect(genOf(JSON.stringify({ sha: "a".repeat(64), node: "" })) === undefined).toBe(true)
+  expect(genOf(JSON.stringify({ sha: "a".repeat(64), node: "n" }))?.node ?? "").toBe("n")
+})
+
+test("every per-key block survives the key routes, and masked secrets inside a block keep the stored values", () => {
+  const path = tmpPath()
+  try {
+    const s = new ConfigStore(path, {})
+    expect(handleApi(s, "PUT", "/api/providers/openai", `{"keys":[]}`).status).toBe(200)
+    const pem = "-----BEGIN " + "PRIVATE KEY-----\nAAAAexampleonlyZZZZ\n-----END " + "PRIVATE KEY-----"
+    const body = JSON.stringify({ id: "k1", value: "sk-test-1234567890", oauth_key_config: { grant_type: "client_credentials", token_url: "https://auth.example.test/token", client_id: "cid", client_secret: "csecret-1234567890", extra_params: { resource: "res-secret-123456" } }, azure_key_config: { endpoint: "https://a.example.test", client_secret: "azsecret-1234567890" }, databricks_key_config: { workspace_url: "w.example.test", client_secret: "dbsecret-1234567890" }, github_copilot_key_config: { app_id: "1", installation_id: "2", repository_id: "3", private_key: pem }, cloudflare_key_config: { account_id: "acct" }, watsonx_key_config: { api_key: "wxkey-1234567890", project_id: "p", url: "https://wx.example.test" }, bedrock_mantle_key_config: { region: "us-east-1", secret_key: "bmsecret-1234567890" } })
+    expect(handleApi(s, "POST", "/api/providers/openai/keys", body).status).toBe(201)
+    const k = findKey(providerOf(s.cfg, "openai")!.keys ?? [], "k1")!
+    expect(k.oauth_key_config!.client_secret).toBe("csecret-1234567890")
+    expect(k.azure_key_config!.client_secret).toBe("azsecret-1234567890")
+    expect(k.github_copilot_key_config!.private_key).toBe(pem)
+    expect(k.cloudflare_key_config!.account_id).toBe("acct")
+    // a read masks every secret, in every block
+    const got = handleApi(s, "GET", "/api/providers/openai/keys/k1", "")
+    expect(got.status).toBe(200)
+    expect(got.body.includes("csecret-1234567890")).toBe(false)
+    expect(got.body.includes("azsecret-1234567890")).toBe(false)
+    expect(got.body.includes("dbsecret-1234567890")).toBe(false)
+    expect(got.body.includes("AAAAexampleonlyZZZZ")).toBe(false)
+    expect(got.body.includes("wxkey-1234567890")).toBe(false)
+    expect(got.body.includes("res-secret-123456")).toBe(false)
+    expect(got.body.includes("bmsecret-1234567890")).toBe(false)
+    expect(got.body.includes(`"oauth_key_config"`)).toBe(true)
+    expect(got.body.includes(`"account_id":"acct"`)).toBe(true)
+    // sent back as read: the stored secrets stay; a changed setting replaces its own
+    const back = got.body.replace(`"client_id":"cid"`, `"client_id":"cid2"`)
+    expect(handleApi(s, "PUT", "/api/providers/openai/keys/k1", back).status).toBe(200)
+    const k2 = findKey(providerOf(s.cfg, "openai")!.keys ?? [], "k1")!
+    expect(k2.value).toBe("sk-test-1234567890")
+    expect(k2.oauth_key_config!.client_id).toBe("cid2")
+    expect(k2.oauth_key_config!.client_secret).toBe("csecret-1234567890")
+    expect(k2.oauth_key_config!.extra_params!.get("resource")).toBe("res-secret-123456")
+    expect(k2.azure_key_config!.client_secret).toBe("azsecret-1234567890")
+    expect(k2.databricks_key_config!.client_secret).toBe("dbsecret-1234567890")
+    expect(k2.github_copilot_key_config!.private_key).toBe(pem)
+    expect(k2.watsonx_key_config!.api_key).toBe("wxkey-1234567890")
+    expect(k2.bedrock_mantle_key_config!.secret_key).toBe("bmsecret-1234567890")
+    // the whole provider read and written back keeps them too
+    const prov = handleApi(s, "GET", "/api/providers/openai", "")
+    expect(prov.status).toBe(200)
+    expect(handleApi(s, "PUT", "/api/providers/openai", prov.body).status).toBe(200)
+    const k3 = findKey(providerOf(s.cfg, "openai")!.keys ?? [], "k1")!
+    expect(k3.oauth_key_config!.client_secret).toBe("csecret-1234567890")
+    expect(k3.github_copilot_key_config!.private_key).toBe(pem)
+    expect(k3.cloudflare_key_config!.account_id).toBe("acct")
+  } finally {
+    cleanup(path)
+  }
 })

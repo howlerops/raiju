@@ -1,0 +1,264 @@
+// PUT /api/plugins/{name} as Bifrost's plugins handler makes it: the body's config is merged over the stored one
+// (top-level keys, so a field the calling form does not know is kept), and a redacted placeholder in the body keeps the
+// stored value. While dashboard auth is off, a change to where a plugin sends data (an endpoint, or an env. or vault.
+// reference) is refused: dialTargets lists those values by path, and changedTargets the ones a save would add or change
+// (Bifrost's pluginConfigDialTargets and requireGenuineAuthForPluginConfigChange).
+import { Field, fields, elements, decodeString, quote, build } from "./json"
+
+// Plugin config keys whose string value is a host the plugin dials (Bifrost's pluginEndpointKeys), matched without case.
+const ENDPOINT_KEYS: string[] = ["collector_url", "metrics_endpoint", "push_gateway_url", "endpoint", "url", "base_url"]
+// The fields a SecretVar object is read from.
+const SECRET_FIELDS: string[] = ["value", "ref", "type", "env_var", "from_env"]
+
+export function isEndpointKey(key: string): bool {
+  return ENDPOINT_KEYS.includes(key.toLowerCase())
+}
+
+function isReference(v: string): bool {
+  return v.startsWith("env.") || v.startsWith("vault.")
+}
+
+function strOf(raw: string): string | undefined {
+  if (!raw.startsWith("\"")) return undefined
+  try {
+    return decodeString(raw)
+  } catch (e) {
+    return undefined
+  }
+}
+
+function fieldsOf(raw: string): Field[] | undefined {
+  if (!raw.startsWith("{")) return undefined
+  try {
+    return fields(raw)
+  } catch (e) {
+    return undefined
+  }
+}
+
+function elementsOf(raw: string): string[] | undefined {
+  if (!raw.startsWith("[")) return undefined
+  try {
+    return elements(raw)
+  } catch (e) {
+    return undefined
+  }
+}
+
+// The value of the field whose name folds to name, as Go's decoder finds it.
+function folded(fs: Field[], name: string): string | undefined {
+  for (const f of fs) {
+    if (f.key.toLowerCase() === name) return f.raw
+  }
+  return undefined
+}
+
+function withPrefix(prefix: string, ref: string): string {
+  return isReference(ref) ? ref : prefix + ref
+}
+
+// The target a SecretVar-shaped object stands for: an env or vault type makes its ref the target, a ref with a reference
+// prefix is one, the legacy env_var with from_env names an env reference; else its value when that is a reference or
+// sits under an endpoint key.
+function secretTarget(fs: Field[], endpoint: bool): string {
+  const ref = (strOf(folded(fs, "ref") ?? "") ?? "").trim()
+  const kind = strOf(folded(fs, "type") ?? "") ?? ""
+  if (kind !== "") {
+    if (kind === "env" && ref !== "") return withPrefix("env.", ref)
+    if (kind === "vault" && ref !== "") return withPrefix("vault.", ref)
+  } else if (ref !== "") {
+    if (isReference(ref)) return ref
+  } else {
+    const ev = strOf(folded(fs, "env_var") ?? "") ?? ""
+    if (ev !== "" && (folded(fs, "from_env") ?? "") === "true") return withPrefix("env.", ev)
+  }
+  const v = strOf(folded(fs, "value") ?? "") ?? ""
+  if (isReference(v) || endpoint) return v
+  return ""
+}
+
+function secretFieldsOnly(fs: Field[]): bool {
+  if (fs.length === 0) return false
+  for (const f of fs) {
+    if (!SECRET_FIELDS.includes(f.key.toLowerCase())) return false
+  }
+  return true
+}
+
+function walk(prefix: string, raw: string, inout out: Map<string, string>): void {
+  const fs = fieldsOf(raw)
+  if (fs !== undefined) {
+    for (const f of fs) {
+      const path = prefix === "" ? f.key : prefix + "." + f.key
+      const obj = fieldsOf(f.raw)
+      if (obj !== undefined) {
+        const target = secretTarget(obj, isEndpointKey(f.key))
+        if (target !== "") out.set(path, target)
+        if (secretFieldsOnly(obj)) {
+          for (const g of obj) {
+            const r = strOf(g.raw)
+            if (r !== undefined && isReference(r) && r !== target) out.set(path + "." + g.key, r)
+          }
+          continue
+        }
+      }
+      const s = strOf(f.raw)
+      if (s !== undefined && isEndpointKey(f.key) && s !== "") {
+        out.set(path, s)
+        continue
+      }
+      walk(path, f.raw, &out)
+    }
+    return
+  }
+  const es = elementsOf(raw)
+  if (es !== undefined) {
+    for (let i = 0; i < es.length; i++) walk(`${prefix}[${i}]`, es[i]!, &out)
+    return
+  }
+  const s = strOf(raw)
+  if (s !== undefined && isReference(s)) out.set(prefix, s)
+}
+
+// Every env./vault. reference in a config at any depth and every non-empty value under an endpoint key, by path.
+export function dialTargets(config: string): Map<string, string> {
+  let out = new Map<string, string>()
+  walk("", config, &out)
+  return out
+}
+
+// The paths whose dial target the next config adds or changes (sorted). Removing one, or keeping it, is not a change.
+export function changedTargets(stored: string, next: string): string[] {
+  const before = dialTargets(stored)
+  const after = dialTargets(next)
+  const out: string[] = []
+  for (const k of after.keys()) {
+    if (before.get(k) !== after.get(k)) out.push(k)
+  }
+  out.sort()
+  return out
+}
+
+// Bifrost's 403 message for such a change while dashboard auth is off.
+export function targetAuthMessage(paths: string[]): string {
+  return `Setting a plugin's endpoints or env./vault. references (${paths.join(", ")}) requires an authenticated admin session; dashboard auth is currently disabled or unconfigured. Enable dashboard authentication, or provision the plugin via config.json instead.`
+}
+
+// A redaction placeholder (SecretVar.IsRedacted without the reference case): all asterisks up to 8 characters, 4 + 24
+// asterisks + 4, or the <redacted> and [REDACTED] sentinels.
+export function isRedacted(v: string): bool {
+  if (v === "") return false
+  const n = v.byteLength
+  if (n <= 8) {
+    for (let i = 0; i < n; i++) {
+      if (v.slice(i, i + 1) !== "*") return false
+    }
+    return true
+  }
+  if (n === 32 && v.slice(4, 28) === "************************") return true
+  const low = v.toLowerCase()
+  return low === "<redacted>" || low === "[redacted]"
+}
+
+// A SecretVar-shaped object: a string value plus only SecretVar fields.
+function secretObject(fs: Field[]): bool {
+  let hasValue = false
+  for (const f of fs) {
+    if (!SECRET_FIELDS.includes(f.key)) return false
+    if (f.key === "value" && f.raw.startsWith("\"")) hasValue = true
+  }
+  return hasValue
+}
+
+// An incoming value with each redacted placeholder put back from the stored value at the same place (Bifrost's
+// restoreRedactedValue): objects by key, arrays by index (a plain string in an array is a list entry, never a secret).
+function restore(incoming: string, stored: string | undefined): string {
+  if (stored === undefined) return incoming
+  const obj = fieldsOf(incoming)
+  if (obj !== undefined) {
+    if (secretObject(obj)) {
+      const v = strOf(folded(obj, "value") ?? "") ?? ""
+      const ref = strOf(folded(obj, "ref") ?? "") ?? ""
+      if (ref === "" && !isReference(v) && (v === "" || isRedacted(v))) return stored
+      return incoming
+    }
+    const sfs = fieldsOf(stored)
+    if (sfs === undefined) return incoming
+    const out: Field[] = []
+    for (const f of obj) {
+      let prior: string | undefined = undefined
+      for (const g of sfs) {
+        if (g.key === f.key) prior = g.raw
+      }
+      out.push({ key: f.key, raw: restore(f.raw, prior) })
+    }
+    return build(out)
+  }
+  const es = elementsOf(incoming)
+  if (es !== undefined) {
+    const ses = elementsOf(stored)
+    if (ses === undefined) return incoming
+    const out: string[] = []
+    for (let i = 0; i < es.length; i++) {
+      const item = es[i]!
+      if (item.startsWith("\"") || i >= ses.length) out.push(item)
+      else out.push(restore(item, ses[i]!))
+    }
+    return "[" + out.join(",") + "]"
+  }
+  const s = strOf(incoming)
+  const prior = strOf(stored)
+  if (s !== undefined && prior !== undefined && !isReference(s) && isRedacted(s)) return quote(prior)
+  return incoming
+}
+
+// The config a PUT saves: the stored config's keys, then the body's over them, placeholders restored. A stored config
+// that is empty or not an object is replaced by the body's.
+export function mergeConfig(stored: string, incoming: string): string {
+  const sfs = fieldsOf(stored.trim())
+  const ifs = fieldsOf(incoming.trim())
+  if (sfs === undefined || sfs.length === 0 || ifs === undefined) return incoming
+  const out: Field[] = []
+  for (const g of sfs) {
+    let next: string | undefined = undefined
+    for (const f of ifs) {
+      if (f.key === g.key) next = f.raw
+    }
+    out.push({ key: g.key, raw: next === undefined ? g.raw : restore(next, g.raw) })
+  }
+  for (const f of ifs) {
+    if (!sfs.some((g) => g.key === f.key)) out.push(f)
+  }
+  return build(out)
+}
+
+test("a PUT config is merged over the stored one, keeping fields the body leaves out", () => {
+  expect(mergeConfig(`{"a":1,"span_filter":{"x":true}}`, `{"a":2,"b":3}`)).toBe(`{"a":2,"span_filter":{"x":true},"b":3}`)
+  expect(mergeConfig(`{}`, `{"a":2}`)).toBe(`{"a":2}`)
+  expect(mergeConfig(``, `{"a":2}`)).toBe(`{"a":2}`)
+  // redacted placeholders keep the stored secret; a new value or a reference replaces it
+  expect(mergeConfig(`{"headers":{"key":"abcd-secret"}}`, `{"headers":{"key":"****"}}`)).toBe(`{"headers":{"key":"abcd-secret"}}`)
+  expect(mergeConfig(`{"headers":{"key":"abcd-secret"}}`, `{"headers":{"key":"env.KEY"}}`)).toBe(`{"headers":{"key":"env.KEY"}}`)
+  expect(mergeConfig(`{"auth":{"value":"pw"}}`, `{"auth":{"value":"<redacted>"}}`)).toBe(`{"auth":{"value":"pw"}}`)
+  expect(mergeConfig(`{"auth":{"value":"pw"}}`, `{"auth":{"value":"new"}}`)).toBe(`{"auth":{"value":"new"}}`)
+  // a string in an array is a list entry, not a placeholder
+  expect(mergeConfig(`{"patterns":["a"],"profiles":[{"k":"s1"}]}`, `{"patterns":["*"],"profiles":[{"k":"***"}]}`)).toBe(`{"patterns":["*"],"profiles":[{"k":"s1"}]}`)
+  expect(isRedacted("abcd" + "************************" + "wxyz")).toBe(true)
+  expect(isRedacted("abc")).toBe(false)
+  expect(isRedacted("")).toBe(false)
+})
+
+test("dial targets: endpoints and references by path, and the ones a change adds or moves", () => {
+  const t = dialTargets(`{"collector_url":"http://c:4318","headers":{"auth":"env.TOKEN","plain":"x"},"profiles":[{"URL":"http://p"}],"push":{"ref":"vault.k","type":"vault"},"legacy":{"env_var":"V","from_env":true}}`)
+  expect(t.get("collector_url")).toBe("http://c:4318")
+  expect(t.get("headers.auth")).toBe("env.TOKEN")
+  expect(t.get("headers.plain")).toBeUndefined()
+  expect(t.get("profiles[0].URL")).toBe("http://p")
+  expect(t.get("push")).toBe("vault.k")
+  expect(t.get("legacy")).toBe("env.V")
+  expect(changedTargets(`{"collector_url":"http://a","x":1}`, `{"collector_url":"http://a","x":2}`).length).toBe(0)
+  expect(changedTargets(`{"collector_url":"http://a"}`, `{}`).length).toBe(0)
+  expect(changedTargets(`{"collector_url":"http://a"}`, `{"collector_url":"http://b","headers":{"h":"env.SECRET"}}`).join(",")).toBe("collector_url,headers.h")
+  expect(changedTargets(`{}`, `{"service_name":"x"}`).length).toBe(0)
+  expect(targetAuthMessage(["url"]).startsWith("Setting a plugin's endpoints or env./vault. references (url) requires")).toBe(true)
+})

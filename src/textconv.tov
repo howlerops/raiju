@@ -3,12 +3,20 @@
 // not held. A prompt given as a list of strings is joined with newlines, as textToChatFields joins it. What is held:
 // the parameters textToChatFields keeps (written at the end, in its order), bounded by holdMax. The chat body then
 // goes to an OpenAI-format provider's chat endpoint, or through the chat converter of the provider's format.
-import { Field, fields, quote, rawBool, isNull, decodeString, build, elements } from "./json"
+import { Field, fields, find, quote, rawBool, isNull, decodeString, build, elements } from "./json"
 import { JsonTokenizer, ByteOut, Compact, Tok, bytesOf, textOfBytes, T_OBJ, T_OBJ_END, T_ARR, T_ARR_END, T_KEY, T_STR, T_STRH, T_STRP, T_STRE, T_LIT } from "./jsonstream"
 import { textToChatFields } from "./compat"
+import { ChatRequest } from "./schemas"
+import { chatBody } from "./providers/replicate"
 
 // the parameters a text completion keeps when it is sent as chat (compat's textToChatFields), in its order
 const KEPT = ["max_tokens", "temperature", "top_p", "stop", "seed", "presence_penalty", "frequency_penalty", "logit_bias", "n", "user"]
+
+// the kept parameters Replicate's prediction input takes, in the order replicate.chatBody writes them
+const REPLICATE_INPUT = ["max_tokens", "temperature", "top_p", "presence_penalty", "frequency_penalty", "seed"]
+
+// the compat drops and fits on a text completion's parameters (CompatPlan.shapeParams for one target)
+export type ShapeFn = (fs: Field[]) => Field[] throws SyntaxError
 
 const TS_START = 0
 const TS_KEYS = 1
@@ -44,6 +52,14 @@ export class TextToChat {
   private items = 0
   private inStr = false
   private usage = false
+  // Replicate's prediction body in place of the chat body (replicate.chatBody of the one user message): the prompt goes
+  // in input.prompt, left out when it is empty, and the version names the model when versionHead is set
+  private rep = false
+  private versionHead = false
+  private promptOpen = false
+  private pendingSep = ""
+  // the compat drops and fits, applied to the kept parameters when the body ends (CompatPlan.shape on them)
+  shape: ShapeFn | undefined = undefined
 
   // `wire`: the body goes to an OpenAI-format chat endpoint as a stream (stream and include_usage are added, as
   // the whole-body path adds them)
@@ -51,6 +67,12 @@ export class TextToChat {
     this.tk = new JsonTokenizer(strMax, 65536)
     this.vout = new ByteOut()
     this.vcomp = new Compact(this.vout)
+  }
+
+  // writes Replicate's prediction body for the text completion, as the whole-body route sends it
+  forReplicate(versionHead: bool): void {
+    this.rep = true
+    this.versionHead = versionHead
   }
 
   // the request's stream_options.include_usage, once read
@@ -67,14 +89,58 @@ export class TextToChat {
     for (const t of try this.tk.finish()) try this.tok(t)
     if (this.ts !== TS_DONE) throw new SyntaxError("the request body must be a JSON object")
     if (!this.ended) throw new SyntaxError("prompt is required")
+    const sh = this.shape
+    const held = sh === undefined ? this.held : try sh(this.held)
+    if (this.rep) {
+      // the input's parameters; a prompt before them takes a comma
+      let first = !this.promptOpen
+      for (const k of REPLICATE_INPUT) {
+        for (const f of held) {
+          if (f.key !== k) continue
+          this.out.text(`${first ? "" : ","}${quote(k)}:${f.raw}`)
+          first = false
+        }
+      }
+      this.out.text("}}")
+      return this.out.take()
+    }
     for (const k of KEPT) {
-      for (const f of this.held) {
+      for (const f of held) {
         if (f.key === k) this.out.text(`,${quote(k)}:${f.raw}`)
       }
     }
     if (this.wire) this.out.text(`,"stream":true,"stream_options":{"include_usage":true}`)
     this.out.byte(125)
     return this.out.take()
+  }
+
+  // Prompt bytes (raw JSON string bytes). Replicate's body opens the prompt at its first byte, so an empty prompt is
+  // left out; a list separator waits for the text after it.
+  private promptBytes(b: u8[]): void {
+    if (!this.rep) {
+      this.out.bytes(b)
+      return
+    }
+    if (b.length === 0) return
+    this.openPrompt()
+    this.out.bytes(b)
+  }
+
+  private openPrompt(): void {
+    if (!this.promptOpen) {
+      this.promptOpen = true
+      this.out.text(`"prompt":"`)
+    }
+    if (this.pendingSep !== "") {
+      this.out.text(this.pendingSep)
+      this.pendingSep = ""
+    }
+  }
+
+  // the newline between the strings of a prompt list
+  private separator(): void {
+    if (this.rep) this.pendingSep += "\\n"
+    else this.out.text("\\n")
   }
 
   private tok(t: Tok): void throws SyntaxError {
@@ -106,11 +172,21 @@ export class TextToChat {
   // the head of the chat body and the opening of the user message's text
   private open(): void {
     this.begun = true
+    if (this.rep) {
+      this.out.text(`{${this.versionHead ? `"version":${quote(this.model)},` : ""}"input":{`)
+      return
+    }
     this.out.text(`{"model":${quote(this.model)},"messages":[{"role":"user","content":"`)
   }
 
   private close(): void {
-    this.out.text(`"}]`)
+    if (this.rep) {
+      // separators with no text after them still make a prompt (two empty strings are "\n")
+      if (this.pendingSep !== "") this.openPrompt()
+      if (this.promptOpen) this.out.text(`"`)
+    } else {
+      this.out.text(`"}]`)
+    }
     this.ended = true
     this.ts = TS_KEYS
   }
@@ -120,7 +196,7 @@ export class TextToChat {
     const k = t.kind
     if (this.inStr) {
       if (k === T_STRP) {
-        this.out.bytes(t.raw)
+        this.promptBytes(t.raw)
       } else if (k === T_STRE) {
         this.inStr = false
         if (!this.arr) this.close()
@@ -138,9 +214,9 @@ export class TextToChat {
     }
     if (k === T_STR || k === T_STRH) {
       if (!this.begun) this.open()
-      if (this.arr && this.items > 0) this.out.text("\\n")
+      if (this.arr && this.items > 0) this.separator()
       this.items += 1
-      this.out.bytes(t.raw)
+      this.promptBytes(t.raw)
       if (k === T_STRH) this.inStr = true
       else if (!this.arr) this.close()
       return
@@ -175,6 +251,106 @@ export class TextToChat {
       }
       this.keep = false
       this.ts = TS_KEYS
+    }
+  }
+}
+
+// A large text completion that goes to an OpenAI-format provider as a text completion, with compat's drops and fits:
+// the prompt (any JSON value) is written as it arrives, the other members are held (bounded by holdMax) and written
+// after it through the shape, with the provider's model name. `askUsage`: a stream asks for its usage chunk unless
+// the caller wrote stream_options, as the body sent as it is asks for it.
+export class TextShaper {
+  private tk: JsonTokenizer
+  private out: ByteOut = new ByteOut()
+  private ts = TS_START
+  private curKey = ""
+  private vd = 0
+  private vlong = false
+  private vout: ByteOut
+  private vcomp: Compact
+  private pcomp: Compact
+  private inPrompt = false
+  private sawPrompt = false
+  private held: Field[] = []
+  private heldSize = 0
+  shape: ShapeFn | undefined = undefined
+
+  constructor(readonly model: string, readonly askUsage: bool, readonly holdMax: int, strMax: int) {
+    this.tk = new JsonTokenizer(strMax, 65536)
+    this.vout = new ByteOut()
+    this.vcomp = new Compact(this.vout)
+    this.pcomp = new Compact(this.out)
+  }
+
+  push(b: u8[]): u8[][] throws SyntaxError {
+    for (const t of try this.tk.push(b)) try this.tok(t)
+    return this.out.take()
+  }
+
+  finish(): u8[][] throws SyntaxError {
+    for (const t of try this.tk.finish()) try this.tok(t)
+    if (this.ts !== TS_DONE) throw new SyntaxError("the request body must be a JSON object")
+    const sh = this.shape
+    let fs = this.held.filter((f) => f.key !== "model")
+    if (sh !== undefined) fs = try sh(fs)
+    if (this.askUsage && find(this.held, "stream_options") === undefined) fs.unshift({ key: "stream_options", raw: `{"include_usage":true}` })
+    fs.unshift({ key: "model", raw: quote(this.model) })
+    let first = !this.sawPrompt
+    for (const f of fs) {
+      this.out.text(`${first ? "" : ","}${quote(f.key)}:${f.raw}`)
+      first = false
+    }
+    this.out.byte(125)
+    return this.out.take()
+  }
+
+  private tok(t: Tok): void throws SyntaxError {
+    const k = t.kind
+    if (this.ts === TS_START) {
+      if (k !== T_OBJ) throw new SyntaxError("the request body must be a JSON object")
+      this.out.byte(123)
+      this.ts = TS_KEYS
+    } else if (this.ts === TS_KEYS) {
+      if (k === T_KEY) {
+        this.curKey = rawText(t.raw)
+        this.ts = TS_VALUE
+        this.vd = 0
+        this.vlong = false
+        this.inPrompt = this.curKey === "prompt"
+        if (this.inPrompt) {
+          if (this.sawPrompt) throw new SyntaxError("prompt is given twice")
+          this.sawPrompt = true
+          this.out.text(`"prompt":`)
+          this.pcomp = new Compact(this.out)
+        } else {
+          this.vout = new ByteOut()
+          this.vcomp = new Compact(this.vout)
+        }
+      } else if (k === T_OBJ_END) {
+        this.ts = TS_DONE
+      } else {
+        throw new SyntaxError("the request body must be a JSON object")
+      }
+    } else if (this.ts === TS_VALUE) {
+      if (this.inPrompt) this.pcomp.tok(t)
+      else {
+        this.vcomp.tok(t)
+        if (this.heldSize + this.vout.size > this.holdMax) throw new SyntaxError(`the request field ${this.curKey} is too large to convert while streaming`)
+      }
+      if (k === T_STRH) this.vlong = true
+      else if (k === T_STRE) this.vlong = false
+      if (k === T_OBJ || k === T_ARR) this.vd += 1
+      else if (k === T_OBJ_END || k === T_ARR_END) this.vd -= 1
+      if (this.vd === 0 && !this.vlong) {
+        if (!this.inPrompt) {
+          const raw = textOfBytes(this.vout.all())
+          this.held = this.held.filter((f) => f.key !== this.curKey)
+          this.held.push({ key: this.curKey, raw: raw })
+          this.heldSize += raw.byteLength
+        }
+        this.inPrompt = false
+        this.ts = TS_KEYS
+      }
     }
   }
 }
@@ -283,6 +459,104 @@ test("bad prompts are refused", () => {
   let big = false
   try {
     streamedText(`{"model":"m","prompt":"x","user":"${"u".repeat(300)}"}`, 9, 16, 64, false)
+  } catch (e) {
+    big = true
+  }
+  expect(big).toBe(true)
+})
+
+// Replicate's body, as the whole-body route writes it (replicate.chatBody of the chat request textToChatFields gives)
+function wholeReplicate(text: string, model: string, version: bool): string throws SyntaxError {
+  const cf = try textToChatFields(try fields(text))
+  const req = try JSON.parse(build(cf)) as ChatRequest
+  return chatBody(model, version, req, cf)
+}
+
+function streamedReplicate(text: string, step: int, strMax: int, version: bool): string throws SyntaxError {
+  const c = new TextToChat("owner/model", false, 1048576, strMax)
+  c.forReplicate(version)
+  const out = new ByteOut()
+  const b = bytesOf(text)
+  let i = 0
+  while (i < b.length) {
+    const e = i + step < b.length ? i + step : b.length
+    for (const p of try c.push(b.slice(i, e))) out.bytes(p)
+    i = e
+  }
+  for (const p of try c.finish()) out.bytes(p)
+  return textOfBytes(out.all())
+}
+
+test("a text completion streamed for Replicate is the prediction body the whole-body route writes", () => {
+  const texts = textCorpus().concat([
+    `{"model":"m","prompt":""}`,
+    `{"model":"m","prompt":["",""],"seed":4}`,
+    `{"model":"m","prompt":["","x",""],"temperature":0.7}`,
+  ])
+  for (const text of texts) {
+    for (const version of [false, true]) {
+      const want = try canon(try wholeReplicate(text, "owner/model", version))
+      for (const step of [1, 7, 100000]) {
+        for (const mx of [4, 4096]) {
+          const got = try canon(try streamedReplicate(text, step, mx, version))
+          if (got !== want) console.log(`MISMATCH replicate step=${step} strMax=${mx}\n  input: ${text}\n  want:  ${want}\n  got:   ${got}`)
+          expect(got).toBe(want)
+        }
+      }
+    }
+  }
+})
+
+test("the compat shape is applied to the kept parameters at the end", () => {
+  const c = new TextToChat("m", false, 4096, 16)
+  c.shape = (fs) => fs.filter((f) => f.key !== "temperature").map((f) => f.key === "max_tokens" ? { key: f.key, raw: "10" } : f)
+  const out = new ByteOut()
+  for (const p of try c.push(bytesOf(`{"model":"m","prompt":"hi","temperature":0.5,"max_tokens":999,"seed":1}`))) out.bytes(p)
+  for (const p of try c.finish()) out.bytes(p)
+  expect(textOfBytes(out.all())).toBe(`{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":10,"seed":1}`)
+})
+
+function shaped(text: string, step: int, strMax: int, holdMax: int, askUsage: bool, shape: ShapeFn | undefined): string throws SyntaxError {
+  const c = new TextShaper("target-model", askUsage, holdMax, strMax)
+  c.shape = shape
+  const out = new ByteOut()
+  const b = bytesOf(text)
+  let i = 0
+  while (i < b.length) {
+    const e = i + step < b.length ? i + step : b.length
+    for (const p of try c.push(b.slice(i, e))) out.bytes(p)
+    i = e
+  }
+  for (const p of try c.finish()) out.bytes(p)
+  return textOfBytes(out.all())
+}
+
+test("a text completion shaped as it streams keeps its prompt and every other field, with the shape applied", () => {
+  const drop: ShapeFn = (fs) => fs.filter((f) => f.key !== "temperature")
+  const texts = textCorpus().concat([
+    `{"model":"m","prompt":[[1,2,3],[4]],"echo":true,"temperature":0.2}`,
+    `{"prompt":[17,18],"model":"m","suffix":"end","best_of":2}`,
+  ])
+  for (const text of texts) {
+    let want = (try fields(text)).filter((f) => f.key !== "model" && f.key !== "temperature")
+    want.unshift({ key: "model", raw: quote("target-model") })
+    const wantCanon = try canon(build(want))
+    for (const step of [1, 7, 100000]) {
+      for (const mx of [4, 4096]) {
+        const got = try canon(try shaped(text, step, mx, 1048576, false, drop))
+        if (got !== wantCanon) console.log(`MISMATCH shaped step=${step} strMax=${mx}\n  input: ${text}\n  want:  ${wantCanon}\n  got:   ${got}`)
+        expect(got).toBe(wantCanon)
+      }
+    }
+  }
+  // a stream asks for its usage unless the caller wrote stream_options
+  expect(try shaped(`{"model":"m","prompt":"hi","stream":true}`, 3, 16, 4096, true, undefined)).toBe(`{"prompt":"hi","model":"target-model","stream_options":{"include_usage":true},"stream":true}`)
+  expect(try shaped(`{"model":"m","stream_options":{"include_usage":false},"prompt":"hi"}`, 3, 16, 4096, true, undefined)).toBe(`{"prompt":"hi","model":"target-model","stream_options":{"include_usage":false}}`)
+  // no prompt: the fields alone
+  expect(try shaped(`{"model":"m"}`, 3, 16, 4096, false, undefined)).toBe(`{"model":"target-model"}`)
+  let big = false
+  try {
+    shaped(`{"model":"m","prompt":"x","user":"${"u".repeat(300)}"}`, 9, 16, 64, false, undefined)
   } catch (e) {
     big = true
   }

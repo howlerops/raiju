@@ -2,7 +2,7 @@
 // no RSA library, so the RSASSA-PKCS1-v1_5 signature (RFC 8017) is computed
 // here with bigint: parse the PEM key, then one modular exponentiation.
 import { quote } from "./json"
-import { sha256, utf8, toHex, secureHex } from "./crypto"
+import { sha256, sha384, sha512, utf8, toHex, secureHex } from "./crypto"
 import { encodeUrl, decode, encode } from "./base64"
 
 // ---- DER ----
@@ -178,6 +178,134 @@ export function verifyRs256(pem: string, signingInput: string, sigB64: string): 
   if (s >= key.n) return false
   const want = try encodeEmsa(sha256(utf8(signingInput)), k)
   return modPow(s, key.e, key.n) === want
+}
+
+// ---- RS384, RS512 and PS256 to PS512 (RFC 7518 sections 3.3 and 3.5) ----
+
+// DigestInfo prefixes for SHA-384 and SHA-512 (RFC 8017, section 9.2 note 1)
+const SHA384_DIGEST_INFO: int[] = [0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02, 0x05, 0x00, 0x04, 0x30]
+const SHA512_DIGEST_INFO: int[] = [0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05, 0x00, 0x04, 0x40]
+
+// The hash an RS or PS algorithm names by its number (256, 384 or 512).
+function hashFor(bits: string, data: u8[]): u8[] {
+  if (bits === "384") return sha384(data)
+  if (bits === "512") return sha512(data)
+  return sha256(data)
+}
+
+// EMSA-PKCS1-v1_5 with the DigestInfo of the hash.
+function encodePkcs1(hash: u8[], k: int): bigint throws SyntaxError {
+  const info = hash.length === 48 ? SHA384_DIGEST_INFO : (hash.length === 64 ? SHA512_DIGEST_INFO : SHA256_DIGEST_INFO)
+  const tLen = info.length + hash.length
+  if (k < tLen + 11) throw new SyntaxError("rsa: key too small for this hash")
+  const em: u8[] = [u8(0), u8(1)]
+  for (let i = 0; i < k - tLen - 3; i++) em.push(u8(0xff))
+  em.push(u8(0))
+  for (const b of info) em.push(u8(b))
+  for (const b of hash) em.push(b)
+  return bigOf(em)
+}
+
+// MGF1 (RFC 8017, B.2.1) over the algorithm's hash.
+function mgf1(bits: string, seed: u8[], len: int): u8[] {
+  const out: u8[] = []
+  let c = 0
+  while (out.length < len) {
+    const block = hashFor(bits, seed.concat([u8((c >> 24) & 0xff), u8((c >> 16) & 0xff), u8((c >> 8) & 0xff), u8(c & 0xff)]))
+    for (const b of block) {
+      if (out.length < len) out.push(b)
+    }
+    c++
+  }
+  return out
+}
+
+function bitLen(x: bigint): int {
+  let n = 0
+  let v = x
+  while (v > 0n) {
+    v = v >> 1n
+    n++
+  }
+  return n
+}
+
+// EMSA-PSS-ENCODE (RFC 8017, 9.1.1) with MGF1 and a salt as long as the hash, as JWS PS* signs.
+function encodePss(bits: string, mHash: u8[], salt: u8[], emBits: int): u8[] throws SyntaxError {
+  const hLen = mHash.length
+  const emLen: int = Math.ceil(emBits / 8)
+  if (emLen < hLen + salt.length + 2) throw new SyntaxError("rsa: key too small for this hash")
+  const mp: u8[] = []
+  for (let i = 0; i < 8; i++) mp.push(u8(0))
+  const h = hashFor(bits, mp.concat(mHash).concat(salt))
+  const db: u8[] = []
+  for (let i = 0; i < emLen - salt.length - hLen - 2; i++) db.push(u8(0))
+  db.push(u8(1))
+  for (const b of salt) db.push(b)
+  const mask = mgf1(bits, h, emLen - hLen - 1)
+  const masked: u8[] = []
+  for (let i = 0; i < db.length; i++) masked.push(u8(int(db[i]!) ^ int(mask[i]!)))
+  masked[0] = u8(int(masked[0]!) & (0xff >> (8 * emLen - emBits)))
+  return masked.concat(h).concat([u8(0xbc)])
+}
+
+function decodeHex(h: string): u8[] throws SyntaxError {
+  const out: u8[] = []
+  for (let i = 0; i + 1 < h.byteLength; i += 2) {
+    const v = parseInt(h.slice(i, i + 2), 16)
+    if (v === undefined) throw new SyntaxError("hex: bad digit")
+    out.push(u8(v))
+  }
+  return out
+}
+
+// Base64url signature of signingInput by RS256, RS384, RS512, PS256, PS384 or PS512 under a PEM private key.
+export function signRsa(alg: string, pem: string, signingInput: string): string throws SyntaxError {
+  const family = alg.slice(0, 2)
+  const bits = alg.slice(2)
+  if ((family !== "RS" && family !== "PS") || (bits !== "256" && bits !== "384" && bits !== "512")) throw new SyntaxError(`rsa: unknown algorithm ${alg}`)
+  const key = try parseKey(pem)
+  const k = byteLen(key.n)
+  const mHash = hashFor(bits, utf8(signingInput))
+  let m = 0n
+  if (family === "RS") {
+    m = try encodePkcs1(mHash, k)
+  } else {
+    let hex = ""
+    try {
+      hex = secureHex(mHash.length * 2)
+    } catch (e) {
+      throw new SyntaxError(`rsa: no random salt: ${e.message}`)
+    }
+    const salt = try decodeHex(hex)
+    m = bigOf(try encodePss(bits, mHash, salt, bitLen(key.n) - 1))
+  }
+  const s = try rsaSign(key, m)
+  return encodeUrl(bytesOf(s, k))
+}
+
+// Whether a PS* signature verifies (EMSA-PSS-VERIFY with the hash-length salt), for the tests.
+function verifyPss(alg: string, pem: string, signingInput: string, sigB64: string): bool throws SyntaxError {
+  const bits = alg.slice(2)
+  const key = try parseKey(pem)
+  const k = byteLen(key.n)
+  const emBits = bitLen(key.n) - 1
+  const emLen: int = Math.ceil(emBits / 8)
+  const sig = try decode(sigB64)
+  if (sig.length !== k) return false
+  const em = bytesOf(modPow(bigOf(sig), key.e, key.n), emLen)
+  const mHash = hashFor(bits, utf8(signingInput))
+  const hLen = mHash.length
+  if (int(em[emLen - 1]!) !== 0xbc) return false
+  const masked = em.slice(0, emLen - hLen - 1)
+  const h = em.slice(emLen - hLen - 1, emLen - 1)
+  const mask = mgf1(bits, h, emLen - hLen - 1)
+  const db: u8[] = []
+  for (let i = 0; i < masked.length; i++) db.push(u8(int(masked[i]!) ^ int(mask[i]!)))
+  db[0] = u8(int(db[0]!) & (0xff >> (8 * emLen - emBits)))
+  const salt = db.slice(db.length - hLen)
+  const want = try encodePss(bits, mHash, salt, emBits)
+  return toHex(want) === toHex(em)
 }
 
 // A public identifier of a PEM key: the first 32 hex digits of the SHA-256 of its modulus. It is the kid of
@@ -508,4 +636,37 @@ test("generated key sizes are checked", () => {
     threw = true
   }
   expect(threw).toBe(true)
+})
+
+// openssl dgst -sha384 -sign over "hello", base64url without padding
+const RS384_HELLO = "g2yS7Qp1D_ckxiwiKIzYUC7X9gNWysYKGm7mAq9_9ag4xo-9p7mEmfCxksyXefRFAY3fW6fiViXEUUPNSbSv5p34s-VHTK1k6cwgFOsR32l6FEnpSisp0nHLGTSjSu-wBo3uYMJ3pGMTuzE-Lo891LpgLkDOI8H7bJBXchwPEoLDeYSAbwEJkAZ7Yu-xptB6jYmvl9DYBYs-l41-aVRXswJfU6YmcKjGntHSc6oA4NSeSrdiiuEgj1TrrAG3du29dLcGFEt7vn3-HNRiCkKDsIjJIyNdGTR5X70NXvrBevtF3s_SsHkIAUO4YLEsFtxiSdtPJ1ZmzU4KloiTXj8aag"
+
+test("RS384 and RS512 sign the SHA-384 and SHA-512 DigestInfo; RS256 matches signRs256", () => {
+  expect(try signRsa("RS256", TEST_PKCS8, "hello")).toBe(SIG_HELLO)
+  const key = try parseKey(TEST_PKCS8)
+  const k = byteLen(key.n)
+  for (const alg of ["RS384", "RS512"]) {
+    const sig = try decode(try signRsa(alg, TEST_PKCS1, "hello"))
+    expect(sig.length).toBe(k)
+    const want = try encodePkcs1(hashFor(alg.slice(2), utf8("hello")), k)
+    expect(modPow(bigOf(sig), key.e, key.n)).toBe(want)
+  }
+  expect(try signRsa("RS384", TEST_PKCS1, "hello")).toBe(RS384_HELLO)
+})
+
+test("PS256, PS384 and PS512 signatures verify as RSA-PSS and differ on each signing", () => {
+  for (const alg of ["PS256", "PS384", "PS512"]) {
+    const a = try signRsa(alg, TEST_PKCS8, "hello")
+    const b = try signRsa(alg, TEST_PKCS8, "hello")
+    expect(a === b).toBe(false)
+    expect(try verifyPss(alg, TEST_PKCS8, "hello", a)).toBe(true)
+    expect(try verifyPss(alg, TEST_PKCS8, "hellO", a)).toBe(false)
+  }
+  let bad = ""
+  try {
+    signRsa("HS256", TEST_PKCS8, "x")
+  } catch (e) {
+    bad = e.message
+  }
+  expect(bad.includes("unknown algorithm")).toBe(true)
 })

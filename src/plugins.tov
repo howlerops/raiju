@@ -7,14 +7,15 @@
 // httpChunk in reverse for each chunk of a streamed answer (it can rewrite or drop the chunk, or end the
 // stream). pluginroute.tov calls them from the servers.
 
-import { Field, fields, find, elements, rawStr, rawNum, isNull, quote, build, setField } from "./json"
+import { Field, fields, find, elements, rawStr, rawNum, rawBool, isNull, quote, build, setField } from "./json"
 import { errorJson, newId, nowSeconds } from "./schemas"
 import { compileRegex } from "./regex"
 import { deltaText } from "./guard_stream"
 import { WasmPluginInst, WasmPluginLimits, openWasmPlugin } from "./wasmplugin"
-import { isPluginUrl, downloadedPlugin } from "./plugindl"
+import { isPluginUrl, downloadedPlugin, fileMatchesPin } from "./plugindl"
 import { HttpReq, HttpResp, LlmKind, CHAT_KIND, kindOfOp, emptyReq, httpReqJson, httpRespJson, applyHttpReq, applyHttpResp, respFromJson } from "./plughttp"
 import { utf8 } from "./crypto"
+import * as responses from "./responses"
 
 // Hooks take the context by inout: plugins add headers and share values
 // through ctx.headers and ctx.values, which parameters can't change. trace collects the
@@ -41,6 +42,18 @@ export type PluginSpan = { name: string, startMs: f64, durUs: f64, error: string
 export class PluginTrace {
   spans: PluginSpan[] = []
   logs: PluginLogEntry[] = []
+  // A route whose post hooks run after its handler wrote the request's log row sets defer: the handler then leaves the
+  // export of the request's trace to done (held in onDone), which the route calls once its post hooks have run, so their
+  // spans are exported with the rest of the trace.
+  defer = false
+  onDone: ((tr: PluginTrace) => void) | undefined = undefined
+
+  // Exports the trace the handler held back, once (the trace is passed in, so the callback holds no link back to it).
+  done(): void {
+    const f = this.onDone
+    this.onDone = undefined
+    if (f !== undefined) f(this)
+  }
 
   // A hook's span; with accumulate, a span of the same name already recorded grows by this duration.
   span(name: string, startMs: f64, durUs: f64, error: string, accumulate: bool): void {
@@ -420,8 +433,18 @@ export class PluginChain {
   // The post hooks for one chunk of a streamed answer, in reverse for the plugins whose preRequest ran. The
   // run's record of them stays until finish.
   runPostChunk(inout ctx: PluginContext, chunk: string): PostOutcome {
+    return this.chunkFrom(&ctx, 200, chunk)
+  }
+
+  // The post hooks on an error event in a stream (Bifrost calls PostLLMHook with the stream's error): the plugins get it
+  // as an error with its status and may change it or recover from it (a status below 400 is a chunk to send instead).
+  runPostChunkError(inout ctx: PluginContext, status: int, chunk: string): PostOutcome {
+    return this.chunkFrom(&ctx, status, chunk)
+  }
+
+  private chunkFrom(inout ctx: PluginContext, start: int, chunk: string): PostOutcome {
     const ran = (ctx.values.get(RAN_KEY) ?? "").split(",")
-    let status = 200
+    let status = start
     let cur = chunk
     for (let i = this.plugins.length - 1; i >= 0; i--) {
       if (!ran.includes(`${i}`)) continue
@@ -448,9 +471,34 @@ export class PluginChain {
   // Stops at the first short-circuit. Later plugins' preRequest hooks don't run. Only the plugins that
   // handle the request's type (ctx.op) take part.
   runPre(inout ctx: PluginContext, body: string): PreResult {
-    const ran: string[] = []
+    return this.preRange(&ctx, body, 0, this.plugins.length, [])
+  }
+
+  // The pre hooks of the plugins before the cache (pre_builtin and builtin), the first part of a chat request's
+  // pre hooks: the cache is looked up with the request as they left it (Bifrost's cache is a builtin plugin).
+  runPreBeforeCache(inout ctx: PluginContext, body: string): PreResult {
+    return this.preRange(&ctx, body, 0, this.cacheAt(), [])
+  }
+
+  // The pre hooks of the post_builtin plugins, run once the cache missed; the plugins whose hooks ran before stay
+  // recorded, so the post hooks run for all of them.
+  runPreAfterCache(inout ctx: PluginContext, body: string): PreResult {
+    const before = ctx.values.get(RAN_KEY) ?? ""
+    return this.preRange(&ctx, body, this.cacheAt(), this.plugins.length, before === "" ? [] : before.split(","))
+  }
+
+  // Whether any plugin after the cache takes part in a request type (runPreAfterCache has work to do).
+  hasAfterCache(op: string): bool {
+    for (let i = this.cacheAt(); i < this.plugins.length; i++) {
+      if (this.plugins[i]!.handlesOp(op)) return true
+    }
+    return false
+  }
+
+  private preRange(inout ctx: PluginContext, body: string, from: int, to: int, ran0: string[]): PreResult {
+    const ran: string[] = ran0.slice()
     let cur = body
-    for (let i = 0; i < this.plugins.length; i++) {
+    for (let i = from; i < to; i++) {
       if (!this.plugins[i]!.handlesOp(ctx.op)) continue
       const r = safePre(this.plugins[i]!, &ctx, cur)
       if (r === undefined) continue
@@ -852,8 +900,9 @@ function byPriority(rules: MockRule[]): MockRule[] {
 function messageText(body: string): string {
   let out = ""
   try {
-    const raw = find(try fields(body), "messages")
-    if (raw === undefined) return ""
+    const bf = try fields(body)
+    const raw = find(bf, "messages")
+    if (raw === undefined) return inputText(bf)
     for (const el of try elements(raw)) {
       const mf = try fields(el)
       const c = rawStr(mf, "content")
@@ -870,6 +919,51 @@ function messageText(body: string): string {
     return out
   }
   return out
+}
+
+// The text of a Responses request's input (Bifrost's mocker reads the input messages' content): a string input, or
+// each item's string content and its text parts, one per line.
+function inputText(bf: Field[]): string throws SyntaxError {
+  const raw = find(bf, "input")
+  if (raw === undefined || isNull(raw)) return ""
+  if (raw.startsWith("\"")) return (rawStr(bf, "input") ?? "") + "\n"
+  if (!raw.startsWith("[")) return ""
+  let out = ""
+  for (const el of try elements(raw)) {
+    if (!el.startsWith("{")) continue
+    const mf = try fields(el)
+    const c = rawStr(mf, "content")
+    if (c !== undefined) out += c + "\n"
+    const parts = find(mf, "content")
+    if (c === undefined && parts !== undefined && parts.startsWith("[")) {
+      for (const p of try elements(parts)) {
+        const t = p.startsWith("{") ? rawStr(try fields(p), "text") : undefined
+        if (t !== undefined) out += t + "\n"
+      }
+    }
+  }
+  return out
+}
+
+// A mocked chat completion as a Responses answer, for a short circuit on the Responses route, as Bifrost's mocker
+// answers a Responses request: the response object, or for a streamed request the one response.completed event it
+// sends. An error answer, or a body that is not a chat completion (a rule's raw response), stays as it is.
+export function asResponses(pre: PreResult, body: string): PreResult {
+  if (pre.kind !== "short_circuit" || pre.status >= 400) return pre
+  try {
+    const bf = try fields(body)
+    const cf = try fields(pre.body)
+    if (rawStr(cf, "object") !== "chat.completion") return pre
+    const model = rawStr(cf, "model") ?? rawStr(bf, "model") ?? ""
+    const resp = try responses.toResponse(pre.body, model, body)
+    if (rawBool(bf, "stream") === true) {
+      const ev = `{"type":"response.completed","sequence_number":0,"response":${resp}}`
+      return { kind: "short_circuit", status: pre.status, body: `event: response.completed\ndata: ${ev}\n\n`, contentType: "text/event-stream", allowFallbacks: pre.allowFallbacks }
+    }
+    return { kind: "short_circuit", status: pre.status, body: resp, contentType: "application/json", allowFallbacks: pre.allowFallbacks }
+  } catch (e) {
+    return pre
+  }
 }
 
 // The request's provider and its model without the provider: the provider the gateway resolved for it (ctx.provider, so a
@@ -973,6 +1067,11 @@ export class MockerPlugin extends BasePlugin {
     return "mocker"
   }
 
+  // Bifrost's mocker answers chat and Responses requests (and the routes served as them).
+  handlesOp(op: string): bool {
+    return op === "chat" || op === "responses"
+  }
+
   // A rule that matches the request (its probability aside), or a default behaviour that answers. Bifrost's mocker runs
   // on chat and Responses requests, which the Anthropic, GenAI, Bedrock and Cohere chat routes become.
   appliesNative(ctx: PluginContext, chat: string): bool {
@@ -998,6 +1097,11 @@ export class MockerPlugin extends BasePlugin {
   }
 
   preRequest(inout ctx: PluginContext, body: string): PreResult {
+    const pre = this.decide(&ctx, body)
+    return ctx.op === "responses" ? asResponses(pre, body) : pre
+  }
+
+  private decide(inout ctx: PluginContext, body: string): PreResult {
     this.totalRequests += 1
     for (const r of byPriority(this.config.rules)) {
       if (r.enabled === false) continue
@@ -1669,7 +1773,7 @@ export class WasmPlugin extends BasePlugin {
 
 // path names a .wasm file to load as a plugin (name is then only the entry's label); limits are
 // that plugin's wasm_limits.
-export type PluginEntry = { name: string, enabled?: bool, configJson: string, placement?: string, order?: int, path?: string, limits?: WasmPluginLimits }
+export type PluginEntry = { name: string, enabled?: bool, configJson: string, placement?: string, order?: int, path?: string, limits?: WasmPluginLimits, sha256?: string }
 
 // Bifrost's placement groups, in run order. Pre-hooks run in this order and post-hooks in reverse.
 // A plugin with no placement is post_builtin, as in Bifrost. undefined for any other value.
@@ -1684,7 +1788,7 @@ type Sequenced = { p: BasePlugin, rank: int, order: int, at: int }
 
 // Builds the plugin for one name from its raw JSON config. Throws SyntaxError
 // on a bad config; returns undefined for a name nothing provides.
-function makePlugin(name: string, text: string, path: string | undefined, limits: WasmPluginLimits | undefined): BasePlugin | undefined throws SyntaxError {
+function makePlugin(name: string, text: string, path: string | undefined, limits: WasmPluginLimits | undefined, pin: string | undefined): BasePlugin | undefined throws SyntaxError {
   if (path !== undefined && path.trim() !== "") {
     // a URL loads from the copy plugindl.tov downloaded (at startup, on the API's save, or on a reload)
     let file = path.trim()
@@ -1693,6 +1797,9 @@ function makePlugin(name: string, text: string, path: string | undefined, limits
       if (got === undefined) throw new SyntaxError(`the plugin at "${file}" has not been downloaded`)
       file = got
     }
+    // a pinned file loads only while its SHA-256 matches (checked on each load, not only on download)
+    const mismatch = fileMatchesPin(file, pin)
+    if (mismatch !== "") throw new SyntaxError(mismatch)
     try {
       return new WasmPlugin(openWasmPlugin(file, text, limits))
     } catch (e) {
@@ -1738,7 +1845,7 @@ export function buildChain(entries: PluginEntry[]): { chain: PluginChain, errors
     }
     const text = e.configJson.trim() === "" ? "{}" : e.configJson
     try {
-      const p = makePlugin(e.name, text, e.path, e.limits)
+      const p = makePlugin(e.name, text, e.path, e.limits, e.sha256)
       if (p === undefined) errors.push(`unknown plugin "${e.name}"`)
       else seq.push({ p: p, rank: rank, order: e.order ?? 0, at: i })
     } catch (err) {
@@ -1768,7 +1875,7 @@ export function entryStatus(e: PluginEntry): { status: string, error: string, ty
   if (e.enabled === false) return { status: "disabled", error: "", types: ["llm"] }
   const text = e.configJson.trim() === "" ? "{}" : e.configJson
   try {
-    const p = makePlugin(e.name, text, e.path, e.limits)
+    const p = makePlugin(e.name, text, e.path, e.limits, e.sha256)
     if (p === undefined) return { status: "error", error: `unknown plugin "${e.name}"`, types: ["llm"] }
     return { status: "active", error: "", types: p.hasHttp() ? ["llm", "http"] : ["llm"] }
   } catch (err) {
@@ -2199,6 +2306,42 @@ test("mocker conditions match provider, model and message regex", () => {
   expect(p.preRequest(&miss, `{"messages":[{"role":"user","content":"bye"}]}`).kind).toBe("continue")
 })
 
+test("mocker answers Responses requests in Responses' shape, matching their input", () => {
+  const cfg = try JSON.parse(`{"rules":[
+    {"name":"r","responses":[{"type":"success","content":{"message":"mocked {{model}}","usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}}],"conditions":{"message_regex":"(?s).*refund.*"}},
+    {"name":"e","responses":[{"type":"error","error":{"message":"nope","status_code":429}}],"conditions":{"message_regex":"(?s).*denied.*"}}
+  ]}`) as MockerConfig
+  const p = new MockerPlugin(cfg)
+  expect(p.handlesOp("responses")).toBe(true)
+  let c = mockCtx("openai/gpt-4o")
+  c.op = "responses"
+  const r = p.preRequest(&c, `{"model":"openai/gpt-4o","input":"I want a refund"}`)
+  expect(r.kind).toBe("short_circuit")
+  if (r.kind === "short_circuit") {
+    expect(r.body.includes(`"object":"response"`)).toBe(true)
+    expect(r.body.includes(`"text":"mocked gpt-4o"`)).toBe(true)
+    expect(r.body.includes(`"input_tokens":3`)).toBe(true)
+    expect(r.contentType).toBe("application/json")
+  }
+  // input items with text parts, streamed: one response.completed event
+  let s = mockCtx("openai/gpt-4o")
+  s.op = "responses"
+  const rs = p.preRequest(&s, `{"model":"openai/gpt-4o","stream":true,"input":[{"role":"user","content":[{"type":"input_text","text":"refund please"}]}]}`)
+  if (rs.kind === "short_circuit") {
+    expect(rs.body.startsWith(`event: response.completed\ndata: {"type":"response.completed","sequence_number":0,"response":{`)).toBe(true)
+    expect(rs.contentType).toBe("text/event-stream")
+  }
+  expect(rs.kind).toBe("short_circuit")
+  // errors keep the error shape; a request no rule matches passes
+  let e = mockCtx("openai/gpt-4o")
+  e.op = "responses"
+  const re = p.preRequest(&e, `{"model":"openai/gpt-4o","input":"access denied"}`)
+  if (re.kind === "short_circuit") expect(re.status).toBe(429)
+  let m = mockCtx("openai/gpt-4o")
+  m.op = "responses"
+  expect(p.preRequest(&m, `{"model":"openai/gpt-4o","input":"hello"}`).kind).toBe("continue")
+})
+
 test("mocker error responses carry status_code, and default_behavior applies when nothing matches", () => {
   const cfg = try JSON.parse(`{"default_behavior":"error","rules":[
     {"model":"gpt-4o","responses":[{"type":"error","error":{"message":"slow down","type":"rate_limit","status_code":429}}]}
@@ -2595,6 +2738,16 @@ test("the plugins that handle a request type are the only ones that see it", () 
   chain.runPre(&ctx, `{}`)
   chain.runPost(&ctx, 200, `{}`)
   expect(traceOf(ctx)).toBe("pre:w post:w:200")
+})
+
+test("an error event in a stream reaches the chunk post hooks as an error, with its status", () => {
+  const chain = new PluginChain([new HttpRecorder("a", "mark"), new HttpRecorder("b", "")])
+  let ctx = ctxFor("m")
+  chain.runPre(&ctx, `{}`)
+  const o = chain.runPostChunkError(&ctx, 500, `{"error":{"message":"broke"}}`)
+  expect(o.status).toBe(500)
+  expect(o.body).toBe(`{"error":{"message":"broke"}}+a`)
+  expect(traceOf(ctx)).toBe("pre:a pre:b chunk:b:500 chunk:a:500")
 })
 
 test("the post hooks of a stream run per chunk for the plugins whose pre hook ran, until finish", () => {

@@ -31,10 +31,12 @@ export type OpenApiConfig = {
 }
 
 export type OpParam = { name: string, in: string, required: bool, schema: string, description: string, style: string, explode?: bool, contentType: string, unsupported: string }
-export type OpBody = { contentType: string, required: bool, description: string, schema: string, delimiters: Map<string, string> }
+// objectStyles: form fields whose objects use a declared encoding style (form, formPacked or deepObject)
+export type OpBody = { contentType: string, required: bool, description: string, schema: string, delimiters: Map<string, string>, objectStyles: Map<string, string> }
 export type OpScheme = { name: string, type: string, in: string, param_name: string, scheme: string, description: string, supported: bool, reason: string }
 // How one tool argument reaches the request: its place, its name there, and how it is serialised.
-export type ArgBinding = { arg: string, in: string, name: string, required: bool, explode: bool, style: string, contentType: string }
+// group names the optional 3.2 querystring a field was flattened from; ifGroupSent marks a field it requires once any of its fields is sent
+export type ArgBinding = { arg: string, in: string, name: string, required: bool, explode: bool, style: string, contentType: string, group: string, ifGroupSent: bool }
 export type OpenApiOp = {
   name: string,
   operationId: string,
@@ -689,8 +691,49 @@ function buildOpV3(method: string, path: string, opRaw: string, pathParams: OpPa
     op.unsupported = pick.reason
     return op
   }
-  op.body = { contentType: pick.contentType, required: required, description: str(find(rb, "description")).trim(), schema: pick.schema, delimiters: new Map() }
+  // a form body's encoding entries declare how its arrays and objects are sent
+  let encoding: Field[] = []
+  if (pick.contentType === FORM_CT) {
+    for (const c of content) {
+      if (lowerBase(c.key) === FORM_CT) encoding = obj(find(obj(c.raw), "encoding"))
+    }
+  }
+  op.body = { contentType: pick.contentType, required: required, description: str(find(rb, "description")).trim(), schema: pick.schema, delimiters: formDelimiters(encoding), objectStyles: formObjectStyles(encoding) }
   return op
+}
+
+// The form fields whose arrays join into one value: style form with explode false, or a space or pipe
+// delimited style. Fields without an entry repeat the key (style form, explode true).
+function formDelimiters(encoding: Field[]): Map<string, string> {
+  const out: Map<string, string> = new Map()
+  for (const e of encoding) {
+    const enc = obj(e.raw)
+    let style = str(find(enc, "style"))
+    if (style === "") style = "form"
+    const explode = rawBool(enc, "explode") ?? style === "form"
+    if (style === "spaceDelimited" || style === "pipeDelimited") out.set(e.key, delimiterOf(style))
+    else if (style === "form" && !explode) out.set(e.key, ",")
+  }
+  return out
+}
+
+// The form fields whose objects use a declared style: exploded form sends each member as its own field,
+// packed form one field of key,value pairs, deepObject field[key]=value. Without a declared style or
+// explode an object stays a JSON value, the OpenAPI default.
+function formObjectStyles(encoding: Field[]): Map<string, string> {
+  const out: Map<string, string> = new Map()
+  for (const e of encoding) {
+    const enc = obj(e.raw)
+    let style = str(find(enc, "style"))
+    const set = rawBool(enc, "explode")
+    if (style === "" && set === undefined) continue
+    if (style === "") style = "form"
+    const explode = set ?? style === "form"
+    if (style === "deepObject") out.set(e.key, "deepObject")
+    else if (style === "form" && explode) out.set(e.key, "form")
+    else if (style === "form") out.set(e.key, "formPacked")
+  }
+  return out
 }
 
 const METHODS_V3: string[] = ["get", "put", "post", "delete", "patch", "head", "options", "trace"]
@@ -871,14 +914,14 @@ function buildOpV2(method: string, path: string, opRaw: string, pathParamsRaw: s
       return op
     }
     const schema = find(bodyParam, "schema")
-    op.body = { contentType: bt.ct === FORM_CT ? JSON_CT : bt.ct, required: rawBool(bodyParam, "required") ?? false, description: str(find(bodyParam, "description")).trim(), schema: schema !== undefined && schema.trim().startsWith("{") ? schema.trim() : "{\"type\":\"object\"}", delimiters: new Map() }
+    op.body = { contentType: bt.ct === FORM_CT ? JSON_CT : bt.ct, required: rawBool(bodyParam, "required") ?? false, description: str(find(bodyParam, "description")).trim(), schema: schema !== undefined && schema.trim().startsWith("{") ? schema.trim() : "{\"type\":\"object\"}", delimiters: new Map(), objectStyles: new Map() }
   } else if (formSeen) {
     if (!bt.ok) {
       op.unsupported = bt.reason
       return op
     }
     const schema = formRequired.length > 0 ? `{"type":"object","properties":${objText(formProps)},"required":${quoteList(formRequired)}}` : `{"type":"object","properties":${objText(formProps)}}`
-    op.body = { contentType: FORM_CT, required: formRequired.length > 0, description: "", schema: schema, delimiters: delims }
+    op.body = { contentType: FORM_CT, required: formRequired.length > 0, description: "", schema: schema, delimiters: delims, objectStyles: new Map() }
   }
   return op
 }
@@ -1090,7 +1133,7 @@ function explodeOf(p: OpParam): bool {
 // (an array, a primitive, a choice, text) travels as one "body" argument.
 function flatten(inout op: OpenApiOp): string {
   let props: Field[] = []
-  const required: string[] = []
+  let required: string[] = []
   const body = op.body
   if (body !== undefined) {
     if (body.contentType === TEXT_CT) {
@@ -1125,6 +1168,14 @@ function flatten(inout op: OpenApiOp): string {
   }
   // a name shared by parameters in different places is suffixed on every side
   for (const p of op.params) {
+    if (p.in === "querystring") {
+      const err = flattenQuerystring(&op, p, &props, &required)
+      if (err !== "") {
+        op.unsupported = err
+        return ""
+      }
+      continue
+    }
     if (p.in !== "path" && p.in !== "query" && p.in !== "header" && p.in !== "cookie") {
       op.warnings.push(`parameter "${p.name}" has unsupported location "${p.in}" and was skipped`)
       continue
@@ -1135,10 +1186,61 @@ function flatten(inout op: OpenApiOp): string {
     put(&schema, "description", quote(joinDescription(p.description, `(${p.in} parameter)`)))
     props.push({ key: arg, raw: objText(sortedFields(schema)) })
     if (p.required) required.push(arg)
-    op.args.push({ arg: arg, in: p.in, name: p.name, required: p.required, explode: explodeOf(p), style: p.style, contentType: p.contentType })
+    op.args.push({ arg: arg, in: p.in, name: p.name, required: p.required, explode: explodeOf(p), style: p.style, contentType: p.contentType, group: "", ifGroupSent: false })
   }
   const req = sortStrings(required)
   return `{"type":"object","properties":${objText(sortedFields(props))}${req.length > 0 ? `,"required":${quoteList(req)}` : ""}}`
+}
+
+// A 3.2 `in: querystring` parameter. An object schema with named properties gives one query argument per
+// property (suffixed "__querystring" on a clash); any other schema, or a JSON-encoded query string, is one
+// argument sent as the whole query string. Answers an error that makes the operation unsupported, or "".
+function flattenQuerystring(inout op: OpenApiOp, p: OpParam, inout props: Field[], inout required: string[]): string {
+  const schema = obj(normalizeSchema(p.schema))
+  const qsProps = obj(find(schema, "properties"))
+  const json = p.contentType !== "" && jsonMedia(p.contentType)
+  if (isObjectSchema(schema) && qsProps.length > 0 && !freeForm(schema) && !json) {
+    const req = strList(find(schema, "required"))
+    // an optional querystring that requires a field accepting no value is left out: it cannot be sent
+    if (!p.required) {
+      for (const n of req) {
+        const pr = find(qsProps, n)
+        if (pr !== undefined && pr.trim() === "false") {
+          op.warnings.push(`optional querystring "${p.name}" requires field "${n}", whose schema is false; it was left out of the tool`)
+          return ""
+        }
+      }
+    }
+    for (const f of sortedFields(qsProps)) {
+      const t = f.raw.trim()
+      if (t === "false") {
+        if (req.includes(f.key)) return `querystring "${p.name}" requires field "${f.key}", whose schema is false and accepts no value`
+        continue
+      }
+      let prop: Field[] = t.startsWith("{") ? obj(t) : t === "true" ? [] : [{ key: "type", raw: "\"string\"" }]
+      put(&prop, "description", quote(joinDescription(str(find(prop, "description")), "(query parameter)")))
+      const arg = has(props, f.key) ? uniqueArg(props, `${f.key}__querystring`) : f.key
+      props.push({ key: arg, raw: objText(sortedFields(prop)) })
+      const must = req.includes(f.key)
+      if (must && p.required) required.push(arg)
+      // an optional querystring keeps its fields optional, but its required ones go along once any is sent
+      op.args.push({ arg: arg, in: "query", name: f.key, required: must && p.required, explode: true, style: "", contentType: "", group: p.required ? "" : "querystring:" + p.name, ifGroupSent: !p.required && must })
+    }
+    return ""
+  }
+  const base = p.name === "" ? "querystring" : p.name
+  const arg = has(props, base) ? uniqueArg(props, `${base}__querystring`) : base
+  if (json) {
+    // the whole query string is one JSON document, encoded when sent
+    let js = schema
+    put(&js, "description", quote(joinDescription(str(find(js, "description")), joinDescription(p.description, "(query string, sent as JSON)"))))
+    props.push({ key: arg, raw: objText(sortedFields(js)) })
+  } else {
+    props.push({ key: arg, raw: `{"description":${quote(joinDescription(p.description, "(raw query string, sent verbatim)"))},"type":"string"}` })
+  }
+  if (p.required) required.push(arg)
+  op.args.push({ arg: arg, in: "querystring", name: p.name, required: p.required, explode: false, style: "", contentType: p.contentType, group: "", ifGroupSent: false })
+  return ""
 }
 
 // ---- naming ----
@@ -1293,6 +1395,10 @@ export function parseSpec(text: string, includeDeprecated: bool, specUrl?: strin
       continue
     }
     op.inputSchema = flatten(&op)
+    if (op.unsupported !== "") {
+      unsupported.push({ operation_id: op.operationId, method: op.method, path: op.path, reason: op.unsupported })
+      continue
+    }
     op.name = toolName(op, budget)
     const sw = securityWarning(op, parsed.schemes, parsed.global)
     if (sw !== "") op.warnings.push(sw)
@@ -1583,8 +1689,17 @@ export function requestFor(op: OpenApiOp, base: string, args: string, doc: OpenA
   }
   let path = op.path
   let query: QPair[] = []
+  let rawQuery = ""
   const argHeaders: Map<string, string> = new Map()
   const cookies: Field[] = []
+  // an optional querystring's required fields go along once any of its fields is sent
+  const sentGroups: string[] = []
+  for (const b of op.args) {
+    if (b.group !== "" && find(fs, b.arg) !== undefined) sentGroups.push(b.group)
+  }
+  for (const b of op.args) {
+    if (b.ifGroupSent && sentGroups.includes(b.group) && find(fs, b.arg) === undefined) throw new SyntaxError(`query parameter "${b.name}" is required when other fields of the query string are sent`)
+  }
   for (const b of op.args) {
     const raw = find(fs, b.arg)
     const jsonParam = b.contentType !== "" && jsonMedia(b.contentType)
@@ -1607,6 +1722,13 @@ export function requestFor(op: OpenApiOp, base: string, args: string, doc: OpenA
       argHeaders.set(ln, headerValue(b, value))
     } else if (b.in === "cookie") {
       cookies.push({ key: b.name, raw: stringify(value, ",") })
+    } else if (b.in === "querystring") {
+      // a JSON query string is the document percent-encoded; any other is sent as written
+      if (jsonParam) rawQuery = formEncode(stringify(value, "&"))
+      else {
+        rawQuery = stringify(value, "&")
+        if (rawQuery.startsWith("?")) rawQuery = rawQuery.slice(1)
+      }
     }
   }
   if (path.includes("{")) throw new SyntaxError(`path "${path}" has unresolved parameters`)
@@ -1643,17 +1765,33 @@ export function requestFor(op: OpenApiOp, base: string, args: string, doc: OpenA
     if (present) {
       if (ob.contentType === FORM_CT) {
         if (!payload.startsWith("{")) throw new SyntaxError("form request body must be an object")
-        const pairs: string[] = []
+        // encoded as Go's url.Values: sorted by key, each key's values in order
+        let pairs: QPair[] = []
         for (const f of sortedFields(obj(payload))) {
           const t = f.raw.trim()
           const d = ob.delimiters.get(f.key)
-          if (t.startsWith("[") && d === undefined) {
-            for (const x of arr(t)) pairs.push(formEncode(f.key) + "=" + formEncode(stringify(x, ",")))
+          const os = ob.objectStyles.get(f.key)
+          if (t.startsWith("{") && os !== undefined) {
+            const members = sortedFields(obj(t))
+            if (os === "form") {
+              for (const m of members) pairs.push({ k: m.key, v: stringify(m.raw, ",") })
+            } else if (os === "deepObject") {
+              for (const m of members) pairs.push({ k: `${f.key}[${m.key}]`, v: stringify(m.raw, ",") })
+            } else {
+              const items: string[] = []
+              for (const m of members) {
+                items.push(m.key)
+                items.push(stringify(m.raw, ","))
+              }
+              pairs.push({ k: f.key, v: items.join(",") })
+            }
+          } else if (t.startsWith("[") && d === undefined) {
+            for (const x of arr(t)) pairs.push({ k: f.key, v: stringify(x, ",") })
           } else {
-            pairs.push(formEncode(f.key) + "=" + formEncode(t.startsWith("[") ? arr(t).map((x: string): string => stringify(x, ",")).join(d ?? ",") : stringify(t, ",")))
+            pairs.push({ k: f.key, v: t.startsWith("[") ? arr(t).map((x: string): string => stringify(x, ",")).join(d ?? ",") : stringify(t, ",") })
           }
         }
-        body = pairs.join("&")
+        body = encodeQuery(pairs)
         contentType = FORM_CT
       } else if (ob.contentType === TEXT_CT) {
         body = stringify(payload, "\n")
@@ -1709,6 +1847,7 @@ export function requestFor(op: OpenApiOp, base: string, args: string, doc: OpenA
   const hashAt = rootUrl.indexOf("#")
   if (hashAt >= 0) rootUrl = rootUrl.slice(0, hashAt)
   const qAt = rootUrl.indexOf("?")
+  const owned: string[] = []
   if (qAt >= 0) {
     for (const part of rootUrl.slice(qAt + 1).split("&")) {
       if (part === "") continue
@@ -1716,15 +1855,28 @@ export function requestFor(op: OpenApiOp, base: string, args: string, doc: OpenA
       const k = pctDecode(eq < 0 ? part : part.slice(0, eq))
       query = query.filter((p) => p.k !== k)
       query.push({ k: k, v: pctDecode(eq < 0 ? "" : part.slice(eq + 1)) })
+      owned.push(k)
     }
     rootUrl = rootUrl.slice(0, qAt)
   }
   for (const p of credQuery) {
     query = query.filter((x) => x.k !== p.k)
     query.push(p)
+    owned.push(p.k)
+  }
+  // under those names a raw query string's pairs are dropped too, the rest kept as written
+  if (rawQuery !== "" && owned.length > 0) {
+    const kept: string[] = []
+    for (const pair of rawQuery.split("&")) {
+      const eq = pair.indexOf("=")
+      const k = pctDecode((eq < 0 ? pair : pair.slice(0, eq)).split("+").join(" "))
+      if (!owned.includes(k)) kept.push(pair)
+    }
+    rawQuery = kept.join("&")
   }
   if (rootUrl.endsWith("/")) rootUrl = rootUrl.slice(0, rootUrl.byteLength - 1)
-  const qs = encodeQuery(query)
+  let qs = encodeQuery(query)
+  if (rawQuery !== "") qs = qs === "" ? rawQuery : qs + "&" + rawQuery
   const full = rootUrl + (path === "" || path.startsWith("/") ? path : "/" + path) + (qs === "" ? "" : "?" + qs)
   return { method: op.method, url: full, headers: headers, body: body }
 }
@@ -2019,6 +2171,49 @@ test("calls build the URL, the query, the body and the credentials", () => {
   expect(ans.isError).toBe(true)
   expect(formatAnswer(204, "", [], 0).text).toBe("HTTP 204 No Content")
   expect(formatAnswer(200, "image/png", [u8(1), u8(2)], 0).text).toBe("[binary response: image/png, 2 bytes]")
+})
+
+test("3.2 querystring parameters flatten or travel whole, and form objects follow their encoding style", () => {
+  const spec = `{"openapi":"3.2.0","info":{"title":"t","version":"1"},"paths":{
+    "/s":{"get":{"operationId":"s","parameters":[{"name":"filter","in":"querystring","required":true,"content":{"application/x-www-form-urlencoded":{"schema":{"type":"object","required":["q"],"properties":{"q":{"type":"string"},"page":{"type":"integer"}}}}}}]}},
+    "/o":{"get":{"operationId":"o","parameters":[{"name":"f","in":"querystring","content":{"application/x-www-form-urlencoded":{"schema":{"type":"object","required":["a"],"properties":{"a":{"type":"string"},"b":{"type":"string"}}}}}}]}},
+    "/r":{"get":{"operationId":"r","parameters":[{"name":"raw","in":"querystring","content":{"text/plain":{"schema":{"type":"string"}}}}]}},
+    "/j":{"get":{"operationId":"j","parameters":[{"name":"doc","in":"querystring","content":{"application/json":{"schema":{"type":"object","properties":{"x":{"type":"integer"}}}}}}]}},
+    "/no":{"get":{"operationId":"no","parameters":[{"name":"n","in":"querystring","required":true,"content":{"application/x-www-form-urlencoded":{"schema":{"type":"object","required":["z"],"properties":{"z":false,"y":{"type":"string"}}}}}}]}},
+    "/form":{"post":{"operationId":"form","requestBody":{"content":{"application/x-www-form-urlencoded":{"schema":{"type":"object","properties":{"deep":{"type":"object"},"ex":{"type":"object"},"pk":{"type":"object"},"plain":{"type":"object"},"tags":{"type":"array"}}},
+      "encoding":{"deep":{"style":"deepObject"},"ex":{"style":"form","explode":true},"pk":{"explode":false},"tags":{"style":"pipeDelimited"}}}}}}}}}`
+  const doc = try parseSpec(spec, false)
+  const byName = (n: string): OpenApiOp => doc.ops.filter((o) => o.name === n)[0]!
+  // an object querystring becomes query arguments; a required querystring keeps its required fields
+  const s = byName("s")
+  expect(s.inputSchema).toBe('{"type":"object","properties":{"page":{"description":"(query parameter)","type":"integer"},"q":{"description":"(query parameter)","type":"string"}},"required":["q"]}')
+  const creds: Map<string, OpenApiCred> = new Map()
+  expect((try requestFor(s, "https://a.example?key=1", '{"q":"a b","page":2}', doc, creds)).url).toBe("https://a.example/s?key=1&page=2&q=a+b")
+  // an optional one: nothing is required until one of its fields is sent
+  const o = byName("o")
+  expect(o.inputSchema.includes('"required"')).toBe(false)
+  expect((try requestFor(o, "https://a.example", "{}", doc, creds)).url).toBe("https://a.example/o")
+  let msg = ""
+  try {
+    requestFor(o, "https://a.example", '{"b":"x"}', doc, creds)
+  } catch (e) {
+    msg = e.message
+  }
+  expect(msg).toBe('query parameter "a" is required when other fields of the query string are sent')
+  // a raw query string is sent as written, after the call's own query, without the base URL's names
+  const r = byName("r")
+  expect(r.inputSchema.includes('"raw":{"description":"(raw query string, sent verbatim)","type":"string"}')).toBe(true)
+  expect((try requestFor(r, "https://a.example?key=1", '{"raw":"?a=1&key=2&b=x%20y"}', doc, creds)).url).toBe("https://a.example/r?key=1&a=1&b=x%20y")
+  // a JSON query string is the document, percent-encoded
+  const j = byName("j")
+  expect(j.inputSchema.includes("(query string, sent as JSON)")).toBe(true)
+  expect((try requestFor(j, "https://a.example", '{"doc":{"x":1}}', doc, creds)).url).toBe("https://a.example/j?%7B%22x%22%3A1%7D")
+  // a required field whose schema is false makes the operation unsupported
+  expect(doc.ops.some((x) => x.name === "no")).toBe(false)
+  expect(doc.unsupported.some((u) => u.path === "/no" && u.reason.includes('requires field "z", whose schema is false'))).toBe(true)
+  // form objects: deepObject, exploded form, packed form, JSON by default; a pipe-delimited array
+  const f = try requestFor(byName("form"), "https://a.example", '{"deep":{"b":1,"a":"x"},"ex":{"m":"1"},"pk":{"k":"v","j":2},"plain":{"p":1},"tags":["a","b"]}', doc, creds)
+  expect(f.body).toBe("deep%5Ba%5D=x&deep%5Bb%5D=1&m=1&pk=j%2C2%2Ck%2Cv&plain=%7B%22p%22%3A1%7D&tags=a%7Cb")
 })
 
 test("allOf merges into one object, and the preview reports tools, unsupported operations and schemes", () => {

@@ -4,7 +4,7 @@
 // limit, and the caller gets the final answer. The step logic is pure so it tests without
 // a network; runAgent takes the model call and the tool executor as functions.
 import { fields, elements, find, rawStr, isNull, decodeString, build, setField, quote } from "./json"
-import { toolMessage } from "./mcp"
+import { toolMessage, patternMatches } from "./mcp"
 import { EXECUTE_TOOL, isDiscoveryTool } from "./codemode"
 
 export type AgentConfig = {
@@ -68,10 +68,11 @@ export function assistantMessage(completion: string): string throws SyntaxError 
   return msg
 }
 
-// A tool may run on its own only if it is an MCP tool and the list allows it.
+// A tool may run on its own only if it is an MCP tool and the list allows it: by name, "*", or a
+// "<server>-*" pattern (tools_to_auto_execute ["*"]), as the code mode check matches them.
 export function allowed(name: string, cfg: AgentConfig, mcpNames: string[]): bool {
   if (!mcpNames.includes(name)) return false
-  return cfg.auto_execute.includes("*") || cfg.auto_execute.includes(name)
+  return cfg.auto_execute.some((p) => patternMatches(name, p))
 }
 
 // The chat request with the assistant message and the tool results appended to messages.
@@ -94,7 +95,11 @@ export function nextRequest(chatBody: string, assistantMsg: string, toolMessages
 // discovery tools only read, so they run whenever they are offered (mcpNames); executeToolCode runs when
 // codeOk accepts its arguments (every tool the program calls is auto-executable).
 export function decide(completion: string, cfg: AgentConfig, mcpNames: string[], depth: int, codeOk: (argsJson: string) => bool): AgentDecision throws SyntaxError {
-  const calls = try toolCallsOf(completion)
+  return decideCalls(try toolCallsOf(completion), completion, cfg, mcpNames, depth, codeOk)
+}
+
+// decide for calls already read from an answer (a chat completion or a Responses answer).
+function decideCalls(calls: ToolCallRef[], completion: string, cfg: AgentConfig, mcpNames: string[], depth: int, codeOk: (argsJson: string) => bool): AgentDecision {
   if (calls.length === 0) return { kind: "done" }
   for (const c of calls) {
     if (isDiscoveryTool(c.name) && mcpNames.includes(c.name)) continue
@@ -163,6 +168,121 @@ export async function runAgent(
   }
 }
 
+// ---- the Responses API (Bifrost's responsesAPIAdapter) ----
+
+// The function_call items of a Responses answer's output.
+export function responsesCalls(answer: string): ToolCallRef[] throws SyntaxError {
+  const out: ToolCallRef[] = []
+  const items = find(try fields(answer), "output")
+  if (items === undefined || isNull(items)) return out
+  for (const el of try elements(items)) {
+    const f = try fields(el)
+    if (rawStr(f, "type") !== "function_call") continue
+    const a = find(f, "arguments")
+    let args = "{}"
+    if (a !== undefined && !isNull(a)) args = a.startsWith('"') ? try decodeString(a) : a
+    out.push({ id: rawStr(f, "call_id") ?? rawStr(f, "id") ?? "", name: rawStr(f, "name") ?? "", argumentsJson: args })
+  }
+  return out
+}
+
+// The next Responses request: the conversation so far (a string input is the user's message), every output
+// item of the answer, then a function_call_output per executed call. The other fields keep their raw values.
+export function responsesNext(reqBody: string, answer: string, results: ToolResult[]): string throws SyntaxError {
+  let fs = try fields(reqBody)
+  const parts: string[] = []
+  const input = find(fs, "input")
+  if (input !== undefined && !isNull(input)) {
+    if (input.trim().startsWith("[")) {
+      for (const el of try elements(input)) parts.push(el)
+    } else {
+      parts.push(`{"role":"user","content":${input.trim()}}`)
+    }
+  }
+  const items = find(try fields(answer), "output")
+  if (items !== undefined && !isNull(items)) {
+    for (const el of try elements(items)) parts.push(el)
+  }
+  for (const r of results) parts.push(`{"type":"function_call_output","call_id":${quote(r.id)},"output":${quote(r.text)}}`)
+  setField(&fs, "input", "[" + parts.join(",") + "]")
+  return build(fs)
+}
+
+// The output items of a superseded turn that stay in the final answer: all but its function calls, as
+// Bifrost's carryForward keeps them (a reasoning item whole, its encrypted content included).
+function carriedItems(answer: string): string[] throws SyntaxError {
+  const out: string[] = []
+  const items = find(try fields(answer), "output")
+  if (items === undefined || isNull(items)) return out
+  for (const el of try elements(items)) {
+    if (rawStr(try fields(el), "type") !== "function_call") out.push(el)
+  }
+  return out
+}
+
+// The final answer with the earlier turns' carried items ahead of its own output.
+function withCarried(answer: string, carried: string[]): string throws SyntaxError {
+  if (carried.length === 0) return answer
+  let fs = try fields(answer)
+  const own = find(fs, "output")
+  const parts = carried.slice(0)
+  if (own !== undefined && !isNull(own)) {
+    for (const el of try elements(own)) parts.push(el)
+  }
+  setField(&fs, "output", "[" + parts.join(",") + "]")
+  return build(fs)
+}
+
+export type ToolResult = { id: string, text: string }
+
+async function runOneText(c: ToolCallRef, exec: (name: string, argsJson: string) => Promise<{ text: string, isError: bool }, Error>): Promise<ToolResult> {
+  try {
+    const r = try await exec(c.name, c.argumentsJson)
+    return { id: c.id, text: r.isError ? "Error: " + r.text : r.text }
+  } catch (e) {
+    return { id: c.id, text: "Error: " + e.message }
+  }
+}
+
+// runAgent for the Responses API: each model call is a Responses request, the answer's function calls run
+// when auto-executable (decide's rules), and their outputs go back as function_call_output items.
+export async function runResponsesAgent(
+  reqBody: string,
+  call: (body: string) => Promise<{ status: int, body: string }, Error>,
+  exec: (name: string, argsJson: string) => Promise<{ text: string, isError: bool }, Error>,
+  cfg: AgentConfig,
+  mcpNames: string[],
+  codeOk: (argsJson: string) => bool,
+): Promise<{ status: int, body: string, steps: int, toolCalls: int }, Error> throws SyntaxError | Error {
+  let body = reqBody
+  let steps = 0
+  let toolCalls = 0
+  let carried: string[] = []
+  while (true) {
+    const r = try await call(body)
+    if (r.status < 200 || r.status >= 300) return { status: r.status, body: r.body, steps: steps, toolCalls: toolCalls }
+    steps += 1
+    let d: AgentDecision = { kind: "done" }
+    try {
+      d = decideCalls(responsesCalls(r.body), r.body, cfg, mcpNames, steps - 1, codeOk)
+    } catch (e) {
+      return { status: r.status, body: r.body, steps: steps, toolCalls: toolCalls }
+    }
+    if (d.kind !== "execute") return { status: r.status, body: try withCarried(r.body, carried), steps: steps, toolCalls: toolCalls }
+    const results: ToolResult[] = []
+    if (cfg.parallel) {
+      const pending: Promise<ToolResult>[] = []
+      for (const c of d.calls) pending.push(runOneText(c, exec))
+      for (const x of try await Promise.all(pending)) results.push(x)
+    } else {
+      for (const c of d.calls) results.push(try await runOneText(c, exec))
+    }
+    for (const it of try carriedItems(r.body)) carried.push(it)
+    body = try responsesNext(body, r.body, results)
+    toolCalls += d.calls.length
+  }
+}
+
 test("tool calls and the assistant message of a completion", () => {
   const msgJson = '{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"fs-read","arguments":"{\\"path\\":\\"a.txt\\"}"}},{"id":"call_2","type":"function","function":{"name":"fs-list","arguments":{"dir":"/"}}}]}'
   const completion = '{"id":"c1","choices":[{"index":0,"message":' + msgJson + ',"finish_reason":"tool_calls"}],"usage":{"total_tokens":3}}'
@@ -204,6 +324,10 @@ test("allowed: MCP tools only, by list or by star", () => {
   // a function the caller defined is never run here, even under "*"
   expect(allowed("get_weather", star, mcp)).toBe(false)
   expect(allowed("get_weather", one, mcp)).toBe(false)
+  // a server pattern covers that server's tools only
+  const server: AgentConfig = { max_depth: 10, auto_execute: ["fs-*"], parallel: true }
+  expect(allowed("fs-list", server, mcp.concat(["db-q"]))).toBe(true)
+  expect(allowed("db-q", server, mcp.concat(["db-q"]))).toBe(false)
   expect(defaultAgentConfig().max_depth).toBe(10)
 })
 
@@ -273,4 +397,24 @@ test("decide: code mode's discovery tools run; executeToolCode runs only when co
   expect(try decide(callOf("executeToolCode", "{\"code\":\"result = 1\"}"), cfg, names, 0, no).kind).toBe("stop")
   expect(try decide(callOf("executeToolCode", "{\"code\":\"result = 1\"}"), cfg, names, 0, yes).kind).toBe("execute")
   expect(try decide(callOf("executeToolCode", "{\"code\":\"x = 1\"}"), cfg, ["fs-read"], 0, yes).kind).toBe("stop")
+})
+
+test("Responses answers: function calls, the next request and the carried output", () => {
+  const answer = '{"id":"resp_1","output":[{"type":"reasoning","id":"rs_1","encrypted_content":"e"},{"type":"function_call","id":"fc_1","call_id":"call_1","name":"fs-read","arguments":"{\\"path\\":\\"a\\"}"}]}'
+  const calls = try responsesCalls(answer)
+  expect(calls).toEqual([{ id: "call_1", name: "fs-read", argumentsJson: '{"path":"a"}' }])
+  expect(try responsesCalls('{"output":[{"type":"message","content":[]}]}')).toEqual([])
+  // a string input becomes the user's message; the answer's items and the outputs follow
+  const next = try responsesNext('{"model":"m","input":"hi","tools":[{"type":"function","name":"fs-read"}]}', answer, [{ id: "call_1", text: "body" }])
+  expect(next).toBe('{"model":"m","input":[{"role":"user","content":"hi"},{"type":"reasoning","id":"rs_1","encrypted_content":"e"},{"type":"function_call","id":"fc_1","call_id":"call_1","name":"fs-read","arguments":"{\\"path\\":\\"a\\"}"},{"type":"function_call_output","call_id":"call_1","output":"body"}],"tools":[{"type":"function","name":"fs-read"}]}')
+  const again = try responsesNext('{"input":[{"role":"user","content":"x"}]}', '{"output":[]}', [])
+  expect(again).toBe('{"input":[{"role":"user","content":"x"}]}')
+  // the superseded turn's items but its function calls go ahead of the final output
+  const carried = try carriedItems(answer)
+  expect(carried).toEqual(['{"type":"reasoning","id":"rs_1","encrypted_content":"e"}'])
+  expect(try withCarried('{"id":"resp_2","output":[{"type":"message"}]}', carried)).toBe('{"id":"resp_2","output":[{"type":"reasoning","id":"rs_1","encrypted_content":"e"},{"type":"message"}]}')
+  // the decision rules are the chat loop's
+  const cfg: AgentConfig = { max_depth: 3, auto_execute: ["fs-*"], parallel: true }
+  expect(decideCalls(calls, answer, cfg, ["fs-read"], 0, (a: string): bool => false).kind).toBe("execute")
+  expect(decideCalls(calls, answer, { max_depth: 3, auto_execute: ["db-*"], parallel: true }, ["fs-read"], 0, (a: string): bool => false).kind).toBe("stop")
 })

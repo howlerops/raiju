@@ -1,7 +1,7 @@
 // Bifrost's log API shapes over Raiju's request log (handlers/logging.go): the list page, one log,
 // the session views, the User-Agent to app mappings, and the parsing their query strings need.
 // The views are pure: the handlers pass in the entries a caller may see and the filter applied.
-import { LogEntry, Filter, filterFrom, statsView, kindOf, daysFromCivil, jobj, jarr, jkv, jn, hitTypeOf } from "./logstore"
+import { LogEntry, Filter, filterFrom, statsView, kindOf, daysFromCivil, jobj, jarr, jkv, jn, hitTypeOf, publicEntry } from "./logstore"
 import { UserAgentMapping } from "./config"
 import { compileRegex, Regex } from "./regex"
 import { isoMs } from "./exports"
@@ -113,7 +113,7 @@ export function listJson(es: LogEntry[], page: Page, hasLogs: bool): string {
   const entries: string[] = []
   for (let i = page.offset; i < sorted.length && rows.length < page.limit; i++) {
     rows.push(logJson(sorted[i]!, false))
-    entries.push(JSON.stringify(sorted[i]!))
+    entries.push(JSON.stringify(publicEntry(sorted[i]!)))
   }
   return jobj([
     jkv("logs", jarr(rows)),
@@ -178,6 +178,36 @@ export function sessionSummaryJson(es: LogEntry[], sessionId: string): string {
 // One log by id, in Bifrost's shape with the detail fields.
 export function detailJson(e: LogEntry): string {
   return logJson(e, true)
+}
+
+// ---- logs_only reveal (Bifrost's redaction_mapping on the log detail) ----
+
+// The placeholder key a mapping uses: the placeholder without its brackets ("[EMAIL-1]" is "EMAIL-1").
+function placeholderKey(token: string): string {
+  return token.startsWith("[") && token.endsWith("]") ? token.slice(1, token.byteLength - 1) : token
+}
+
+// The phase-scoped mapping of a request's placeholders: a placeholder found in a request text goes under input, one
+// found in an answer or error under output (both when it is in both). "" when nothing was replaced.
+export function phaseMapping(items: { token: string, value: string }[], inputs: string[], outputs: string[]): string {
+  const inp: string[] = []
+  const out: string[] = []
+  for (const it of items) {
+    const pair = jkv(placeholderKey(it.token), JSON.stringify(it.value))
+    if (inputs.some((t) => t.includes(it.token))) inp.push(pair)
+    if (outputs.some((t) => t.includes(it.token))) out.push(pair)
+  }
+  if (inp.length === 0 && out.length === 0) return ""
+  const parts: string[] = []
+  if (inp.length > 0) parts.push(jkv("input", "{" + inp.join(",") + "}"))
+  if (out.length > 0) parts.push(jkv("output", "{" + out.join(",") + "}"))
+  return jobj(parts)
+}
+
+// A detail object with the opened reveal mapping added as redaction_mapping (unchanged without one).
+export function withMapping(detail: string, mapping: string): string {
+  if (mapping === "" || !mapping.startsWith("{") || !detail.endsWith("}")) return detail
+  return detail.slice(0, detail.byteLength - 1) + "," + jkv("redaction_mapping", mapping) + "}"
 }
 
 // ---- User-Agent to app ----
@@ -610,4 +640,17 @@ test("the user agent mapping routes validate, create, update and delete", () => 
   expect(del.status).toBe(200)
   expect((del.next ?? []).length).toBe(0)
   expect(uaRoute(list, "GET", "/api/logs/user-agent-mappings", "", "t").body.includes(`"mappings":[{`)).toBe(true)
+})
+
+test("the reveal mapping is scoped by phase and kept out of list entries", () => {
+  const items = [{ token: "[EMAIL-1]", value: "a@b.io" }, { token: "[PHONE-1]", value: "555 0100" }, { token: "[EMAIL-2]", value: "unused@x.io" }]
+  const m = phaseMapping(items, [`{"content":"mail [EMAIL-1]"}`], [`call [PHONE-1] or [EMAIL-1]`])
+  expect(m).toBe(`{"input":{"EMAIL-1":"a@b.io"},"output":{"EMAIL-1":"a@b.io","PHONE-1":"555 0100"}}`)
+  expect(phaseMapping(items, ["nothing"], [])).toBe("")
+  expect(withMapping(`{"id":"r1"}`, m)).toBe(`{"id":"r1","redaction_mapping":${m}}`)
+  expect(withMapping(`{"id":"r1"}`, "")).toBe(`{"id":"r1"}`)
+  const e: LogEntry = { id: "r1", ts: 1.0, request_id: "r1", op: "chat", provider: "openai", model: "m", status: 200, latency_ms: 1.0, prompt_tokens: 0, completion_tokens: 0, cost: 0.0, cache_hit: false, redaction_mapping: m }
+  const page: Page = { limit: 10, offset: 0, sortBy: "timestamp", order: "desc" }
+  expect(listJson([e], page, true).includes("redaction_mapping")).toBe(false)
+  expect(detailJson(e).includes("redaction_mapping")).toBe(false)
 })

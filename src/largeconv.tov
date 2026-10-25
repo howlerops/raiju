@@ -11,18 +11,19 @@ import * as bedrock from "./providers/bedrock"
 import * as vertex from "./providers/vertex"
 import * as openai from "./providers/openai"
 import * as providers from "./providers/index"
+import * as replicate from "./providers/replicate"
 import { ChatConv, MessagesConv, ConvOpts, TailFn, F_ANTHROPIC, F_VERTEX_CLAUDE, F_GEMINI, F_CONVERSE, F_COHERE } from "./streamconv"
 import { RespConv, respCorpus, streamedChat, canonJson } from "./respconv"
 import { MsgToChat, MsgChain } from "./msgconv"
 import { EmbConv, EMB_GEMINI, EMB_VERTEX, EMB_COHERE, EMB_BEDROCK, EMB_TITAN, TitanPiece } from "./embconv"
-import { TextToChat, textCorpus } from "./textconv"
+import { TextToChat, TextShaper, ShapeFn, textCorpus } from "./textconv"
 import { textToChatFields } from "./compat"
 import { toChatRequest } from "./providers/anthropic_in"
 import { bytesOf, textOfBytes, ByteOut } from "./jsonstream"
-import { LargeBody, ExtraBody } from "./largepayload"
+import { LargeBody, ExtraBody, withMember } from "./largepayload"
 import { Sha256, sha256, toHex } from "./crypto"
 import { newId } from "./schemas"
-import { readFileBytesSync, appendFileSync, mkdirSync, rmSync, unlinkSync, readdirSync, statSync, existsSync } from "node:fs"
+import { readFileBytesSync, appendFileSync, mkdirSync, rmSync, unlinkSync, readdirSync, statSync, existsSync, chmodSync } from "node:fs"
 
 // A converter for one request: a chat body to the provider's format, a Messages body to Bedrock/Vertex Claude, a
 // Messages body to chat (possibly chained to a chat converter), or an embeddings body to the provider's batch format.
@@ -31,11 +32,18 @@ import { readFileBytesSync, appendFileSync, mkdirSync, rmSync, unlinkSync, readd
 export class AnyConv {
   resp: RespConv | undefined = undefined
   text: TextToChat | undefined = undefined
+  // a text completion that goes on as a text completion with compat's drops and fits (family text-shaped)
+  shaper: TextShaper | undefined = undefined
+  // openai_config.disable_store on a chat body for an OpenAI-format provider: "store":false ends the body, as the
+  // whole-body path forces it (the last of two equal keys wins)
+  noStore = false
 
   constructor(readonly chat: ChatConv | undefined, readonly msgs: MessagesConv | undefined, readonly mchain: MsgChain | undefined, readonly emb: EmbConv | undefined) {}
 
   // the chat or Messages converter's output for a chunk of its input (the chunk itself when there is none)
   private through(b: u8[]): u8[][] throws SyntaxError {
+    const sp = this.shaper
+    if (sp !== undefined) return try sp.push(b)
     const c = this.chat
     if (c !== undefined) return try c.push(b)
     const m = this.msgs
@@ -48,6 +56,8 @@ export class AnyConv {
   }
 
   private end(): u8[][] throws SyntaxError {
+    const sp = this.shaper
+    if (sp !== undefined) return try sp.finish()
     const c = this.chat
     if (c !== undefined) return try c.finish()
     const m = this.msgs
@@ -72,6 +82,16 @@ export class AnyConv {
   }
 
   finish(): u8[][] throws SyntaxError {
+    const out = try this.finishBody()
+    if (!this.noStore) return out
+    // the closing brace is in the last chunk that has bytes
+    let i = out.length - 1
+    while (i >= 0 && out[i]!.length === 0) i -= 1
+    if (i >= 0) out[i] = withMember(out[i]!, new TextEncoder().encode(`,"store":false`))
+    return out
+  }
+
+  private finishBody(): u8[][] throws SyntaxError {
     const r = this.resp
     const x = this.text
     let last: u8[][] = []
@@ -82,6 +102,14 @@ export class AnyConv {
     for (const p of last) for (const q of try this.through(p)) out.push(q)
     for (const q of try this.end()) out.push(q)
     return out
+  }
+
+  // compat's drops and fits on a text completion's parameters, applied when its body ends
+  setShape(fn: ShapeFn): void {
+    const x = this.text
+    if (x !== undefined) x.shape = fn
+    const sp = this.shaper
+    if (sp !== undefined) sp.shape = fn
   }
 
   // the fields a Responses answer repeats (none for a chat request)
@@ -122,7 +150,11 @@ export function familyFor(route: string, kind: string, model: string, cfg: Provi
     const f = familyFor("chat", kind, model, cfg, stream)
     return f === "" ? "" : "resp-" + f
   }
-  if (route === "text-chat") {
+  if (route === "completions" || route === "text-chat") {
+    // Replicate takes a text completion as the prediction of its one user message, as the whole-body route sends it,
+    // whether or not compat sends it as chat
+    if (kind === "replicate") return "text-replicate"
+    if (route === "completions") return ""
     // a text completion that compat sends as chat (textconv.tov): the chat body as it is to an OpenAI-format
     // provider, else through the provider's chat family
     if (providers.streamsNatively(kind)) return "text-openai"
@@ -174,6 +206,12 @@ export function familyFor(route: string, kind: string, model: string, cfg: Provi
   return ""
 }
 
+// openai_config.disable_store, which the OpenAI-format chat request forces as store false (openai.tov storeOff)
+function storeOff(cfg: ProviderConfig): bool {
+  const v: bool = cfg.openai_config?.disable_store ?? false
+  return v
+}
+
 // Bedrock signs the payload, so its body is known whole (and hashed) before the request is made.
 export function needsHash(family: string): bool {
   const f = family.startsWith("resp-") || family.startsWith("text-") ? family.slice(5) : family
@@ -188,7 +226,21 @@ export function newConv(family: string, model: string, cfg: ProviderConfig, auto
     const sub = family.slice(5)
     const c = sub === "openai" ? new AnyConv(undefined, undefined, undefined, undefined) : newConv(sub, model, cfg, autoCache, wire, holdMax, strMax)
     c.resp = new RespConv(model, sub === "openai", holdMax, strMax)
+    c.noStore = sub === "openai" && storeOff(cfg)
     return c
+  }
+  if (family === "text-replicate") {
+    // Replicate's prediction body (convFor names the model as its version when the target does)
+    const rc = new AnyConv(undefined, undefined, undefined, undefined)
+    rc.text = new TextToChat(model, false, holdMax, strMax)
+    rc.text!.forReplicate(false)
+    return rc
+  }
+  if (family === "text-shaped") {
+    // the text completion as it is but for its parameters (compat's drops and fits); `wire` asks a stream for its usage
+    const sc = new AnyConv(undefined, undefined, undefined, undefined)
+    sc.shaper = new TextShaper(model, wire, holdMax, strMax)
+    return sc
   }
   if (family.startsWith("text-")) {
     // a text completion, written as the chat body textToChatFields gives, then by its chat family's converter (none
@@ -196,6 +248,7 @@ export function newConv(family: string, model: string, cfg: ProviderConfig, auto
     const sub = family.slice(5)
     const c = sub === "openai" ? new AnyConv(undefined, undefined, undefined, undefined) : newConv(sub, model, cfg, false, wire, holdMax, strMax)
     c.text = new TextToChat(model, sub === "openai" && wire, holdMax, strMax)
+    c.noStore = sub === "openai" && storeOff(cfg)
     return c
   }
   if (family === "messages-converse") {
@@ -205,7 +258,11 @@ export function newConv(family: string, model: string, cfg: ProviderConfig, auto
   }
   if (family === "messages-bedrock") return new AnyConv(undefined, new MessagesConv(true, "bedrock-2023-05-31", false, strMax), undefined, undefined)
   if (family === "messages-vertex") return new AnyConv(undefined, new MessagesConv(false, vertex.CLAUDE_VERSION, wire, strMax), undefined, undefined)
-  if (family === "messages-chat") return new AnyConv(undefined, undefined, new MsgChain(new MsgToChat(model, holdMax, strMax), undefined), undefined)
+  if (family === "messages-chat") {
+    const mc = new AnyConv(undefined, undefined, new MsgChain(new MsgToChat(model, holdMax, strMax), undefined), undefined)
+    mc.noStore = storeOff(cfg)
+    return mc
+  }
   if (family === "messages-gemini" || family === "messages-cohere") {
     // the chat converter of the provider's format, behind the Messages-to-chat stage
     const inner = newConv(family === "messages-gemini" ? "gemini" : "cohere", model, cfg, autoCache, wire, holdMax, strMax)
@@ -236,6 +293,14 @@ export function newConv(family: string, model: string, cfg: ProviderConfig, auto
   return new AnyConv(new ChatConv(o), undefined, undefined, undefined)
 }
 
+// newConv for one target: what depends on its key as well (a Replicate version id names the model in the body).
+export function convFor(family: string, t: Target, autoCache: bool, wire: bool, holdMax: int, strMax: int): AnyConv {
+  const c = newConv(family, t.model, t.cfg, autoCache, wire, holdMax, strMax)
+  const x = c.text
+  if (family === "text-replicate" && x !== undefined) x.forReplicate(replicate.writesVersion(t))
+  return c
+}
+
 // The upstream request (URL and headers, no body) for a converted body. `wire`: called as a stream. `hash` is the
 // body's SHA-256 in hex, for the families that need it.
 export function upstreamFor(family: string, t: Target, wire: bool, hash: string): Upstream throws SyntaxError {
@@ -246,6 +311,11 @@ export function upstreamFor(family: string, t: Target, wire: bool, hash: string)
   }
   if (family === "text-openai") {
     const up = openai.chatRequest(t, [{ key: "model", raw: quote(t.model) }])
+    return { url: up.url, headers: up.headers, body: "" }
+  }
+  if (family === "text-replicate") return try replicate.largeRequest(t)
+  if (family === "text-shaped") {
+    const up = openai.completionsRequest(t, [{ key: "model", raw: quote(t.model) }])
     return { url: up.url, headers: up.headers, body: "" }
   }
   if (family.startsWith("resp-") || family.startsWith("text-")) return try upstreamFor(family.slice(5), t, wire, hash)
@@ -363,8 +433,10 @@ export class Spool {
         // best effort
       }
     }
+    // the spool holds request bodies: a fresh folder (mkdir refuses one that is already there) that only we can read
     this.dir = root + "/raiju-spool-" + newId("")
-    try mkdirSync(this.dir, { recursive: true })
+    try mkdirSync(this.dir)
+    try chmodSync(this.dir, 448)
   }
 
   private segment(i: int): string {
@@ -636,6 +708,9 @@ function corpus(): string[] {
     `{"model":"m","messages":[{"role":"function","name":"f","content":"result text here"},{"role":"user","content":"u"}]}`,
     // no messages
     `{"model":"m","messages":[]}`,
+    // empty strings before the first cacheable content (auto_inject skips them, as Bifrost's injector does)
+    `{"model":"m","messages":[{"role":"system","content":""},{"role":"tool","tool_call_id":"t0","content":""},{"role":"assistant","content":"the first text, long enough to split"},{"role":"user","content":"then this"}]}`,
+    `{"model":"m","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,${b64}"}},{"type":"text","text":"after the image"}]},{"role":"user","content":"more"}]}`,
   ]
 }
 
@@ -646,6 +721,9 @@ test("the streaming conversion writes what the whole-body converters write, for 
     for (const f of families) {
       for (const cache of [false, true]) {
         if (cache && f !== "anthropic" && f !== "converse") continue
+        // a caller's own cache_control turns auto_inject off in the whole-body converters (Bifrost's injector), which a
+        // conversion that streams cannot see ahead of the first block it marks
+        if (cache && text.includes("cache_control")) continue
         for (const wire of [false, true]) {
           if (wire && f !== "anthropic" && f !== "vertex-claude" && f !== "cohere") continue
           const want = try canon(try reference(f, text, cache, wire))
@@ -840,4 +918,47 @@ test("families and upstreams of a text completion sent as chat, a Bedrock stream
   for (const p of try c.finish()) out.bytes(p)
   expect(textOfBytes(out.all())).toBe(`{"model":"target-model","messages":[{"role":"user","content":"hi"}],"stream":true,"stream_options":{"include_usage":true}}`)
   expect(c.wantsUsage()).toBe(true)
+})
+
+test("a large text completion to Replicate and one shaped by compat: families, bodies and upstreams", () => {
+  expect(familyFor("completions", "replicate", "owner/m", {}, false)).toBe("text-replicate")
+  expect(familyFor("text-chat", "replicate", "owner/m", {}, true)).toBe("text-replicate")
+  expect(familyFor("completions", "openai", "m", {}, false)).toBe("")
+  expect(needsHash("text-replicate")).toBe(false)
+  expect(needsHash("text-shaped")).toBe(false)
+  const ver = "5c7d5dc6dd8bf75c1acaa8565735e7986bc5b66206b55cca93cb72c9bf15ccaa"
+  const rt: Target = { provider: "replicate", kind: "replicate", model: ver, key: { value: "r8" }, cfg: {} }
+  const up = try upstreamFor("text-replicate", rt, false, "")
+  expect(up.url).toBe("https://api.replicate.com/v1/predictions")
+  expect(up.headers.get("prefer")).toBe("wait")
+  const run = (c: AnyConv, text: string): string => {
+    const out = new ByteOut()
+    try {
+      for (const p of c.push(bytesOf(text))) out.bytes(p)
+      for (const p of c.finish()) out.bytes(p)
+    } catch (e) {
+      return "error: " + e.message
+    }
+    return textOfBytes(out.all())
+  }
+  expect(run(convFor("text-replicate", rt, false, false, 1048576, 16), `{"model":"replicate/x","prompt":"hi","max_tokens":5}`)).toBe(`{"version":"${ver}","input":{"prompt":"hi","max_tokens":5}}`)
+  const named: Target = { provider: "replicate", kind: "replicate", model: "meta/llama", key: { value: "r8" }, cfg: {} }
+  expect(run(convFor("text-replicate", named, false, false, 1048576, 16), `{"model":"replicate/x","prompt":["a","b"]}`)).toBe(`{"input":{"prompt":"a\\nb"}}`)
+  // compat's shape on the parameters, for a text completion sent as chat and for one sent as it is
+  const g: Target = { provider: "groq", kind: "groq", model: "llama", key: { value: "k" }, cfg: {} }
+  const tc = convFor("text-openai", g, false, false, 1048576, 16)
+  tc.setShape((fs) => fs.filter((f) => f.key !== "temperature"))
+  expect(run(tc, `{"model":"m","prompt":"hi","temperature":1,"max_tokens":3}`)).toBe(`{"model":"llama","messages":[{"role":"user","content":"hi"}],"max_tokens":3}`)
+  const sh = convFor("text-shaped", g, false, true, 1048576, 16)
+  sh.setShape((fs) => fs.filter((f) => f.key !== "temperature"))
+  expect(run(sh, `{"model":"m","temperature":1,"prompt":"hi","stream":true}`)).toBe(`{"prompt":"hi","model":"llama","stream_options":{"include_usage":true},"stream":true}`)
+  expect((try upstreamFor("text-shaped", g, true, "")).url.endsWith("/completions")).toBe(true)
+  // disable_store ends a chat body for an OpenAI-format provider
+  const ns = newConv("text-openai", "llama", { openai_config: { disable_store: true } }, false, false, 1048576, 16)
+  expect(run(ns, `{"model":"m","prompt":"hi"}`)).toBe(`{"model":"llama","messages":[{"role":"user","content":"hi"}],"store":false}`)
+  const nr = newConv("resp-openai", "llama", { openai_config: { disable_store: true } }, false, false, 1048576, 16)
+  expect(run(nr, `{"model":"m","input":"hi"}`).endsWith(`,"store":false}`)).toBe(true)
+  const nm = newConv("messages-chat", "llama", { openai_config: { disable_store: true } }, false, false, 1048576, 16)
+  expect(run(nm, `{"model":"m","max_tokens":4,"messages":[{"role":"user","content":"hi"}]}`).endsWith(`,"store":false}`)).toBe(true)
+  expect(run(newConv("messages-chat", "llama", {}, false, false, 1048576, 16), `{"model":"m","max_tokens":4,"messages":[{"role":"user","content":"hi"}]}`).includes(`"store"`)).toBe(false)
 })

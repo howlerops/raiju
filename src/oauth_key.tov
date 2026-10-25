@@ -1,15 +1,16 @@
 // Bifrost's oauth_key_config: a provider key with no value gets its bearer token from a token endpoint
 // (core/providers/utils/tokencache). The grant is RFC 6749 client_credentials (the client's id and secret as
 // HTTP Basic auth, or in the form with auth_style "body"), or RFC 7523 jwt_bearer (an assertion signed with
-// the key's private key: RS256 with an RSA key, ES256 with a P-256 EC key). This module builds the token
+// the key's private key: RS256, RS384, RS512, PS256, PS384 or PS512 with an RSA key, ES256, ES384 or ES512 with an EC
+// key on P-256, P-384 or P-521). This module builds the token
 // request and reads the answer; gateway.tov caches the token per credential and mints a new one before it
 // expires, for every call the key serves (the routes, the raw passthrough, batches and files).
 
 import { fields, rawStr, rawNum, quote } from "./json"
 import { utf8, sha256, toHex, secureHex } from "./crypto"
 import { encodeUrl, encode, decode } from "./base64"
-import { signRs256 } from "./jwt"
-import { signEs256 } from "./ecdsa"
+import { signRsa } from "./jwt"
+import { signEs, ecPrivateKey } from "./ecdsa"
 import { pctEncode } from "./cloud_auth"
 import { OAuthKeyConfig } from "./config"
 
@@ -22,8 +23,8 @@ const ASSERTION_SECONDS = 300
 const ISSUED_SKEW_SECONDS = 30
 // the token lifetime when the response names none
 const DEFAULT_TOKEN_SECONDS = 3600.0
-// the algorithms an assertion can be signed with here (Bifrost also lists RS384, RS512, PS256 to PS512, ES384, ES512)
-const ALGORITHMS = ["RS256", "ES256"]
+// the algorithms an assertion can be signed with (Bifrost's OAuthSigningAlgorithms)
+const ALGORITHMS = ["RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512"]
 
 // A token URL is an absolute https URL with no userinfo, query or fragment. Plain http is for loopback only.
 function checkTokenUrl(url: string): void throws SyntaxError {
@@ -33,24 +34,75 @@ function checkTokenUrl(url: string): void throws SyntaxError {
   if (rest.includes("@") || url.includes("?") || url.includes("#")) throw new SyntaxError("oauth_key_config.token_url must not carry userinfo, a query, or a fragment; send extra parameters through extra_params")
 }
 
-// The issuer of a jwt_bearer assertion (Bifrost requires issuer; client_id stands in for it here).
-function issuerOf(c: OAuthKeyConfig): string {
-  const iss = (c.issuer ?? "").trim()
-  return iss !== "" ? iss : (c.client_id ?? "").trim()
+// Why a key's oauth_key_config is refused, as Bifrost's OAuthKeyConfig.Validate words it; "" when it is whole. With
+// checkKey, a literal PEM private key must also fit the algorithm (an EC key on its curve), as Bifrost's key routes
+// check it when a key is saved.
+export function oauthKeyProblem(c: OAuthKeyConfig, checkKey: bool): string {
+  const url = (c.token_url ?? "").trim()
+  if (url === "") return "oauth_key_config.token_url is required"
+  if (!url.startsWith("env.")) {
+    try {
+      checkTokenUrl(url)
+    } catch (e) {
+      return e.message
+    }
+  }
+  const grant = c.grant_type ?? ""
+  if (grant === "client_credentials") {
+    if ((c.client_id ?? "").trim() === "" || (c.client_secret ?? "").trim() === "") return "oauth_key_config.client_id and oauth_key_config.client_secret are required for the client_credentials grant"
+    const style = c.auth_style ?? ""
+    if (style !== "" && style !== "header" && style !== "body") return "oauth_key_config.auth_style must be header or body"
+  } else if (grant === "jwt_bearer") {
+    const pem = (c.private_key ?? "").trim()
+    if (pem === "") return "oauth_key_config.private_key is required for the jwt_bearer grant"
+    if ((c.issuer ?? "").trim() === "") return "oauth_key_config.issuer is required for the jwt_bearer grant"
+    if ((c.audience ?? "").trim() === "") return "oauth_key_config.audience is required for the jwt_bearer grant"
+    const alg = c.signing_algorithm ?? ""
+    if (alg !== "" && !ALGORITHMS.includes(alg)) return "oauth_key_config.signing_algorithm must be one of " + ALGORITHMS.join(", ")
+    const life = c.assertion_lifetime_seconds ?? 0
+    if (life < 0 || life > 3600) return "oauth_key_config.assertion_lifetime_seconds must be between 0 (default) and 3600"
+    if (checkKey && !pem.startsWith("env.")) return keyAlgorithmProblem(pem, alg === "" ? "RS256" : alg)
+  } else if (grant === "") {
+    return "oauth_key_config.grant_type is required"
+  } else {
+    return "oauth_key_config.grant_type must be client_credentials or jwt_bearer"
+  }
+  return ""
 }
 
-// The audience of a jwt_bearer assertion (Bifrost requires audience; the token URL stands in for it here).
-function audienceOf(c: OAuthKeyConfig): string {
-  const aud = (c.audience ?? "").trim()
-  return aud !== "" ? aud : (c.token_url ?? "")
+// Whether a PEM private key fits the algorithm (Bifrost's keyMatchesSigningAlgorithm): RSA for RS* and PS*, and for
+// ES* an EC key on the curve the algorithm names.
+function keyAlgorithmProblem(pem: string, alg: string): string {
+  const isRsa = pem.includes("-----BEGIN RSA PRIVATE KEY-----")
+  const isP8 = pem.includes("-----BEGIN PRIVATE KEY-----")
+  let ecCurve = ""
+  let isEc = false
+  if (!isRsa) {
+    try {
+      ecCurve = ecPrivateKey(pem).curve
+      isEc = true
+    } catch (e) {
+      // a PKCS#8 container that is not an EC key is taken as RSA
+      if (!isP8 || !e.message.includes("not an EC key")) return "oauth_key_config.private_key must be an RSA or EC private key in PEM form"
+    }
+  }
+  if (alg.startsWith("ES")) {
+    if (!isEc) return `oauth_key_config.signing_algorithm ${alg} needs an EC private key; private_key is RSA`
+    const want = alg === "ES256" ? "P-256" : (alg === "ES384" ? "P-384" : "P-521")
+    if (ecCurve !== "" && ecCurve !== want) return `oauth_key_config.signing_algorithm ${alg} needs a ${want} key; private_key is on ${ecCurve}`
+    return ""
+  }
+  if (isEc) return `oauth_key_config.signing_algorithm ${alg} needs an RSA private key; private_key is EC (set an ES* algorithm)`
+  return ""
 }
 
 // The RFC 7523 assertion of a jwt_bearer key: iss, sub (the subject, else the issuer), aud, iat and nbf (backdated
-// 30 seconds), exp, and a random jti; kid in the header when key_id is set. Signed RS256 or ES256.
+// 30 seconds), exp, and a random jti; kid in the header when key_id is set. Signed by signing_algorithm (RS256 when
+// unset).
 export function jwtAssertion(c: OAuthKeyConfig, nowSeconds: int): string throws SyntaxError {
   const alg = (c.signing_algorithm ?? "") === "" ? "RS256" : (c.signing_algorithm ?? "")
-  if (!ALGORITHMS.includes(alg)) throw new SyntaxError(`oauth jwt_bearer: signing_algorithm "${alg}" is not supported (RS256 or ES256)`)
-  const iss = issuerOf(c)
+  if (!ALGORITHMS.includes(alg)) throw new SyntaxError(`oauth jwt_bearer: signing_algorithm "${alg}" is not supported`)
+  const iss = (c.issuer ?? "").trim()
   const sub = (c.subject ?? "").trim() === "" ? iss : (c.subject ?? "").trim()
   const life = c.assertion_lifetime_seconds ?? 0
   const lifetime = life > 0 ? life : ASSERTION_SECONDS
@@ -63,14 +115,16 @@ export function jwtAssertion(c: OAuthKeyConfig, nowSeconds: int): string throws 
     throw new SyntaxError(`oauth jwt_bearer: could not generate jti: ${e.message}`)
   }
   const issued = nowSeconds - ISSUED_SKEW_SECONDS
-  const claims = `{"aud":${quote(audienceOf(c))},"exp":${nowSeconds + lifetime},"iat":${issued},"iss":${quote(iss)},"jti":${quote(jti)},"nbf":${issued},"sub":${quote(sub)}}`
+  const claims = `{"aud":${quote((c.audience ?? "").trim())},"exp":${nowSeconds + lifetime},"iat":${issued},"iss":${quote(iss)},"jti":${quote(jti)},"nbf":${issued},"sub":${quote(sub)}}`
   const input = encodeUrl(utf8(header)) + "." + encodeUrl(utf8(claims))
   const pem = c.private_key ?? ""
   let sig = ""
   try {
-    sig = alg === "ES256" ? signEs256(pem, input) : signRs256(pem, input)
+    sig = alg.startsWith("ES") ? signEs(alg, pem, input) : signRsa(alg, pem, input)
   } catch (e) {
-    throw new SyntaxError(`oauth jwt_bearer: ${alg === "ES256" ? e.message : "private_key could not be parsed as an RSA PEM (PKCS#1 or PKCS#8) for RS256: " + e.message}`)
+    const msg = e.message
+    const es = msg.includes("EC PEM") ? `private_key could not be parsed as an EC PEM for ${alg}` : msg
+    throw new SyntaxError(`oauth jwt_bearer: ${alg.startsWith("ES") ? es : "private_key could not be parsed as an RSA PEM (PKCS#1 or PKCS#8) for " + alg + ": " + msg}`)
   }
   return input + "." + sig
 }
@@ -80,25 +134,20 @@ export function jwtAssertion(c: OAuthKeyConfig, nowSeconds: int): string throws 
 // auth_style is "body".
 export function tokenRequest(c: OAuthKeyConfig, nowSeconds: int): OAuthRequest throws SyntaxError {
   const url = (c.token_url ?? "").trim()
-  if (url === "") throw new SyntaxError("oauth_key_config.token_url is required")
-  try checkTokenUrl(url)
+  const problem = oauthKeyProblem(c, false)
+  if (problem !== "") throw new SyntaxError(problem)
   let parts: string[] = []
   const hs: Map<string, string> = new Map()
   hs.set("content-type", "application/x-www-form-urlencoded")
   hs.set("accept", "application/json")
   if (c.grant_type === "jwt_bearer") {
-    if ((c.private_key ?? "") === "" || issuerOf(c) === "") throw new SyntaxError("oauth_key_config.private_key, oauth_key_config.issuer and oauth_key_config.audience are required for the jwt_bearer grant")
-    const life = c.assertion_lifetime_seconds ?? 0
-    if (life < 0 || life > 3600) throw new SyntaxError("oauth_key_config.assertion_lifetime_seconds must be between 0 (default) and 3600")
     const assertion = try jwtAssertion(c, nowSeconds)
     parts.push("grant_type=" + pctEncode(JWT_BEARER_URN))
     parts.push("assertion=" + pctEncode(assertion))
   } else if (c.grant_type === "client_credentials") {
     const id = c.client_id ?? ""
     const secret = c.client_secret ?? ""
-    if (id === "" || secret === "") throw new SyntaxError("oauth_key_config.client_id and oauth_key_config.client_secret are required for the client_credentials grant")
     const style = c.auth_style ?? ""
-    if (style !== "" && style !== "header" && style !== "body") throw new SyntaxError("oauth_key_config.auth_style must be header or body")
     parts.push("grant_type=client_credentials")
     if (style === "body") {
       parts.push("client_id=" + pctEncode(id))
@@ -107,10 +156,6 @@ export function tokenRequest(c: OAuthKeyConfig, nowSeconds: int): OAuthRequest t
       // RFC 6749 section 2.3.1: the id and secret are form-encoded, then joined for Basic auth
       hs.set("authorization", "Basic " + encode(utf8(pctEncode(id) + ":" + pctEncode(secret))))
     }
-  } else if ((c.grant_type ?? "") === "") {
-    throw new SyntaxError("oauth_key_config.grant_type is required")
-  } else {
-    throw new SyntaxError("oauth_key_config.grant_type must be client_credentials or jwt_bearer")
   }
   const scopes = c.scopes ?? []
   if (scopes.length > 0) parts.push("scope=" + pctEncode(scopes.join(" ")))
@@ -206,7 +251,7 @@ test("a jwt_bearer key needs its private key and a known grant and algorithm", (
   expect(unknown).toBe(true)
   let alg = ""
   try {
-    jwtAssertion({ grant_type: "jwt_bearer", token_url: "https://t", private_key: "k", issuer: "i", signing_algorithm: "HS256" }, 0)
+    jwtAssertion({ grant_type: "jwt_bearer", token_url: "https://t", private_key: "k", issuer: "i", audience: "a", signing_algorithm: "HS256" }, 0)
   } catch (e) {
     alg = e.message
   }
@@ -267,4 +312,60 @@ test("an ES256 jwt_bearer assertion names its issuer, subject, audience and kid"
   expect(rawNum(claims, "iat")).toBe(999970.0)
   expect((rawStr(claims, "jti") ?? "").byteLength).toBe(32)
   expect((try decode(parts[2]!)).length).toBe(64)
+})
+
+// RFC 6979's P-384 test key as a SEC 1 PEM, built here.
+function testEc384Pem(): string {
+  const der: u8[] = []
+  for (const b of [0x30, 0x3e, 0x02, 0x01, 0x01, 0x04, 0x30]) der.push(u8(b))
+  const d = "6b9d3dad2e1b8c1c05b19875b6659f4de23c3b667bf297ba9aa47740787137d896d5724e4c70a825f872c9ea60d2edf5"
+  for (let i = 0; i < 96; i += 2) {
+    const v: int = parseInt(d.slice(i, i + 2), 16) ?? 0
+    der.push(u8(v))
+  }
+  for (const b of [0xa0, 0x07, 0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x22]) der.push(u8(b))
+  return "-----BEGIN EC " + "PRIVATE KEY-----\n" + encode(der) + "\n-----END EC " + "PRIVATE KEY-----\n"
+}
+
+test("a jwt_bearer key with no issuer or audience is refused, as Bifrost refuses it", () => {
+  const base: OAuthKeyConfig = { grant_type: "jwt_bearer", token_url: "https://auth.example.test/token", client_id: "cid", private_key: testEcPem(), signing_algorithm: "ES256" }
+  expect(oauthKeyProblem(base, false)).toBe("oauth_key_config.issuer is required for the jwt_bearer grant")
+  let withIss = base
+  withIss.issuer = "svc"
+  expect(oauthKeyProblem(withIss, false)).toBe("oauth_key_config.audience is required for the jwt_bearer grant")
+  let msg = ""
+  try {
+    tokenRequest(withIss, 0)
+  } catch (e) {
+    msg = e.message
+  }
+  expect(msg).toBe("oauth_key_config.audience is required for the jwt_bearer grant")
+  let whole = withIss
+  whole.audience = "https://api.example.test"
+  expect(oauthKeyProblem(whole, true)).toBe("")
+  let badAlg = whole
+  badAlg.signing_algorithm = "HS256"
+  expect(oauthKeyProblem(badAlg, false)).toBe("oauth_key_config.signing_algorithm must be one of RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384, ES512")
+})
+
+test("a saved key must fit its algorithm: RSA for RS and PS, an EC key on the named curve for ES", () => {
+  let c: OAuthKeyConfig = { grant_type: "jwt_bearer", token_url: "https://auth.example.test/token", private_key: testEcPem(), issuer: "i", audience: "a", signing_algorithm: "ES384" }
+  expect(oauthKeyProblem(c, true)).toBe("oauth_key_config.signing_algorithm ES384 needs a P-384 key; private_key is on P-256")
+  c.signing_algorithm = "PS256"
+  expect(oauthKeyProblem(c, true)).toBe("oauth_key_config.signing_algorithm PS256 needs an RSA private key; private_key is EC (set an ES* algorithm)")
+  c.signing_algorithm = "ES384"
+  c.private_key = testEc384Pem()
+  expect(oauthKeyProblem(c, true)).toBe("")
+  c.private_key = "not a pem"
+  expect(oauthKeyProblem(c, true)).toBe("oauth_key_config.private_key must be an RSA or EC private key in PEM form")
+  c.private_key = "env.SIGNING_KEY"
+  expect(oauthKeyProblem(c, true)).toBe("")
+})
+
+test("an ES384 assertion carries the 96-byte r||s and its alg", () => {
+  const c: OAuthKeyConfig = { grant_type: "jwt_bearer", token_url: "https://auth.example.test/token", private_key: testEc384Pem(), issuer: "svc", audience: "aud", signing_algorithm: "ES384" }
+  const a = try jwtAssertion(c, 1000)
+  const parts = a.split(".")
+  expect(try new TextDecoder().decode(try decode(parts[0]!))).toBe(`{"alg":"ES384","typ":"JWT"}`)
+  expect((try decode(parts[2]!)).length).toBe(96)
 })

@@ -162,11 +162,18 @@ test("maxim attributes: reserved names are ids, the rest are tags", () => {
 })
 
 // The stop reason of a whole answer: the chat finish_reason, the Anthropic stop_reason, or the Gemini
-// finishReason, whichever the body carries. "" when it has none (a stream, or an error body).
+// finishReason, whichever the body carries. A streamed answer (SSE text) gives the last stop reason its events
+// carry. "" when it has none (an error body).
 type StopShape = { stop_reason?: string, choices?: { finish_reason?: string }[], candidates?: { finishReason?: string }[] }
 
 export function stopReasonOf(body: string): string {
   if (!body.includes("finish") && !body.includes("stop_reason")) return ""
+  if (body.startsWith("data:") || body.startsWith("event:")) {
+    const st = new ToolNameStream()
+    st.push(body)
+    st.end()
+    return st.stop
+  }
   let s: StopShape = {}
   try {
     s = JSON.parse(body) as StopShape
@@ -193,6 +200,18 @@ test("stop reasons: chat, Anthropic and Gemini answers; none for a stream or a b
   expect(stopReasonOf(`{"candidates":[{"content":{"parts":[]},"finishReason":"MAX_TOKENS"}]}`)).toBe("MAX_TOKENS")
   expect(stopReasonOf(`{"choices":[{"index":0,"finish_reason":null}]}`)).toBe("")
   expect(stopReasonOf(`data: {"choices":[{"delta":{}}]}`)).toBe("")
+  // streamed answers: the last stop reason their events carry
+  expect(stopReasonOf(`data: {"choices":[{"delta":{"content":"x"},"finish_reason":null}]}\n\ndata: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\ndata: [DONE]\n\n`)).toBe("length")
+  expect(stopReasonOf(`event: message_start\ndata: {"type":"message_start","message":{"stop_reason":null}}\n\nevent: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":5}}\n\n`)).toBe("max_tokens")
+  expect(stopReasonOf(`data: {"candidates":[{"content":{"parts":[{"text":"a"}]}}]}\n\ndata: {"candidates":[{"content":{"parts":[]},"finishReason":"STOP"}]}\n\n`)).toBe("STOP")
+  const st = new ToolNameStream()
+  const chunks = `data: {"choices":[{"delta":{"content":"x"}}]}\n\ndata: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\ndata: [DONE]\n\n`
+  for (let at = 0; at < chunks.byteLength; at += 7) st.push(chunks.slice(at, at + 7))
+  st.end()
+  expect(st.stop).toBe("tool_calls")
+  expect(stopReasonOfTail(chunks.slice(10))).toBe("tool_calls")
+  expect(stopReasonOfTail(chunks)).toBe("tool_calls")
+  expect(stopReasonOfTail(`finish_reason":"stop"}]}`)).toBe("")
   expect(stopReasonOf("not json finish")).toBe("")
   expect(stopReasonOf("")).toBe("")
 })
@@ -267,6 +286,52 @@ type StreamToolEvent = {
   candidates?: { content?: { parts?: { functionCall?: { name?: string } }[] } }[],
 }
 
+// The stop reason of the end of a streamed answer, kept as a tail that may start in the middle of an event: read
+// from its first whole event on.
+export function stopReasonOfTail(tail: string): string {
+  if (tail.startsWith("data:") || tail.startsWith("event:")) return stopReasonOf(tail)
+  const at = tail.indexOf("\n\n")
+  if (at < 0) return ""
+  return stopReasonOf(tail.slice(at + 2))
+}
+
+// The stop reason one streamed event carries: a chat chunk's finish_reason, an Anthropic message_delta's
+// delta.stop_reason, or a Gemini chunk's finishReason. "" for any other event.
+type StreamStopEvent = {
+  type?: string,
+  choices?: { finish_reason?: string }[],
+  candidates?: { finishReason?: string }[],
+}
+type AnthropicStopDelta = { delta?: { stop_reason?: string } }
+
+function eventStop(ev: string): string {
+  let body = ""
+  for (const line of ev.split("\n")) {
+    if (line.startsWith("data:")) body = line.slice(5).trim()
+  }
+  if (body === "" || body === "[DONE]" || (!body.includes("finish") && !body.includes("stop_reason"))) return ""
+  try {
+    const s = JSON.parse(body) as StreamStopEvent
+    if (s.type === "message_delta") {
+      const d = JSON.parse(body) as AnthropicStopDelta
+      return d.delta?.stop_reason ?? ""
+    }
+    const cs = s.choices
+    if (cs !== undefined && cs.length > 0) {
+      const r = cs[0]!.finish_reason
+      if (r !== undefined && r !== "") return r
+    }
+    const gs = s.candidates
+    if (gs !== undefined && gs.length > 0) {
+      const r = gs[0]!.finishReason
+      if (r !== undefined && r !== "") return r
+    }
+  } catch (e) {
+    return ""
+  }
+  return ""
+}
+
 function eventNames(names: string[], ev: string): string[] {
   let body = ""
   for (const line of ev.split("\n")) {
@@ -312,16 +377,24 @@ function eventNames(names: string[], ev: string): string[] {
 // out (events may be split across pushes); end reads the last event when the stream ends without a blank line.
 export class ToolNameStream {
   names: string[] = []
+  // the last stop reason the events carried (the stop reason of a streamed answer, for the log row)
+  stop = ""
   private tail = ""
+
+  private event(ev: string): void {
+    this.names = eventNames(this.names, ev)
+    const r = eventStop(ev)
+    if (r !== "") this.stop = r
+  }
 
   push(s: string): void {
     const parts = (this.tail + s).split("\n\n")
     this.tail = parts[parts.length - 1]!
-    for (let k = 0; k < parts.length - 1; k++) this.names = eventNames(this.names, parts[k]!)
+    for (let k = 0; k < parts.length - 1; k++) this.event(parts[k]!)
   }
 
   end(): void {
-    if (this.tail !== "") this.names = eventNames(this.names, this.tail)
+    if (this.tail !== "") this.event(this.tail)
     this.tail = ""
   }
 }

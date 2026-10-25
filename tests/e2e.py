@@ -35,6 +35,25 @@ def build():
 
 ADMIN = {"authorization": "Bearer admin-secret"}
 
+# /api is locked on a gateway with no admin account (Bifrost's setup lock, L184): every gateway e2e starts gets this
+# setup token (BIFROST_SETUP_TOKEN, set in main), and every /api request urllib sends carries it unless the request
+# names its own X-Bifrost-Setup-Token (an empty one tests the lock). A gateway with an admin ignores it.
+E2E_SETUP = "e2e-setup-" + "token-l184"
+
+class SetupTokenHandler(urllib.request.BaseHandler):
+    handler_order = 100
+
+    def http_request(self, req):
+        # a request with a setup session cookie tests the cookie, so it gets no token beside it
+        cookie = req.get_header("Cookie") or ""
+        if urllib.parse.urlsplit(req.full_url).path.startswith("/api/") and not req.has_header("X-bifrost-setup-token") and "bifrost_setup_session=" not in cookie:
+            req.add_unredirected_header("X-bifrost-setup-token", E2E_SETUP)
+        return req
+
+    https_request = http_request
+
+urllib.request.install_opener(urllib.request.build_opener(SetupTokenHandler))
+
 def call(method, path, body=None, headers=None, base=GW, auth=True):
     data = None if body is None else (body if isinstance(body, str) else json.dumps(body)).encode()
     extra = ADMIN if auth and base == GW and path.startswith("/api/") else {}
@@ -98,7 +117,11 @@ class WsClient:
         import base64 as b64m, os as _os, socket
         self.sock = socket.create_connection(("127.0.0.1", port), timeout=5)
         key = b64m.b64encode(_os.urandom(16)).decode()
-        extra = "".join(f"{k}: {v}\r\n" for k, v in (headers or {}).items())
+        headers = dict(headers or {})
+        # the UI socket is a management route: the e2e setup token opens it on a gateway with no admin (see E2E_SETUP)
+        if (path == "/ws" or path.startswith("/ws?")) and not any(k.lower() == "x-bifrost-setup-token" for k in headers):
+            headers["x-bifrost-setup-token"] = E2E_SETUP
+        extra = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
         self.sock.sendall(f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n{extra}\r\n".encode())
         head = b""
         while b"\r\n\r\n" not in head:
@@ -272,6 +295,15 @@ def seen(traces=False):
     return [x for x in got if traces or (x["path"] != "/v1/traces" and not background(x))]
 
 FAILS = []
+
+# The test WASM plugin's config keys (tests/wasm/plugin.c). PUT /api/plugins/{name} merges its config over the stored
+# one, as Bifrost does, so a test that sets a whole new config sends null for every key it leaves out.
+WASM_CFG_KEYS = ["mode", "from", "to", "tag", "http", "post", "count", "chunk_from", "chunk_to", "chunk_skip", "chunk_stop"]
+
+
+def whole_wasm_config(config):
+    return {**{k: None for k in WASM_CFG_KEYS}, **config}
+
 
 def check(name, cond, detail=""):
     print(("ok   " if cond else "FAIL ") + name + ("" if cond else f"\n     {detail}"))
@@ -2159,7 +2191,7 @@ def mcp_po_e2e(env):
     def authorize(auth_url):
         loc = ""
         try:
-            urllib.request.build_opener(NoRedirect).open(auth_url, timeout=10)
+            urllib.request.build_opener(NoRedirect, SetupTokenHandler).open(auth_url, timeout=10)
         except urllib.error.HTTPError as e:
             loc = e.headers.get("location", "")
         return loc
@@ -2256,7 +2288,7 @@ def raw(method, url, body=None, headers=None):
         data = json.dumps(body).encode()
     req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
     try:
-        with urllib.request.build_opener(NoFollow).open(req, timeout=10) as r:
+        with urllib.request.build_opener(NoFollow, SetupTokenHandler).open(req, timeout=10) as r:
             return r.status, r.headers, r.read().decode()
     except urllib.error.HTTPError as e:
         return e.code, e.headers, e.read().decode()
@@ -2509,6 +2541,25 @@ def mcp_peruser_e2e(env):
         check("a revoked credential is no longer used", s == 401 and "Authentication required for tenant" in b and "kind=headers" in b, (s, b[:200]))
         s, _, b = tool("sk-bf-tenant-a")
         check("revoking one key leaves the others", s == 200, (s, b[:200]))
+        # L177: an x-bf-mcp-session-id is an identity of its own (session mode): its values, not the key's, go along
+        def stool(sid):
+            h = {"authorization": "Bearer sk-bf-tenant-a", "x-bf-mcp-session-id": sid}
+            return call("POST", "/v1/mcp/tool/execute", {"id": "c1", "type": "function", "function": {"name": "tenant-get_weather", "arguments": "{\"city\":\"Oslo\"}"}}, h, base=MCP_PU, auth=False)
+        s, _, b = stool("sess-l177")
+        check("a session with no values of its own is refused with a submission link, although its key has values", s == 401 and "kind=headers" in b and "flow=" in b, (s, b[:300]))
+        sflow = b.split("flow=")[1].split("&")[0] if "flow=" in b else ""
+        s, _, b = call("GET", "/api/mcp/per-user-headers/flows/" + sflow, base=MCP_PU, auth=False)
+        sd = json.loads(b) if s == 200 else {}
+        check("the session's flow is in session mode and names the session", sd.get("flow_mode") == "session" and sd.get("session_id") == "sess-l177" and sd.get("has_active_credential") is False, (s, b[:300]))
+        s, _, b = call("PUT", "/api/mcp/per-user-headers/flows/" + sflow, {"headers": {"X-Tenant": "tenant-b-key-example"}}, base=MCP_PU, auth=False)
+        check("the session's submission is stored", s == 200 and json.loads(b)["status"] == "success", (s, b[:200]))
+        s, _, b = stool("sess-l177")
+        check("the session's own values go with its tool call", s == 200 and sent_tenants()[-1:] == ["tenant-b-key-example"], (s, b[:200], sent_tenants()[-1:]))
+        s, _, b = tool("sk-bf-tenant-a")
+        check("the key without the session header keeps its own values", s == 200 and sent_tenants()[-1:] == ["tenant-a-key-example"], (s, b[:200], sent_tenants()[-1:]))
+        s, _, b = call("GET", "/api/mcp/sessions?kind=header", base=MCP_PU, auth=False)
+        rows = json.loads(b).get("sessions", []) if s == 200 else []
+        check("the sessions list shows the session's header credential in session mode", any(r.get("auth_mode") == "session" and r.get("session_id") == "sess-l177" for r in rows), (s, b[:400]))
         s, _, b = call("DELETE", "/api/mcp/per-user-headers/credential/" + cred_a, base=MCP_PU, auth=False)
         check("the remaining credential is revoked too", s == 200, (s, b[:200]))
     finally:
@@ -3267,10 +3318,10 @@ def l97g_e2e(env):
         s, _, b = call("GET", "/api/session/is-auth-enabled", None, None, base=GW_L97G, auth=False)
         st_json = json.loads(b)
         check("setup_token is reported as configured, with setup required", st_json.get("setup_token_configured") is True and st_json.get("setup_required") is True, b[:300])
-        s, _, b = call("POST", "/api/users", {"name": "first", "role": "admin", "password": "first-pass-1"}, None, base=GW_L97G, auth=False)
+        s, _, b = call("POST", "/api/users", {"name": "first", "role": "admin", "password": "first-pass-1"}, {"x-bifrost-setup-token": ""}, base=GW_L97G, auth=False)
         check("the first admin account needs the setup token (the setup lock's 401)", s == 401 and "X-Bifrost-Setup-Token" in b, (s, b[:200]))
         # Bifrost's setup lock: every other /api route is locked behind the token too, while no admin exists (L172)
-        s, _, b = call("GET", "/api/providers", None, None, base=GW_L97G, auth=False)
+        s, _, b = call("GET", "/api/providers", None, {"x-bifrost-setup-token": ""}, base=GW_L97G, auth=False)
         check("the setup lock refuses a management route without the token", s == 401 and "setup token" in b, (s, b[:200]))
         s, _, b = call("GET", "/api/providers", None, {"x-bifrost-setup-token": "wrong"}, base=GW_L97G, auth=False)
         check("... and with a wrong token", s == 403 and "invalid setup token" in b, (s, b[:200]))
@@ -3876,7 +3927,7 @@ def l97l_e2e(env):
         s, _, b = call("POST", "/api/plugins", {"name": "x-l170", "path": "/tmp/x-l170.wasm"}, {"cookie": "bifrost_setup_session=" + value}, base=GW_L97L_SETUP, auth=False)
         check("a custom plugin path needs genuine admin authentication while dashboard auth is off", s == 403 and "genuine admin authentication" in b, (s, b[:200]))
         s, _, b = call("GET", "/api/config", None, {"cookie": "bifrost_setup_session=" + value}, base=GW_L97L_SETUP, auth=False)
-        s2, _, b2 = call("GET", "/api/config", None, None, base=GW_L97L_SETUP, auth=False)
+        s2, _, b2 = call("GET", "/api/config", None, {"x-bifrost-setup-token": ""}, base=GW_L97L_SETUP, auth=False)
         check("the setup session cookie opens the locked API, which is closed without it", s == 200 and s2 == 401, (s, s2, b2[:200]))
         s, _, b = call("POST", "/api/users", {"name": "first", "role": "admin", "password": "first-pass-1"}, {"cookie": "bifrost_setup_session=" + value}, base=GW_L97L_SETUP, auth=False)
         check("the setup session cookie creates the first admin without the token", s in (200, 201), (s, b[:200]))
@@ -4299,8 +4350,8 @@ def l116_e2e(env):
         check("the gateway card names the gateway's JSON-RPC route, with the public URL's trailing slash dropped", s == 200 and card.get("url") == "https://gw.example.test/agents/a2a/echo/json-rpc" and card.get("name") == "echo-agent", (s, b[:300]))
         s, _, _ = gwc("GET", "/agents/a2a/echo/.well-known/agent-card.json", None, None)
         check("a gateway call without a virtual key is refused when enforcement is on", s == 401, s)
-        s, _, _ = gwc("GET", "/agents/a2a/echo/.well-known/agent-card.json", None, B)
-        check("a virtual key without the agent's grant is refused", s == 403, s)
+        s, _, b = gwc("GET", "/agents/a2a/echo/.well-known/agent-card.json", None, B)
+        check("a virtual key without the agent's grant is refused the card with Bifrost's bare 403", s == 403 and b.strip() == "Forbidden", (s, b[:100]))
         s, _, b = api("POST", "/api/agents", {"name": "Bad_Name", "agent_card_url": MOCK + "/a2a/agent/.well-known/agent-card.json", "allow_private_network": True})
         check("an agent name that is not a slug is refused", s == 400, (s, b[:200]))
         s, _, b = api("POST", "/api/agents", {"name": "api-echo", "agent_card_url": MOCK + "/a2a/agent/.well-known/agent-card.json"})
@@ -4326,7 +4377,11 @@ def l116_e2e(env):
         check("the agent gets the runtime header and not the caller's virtual key", len(sent) == 1 and sent[0]["auth"] == "Bearer agent-token-l116" and "sk-bf-l116-a" not in json.dumps(sent), sent[:1])
         before = len(upstream())
         s, _, b = rpc("message/send", message("nope-l116"), B)
-        check("a key without the grant does not reach the agent", s == 403 and len(upstream()) == before, (s, b[:200]))
+        denied = json.loads(b) if s == 200 else {}
+        derr = denied.get("error", {})
+        dinfo = (derr.get("data") or [{}])[0]
+        check("a key without the grant does not reach the agent: JSON-RPC -31403 in a 200, as Bifrost's governance refuses it", s == 200 and derr.get("code") == -31403 and len(upstream()) == before, (s, b[:300]))
+        check("the refusal carries the UNAUTHORIZED ErrorInfo with the agent and the request type", dinfo.get("@type") == "type.googleapis.com/google.rpc.ErrorInfo" and dinfo.get("reason") == "UNAUTHORIZED" and dinfo.get("domain") == "a2a-protocol.org" and dinfo.get("metadata", {}).get("agentName") == "echo" and dinfo.get("metadata", {}).get("requestType") == "send_message" and "timestamp" in dinfo.get("metadata", {}), dinfo)
         s, h, b = rpc("message/stream", message("stream-l116"))
         ctype = h.get("Content-Type") or h.get("content-type") or ""
         check("message/stream passes the agent's SSE on", s == 200 and "text/event-stream" in ctype and "working" in b and "streamed" in b, (s, b[:300]))
@@ -4353,9 +4408,9 @@ def l116_e2e(env):
         check("a deleted agent is gone", s == 200 and s2 == 404, (s, s2))
         s, _, b = api("GET", "/api/agents/history")
         hist = json.loads(b) if s == 200 else {}
-        check("every call that reached the agent is in the agent history, under its name", s == 200 and hist.get("total", 0) >= 5 and all(x["agent_name"] == "echo" for x in hist.get("history", [])), (s, b[:200]))
+        check("every call that reached the agent is in the agent history, under its name", s == 200 and hist.get("pagination", {}).get("total_count", 0) >= 5 and all(x["agent_name"] == "echo" for x in hist.get("logs", [])), (s, b[:200]))
         s, _, b = api("GET", "/api/agents/history?agent_names=nosuch")
-        check("the agent history filters by agent name", s == 200 and json.loads(b)["total"] == 0, (s, b[:200]))
+        check("the agent history filters by agent name", s == 200 and json.loads(b)["pagination"]["total_count"] == 0, (s, b[:200]))
         s, _, b = chat("l116-ctx", "chat-in-agent-session")
         s2, _, _ = chat("l116-other", "chat-elsewhere")
         check("LLM requests in the agent's sessions are sent", s == 200 and s2 == 200, (s, s2))
@@ -4501,6 +4556,7 @@ def l134_e2e(env):
         check("a REST call without a key is refused in the REST error shape, with the challenge", s == 401 and json.loads(b)["error"]["status"] == "UNAUTHENTICATED" and "x-bf-vk" in (hdr(h, "www-authenticate") or ""), (s, h, b[:200]))
         s, _, b = rest("v1", "POST", "/message:send", message("nogrant"), B)
         check("a key without the agent's grant is refused in the REST error shape", s == 403 and json.loads(b)["error"]["status"] == "PERMISSION_DENIED", (s, b[:200]))
+        check("the REST refusal's details hold the UNAUTHORIZED ErrorInfo", s == 403 and (json.loads(b)["error"].get("details") or [{}])[0].get("reason") == "UNAUTHORIZED", (s, b[:300]))
         s, _, b = rest("v1", "POST", "/message:send", message("fail"))
         check("an agent's failure on a REST call is a REST error", s == 500 and "agent failed on request" in b, (s, b[:200]))
         # ---- bridging between the bindings ----
@@ -4671,7 +4727,7 @@ def l134_e2e(env):
         check("the timer fetches a changed card again and keeps it", moved, api("GET", "/api/agents/moving")[2][:300])
         # ---- the history ----
         s, _, b = api("GET", "/api/agents/history?agent_names=v1&limit=200")
-        methods = {x["method"] for x in json.loads(b)["history"]} if s == 200 else set()
+        methods = {x["method"] for x in json.loads(b)["logs"]} if s == 200 else set()
         check("pushes and their deliveries are in the agent history", {"push_notification", "push_delivery", "SendMessage", "CreateTaskPushNotificationConfig"} <= methods, methods)
     finally:
         gw.terminate()
@@ -4696,9 +4752,10 @@ def l134b_config():
                 {"name": "ana", "role": "viewer", "token_sha256": hashlib.sha256("ana-session-l134b".encode()).hexdigest()},
             ],
             "virtual_keys": [
-                {"id": "vk-all", "value": "sk-bf-l134b-all", "user_id": "ana"},
+                # a key without mcp_configs gets no MCP tools (L184, as in Bifrost): "all" is granted every client
+                {"id": "vk-all", "value": "sk-bf-l134b-all", "user_id": "ana", "mcp_configs": [{"mcp_client_name": n, "tools_to_execute": ["*"]} for n in ("docs", "notes", "quiet", "code")]},
                 {"id": "vk-notes", "value": "sk-bf-l134b-notes", "mcp_configs": [{"mcp_client_name": "notes", "tools_to_execute": ["*"]}]},
-                {"id": "vk-bo", "value": "sk-bf-l134b-bo", "user_id": "bo"},
+                {"id": "vk-bo", "value": "sk-bf-l134b-bo", "user_id": "bo", "mcp_configs": [{"mcp_client_name": n, "tools_to_execute": ["*"]} for n in ("docs", "notes", "quiet", "code")]},
             ],
         },
     }
@@ -5304,13 +5361,18 @@ def l133_e2e(env):
         _, _, b = req("POST", "/mcp", {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "executeToolCode", "arguments": {"code": 'result = weather.get_weather(city = "Oslo")'}}}, {"mcp-session-id": sid})
         check("code mode on POST /mcp: executeToolCode runs its program", "Sunny in Oslo" in b and "Return value" in b, b[:400])
 
-        s, _, b = req("POST", "/v1/responses", {"model": "openai/codeagent-1", "input": "weather in Oslo?"})
-        check("code mode on /v1/responses: the program answers the request", s == 200 and "sunny in Oslo" in b, (s, b[:400]))
-        offered = [x for x in seen() if x["path"] == "/v1/chat/completions" and "codeagent-1" in x["body"] and "executeToolCode" in x["body"]]
-        check("code mode on /v1/responses: the four meta-tools go upstream with the request", len(offered) > 0 and "listToolFiles" in offered[-1]["body"], str(len(offered)))
+        n_seen = len(seen())
+        s, h, b = req("POST", "/v1/responses", {"model": "openai/codeagent-1", "input": "weather in Oslo?"})
+        hl = {k.lower(): v for k, v in h.items()}
+        check("code mode on /v1/responses: the program answers the request (agent mode on the Responses API)", s == 200 and "sunny in Oslo" in b and hl.get("x-bf-agent-steps") == "2" and hl.get("x-bf-agent-tool-calls") == "1", (s, b[:400], hl.get("x-bf-agent-steps")))
+        offered = [x for x in seen()[n_seen:] if x["path"] == "/v1/responses" and "codeagent-1" in x["body"]]
+        first = offered[0]["body"] if offered else ""
+        check("code mode on /v1/responses: the meta-tools go upstream beside the plain MCP tools, on the Responses route", len(offered) == 2 and all(n in first for n in ["listToolFiles", "executeToolCode", "jira-get_weather"]) and "weather-get_weather" not in first, str(len(offered)))
+        check("code mode on /v1/responses: the second round carries the call and its output", len(offered) == 2 and '"function_call_output"' in offered[1]["body"] and "Sunny in Oslo" in offered[1]["body"], offered[1]["body"][:400] if len(offered) == 2 else "")
+        check("code mode on /v1/responses: the first round's reasoning item is carried into the final output", '"rs_a"' in b and b.index('"rs_a"') < b.index("sunny in Oslo"), b[:400])
         s, h, b = req("POST", "/v1/responses", {"model": "openai/codeagent-1", "input": "weather in Oslo?", "stream": True})
         hl = {k.lower(): v for k, v in h.items()}
-        check("code mode on /v1/responses: a streamed request is answered as a stream", s == 200 and "sunny in Oslo" in b and "text/event-stream" in hl.get("content-type", ""), (s, b[:300]))
+        check("code mode on /v1/responses: a stream is served live with the call for the caller, as Bifrost runs no agent on streams", s == 200 and "text/event-stream" in hl.get("content-type", "") and "executeToolCode" in b and "sunny in Oslo" not in b, (s, b[:300]))
     finally:
         gw.terminate()
         gw.wait()
@@ -5676,12 +5738,156 @@ def l147_cluster_e2e(env):
         check("cluster: both nodes serve after the 401 renewal", all(c == 200 for c in codes), codes)
         ok = all(l147_jira(u).get("connected") is True and (l147_jira(u).get("credential") or {}).get("status") == "active" for u in [L147_NODE_A, L147_NODE_B])
         check("cluster: both nodes stay connected with an active credential", ok, (l147_jira(L147_NODE_A), l147_jira(L147_NODE_B)))
+        # L177: the MCP client configs are shared across the cluster: created, edited and deleted on one node, on both
+        def client_on(u, name):
+            s, _, b = call("GET", "/api/mcp/clients", None, base=u, auth=False)
+            return l133_find_named(json.loads(b), name) if s == 200 else None
+        s, _, b = call("POST", "/api/mcp/client", {"name": "shared", "connection_type": "http", "connection_string": MOCK + "/mcp", "tool_sync_interval": "1h"}, None, base=L147_NODE_A, auth=False)
+        check("cluster: a client created on node A", s in (200, 201), (s, b[:300]))
+        check("cluster: node B gets the client node A created", l147_until(lambda: client_on(L147_NODE_B, "shared") is not None, 15), client_on(L147_NODE_B, "shared"))
+        s, _, b = call("PUT", "/api/mcp/client/shared", {"name": "shared", "connection_type": "http", "connection_string": MOCK + "/mcp", "tool_sync_interval": "2h"}, None, base=L147_NODE_B, auth=False)
+        check("cluster: the client edited on node B reaches node A", s == 200 and l147_until(lambda: "2h" in json.dumps(client_on(L147_NODE_A, "shared") or {}), 15), (s, b[:200], client_on(L147_NODE_A, "shared")))
+        s, _, b = call("DELETE", "/api/mcp/client/shared", None, None, base=L147_NODE_A, auth=False)
+        check("cluster: a client deleted on node A is deleted on node B too", s == 200 and l147_until(lambda: client_on(L147_NODE_B, "shared") is None, 15), (s, b[:200], client_on(L147_NODE_B, "shared")))
+        saved_b = json.load(open(pb))
+        check("cluster: node B's config file follows (no shared client, its own cluster section kept)", all(c["name"] != "shared" for c in saved_b["mcp"]["client_configs"]) and saved_b.get("cluster", {}).get("node_id") == "l147-b", [c["name"] for c in saved_b["mcp"]["client_configs"]])
     finally:
         for p in [ga, gb]:
             p.terminate()
             p.wait()
         srv.shutdown()
         srv.server_close()
+
+GW_L185_A = "http://127.0.0.1:18326"  # L185: node A with two workers (Bun; one process on http1), then the storage checks
+GW_L185_B = "http://127.0.0.1:18327"  # L185: node B, a config file of its own (cluster.config_sync "pull")
+L185_ADMIN = {"authorization": "Bearer sk-admin-l185"}
+L185_SECRET = "e2e-l185"
+
+def l185_config(node, peer):
+    """An L185 cluster member: an admin, virtual keys vk-1 and vk-2, the shared mock as OpenAI, config_sync "pull"."""
+    import hashlib
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": True},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "l185", "value": "sk-l185", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l185".encode()).hexdigest()}],
+            "virtual_keys": [{"id": "vk-1", "value": "sk-bf-l185-one"}, {"id": "vk-2", "value": "sk-bf-l185-two"}],
+        },
+        "cluster": {"enabled": True, "node_id": node, "secret": L185_SECRET, "interval_ms": 200, "peers": [peer], "config_sync": "pull"},
+    }
+
+def l185_codes(base, key, n=24):
+    """n chat calls with virtual key value key, eight at a time on fresh connections (so both workers of a node take some)."""
+    from concurrent.futures import ThreadPoolExecutor
+    body = {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l185"}]}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        return list(ex.map(lambda _: call("POST", "/v1/chat/completions", body, {"x-bf-vk": key}, base=base, auth=False)[0], range(n)))
+
+def l185_start(env, name, port, cfg_path, extra=None):
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    return subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", str(port), "-host", "127.0.0.1", "-config", cfg_path, "-server", server] + (extra or []),
+                            env=env, stderr=open(os.path.join(BUILD, f"e2e.l185{name}.log"), "w"))
+
+def l185_e2e(env):
+    """L185: config consistency. Node A runs two workers (Bun; http1 is one process): a virtual key deleted through one is
+    refused by every worker as soon as the DELETE has answered. Node B has a config file of its own and
+    cluster.config_sync "pull": it takes A's saves from A (keeping its own cluster section), and A takes B's. The pull route
+    is signed and refuses stale or unknown requests. Then the storage checks: a required logs_store or audit folder that
+    cannot be written stops the start, required: false starts without it, and the default folders are read from the
+    app dir, not the working directory. Ports 18326 (A, then the storage gateways) and 18327 (B)."""
+    import hashlib, shutil
+    pa = os.path.join(BUILD, "e2e.l185a.json")
+    pb = os.path.join(BUILD, "e2e.l185b.json")
+    json.dump(l185_config("l185-a", GW_L185_B), open(pa, "w"))
+    json.dump(l185_config("l185-b", GW_L185_A), open(pb, "w"))
+    ga = l185_start(env, "a", 18326, pa, ["-workers", "2"])
+    gb = l185_start(env, "b", 18327, pb)
+    try:
+        wait(GW_L185_A + "/health")
+        wait(GW_L185_B + "/health")
+        time.sleep(1.0)
+        before = l185_codes(GW_L185_A, "sk-bf-l185-one")
+        check("l185: vk-1 is served by every worker of node A", all(c == 200 for c in before), before)
+        s, _, b = call("DELETE", "/api/governance/virtual-keys/vk-1", None, L185_ADMIN, base=GW_L185_A, auth=False)
+        check("l185: vk-1 is deleted through node A", s == 200, (s, b[:200]))
+        after = l185_codes(GW_L185_A, "sk-bf-l185-one")
+        check("l185: once the DELETE has answered, every worker of node A refuses vk-1", all(c == 401 for c in after), after)
+        check("l185: vk-2 still works on every worker of node A", all(c == 200 for c in l185_codes(GW_L185_A, "sk-bf-l185-two")), "")
+        # node B pulls A's save (cluster sync every 200 ms)
+        gone = l147_until(lambda: all(c == 401 for c in l185_codes(GW_L185_B, "sk-bf-l185-one", 6)), 5)
+        check("l185: node B (its own config file) refuses vk-1 after node A's save", gone, l185_codes(GW_L185_B, "sk-bf-l185-one", 6))
+        saved_b = json.load(open(pb))
+        check("l185: node B wrote the pulled config to its file and kept its own cluster section",
+              [v["id"] for v in saved_b["governance"]["virtual_keys"]] == ["vk-2"] and saved_b["cluster"]["node_id"] == "l185-b" and saved_b["cluster"]["peers"] == [GW_L185_A],
+              (saved_b.get("governance"), saved_b.get("cluster")))
+        check("l185: vk-2 still works on node B", all(c == 200 for c in l185_codes(GW_L185_B, "sk-bf-l185-two", 6)), "")
+        # the other way round: a key created on B reaches both workers of A
+        s, _, b = call("POST", "/api/governance/virtual-keys", {"id": "vk-3", "name": "three", "value": "sk-bf-l185-three"}, L185_ADMIN, base=GW_L185_B, auth=False)
+        check("l185: vk-3 is created through node B", s in (200, 201), (s, b[:200]))
+        here = l147_until(lambda: all(c == 200 for c in l185_codes(GW_L185_A, "sk-bf-l185-three")), 5)
+        check("l185: every worker of node A serves vk-3, created on node B", here, l185_codes(GW_L185_A, "sk-bf-l185-three"))
+        saved_a = json.load(open(pa))
+        check("l185: node A keeps its own cluster section", saved_a["cluster"]["node_id"] == "l185-a" and saved_a["cluster"]["peers"] == [GW_L185_B], saved_a.get("cluster"))
+        # the pull route: signed, fresh, and only for the generation the node holds (node A now holds B's save, as B wrote it)
+        sha = hashlib.sha256(open(pb, "rb").read()).hexdigest()
+        def pull(body, sig=None):
+            raw = json.dumps(body)
+            return call("POST", "/api/cluster/config", raw, {"x-raiju-cluster-sig": sig if sig is not None else cluster_sig(L185_SECRET, raw)}, base=GW_L185_A, auth=False)
+        s, _, _ = pull({"sha": sha, "ts": time.time() * 1000}, "0" * 64)
+        check("l185: an unsigned config pull is refused", s == 401, s)
+        s, _, _ = pull({"sha": sha, "ts": time.time() * 1000 - 120000})
+        check("l185: a config pull older than a minute is refused", s == 401, s)
+        s, _, _ = pull({"sha": "0" * 64, "ts": time.time() * 1000})
+        check("l185: a config pull for a generation the node does not hold is 404", s == 404, s)
+        s, _, b = pull({"sha": sha, "ts": time.time() * 1000})
+        check("l185: a signed pull for the generation node A holds answers that config text as its writer saved it", s == 200 and hashlib.sha256(b.encode()).hexdigest() == sha, (s, b[:200]))
+    finally:
+        for p in [ga, gb]:
+            p.terminate()
+            p.wait()
+    # storage: a folder that cannot be written (a file stands where it should be) stops the start
+    app = os.path.join(BUILD, "e2e-l185-app")
+    shutil.rmtree(app, ignore_errors=True)
+    os.makedirs(app)
+    open(os.path.join(app, "blocker"), "w").write("x")
+    base_cfg = {"client": {"enable_logging": True, "enforce_auth_on_inference": False}, "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+                "providers": {"openai": {"keys": [{"name": "l185", "value": "sk-l185", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}}}
+    cp = os.path.join(app, "config.json")
+    for section, extra in [("logs_store", {}), ("audit", {"key": "e2e-l185-audit"})]:
+        json.dump({**base_cfg, section: {"enabled": True, "dir": "blocker/" + section, **extra}}, open(cp, "w"))
+        p = l185_start(env, "fail-" + section, 18326, cp)
+        try:
+            code = p.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            p.terminate()
+            p.wait()
+            code = None
+        log = open(os.path.join(BUILD, f"e2e.l185fail-{section}.log")).read()
+        check(f"l185: a required {section} folder that cannot be written stops the start, naming it", code == 1 and f"raiju: {section}: " in log and "required: false" in log, (code, log[-400:]))
+    # required: false starts without the store
+    json.dump({**base_cfg, "logs_store": {"enabled": True, "dir": "blocker/logs", "required": False}}, open(cp, "w"))
+    p = l185_start(env, "soft", 18326, cp)
+    try:
+        wait(GW_L185_A + "/health")
+        s, _, _ = call("GET", "/health", base=GW_L185_A, auth=False)
+        check("l185: with required: false the gateway starts without the log store", s == 200 and p.poll() is None, s)
+    finally:
+        p.terminate()
+        p.wait()
+    # the default folders sit in the app dir (the config file's folder), whatever the working directory is (ROOT here)
+    json.dump({**base_cfg, "logs_store": {"enabled": True}, "audit": {"enabled": True, "key": "e2e-l185-audit"}}, open(cp, "w"))
+    p = l185_start(env, "appdir", 18326, cp)
+    try:
+        wait(GW_L185_A + "/health")
+        s, _, _ = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l185"}]}, base=GW_L185_A, auth=False)
+        time.sleep(0.5)
+        logs_dir = os.path.join(app, "logs")
+        files = sorted(os.listdir(logs_dir)) if os.path.isdir(logs_dir) else []
+        check("l185: the default request log and audit folders are in the app dir", s == 200 and any(f.endswith(".jsonl") for f in files) and os.path.isdir(os.path.join(logs_dir, "audit")), (s, files))
+    finally:
+        p.terminate()
+        p.wait()
 
 GW_L144 = "http://127.0.0.1:18228"  # audio billing: speech by its characters, transcriptions by their usage, budgets and the log rows
 
@@ -6269,16 +6475,16 @@ def l171_e2e(env):
         s, _, b = gcall("v1", Bk)
         check("a key's own agent_grants let it call the agent", s == 200 and "echo: grant-v1" in b, (s, b[:200]))
         s, _, b = gcall("old", Bk)
-        check("a key without a grant for the agent is refused", s == 403 and "is not allowed" in b, (s, b[:200]))
+        check("a key without a grant for the agent is refused (-31403, Bifrost's governance message)", s == 200 and json.loads(b).get("error", {}).get("code") == -31403 and json.loads(b)["error"].get("message") == "Agent 'old' is not allowed", (s, b[:200]))
         s, _, b = gcall("old", Ck)
         check("an access profile's agent_grants let its keys call the agent", s == 200 and "grant-old" in b, (s, b[:200]))
         s, _, b = gcall("fo", Bk, {"x-bf-project-name": "agents-project"})
         check("a union project's agent_grants add the agent to the caller's", s == 200 and "grant-fo" in b, (s, b[:200]))
         s, _, b = gcall("fo", Bk)
-        check("without the project header the agent stays refused", s == 403, (s, b[:200]))
+        check("without the project header the agent stays refused", s == 200 and json.loads(b).get("error", {}).get("code") == -31403, (s, b[:200]))
         # ---- the history ----
         s, _, b = api("GET", "/api/agents/history?limit=200")
-        hist = json.loads(b).get("history", []) if s == 200 else []
+        hist = json.loads(b).get("logs", []) if s == 200 else []
         row = next((x for x in hist if x["agent_name"] == "v1" and x["method"] == "message/send"), {})
         check("a history row names its operation, its bindings and its task", row.get("operation") == "message/send" and row.get("downstream_transport") == "JSONRPC" and row.get("upstream_transport") == "JSONRPC" and row.get("task_id", "") != "", row)
         s, _, b = api("GET", "/api/agents/history/" + row.get("id", "none"))
@@ -6466,6 +6672,7 @@ def webrtc_e2e(env):
     GW_R = "http://127.0.0.1:18162"
     shutil.rmtree(os.path.join(BUILD, "e2e-live-logs"), ignore_errors=True)
     cfg = {"client": {"enable_logging": False, "enforce_auth_on_inference": True, "allow_per_request_content_storage_override": True},
+           "server": {"webrtc_enabled": True},
            "providers": {"openai": {"keys": [{"name": "pool", "value": "sk-pool", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
            "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-live-logs"), "content_logging": True},
            "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
@@ -6583,6 +6790,7 @@ def realtime_e2e(env):
     # the voice rate per second is set too: a realtime call is billed by its tokens, not by its seconds (Bifrost's RealtimeRequest)
     rt_price = {"input_cost_per_token": 0.000004, "output_cost_per_token": 0.000016, "cache_read_input_token_cost": 0.0000004, "input_cost_per_audio_token": 0.000032, "output_cost_per_audio_token": 0.000064, "input_cost_per_second": 0.001}
     cfg = {"client": {"enable_logging": False, "enforce_auth_on_inference": True, "allow_per_request_content_storage_override": True},
+           "server": {"webrtc_enabled": True},
            "providers": {"openai": {"keys": [{"name": "pool", "value": "sk-pool", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
                          "xai": {"keys": [{"name": "xk", "value": "xai-rt-key", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
            "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-rt-logs"), "content_logging": True},
@@ -6612,6 +6820,7 @@ def realtime_e2e(env):
     json.dump(cfg, open(path, "w"))
     # Azure OpenAI has a WebRTC call API too: its own key, endpoint and price
     acfg = {"client": {"enable_logging": False, "enforce_auth_on_inference": False},
+            "server": {"webrtc_enabled": True},
             "providers": {"azure": {"keys": [{"name": "az", "value": "az-rt-key", "models": [], "weight": 1.0, "azure_key_config": {"endpoint": MOCK, "api_version": "2025-04-01-preview"}}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
             "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-rt-azure-logs"), "content_logging": True},
             "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
@@ -6988,6 +7197,7 @@ def l160_e2e(env):
     rt_price = {"input_cost_per_token": 0.000004, "output_cost_per_token": 0.000016, "cache_read_input_token_cost": 0.0000004, "input_cost_per_audio_token": 0.000032, "output_cost_per_audio_token": 0.000064}
     tr_price = {"input_cost_per_token": 0.0000025, "output_cost_per_token": 0.00001, "input_cost_per_audio_token": 0.000006, "input_cost_per_second": 0.0001}
     cfg = {"client": {"enable_logging": False, "enforce_auth_on_inference": True},
+           "server": {"webrtc_enabled": True},
            "providers": {"openai": {"keys": [{"id": "k-pool", "name": "pool", "value": "sk-pool", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
            "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l160-logs"), "content_logging": True},
            "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
@@ -7929,7 +8139,7 @@ def l130_e2e(env):
         return call(method, p, body, adm, base=base, auth=False)
 
     def setp(config, name="h130"):
-        s, _, b = api("PUT", "/api/plugins/" + name, {"config": config})
+        s, _, b = api("PUT", "/api/plugins/" + name, {"config": whole_wasm_config(config)})
         if s != 200:
             raise SystemExit(f"l130: could not set the plugin config {config}: {s} {b[:200]}")
 
@@ -8158,7 +8368,7 @@ def l139_e2e(env):
     gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18217", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l139.log"), "w"))
 
     def setp(config):
-        s, _, b = call("PUT", "/api/plugins/h139", {"config": config}, adm, base=base, auth=False)
+        s, _, b = call("PUT", "/api/plugins/h139", {"config": whole_wasm_config(config)}, adm, base=base, auth=False)
         if s != 200:
             raise SystemExit(f"l139: could not set the plugin config {config}: {s} {b[:200]}")
 
@@ -8482,7 +8692,7 @@ def l159_e2e(env):
         check("bedrock count-tokens on Bedrock: the rewritten body is counted, without the model the plugins saw", s == 200 and len(up) == 1 and "pong" in up[0]["body"] and '"model"' not in up[0]["body"] and json.loads(b).get("inputTokens") == 17, (s, b[:200], up))
         # batch creation: the requests the provider gets are the rewritten ones (the mock answers each with the model
         # its line names), and post_hook sees the created batch
-        api("PUT", "/api/plugins/w159", {"config": {"mode": "rewrite", "from": "gpt-4o-mini", "to": "gpt-4o-l159", "tag": "l159"}})
+        api("PUT", "/api/plugins/w159", {"config": whole_wasm_config({"mode": "rewrite", "from": "gpt-4o-mini", "to": "gpt-4o-l159", "tag": "l159"})})
         n = len(seen())
         oa = {"x-model-provider": "openai"}
         s, _, b = post("/anthropic/v1/messages/batches", {"requests": [{"custom_id": "a", "params": {"model": "gpt-4o-mini", "max_tokens": 10, "messages": [{"role": "user", "content": "ping"}]}}]}, oa)
@@ -8494,7 +8704,7 @@ def l159_e2e(env):
         s, _, b = post("/genai/v1beta/models/openai/gpt-4o-mini:batchGenerateContent", inline)
         check("genai batch create: the hooks run around it, and the batch is created at the provider", s == 200 and json.loads(b).get("x_wasm_plugin") == "ctx-ok:l159" and len(since(n, "/v1/files")) == 1 and len(since(n, "/v1/batches")) == 1, (s, b[:200], [u["path"] for u in seen()[n:]]))
         # a short-circuit error answers each of these routes, and no provider is called
-        api("PUT", "/api/plugins/w159", {"config": {"mode": "fail"}})
+        api("PUT", "/api/plugins/w159", {"config": whole_wasm_config({"mode": "fail"})})
         FAILS_AT = [
             ("genai embedContent", EMB + ":embedContent", {"content": {"parts": [{"text": "x"}]}}),
             ("bedrock rerank", "/bedrock/rerank", WIRE),
@@ -8610,7 +8820,7 @@ def l170_e2e(env):
         return got
 
     def setp(config, name="h170"):
-        s, _, b = api("PUT", "/api/plugins/" + name, {"config": config})
+        s, _, b = api("PUT", "/api/plugins/" + name, {"config": whole_wasm_config(config)})
         if s != 200:
             raise SystemExit(f"l170: could not set the plugin config {config}: {s} {b[:200]}")
 
@@ -8735,14 +8945,16 @@ def l170_e2e(env):
         check("telemetry's user_name is the name of the user the key is assigned to", s == 200 and 'user_id="ada-l170",user_name="ada-l170"' in metrics_text, [l for l in metrics_text.split("\n") if "ada-l170" in l][:2])
 
         # ---- a plugin loaded from a URL ----
-        s, _, b = api("POST", "/api/plugins", {"name": "urlplug", "enabled": True, "path": MOCK + "/plugins/plugin.wasm", "config": {"mode": "rewrite", "tag": "url"}})
+        # plain http is accepted only for a plugin pinned by sha256 (L186)
+        pin = hashlib.sha256(open(wasm, "rb").read()).hexdigest()
+        s, _, b = api("POST", "/api/plugins", {"name": "urlplug", "enabled": True, "path": MOCK + "/plugins/plugin.wasm", "sha256": pin, "config": {"mode": "rewrite", "tag": "url"}})
         check("a plugin whose path is a URL is downloaded and loaded (its host is in server.plugin_download_private_allowlist)", s == 201 and json.loads(b).get("plugin", {}).get("status", {}).get("status") == "active", (s, b[:300]))
         s, h, b = chat("openai/gpt-4o-mini", "from a url plugin l170")
         check("the downloaded plugin runs: its post_hook marks the answer", s == 200 and json.loads(b).get("x_wasm_plugin") == "ctx-ok:url", (s, b[:200]))
         api("DELETE", "/api/plugins/urlplug")
-        s, _, b = api("POST", "/api/plugins", {"name": "gone", "enabled": True, "path": MOCK + "/plugins/missing.wasm"})
+        s, _, b = api("POST", "/api/plugins", {"name": "gone", "enabled": True, "path": MOCK + "/plugins/missing.wasm", "sha256": pin})
         check("a download that fails is answered as Bifrost answers a plugin that does not load", s == 500 and "Plugin was not created, it failed to load: failed to download plugin: HTTP 404" in b, (s, b[:300]))
-        s, _, b = api("POST", "/api/plugins", {"name": "local", "enabled": True, "path": "http://localhost:18099/plugins/plugin.wasm"})
+        s, _, b = api("POST", "/api/plugins", {"name": "local", "enabled": True, "path": "http://127.0.0.2:18099/plugins/plugin.wasm", "sha256": pin})
         check("a URL on a private host the allowlist does not name is refused", s == 500 and "private address" in b, (s, b[:300]))
 
         # ---- a wall-clock bound on a WebAssembly call, and the plugin spans and logs ----
@@ -8775,6 +8987,136 @@ def l170_e2e(env):
         api("DELETE", "/api/plugins/slowplug")
     finally:
         gw.terminate()
+
+GW_L176 = "http://127.0.0.1:18304"  # plugins: the WP3 pipeline remainders (Responses lifecycle and cached contents hooked, large bodies, stream errors, late spans)
+
+def l176_e2e(env):
+    """L176: the plugin pipeline's remainders. A WebAssembly plugin's LLM hooks on the Responses lifecycle calls and on the
+    GenAI and Vertex cached contents; the HTTP transport hooks on a body over 4 MiB (they get it empty, and it goes on intact);
+    an error event in a stream through post_hook; the post hook spans of a non-chat route exported with its trace. Its own
+    gateway (18304)."""
+    import re, shutil
+    shutil.rmtree(os.path.join(BUILD, "e2e-l176-logs"), ignore_errors=True)
+    base = GW_L176
+    wasm = os.path.join(ROOT, "tests", "wasm", "plugin.wasm")
+    cfg_path = os.path.join(BUILD, "e2e.l176.json")
+    src = open(os.path.join(ROOT, "src/jwt.tov")).read()
+    pem = re.search(r"const TEST_PKCS8 = `(.*?)`", src, re.S).group(1)
+    sa = {"type": "service_account", "client_email": "e2e@test.iam.gserviceaccount.com", "private_key": pem, "token_uri": MOCK + "/token"}
+    cfg = {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l176-logs")},
+        "otel": {"endpoint": MOCK + "/v1/traces", "service_name": "raiju-l176", "flush_ms": 100},
+        "providers": {
+            "openai": {"keys": [{"name": "o", "value": "sk-l176", "models": [], "weight": 1.0, "use_for_batch_api": True}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "gemini": {"keys": [{"name": "g", "value": "g-" + "l176", "models": [], "weight": 1.0, "use_for_batch_api": True}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "vertex": {"keys": [{"name": "vx", "models": [], "weight": 1.0, "use_for_batch_api": True, "vertex_key_config": {"project_id": "proj", "region": "us-central1", "auth_credentials": json.dumps(sa)}}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+        "plugins": [{"name": "h176", "enabled": True, "path": wasm, "config": {"mode": "rewrite", "tag": "late"}}],
+    }
+    json.dump(cfg, open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18304", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l176.log"), "w"))
+
+    def api(method, p, body=None):
+        return call(method, p, body, None, base=base, auth=False)
+
+    def raw(method, path, body=None, headers=None, ctype="application/json"):
+        data = None if body is None else (body if isinstance(body, bytes) else (body if isinstance(body, str) else json.dumps(body)).encode())
+        req = urllib.request.Request(base + path, data=data, method=method, headers={"content-type": ctype, **(headers or {})})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, {k.lower(): v for k, v in r.headers.items()}, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, {k.lower(): v for k, v in e.headers.items()}, e.read()
+
+    def setp(config):
+        s, _, b = api("PUT", "/api/plugins/h176", {"config": whole_wasm_config(config)})
+        if s != 200:
+            raise SystemExit(f"l176: could not set the plugin config {config}: {s} {b[:200]}")
+
+    def mark(b):
+        try:
+            return json.loads(b).get("x_wasm_plugin")
+        except Exception:
+            return None
+
+    def events(text):
+        return [line[5:].strip() for block in text.split("\n\n") for line in block.split("\n") if line.startswith("data:")]
+
+    try:
+        wait(base + "/health")
+        # ---- the spans of a non-chat route's post hook go out with its trace (the first request this gateway serves) ----
+        s, h, b = raw("POST", "/v1/embeddings", {"model": "openai/text-embedding-3-small", "input": "late spans l176"})
+        check("an embeddings request runs the plugin's hooks", s == 200 and mark(b) == "ctx-ok:late", (s, b[:200]))
+        spans = ""
+        for _ in range(30):
+            spans = "".join(x["body"] for x in seen(traces=True) if x["path"] == "/v1/traces" and "raiju-l176" in x["body"])
+            if "plugin.raiju-test-plugin.posthook" in spans:
+                break
+            # the exporter flushes when a later request's trace finishes: another embeddings request
+            raw("POST", "/v1/embeddings", {"model": "openai/text-embedding-3-small", "input": "flush l176"})
+            time.sleep(0.2)
+        check("the post_hook span of a non-chat route (it runs after the log row is written) is exported with the request's trace", "plugin.raiju-test-plugin.prehook" in spans and "plugin.raiju-test-plugin.posthook" in spans, spans[-400:])
+
+        # ---- the Responses lifecycle calls ----
+        setp({"mode": "rewrite", "tag": "rl", "from": "resp_l176ghost", "to": "resp_l176real"})
+        n = len(seen())
+        s, h, b = raw("GET", "/v1/responses/resp_l176ghost")
+        up = [u for u in seen()[n:] if u["path"].startswith("/v1/responses/")]
+        check("a Responses retrieve runs the LLM hooks (responses_retrieve): pre_hook's id is the one called, post_hook marks the answer", s == 200 and mark(b) == "ctx-ok:rl" and len(up) == 1 and up[0]["path"] == "/v1/responses/resp_l176real", (s, b[:200], [u["path"] for u in up]))
+        s, h, b = raw("GET", "/v1/responses/resp_l176a/input_items?limit=2")
+        check("listing a response's input items runs the hooks (responses_input_items)", s == 200 and mark(b) == "ctx-ok:rl", (s, b[:200]))
+        s, h, b = raw("POST", "/v1/responses/resp_l176a/cancel", {})
+        check("cancelling a response runs the hooks (responses_cancel)", s == 200 and mark(b) == "ctx-ok:rl", (s, b[:200]))
+        s, h, b = raw("DELETE", "/v1/responses/resp_l176a")
+        check("deleting a response runs the hooks (responses_delete)", s == 200 and mark(b) == "ctx-ok:rl", (s, b[:200]))
+        setp({"mode": "rewrite", "post": "error"})
+        s, h, b = raw("GET", "/v1/responses/resp_l176a")
+        check("a lifecycle call's post_hook may turn the answer into an error", s == 429 and b"turned into an error by the plugin" in b, (s, b[:200]))
+
+        # ---- the cached contents: GenAI's and Vertex's regional paths ----
+        setp({"mode": "rewrite", "tag": "cc", "from": "l176-from", "to": "l176-to"})
+        n = len(seen())
+        s, h, b = raw("POST", "/genai/v1beta/cachedContents", {"model": "models/l176-from", "displayName": "cache"})
+        up = [u for u in seen()[n:] if u["path"] == "/v1beta/cachedContents"]
+        check("a GenAI cached content creation runs the hooks (cached_content_create): the model pre_hook rewrote is the one sent", s == 200 and mark(b) == "ctx-ok:cc" and len(up) == 1 and json.loads(up[0]["body"]).get("model") == "models/l176-to", (s, b[:200], [u["body"][:120] for u in up]))
+        s, h, b = raw("GET", "/genai/v1beta/cachedContents")
+        check("listing GenAI cached contents runs the hooks (cached_content_list)", s == 200 and mark(b) == "ctx-ok:cc", (s, b[:200]))
+        setp({"mode": "rewrite", "tag": "cc", "from": "c-l176ghost", "to": "c-l176real"})
+        n = len(seen())
+        s, h, b = raw("GET", "/genai/v1beta/cachedContents/c-l176ghost")
+        up = [u for u in seen()[n:] if u["path"].startswith("/v1beta/cachedContents/")]
+        check("a cached content's name pre_hook changes is the one read (cached_content_retrieve)", s == 200 and mark(b) == "ctx-ok:cc" and len(up) == 1 and up[0]["path"] == "/v1beta/cachedContents/c-l176real", (s, b[:200], [u["path"] for u in up]))
+        s, h, b = raw("PATCH", "/genai/v1beta/cachedContents/c-1", {"ttl": "900s"})
+        check("updating a cached content runs the hooks (cached_content_update)", s == 200 and mark(b) == "ctx-ok:cc", (s, b[:200]))
+        n = len(seen())
+        s, h, b = raw("GET", "/genai/v1beta/projects/proj/locations/us-central1/cachedContents", headers={"x-model-provider": "vertex"})
+        up = [u for u in seen()[n:] if "/cachedContents" in u["path"]]
+        check("Vertex's regional cached contents run the hooks too (cached_content_list)", s == 200 and mark(b) == "ctx-ok:cc" and len(up) == 1 and up[0]["path"].startswith("/v1beta1/projects/proj/locations/us-central1/cachedContents"), (s, b[:200], [u["path"] for u in up]))
+
+        # ---- the HTTP transport hooks on a body over 4 MiB ----
+        setp({"mode": "rewrite", "tag": "big", "http": "rewrite"})
+        bulk = "y" * (5 * 1024 * 1024)
+        n = len(seen())
+        s, h, b = raw("POST", "/v1/embeddings", {"model": "openai/text-embedding-3-small", "input": bulk})
+        up = [u for u in seen()[n:] if u["path"] == "/v1/embeddings"]
+        check("a request over 4 MiB still runs the transport hooks (with an empty body, as Bifrost): http_post_hook saw the context http_pre_hook set", s == 200 and h.get("x-wasm-http-post") == "big" and h.get("x-wasm-http-ctx") == "ok", (s, {k: v for k, v in h.items() if k.startswith("x-")}, b[:200]))
+        check("and its body reaches the provider whole", len(up) == 1 and up[0]["size"] > len(bulk), [u["size"] for u in up])
+
+        # ---- an error event in a stream reaches post_hook ----
+        setp({"mode": "rewrite", "post": "recover"})
+        s, h, b = raw("POST", "/v1/chat/completions", {"model": "openai/l176-broken", "messages": [{"role": "user", "content": "hi"}], "stream": True})
+        evs = events(b.decode())
+        check("a stream's error event goes through post_hook, which may recover with a chunk sent in its place", s == 200 and not any(e.startswith('{"error"') for e in evs) and any('"chat.completion"' in e for e in evs), (s, evs[:6]))
+        setp({"mode": "rewrite"})
+        s, h, b = raw("POST", "/v1/chat/completions", {"model": "openai/l176-broken", "messages": [{"role": "user", "content": "hi"}], "stream": True})
+        evs = events(b.decode())
+        check("an error event a plugin keeps reaches the caller as it was", s == 200 and any("upstream broke" in e for e in evs), (s, evs[:6]))
+    finally:
+        gw.terminate()
+
 GW_L126 = "http://127.0.0.1:18186"  # network_config pool knobs and upstream HTTP/2, against tov-patches/tests/h2_server.py origins
 
 def l126_python_env():
@@ -9689,11 +10031,11 @@ def l145_e2e(env):
             row = mine(ppath)[-1]
             check("a 12 MiB image in a Responses request to %s arrives as the %s body, instructions hoisted" % (model.split("/")[0], fam), s == 200 and row["size"] == len(want) and row["sha"] == sha(want), (s, b[:200], row["size"], len(want)))
 
-        # ---- a stream the caller asked for: the answer is replayed as Responses events, as the whole-request path does ----
+        # ---- a stream the caller asked for: Anthropic is called as a stream, its events converted to Responses events (L178) ----
         sb = ('{"model":"anthropic/claude-l145","stream":true,"max_output_tokens":16,"input":"%s"}' % FILL(2 * MB)).encode()
         s, hs, b = l124_http(port, "POST", "/v1/responses", sb, timeout=120)
         t = b.decode("utf8", "replace")
-        check("a big streamed Responses request to Anthropic gets Responses events with the answer and response.completed", s == 200 and hdr(hs, "content-type") == "text/event-stream" and "response.output_text.delta" in t and "response.completed" in t and "Hi from claude" in t, (s, hs, t[:300]))
+        check("a big streamed Responses request to Anthropic gets Responses events with the answer and response.completed", s == 200 and hdr(hs, "content-type") == "text/event-stream" and "response.output_text.delta" in t and "response.completed" in t and '"delta":"hi"' in t, (s, hs, t[:300]))
 
         # ---- the gateway does not hold the body ----
         pid = gw145.pid
@@ -10099,6 +10441,155 @@ def l162_e2e(env):
         gw.wait()
 
 
+GW_L178 = "http://127.0.0.1:18308"  # L178: large Responses streams converted live, disable_store, the stream label, Replicate and compat on large completions
+
+def l178_e2e(env):
+    """L178. A large Responses stream to a provider whose format differs is called as a stream and its events become Responses
+    events as they arrive (the first text reaches the caller before the provider's stream is over), with the usage counted. A large
+    chat or Responses body to a provider with openai_config.disable_store ends with "store":false. A large body whose "stream": true
+    lies past the prefix is labelled a stream from its answer. A large text completion to Replicate becomes its prediction body as it
+    streams in, and compat's drops and fits apply to large text completions (sent as they are, or as chat). Its own gateway (18308)."""
+    import hashlib
+    net = {"base_url": MOCK, "max_retries": 0}
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False, "max_request_body_size_mb": 8, "compat": {}},
+        # the compat datasheet rows: chatonly-mini serves chat only, textfit-mini text completions with max_tokens and stop listed
+        "pricing_sync": {"url": MOCK + "/cdatasheet", "enabled": False},
+        "large_payload_optimization": {"enabled": True, "request_threshold_bytes": 262144, "response_threshold_bytes": 1048576, "prefetch_size_bytes": 16384, "max_payload_bytes": 134217728, "truncated_log_bytes": 4096},
+        "governance": {
+            "budgets": [{"id": "b-l178", "max_limit": 100, "reset_duration": "1d"}],
+            "pricing_overrides": [{"id": "po-l178", "name": "l178", "scope_kind": "global", "match_type": "wildcard", "pattern": "*", "pricing_patch": json.dumps({"input_cost_per_token": 0.000001, "output_cost_per_token": 0.000001})}],
+            "virtual_keys": [{"id": "vk-l178", "value": "sk-bf-l178-budget-0123456789", "budget_id": "b-l178"}],
+        },
+        "providers": {
+            "anthropic": {"keys": [{"name": "a", "value": "sk-ant-" + "l178", "models": [], "weight": 1.0}], "network_config": net},
+            "groq": {"keys": [{"name": "gq", "value": "gsk-" + "l178", "models": [], "weight": 1.0}], "network_config": net},
+            "openai": {"keys": [{"name": "o", "value": "sk-" + "l178", "models": [], "weight": 1.0}], "network_config": net, "openai_config": {"disable_store": True}},
+            "replicate": {"keys": [{"name": "rp", "value": "r8_e2e", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK + "/replicate", "max_retries": 0}},
+        },
+    }
+    path = os.path.join(BUILD, "e2e.l178.json")
+    json.dump(cfg, open(path, "w"))
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18308", "-host", "127.0.0.1", "-config", path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l178.log"), "w"))
+    port = 18308
+    try:
+        wait(GW_L178 + "/health")
+        mine = lambda p_: [x for x in seen() if x["path"] == p_]
+        sha = lambda b: hashlib.sha256(b).hexdigest()
+        used = lambda: {x["id"]: x["used"] for x in json.loads(call("GET", "/api/governance/usage", base=GW_L178, auth=False)[2])["budgets"]}
+        MB = 1048576
+        FILL = lambda n, c="F": c * n
+
+        def events(t):
+            out = []
+            for block in t.split("\n\n"):
+                lines = block.split("\n")
+                if lines and lines[0].startswith("event: "):
+                    data = next((l[6:] for l in lines if l.startswith("data: ")), "{}")
+                    out.append((lines[0][7:], json.loads(data)))
+            return out
+
+        def sse_text(t):
+            out = ""
+            for line in t.split("\n"):
+                if line.startswith("data: {"):
+                    ch = json.loads(line[6:])
+                    for c in ch.get("choices", []):
+                        out += c.get("delta", {}).get("content") or c.get("text") or ""
+            return out
+
+        # ---- a 12 MiB Responses stream to Anthropic: called as a stream, its events become Responses events as they arrive ----
+        # (12 MiB is over client.max_request_body_size_mb: a buffered request would be refused)
+        body = ('{"model":"anthropic/claude-l178slow","stream":true,"max_output_tokens":16,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"%s"}]}]}' % FILL(12 * MB)).encode()
+        n0 = len(mine("/v1/messages"))
+        s, hs, b, gap = l162_timed(port, "/v1/responses", body)
+        t = b.decode("utf8", "replace")
+        evs = events(t)
+        names = [e[0] for e in evs]
+        deltas = "".join(e[1].get("delta", "") for e in evs if e[0] == "response.output_text.delta")
+        done = [e[1] for e in evs if e[0] == "response.completed"]
+        check("a 12 MiB Responses stream to Anthropic is answered with Responses events carrying the text and response.completed", s == 200 and hdr(hs, "content-type") == "text/event-stream" and names[:2] == ["response.created", "response.in_progress"] and deltas == "Hi from claude" and len(done) == 1, (s, hs, t[:400]))
+        check("... with the stream's usage in response.completed", done and done[0]["response"].get("usage", {}).get("input_tokens") == 9 and done[0]["response"]["usage"].get("output_tokens") == 5, done)
+        check("... the first text reached the caller before Anthropic's stream was over (%.2f s before the end)" % gap, gap >= 1.5, gap)
+        rows = mine("/v1/messages")[n0:]
+        check("... Anthropic was called once, as a stream, with the converted body", len(rows) == 1 and rows[0]["size"] > 12 * MB and rows[0]["body"].startswith('{"model":"claude-l178slow","messages":[{"role":"user","content":[{"type":"text","text":"FFF'), [(r["size"], r["body"][:80]) for r in rows])
+        vk = {"x-bf-vk": "sk-bf-l178-budget-0123456789"}
+        u0 = used()["b-l178"]
+        s, _, b = l124_http(port, "POST", "/v1/responses", body.replace(b"claude-l178slow", b"claude-l178"), headers=vk, timeout=120)
+        u1 = used()["b-l178"]
+        check("... and a live Responses stream is counted in the key's budget from its events (9 + 5 tokens)", s == 200 and abs((u1 - u0) - 14e-6) < 1e-9, (s, b[:200], u0, u1))
+        # an OpenAI-format provider's chat stream becomes Responses events too
+        body = ('{"model":"groq/llama-l178","stream":true,"input":"%s"}' % FILL(2 * MB)).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/responses", body, timeout=120)
+        t = b.decode("utf8", "replace")
+        names = [e[0] for e in events(t)]
+        row = mine("/v1/chat/completions")[-1]
+        check("a big Responses stream to an OpenAI-format provider streams its chat chunks back as Responses events", s == 200 and "response.output_text.delta" in names and names[-1] == "response.completed" and row["size"] > 2 * MB, (s, t[:300]))
+
+        # ---- openai_config.disable_store: "store":false ends a large chat or Responses body (it outvotes the caller's) ----
+        body = ('{"model":"openai/gpt-4o-l178","store":true,"messages":[{"role":"user","content":"%s"}]}' % FILL(12 * MB)).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/chat/completions", body, timeout=120)
+        want = body.replace(b'"openai/gpt-4o-l178"', b'"gpt-4o-l178"')[:-1] + b',"store":false}'
+        row = mine("/v1/chat/completions")[-1]
+        check("a 12 MiB chat body to a provider with disable_store arrives with store false last, intact by content hash", s == 200 and row["size"] == len(want) and row["sha"] == sha(want) and row["hdr"].split("|")[1] == str(len(want)), (s, b[:200], row["size"], len(want), row["hdr"]))
+        body = ('{"model":"openai/gpt-4o-l178","input":"%s"}\n' % FILL(12 * MB)).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/responses", [body[:5000], body[5000:]], chunked=True, timeout=120)
+        want = body.replace(b'"openai/gpt-4o-l178"', b'"gpt-4o-l178"')[:-2] + b',"store":false}\n'
+        row = mine("/v1/responses")[-1]
+        check("a chunked 12 MiB Responses body to it ends with store false before its closing brace, intact", s == 200 and row["sha"] == sha(want), (s, b[:200], row["size"], len(want)))
+        body = ('{"model":"groq/llama-l178","messages":[{"role":"user","content":"%s"}]}' % FILL(2 * MB)).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/chat/completions", body, timeout=120)
+        row = mine("/v1/chat/completions")[-1]
+        check("... and a provider without it gets the body as it was", s == 200 and row["sha"] == sha(body.replace(b'"groq/llama-l178"', b'"llama-l178"')), (s, row["size"]))
+
+        # ---- the request type of a large body whose "stream": true lies past the prefix: read from its answer ----
+        body = ('{"model":"groq/llama-l178late","messages":[{"role":"user","content":"%s"}],"stream":true}' % FILL(2 * MB)).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/chat/completions", body, timeout=120)
+        t = b.decode("utf8", "replace")
+        check("a big chat body with its stream flag past the prefix streams back, labelled chat_completion_stream", s == 200 and hdr(hs, "content-type") == "text/event-stream" and hdr(hs, "x-bifrost-request-type") == "chat_completion_stream" and "data: [DONE]" in t, (s, hs, t[:200]))
+        m = call("GET", "/metrics", base=GW_L178, auth=False)[2]
+        line = [l for l in m.split("\n") if l.startswith("bifrost_upstream_requests_total{") and 'model="llama-l178late"' in l]
+        check("... and counted in the metrics under method chat_completion_stream", len(line) == 1 and 'method="chat_completion_stream"' in line[0], line)
+
+        # ---- a 12 MiB text completion to Replicate: its prediction body, written as the body streams in ----
+        def comp(model, n, extra="", stream=False, mt=16):
+            st = '"stream":true,' if stream else ""
+            return ('{"model":"%s",%s"prompt":"%s","max_tokens":%d%s}' % (model, st, FILL(n), mt, extra)).encode()
+        s, hs, b = l124_http(port, "POST", "/v1/completions", comp("replicate/meta/llama-l178", 12 * MB, ',"echo":false'), timeout=180)
+        row = mine("/v1/models/meta/llama-l178/predictions")[-1]
+        want = ('{"input":{"prompt":"%s","max_tokens":16}}' % FILL(12 * MB)).encode()
+        out = json.loads(b) if s == 200 else {}
+        check("a 12 MiB text completion to Replicate arrives as its prediction body, intact by content hash", s == 200 and row["sha"] == sha(want), (s, b[:200], row["size"], len(want)))
+        check("... and is answered as a text completion with the prediction's output and token counts", out.get("object") == "text_completion" and out["choices"][0]["text"] == "Replicate says: a prompt of %d bytes" % (12 * MB) and out.get("usage", {}).get("prompt_tokens") == 7, b[:300])
+        s, hs, b = l124_http(port, "POST", "/v1/completions", comp("replicate/meta/llama-l178", 2 * MB, stream=True), timeout=180)
+        t = b.decode("utf8", "replace")
+        frames = [json.loads(l[6:]) for l in t.split("\n") if l.startswith("data: {")]
+        check("... a streamed one is answered as text_completion chunks", s == 200 and frames and all(f.get("object") == "text_completion" for f in frames) and sse_text(t) == "Replicate says: a prompt of %d bytes" % (2 * MB) and t.rstrip().endswith("data: [DONE]"), (s, t[:300]))
+
+        # ---- compat's drops and fits on a large text completion: sent as it is (textfit-mini), and sent as chat (chatonly-mini) ----
+        n0 = len(mine("/v1/completions"))
+        s, hs, b = l124_http(port, "POST", "/v1/completions", comp("openai/textfit-mini", 12 * MB, ',"temperature":0.5,"echo":false', mt=500), timeout=180)
+        rows = mine("/v1/completions")[n0:]
+        want = ('{"prompt":"%s","model":"textfit-mini","max_tokens":50,"echo":false}' % FILL(12 * MB)).encode()
+        check("a 12 MiB text completion has its unlisted temperature dropped and max_tokens fitted to the row's 50, the prompt intact", s == 200 and len(rows) == 1 and rows[0]["sha"] == sha(want), (s, b[:200], [r["size"] for r in rows], len(want)))
+        check("... answered by the provider as it is, with the compat header", s == 200 and json.loads(b)["choices"][0]["text"] == "Hi from textfit" and hdr(hs, "x-bifrost-dropped-compat-params") == "temperature", (hs, b[:200]))
+        s, hs, b = l124_http(port, "POST", "/v1/completions", comp("openai/textfit-mini", 2 * MB, ',"temperature":0.5', stream=True), timeout=180)
+        t = b.decode("utf8", "replace")
+        row = mine("/v1/completions")[-1]
+        want = ('{"prompt":"%s","model":"textfit-mini","stream_options":{"include_usage":true},"stream":true,"max_tokens":16}' % FILL(2 * MB)).encode()
+        check("... a streamed one asks for its usage chunk and its events pass back as they came", s == 200 and hdr(hs, "content-type") == "text/event-stream" and sse_text(t) == "Hi from textfit" and row["sha"] == sha(want), (s, t[:200], row["size"], len(want)))
+        s, hs, b = l124_http(port, "POST", "/v1/completions", comp("openai/chatonly-mini", 12 * MB, ',"seed":5', mt=9000), timeout=180)
+        row = mine("/v1/chat/completions")[-1]
+        # (the openai provider has disable_store, which ends its chat bodies)
+        want = ('{"model":"chatonly-mini","messages":[{"role":"user","content":"%s"}],"max_tokens":4096,"store":false}' % FILL(12 * MB)).encode()
+        check("a 12 MiB text completion sent as chat has seed dropped and max_tokens fitted to 4096, the prompt intact", s == 200 and row["sha"] == sha(want) and json.loads(b).get("object") == "text_completion", (s, b[:200], row["size"], len(want)))
+        check("... with the compat headers (the drop and the endpoint change)", hdr(hs, "x-bifrost-dropped-compat-params") == "seed" and hdr(hs, "x-bifrost-converted-request-type") == "chat_completion", hs)
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
 A2A_GRPC_LISTEN = 18245  # the port the listener binds (RAIJU_A2A_GRPC_LISTEN_PORT)
 A2A_GRPC_ADVERTISED = 18246  # server.a2a_grpc_port: what the cards advertise
 A2A_GRPC_DOMAIN = "gw.grpc.test"
@@ -10166,7 +10657,7 @@ def l148_run(env, workers: int, label: str, port: int):
         grpc_ifs = [i for i in card.get("supportedInterfaces", []) if i.get("protocolBinding") == "GRPC"]
         check("the served card lists the gRPC interface under the agent's name and the advertised port", len(grpc_ifs) == 1 and grpc_ifs[0]["url"] == f"grpc.{A2A_GRPC_DOMAIN}:{A2A_GRPC_ADVERTISED}", (s, b[:300]))
         s, _, b = api("GET", "/api/agents/history?limit=200")
-        before = len(json.loads(b).get("history", [])) if s == 200 else 0
+        before = len(json.loads(b).get("logs", [])) if s == 200 else 0
         before_up = len(upstream())
         run = subprocess.run([client, "-addr", f"127.0.0.1:{A2A_GRPC_LISTEN}", "-domain", A2A_GRPC_DOMAIN, "-agent", "grpc", "-key", "sk-bf-l148-a", "-nogrant", "sk-bf-l148-b", "-push", MOCK + "/cb/push"], capture_output=True, text=True, timeout=300)
         check("the gRPC client runs to the end", run.returncode == 0, (run.returncode, run.stderr[-600:]))
@@ -10202,18 +10693,19 @@ def l148_run(env, workers: int, label: str, port: int):
         # L161: an agent's error carries the google.rpc.ErrorInfo a2a-go sends (grpc-status-details-bin); the gateway's own refusals do not
         check("a missing task's status carries an ErrorInfo TASK_NOT_FOUND in the A2A domain", row("task-missing").get("reason") == "TASK_NOT_FOUND" and row("task-missing").get("domain") == "a2a-protocol.org", row("task-missing"))
         check("an agent's server error carries the ErrorInfo SERVER_ERROR", row("agent-error").get("reason") == "SERVER_ERROR", row("agent-error"))
-        check("the gateway's own refusals are plain statuses, without details", all(row(n).get("reason") is None for n in ("no-key", "no-grant", "unknown-agent")), [row(n) for n in ("no-key", "no-grant")])
+        check("the gateway's own refusals are plain statuses, without details", all(row(n).get("reason") is None for n in ("no-key", "unknown-agent")), [row(n) for n in ("no-key", "unknown-agent")])
+        check("a refused grant is a2a-go's ErrUnauthorized: the ErrorInfo UNAUTHORIZED in the A2A domain", row("no-grant").get("reason") == "UNAUTHORIZED" and row("no-grant").get("domain") == "a2a-protocol.org", row("no-grant"))
         check("the SDK reads the A2A error back from the details (errors.Is a2a.ErrTaskNotFound)", row("sdk-task-missing").get("a2a") == "task-not-found" and row("sdk-task-missing")["message"] == "task not found", row("sdk-task-missing"))
         check("the key sent as x-api-key is read", row("api-key-header")["code"] == "OK", row("api-key-header"))
         sent = upstream()[before_up:]
         check("the calls reach the mock agent as JSON-RPC with the v1 method names", any(x["body"].find('"method":"SendMessage"') >= 0 for x in sent) and any(x["body"].find('"method":"CancelTask"') >= 0 for x in sent), [x["body"][:120] for x in sent[:3]])
         check("the agent does not get the caller's virtual key", len(sent) > 0 and all("sk-bf-l148" not in json.dumps(x) for x in sent), sent[:1])
         s, _, b = api("GET", "/api/agents/history?limit=200")
-        hist = json.loads(b).get("history", []) if s == 200 else []
+        hist = json.loads(b).get("logs", []) if s == 200 else []
         mine = [x for x in hist[: max(0, len(hist) - before)]]
         check("every call that reached the agent is logged under its name, with its method", s == 200 and len(mine) >= 8 and all(x["agent_name"] == "grpc" for x in mine) and any(x["method"] == "SendMessage" for x in mine), (s, len(mine), b[:200]))
         s, _, b = api("GET", "/api/agents/history?agent_names=grpc&limit=200")
-        check("the agent history selects the gRPC calls by name", s == 200 and json.loads(b).get("total", 0) >= 8, (s, b[:200]))
+        check("the agent history selects the gRPC calls by name", s == 200 and json.loads(b).get("pagination", {}).get("total_count", 0) >= 8, (s, b[:200]))
         s, _, _ = gwc("GET", "/health")
         check("the HTTP side of the gateway still answers", s == 200, s)
     finally:
@@ -10408,7 +10900,7 @@ def l161_e2e(env):
         check("the agent gets the runtime credentials as metadata, and never the caller's virtual key", len(plain) >= 8 and all("sk-bf-l161" not in json.dumps(x) for x in seen), seen[:2])
         check("the TLS agent gets its own credentials", any(x["metadata"].get("x-agent-token") == "tok-l161-tls" for x in seen), [x["metadata"] for x in seen][-2:])
         s, _, b = call("GET", "/api/agents/history?agent_names=gonly&limit=200", None, ADM, base=base, auth=False)
-        hist = json.loads(b).get("history", []) if s == 200 else []
+        hist = json.loads(b).get("logs", []) if s == 200 else []
         check("the calls to the gRPC-only agent are logged under its name", len(hist) >= 10 and all(x["agent_name"] == "gonly" for x in hist), (s, len(hist)))
     finally:
         if gw is not None:
@@ -11012,7 +11504,7 @@ def l167_e2e(env, idp_state):
             "client": client_cfg(disable_vk),
             "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
             "providers": {"openai": {"keys": [{"name": "k", "value": "sk-k", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
-            "governance": {"auth_config": {"token": "admin-secret"}, "virtual_keys": [{"id": "vk-l167-a", "value": "sk-bf-l167-a"}]},
+            "governance": {"auth_config": {"token": "admin-secret"}, "virtual_keys": [{"id": "vk-l167-a", "value": "sk-bf-l167-a", "mcp_configs": [{"mcp_client_name": n, "tools_to_execute": ["*"]} for n in ("po", "oa", "tenant", "jira")]}]},
             "oidc": {"enabled": True, "issuer": "http://127.0.0.1:18096", "client_id": "raiju", "redirect_uri": GW_L167 + "/api/oidc/callback", "role_claim": "groups", "role_map": {"raiju-editors": "editor"}},
             "mcp": {"tool_sync_interval": "1h", "oauth_private_allowlist": ["127.0.0.1"], "client_configs": [
                 {"name": "po", "connection_type": "http", "connection_string": MOCK + "/mcp-peruser-oauth", "auth_type": "per_user_oauth", "auth": {"type": "oauth"}},
@@ -11044,7 +11536,7 @@ def l167_e2e(env, idp_state):
         """The authorization server's redirect for an authorize URL: (path, query) of the callback."""
         loc = ""
         try:
-            urllib.request.build_opener(NoFollow).open(url, timeout=10)
+            urllib.request.build_opener(NoFollow, SetupTokenHandler).open(url, timeout=10)
         except urllib.error.HTTPError as e:
             loc = e.headers.get("location", "")
         lu = urllib.parse.urlparse(loc)
@@ -11293,7 +11785,9 @@ def l166_config():
             "budgets": [{"id": "b-l166", "max_limit": 0.4, "reset_duration": "1d"}],
             "customers": [{"id": "c-l166", "name": "Toolco", "budget_id": "b-l166"}],
             "teams": [{"id": "t-l166", "name": "tools", "customer_id": "c-l166"}],
-            "virtual_keys": [{"id": "vk-l166", "value": "sk-bf-l166"}, {"id": "vk-l166-team", "value": "sk-bf-l166-team", "team_id": "t-l166"}],
+            # a key without mcp_configs gets no MCP tools (L184, as in Bifrost): these keys are granted every client
+            "virtual_keys": [{"id": "vk-l166", "value": "sk-bf-l166", "mcp_configs": [{"mcp_client_name": n, "tools_to_execute": ["*"]} for n in ("pingy", "noping", "dyn", "echo", "filed", "escaped")]},
+                             {"id": "vk-l166-team", "value": "sk-bf-l166-team", "team_id": "t-l166", "mcp_configs": [{"mcp_client_name": n, "tools_to_execute": ["*"]} for n in ("pingy", "noping", "dyn", "echo", "filed", "escaped")]}],
             "projects": [{"id": "p-l166", "name": "tool-proj", "membership_mode": "open", "access_rule": "intersect", "provider_configs": [{"provider": "openai"}],
                           "mcp_configs": [{"mcp_client_name": "pingy", "tools_to_execute": ["lookup"]}], "virtual_mcps": ["vdyn"]}],
         },
@@ -11467,6 +11961,91 @@ def l166_e2e(env):
         gw.terminate()
         gw.wait()
 
+
+GW_L177 = "http://127.0.0.1:18306"  # L177: MCP agent mode on Responses (plain tools, server patterns, logs), OpenAPI 3.2 querystring and form styles
+
+L177_SPEC = json.dumps({"openapi": "3.2.0", "info": {"title": "QS", "version": "1"}, "paths": {
+    "/search": {"get": {"operationId": "search", "parameters": [{"name": "filter", "in": "querystring", "required": True, "content": {"application/x-www-form-urlencoded": {"schema": {"type": "object", "required": ["q"], "properties": {"q": {"type": "string"}, "page": {"type": "integer"}}}}}}]}},
+    "/raw": {"get": {"operationId": "rawq", "parameters": [{"name": "raw", "in": "querystring", "content": {"text/plain": {"schema": {"type": "string"}}}}]}},
+    "/form": {"post": {"operationId": "form", "requestBody": {"required": True, "content": {"application/x-www-form-urlencoded": {
+        "schema": {"type": "object", "properties": {"filter": {"type": "object"}, "tags": {"type": "array", "items": {"type": "string"}}}},
+        "encoding": {"filter": {"style": "deepObject"}, "tags": {"style": "pipeDelimited"}}}}}}},
+}})
+
+def l177_e2e(env):
+    """L177: MCP on the Responses API. A plain MCP client whose tools_to_auto_execute is ["*"] (a server pattern the agent
+    now matches) is run by agent mode on /v1/responses: the function call runs, its output goes back as a
+    function_call_output, each round is served (and logged) by the Responses route, and x-bf-mcp-agent: off returns the
+    call. An OpenAPI 3.2 client: a querystring parameter flattened into query arguments, a raw query string, and a form
+    body with deepObject and pipe-delimited fields. Its own gateway on 18306."""
+    import shutil
+    logs = os.path.join(BUILD, "e2e-l177-logs")
+    shutil.rmtree(logs, ignore_errors=True)
+    cfg = {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False},
+        "logs_store": {"enabled": True, "dir": logs},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "l177", "value": "sk-l177", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "mcp": {"tool_sync_interval": "1h", "client_configs": [
+            {"name": "plain", "connection_type": "http", "connection_string": MOCK + "/mcp", "tools_to_auto_execute": ["*"]},
+            {"name": "qs", "connection_type": "openapi", "openapi_config": {"spec": L177_SPEC, "base_url": MOCK + "/mcp-i/_api"}},
+        ]},
+        "governance": {"virtual_keys": [{"id": "vk-l177", "value": "sk-bf-l177", "mcp_configs": [{"mcp_client_name": "plain", "tools_to_execute": ["*"]}, {"mcp_client_name": "qs", "tools_to_execute": ["*"]}]}]},
+    }
+    path = os.path.join(BUILD, "e2e.l177.json")
+    json.dump(cfg, open(path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18306", "-host", "127.0.0.1", "-config", path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l177.log"), "w"))
+    KEY = {"x-bf-vk": "sk-bf-l177"}
+    def gwc(method, p, body=None, headers=None):
+        return call(method, p, body, {**KEY, **(headers or {})}, base=GW_L177, auth=False)
+    def tool(name, args):
+        s, _, b = gwc("POST", "/v1/mcp/tool/execute", {"id": "c1", "type": "function", "function": {"name": name, "arguments": json.dumps(args)}})
+        return s, (json.loads(b).get("content", "") if s == 200 else b)
+    try:
+        wait(GW_L177 + "/health")
+        b = ""
+        for _ in range(120):
+            s, h, _ = gwc("POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "e2e-l177", "version": "1"}}})
+            s, _, b = gwc("POST", "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, {"mcp-session-id": hdr(h, "mcp-session-id") or ""})
+            if all(n in b for n in ["plain-get_weather", "qs-search", "qs-rawq", "qs-form"]):
+                break
+            time.sleep(0.25)
+        check("L177: the plain and OpenAPI clients list their tools", all(n in b for n in ["plain-get_weather", "qs-search", "qs-rawq", "qs-form"]), b[:300])
+
+        # ---- agent mode on /v1/responses with a plain MCP tool ----
+        n0 = len(seen())
+        s, h, b = gwc("POST", "/v1/responses", {"model": "openai/agent-plain", "input": "weather in Oslo?"})
+        hl = {k.lower(): v for k, v in h.items()}
+        check("L177: a plain MCP tool is auto-executed on /v1/responses (tools_to_auto_execute ['*'])", s == 200 and "It is sunny in Oslo" in b and hl.get("x-bf-agent-steps") == "2" and hl.get("x-bf-agent-tool-calls") == "1", (s, b[:300], hl.get("x-bf-agent-steps")))
+        ups = [x for x in seen()[n0:] if x["path"] == "/v1/responses" and "agent-plain" in x["body"]]
+        check("L177: both rounds go upstream on the Responses route, the second with the tool's output", len(ups) == 2 and '"plain-get_weather"' in ups[0]["body"] and '"function_call_output"' in ups[1]["body"] and "Sunny in Oslo" in ups[1]["body"], [u["body"][:200] for u in ups])
+        s, _, b = gwc("POST", "/v1/responses", {"model": "openai/agent-plain", "input": "weather in Oslo?"}, {"x-bf-mcp-agent": "off"})
+        check("L177: x-bf-mcp-agent: off returns the function call to the caller", s == 200 and "plain-get_weather" in b and "sunny" not in b, (s, b[:300]))
+        rows = []
+        for _ in range(40):
+            s, _, lb = call("GET", "/api/logs?limit=50", None, None, base=GW_L177, auth=False)
+            rows = [r for r in (json.loads(lb).get("logs", []) if s == 200 else []) if "agent-plain" in json.dumps(r.get("model", ""))]
+            if len(rows) >= 3:
+                break
+            time.sleep(0.25)
+        check("L177: each round of the agent is a request log entry of the Responses route", len(rows) >= 3, len(rows))
+
+        # ---- OpenAPI 3.2: querystring parameters and form encoding styles ----
+        s, c = tool("qs-search", {"q": "a b", "page": 2})
+        got = json.loads(c) if s == 200 and c.startswith("{") else {}
+        check("L177: a querystring object is sent as query arguments", got.get("path") == "/mcp-i/_api/search" and got.get("query") == "?page=2&q=a+b", (s, c[:300]))
+        s, c = tool("qs-search", {"page": 2})
+        check("L177: a required querystring field must be sent", 'missing required query parameter "q"' in c, (s, c[:300]))
+        s, c = tool("qs-rawq", {"raw": "a=1&b=x%20y"})
+        got = json.loads(c) if s == 200 and c.startswith("{") else {}
+        check("L177: a raw query string is sent as written", got.get("path") == "/mcp-i/_api/raw" and got.get("query") == "?a=1&b=x%20y", (s, c[:300]))
+        s, c = tool("qs-form", {"filter": {"b": 1, "a": "x"}, "tags": ["a", "b"]})
+        got = json.loads(c) if s == 200 and c.startswith("{") else {}
+        check("L177: a form body sends a deepObject field as field[key] and a pipe-delimited array joined", got.get("method") == "POST" and got.get("body") == "filter%5Ba%5D=x&filter%5Bb%5D=1&tags=a%7Cb", (s, c[:300]))
+    finally:
+        gw.terminate()
+        gw.wait()
 
 GW_L165 = "http://127.0.0.1:18284"  # built-in role ids, user emails, quota model_configs, role attachments, complexity status, rotate revoking MCP grants
 
@@ -11958,6 +12537,161 @@ def l173_e2e(env):
 
 GW_L172 = "http://127.0.0.1:18294"  # L172: Vertex tuned endpoints by project_number, body limits that follow a config change
 
+GW_L175 = "http://127.0.0.1:18302"  # L175: editable built-in roles, plugin PUT merge, quota per-model usage and profile budgets, profile audit lists, vMCP reverse lookup, member usage, user budget overrides
+GW_L175_OPEN = "http://127.0.0.1:18303"  # L175: the same gateway shape with dashboard auth off (plugin genuine-auth check)
+
+
+def l175_e2e(env):
+    """L175: the management API in Bifrost's shapes. Two gateways of its own, started and stopped here."""
+    import hashlib, shutil
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    d = os.path.join(BUILD, "e2e-l175")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    def tok(t):
+        return hashlib.sha256(t.encode()).hexdigest()
+    openai = {"keys": [{"name": "l175", "value": "sk-l175-pool", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}
+    cfg = {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": True},
+        "logs_store": {"enabled": True, "dir": os.path.join(d, "logs")},
+        "audit": {"enabled": True, "dir": os.path.join(d, "audit"), "key": "e2e-l175-audit-key-0123456789abcdef"},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": openai},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": tok("sk-admin-l175-root")},
+                      {"name": "vi", "role": "viewer", "token_sha256": tok("sk-admin-l175-view")},
+                      {"name": "ann", "role": "viewer", "access_profile_ids": ["p1"]}],
+            "access_profiles": [{"id": "p1", "name": "Base", "budget_id": "b-p", "virtual_mcps": ["dev"], "provider_configs": [{"provider": "openai", "budget_id": "b-oa"}]}],
+            "budgets": [{"id": "b-p", "max_limit": 10, "reset_duration": "1d"}, {"id": "b-oa", "max_limit": 0.000000001, "reset_duration": "1d"},
+                        {"id": "b-pj", "max_limit": 8, "reset_duration": "1d"}],
+            "virtual_keys": [{"id": "vk-ann", "name": "ann key", "value": "sk-bf-l175-ann", "user_id": "ann"},
+                             {"id": "vk-own", "name": "own key", "value": "sk-bf-l175-own"}],
+            "projects": [{"id": "pj", "name": "proj", "budget_id": "b-pj", "split_policy": "equal", "members": [{"id": "m1", "user_id": "ann"}]}],
+        },
+        "virtual_mcps": [{"name": "dev", "tools": [], "allowed_keys": ["vk-own"]}],
+    }
+    cfg_path = os.path.join(d, "config.json")
+    json.dump(cfg, open(cfg_path, "w"))
+    open_cfg = {"client": {"enable_logging": False}, "alerts": {"enabled": False}, "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False}, "providers": {"openai": openai}}
+    open_path = os.path.join(d, "open.json")
+    json.dump(open_cfg, open(open_path, "w"))
+    root = {"authorization": "Bearer sk-admin-l175-root"}
+    view = {"authorization": "Bearer sk-admin-l175-view"}
+    def api(method, p, body=None, who=root, base=GW_L175):
+        return raw(method, base + p, body, {"content-type": "application/json", **who})
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18302", "-host", "127.0.0.1", "-config", cfg_path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l175.log"), "w"))
+    gwo = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18303", "-host", "127.0.0.1", "-config", open_path, "-server", server], env=env, stderr=open(os.path.join(BUILD, "e2e.l175-open.log"), "w"))
+    try:
+        wait(GW_L175 + "/health")
+        wait(GW_L175_OPEN + "/health")
+        # ---- built-in roles are editable, as in Bifrost ----
+        s, _, b = api("GET", "/api/governance/rbac/roles/9003/permissions")
+        before = [p["id"] for p in json.loads(b).get("permissions", [])] if s == 200 else []
+        s, _, b = api("PUT", "/api/governance/rbac/roles/9003/permissions", {"permission_ids": [1]})
+        check("a built-in role's permissions are replaced by id", s == 200 and [p["resource"] + ":" + p["operation"] for p in json.loads(b).get("permissions", [])] == ["Logs:View"], (s, b[:300]))
+        s1, _, _ = api("GET", "/api/logs", who=view)
+        s2, _, b2 = api("GET", "/api/providers", who=view)
+        check("the edited viewer role is judged by its new permissions", s1 == 200 and s2 == 403, (s1, s2, b2[:200]))
+        s, _, b = api("PUT", "/api/governance/rbac/roles/9003", {"description": "read logs only"})
+        r = json.loads(b).get("role", {}) if s == 200 else {}
+        check("a built-in role's description is edited; it keeps its id and stays a system role", r.get("id") == 9003 and r.get("is_system_role") is True and r.get("description") == "read logs only", (s, b[:300]))
+        s, _, b = api("GET", "/api/governance/rbac/roles")
+        roles = json.loads(b).get("roles", []) if s == 200 else []
+        check("the role list keeps the edited role in its place", [x["id"] for x in roles[:4]] == [9001, 9002, 9003, 9004] and roles[2].get("description") == "read logs only", (s, b[:300]))
+        s, _, b = api("PUT", "/api/governance/rbac/roles/9003", {"name": "readers"})
+        check("a built-in role cannot be renamed", s == 400, (s, b[:200]))
+        s, _, b = api("DELETE", "/api/governance/rbac/roles/9003")
+        check("an edited built-in role still cannot be deleted", s == 403, (s, b[:200]))
+        s, _, _ = api("PUT", "/api/governance/rbac/roles/9003/permissions", {"permission_ids": before})
+        s2, _, _ = api("GET", "/api/providers", who=view)
+        check("the viewer's permissions are set back", s == 200 and s2 == 200, (s, s2))
+
+        # ---- plugins: PUT merges over the stored config; endpoints need a signed-in caller ----
+        s, _, b = api("POST", "/api/plugins", {"name": "blocklist", "enabled": True, "config": {"words": ["l175-a"], "note": "keep"}})
+        s2, _, b2 = api("PUT", "/api/plugins/blocklist", {"config": {"words": ["l175-b"]}})
+        s3, _, b3 = api("GET", "/api/plugins/blocklist")
+        conf = json.loads(b3).get("config", {}) if s3 == 200 else {}
+        check("a plugin PUT merges its config over the stored one, as Bifrost does", s == 201 and s2 == 200 and conf == {"words": ["l175-b"], "note": "keep"}, (s, s2, b3[:300]))
+        s, _, b = api("POST", "/api/plugins", {"name": "blocklist", "enabled": True, "config": {"words": ["x"], "headers": {"auth": "env.HOME"}}}, who={}, base=GW_L175_OPEN)
+        check("with dashboard auth off a plugin config naming an env. reference is refused", s == 403 and "headers.auth" in b and "authenticated admin session" in b, (s, b[:300]))
+        s, _, b = api("POST", "/api/plugins", {"name": "blocklist", "enabled": True, "config": {"words": ["x"]}}, who={}, base=GW_L175_OPEN)
+        s2, _, b2 = api("PUT", "/api/plugins/blocklist", {"config": {"url": "http://elsewhere.example"}}, who={}, base=GW_L175_OPEN)
+        s3, _, _ = api("PUT", "/api/plugins/blocklist", {"enabled": False}, who={}, base=GW_L175_OPEN)
+        check("with dashboard auth off a changed endpoint is refused, other changes are not", s == 201 and s2 == 403 and '"url"' not in b2 and "(url)" in b2 and s3 == 200, (s, s2, b2[:300], s3))
+
+        # ---- the quota view: profile budgets with their source, per-model usage from the logs ----
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l175 quota"}]}, {"x-bf-vk": "sk-bf-l175-ann"}, base=GW_L175, auth=False)
+        check("a request on the profile-governed key is served", s == 200, (s, b[:200]))
+        q = {}
+        for _ in range(50):
+            s, _, b = call("GET", "/api/governance/virtual-keys/quota", None, {"x-bf-vk": "sk-bf-l175-ann"}, base=GW_L175, auth=False)
+            q = json.loads(b) if s == 200 else {}
+            bud = (q.get("budgets") or [{}])[0]
+            if bud.get("per_model_usage"):
+                break
+            time.sleep(0.1)
+        bud = (q.get("budgets") or [{}])[0]
+        pm = bud.get("per_model_usage") or [{}]
+        check("the quota lists the held profile's budget with the profile as its source", bud.get("id") == "b-p" and bud.get("source_type") == "access_profile" and bud.get("source_id") == "p1" and bud.get("source_name") == "Base", q)
+        check("each budget carries its spend per model in the cycle", "gpt-4o-mini" in pm[0].get("model", "") and pm[0].get("total_requests", 0) >= 1 and "total_cost" in pm[0], pm)
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l175 quota 2"}]}, {"x-bf-vk": "sk-bf-l175-ann"}, base=GW_L175, auth=False)
+        check("the held profile's openai provider-config budget is charged to the user's copy", s == 402, (s, b[:200]))
+
+        # ---- a user's budget override on a profile budget ----
+        s, _, b = api("PUT", "/api/users/ann/access-profiles/p1/budgets/b-p/override", {"amount": 5, "mode": "forever"})
+        r = json.loads(b) if s == 200 else {}
+        check("a user's budget override is set, with the effective limit", r.get("effective_max_limit") == 15 and r.get("budget", {}).get("override", {}).get("mode") == "forever", (s, b[:300]))
+        q = {}
+        for _ in range(50):
+            s, _, b = call("GET", "/api/governance/virtual-keys/quota", None, {"x-bf-vk": "sk-bf-l175-ann"}, base=GW_L175, auth=False)
+            q = json.loads(b) if s == 200 else {}
+            if (q.get("budgets") or [{}])[0].get("effective_max_limit") == 15:
+                break
+            time.sleep(0.1)
+        check("the override raises the user's copy of the budget", (q.get("budgets") or [{}])[0].get("effective_max_limit") == 15, q)
+        s, _, b = api("PUT", "/api/governance/users/ann/access-profiles/p1/budgets/b-oa/override", {"amount": 5, "mode": "forever"})
+        check("an override on a budget the profile does not hold is 404", s == 404, (s, b[:200]))
+        s, _, b = api("DELETE", "/api/users/ann/access-profiles/p1/budgets/b-p/override")
+        check("a user's budget override is removed", s == 200 and json.loads(b).get("budget", {}).get("override") is None, (s, b[:200]))
+
+        # ---- the access-profile audit lists ----
+        api("POST", "/api/governance/access-profiles/p1/deactivate")
+        api("POST", "/api/governance/access-profiles/p1/activate")
+        s, _, b = api("GET", "/api/governance/access-profiles/p1/audit-logs")
+        r = json.loads(b) if s == 200 else {}
+        acts = [x["action"] for x in r.get("audit_logs", [])]
+        check("a profile's audit list names its changes, newest first, in Bifrost's shape", acts[:2] == ["activate", "deactivate"] and r.get("total_count", 0) >= 2 and r["audit_logs"][0].get("access_profile_id") == "p1" and r["audit_logs"][0].get("actor") == "root", (s, b[:400]))
+        s, _, b = api("GET", "/api/access-profiles/audit-logs?action=deactivate")
+        r = json.loads(b) if s == 200 else {}
+        check("the workspace audit list filters by action, on Bifrost's other path too", s == 200 and [x["action"] for x in r.get("audit_logs", [])] == ["deactivate"], (s, b[:300]))
+        s, _, b = api("GET", "/api/governance/access-profiles/nope/audit-logs")
+        check("an unknown profile's audit list is 404", s == 404, (s, b[:200]))
+
+        # ---- the virtual MCP reverse lookup ----
+        s, _, b = api("GET", "/api/mcp/virtual-mcps/dev/access-profiles")
+        check("a virtual MCP lists the access profiles that grant it and the users they reach", s == 200 and json.loads(b).get("access_profiles") == [{"id": "p1", "name": "Base", "is_active": True, "user_count": 1}], (s, b[:300]))
+        s, _, b = api("POST", "/api/mcp/virtual-mcps/dev/virtual-keys/vk-ann")
+        check("a key whose owner holds an access profile is not attached by hand (409)", s == 409, (s, b[:200]))
+
+        # ---- one project member's usage ----
+        s, _, b = api("GET", "/api/governance/projects/pj/members/m1/usage")
+        r = json.loads(b) if s == 200 else {}
+        check("a member's usage lists its slice of each project budget with its counter", r.get("user_id") == "ann" and [(x["source_budget_id"], x["max_limit"]) for x in r.get("budgets", [])] == [("b-pj", 8)] and isinstance(r.get("usage"), list), (s, b[:300]))
+        s, _, b = api("GET", "/api/governance/projects/pj/members/zed/usage")
+        check("an unknown member's usage is 404", s == 404, (s, b[:200]))
+
+        # ---- the agent history list in Bifrost's shape ----
+        s, _, b = api("GET", "/api/agents/history?group_sessions=true&hydrate=true&limit=5")
+        r = json.loads(b) if s == 200 else {}
+        check("the agent history answers {logs, pagination}", r.get("logs") == [] and r.get("pagination") == {"limit": 5, "offset": 0, "sort_by": "timestamp", "order": "desc", "total_count": 0}, (s, b[:300]))
+    finally:
+        gw.terminate()
+        gwo.terminate()
+        gw.wait()
+        gwo.wait()
+
+
 def l172_config() -> dict:
     """The L172 gateway: Vertex with a project_number (its token from the mock), and a body limit of 1 MiB."""
     import re
@@ -12000,6 +12734,1246 @@ def l172_e2e(env):
         gw.wait()
 
 
+def l183_config(d, logs_dir, extra_server):
+    return {
+        "client": {"enforce_auth_on_inference": False, "enable_logging": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "logs_store": {"enabled": True, "dir": logs_dir, "required": False},  # required false: the gateway starts and /ready reports the store (L185)
+        "server": extra_server,
+        "providers": {
+            "openai": {"keys": [{"name": "l183", "value": "sk-l183", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            # the mock's slow route: four SSE events 150 ms apart
+            "slowp": {"keys": [{"name": "s", "value": "sk-slow-l183", "models": [], "weight": 1.0}], "custom_provider_config": {"base_provider_type": "openai"}, "network_config": {"base_url": "http://127.0.0.1:18100", "max_retries": 0}},
+        },
+    }
+
+
+def l183_raw(port, data, timeout=6):
+    """Sends data on a new connection and reads until the server closes it: (bytes, seconds)."""
+    s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    if data:
+        s.sendall(data)
+    t = time.time()
+    out = b""
+    try:
+        while True:
+            b = s.recv(65536)
+            if not b:
+                break
+            out += b
+    except OSError:
+        pass
+    s.close()
+    return out, time.time() - t
+
+
+def l183_start(env, name, port, cfg, workers=1):
+    path = os.path.join(BUILD, f"e2e.{name}.json")
+    json.dump(cfg, open(path, "w"))
+    args = [os.path.join(BUILD, "raiju"), "-port", str(port), "-host", "127.0.0.1", "-config", path, "-server", os.environ.get("RAIJU_SERVER", "bun")]
+    if workers > 1:
+        args += ["-workers", str(workers)]
+    gw = subprocess.Popen(cwd=ROOT, args=args, env=env, stderr=open(os.path.join(BUILD, f"e2e.{name}.log"), "w"))
+    wait(f"http://127.0.0.1:{port}/health")
+    return gw
+
+
+def l183_drain(gw, port, label):
+    """A stream in flight when SIGTERM comes: /ready turns 503 at once (the listener stays open for
+    shutdown_delay_seconds), /health stays ok, then new connections are refused, the stream ends whole and the
+    process exits 0."""
+    import signal
+    body = json.dumps({"model": "slowp/slow-l183", "stream": True, "messages": [{"role": "user", "content": "drain l183"}]})
+    req = f"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n{body}".encode()
+    s = socket.create_connection(("127.0.0.1", port), timeout=10)
+    s.sendall(req)
+    first = s.recv(65536)
+    gw.send_signal(signal.SIGTERM)
+    time.sleep(0.2)
+    rs, _, rb = call("GET", "/ready", None, None, base=f"http://127.0.0.1:{port}", auth=False)
+    check(f"{label}: /ready answers 503 while draining", rs == 503 and '"listener":"draining"' in rb, (rs, rb[:300]))
+    hs, _, _ = call("GET", "/health", None, None, base=f"http://127.0.0.1:{port}", auth=False)
+    check(f"{label}: /health stays ok while draining", hs == 200, hs)
+    out = first
+    try:
+        while True:
+            b = s.recv(65536)
+            if not b:
+                break
+            out += b
+    except OSError as e:
+        out += f"<{e}>".encode()
+    s.close()
+    text = out.decode(errors="replace")
+    check(f"{label}: the stream in flight at SIGTERM ends whole", "four" in text and "[DONE]" in text, text[-300:])
+    time.sleep(1.2)
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=2).close()
+        refused = False
+    except OSError:
+        refused = True
+    check(f"{label}: after shutdown_delay_seconds new connections are refused", refused)
+    try:
+        code = gw.wait(10)
+    except subprocess.TimeoutExpired:
+        gw.kill()
+        code = None
+    check(f"{label}: the gateway exits 0 once the requests in hand are done", code == 0, code)
+
+
+def l183_e2e(env):
+    """L183: the server lifecycle on both servers (its own gateways, 18322 and 18323). GET /ready reflects the
+    listener and the stores; a slow or silent client is timed out (408 on a half-sent head or body, a silent or idle
+    connection closed); a connection over server.max_connections is answered 503; SIGTERM drains: /ready 503,
+    the listener closes after the delay, a stream in flight ends whole, the process exits 0 (and with two bun workers)."""
+    import shutil
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    d = os.path.join(BUILD, "e2e-l183")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    limits = {"shutdown_grace_seconds": 8, "shutdown_delay_seconds": 1, "header_timeout_seconds": 1, "idle_timeout_seconds": 2, "body_timeout_seconds": 1}
+    gw = l183_start(env, "l183", 18322, l183_config(d, os.path.join(d, "logs"), limits))
+    try:
+        s, _, b = call("GET", "/ready", None, None, base="http://127.0.0.1:18322", auth=False)
+        check("/ready answers 200 with each component", s == 200 and json.loads(b) == {"status": "ready", "components": {"listener": "ok", "config": "ok", "logs_store": "ok", "audit": "off"}}, (s, b))
+        r, dt = l183_raw(18322, b"")
+        check("a silent connection is closed after header_timeout_seconds", r == b"" and 0.7 < dt < 3.0, (r[:60], dt))
+        r, dt = l183_raw(18322, b"GET /health HTTP/1.1\r\nHost: x\r\n")
+        check("a half-sent request head is answered 408", r.startswith(b"HTTP/1.1 408") and 0.7 < dt < 3.0, (r[:60], dt))
+        r, dt = l183_raw(18322, b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"model\":")
+        check("a body that stops arriving is answered 408", r.startswith(b"HTTP/1.1 408") and 0.7 < dt < 3.0, (r[:60], dt))
+        r, dt = l183_raw(18322, b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+        check("an idle keep-alive connection is closed after idle_timeout_seconds", r.startswith(b"HTTP/1.1 200") and 1.7 < dt < 4.0, (r[:60], dt))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "slowp/slow-l183", "stream": True, "messages": [{"role": "user", "content": "slow l183"}]}, None, base="http://127.0.0.1:18322", auth=False)
+        check("a stream longer than the timeouts' sweep is not cut", s == 200 and "[DONE]" in b, (s, b[-200:]))
+        l183_drain(gw, 18322, server)
+    finally:
+        if gw.poll() is None:
+            gw.terminate()
+        gw.wait()
+    # the cap, and a store that could not open
+    blocker = os.path.join(d, "blocker")
+    open(blocker, "w").write("a file, so a folder under it cannot be made")
+    gw2 = l183_start(env, "l183b", 18323, l183_config(d, os.path.join(blocker, "logs"), {"max_connections": 2}))
+    try:
+        s, _, b = call("GET", "/ready", None, None, base="http://127.0.0.1:18323", auth=False)
+        check("/ready answers 503 when the request log store could not open", s == 503 and '"logs_store":"failed"' in b and "request log store" in b, (s, b[:300]))
+        held = []
+        for _ in range(2):
+            h = socket.create_connection(("127.0.0.1", 18323), timeout=5)
+            h.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+            h.recv(4096)
+            held.append(h)
+        r, _ = l183_raw(18323, b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+        check("a connection over server.max_connections is answered 503", r.startswith(b"HTTP/1.1 503"), r[:80])
+        for h in held:
+            h.close()
+        time.sleep(0.5)
+        s, _, _ = call("GET", "/health", None, None, base="http://127.0.0.1:18323", auth=False)
+        check("below server.max_connections again, requests are served", s == 200, s)
+    finally:
+        gw2.terminate()
+        gw2.wait()
+    if server != "http1":
+        gw3 = l183_start(env, "l183w", 18322, l183_config(d, os.path.join(d, "logs-w"), limits), workers=2)
+        try:
+            l183_drain(gw3, 18322, "bun, 2 workers")
+        finally:
+            if gw3.poll() is None:
+                gw3.terminate()
+            gw3.wait()
+
+
+GW_L174 = "http://127.0.0.1:18300"  # L174: inference compatibility leftovers (extra params, auto_inject, listings, counts, Vertex pools, Stability extras, mocker on Responses, stream stop reasons)
+
+def l174_config() -> dict:
+    """The L174 gateway: Anthropic with auto_inject, Bedrock and Vertex on the mock (Vertex keeps the main e2e key, with
+    an alias pinned to its region), a provider with two keys and regex: model lists, the mocker on Responses, the
+    model-catalog-resolver entry, and the request log on."""
+    import shutil
+    base = json.load(open(os.path.join(BUILD, "e2e.config.json")))
+    logs_dir = os.path.join(BUILD, "e2e-l174-logs")
+    shutil.rmtree(logs_dir, ignore_errors=True)
+    def key(name, value, **extra):
+        return {"name": name, "value": value, "models": [], "weight": 1.0, **extra}
+    vertex = dict(base["providers"]["vertex"])
+    vertex["keys"] = [{**vertex["keys"][0], "aliases": {"pinned": {"model_id": "claude-opus-4-7", "force_single_region": True}}}]
+    return {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False},
+        "logs_store": {"enabled": True, "dir": logs_dir},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {
+            "openai": {"keys": [key("o", "sk-l174")], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "anthropic": {"keys": [key("an", "sk-ant-l174")], "network_config": {"base_url": MOCK, "max_retries": 0}, "prompt_cache": {"auto_inject": True}},
+            "bedrock": {"keys": [key("bk", "", bedrock_key_config={"access_key": "AKIDEXAMPLE", "secret_key": "secret", "region": "us-east-1"})],
+                        "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "vertex": vertex,
+            # the listing with every key: the first key's regex allow list less its regex blacklist, the second key's
+            # own listing (one model more) through its regex entry, plus a plain name
+            "lst": {"keys": [key("k1", "sk-l174a", models=["regex:m-[ab]"], blacklisted_models=["regex:.*-b"]), key("k2", "sk-l174b", models=["regex:m-c", "extra-x"])],
+                    "custom_provider_config": {"base_provider_type": "openai"}, "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+        "plugins": [
+            {"name": "mocker", "enabled": True, "config": {"rules": [{"name": "l174", "conditions": {"message_regex": "(?s).*mock-l174.*"},
+                                                                       "responses": [{"type": "success", "content": {"message": "mocked responses l174", "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}}}]}]}},
+            {"name": "model-catalog-resolver", "enabled": True},
+        ],
+    }
+
+def l174_e2e(env):
+    """L174: extra_params merged into a converted provider body, auto_inject on the first cacheable block, regex: model
+    entries and listings read with every key, the Anthropic count route for other providers, Vertex's multi-region
+    pools, Stability's extra form options, the mocker on Responses, and the stop reason of streamed answers. Its own
+    gateway (18300)."""
+    cfg_path = os.path.join(BUILD, "e2e.l174.json")
+    json.dump(l174_config(), open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18300", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l174.log"), "w"))
+    def post(path, body, headers=None):
+        return call("POST", path, body, headers, base=GW_L174, auth=False)
+    def last(prefix):
+        rows = [x for x in seen() if x["path"].startswith(prefix)]
+        return rows[-1] if rows else {"path": "", "body": "", "auth": ""}
+    def jb(text):
+        try:
+            return json.loads(text)
+        except Exception:
+            return {}
+    try:
+        wait(GW_L174 + "/health")
+        msgs = [{"role": "user", "content": "first l174"}, {"role": "assistant", "content": "a"}, {"role": "user", "content": "last l174"}]
+        EP = {"x-bf-passthrough-extra-params": "true"}
+
+        # x-bf-passthrough-extra-params: the extras reach the converted provider body (Anthropic, Bedrock)
+        s, _, b = post("/v1/chat/completions", {"model": "anthropic/claude-sonnet-4", "messages": msgs, "extra_params": {"top_k": 7, "metadata": {"user_id": "u-174"}}}, EP)
+        upb = jb(last("/v1/messages")["body"])
+        check("extra params: Anthropic's converted body gets the extras (top_k, metadata)", s == 200 and upb.get("top_k") == 7 and upb.get("metadata", {}).get("user_id") == "u-174" and "extra_params" not in upb, (s, b[:200], upb))
+        s, _, b = post("/v1/chat/completions", {"model": "anthropic/claude-sonnet-4", "messages": msgs, "extra_params": {"top_k": 7}})
+        upb = jb(last("/v1/messages")["body"])
+        check("extra params: without the header nothing is merged", s == 200 and "top_k" not in upb, (s, b[:200], upb))
+        s, _, b = post("/v1/chat/completions", {"model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0", "messages": msgs, "extra_params": {"additionalModelRequestFields": {"top_k": 9}, "performanceConfig": {"latency": "optimized"}}}, EP)
+        up = last("/model/anthropic.claude-3-haiku")
+        upb = jb(up["body"])
+        check("extra params: Bedrock's Converse body gets the extras, signed again", s == 200 and upb.get("additionalModelRequestFields", {}).get("top_k") == 9 and upb.get("performanceConfig") == {"latency": "optimized"}
+              and up["path"].endswith("/converse") and up["auth"].startswith("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/"), (s, b[:200], up))
+
+        # auto_inject: the first cacheable block, not the newest turn
+        s, _, b = post("/v1/chat/completions", {"model": "anthropic/claude-sonnet-4", "messages": msgs})
+        upb = jb(last("/v1/messages")["body"])
+        ms = upb.get("messages", [])
+        check("auto_inject marks the first cacheable block of the conversation", s == 200 and len(ms) == 3 and ms[0].get("content") == [{"type": "text", "text": "first l174", "cache_control": {"type": "ephemeral"}}]
+              and "cache_control" not in json.dumps(ms[1:]), (s, b[:200], upb))
+        s, _, b = post("/v1/chat/completions", {"model": "anthropic/claude-sonnet-4", "messages": [{"role": "system", "content": "rules l174"}] + msgs})
+        upb = jb(last("/v1/messages")["body"])
+        check("auto_inject marks the system prompt when it comes first, and nothing else", s == 200 and upb.get("system") == [{"type": "text", "text": "rules l174", "cache_control": {"type": "ephemeral"}}]
+              and "cache_control" not in json.dumps(upb.get("messages", [])), (s, b[:200], upb))
+
+        # the model listing: every key's own listing, regex: entries in the allow lists and blacklists
+        s, _, b = call("GET", "/v1/models", headers={"x-bf-list-models-provider": "lst"}, base=GW_L174, auth=False)
+        ids = [m["id"] for m in jb(b).get("data", [])]
+        check("listing: each key lists with its own credentials, regex: entries match, results joined", s == 200 and ids == ["lst/m-a", "lst/m-c", "lst/extra-x"], (s, b[:300]))
+        s, _, b = post("/v1/chat/completions", {"model": "lst/m-c", "messages": msgs})
+        check("routing: a regex: model entry picks the key that allows the model", s == 200 and last("/v1/chat/completions")["auth"] == "Bearer sk-l174b", (s, b[:200], last("/v1/chat/completions")["auth"]))
+        n = len(seen())
+        s, _, b = post("/v1/chat/completions", {"model": "lst/m-b", "messages": msgs})
+        check("routing: a model a regex: blacklist entry names is refused without a call", s != 200 and len([x for x in seen()[n:] if x["path"] == "/v1/chat/completions"]) == 0, (s, b[:200]))
+
+        # the Anthropic count route for a provider that is not Anthropic: counted by that provider, in Anthropic's shape
+        s, _, b = post("/anthropic/v1/messages/count_tokens", {"model": "vertex/gemini-2.5-flash", "messages": [{"role": "user", "content": "count l174"}]})
+        up = last("/v1/projects/")
+        check("count_tokens: the Anthropic route counts a Gemini model on Vertex exactly, in Anthropic's shape", s == 200 and jb(b) == {"input_tokens": 11} and up["path"].endswith(":countTokens"), (s, b[:200], up["path"]))
+
+        # Vertex: a multi-region-only model is promoted to its region's pool; force_single_region keeps the region
+        s, _, b = post("/v1/chat/completions", {"model": "vertex/claude-opus-4-7", "messages": msgs, "stream": True})
+        up = last("/v1/projects/")
+        check("vertex: a multi-region-only model goes to its region's pool", s == 200 and up["path"] == "/v1/projects/proj/locations/us/publishers/anthropic/models/claude-opus-4-7:streamRawPredict", (s, b[:200], up["path"]))
+        s, _, b = post("/v1/chat/completions", {"model": "vertex/pinned", "messages": msgs, "stream": True})
+        up = last("/v1/projects/")
+        check("vertex: an alias's force_single_region keeps the configured region", s == 200 and up["path"] == "/v1/projects/proj/locations/us-central1/publishers/anthropic/models/claude-opus-4-7:streamRawPredict", (s, b[:200], up["path"]))
+
+        # Stability edits: the form's options outside Bifrost's named list go into the body as the form sent them
+        png = bytes.fromhex("89504e470d0a1a0a")
+        s, _, b = mp_form(GW_L174, "/v1/images/edits", [("model", None, "text/plain", "bedrock/stability.stable-image-inpaint-v1:0"), ("prompt", None, "text/plain", "a red fox"), ("type", None, "text/plain", "inpainting"),
+                                                        ("grow_mask", None, "text/plain", "5"), ("safety_tolerance", None, "text/plain", "2"), ("select_prompt", None, "text/plain", "sky"), ("image", "in.png", "image/png", png), ("mask", "m.png", "image/png", png)])
+        stb = jb(last("/model/stability.stable-image-inpaint")["body"])
+        check("stability edits: extra form options pass through (Bifrost's ExtraParams), named ones stay typed", s == 200 and stb.get("grow_mask") == 5 and stb.get("safety_tolerance") == "2" and stb.get("select_prompt") == "sky" and "mask" in stb, (s, b[:200], {k: v for k, v in stb.items() if k not in ("image", "mask")}))
+
+        # the mocker answers Responses requests in Responses' shape
+        n = len(seen())
+        s, h, b = post("/v1/responses", {"model": "openai/gpt-4o-mini", "input": "please mock-l174"})
+        r = jb(b)
+        text = "".join(c.get("text", "") for o in r.get("output", []) for c in o.get("content", []) if isinstance(c, dict))
+        check("mocker: a Responses request is answered in Responses' shape with no upstream call", s == 200 and r.get("object") == "response" and text == "mocked responses l174"
+              and r.get("usage", {}).get("input_tokens") == 3 and {k.lower(): v for k, v in h.items()}.get("x-bf-plugin-short-circuit") == "true" and len([x for x in seen()[n:] if x["path"].startswith("/v1/responses")]) == 0, (s, b[:300]))
+        s, h, b = post("/v1/responses", {"model": "openai/gpt-4o-mini", "input": [{"role": "user", "content": [{"type": "input_text", "text": "mock-l174 streamed"}]}], "stream": True})
+        check("mocker: a streamed Responses request gets one response.completed event", s == 200 and "event: response.completed" in b and "mocked responses l174" in b, (s, b[:300]))
+        s, _, b = post("/v1/responses", {"model": "openai/gpt-4o-mini", "input": "not mocked"})
+        check("mocker: a Responses request no rule matches goes upstream", s == 200 and "mocked" not in b and last("/v1/responses")["path"] == "/v1/responses", (s, b[:200]))
+
+        # the stop reason of a streamed answer is logged (from the events the client was sent)
+        s, _, b = post("/v1/chat/completions", {"model": "openai/l174-stream", "messages": msgs, "stream": True})
+        n0 = len([e for e in jb(call("GET", "/api/logs?limit=100", base=GW_L174, auth=False)[2]).get("entries", []) if e.get("model") == "anthropic/claude-sonnet-4"])
+        s2, _, b2 = post("/v1/chat/completions", {"model": "anthropic/claude-sonnet-4", "messages": [{"role": "user", "content": "stream stop l174"}], "stream": True})
+        # the rows are written when each stream ends: wait for both (the list is newest first)
+        entries, sr, sa = [], [], []
+        for _ in range(50):
+            entries = jb(call("GET", "/api/logs?limit=100", base=GW_L174, auth=False)[2]).get("entries", [])
+            sr = [e.get("stop_reason") for e in entries if e.get("model") == "openai/l174-stream"]
+            ant = [e.get("stop_reason") for e in entries if e.get("model") == "anthropic/claude-sonnet-4"]
+            sa = ant[:1] if len(ant) > n0 else []
+            if sr and sa and sa[0]:
+                break
+            time.sleep(0.1)
+        check("logs: a streamed answer's stop reason is recorded", s == 200 and "data: [DONE]" in b and sr == ["length"], (s, sr, [(e.get("model"), e.get("stop_reason")) for e in entries[:6]]))
+        check("logs: a converted stream's stop reason is the one the client was sent", s2 == 200 and sa == ["stop"], (s2, sa))
+        s, _, b = call("GET", "/api/logs?stop_reasons=length", base=GW_L174, auth=False)
+        check("logs: the stop_reasons filter finds the streamed answer", s == 200 and any(e.get("model") == "openai/l174-stream" for e in jb(b).get("entries", [])), (s, b[:200]))
+
+        # the model-catalog-resolver entry is built in: no unknown plugin
+        s, _, b = call("GET", "/api/plugins", base=GW_L174, auth=False)
+        check("model-catalog-resolver is accepted as built in, not reported as an unknown plugin", s == 200 and "unknown plugin" not in b and "mocker" in b, (s, b[:300]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
+GW_L186 = "http://127.0.0.1:18328"  # L186: outbound safety (canonical addresses, resolved hosts, pinned plugin downloads)
+
+
+def private_hostname():
+    """A host name that resolves only to non-public addresses (this machine's own name usually does, through
+    /etc/hosts), with those addresses; (None, []) when there is none, and the checks that need it are skipped."""
+    import ipaddress
+    name = socket.gethostname()
+    try:
+        addrs = sorted({ai[4][0] for ai in socket.getaddrinfo(name, None)})
+    except OSError:
+        return None, []
+    if not addrs or any(ipaddress.ip_address(a.split("%")[0]).is_global for a in addrs):
+        return None, []
+    try:
+        ipaddress.ip_address(name)
+        return None, []
+    except ValueError:
+        return name, addrs
+
+
+def l186_e2e(env):
+    """L186: outbound safety. Numeric spellings of private and metadata addresses are refused like the dotted form
+    (webhooks, provider base_url, plugin downloads); a host name is resolved and refused when it points at a private
+    address; plugin downloads must be https unless pinned by sha256, the pin is checked on download and on load, and the
+    cache folder is private. Its own gateway (18328)."""
+    import hashlib, shutil, stat
+    base = GW_L186
+    cfg_dir = os.path.join(BUILD, "e2e-l186")
+    shutil.rmtree(cfg_dir, ignore_errors=True)
+    os.makedirs(cfg_dir)
+    cfg_path = os.path.join(cfg_dir, "config.json")
+    adm = {"authorization": "Bearer sk-admin-l186"}
+    wasm = os.path.join(ROOT, "tests", "wasm", "plugin.wasm")
+    pin = hashlib.sha256(open(wasm, "rb").read()).hexdigest()
+    port = MOCK.rsplit(":", 1)[1]
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        # the allowlist names the host localhost only: 127.0.0.1 in another spelling, or a name resolving to it, is refused
+        "server": {"plugin_download_private_allowlist": ["localhost"]},
+        "providers": {"openai": {"keys": [{"name": "o", "value": "sk-l186", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {"users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256(b"sk-admin-l186").hexdigest()}]},
+    }
+    json.dump(cfg, open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18328", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env={k: v for k, v in env.items() if k != "RAIJU_PLUGIN_DIR"}, stderr=open(os.path.join(BUILD, "e2e.l186.log"), "w"))
+
+    def api(method, p, body=None):
+        return call(method, p, body, adm, base=base, auth=False)
+
+    def plugin(name, path, sha=None):
+        body = {"name": name, "enabled": True, "path": path, "config": {"mode": "rewrite", "tag": "l186"}}
+        if sha is not None:
+            body["sha256"] = sha
+        return api("POST", "/api/plugins", body)
+
+    try:
+        wait(base + "/health")
+        local = f"http://localhost:{port}/plugins/plugin.wasm"
+
+        # ---- plugin downloads: https unless pinned, the pin checked on download and on load, a private cache ----
+        s, _, b = plugin("l186-plain", local)
+        check("a plain-http plugin URL without a sha256 pin is refused", s == 500 and "must be https" in b, (s, b[:300]))
+        s, _, b = plugin("l186-bad", local, "0" * 64)
+        check("a download that does not match its sha256 pin is refused", s == 500 and "does not match its sha256 pin" in b, (s, b[:300]))
+        s, _, b = plugin("l186-short", local, "abc")
+        check("a malformed sha256 pin is refused", s == 500 and "64 hex digits" in b, (s, b[:300]))
+        s, _, b = plugin("l186-pin", local, pin.upper())
+        made = json.loads(b).get("plugin", {}) if s == 201 else {}
+        check("a pinned plain-http plugin on an allowlisted host is downloaded and loaded", s == 201 and made.get("status", {}).get("status") == "active" and made.get("sha256") == pin, (s, b[:300]))
+        cache = os.path.join(cfg_dir, "plugin-cache")
+        files = [f for f in os.listdir(cache)] if os.path.isdir(cache) else []
+        dmode = stat.S_IMODE(os.stat(cache).st_mode) if os.path.isdir(cache) else -1
+        fmode = stat.S_IMODE(os.stat(os.path.join(cache, files[0])).st_mode) if files else -1
+        check("the download is kept in a private plugin-cache folder beside the config file (0700, the file 0600)", dmode == 0o700 and fmode == 0o600 and len(files) == 1, (oct(dmode), oct(fmode), files))
+        s, _, b = chat_l186(base, "pinned plugin l186")
+        check("the pinned plugin runs", s == 200 and json.loads(b).get("x_wasm_plugin") == "ctx-ok:l186", (s, b[:200]))
+        if files:
+            open(os.path.join(cache, files[0]), "wb").write(b"\0asm tampered")
+        s, _, b = api("GET", "/api/plugins/l186-pin")
+        st = json.loads(b).get("status", {}) if s == 200 else {}
+        check("a cached copy that no longer matches its pin is not loaded", s == 200 and st.get("status") == "error" and "does not match its sha256 pin" in b, (s, b[:600]))
+        api("DELETE", "/api/plugins/l186-pin")
+        for spelled in ["2130706433", "0x7f000001", "0177.0.0.1", "127.1", "[::ffff:127.0.0.1]"]:
+            s, _, b = plugin("l186-num", f"http://{spelled}:{port}/plugins/plugin.wasm", pin)
+            check(f"a plugin URL on {spelled} (127.0.0.1 spelled another way) is refused like 127.0.0.1", s == 500 and "private address" in b, (s, b[:300]))
+        s, _, b = plugin("l186-meta", "http://[::ffff:169.254.169.254]/p.wasm", pin)
+        check("a plugin URL on an IPv4-mapped metadata address is refused", s == 500 and "metadata" in b, (s, b[:300]))
+        name, addrs = private_hostname()
+        if name is not None:
+            s, _, b = plugin("l186-dns", f"http://{name}:{port}/plugins/plugin.wasm", pin)
+            check(f"a plugin URL whose host name resolves to a private address ({name} -> {addrs}) is refused", s == 500 and "private address" in b and name.lower() in b, (s, b[:300]))
+        else:
+            print("  skip: no host name here resolves only to private addresses")
+
+        # ---- webhooks: numeric spellings refused at save ----
+        s, _, b = api("POST", "/api/webhooks", {"name": "l186-num", "url": "https://0x7f000001/hook", "events": ["async_job.completed"]})
+        check("a webhook URL on 0x7f000001 is refused as a private address", s == 400 and "private address" in b, (s, b[:300]))
+        s, _, b = api("POST", "/api/webhooks", {"name": "l186-meta", "url": "https://[::ffff:a9fe:a9fe]/hook", "events": ["async_job.completed"], "allow_private_network": True})
+        check("a webhook URL on the metadata address in IPv6 form is refused even with allow_private_network", s == 400 and "metadata" in b, (s, b[:300]))
+
+        # ---- provider base_url through the API (Bifrost's ValidateExternalURL) ----
+        def prov(name, nc):
+            return api("PUT", "/api/providers/" + name, {"keys": [{"name": "k", "value": "sk-l186-prov", "models": [], "weight": 1.0}], "custom_provider_config": {"base_provider_type": "openai"}, "network_config": nc})
+        s, _, b = prov("l186a", {"base_url": "http://0x0a000001/v1"})
+        check("a provider base_url on a private address (10.0.0.1 in hex) is refused", s == 400 and "private IP addresses are not allowed" in b, (s, b[:300]))
+        s, _, b = prov("l186a", {"base_url": "http://0x0a000001/v1", "allow_private_network": True})
+        check("allow_private_network lets a provider base_url name a private address", s == 200, (s, b[:300]))
+        s, _, b = prov("l186b", {"base_url": "http://[::ffff:169.254.169.254]/", "allow_private_network": True})
+        check("a provider base_url on the metadata address is refused even with allow_private_network", s == 400 and "metadata" in b, (s, b[:300]))
+        s, _, b = prov("l186c", {"base_url": f"http://2130706433:{port}"})
+        check("a provider base_url on the loopback interface is allowed, as Bifrost allows it", s == 200, (s, b[:300]))
+        s, _, b = prov("l186d", {"base_url": "http://no-such-host.invalid/v1"})
+        check("a provider base_url whose host does not resolve is refused", s == 400 and "failed to resolve" in b, (s, b[:300]))
+        if name is not None and any(not a.startswith("127.") and a != "::1" for a in addrs):
+            s, _, b = prov("l186e", {"base_url": f"http://{name}/v1"})
+            check(f"a provider base_url whose host resolves to a private address is refused ({name})", s == 400 and "private IP addresses" in b, (s, b[:300]))
+        for p in ["l186a", "l186c"]:
+            api("DELETE", "/api/providers/" + p)
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
+GW_L182 = "http://127.0.0.1:18320"  # the request log store's segments, disk cap and batched writes
+
+def l182_e2e(env):
+    """L182: the log store writes its rows in batches, starts a new segment of today's file once the current one is
+    over logs_store.max_file_mb, reads only the newest segments at start-up, and keeps the folder under max_disk_mb by
+    deleting the oldest segments. Its own gateway (18320), started and stopped here (twice)."""
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    logs = os.path.join(BUILD, "e2e-l182-logs")
+    __import__("shutil").rmtree(logs, ignore_errors=True)
+    os.makedirs(logs)
+    day = lambda back: time.strftime("%Y-%m-%d", time.gmtime(time.time() - back * 86400))
+    junk = "x" * (1200 * 1024) + "\n"
+    # two older days of 1.2 MB each and a first segment of today already over the 1 MB segment size: 3.6 MB in a
+    # 3 MB folder, so the oldest day goes at start-up and today's rows go to a second segment
+    for name in (f"requests-{day(2)}.jsonl", f"requests-{day(1)}.jsonl", f"requests-{day(0)}.jsonl"):
+        open(os.path.join(logs, name), "w").write(junk)
+    cfg = {"client": {"enable_logging": False, "enforce_auth_on_inference": False},
+           "logs_store": {"enabled": True, "dir": logs, "max_file_mb": 1, "max_disk_mb": 3},
+           "providers": {"openai": {"keys": [{"name": "k", "value": "sk-l182-" + "key", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK}}}}
+    cfg_path = os.path.join(BUILD, "e2e.l182.json")
+    json.dump(cfg, open(cfg_path, "w"))
+    def start(tag):
+        g = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18320", "-host", "127.0.0.1", "-config", cfg_path, "-server", server], env=env, stderr=open(os.path.join(BUILD, f"e2e.l182.{tag}.log"), "w"))
+        wait(GW_L182 + "/health")
+        return g
+    def chat(rid, stream):
+        body = {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}], "stream": stream}
+        return call("POST", "/v1/chat/completions", body, {"x-request-id": rid}, base=GW_L182, auth=False)[0]
+    seg0 = os.path.join(logs, f"requests-{day(0)}.jsonl")
+    seg1 = os.path.join(logs, f"requests-{day(0)}.1.jsonl")
+    gw = start("a")
+    try:
+        check("log store: the oldest segment goes when the folder is over max_disk_mb, the newer ones stay",
+              not os.path.exists(os.path.join(logs, f"requests-{day(2)}.jsonl")) and os.path.exists(os.path.join(logs, f"requests-{day(1)}.jsonl")), sorted(os.listdir(logs)))
+        codes = [chat("req-l182-plain", False), chat("req-l182-stream", True)]
+        s, _, b = call("GET", "/api/logs?limit=10", base=GW_L182, auth=False)
+        ids = [e["request_id"] for e in json.loads(b).get("entries", [])] if s == 200 else []
+        check("log store: rows are queryable as soon as the request ends", codes == [200, 200] and "req-l182-plain" in ids and "req-l182-stream" in ids, (codes, s, b[:300]))
+        text = ""
+        for _ in range(40):
+            text = open(seg1).read() if os.path.exists(seg1) else ""
+            if "req-l182-stream" in text:
+                break
+            time.sleep(0.05)
+        check("log store: the batch reaches disk within its interval, in a new segment once today's first is over max_file_mb",
+              "req-l182-plain" in text and "req-l182-stream" in text and "req-l182" not in open(seg0).read(), sorted(os.listdir(logs)))
+    finally:
+        gw.terminate()
+        gw.wait()
+    gw = start("b")
+    try:
+        s, _, b = call("GET", "/api/logs?limit=10", base=GW_L182, auth=False)
+        ids = [e["request_id"] for e in json.loads(b).get("entries", [])] if s == 200 else []
+        check("log store: a restart reads today's rows back from the newest segments", "req-l182-plain" in ids and "req-l182-stream" in ids, (s, b[:300]))
+        # SIGTERM right after a request: the graceful stop writes the batch before the exit (ops.flushForStop)
+        code = chat("req-l182-sigterm", False)
+        gw.terminate()
+        gw.wait(30)
+        text = open(seg1).read() if os.path.exists(seg1) else ""
+        check("log store: a row still in its batch is written when SIGTERM stops the gateway", code == 200 and gw.returncode == 0 and "req-l182-sigterm" in text, (code, gw.returncode, text[-300:]))
+    finally:
+        if gw.poll() is None:
+            gw.terminate()
+        gw.wait()
+
+def chat_l186(base, text):
+    return call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": text}]}, None, base=base, auth=False)
+
+
+GW_L180 = "http://127.0.0.1:18312"  # L180: JWT algorithms, provider ranking, model parameters, complexity session, fallback and vector store, held keys
+L180_ADMIN = "sk-admin-l180-" + "root"
+
+
+def l180_config(rsa_pem, ec_pem, params_path):
+    import hashlib
+    token = hashlib.sha256(L180_ADMIN.encode()).hexdigest()
+    jwt = lambda alg, pem: {"grant_type": "jwt_bearer", "token_url": MOCK + "/token", "private_key": pem, "issuer": "svc-l180", "audience": "https://api.l180.example", "signing_algorithm": alg}
+    custom = {"base_provider_type": "openai"}
+    net = {"base_url": MOCK, "max_retries": 0}
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "server": {"shutdown_grace_seconds": 3, "shutdown_delay_seconds": 0},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False, "model_parameters_url": "file://" + params_path, "live_models_sync_interval": 0},
+        "pricing": {"openai/tier-complex": {"input_cost_per_token": 1.0, "output_cost_per_token": 1.0}, "openai/text-embedding-3-small": {"input_cost_per_token": 1.0, "output_cost_per_token": 0.0}},
+        "load_balancer_config": {"enabled": True},
+        "vector_store": {"enabled": True, "type": "qdrant", "config": {"host": "127.0.0.1", "rest_port": 18313}},
+        "providers": {
+            # the slow key answers 300 ms late (the mock's l180-slow); "held" is refused (bad-key); "retry" is rate limited
+            "openai": {"keys": [{"name": "slow", "value": "sk-l180-slow-aaaa", "models": ["l180-model"], "weight": 1.0},
+                                {"name": "held", "value": "sk-l180-bad-key", "models": ["l180-held"], "weight": 1.0},
+                                {"name": "retry", "value": "sk-l180-retry", "models": ["l180-retryinfo"], "weight": 1.0},
+                                {"name": "emb", "value": "sk-l180-emb", "models": ["text-embedding-3-small", "tier-complex", "l180-plain"], "weight": 1.0}],
+                       "network_config": net},
+            "fastai": {"keys": [{"name": "fast", "value": "sk-l180-fast-bbbb", "models": ["l180-model"], "weight": 1.0}], "custom_provider_config": custom, "network_config": net},
+            "jwtps": {"keys": [{"name": "ps", "value": "", "models": ["l180-jwt-ps"], "weight": 1.0, "oauth_key_config": jwt("PS256", rsa_pem)}], "custom_provider_config": custom, "network_config": net},
+            "jwtes": {"keys": [{"name": "es", "value": "", "models": ["l180-jwt-es"], "weight": 1.0, "oauth_key_config": jwt("ES512", ec_pem)}], "custom_provider_config": custom, "network_config": net},
+        },
+        # the semantic classifier keeps its exemplars in the vector store, falls back to the llm block when no exemplar is
+        # close enough, and its own calls are not charged (the llm block's are); sessions never step down a tier
+        "complexity_router": {"enabled": True, "classifier": "semantic", "session": {"enabled": True},
+                              "semantic": {"provider": "openai", "embedding_model": "text-embedding-3-small", "min_similarity": 0.99, "vector_store": "vector_store", "fallback": "llm", "count_toward_budgets": False},
+                              "llm": {"provider": "openai", "model": "tier-complex", "count_toward_budgets": True}},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": token}],
+            "budgets": [{"id": "b-l180", "max_limit": 1000.0, "reset_duration": "1d"}],
+            "virtual_keys": [{"id": "vk-l180", "name": "l180-key", "value": "sk-bf-l180-0123456789abcdef", "budget_id": "b-l180", "provider_configs": [{"provider": "openai"}]}],
+        },
+    }
+
+
+def l180_start(env, cfg_path):
+    args = [os.path.join(BUILD, "raiju"), "-port", "18312", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")]
+    gw = subprocess.Popen(cwd=ROOT, args=args, env=env, stderr=open(os.path.join(BUILD, "e2e.l180.log"), "a"))
+    wait(GW_L180 + "/health")
+    return gw
+
+
+def l180_e2e(env):
+    """L180 (its own gateway 18312, and a Qdrant mock on 18313): oauth_key_config signs PS256 and ES512 assertions and a
+    key without audience is refused on save; a request naming no provider goes to the best measured provider;
+    model_parameters_url is read; the complexity router's semantic exemplars sit in the vector store, its llm fallback
+    answers when no exemplar is close, its own calls are charged only with count_toward_budgets, and a session never
+    steps down a tier; a pinned request settles a hold; a RetryInfo body sets the wait; holds and incidents survive a restart."""
+    import base64, urllib.parse
+    rsa_pem = subprocess.run(["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048"], capture_output=True, check=True, text=True).stdout
+    ec_pem = subprocess.run(["openssl", "ecparam", "-name", "secp521r1", "-genkey", "-noout"], capture_output=True, check=True, text=True).stdout
+    params_path = os.path.join(BUILD, "e2e.l180.params.json")
+    json.dump({"l180-param-model": {"mode": "chat", "provider": "openai", "model_parameters": [{"id": "max_tokens"}, {"id": "temperature"}]}}, open(params_path, "w"))
+    cfg_path = os.path.join(BUILD, "e2e.l180.json")
+    json.dump(l180_config(rsa_pem, ec_pem, params_path), open(cfg_path, "w"))
+    held_path = cfg_path + ".adaptive.json"
+    if os.path.exists(held_path):
+        os.remove(held_path)
+    qdrant = subprocess.Popen([sys.executable, os.path.join(ROOT, "tests/qdrant_mock.py"), "18313"])
+    gw = l180_start(env, cfg_path)
+    root = {"authorization": "Bearer " + L180_ADMIN}
+    medium = {"x-bf-complexity-tier": "MEDIUM"}
+    def adm(method, p, body=None):
+        return call(method, p, body, root, base=GW_L180, auth=False)
+    def chat180(model, text, headers=None):
+        return call("POST", "/v1/chat/completions", {"model": model, "messages": [{"role": "user", "content": text}]}, headers, base=GW_L180, auth=False)
+    def b64(s):
+        return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+    try:
+        # JWT bearer assertions signed PS256 (RSA-PSS) and ES512 (P-521)
+        for model, alg, siglen in [("jwtps/l180-jwt-ps", "PS256", 256), ("jwtes/l180-jwt-es", "ES512", 132)]:
+            n0 = len([x for x in seen(True) if x["path"] == "/token"])
+            s, _, b = chat180(model, "jwt " + alg, medium)
+            mints = [x for x in seen(True) if x["path"] == "/token"][n0:]
+            form = urllib.parse.parse_qs(mints[-1]["body"]) if mints else {}
+            assertion = form.get("assertion", [""])[0]
+            parts = assertion.split(".")
+            header = json.loads(b64(parts[0])) if len(parts) == 3 else {}
+            claims = json.loads(b64(parts[1])) if len(parts) == 3 else {}
+            sig = b64(parts[2]) if len(parts) == 3 else b""
+            check(f"a {alg} jwt_bearer key mints its token with a {alg} assertion naming its issuer and audience", s == 200 and header.get("alg") == alg and claims.get("iss") == "svc-l180" and claims.get("aud") == "https://api.l180.example" and len(sig) == siglen, (s, b[:200], header, claims, len(sig)))
+            try:
+                from cryptography.hazmat.primitives import hashes, serialization
+                from cryptography.hazmat.primitives.asymmetric import padding, ec, utils
+                signed = (parts[0] + "." + parts[1]).encode()
+                if alg == "PS256":
+                    pub = serialization.load_pem_private_key(rsa_pem.encode(), None).public_key()
+                    pub.verify(sig, signed, padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=32), hashes.SHA256())
+                else:
+                    pub = serialization.load_pem_private_key(ec_pem.encode(), None).public_key()
+                    pub.verify(utils.encode_dss_signature(int.from_bytes(sig[:66], "big"), int.from_bytes(sig[66:], "big")), signed, ec.ECDSA(hashes.SHA512()))
+                check(f"the {alg} signature verifies with the key's public half", True)
+            except ImportError:
+                print(f"skip the {alg} signature check: cryptography is not installed")
+            except Exception as e:
+                check(f"the {alg} signature verifies with the key's public half", False, repr(e))
+        s, _, b = adm("POST", "/api/providers/openai/keys", {"value": "", "oauth_key_config": {"grant_type": "jwt_bearer", "token_url": "https://auth.l180.example/token", "private_key": "env.L180_KEY", "issuer": "svc"}})
+        check("a jwt_bearer key without an audience is refused on save, as Bifrost refuses it", s == 400 and "oauth_key_config.audience is required for the jwt_bearer grant" in b, (s, b[:200]))
+        # a key saved through the API keeps its oauth_key_config, and a masked secret sent back keeps the stored one
+        rt_secret = "csec-rt-" + "1234567890"
+        s, _, b = adm("POST", "/api/providers/openai/keys", {"id": "rt", "value": "", "models": ["l180-roundtrip"], "oauth_key_config": {"grant_type": "client_credentials", "token_url": MOCK + "/token", "client_id": "cid-rt", "client_secret": rt_secret}, "cloudflare_key_config": {"account_id": "acct-rt"}})
+        s2, _, got = adm("GET", "/api/providers/openai/keys/rt")
+        check("a key saved through the API keeps its blocks, its secrets masked on read", s == 201 and s2 == 200 and '"oauth_key_config"' in got and "cid-rt" in got and rt_secret not in got and "acct-rt" in got, (s, b[:200], s2, got[:300]))
+        s3, _, b3 = adm("PUT", "/api/providers/openai/keys/rt", got)
+        time.sleep(0.3)
+        s4, _, b4 = chat180("openai/l180-roundtrip", "roundtrip l180", medium)
+        basic = "Basic " + base64.b64encode(f"cid-rt:{rt_secret}".encode()).decode()
+        mints = [x for x in seen(True) if x["path"] == "/token" and x["auth"] == basic]
+        check("sent back masked, the key still mints its token with the stored client secret", s3 == 200 and s4 == 200 and len(mints) >= 1, (s3, b3[:200], s4, b4[:200]))
+
+        # the provider level picks the best measured provider for a request that names none
+        for i in range(6):
+            chat180("l180-model", f"l180-dir-{i}", medium)
+        dirs = [x for x in seen() if "l180-dir-" in x.get("body", "")]
+        last = [x["auth"] for x in dirs[2:]]
+        check("once both are measured, requests that name no provider go to the faster provider", len(dirs) == 6 and dirs[0]["auth"] == "Bearer sk-l180-slow-aaaa" and dirs[1]["auth"] == "Bearer sk-l180-fast-bbbb" and all(a == "Bearer sk-l180-fast-bbbb" for a in last), [x["auth"] for x in dirs])
+
+        # model_parameters_url
+        s, _, b = adm("GET", "/api/models/parameters?model=l180-param-model")
+        check("model parameters are read from framework.pricing.model_parameters_url", s == 200 and '"temperature"' in b, (s, b[:200]))
+
+        # complexity: exemplars in the vector store, the llm fallback, budgets, and sessions
+        vk = {"x-bf-vk": "sk-bf-l180-0123456789abcdef"}
+        s, h, b = chat180("openai/l180-plain", "zebra quantum lattice l180", vk)
+        check("no exemplar close enough: the llm fallback classifies the request", s == 200 and hdr(h, "x-bf-complexity-tier") == "COMPLEX", (s, hdr(h, "x-bf-complexity-tier"), b[:200]))
+        s, _, b = call("GET", "/api/governance/virtual-keys/quota", None, vk, base=GW_L180, auth=False)
+        q = json.loads(b) if s == 200 else {}
+        used = (q.get("budgets") or [{}])[0].get("current_usage")
+        check("the llm classifier's call is charged (count_toward_budgets) and the embeddings are not", s == 200 and used is not None and abs(used - 7.0) < 1e-6, (s, b[:300]))
+        s, h, b = chat180("openai/l180-plain", "hi there", vk)
+        check("a request that is an exemplar takes its tier from the vector store", s == 200 and hdr(h, "x-bf-complexity-tier") == "SIMPLE", (s, hdr(h, "x-bf-complexity-tier"), b[:200]))
+        qc = json.loads(call("GET", "/_calls", base="http://127.0.0.1:18313")[2])
+        check("the exemplars are written to and searched in the vector store under the generation's namespace", any(c["method"] == "PUT" and c["path"].startswith("/collections/BifrostComplexityRouter_") and c["path"].endswith("/points") for c in qc) and any(c["path"].endswith("/points/query") and "BifrostComplexityRouter_" in c["path"] for c in qc), qc[-6:])
+        s, _, b = adm("GET", "/api/routing/complexity-analyzer-status")
+        check("the analyzer status reports the exemplars in the vector store", s == 200 and '"storage_mode":"vector_store"' in b and '"state":"ready"' in b, (s, b[:300]))
+        sess = {**vk, "x-bf-session-id": "s-l180"}
+        s1, h1, _ = chat180("openai/l180-plain", "zebra quantum lattice l180", sess)
+        s2, h2, _ = chat180("openai/l180-plain", "hi there", sess)
+        s3, h3, _ = chat180("openai/l180-plain", "hi there", {**vk, "x-bf-session-id": "s-l180-other"})
+        check("a session keeps the highest tier it reached: a simple follow-up stays COMPLEX, another session is SIMPLE", (s1, s2, s3) == (200, 200, 200) and hdr(h1, "x-bf-complexity-tier") == "COMPLEX" and hdr(h2, "x-bf-complexity-tier") == "COMPLEX" and hdr(h3, "x-bf-complexity-tier") == "SIMPLE", (hdr(h1, "x-bf-complexity-tier"), hdr(h2, "x-bf-complexity-tier"), hdr(h3, "x-bf-complexity-tier")))
+
+        # holds: a refused key, a pinned request that settles the hold, and a RetryInfo wait
+        s, _, _ = chat180("openai/l180-held", "held l180", medium)
+        s2, _, b = adm("GET", "/api/adaptive-routing/held-keys")
+        rows = {r["target"]: r for r in json.loads(b).get("held_keys", [])} if s2 == 200 else {}
+        check("a refused key is held", s == 401 and "openai#held" in rows and rows["openai#held"]["rung"] == 0, (s, s2, b[:300]))
+        s, _, _ = chat180("openai/l180-held", "pinned l180", {**medium, "x-bf-api-key": "held"})
+        rows = {r["target"]: r for r in json.loads(adm("GET", "/api/adaptive-routing/held-keys")[2]).get("held_keys", [])}
+        check("a request pinned to the held key is sent, and its refusal climbs the ladder as a check's does", s == 401 and rows.get("openai#held", {}).get("rung") == 1, rows.get("openai#held"))
+        s, _, _ = chat180("openai/l180-retryinfo", "retryinfo l180", medium)
+        rows = {r["target"]: r for r in json.loads(adm("GET", "/api/adaptive-routing/held-keys")[2]).get("held_keys", [])}
+        check("a RetryInfo detail in the error body sets the hold's wait, over the Retry-After header", s == 429 and rows.get("openai#retry@l180-retryinfo", {}).get("wait_seconds") == 42, rows.get("openai#retry@l180-retryinfo"))
+
+        # a graceful stop keeps the holds and incidents; the next start restores them
+        gw.terminate()
+        try:
+            gw.wait(15)
+        except subprocess.TimeoutExpired:
+            gw.kill()
+            gw.wait()
+        check("a graceful stop writes the held keys next to the config", os.path.exists(held_path), held_path)
+        gw = l180_start(env, cfg_path)
+        time.sleep(0.5)
+        s, _, b = adm("GET", "/api/adaptive-routing/held-keys")
+        rows = {r["target"]: r for r in json.loads(b).get("held_keys", [])} if s == 200 else {}
+        check("held keys survive a restart, with their rung and reason", rows.get("openai#held", {}).get("rung") == 1 and rows.get("openai#held", {}).get("failure_class") == "credential" and "openai#retry@l180-retryinfo" in rows, (s, b[:300]))
+        s, _, b = adm("GET", "/api/adaptive-routing/incidents")
+        check("their incidents survive the restart too", s == 200 and "openai#held" in b and "openai#retry@l180-retryinfo" in b, (s, b[:300]))
+    finally:
+        if gw.poll() is None:
+            gw.terminate()
+        gw.wait()
+        qdrant.terminate()
+        qdrant.wait()
+
+
+GW_L181 = "http://127.0.0.1:18314"  # L181: Gemini streamed transcription, Claude on Azure, use_anthropic_endpoints, Bedrock's Mantle surface, SCIM claims
+
+
+def l181_config() -> dict:
+    """The L181 gateway: Gemini, Azure (OpenAI and Claude deployments on one resource), Fireworks with
+    use_anthropic_endpoints on the key, DeepSeek with it on one alias, and Bedrock whose OpenAI-family models go to
+    the Mantle surface with an alias's project, all on the mock; the request log on."""
+    import shutil
+    logs_dir = os.path.join(BUILD, "e2e-l181-logs")
+    shutil.rmtree(logs_dir, ignore_errors=True)
+    def key(name, value, **extra):
+        return {"name": name, "value": value, "models": [], "weight": 1.0, **extra}
+    nc = {"base_url": MOCK, "max_retries": 0}
+    return {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False},
+        "logs_store": {"enabled": True, "dir": logs_dir},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {
+            "gemini": {"keys": [key("g", "gk-l181")], "network_config": nc},
+            "azure": {"keys": [key("az", "az-l181", azure_key_config={"endpoint": MOCK, "api_version": "2024-10-21"},
+                                   aliases={"best-claude": {"model_id": "dep-claude-77", "model_family": "anthropic", "anthropic_version": "2024-10-01"}})],
+                      "network_config": {"max_retries": 0}},
+            "fireworks": {"keys": [key("fw", "fw-l181", use_anthropic_endpoints=True)], "network_config": nc},
+            "deepseek": {"keys": [key("ds", "ds-l181", aliases={"ds-anthropic": {"model_id": "deepseek-chat", "use_anthropic_endpoints": True}})], "network_config": nc},
+            "bedrock": {"keys": [key("bk", "", bedrock_key_config={"access_key": "AKIDEXAMPLE", "secret_key": "secret", "region": "us-west-2"},
+                                     aliases={"oss-proj": {"model_id": "openai.gpt-oss-120b", "project_id": "proj-l181"}})],
+                        "network_config": nc},
+            # gcloud's AWS external_account file: the workload's AWS identity federated into a GCP token on the mock
+            "vertex": {"keys": [key("vx", "", vertex_key_config={"project_id": "proj", "region": "us-central1", "auth_credentials": json.dumps({
+                "type": "external_account", "audience": "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/aws",
+                "subject_token_type": "urn:ietf:params:aws:token-type:aws4_request", "token_url": MOCK + "/wif/sts",
+                "service_account_impersonation_url": MOCK + "/wif/impersonate", "service_account_impersonation": {"token_lifetime_seconds": 1200},
+                "credential_source": {"environment_id": "aws1", "regional_cred_verification_url": "https://sts.{region}.amazonaws.com?Action=GetCallerIdentity&Version=2011-06-15"}})})],
+                       "network_config": nc},
+        },
+    }
+
+
+def l181_e2e(env):
+    """L181: Gemini's streamed transcription as Bifrost streams it, Claude deployments on Azure through the resource's
+    Anthropic route (with an alias's anthropic_version), use_anthropic_endpoints for Fireworks (key) and DeepSeek
+    (alias), and a Bedrock key's OpenAI-family models on the Mantle surface with an alias's project. Its own gateway
+    (18314)."""
+    cfg_path = os.path.join(BUILD, "e2e.l181.json")
+    json.dump(l181_config(), open(cfg_path, "w"))
+    # the workload's AWS identity for the Vertex federation (AWS's documented example key)
+    genv = {**env, "AWS_ACCESS_KEY_ID": "AKIDEXAMPLE", "AWS_SECRET_ACCESS_KEY": "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "AWS_REGION": "us-east-1"}
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18314", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=genv, stderr=open(os.path.join(BUILD, "e2e.l181.log"), "w"))
+    def post(path, body, headers=None):
+        return call("POST", path, body, headers, base=GW_L181, auth=False)
+    def last(prefix):
+        rows = [x for x in seen() if x["path"].startswith(prefix)]
+        return rows[-1] if rows else {"path": "", "body": "", "auth": "", "ver": "", "proj": ""}
+    def jb(text):
+        try:
+            return json.loads(text)
+        except Exception:
+            return {}
+    msgs = [{"role": "user", "content": "hello l181"}]
+    try:
+        wait(GW_L181 + "/health")
+
+        # ---- Gemini's streamed transcription: delta events, the done event with the usage, [DONE] ----
+        s, h, b = mp_form(GW_L181, "/v1/audio/transcriptions", [("model", None, "text/plain", "gemini/gemini-2.5-flash"), ("stream", None, "text/plain", "true"), ("file", "talk.wav", "audio/wav", b"RIFF\x00\x00\x00\x00WAVEfmt ")])
+        up = last("/v1beta/models/gemini-2.5-flash")
+        events = [json.loads(l[6:]) for l in b.split("\n") if l.startswith("data: {")]
+        check("gemini streamed transcription: streamGenerateContent with the audio inline", up["path"] == "/v1beta/models/gemini-2.5-flash:streamGenerateContent" and '"inlineData":{"mimeType":"audio/wav"' in up["body"], up["path"])
+        check("gemini streamed transcription: one transcript.text.delta per chunk, then transcript.text.done with Bifrost's usage and [DONE]",
+              s == 200 and h.get("Content-Type", h.get("content-type", "")).startswith("text/event-stream")
+              and [e.get("delta") for e in events if e.get("type") == "transcript.text.delta"] == ["Hi from ", "gemini stream"]
+              and events[-1] == {"type": "transcript.text.done", "text": "Hi from gemini stream", "usage": {"type": "tokens", "input_tokens": 14, "output_tokens": 4, "total_tokens": 18}}
+              and b.rstrip().endswith("data: [DONE]"), (s, b[:500]))
+        rows = []
+        for _ in range(50):
+            rows = [e for e in jb(call("GET", "/api/logs?limit=50", base=GW_L181, auth=False)[2]).get("entries", []) if e.get("op") == "transcription"]
+            if rows:
+                break
+            time.sleep(0.1)
+        check("gemini streamed transcription: logged with the tokens of the done event", rows and rows[0].get("prompt_tokens") == 14 and rows[0].get("completion_tokens") == 4, rows[:1])
+
+        # ---- Claude on Azure: the resource's /anthropic/v1/messages, with x-api-key and anthropic-version ----
+        s, _, b = post("/v1/chat/completions", {"model": "azure/claude-sonnet-4-5", "messages": msgs})
+        up = last("/anthropic/v1/messages")
+        check("azure claude: a Claude model goes to the resource's Anthropic route as a Messages body, answered as chat",
+              s == 200 and jb(b).get("choices", [{}])[0].get("message", {}).get("content") == "Hi from mantle claude"
+              and jb(up["body"]).get("model") == "claude-sonnet-4-5" and up["auth"] == "az-l181" and up["ver"] == "2023-06-01", (s, b[:200], up))
+        s, _, b = post("/v1/chat/completions", {"model": "azure/best-claude", "messages": msgs})
+        up = last("/anthropic/v1/messages")
+        check("azure claude: an alias's model_family picks the route and its anthropic_version is sent", s == 200 and jb(up["body"]).get("model") == "dep-claude-77" and up["ver"] == "2024-10-01", (s, b[:200], up))
+        s, _, b = post("/v1/chat/completions", {"model": "azure/gpt-4o", "messages": msgs})
+        check("azure: an OpenAI model stays on the deployments route", s == 200 and last("/openai/deployments/")["path"].startswith("/openai/deployments/gpt-4o/chat/completions"), (s, b[:200], last("/openai/deployments/")["path"]))
+        s, _, b = post("/anthropic/v1/messages", {"model": "azure/claude-sonnet-4-5", "max_tokens": 10, "messages": msgs})
+        check("azure claude: the Messages route passes through to the resource's Anthropic route", s == 200 and jb(b).get("type") == "message" and last("/anthropic/v1/messages")["auth"] == "az-l181", (s, b[:200]))
+
+        # ---- use_anthropic_endpoints: Fireworks (on the key) and DeepSeek (on an alias) ----
+        s, _, b = post("/v1/chat/completions", {"model": "fireworks/accounts/fireworks/models/kimi-k2", "messages": msgs})
+        up = last("/v1/messages")
+        check("use_anthropic_endpoints: Fireworks sends a Messages body to /v1/messages with its bearer key", s == 200 and jb(b).get("choices") is not None and up["auth"] == "Bearer fw-l181" and jb(up["body"]).get("max_tokens") is not None, (s, b[:200], up))
+        s, _, b = post("/v1/chat/completions", {"model": "fireworks/accounts/fireworks/models/kimi-k2", "messages": msgs, "stream": True})
+        check("use_anthropic_endpoints: a Fireworks stream is converted from Anthropic events", s == 200 and '"content":"hi"' in b and "data: [DONE]" in b and last("/v1/messages")["auth"] == "Bearer fw-l181", (s, b[:300]))
+        s, _, b = post("/v1/chat/completions", {"model": "deepseek/ds-anthropic", "messages": msgs})
+        up = last("/anthropic/v1/messages")
+        check("use_anthropic_endpoints: a DeepSeek alias goes to /anthropic/v1/messages with x-api-key", s == 200 and up["auth"] == "ds-l181" and jb(up["body"]).get("model") == "deepseek-chat", (s, b[:200], up))
+        s, _, b = post("/v1/chat/completions", {"model": "deepseek/deepseek-chat", "messages": msgs})
+        check("use_anthropic_endpoints: without it DeepSeek stays on its OpenAI route", s == 200 and last("/v1/chat/completions")["auth"] == "Bearer ds-l181", (s, b[:200]))
+
+        # ---- Bedrock: OpenAI-family models on the Mantle surface, the alias's project sent ----
+        s, _, b = post("/v1/chat/completions", {"model": "bedrock/oss-proj", "messages": msgs})
+        up = last("/v1/chat/completions")
+        check("bedrock: an OpenAI-family model goes to the Mantle surface (OpenAI chat, SigV4 for bedrock-mantle) with the alias's project",
+              s == 200 and jb(up["body"]).get("model") == "openai.gpt-oss-120b" and "/bedrock-mantle/aws4_request" in up["auth"] and up["proj"] == "proj-l181|", (s, b[:200], up))
+        s, _, b = post("/v1/chat/completions", {"model": "bedrock/us.openai.gpt-oss-120b", "messages": msgs})
+        check("bedrock: a cross-region id stays on bedrock-runtime (Converse)", s == 200 and last("/model/")["path"].endswith("/converse"), (s, b[:200], last("/model/")["path"]))
+
+        # ---- Vertex: a GCP token federated from the workload's AWS identity (an AWS external_account file) ----
+        s, _, b = post("/v1/chat/completions", {"model": "vertex/gemini-2.5-flash", "messages": msgs})
+        sts, imp, up = last("/wif/sts"), last("/wif/impersonate"), last("/v1/projects/proj/")
+        sub = urllib.parse.unquote(urllib.parse.unquote(urllib.parse.parse_qs(sts["body"]).get("subject_token", [""])[0]))
+        check("vertex aws federation: the signed GetCallerIdentity request is exchanged at the token URL, bound to the pool provider",
+              s == 200 and "audience=%2F%2Fiam.googleapis.com%2Fprojects%2F1" in sts["body"] and '"method":"POST"' in sub and "Action=GetCallerIdentity" in sub
+              and "Credential=AKIDEXAMPLE/" in sub and "/us-east-1/sts/aws4_request" in sub and "X-Goog-Cloud-Target-Resource" in sub, (s, b[:200], sts["body"][:300], sub[:300]))
+        check("vertex aws federation: the federated token impersonates the service account, whose token calls Vertex",
+              imp["auth"] == "Bearer fed-token-l181" and '"lifetime":"1200s"' in imp["body"] and up["auth"] == "Bearer ya29.impersonated-l181", (imp, up["auth"]))
+        n = len([x for x in seen() if x["path"] == "/wif/sts"])
+        s, _, b = post("/v1/chat/completions", {"model": "vertex/gemini-2.5-flash", "messages": msgs})
+        check("vertex aws federation: the token is reused until it nears expiry", s == 200 and len([x for x in seen() if x["path"] == "/wif/sts"]) == n, (s, n))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
+GW_L181S = "http://127.0.0.1:18315"  # L181: sign-in through scim_config's provider: claims to roles and memberships, SCIM only, token rotation
+
+
+def l181_scim_config(mode: str) -> dict:
+    """The L181 sign-in gateway: the identity provider set up only through scim_config (the generic provider on the mock
+    IdP, no oidc section and no redirect URI), attribute mappings for roles, teams (pass-through), business units and
+    projects, a project to map to, and SCIM provisioning on with claimsSyncMode as given."""
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "governance": {"auth_config": {"token": "admin-secret"}, "projects": [{"id": "proj-apollo", "name": "Apollo"}]},
+        "scim_config": {"enabled": True, "provider": "generic", "trusted_networks": [{"cidr": "127.0.0.1"}], "config": {
+            "issuerUrl": "http://127.0.0.1:18096", "clientId": "raiju", "provisioningToken": "env.E2E_SCIM_TOKEN", "claimsSyncMode": mode,
+            "attributeRoleMappings": [{"attribute": "groups", "value": "raiju-editors", "role": "editor"}, {"attribute": "groups", "value": "raiju-admins", "role": "admin"}, {"attribute": "groups", "value": "raiju-ghosts", "role": "ghost"}],
+            "attributeTeamMappings": [{"attribute": "groups", "value": "*"}],
+            "attributeBusinessUnitMappings": [{"attribute": "dept", "value": "*"}],
+            "attributeProjectMappings": [{"attribute": "groups", "value": "staff", "project": "apollo"}]}},
+    }
+
+
+def l181_scim_e2e(env, idp_state):
+    """L181: a sign-in through scim_config's generic provider: the user is created with the role its groups map to (the
+    highest), teams and business units made from the claims, a project joined; later sign-ins move the role and the
+    synced teams; a group that maps to no role, or to a role that does not exist, is refused and the role taken away;
+    the provisioning token rotates; with claimsSyncMode scim a user SCIM has not pushed is refused and a pushed one
+    signs in with the role SCIM gave. Its own gateway (18315), started twice."""
+    import http.client, re as _re
+    cfg_path = os.path.join(BUILD, "e2e.l181s.json")
+    genv = {**env, "E2E_SCIM_TOKEN": SCIM_TOKEN}
+    A = {"authorization": "Bearer admin-secret"}
+    def start(mode):
+        json.dump(l181_scim_config(mode), open(cfg_path, "w"))
+        return subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18315", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=genv, stderr=open(os.path.join(BUILD, "e2e.l181s.log"), "w"))
+    def sign_in(claims):
+        idp_state["claims"] = claims
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", 18315, timeout=10)
+            conn.request("GET", "/api/oidc/login"); r = conn.getresponse(); r.read()
+            loc = r.getheader("location") or ""
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)
+            idp_state["nonce"] = q.get("nonce", [""])[0]
+            s, _, page = call("GET", "/api/oidc/callback?code=abc&state=" + q.get("state", [""])[0], base=GW_L181S, auth=False)
+            return s, page, q.get("redirect_uri", [""])[0]
+        finally:
+            idp_state["claims"] = {}
+    def user(name):
+        s, _, b = call("GET", "/api/users", headers=A, base=GW_L181S, auth=False)
+        us = json.loads(b) if s == 200 else []
+        us = us.get("users", us.get("data", [])) if isinstance(us, dict) else us
+        return next((u for u in us if u.get("name") == name), None)
+    def gov(path):
+        s, _, b = call("GET", path, headers=A, base=GW_L181S, auth=False)
+        return json.loads(b) if s == 200 else {}
+    def stored_user(name):
+        cfg = json.load(open(cfg_path))
+        return next((u for u in cfg.get("governance", {}).get("users", []) if u.get("name") == name), {})
+    gw = start("both")
+    try:
+        wait(GW_L181S + "/health")
+        s, page, redirect = sign_in({"groups": ["staff", "raiju-editors", "raiju-admins"], "dept": "Research"})
+        tok = (_re.search(r'"(sk-sess-[0-9a-f]+)"', page) or [None, ""])[1] if "sk-sess-" in page else ""
+        check("scim sign-in: the generic provider's settings sign in with no oidc section, the redirect URI the gateway's own callback", s == 200 and tok != "" and redirect == GW_L181S + "/api/oidc/callback", (s, page[:200], redirect))
+        u = stored_user("alice@example.com")
+        teams = {t["id"]: t["name"] for t in json.load(open(cfg_path)).get("governance", {}).get("teams", [])}
+        bus = {b["id"]: b["name"] for b in json.load(open(cfg_path)).get("governance", {}).get("business_units", [])}
+        check("scim sign-in: the new user gets the mapped role with the most permissions", u.get("role") == "admin" and u.get("email") == "alice@example.com", u)
+        check("scim sign-in: pass-through teams and business units are created from the claims, a mapped project joined",
+              sorted(teams.get(t, "") for t in u.get("teams", [])) == ["raiju-admins", "raiju-editors", "staff"] and [bus.get(b) for b in u.get("business_units", [])] == ["Research"] and u.get("projects") == ["proj-apollo"], (u, teams, bus))
+        s, _, b = call("GET", "/api/users/me/permissions", headers={"authorization": "Bearer " + tok}, base=GW_L181S, auth=False)
+        check("scim sign-in: the session holds the mapped role", s == 200, (s, b[:200]))
+        s, page, _ = sign_in({"groups": ["raiju-editors"]})
+        u = stored_user("alice@example.com")
+        teams = {t["id"]: t["name"] for t in json.load(open(cfg_path)).get("governance", {}).get("teams", [])}
+        check("scim sign-in: a later sign-in moves the role and the synced teams; a claim left out (dept) keeps its memberships",
+              s == 200 and u.get("role") == "editor" and [teams.get(t) for t in u.get("teams", [])] == ["raiju-editors"] and len(u.get("business_units", [])) == 1 and u.get("projects") == [], (s, u))
+        s, page, _ = sign_in({"groups": ["raiju-ghosts"]})
+        check("scim sign-in: a mapped role that does not exist is refused and the role taken away", s == 403 and "sk-sess-" not in page and stored_user("alice@example.com").get("role") == "", (s, page[:200], stored_user("alice@example.com").get("role")))
+        s, page, _ = sign_in({"groups": ["raiju-editors"]})
+        check("scim sign-in: a matching group gives the role back", s == 200 and stored_user("alice@example.com").get("role") == "editor", (s, page[:200]))
+        s, page, _ = sign_in({"sub": "carol", "email": "carol@example.com", "groups": ["outsiders"]})
+        check("scim sign-in: a new user whose groups map to no role is refused and not created", s == 403 and stored_user("carol@example.com") == {}, (s, page[:200]))
+        # the provisioning token rotates: the old one stops working
+        auth_old = {"authorization": "Bearer " + SCIM_TOKEN}
+        s, _, b = call("GET", "/scim/v2/Users", headers=auth_old, base=GW_L181S, auth=False)
+        check("scim token: the configured token works", s == 200, (s, b[:200]))
+        s, _, b = call("POST", "/api/scim/provisioning-token", {}, headers=A, base=GW_L181S, auth=False)
+        new = json.loads(b).get("token", "") if s == 200 else ""
+        check("scim token: a rotation returns a new token once", s == 200 and new.startswith("scim-") and new != SCIM_TOKEN, (s, b[:200]))
+        s1, _, _ = call("GET", "/scim/v2/Users", headers=auth_old, base=GW_L181S, auth=False)
+        s2, _, _ = call("GET", "/scim/v2/Users", headers={"authorization": "Bearer " + new}, base=GW_L181S, auth=False)
+        check("scim token: the old token is refused, the new one accepted", s1 == 401 and s2 == 200, (s1, s2))
+        s, _, b = call("GET", "/api/config", headers=A, base=GW_L181S, auth=False)
+        check("scim token: the config shows the new token masked", s == 200 and new not in b, b[:100])
+        s, _, b = call("POST", "/api/scim/provisioning-token", {}, base=GW_L181S, auth=False)
+        check("scim token: rotation needs an admin", s in (401, 403), (s, b[:200]))
+    finally:
+        gw.terminate()
+        gw.wait()
+    gw = start("scim")
+    try:
+        wait(GW_L181S + "/health")
+        s, page, _ = sign_in({"sub": "bob", "email": "bob@example.com", "groups": ["raiju-admins"]})
+        check("scim only: a user SCIM has not pushed is refused, whatever the token says", s == 403 and "managed by SCIM" in page and stored_user("bob@example.com") == {}, (s, page[:200]))
+        auth = {"authorization": "Bearer " + SCIM_TOKEN}
+        s, _, b = call("POST", "/scim/v2/Users", {"schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"], "userName": "bob@example.com", "active": True, "roles": [{"value": "viewer"}]}, headers=auth, base=GW_L181S, auth=False)
+        s2, page, _ = sign_in({"sub": "bob", "email": "bob@example.com", "groups": ["raiju-admins"]})
+        check("scim only: a pushed user signs in with the role SCIM gave, the token's claims ignored", s == 201 and s2 == 200 and "sk-sess-" in page and stored_user("bob@example.com").get("role") == "viewer", (s, b[:200], s2, page[:200]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+GW_L184 = "http://127.0.0.1:18324"  # L184: no admin and no setup token (the locked /api), virtual keys, MCP, WebRTC off
+GW_L184_SETUP = "http://127.0.0.1:18325"  # L184: a setup token, keys without ids, private files and the share folder
+
+def l184_e2e(env):
+    """L184, secure defaults. A gateway with no admin and no setup token answers 403 on /api (an unauthenticated PUT can
+    no longer move a provider's base_url); a setup token opens it. /metrics labels stay a fixed set under junk paths and
+    models. Async job ids are random and a job is shown only to the key that submitted it. A provider read and written
+    back masked keeps its keys, and a masked value that matches none is refused. The config, its .bak, the request log
+    and the workers' share folder are private. A virtual key without mcp_configs gets no MCP tools; WebRTC calls are
+    off unless server.webrtc_enabled is set."""
+    import re as _re, shutil, stat
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    d = os.path.join(BUILD, "e2e-l184")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    open_cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": True},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "l184", "value": "sk-l184-real-0001", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "mcp": {"client_configs": [{"name": "weather", "connection_type": "http", "connection_string": MOCK + "/mcp"}]},
+        "governance": {"virtual_keys": [{"id": "vk-l184-a", "value": "sk-bf-l184-a"}, {"id": "vk-l184-b", "value": "sk-bf-l184-b"},
+                                        {"id": "vk-l184-mcp", "value": "sk-bf-l184-mcp", "mcp_configs": [{"mcp_client_name": "weather", "tools_to_execute": ["*"]}]}]},
+    }
+    open_path = os.path.join(d, "open.json")
+    json.dump(open_cfg, open(open_path, "w"))
+    # keys written by hand without ids, a logs folder, and two workers on bun (the share folder)
+    setup_dir = os.path.join(d, "setup")
+    os.makedirs(setup_dir)
+    setup_path = os.path.join(setup_dir, "config.json")
+    json.dump({
+        "setup_token": "l184-setup",
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "logs_store": {"enabled": True, "dir": os.path.join(setup_dir, "logs")},
+        "providers": {"openai": {"keys": [{"name": "hand-1", "value": "sk-l184-hand-written-0001", "models": [], "weight": 1.0},
+                                          {"name": "hand-2", "value": "sk-l184-hand-written-0002", "models": [], "weight": 1.0}],
+                                 "network_config": {"base_url": MOCK, "max_retries": 0}}},
+    }, open(setup_path, "w"))
+    os.chmod(setup_path, 0o600)
+    # the first gateway must not inherit the e2e setup token: it shows the lock with none configured
+    open_env = {k: v for k, v in env.items() if k != "BIFROST_SETUP_TOKEN"}
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18324", "-host", "127.0.0.1", "-config", open_path, "-server", server], env=open_env, stderr=open(os.path.join(BUILD, "e2e.l184.log"), "w"))
+    args_b = [os.path.join(BUILD, "raiju"), "-port", "18325", "-host", "127.0.0.1", "-config", setup_path, "-server", server]
+    if server != "http1":
+        args_b += ["-workers", "2"]
+    gw_b = subprocess.Popen(cwd=ROOT, args=args_b, env=env, stderr=open(os.path.join(BUILD, "e2e.l184-setup.log"), "w"))
+    A = {"authorization": "Bearer sk-bf-l184-a"}
+    B = {"authorization": "Bearer sk-bf-l184-b"}
+    try:
+        wait(GW_L184 + "/health")
+        wait(GW_L184_SETUP + "/health")
+        none = {"x-bifrost-setup-token": ""}
+        # ---- P0-1: the locked /api ----
+        s, _, b = call("GET", "/api/providers", None, none, base=GW_L184, auth=False)
+        check("with no admin and no setup token, /api answers 403 (Bifrost's lock)", s == 403 and "no setup token is set" in b, (s, b[:200]))
+        s, _, b = call("GET", "/api/config", None, {"x-bifrost-setup-token": "anything"}, base=GW_L184, auth=False)
+        check("... and no setup token opens it", s == 403, (s, b[:200]))
+        s, _, b = call("PUT", "/api/providers/openai", {"keys": [], "network_config": {"base_url": "http://127.0.0.1:9/steal"}}, none, base=GW_L184, auth=False)
+        check("an unauthenticated PUT cannot move a provider's base_url", s == 403, (s, b[:200]))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l184 after put"}]}, A, base=GW_L184, auth=False)
+        check("... and inference still goes to the configured upstream", s == 200 and seen()[-1]["auth"] == "Bearer sk-l184-real-0001", (s, b[:200], seen()[-1:]))
+        s, _, b = call("GET", "/api/session/is-auth-enabled", None, none, base=GW_L184, auth=False)
+        check("the auth state stays readable under the lock", s == 200 and json.loads(b).get("setup_token_configured") is False, (s, b[:200]))
+        s, _, b = call("GET", "/health", base=GW_L184, auth=False)
+        check("/health stays open", s == 200, s)
+        log = open(os.path.join(BUILD, "e2e.l184.log")).read()
+        check("start-up warns that /api is locked and how to set a setup token", "/api is locked (403)" in log and "BIFROST_SETUP_TOKEN" in log, log[-600:])
+        s, _, b = call("GET", "/api/providers", None, none, base=GW_L184_SETUP, auth=False)
+        check("with a setup token, /api without it is a 401", s == 401, (s, b[:200]))
+        s, _, b = call("GET", "/api/providers", None, {"x-bifrost-setup-token": "l184-setup"}, base=GW_L184_SETUP, auth=False)
+        check("... and the token opens it", s == 200, (s, b[:200]))
+        # ---- P0-4: bounded metric labels ----
+        for i in range(60):
+            call("GET", f"/zz-junk-path-{i}x", None, None, base=GW_L184, auth=False)
+            call("POST", "/v1/chat/completions", {"model": f"openai/zz-junk-model-{i}", "messages": [{"role": "user", "content": "x"}]}, None, base=GW_L184, auth=False)
+        _, _, m = call("GET", "/metrics", base=GW_L184, auth=False)
+        check("unrouted paths are labelled other, not one series each", 'path="other"' in m and "zz-junk-path" not in m, [l for l in m.splitlines() if "zz-junk-path" in l][:3])
+        # ---- P1-2: async job ids and owners ----
+        s, _, b = call("POST", "/v1/async/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l184 job"}]}, A, base=GW_L184, auth=False)
+        job = json.loads(b).get("id", "") if s == 202 else ""
+        check("an async job id is 128 random bits", s == 202 and _re.fullmatch(r"job_[0-9a-f]{32}", job) is not None, (s, b[:200]))
+        done = {}
+        for _ in range(50):
+            s2, _, b2 = call("GET", "/v1/async/jobs/" + job, None, A, base=GW_L184, auth=False)
+            done = json.loads(b2) if s2 == 200 else {}
+            if done.get("status") == "completed":
+                break
+            time.sleep(0.1)
+        check("the key that submitted a job reads its result", done.get("status") == "completed", done)
+        s, _, b = call("GET", "/v1/async/jobs/" + job, None, B, base=GW_L184, auth=False)
+        check("another virtual key polling the job gets a 404", s == 404, (s, b[:200]))
+        s, _, b = call("GET", "/v1/async/chat/completions/" + job, None, None, base=GW_L184, auth=False)
+        check("a poll with no credential gets a 404", s == 404, (s, b[:200]))
+        # ---- owner decision 2: MCP denied to a key without mcp_configs ----
+        def tools_for(h):
+            s0, hh, _ = call("POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "e2e-l184", "version": "1"}}}, h, base=GW_L184, auth=False)
+            sid = {k.lower(): v for k, v in hh.items()}.get("mcp-session-id", "")
+            _, _, tb = call("POST", "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, {**h, "mcp-session-id": sid}, base=GW_L184, auth=False)
+            return tb
+        # the key granted the client waits for the tools to be listed (inference auth is enforced here)
+        got = ""
+        for _ in range(120):
+            got = tools_for({"authorization": "Bearer sk-bf-l184-mcp"})
+            if "get_weather" in got:
+                break
+            time.sleep(0.25)
+        check("a key granted the client lists its tools", "get_weather" in got, got[:300])
+        got = tools_for(A)
+        check("a virtual key without mcp_configs lists no MCP tools", '"tools"' in got and "get_weather" not in got, got[:300])
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l184 no tools"}]}, A, base=GW_L184, auth=False)
+        sent = json.loads(seen()[-1]["body"])
+        check("... and its chat requests reach the provider without MCP tools", s == 200 and not any("weather" in json.dumps(t) for t in sent.get("tools", [])), sent.get("tools"))
+        s, _, b = call("POST", "/v1/mcp/tool/execute", {"id": "c1", "type": "function", "function": {"name": "weather-get_weather", "arguments": "{\"city\":\"Oslo\"}"}}, A, base=GW_L184, auth=False)
+        check("... and it may not run them", s == 403 or "not allowed" in b, (s, b[:200]))
+        # ---- owner decision 3: WebRTC off by default ----
+        s, _, b = call("POST", "/v1/realtime/calls?model=openai/gpt-realtime", "v=0", {**A, "content-type": "application/sdp"}, base=GW_L184, auth=False)
+        check("a WebRTC realtime call is refused while server.webrtc_enabled is off", s == 403 and "webrtc_enabled" in b, (s, b[:200]))
+        s, _, b = call("POST", "/v1/live/sessions", {"session": {"model": "openai/gpt-4o-mini"}, "transport": {"type": "webrtc", "sdp": "v=0"}}, A, base=GW_L184, auth=False)
+        check("... and so is a WebRTC live session", s == 403 and "webrtc_enabled" in b, (s, b[:200]))
+        # ---- P1-3: the masked-key round trip ----
+        tok = {"x-bifrost-setup-token": "l184-setup"}
+        s, _, b = call("GET", "/api/providers/openai", None, tok, base=GW_L184_SETUP, auth=False)
+        got = json.loads(b) if s == 200 else {}
+        check("a provider read shows each key's effective id, masked", s == 200 and [k.get("id") for k in got.get("keys", [])] == ["hand-1", "hand-2"] and "hand-written" not in b, (s, b[:300]))
+        got["send_back_raw_response"] = True
+        s, _, b = call("PUT", "/api/providers/openai", got, tok, base=GW_L184_SETUP, auth=False)
+        saved = json.load(open(setup_path))
+        vals = [k.get("value") for k in saved["providers"]["openai"]["keys"]]
+        check("sending the masked provider back keeps the real keys in config.json", s == 200 and vals == ["sk-l184-hand-written-0001", "sk-l184-hand-written-0002"], (s, b[:200], vals))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l184 keys kept"}]}, None, base=GW_L184_SETUP, auth=False)
+        check("... and inference still uses a real key", s == 200 and seen()[-1]["auth"].startswith("Bearer sk-l184-hand-written-000"), (s, seen()[-1:]))
+        bad = {"keys": [{"name": "new-one", "value": "sk-R…3456", "models": [], "weight": 1.0}]}
+        s, _, b = call("PUT", "/api/providers/openai", bad, tok, base=GW_L184_SETUP, auth=False)
+        check("a masked key value that matches no stored key is refused", s == 400 and "masked" in b, (s, b[:200]))
+        # ---- P1-9: private files and share folder ----
+        mode = lambda p: stat.S_IMODE(os.stat(p).st_mode)
+        check("the config backup is private (0600)", os.path.exists(setup_path + ".bak") and mode(setup_path + ".bak") == 0o600, oct(mode(setup_path + ".bak")) if os.path.exists(setup_path + ".bak") else "no .bak")
+        check("the config keeps 0600 across saves", mode(setup_path) == 0o600, oct(mode(setup_path)))
+        logs = os.path.join(setup_dir, "logs")
+        # (a single process batches its log rows: the file appears within the flush interval)
+        files = []
+        for _ in range(40):
+            files = [f for f in os.listdir(logs) if f.endswith(".jsonl")] if os.path.isdir(logs) else []
+            if files:
+                break
+            time.sleep(0.1)
+        check("the request log folder and its files are private", os.path.isdir(logs) and mode(logs) == 0o700 and files and all(mode(os.path.join(logs, f)) == 0o600 for f in files), (oct(mode(logs)) if os.path.isdir(logs) else "no logs", files))
+        if server != "http1":
+            tmp = os.environ.get("TMPDIR") or "/tmp"
+            shares = [n for n in os.listdir(tmp) if n.startswith(f"raiju-{gw_b.pid}")]
+            check("the workers' share folder has an unpredictable name and is private (0700)", len(shares) == 1 and _re.fullmatch(rf"raiju-{gw_b.pid}-[0-9a-f]{{16}}", shares[0]) is not None and mode(os.path.join(tmp, shares[0])) == 0o700, shares)
+            check("no predictable /tmp/raiju-<pid> folder is made", not os.path.exists(f"/tmp/raiju-{gw_b.pid}"), f"/tmp/raiju-{gw_b.pid}")
+    finally:
+        gw.terminate()
+        gw_b.terminate()
+        gw.wait()
+        gw_b.wait()
+
+GW_L179 = "http://127.0.0.1:18310"  # object ownership, logs_only reveal, earlier days in the request log
+
+
+def l179_e2e(env):
+    """L179: client.enforce_vk_object_ownership (files and batches belong to the virtual key that created them: another
+    key gets a 404, list pages are narrowed, a batch cannot run on another key's file, a batch's output file follows
+    the batch, the records survive a restart); the logs_only reveal mapping (redaction_mapping on GET /api/logs/{id}
+    for a caller holding Logs:Reveal, no-store, never on the list or for a viewer); and the log reads of earlier days
+    (a row from yesterday's file is listed and served after start). Its own gateway (18310), started twice."""
+    import hashlib, shutil
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    d = os.path.join(BUILD, "e2e-l179")
+    shutil.rmtree(d, ignore_errors=True)
+    logs = os.path.join(d, "logs")
+    os.makedirs(logs)
+    # a row of yesterday's, in yesterday's day file (written before the gateway starts: memory then holds today only)
+    yts = time.time() * 1000 - 86400000
+    yrow = {"id": "l179-yesterday", "ts": yts, "request_id": "l179-yesterday", "op": "chat", "provider": "openai", "model": "gpt-4o-mini", "status": 200,
+            "latency_ms": 5.0, "prompt_tokens": 1, "completion_tokens": 1, "cost": 0.0, "cache_hit": False}
+    open(os.path.join(logs, "requests-" + time.strftime("%Y-%m-%d", time.gmtime(yts / 1000)) + ".jsonl"), "w").write(json.dumps(yrow) + "\n")
+    tok = lambda t: hashlib.sha256(t.encode()).hexdigest()
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "logs_store": {"enabled": True, "dir": logs, "content_logging": True},
+        "guardrails": {"enabled": True, "detect": ["email"], "mode": "redact", "apply_to": "both", "logs_only": True},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "l179", "value": "sk-l179-pool", "models": [], "weight": 1.0, "use_for_batch_api": True}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": tok("sk-admin-l179-root")},
+                      {"name": "vi", "role": "viewer", "token_sha256": tok("sk-admin-l179-view")}],
+            "virtual_keys": [{"id": "vk-l179-a", "name": "a", "value": "sk-bf-l179-a"}, {"id": "vk-l179-b", "name": "b", "value": "sk-bf-l179-b"}],
+        },
+    }
+    cfg_path = os.path.join(d, "config.json")
+    json.dump(cfg, open(cfg_path, "w"))
+    A, B = {"x-bf-vk": "sk-bf-l179-a"}, {"x-bf-vk": "sk-bf-l179-b"}
+    root, view = {"authorization": "Bearer sk-admin-l179-root"}, {"authorization": "Bearer sk-admin-l179-view"}
+    api = lambda m, p, b=None, h=None: call(m, p, b, h, base=GW_L179, auth=False)
+    line = json.dumps({"custom_id": "l179-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}}) + "\n"
+
+    def start(tag):
+        g = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18310", "-host", "127.0.0.1", "-config", cfg_path, "-server", server], env=env, stderr=open(os.path.join(BUILD, f"e2e.l179.{tag}.log"), "w"))
+        wait(GW_L179 + "/health")
+        return g
+
+    gw = start("a")
+    fid = bid = out_id = ""
+    try:
+        # ---- enforce_vk_object_ownership (on by default, as in Bifrost) ----
+        s, _, b = mp_form(GW_L179, "/v1/files", [("purpose", None, "text/plain", "batch"), ("file", "l179.jsonl", "application/jsonl", line)], A)
+        fid = json.loads(b).get("id", "") if s == 200 else ""
+        check("ownership: key A uploads a file", s == 200 and fid != "", (s, b[:200]))
+        n = len(seen())
+        s, _, b = api("GET", "/v1/files/" + fid, None, B)
+        check("ownership: another key reading the file gets Bifrost's 404, and the provider is not called",
+              s == 404 and f"file '{fid}' not found" in b and json.loads(b)["error"]["type"] == "access_blocked" and len(seen()) == n, (s, b[:200], len(seen()) - n))
+        s, _, _ = api("GET", "/v1/files/" + fid, None, A)
+        s2, _, _ = api("GET", "/v1/files/" + fid)
+        check("ownership: the creating key and a request with no virtual key read the file", s == 200 and s2 == 200, (s, s2))
+        s, _, b = api("GET", "/v1/files", None, B)
+        sa, _, ba = api("GET", "/v1/files", None, A)
+        ids_b = [x.get("id") for x in json.loads(b).get("data", [])] if s == 200 else None
+        ids_a = [x.get("id") for x in json.loads(ba).get("data", [])] if sa == 200 else []
+        check("ownership: the list page leaves another key's files out", ids_b is not None and fid not in ids_b and fid in ids_a, (s, ids_b, ids_a))
+        s, _, b = api("POST", "/v1/batches", {"input_file_id": fid, "endpoint": "/v1/chat/completions", "completion_window": "24h"}, B)
+        check("ownership: a batch cannot run on another key's file", s == 404 and f"file '{fid}' not found" in b, (s, b[:200]))
+        s, _, b = api("POST", "/v1/batches", {"input_file_id": fid, "endpoint": "/v1/chat/completions", "completion_window": "24h"}, A)
+        bj = json.loads(b) if s == 200 else {}
+        bid, out_id = bj.get("id", ""), bj.get("output_file_id", "")
+        check("ownership: the creating key runs a batch on its file", s == 200 and bid != "" and out_id != "", (s, b[:200]))
+        s1, _, b1 = api("GET", "/v1/batches/" + bid, None, B)
+        s2, _, _ = api("POST", f"/v1/batches/{bid}/cancel", None, B)
+        check("ownership: another key's batch retrieve and cancel are 404", s1 == 404 and f"batch '{bid}' not found" in b1 and s2 == 404, (s1, b1[:200], s2))
+        s, _, _ = api("GET", "/v1/batches/" + bid, None, A)
+        s1, _, _ = api("GET", f"/v1/files/{out_id}/content", None, B)
+        s2, _, b2 = api("GET", f"/v1/files/{out_id}/content", None, A)
+        check("ownership: a batch's output file belongs to the batch's key once a retrieve names it", s == 200 and s1 == 404 and s2 == 200 and "l179-1" in b2, (s, s1, s2, b2[:200]))
+        s, _, b = api("GET", "/v1/batches", None, B)
+        check("ownership: the batch list leaves another key's batch out", s == 200 and bid not in [x.get("id") for x in json.loads(b).get("data", [])], (s, b[:300]))
+
+        # ---- logs_only reveal mapping ----
+        s, _, _ = api("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l179 reveal mail ann.l179@example.com"}]}, {"x-request-id": "req-l179-reveal"})
+        time.sleep(0.3)
+        s1, h1, b1 = api("GET", "/api/logs/req-l179-reveal", None, root)
+        det = json.loads(b1) if s1 == 200 else {}
+        check("reveal: an admin's log detail carries the logs_only mapping by phase, marked no-store",
+              s == 200 and det.get("redaction_mapping", {}).get("input", {}).get("EMAIL-1") == "ann.l179@example.com" and hdr(h1, "cache-control") == "no-store" and "ann.l179@example.com" not in json.dumps({k: v for k, v in det.items() if k != "redaction_mapping"}),
+              (s, s1, b1[:400], hdr(h1, "cache-control")))
+        s2, h2, b2 = api("GET", "/api/logs/req-l179-reveal", None, view)
+        check("reveal: a viewer (no Logs:Reveal) gets the placeholders only", s2 == 200 and "redaction_mapping" not in b2 and "ann.l179@example.com" not in b2 and "[EMAIL-1]" in b2, (s2, b2[:300]))
+        s3, _, b3 = api("GET", "/api/logs?limit=50", None, root)
+        check("reveal: the list never carries the mapping or the original", s3 == 200 and "redaction_mapping" not in b3 and "ann.l179@example.com" not in b3, (s3, b3[:200]))
+
+        # ---- earlier days: yesterday's row is read from its file after the start ----
+        s, _, b = api("GET", "/api/logs?limit=200", None, root)
+        ids = [e.get("id") for e in json.loads(b).get("logs", [])] if s == 200 else []
+        s2, _, b2 = api("GET", "/api/logs/l179-yesterday", None, root)
+        check("earlier days: yesterday's row is listed and served after a start", "l179-yesterday" in ids and s2 == 200 and json.loads(b2).get("id") == "l179-yesterday", (s, ids[:10], s2, b2[:200]))
+    finally:
+        gw.terminate()
+        gw.wait()
+    gw = start("b")
+    try:
+        s, _, b = api("GET", "/v1/batches/" + bid, None, B)
+        s2, _, _ = api("GET", "/v1/batches/" + bid, None, A)
+        check("ownership: the records survive a restart (kept in the logs_store folder)", s == 404 and s2 == 200, (s, b[:200], s2))
+        s, _, b = api("DELETE", "/v1/files/" + fid, None, B)
+        s2, _, b2 = api("DELETE", "/v1/files/" + fid, None, A)
+        s3, _, _ = api("GET", "/v1/files/" + fid, None, B)
+        # (the mock keeps a deleted file's metadata, so once the record is gone another key reaches it again)
+        check("ownership: another key cannot delete the file; the creator can, and the record goes with it", s == 404 and s2 == 200 and s3 == 200, (s, b[:200], s2, b2[:200], s3))
+        s, _, b = api("GET", "/api/logs?limit=200", None, root)
+        ids = [e.get("id") for e in json.loads(b).get("logs", [])] if s == 200 else []
+        check("earlier days: after a restart the list holds today's and yesterday's rows", "l179-yesterday" in ids and "req-l179-reveal" in ids, ids[:10])
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
+def l187_e2e(env):
+    """L187: `raiju -healthcheck [path]`, the image's Docker HEALTHCHECK (the image has no curl). It probes the
+    gateway on this host (-host, -port or PORT) and exits 0 on a 2xx, 1 otherwise; its own gateway (18330), and
+    18331 with nothing listening."""
+    import shutil
+    d = os.path.join(BUILD, "e2e-l187")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    cfg = {"client": {"enable_logging": False, "enforce_auth_on_inference": False},
+           "providers": {"openai": {"keys": [{"name": "hc", "value": "sk-l187", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}}}
+    json.dump(cfg, open(os.path.join(d, "config.json"), "w"))
+    raiju = os.path.join(BUILD, "raiju")
+    gw = subprocess.Popen(cwd=ROOT, args=[raiju, "-app-dir", d, "-port", "18330", "-host", "0.0.0.0", "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l187.log"), "w"))
+    try:
+        wait("http://127.0.0.1:18330/health")
+        def probe(args, extra_env=None):
+            t0 = time.time()
+            p = subprocess.run([raiju, "-healthcheck", *args], env={**env, **(extra_env or {})}, capture_output=True, text=True, timeout=20)
+            return p.returncode, p.stderr, time.time() - t0
+        code, err, _ = probe(["-port", "18330"])
+        check("raiju -healthcheck exits 0 against a running gateway (a 0.0.0.0 bind is probed on 127.0.0.1)", code == 0, (code, err))
+        code, err, _ = probe(["/ready", "-port", "18330", "-host", "0.0.0.0"])
+        check("raiju -healthcheck /ready exits 0 while the gateway is ready", code == 0, (code, err))
+        code, err, _ = probe([], {"PORT": "18330"})
+        check("raiju -healthcheck reads the port from PORT, as the gateway does", code == 0, (code, err))
+        code, err, _ = probe(["/no-such-route", "-port", "18330"])
+        check("raiju -healthcheck exits 1 on an answer that is not 2xx", code == 1 and "HTTP 404" in err, (code, err))
+        code, err, dt = probe(["-port", "18331"])
+        check("raiju -healthcheck exits 1 at once when nothing listens", code == 1 and dt < 5 and "healthcheck" in err, (code, err, dt))
+        s, _, _ = call("GET", "/health", None, None, base="http://127.0.0.1:18330", auth=False)
+        check("the probes leave the gateway serving", s == 200, s)
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
 def main():
     unique_ports()
     build()
@@ -12008,11 +13982,17 @@ def main():
         if name.startswith("e2e") and name.endswith(".json"):
             flag_batch_keys(os.path.join(BUILD, name))
     import shutil
+    # held keys and incidents a gateway kept from an earlier run (L180) would carry into this one
+    for name in os.listdir(BUILD):
+        if name.startswith("e2e") and name.endswith(".adaptive.json"):
+            os.remove(os.path.join(BUILD, name))
     shutil.rmtree(os.path.join(ROOT, "build/e2e-logs"), ignore_errors=True)
     shutil.rmtree(os.path.join(ROOT, "build/e2e-audit"), ignore_errors=True)
     shutil.rmtree(os.path.join(ROOT, "build/e2e-wlogs"), ignore_errors=True)
     shutil.rmtree(os.path.join(ROOT, "build/e2e-chromem"), ignore_errors=True)
     shutil.rmtree(os.path.join(ROOT, "build/e2e-l80-logs"), ignore_errors=True)
+    # every gateway started from here on holds the e2e setup token (see E2E_SETUP); os.environ too, for the ones started from a copy of it
+    os.environ["BIFROST_SETUP_TOKEN"] = E2E_SETUP
     env = {**os.environ, "E2E_OPENAI_KEY": "sk-from-env", "E2E_ADMIN_TOKEN": "admin-secret", "MOCK_PORT": "18099", "RAIJU_WEBRTC_BIND": "127.0.0.1", "MOCK_RTC_BIND": "127.0.0.1"}
     mock = subprocess.Popen([os.path.join(BUILD, "mock_upstream")], env=env, stdout=subprocess.DEVNULL)
     qdrant = subprocess.Popen([sys.executable, os.path.join(ROOT, "tests/qdrant_mock.py"), "18089"])
@@ -13599,6 +15579,11 @@ def main():
         check("weaviate: a near-duplicate from the same key is served from the store", hl(vw2).get("x-bf-cache") == "semantic-hit" and hl(vw1).get("x-bf-cache") != "semantic-hit", (vw1, vw2))
         check("weaviate: another virtual key does not see the entry (identity scoping)", hl(vw3).get("x-bf-cache") != "semantic-hit", vw3)
         check("weaviate: the schema, objects and nearVector queries reach the server", {"method": "POST", "path": "/v1/schema"} in wc and {"method": "POST", "path": "/v1/objects"} in wc and {"method": "POST", "path": "/v1/graphql"} in wc, wc[-5:])
+        # clear-by-key on Weaviate: a batch delete by the cache_key property, as Bifrost's DeleteAll
+        s, _, b = call("DELETE", "/api/cache/clear-by-key/vs-e2e", None, {}, base="http://127.0.0.1:18110", auth=False)
+        _, vw4, _ = vs_chat(18110, "openai/gpt-4o-mini", "sk-bf-a", "what is the capital of france?")
+        wc = json.loads(call("GET", "/_calls", base="http://127.0.0.1:18114")[2])
+        check("weaviate: clear-by-key deletes the key's entries in the store", s == 200 and hl(vw4).get("x-bf-cache") != "semantic-hit" and {"method": "DELETE", "path": "/v1/batch/objects"} in wc, (s, b[:200], vw4, wc[-4:]))
         _, vp1, _ = vs_chat(18111, "openai/gpt-4o-mini", "sk-bf-a", "what is the capital of france")
         _, vp2, _ = vs_chat(18111, "openai/gpt-4o-mini", "sk-bf-a", "what is the capital of france?")
         check("pinecone: a near-duplicate is served from the index", hl(vp2).get("x-bf-cache") == "semantic-hit" and hl(vp1).get("x-bf-cache") != "semantic-hit", (vp1, vp2))
@@ -13607,6 +15592,10 @@ def main():
         check("pinecone: a response with tool calls is not kept", hl(vt1).get("x-bf-cache") != "semantic-hit" and hl(vt2).get("x-bf-cache") != "semantic-hit", (vt1, vt2))
         pc = json.loads(call("GET", "/_calls", base="http://127.0.0.1:18115")[2])
         check("pinecone: upserts and queries reach the index", {"method": "POST", "path": "/vectors/upsert"} in pc and {"method": "POST", "path": "/query"} in pc, pc[-5:])
+        # clear-by-key on Pinecone: a delete by metadata filter
+        s, _, b = call("DELETE", "/api/cache/clear-by-key/vs-e2e", None, {}, base="http://127.0.0.1:18111", auth=False)
+        _, vp3, _ = vs_chat(18111, "openai/gpt-4o-mini", "sk-bf-a", "what is the capital of france?")
+        check("pinecone: clear-by-key deletes the key's entries in the index", s == 200 and hl(vp3).get("x-bf-cache") != "semantic-hit", (s, b[:200], vp3))
         _, vc1, _ = vs_chat(18112, "openai/gpt-4o-mini", "sk-bf-a", "what is the capital of france")
         _, vc2, _ = vs_chat(18112, "openai/gpt-4o-mini", "sk-bf-b", "what is the capital of france?")
         check("chromem: with disable_identity_scoping another key's entry is served", hl(vc2).get("x-bf-cache") == "semantic-hit" and hl(vc1).get("x-bf-cache") != "semantic-hit", (vc1, vc2))
@@ -13998,7 +15987,7 @@ def main():
                 return None
         loc = ""
         try:
-            urllib.request.build_opener(NoRedirect).open(auth_url, timeout=10)
+            urllib.request.build_opener(NoRedirect, SetupTokenHandler).open(auth_url, timeout=10)
         except urllib.error.HTTPError as e:
             loc = e.headers.get("location", "")
         lu = urllib.parse.urlparse(loc)
@@ -14328,6 +16317,8 @@ def main():
         l134b_e2e(env)
         # L166: MCP management (SSE heartbeats, OpenAPI YAML/$ref/security and spec_url, the library, ping, tool cost, Responses, project MCP access): its own gateway
         l166_e2e(env)
+        # L177: MCP agent mode on Responses, OpenAPI 3.2 querystring and form styles: its own gateway
+        l177_e2e(env)
         # L138: A2A push state shared by the workers of a node, exactly-once relay across workers: their own gateway
         l138_e2e(env)
         # L148: A2A over gRPC: the lf.a2a.v1 listener, the agent named by the authority, the key from the metadata, the eleven methods (go client): their own gateway
@@ -14349,6 +16340,9 @@ def main():
         # L147: the token_exchange admin credential renewed once across two workers, and once across two cluster nodes (sealed through the cluster state)
         l147_workers_e2e(env)
         l147_cluster_e2e(env)
+        # L185: a config change reaches every worker before the API answers, and the other cluster node (config_sync
+        # "pull"); a log or audit folder that cannot be written stops the start; default folders in the app dir (18326, 18327)
+        l185_e2e(env)
         # audio billing: speech by its characters, transcriptions and translations by their usage, the log rows and the budgets: their own gateway
         l144_e2e(env)
         # L169: streamed transcriptions, Sarvam's audio, refused and failed audio logged, a second response.create refused,
@@ -14372,6 +16366,9 @@ def main():
         # the WP6 remainder: fallback pre hooks, cache-hit post hooks, chunk skip, /mcp and Bedrock frame hooks, batch and file
         # hooks, the mocker's remainders, jsonparser on Responses, placement from the API, telemetry user_name: its own gateway
         l170_e2e(env)
+        # L176: the plugin pipeline's remainders (Responses lifecycle and cached contents hooked, a body over 4 MiB through the
+        # transport hooks, a stream's error event through post_hook, late post hook spans exported): its own gateway (18304)
+        l176_e2e(env)
         # serving the web UI: the embedded build and RAIJU_UI_DIR: their own gateways
         l113_ui_e2e(env)
         # network_config pool knobs and upstream HTTP/2 (Tov patch 0007): origins from tov-patches/tests/h2_server.py, their own gateway
@@ -14391,6 +16388,9 @@ def main():
         # L162: Bedrock streams of large requests converted live, large completions sent as chat and Titan embeddings streamed,
         # Gemini transcription cost: its own gateway
         l162_e2e(env)
+        # L178: large Responses streams converted live, disable_store, the stream label from the answer, Replicate and compat on
+        # large completions: its own gateway (18308)
+        l178_e2e(env)
         # L153: crew routing (crew/<pool> models, the task headers, the assign API, the task detail): its own gateways
         l153_e2e(env)
         # L154: crew outcomes, learning, budget pacing and the sequential layer: its own gateways
@@ -14411,6 +16411,35 @@ def main():
         # L173: provider leftovers (Bedrock text streams, OpenAI-shaped decisions, Mantle, Replicate, cache points, alias
         # overrides, listings): its own gateway (18296)
         l173_e2e(env)
+        # L174: inference compatibility leftovers (extra params on converted bodies, auto_inject placement, listings with
+        # every key and regex: entries, the Anthropic count route, Vertex pools, Stability extras, the mocker on
+        # Responses, streamed stop reasons): its own gateway (18300)
+        l174_e2e(env)
+        # L183: the server lifecycle (SIGTERM drain, /ready, header/idle/body timeouts, the connection cap; Tov patch
+        # 0012): its own gateways (18322, 18323)
+        l183_e2e(env)
+        # L175: editable built-in roles, plugin PUT merge and genuine-auth check, quota per-model usage, profile audit lists,
+        # vMCP reverse lookup, member usage, user budget overrides: its own gateways (18302, 18303)
+        l175_e2e(env)
+        # L182: the log store's batched writes, segments and disk cap: its own gateway (18320)
+        l182_e2e(env)
+        # L186: outbound safety (address spellings, resolved hosts, pinned plugin downloads, provider base_url): its own gateway (18328)
+        l186_e2e(env)
+        # L180: JWT algorithms, provider ranking, model parameters, the complexity session, fallback and vector store,
+        # pinned and restored held keys: its own gateway (18312) and Qdrant mock (18313)
+        l180_e2e(env)
+        # L181: Gemini streamed transcription, Claude on Azure, use_anthropic_endpoints, Bedrock's Mantle surface, SCIM
+        # claims and token rotation: its own gateways (18314, 18315)
+        l181_e2e(env)
+        l181_scim_e2e(env, idp_state)
+        # L179: provider files and batches bound to their creating virtual key, the logs_only reveal mapping, and
+        # log reads of earlier days after a restart: its own gateway (18310)
+        l179_e2e(env)
+        # L184: secure defaults (the locked /api, bounded metric labels, owned job ids, the masked-key round trip, private
+        # files and share folder, MCP denied to a key without mcp_configs, WebRTC off): its own gateways (18324, 18325)
+        l184_e2e(env)
+        # L187: raiju -healthcheck, the image's Docker HEALTHCHECK: its own gateway (18330; 18331 stays closed)
+        l187_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

@@ -161,6 +161,10 @@ fails the same way.
 **Workaround in Raiju**: copy what the closure needs into locals that are not changed afterwards
 (`upUrl`, a fresh `upHeaders` map) before making the closure (`src/realtimecalls.tov`).
 
+**Seen again**: a `let grant: Grant` that is changed after closures capture it fails the same way
+("incomplete type 'R…_Grant'"). Raiju builds the record once with a conditional and binds it with
+`const` instead.
+
 ---
 
 ## C4. A class instance held only through an interface-typed field is freed while in use

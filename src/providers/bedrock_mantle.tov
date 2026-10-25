@@ -8,7 +8,8 @@ import * as openai from "./openai"
 import * as anthropic from "./anthropic"
 import { AwsCreds, signV4 } from "../cloud_auth"
 import { signRequest } from "./bedrock"
-import { BedrockKeyConfig, ProviderPromptCacheConfig } from "../config"
+import { BedrockKeyConfig, ProviderPromptCacheConfig, AliasTarget } from "../config"
+import { resolveFamily } from "./anthropic_route"
 import { ChatRequest } from "../schemas"
 
 const DEFAULT_REGION = "us-east-1"
@@ -84,6 +85,47 @@ export function chatRequestAt(t: Target, body: Field[], nowMs: f64, autoCache?: 
   if (anth) text = try messagesText(body, sel.model, t.cfg.prompt_cache, autoCache)
   else text = withModel(body, sel.model)
   return try postAt(t, sel.region, path, text, anth, nowMs)
+}
+
+// The geographic and global inference-profile prefixes (Bifrost's bedrockCrossRegionPrefixes): such ids exist only on
+// bedrock-runtime.
+const CROSS_REGION_PREFIXES = ["us-gov", "us", "eu", "apac", "au", "jp", "in", "global"]
+
+function alnum(s: string): bool {
+  if (s === "") return false
+  for (const c of s.chars()) {
+    if (!"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".includes(c)) return false
+  }
+  return true
+}
+
+// The resource type of an ARN ("application-inference-profile"), or "" when it is not one.
+function arnResourceType(arn: string): string {
+  if (!arn.startsWith("arn:")) return ""
+  const parts = arn.split(":")
+  if (parts.length < 6) return ""
+  const res = parts.slice(5).join(":")
+  let end = res.byteLength
+  const sl = res.indexOf("/")
+  const co = res.indexOf(":")
+  if (sl >= 0 && sl < end) end = sl
+  if (co >= 0 && co < end) end = co
+  return res.slice(0, end)
+}
+
+// Whether a request to a Bedrock key is served on the Mantle surface (Bifrost's resolveBedrockSurface): never for an
+// application inference profile (the key's or the alias's arn) whose model is a profile resource id, nor for a
+// cross-region id; otherwise the OpenAI family (by the alias's family, else the names), Gemma 4 and Grok
+// (isMantleModel). Bifrost consults its datasheet's bedrock_apis between those rules; Raiju's price table has none, so
+// the family decides.
+export function mantleSurface(t: Target, alias: AliasTarget | undefined, aliasName: string): bool {
+  const bare = splitRegion(t.model).model
+  const arn = t.key.bedrock_key_config?.arn ?? ""
+  if (arnResourceType(arn) === "application-inference-profile" && alnum(bare)) return false
+  for (const p of CROSS_REGION_PREFIXES) {
+    if (bare.startsWith(p + ".")) return false
+  }
+  return resolveFamily(t.model, alias, aliasName) === "openai" || t.model.includes("gemma-4") || t.model.includes("grok")
 }
 
 // Whether a Responses request goes to Mantle's own Responses endpoint: the OpenAI-compatible models (gpt-*, Gemma,
@@ -361,4 +403,27 @@ test("Claude on Mantle applies the provider's cache_control_injection_points", (
   const up = try chatRequestAt(t, body, 0.0)
   expect(up.body.includes(`{"type":"text","text":"three","cache_control":{"type":"ephemeral"}}`)).toBe(true)
   expect(up.body.includes(`{"type":"text","text":"one"}`)).toBe(true)
+})
+
+test("the Mantle surface of a Bedrock key: OpenAI family, Gemma 4 and Grok, unless the id says bedrock-runtime", () => {
+  const on = (model: string, arn: string): bool => {
+    const t: Target = { provider: "bedrock", kind: "bedrock", model: model, key: { value: "", bedrock_key_config: { region: "us-east-1", arn: arn === "" ? undefined : arn } }, cfg: {} }
+    return mantleSurface(t, undefined, model)
+  }
+  expect(on("openai.gpt-oss-120b", "")).toBe(true)
+  expect(on("us-west-2/openai.gpt-5.5", "")).toBe(true)
+  expect(on("google.gemma-4-31b", "")).toBe(true)
+  expect(on("xai.grok-4", "")).toBe(true)
+  expect(on("anthropic.claude-3-haiku-20240307-v1:0", "")).toBe(false)
+  expect(on("meta.llama3-70b", "")).toBe(false)
+  // a cross-region id exists only on bedrock-runtime
+  expect(on("us.openai.gpt-oss-120b", "")).toBe(false)
+  expect(on("global.openai.gpt-5.5", "")).toBe(false)
+  // an application inference profile with a profile resource id is Converse-only; a real model id is not covered by it
+  expect(on("abc12xyz", "arn:aws:bedrock:us-east-1:123:application-inference-profile")).toBe(false)
+  expect(on("openai.gpt-oss-120b", "arn:aws:bedrock:us-east-1:123:application-inference-profile")).toBe(true)
+  // an alias's family decides for an opaque id
+  const t: Target = { provider: "bedrock", kind: "bedrock", model: "my-dep", key: { value: "" }, cfg: {} }
+  expect(mantleSurface(t, { model_id: "my-dep", model_family: "openai" }, "x")).toBe(true)
+  expect(mantleSurface(t, { model_id: "my-dep", model_name: "claude-opus-4-8" }, "x")).toBe(false)
 })

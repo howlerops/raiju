@@ -6,6 +6,7 @@ import { isOpenAICompatible } from "./providers/openai"
 import { Health, pickAdaptive } from "./health"
 import { datasheetProviders } from "./pricing"
 import { aliasLookup, aliasEntry, aliasProblem, aliasProviderProblem, resolveKeyAlias, AliasResult } from "./aliases"
+import { compileRegex, Regex } from "./regex"
 
 export type ModelRef = { provider: string, model: string }
 
@@ -112,6 +113,9 @@ export function aliasProblems(cfg: Config): string[] {
   for (const name of ps.keys()) {
     const keys = ps.get(name)!.keys ?? []
     for (let i = 0; i < keys.length; i++) {
+      // a regex: entry that cannot match (Bifrost refuses the key; here the entry never matches)
+      const rp = regexEntryProblem((keys[i]!.models ?? []).concat(keys[i]!.blacklisted_models ?? []))
+      if (rp !== "") out.push(name + " key " + (keys[i]!.name ?? ("" + i)) + ": " + rp + "; the entry never matches")
       const a = keys[i]!.aliases
       if (a === undefined) continue
       const p = aliasProblem(a, cfg.client?.routing_chain_max_depth)
@@ -124,14 +128,67 @@ export function aliasProblems(cfg: Config): string[] {
   return out
 }
 
+// Compiled regex: list entries by entry text; one that does not compile is kept as undefined.
+class EntryRegexes {
+  items: Map<string, Regex | undefined> = new Map()
+
+  get(entry: string): Regex | undefined {
+    if (this.items.has(entry)) return this.items.get(entry)
+    if (this.items.size >= 512) this.items.clear()
+    let re: Regex | undefined = undefined
+    const pat = entry.slice(6)
+    if (pat !== "" && pat !== "*") {
+      try {
+        re = compileRegex("(?i)^(?:" + pat + ")$")
+      } catch (e) {
+        re = undefined
+      }
+    }
+    this.items.set(entry, re)
+    return re
+  }
+}
+
+const entryRegexes = new EntryRegexes()
+
+// Whether a model or blacklist entry is a "regex:<pattern>" entry (Bifrost's IsRegexEntry).
+export function isRegexEntry(entry: string): bool {
+  return entry.startsWith("regex:")
+}
+
+// Whether a model list or blacklist entry names value, as Bifrost's MatchEntry: a regex: entry is a full,
+// case-insensitive match of its pattern (one that does not compile never matches), any other entry is equal
+// ignoring case.
+export function matchEntry(entry: string, value: string): bool {
+  if (!isRegexEntry(entry)) return entry.toLowerCase() === value.toLowerCase()
+  const re = entryRegexes.get(entry)
+  return re !== undefined && re.test(value)
+}
+
+// The problem with a list's regex: entries ("" when none), as Bifrost's ValidateRegexEntries: an empty pattern,
+// the bare wildcard, or a pattern that does not compile.
+export function regexEntryProblem(entries: string[]): string {
+  for (const e of entries) {
+    if (!isRegexEntry(e)) continue
+    const pat = e.slice(6)
+    if (pat === "") return `regex entry "${e}" has no pattern`
+    if (pat === "*") return `regex entry "${e}" is not a pattern; use a bare "*" to allow or block everything`
+    try {
+      compileRegex("(?i)^(?:" + pat + ")$")
+    } catch (err) {
+      return `regex entry "${e}" does not compile: ${err.message}`
+    }
+  }
+  return ""
+}
+
 // Whether a key's blacklisted_models block a model (a request model name, so an alias by its name): "*" blocks every
-// model, any other entry the model by name, case-insensitively, as Bifrost's BlackList.
+// model, any other entry the model by name, case-insensitively, or by its regex: pattern, as Bifrost's BlackList.
 export function keyBlocks(k: KeyConfig, model: string): bool {
   const bl = k.blacklisted_models
   if (bl === undefined || bl.length === 0) return false
-  const low = model.toLowerCase()
   for (const b of bl) {
-    if (b === "*" || b.toLowerCase() === low) return true
+    if (b === "*" || matchEntry(b, model)) return true
   }
   return false
 }
@@ -145,16 +202,26 @@ export function keyAllows(k: KeyConfig, model: string): bool {
   if (a !== undefined && aliasLookup(a, model) !== undefined) return true
   for (const m of ms) {
     if (m === "*" || m === model) return true
+    if (isRegexEntry(m) && matchEntry(m, model)) return true
   }
   return false
+}
+
+// Whether a key's model listing needs the provider's own listing: an open key, or a model list with a regex: entry
+// (only the provider's models can match it). A key with plain entries lists those names without asking the provider.
+export function listingNeedsUpstream(k: KeyConfig): bool {
+  const ms = (k.models ?? []).filter((m) => m !== "*")
+  return ms.length === 0 || ms.some((m) => isRegexEntry(m))
 }
 
 // A provider's model listing (provider/model ids as its API lists them) through Bifrost's ListModelsPipeline, key by
 // key, the results joined: a model an alias of the key targets is listed under the alias name as well as its own; a
 // model the key blacklists is dropped (by either name); and the key's aliases its listing did not match are added
-// back. A key with a model list lists those models (minus its blacklist), as Bifrost lists a restricted allow list.
-// keys are the provider's keys; none (a keyless provider) lists the ids as they are.
-export function listingPipeline(provider: string, ids: string[], keys: KeyConfig[]): string[] {
+// back. A key with a model list lists the provider's models its regex: entries match, then its plain entries (minus
+// its blacklist), as Bifrost lists a restricted allow list. keys are the provider's keys; none (a keyless provider)
+// lists the ids as they are. idsByKey, when given, holds each key's own listing (Bifrost lists with every key);
+// otherwise every key reads ids.
+export function listingPipeline(provider: string, ids: string[], keys: KeyConfig[], idsByKey?: string[][]): string[] {
   if (keys.length === 0) return ids
   const out: string[] = []
   const seen: Set<string> = new Set()
@@ -165,17 +232,15 @@ export function listingPipeline(provider: string, ids: string[], keys: KeyConfig
     out.push(id)
   }
   const pre = provider + "/"
-  for (const k of keys) {
+  for (let ki = 0; ki < keys.length; ki++) {
+    const k = keys[ki]!
     const ms = (k.models ?? []).filter((m) => m !== "*")
-    if (ms.length > 0) {
-      for (const m of ms) {
-        if (!keyBlocks(k, m)) add(m)
-      }
-      continue
-    }
     const a = k.aliases
     const matched: Set<string> = new Set()
-    for (const id of ids) {
+    const included: Set<string> = new Set()
+    // a plain model list does not read the listing
+    const kids: string[] = !listingNeedsUpstream(k) ? [] : idsByKey !== undefined ? (idsByKey[ki] ?? []) : ids
+    for (const id of kids) {
       const bare = id.startsWith(pre) ? id.slice(pre.byteLength) : id
       const names: string[] = []
       if (a !== undefined) {
@@ -189,8 +254,18 @@ export function listingPipeline(provider: string, ids: string[], keys: KeyConfig
       }
       names.push(bare)
       for (const n of names) {
-        if (!keyBlocks(k, n)) add(n)
+        if (keyBlocks(k, n)) continue
+        if (ms.length > 0 && !ms.some((m) => matchEntry(m, n))) continue
+        add(n)
+        included.add(n.toLowerCase())
       }
+    }
+    if (ms.length > 0) {
+      // the plain entries are models of this key whether or not the listing named them
+      for (const m of ms) {
+        if (!isRegexEntry(m) && !included.has(m.toLowerCase()) && !keyBlocks(k, m)) add(m)
+      }
+      continue
     }
     // the aliases the provider's listing did not name are still models of this key
     if (a !== undefined) {
@@ -233,9 +308,10 @@ export function healthId(provider: string, k: KeyConfig, index: int): string {
 }
 
 // Breaker-aware choice: keys whose breaker is open are skipped, the rest are
-// weighted by measured health when `adaptive` is set, else by static weight. Under adaptive load
-// balancing a key held by a provider's refusal (holds.tov) is skipped too.
-function pickHealthy(provider: string, keys: KeyConfig[], model: string, exclude: Set<int>, health: Health, adaptive: bool): int {
+// weighted by measured health when `weighted` is set (adaptive key selection, Bifrost's route_selection_enabled),
+// else by static weight. Under adaptive load balancing (`adaptive`) a key held by a provider's refusal (holds.tov) is
+// skipped too, whichever way the keys are weighted.
+function pickHealthy(provider: string, keys: KeyConfig[], model: string, exclude: Set<int>, health: Health, adaptive: bool, weighted: bool): int {
   const now = Date.now()
   const tried: Set<int> = new Set()
   for (const i of exclude.values()) tried.add(i)
@@ -275,7 +351,7 @@ function pickHealthy(provider: string, keys: KeyConfig[], model: string, exclude
       return heldIdx
     }
     let j = -1
-    if (adaptive) j = pickAdaptive(ids, ws, health, now, Math.random())
+    if (weighted) j = pickAdaptive(ids, ws, health, now, Math.random())
     else {
       // static weights; open breakers, held keys and keys already tried are skipped
       const open: Set<int> = new Set()
@@ -315,7 +391,7 @@ export function target(cfg: Config, ref: ModelRef, exclude: Set<int>, pinned: st
   const hc = cfg.health
   const useHealth = health !== undefined && pinned === undefined && hc !== undefined && (hc.circuit_breaker === true || hc.adaptive === true)
   let i: int = -1
-  if (useHealth) i = pickHealthy(ref.provider, keys, ref.model, exclude, health!, hc!.adaptive === true)
+  if (useHealth) i = pickHealthy(ref.provider, keys, ref.model, exclude, health!, hc!.adaptive === true, hc!.adaptive === true && hc!.route_selection !== false)
   else i = pickKey(keys, ref.model, exclude, pinned)
   if (i < 0) return undefined
   const up = resolveAlias(keys[i]!, ref.model, cfg.client?.routing_chain_max_depth)
@@ -327,7 +403,7 @@ export function target(cfg: Config, ref: ModelRef, exclude: Set<int>, pinned: st
 // The key a request to an alias is sent with: the alias's provider overrides replace the key's own settings, as
 // Bifrost's per-alias AliasConfig overrides the key-level defaults. Each applies to its provider's keys only:
 // api_version and endpoint (Azure), region, project_id, project_number and force_single_region (Vertex), region,
-// inference_profile_arn and use_openai_endpoints (Bedrock), region and project_id (Bedrock Mantle) and
+// inference_profile_arn, use_openai_endpoints and project_id (Bedrock, the project on its Mantle surface), region and project_id (Bedrock Mantle) and
 // use_deployments_endpoint (Replicate). Values written "env.NAME" are read from the environment.
 export function aliasOverrides(k: KeyConfig, a: AliasTarget | undefined, kind: string): KeyConfig {
   if (a === undefined) return k
@@ -358,8 +434,9 @@ export function aliasOverrides(k: KeyConfig, a: AliasTarget | undefined, kind: s
     const rg = a.region
     const arn = kind === "bedrock" ? a.inference_profile_arn : undefined
     const oai = kind === "bedrock" ? a.use_openai_endpoints : undefined
-    // the Bedrock project (Mantle's OpenAI-Project / anthropic-workspace-id header)
-    const proj = kind === "bedrock_mantle" ? a.project_id : undefined
+    // the Bedrock project (Mantle's OpenAI-Project / anthropic-workspace-id header; a Bedrock key sends it when the request
+    // is served on the Mantle surface, providers/bedrock_mantle.tov mantleSurface)
+    const proj = a.project_id
     if ((rg !== undefined && rg !== "") || (arn !== undefined && arn !== "") || oai !== undefined || (proj !== undefined && proj !== "")) {
       let bk = n.bedrock_key_config ?? {}
       if (rg !== undefined && rg !== "") bk.region = resolveEnv(rg)
@@ -437,9 +514,20 @@ export function directRefs(cfg: Config, refs: ModelRef[], pinned: bool, health: 
   const ok = (r: ModelRef): bool => directionHealthy(cfg, r, health, now)
   const broken = !ok(first)
   if (pinned && !o.append && !(o.reroute && broken)) return refs
-  const candidates = eligibleProviders(cfg, first.model).filter((n) => n !== first.provider).map((n) => ({ provider: n, model: first.model }))
+  // the other providers for the model, best measured first (config order among equals)
+  const candidates = rankDirections(cfg, eligibleProviders(cfg, first.model).filter((n) => n !== first.provider).map((n) => ({ provider: n, model: first.model })), health, now)
+  // every provider for the model, ranked the same way; the provider the request resolved to wins a tie
+  const pool = rankDirections(cfg, [first].concat(candidates), health, now)
   let primary = first
-  if (broken && (!pinned || o.reroute)) {
+  if (!pinned) {
+    // a request that names no provider takes the best healthy one
+    for (const c of pool) {
+      if (ok(c)) {
+        primary = c
+        break
+      }
+    }
+  } else if (broken && o.reroute) {
     for (const c of candidates) {
       if (ok(c)) {
         primary = c
@@ -453,10 +541,45 @@ export function directRefs(cfg: Config, refs: ModelRef[], pinned: bool, health: 
     if (o.prune && !ok(f)) continue
     if (!has(f)) out.push(f)
   }
-  for (const c of candidates) {
+  for (const c of pool) {
     if (ok(c) && !has(c)) out.push(c)
   }
   return out
+}
+
+// A direction's measured performance: the best of its usable keys (closed breaker, not held) by success rate
+// squared over latency (health.tov performance). -1 when none has been measured yet.
+export function directionScore(cfg: Config, ref: ModelRef, health: Health, now: f64): f64 {
+  const p = providerOf(cfg, ref.provider)
+  if (p === undefined) return -1.0
+  const keys = p.keys ?? []
+  let best = -1.0
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i]!
+    if (!keyAllows(k, ref.model)) continue
+    const hid = healthId(ref.provider, k, i)
+    const hs = health.holds.state(hid, ref.model, now)
+    if (hs === "held" || hs === "checking" || !health.wouldAllow(hid, now)) continue
+    const s = health.performance(hid, now)
+    if (s > best) best = s
+  }
+  return best
+}
+
+// Directions ordered by measured performance, best first. One not tried yet ranks first, so a new provider is tried
+// before it is judged; equals keep their order (the config's).
+export function rankDirections(cfg: Config, refs: ModelRef[], health: Health, now: f64): ModelRef[] {
+  const scores: f64[] = refs.map((r) => directionScore(cfg, r, health, now))
+  const idx: int[] = []
+  for (let i = 0; i < refs.length; i++) idx.push(i)
+  const eff = (i: int): f64 => scores[i]! < 0.0 ? 1.0e300 : scores[i]!
+  idx.sort((a: int, b: int): int => {
+    const d = eff(b) - eff(a)
+    if (d > 0.0) return 1
+    if (d < 0.0) return -1
+    return a - b
+  })
+  return idx.map((i) => refs[i]!)
 }
 
 // How an upstream failure is handled.
@@ -548,6 +671,35 @@ test("the model listing goes through each key's aliases and blacklist", () => {
   expect(listingPipeline("p", [], [k3, { value: "k", models: ["a", "c"] }])).toEqual(["p/a", "p/c"])
   // a keyless provider lists as it is
   expect(listingPipeline("p", ["p/x"], [])).toEqual(["p/x"])
+})
+
+test("regex: entries in a key's model list and blacklist", () => {
+  expect(matchEntry("regex:gpt-4.*", "GPT-4o")).toBe(true)
+  expect(matchEntry("regex:gpt-4", "gpt-4o")).toBe(false)
+  expect(matchEntry("regex:(", "(")).toBe(false)
+  expect(matchEntry("GPT-4o", "gpt-4o")).toBe(true)
+  const k: KeyConfig = { value: "k", models: ["regex:gpt-4.*", "extra"], blacklisted_models: ["regex:.*-mini"] }
+  expect(keyAllows(k, "gpt-4o")).toBe(true)
+  expect(keyAllows(k, "gpt-4o-mini")).toBe(false)
+  expect(keyAllows(k, "o3")).toBe(false)
+  expect(keyAllows(k, "extra")).toBe(true)
+  const ids = ["p/gpt-4o", "p/gpt-4o-mini", "p/o3", "p/gpt-4.1"]
+  expect(listingPipeline("p", ids, [k])).toEqual(["p/gpt-4o", "p/gpt-4.1", "p/extra"])
+  expect(listingNeedsUpstream(k)).toBe(true)
+  expect(listingNeedsUpstream({ value: "k", models: ["a"] })).toBe(false)
+  expect(listingNeedsUpstream({ value: "k", models: ["*"] })).toBe(true)
+  // a regex blacklist on an open key
+  expect(listingPipeline("p", ids, [{ value: "k", models: [], blacklisted_models: ["regex:gpt-.*"] }])).toEqual(["p/o3"])
+  expect(regexEntryProblem(["a", "regex:gpt-.*"])).toBe("")
+  expect(regexEntryProblem(["regex:"])).toBe(`regex entry "regex:" has no pattern`)
+  expect(regexEntryProblem(["regex:*"]).includes("bare")).toBe(true)
+  expect(regexEntryProblem(["regex:(ab"]).includes("does not compile")).toBe(true)
+})
+
+test("each key's own listing is read and the results joined", () => {
+  const k1: KeyConfig = { value: "a", models: [] }
+  const k2: KeyConfig = { value: "b", models: [], blacklisted_models: ["y"] }
+  expect(listingPipeline("p", [], [k1, k2], [["p/x"], ["p/x", "p/y", "p/z"]])).toEqual(["p/x", "p/z"])
 })
 
 test("parses provider-prefixed and bare models", () => {
@@ -671,6 +823,55 @@ test("adaptive weights favor the faster key", () => {
   }
   // weights 1.0 vs 0.1: about 91% fast
   expect(fast > 850).toBe(true)
+})
+
+test("route selection off picks keys by static weight and still skips held keys", () => {
+  const cfg: Config = { providers: new Map(), health: { adaptive: true, route_selection: false } }
+  cfg.providers!.set("openai", { keys: [{ name: "fast", value: "1" }, { name: "slow", value: "2" }, { name: "held", value: "3" }] })
+  const h = new Health()
+  const now = Date.now()
+  for (let i = 0; i < 20; i++) {
+    h.record("openai#fast", true, 100.0, now)
+    h.record("openai#slow", true, 1000.0, now)
+  }
+  h.holds.settle("openai#held", "m", "refused", "credential", "key rejected", undefined, now, 0.5)
+  const none: Set<int> = new Set()
+  let fast = 0
+  let held = 0
+  for (let i = 0; i < 1000; i++) {
+    const n = target(cfg, { provider: "openai", model: "m" }, none, undefined, h)!.t.key.name
+    if (n === "fast") fast += 1
+    if (n === "held") held += 1
+  }
+  // equal static weights: about half each, where adaptive weights would send about 91% to fast
+  expect(fast > 400 && fast < 600).toBe(true)
+  expect(held).toBe(0)
+})
+
+test("directions: a request naming no provider takes the best measured healthy provider", () => {
+  const cfg: Config = { providers: new Map(), health: { adaptive: true } }
+  cfg.providers!.set("openai", { keys: [{ name: "o", value: "1", models: ["gpt-x"] }] })
+  cfg.providers!.set("groq", { keys: [{ name: "g", value: "2", models: ["gpt-x"] }] })
+  cfg.providers!.set("azure", { keys: [{ name: "a", value: "3", models: ["gpt-x"] }] })
+  const h = new Health()
+  const now = Date.now()
+  const o = directionOpts(cfg)
+  const ref: ModelRef[] = [{ provider: "openai", model: "gpt-x" }]
+  // nothing measured: the resolved provider, then the others in config order
+  expect(directRefs(cfg, ref, false, h, o, now).map((x) => x.provider).join(",")).toBe("openai,groq,azure")
+  // groq answers fastest, openai slower, azure is not tried yet (it goes first, to be measured)
+  for (let i = 0; i < 5; i++) {
+    h.record("openai#o", true, 900.0, now)
+    h.record("groq#g", true, 100.0, now)
+  }
+  expect(directRefs(cfg, ref, false, h, o, now).map((x) => x.provider).join(",")).toBe("azure,groq,openai")
+  expect(directionScore(cfg, { provider: "azure", model: "gpt-x" }, h, now)).toBe(-1.0)
+  // a pinned request keeps its provider
+  expect(directRefs(cfg, ref, true, h, o, now).map((x) => x.provider).join(",")).toBe("openai")
+  // errors count against a provider: groq failing half its requests ranks below a slower clean one
+  for (let i = 0; i < 5; i++) h.record("azure#a", true, 150.0, now)
+  for (let i = 0; i < 4; i++) h.record("groq#g", false, 0.0, now)
+  expect(directRefs(cfg, ref, false, h, o, now).map((x) => x.provider).join(",")).toBe("azure,groq,openai")
 })
 
 test("classifies failures and backs off", () => {

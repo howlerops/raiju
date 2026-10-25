@@ -88,19 +88,52 @@ export function isClaude(model: string): bool {
   return model.startsWith("claude")
 }
 
+// The partner models Google serves only from a multi-region pool: the datasheet's vertex_multi_region_only entries
+// (Bifrost's IsVertexMultiRegionOnlyModel), as of the 2026-10-19 datasheet.
+const MULTI_REGION_ONLY = ["claude-opus-4-7", "claude-opus-4-8", "claude-opus-5"]
+
+// Whether a model is served only from a multi-region pool. A version ("@20260101", "@default") is not part of the name.
+export function isMultiRegionOnly(model: string): bool {
+  let m = model.startsWith("vertex_ai/") ? model.slice(10) : model
+  const at = m.indexOf("@")
+  if (at >= 0) m = m.slice(0, at)
+  return MULTI_REGION_ONLY.includes(m)
+}
+
+// The multi-region pool of a single region (Bifrost's vertexRegionToPool): "us" for us-*, "eu" for europe-*, "" for
+// a region with no pool.
+export function regionPool(region: string): string {
+  if (region.startsWith("us-")) return "us"
+  if (region.startsWith("europe-")) return "eu"
+  return ""
+}
+
+// The location a partner model is called in (Bifrost's getVertexEffectiveRegion): a multi-region-only model in a
+// single region that belongs to a pool is promoted to the pool (its rep.googleapis.com host and location), unless
+// force_single_region keeps the configured region (provisioned throughput).
+export function effectiveRegion(region: string, model: string, forceSingle: bool): string {
+  if (region === "global" || region === "us" || region === "eu") return region
+  if (forceSingle || !isMultiRegionOnly(model)) return region
+  const pool = regionPool(region)
+  return pool === "" ? region : pool
+}
+
 // A model's URL under a publisher ("google" or "anthropic") and method, for the named model. A tuned Gemini model (an
 // all-digit id) is an endpoint of the project, addressed by its project_number under v1beta1, as Bifrost addresses it.
-function vertexModelUrl(t: Target, publisher: string, model: string, method: string): string throws SyntaxError {
+// A partner model (not Google's) is called in its effective region (effectiveRegion, for the request's model, which
+// regionModel names when the URL's model is another, as count-tokens is).
+function vertexModelUrl(t: Target, publisher: string, model: string, method: string, regionModel?: string): string throws SyntaxError {
   const vk = t.key.vertex_key_config
   if (vk === undefined) throw new SyntaxError("vertex: key has no vertex_key_config")
+  const reg = publisher === "google" ? vk.region : effectiveRegion(vk.region, regionModel ?? model, vk.force_single_region === true)
   const b = t.cfg.network_config?.base_url
-  const origin = b === undefined || b === "" ? `https://${host(vk.region)}` : trimSlash(b)
+  const origin = b === undefined || b === "" ? `https://${host(reg)}` : trimSlash(b)
   if (publisher === "google" && isEndpointModel(model)) {
     const num = vk.project_number ?? ""
     if (num === "") throw new SyntaxError("project number is not set for fine-tuned models")
-    return `${origin}/v1beta1/projects/${num}/locations/${vk.region}/endpoints/${model}:${method}`
+    return `${origin}/v1beta1/projects/${num}/locations/${reg}/endpoints/${model}:${method}`
   }
-  return `${origin}/v1/projects/${vk.project_id}/locations/${vk.region}/publishers/${publisher}/models/${model}:${method}`
+  return `${origin}/v1/projects/${vk.project_id}/locations/${reg}/publishers/${publisher}/models/${model}:${method}`
 }
 
 // The model's URL under a publisher ("google" or "anthropic") and method.
@@ -128,7 +161,7 @@ export function countRequest(t: Target, generateBody: string, messagesBody: stri
   if (isClaude(t.model)) {
     let fs = without(try fields(messagesBody), ["model"])
     setField(&fs, "anthropic_version", quote(ANTHROPIC_VERSION))
-    return { url: try vertexModelUrl(t, "anthropic", "count-tokens", "rawPredict"), headers: h, body: build(fs) }
+    return { url: try vertexModelUrl(t, "anthropic", "count-tokens", "rawPredict", t.model), headers: h, body: build(fs) }
   }
   const contents = find(try fields(generateBody), "contents")
   if (contents === undefined) throw new SyntaxError("generateContent body has no contents")
@@ -348,6 +381,21 @@ test("the multi-region locations use their rep hosts, and listing stays on the s
   expect(try vertexUrl(target("claude-sonnet-4@20250514", "us"), "anthropic", "rawPredict")).toBe(
     "https://aiplatform.us.rep.googleapis.com/v1/projects/my-proj/locations/us/publishers/anthropic/models/claude-sonnet-4@20250514:rawPredict")
   expect(vertexHost("eu")).toBe("aiplatform.eu.rep.googleapis.com")
+  // a multi-region-only model is promoted to its region's pool, unless force_single_region keeps the region
+  expect(try vertexUrl(target("claude-opus-4-7@20260416", "us-east5"), "anthropic", "rawPredict")).toBe(
+    "https://aiplatform.us.rep.googleapis.com/v1/projects/my-proj/locations/us/publishers/anthropic/models/claude-opus-4-7@20260416:rawPredict")
+  expect(try vertexUrl(target("claude-opus-5", "europe-west1"), "anthropic", "streamRawPredict")).toBe(
+    "https://aiplatform.eu.rep.googleapis.com/v1/projects/my-proj/locations/eu/publishers/anthropic/models/claude-opus-5:streamRawPredict")
+  expect((try vertexUrl(target("claude-opus-4-7", "asia-east1"), "anthropic", "rawPredict")).startsWith("https://asia-east1-aiplatform.googleapis.com/v1/projects/my-proj/locations/asia-east1/")).toBe(true)
+  expect((try vertexUrl(target("claude-sonnet-4", "us-east5"), "anthropic", "rawPredict")).startsWith("https://us-east5-aiplatform.googleapis.com/")).toBe(true)
+  let forced = target("claude-opus-4-7", "us-east5")
+  forced.key.vertex_key_config!.force_single_region = true
+  expect((try vertexUrl(forced, "anthropic", "rawPredict")).startsWith("https://us-east5-aiplatform.googleapis.com/v1/projects/my-proj/locations/us-east5/")).toBe(true)
+  // count-tokens goes where the model is served
+  const ct = try countRequest(target("claude-opus-4-8", "us-east5"), "{}", `{"model":"m","messages":[]}`)
+  expect(ct.url).toBe("https://aiplatform.us.rep.googleapis.com/v1/projects/my-proj/locations/us/publishers/anthropic/models/count-tokens:rawPredict")
+  expect(effectiveRegion("global", "claude-opus-4-7", false)).toBe("global")
+  expect(isMultiRegionOnly("vertex_ai/claude-opus-4-7@default")).toBe(true)
   expect((try publisherListUrl(target("m", "us"), "google", "")).startsWith("https://aiplatform.googleapis.com/v1beta1/")).toBe(true)
 })
 

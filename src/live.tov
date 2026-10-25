@@ -30,6 +30,11 @@ import { Config, KeyConfig, AliasTarget } from "./config"
 import { SocketExt, upstreamFor, wsBase } from "./realtime"
 import { Grant } from "./governance"
 import { SessionSpec, sessionHooks, sessionGuard } from "./livehooks"
+import { deadline } from "./deadline"
+
+// how long a live session control call and a recording download may take upstream
+const LIVE_CONTROL_MS = 30000
+const LIVE_CONTENT_MS = 120000
 import { Relay, Leg, Exchange, Refusal, UpdateCheck, establish, prepareServerEvents, startClock, withOffer, strAt, withJsonAt, eventType } from "./webrtc"
 
 // How many sessions the registry holds. Past that a new session is refused, not left unrecorded.
@@ -215,6 +220,8 @@ function admitFor(engine: Engine, h: Hdrs): (provider: string, model: string) =>
 // governance admission), and the provider's session id is recorded for the virtual key, so attach and content
 // stay with its owner.
 export async function liveCreate(engine: Engine, reg: LiveRegistry, req: Request): Promise<Response> {
+  const off = webrtcRefusal(engine.cfg)
+  if (off !== undefined) return off
   let webrtc = false
   let model = ""
   let body = ""
@@ -322,6 +329,13 @@ export async function liveCreate(engine: Engine, reg: LiveRegistry, req: Request
   return new Response(reply, { status: 201, headers: out })
 }
 
+// The answer to a WebRTC call while server.webrtc_enabled is off (the default), undefined when it is on. The calls are
+// refused before the body is read, so no SDP reaches the peer's parsers.
+export function webrtcRefusal(cfg: Config): Response | undefined {
+  if (cfg.server?.webrtc_enabled === true) return undefined
+  return errorResponse(403, "WebRTC calls are turned off on this gateway; set server.webrtc_enabled to true to allow them (WebSocket realtime at GET /v1/realtime is not affected)", "permission_error", noHeaders())
+}
+
 // The STUN and TURN servers the gateway's peer connections use (RAIJU_WEBRTC_ICE_SERVERS, comma separated).
 // Bifrost uses none: the connections offer the host's own addresses.
 export function iceServers(): string[] {
@@ -340,9 +354,16 @@ function errorReply400(message: string): Response {
 // The provider's reply to a POST: its status, content type and body. undefined when it can't be reached.
 async function postLive(url: string, hs: Record<string, string>, body: string): Promise<{ status: int, type: string, text: string } | undefined> {
   try {
-    const res = await fetch(url, { method: "POST", headers: hs, body: body })
-    const text = await res.text()
-    return { status: res.status, type: res.headers.get("content-type") ?? "application/json", text: text }
+    const dl = deadline(LIVE_CONTROL_MS)
+    try {
+      const res = await fetch(url, { method: "POST", headers: hs, body: body, signal: dl.controller.signal })
+      const text = await res.text()
+      dl.finish()
+      return { status: res.status, type: res.headers.get("content-type") ?? "application/json", text: text }
+    } catch (e) {
+      dl.finish()
+      throw e
+    }
   } catch (e) {
     console.error(`raiju: ${e.message}`)
     return undefined
@@ -681,8 +702,17 @@ export async function liveContent(engine: Engine, reg: LiveRegistry, req: Reques
   for (const k of up.headers.keys()) hs.set(k, up.headers.get(k)!)
   try {
     // buffered, as media.tov's files are: a streamed upstream body doesn't survive the Bun.serve path
-    const res = await fetch(liveBase(t) + "/v1/live/sessions/" + id + "/content", { method: "GET", headers: hs })
-    const bytes = await res.bytes()
+    const dl = deadline(LIVE_CONTENT_MS)
+    let res: Response | undefined = undefined
+    let bytes: u8[] = []
+    try {
+      const r = await fetch(liveBase(t) + "/v1/live/sessions/" + id + "/content", { method: "GET", headers: hs, signal: dl.controller.signal })
+      bytes = await r.bytes()
+      res = r
+    } finally {
+      dl.finish()
+    }
+    if (res === undefined) return errorResponse(502, "failed to fetch the live session's recording", "api_error", noHeaders())
     const out: Record<string, string> = {}
     out.set("content-type", res.headers.get("content-type") ?? "application/octet-stream")
     return new Response(bytes, { status: res.status, headers: out })
@@ -783,4 +813,11 @@ test("a live session.update's delegated model: the session's provider, the key's
   expect(v.frame).toBe(voice)
   expect(v.model).toBe("")
   expect(delegationRef(cfg, "openai", "nope/x").model).toBe("nope/x")
+})
+
+test("WebRTC calls are refused unless server.webrtc_enabled is set", () => {
+  const off = webrtcRefusal({})
+  expect(off?.status).toBe(403)
+  expect(webrtcRefusal({ server: { webrtc_enabled: false } })?.status).toBe(403)
+  expect(webrtcRefusal({ server: { webrtc_enabled: true } })).toBeUndefined()
 })

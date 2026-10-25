@@ -39,9 +39,13 @@ variable "provider_secret_arns" {
 }
 
 variable "certificate_arn" {
-  description = "ACM certificate for HTTPS. Null serves HTTP only."
+  description = "ACM certificate for HTTPS."
   type        = string
-  default     = null
+}
+
+variable "ingress_cidr_blocks" {
+  description = "Networks allowed to reach the ALB, for example your office or VPN ranges."
+  type        = list(string)
 }
 
 provider "aws" {
@@ -58,13 +62,17 @@ module "raiju" {
   image             = var.image
   certificate_arn   = var.certificate_arn
 
+  ingress_cidr_blocks = var.ingress_cidr_blocks
+
   cpu           = 512
   memory        = 1024
   desired_count = 2
   workers       = 1
 
   # Providers come from environment variables, which Raiju reads without a
-  # config file. No file means the config is not mounted.
+  # config file. No file means the config is not mounted. Add a
+  # BIFROST_SETUP_TOKEN secret to open /api until the first admin is created:
+  # without an admin or a setup token the management API answers 403.
   secret_arns = var.provider_secret_arns
 }
 

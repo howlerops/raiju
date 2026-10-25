@@ -844,14 +844,52 @@ export class CompatPlan {
         this.converted = "responses"
       }
     }
+    this.note(model, changes)
+    const changed = route !== "" || this.dropped.length > 0 || this.toolDrops.length > 0 || changes.length > 0
+    return { body: cur, route: route, changed: changed, text: changed ? build(cur) : "" }
+  }
+
+  private note(model: string, changes: string[]): void {
     this.changes = changes
     if (changes.length > 0) this.warnings.push(`converted param values for model ${model}: ${changes.join(", ")}`)
     // service_tier decides what the caller is billed; dropping it moves the request to the default tier silently
     if (this.dropped.includes("service_tier")) {
       this.warnings.push(`dropped service_tier for model ${model}: the datasheet row does not list service_tier, so the request is served and billed at the provider's default tier`)
     }
-    const changed = route !== "" || this.dropped.length > 0 || this.toolDrops.length > 0 || changes.length > 0
-    return { body: cur, route: route, changed: changed, text: changed ? build(cur) : "" }
+  }
+
+  // Whether the drops or the fits can change a text completion's parameters for this target: its datasheet row lists
+  // the parameters (drops), or gives an output limit (fits).
+  mayShape(provider: string, model: string): bool {
+    if (!this.enabled || this.op !== "completions") return false
+    const sup = this.known.get(provider + "/" + model) ?? unknownSupport()
+    const s = this.settings
+    return (s.dropParams && sup.known) || (s.convertParams && (sup.maxOutput > 0.0 || sup.minOutput > 0.0))
+  }
+
+  // The drops and fits of a text completion, on its parameters alone: what shape does to the body but the endpoint
+  // change, for a large body whose prompt streams past (large_payload_optimization). The endpoint change is reported
+  // as shape reports it.
+  shapeParams(provider: string, kind: string, model: string, body: Field[]): Field[] throws SyntaxError {
+    this.dropped = []
+    this.toolDrops = []
+    this.converted = ""
+    this.changes = []
+    this.warnings = []
+    if (!this.enabled || this.op !== "completions") return body
+    const sup = this.known.get(provider + "/" + model) ?? unknownSupport()
+    const s = this.settings
+    let changes: string[] = []
+    let cur = body
+    if (s.dropParams && sup.known) {
+      const d = dropText(cur, sup)
+      cur = d.body
+      this.dropped = d.dropped
+    }
+    if (s.convertParams) cur = try fitCaps(cur, sup, model, &changes)
+    if (this.routeFor(provider, kind, model) === "chat") this.converted = "chat_completion"
+    this.note(model, changes)
+    return cur
   }
 }
 
@@ -1119,4 +1157,31 @@ test("plan: reasoning with tools goes to Responses when the row refuses it, and 
   const o = try off.shape("openai", "openai", "r", fields(`{"model":"r","messages":[],"temperature":0.3}`))
   expect(o.changed).toBe(false)
   expect(find(o.body, "temperature")).toBe("0.3")
+})
+
+test("the drops and fits of a text completion on its parameters alone, as shape makes them", () => {
+  const row = `{"mode":"completion","max_output_tokens":100,"supported_endpoints":["/v1/completions"],"model_parameters":[{"id":"max_tokens"},{"id":"stop_sequences"}]}`
+  const p = new CompatPlan(settingsOf({}), "completions", false)
+  p.put("openai/small", row)
+  expect(p.mayShape("openai", "small")).toBe(true)
+  // no row: nothing to drop or fit
+  expect(p.mayShape("openai", "other")).toBe(false)
+  const params = try fields(`{"model":"small","max_tokens":500,"temperature":0.3,"stop":["x"],"echo":true}`)
+  const got = try p.shapeParams("openai", "openai", "small", params)
+  const whole = try p.shape("openai", "openai", "small", try fields(`{"model":"small","prompt":"hi","max_tokens":500,"temperature":0.3,"stop":["x"],"echo":true}`))
+  expect(build(got)).toBe(build(whole.body.filter((f) => f.key !== "prompt")))
+  expect(find(got, "max_tokens")).toBe("100")
+  expect(find(got, "temperature")).toBe(undefined)
+  try p.shapeParams("openai", "openai", "small", params)
+  expect(p.dropped).toEqual(["temperature"])
+  expect(p.warnings.length).toBe(1)
+  // a chat-only row reports the endpoint change
+  const q = new CompatPlan(settingsOf({}), "completions", false)
+  q.put("openai/chat-only", `{"mode":"chat","model_parameters":[{"id":"max_tokens"}]}`)
+  try q.shapeParams("openai", "openai", "chat-only", try fields(`{"max_tokens":5}`))
+  expect(q.converted).toBe("chat_completion")
+  // off: unchanged
+  const off = new CompatPlan(settingsOf(undefined), "completions", false)
+  expect(off.mayShape("openai", "small")).toBe(false)
+  expect(build(try off.shapeParams("openai", "openai", "small", params))).toBe(build(params))
 })

@@ -1,41 +1,451 @@
-// Address checks shared by the outbound callers that must not reach internal hosts: webhook
-// endpoints (webhooks.tov) and MCP servers marked require_public_target (mcp.tov). A leaf module,
-// so the callers can import it without a cycle through the config types.
+// Address checks for every outbound URL a user controls: webhook endpoints (webhooks.tov), A2A agents and push
+// callbacks (agents.tov, agentauth.tov, a2agrpcup.tov, a2apush.tov, ops.tov), MCP servers marked
+// require_public_target (mcp.tov, mcpapi.tov), plugin downloads (plugindl.tov), exporters (exporters.tov) and
+// provider base URLs set through the API (providerapi in ops.tov). A leaf module, so the callers can import it
+// without a cycle through the config types.
+//
+// Hosts are parsed the way the resolver reads them, so another spelling of a private address is the same address:
+// IPv4 in inet_aton form (one to four parts, each decimal, 0x hex or 0 octal: 2130706433, 0x7f000001, 0177.0.0.1 and
+// 127.1 are all 127.0.0.1), IPv6 with "::", an embedded dotted quad and a zone, and the IPv6 forms that carry an IPv4
+// address (IPv4-mapped ::ffff:0:0/96, IPv4-compatible ::/96, 6to4 2002::/16, NAT64 64:ff9b::/96 and 64:ff9b:1::/48),
+// which are judged by that IPv4 address. A trailing dot is dropped. The ranges follow Bifrost's core/network/ssrf.go:
+//
+// - blocked (refused whatever the policy and the allowlist say): 0.0.0.0/8 and ::, link-local 169.254.0.0/16 and
+//   fe80::/10 (169.254.169.254 is the cloud metadata service), Teredo 2001::/32, the metadata endpoints outside the
+//   link-local range (100.100.100.200, fd00:ec2::254), and the names metadata.google.internal and metadata.
+// - private (refused unless the caller allows private targets or the allowlist names the host or address): loopback
+//   127.0.0.0/8 and ::1, RFC 1918, carrier-grade NAT 100.64.0.0/10, unique-local fc00::/7, site-local fec0::/10,
+//   multicast and 240.0.0.0/4, and localhost names.
+// - public: the rest.
+//
+// A host name is resolved and every address it resolves to is checked (resolveVerdict), right before each request,
+// so a public name that points at a private address is refused like the address itself.
 
-// Hosts and address ranges that are private or local: loopback, RFC 1918, carrier-grade NAT,
-// IPv6 unique-local and link-local, and localhost names.
-export function isPrivateHost(h: string): bool {
-  if (h === "localhost" || h.endsWith(".localhost") || h === "[::1]" || h === "::1") return true
-  if (h.startsWith("127.") || h.startsWith("10.") || h.startsWith("192.168.")) return true
-  if (h.startsWith("[fc") || h.startsWith("[fd") || h.startsWith("[fe80")) return true
-  if (h.startsWith("172.")) {
-    const second = parseInt(h.split(".")[1] ?? "")
-    if (second !== undefined && second >= 16 && second <= 31) return true
+import * as dns from "node:dns"
+
+export type AddrClass = "public" | "private" | "blocked"
+
+// What a check found: kind "" (the target may be reached), "private", "blocked", "dns" (the name does not resolve)
+// or, from hostVerdict only, "name" (a host name the caller must resolve). detail says which address it was.
+export type Verdict = { kind: string, detail: string }
+
+// How a caller judges targets: private lets private (not blocked) addresses through, loopback lets the loopback
+// addresses through (Bifrost's provider base URLs), and allow lists hosts, addresses and CIDR ranges that may be
+// reached although private (the blocked ranges stay refused).
+export type Policy = { private: bool, loopback: bool, allow: string[] }
+
+export function strictPolicy(allow: string[]): Policy {
+  return { private: false, loopback: false, allow: allow }
+}
+
+export function policyOf(allowPrivate: bool): Policy {
+  return { private: allowPrivate, loopback: false, allow: [] }
+}
+
+const enc = new TextEncoder()
+
+function digitValue(c: int): int {
+  if (c >= 48 && c <= 57) return c - 48
+  if (c >= 97 && c <= 102) return c - 87
+  if (c >= 65 && c <= 70) return c - 55
+  return -1
+}
+
+// One inet_aton part: decimal, 0x hex or 0 octal; -1 when it is not a number or is over 32 bits.
+function partValue(p: string): int {
+  const b = enc.encode(p)
+  if (b.length === 0) return -1
+  let base = 10
+  let i = 0
+  if (b.length >= 2 && int(b[0]!) === 48 && (int(b[1]!) === 120 || int(b[1]!) === 88)) {
+    base = 16
+    i = 2
+  } else if (b.length >= 2 && int(b[0]!) === 48) {
+    base = 8
+    i = 1
   }
-  if (h.startsWith("100.")) {
-    const second = parseInt(h.split(".")[1] ?? "")
-    if (second !== undefined && second >= 64 && second <= 127) return true
+  let v = 0
+  for (; i < b.length; i++) {
+    const d = digitValue(int(b[i]!))
+    if (d < 0 || d >= base) return -1
+    v = v * base + d
+    if (v > 4294967295) return -1
+  }
+  return v
+}
+
+// An IPv4 address in inet_aton form (what getaddrinfo accepts): four bytes, or undefined.
+export function parseIPv4(h: string): int[] | undefined {
+  const parts = h.split(".")
+  if (parts.length < 1 || parts.length > 4) return undefined
+  const vals: int[] = []
+  for (const p of parts) {
+    const v = partValue(p)
+    if (v < 0) return undefined
+    vals.push(v)
+  }
+  const n = vals.length
+  let value = 0
+  for (let j = 0; j < n - 1; j++) {
+    if (vals[j]! > 255) return undefined
+    value = value * 256 + vals[j]!
+  }
+  // the last part fills the bytes the others leave
+  let room = 1
+  for (let j = n - 1; j < 4; j++) room = room * 256
+  const last = vals[n - 1]!
+  if (last >= room) return undefined
+  value = value * room + last
+  return [(value >> 24) & 255, (value >> 16) & 255, (value >> 8) & 255, value & 255]
+}
+
+// A strict dotted quad (the IPv4 tail of an IPv6 address): four decimal parts of at most 255.
+function dottedQuad(s: string): int[] | undefined {
+  const parts = s.split(".")
+  if (parts.length !== 4) return undefined
+  const out: int[] = []
+  for (const p of parts) {
+    const b = enc.encode(p)
+    if (b.length === 0 || b.length > 3) return undefined
+    let v = 0
+    for (const c of b) {
+      const d = int(c) - 48
+      if (d < 0 || d > 9) return undefined
+      v = v * 10 + d
+    }
+    if (v > 255) return undefined
+    out.push(v)
+  }
+  return out
+}
+
+function hexGroup(g: string): int {
+  const b = enc.encode(g)
+  if (b.length === 0 || b.length > 4) return -1
+  let v = 0
+  for (const c of b) {
+    const d = digitValue(int(c))
+    if (d < 0) return -1
+    v = v * 16 + d
+  }
+  return v
+}
+
+// Groups of an IPv6 half ("" is none); the last may be a dotted quad when tail is true. undefined when malformed.
+function groupsOf(s: string, tail: bool): int[] | undefined {
+  const out: int[] = []
+  if (s === "") return out
+  const gs = s.split(":")
+  for (let i = 0; i < gs.length; i++) {
+    const g = gs[i]!
+    if (tail && i === gs.length - 1 && g.includes(".")) {
+      const q = dottedQuad(g)
+      if (q === undefined) return undefined
+      out.push(q[0]! * 256 + q[1]!)
+      out.push(q[2]! * 256 + q[3]!)
+      continue
+    }
+    const v = hexGroup(g)
+    if (v < 0) return undefined
+    out.push(v)
+  }
+  return out
+}
+
+// An IPv6 address (brackets and a zone allowed): sixteen bytes, or undefined.
+export function parseIPv6(raw: string): int[] | undefined {
+  let h = raw
+  if (h.startsWith("[") && h.endsWith("]")) h = h.slice(1, h.byteLength - 1)
+  const zone = h.indexOf("%")
+  if (zone >= 0) h = h.slice(0, zone)
+  if (!h.includes(":")) return undefined
+  const halves = h.split("::")
+  if (halves.length > 2) return undefined
+  let groups: int[] = []
+  if (halves.length === 1) {
+    const g = groupsOf(h, true)
+    if (g === undefined || g.length !== 8) return undefined
+    groups = g
+  } else {
+    const head = groupsOf(halves[0]!, false)
+    const tail = groupsOf(halves[1]!, true)
+    if (head === undefined || tail === undefined || head.length + tail.length > 7) return undefined
+    for (const v of head) groups.push(v)
+    for (let i = head.length + tail.length; i < 8; i++) groups.push(0)
+    for (const v of tail) groups.push(v)
+  }
+  const out: int[] = []
+  for (const g of groups) {
+    out.push((g >> 8) & 255)
+    out.push(g & 255)
+  }
+  return out
+}
+
+// An address in either family as sixteen bytes (IPv4 as ::ffff:a.b.c.d), or undefined for a host name.
+export function parseIP(h: string): int[] | undefined {
+  const c = canonicalHost(h)
+  if (c.includes(":")) return parseIPv6(c)
+  const v4 = parseIPv4(c)
+  if (v4 === undefined) return undefined
+  return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, v4[0]!, v4[1]!, v4[2]!, v4[3]!]
+}
+
+// A host as the resolver sees it: lower case, without brackets or trailing dots.
+export function canonicalHost(h: string): string {
+  let c = h.trim().toLowerCase()
+  if (c.startsWith("[") && c.endsWith("]")) c = c.slice(1, c.byteLength - 1)
+  while (c.endsWith(".")) c = c.slice(0, c.byteLength - 1)
+  return c
+}
+
+function allZero(b: int[], from: int, to: int): bool {
+  for (let i = from; i < to; i++) {
+    if (b[i]! !== 0) return false
+  }
+  return true
+}
+
+// The IPv4 address an IPv6 address carries (mapped, compatible, 6to4, NAT64), or undefined.
+function embeddedV4(b: int[]): int[] | undefined {
+  if (allZero(b, 0, 10) && b[10]! === 255 && b[11]! === 255) return [b[12]!, b[13]!, b[14]!, b[15]!]
+  // IPv4-compatible ::a.b.c.d, but not :: and ::1 themselves
+  if (allZero(b, 0, 12) && !(allZero(b, 12, 15) && b[15]! <= 1)) return [b[12]!, b[13]!, b[14]!, b[15]!]
+  if (b[0]! === 32 && b[1]! === 2) return [b[2]!, b[3]!, b[4]!, b[5]!]
+  if (b[0]! === 0 && b[1]! === 100 && b[2]! === 255 && b[3]! === 155) {
+    if (allZero(b, 4, 12)) return [b[12]!, b[13]!, b[14]!, b[15]!]
+    if (b[4]! === 0 && b[5]! === 1) return [b[6]!, b[7]!, b[9]!, b[10]!]
+  }
+  return undefined
+}
+
+function classV4(a: int, b: int, c: int, d: int): AddrClass {
+  if (a === 0) return "blocked"
+  if (a === 169 && b === 254) return "blocked"
+  if (a === 100 && b === 100 && c === 100 && d === 200) return "blocked"
+  if (a === 127 || a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)) return "private"
+  if (a === 100 && b >= 64 && b <= 127) return "private"
+  if (a >= 224) return "private"
+  return "public"
+}
+
+// The class of an address (sixteen bytes).
+export function addrClass(b: int[]): AddrClass {
+  const v4 = embeddedV4(b)
+  if (v4 !== undefined) return classV4(v4[0]!, v4[1]!, v4[2]!, v4[3]!)
+  if (allZero(b, 0, 16)) return "blocked"
+  if (allZero(b, 0, 15) && b[15]! === 1) return "private"
+  if (b[0]! === 254 && (b[1]! & 192) === 128) return "blocked"
+  if (b[0]! === 32 && b[1]! === 1 && b[2]! === 0 && b[3]! === 0) return "blocked"
+  // fd00:ec2::254, the AWS metadata service over IPv6
+  if (b[0]! === 253 && b[1]! === 0 && b[2]! === 14 && b[3]! === 194 && allZero(b, 4, 14) && b[14]! === 2 && b[15]! === 84) return "blocked"
+  if ((b[0]! & 254) === 252) return "private"
+  if (b[0]! === 254 && (b[1]! & 192) === 192) return "private"
+  if (b[0]! === 255) return "private"
+  return "public"
+}
+
+// Whether an address is on the loopback interface (127.0.0.0/8 or ::1, in any of their spellings).
+export function isLoopbackAddr(b: int[]): bool {
+  const v4 = embeddedV4(b)
+  if (v4 !== undefined) return v4[0]! === 127
+  return allZero(b, 0, 15) && b[15]! === 1
+}
+
+const HEX = "0123456789abcdef"
+
+function hex4(v: int): string {
+  let s = ""
+  let started = false
+  for (let shift = 12; shift >= 0; shift -= 4) {
+    const d = (v >> shift) & 15
+    if (d === 0 && !started && shift > 0) continue
+    started = true
+    s += HEX.slice(d, d + 1)
+  }
+  return s
+}
+
+// An address as text: a dotted quad for IPv4 (mapped included), groups for IPv6.
+export function formatIP(b: int[]): string {
+  if (allZero(b, 0, 10) && b[10]! === 255 && b[11]! === 255) return `${b[12]!}.${b[13]!}.${b[14]!}.${b[15]!}`
+  const gs: string[] = []
+  for (let i = 0; i < 16; i += 2) gs.push(hex4(b[i]! * 256 + b[i + 1]!))
+  return gs.join(":")
+}
+
+function isLocalName(c: string): bool {
+  return c === "localhost" || c.endsWith(".localhost")
+}
+
+function isMetadataName(c: string): bool {
+  return c === "metadata.google.internal" || c === "metadata"
+}
+
+// The class of a host as written: an address literal or a well-known name, or "name" for a host that must be resolved.
+export function hostClass(h: string): string {
+  const c = canonicalHost(h)
+  if (c === "") return "blocked"
+  if (isMetadataName(c)) return "blocked"
+  if (isLocalName(c)) return "private"
+  const b = parseIP(c)
+  if (b === undefined) return "name"
+  return addrClass(b)
+}
+
+// Hosts and address ranges that are private, local or blocked, in any spelling (see hostClass).
+export function isPrivateHost(h: string): bool {
+  const k = hostClass(h)
+  return k === "private" || k === "blocked"
+}
+
+// Link-local, unspecified and cloud metadata addresses and names: refused even when private addresses are allowed.
+export function isMetadataHost(h: string): bool {
+  return hostClass(h) === "blocked"
+}
+
+// Whether an address falls in an allowlist entry that is an address or a CIDR range (a.b.c.d/n or v6/n).
+function inEntry(b: int[], entry: string): bool {
+  const slash = entry.indexOf("/")
+  const addrText = slash >= 0 ? entry.slice(0, slash) : entry
+  const a = parseIP(addrText)
+  if (a === undefined) return false
+  let bits = 128
+  if (slash >= 0) {
+    const n = parseInt(entry.slice(slash + 1))
+    if (n === undefined) return false
+    bits = Math.trunc(n)
+    // an IPv4 prefix length counts within the mapped form
+    if (!addrText.includes(":")) bits = bits + 96
+    if (bits < 0 || bits > 128) return false
+  }
+  // an address carried in an IPv6 form is matched as that IPv4 address
+  const v4 = embeddedV4(b)
+  const m: int[] = v4 === undefined ? b : [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, v4[0]!, v4[1]!, v4[2]!, v4[3]!]
+  for (let i = 0; i < 16; i++) {
+    const left = bits - i * 8
+    if (left <= 0) return true
+    const mask = left >= 8 ? 255 : (255 << (8 - left)) & 255
+    if ((m[i]! & mask) !== (a[i]! & mask)) return false
+  }
+  return true
+}
+
+// Whether the allowlist names the host, or an address or range that holds addr (undefined: the name only).
+export function allowListed(host: string, addr: int[] | undefined, allow: string[]): bool {
+  const c = canonicalHost(host)
+  for (const raw of allow) {
+    const e = canonicalHost(raw)
+    if (e === "") continue
+    if (parseIP(e.split("/")[0]!) === undefined) {
+      if (e === c) return true
+      continue
+    }
+    if (addr !== undefined && inEntry(addr, e)) return true
   }
   return false
 }
 
-// Link-local and cloud metadata addresses: refused even when private addresses are allowed.
-export function isMetadataHost(h: string): bool {
-  return h.startsWith("169.254.") || h === "0.0.0.0" || h === "metadata.google.internal" || h === "fd00:ec2::254"
+// The verdict on one address host resolved to (or is).
+function addrVerdict(host: string, b: int[], p: Policy): Verdict {
+  const cls = addrClass(b)
+  const at = parseIP(host) !== undefined ? formatIP(b) : `${canonicalHost(host)} (${formatIP(b)})`
+  if (cls === "blocked") return { kind: "blocked", detail: at }
+  if (cls === "private" && !p.private && !(p.loopback && isLoopbackAddr(b)) && !allowListed(host, b, p.allow)) return { kind: "private", detail: at }
+  return { kind: "", detail: "" }
 }
 
-// The reason a target URL is refused for a caller that may reach only public addresses, or "".
-// allow lists the hosts that may be reached even when private (oauth_private_allowlist); the
-// metadata addresses are refused whatever the list says.
+// The verdict on the addresses a host resolved to: the first one refused, else fine.
+export function verdictFor(host: string, addrs: int[][], p: Policy): Verdict {
+  if (addrs.length === 0) return { kind: "dns", detail: `${canonicalHost(host)} resolves to no address` }
+  for (const b of addrs) {
+    const v = addrVerdict(host, b, p)
+    if (v.kind !== "") return v
+  }
+  return { kind: "", detail: "" }
+}
+
+// The verdict on a host as written, without resolving it: an address literal or a well-known name is judged, any
+// other name is kind "name".
+export function hostVerdict(host: string, p: Policy): Verdict {
+  const c = canonicalHost(host)
+  if (c === "" || isMetadataName(c)) return { kind: "blocked", detail: c }
+  if (isLocalName(c)) return verdictFor(c, [parseIP("127.0.0.1")!, parseIP("::1")!], p)
+  const b = parseIP(c)
+  if (b === undefined) return { kind: "name", detail: c }
+  return addrVerdict(c, b, p)
+}
+
+// Recent lookups (a few seconds, as the runtime's fetch keeps its own), so a busy caller does not resolve per request.
+type Looked = { addrs: int[][], error: string, at: int }
+const LOOKUP_TTL_MS = 5000
+let lookups: Map<string, Looked> = new Map()
+
+async function lookupAll(c: string): Promise<Looked> {
+  const now = Math.floor(Date.now())
+  const hit = lookups.get(c)
+  if (hit !== undefined && now - hit.at < LOOKUP_TTL_MS) return hit
+  let got: Looked = { addrs: [], error: "", at: now }
+  try {
+    const rows = try await dns.promises.lookup(c, { all: true }) as { address: string }[]
+    for (const r of rows) {
+      const b = parseIP(r.address)
+      if (b !== undefined) got.addrs.push(b)
+    }
+  } catch (e) {
+    got.error = e.message
+  }
+  if (lookups.size > 1024) lookups = new Map()
+  lookups.set(c, got)
+  return got
+}
+
+// The verdict on a host at connect time: a literal or well-known name as hostVerdict judges it, and a name by every
+// address it resolves to now.
+export async function resolveVerdict(host: string, p: Policy): Promise<Verdict> {
+  const v = hostVerdict(host, p)
+  if (v.kind !== "name") return v
+  const got = await lookupAll(v.detail)
+  if (got.error !== "") return { kind: "dns", detail: `${v.detail} does not resolve (${got.error})` }
+  return verdictFor(v.detail, got.addrs, p)
+}
+
+// The connect-time verdict on a URL's host (an unparsable URL is kind "blocked").
+export async function urlVerdict(raw: string, p: Policy): Promise<Verdict> {
+  const u = URL.parse(raw)
+  if (u === undefined) return { kind: "blocked", detail: "url is not a valid URL" }
+  return await resolveVerdict(u.hostname, p)
+}
+
+// The usual wording of a refused verdict ("" when it is fine).
+export function verdictText(v: Verdict): string {
+  if (v.kind === "") return ""
+  if (v.kind === "private") return `url points at a private address: ${v.detail}`
+  if (v.kind === "blocked") return `link-local and metadata addresses are not allowed: ${v.detail}`
+  if (v.kind === "dns") return `url host cannot be checked: ${v.detail}`
+  return ""
+}
+
+// The reason a target URL is refused for a caller that may reach only public addresses, or "", judged as written
+// (resolveVerdict also resolves names). allow lists the hosts, addresses and CIDR ranges that may be reached even when
+// private (oauth_private_allowlist, plugin_download_private_allowlist); the blocked ranges are refused whatever the
+// list says.
 export function targetProblem(raw: string, allow: string[]): string {
   const u = URL.parse(raw)
   if (u === undefined) return "url is not a valid URL"
-  const host = u.hostname
-  if (isMetadataHost(host)) return "link-local and metadata addresses are not allowed"
-  if (allow.includes(host)) return ""
-  if (isPrivateHost(host)) return "url points at a private address"
+  const v = hostVerdict(u.hostname, strictPolicy(allow))
+  if (v.kind === "blocked") return "link-local and metadata addresses are not allowed"
+  if (v.kind === "private") return "url points at a private address"
   return ""
 }
+
+// The connect-time form of targetProblem: names are resolved and each address is checked.
+export async function resolvedTargetProblem(raw: string, allow: string[]): Promise<string> {
+  const v = await urlVerdict(raw, strictPolicy(allow))
+  return verdictText(v)
+}
+
+// ---- tests ----
 
 test("target URLs must be public unless the host is allowed", () => {
   expect(targetProblem("https://mcp.example.com/mcp", [])).toBe("")
@@ -54,4 +464,91 @@ test("private and metadata hosts", () => {
   expect(isPrivateHost("mcp.example.com")).toBe(false)
   expect(isMetadataHost("169.254.169.254")).toBe(true)
   expect(isMetadataHost("10.0.0.1")).toBe(false)
+})
+
+test("numeric IPv4 spellings are the address they name (the audit's bypasses)", () => {
+  for (const h of ["2130706433", "0x7f000001", "0177.0.0.1", "127.1", "127.0.1", "0x7f.1", "017700000001", "127.0.0.1.", "LOCALHOST", "localhost."]) {
+    expect(isPrivateHost(h)).toBe(true)
+    expect(targetProblem(`http://${h}/`, [])).toBe("url points at a private address")
+  }
+  expect(formatIP(parseIP("2130706433")!)).toBe("127.0.0.1")
+  expect(formatIP(parseIP("0x0a.0x1.2.3")!)).toBe("10.1.2.3")
+  expect(formatIP(parseIP("192.168.257")!)).toBe("192.168.1.1")
+  expect(parseIPv4("256.1.1.1")).toBe(undefined)
+  expect(parseIPv4("1.2.3.4.5")).toBe(undefined)
+  expect(parseIPv4("08.1.1.1")).toBe(undefined)
+  expect(parseIPv4("4294967296")).toBe(undefined)
+  expect(parseIPv4("example")).toBe(undefined)
+  expect(hostClass("0")).toBe("blocked")
+  expect(hostClass("0.0.0.0")).toBe("blocked")
+  expect(hostClass("0.1.2.3")).toBe("blocked")
+  expect(hostClass("2852039166")).toBe("blocked") // 169.254.169.254
+  expect(hostClass("100.100.100.200")).toBe("blocked")
+  expect(hostClass("metadata.google.internal.")).toBe("blocked")
+  expect(hostClass("8.8.8.8")).toBe("public")
+  expect(hostClass("134744072")).toBe("public") // 8.8.8.8
+  expect(hostClass("example.com")).toBe("name")
+  expect(hostClass("1.2.3.4.example.com")).toBe("name")
+})
+
+test("IPv6 forms, IPv4 carried in IPv6, and the blocked ranges", () => {
+  expect(hostClass("[::1]")).toBe("private")
+  expect(hostClass("[0:0:0:0:0:0:0:1]")).toBe("private")
+  expect(hostClass("[::]")).toBe("blocked")
+  expect(hostClass("[::ffff:127.0.0.1]")).toBe("private")
+  expect(hostClass("[::ffff:7f00:1]")).toBe("private")
+  expect(hostClass("[::ffff:169.254.169.254]")).toBe("blocked")
+  expect(hostClass("[::127.0.0.1]")).toBe("private")
+  expect(hostClass("[2002:a9fe:a9fe::1]")).toBe("blocked") // 6to4 of 169.254.169.254
+  expect(hostClass("[64:ff9b::10.0.0.1]")).toBe("private")
+  expect(hostClass("[fe80::1%25eth0]")).toBe("blocked")
+  expect(hostClass("[FD00::1]")).toBe("private")
+  expect(hostClass("[fd00:ec2::254]")).toBe("blocked")
+  expect(hostClass("[fec0::1]")).toBe("private")
+  expect(hostClass("[2001:0:4136:e378:8000:63bf:3fff:fdd2]")).toBe("blocked") // Teredo
+  expect(hostClass("[ff02::1]")).toBe("private")
+  expect(hostClass("[2606:4700::1111]")).toBe("public")
+  expect(hostClass("[2001:4860::8888]")).toBe("public")
+  expect(parseIPv6("1::2::3")).toBe(undefined)
+  expect(parseIPv6("1:2:3:4:5:6:7:8:9")).toBe(undefined)
+  expect(parseIPv6("12345::1")).toBe(undefined)
+  expect(formatIP(parseIP("::ffff:10.0.0.1")!)).toBe("10.0.0.1")
+  expect(formatIP(parseIP("2001:db8::1")!)).toBe("2001:db8:0:0:0:0:0:1")
+})
+
+test("allowlists name hosts, addresses and CIDR ranges; blocked addresses stay refused", () => {
+  const p = strictPolicy(["10.0.0.0/8", "internal.example", "fd12::/16", "192.168.1.5"])
+  expect(hostVerdict("10.9.9.9", p).kind).toBe("")
+  expect(hostVerdict("0x0a090909", p).kind).toBe("")
+  expect(hostVerdict("[::ffff:10.1.1.1]", p).kind).toBe("")
+  expect(hostVerdict("11.0.0.1", p).kind).toBe("")
+  expect(hostVerdict("172.16.0.1", p).kind).toBe("private")
+  expect(hostVerdict("[fd12::9]", p).kind).toBe("")
+  expect(hostVerdict("[fd13::9]", p).kind).toBe("private")
+  expect(hostVerdict("192.168.1.5", p).kind).toBe("")
+  expect(hostVerdict("192.168.1.6", p).kind).toBe("private")
+  expect(hostVerdict("internal.example", p).kind).toBe("name")
+  expect(verdictFor("internal.example.", [parseIP("10.0.0.1")!], strictPolicy(["internal.example"])).kind).toBe("")
+  expect(verdictFor("other.example", [parseIP("172.16.0.1")!], strictPolicy(["internal.example"])).kind).toBe("private")
+  expect(hostVerdict("169.254.169.254", strictPolicy(["169.254.0.0/16"])).kind).toBe("blocked")
+  expect(hostVerdict("169.254.169.254", { private: true, loopback: true, allow: [] }).kind).toBe("blocked")
+})
+
+test("resolved names: every address is checked; private policies and loopback", () => {
+  const pub = parseIP("93.184.216.34")!
+  const priv = parseIP("10.0.0.7")!
+  const v = verdictFor("rebind.example", [pub, priv], strictPolicy([]))
+  expect(v.kind).toBe("private")
+  expect(v.detail).toBe("rebind.example (10.0.0.7)")
+  expect(verdictFor("ok.example", [pub], strictPolicy([])).kind).toBe("")
+  expect(verdictFor("meta.example", [parseIP("169.254.169.254")!], policyOf(true)).kind).toBe("blocked")
+  expect(verdictFor("lan.example", [priv], policyOf(true)).kind).toBe("")
+  expect(verdictFor("none.example", [], policyOf(true)).kind).toBe("dns")
+  const prov: Policy = { private: false, loopback: true, allow: [] }
+  expect(hostVerdict("127.0.0.1", prov).kind).toBe("")
+  expect(hostVerdict("2130706433", prov).kind).toBe("")
+  expect(hostVerdict("localhost", prov).kind).toBe("")
+  expect(hostVerdict("10.0.0.1", prov).kind).toBe("private")
+  expect(hostVerdict("0.0.0.0", prov).kind).toBe("blocked")
+  expect(verdictText(hostVerdict("0x7f000001", strictPolicy([])))).toBe("url points at a private address: 127.0.0.1")
 })

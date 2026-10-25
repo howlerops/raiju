@@ -11,7 +11,7 @@ import { InstructionPart, aggregate, commentBlock } from "./mcpinstructions"
 type UserReply = { status: int, contentType: string, body: string, sid: string }
 import { fields, elements, find, rawStr, rawBool, rawNum, quote, build, setField, isNull, decodeString } from "./json"
 import { deadline } from "./deadline"
-import { targetProblem } from "./netguard"
+import { resolvedTargetProblem } from "./netguard"
 import { OpenApiConfig, OpenApiCred, OpenApiDoc, OpenApiOp, OpRequest, parseSpec, inputSchema, requestFor, callOperation, toolDescription, baseUrlOf, operationServersCover, specInstructions, specFilePath } from "./openapi"
 import { readFileSync } from "node:fs"
 
@@ -85,13 +85,28 @@ export type CodeLimitsIn = {
 
 export type McpTlsConfig = { insecure_skip_verify?: bool, ca_cert_pem?: string }
 
-// The header values one virtual key submitted for one per_user_headers client (Bifrost's per-user
-// headers credential). Its values are sealed in the saved file.
-export type McpUserCredential = { id: string, mcp_client_name: string, virtual_key_id: string, headers: Map<string, string>, updated_at: f64 }
+// The header values one caller submitted for one per_user_headers client (Bifrost's per-user headers
+// credential). The caller is a virtual key (vk mode), an x-bf-mcp-session-id (session_id, session mode) or the
+// user of a user-mode MCP token (user_id, user mode); the fields of the other modes are empty. Its values are
+// sealed in the saved file.
+export type McpUserCredential = { id: string, mcp_client_name: string, virtual_key_id: string, session_id?: string, user_id?: string, headers: Map<string, string>, updated_at: f64 }
 
-// A pending submission of those values (Bifrost's per-user headers flow). It expires at expires_at, in
-// epoch milliseconds, and is removed once submitted or revoked.
-export type McpHeaderFlow = { id: string, mcp_client_name: string, virtual_key_id: string, expires_at: f64, created_at: f64 }
+// A pending submission of those values (Bifrost's per-user headers flow), for the same identities. It expires
+// at expires_at, in epoch milliseconds, and is removed once submitted or revoked.
+export type McpHeaderFlow = { id: string, mcp_client_name: string, virtual_key_id: string, session_id?: string, user_id?: string, expires_at: f64, created_at: f64 }
+
+// Whether a credential or flow belongs to this identity (mcpuser.tov identityOf: one of the three is set).
+export function sameHeaderIdentity(rowVk: string, rowSession: string | undefined, rowUser: string | undefined, vk: string, session: string, user: string): bool {
+  return rowVk === vk && (rowSession ?? "") === session && (rowUser ?? "") === user
+}
+
+// The per-user headers one identity submitted for one client; undefined when it has submitted none.
+export function userHeadersFor(creds: McpUserCredential[] | undefined, client: string, vk: string, session: string, user: string): Map<string, string> | undefined {
+  for (const c of creds ?? []) {
+    if (c.mcp_client_name === client && sameHeaderIdentity(c.virtual_key_id, c.session_id, c.user_id, vk, session, user)) return c.headers
+  }
+  return undefined
+}
 
 export type McpConfig = {
   client_configs?: McpClientConfig[],
@@ -118,11 +133,7 @@ export type McpConfig = {
 
 // The per-user headers a virtual key submitted for one client; undefined when it has submitted none.
 export function userHeadersOf(creds: McpUserCredential[] | undefined, client: string, vk: string): Map<string, string> | undefined {
-  const list = creds ?? []
-  for (const c of list) {
-    if (c.mcp_client_name === client && c.virtual_key_id === vk) return c.headers
-  }
-  return undefined
+  return userHeadersFor(creds, client, vk, "", "")
 }
 
 // The names of the clients whose auth_type is per_user_oauth.
@@ -826,6 +837,10 @@ export class McpSession {
     if (this.tokenUrl === "") {
       const urls = discoveryUrls(this.cfg.connection_string ?? "")
       if (urls.length < 2) throw new Error(`${this.cfg.name}: no token_url and no metadata URL`)
+      // the discovery chain reaches public addresses only, or those in oauth_private_allowlist (Bifrost's
+      // SSRF-hardened OAuth discovery client)
+      const pr = await resolvedTargetProblem(urls[1]!, this.allow)
+      if (pr !== "") throw new Error(`${this.cfg.name}: OAuth metadata: ${pr} (add the host to oauth_private_allowlist to allow it)`)
       const dl = deadline(CONNECT_TIMEOUT_MS)
       try {
         const r = await fetch(urls[1]!, { signal: dl.controller.signal })
@@ -882,7 +897,7 @@ export class McpSession {
   private async send(body: string, timeoutMs: int, extra?: Map<string, string>): Promise<Reply> throws Error {
     // require_public_target: every dial must reach a public address, checked on each request
     if (this.cfg.require_public_target === true) {
-      const pr = targetProblem(this.cfg.connection_string ?? "", this.allow)
+      const pr = await resolvedTargetProblem(this.cfg.connection_string ?? "", this.allow)
       if (pr !== "") throw new Error(`${this.cfg.name}: ${pr}`)
     }
     const dl = deadline(timeoutMs)
@@ -1022,7 +1037,7 @@ export class McpSession {
     }
     if (text === "" && specUrl !== "") {
       if (this.cfg.require_public_target === true) {
-        const pr = targetProblem(specUrl, this.allow)
+        const pr = await resolvedTargetProblem(specUrl, this.allow)
         if (pr !== "") throw new Error(`${this.cfg.name}: ${pr}`)
       }
       const dl = deadline(CONNECT_TIMEOUT_MS)
@@ -1086,7 +1101,7 @@ export class McpSession {
       return { text: e.message, isError: true }
     }
     if (this.cfg.require_public_target === true) {
-      const pr = targetProblem(req!.url, this.allow)
+      const pr = await resolvedTargetProblem(req!.url, this.allow)
       if (pr !== "") return { text: `${this.cfg.name}: ${pr}`, isError: true }
     }
     const r = try await callOperation(req!, this.timeoutMs, oc?.max_response_bytes ?? 0)
@@ -1290,7 +1305,7 @@ export class McpSession {
   // request whose reply is parsed (-1 for a notification, which has none).
   private async postAs(base: Map<string, string>, body: string, timeoutMs: int, id: int): Promise<UserReply> throws Error {
     if (this.cfg.require_public_target === true) {
-      const pr = targetProblem(this.cfg.connection_string ?? "", this.allow)
+      const pr = await resolvedTargetProblem(this.cfg.connection_string ?? "", this.allow)
       if (pr !== "") throw new Error(`${this.cfg.name}: ${pr}`)
     }
     const hs: Record<string, string> = base

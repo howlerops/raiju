@@ -312,6 +312,73 @@ export function mergeRendered(texts: string[]): string {
   return out
 }
 
+// ---- bounded label values ----
+// Label values that callers choose (a model name, a path, an x-bf-dim header) would let anyone who can send a request
+// add series without end, which grows memory and /metrics until Prometheus gives up. Each label name keeps at most
+// MAX_LABEL_VALUES distinct values; a new value past that is reported as OTHER_LABEL. Configured names (providers,
+// keys, teams) stay far below the cap, so in practice only junk is folded.
+export const MAX_LABEL_VALUES = 1000
+export const OTHER_LABEL = "other"
+
+// The values one label has reported (a class, so adding to it changes the shared set, not a copy).
+class SeenValues {
+  values: Set<string> = new Set()
+}
+
+const seenValues: Map<string, SeenValues> = new Map()
+
+// The labels a caller names freely on every request (any model name routes to a configured provider): a new value is
+// taken only from a request the provider served, or failed for its own reasons (a rate limit, a server error), not one
+// it refused as unknown or bad (prove), so requests with made-up models add no series; until then it is reported as
+// OTHER_LABEL.
+const PROVEN_LABELS: string[] = ["model", "alias"]
+
+function seenFor(name: string): SeenValues {
+  let seen = seenValues.get(name)
+  if (seen === undefined) {
+    const fresh = new SeenValues()
+    seenValues.set(name, fresh)
+    seen = fresh
+  }
+  return seen
+}
+
+// The value to report for one label: v itself while the label has room for it, else OTHER_LABEL. A label in
+// PROVEN_LABELS reports only values a successful request proved.
+export function bounded(name: string, v: string): string {
+  const seen = seenFor(name)
+  if (seen.values.has(v) || v === "") return v
+  if (PROVEN_LABELS.includes(name)) return OTHER_LABEL
+  if (seen.values.size >= MAX_LABEL_VALUES) return OTHER_LABEL
+  seen.values.add(v)
+  return v
+}
+
+// Records v as a value of name that a successful request used (within the cap).
+export function prove(name: string, v: string): void {
+  const seen = seenFor(name)
+  if (seen.values.has(v) || seen.values.size >= MAX_LABEL_VALUES) return
+  seen.values.add(v)
+}
+
+// The request labels a successful request proves (see PROVEN_LABELS).
+function proveRequest(l: RequestLabels): void {
+  prove("model", l.model)
+  prove("alias", l.alias)
+}
+
+// HTTP methods are a closed set: anything else is OTHER.
+export function methodLabel(m: string): string {
+  return ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "TRACE"].includes(m) ? m : "OTHER"
+}
+
+// Forgets the values seen (tests).
+export function resetBounds(): void {
+  seenValues.clear()
+  labelCache.clear()
+  baseCache.clear()
+}
+
 const labelCache: Map<string, string> = new Map()
 
 // Raiju's own labels (provider, model, status) for the raiju_* families.
@@ -319,8 +386,13 @@ export function labels(provider: string, model: string, status: string): string 
   const k = provider + "\u0000" + model + "\u0000" + status
   const hit = labelCache.get(k)
   if (hit !== undefined) return hit
-  const text = `provider="${esc(provider)}",model="${esc(model)}",status="${esc(status)}"`
-  if (labelCache.size < 100000) labelCache.set(k, text)
+  // these name guardrails, tools and live models too, so they are capped apart from the request labels
+  const p = bounded("raiju_provider", provider)
+  const m = bounded("raiju_model", model)
+  const s = bounded("raiju_status", status)
+  const text = `provider="${esc(p)}",model="${esc(m)}",status="${esc(s)}"`
+  // a folded value is not cached under its own name, so the cache stays as bounded as the labels
+  if (labelCache.size < 100000 && p === provider && m === model && s === status) labelCache.set(k, text)
   return text
 }
 
@@ -431,11 +503,15 @@ export function baseLabels(l: RequestLabels): string {
   if (hit !== undefined) return hit
   const names: string[] = (userLabels ? BASE_NAMES.concat(["user_id", "user_name"]) : BASE_NAMES).concat(customNames)
   let text = ""
+  let folded = false
   for (let i = 0; i < names.length; i++) {
     if (i > 0) text += ","
-    text += `${names[i]!}="${esc(vals[i] ?? "")}"`
+    const raw = vals[i] ?? ""
+    const v = bounded(names[i]!, raw)
+    if (v !== raw) folded = true
+    text += `${names[i]!}="${esc(v)}"`
   }
-  if (baseCache.size < 100000) baseCache.set(k, text)
+  if (baseCache.size < 100000 && !folded) baseCache.set(k, text)
   return text
 }
 
@@ -475,6 +551,7 @@ export function errorTypeForStatus(status: int): string {
 // Feeds bifrost_upstream_requests_total, bifrost_upstream_latency_seconds (is_success),
 // bifrost_success_requests_total or bifrost_error_requests_total, and bifrost_request_retries.
 export function observeRequest(l: RequestLabels, o: Outcome, upstreamSeconds: f64): void {
+  if (o.ok || o.status === 429 || o.status >= 500) proveRequest(l)
   const base = baseLabels(l)
   inc("bifrost_upstream_requests_total", base, 1.0)
   const isSuccess = o.ok ? "true" : "false"
@@ -495,6 +572,7 @@ export type Usage = {
 }
 
 export function observeUsage(l: RequestLabels, u: Usage): void {
+  proveRequest(l)
   const base = baseLabels(l)
   inc("bifrost_input_tokens_total", base, u.input)
   inc("bifrost_output_tokens_total", base, u.output)
@@ -507,6 +585,7 @@ export function observeUsage(l: RequestLabels, u: Usage): void {
 
 // A Bifrost cache hit. cacheType is "direct" or "semantic".
 export function observeCacheHit(l: RequestLabels, cacheType: string): void {
+  proveRequest(l)
   inc("bifrost_cache_hits_total", baseLabels(l) + `,cache_type="${esc(cacheType)}"`, 1.0)
 }
 
@@ -563,8 +642,8 @@ export function observeOverhead(us: f64): void {
 // custom holds the client.prometheus_labels values of the request (httpCustomValues), which the http_*
 // families take after path, method and status, as Bifrost's telemetry plugin does.
 export function observeHttp(path: string, method: string, status: int, durationSeconds: f64, reqBytes: f64, respBytes: f64, custom: string[]): void {
-  let l = `path="${esc(path)}",method="${esc(method)}",status="${status}"`
-  for (let i = 0; i < customNames.length; i++) l += `,${customNames[i]!}="${esc(custom[i] ?? "")}"`
+  let l = `path="${esc(bounded("path", path))}",method="${esc(methodLabel(method))}",status="${status}"`
+  for (let i = 0; i < customNames.length; i++) l += `,${customNames[i]!}="${esc(bounded(customNames[i]!, custom[i] ?? ""))}"`
   inc("http_requests_total", l, 1.0)
   observe("http_request_duration_seconds", l, durationSeconds)
   observe("http_request_size_bytes", l, reqBytes)
@@ -583,7 +662,7 @@ export function observeKeyUp(provider: string, keyId: string, keyName: string, o
 
 // bifrost_key_rotation_events_total: a failed attempt on one key that moved the request to another.
 export function observeRotation(provider: string, model: string, keyId: string, keyName: string, reason: string): void {
-  inc("bifrost_key_rotation_events_total", `provider="${esc(provider)}",requested_model="${esc(model)}",key_id="${esc(keyId)}",key_name="${esc(keyName)}",fail_reason="${esc(reason)}"`, 1.0)
+  inc("bifrost_key_rotation_events_total", `provider="${esc(provider)}",requested_model="${esc(bounded("requested_model", model))}",key_id="${esc(keyId)}",key_name="${esc(keyName)}",fail_reason="${esc(reason)}"`, 1.0)
 }
 
 // bifrost_active_requests: by is +1 when a request starts and -1 when it ends.
@@ -594,21 +673,21 @@ export function activeRequests(method: string, by: f64): void {
 // bifrost_a2a_client_operation_duration_seconds: one call to an upstream agent, by the A2A operation, the wire
 // method, the virtual key and the error type ("" on success). OTLP pushes it under Bifrost's name and keys.
 export function observeA2a(operation: string, method: string, virtualKeyId: string, errorType: string, seconds: f64): void {
-  let labels = `bifrost_a2a_operation_name="${esc(operation)}",a2a_method_name="${esc(method)}"`
-  if (virtualKeyId !== "") labels += `,virtual_key_id="${esc(virtualKeyId)}"`
+  let labels = `bifrost_a2a_operation_name="${esc(bounded("bifrost_a2a_operation_name", operation))}",a2a_method_name="${esc(bounded("a2a_method_name", method))}"`
+  if (virtualKeyId !== "") labels += `,virtual_key_id="${esc(bounded("virtual_key_id", virtualKeyId))}"`
   if (errorType !== "") labels += `,error_type="${esc(errorType)}"`
   observe("bifrost_a2a_client_operation_duration_seconds", labels, seconds)
 }
 
 // bifrost_mcp_client_operation_duration_seconds: one MCP tool call, timed at the client.
 export function observeMcp(client: string, tool: string, errorType: string, seconds: f64): void {
-  observe("bifrost_mcp_client_operation_duration_seconds", `mcp_client="${esc(client)}",mcp_tool_name="${esc(tool)}",mcp_method="tools/call",error_type="${esc(errorType)}"`, seconds)
+  observe("bifrost_mcp_client_operation_duration_seconds", `mcp_client="${esc(bounded("mcp_client", client))}",mcp_tool_name="${esc(bounded("mcp_tool_name", tool))}",mcp_method="tools/call",error_type="${esc(errorType)}"`, seconds)
 }
 
 // ---- crew routing (crew.tov; docs/crew-routing.md) ----
 
 function crewLabels(pool: string, klass: string): string {
-  return `pool="${esc(pool)}",class="${esc(klass)}"`
+  return `pool="${esc(bounded("pool", pool))}",class="${esc(bounded("class", klass))}"`
 }
 
 // A task is given its crew: by a crew/<pool> call with no assignment in force, or by the assign API.
@@ -817,4 +896,20 @@ test("the merge keeps the largest crew gauge and sums the crew counters", () => 
   const a = "# TYPE raiju_crew_lambda gauge\nraiju_crew_lambda{pool=\"p\",class=\"c\"} 1.5\n# TYPE raiju_crew_calls_total counter\nraiju_crew_calls_total{pool=\"p\"} 2\n"
   const b = "# TYPE raiju_crew_lambda gauge\nraiju_crew_lambda{pool=\"p\",class=\"c\"} 1.5\n# TYPE raiju_crew_calls_total counter\nraiju_crew_calls_total{pool=\"p\"} 3\n"
   expect(mergeRendered([a, b])).toBe("# TYPE raiju_crew_lambda gauge\nraiju_crew_lambda{pool=\"p\",class=\"c\"} 1.5\n# TYPE raiju_crew_calls_total counter\nraiju_crew_calls_total{pool=\"p\"} 5\n")
+})
+
+test("a model name becomes a label value only once a request with it succeeds", () => {
+  resetBounds()
+  const bad = newLabels("openai", "made-up-model-x", "chat")
+  observeRequest(bad, { ok: false, status: 404, errorType: "provider_not_found", retries: 0.0 }, 0.01)
+  observeRequest(bad, { ok: false, status: 0, errorType: "provider_connection_failed", retries: 0.0 }, 0.01)
+  expect(render().includes(`model="made-up-model-x"`)).toBe(false)
+  expect(render().includes(`model="other"`)).toBe(true)
+  const good = newLabels("openai", "gpt-real-y", "chat")
+  observeRequest(good, { ok: true, status: 200, errorType: "", retries: 0.0 }, 0.01)
+  expect(render().includes(`model="gpt-real-y"`)).toBe(true)
+  // after a success the model's failures carry its name too
+  observeRequest(good, { ok: false, status: 500, errorType: "provider_server_error", retries: 0.0 }, 0.01)
+  expect(render().includes(`bifrost_error_requests_total{provider="openai",model="gpt-real-y"`)).toBe(true)
+  resetBounds()
 })

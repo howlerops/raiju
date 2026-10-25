@@ -4,7 +4,7 @@
 # 1. The spec is valid OpenAPI 3.1 (openapi-spec-validator when installed) and every $ref resolves.
 # 2. Every operation in the spec is served: a gateway started here answers its method and path
 #    with something other than 405 or the generic "no route" 404.
-# 3. Every /api, /mcp, /health, /metrics and /v1/mcp/tool/execute path the source names (string
+# 3. Every /api, /mcp, /health, /ready, /metrics and /v1/mcp/tool/execute path the source names (string
 #    literals in src/*.tov) that the gateway serves is listed in the spec.
 #
 # Usage: python3 tests/openapi_check.py [path/to/raiju]   (default: build/raiju)
@@ -31,7 +31,7 @@ BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "build", "raiju")
 PORTS = [p for p in range(18190, 18200) if p != 18193]  # 18193 is the e2e UDP beacon port
 METHODS = ["GET", "POST", "PUT", "DELETE"]
 GENERIC_404 = re.compile(r"no route|no such route")
-CANDIDATE = re.compile(r'["`](/(?:api/[^"`\s]*|mcp[^"`\s]*|v1/mcp/tool/execute|health|metrics))')
+CANDIDATE = re.compile(r'["`](/(?:api/[^"`\s]*|mcp[^"`\s]*|v1/mcp/tool/execute|health|ready|metrics))')
 PARAM = re.compile(r"\{[^}]+\}")
 # Known bug, listed in the ledger's LIMITS: GET /api/mcp/virtual answers every method with 200
 # (ops.virtualView ignores the method). Remove an entry when the route rejects the other methods.
@@ -114,10 +114,13 @@ def wait_ready(port, proc):
     sys.exit("the gateway did not answer /health")
 
 
+SETUP_TOKEN = "openapi-check-setup"
+
+
 def probe(port, method, path):
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
     body = None if method == "GET" else ""
-    c.request(method, path, body=body, headers={"content-type": "application/json"})
+    c.request(method, path, body=body, headers={"content-type": "application/json", "x-bifrost-setup-token": SETUP_TOKEN})
     r = c.getresponse()
     data = r.read(4096).decode("utf8", "replace")
     c.close()
@@ -156,7 +159,8 @@ def main():
     workdir = tempfile.mkdtemp(prefix="raiju-openapi-")
     cfg = os.path.join(workdir, "config.json")
     with open(cfg, "w", encoding="utf8") as f:
-        json.dump({"providers": {}, "pricing_sync": {"url": "http://127.0.0.1:9"}}, f)
+        # /api is locked without an admin (Bifrost's setup lock): the probes send this setup token
+        json.dump({"setup_token": SETUP_TOKEN, "providers": {}, "pricing_sync": {"url": "http://127.0.0.1:9"}}, f)
     log = open(os.path.join(workdir, "gateway.log"), "w")
     proc = subprocess.Popen([BIN, "-port", str(port), "-host", "127.0.0.1", "-config", cfg], stderr=log, stdout=log)
     try:

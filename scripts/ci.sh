@@ -8,9 +8,13 @@
 #   openapi    make openapi-check
 #   web        make web-check (the UI bundle and API types are up to date)
 #   parity     the docs/parity.md summary is up to date
+#   configdoc  docs/config-reference.md is up to date (scripts/gen_config_doc.py --check)
+#   deploy     the Dockerfile, compose file and Helm chart (tests/test_deploy.py; helm template needs helm)
 #   e2e-bun    tests/e2e.py on the Bun.serve server
 #   e2e-http1  tests/e2e.py on the HTTP/1.1 server
 #   ui         make ui (headless Chromium through Playwright)
+#   soak       optional, not in the default list: tests/soak/soak.py, a memory soak of one worker that fails
+#              when RSS grows (about two minutes; make soak)
 # scripts/ci.sh tov-key prints the compiler's cache key (Tov's revision, a hash of tov-patches/
 # and scripts/build-tov.sh).
 #
@@ -23,7 +27,7 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 
-ALL=(tov check unit openapi web parity e2e-bun e2e-http1 ui)
+ALL=(tov check unit openapi web parity configdoc deploy e2e-bun e2e-http1 ui)
 
 export TOV=${TOV:-$ROOT/build/tov/target/release/tov}
 export TOV_CFLAGS=${TOV_CFLAGS:--DTV_PLAIN_ALLOC}
@@ -40,21 +44,24 @@ stage_cmd() {
     openapi)   echo 'make openapi-check TOV="$TOV"' ;;
     web)       echo 'make web-check BUN="$BUN"' ;;
     parity)    echo 'python3 scripts/parity_count.py --check && echo "parity: up to date"' ;;
+    configdoc) echo 'python3 scripts/gen_config_doc.py --check' ;;
+    deploy)    echo 'python3 -m unittest -v tests/test_deploy.py' ;;
     # unset, not "bun": tests/e2e.py reads an unset RAIJU_SERVER as the default server in places
     e2e-bun)   echo 'env -u RAIJU_SERVER python3 tests/e2e.py' ;;
     e2e-http1) echo 'RAIJU_SERVER=http1 python3 tests/e2e.py' ;;
     ui)        echo 'make ui TOV="$TOV"' ;;
+    soak)      echo 'make soak TOV="$TOV"' ;;
     *) return 1 ;;
   esac
 }
 
 # the stages that start gateways or mocks on fixed ports
 locked() {
-  case "$1" in openapi|e2e-bun|e2e-http1|ui) return 0 ;; *) return 1 ;; esac
+  case "$1" in openapi|e2e-bun|e2e-http1|ui|soak) return 0 ;; *) return 1 ;; esac
 }
 
 needs_tov() {
-  case "$1" in tov|parity|web) return 1 ;; *) return 0 ;; esac
+  case "$1" in tov|parity|web|configdoc|deploy) return 1 ;; *) return 0 ;; esac
 }
 
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
@@ -74,7 +81,7 @@ STAGES=("$@")
 [ ${#STAGES[@]} -eq 0 ] && STAGES=("${ALL[@]}")
 for s in "${STAGES[@]}"; do
   if ! stage_cmd "$s" >/dev/null; then
-    echo "ci: unknown stage '$s' (stages: ${ALL[*]})" >&2
+    echo "ci: unknown stage '$s' (stages: ${ALL[*]}, and the optional soak)" >&2
     exit 2
   fi
 done

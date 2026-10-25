@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""Run `tov check --json` on files and apply every fix marked "safe".
+"""Run `tov check --json` on files and apply every fix marked "safe"; then flag fetch() calls in src/ that
+have no timeout (scripts/fetch_lint.py).
 
 Usage: scripts/check.py [--no-fix] FILE...
 """
 import re, json, os, subprocess, sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fetch_lint  # noqa: E402
+
+SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src") + os.sep
 
 def run(files):
     out = subprocess.run([os.environ.get("TOV", "tov"), "check", "--json", *files], capture_output=True, text=True).stdout
@@ -49,6 +55,14 @@ def main():
         print(f'{x["code"]} {x["file"]}:{x["start"]["line"]}:{x["start"]["col"]} {x["message"]}')
         for n in x.get("notes", []):
             print(f'    {n["label"]}: {n["text"]}')
-    sys.exit(1 if d["errors"] else 0)
+    # the gateway's own sources: every fetch() has a timeout (scripts/fetch_lint.py)
+    lint_bad = 0
+    for path in files:
+        if not os.path.abspath(path).startswith(SRC):
+            continue
+        for line, col, msg in fetch_lint.problems(path, open(path).read()):
+            print(f"{fetch_lint.CODE} {path}:{line}:{col} {msg}")
+            lint_bad += 1
+    sys.exit(1 if d["errors"] or lint_bad else 0)
 
 main()

@@ -16,7 +16,7 @@ import { a2aHandle, pushV03, knowTask, resubscribeV03 } from "./mock_a2a"
 // size and sha: the request body's length and SHA-256, kept for bodies too big to keep whole (body is then its first 2000 bytes)
 // hdr: the request's x-amz-date, content-length and transfer-encoding, bar-separated (the SigV4 and framing checks of the large request tests)
 // proj: the Bedrock Mantle project headers, OpenAI-Project and anthropic-workspace-id, bar-separated (L173)
-type Seen = { path: string, auth: string, body: string, team: string, tenant: string, size: int, sha: string, hdr?: string, proj?: string }
+type Seen = { path: string, auth: string, body: string, team: string, tenant: string, size: int, sha: string, hdr?: string, proj?: string, ver?: string }
 
 const seen: Seen[] = []
 // webhook deliveries received: the path, the Standard Webhooks headers and the body
@@ -106,7 +106,7 @@ function record(req: Request, path: string, body: string): void {
   const big = size > 65536
   const hdr = (req.headers.get("x-amz-date") ?? "") + "|" + (req.headers.get("content-length") ?? "") + "|" + (req.headers.get("transfer-encoding") ?? "")
   const proj = (req.headers.get("openai-project") ?? "") + "|" + (req.headers.get("anthropic-workspace-id") ?? "")
-  seen.push({ path: path, auth: auth, body: big ? body.slice(0, 2000) : body, team: req.headers.get("x-team") ?? "", tenant: req.headers.get("x-tenant") ?? "", size: size, sha: big ? toHex(sha256(utf8(body))) : "", hdr: hdr, proj: proj })
+  seen.push({ path: path, auth: auth, body: big ? body.slice(0, 2000) : body, team: req.headers.get("x-team") ?? "", tenant: req.headers.get("x-tenant") ?? "", size: size, sha: big ? toHex(sha256(utf8(body))) : "", hdr: hdr, proj: proj, ver: req.headers.get("anthropic-version") ?? "" })
 }
 
 // The raw JSON text of a field of an event, or "".
@@ -131,6 +131,8 @@ function failure(model: string, auth: string): Response | undefined {
   if (auth.includes("bad-key")) return Response.json({ error: { message: "invalid api key", type: "auth" } }, { status: 401 })
   if (model.startsWith("down-")) return Response.json({ error: { message: "upstream down", type: "server" } }, { status: 500 })
   if (model.startsWith("limited-")) return new Response('{"error":{"message":"rate limited","type":"rate_limit"}}', { status: 429, headers: { "content-type": "application/json", "retry-after-ms": "2500" } })
+  // L180: a Google-shaped rate limit whose RetryInfo detail asks for 42 s (the header says 3 s; the body wins)
+  if (model === "l180-retryinfo") return new Response('{"error":{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"42s"}]}}', { status: 429, headers: { "content-type": "application/json", "retry-after": "3" } })
   if (model.startsWith("flaky-")) {
     flakyCalls += 1
     if (flakyCalls % 2 === 1) return Response.json({ error: { message: "overloaded", type: "server" } }, { status: 503 })
@@ -154,7 +156,8 @@ const COMPAT_ROWS = `{
   "strict-mini": {"mode":"chat","max_output_tokens":1000,"model_parameters":[{"id":"max_tokens"},{"id":"max_completion_tokens"},{"id":"tools"},{"id":"tool_choice"},{"id":"stop"}]},
   "chatonly-mini": {"mode":"chat","max_output_tokens":4096,"model_parameters":[{"id":"max_tokens"},{"id":"temperature"},{"id":"top_p"},{"id":"stop"}]},
   "responses-only": {"mode":"responses","supported_endpoints":["/v1/responses"],"max_output_tokens":8000,"model_parameters":[{"id":"max_output_tokens"},{"id":"reasoning_effort"},{"id":"tools"},{"id":"temperature"}]},
-  "reasoning-tools": {"mode":"chat","max_output_tokens":8000,"model_parameters":[{"id":"reasoning_effort"},{"id":"tools"},{"id":"max_tokens"},{"id":"max_completion_tokens"}],"supports_reasoning_with_tool_calls":false}
+  "reasoning-tools": {"mode":"chat","max_output_tokens":8000,"model_parameters":[{"id":"reasoning_effort"},{"id":"tools"},{"id":"max_tokens"},{"id":"max_completion_tokens"}],"supports_reasoning_with_tool_calls":false},
+  "textfit-mini": {"mode":"completion","max_output_tokens":50,"supported_endpoints":["/v1/completions"],"model_parameters":[{"id":"max_tokens"},{"id":"stop"}]}
 }`
 
 function putObject(k: string, body: string): void {
@@ -350,7 +353,8 @@ async function replicateMock(req: Request, path: string, lu: URL | undefined): P
       for (let i = 0; i < n; i++) urls.push("http://127.0.0.1:18099/replicate/out/" + i + ".png")
       return Response.json({ id: id, status: "succeeded", created_at: now, output: urls })
     }
-    const pieces = ["Replicate says: ", prompt]
+    // (a large prompt is not echoed whole: its size is)
+    const pieces = ["Replicate says: ", prompt.byteLength > 65536 ? `a prompt of ${prompt.byteLength} bytes` : prompt]
     return Response.json({ id: id, status: "succeeded", created_at: now, output: pieces, logs: "Input token count: 7\nOutput token count: 4" })
   }
   return jsonBody(JSON.stringify({ detail: "not found" }), 404)
@@ -551,8 +555,20 @@ Bun.serve<string>({
         const model = m.model ?? ""
         const f = failure(model, req.headers.get("authorization") ?? "")
         if (f !== undefined) return f
+        // L180: a key named "l180-slow" answers 300 ms late (the provider level ranks providers by measured latency)
+        if ((req.headers.get("authorization") ?? "").includes("l180-slow")) await new Promise((done) => setTimeout(done, 300))
         // large_payload_optimization: "large-answer" answers with a 3 MB completion, "large-stream" with a 3 MB event stream
         if (model === "large-answer") return Response.json({ id: "cl1", object: "chat.completion", created: 1, model: model, choices: [{ index: 0, message: { role: "assistant", content: "y".repeat(3000000) }, finish_reason: "stop" }], usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 } })
+        // L174: a stream that stops for its length (the stop reason of a streamed answer is logged)
+        if (model === "l174-stream") {
+          const ck = (delta: string, finish: string) => `data: {"id":"cs174","object":"chat.completion.chunk","created":1,"model":"${model}","choices":[{"index":0,"delta":${delta},"finish_reason":${finish}}]}\n\n`
+          return new Response(ck(`{"role":"assistant","content":"cut "}`, "null") + ck(`{"content":"short"}`, "null") + ck(`{}`, `"length"`) + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } })
+        }
+        // L176: a stream that breaks after its first chunk with an error event (the post hooks see the error)
+        if (model === "l176-broken") {
+          const bk = `data: {"id":"cs176","object":"chat.completion.chunk","created":1,"model":"${model}","choices":[{"index":0,"delta":{"role":"assistant","content":"Hel"},"finish_reason":null}]}\n\n`
+          return new Response(bk + `data: {"error":{"message":"upstream broke","type":"server_error"}}\n\n`, { headers: { "content-type": "text/event-stream" } })
+        }
         if (model === "large-stream") {
           const bulk = "z".repeat(1000)
           let sse = ""
@@ -786,9 +802,9 @@ Bun.serve<string>({
         record(req, "/v1/completions", body)
         const m = try JSON.parse(body) as Model
         const model = m.model ?? ""
-        // only the L97s models have a text completion here; the others are not served (the compat tests read that)
-        if (model !== "pii-text" && model !== "block-text") return Response.json({ error: { message: `The model '${model}' does not exist`, type: "invalid_request_error", code: "model_not_found" } }, { status: 404 })
-        const parts = model === "block-text" ? ["a forbidden", " word"] : ["call 555-", "1234 now"]
+        // only the L97s models (and L178's textfit-mini) have a text completion here; the others are not served (the compat tests read that)
+        if (model !== "pii-text" && model !== "block-text" && model !== "textfit-mini") return Response.json({ error: { message: `The model '${model}' does not exist`, type: "invalid_request_error", code: "model_not_found" } }, { status: 404 })
+        const parts = model === "block-text" ? ["a forbidden", " word"] : model === "textfit-mini" ? ["Hi from ", "textfit"] : ["call 555-", "1234 now"]
         if (m.stream === true) {
           const chunk = (text: string, finish: string) => `data: {"id":"tc1","object":"text_completion","created":1,"model":"${model}","choices":[{"index":0,"text":${JSON.stringify(text)},"finish_reason":${finish}}]}\n\n`
           let sse = ""
@@ -819,6 +835,8 @@ Bun.serve<string>({
       // a Bedrock Mantle listing scoped to a project is recorded (L173); the other listings are not
       if ((req.headers.get("openai-project") ?? "") !== "") record(req, "/v1/models", "")
       if (isAnthropic(req)) return Response.json({ data: [{ type: "model", id: "claude-sonnet-4", display_name: "Claude Sonnet 4", created_at: STAMP }], has_more: false, first_id: "claude-sonnet-4", last_id: "claude-sonnet-4" })
+      // L174: the second key of a provider lists one model more (the listing is read with every key)
+      if ((req.headers.get("authorization") ?? "") === "Bearer sk-l174b") return Response.json({ object: "list", data: [{ id: "m-a", object: "model" }, { id: "m-b", object: "model" }, { id: "m-c", object: "model" }] })
       return Response.json({ object: "list", data: [{ id: "m-a", object: "model", created: 1735689600 }, { id: "m-b", object: "model" }] })
     },
     // one model: Anthropic's shape for an x-api-key client, OpenAI's otherwise. "missing" is a 404, and so is
@@ -1017,6 +1035,24 @@ Bun.serve<string>({
         const m = try JSON.parse(body) as Model
         const f = failure(m.model ?? "", req.headers.get("x-api-key") ?? "")
         if (f !== undefined) return f
+        // a slow stream (L178): its first text, then the rest 2 s later (a gateway that buffers holds the first back)
+        if (m.stream === true && (m.model ?? "").includes("l178slow")) {
+          const first = new TextEncoder().encode(`event: message_start\ndata: {"type":"message_start","message":{"id":"msg_s","usage":{"input_tokens":9,"output_tokens":1}}}\n\nevent: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi from "}}\n\n`)
+          const rest = new TextEncoder().encode(`event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"claude"}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n`)
+          const slow = new ReadableStream({
+            start: async (c) => {
+              c.enqueue(first)
+              await new Promise((done) => setTimeout(done, 2000))
+              try {
+                c.enqueue(rest)
+                c.close()
+              } catch (e) {
+                // the client went away
+              }
+            },
+          })
+          return new Response(slow, { headers: { "content-type": "text/event-stream" } })
+        }
         if (m.stream === true) {
           return new Response(`event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":9,"output_tokens":1}}}\n\nevent: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n`, { headers: { "content-type": "text/event-stream" } })
         }
@@ -1052,6 +1088,10 @@ Bun.serve<string>({
           return new Response(op, { headers: { "content-type": "application/json" } })
         }
         if (action.endsWith(":predict")) return Response.json({ predictions: [{ bytesBase64Encoded: "iVBORw0KGgo=" }] })
+        // a streamed transcription (audio inline): the transcript in two chunks, the usage on the last
+        if (action.endsWith(":streamGenerateContent") && body.includes(`"inlineData":{"mimeType":"audio/`)) {
+          return new Response(`data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Hi from "}]}}]}\r\n\r\ndata: {"candidates":[{"content":{"role":"model","parts":[{"text":"gemini stream"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":14,"candidatesTokenCount":4,"totalTokenCount":18}}\r\n\r\n`, { headers: { "content-type": "text/event-stream" } })
+        }
         if (action.endsWith(":streamGenerateContent")) return new Response(GEMINI_SSE, { headers: { "content-type": "text/event-stream" } })
         // image models answer with inline image data; TTS with 16-bit mono PCM at 24 kHz
         if (body.includes(`"IMAGE"`)) return Response.json({ candidates: [{ content: { role: "model", parts: [{ inlineData: { mimeType: "image/png", data: "iVBORw0KGgo=" } }] }, finishReason: "STOP" }] })
@@ -1249,6 +1289,27 @@ Bun.serve<string>({
           sse += sev("response.completed", `{"type":"response.completed","sequence_number":${n + 1},"response":{"id":"resp_p1","status":"completed","output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":${full}}]}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`)
           return new Response(sse, { headers: { "content-type": "text/event-stream" } })
         }
+        // "codeagent-*" and "agent-*" on Responses: a code mode program (or the plain weather tool) is asked for as a
+        // function call; once its output is in the input, the answer says what it returned. A stream sends the call
+        const rmodel = rawStr(try fields(body), "model") ?? ""
+        if (rmodel.startsWith("codeagent-") || rmodel.startsWith("agent-")) {
+          const code = rmodel.startsWith("codeagent-")
+          if (!body.includes(`"function_call_output"`)) {
+            const args = code ? JSON.stringify(JSON.stringify({ code: "result = weather.get_weather(city = \"Oslo\")" })) : JSON.stringify(`{"city":"Oslo"}`)
+            const item = `{"type":"function_call","id":"fc_a","call_id":"call_a","name":"${code ? "executeToolCode" : rmodel === "agent-plain" ? "plain-get_weather" : "weather-get_weather"}","arguments":${args},"status":"completed"}`
+            const done = `{"id":"resp_a1","object":"response","status":"completed","model":"agent","output":[{"type":"reasoning","id":"rs_a","summary":[]},${item}],"usage":{"input_tokens":5,"output_tokens":5,"total_tokens":10}}`
+            if (body.includes(`"stream":true`)) {
+              const aev = (name: string, data: string): string => `event: ${name}\ndata: ${data}\n\n`
+              const sse = aev("response.created", `{"type":"response.created","sequence_number":0,"response":{"id":"resp_a1","status":"in_progress"}}`) +
+                aev("response.output_item.done", `{"type":"response.output_item.done","sequence_number":1,"output_index":0,"item":${item}}`) +
+                aev("response.completed", `{"type":"response.completed","sequence_number":2,"response":${done}}`)
+              return new Response(sse, { headers: { "content-type": "text/event-stream" } })
+            }
+            return new Response(done, { headers: { "content-type": "application/json" } })
+          }
+          const said = body.includes("Sunny in Oslo") ? (code ? "The program says it is sunny in Oslo" : "It is sunny in Oslo") : "no tool result"
+          return Response.json({ id: "resp_a2", object: "response", status: "completed", model: "agent", output: [{ type: "message", id: "msg_a", role: "assistant", status: "completed", content: [{ type: "output_text", text: said }] }], usage: { input_tokens: 9, output_tokens: 5, total_tokens: 14 } })
+        }
         // "json-responses" streams a JSON object in two deltas (the jsonparser checks)
         if (body.includes(`"stream":true`) && body.includes(`"json-responses"`)) {
           const jev = (name: string, data: string): string => `event: ${name}\ndata: ${data}\n\n`
@@ -1272,6 +1333,23 @@ Bun.serve<string>({
           return new Response(sse, { headers: { "content-type": "text/event-stream" } })
         }
         return new Response(`{"id":"resp_1","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"native responses","annotations":[]}]}],"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}`, { headers: { "content-type": "application/json" } })
+      },
+    },
+    // GCP's Security Token Service and IAM Credentials, for Vertex keys federated from an AWS identity (L181)
+    "/wif/sts": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/wif/sts", body)
+        if (!body.includes("subject_token=") || !body.includes("GetCallerIdentity")) return Response.json({ error: "invalid_grant", error_description: "no subject token" }, { status: 400 })
+        return Response.json({ access_token: "fed-token-l181", issued_token_type: "urn:ietf:params:oauth:token-type:access_token", token_type: "Bearer", expires_in: 3600 })
+      },
+    },
+    "/wif/impersonate": {
+      POST: async (req) => {
+        const body = await req.text()
+        record(req, "/wif/impersonate", body)
+        if (req.headers.get("authorization") !== "Bearer fed-token-l181") return Response.json({ error: { code: 401, message: "bad federated token" } }, { status: 401 })
+        return Response.json({ accessToken: "ya29.impersonated-l181", expireTime: "2099-01-01T00:00:00Z" })
       },
     },
     // Google's OAuth token endpoint, for Vertex service-account auth

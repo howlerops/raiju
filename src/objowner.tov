@@ -1,0 +1,297 @@
+// Provider objects bound to the virtual key that created them (Bifrost's client.enforce_vk_object_ownership,
+// plugins/governance/providerjobs.go).
+//
+// Files and batches are created through the operator's provider key, which every virtual key allowed on the
+// provider shares, and are then addressed by the provider's id alone. The create answer records the key that made
+// the object; a read, download, cancel, results or delete call by another key is refused as not found (so the other
+// tenant's object is not confirmed to exist), a batch may not run on another key's input file, and a list page
+// keeps only what the key may see. A request with no virtual key is unrestricted, and an object with no record
+// (created outside the gateway, or before this) stays reachable, as in Bifrost. Creators are recorded while the
+// option is off too, so turning it on binds objects created meanwhile. A batch's output and error files are bound
+// to the batch's creator when a retrieve names them.
+//
+// Records live in memory and, with a directory (the logs_store folder), as one small file each, so the workers of a
+// node share them and they survive a restart. Bifrost keeps them in its config database. Records are keyed by kind
+// and id, not by provider: provider ids are unique, and a record then also holds for every provider name that
+// reaches the same upstream (Bifrost forgets and checks across those names).
+import { readFileSync, existsSync, unlinkSync } from "node:fs"
+import { writeFileAtomic, mkdirPrivate } from "./atomicfile"
+import { sha256, toHex, utf8 } from "./crypto"
+import { Field, fields, elements, find, rawStr, quote, build, setField } from "./json"
+
+// The noun a kind goes by in messages.
+export function objectLabel(kind: string): string {
+  return kind === "batch" ? "batch" : kind === "file" ? "file" : "object"
+}
+
+// The kind of object a batch or file operation (pluginroute.tov storageOp) addresses, or "".
+export function ownerKind(op: string): string {
+  if (op.startsWith("file_")) return "file"
+  if (op.startsWith("batch_")) return "batch"
+  return ""
+}
+
+// Whether an operation addresses one existing object by id (the ones a foreign key is refused on).
+export function addressesObject(op: string): bool {
+  return op === "file_retrieve" || op === "file_content" || op === "file_delete" || op === "batch_retrieve" || op === "batch_cancel" || op === "batch_results" || op === "batch_delete"
+}
+
+// The trailing id of an ARN (a Bedrock job: arn:aws:bedrock:...:model-invocation-job/<id>), or "".
+function arnTail(id: string): string {
+  if (!id.startsWith("arn:")) return ""
+  const parts = id.split("/")
+  return parts.length > 1 ? parts[parts.length - 1]! : ""
+}
+
+// The forms an id is recorded under: as created, and an ARN's trailing job id.
+export function recordForms(id: string): string[] {
+  if (id === "") return []
+  const out = [id]
+  const t = arnTail(id)
+  if (t !== "" && t !== id) out.push(t)
+  return out
+}
+
+// The forms an addressed id may be recorded under: as written, a Google resource name with and without its
+// collection ("files/abc" and "abc"), and an ARN's trailing job id.
+export function lookupForms(kind: string, id: string): string[] {
+  if (id === "") return []
+  const out = recordForms(id)
+  const coll = kind === "file" ? "files/" : kind === "batch" ? "batches/" : ""
+  if (coll !== "" && !id.startsWith("arn:") && !id.startsWith("projects/")) {
+    const bare = id.startsWith(coll) ? id.slice(coll.byteLength) : id
+    for (const f of [bare, coll + bare]) {
+      if (f !== "" && !out.includes(f)) out.push(f)
+    }
+  }
+  return out
+}
+
+export class ObjectOwners {
+  mem: Map<string, string> = new Map()
+  dir = ""
+
+  // Keeps the records in dir as well (made with the first record).
+  useDir(dir: string): void {
+    this.dir = dir
+  }
+
+  private key(kind: string, id: string): string {
+    return kind + "\u0000" + id
+  }
+
+  private file(kind: string, id: string): string {
+    return this.dir + "/" + toHex(sha256(utf8(this.key(kind, id)))) + ".json"
+  }
+
+  // The virtual key recorded for one exact form, or "".
+  private read(kind: string, id: string): string {
+    const k = this.key(kind, id)
+    if (this.dir === "") return this.mem.get(k) ?? ""
+    const p = this.file(kind, id)
+    if (!existsSync(p)) return ""
+    try {
+      return rawStr(try fields(try readFileSync(p, "utf8")), "virtual_key_id") ?? ""
+    } catch (e) {
+      return this.mem.get(k) ?? ""
+    }
+  }
+
+  // The virtual key that created the object an id addresses, or "" when none is recorded.
+  owner(kind: string, id: string): string {
+    for (const f of lookupForms(kind, id)) {
+      const o = this.read(kind, f)
+      if (o !== "") return o
+    }
+    return ""
+  }
+
+  // Records the creating key; an object already recorded keeps its first creator.
+  record(kind: string, id: string, vk: string, now: int): void {
+    if (vk === "") return
+    for (const f of recordForms(id)) {
+      if (this.read(kind, f) !== "") continue
+      this.mem.set(this.key(kind, f), vk)
+      if (this.dir === "") continue
+      try {
+        if (!existsSync(this.dir)) mkdirPrivate(this.dir)
+        writeFileAtomic(this.file(kind, f), `{"kind":${quote(kind)},"id":${quote(f)},"virtual_key_id":${quote(vk)},"created_at":${now}}`)
+      } catch (e) {
+        console.error(`raiju: could not record the creating virtual key of ${objectLabel(kind)} ${f}: ${e.message}`)
+      }
+    }
+  }
+
+  // Forgets an object a delete confirmed gone, under every form.
+  forget(kind: string, id: string): void {
+    for (const f of lookupForms(kind, id)) {
+      this.mem.delete(this.key(kind, f))
+      if (this.dir === "") continue
+      try {
+        const p = this.file(kind, f)
+        if (existsSync(p)) unlinkSync(p)
+      } catch (e) {
+        continue
+      }
+    }
+  }
+}
+
+let ownersInstance: ObjectOwners | undefined = undefined
+
+// The process's owner records (made on first use: top-level statements in imported modules do not run).
+export function objectOwners(): ObjectOwners {
+  let o = ownersInstance
+  if (o === undefined) {
+    o = new ObjectOwners()
+    ownersInstance = o
+  }
+  return o
+}
+
+// The id of an object one item of an answer describes: id (OpenAI, Anthropic), name (Gemini), jobArn (Bedrock),
+// or a nested file's name (a Gemini upload answers {file: {name}}).
+export function itemId(raw: string): string {
+  try {
+    const f = try fields(raw)
+    const id = rawStr(f, "id") ?? rawStr(f, "name") ?? rawStr(f, "jobArn") ?? ""
+    if (id !== "") return id
+    const file = find(f, "file")
+    if (file !== undefined && file.startsWith("{")) return rawStr(try fields(file), "name") ?? ""
+  } catch (e) {
+    return ""
+  }
+  return ""
+}
+
+// The input file a batch create names (OpenAI's input_file_id, Gemini's src.file_name or input_config.file_name),
+// or "".
+export function batchInputFile(body: string): string {
+  try {
+    const f = try fields(body)
+    const direct = rawStr(f, "input_file_id") ?? ""
+    if (direct !== "") return direct
+    for (const outer of ["batch", "src", "input_config", "inputConfig"]) {
+      const o = find(f, outer)
+      if (o === undefined || !o.startsWith("{")) continue
+      const of = try fields(o)
+      const n = rawStr(of, "file_name") ?? rawStr(of, "fileName") ?? ""
+      if (n !== "") return n
+      const src = find(of, "src") ?? find(of, "input_config") ?? find(of, "inputConfig")
+      if (src !== undefined && src.startsWith("{")) {
+        const sf = try fields(src)
+        const m = rawStr(sf, "file_name") ?? rawStr(sf, "fileName") ?? ""
+        if (m !== "") return m
+      }
+    }
+  } catch (e) {
+    return ""
+  }
+  return ""
+}
+
+// The output and error files a batch answer names (OpenAI's output_file_id and error_file_id).
+export function batchFiles(body: string): string[] {
+  const out: string[] = []
+  try {
+    const f = try fields(body)
+    for (const k of ["output_file_id", "error_file_id"]) {
+      const v = rawStr(f, k) ?? ""
+      if (v !== "") out.push(v)
+    }
+  } catch (e) {
+    return out
+  }
+  return out
+}
+
+// A list answer with the items another key created left out, or undefined when nothing is left out. The list is
+// data (OpenAI, Anthropic), files or batches (Gemini) or invocationJobSummaries (Bedrock); pagination cursors are
+// the provider's and stay as they are.
+export function filterList(body: string, kind: string, hidden: (id: string) => bool): string | undefined {
+  try {
+    let f: Field[] = try fields(body)
+    for (const k of ["data", "files", "batches", "operations", "invocationJobSummaries"]) {
+      const arr = find(f, k)
+      if (arr === undefined || !arr.startsWith("[")) continue
+      const kept: string[] = []
+      let dropped = false
+      for (const el of try elements(arr)) {
+        const id = el.startsWith("{") ? itemId(el) : ""
+        if (id !== "" && hidden(id)) dropped = true
+        else kept.push(el)
+      }
+      if (!dropped) return undefined
+      setField(&f, k, "[" + kept.join(",") + "]")
+      return build(f)
+    }
+  } catch (e) {
+    return undefined
+  }
+  return undefined
+}
+
+// The refusal of a foreign object: Bifrost's 404 access_blocked, so the object is not confirmed to exist.
+export function notFoundMessage(kind: string, id: string): string {
+  return `${objectLabel(kind)} '${id}' not found`
+}
+
+// ---- tests ----
+
+test("forms: Gemini resource names, ARNs and plain ids", () => {
+  expect(lookupForms("file", "files/abc").join(",")).toBe("files/abc,abc")
+  expect(lookupForms("file", "abc").join(",")).toBe("abc,files/abc")
+  expect(lookupForms("batch", "batch_1").join(",")).toBe("batch_1,batches/batch_1")
+  expect(recordForms("arn:aws:bedrock:us-east-1:1:model-invocation-job/j9").join(",")).toBe("arn:aws:bedrock:us-east-1:1:model-invocation-job/j9,j9")
+  expect(lookupForms("batch", "arn:aws:bedrock:us-east-1:1:model-invocation-job/j9").length).toBe(2)
+  expect(lookupForms("file", "").length).toBe(0)
+})
+
+test("owners: first creator kept, short forms found, delete forgets", () => {
+  const o = new ObjectOwners()
+  o.record("file", "files/abc", "vk-a", 1)
+  o.record("file", "files/abc", "vk-b", 2)
+  expect(o.owner("file", "abc")).toBe("vk-a")
+  expect(o.owner("file", "files/abc")).toBe("vk-a")
+  expect(o.owner("batch", "abc")).toBe("")
+  o.record("batch", "arn:aws:bedrock:r:1:model-invocation-job/j1", "vk-b", 3)
+  expect(o.owner("batch", "j1")).toBe("vk-b")
+  o.forget("file", "abc")
+  expect(o.owner("file", "files/abc")).toBe("")
+  o.record("file", "x", "", 4)
+  expect(o.owner("file", "x")).toBe("")
+})
+
+test("owners in a directory are shared by two processes", () => {
+  const dir = "/tmp/raiju-objowner-test-" + toHex(sha256(utf8("" + Date.now())))
+  const a = new ObjectOwners()
+  a.useDir(dir)
+  const b = new ObjectOwners()
+  b.useDir(dir)
+  a.record("file", "file-1", "vk-a", 1)
+  expect(b.owner("file", "file-1")).toBe("vk-a")
+  b.forget("file", "file-1")
+  expect(a.owner("file", "file-1")).toBe("")
+})
+
+test("ids of answers and batch inputs", () => {
+  expect(itemId(`{"id":"file-1","object":"file"}`)).toBe("file-1")
+  expect(itemId(`{"file":{"name":"files/g1"}}`)).toBe("files/g1")
+  expect(itemId(`{"name":"batches/b2"}`)).toBe("batches/b2")
+  expect(itemId(`{"jobArn":"arn:x/j"}`)).toBe("arn:x/j")
+  expect(batchInputFile(`{"input_file_id":"file-9","endpoint":"/v1/chat/completions"}`)).toBe("file-9")
+  expect(batchInputFile(`{"batch":{"input_config":{"file_name":"files/g7"}}}`)).toBe("files/g7")
+  expect(batchInputFile(`{"src":{"file_name":"files/g8"}}`)).toBe("files/g8")
+  expect(batchInputFile(`{"requests":[]}`)).toBe("")
+  expect(batchFiles(`{"id":"b","output_file_id":"file-o","error_file_id":null}`).join(",")).toBe("file-o")
+})
+
+test("a list page keeps only the visible items", () => {
+  const body = `{"object":"list","data":[{"id":"file-a"},{"id":"file-b"},{"id":"file-c"}],"has_more":false}`
+  const out = filterList(body, "file", (id: string): bool => id === "file-b")
+  expect(out).toBe(`{"object":"list","data":[{"id":"file-a"},{"id":"file-c"}],"has_more":false}`)
+  expect(filterList(body, "file", (id: string): bool => false)).toBe(undefined)
+  const g = filterList(`{"files":[{"name":"files/x"},{"name":"files/y"}],"nextPageToken":"t"}`, "file", (id: string): bool => id === "files/x")
+  expect(g).toBe(`{"files":[{"name":"files/y"}],"nextPageToken":"t"}`)
+  expect(notFoundMessage("batch", "b1")).toBe("batch 'b1' not found")
+})

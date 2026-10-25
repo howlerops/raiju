@@ -36,7 +36,8 @@ export type ConvOpts = {
   fmt: int,
   // the provider's name for the model (in the body of Anthropic and Cohere)
   model: string,
-  // Anthropic: mark the system prompt and the newest block as cache breakpoints
+  // auto_inject: mark the first cacheable block (text or an image, the system prompt when it comes first) as a cache
+  // breakpoint, as Bifrost's injector places it
   autoCache: bool,
   // the cache_control value of those breakpoints
   cacheMarker: string,
@@ -114,8 +115,9 @@ class ChatWriter {
   private turnRole = ""
   private turnCount = 0
   private blocks = 0
-  // an Anthropic block waiting for its closing brace (the newest one may take a cache_control)
-  private pending = false
+  // auto_inject's breakpoint is placed (on the system prompt when sysAuto)
+  private autoDone = false
+  private sysAuto = false
   // system content held back: raw string pieces (Anthropic) or whole parts (Gemini, Converse)
   private sysFrags: u8[][] = []
   private sysSize = 0
@@ -125,6 +127,10 @@ class ChatWriter {
   private role = ""
   private toolId = ""
   private toolOpen = false
+  // the tool result has content auto_inject can mark (a text part, or a non-empty string), as Bifrost's injector reads it
+  private toolText = false
+  // the same for the text being written: a text part, or a string with something in it (an empty string is skipped)
+  private textHad = false
   private textMode = 0
   private imgMode = 0
   private callNames: Map<string, string> = new Map()
@@ -157,17 +163,26 @@ class ChatWriter {
     return this.role === "assistant" ? "assistant" : "user"
   }
 
-  private closePending(): void {
-    if (this.pending) {
-      this.out.byte(125)
-      this.pending = false
-    }
+  // Whether this cacheable block takes auto_inject's breakpoint (the first one), marking it placed.
+  private takesAuto(): bool {
+    if (!this.o.autoCache || this.autoDone) return false
+    this.autoDone = true
+    return true
+  }
+
+  // A system message's content takes the breakpoint when nothing before it did.
+  private systemSeen(): void {
+    if (this.takesAuto()) this.sysAuto = true
+  }
+
+  // Converse: a cache point after the block just written, when it is the first cacheable one.
+  private conversePoint(): void {
+    if (this.takesAuto()) this.out.text(`,{"cachePoint":{"type":"default"}}`)
   }
 
   // The start of a block (part) in the turn of the message's role: a new turn when the role changes.
   private blockBegin(): void {
     const r = this.turnFor()
-    this.closePending()
     if (this.turnRole === r) {
       if (this.blocks > 0) this.out.byte(44)
     } else {
@@ -181,16 +196,18 @@ class ChatWriter {
     this.blocks += 1
   }
 
-  // The end of an Anthropic block, which was written without its closing brace.
-  private blockEnd(): void {
-    if (this.o.autoCache) this.pending = true
-    else this.out.byte(125)
+  // The end of an Anthropic block, which was written without its closing brace. cacheable: text, an image or a tool
+  // result, which can take auto_inject's breakpoint.
+  private blockEnd(cacheable: bool): void {
+    if (cacheable && this.takesAuto()) this.out.text(`,"cache_control":${this.o.cacheMarker}`)
+    this.out.byte(125)
   }
 
   msgOpen(role: string, id: string): void {
     this.role = role
     this.toolId = id
     this.toolOpen = false
+    this.toolText = false
     this.textMode = 0
     this.imgMode = 0
     if (this.fmt !== F_COHERE) return
@@ -262,19 +279,23 @@ class ChatWriter {
       this.textMode = 5
       return true
     }
+    // a system string takes auto_inject's breakpoint once it has text (textPiece); a text part at once
     if (r === "system") {
       if (this.isA()) {
+        if (typed && !fromString) this.systemSeen()
         this.startHold()
         this.textMode = 2
         return true
       }
       if (!typed) return false
+      if (!fromString) this.systemSeen()
       this.startHold()
       this.hold.text(`{"text":"`)
       this.textMode = 2
       return true
     }
     if (r === "tool") {
+      if (!fromString) this.toolText = true
       this.toolBlock()
       this.textMode = 3
       return true
@@ -283,12 +304,16 @@ class ChatWriter {
     this.blockBegin()
     this.out.text(this.isA() ? `{"type":"text","text":"` : `{"text":"`)
     this.textMode = 1
+    this.textHad = !fromString
     return true
   }
 
   // raw JSON string bytes of the text
   textPiece(raw: u8[]): void throws SyntaxError {
     if (raw.length === 0) return
+    if (this.role === "tool") this.toolText = true
+    if (this.role === "system") this.systemSeen()
+    this.textHad = true
     if (this.fmt === F_COHERE && this.role === "assistant" && !this.hasContent) {
       this.out.text(`,"content":"`)
       this.hasContent = true
@@ -308,9 +333,10 @@ class ChatWriter {
     if (m === 1) {
       if (this.isA()) {
         this.out.byte(34)
-        this.blockEnd()
+        this.blockEnd(this.textHad)
       } else {
         this.out.text(`"}`)
+        if (this.fmt === F_CONVERSE && this.textHad) this.conversePoint()
       }
     } else if (m === 2) {
       if (!this.isA()) this.hold.text(`"}`)
@@ -338,8 +364,10 @@ class ChatWriter {
     const du = try splitData(head)
     if (this.fmt === F_CONVERSE) {
       if (!du.ok || !du.prefix.startsWith("data:image/")) return false
-      if (r === "system") this.startHold()
-      else this.blockBegin()
+      if (r === "system") {
+        this.systemSeen()
+        this.startHold()
+      } else this.blockBegin()
       const semi = du.prefix.indexOf(";")
       const format = du.prefix.slice(11, semi > 0 ? semi : du.prefix.byteLength)
       const d = this.dest()
@@ -385,11 +413,12 @@ class ChatWriter {
     this.imgMode = 0
     if (m === 1) {
       this.out.text(`"}`)
-      this.blockEnd()
+      this.blockEnd(true)
     } else if (m === 2 || m === 3 || m === 5) {
       this.dest().text(`"}}`)
     } else if (m === 4) {
       this.dest().text(`"}}}`)
+      if (!this.holding) this.conversePoint()
     }
     if (this.holding) this.endHold()
   }
@@ -410,7 +439,7 @@ class ChatWriter {
     this.blockBegin()
     if (this.isA()) {
       this.out.text(`{"type":"tool_use","id":${quote(id)},"name":${quote(name)},"input":${input}`)
-      this.blockEnd()
+      this.blockEnd(false)
     } else if (this.fmt === F_GEMINI) {
       this.out.text(`{"functionCall":{"name":${quote(name)},"args":${input}}}`)
       this.callNames.set(id, name)
@@ -442,11 +471,12 @@ class ChatWriter {
     this.toolBlock()
     if (this.isA()) {
       this.out.byte(34)
-      this.blockEnd()
+      this.blockEnd(this.toolText)
     } else if (this.fmt === F_GEMINI) {
       this.out.text(`"}}}`)
     } else {
       this.out.text(`"}]}}`)
+      if (this.toolText) this.conversePoint()
     }
   }
 
@@ -461,22 +491,18 @@ class ChatWriter {
       return
     }
     if (this.isA()) {
-      if (this.pending) {
-        o.text(`,"cache_control":${this.o.cacheMarker}}`)
-        this.pending = false
-      }
       if (this.turnRole !== "") o.text("]}")
       o.byte(93)
       let total = 0
       for (const f of this.sysFrags) total += f.length
       if (this.sysFrags.length > 1) total += 4 * (this.sysFrags.length - 1)
       if (total > 0) {
-        o.text(this.o.autoCache ? `,"system":[{"type":"text","text":"` : `,"system":"`)
+        o.text(this.sysAuto ? `,"system":[{"type":"text","text":"` : `,"system":"`)
         for (let i = 0; i < this.sysFrags.length; i++) {
           if (i > 0) o.text("\\n\\n")
           o.bytes(this.sysFrags[i]!)
         }
-        o.text(this.o.autoCache ? `","cache_control":${this.o.cacheMarker}}]` : `"`)
+        o.text(this.sysAuto ? `","cache_control":${this.o.cacheMarker}}]` : `"`)
       }
       for (const p of tail) o.text("," + p)
       if (this.fmt === F_VERTEX_CLAUDE) o.text(`,"anthropic_version":${quote(this.o.version)}`)
@@ -499,7 +525,6 @@ class ChatWriter {
       return
     }
     // Converse
-    if (this.o.autoCache && this.turnRole !== "") o.text(`,{"cachePoint":{"type":"default"}}`)
     if (this.turnRole !== "") o.text("]}")
     o.byte(93)
     if (this.sysFrags.length > 0) {
@@ -507,8 +532,9 @@ class ChatWriter {
       for (let i = 0; i < this.sysFrags.length; i++) {
         if (i > 0) o.byte(44)
         o.bytes(this.sysFrags[i]!)
+        // auto_inject's cache point after the system prompt's first block
+        if (i === 0 && this.sysAuto) o.text(`,{"cachePoint":{"type":"default"}}`)
       }
-      if (this.o.autoCache) o.text(`,{"cachePoint":{"type":"default"}}`)
       o.byte(93)
     }
     for (const p of tail) o.text("," + p)
@@ -1150,11 +1176,17 @@ test("a chat request to Anthropic is written in order, whatever the chunking", (
   expect(out).toBe(`{"model":"claude","messages":[{"role":"user","content":[{"type":"text","text":"what is in this picture, tell me"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAABBBBCCCC"}}]},{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"look","input":{"q":1}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"a cat sitting on a mat"},{"type":"text","text":"thanks for the answer"}]}],"system":"be brief and answer in one line","max_tokens":9}`)
 })
 
-test("Anthropic auto caching marks the newest block and the system prompt", () => {
+test("Anthropic auto caching marks the first cacheable block: the system prompt when it comes first", () => {
   const out = try sameEverywhere(F_ANTHROPIC, CHAT, true)
-  expect(out.includes(`"text":"thanks for the answer","cache_control":{"type":"ephemeral"}}]}]`)).toBe(true)
   expect(out.includes(`"system":[{"type":"text","text":"be brief and answer in one line","cache_control":{"type":"ephemeral"}}]`)).toBe(true)
+  expect(out.includes(`"cache_control":{"type":"ephemeral"}}],"system"`)).toBe(false)
   expect(out.includes(`"text":"what is in this picture, tell me","cache_control"`)).toBe(false)
+  // no system prompt: the first text block, and nothing else
+  const noSys = `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"what is in this picture, tell me"},{"type":"text","text":"and this one too"}]},{"role":"user","content":"thanks for the answer"}]}`
+  const o2 = try sameEverywhere(F_ANTHROPIC, noSys, true)
+  expect(o2).toBe(`{"model":"claude","messages":[{"role":"user","content":[{"type":"text","text":"what is in this picture, tell me","cache_control":{"type":"ephemeral"}},{"type":"text","text":"and this one too"},{"type":"text","text":"thanks for the answer"}]}]}`)
+  const c2 = try sameEverywhere(F_CONVERSE, noSys, true)
+  expect(c2).toBe(`{"messages":[{"role":"user","content":[{"text":"what is in this picture, tell me"},{"cachePoint":{"type":"default"}},{"text":"and this one too"},{"text":"thanks for the answer"}]}]}`)
 })
 
 test("Vertex Claude has no model and ends with its version", () => {
@@ -1172,7 +1204,7 @@ test("a chat request to Bedrock Converse", () => {
   const out = try sameEverywhere(F_CONVERSE, CHAT, false)
   expect(out).toBe(`{"messages":[{"role":"user","content":[{"text":"what is in this picture, tell me"},{"image":{"format":"png","source":{"bytes":"AAAABBBBCCCC"}}}]},{"role":"assistant","content":[{"toolUse":{"toolUseId":"t1","name":"look","input":{"q":1}}}]},{"role":"user","content":[{"toolResult":{"toolUseId":"t1","content":[{"text":"a cat sitting on a mat"}]}},{"text":"thanks for the answer"}]}],"system":[{"text":"be brief and answer in one line"}],"max_tokens":9}`)
   const cached = try sameEverywhere(F_CONVERSE, CHAT, true)
-  expect(cached.includes(`{"text":"thanks for the answer"},{"cachePoint":{"type":"default"}}]}]`)).toBe(true)
+  expect(cached.includes(`{"text":"thanks for the answer"},{"cachePoint":{"type":"default"}}]}]`)).toBe(false)
   expect(cached.includes(`"system":[{"text":"be brief and answer in one line"},{"cachePoint":{"type":"default"}}]`)).toBe(true)
 })
 

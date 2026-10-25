@@ -41,6 +41,12 @@ locals {
         port = var.port
       }
       resources = var.resources
+      # the chart's data volume is a ReadWriteOnce claim, which serves one pod: several pods each get an emptyDir
+      # with the config copied in at every start (deploy/README.md, Several replicas)
+      persistence = { enabled = var.replicas <= 1 }
+      configMode  = var.replicas > 1 ? "always" : "ifAbsent"
+      # /api is locked until an admin exists: the token that creates the first one, from a Secret
+      setupToken = { existingSecret = var.setup_token_secret_name == null ? "" : var.setup_token_secret_name }
     },
     local.config_values == null ? {} : { config = local.config_values },
     local.secret_name == null ? {} : { existingSecret = local.secret_name },

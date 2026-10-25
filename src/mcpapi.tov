@@ -12,12 +12,14 @@ import { McpAuthConfig, AuthEndpoints, discoveryUrls, registrationRequest, regis
 import { deadline } from "./deadline"
 import { rfc3339Of } from "./vkexpiry"
 import { secureHex } from "./crypto"
-import { McpClientConfig, McpConfig, McpTlsConfig, McpUserCredential, McpHeaderFlow, McpSession, sanitizeName, durationMsOf, userHeadersOf } from "./mcp"
+import { McpClientConfig, McpConfig, McpTlsConfig, McpUserCredential, McpHeaderFlow, McpSession, sanitizeName, durationMsOf, userHeadersFor, sameHeaderIdentity } from "./mcp"
 import { McpTokenExchange, IdpEndpoints, exchangeToken, adminCredential, needsReverify } from "./tokenexchange"
 import { McpUserToken, UserFlow, userFlowById, userFlowsLive, takeUserFlow, forgetUserFlows, dropUserFlow, startUserFlow, startAdminFlow, adminFlowById, adminFlowsOf, failAdminFlow, endAdminFlow, peekFlow, mayOpenFlow, mintTempToken, endTempTokens, headersLink, exchangeUserCode, rowFromTokens, upsertUserRow, dropUserRow, userTokenIndex, tokenAction, flowIdOfPath, consentLink } from "./mcpuser"
 import { OpenApiConfig, OpenApiCred, OpenApiDoc, OpenApiOp, OpScheme, Unsupported, parseSpec, inputSchema, previewJson, baseUrlOf, operationServersCover } from "./openapi"
-import { targetProblem } from "./netguard"
+import { resolvedTargetProblem } from "./netguard"
 import * as vmcp from "./vmcp"
+import { DataScope, inScope } from "./scope"
+import { heldProfiles } from "./govapi"
 import { Field, fields, elements, find, quote, rawStr, rawNum, rawBool, setField, build } from "./json"
 
 // The reply. action asks the lead to run a step on the live manager after sending body:
@@ -816,7 +818,7 @@ async function fetchSpec(url: string, publicOnly: bool): Promise<{ text: string,
   const u = url.trim()
   if (!u.startsWith("http://") && !u.startsWith("https://")) return { text: "", error: fail(400, `could not load spec_url: invalid spec_url: "${u}" must be an http(s) URL`) }
   if (publicOnly) {
-    const pr = targetProblem(u, [])
+    const pr = await resolvedTargetProblem(u, [])
     if (pr !== "") return { text: "", error: fail(403, pr) }
   }
   const dl = deadline(SPEC_FETCH_MS)
@@ -992,11 +994,23 @@ function flowIndex(list: McpHeaderFlow[], id: string): int {
   return -1
 }
 
-function credentialIndex(list: McpUserCredential[], client: string, vk: string): int {
+function credentialIndex(list: McpUserCredential[], client: string, vk: string, session: string, user: string): int {
   for (let i = 0; i < list.length; i++) {
-    if (list[i]!.mcp_client_name === client && list[i]!.virtual_key_id === vk) return i
+    if (list[i]!.mcp_client_name === client && sameHeaderIdentity(list[i]!.virtual_key_id, list[i]!.session_id, list[i]!.user_id, vk, session, user)) return i
   }
   return -1
+}
+
+// A flow's identity fields, as sameHeaderIdentity and the credential rows take them.
+function flowIdentity(f: McpHeaderFlow): { vk: string, session: string, user: string } {
+  return { vk: f.virtual_key_id, session: f.session_id ?? "", user: f.user_id ?? "" }
+}
+
+// A user-mode submission opens only for its own user (Bifrost's canAccessUserFlow): the identity-provider user of
+// the caller's single sign-on session.
+function mayOpenHeaderFlow(f: McpHeaderFlow, callerUser: string): bool {
+  const u = f.user_id ?? ""
+  return u === "" || (callerUser !== "" && callerUser === u)
 }
 
 // Connects to a per_user_headers client with these header values and reports the tools it lists, or why it
@@ -1035,38 +1049,41 @@ function dropExpired(list: McpHeaderFlow[], now: f64): McpHeaderFlow[] {
   return out
 }
 
-// POST /api/mcp/per-user-headers/flows: opens a submission for one virtual key and one per_user_headers
-// client. A pending submission for the same pair is kept and its expiry renewed.
+// POST /api/mcp/per-user-headers/flows: opens a submission for one virtual key (or one x-bf-mcp-session-id, sent
+// as session_id) and one per_user_headers client. A pending submission for the same pair is kept and its expiry renewed.
 function createFlow(store: ConfigStore, body: string): McpReply {
-  let parsed: { mcp_client_name?: string, virtual_key_id?: string } = {}
+  let parsed: { mcp_client_name?: string, virtual_key_id?: string, session_id?: string } = {}
   try {
-    parsed = JSON.parse(body) as { mcp_client_name?: string, virtual_key_id?: string }
+    parsed = JSON.parse(body) as { mcp_client_name?: string, virtual_key_id?: string, session_id?: string }
   } catch (e) {
     return fail(400, "Invalid request payload")
   }
   const cname = parsed.mcp_client_name ?? ""
-  const vk = parsed.virtual_key_id ?? ""
-  if (cname === "" || vk === "") return fail(400, "mcp_client_name and virtual_key_id are required")
+  const session = (parsed.session_id ?? "").trim()
+  const vk = session !== "" ? "" : parsed.virtual_key_id ?? ""
+  if (cname === "" || (vk === "" && session === "")) return fail(400, "mcp_client_name and virtual_key_id (or session_id) are required")
   const cfg = store.cfg
   const clients = clientsOf(cfg)
   const ci = clientIndex(clients, cname)
   if (ci < 0) return fail(404, `MCP client '${cname}' not found`)
   if (clients[ci]!.auth_type !== "per_user_headers") return fail(400, `headers submissions only apply to auth_type='per_user_headers' clients, got "${clientAuthType(clients[ci]!)}"`)
   const vks = cfg.governance?.virtual_keys ?? []
-  if (!vks.some((v) => v.id === vk)) return fail(404, `virtual key '${vk}' not found`)
+  if (vk !== "" && !vks.some((v) => v.id === vk)) return fail(404, `virtual key '${vk}' not found`)
   const now = Date.now()
-  const o = openHeaderFlow(store, cname, vk, now)
+  const o = openHeaderFlow(store, cname, vk, session, "", now)
   if (o.error !== undefined) return o.error
-  return reply(201, `{"id":${quote(o.id)},"flow_mode":"vk","status":"pending","mcp_client_name":${quote(cname)},"virtual_key_id":${quote(vk)},"expires_at":${now + HEADER_FLOW_TTL_MS},"url":${quote(`/api/mcp/per-user-headers/flows/${o.id}`)}}`)
+  const who = session !== "" ? `"session_id":${quote(session)}` : `"virtual_key_id":${quote(vk)}`
+  return reply(201, `{"id":${quote(o.id)},"flow_mode":"${session !== "" ? "session" : "vk"}","status":"pending","mcp_client_name":${quote(cname)},${who},"expires_at":${now + HEADER_FLOW_TTL_MS},"url":${quote(`/api/mcp/per-user-headers/flows/${o.id}`)}}`)
 }
 
-// Opens a submission for one key and one per_user_headers client, or renews the pending one of that pair (Bifrost's
-// find-or-update), and saves it. The flow's id, or the reply that says why it could not be saved.
-function openHeaderFlow(store: ConfigStore, cname: string, vk: string, now: f64): { id: string, error: McpReply | undefined } {
+// Opens a submission for one caller (a key, a session or a user) and one per_user_headers client, or renews the
+// pending one of that pair (Bifrost's find-or-update), and saves it. The flow's id, or the reply that says why it
+// could not be saved.
+function openHeaderFlow(store: ConfigStore, cname: string, vk: string, session: string, user: string, now: f64): { id: string, error: McpReply | undefined } {
   const cfg = store.cfg
   let list = dropExpired(cfg.mcp?.header_flows ?? [], now)
   let id = ""
-  const at = list.findIndex((f) => f.mcp_client_name === cname && f.virtual_key_id === vk)
+  const at = list.findIndex((f) => f.mcp_client_name === cname && sameHeaderIdentity(f.virtual_key_id, f.session_id, f.user_id, vk, session, user))
   if (at >= 0) {
     let f = list[at]!
     f.expires_at = now + HEADER_FLOW_TTL_MS
@@ -1074,21 +1091,25 @@ function openHeaderFlow(store: ConfigStore, cname: string, vk: string, now: f64)
     id = f.id
   } else {
     id = randomId("mcphf")
-    list.push({ id: id, mcp_client_name: cname, virtual_key_id: vk, expires_at: now + HEADER_FLOW_TTL_MS, created_at: now })
+    let f: McpHeaderFlow = { id: id, mcp_client_name: cname, virtual_key_id: vk, expires_at: now + HEADER_FLOW_TTL_MS, created_at: now }
+    if (session !== "") f.session_id = session
+    if (user !== "") f.user_id = user
+    list.push(f)
   }
   const err = persist(store, withHeaderState(cfg, cfg.mcp?.user_credentials ?? [], list))
   return { id: id, error: err }
 }
 
-// The answer of a tool call whose key has not submitted the per-user headers of a client: a submission is opened
-// (or renewed) for the key, and the message names its page (the auth page with kind=headers), with a temp token in
-// the fragment when client.mcp_enable_temp_token_auth is on (Bifrost's inline 401). "" when no flow could be opened.
-export function headersAuthMessage(store: ConfigStore, client: string, vk: string, base: string): string {
+// The answer of a tool call whose caller has not submitted the per-user headers of a client: a submission is opened
+// (or renewed) for its identity (a key, a session or a user), and the message names its page (the auth page with
+// kind=headers), with a temp token in the fragment when client.mcp_enable_temp_token_auth is on (Bifrost's inline
+// 401; a user-mode submission gets none, as its page opens only for that user). "" when no flow could be opened.
+export function headersAuthMessage(store: ConfigStore, client: string, vk: string, session: string, user: string, base: string): string {
   const now = Date.now()
-  const o = openHeaderFlow(store, client, vk, now)
+  const o = openHeaderFlow(store, client, vk, session, user, now)
   if (o.error !== undefined) return ""
   let temp = ""
-  if (store.cfg.client?.mcp_enable_temp_token_auth === true) {
+  if (store.cfg.client?.mcp_enable_temp_token_auth === true && user === "") {
     try {
       // the token lives as long as the submission, at most the temp tokens' 15 minutes
       temp = mintTempToken("mcp_headers_auth", o.id, now + Math.min(HEADER_FLOW_TTL_MS, 900000.0))
@@ -1108,34 +1129,28 @@ function consentMessageOf(client: string, link: string, tempToken: bool, what: s
 }
 
 // GET /api/mcp/per-user-headers/flows/{id}: the flow, the header names it asks for and the names already submitted.
-function flowDetail(store: ConfigStore, id: string): McpReply {
+function flowDetail(store: ConfigStore, id: string, callerUser: string): McpReply {
   const cfg = store.cfg
   const list = cfg.mcp?.header_flows ?? []
   const at = flowIndex(list, id)
   if (at < 0) return fail(404, "Headers submission flow not found")
   const f = list[at]!
+  if (!mayOpenHeaderFlow(f, callerUser)) return fail(403, "This submission link is bound to a different user.")
   if (f.expires_at <= Date.now()) return fail(410, "Headers submission flow has expired; create a new one")
   const clients = clientsOf(cfg)
   const ci = clientIndex(clients, f.mcp_client_name)
   const keys: string[] = ci < 0 ? [] : (clients[ci]!.per_user_header_keys ?? [])
-  const cred = userHeadersOf(cfg.mcp?.user_credentials, f.mcp_client_name, f.virtual_key_id)
+  const fi = flowIdentity(f)
+  const cred = userHeadersFor(cfg.mcp?.user_credentials, f.mcp_client_name, fi.vk, fi.session, fi.user)
   const submitted: string[] = []
   if (cred !== undefined) {
     for (const k of cred.keys()) submitted.push(k)
   }
   submitted.sort()
-  return reply(200, JSON.stringify({
-    id: f.id,
-    flow_mode: "vk",
-    status: "pending",
-    expires_at: f.expires_at,
-    created_at: f.created_at,
-    mcp_client: { name: f.mcp_client_name },
-    virtual_key: { id: f.virtual_key_id },
-    required_header_keys: keys,
-    has_active_credential: cred !== undefined,
-    submitted_keys: submitted,
-  }))
+  // the identity of the flow's mode: virtual_key, session_id or user_id (Bifrost's flow detail)
+  const mode = flowModeOf(fi.vk, fi.session, fi.user)
+  const who = mode === "user" ? `"user_id":${quote(fi.user)}` : mode === "session" ? `"session_id":${quote(fi.session)}` : `"virtual_key":{"id":${quote(fi.vk)}}`
+  return reply(200, `{"id":${quote(f.id)},"flow_mode":"${mode}","status":"pending","expires_at":${f.expires_at},"created_at":${f.created_at},"mcp_client":{"name":${quote(f.mcp_client_name)}},${who},"required_header_keys":${JSON.stringify(keys)},"has_active_credential":${cred !== undefined},"submitted_keys":${JSON.stringify(submitted)}}`)
 }
 
 // DELETE /api/mcp/per-user-headers/credential/{id}: removes one key's values for one client, and any pending
@@ -1153,7 +1168,7 @@ function revokeCredential(store: ConfigStore, id: string): McpReply {
   const flows: McpHeaderFlow[] = []
   const ended: string[] = []
   for (const f of cfg.mcp?.header_flows ?? []) {
-    if (!(f.mcp_client_name === row.mcp_client_name && f.virtual_key_id === row.virtual_key_id)) flows.push(f)
+    if (!(f.mcp_client_name === row.mcp_client_name && sameHeaderIdentity(f.virtual_key_id, f.session_id, f.user_id, row.virtual_key_id, row.session_id ?? "", row.user_id ?? ""))) flows.push(f)
     else ended.push(f.id)
   }
   const err = persist(store, withHeaderState(cfg, kept, flows))
@@ -1164,19 +1179,21 @@ function revokeCredential(store: ConfigStore, id: string): McpReply {
 
 function headersRoute(store: ConfigStore, m: string, segs: string[], body: string, p: string): McpReply {
   if (segs.length === 4 && segs[3] === "flows") return m === "POST" ? createFlow(store, body) : notAllowed(m)
-  if (segs.length === 5 && segs[3] === "flows") return m === "GET" ? flowDetail(store, segs[4]!) : notAllowed(m)
+  if (segs.length === 5 && segs[3] === "flows") return m === "GET" ? flowDetail(store, segs[4]!, "") : notAllowed(m)
   if (segs.length === 5 && segs[3] === "credential") return m === "DELETE" ? revokeCredential(store, segs[4]!) : notAllowed(m)
   return fail(404, `no route for ${p}`)
 }
 
 // PUT /api/mcp/per-user-headers/flows/{id}: checks the submitted values against the MCP server, then stores
-// them for the flow's key and closes the flow.
-async function submitFlow(store: ConfigStore, id: string, body: string): Promise<McpReply> {
+// them for the flow's caller (its key, session or user) and closes the flow.
+async function submitFlow(store: ConfigStore, id: string, body: string, callerUser: string): Promise<McpReply> {
   const cfg = store.cfg
   const list = dropExpired(cfg.mcp?.header_flows ?? [], Date.now())
   const at = flowIndex(list, id)
   if (at < 0) return fail(404, "Headers submission flow not found")
   const f = list[at]!
+  if (!mayOpenHeaderFlow(f, callerUser)) return fail(403, "This submission link is bound to a different user.")
+  const fi = flowIdentity(f)
   const clients = clientsOf(cfg)
   const ci = clientIndex(clients, f.mcp_client_name)
   if (ci < 0) return fail(404, `MCP client '${f.mcp_client_name}' not found`)
@@ -1188,15 +1205,17 @@ async function submitFlow(store: ConfigStore, id: string, body: string): Promise
     return fail(400, "Invalid request payload")
   }
   const keys = client.per_user_header_keys ?? []
-  const merged = mergedValues(userHeadersOf(cfg.mcp?.user_credentials, f.mcp_client_name, f.virtual_key_id), canonMap(parsed.headers), keys)
+  const merged = mergedValues(userHeadersFor(cfg.mcp?.user_credentials, f.mcp_client_name, fi.vk, fi.session, fi.user), canonMap(parsed.headers), keys)
   if (merged.missing.length > 0) return fail(400, `missing values for required keys: ${merged.missing.join(", ")}`)
   const v = try await dialWith(client, merged.values, cfg.mcp?.oauth_private_allowlist ?? [])
   if (!v.ok) return fail(422, `Verification failed: ${v.error}`)
   const now = Date.now()
   let creds = cfg.mcp?.user_credentials ?? []
-  const ui = credentialIndex(creds, f.mcp_client_name, f.virtual_key_id)
+  const ui = credentialIndex(creds, f.mcp_client_name, fi.vk, fi.session, fi.user)
   const credId = ui >= 0 ? creds[ui]!.id : randomId("mcpuc")
-  const row: McpUserCredential = { id: credId, mcp_client_name: f.mcp_client_name, virtual_key_id: f.virtual_key_id, headers: merged.values, updated_at: now }
+  let row: McpUserCredential = { id: credId, mcp_client_name: f.mcp_client_name, virtual_key_id: fi.vk, headers: merged.values, updated_at: now }
+  if (fi.session !== "") row.session_id = fi.session
+  if (fi.user !== "") row.user_id = fi.user
   if (ui >= 0) creds[ui] = row
   else creds.push(row)
   const flows: McpHeaderFlow[] = []
@@ -1237,13 +1256,15 @@ async function verifyClient(store: ConfigStore, id: string, body: string): Promi
 
 // The per-user headers routes that reach the MCP server: PUT .../flows/{id} and POST .../verify-headers of a
 // per_user_headers client. undefined for any other request, which mcpApi answers.
-export async function headersRouteAsync(store: ConfigStore, method: string, path: string, body: string): Promise<McpReply | undefined> {
+export async function headersRouteAsync(store: ConfigStore, method: string, path: string, body: string, callerUser?: string): Promise<McpReply | undefined> {
   const q = path.indexOf("?")
   const p = q < 0 ? path : path.slice(0, q)
   const segs = p.split("/").filter((s) => s !== "")
   if (segs.length < 4 || segs[0] !== "api" || segs[1] !== "mcp") return undefined
   const m = method.toUpperCase()
-  if (segs.length === 5 && segs[2] === "per-user-headers" && segs[3] === "flows" && m === "PUT") return try await submitFlow(store, segs[4]!, body)
+  if (segs.length === 5 && segs[2] === "per-user-headers" && segs[3] === "flows" && m === "PUT") return try await submitFlow(store, segs[4]!, body, callerUser ?? "")
+  // the flow's detail here too, where the caller's single sign-on user is known (a user-mode flow opens for it only)
+  if (segs.length === 5 && segs[2] === "per-user-headers" && segs[3] === "flows" && m === "GET") return flowDetail(store, segs[4]!, callerUser ?? "")
   if (segs.length === 5 && segs[2] === "client" && segs[4] === "verify-headers" && m === "POST") {
     const clients = clientsOf(store.cfg)
     const ci = clientIndex(clients, segs[3]!)
@@ -1439,12 +1460,46 @@ function virtualJson(v: vmcp.VirtualMcp, keyIds: string[]): string {
   return `{"id":${quote(v.name)},"name":${quote(v.name)},"endpoint_slug":${quote(v.name)}${desc},"enabled":true,"tools":${JSON.stringify(v.tools)},"virtual_key_ids":[${quotedKeys.join(",")}]}`
 }
 
-function listVirtuals(store: ConfigStore): McpReply {
-  const list = virtualsOf(store.cfg)
+function listVirtuals(store: ConfigStore, scope: DataScope | undefined): McpReply {
+  const list = virtualsOf(store.cfg).filter((v) => virtualVisible(store.cfg, v, scope))
   const keyIds = virtualKeyIds(store.cfg)
   const parts: string[] = []
   for (const v of list) parts.push(virtualJson(v, keyIds))
   return reply(200, `{"virtual_mcps":[${parts.join(",")}],"count":${list.length},"total_count":${list.length}}`)
+}
+
+// Data access control on virtual MCPs (Bifrost's vMCP visibility): a caller with a narrowed data scope sees a virtual
+// MCP when one of its attached keys is in that scope (the key's team or customer); one without allowed_keys is
+// attached to every key and seen by all. An unscoped caller sees every one.
+export function virtualVisible(c: Config, v: vmcp.VirtualMcp, scope: DataScope | undefined): bool {
+  if (scope === undefined || scope.all) return true
+  const keys = v.allowed_keys
+  if (keys === undefined) return true
+  for (const vk of c.governance?.virtual_keys ?? []) {
+    if (keys.includes(vk.id) && inScope(scope, vk.team_id ?? "", "", vk.customer_id ?? "", "")) return true
+  }
+  return false
+}
+
+// The reverse lookup of a virtual MCP: the access profiles that grant it (their virtual_mcps name it) and how many users
+// reach it through each, the users who hold the profile (by hand or through a role) and the users of the keys it is
+// attached to.
+export function grantingProfilesJson(c: Config, name: string): string {
+  const g = c.governance
+  const rows: string[] = []
+  for (const p of g?.access_profiles ?? []) {
+    if (!(p.virtual_mcps ?? []).includes(name)) continue
+    const users: string[] = []
+    for (const u of g?.users ?? []) {
+      if (heldProfiles(g?.users, g?.roles, g?.access_profiles, u.name).some((h) => h.id === p.id) && !users.includes(u.name)) users.push(u.name)
+    }
+    for (const vk of g?.virtual_keys ?? []) {
+      const uid = vk.user_id ?? ""
+      if (uid !== "" && (vk.access_profile_ids ?? []).includes(p.id) && !users.includes(uid)) users.push(uid)
+    }
+    rows.push(`{"id":${quote(p.id)},"name":${quote(p.name ?? p.id)},"is_active":${p.is_active === false ? "false" : "true"},"user_count":${users.length}}`)
+  }
+  return `[${rows.join(",")}]`
 }
 
 // Whether a virtual MCP name is taken by another virtual MCP or by an MCP client (they share
@@ -1545,6 +1600,12 @@ function setAttached(store: ConfigStore, id: string, vkId: string, attach: bool)
   const at = virtualIndex(list, id)
   if (at < 0) return fail(404, "virtual MCP not found")
   if (attach && !virtualKeyIds(store.cfg).includes(vkId)) return fail(404, "virtual key not found")
+  // a key whose owner holds an access profile takes its virtual MCPs from the profile (Bifrost answers 409)
+  const g = store.cfg.governance
+  for (const vk of g?.virtual_keys ?? []) {
+    const uid = vk.user_id ?? ""
+    if (vk.id === vkId && uid !== "" && heldProfiles(g?.users, g?.roles, g?.access_profiles, uid).length > 0) return fail(409, "the virtual key's owner holds an access profile; grant the virtual MCP through the profile")
+  }
   let v = list[at]!
   let keys: string[] = v.allowed_keys ?? virtualKeyIds(store.cfg)
   if (attach) {
@@ -1562,13 +1623,21 @@ function setAttached(store: ConfigStore, id: string, vkId: string, attach: bool)
   return reply(200, `{"success":true}`)
 }
 
-function virtualRoute(store: ConfigStore, m: string, segs: string[], body: string, p: string): McpReply {
+function virtualRoute(store: ConfigStore, m: string, segs: string[], body: string, p: string, scope: DataScope | undefined): McpReply {
   if (segs.length === 3) {
-    if (m === "GET") return listVirtuals(store)
+    if (m === "GET") return listVirtuals(store, scope)
     if (m === "POST") return createVirtual(store, body)
     return notAllowed(m)
   }
   const id = segs[3]!
+  // one the caller's data scope does not reach is not found, as Bifrost answers
+  const seen = virtualIndex(virtualsOf(store.cfg), id)
+  if (seen >= 0 && !virtualVisible(store.cfg, virtualsOf(store.cfg)[seen]!, scope)) return fail(404, "virtual MCP not found")
+  if (segs.length === 5 && segs[4] === "access-profiles") {
+    if (m !== "GET") return notAllowed(m)
+    if (seen < 0) return fail(404, "virtual MCP not found")
+    return reply(200, `{"access_profiles":${grantingProfilesJson(store.cfg, id)}}`)
+  }
   if (segs.length === 4) {
     if (m === "GET") {
       const at = virtualIndex(virtualsOf(store.cfg), id)
@@ -2049,7 +2118,7 @@ export async function oauthRoute(store: ConfigStore, method: string, path: strin
 // The MCP management route for method and path, or undefined when the path is not one of them.
 // The caller passes every /api/mcp path that is not handled elsewhere (the /api/mcp view and the
 // library are not).
-export function mcpApi(store: ConfigStore, method: string, path: string, body: string, publicOnly?: bool): McpReply | undefined {
+export function mcpApi(store: ConfigStore, method: string, path: string, body: string, publicOnly?: bool, scope?: DataScope): McpReply | undefined {
   const m = method.toUpperCase()
   const q = path.indexOf("?")
   const p = q < 0 ? path : path.slice(0, q)
@@ -2058,7 +2127,7 @@ export function mcpApi(store: ConfigStore, method: string, path: string, body: s
   const area = segs[2]!
   if (area === "clients") return m === "GET" ? listClients(store) : notAllowed(m)
   if (area === "client") return clientRoute(store, m, segs, body, p, publicOnly ?? false)
-  if (area === "virtual-mcps") return virtualRoute(store, m, segs, body, p)
+  if (area === "virtual-mcps") return virtualRoute(store, m, segs, body, p, scope)
   if (area === "tool-groups") return toolGroupRoute(store, m, segs, body, p)
   if (area === "per-user-headers") return headersRoute(store, m, segs, body, p)
   return undefined
@@ -2171,7 +2240,7 @@ function sessionRows(cfg: Config, now: f64): SessionRow[] {
     out.push({ id: f.id, kind: "flow", auth_kind: "oauth", auth_mode: flowModeOf(f.virtual_key_id, f.session_id, f.user_id), user_id: f.user_id ?? "", virtual_key_id: f.virtual_key_id, session_id: f.session_id, mcp_client: { name: f.client }, status: "pending", expires_at: f.expires_at, created_at: f.created_at, has_refresh_token: false, can_reauth: false })
   }
   for (const c of cfg.mcp?.user_credentials ?? []) {
-    out.push({ id: c.id, kind: "header", auth_kind: "headers", auth_mode: "vk", user_id: "", virtual_key_id: c.virtual_key_id, session_id: "", mcp_client: { name: c.mcp_client_name }, status: "active", expires_at: 0.0, created_at: c.updated_at, has_refresh_token: false, can_reauth: false })
+    out.push({ id: c.id, kind: "header", auth_kind: "headers", auth_mode: flowModeOf(c.virtual_key_id, c.session_id ?? "", c.user_id), user_id: c.user_id ?? "", virtual_key_id: c.virtual_key_id, session_id: c.session_id ?? "", mcp_client: { name: c.mcp_client_name }, status: "active", expires_at: 0.0, created_at: c.updated_at, has_refresh_token: false, can_reauth: false })
   }
   return out
 }
@@ -2578,7 +2647,8 @@ test("per-user headers: flows are opened per key, read, and revoked with their p
   expect(mcpApi(s, "GET", "/api/mcp/per-user-headers/flows/nope", "")!.status).toBe(404)
   expect(mcpApi(s, "PATCH", "/api/mcp/per-user-headers/flows/" + id, "")!.status).toBe(405)
   // a stored submission shows as submitted, and revoking it clears the key's pending flows
-  s.cfg.mcp!.user_credentials = [{ id: "uc1", mcp_client_name: "tenant", virtual_key_id: "vk1", headers: oneEntry("x-tenant-key", "tenant-a-key-example"), updated_at: 1.0 }]
+  const uc1: McpUserCredential = { id: "uc1", mcp_client_name: "tenant", virtual_key_id: "vk1", headers: oneEntry("x-tenant-key", "tenant-a-key-example"), updated_at: 1.0 }
+  s.cfg.mcp!.user_credentials = [uc1]
   const d2 = mcpApi(s, "GET", "/api/mcp/per-user-headers/flows/" + id, "")!
   expect(d2.body.includes("\"submitted_keys\":[\"x-tenant-key\"]")).toBe(true)
   expect(d2.body.includes("tenant-a-key-example")).toBe(false)
@@ -2586,6 +2656,43 @@ test("per-user headers: flows are opened per key, read, and revoked with their p
   expect(mcpApi(s, "DELETE", "/api/mcp/per-user-headers/credential/uc1", "")!.status).toBe(200)
   expect(s.cfg.mcp!.user_credentials!.length).toBe(0)
   expect(mcpApi(s, "GET", "/api/mcp/per-user-headers/flows/" + id, "")!.status).toBe(404)
+  cleanupFile(s.path)
+})
+
+test("per-user headers: session and user identities have flows and credentials of their own", () => {
+  const s = fixture()
+  mcpApi(s, "POST", "/api/mcp/client", "{\"name\":\"tenant\",\"connection_type\":\"http\",\"connection_string\":\"http://127.0.0.1:1/mcp\",\"auth_type\":\"per_user_headers\",\"per_user_header_keys\":[\"x-tenant-key\"]}")
+  // a session's flow, opened over the API or by a tool call (headersAuthMessage), is not the key's
+  const sf = mcpApi(s, "POST", "/api/mcp/per-user-headers/flows", "{\"mcp_client_name\":\"tenant\",\"session_id\":\"sess-1\"}")!
+  expect(sf.status).toBe(201)
+  expect(sf.body.includes("\"flow_mode\":\"session\"")).toBe(true)
+  expect(headersAuthMessage(s, "tenant", "", "sess-1", "", "http://gw").includes("kind=headers")).toBe(true)
+  expect(headersAuthMessage(s, "tenant", "vk1", "", "", "http://gw").includes("kind=headers")).toBe(true)
+  expect(headersAuthMessage(s, "tenant", "", "", "alice", "http://gw").includes("kind=headers")).toBe(true)
+  const flows = s.cfg.mcp!.header_flows!
+  expect(flows.length).toBe(3)
+  const sid = flows.filter((f) => (f.session_id ?? "") === "sess-1")[0]!.id
+  const uid = flows.filter((f) => (f.user_id ?? "") === "alice")[0]!.id
+  const ds = mcpApi(s, "GET", "/api/mcp/per-user-headers/flows/" + sid, "")!
+  expect(ds.body.includes("\"flow_mode\":\"session\"") && ds.body.includes("\"session_id\":\"sess-1\"")).toBe(true)
+  // a user-mode flow opens for its own user only
+  expect(flowDetail(s, uid, "bob").status).toBe(403)
+  const du = flowDetail(s, uid, "alice")
+  expect(du.status === 200 && du.body.includes("\"flow_mode\":\"user\"") && du.body.includes("\"user_id\":\"alice\"")).toBe(true)
+  // each identity reads its own credential
+  const ucs: McpUserCredential = { id: "uc-s", mcp_client_name: "tenant", virtual_key_id: "", session_id: "sess-1", headers: oneEntry("x-tenant-key", "session-value-example"), updated_at: 1.0 }
+  const ucv: McpUserCredential = { id: "uc-v", mcp_client_name: "tenant", virtual_key_id: "vk1", headers: oneEntry("x-tenant-key", "key-value-example"), updated_at: 1.0 }
+  s.cfg.mcp!.user_credentials = [ucs, ucv]
+  expect(userHeadersFor(s.cfg.mcp!.user_credentials, "tenant", "", "sess-1", "")!.get("x-tenant-key")).toBe("session-value-example")
+  expect(userHeadersFor(s.cfg.mcp!.user_credentials, "tenant", "vk1", "", "")!.get("x-tenant-key")).toBe("key-value-example")
+  expect(userHeadersFor(s.cfg.mcp!.user_credentials, "tenant", "", "", "alice") === undefined).toBe(true)
+  expect(mcpApi(s, "GET", "/api/mcp/per-user-headers/flows/" + sid, "")!.body.includes("\"has_active_credential\":true")).toBe(true)
+  // the sessions list names each credential's mode; revoking the session's ends its flow only
+  const list = perUserApi(s, "GET", "/api/mcp/sessions?kind=header", "", "")!
+  expect(list.body.includes("\"auth_mode\":\"session\"") && list.body.includes("\"auth_mode\":\"vk\"")).toBe(true)
+  expect(mcpApi(s, "DELETE", "/api/mcp/per-user-headers/credential/uc-s", "")!.status).toBe(200)
+  expect(s.cfg.mcp!.header_flows!.length).toBe(2)
+  expect(s.cfg.mcp!.header_flows!.some((f) => (f.session_id ?? "") === "sess-1")).toBe(false)
   cleanupFile(s.path)
 })
 
@@ -2721,4 +2828,32 @@ test("a token_exchange client is refused while dual_credential_conflict_behavior
   expect(dualConflictError("token_exchange", { client: { dual_credential_conflict_behavior: "error" } }).includes("prefer_idp")).toBe(true)
   expect(dualConflictError("per_user_oauth", { client: { dual_credential_conflict_behavior: "error" } })).toBe("")
   cleanupFile(s.path)
+})
+
+test("virtual MCPs: data access scope, the granting profiles and the profile-held key rule", () => {
+  const c: Config = {
+    governance: {
+      virtual_keys: [{ id: "vk1", value: "sk-bf-1", team_id: "t1" }, { id: "vk2", value: "sk-bf-2", team_id: "t2" }, { id: "vk3", value: "sk-bf-3", user_id: "ann", access_profile_ids: ["p1"] }],
+      users: [{ name: "ann", role: "viewer", access_profile_ids: ["p1"] }, { name: "bo", role: "viewer" }],
+      access_profiles: [{ id: "p1", name: "Base", virtual_mcps: ["dev"] }, { id: "p2", virtual_mcps: ["ops"] }],
+    },
+  }
+  const none: vmcp.VirtualTool[] = []
+  c.virtual_mcps = [{ name: "dev", tools: none, allowed_keys: ["vk1"] }, { name: "ops", tools: none, allowed_keys: ["vk2"] }, { name: "open", tools: none }]
+  const s = new ConfigStore(tmpPath(), c)
+  const t1: DataScope = { all: false, teams: ["t1"], businessUnits: [], customers: [], projects: [] }
+  const list = mcpApi(s, "GET", "/api/mcp/virtual-mcps", "", false, t1)!.body
+  expect(list.includes(`"name":"dev"`)).toBe(true)
+  expect(list.includes(`"name":"open"`)).toBe(true)
+  expect(list.includes(`"name":"ops"`)).toBe(false)
+  expect(mcpApi(s, "GET", "/api/mcp/virtual-mcps/ops", "", false, t1)!.status).toBe(404)
+  expect(mcpApi(s, "DELETE", "/api/mcp/virtual-mcps/ops", "", false, t1)!.status).toBe(404)
+  expect(mcpApi(s, "GET", "/api/mcp/virtual-mcps/ops", "")!.status).toBe(200)
+  const rev = mcpApi(s, "GET", "/api/mcp/virtual-mcps/dev/access-profiles", "")!
+  expect(rev.status).toBe(200)
+  expect(rev.body).toBe(`{"access_profiles":[{"id":"p1","name":"Base","is_active":true,"user_count":1}]}`)
+  expect(mcpApi(s, "GET", "/api/mcp/virtual-mcps/open/access-profiles", "")!.body).toBe(`{"access_profiles":[]}`)
+  expect(mcpApi(s, "GET", "/api/mcp/virtual-mcps/none/access-profiles", "")!.status).toBe(404)
+  expect(mcpApi(s, "POST", "/api/mcp/virtual-mcps/dev/virtual-keys/vk3", "")!.status).toBe(409)
+  expect(mcpApi(s, "POST", "/api/mcp/virtual-mcps/dev/virtual-keys/vk2", "")!.status).toBe(200)
 })

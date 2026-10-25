@@ -14,7 +14,8 @@ import { fields, elements, find, quote, rawStr, rawNum, setField, without, build
 import { Target, Upstream, trimSlash } from "./providers/types"
 import * as anthropic from "./providers/anthropic"
 import * as gemini from "./providers/gemini"
-import { newId, Hdrs } from "./schemas"
+import { Hdrs } from "./schemas"
+import { secureHex, sha256, toHex, utf8 } from "./crypto"
 import { isoMs } from "./exports"
 
 export type Job = {
@@ -30,6 +31,8 @@ export type Job = {
   ttl_ms?: int,
   // the answer's body as the route sent it, for a poll on an SDK route (x-bf-async-id)
   raw?: string,
+  // who submitted it (jobOwner): a poll must come from the same caller. Unset for an anonymous submit.
+  owner?: string,
 }
 
 // The store's own bookkeeping: `at` is the ms the expiry clock started
@@ -75,6 +78,26 @@ function errorMessage(body: string): string | undefined {
   }
 }
 
+// Who a request comes from, for job ownership: its virtual key ("vk:" and the key's id) when it has one, else a hash of
+// the credential it sent (a direct provider key, an admin token), else "" (anonymous: its jobs are open to any poll,
+// as a job without a virtual key is in Bifrost).
+export function jobOwner(vkId: string, h: Hdrs): string {
+  if (vkId !== "") return "vk:" + vkId
+  for (const name of ["authorization", "x-api-key", "x-goog-api-key", "x-bf-api-key", "api-key"]) {
+    const v = (h.get(name) ?? "").trim()
+    if (v !== "") return "cred:" + toHex(sha256(utf8(name + "\n" + v)))
+  }
+  return ""
+}
+
+// Compares owners without stopping at the first difference.
+function sameOwner(a: string, b: string): bool {
+  if (a.byteLength !== b.byteLength) return false
+  let d = 0
+  for (let i = 0; i < a.byteLength; i++) d = d | (a.slice(i, i + 1) === b.slice(i, i + 1) ? 0 : 1)
+  return d === 0
+}
+
 export class JobStore {
   // Insertion order is creation order, which the eviction below relies on.
   private jobs: Map<string, Slot> = new Map()
@@ -100,12 +123,21 @@ export class JobStore {
 
   // Returns undefined when the store is full of unfinished jobs.
   // ttlMs, when set, is the job's own result TTL (x-bf-async-job-result-ttl); the store's applies otherwise.
-  create(op: string, nowMs: int, ttlMs?: int): Job | undefined {
+  // owner is jobOwner of the submitting request. The id is 128 random bits from the kernel (Bifrost's are random
+  // UUIDs), so it cannot be guessed; undefined also when no random id could be had.
+  create(op: string, nowMs: int, ttlMs?: int, owner?: string): Job | undefined {
     if (this.jobs.size >= this.maxJobs) {
       this.sweep(nowMs)
       if (this.jobs.size >= this.maxJobs && !this.evictOne()) return undefined
     }
-    const job: Job = { id: newId("job_"), op: op, status: "pending", created_at: Math.floor(nowMs / 1000), ttl_ms: ttlMs }
+    let id = ""
+    try {
+      id = "job_" + (try secureHex(32))
+    } catch (e) {
+      return undefined
+    }
+    const who: string | undefined = owner === undefined || owner === "" ? undefined : owner
+    const job: Job = { id: id, op: op, status: "pending", created_at: Math.floor(nowMs / 1000), ttl_ms: ttlMs, owner: who }
     this.jobs.set(job.id, { job: job, at: nowMs })
     return job
   }
@@ -113,7 +145,7 @@ export class JobStore {
   start(id: string): bool {
     const slot = this.jobs.get(id)
     if (slot === undefined || slot.job.status !== "pending") return false
-    const job: Job = { id: slot.job.id, op: slot.job.op, status: "processing", created_at: slot.job.created_at, ttl_ms: slot.job.ttl_ms }
+    const job: Job = { id: slot.job.id, op: slot.job.op, status: "processing", created_at: slot.job.created_at, ttl_ms: slot.job.ttl_ms, owner: slot.job.owner }
     this.jobs.set(id, { job: job, at: slot.at })
     return true
   }
@@ -128,13 +160,23 @@ export class JobStore {
     if (httpStatus >= 200 && httpStatus < 300) {
       const text = body.trim()
       const result = isJsonValue(text) ? text : quote(body)
-      job = { id: cur.id, op: cur.op, status: "completed", created_at: cur.created_at, completed_at: completed, http_status: httpStatus, result: result, ttl_ms: cur.ttl_ms, raw: body }
+      job = { id: cur.id, op: cur.op, status: "completed", created_at: cur.created_at, completed_at: completed, http_status: httpStatus, result: result, ttl_ms: cur.ttl_ms, raw: body, owner: cur.owner }
     } else {
       const msg = errorMessage(body) ?? `upstream returned HTTP ${httpStatus}`
-      job = { id: cur.id, op: cur.op, status: "failed", created_at: cur.created_at, completed_at: completed, http_status: httpStatus, error: msg, ttl_ms: cur.ttl_ms, raw: body }
+      job = { id: cur.id, op: cur.op, status: "failed", created_at: cur.created_at, completed_at: completed, http_status: httpStatus, error: msg, ttl_ms: cur.ttl_ms, raw: body, owner: cur.owner }
     }
     this.jobs.set(id, { job: job, at: nowMs })
     return true
+  }
+
+  // The job for a poll from caller (jobOwner of the poll): a job submitted with a credential is only shown to the
+  // same credential, as Bifrost scopes jobs to their virtual key. A mismatch reads as no job, so ids are not probed.
+  getFor(id: string, caller: string, nowMs: int): Job | undefined {
+    const j = this.get(id, nowMs)
+    if (j === undefined) return undefined
+    const owner = j.owner ?? ""
+    if (owner !== "" && !sameOwner(owner, caller)) return undefined
+    return j
   }
 
   get(id: string, nowMs: int): Job | undefined {
@@ -527,6 +569,33 @@ test("jobJson embeds the result raw", () => {
   expect(asyncPoll("/v1/async/chat/completions/job_1")).toEqual({ op: "chat/completions", id: "job_1" })
   expect(asyncPoll("/v1/async/jobs/job_1")).toEqual({ op: "jobs", id: "job_1" })
   expect(asyncPoll("/v1/async/nope/job_1")).toBeUndefined()
+})
+
+test("job ids are random and a job is only shown to the caller that submitted it", () => {
+  const s = new JobStore(60000, 10)
+  const h: Hdrs = new Map()
+  h.set("authorization", "Bearer sk-direct-one")
+  const other: Hdrs = new Map()
+  other.set("authorization", "Bearer sk-direct-two")
+  const a = s.create("chat/completions", 0, undefined, jobOwner("vk-a", h))!
+  const b = s.create("chat/completions", 0, undefined, jobOwner("", h))!
+  const open = s.create("chat/completions", 0, undefined, jobOwner("", new Map()))!
+  // 32 random hex digits, unrelated from one job to the next (the old ids were a clock, a counter and Math.random)
+  expect(a.id.byteLength).toBe(36)
+  expect(a.id.startsWith("job_")).toBe(true)
+  expect(a.id.slice(4, 20) === b.id.slice(4, 20)).toBe(false)
+  // a virtual key's job: the same key reads it, another key, another credential or none does not
+  expect(s.getFor(a.id, jobOwner("vk-a", other), 0)?.id).toBe(a.id)
+  expect(s.getFor(a.id, jobOwner("vk-b", h), 0)).toBeUndefined()
+  expect(s.getFor(a.id, jobOwner("", h), 0)).toBeUndefined()
+  expect(s.getFor(a.id, "", 0)).toBeUndefined()
+  // a job sent with a direct credential is the credential's; the owner survives the job finishing
+  s.finish(b.id, 200, `{"ok":true}`, 1)
+  expect(s.getFor(b.id, jobOwner("", h), 1)?.status).toBe("completed")
+  expect(s.getFor(b.id, jobOwner("", other), 1)).toBeUndefined()
+  // an anonymous job is open to any poll, as in Bifrost
+  expect(s.getFor(open.id, jobOwner("", other), 0)?.id).toBe(open.id)
+  expect(jobJson(a, 60000).includes("vk-a")).toBe(false)
 })
 
 test("asyncOp maps known ops only", () => {

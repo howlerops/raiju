@@ -20,6 +20,7 @@ import * as cloudAuth from "./cloud_auth"
 import * as base64 from "./base64"
 import { S3Creds, awsCall } from "./exports"
 import { parseServiceAccount } from "./providers/vertex"
+import * as vertexWif from "./vertexwif"
 import { Grant } from "./governance"
 import { SttUsage } from "./pricing"
 
@@ -470,6 +471,8 @@ async function copyPump(upstream: ReadableStream, p: Pump, conv: (chunk: u8[]) =
   }
   const end = tail(ok && !p.cancelled)
   const c = p.ctl
+  // (the controller reaches this pump through the stream's callbacks: dropped at the end, or the pair is never freed)
+  p.ctl = undefined
   if (c !== undefined && !p.cancelled) {
     try {
       if (end.length > 0) c.enqueue(end)
@@ -1039,13 +1042,17 @@ async function readEdit(form: FormData): Promise<native.EditInput> throws Syntax
   }
 }
 
-// The Stability options the form sent, by name.
+// The Stability options the form sent, by name, and every other text field Bifrost does not read itself (its extra
+// params, passed on to a Stability edit).
 function formExtras(form: FormData): Map<string, string> {
   const extra: Map<string, string> = new Map()
   for (const k of cloud.stabilityFormFields()) {
     const v = formText(form, k)
     if (v !== "") extra.set(k, v)
   }
+  form.forEach((value, k) => {
+    if (typeof value === "string" && value !== "" && !extra.has(k) && !cloud.editKnownField(k)) extra.set(k, value)
+  })
   return extra
 }
 
@@ -1116,6 +1123,30 @@ async function sarvamSpeechStream(t: Target, mr: native.MediaRequest): Promise<R
   }
 }
 
+// Gemini's streamed transcription: the upstream's SSE chunks become transcript.text.delta events as they arrive, then
+// transcript.text.done (its usage is what the gateway bills) and [DONE] (native.GeminiTranscriptStream). A refusal
+// before the stream is Gemini's answer as it came.
+async function geminiTranscriptStream(t: Target, mr: native.MediaRequest): Promise<Response> {
+  const r: Record<string, string> = mr.headers
+  const dl = deadline(timeoutMs(t.cfg))
+  try {
+    const body = mr.body
+    const res = typeof body === "string" ? await fetch(mr.url, { method: "POST", headers: r, body: body, signal: dl.controller.signal, proxy: proxyOf(t.cfg), tls: tlsOf(t.cfg), pool: poolOf(t.cfg) }) : await fetch(mr.url, { method: "POST", headers: r, signal: dl.controller.signal, proxy: proxyOf(t.cfg), tls: tlsOf(t.cfg), pool: poolOf(t.cfg) })
+    const st = res.body
+    if (res.status !== 200 || st === undefined) {
+      const raw = await res.bytes()
+      dl.finish()
+      return new Response(raw, { status: res.status === 200 ? 502 : res.status, headers: { "content-type": res.headers.get("content-type") ?? "application/json" } })
+    }
+    dl.finish()
+    const conv = native.transcriptStream()
+    return new Response(pump(st, (c: u8[]): u8[] => eventBytes(conv.push(c)), (ok: bool): u8[] => eventBytes(conv.end())), { status: 200, headers: { "content-type": "text/event-stream", "cache-control": "no-cache" } })
+  } catch (e) {
+    dl.finish()
+    return errorReply(502, `${t.provider} request failed: ${e.message}`, "api_connection_error")
+  }
+}
+
 // A GET to the upstream URL of a route, with the provider's auth.
 function getRequest(t: Target, route: MediaRoute): native.MediaRequest {
   return { method: "GET", url: upstreamUrl(t, route, ""), headers: authHeaders(t), body: undefined }
@@ -1136,6 +1167,13 @@ async function openaiBatchResults(t: Target, bid: string): Promise<Response> thr
 // The bearer token for a Vertex call: the cached one for its service account, else a
 // new one from its token endpoint (as gateway.tov's vertexToken fetches it).
 export async function vertexBearer(t: Target): Promise<string> throws SyntaxError | Error {
+  // a token federated from the workload's AWS identity (vertexwif.tov), when the key asks for one
+  const plan = try vertexWif.planOf(t.key.vertex_key_config)
+  if (plan !== undefined) {
+    const ft = await vertexWif.federatedToken(plan)
+    if (ft.error !== "") throw new Error(ft.error)
+    return ft.token
+  }
   const sa = try parseServiceAccount(t.key.vertex_key_config?.auth_credentials)
   const now = Math.floor(Date.now() / 1000)
   const cached = cloud.VERTEX_TOKENS.get(sa.client_email, now)
@@ -1999,6 +2037,8 @@ async function geminiMedia(t: Target, route: MediaRoute, qs: string, text: strin
     const mime = native.audioMime(f.type, f.name)
     if (mime === "") return errorReply(400, "the audio type is not one Gemini takes (wav, mp3, aiff, aac, ogg or flac)", "invalid_request_error")
     const audio = try await f.bytes()
+    // stream=true: Gemini's streamGenerateContent, its chunks converted to transcription events as they come
+    if (formText(form, "stream") === "true") return await geminiTranscriptStream(t, native.geminiTranscriptionStream(t, formText(form, "prompt"), mime, audio))
     const up = await send(t, native.geminiTranscription(t, formText(form, "prompt"), mime, audio))
     if (!up.ok) return up
     const raw = try await up.text()
