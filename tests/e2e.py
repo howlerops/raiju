@@ -17173,7 +17173,7 @@ print(json.dumps(codes))
 
 def l203_e2e(env, idp_state):
     """L203: unauthenticated MCP client registration is bounded (registrations a minute and unused clients per address,
-    unused clients in all) and appends one line per client instead of rewriting the state file, so a register flood
+    unused clients in all) and never rewrites the state file (L206: it stores no client at all, only a count line), so a register flood
     leaves /health fast and the real grants kept; /oauth2/authorize stores nothing (its consent link carries the
     request, sealed) and works on every worker at once; without an encryption key two clustered nodes share the OIDC
     state key through cluster.secret, so a callback on the other node signs in, and a start with neither warns when
@@ -17234,8 +17234,13 @@ def l203_e2e(env, idp_state):
         ok2, lat2 = fast(hs2)
         check("L203: a register flood from many addresses is served (201) and /health stays fast", codes2.get("201", 0) > 100 and ok2, (codes2, lat2))
         check("L203: no register flood writes the state file (the grants are written only by consent, token and revoke)", mtime(state) == st_before and st_before != 0, (st_before, mtime(state)))
-        lines = open(registry).read().split("\n") if os.path.exists(registry) else []
-        check("L203: the client registry stays bounded (60 unused clients kept; rewritten at twice that plus slack)", 2 <= len(lines) <= 2 * 60 + 64 + 3, len(lines))
+        # L206: a registration stores no client (its client_id carries it, sealed), so there is no registry to bound;
+        # the count log for the per-address limits holds one short line per counted registration
+        counts = os.path.join(dcr_dir, "mcp-oauth-state-registrations.jsonl")
+        lines = open(counts).read().split("\n") if os.path.exists(counts) else []
+        made = codes.get("201", 0) + codes2.get("201", 0) + 1
+        check("L203: no client registry is written, and the registration count log has a line per counted registration at most",
+              not os.path.exists(registry) and 2 <= len(lines) <= made + 2 and os.path.getsize(counts) < 120 * (made + 1), (os.path.exists(registry), len(lines), made))
         sj = json.load(open(state))
         check("L203: the state file keeps the granted client and its refresh row, and no flood client",
               any(c["client_id"] == cid for c in sj.get("clients", [])) and not any(c.get("client_name") == "l203-flood" for c in sj.get("clients", [])) and len(sj.get("refresh", [])) >= 1, (len(sj.get("clients", [])), len(sj.get("refresh", []))))
@@ -17328,6 +17333,139 @@ def l203_e2e(env, idp_state):
         for g in gws:
             g.terminate()
             g.wait()
+
+GW_L206 = "http://127.0.0.1:18368"  # L206: stateless MCP client registration (four workers on Bun; one process on http1)
+GW_L206_B = "http://127.0.0.1:18369"  # L206: webhook ids on four workers, RAIJU_TRUSTED_PROXIES
+L206_ADMIN = {"authorization": "Bearer sk-admin-l206", "content-type": "application/json"}
+
+# /oauth2/register from NADDR loopback source addresses (127.2.x.y, real TCP peers), each until it is refused (429) or
+# has made 12 tries on one keep-alive connection. Prints the status counts.
+L206_SPREAD = """
+import asyncio, json, sys
+port, naddr = int(sys.argv[1]), int(sys.argv[2])
+REG = json.dumps({"redirect_uris": ["http://127.0.0.1:9999/cb"], "client_name": "l206-flood"}).encode()
+codes = {}
+async def one(src):
+    r, w = await asyncio.open_connection("127.0.0.1", port, local_addr=(src, 0))
+    try:
+        for _ in range(12):
+            w.write(b"POST /oauth2/register HTTP/1.1\\r\\nHost: x\\r\\ncontent-type: application/json\\r\\nContent-Length: %d\\r\\n\\r\\n" % len(REG) + REG)
+            await w.drain()
+            code = int((await r.readline()).split()[1])
+            n = 0
+            while True:
+                h = await r.readline()
+                if h in (b"\\r\\n", b""):
+                    break
+                if h.lower().startswith(b"content-length"):
+                    n = int(h.split(b":")[1])
+            await r.readexactly(n)
+            codes[code] = codes.get(code, 0) + 1
+            if code == 429:
+                break
+    finally:
+        w.close()
+async def main():
+    sem = asyncio.Semaphore(32)
+    async def g(i):
+        async with sem:
+            await one("127.2.%d.%d" % (i // 250, i % 250 + 1))
+    await asyncio.gather(*[g(i) for i in range(naddr)])
+    print(json.dumps(codes))
+asyncio.run(main())
+"""
+
+def l206_e2e(env):
+    """L206: dynamic client registration stores no client: the client_id is the client's metadata sealed under a key
+    derived from the signing key, and the client is written to the state file at its first grant; so 1,500
+    registrations from 150 addresses (past the old max_unused_clients of 1000, which dropped the oldest) leave a user's
+    in-flight sign-in working, and the per-address limits still hold. Entity ids come from the kernel's random source:
+    12 webhooks created at once on four workers get 12 different ids (Math.random was seeded alike in every worker;
+    Tov patch 0021 seeds each from getrandom). RAIJU_TRUSTED_PROXIES stands in for server.trusted_proxies when the config
+    names none (the ECS module sets it). Ports 18368 and 18369, one gateway after the other."""
+    import hashlib, shutil
+    from concurrent.futures import ThreadPoolExecutor
+    d = os.path.join(BUILD, "e2e-l206")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    base_cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "l206", "value": "sk-l206", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+    }
+    # ---- MCP client registration: no client is stored before its grant ----
+    dcr_dir = os.path.join(d, "dcr")
+    os.makedirs(dcr_dir)
+    dcr_path = os.path.join(dcr_dir, "config.json")
+    json.dump({**base_cfg,
+               "client": {**base_cfg["client"], "mcp_server_auth_mode": "both", "oauth2_server_config": {"issuer_url": GW_L206}},
+               "governance": {"users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l206".encode()).hexdigest()}],
+                              "virtual_keys": [{"id": "vk-l206", "name": "l206 key", "value": "sk-bf-l206"}]}}, open(dcr_path, "w"))
+    state = os.path.join(dcr_dir, "mcp-oauth-state.json")
+    gw = l200_start(env, 18368, dcr_path, "l206dcr", 4)
+    try:
+        wait(GW_L206 + "/health")
+        time.sleep(0.5)
+        s, _, b = raw("POST", GW_L206 + "/oauth2/register", {"client_name": "l206-user", "redirect_uris": [AS_REDIRECT]}, {"content-type": "application/json"})
+        cid = json.loads(b).get("client_id", "") if s == 201 else ""
+        check("L206: a client_id is the sealed client (c1. prefix), not a stored row", cid.startswith("c1.") and "l206-user" not in cid, cid[:60])
+        verifier, challenge = as_pkce()
+        fid, tok = as_authorize(GW_L206, cid, challenge, "st-l206")
+        check("L206: the user's sign-in starts (authorize 302 to the consent page)", fid != "" and tok != "", (fid, tok[:20]))
+        st_before = open(state).read()
+        p = subprocess.run([sys.executable, "-I", "-c", L206_SPREAD, "18368", "150"], capture_output=True, text=True, timeout=120)
+        codes = json.loads(p.stdout) if p.stdout.strip() else {}
+        check("L206: 150 addresses register 1,500 clients (ten a minute each, then 429)", codes.get("201", 0) == 1500 and codes.get("429", 0) == 150, (codes, p.stderr[-300:]))
+        check("L206: no registration writes the state file", open(state).read() == st_before, len(st_before))
+        check("L206: no client registry is written", not os.path.exists(os.path.join(dcr_dir, "mcp-oauth-state-clients.jsonl")), os.listdir(dcr_dir))
+        fid2, tok2 = as_authorize(GW_L206, cid, challenge, "st-l206-again")
+        check("L206: after the flood the user's client still authorizes (it was dropped as the oldest of 1000 before)", fid2 != "", (fid2,))
+        s, redirect = as_approve(GW_L206, fid, tok, "sk-bf-l206")
+        check("L206: the in-flight sign-in is approved after the flood", s == 200 and "code=" in redirect, (s, redirect[:120]))
+        s, body = as_token(GW_L206, cid, redirect, verifier)
+        check("L206: and its code exchanges for tokens", s == 200 and body.get("refresh_token", "") != "", (s, body))
+        sj = json.load(open(state))
+        check("L206: the client is stored at its grant (the state file holds it, and no flood client)",
+              [c["client_name"] for c in sj.get("clients", [])] == ["l206-user"], [c.get("client_name") for c in sj.get("clients", [])])
+        bad = cid[:-4] + ("AAAA" if not cid.endswith("AAAA") else "BBBB")
+        q = urllib.parse.urlencode({"client_id": bad, "redirect_uri": AS_REDIRECT, "response_type": "code", "code_challenge": challenge, "code_challenge_method": "S256"})
+        s, _, b = raw("GET", GW_L206 + "/oauth2/authorize?" + q)
+        check("L206: a changed client_id is refused (400 invalid_client)", s == 400 and "invalid_client" in b, (s, b[:200]))
+        s, _, b = raw("GET", GW_L206 + "/api/oauth2/sessions?q=l206-user", None, L206_ADMIN)
+        check("L206: the grant is listed with its client's name", s == 200 and json.loads(b).get("total_count") == 1, (s, b[:200]))
+    finally:
+        gw.terminate()
+        gw.wait()
+    # ---- webhook ids on four workers, and RAIJU_TRUSTED_PROXIES ----
+    wh_dir = os.path.join(d, "wh")
+    os.makedirs(wh_dir)
+    wh_path = os.path.join(wh_dir, "config.json")
+    json.dump({**base_cfg,
+               "client": {**base_cfg["client"], "mcp_server_auth_mode": "both", "oauth2_server_config": {"issuer_url": GW_L206_B, "registrations_per_minute": 3}},
+               "governance": {"users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l206".encode()).hexdigest()}]}}, open(wh_path, "w"))
+    gw = l200_start({**env, "RAIJU_TRUSTED_PROXIES": "127.0.0.1"}, 18369, wh_path, "l206wh", 4)
+    try:
+        wait(GW_L206_B + "/health")
+        time.sleep(0.5)
+        def create(i):
+            body = {"name": "l206-wh%d" % i, "url": "http://127.0.0.1:9/x", "events": ["async_job.completed"], "allow_private_network": True}
+            s, _, b = raw("POST", GW_L206_B + "/api/webhooks", body, L206_ADMIN)
+            return s, (json.loads(b).get("endpoint", {}).get("id", "") if s in (200, 201) else b[:200])
+        with ThreadPoolExecutor(12) as ex:
+            made = list(ex.map(create, range(12)))
+        ids = [m[1] for m in made]
+        check("L206: 12 webhooks created at once on four workers all succeed with 12 different ids",
+              all(m[0] in (200, 201) for m in made) and len(set(ids)) == 12 and all(i.startswith("wh_") and len(i) == 27 for i in ids), made)
+        saved = json.load(open(wh_path)).get("webhooks", [])
+        check("L206: all 12 webhooks are saved", len(saved) == 12 and len({w["id"] for w in saved}) == 12, len(saved))
+        reg = {"client_name": "l206-xff", "redirect_uris": [AS_REDIRECT]}
+        seen = [raw("POST", GW_L206_B + "/oauth2/register", reg, {"content-type": "application/json", "x-forwarded-for": "203.0.113.7"})[0] for _ in range(4)]
+        other = raw("POST", GW_L206_B + "/oauth2/register", reg, {"content-type": "application/json", "x-forwarded-for": "203.0.113.8"})[0]
+        check("L206: with RAIJU_TRUSTED_PROXIES (no server.trusted_proxies) the forwarded address is the client's: 3 a minute each",
+              seen == [201, 201, 201, 429] and other == 201, (seen, other))
+    finally:
+        gw.terminate()
+        gw.wait()
 
 GW_L202 = "http://127.0.0.1:18360"  # L202: the config lock only around a save (four workers on Bun; one process on http1)
 L202_HOLE = 18361  # a provider base_url that accepts connections and never answers
@@ -20056,6 +20194,9 @@ def main():
         # cluster.secret across two nodes and its start warning, and the OIDC state cookie: its own gateways, one after
         # the other (18362, 18363)
         l203_e2e(env, idp_state)
+        # L206: stateless MCP client registration under a 1,500-client spread, webhook ids on four workers and
+        # RAIJU_TRUSTED_PROXIES: its own gateways, one after the other (18368, 18369)
+        l206_e2e(env)
         # L202: the config lock held only around a save (a slow refresh-models holds none, 503 on a kept lock) and the
         # upgrade bridge with the old mkdir lock: its own gateway (18360) and silent provider (18361)
         l202_e2e(env)

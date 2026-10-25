@@ -1,5 +1,5 @@
 #!/bin/sh
-# Checks patches 0001-0010, 0012, 0013, 0015, 0016, 0017, 0019 and 0020 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
+# Checks patches 0001-0010, 0012, 0013, 0015, 0016, 0017, 0019, 0020 and 0021 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
 # (or `make tov-test`). Each program prints "ok" lines and "FAIL" lines; a run passes when no line
 # fails and the expected number of "ok" lines appears.
 set -eu
@@ -186,5 +186,10 @@ if [ -d /proc/self/task ]; then
 else
   echo "skipped: worker respawn (needs /proc)"
 fi
+
+# Math.random seeded from getrandom(2) and again in each forked worker; TOV_SEED=<n> still fixes it (patch 0021)
+TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/random_seed.tov" -o "$OUT/random_seed" >/dev/null
+python3 "$DIR/random_seed_client.py" "$OUT/random_seed" > "$OUT/random_seed.out" || true
+expect "$OUT/random_seed.out" 5 "Math.random seeded per process and per worker"
 
 echo "tov-patches tests passed"

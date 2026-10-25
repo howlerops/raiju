@@ -11,11 +11,16 @@ session. It sets up the machine, explains the lead/worker loop and points at the
 Worker briefs start from [handoff/worker-prompt-template.md](handoff/worker-prompt-template.md);
 the rules all workers follow are in [handoff/worker-brief.md](handoff/worker-brief.md).
 
-Branch: `claude/affectionate-shannon-pjwi5z`. Waves 1 to 26 are on `main` (PR howlerops/raiju#8).
-The branch carries wave 27 (L202 to L204).
+Branch: `claude/affectionate-shannon-pjwi5z`. Waves 1 to 27 are on `main` (PR howlerops/raiju#9).
+The branch carries wave 28 (L205 to L207).
 
 ## Where things stand
 
+- Wave 28 (L205 to L207) fixed the fourth re-audit (docs/audits/production-reaudit-4-2026-10-25.md): checked
+  bodies keep a minimum rate over a sliding window with a ceiling and a per-credential share, and the broker checks
+  signed heads; MCP OAuth registration is stateless (sealed client_ids); Math.random is seeded from getrandom per
+  worker (tov-patches 0021) and entity ids come from secureHex; concurrent config writes on a worker are group
+  committed, and key, team and customer names are unique. Behaviour changes are in docs/behaviour-changes-wave-28.md.
 - Wave 27 (L202 to L204) fixed the third re-audit (docs/audits/production-reaudit-3-2026-10-25.md): the config
   lock is held only around reread-merge-save with network I/O outside it and a bridge to the wave 25 lock for
   rolling upgrades; MCP OAuth registration is bounded and authorize stores nothing; the OIDC state is bound to
@@ -82,7 +87,7 @@ The branch carries wave 27 (L202 to L204).
   current Bifrost datasheet.
 - docs/parity.md counts 567 parity rows: done 531, partial 12, missing 0, out of scope 15,
   n/a 9, plus 42 Raiju-only extras.
-- Tests at handoff (compiler from tov-patches 0001 to 0010, 0012, 0013, 0015 to 0017, 0019 and 0020): `make unit` 2,464 passed,
+- Tests at handoff (compiler from tov-patches 0001 to 0010, 0012, 0013, 0015 to 0017, 0019 to 0021): `make unit` 2,485 passed,
   0 failed, plus the Python tests (gen_pricing, the h2/gRPC interop suite, crew_priors,
   test_deploy, test_gen_config_doc); e2e "all passed" on Bun and http1; `make ui` all passed;
   `make openapi-check` ok; `make web-check` and `make config-doc-check` up to date. Helm lint and
@@ -94,7 +99,7 @@ The branch carries wave 27 (L202 to L204).
   streamed request bodies, 0009 node:fs rename and fsync, 0010 a WASM wall-clock limit, 0012
   server lifecycle (graceful stop, timeouts, connection cap), 0013 the fetch peer address policy,
   0015 TLS client certificates, Request.signal and gunzip, 0016 a small fetch input buffer, 0017
-  server.requestIP, 0019 worker respawn after SIGKILL and Bun.plainAlloc, 0020 flockSync. 0011, 0014 and 0018 are
+  server.requestIP, 0019 worker respawn after SIGKILL and Bun.plainAlloc, 0020 flockSync, 0021 random seeding. 0011, 0014 and 0018 are
   unused. They apply in order only; `make tov` rebuilds the compiler.
 - Admin UI: SolidJS 2.0 RC in `web/`, embedded through the committed `src/ui_assets.tov`;
   charts with zoom and series toggles, MCP access and virtual MCP screens, role-aware actions
@@ -122,7 +127,7 @@ real accounts. The production items left:
 - Deployment: build and scan the image, install the chart on a real cluster and apply the ECS
   module on AWS (both are checked only by lint, terraform validate and mock-provider tests).
 - Crew routing: fit real priors and a classifier from your own evaluation data.
-- Upstream: offer tov-patches/upstream to Tov (0013, 0015, 0016, 0017, 0019 and 0020 have no write-up yet).
+- Upstream: offer tov-patches/upstream to Tov (0013, 0015, 0016, 0017, 0019, 0020 and 0021 have no write-up yet).
 
 ## Owner decisions after wave 22 (2026-10-24)
 

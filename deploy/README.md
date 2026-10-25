@@ -103,11 +103,28 @@ comes when the process is out of descriptors. 0 turns a timeout off. These keys 
 
 ## Behind a proxy or ingress
 
-The audit log and the sign-in throttle use the client's address. Raiju believes `X-Forwarded-For` and
-`X-Real-IP` only from the proxies in `server.trusted_proxies` (addresses or CIDR ranges). Behind a load
-balancer, an ingress controller or the ECS ALB, list its addresses (for a cluster, the pod or node range the
-ingress runs in), or every request is seen as coming from the proxy: the audit log then names the proxy, and
-failed sign-ins from all clients count against one address (`server.sign_in_throttle.ip_failures`, 20 an hour).
+The audit log, the sign-in throttle and the MCP client registration limits use the client's address. Raiju
+believes `X-Forwarded-For` and `X-Real-IP` only from the proxies in `server.trusted_proxies` (addresses or CIDR
+ranges). Behind a load balancer, an ingress controller or the ECS ALB, list its addresses (for a cluster, the pod
+or node range the ingress runs in), or every request is seen as coming from the proxy: the audit log then names
+the proxy, failed sign-ins from all clients count against one address (`server.sign_in_throttle.ip_failures`, 20
+an hour), and so do MCP client registrations (`client.oauth2_server_config.registrations_per_minute`, 10 a minute).
+
+When the config names no `trusted_proxies`, the comma-separated `RAIJU_TRUSTED_PROXIES` environment variable is
+used. The ECS module sets it to the VPC's CIDR block (its `trusted_proxies` variable; `[]` turns it off), where the
+ALB's addresses are; a `trusted_proxies` list in config.json still wins. With the Helm chart, set it in the config,
+to the range your ingress controller's pods (or, with `externalTrafficPolicy: Local` load balancers, the nodes) send
+from:
+
+```yaml
+config:
+  server:
+    trusted_proxies: ["10.0.0.0/8"]   # the cluster's pod range, or the ingress controller's
+```
+
+With `configMode: ifAbsent` this reaches only a fresh volume; on an existing one, set it through the API or the
+config file (or use `configMode: always`). Do not list a range that untrusted clients can send from directly: a
+listed peer's `X-Forwarded-For` is taken as given.
 
 A keep-alive connection that a client or proxy reuses just as the idle timeout closes it gets no
 answer (the request finds the connection closed: an incomplete read, or a 502 from a load
@@ -312,6 +329,24 @@ wave 26 on (flock on `config.json.flock`), and from wave 27 on also the wave 25 
 release after wave 27, with `strategy: {type: Recreate}` (ECS: `deployment_minimum_healthy_percent = 0`,
 `deployment_maximum_percent = 100`) for that one upgrade. docs/operations.md has the details and what flock
 means on NFS and EFS.
+
+Upgrading with MCP OAuth on (`client.mcp_server_auth_mode` "both" or "oauth") and more than one pod: stop the old
+pods first (`strategy: {type: Recreate}`; ECS: `deployment_minimum_healthy_percent = 0`,
+`deployment_maximum_percent = 100`) whenever the client registration format changes, which it did twice:
+
+- wave 27 moved unused clients from `mcp-oauth-state.json` to `mcp-oauth-state-clients.jsonl`, which a wave 26
+  pod does not read;
+- wave 28 (L206) stores no client at registration: the `client_id` is the client's metadata sealed under a key
+  derived from the signing key (it starts with `c1.`), and the client is written to `mcp-oauth-state.json` only
+  at its first grant. A wave 27 pod does not know such an id, so during a rolling update a client registered on a
+  new pod and sent to an old one gets `400 invalid_client` at `/oauth2/authorize`.
+
+A stop-first upgrade loses nothing: the new release reads the clients and grants the old one stored (and a wave
+27 registry, until its clients' unused hour ends), and a consent link begun before the stop still opens. Clients
+that already hold a grant are in the state file in full and work on either release, so a rollback forgets only
+clients registered on the new release that have no grant yet (they register again). Several nodes must share the
+signing key (a configured `signing_key`, or the generated one on a shared volume) for a `client_id` minted on one to
+open on another, as for consent links.
 
 Each pod's log and audit folders are on its own data volume (`/app/data/logs`, `/app/data/logs/audit`):
 `/api/logs` answers from the pod that is asked. An enabled store that cannot open its folder stops the

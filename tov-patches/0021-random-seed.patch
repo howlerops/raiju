@@ -1,0 +1,116 @@
+diff --git a/runtime/tov.c b/runtime/tov.c
+--- a/runtime/tov.c
++++ b/runtime/tov.c
+@@ -2496,20 +2496,66 @@
+     tv_rng_state = (x ? x : TV_RNG_DEFAULT) ^ TV_RNG_DEFAULT;
+ }
+ 
+-/* Seeded on first use (TOV_SEED: a number, or any other value for a random seed), so programs
+- * that never draw a random number don't link getenv, time and clock. */
++/* 64 bits from the system's random source (getrandom(2); arc4random on macOS), or from the
++ * clock, the pid and an address when it gives none. */
++#if defined(__linux__)
++#include <sys/random.h>
++#endif
++static uint64_t tv_random_os(void) {
++    uint64_t v = 0;
++#if defined(__APPLE__)
++    arc4random_buf(&v, sizeof v);
++#elif defined(__linux__)
++    uint8_t *b = (uint8_t *)&v;
++    size_t n = sizeof v;
++    while (n) {
++        ssize_t r = getrandom(b, n, 0);
++        if (r <= 0) {
++            if (r < 0 && errno == EINTR) continue;
++            break;
++        }
++        b += r;
++        n -= (size_t)r;
++    }
++#endif
++    if (!v) {
++        v = (uint64_t)time(NULL) ^ ((uint64_t)clock() << 32) ^ (uint64_t)(uintptr_t)&v;
++#if defined(__unix__) || defined(__APPLE__)
++        v ^= (uint64_t)getpid() << 16;
++#endif
++    }
++    return v;
++}
++
++/* TOV_SEED as a number (a fixed seed, for reproducible runs), or false. */
++static bool tv_random_fixed(uint64_t *out) {
++    const char *seed = getenv("TOV_SEED");
++    if (!seed) return false;
++    char *end;
++    unsigned long long v = strtoull(seed, &end, 0);
++    if (end == seed || *end != 0) return false;
++    *out = v;
++    return true;
++}
++
++/* Seeded on first use, so programs that never draw a random number don't link getenv and
++ * getrandom: from the system's random source, so every process (and every node) draws its own
++ * numbers; TOV_SEED=<n> fixes the seed instead (any other value: the system's source). */
+ static bool tv_rng_ready;
+ static __attribute__((noinline, cold)) void tv_random_init(void) {
+     tv_rng_ready = true;
+-    const char *seed = getenv("TOV_SEED");
+-    if (seed) {
+-        char *end;
+-        unsigned long long v = strtoull(seed, &end, 0);
+-        if (end != seed && *end == 0) tv_random_seed(v);
+-        else tv_random_seed((uint64_t)time(NULL) ^ ((uint64_t)clock() << 32) ^ (uint64_t)(uintptr_t)&seed);
+-    } else {
+-        tv_random_seed(0);
+-    }
++    uint64_t v;
++    if (tv_random_fixed(&v)) tv_random_seed(v);
++    else tv_random_seed(tv_random_os());
++}
++
++/* In a forked worker: a state of its own, not the copy of its parent's (worker `child` of a
++ * fixed TOV_SEED gets a seed derived from it and its index, so a run stays reproducible). */
++void tv_random_after_fork(tv_int child) {
++    tv_rng_ready = true;
++    uint64_t v;
++    if (tv_random_fixed(&v)) tv_random_seed(v + TV_RNG_DEFAULT * (uint64_t)(child + 1));
++    else tv_random_seed(tv_random_os());
+ }
+ 
+ double tv_random(void) { /* xorshift64* */
+@@ -5555,6 +5601,8 @@
+     /* the parent's event queue (epoll's is shared after fork) and client state aren't ours */
+     if (tv_http_q >= 0) { close(tv_http_q); tv_http_q = -1; }
+     if (tv_io_after_fork) tv_io_after_fork();
++    /* Math.random: the parent's state was copied, so every worker would draw the same numbers */
++    tv_random_after_fork(w);
+     /* Give back the free malloc pages inherited from the program's setup. */
+ #if defined(__APPLE__)
+     malloc_zone_pressure_relief(NULL, 0);
+diff --git a/runtime/tov.h b/runtime/tov.h
+--- a/runtime/tov.h
++++ b/runtime/tov.h
+@@ -505,7 +505,8 @@
+ 
+ double tv_math_round(double x);           /* JS Math.round: half toward +infinity */
+ tv_int tv_f64_to_int(double x, const char *what, const char *loc);   /* traps on NaN/±inf/out of i64 range */
+-double tv_random(void);                   /* xorshift, deterministic seed unless TOV_SEED is set */
++double tv_random(void);                   /* xorshift, seeded from the system unless TOV_SEED=<n> fixes it */
++void tv_random_after_fork(tv_int child);  /* a forked worker's own state */
+ 
+ /* ------------------------------------------------------------------ closures and boxes */
+ 
+diff --git a/runtime/README.md b/runtime/README.md
+--- a/runtime/README.md
++++ b/runtime/README.md
+@@ -23,7 +23,8 @@
+   `tv_inspect_record`. Stdout is buffered (64 KiB) and flushed at exit, before traps and before
+   stderr writes (per line when stdout is a TTY).
+ - **Math, closures, tests**: `Math.round`, checked float→int, seeded `Math.random`
+-  (fixed seed; `TOV_SEED=<n>` picks a seed, any other value seeds from the clock),
++  (seeded from getrandom(2), and again in each forked worker; `TOV_SEED=<n>` fixes the seed,
++  each worker deriving its own from it and its index),
+   closure environments, and the `test(...)` runner.
+ 
+ ## Tests

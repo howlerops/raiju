@@ -139,6 +139,14 @@ class EcsTest(unittest.TestCase):
         hi = re.search(r'variable "deployment_maximum_percent" \{.*?default\s*=\s*(\d+)', self.vars, re.S)
         self.assertEqual((lo.group(1), hi.group(1)), ("100", "200"))
 
+    def test_trusted_proxies_default_to_the_vpc(self):
+        # behind the ALB every client would share its address (audit log, sign-in throttle, MCP registration limits)
+        self.assertRegex(self.vars, r'variable "trusted_proxies" \{[^}]*default\s*=\s*null')
+        self.assertIn('data "aws_vpc" "this"', self.main)
+        self.assertIn("[data.aws_vpc.this.cidr_block]", self.main)
+        self.assertIn("RAIJU_TRUSTED_PROXIES", self.main)
+        self.assertIn("for k, v in local.environment", self.main)
+
     @unittest.skipUnless(os.environ.get("TERRAFORM"), "set TERRAFORM to a terraform binary to run the module's terraform test")
     def test_terraform_test(self):
         tf = os.environ["TERRAFORM"]

@@ -2,6 +2,11 @@ data "aws_region" "current" {}
 
 data "aws_caller_identity" "current" {}
 
+# the VPC's CIDR block: the default trusted_proxies (the ALB's addresses are in it)
+data "aws_vpc" "this" {
+  id = var.vpc_id
+}
+
 locals {
   cluster_arn = var.cluster_arn != null ? var.cluster_arn : one(aws_ecs_cluster.this[*].arn)
   efs_enabled = var.efs_file_system_id != null
@@ -19,6 +24,14 @@ locals {
   command = concat(
     ["-app-dir", "/app/data", "-host", "0.0.0.0", "-port", tostring(var.port)],
     ["-workers", tostring(var.workers)],
+  )
+
+  # The ALB forwards each client's address in X-Forwarded-For: Raiju believes it from the VPC's range (the ALB's
+  # addresses) unless trusted_proxies says otherwise. An explicit RAIJU_TRUSTED_PROXIES in environment wins.
+  trusted_proxies = var.trusted_proxies != null ? var.trusted_proxies : [data.aws_vpc.this.cidr_block]
+  environment = merge(
+    length(local.trusted_proxies) > 0 ? { RAIJU_TRUSTED_PROXIES = join(",", local.trusted_proxies) } : {},
+    var.environment,
   )
 
   secrets_manager_arns = [for arn in values(local.all_secrets) : arn if can(regex(":secretsmanager:", arn))]
@@ -363,7 +376,7 @@ resource "aws_ecs_task_definition" "this" {
       stopTimeout = 35
 
       readonlyRootFilesystem = var.readonly_root_filesystem
-      environment            = [for k, v in var.environment : { name = k, value = v }]
+      environment            = [for k, v in local.environment : { name = k, value = v }]
       secrets                = [for k, v in local.all_secrets : { name = k, valueFrom = v }]
       mountPoints = [
         { sourceVolume = "data", containerPath = "/app/data", readOnly = false },

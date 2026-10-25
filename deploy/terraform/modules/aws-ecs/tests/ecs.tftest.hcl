@@ -11,6 +11,9 @@ mock_provider "aws" {
   mock_data "aws_iam_policy_document" {
     defaults = { json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}" }
   }
+  mock_data "aws_vpc" {
+    defaults = { cidr_block = "10.20.0.0/16" }
+  }
 }
 
 variables {
@@ -54,6 +57,36 @@ run "one_task_with_writable_ephemeral_data_and_tmp" {
   assert {
     condition     = aws_lb.this.idle_timeout < 60
     error_message = "the ALB closes idle connections before Raiju does (server.idle_timeout_seconds 60)"
+  }
+  assert {
+    condition     = contains([for e in jsondecode(aws_ecs_task_definition.this.container_definitions)[0].environment : "${e.name}=${e.value}"], "RAIJU_TRUSTED_PROXIES=10.20.0.0/16")
+    error_message = "the ALB's forwarding headers are believed from the VPC's range by default"
+  }
+}
+
+run "trusted_proxies_can_be_named_or_turned_off" {
+  command = plan
+
+  variables {
+    trusted_proxies = []
+  }
+
+  assert {
+    condition     = !contains([for e in jsondecode(aws_ecs_task_definition.this.container_definitions)[0].environment : e.name], "RAIJU_TRUSTED_PROXIES")
+    error_message = "[] trusts no proxy"
+  }
+}
+
+run "trusted_proxies_named" {
+  command = plan
+
+  variables {
+    trusted_proxies = ["10.20.1.0/24", "10.20.2.0/24"]
+  }
+
+  assert {
+    condition     = contains([for e in jsondecode(aws_ecs_task_definition.this.container_definitions)[0].environment : "${e.name}=${e.value}"], "RAIJU_TRUSTED_PROXIES=10.20.1.0/24,10.20.2.0/24")
+    error_message = "the named ranges are passed on"
   }
 }
 
