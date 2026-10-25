@@ -531,6 +531,30 @@ export class Governance {
     return at !== undefined && at <= Date.now()
   }
 
+  // The part of admit that reads the credential headers alone: a missing credential while auth is enforced (401), a
+  // key that is inactive or expired or that the caller's identity may not pick (403). The servers ask it before they
+  // read a big request body, so a caller without a credential is refused without the body being read.
+  credentialDenial(h: Hdrs): Denial | undefined {
+    return this.keyDenial(h, this.findKey(h))
+  }
+
+  // credentialDenial for the key the request's headers name (findKey).
+  private keyDenial(h: Hdrs, vk: VirtualKeyConfig | undefined): Denial | undefined {
+    const wrong = vk === undefined ? this.unassignedSelection(h) : undefined
+    if (wrong !== undefined) return { kind: "denial", status: 403, type: "permission_error", message: `virtual key ${wrong} is not assigned to this user` }
+    if (vk === undefined) {
+      const alt = this.altAuth
+      // a direct provider key satisfies the auth requirement, as in Bifrost; provider and model limits still apply
+      const direct = directKeyFrom(h, this.directKeys) !== undefined
+      if (this.enforce && !direct && !(alt !== undefined && alt(h))) return { kind: "denial", status: 401, type: "authentication_error", message: "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)" }
+    } else if (vk.is_active === false) {
+      return { kind: "denial", status: 403, type: "permission_error", message: `virtual key ${vk.name ?? vk.id} is inactive` }
+    } else if (this.expired(vk)) {
+      return { kind: "denial", status: 403, type: "permission_error", message: `virtual key ${vk.name ?? vk.id} has expired` }
+    }
+    return undefined
+  }
+
   // Checks the key, the provider and model it may use, the project it names, and every limit above
   // them. The caller's own access (its key's profile and provider configs) and the project's access
   // combine by the project's access_rule: union when either allows, intersect when both do. A peek checks the same
@@ -545,18 +569,8 @@ export class Governance {
       if (idAuth !== undefined && idAuth(h)) return { kind: "denial", status: 400, type: "invalid_request_error", message: "the request carries both an identity token and x-bf-vk, and client.dual_credential_conflict_behavior is error" }
     }
     const vk = this.findKey(h)
-    const wrong = vk === undefined ? this.unassignedSelection(h) : undefined
-    if (wrong !== undefined) return { kind: "denial", status: 403, type: "permission_error", message: `virtual key ${wrong} is not assigned to this user` }
-    if (vk === undefined) {
-      const alt = this.altAuth
-      // a direct provider key satisfies the auth requirement, as in Bifrost; provider and model limits still apply
-      const direct = directKeyFrom(h, this.directKeys) !== undefined
-      if (this.enforce && !direct && !(alt !== undefined && alt(h))) return { kind: "denial", status: 401, type: "authentication_error", message: "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)" }
-    } else if (vk.is_active === false) {
-      return { kind: "denial", status: 403, type: "permission_error", message: `virtual key ${vk.name ?? vk.id} is inactive` }
-    } else if (this.expired(vk)) {
-      return { kind: "denial", status: 403, type: "permission_error", message: `virtual key ${vk.name ?? vk.id} has expired` }
-    }
+    const refused = this.keyDenial(h, vk)
+    if (refused !== undefined) return refused
     const pol = vk === undefined ? undefined : this.policies.get(vk.id)
     if (vk !== undefined && pol !== undefined) {
       // fail closed: a profile that went missing must not lift its restrictions
@@ -1890,4 +1904,23 @@ test("a held profile's provider-config budgets have a copy per user, and a user'
   expect(lims.find((u) => u.id === "b-p@user/cy")?.limit).toBe(10.0)
   expect(g.budgetCycleStart("b-p@user/ana", Date.now()) !== undefined).toBe(true)
   expect(g.budgetCycleStart("nope", Date.now())).toBeUndefined()
+})
+
+test("credentialDenial: the header-only refusals of admit", () => {
+  const cfg: Config = { client: { enforce_auth_on_inference: true }, governance: { virtual_keys: [{ id: "k", value: "sk-bf-k" }, { id: "off", value: "sk-bf-off", is_active: false }, { id: "old", value: "sk-bf-old", expires_at: "2001-01-01T00:00:00Z" }] } }
+  const g = new Governance(cfg)
+  expect(g.credentialDenial(hdrs([["x-bf-vk", "sk-bf-k"]]))).toBeUndefined()
+  expect(g.credentialDenial(hdrs([["authorization", "Bearer sk-bf-k"]]))).toBeUndefined()
+  expect(g.credentialDenial(hdrs([]))!.status).toBe(401)
+  expect(g.credentialDenial(hdrs([["x-bf-vk", "sk-bf-nope"]]))!.status).toBe(401)
+  expect(g.credentialDenial(hdrs([["x-bf-vk", "sk-bf-off"]]))!.status).toBe(403)
+  expect(g.credentialDenial(hdrs([["x-bf-vk", "sk-bf-old"]]))!.status).toBe(403)
+  // another accepted credential (an admin user, an agent token) passes
+  g.altAuth = (h) => h.get("authorization") === "Bearer admin"
+  expect(g.credentialDenial(hdrs([["authorization", "Bearer admin"]]))).toBeUndefined()
+  // what admit answers for the same headers
+  expect((g.admit(hdrs([]), "openai", "m") as Denial).status).toBe(401)
+  expect((g.admit(hdrs([["x-bf-vk", "sk-bf-off"]]), "openai", "m") as Denial).status).toBe(403)
+  // not enforced: no credential is fine
+  expect(new Governance({ client: { enforce_auth_on_inference: false } }).credentialDenial(hdrs([]))).toBeUndefined()
 })

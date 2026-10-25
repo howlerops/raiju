@@ -27,7 +27,27 @@ export type FeedConfig = { cluster_wide?: bool, ring_size?: int, ring_seconds?: 
 // log_reads (default true): a request log read (/api/logs, its detail, stats, sessions and histograms, the MCP and
 // agent logs) also asks the peers for their rows (POST /api/cluster/logs), since each node keeps its own log files;
 // false answers with this node's rows only.
-export type ClusterConfig = { enabled: bool, node_id?: string, peers: string[], secret: string, interval_ms?: int, discovery?: DiscoveryConfig, type?: string, broker?: BrokerConfig, leader_lock?: LeaderLockConfig, feed?: FeedConfig, config_sync?: string, log_reads?: bool }
+// listen_port (Raiju only): a second listener that serves the peer routes (/api/cluster/*) and /health, so they need
+// not be reachable on the public port; the main listener then answers 404 for them, and the other nodes name this
+// port. bind: the address of that listener (default the gateway's -host). serve_metrics: /metrics moves to that
+// listener too (404 on the main one). Read at start.
+// secret: env.NAME allowed. It must hold at least 32 bytes once resolved, or the gateway refuses to start with
+// clustering on (secretProblem).
+export type ClusterConfig = { enabled: bool, node_id?: string, peers: string[], secret: string, interval_ms?: int, discovery?: DiscoveryConfig, type?: string, broker?: BrokerConfig, leader_lock?: LeaderLockConfig, feed?: FeedConfig, config_sync?: string, log_reads?: bool, listen_port?: int, bind?: string, serve_metrics?: bool }
+
+// The shortest cluster.secret accepted: 32 bytes (256 bits, as long as the HMAC-SHA256 key it becomes).
+export const MIN_SECRET_BYTES = 32
+
+// Why a cluster secret cannot sign peer traffic, or "". raw is the value as written, resolved the value after its
+// env.NAME reference was read ("" when the variable is unset). Every node holding the same weak or missing secret
+// would let anyone who reaches the port sign the peer routes (the config with its keys, the logs, the counters).
+export function secretProblem(raw: string, resolved: string): string {
+  if (raw.startsWith("env.") && resolved === "") return `cluster.secret names ${raw}, but the environment variable ${raw.slice(4)} is not set`
+  if (resolved === "") return "cluster.secret is empty"
+  if (resolved.startsWith("env.")) return `cluster.secret is still an unresolved reference (${resolved})`
+  if (resolved.byteLength < MIN_SECRET_BYTES) return `cluster.secret is ${resolved.byteLength} bytes; it must be at least ${MIN_SECRET_BYTES} (for example: openssl rand -hex 32)`
+  return ""
+}
 
 export function syncInterval(cfg: ClusterConfig): int {
   return cfg.interval_ms ?? 1000
@@ -240,6 +260,8 @@ export function sign(secret: string, body: string): string {
 
 // Constant-time: the loop always runs over the whole signature, so timing reveals only its length.
 export function verify(secret: string, body: string, sig: string): bool {
+  // no secret, no trust: an empty key is one anyone can sign with
+  if (secret === "") return false
   const want = utf8(sign(secret, body))
   const got = utf8(sig)
   if (want.length !== got.length) return false
@@ -426,6 +448,25 @@ test("the roster is only in answers that ask for it, and a bad roster changes no
   expect(threw).toBe(2)
   expect(a.total("c", "w")).toBe(1)
   expect(a.peers().length).toBe(0)
+})
+
+test("a cluster secret must be set, resolved and at least 32 bytes", () => {
+  const strong = "0123456789abcdef0123456789abcdef"
+  expect(secretProblem(strong, strong)).toBe("")
+  expect(secretProblem("env.RAIJU_CLUSTER_SECRET", strong)).toBe("")
+  expect(secretProblem("", "")).toBe("cluster.secret is empty")
+  expect(secretProblem("env.RAIJU_CLUSTER_SECRET", "")).toBe("cluster.secret names env.RAIJU_CLUSTER_SECRET, but the environment variable RAIJU_CLUSTER_SECRET is not set")
+  expect(secretProblem("env.A", "env.B_STILL_A_REFERENCE_PADDED_TO_32")).toBe("cluster.secret is still an unresolved reference (env.B_STILL_A_REFERENCE_PADDED_TO_32)")
+  expect(secretProblem("short", "short")).toBe("cluster.secret is 5 bytes; it must be at least 32 (for example: openssl rand -hex 32)")
+  expect(secretProblem(strong.slice(1), strong.slice(1)).includes("31 bytes")).toBe(true)
+})
+
+test("an empty secret verifies nothing, not even a signature made with an empty key", () => {
+  expect(verify("", "", sign("", ""))).toBe(false)
+  expect(verify("", "{}", sign("", "{}"))).toBe(false)
+  const k = "0123456789abcdef0123456789abcdef"
+  expect(verify(k, "{}", sign(k, "{}"))).toBe(true)
+  expect(verify(k, "{}", sign("env.RAIJU_CLUSTER_SECRET", "{}"))).toBe(false)
 })
 
 test("broker mode and the broker URL", () => {

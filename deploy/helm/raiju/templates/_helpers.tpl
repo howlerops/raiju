@@ -79,10 +79,48 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- define "raiju.config" -}}
 {{- $cfg := deepCopy .Values.config }}
 {{- $cl := get $cfg "cluster" }}
-{{- if and (kindIs "map" $cl) (get $cl "enabled") (not (hasKey $cl "config_sync")) }}
+{{- if and (kindIs "map" $cl) (get $cl "enabled") }}
+{{- if not (hasKey $cl "config_sync") }}
 {{- $_ := set $cl "config_sync" (ternary "file" "pull" (eq (include "raiju.sharedData" .) "true")) }}
 {{- end }}
+{{- if and .Values.cluster.secret.existingSecret (not (get $cl "secret")) }}
+{{- $_ := set $cl "secret" "env.RAIJU_CLUSTER_SECRET" }}
+{{- end }}
+{{- if and (gt (int .Values.cluster.listenPort) 0) (not (hasKey $cl "listen_port")) }}
+{{- $_ := set $cl "listen_port" (int .Values.cluster.listenPort) }}
+{{- $_ := set $cl "bind" "0.0.0.0" }}
+{{- end }}
+{{- if and .Values.cluster.serveMetrics (not (hasKey $cl "serve_metrics")) }}
+{{- $_ := set $cl "serve_metrics" true }}
+{{- end }}
+{{- end }}
+{{- if .Values.metricsToken.existingSecret }}
+{{- $server := default dict (get $cfg "server") }}
+{{- if not (hasKey $server "metrics_token") }}
+{{- $_ := set $server "metrics_token" "env.RAIJU_METRICS_TOKEN" }}
+{{- end }}
+{{- $_ := set $cfg "server" $server }}
+{{- end }}
 {{- toJson $cfg }}
+{{- end }}
+
+{{/* The cluster listener's port when the rendered config has clustering on and a listen_port, else empty. */}}
+{{- define "raiju.clusterPort" -}}
+{{- $cfg := include "raiju.config" . | fromJson }}
+{{- $cl := get $cfg "cluster" }}
+{{- if and (kindIs "map" $cl) (get $cl "enabled") (hasKey $cl "listen_port") }}{{ get $cl "listen_port" | int }}{{ end }}
+{{- end }}
+
+{{/* Non-empty when /metrics is served on the cluster listener (cluster.serve_metrics with a cluster port). */}}
+{{- define "raiju.metricsOnCluster" -}}
+{{- $cfg := include "raiju.config" . | fromJson }}
+{{- $cl := get $cfg "cluster" }}
+{{- if and (include "raiju.clusterPort" .) (get $cl "serve_metrics") }}true{{ end }}
+{{- end }}
+
+{{/* The port Prometheus scrapes /metrics on: the cluster port with serveMetrics, the main port otherwise. */}}
+{{- define "raiju.metricsPort" -}}
+{{- if include "raiju.metricsOnCluster" . }}{{ include "raiju.clusterPort" . }}{{ else }}{{ .Values.port }}{{ end }}
 {{- end }}
 
 {{/* Settings the chart refuses: a single-writer claim with more than one pod, an unknown configMode, and a kill
@@ -94,6 +132,16 @@ about 5 s to send what is queued). */}}
 {{- end }}
 {{- if not (has .Values.configMode (list "ifAbsent" "always")) }}
 {{- fail (printf "configMode must be ifAbsent or always, not %q" .Values.configMode) }}
+{{- end }}
+{{- $cl := get .Values.config "cluster" }}
+{{- if and (kindIs "map" $cl) (get $cl "enabled") }}
+{{- $sec := toString (default "" (get $cl "secret")) }}
+{{- if and (eq $sec "") (not .Values.cluster.secret.existingSecret) }}
+{{- fail "config.cluster.enabled needs a cluster secret: set cluster.secret.existingSecret (a Secret holding RAIJU_CLUSTER_SECRET, at least 32 bytes)" }}
+{{- end }}
+{{- if and (ne $sec "") (not (hasPrefix "env." $sec)) }}
+{{- fail "config.cluster.secret must be an env.NAME reference: the config is a ConfigMap; keep the value in a Secret (cluster.secret.existingSecret)" }}
+{{- end }}
 {{- end }}
 {{- $server := default dict (get .Values.config "server") }}
 {{- $grace := 25.0 }}

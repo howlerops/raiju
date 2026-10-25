@@ -21,7 +21,12 @@ BIFROST_SETUP_TOKEN=$(openssl rand -hex 16) build/raiju   # /api opens to this t
 
 The gateway listens on 127.0.0.1 unless `-host` (or `BIFROST_HOST`) says otherwise; the image and the
 deploy files pass `-host 0.0.0.0`. The management API is locked until an admin exists (see
-[Secure defaults](#secure-defaults)).
+[Secure defaults](#secure-defaults)). The first start after an upgrade lists, once, the defaults that changed
+in recent releases and that your config relies on (recorded in `.raiju-notices.json` beside `config.json`).
+
+`make build` compiles with `TOV_CFLAGS=-DTV_PLAIN_ALLOC` (the Makefile, CI and the Dockerfile set it). A binary
+built without it crashes under concurrent requests, so it refuses to start (`RAIJU_ALLOW_UNSAFE_ALLOC=1` starts
+it anyway, with a warning).
 
 ```sh
 build/raiju -healthcheck -port 8080          # exits 0 when the gateway on this host answers /health
@@ -179,6 +184,10 @@ gateway process's memory, as dashboard sessions do.
   sign-in applies and the token opens nothing. `client.whitelisted_routes` stay open.
   In the deployments: `BIFROST_SETUP_TOKEN` in compose's `.env`, the chart's `setupToken.existingSecret`,
   or a `secret_arns` entry on ECS ([deploy/README.md](deploy/README.md)).
+- **Sign-in:** passwords are bcrypt hashes (Bifrost's form; old salted SHA-256 ones are replaced at the
+  next sign-in), unknown users cost the same time as real ones, and failed sign-ins are throttled per
+  account and per client address (429 with Retry-After; `server.sign_in_throttle`). Forwarding headers
+  are believed only from `server.trusted_proxies`. See [SECURITY.md](SECURITY.md#sign-in).
 - **Bind address:** 127.0.0.1 by default (Bifrost's `localhost`); `-host` or `BIFROST_HOST` change it.
   The image, compose, the chart and the Terraform modules pass `-host 0.0.0.0`.
 - **Metrics:** label values a caller chooses are bounded. A path no route serves (404, 405, 501), and
@@ -225,6 +234,9 @@ Two Raiju-only switches, both off by default (Bifrost's behaviour):
 
 The default server is Tov's built-in `Bun.serve`. `-workers N` forks N
 processes that share the port, and each one serves WebSockets (`/v1/realtime`).
+A worker that dies (a crash, or SIGKILL from the OOM killer) is replaced while the
+others keep serving, after a pause of 1 s doubling to 30 s while it keeps dying
+within 10 s of starting (Tov patch 0019).
 Streamed answers go to the client chunk by chunk as a `ReadableStream`
 response body. OpenAI-format, Anthropic, Gemini, Bedrock, Vertex and Cohere
 streams are converted as they arrive. Stream bodies need Tov with the patch in
@@ -258,6 +270,14 @@ connections per process (`server.max_connections`, three quarters of the descrip
 default; 503 past it). `GET /health` is liveness, `GET /ready` readiness. See
 [deploy/README.md](deploy/README.md#stopping-and-slow-clients).
 
+Request bodies over 64 KB reach the gateway unread, so a caller whose credentials are refused gets its
+401 or 403 from the headers and its body is never read (inference routes while auth is enforced, and
+the management API's gate). Each process also caps the request-body bytes it reads at once across
+requests, `server.max_buffered_body_mb` (default 48, sized for a 512Mi pod: parsing a chat body costs
+several times its size); a body that does not fit is answered 503 with `retry-after`, unread. A lone
+body up to `client.max_request_body_size_mb` is always read, so that limit keeps Bifrost's meaning.
+`bench/body_memory.py` measures both.
+
 The workers of one node share budgets, rate limits, the response and semantic
 caches and `/metrics` (summed) through a private share folder, `$TMPDIR/raiju-<pid>-<random>` (the clustering CRDT, one slot per worker).
 Request-log queries are shared only when the log store is shared; otherwise each worker answers from its own log. Usage
@@ -266,7 +286,9 @@ workers can pass a limit by a few requests, as across cluster nodes. Each
 worker starts its own stdio MCP servers.
 
 A config change saved by one worker (through the API, say) is applied by every worker before the request is answered,
-so a deleted virtual key stops working on all of them at once. Cluster nodes take each other's saves when they share
+so a deleted virtual key stops working on all of them at once; saves made at the same time on several workers are
+merged under the config file's lock (or refused with 409 when they set one value differently). Async jobs, dashboard
+sessions and the CLI's agent tokens work on every worker, and sessions and agent tokens outlive a restart. Cluster nodes take each other's saves when they share
 the config file, or pull them from a peer with `cluster.config_sync: "pull"`. The request log and audit folders default
 to `logs` and `logs/audit` in the app dir, and a required store that cannot open stops the start. See
 [docs/operations.md](docs/operations.md).

@@ -63,6 +63,7 @@ COMPAT_LISTS = {
     "clusterFeedKeys": "cluster.feed",
     "governanceKeys": "governance",
     "serverKeys": "server",
+    "signInThrottleKeys": "server.sign_in_throttle",
     "mcpKeys": "mcp",
     "toolManagerKeys": "mcp.tool_manager_config",
     "keyChildKeys": "providers.<name>.keys[]",

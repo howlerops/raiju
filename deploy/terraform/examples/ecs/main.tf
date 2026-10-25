@@ -64,13 +64,17 @@ module "raiju" {
 
   ingress_cidr_blocks = var.ingress_cidr_blocks
 
-  cpu           = 512
-  memory        = 1024
-  desired_count = 2
+  cpu    = 512
+  memory = 1024
+  # One task: without a Raiju cluster each task would enforce budgets and rate
+  # limits alone. For more tasks set cluster_enabled with an EFS volume and a
+  # cluster secret (deploy/terraform/README.md, Several tasks).
+  desired_count = 1
   workers       = 1
 
   # Providers come from environment variables, which Raiju reads without a
-  # config file. No file means the config is not mounted. Add a
+  # config file. With no EFS volume /app/data is the task's ephemeral storage:
+  # API changes and the first admin last until the task stops. Add a
   # BIFROST_SETUP_TOKEN secret to open /api until the first admin is created:
   # without an admin or a setup token the management API answers 403.
   secret_arns = var.provider_secret_arns

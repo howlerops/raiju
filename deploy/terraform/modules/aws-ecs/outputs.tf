@@ -32,3 +32,8 @@ output "service_security_group_id" {
   description = "Security group of the tasks. Allow it on the EFS mount targets when EFS is used."
   value       = aws_security_group.service.id
 }
+
+output "cluster_dns_name" {
+  description = "With cluster_enabled: the Cloud Map name that lists the tasks, for config.json's cluster.discovery.dns_names."
+  value       = local.cluster_dns_name
+}

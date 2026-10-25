@@ -26,6 +26,8 @@ import { connectPageHtml, consentPageHtml } from "./mcpconsent"
 import { ConfigCipher, sealStored, openStored } from "./store"
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs"
 import { writeFileAtomic } from "./atomicfile"
+import { readState, stateVersion } from "./statever"
+import { lockFile, unlockFile } from "./filelock"
 
 // The lifetimes and limits of Bifrost's defaults (mcpoauth2issuance.go and the table constants).
 const DEFAULT_CODE_TTL_S: f64 = 300.0
@@ -74,7 +76,9 @@ type ConsentRow = { hash: string, id: string, expires_at: f64 }
 
 // The state file: the signing key (sealed with the config's cipher when there is one), the registered clients, the
 // refresh rows, the authorization requests not yet expired, and their consent tokens.
-type StateFile = { signing_key?: string, clients?: OAuthClientRow[], refresh?: RefreshRow[], requests?: AuthRequest[], consent?: ConsentRow[] }
+type StateFile = { version?: int, signing_key?: string, clients?: OAuthClientRow[], refresh?: RefreshRow[], requests?: AuthRequest[], consent?: ConsentRow[] }
+// The state file's version (statever.tov): a file from a newer Raiju is neither read nor written over.
+const ISSUER_STATE_VERSION = 1
 
 // Who is consenting, as the request's credentials show it (Bifrost's identity resolver and consent checks).
 // signedIn: a dashboard sign-in (a session token or admin credentials) or an identity-provider user is on the
@@ -142,7 +146,13 @@ export function openIssuerState(c: Config, file: string, cipher: ConfigCipher | 
   let st: StateFile = {}
   if (existsSync(file)) {
     try {
-      st = try JSON.parse(try readFileSync(file, "utf8")) as StateFile
+      const r = readState(file, try readFileSync(file, "utf8"), ISSUER_STATE_VERSION, [])
+      if (!r.ok && r.from > ISSUER_STATE_VERSION) {
+        // nothing is written over it either
+        stateFile = ""
+        return `${r.problem}: it is not written over, and the MCP authorization server is off until it is moved aside or removed`
+      }
+      st = try JSON.parse(r.text) as StateFile
     } catch (e) {
       return `the state file ${file} cannot be read; the MCP authorization server is off until it is fixed or removed`
     }
@@ -209,17 +219,27 @@ function adoptGrants(st: StateFile): void {
 function syncGrants(): void {
   if (stateFile === "" || !existsSync(stateFile)) return
   try {
-    const st = try JSON.parse(try readFileSync(stateFile, "utf8")) as StateFile
+    const text = try readFileSync(stateFile, "utf8")
+    // a newer Raiju wrote it since: its rows are not taken (persistGrants does not write over it either)
+    if (stateVersion(text) > ISSUER_STATE_VERSION) return
+    const st = try JSON.parse(text) as StateFile
     adoptGrants(st)
   } catch (e) {
     return
   }
 }
 
-// Writes the grants and the signing key to the state file. The file is read first, so the rows another worker
-// wrote are kept too. Refresh rows revoked long ago are dropped. Without a state file this does nothing.
+// Writes the grants and the signing key to the state file. The file is read first, under its lock (filelock.tov), so
+// the rows another worker wrote are kept too. Refresh rows revoked long ago are dropped. Without a state file this
+// does nothing.
 function persistGrants(): void {
   if (stateFile === "") return
+  const lock = lockFile(stateFile)
+  writeGrants()
+  unlockFile(lock)
+}
+
+function writeGrants(): void {
   syncGrants()
   const cutoff = Date.now() - REVOKED_KEEP_MS
   const refresh: RefreshRow[] = []
@@ -239,9 +259,13 @@ function persistGrants(): void {
     const r = REQUESTS.get(c.id)
     if (c.expires_at > now && r !== undefined && r.status === "pending") consent.push(c)
   }
-  const st: StateFile = { clients: clients, refresh: refresh, requests: requests, consent: consent }
+  const st: StateFile = { version: ISSUER_STATE_VERSION, clients: clients, refresh: refresh, requests: requests, consent: consent }
   if (sealedKey !== "") st.signing_key = sealedKey
   try {
+    if (existsSync(stateFile) && stateVersion(try readFileSync(stateFile, "utf8")) > ISSUER_STATE_VERSION) {
+      console.error(`raiju: mcp oauth: ${stateFile} was written by a newer Raiju; it is not written over`)
+      return
+    }
     writeFileAtomic(stateFile, JSON.stringify(st) + "\n", { mode: 384 })
   } catch (e) {
     console.error(`raiju: mcp oauth: could not write ${stateFile}: ${e.message}`)
@@ -1262,6 +1286,8 @@ test("the state file keeps the generated key and the grants across a restart", (
   expect(first.kid.byteLength).toBe(32)
   const g = try vkGrant(iss0, "persist-client", "8083", 7000.0)
   expect(existsSync(file)).toBe(true)
+  // the file carries its state version
+  expect(stateVersion(try readFileSync(file, "utf8"))).toBe(ISSUER_STATE_VERSION)
   // a second start reads the same key, and the grant is still there to refresh
   expect(openIssuerState(cfg, file, undefined)).toBe("")
   expect(issuerOf(cfg)!.kid).toBe(first.kid)
@@ -1279,6 +1305,25 @@ test("the state file keeps the generated key and the grants across a restart", (
 function off(): Config {
   return { client: { mcp_server_auth_mode: "headers" } }
 }
+
+test("a state file from a newer Raiju is neither read nor written over, and one from before versions is read", () => {
+  const file = "raiju-mcp-state-newer-test.json"
+  const cfg: Config = { client: { mcp_server_auth_mode: "both", oauth2_server_config: { issuer_url: "https://gw.example" } } }
+  const newer = `{"version":99,"signing_key":"from-the-future","clients":[]}\n`
+  try writeFileSync(file, newer)
+  const note = openIssuerState(cfg, file, undefined)
+  expect(note.includes("newer Raiju")).toBe(true)
+  expect(issuerOf(cfg)).toBe(undefined)
+  persistGrants()
+  expect(try readFileSync(file, "utf8")).toBe(newer)
+  // a file written before state versions (no "version") is read as version 0 and written back at the current one
+  try writeFileSync(file, `{"clients":[{"client_id":"old-client","client_name":"old","redirect_uris":["http://127.0.0.1/cb"],"grant_types":["authorization_code"],"scope":"","created_at":1}]}`)
+  expect(openIssuerState(cfg, file, undefined)).toBe("")
+  expect(CLIENTS.has("old-client")).toBe(true)
+  expect(stateVersion(try readFileSync(file, "utf8"))).toBe(ISSUER_STATE_VERSION)
+  openIssuerState(off(), "", undefined)
+  try unlinkSync(file)
+})
 
 test("the metadata names the endpoints and the protected resource", () => {
   const iss = testIssuer()

@@ -1,0 +1,158 @@
+// Checks and notices printed once at start, before the workers fork: a build without TV_PLAIN_ALLOC, and the
+// defaults that changed in recent releases which this config relies on (shown once per change, recorded in a small
+// marker file beside config.json).
+import { Config } from "./config"
+import { existsSync, readFileSync, unlinkSync } from "node:fs"
+import { writeFileAtomic } from "./atomicfile"
+import { readState } from "./statever"
+import { DEFAULT_DISK_MB } from "./logstore"
+
+// The marker file's name (beside config.json) and its state version.
+export const NOTICE_FILE = ".raiju-notices.json"
+const NOTICE_VERSION = 1
+// Bumped whenever a default listed in changedDefaults changes: a marker older than this shows the notice again.
+export const DEFAULTS_GENERATION = 25
+
+export type AllocCheck = { fatal: bool, message: string }
+
+// The allocator check. Tov's small-object free lists are not thread-safe, and the gateway allocates off its loop
+// thread (fetch, name lookups), so a build without TV_PLAIN_ALLOC crashes under concurrent requests (docs/tov-notes.md).
+// It refuses to serve unless RAIJU_ALLOW_UNSAFE_ALLOC=1 asks to go on with a warning. plain: Bun.plainAlloc().
+export function allocCheck(plain: bool, allow: string): AllocCheck {
+  if (plain) return { fatal: false, message: "" }
+  const why = "this binary was built without TOV_CFLAGS=-DTV_PLAIN_ALLOC and crashes under concurrent requests; rebuild it with make build (or the Dockerfile)"
+  if (allow === "1") return { fatal: false, message: `warning: ${why} (going on: RAIJU_ALLOW_UNSAFE_ALLOC=1)` }
+  return { fatal: true, message: `${why}, or set RAIJU_ALLOW_UNSAFE_ALLOC=1 to start anyway` }
+}
+
+// The defaults changed in waves 23 to 25 (docs/behaviour-changes-wave-23.md, -wave-24.md) that this config relies on
+// (it leaves the key unset, or the change applies to what it has). hostGiven: -host or BIFROST_HOST was given.
+// apiLocked: there is no admin account, so the management API is locked.
+export function changedDefaults(c: Config, hostGiven: bool, apiLocked: bool): string[] {
+  const out: string[] = []
+  if (!hostGiven) out.push("the gateway listens on 127.0.0.1 by default (it was 0.0.0.0): pass -host 0.0.0.0 or set BIFROST_HOST to accept other hosts")
+  if (apiLocked) out.push("/api and the dashboard are locked until an admin account exists (they were open): create one with the setup token (setup_token or BIFROST_SETUP_TOKEN)")
+  const vks = c.governance?.virtual_keys ?? []
+  const clients = c.mcp?.client_configs ?? []
+  if (clients.length > 0 && !clients.some((m) => m.allow_by_default === true)) {
+    const bare = vks.filter((v) => (v.mcp_configs ?? []).length === 0).length
+    if (bare > 0) out.push(`${bare} virtual key${bare === 1 ? " has" : "s have"} no mcp_configs and get${bare === 1 ? "s" : ""} no MCP tools (they got every tool): add mcp_configs, or allow_by_default on a client`)
+  }
+  if (vks.length > 0 && c.client?.enforce_vk_object_ownership === undefined) out.push("client.enforce_vk_object_ownership defaults to true: a virtual key reads, cancels and deletes only the provider files and batches it created")
+  if (c.server?.webrtc_enabled === undefined) out.push("realtime WebRTC calls are off unless server.webrtc_enabled is true (WebSocket realtime is unchanged)")
+  const ls = c.logs_store
+  if (ls !== undefined && ls.enabled === true) {
+    if (ls.max_disk_mb === undefined) out.push(`logs_store.max_disk_mb defaults to ${DEFAULT_DISK_MB}: past that the oldest request log files are deleted (it had no cap; set 0 for none)`)
+    const dir = ls.dir ?? "logs"
+    if (!dir.startsWith("/")) out.push(`the relative logs_store.dir "${dir}" is read from the config file's folder (it was the working directory)`)
+    if (ls.object_storage !== undefined && ls.object_storage_offload === undefined) out.push("every log row's payload goes to logs_store.object_storage (it held retained content only): set logs_store.object_storage_offload to false for the old behaviour")
+  }
+  const cl = c.cluster
+  if (cl !== undefined && cl.enabled && cl.log_reads === undefined) out.push("log reads include the other nodes' rows (cluster.log_reads defaults to true)")
+  return out
+}
+
+// Whether the notice for DEFAULTS_GENERATION is still to be shown: the marker file is missing, unreadable or older.
+export function noticeDue(file: string): bool {
+  if (!existsSync(file)) return true
+  try {
+    const r = readState(file, try readFileSync(file, "utf8"), NOTICE_VERSION, [])
+    if (!r.ok) return r.from <= NOTICE_VERSION
+    const m = try JSON.parse(r.text) as { defaults_notice?: int }
+    return (m.defaults_notice ?? 0) < DEFAULTS_GENERATION
+  } catch (e) {
+    return true
+  }
+}
+
+// Records that the notice was shown. Returns false when the marker could not be written (the notice repeats).
+export function markNoticed(file: string): bool {
+  try {
+    try writeFileAtomic(file, `{"version":${NOTICE_VERSION},"defaults_notice":${DEFAULTS_GENERATION}}\n`, { durable: false })
+    return true
+  } catch (e) {
+    return false
+  }
+}
+
+// The notice's lines (empty when nothing applies or it was shown already), and the marker written when shown.
+export function upgradeNotice(c: Config, hostGiven: bool, apiLocked: bool, file: string): string[] {
+  if (!noticeDue(file)) return []
+  const items = changedDefaults(c, hostGiven, apiLocked)
+  if (items.length === 0) return []
+  const kept = markNoticed(file)
+  const out = [`notice: defaults that changed in recent releases apply to this config (docs/behaviour-changes-wave-23.md and -wave-24.md); ${kept ? `shown once (${file} records it)` : `shown at every start while ${file} cannot be written`}:`]
+  for (const i of items) out.push(`notice:   - ${i}`)
+  return out
+}
+
+test("a build without TV_PLAIN_ALLOC refuses to serve unless asked to go on", () => {
+  expect(allocCheck(true, "").message).toBe("")
+  const refused = allocCheck(false, "")
+  expect(refused.fatal).toBe(true)
+  expect(refused.message.includes("TV_PLAIN_ALLOC")).toBe(true)
+  const warned = allocCheck(false, "1")
+  expect(warned.fatal).toBe(false)
+  expect(warned.message.startsWith("warning:")).toBe(true)
+})
+
+test("changedDefaults lists only what the config relies on", () => {
+  const bare: Config = {}
+  const all = changedDefaults(bare, false, true)
+  expect(all.some((s) => s.includes("127.0.0.1"))).toBe(true)
+  expect(all.some((s) => s.includes("locked"))).toBe(true)
+  expect(all.some((s) => s.includes("webrtc_enabled"))).toBe(true)
+  // nothing about keys, logs or the cluster in a config without them
+  expect(all.length).toBe(3)
+  const set: Config = { server: { webrtc_enabled: false } }
+  expect(changedDefaults(set, true, false).length).toBe(0)
+  const busy: Config = {
+    server: { webrtc_enabled: true },
+    governance: { virtual_keys: [{ id: "vk-a", value: "sk-bf-a" }, { id: "vk-b", value: "sk-bf-b", mcp_configs: [{ mcp_client_name: "m", tools_to_execute: ["*"] }] }] },
+    mcp: { client_configs: [{ name: "m", connection_type: "http", connection_string: "http://127.0.0.1:1/mcp" }] },
+    logs_store: { enabled: true, dir: "logs", object_storage: { type: "s3", bucket: "b", access_key_id: "AKIAIOSFODNN7EXAMPLE", secret_access_key: "example" } },
+    cluster: { enabled: true, peers: [], secret: "s" },
+  }
+  const got = changedDefaults(busy, true, false)
+  expect(got.some((s) => s.startsWith("1 virtual key has no mcp_configs"))).toBe(true)
+  expect(got.some((s) => s.includes("enforce_vk_object_ownership"))).toBe(true)
+  expect(got.some((s) => s.includes(`max_disk_mb defaults to ${DEFAULT_DISK_MB}`))).toBe(true)
+  expect(got.some((s) => s.includes("relative logs_store.dir"))).toBe(true)
+  expect(got.some((s) => s.includes("object_storage_offload"))).toBe(true)
+  expect(got.some((s) => s.includes("cluster.log_reads"))).toBe(true)
+  // an allow_by_default client, an explicit cap and an absolute folder say nothing about them
+  let quiet = busy
+  quiet.mcp = { client_configs: [{ name: "m", connection_type: "http", connection_string: "http://127.0.0.1:1/mcp", allow_by_default: true }] }
+  quiet.logs_store = { enabled: true, dir: "/var/raiju/logs", max_disk_mb: 0 }
+  const q = changedDefaults(quiet, true, false)
+  expect(q.some((s) => s.includes("mcp_configs") || s.includes("max_disk_mb") || s.includes("relative"))).toBe(false)
+})
+
+test("the upgrade notice is shown once, then again only for a newer generation", () => {
+  const file = "/tmp/raiju-notice-test-" + `${process.pid}` + ".json"
+  try {
+    unlinkTest(file)
+    const first = upgradeNotice({}, false, false, file)
+    expect(first.length > 1).toBe(true)
+    expect(first[0]!.includes("shown once")).toBe(true)
+    expect(upgradeNotice({}, false, false, file).length).toBe(0)
+    // an older marker shows it again
+    try writeFileAtomic(file, `{"version":1,"defaults_notice":24}`)
+    expect(noticeDue(file)).toBe(true)
+    // a marker from before versions, and nothing to say: no lines and no marker change
+    try writeFileAtomic(file, `{"defaults_notice":24}`)
+    expect(upgradeNotice({ server: { webrtc_enabled: true } }, true, false, file).length).toBe(0)
+    expect(noticeDue(file)).toBe(true)
+    // a marker that cannot be written: the notice says it repeats
+    expect(upgradeNotice({}, false, false, "/nonexistent-dir-l199/x.json")[0]!.includes("at every start")).toBe(true)
+  } catch (e) {
+    expect(e.message).toBe("")
+  }
+  unlinkTest(file)
+})
+
+function unlinkTest(file: string): void {
+  try {
+    if (existsSync(file)) unlinkSync(file)
+  } catch (e) {}
+}

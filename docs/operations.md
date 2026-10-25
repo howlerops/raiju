@@ -27,6 +27,13 @@ rebuilds its engine, exactly as the saving worker does.
   logged. So when `DELETE /api/governance/virtual-keys/{id}` answers, no worker of that node accepts
   the key any more.
 - A worker whose share file has not moved for a second is taken for gone and is not waited for.
+- Saves from several workers at once do not overwrite each other. A save takes the config file's lock
+  (`config.json.lock`, a directory; one left by a dead process is taken over after 10 seconds) and reads
+  the file again; when another worker saved since, its own change is reapplied to the file as it is now
+  (a three-way merge: objects key by key, lists by id or name). Two changes that cannot both hold (the
+  same value set differently, an element changed on one worker and deleted on another, two new elements
+  with one name) answer 409, and the worker takes the file's config, so a retry starts from it. Nodes
+  that share the file on a volume take the same lock.
 
 ### Nodes of a cluster
 
@@ -76,6 +83,13 @@ Shared between the workers of a node and between nodes:
 Shared between the workers of one node only:
 
 - The response cache and the in-process semantic cache.
+- Async jobs (one file per job in the share folder): a poll may reach any worker of the node that took
+  the job, not another node.
+- Dashboard sessions, single sign-on logins in flight and the CLI's agent sign-in codes and tokens, in
+  `<config>.sessions.json`, `<config>.oidc-flows.json` and `<config>.agent-sessions.json` beside the
+  config file (0600, tokens by hash, refresh tokens sealed with the encryption key). They outlive a
+  restart; nodes share them only when they share the config folder, so put several nodes behind sticky
+  sessions or a shared volume for dashboard and CLI sign-ins.
 - `/metrics` (each worker's series are summed when scraped).
 - The request log files, when `logs_store` is on (one folder per node).
 
@@ -93,7 +107,22 @@ Kept per node:
 ## Securing cluster traffic
 
 Cluster traffic (`/api/cluster/sync`, `/api/cluster/feed`, `/api/cluster/config`, `/api/cluster/logs`, the broker) is
-signed with HMAC-SHA256 using `cluster.secret`, but it is plain HTTP. Anyone who can read the network
+signed with HMAC-SHA256 using `cluster.secret`. Anyone who holds the secret can read every node's config (with the
+values stored in the file), its request logs, and write budget and rate-limit counters, so the gateway checks it at
+start: with `cluster.enabled` (or `-mode broker`) it refuses to start when the secret is empty, is an `env.NAME`
+reference to a variable that is not set, or is shorter than 32 bytes (`openssl rand -hex 32` makes a good one). A
+config saved while running with such a secret turns clustering off and logs why. `env.NAME` is resolved in
+`cluster.secret`, `cluster.bind`, `cluster.broker.address`, `cluster.discovery.advertise_address` and
+`cluster.discovery.consul_address`.
+
+The peer routes can have a listener of their own: `cluster.listen_port` (and `cluster.bind`, default the `-host`
+address) opens a second port that serves only `/api/cluster/*`, `/health` and, with `cluster.serve_metrics: true`,
+`/metrics`. The main listener then answers 404 for `/api/cluster/*` (and for `/metrics` with `serve_metrics`), so a
+public load balancer in front of the main port never reaches them. Peers name that port (`peers`, or discovery,
+whose `bind_port` defaults to it). Both are read at start. Bifrost's own cluster traffic is on separate gossip ports
+too.
+
+The traffic is plain HTTP. Anyone who can read the network
 can read the usage data and, with `config_sync: "pull"`, the configuration text. That text keeps
 `env.NAME` references as references. Values stored in the file itself are readable unless
 `encryption_key` is set: then provider keys, virtual key values and admin credentials are sealed in
@@ -101,7 +130,19 @@ the file and on the wire.
 
 - Run cluster traffic on a private network, or through a service mesh that adds mTLS between pods.
 - Set `encryption_key` (or `BIFROST_ENCRYPTION_KEY`) to the same value on every node.
-- Use a long random `cluster.secret`, and keep `/api/cluster/*` off the public ingress.
+- Use a long random `cluster.secret` from a secret store (`"secret": "env.RAIJU_CLUSTER_SECRET"`), and set
+  `cluster.listen_port` so `/api/cluster/*` is not on the public port at all.
+
+## /metrics
+
+`GET /metrics` is open by default, as in Bifrost. Its labels include virtual key, team, customer, business unit and
+project names, so anyone who reaches the inference port can read every tenant's names, volume and errors. Two
+settings close it, alone or together:
+
+- `server.metrics_token` (`env.NAME` allowed): `/metrics` answers 401 unless the request carries
+  `Authorization: Bearer <token>`. Prometheus sends it with `authorization: {credentials: ...}` in the scrape config
+  (or a ServiceMonitor's `bearerTokenSecret`; the chart's `metricsToken` sets both sides).
+- `cluster.serve_metrics: true` with `cluster.listen_port`: `/metrics` is served on the cluster listener only.
 
 ## Log and audit storage
 

@@ -563,6 +563,9 @@ export type AdminUserConfig = {
   // a built-in role (admin, editor, viewer, auditor) or the name of a custom role under governance.roles
   role: string,
   token_sha256?: string,
+  // the password as a bcrypt hash ($2a$/$2b$/$2y$, Bifrost's form); password_sha256 with salt is the old form, read
+  // and replaced by password_hash at the user's next sign-in
+  password_hash?: string,
   password_sha256?: string,
   salt?: string,
   disabled?: bool,
@@ -787,7 +790,7 @@ export type LogsStoreConfig = {
   // the start fails when the store cannot open (default true, as Bifrost's start fails); false logs and runs without it
   required?: bool,
   // a day's file is cut into segments of this size (MB, default 32): start-up and shared queries read only the
-  // newest ones. max_disk_mb caps all the log files together (oldest segments deleted first; 0, the default: no cap)
+  // newest ones. max_disk_mb caps all the log files together (oldest segments deleted first; default 512, 0: no cap)
   max_file_mb?: int,
   max_disk_mb?: int,
   // Bifrost's logs_store.object_storage: the hybrid store's bucket (each row's payload fields go there, hybrid.tov) and
@@ -1068,7 +1071,8 @@ export type UserAgentMapping = { id: string, pattern: string, match_type: string
 // its own peer (POST /v1/realtime/calls, POST /v1/realtime, POST /v1/live/sessions). Off by default: the peer's
 // DTLS/SCTP stack is C code reachable by any caller with a virtual key. WebSocket realtime is not affected.
 // The lifecycle keys (lifecycle.tov, Raiju's own): the graceful stop's grace and the delay before the listener
-// closes, the HTTP servers' header, keep-alive idle and body timeouts in seconds, and the connection cap per process.
+// closes, the HTTP servers' header, keep-alive idle and body timeouts in seconds, the connection cap per process, and
+// the request-body bytes each process reads at once (read per request, so a reload moves it).
 export type ServerSectionConfig = {
   a2a_allow_private_push_callbacks?: bool,
   a2a_grpc_base_domain?: string,
@@ -1080,7 +1084,24 @@ export type ServerSectionConfig = {
   idle_timeout_seconds?: f64, // a keep-alive connection with no request closes after this (default 60; 0 off)
   body_timeout_seconds?: f64, // a request body may go this long without a byte (default 60; 0 off)
   max_connections?: int, // open connections per process (default three quarters of ulimit -n; -1 no cap)
+  max_buffered_body_mb?: int, // request-body megabytes each process reads at once across requests (default 48; -1 no cap; bodybudget.tov)
   webrtc_enabled?: bool,
+  // Raiju's: when set (env.NAME allowed), /metrics answers only a request with "Authorization: Bearer <token>"
+  // (401 otherwise). Unset keeps Bifrost's open /metrics.
+  metrics_token?: string,
+  // Raiju's own (Bifrost believes no forwarding header): the addresses or CIDR ranges of the reverse proxies in front
+  // of the gateway. Only a request from one of them has its X-Forwarded-For / X-Real-IP taken as the client's address
+  // (clientip.tov), for the audit log and the sign-in throttle. Empty (the default): the TCP peer is the client.
+  trusted_proxies?: string[],
+  sign_in_throttle?: SignInThrottleConfig,
+}
+// Raiju's sign-in throttle (signinguard.tov): past the free failures within an hour, each attempt waits twice as long
+// as the last (1 s, 2 s, 4 s, ...), answered 429 with Retry-After and not checked. On by default.
+export type SignInThrottleConfig = {
+  enabled?: bool, // false turns the throttle off (default true)
+  account_failures?: int, // free failed sign-ins per account name within an hour (default 5)
+  ip_failures?: int, // free failed sign-ins per client address within an hour (default 20)
+  max_backoff_seconds?: int, // the longest wait (default 900)
 }
 export type AgentOAuth = { provider_url?: string, discovery_url?: string, token_url?: string, client_id: string, client_secret: string, scopes?: string[], resource?: string }
 export type AgentTls = { insecure_skip_verify?: bool, ca_cert_pem?: string, client_cert_pem?: string, client_key_pem?: string }
@@ -1463,6 +1484,99 @@ export function resolveConfig(inout c: Config): void {
     ls.object_storage = ob
     c.logs_store = ls
   }
+  resolveClusterAndTelemetry(&c)
+}
+
+function resolvedHeaders(hs: Map<string, string> | undefined): Map<string, string> | undefined {
+  if (hs === undefined) return undefined
+  const m: Map<string, string> = new Map()
+  for (const k of hs.keys()) m.set(k, resolveEnv(hs.get(k) ?? ""))
+  return m
+}
+
+// The cluster secret and addresses, the metrics token, and the telemetry settings Bifrost documents as env.NAME
+// capable (the push gateway URL and basic auth, the otel collector and headers, the alert channels' URLs, keys and
+// headers).
+function resolveClusterAndTelemetry(inout c: Config): void {
+  const cc = c.cluster
+  if (cc !== undefined) {
+    let n = cc
+    n.secret = resolveEnv(n.secret)
+    n.bind = opt(n.bind)
+    const d = n.discovery
+    if (d !== undefined) {
+      let nd = d
+      nd.advertise_address = opt(nd.advertise_address)
+      nd.consul_address = opt(nd.consul_address)
+      n.discovery = nd
+    }
+    const b = n.broker
+    if (b !== undefined) {
+      let nb = b
+      nb.address = resolveEnv(nb.address)
+      n.broker = nb
+    }
+    c.cluster = n
+  }
+  const sv = c.server
+  if (sv !== undefined && sv.metrics_token !== undefined) {
+    let ns = sv
+    ns.metrics_token = opt(ns.metrics_token)
+    c.server = ns
+  }
+  const tel = c.telemetry
+  const pg = tel?.push_gateway
+  if (tel !== undefined && pg !== undefined) {
+    let np = pg
+    np.push_gateway_url = opt(np.push_gateway_url)
+    const ba = np.basic_auth
+    if (ba !== undefined) np.basic_auth = { username: opt(ba.username), password: opt(ba.password) }
+    let nt = tel
+    nt.push_gateway = np
+    c.telemetry = nt
+  }
+  const ot = c.otel
+  if (ot !== undefined) {
+    let no = ot
+    no.endpoint = otelEnvUrl(no.endpoint, no.protocol === "grpc", true)
+    const me = no.metrics_endpoint
+    if (me !== undefined) no.metrics_endpoint = otelEnvUrl(me, no.protocol === "grpc", false)
+    no.headers = resolvedHeaders(no.headers)
+    no.trace_headers = resolvedHeaders(no.trace_headers)
+    no.metrics_headers = resolvedHeaders(no.metrics_headers)
+    c.otel = no
+  }
+  const al = c.alerts
+  const chans = al?.channels
+  if (al !== undefined && chans !== undefined) {
+    const out: Channel[] = []
+    for (const ch of chans) {
+      let n = ch
+      n.url = resolveEnv(n.url)
+      n.routing_key = opt(n.routing_key)
+      n.headers = resolvedHeaders(n.headers)
+      out.push(n)
+    }
+    let na = al
+    na.channels = out
+    c.alerts = na
+  }
+}
+
+// An otel collector URL written as env.NAME: the variable's value, given the scheme and the /v1/traces path the
+// config reader adds to a URL written out (config_compat otelUrl). Any other value is kept as it is.
+export function otelEnvUrl(v: string, grpc: bool, tracePath: bool): string {
+  if (!v.startsWith("env.")) return v
+  let u = resolveEnv(v)
+  if (u === "" || grpc) return u
+  if (!u.includes("://")) u = "http://" + u
+  const parts = u.split("/")
+  const noPath = parts.length <= 3 || (parts.length === 4 && parts[3] === "")
+  if (tracePath && noPath) {
+    if (u.endsWith("/")) u = u.slice(0, u.byteLength - 1)
+    u = u + "/v1/traces"
+  }
+  return u
 }
 
 // The header values of an agent's auth may be env.NAME references.
@@ -1716,3 +1830,48 @@ test("rawConfigOf reads a file's text as loadRawConfig does", () => {
   expect(ps[0]?.config_json ?? "").toBe(`{"a":1}`)
 })
 
+
+test("the cluster secret and addresses, the metrics token and the telemetry settings resolve env references", () => {
+  const home = process.env.HOME ?? ""
+  let c: Config = {
+    cluster: { enabled: true, peers: [], secret: "env.HOME", bind: "env.HOME", discovery: { type: "consul", advertise_address: "env.HOME", consul_address: "env.HOME" }, broker: { address: "env.HOME" } },
+    server: { metrics_token: "env.HOME" },
+    telemetry: { push_gateway: { push_gateway_url: "env.HOME", basic_auth: { username: "env.HOME", password: "env.RAIJU_L195_UNSET" } } },
+    otel: { endpoint: "env.RAIJU_L195_UNSET", headers: hdrMap("Authorization", "env.HOME"), metrics_headers: hdrMap("x-k", "env.HOME"), trace_headers: hdrMap("x-t", "plain") },
+    alerts: { channels: [{ id: "c", type: "webhook", url: "env.HOME", routing_key: "env.HOME", headers: hdrMap("X-Alert-Token", "env.HOME") }] },
+  }
+  resolveConfig(&c)
+  expect(c.cluster!.secret).toBe(home)
+  expect(c.cluster!.bind).toBe(home)
+  expect(c.cluster!.discovery!.advertise_address).toBe(home)
+  expect(c.cluster!.discovery!.consul_address).toBe(home)
+  expect(c.cluster!.broker!.address).toBe(home)
+  expect(c.server!.metrics_token).toBe(home)
+  expect(c.telemetry!.push_gateway!.push_gateway_url).toBe(home)
+  expect(c.telemetry!.push_gateway!.basic_auth!.username).toBe(home)
+  expect(c.telemetry!.push_gateway!.basic_auth!.password).toBe("")
+  expect(c.otel!.endpoint).toBe("")
+  expect(c.otel!.headers!.get("Authorization")).toBe(home)
+  expect(c.otel!.metrics_headers!.get("x-k")).toBe(home)
+  expect(c.otel!.trace_headers!.get("x-t")).toBe("plain")
+  const ch = c.alerts!.channels![0]!
+  expect(ch.url).toBe(home)
+  expect(ch.routing_key).toBe(home)
+  expect(ch.headers!.get("X-Alert-Token")).toBe(home)
+  // a secret written out is kept as written
+  let plain: Config = { cluster: { enabled: true, peers: [], secret: "literal-secret" } }
+  resolveConfig(&plain)
+  expect(plain.cluster!.secret).toBe("literal-secret")
+})
+
+test("an otel collector URL from the environment gets the scheme and trace path a written one gets", () => {
+  expect(otelEnvUrl("http://c:4318/v1/traces", false, true)).toBe("http://c:4318/v1/traces")
+  expect(otelEnvUrl("env.RAIJU_L195_UNSET", false, true)).toBe("")
+  expect(otelEnvUrl("env.HOME", true, true)).toBe(process.env.HOME ?? "")
+})
+
+function hdrMap(k: string, v: string): Map<string, string> {
+  const m: Map<string, string> = new Map()
+  m.set(k, v)
+  return m
+}

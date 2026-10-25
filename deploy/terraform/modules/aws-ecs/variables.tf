@@ -92,9 +92,44 @@ variable "memory" {
 }
 
 variable "desired_count" {
-  description = "Number of tasks."
+  description = "Number of tasks. Above 1 needs cluster_enabled: without a Raiju cluster each task enforces budgets and rate limits alone and keeps its own config."
   type        = number
-  default     = 2
+  default     = 1
+}
+
+variable "cluster_enabled" {
+  description = "Run the tasks as one Raiju cluster: a Cloud Map DNS name lists the tasks for discovery, the tasks may reach each other on port, and RAIJU_CLUSTER_SECRET is injected from cluster_secret_arn. Needs efs_file_system_id; config.json on it must hold the cluster block (see deploy/terraform/README.md)."
+  type        = bool
+  default     = false
+}
+
+variable "cluster_port" {
+  description = "With cluster_enabled: the cluster listener's port (config.json cluster.listen_port, 7946 as in the chart). Only the tasks themselves may reach it; the ALB never forwards to it."
+  type        = number
+  default     = 7946
+}
+
+variable "cluster_secret_arn" {
+  description = "Secrets Manager or SSM ARN of the cluster secret (at least 32 bytes, or the tasks refuse to start), injected as RAIJU_CLUSTER_SECRET (config.json: \"secret\": \"env.RAIJU_CLUSTER_SECRET\"). Required when cluster_enabled."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.cluster_secret_arn == null || can(regex("^arn:[^:]+:(secretsmanager|ssm):", var.cluster_secret_arn))
+    error_message = "cluster_secret_arn must be a Secrets Manager or SSM parameter ARN."
+  }
+}
+
+variable "service_discovery_namespace_id" {
+  description = "Existing Cloud Map private DNS namespace for cluster discovery. Null creates <name>.local in vpc_id when cluster_enabled."
+  type        = string
+  default     = null
+}
+
+variable "service_discovery_namespace_name" {
+  description = "Name of service_discovery_namespace_id (for example internal.example), used for cluster_dns_name. Set it with service_discovery_namespace_id."
+  type        = string
+  default     = null
 }
 
 variable "port" {
@@ -134,13 +169,13 @@ variable "secret_arns" {
 }
 
 variable "efs_file_system_id" {
-  description = "Optional EFS file system mounted read-only at the -app-dir (/app/data) so config.json can be supplied from it. Null mounts nothing; providers then come from environment variables."
+  description = "Optional EFS file system mounted read-write at the -app-dir (/app/data): config.json (saved on every API change), the MCP OAuth state and the logs are kept there across tasks. Null gives /app/data the task's ephemeral storage (lost when the task stops); providers then come from environment variables."
   type        = string
   default     = null
 }
 
 variable "efs_access_point_id" {
-  description = "EFS access point for efs_file_system_id. Required when efs_file_system_id is set. The access point must expose the config directory as its root."
+  description = "EFS access point for efs_file_system_id. Required when efs_file_system_id is set. The access point must expose the data directory as its root, writable by the image's user (uid and gid 65532: set its posix_user, or a root_directory creation_info owned by it)."
   type        = string
   default     = null
 
@@ -154,6 +189,12 @@ variable "readonly_root_filesystem" {
   description = "Mount the container root filesystem read-only, as the chart does."
   type        = bool
   default     = true
+}
+
+variable "alb_idle_timeout" {
+  description = "ALB idle timeout in seconds. Keep it below Raiju's server.idle_timeout_seconds (60 by default): with equal timeouts the ALB can send a request on a connection the task is closing, which answers 502. A stream that sends nothing for this long is cut by the ALB."
+  type        = number
+  default     = 55
 }
 
 variable "health_check_path" {

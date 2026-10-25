@@ -14,6 +14,8 @@ import { secureHex, sha256, utf8, toHex } from "./crypto"
 import { deadline } from "./deadline"
 import { existsSync, readFileSync, unlinkSync } from "node:fs"
 import { writeFileAtomic } from "./atomicfile"
+import { readState, stateVersion } from "./statever"
+import { lockFile, unlockFile } from "./filelock"
 import { resolvedTargetProblem, peerOf, strictPolicy } from "./netguard"
 
 // One caller's tokens for one per_user_oauth client. At most one of virtual_key_id, session_id and user_id is set:
@@ -81,7 +83,9 @@ const TEMP: Map<string, TempRow> = new Map()
 const GONE: Map<string, f64> = new Map()
 
 // The state file the flows are kept in ("" keeps them in memory only), and how a verifier is sealed and opened.
-type FlowFile = { flows?: UserFlow[], temp?: TempRow[], gone?: { key: string, at: f64 }[] }
+type FlowFile = { version?: int, flows?: UserFlow[], temp?: TempRow[], gone?: { key: string, at: f64 }[] }
+// The flow file's version (statever.tov): a file from a newer Raiju is neither read nor written over.
+const FLOW_STATE_VERSION = 1
 let flowFile = ""
 let flowSeal: ((v: string) => string) | undefined = undefined
 let flowOpen: ((v: string) => string | undefined) | undefined = undefined
@@ -94,7 +98,13 @@ export function openFlowState(file: string, seal: (v: string) => string, open: (
   flowOpen = open
   if (file === "" || !existsSync(file)) return ""
   try {
-    adoptFlows(try JSON.parse(try readFileSync(file, "utf8")) as FlowFile)
+    const r = readState(file, try readFileSync(file, "utf8"), FLOW_STATE_VERSION, [])
+    if (!r.ok && r.from > FLOW_STATE_VERSION) {
+      // kept in memory only: nothing is written over it
+      flowFile = ""
+      return `${r.problem}: it is not written over, and consent flows are kept in memory only`
+    }
+    adoptFlows(try JSON.parse(r.text) as FlowFile)
   } catch (e) {
     return `the MCP flow state ${file} cannot be read; pending consent flows start over`
   }
@@ -133,7 +143,10 @@ function adoptFlows(st: FlowFile): void {
 function syncFlows(): void {
   if (flowFile === "" || !existsSync(flowFile)) return
   try {
-    adoptFlows(try JSON.parse(try readFileSync(flowFile, "utf8")) as FlowFile)
+    const text = try readFileSync(flowFile, "utf8")
+    // written by a newer Raiju since: not taken, and saveFlows does not write over it
+    if (stateVersion(text) > FLOW_STATE_VERSION) return
+    adoptFlows(try JSON.parse(text) as FlowFile)
   } catch (e) {
     return
   }
@@ -143,6 +156,13 @@ function syncFlows(): void {
 // the state file, after reading it so the other workers' flows are kept.
 function saveFlows(nowMs: f64): void {
   if (flowFile === "") return
+  // under the file's lock (filelock.tov), so a flow another worker writes between the read and the write is kept
+  const lock = lockFile(flowFile)
+  writeFlows(nowMs)
+  unlockFile(lock)
+}
+
+function writeFlows(nowMs: f64): void {
   syncFlows()
   const flows: UserFlow[] = []
   const seal = flowSeal
@@ -166,8 +186,12 @@ function saveFlows(nowMs: f64): void {
     if (at > nowMs - 2.0 * FLOW_TTL_MS) gone.push({ key: k, at: at })
     else GONE.delete(k)
   }
-  const st: FlowFile = { flows: flows, temp: temp, gone: gone }
+  const st: FlowFile = { version: FLOW_STATE_VERSION, flows: flows, temp: temp, gone: gone }
   try {
+    if (existsSync(flowFile) && stateVersion(try readFileSync(flowFile, "utf8")) > FLOW_STATE_VERSION) {
+      console.error(`raiju: mcp flows: ${flowFile} was written by a newer Raiju; it is not written over`)
+      return
+    }
     writeFileAtomic(flowFile, JSON.stringify(st) + "\n", { mode: 384 })
   } catch (e) {
     console.error(`raiju: mcp flows: could not write ${flowFile}: ${e.message}`)
@@ -754,6 +778,7 @@ test("flows and temp tokens survive a restart through the state file, with the v
   const text = try readFileSync(file, "utf8")
   expect(text.includes(f.verifier)).toBe(false)
   expect(text.includes(f.temp_token)).toBe(false)
+  expect(stateVersion(text)).toBe(FLOW_STATE_VERSION)
   // a restart: the memory is gone, and the file brings the flow and its temp token back
   USER_FLOWS.clear()
   TEMP.clear()
@@ -768,6 +793,17 @@ test("flows and temp tokens survive a restart through the state file, with the v
   USER_FLOWS.set(f.state, f)
   saveFlows(now + 3000.0)
   expect(userFlowById(f.id, now + 3000.0)).toBe(undefined)
+  openFlowState("", seal, open)
+  try unlinkSync(file)
+  // a flow file from a newer Raiju is not read, and a new flow does not write over it
+  const newer = `{"version":99,"flows":[],"temp":[],"gone":[]}\n`
+  try writeFileAtomic(file, newer)
+  expect(openFlowState(file, seal, open).includes("newer Raiju")).toBe(true)
+  const extra = startUserFlow(a, "m", "vk-newer", "", "http://gw", true, now).flow!
+  expect(try readFileSync(file, "utf8")).toBe(newer)
+  // (the flow is ended so the tests after this one see none)
+  endFlow(extra.id, now)
+  GONE.clear()
   openFlowState("", seal, open)
   try unlinkSync(file)
 })

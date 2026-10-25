@@ -3,8 +3,10 @@
 // config file and handed to the lead through onChange, which rebuilds the
 // engine. Secrets are masked on every read, and a masked value sent back
 // unchanged keeps the stored secret.
-import { readFileSync, writeFileSync, existsSync, unlinkSync, statSync, chmodSync } from "node:fs"
+import { readFileSync, writeFileSync, existsSync, unlinkSync, statSync, chmodSync, mkdirSync, rmSync } from "node:fs"
 import { writeFileAtomic, removeStaleTemps, writeTemp, PRIVATE_FILE } from "./atomicfile"
+import { lockFile, unlockFile, lockDirOf, LOCK_WAIT_MS } from "./filelock"
+import { merge3 } from "./merge3"
 import {
   Config, GovernanceConfig, KeyConfig, ProviderConfig, VirtualKeyConfig, BudgetConfig, resolveEnv, getEnv,
   RateLimitConfig, TeamConfig, CustomerConfig, ProviderConfigRef, providerOf, AdminAuthConfig, AdminUserConfig, AccessProfile, NetworkConfig, CustomProviderConfig,
@@ -1316,6 +1318,15 @@ export function withOwnCluster(text: string, own: string | undefined): string th
   return build(fs)
 }
 
+// Members that cache what was fetched (an agent's card): a merge keeps this process's newer fetch over the file's.
+const CACHED_MEMBERS: string[] = ["card", "card_fetched_at"]
+
+// A config as one JSON text, read back the way a file is read, so that two configs that hold the same values have the
+// same text (the three sides of a merge, merge3.tov).
+function canonical(c: Config): string throws Error {
+  return JSON.stringify(try rawConfigOf(JSON.stringify(c)))
+}
+
 export class ConfigStore {
   cfg: Config
   version: int = 0
@@ -1330,6 +1341,16 @@ export class ConfigStore {
   cipher: ConfigCipher | undefined = undefined
   // why the last change could not be saved ("" once one is): GET /ready reports it
   saveError = ""
+  // set when the last save found the file changed by another process in a way this change cannot be merged with
+  // (commit answers 409); the file's config is then this process's config
+  conflicted = false
+  // sha256 of the file's text as this process last wrote or read it ("" when there was none), and the config that text
+  // held: a save that finds other text in the file merges this process's change from that config into the file's
+  // (saveLocked), so the workers of a node, or nodes sharing the file, never lose each other's saves
+  private diskSha = ""
+  private baseCfg: Config = {}
+  // how long a save waits for another process to give the file's lock back
+  lockWaitMs: f64 = LOCK_WAIT_MS
 
   // `initial` should be the config as written in the file (env.NAME references
   // unresolved), so save() writes the references and not their values.
@@ -1339,6 +1360,7 @@ export class ConfigStore {
 
   constructor(readonly path: string, initial: Config) {
     this.cfg = initial
+    this.baseCfg = initial
     setGlobalProxy(initial.proxy_config)
     // temporary files a crash left between write and rename (a recent one may be another worker's save in progress)
     removeStaleTemps(path, 600000.0)
@@ -1347,6 +1369,7 @@ export class ConfigStore {
       if (existsSync(path)) {
         const text = readFileSync(path, "utf8")
         this.fileSha = textSha(text)
+        this.diskSha = this.fileSha
         this.genText = text
         const known = fields(JSON.stringify(initial)).map((f) => f.key)
         this.extras = fields(text).filter((f) => !known.includes(f.key) && f.key !== "plugins")
@@ -1361,8 +1384,54 @@ export class ConfigStore {
   }
 
   // Writes the config as JSON, atomically (a temporary file renamed over it), so a crash or another worker never
-  // sees half a file. The previous file is kept as <path>.bak.
+  // sees half a file. The previous file is kept as <path>.bak. The read-modify-write runs under the file's lock
+  // (filelock.tov), which the workers of a node and nodes sharing the file all take, and a file another process saved
+  // since this one read it is merged with (saveLocked).
   save(): void throws Error {
+    this.conflicted = false
+    const lock = lockFile(this.path, this.lockWaitMs)
+    if (!lock.ok) throw new Error(`another process has held the config file's lock (${lockDirOf(this.path)}) for too long; retry`)
+    try {
+      try this.saveLocked()
+    } catch (e) {
+      unlockFile(lock)
+      throw e
+    }
+    unlockFile(lock)
+  }
+
+  // The file's text now, or "" when there is no file.
+  private diskNow(): string throws Error {
+    if (!existsSync(this.path)) return ""
+    return try readFileSync(this.path, "utf8")
+  }
+
+  // When the file holds other text than this process last wrote or read (another worker's save, or another node's
+  // when nodes share the file), this process's change, from baseCfg to cfg, is reapplied to the file's config
+  // (merge3.tov): cfg becomes the merge, and the sections Config does not model come from the file. A change that
+  // cannot be merged (both sides set one value differently) sets conflicted and throws; the caller restores its
+  // config, and the file's is adopted. Called under the lock.
+  private mergeDisk(disk: string): void throws Error {
+    if (disk === "" || textSha(disk) === this.diskSha) return
+    const opened = try openConfig(try rawConfigOf(disk), this.cipher)
+    if (opened.errors.length > 0) throw new Error(`the config file another process saved cannot be opened: ${opened.errors.join("; ")}`)
+    const r = try merge3(try canonical(this.baseCfg), try canonical(this.cfg), try canonical(opened.cfg), CACHED_MEMBERS)
+    if (!r.ok) {
+      this.conflicted = true
+      throw new Error(`the configuration was changed by another process at the same time (${r.conflict}); reload and retry`)
+    }
+    this.cfg = try rawConfigOf(r.text)
+    try {
+      const known = fields(JSON.stringify(this.cfg)).map((f) => f.key)
+      this.extras = fields(disk).filter((f) => !known.includes(f.key) && f.key !== "plugins")
+    } catch (e) {
+      // the extras this process holds stay
+    }
+  }
+
+  private saveLocked(): void throws Error {
+    const disk = try this.diskNow()
+    try this.mergeDisk(disk)
     this.keepNewerAdmin()
     let text = JSON.stringify(try sealConfig(this.cfg, this.cipher), undefined, 2)
     if (this.extras.length > 0) {
@@ -1370,14 +1439,15 @@ export class ConfigStore {
       const sep = text.trim() === "{}" ? "\n" : ",\n"
       text = text.slice(0, end).trimEnd() + sep + this.extras.map((f) => `  ${quote(f.key)}: ${f.raw}`).join(",\n") + "\n}"
     }
-    if (existsSync(this.path)) {
-      const old = try readFileSync(this.path, "utf8")
+    if (disk !== "") {
       // the backup holds every secret the config held: private, whatever an older version left it as
-      try writeFileAtomic(this.path + ".bak", old, { mode: PRIVATE_FILE, exact: true })
+      try writeFileAtomic(this.path + ".bak", disk, { mode: PRIVATE_FILE, exact: true })
     }
     const out = text + "\n"
     try writeFileAtomic(this.path, out)
     this.fileSha = textSha(out)
+    this.diskSha = this.fileSha
+    this.baseCfg = this.cfg
     this.genText = out
     // the other workers and nodes take this text as their config (takeGeneration)
     const st = clusterState()
@@ -1424,8 +1494,10 @@ export class ConfigStore {
       extras = []
     }
     this.cfg = next
+    this.baseCfg = next
     this.extras = extras
     this.fileSha = sha
+    this.diskSha = textSha(text)
     this.genText = writerText
     this.version += 1
     setGlobalProxy(next.proxy_config)
@@ -1471,6 +1543,18 @@ export class ConfigStore {
     }
   }
 
+  // Takes the file's text as this process's config (after a conflict). Nothing happens when it cannot be read.
+  adoptDisk(): void {
+    try {
+      const disk = try this.diskNow()
+      if (disk === "" || textSha(disk) === this.diskSha) return
+      const problem = this.adopt(disk, textSha(disk), disk)
+      if (problem !== "") console.error(`raiju: config: the file another process saved could not be taken: ${problem}`)
+    } catch (e) {
+      console.error(`raiju: config: ${e.message}`)
+    }
+  }
+
   // A save never writes back a retained admin credential older than the one the file holds: another worker or node
   // renewed it since this copy was read (a renewal moves last_refreshed_at forward). The newer row is kept here too.
   private keepNewerAdmin(): void {
@@ -1512,12 +1596,18 @@ export class ConfigStore {
       this.save()
     } catch (e) {
       this.cfg = prev
+      if (this.conflicted) {
+        // the change was not saved: this process takes the file's config, so a retry starts from it
+        this.adoptDisk()
+        return fail(409, e.message)
+      }
       this.saveError = e.message
       return fail(500, `could not save config: ${e.message}`)
     }
     this.saveError = ""
     this.version += 1
-    setGlobalProxy(next.proxy_config)
+    // what was saved: next, with the changes other processes saved meanwhile merged in
+    setGlobalProxy(this.cfg.proxy_config)
     // the dashboard hears of every saved change (notify.tov)
     notify({ severity: "info", title: "Configuration changed", message: `${id} was saved (configuration version ${this.version}).` })
     const f = this.onChange
@@ -1593,6 +1683,27 @@ export class ConfigStore {
     let g: GovernanceConfig = this.cfg.governance ?? {}
     g.users = users
     return this.commit(withGov(this.cfg, g), "users")
+  }
+
+  // Puts bcrypt hashes in place of old salted SHA-256 passwords (rbac.tov takeUpgrades): each user that still holds
+  // the old hash it was verified against gets the new one, and the old fields go. Nothing to change saves nothing.
+  upgradePasswords(ups: { name: string, old: string, hash: string }[]): Result {
+    const users: AdminUserConfig[] = []
+    let changed = 0
+    for (const u of this.cfg.governance?.users ?? []) {
+      let next = u
+      for (const up of ups) {
+        if (u.name === up.name && u.password_sha256 !== undefined && u.password_sha256 === up.old && u.password_hash === undefined) {
+          next.password_hash = up.hash
+          next.password_sha256 = undefined
+          next.salt = undefined
+          changed += 1
+        }
+      }
+      users.push(next)
+    }
+    if (changed === 0) return { kind: "ok", id: "" }
+    return this.setUsers(users)
   }
 
   // Replaces the users, teams and business units a sign-in's claims changed, as one save (claimsync.tov).
@@ -5795,6 +5906,79 @@ test("a save puts its generation on the cluster state, and a sibling store takes
   try writeFileSync(path, "{broken")
   expect(b.takeGeneration(textSha("{broken")).status).toBe("error")
   expect((b.cfg.governance?.virtual_keys ?? []).length).toBe(1)
+  cleanup(path)
+})
+
+test("two workers saving at once: each save reapplies its change to the file as the other left it, so none is lost", () => {
+  const path = tmpPath()
+  try writeFileSync(path, `{"governance":{"virtual_keys":[{"id":"vk-0","name":"zero","value":"sk-bf-0"}]},"guardrails_config":{"x":1}}`)
+  const first = try loadRawConfig(path)
+  // two workers forked from one supervisor: each holds the file as it was at the start
+  const a = new ConfigStore(path, first)
+  const b = new ConfigStore(path, first)
+  let bSaw: string[] = []
+  b.onChange = (c) => {
+    bSaw.push((c.governance?.virtual_keys ?? []).map((v) => v.id).join(","))
+  }
+  expect(handleApi(a, "POST", "/api/governance/virtual-keys", `{"id":"vk-a","name":"from-a"}`).status).toBe(201)
+  // b has not taken a's generation yet: its save merges a's key in rather than writing over it
+  expect(handleApi(b, "POST", "/api/governance/virtual-keys", `{"id":"vk-b","name":"from-b"}`).status).toBe(201)
+  const ids = (c: Config): string => (c.governance?.virtual_keys ?? []).map((v) => v.id).join(",")
+  expect(ids(try loadRawConfig(path))).toBe("vk-0,vk-a,vk-b")
+  expect(ids(b.cfg)).toBe("vk-0,vk-a,vk-b")
+  expect(bSaw).toEqual(["vk-0,vk-a,vk-b"])
+  // a removal on one side and an addition on the other both hold
+  expect(handleApi(a, "DELETE", "/api/governance/virtual-keys/vk-0", "").status).toBe(200)
+  expect(ids(try loadRawConfig(path))).toBe("vk-a,vk-b")
+  expect(handleApi(b, "PUT", "/api/governance/virtual-keys/vk-b", `{"name":"from-b","description":"edited"}`).status).toBe(200)
+  const disk = try loadRawConfig(path)
+  expect(ids(disk)).toBe("vk-a,vk-b")
+  expect((disk.governance?.virtual_keys ?? [])[1]?.description ?? "").toBe("edited")
+  // the section Config does not model is kept through the merges
+  expect(b.rawSection("guardrails_config")).toBe(`{"x":1}`)
+  expect((try readFileSync(path, "utf8")).includes(`"guardrails_config": {"x":1}`)).toBe(true)
+  // the backup is the file the last save replaced
+  expect(ids(try loadRawConfig(path + ".bak"))).toBe("vk-a,vk-b")
+  cleanup(path)
+})
+
+test("two workers setting one value differently: the later save is refused with 409 and takes the file's config", () => {
+  const path = tmpPath()
+  try writeFileSync(path, `{"governance":{"virtual_keys":[{"id":"vk-1","name":"one","value":"sk-bf-1"}]}}`)
+  const first = try loadRawConfig(path)
+  const a = new ConfigStore(path, first)
+  const b = new ConfigStore(path, first)
+  expect(handleApi(a, "PUT", "/api/governance/virtual-keys/vk-1", `{"name":"one","is_active":false}`).status).toBe(200)
+  const r = handleApi(b, "PUT", "/api/governance/virtual-keys/vk-1", `{"name":"one","is_active":true,"description":"x"}`)
+  expect(r.status).toBe(409)
+  expect(r.body.includes("changed by another process")).toBe(true)
+  // the revocation saved first stays, and b now holds it, so a retry starts from it
+  expect(((try loadRawConfig(path)).governance?.virtual_keys ?? [])[0]?.is_active).toBe(false)
+  expect((b.cfg.governance?.virtual_keys ?? [])[0]?.is_active).toBe(false)
+  expect(b.fileSha).toBe(a.fileSha)
+  expect(handleApi(b, "PUT", "/api/governance/virtual-keys/vk-1", `{"name":"one","is_active":true,"description":"x"}`).status).toBe(200)
+  // two keys created with one name on two workers: the second is refused, not saved twice
+  expect(handleApi(a, "POST", "/api/governance/virtual-keys", `{"id":"vk-x","name":"twin"}`).status).toBe(201)
+  expect(handleApi(b, "POST", "/api/governance/virtual-keys", `{"id":"vk-y","name":"twin"}`).status).toBe(409)
+  expect(((try loadRawConfig(path)).governance?.virtual_keys ?? []).length).toBe(2)
+  cleanup(path)
+})
+
+test("a save waits for the config file's lock, and gives up with an error when another process keeps it", () => {
+  const path = tmpPath()
+  try writeFileSync(path, `{}`)
+  const s = new ConfigStore(path, try loadRawConfig(path))
+  s.lockWaitMs = 50.0
+  // another process holds the lock (made by hand here)
+  try mkdirSync(lockDirOf(path))
+  const r = handleApi(s, "POST", "/api/governance/virtual-keys", `{"id":"vk-l","name":"locked"}`)
+  expect(r.status).toBe(500)
+  expect(r.body.includes("lock")).toBe(true)
+  expect((s.cfg.governance?.virtual_keys ?? []).length).toBe(0)
+  try rmSync(lockDirOf(path), { recursive: true, force: true })
+  expect(handleApi(s, "POST", "/api/governance/virtual-keys", `{"id":"vk-l","name":"locked"}`).status).toBe(201)
+  // the lock is given back after the save
+  expect(existsSync(lockDirOf(path))).toBe(false)
   cleanup(path)
 })
 

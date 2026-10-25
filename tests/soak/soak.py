@@ -88,21 +88,32 @@ async def read_response(reader):
     return status, body, hs.get("connection", "").lower() != "close"
 
 
+# A pooled connection idle this long is closed rather than reused. The gateway closes keep-alive connections idle for
+# server.idle_timeout_seconds (60 by default), and a request sent on one just as it closes gets no answer (an
+# IncompleteReadError): the keep-alive race every HTTP client pool avoids by retiring connections first. The 240 s
+# re-audit soak counted 10 of those, from connections at the bottom of the idle pool; the 60 s runs had none.
+REUSE_IDLE_S = 50
+
+
 class Client:
-    """One keep-alive connection, reopened when the server closes it."""
+    """One keep-alive connection, reopened when the server closes it or after REUSE_IDLE_S unused."""
 
     def __init__(self, stats):
         self.stats = stats
         self.reader = None
         self.writer = None
+        self.used = 0.0
 
     async def request(self, body):
         try:
+            if self.writer is not None and time.monotonic() - self.used > REUSE_IDLE_S:
+                self.close()
             if self.writer is None:
                 self.reader, self.writer = await asyncio.open_connection("127.0.0.1", PORT)
             self.writer.write(b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
                               b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
             status, data, keep = await asyncio.wait_for(read_response(self.reader), 30)
+            self.used = time.monotonic()
             if status == 200 and (body is PLAIN or b"[DONE]" in data):
                 self.stats.ok += 1
             else:

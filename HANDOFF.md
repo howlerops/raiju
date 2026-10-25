@@ -11,11 +11,19 @@ session. It sets up the machine, explains the lead/worker loop and points at the
 Worker briefs start from [handoff/worker-prompt-template.md](handoff/worker-prompt-template.md);
 the rules all workers follow are in [handoff/worker-brief.md](handoff/worker-brief.md).
 
-Branch: `claude/affectionate-shannon-pjwi5z`. Waves 1 to 23 are on `main` (PR howlerops/raiju#5).
-The branch carries wave 24 (L188 to L194).
+Branch: `claude/affectionate-shannon-pjwi5z`. Waves 1 to 24 are on `main` (PR howlerops/raiju#6).
+The branch carries wave 25 (L195 to L199).
 
 ## Where things stand
 
+- Wave 25 (L195 to L199) fixed the production re-audit (docs/audits/production-reaudit-2026-10-25.md):
+  the cluster secret is resolved from env and enforced (32 bytes or more) with an optional cluster
+  listener and a /metrics token (L195); credentials are checked before large bodies are read and a
+  per-process cap bounds buffered bodies (L196); config saves from several workers are merged under a
+  file lock, and sessions, agent tokens and jobs are shared by a node's workers (L197); bcrypt
+  passwords, sign-in throttling and trusted proxies (L198, tov-patches 0017); a worker killed by the
+  OOM killer is respawned (tov-patches 0019), a workable ECS module, versioned state files and an
+  upgrade notice (L199). Behaviour changes are in docs/behaviour-changes-wave-25.md.
 - Wave 24 (L188 to L194): the runtime checks each connection's resolved address (tov-patches 0013,
   DNS rebinding closed for fetch; every provider connection checked as Bifrost's ConfigureDialer);
   WebSocket and WebRTC sessions drain at a stop, broker mode stops gracefully, http1 drops stalled
@@ -64,7 +72,7 @@ The branch carries wave 24 (L188 to L194).
   current Bifrost datasheet.
 - docs/parity.md counts 567 parity rows: done 531, partial 12, missing 0, out of scope 15,
   n/a 9, plus 42 Raiju-only extras.
-- Tests at handoff (compiler from tov-patches 0001 to 0010, 0012, 0013, 0015 and 0016): `make unit` 2,375 passed,
+- Tests at handoff (compiler from tov-patches 0001 to 0010, 0012, 0013, 0015 to 0017 and 0019): `make unit` 2,435 passed,
   0 failed, plus the Python tests (gen_pricing, the h2/gRPC interop suite, crew_priors,
   test_deploy, test_gen_config_doc); e2e "all passed" on Bun and http1; `make ui` all passed;
   `make openapi-check` ok; `make web-check` and `make config-doc-check` up to date. Helm lint and
@@ -75,8 +83,9 @@ The branch carries wave 24 (L188 to L194).
   plugins), 0006 libdatachannel (WebRTC), 0007 fetch pool and upstream HTTP/2 (nghttp2), 0008
   streamed request bodies, 0009 node:fs rename and fsync, 0010 a WASM wall-clock limit, 0012
   server lifecycle (graceful stop, timeouts, connection cap), 0013 the fetch peer address policy,
-  0015 TLS client certificates, Request.signal and gunzip, 0016 a small fetch input buffer. 0011
-  and 0014 are unused. They apply in order only; `make tov` rebuilds the compiler.
+  0015 TLS client certificates, Request.signal and gunzip, 0016 a small fetch input buffer, 0017
+  server.requestIP, 0019 worker respawn after SIGKILL and Bun.plainAlloc. 0011, 0014 and 0018 are
+  unused. They apply in order only; `make tov` rebuilds the compiler.
 - Admin UI: SolidJS 2.0 RC in `web/`, embedded through the committed `src/ui_assets.tov`;
   charts with zoom and series toggles, MCP access and virtual MCP screens, role-aware actions
   (L132), and a Roles tab that edits custom roles (L141). `make web` after any
@@ -97,12 +106,13 @@ real accounts. The production items left:
 
 - Raw-socket connections (A2A gRPC, Redis/Valkey vector stores, realtime WebSockets to providers)
   have no connect-time address check; Bun.serve has no write-stall limit on upgraded sockets.
-- Agent sign-in tokens, provisioning jobs and dashboard sessions are per process.
+- Provisioning jobs and async jobs do not cross nodes or survive restarts; sign-in throttle counts
+  are per node.
 - Real providers: `make smoke` has never run against real keys (none in this environment).
-- Deployment: build and scan the image and install the chart on a real cluster; the ECS module's
-  EFS config is read-only, so management API saves fail there.
+- Deployment: build and scan the image, install the chart on a real cluster and apply the ECS
+  module on AWS (both are checked only by lint, terraform validate and mock-provider tests).
 - Crew routing: fit real priors and a classifier from your own evaluation data.
-- Upstream: offer tov-patches/upstream to Tov (0013, 0015 and 0016 have no write-up yet).
+- Upstream: offer tov-patches/upstream to Tov (0013, 0015, 0016, 0017 and 0019 have no write-up yet).
 
 ## Owner decisions after wave 22 (2026-10-24)
 

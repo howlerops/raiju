@@ -100,6 +100,52 @@ class ComposeTest(unittest.TestCase):
             self.assertEqual(open(os.path.join(data, "config.json")).read(), '{"from": "api"}', "a saved config was overwritten")
 
 
+class EcsTest(unittest.TestCase):
+    """The ECS module (deploy/terraform/modules/aws-ecs): a writable /app/data and /tmp under the read-only root, one
+    task unless the tasks form a Raiju cluster. The module's own terraform test (tests/ecs.tftest.hcl, a mocked AWS
+    provider) runs when TERRAFORM names a terraform binary (1.7 or later); it downloads the AWS provider."""
+
+    def setUp(self):
+        self.dir = os.path.join(ROOT, "deploy", "terraform", "modules", "aws-ecs")
+        self.main = open(os.path.join(self.dir, "main.tf")).read()
+        self.vars = open(os.path.join(self.dir, "variables.tf")).read()
+
+    def test_no_read_only_mount(self):
+        self.assertNotRegex(self.main, r"readOnly\s*=\s*true", "a volume is mounted read-only")
+        self.assertRegex(self.main, r'containerPath\s*=\s*"/app/data",\s*readOnly\s*=\s*false')
+
+    def test_tmp_is_a_volume(self):
+        self.assertRegex(self.main, r'containerPath\s*=\s*"/tmp",\s*readOnly\s*=\s*false')
+        self.assertRegex(self.main, r'volume\s*\{\s*name\s*=\s*"tmp"\s*\}')
+
+    def test_data_without_efs_is_ephemeral_storage(self):
+        self.assertRegex(self.main, r'for_each\s*=\s*local\.efs_enabled \? \[\] : \[1\]\s*content\s*\{\s*name\s*=\s*"data"\s*\}')
+
+    def test_efs_is_written(self):
+        self.assertIn('"elasticfilesystem:ClientWrite"', self.main)
+
+    def test_one_task_unless_clustered(self):
+        m = re.search(r'variable "desired_count" \{.*?default\s*=\s*(\d+)', self.vars, re.S)
+        self.assertEqual(m.group(1), "1")
+        self.assertIn("var.desired_count <= 1 || var.cluster_enabled", self.main)
+        self.assertIn("RAIJU_CLUSTER_SECRET", self.main)
+
+    @unittest.skipUnless(os.environ.get("TERRAFORM"), "set TERRAFORM to a terraform binary to run the module's terraform test")
+    def test_terraform_test(self):
+        tf = os.environ["TERRAFORM"]
+        with tempfile.TemporaryDirectory() as data:
+            env = {**os.environ, "TF_DATA_DIR": data}
+            init = subprocess.run([tf, "init", "-backend=false", "-input=false", "-no-color"], cwd=self.dir, env=env, capture_output=True, text=True)
+            self.assertEqual(init.returncode, 0, init.stdout + init.stderr)
+            try:
+                run = subprocess.run([tf, "test", "-no-color"], cwd=self.dir, env=env, capture_output=True, text=True)
+            finally:
+                lock = os.path.join(self.dir, ".terraform.lock.hcl")
+                if os.path.exists(lock):
+                    os.remove(lock)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+
+
 class HelmPresentTest(unittest.TestCase):
     def test_helm_is_there_when_required(self):
         # CI sets REQUIRE_HELM, so the chart checks never pass by being skipped
@@ -242,11 +288,84 @@ class HelmTest(unittest.TestCase):
         tok = [e for e in env if e["name"] == "BIFROST_SETUP_TOKEN"]
         self.assertEqual(tok[0]["valueFrom"]["secretKeyRef"], {"name": "raiju-setup", "key": "BIFROST_SETUP_TOKEN"})
 
+    def notes(self, *sets):
+        """The chart's NOTES.txt as installing it would print them (helm template skips NOTES: they are rendered
+        through a ConfigMap in a copy of the chart)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            chart = os.path.join(tmp, "raiju")
+            shutil.copytree(CHART, chart)
+            shutil.copy(os.path.join(chart, "templates", "NOTES.txt"), os.path.join(chart, "notes.txt"))
+            with open(os.path.join(chart, "templates", "notes-render.yaml"), "w") as f:
+                f.write('apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: notes\ndata:\n  notes: |\n{{ tpl (.Files.Get "notes.txt") . | indent 4 }}\n')
+            args = [HELM, "template", "r", chart, "--show-only", "templates/notes-render.yaml"]
+            for s in sets:
+                args += ["--set", s]
+            p = subprocess.run(args, capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            return yaml.safe_load(p.stdout)["data"]["notes"]
+
+    def test_notes_say_inference_is_open_without_a_virtual_key(self):
+        self.assertIn("Inference is open until the config has a virtual key", self.notes())
+        self.assertNotIn("Inference is open", self.notes("config.client.enforce_auth_on_inference=true"))
+        self.assertIn("client.enforce_auth_on_inference is false", self.notes("config.client.enforce_auth_on_inference=false"))
+        keyed = self.notes("config.governance.virtual_keys[0].id=vk-1", "config.governance.virtual_keys[0].value=sk-bf-example")
+        self.assertNotIn("Inference is open", keyed)
+
     def test_peers_service(self):
         self.assertFalse([d for d in self.render() if d["kind"] == "Service" and d["metadata"]["name"].endswith("-peers")])
         svc = self.kind(self.render("peers.headlessService=true"), "Service", "r-raiju-peers")
         self.assertEqual(svc["spec"]["clusterIP"], "None")
         self.assertTrue(svc["spec"]["publishNotReadyAddresses"])
+        self.assertEqual([p["name"] for p in svc["spec"]["ports"]], ["http"])
+
+    def test_cluster_secret_from_a_secret(self):
+        # clustering on needs a secret, and never one written into the ConfigMap
+        self.assertIn("cluster.secret.existingSecret", self.render("config.cluster.enabled=true", ok=False))
+        self.assertIn("env.NAME reference", self.render("config.cluster.enabled=true", "config.cluster.secret=plain-text-secret", ok=False))
+        docs = self.render("config.cluster.enabled=true", "cluster.secret.existingSecret=raiju-cluster")
+        self.assertEqual(self.config(docs)["cluster"]["secret"], "env.RAIJU_CLUSTER_SECRET")
+        env = self.pod(docs)["containers"][0]["env"]
+        sec = [e for e in env if e["name"] == "RAIJU_CLUSTER_SECRET"]
+        self.assertEqual(sec[0]["valueFrom"]["secretKeyRef"], {"name": "raiju-cluster", "key": "RAIJU_CLUSTER_SECRET"})
+        # an env.NAME reference of the operator's own is kept
+        kept = self.render("config.cluster.enabled=true", "config.cluster.secret=env.MY_SECRET")
+        self.assertEqual(self.config(kept)["cluster"]["secret"], "env.MY_SECRET")
+
+    def test_cluster_listener(self):
+        docs = self.render("config.cluster.enabled=true", "cluster.secret.existingSecret=raiju-cluster")
+        cl = self.config(docs)["cluster"]
+        self.assertEqual((cl["listen_port"], cl["bind"]), (7946, "0.0.0.0"))
+        self.assertNotIn("serve_metrics", cl)
+        ports = {p["name"]: p["containerPort"] for p in self.pod(docs)["containers"][0]["ports"]}
+        self.assertEqual(ports, {"http": 8080, "cluster": 7946})
+        # the peers Service targets the cluster port; the public Service does not carry it
+        peers = self.kind(docs, "Service", "r-raiju-peers")
+        self.assertEqual([(p["name"], p["port"]) for p in peers["spec"]["ports"]], [("cluster", 7946)])
+        self.assertEqual(peers["metadata"]["labels"]["app.kubernetes.io/component"], "peers")
+        self.assertEqual([p["port"] for p in self.kind(docs, "Service", "r-raiju")["spec"]["ports"]], [8080])
+        # listenPort 0 keeps the peer routes on the main port
+        off = self.render("config.cluster.enabled=true", "cluster.secret.existingSecret=raiju-cluster", "cluster.listenPort=0")
+        self.assertNotIn("listen_port", self.config(off)["cluster"])
+        self.assertEqual([p["name"] for p in self.pod(off)["containers"][0]["ports"]], ["http"])
+        self.assertFalse([d for d in off if d["kind"] == "Service" and d["metadata"]["name"].endswith("-peers")])
+        # without clustering no cluster port is opened
+        self.assertEqual([p["name"] for p in self.pod(self.render())["containers"][0]["ports"]], ["http"])
+
+    def test_metrics_token_and_port(self):
+        self.assertNotIn("server", self.config(self.render()))
+        docs = self.render("metricsToken.existingSecret=raiju-metrics", "serviceMonitor.enabled=true")
+        self.assertEqual(self.config(docs)["server"]["metrics_token"], "env.RAIJU_METRICS_TOKEN")
+        env = self.pod(docs)["containers"][0]["env"]
+        self.assertEqual([e for e in env if e["name"] == "RAIJU_METRICS_TOKEN"][0]["valueFrom"]["secretKeyRef"], {"name": "raiju-metrics", "key": "RAIJU_METRICS_TOKEN"})
+        ep = self.kind(docs, "ServiceMonitor")["spec"]["endpoints"][0]
+        self.assertEqual((ep["port"], ep["bearerTokenSecret"]), ("http", {"name": "raiju-metrics", "key": "RAIJU_METRICS_TOKEN"}))
+        # serveMetrics: scraped on the cluster port, through the peers Service
+        on = self.render("config.cluster.enabled=true", "cluster.secret.existingSecret=raiju-cluster", "cluster.serveMetrics=true", "serviceMonitor.enabled=true")
+        self.assertTrue(self.config(on)["cluster"]["serve_metrics"])
+        sm = self.kind(on, "ServiceMonitor")["spec"]
+        self.assertEqual(sm["endpoints"][0]["port"], "cluster")
+        self.assertEqual(sm["selector"]["matchExpressions"], [{"key": "app.kubernetes.io/component", "operator": "In", "values": ["peers"]}])
+        self.assertEqual(self.kind(on, "Deployment")["spec"]["template"]["metadata"]["annotations"]["prometheus.io/port"], "7946")
 
 
 if __name__ == "__main__":

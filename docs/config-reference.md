@@ -9,7 +9,7 @@ for each element of a list. Descriptions are the comments in the source; default
 has one. The command-line flags (`-app-dir`, `-config`, `-host`, `-port`, `-workers`, `-server`, `-mode`,
 `-healthcheck`) are in the README.
 
-1354 keys (552 with a description), and 38 Bifrost keys read through config_compat.
+1366 keys (565 with a description), and 38 Bifrost keys read through config_compat.
 
 ## Sections
 
@@ -331,6 +331,7 @@ Virtual keys, budgets, rate limits, teams, customers, users, roles, routing rule
 | `governance.users[].email` | string | the user's email address (Bifrost's users carry one; unique, compared without case) |
 | `governance.users[].role` | string | a built-in role (admin, editor, viewer, auditor) or the name of a custom role under governance.roles |
 | `governance.users[].token_sha256` | string |  |
+| `governance.users[].password_hash` | string | the password as a bcrypt hash ($2a$/$2b$/$2y$, Bifrost's form); password_sha256 with salt is the old form, read and replaced by password_hash at the user's next sign-in |
 | `governance.users[].password_sha256` | string |  |
 | `governance.users[].salt` | string |  |
 | `governance.users[].disabled` | bool |  |
@@ -725,7 +726,7 @@ The request log store (files under the app dir; /api/logs reads it).
 | `logs_store.max_memory_entries` | int |  |
 | `logs_store.content_logging` | bool |  |
 | `logs_store.required` | bool | the start fails when the store cannot open (default true, as Bifrost's start fails); false logs and runs without it |
-| `logs_store.max_file_mb` | int | a day's file is cut into segments of this size (MB, default 32): start-up and shared queries read only the newest ones. max_disk_mb caps all the log files together (oldest segments deleted first; 0, the default: no cap) |
+| `logs_store.max_file_mb` | int | a day's file is cut into segments of this size (MB, default 32): start-up and shared queries read only the newest ones. max_disk_mb caps all the log files together (oldest segments deleted first; default 512, 0: no cap) |
 | `logs_store.max_disk_mb` | int |  |
 | `logs_store.object_storage` | object | Bifrost's logs_store.object_storage: the hybrid store's bucket (each row's payload fields go there, hybrid.tov) and where retained content goes (client.retain_content_in_object_storage) |
 | `logs_store.object_storage.type` | "s3" \| "gcs" |  |
@@ -1279,7 +1280,7 @@ Several Raiju nodes sharing usage, state and configuration (docs/operations.md w
 | `cluster.enabled` | bool |  |
 | `cluster.node_id` | string |  |
 | `cluster.peers` | string[] | log_reads (default true): a request log read (/api/logs, its detail, stats, sessions and histograms, the MCP and agent logs) also asks the peers for their rows (POST /api/cluster/logs), since each node keeps its own log files |
-| `cluster.secret` | string |  |
+| `cluster.secret` | string | secret: env.NAME allowed. |
 | `cluster.interval_ms` | int |  |
 | `cluster.discovery` | object |  |
 | `cluster.discovery.enabled` | bool |  |
@@ -1317,6 +1318,9 @@ Several Raiju nodes sharing usage, state and configuration (docs/operations.md w
 | `cluster.feed.batch_ms` | int | batch_ms is the relay interval. |
 | `cluster.config_sync` | string | Raiju only: config_sync is what a node does when another node saves the config (a generation on the cluster state, store.tov). |
 | `cluster.log_reads` | bool | log_reads (default true): a request log read (/api/logs, its detail, stats, sessions and histograms, the MCP and agent logs) also asks the peers for their rows (POST /api/cluster/logs), since each node keeps its own log files |
+| `cluster.listen_port` | int | listen_port (Raiju only): a second listener that serves the peer routes (/api/cluster/*) and /health, so they need not be reachable on the public port |
+| `cluster.bind` | string | bind: the address of that listener (default the gateway's -host). |
+| `cluster.serve_metrics` | bool | serve_metrics: /metrics moves to that listener too (404 on the main one). |
 
 ## oidc
 
@@ -1615,7 +1619,15 @@ Bifrost's server section; Raiju reads a2a_allow_private_push_callbacks (push cal
 | `server.idle_timeout_seconds` | number | a keep-alive connection with no request closes after this (default 60; 0 off) |
 | `server.body_timeout_seconds` | number | a request body may go this long without a byte (default 60; 0 off) |
 | `server.max_connections` | int | open connections per process (default three quarters of ulimit -n; -1 no cap) |
+| `server.max_buffered_body_mb` | int | request-body megabytes each process reads at once across requests (default 48; -1 no cap; bodybudget.tov) |
 | `server.webrtc_enabled` | bool | webrtc_enabled (Raiju's; Bifrost has no switch) turns on the WebRTC realtime and live calls the gateway terminates on its own peer (POST /v1/realtime/calls, POST /v1/realtime, POST /v1/live/sessions). |
+| `server.metrics_token` | string | Raiju's: when set (env.NAME allowed), /metrics answers only a request with "Authorization: Bearer <token>" (401 otherwise). Unset keeps Bifrost's open /metrics. |
+| `server.trusted_proxies` | string[] | Raiju's own (Bifrost believes no forwarding header): the addresses or CIDR ranges of the reverse proxies in front of the gateway. Only a request from one of them has its X-Forwarded-For / X-Real-IP taken as the client's address (clientip.tov), for the audit log and the sign-in throttle. Empty (the default): the TCP peer is the client. |
+| `server.sign_in_throttle` | object | Raiju's sign-in throttle (signinguard.tov): past the free failures within an hour, each attempt waits twice as long as the last (1 s, 2 s, 4 s, ...), answered 429 with Retry-After and not checked. On by default. |
+| `server.sign_in_throttle.enabled` | bool | false turns the throttle off (default true) |
+| `server.sign_in_throttle.account_failures` | int | free failed sign-ins per account name within an hour (default 5) |
+| `server.sign_in_throttle.ip_failures` | int | free failed sign-ins per client address within an hour (default 20) |
+| `server.sign_in_throttle.max_backoff_seconds` | int | the longest wait (default 900) |
 
 ## feature_flags
 

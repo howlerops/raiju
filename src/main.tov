@@ -18,23 +18,25 @@ import { setEkSeal } from "./rtsession"
 import { clusterState } from "./clusterstate"
 import { McpShare, CLIENT_NS, diskConfig, saveShared, pullsConfig } from "./mcpshare"
 import { FileLease, FILE_LEASE_MS } from "./filelease"
-import { start, bodyLimits, NO_BODY_LIMIT, startLiveModelRefresher } from "./server"
-import { serverLimits, stopSettings, beginStop } from "./lifecycle"
+import { start, startCluster, bodyLimits, NO_BODY_LIMIT, startLiveModelRefresher, Served } from "./server"
+import { serverLimits, stopSettings, beginStop, ServerLimits } from "./lifecycle"
+import { secretProblem } from "./cluster"
 import { Ops, withSecrets, makeShareDir } from "./ops"
 import { fromBifrost, merge } from "./guardrails_compat"
 import { warnings } from "./config_compat"
 import { existsSync, readFileSync } from "node:fs"
-import { startFront } from "./front"
+import { startFront, startClusterFront } from "./front"
 import { openIssuerState } from "./mcpissuer"
 import { setA2aGrpc, listenA2aGrpc, claimA2aGrpc } from "./a2agrpc"
 import { healthcheckUrl, runHealthcheck } from "./healthcheck"
+import { allocCheck, upgradeNotice, NOTICE_FILE } from "./startup"
 
-// healthcheck: the path -healthcheck probes ("" when the flag is not given)
-type Args = { port: int, host: string, config: string, workers: int, server: string, mode: string, healthcheck: string }
+// healthcheck: the path -healthcheck probes ("" when the flag is not given); hostGiven: -host or BIFROST_HOST set the bind
+type Args = { port: int, host: string, config: string, workers: int, server: string, mode: string, healthcheck: string, hostGiven: bool }
 
 function parseArgs(argv: string[]): Args {
   // the bind address defaults to the loopback, as Bifrost's (localhost, BIFROST_HOST overrides); containers pass -host 0.0.0.0
-  const a: Args = { port: 8080, host: process.env.BIFROST_HOST ?? "127.0.0.1", config: "", workers: 1, server: process.env.RAIJU_SERVER ?? "", mode: process.env.RAIJU_MODE ?? "", healthcheck: "" }
+  const a: Args = { port: 8080, host: process.env.BIFROST_HOST ?? "127.0.0.1", config: "", workers: 1, server: process.env.RAIJU_SERVER ?? "", mode: process.env.RAIJU_MODE ?? "", healthcheck: "", hostGiven: process.env.BIFROST_HOST !== undefined }
   const envPort = process.env.PORT
   if (envPort !== undefined) a.port = parseInt(envPort) ?? 8080
   const envConfig = process.env.RAIJU_CONFIG
@@ -46,7 +48,10 @@ function parseArgs(argv: string[]): Args {
     const flag = argv[i]!.replace("--", "-")
     const v = argv[i + 1] ?? ""
     if (flag === "-port") a.port = parseInt(v) ?? a.port
-    else if (flag === "-host") a.host = v
+    else if (flag === "-host") {
+      a.host = v
+      a.hostGiven = true
+    }
     else if (flag === "-config") a.config = v
     else if (flag === "-app-dir") appDir = v
     else if (flag === "-workers") a.workers = parseInt(v) ?? a.workers
@@ -144,6 +149,30 @@ async function startStdio(mcp: McpManager): Promise<void> {
   }
 }
 
+// Clustering signs every peer route with cluster.secret, so a secret that is missing, still an unresolved env.NAME
+// reference or shorter than 32 bytes stops the start (rawSecret: as written, first: the resolved config). "" when fine.
+function clusterSecretProblem(rawSecret: string, first: Config, broker: bool): string {
+  const cc = first.cluster
+  if (cc === undefined || !(cc.enabled || broker)) return ""
+  return secretProblem(rawSecret, cc.secret)
+}
+
+// The cluster listener (cluster.listen_port, on cluster.bind or the gateway's host): the peer routes, /health and,
+// with cluster.serve_metrics, /metrics. Opened before the workers fork, so each worker accepts on it. undefined when
+// it is not configured.
+function openClusterListener(engine: Engine, ops: Ops, cfg: Config, host: string, server: string, limits: ServerLimits, maxBody: int): Served | undefined {
+  const cc = cfg.cluster
+  if (cc === undefined) return undefined
+  const port = cc.listen_port ?? 0
+  if (port <= 0 || !(cc.enabled || cc.serve_metrics === true)) return undefined
+  const b = cc.bind ?? ""
+  const bind = b === "" ? host : b
+  const served = server === "http1" ? startClusterFront(engine, ops, bind, port, maxBody, limits) : startCluster(engine, ops, port, bind, limits, maxBody)
+  ops.clusterPort = port
+  ops.metricsOnCluster = cc.serve_metrics === true
+  return served
+}
+
 // Broker mode: the relay only, with no store, providers or gateway. It serves on cluster_config.broker.listen_port
 // and accepts only requests signed with cluster.secret.
 function runBroker(c: Config, host: string): int {
@@ -176,6 +205,10 @@ async function main(): Promise<int> {
     // the Docker HEALTHCHECK: no config is read and nothing is started
     process.exit(await runHealthcheck(healthcheckUrl(args.host, args.port, args.healthcheck)))
   }
+  // a binary built without TV_PLAIN_ALLOC crashes under concurrent requests: it refuses to serve (startup.tov)
+  const alloc = allocCheck(Bun.plainAlloc(), process.env.RAIJU_ALLOW_UNSAFE_ALLOC ?? "")
+  if (alloc.message !== "") console.error(`raiju: ${alloc.message}`)
+  if (alloc.fatal) return 1
   // an OpenAPI MCP client's spec_file is read relative to the config file, and so are the log and audit folders
   const appDir = path.dirname(path.resolve(args.config))
   setSpecBaseDir(appDir)
@@ -201,8 +234,14 @@ async function main(): Promise<int> {
   // The store keeps the config as written (env.NAME references intact); the engine runs on a resolved copy.
   const store = new ConfigStore(args.config, raw)
   store.cipher = cipher
+  const rawSecret = raw.cluster?.secret ?? ""
   let first = raw
   resolveConfig(&first)
+  const weak = clusterSecretProblem(rawSecret, first, args.mode === "broker")
+  if (weak !== "") {
+    console.error(`raiju: ${weak}; refusing to start with clustering on`)
+    return 1
+  }
   if (args.mode === "broker") return runBroker(first, args.host)
   reportConfig(args.config)
   const cfg = withBifrostGuardrails(withAppDirs(await withSecrets(first), appDir), store, true)
@@ -255,6 +294,18 @@ async function main(): Promise<int> {
     }
   }, (v: string): string | undefined => openStored(sealKey, v))
   if (flowNote !== "") console.error(`raiju: mcp oauth: ${flowNote}`)
+  // the dashboard's sessions, the sign-ins in flight and the CLI's sign-in tokens beside config.json, shared by the
+  // workers and kept across restarts; the refresh tokens and PKCE verifiers in them are sealed with the config's key
+  ops.keepAuthState(args.config, {
+    seal: (v: string): string => {
+      try {
+        return sealStored(sealKey, v)
+      } catch (e) {
+        return ""
+      }
+    },
+    open: (v: string): string | undefined => openStored(sealKey, v),
+  })
   const configPath = args.config
   engine.adminOwns = (client: string): bool => ops.ownsAdmin(client)
   engine.adminStored = (client: string): McpUserToken | undefined => readStoredAdmin(configPath, sealKey, client)
@@ -363,12 +414,24 @@ async function main(): Promise<int> {
   const limits = serverLimits(cfg.server, Bun.fdLimit())
   const served = server === "http1" ? startFront(engine, ops, { hostname: args.host, port: args.port, maxBodyBytes: NO_BODY_LIMIT, limits: () => bodyLimits(engine), timeouts: limits }) : start(engine, ops, { port: args.port, hostname: args.host, workers: args.workers, maxBodyBytes: maxBody, limits: limits })
   const url = served.url
+  const clusterServed = openClusterListener(engine, ops, cfg, args.host, server, limits, maxBody)
+  if (clusterServed !== undefined) {
+    const cu = clusterServed.url
+    console.error(`raiju: cluster listener on ${cu} (the peer routes${ops.metricsOnCluster ? " and /metrics" : ""}; /api/cluster/* is refused on the main listener)`)
+  }
   // SIGTERM and SIGINT stop gracefully (lifecycle.tov): in every worker, /ready turns 503, the listener closes, the
   // requests and streams in hand get up to server.shutdown_grace_seconds, and what is queued is sent before the exit
   Bun.onStopSignal((sig: string) => {
     beginStop(sig, stopSettings(engine.cfg.server), {
-      stopListener: served.stopListener,
-      open: served.open,
+      stopListener: () => {
+        served.stopListener()
+        const cs = clusterServed
+        if (cs !== undefined) cs.stopListener()
+      },
+      open: (): int => {
+        const cs = clusterServed
+        return served.open() + (cs === undefined ? 0 : cs.open())
+      },
       flush: async (): Promise<void> => {
         await ops.flushForStop()
       },
@@ -406,6 +469,8 @@ async function main(): Promise<int> {
     }
   }, 0)
   for (const w of ops.startupWarnings()) console.error(`raiju: warning: ${w}`)
+  // the defaults that changed in recent releases and that this config relies on, once (startup.tov)
+  for (const line of upgradeNotice(engine.cfg, args.hostGiven, !ops.authOn, path.join(appDir, NOTICE_FILE))) console.error(`raiju: ${line}`)
   console.error(`raiju listening on ${url} (${providers.length} providers: ${providers.join(", ")}; ${args.workers} worker${args.workers === 1 ? "" : "s"})`)
   return 0
 }
