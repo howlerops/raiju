@@ -13938,6 +13938,42 @@ def l179_e2e(env):
         gw.wait()
 
 
+def l187_e2e(env):
+    """L187: `raiju -healthcheck [path]`, the image's Docker HEALTHCHECK (the image has no curl). It probes the
+    gateway on this host (-host, -port or PORT) and exits 0 on a 2xx, 1 otherwise; its own gateway (18330), and
+    18331 with nothing listening."""
+    import shutil
+    d = os.path.join(BUILD, "e2e-l187")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    cfg = {"client": {"enable_logging": False, "enforce_auth_on_inference": False},
+           "providers": {"openai": {"keys": [{"name": "hc", "value": "sk-l187", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}}}
+    json.dump(cfg, open(os.path.join(d, "config.json"), "w"))
+    raiju = os.path.join(BUILD, "raiju")
+    gw = subprocess.Popen(cwd=ROOT, args=[raiju, "-app-dir", d, "-port", "18330", "-host", "0.0.0.0", "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l187.log"), "w"))
+    try:
+        wait("http://127.0.0.1:18330/health")
+        def probe(args, extra_env=None):
+            t0 = time.time()
+            p = subprocess.run([raiju, "-healthcheck", *args], env={**env, **(extra_env or {})}, capture_output=True, text=True, timeout=20)
+            return p.returncode, p.stderr, time.time() - t0
+        code, err, _ = probe(["-port", "18330"])
+        check("raiju -healthcheck exits 0 against a running gateway (a 0.0.0.0 bind is probed on 127.0.0.1)", code == 0, (code, err))
+        code, err, _ = probe(["/ready", "-port", "18330", "-host", "0.0.0.0"])
+        check("raiju -healthcheck /ready exits 0 while the gateway is ready", code == 0, (code, err))
+        code, err, _ = probe([], {"PORT": "18330"})
+        check("raiju -healthcheck reads the port from PORT, as the gateway does", code == 0, (code, err))
+        code, err, _ = probe(["/no-such-route", "-port", "18330"])
+        check("raiju -healthcheck exits 1 on an answer that is not 2xx", code == 1 and "HTTP 404" in err, (code, err))
+        code, err, dt = probe(["-port", "18331"])
+        check("raiju -healthcheck exits 1 at once when nothing listens", code == 1 and dt < 5 and "healthcheck" in err, (code, err, dt))
+        s, _, _ = call("GET", "/health", None, None, base="http://127.0.0.1:18330", auth=False)
+        check("the probes leave the gateway serving", s == 200, s)
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
 def main():
     unique_ports()
     build()
@@ -16402,6 +16438,8 @@ def main():
         # L184: secure defaults (the locked /api, bounded metric labels, owned job ids, the masked-key round trip, private
         # files and share folder, MCP denied to a key without mcp_configs, WebRTC off): its own gateways (18324, 18325)
         l184_e2e(env)
+        # L187: raiju -healthcheck, the image's Docker HEALTHCHECK: its own gateway (18330; 18331 stays closed)
+        l187_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

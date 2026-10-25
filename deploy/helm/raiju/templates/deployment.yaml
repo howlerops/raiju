@@ -1,3 +1,4 @@
+{{- include "raiju.validate" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -8,13 +9,23 @@ spec:
   {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
   {{- end }}
+  # a ReadWriteOnce data volume cannot be mounted by the new pod while the old one runs
+  strategy:
+    {{- if .Values.strategy }}
+    {{- toYaml .Values.strategy | nindent 4 }}
+    {{- else if include "raiju.singleWriter" . }}
+    type: Recreate
+    {{- else }}
+    type: RollingUpdate
+    {{- end }}
   selector:
     matchLabels:
       {{- include "raiju.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       annotations:
-        # Roll the pods when the config or the secret changes.
+        # Roll the pods when the config or the secret changes. With configMode ifAbsent, a changed config reaches
+        # only a fresh data volume (the file there is the one the API and UI edit).
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
         {{- if not .Values.existingSecret }}
         checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
@@ -38,9 +49,42 @@ spec:
       {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
-      # SIGTERM drains (server.shutdown_delay_seconds, then up to server.shutdown_grace_seconds, then about 5 s to send
-      # what is queued): this must cover all three
+      # The preStop sleep, then the SIGTERM drain (server.shutdown_delay_seconds, up to server.shutdown_grace_seconds,
+      # then about 5 s to send what is queued): this covers all of them (the chart checks it)
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      initContainers:
+        # config.json goes onto the writable data volume, where the API and the UI save their changes: copied when
+        # absent (configMode ifAbsent) or at every start (always), through a temporary file so a half copy is never read
+        - name: config
+          image: {{ include "raiju.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              if [ "$CONFIG_MODE" = always ] || [ ! -f /app/data/config.json ]; then
+                cp /app/seed/config.json /app/data/config.json.seed
+                mv /app/data/config.json.seed /app/data/config.json
+                echo "config.json copied from the ConfigMap ($CONFIG_MODE)"
+              else
+                echo "config.json kept (it exists on the data volume; configMode ifAbsent)"
+              fi
+          env:
+            - name: CONFIG_MODE
+              value: {{ .Values.configMode | quote }}
+          {{- with .Values.initResources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: seed
+              mountPath: /app/seed
+              readOnly: true
+            - name: data
+              mountPath: /app/data
       containers:
         - name: raiju
           image: {{ include "raiju.image" . | quote }}
@@ -59,6 +103,20 @@ spec:
             - name: http
               containerPort: {{ .Values.port }}
               protocol: TCP
+          env:
+            # this pod's address, for config.cluster.discovery.advertise_address ("env.POD_IP")
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          {{- with .Values.setupToken.existingSecret }}
+            # the management API is locked until an admin exists; this token creates the first one
+            - name: BIFROST_SETUP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: {{ $.Values.setupToken.key }}
+          {{- end }}
           {{- if include "raiju.hasSecret" . }}
           envFrom:
             - secretRef:
@@ -70,6 +128,8 @@ spec:
               port: http
             initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
           # /ready turns 503 while the process drains for a stop (SIGTERM), and when a store that is on could not open
           readinessProbe:
             httpGet:
@@ -77,6 +137,15 @@ spec:
               port: http
             initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          {{- if gt (int .Values.preStopSleepSeconds) 0 }}
+          # keep serving while the endpoints drop the pod; SIGTERM comes after
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sleep", {{ .Values.preStopSleepSeconds | toString | quote }}]
+          {{- end }}
           {{- with .Values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
@@ -84,13 +153,26 @@ spec:
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           volumeMounts:
-            - name: config
+            - name: data
               mountPath: /app/data
-              readOnly: true
+            - name: tmp
+              mountPath: /tmp
       volumes:
-        - name: config
+        - name: seed
           configMap:
             name: {{ include "raiju.configMapName" . }}
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "raiju.claimName" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: tmp
+          emptyDir:
+            {{- if .Values.tmp.sizeLimit }}
+            sizeLimit: {{ .Values.tmp.sizeLimit }}
+            {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

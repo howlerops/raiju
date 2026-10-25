@@ -70,8 +70,9 @@ Outputs: `alb_dns_name`, `service_name`, `cluster_arn`, `task_definition_arn`,
 `log_group_name`, `target_group_arn`, `service_security_group_id`.
 
 The container runs `-app-dir /app/data -host 0.0.0.0 -port 8080 -workers N`
-(the image's CMD, with `-workers`). Health check: `GET /health` on the target
-group.
+(the image's CMD, with `-workers`; the binary itself binds 127.0.0.1 unless told otherwise). The
+target group checks `GET /ready` (`health_check_path`), the container's own health check runs
+`raiju -healthcheck` (`GET /health`), and `stopTimeout` is 35 s, above the SIGTERM drain.
 
 ## Config and secrets
 

@@ -157,9 +157,9 @@ variable "readonly_root_filesystem" {
 }
 
 variable "health_check_path" {
-  description = "ALB target group health check path."
+  description = "ALB target group health check path. /ready answers 503 while a task drains or when a store that is on could not open; /health is liveness only."
   type        = string
-  default     = "/health"
+  default     = "/ready"
 }
 
 variable "log_retention_days" {

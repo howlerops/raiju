@@ -281,6 +281,16 @@ resource "aws_ecs_task_definition" "this" {
       essential    = true
       command      = local.command
       portMappings = [{ name = "http", containerPort = var.port, hostPort = var.port, protocol = "tcp" }]
+      # the binary probes itself (the image has no curl); /health is liveness
+      healthCheck = {
+        command     = ["CMD", "/usr/local/bin/raiju", "-healthcheck", "-port", tostring(var.port)]
+        interval    = 30
+        timeout     = 5
+        retries     = 3
+        startPeriod = 15
+      }
+      # SIGTERM drains for up to server.shutdown_grace_seconds (25 by default) plus about 5 s of flushing
+      stopTimeout = 35
 
       readonlyRootFilesystem = var.readonly_root_filesystem
       environment            = [for k, v in var.environment : { name = k, value = v }]

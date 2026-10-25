@@ -12,7 +12,7 @@ Scope and priorities: [SCOPE.md](SCOPE.md) (from the
 
 ```sh
 make tov                         # Tov with the patches in tov-patches/ (needs git and cargo)
-make build                       # build/raiju (3 MB; links only glibc)
+make build                       # build/raiju (about 21 MB; links glibc, libstdc++ and JavaScriptCore)
 OPENAI_API_KEY=sk-... build/raiju            # no config: providers from env vars
 build/raiju -app-dir ~/.config/bifrost       # or an existing Bifrost config.json
 build/raiju -config config.json -port 8080 -workers 4
@@ -22,6 +22,14 @@ BIFROST_SETUP_TOKEN=$(openssl rand -hex 16) build/raiju   # /api opens to this t
 The gateway listens on 127.0.0.1 unless `-host` (or `BIFROST_HOST`) says otherwise; the image and the
 deploy files pass `-host 0.0.0.0`. The management API is locked until an admin exists (see
 [Secure defaults](#secure-defaults)).
+
+```sh
+build/raiju -healthcheck -port 8080          # exits 0 when the gateway on this host answers /health
+```
+
+Every `config.json` key, with its type and description: [docs/config-reference.md](docs/config-reference.md)
+(generated from the source by `make config-doc`). Deployment (Docker, compose, Helm, sizing):
+[deploy/README.md](deploy/README.md).
 
 ```sh
 curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '{
@@ -155,7 +163,10 @@ While inference is not authenticated the gateway says so at start-up.
   set one. Create the first admin with the token (`POST /api/users` with `X-Bifrost-Setup-Token`;
   the dashboard has no setup screen yet); from then on normal sign-in applies and the token opens
   nothing. `client.whitelisted_routes` stay open.
+  In the deployments: `BIFROST_SETUP_TOKEN` in compose's `.env`, the chart's `setupToken.existingSecret`,
+  or a `secret_arns` entry on ECS ([deploy/README.md](deploy/README.md)).
 - **Bind address:** 127.0.0.1 by default (Bifrost's `localhost`); `-host` or `BIFROST_HOST` change it.
+  The image, compose, the chart and the Terraform modules pass `-host 0.0.0.0`.
 - **Metrics:** label values a caller chooses are bounded. A path no route serves (404, 405, 501), and
   a management path the gate refused, is labelled `other`; ids in paths become `{id}` (past the third
   segment for a failed request); methods outside the HTTP set are `OTHER`; a model (or alias) name
@@ -207,11 +218,20 @@ streams are converted as they arrive. Stream bodies need Tov with the patch in
 patch adds chunked responses on the runtime's existing raw-write path, and it is
 small enough to send upstream.
 
-| Server (mock upstream, 64 connections, 4-core VM) | Throughput | Gateway overhead |
+Measured by the production audit (2026-10-24, before the fixes under Memory below: 4-core VM, a minimal mock that
+answers at once, `hey -z 8s` for throughput and vegeta at a fixed rate for latency; the gateway
+pinned to two cores):
+
+| Server | Throughput (16 / 64 / 256 connections) | Added p50 latency (1,000 to 5,000 rps) |
 |---|---|---|
-| `-server bun -workers 2` | 31,000–36,000 rps | 40 µs mean |
-| `-server bun` (1 process) | 16,300 rps | 68 µs mean |
-| `-server http1` (1 process) | 14,300 rps | 100 µs mean |
+| `-server bun -workers 2` | 18,600 / 10,800 / 8,900 rps | 190–320 µs |
+| `-server bun` (1 process) | 8,800 / 9,000 / 9,600 rps | 250–400 µs |
+| `-server http1` (1 process) | not re-measured | not re-measured |
+
+Two workers fall back to about one worker's throughput at 64 connections and more (connections
+are not balanced well across workers), and one worker's p99 had stalls of 40 ms to 0.5 s at
+2,500 to 5,000 rps (the Memory section below has the p99 after the fixes). The earlier figures here (16,300 rps on one worker, 31,000 to 36,000 on two)
+came from an older build and are not reproduced.
 
 `-server http1` is Raiju's own HTTP/1.1 server on raw sockets. It streams too,
 but runs in one process. It stays as a fallback.
@@ -263,10 +283,15 @@ Results from one 4-core cloud VM (single run, 15 s per rate, 100% success everyw
 | Added p50 at 2,500 RPS | 179 µs | 234 µs | 1,179 µs |
 | Added p50 at 5,000 RPS | 99 µs | 139 µs | can't sustain (3,387 rps) |
 | Max throughput, 2 cores | 27,700 rps* | 18,400 rps | 3,700 rps |
-| Memory (RSS) | 10–13 MB | 100–120 MB | 280–470 MB |
-| Binary | 3 MB | 49 MB | 134 MB |
+| Memory (RSS) | 20 MB idle, 44 MB under load† | 100–120 MB | 280–470 MB |
+| Binary | 21 MB | 49 MB | 134 MB |
 
 \* Raiju's ceiling is the mock upstream and load generator (one core each), not Raiju.
+The latency and throughput rows are from an earlier `bench/compare.sh` run and were not repeated on the
+current build; the audit's throughput figures are under Servers.
+
+† Re-measured (production audit, 2026-10-24): one worker, non-streaming load at 1,500 rps stays flat at
+44 MB. Each open stream adds about 170 KB while it lasts (Memory, below; [deploy/README.md](deploy/README.md#sizing)).
 At 10,000 RPS the load generator's own core saturates, so those rows (in
 `bench/results/`) aren't meaningful for either gateway.
 
@@ -308,6 +333,8 @@ make soak    # memory soak of one worker; fails when RSS grows (ports 18320-1832
 make smoke   # opt-in: real providers, for each one with credentials in the environment (below)
 make openapi-check # docs/openapi/management.yaml against a probe gateway
 make parity-count  # recount docs/parity.md and refresh its Summary table
+make config-doc    # regenerate docs/config-reference.md from the config types (CI checks it is up to date)
+make deploy-check  # the Dockerfile, compose file and Helm chart (helm template; needs helm)
 make ui      # the web UI in headless Chromium against a real gateway
 make web     # rebuild the web UI (web/) and embed it in src/ui_assets.tov
 make web-check # rebuild it and fail when src/ui_assets.tov or the API types would change
