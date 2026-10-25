@@ -17460,6 +17460,79 @@ def l202_e2e(env):
             except OSError:
                 pass
 
+GW_L207 = "http://127.0.0.1:18370"  # L207: group commit of config saves (four workers on Bun; one process on http1)
+L207_ADMIN = {"authorization": "Bearer sk-admin-l207"}
+
+def l207_e2e(env):
+    """L207: group commit. A config of 2,000 virtual keys (every save rewrites the whole file); 120 creates of distinct
+    names and 20 of one name sent at once through every worker: the changes that queue on a worker while one waits for
+    the config file's lock are run by it as one group with one file write, so all 120 succeed and the file holds every
+    one; of the 20 twins exactly one is saved and the other 19 get their own 409 (Bifrost's unique virtual key name), the
+    group's other changes saved regardless. The dashboard notice of a group names its changes. Port 18370."""
+    import hashlib, shutil, http.client
+    from concurrent.futures import ThreadPoolExecutor
+    d = os.path.join(BUILD, "e2e-l207")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    path = os.path.join(d, "config.json")
+    json.dump({
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l207".encode()).hexdigest()}],
+            "virtual_keys": [{"id": f"pre{i}", "name": f"pre{i}", "value": f"sk-bf-l207-pre-{i:05d}"} for i in range(2000)],
+        },
+    }, open(path, "w"))
+    def req(method, p, body=None, timeout=60):
+        c = http.client.HTTPConnection("127.0.0.1", 18370, timeout=timeout)
+        t0 = time.time()
+        try:
+            c.request(method, p, body=None if body is None else json.dumps(body), headers={"content-type": "application/json", **L207_ADMIN})
+            r = c.getresponse()
+            return r.status, r.read().decode(), time.time() - t0
+        except Exception as e:
+            return 0, str(e), time.time() - t0
+        finally:
+            c.close()
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    extra = ["-workers", "4"] if server != "http1" else []
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18370", "-host", "127.0.0.1", "-config", path, "-server", server] + extra,
+                          env=env, stderr=open(os.path.join(BUILD, "e2e.l207.log"), "w"))
+    try:
+        wait(GW_L207 + "/health")
+        time.sleep(1.0)
+        bodies = [{"name": f"l207-{i}"} for i in range(120)] + [{"name": "l207-twin"} for _ in range(20)]
+        # twins spread among the distinct creates, so groups mix both
+        bodies = [bodies[(i * 11) % 140] for i in range(140)]
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=70) as ex:
+            out = list(ex.map(lambda b: (b["name"], req("POST", "/api/governance/virtual-keys", b)), bodies))
+        took = time.time() - t0
+        distinct = [o for o in out if o[0] != "l207-twin"]
+        twins = [o[1] for o in out if o[0] == "l207-twin"]
+        check("L207: 120 creates sent at once through every worker against a 2,000-key config all succeed",
+              len(distinct) == 120 and all(o[1][0] == 201 for o in distinct), (round(took, 2), sorted(set(o[1][0] for o in distinct))))
+        check("L207: of 20 creates of one name exactly one is saved, the others get their own 409",
+              sorted(t[0] for t in twins) == [201] + [409] * 19 and all("already exists" in t[1] for t in twins if t[0] == 409), sorted(t[0] for t in twins))
+        time.sleep(0.5)
+        names = [v.get("name") for v in json.load(open(path)).get("governance", {}).get("virtual_keys", [])]
+        check("L207: the config file holds every acknowledged create and one twin, nothing lost",
+              len(names) == 2121 and all(f"l207-{i}" in names for i in range(120)) and names.count("l207-twin") == 1,
+              (len(names), sorted(set(f"l207-{i}" for i in range(120)) - set(names))[:5], names.count("l207-twin")))
+        msgs = set()
+        for _ in range(16):
+            s, b, _ = req("GET", "/api/notifications?limit=500")
+            if s == 200:
+                for n in json.loads(b).get("notifications", []):
+                    msgs.add(n.get("message", ""))
+        grouped = [m for m in msgs if " changes (" in m and " were saved" in m]
+        check("L207: concurrent creates were saved in groups (a notice names a group of changes written at once)", len(grouped) > 0, sorted(msgs)[:4])
+        s, _, _ = req("POST", "/api/governance/virtual-keys", {"name": "l207-after"})
+        check("L207: a create on its own afterwards still saves (a group of one)", s == 201 and "l207-after" in [v.get("name") for v in json.load(open(path))["governance"]["virtual_keys"]], s)
+    finally:
+        gw.terminate()
+        gw.wait()
+
 def main():
     unique_ports()
     build()
@@ -19986,6 +20059,9 @@ def main():
         # L202: the config lock held only around a save (a slow refresh-models holds none, 503 on a kept lock) and the
         # upgrade bridge with the old mkdir lock: its own gateway (18360) and silent provider (18361)
         l202_e2e(env)
+        # L207: group commit of concurrent config saves (one file write per group, each change its own reply, 409 per
+        # twin name): its own gateway (18370)
+        l207_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()
