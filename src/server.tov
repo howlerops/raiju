@@ -37,7 +37,7 @@ import { MINT_ROUTES } from "./rtsession"
 import { sdkRoute, anthropicSdk } from "./anthropic_batch"
 import { snapshot, errorJson, Hdrs, newId } from "./schemas"
 import { CLIENT_IP_HEADER, clientAddress } from "./clientip"
-import { handleApi, proxyWidening, Result, randomId, rotatedKeyIds, isRotatePath, providerBaseUrlProblem } from "./store"
+import { handleApi, proxyWidening, Result, randomId, rotatedKeyIds, isRotatePath, providerBaseUrlProblem, ConfigStore } from "./store"
 import { scimAuthorized, scimHandle, errorBody, ScimState, SCIM_CONTENT_TYPE } from "./scim"
 import { deprovisioned } from "./provision"
 import { passthroughPath, passthroughRoute, routeFor } from "./passthrough"
@@ -57,12 +57,13 @@ import { cookieValue, SETUP_COOKIE } from "./setupsession"
 import { rerank, bedrockRerank, countTokens, responsesInputTokens, asyncSubmit, asyncGet, sdkAsyncSubmit, sdkAsyncPoll, decisionRoute, openaiDecisionPath, Dispatch } from "./extras"
 import { asyncPoll, jobOwner } from "./jobs"
 import { serveUi, uiPath, UI_CSP } from "./uiserve"
-import { TransportRun, transportStart, transportEnd, transportDone, transportSink, llmHooked, storageHooked, StorageCall, storageOp, storageIdKey, pathWithId, ownedRequest, passthroughOwned, recordUpload } from "./pluginroute"
+import { TransportRun, transportStart, transportEnd, transportDone, transportSink, llmHooked, storageHooked, StorageCall, storageOp, storageIdKey, pathWithId, ownedRequest, passthroughOwned, recordUpload, httpHooked } from "./pluginroute"
 import { kindOfPath, isInferencePath } from "./plughttp"
 import { EXTRA_PARAMS_HEADER, EXTRA_PARAMS_CARRY, mergeExtraParams, extraParamsCarry } from "./extraparams"
 import { lifecycle, readyInput, readyReport, ServerLimits } from "./lifecycle"
 import { CLIENT_WATCH_HEADER, watchStart, watchGone, watchEnd, watched } from "./clientgone"
 import { usesChain, withChainCreds } from "./awschain"
+import { bodyBudget, bufferedCap, UNREAD_ABOVE } from "./bodybudget"
 
 type ModelEntry = { id: string, object: string, created: int, owned_by: string }
 
@@ -1006,10 +1007,13 @@ export const NO_BODY_LIMIT = 1099511627776
 // client.max_request_body_size_mb, and the size over which a body reaches the gateway as a stream
 // (large_payload_optimization's request threshold; the limit itself while the feature is off, so a body over it
 // is refused unread).
+// Bodies over UNREAD_ABOVE reach the gateway as a stream whatever the feature says, so a request's credentials are
+// checked, and its body charged to the process's budget, before the body is read (credentialRefusal, heldBody).
 export function bodyLimits(engine: Engine): { limit: int, threshold: int } {
   const limit = (engine.cfg.client?.max_request_body_size_mb ?? 100) * 1048576
   const lp = engine.large
-  return { limit: limit, threshold: lp === undefined ? Math.max(1, limit) : Math.max(1, lp.requestThreshold) }
+  const t = lp === undefined ? limit : lp.requestThreshold
+  return { limit: limit, threshold: Math.max(1, Math.min(t, UNREAD_ABOVE)) }
 }
 
 // client.max_request_body_size_mb is checked here, not by the server: a declared length over the
@@ -1041,6 +1045,125 @@ export async function limitedBody(req: Request, maxBytes: int): Promise<Request 
     // a body cut off reads as what arrived
   }
   return new Request(req.url, { method: req.method, headers: snapshot(req.headers), body: body })
+}
+
+// ---- request bodies before they are read (production re-audit P0-2) ----
+
+// A body that has not been read yet (the servers' stream threshold): a declared length over UNREAD_ABOVE and within
+// the limit (a bigger one is refused unread anyway), or a chunked body.
+function unreadBody(req: Request, limit: int): bool {
+  if (req.method === "GET" || req.method === "HEAD") return false
+  const cl = req.headers.get("content-length")
+  if (cl !== undefined) {
+    const n = parseInt(cl) ?? 0
+    return n > UNREAD_ABOVE && n <= limit
+  }
+  return req.headers.get("transfer-encoding") !== undefined
+}
+
+// The /api routes behind the management gate (manage); the ones routed before it carry their own credentials
+// (sign-in, the agent sign-in, the cluster's signed calls, the OAuth and OIDC endpoints, the key's own quota).
+function gatedPath(p: string): bool {
+  if (!p.startsWith("/api/")) return false
+  for (const pre of ["/api/session/", "/api/agent/", "/api/cluster/", "/api/oauth2/", "/api/oauth/", "/api/oidc/"]) {
+    if (p.startsWith(pre)) return false
+  }
+  return p !== "/api/governance/virtual-keys/quota"
+}
+
+// The answer a request with a big unread body gets for its credentials alone, before the body is read; undefined
+// when its credentials pass (or are not judged from the headers). Inference routes refuse what governance would
+// refuse for any model (a missing credential while auth is enforced, an inactive or expired key), management routes
+// what the gate refuses, SCIM a wrong provisioning token. The MCP server's routes and requests that plugins' HTTP
+// hooks see first (they may add the credential) are left to their handlers. A small body has already been read by
+// the server and goes the usual way.
+export async function credentialRefusal(engine: Engine, ops: Ops, req: Request, limit: int): Promise<Response | undefined> {
+  if (!unreadBody(req, limit)) return undefined
+  const u = URL.parse(req.url)
+  const p = u === undefined ? "" : u.pathname
+  // (an expired single sign-on session is renewed first, as manage does)
+  if (gatedPath(p)) await ops.refreshDue(req)
+  const res = headerRefusal(engine, ops, req, limit)
+  if (res === undefined) return undefined
+  // the answer the route would give: inference answers carry the CORS headers, and every answer the agent mark
+  // and the caller's request id (dispatch)
+  const shaped = isInferencePath(p) ? await cors(engine, req, res) : res
+  return await echoRequestId(req, await markAgentRejection(engine, req, shaped))
+}
+
+// credentialRefusal's decision, as the route answers it before the shared headers are added.
+export function headerRefusal(engine: Engine, ops: Ops, req: Request, limit: int): Response | undefined {
+  if (!unreadBody(req, limit)) return undefined
+  const u = URL.parse(req.url)
+  const p = u === undefined ? "" : u.pathname
+  if (gatedPath(p)) {
+    const g = ops.gate(req, p)
+    return g.kind === "deny" ? g.res : undefined
+  }
+  if (p === "/scim/v2" || p.startsWith("/scim/v2/")) {
+    const sc = ops.store.cfg.scim_config
+    if (sc?.enabled !== true) return undefined
+    if (!scimAuthorized(req.headers.get("authorization") ?? "", resolveEnv(sc?.config?.provisioningToken ?? ""))) return scimReply(401, errorBody(401, "", "the SCIM provisioning token is missing or wrong"))
+    return undefined
+  }
+  if (!isInferencePath(p) || p === "/mcp" || p.startsWith("/mcp/") || compatPath(p).startsWith("/v1/mcp/") || httpHooked(engine)) return undefined
+  const d = engine.gov.credentialDenial(snapshot(req.headers))
+  if (d === undefined) return undefined
+  return errorResponse(d.status, d.message, d.type, noHeaders())
+}
+
+// A request with its body read whole, or the answer that refuses it unread; held is what the request holds of the
+// process's body budget until it is done (bodyBudget().give).
+export type HeldBody = { res: Response | undefined, req: Request, held: int }
+
+function busyResponse(): Response {
+  const h: Hdrs = new Map()
+  h.set("retry-after", "1")
+  return errorResponse(503, "the gateway is reading too many request bodies at once (server.max_buffered_body_mb); retry shortly", "api_error", h)
+}
+
+// Reads a request's body, charged first to the process's body budget (bodybudget.tov, server.max_buffered_body_mb):
+// a declared length over client.max_request_body_size_mb is 413 and one that does not fit the budget 503, both unread;
+// a chunked body is charged and checked as it arrives.
+export async function heldBody(engine: Engine, req: Request, limit: int): Promise<HeldBody> {
+  if (req.method === "GET" || req.method === "HEAD") return { res: undefined, req: req, held: 0 }
+  const cap = bufferedCap(engine.cfg.server)
+  const b = bodyBudget()
+  const declared = req.headers.get("content-length")
+  if (declared !== undefined) {
+    const n = parseInt(declared) ?? 0
+    if (n > limit) return { res: errorResponse(413, "request body too large", "invalid_request_error", noHeaders()), req: req, held: 0 }
+    if (!b.take(n, 0, cap)) return { res: busyResponse(), req: req, held: 0 }
+    // read now, under the charge (a body the server has read already is there at once)
+    await req.text()
+    return { res: undefined, req: req, held: n }
+  }
+  const st = req.body
+  if (st === undefined) return { res: undefined, req: req, held: 0 }
+  const body: u8[] = []
+  let held = 0
+  try {
+    while (true) {
+      const r = await st.pull()
+      const v = r.value
+      if (r.done || v === undefined) break
+      if (body.length + v.length > limit) {
+        await st.cancel()
+        b.give(held)
+        return { res: errorResponse(413, "request body too large", "invalid_request_error", noHeaders()), req: req, held: 0 }
+      }
+      if (!b.take(v.length, held, cap)) {
+        await st.cancel()
+        b.give(held)
+        return { res: busyResponse(), req: req, held: 0 }
+      }
+      held += v.length
+      for (const x of v) body.push(x)
+    }
+  } catch (e) {
+    // a body cut off reads as what arrived
+  }
+  return { res: undefined, req: new Request(req.url, { method: req.method, headers: snapshot(req.headers), body: body }), held: held }
 }
 
 // large_payload_optimization (largepayload.tov) at the front of a server: the Response that refuses or
@@ -1904,16 +2027,36 @@ async function bunHttp(engine: Engine, ops: Ops, req00: Request, limit: int): Pr
 }
 
 async function bunHttpWatched(engine: Engine, ops: Ops, req00: Request, limit: int, watch: string): Promise<Response, TypeError> {
-  let req0 = req00
+  // a big body is not read for a caller its credentials already refuse
+  const refused = await outOfLine(credentialRefusal(engine, ops, req00, limit))
+  if (refused !== undefined) return refused
   let wid = watch
   const lf = await outOfLine(largeFront(engine, req00))
   if (lf instanceof Response) return lf
+  let within: Request = req00
+  let held = 0
   if (lf instanceof Request) {
-    req0 = lf
     wid = ""
+    // (a body the feature streams on is not held here)
+    const lim = try await limitedBody(lf, limit)
+    if (lim === undefined) return errorResponse(413, "request body too large", "invalid_request_error", noHeaders())
+    within = lim
+  } else {
+    const hb = await outOfLine(heldBody(engine, req00, limit))
+    const no = hb.res
+    if (no !== undefined) return no
+    within = hb.req
+    held = hb.held
   }
-  const within = try await limitedBody(req0, limit)
-  if (within === undefined) return errorResponse(413, "request body too large", "invalid_request_error", noHeaders())
+  try {
+    return try await bunRouted(engine, ops, within, wid)
+  } finally {
+    bodyBudget().give(held)
+  }
+}
+
+// The rest of a request on the Bun.serve server, its body read: the plugins' HTTP hooks, then the streamed or whole route.
+async function bunRouted(engine: Engine, ops: Ops, within: Request, wid: string): Promise<Response, TypeError> {
   // the plugins' HTTP pre hooks, before the request is routed
   const th = await transportStart(engine, within)
   if (th.response !== undefined) return th.response
@@ -2038,4 +2181,55 @@ test("the governance users path is the users path", () => {
   expect(usersPath("/api/governance/users/ann/role")).toBe("/api/users/ann/role")
   expect(usersPath("/api/governance/usersx")).toBe("/api/governance/usersx")
   expect(usersPath("/api/users/ann")).toBe("/api/users/ann")
+})
+
+function bigPost(path: string, hs: string[][]): Request {
+  const h: Record<string, string> = new Map()
+  h.set("content-type", "application/json")
+  h.set("content-length", "5000000")
+  for (const kv of hs) h.set(kv[0]!, kv[1]!)
+  return new Request("http://gw" + path, { method: "POST", headers: h })
+}
+
+test("a big unread body is refused for its credentials alone; a small or over-limit one goes the usual way", () => {
+  const cfg: Config = { client: { enforce_auth_on_inference: true }, governance: { virtual_keys: [{ id: "k", value: "sk-bf-k" }, { id: "off", value: "sk-bf-off", is_active: false }] } }
+  const ops = new Ops(new Engine(cfg), new ConfigStore("/tmp/raiju-server-precheck.json", cfg))
+  const eng = ops.engine
+  const limit = 100 * 1048576
+  const st = (r: Request): int => {
+    const res = headerRefusal(eng, ops, r, limit)
+    return res === undefined ? 0 : res.status
+  }
+  expect(st(bigPost("/v1/chat/completions", []))).toBe(401)
+  expect(st(bigPost("/anthropic/v1/messages", []))).toBe(401)
+  expect(st(bigPost("/openai/v1/chat/completions", []))).toBe(401)
+  expect(st(bigPost("/v1/chat/completions", [["x-bf-vk", "sk-bf-k"]]))).toBe(0)
+  expect(st(bigPost("/v1/chat/completions", [["authorization", "Bearer sk-bf-k"]]))).toBe(0)
+  expect(st(bigPost("/v1/chat/completions", [["x-bf-vk", "sk-bf-off"]]))).toBe(403)
+  // the management API: locked (no admin, no setup token) before its body is read
+  expect(st(bigPost("/api/providers", []))).toBe(403)
+  // routes with their own credentials, and the MCP server, are left to their handlers
+  expect(st(bigPost("/api/session/login", []))).toBe(0)
+  expect(st(bigPost("/api/cluster/sync", []))).toBe(0)
+  expect(st(bigPost("/mcp", []))).toBe(0)
+  expect(st(bigPost("/v1/mcp/tool/execute", []))).toBe(0)
+  // a chunked body counts as unread
+  const ch: Record<string, string> = new Map()
+  ch.set("transfer-encoding", "chunked")
+  expect(st(new Request("http://gw/v1/chat/completions", { method: "POST", headers: ch }))).toBe(401)
+  // a small body (already read by the server) and a body over the limit (refused unread with 413) are not judged here
+  let small: Record<string, string> = new Map()
+  small.set("content-length", "100")
+  expect(st(new Request("http://gw/v1/chat/completions", { method: "POST", headers: small, body: "x" }))).toBe(0)
+  expect(headerRefusal(eng, ops, bigPost("/v1/chat/completions", []), 1000)).toBeUndefined()
+  // GET carries no body
+  expect(st(new Request("http://gw/v1/models", { method: "GET" }))).toBe(0)
+})
+
+test("with auth not enforced an inference call passes, and the stream threshold is the smaller of the two", () => {
+  const cfg: Config = { client: { enforce_auth_on_inference: false } }
+  const ops = new Ops(new Engine(cfg), new ConfigStore("/tmp/raiju-server-precheck-open.json", cfg))
+  expect(headerRefusal(ops.engine, ops, bigPost("/v1/chat/completions", []), 100 * 1048576)).toBeUndefined()
+  expect(bodyLimits(ops.engine).threshold).toBe(65536)
+  expect(bodyLimits(ops.engine).limit).toBe(100 * 1048576)
 })

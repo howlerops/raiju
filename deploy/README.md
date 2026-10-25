@@ -48,7 +48,12 @@ open streams on its one worker; raise both with `workers` or more concurrent str
 process a descriptor limit (`nofile`) of at least four times the concurrent streams you expect.
 
 The data volume (1Gi by default) holds the config and, when `logs_store` is on, the request log:
-set `logs_store.max_disk_mb` below the volume's size.
+`logs_store.max_disk_mb` (default 512) keeps the log under half of it; set it from your volume's size.
+
+A worker that dies, of a crash or of SIGKILL from the kernel's OOM killer, is replaced while the other
+workers keep serving (a worker that keeps dying within 10 s of starting waits 1 s, then 2, 4, up to
+30 s, between restarts; each restart is logged). Watch for `was killed by signal 9` in the logs: it
+means a worker ran out of memory.
 
 Throughput measured by the production audit (2026-10-24, 4-core VM, `hey -z 8s`, a mock that
 answers at once): about 9,000 rps for one worker and 11,000 to 18,600 rps for two, at 16 to 256
@@ -96,6 +101,25 @@ The audit log and the sign-in throttle use the client's address. Raiju believes 
 balancer, an ingress controller or the ECS ALB, list its addresses (for a cluster, the pod or node range the
 ingress runs in), or every request is seen as coming from the proxy: the audit log then names the proxy, and
 failed sign-ins from all clients count against one address (`server.sign_in_throttle.ip_failures`, 20 an hour).
+
+A keep-alive connection that a client or proxy reuses just as the idle timeout closes it gets no
+answer (the request finds the connection closed: an incomplete read, or a 502 from a load
+balancer). Keep the idle timeout of whatever pools connections to Raiju below
+`server.idle_timeout_seconds`, or raise the latter above it: an AWS ALB defaults to 60 s, the same as
+Raiju, so the ECS module sets the ALB's to 55 s (`alb_idle_timeout`). `tests/soak/soak.py` drops a
+pooled connection idle for 50 s for the same reason.
+
+Request bodies: a body over 64 KB is not read before the caller's credentials are checked, so an
+inference call without a valid virtual key (while `client.enforce_auth_on_inference` is on) or a
+management call the gate refuses is answered 401 or 403 unread. `server.max_buffered_body_mb`
+(default 48; -1 for no cap; read per request) caps the request-body megabytes each process reads at
+once: a body that does not fit is answered 503 with `retry-after: 1`, unread, and is retried by
+well-behaved clients. A body is always read when the process holds no other, so a single request up
+to `client.max_request_body_size_mb` (default 100) is still served; parsing a chat body costs about
+six to eight times its size, so on a small pod lower `max_request_body_size_mb` too (on the chart's
+512Mi limit a lone 90 MB body peaks near 700 MB; 32 MB keeps a lone body near 250 MB). The default of
+48 keeps a worker near 320 MB with the cap full (`bench/body_memory.py`). With `-workers N` each worker
+has its own cap.
 
 ## AWS credentials from the workload
 
@@ -309,8 +333,8 @@ capacity and availability.
   workers read each other's rows from the files.
 - Each day's file is cut into segments of `logs_store.max_file_mb` (default 32), and start-up reads only the
   newest segments of today, so a restart late in a busy day stays quick.
-- `logs_store.retention_days` (default 7) removes whole days. `logs_store.max_disk_mb` (default 0, no cap)
-  also caps the folder: the oldest segments are deleted first. Set it below the volume's size; at 1,500
+- `logs_store.retention_days` (default 7) removes whole days. `logs_store.max_disk_mb` (default 512; 0 for no
+  cap) also caps the folder: the oldest segments are deleted first. Set it below the volume's size; at 1,500
   requests a second a day of rows is on the order of 100 GB.
 - With `logs_store.object_storage` set (S3, or GCS through its S3 interop API), the rows keep their metadata and a
   prompt preview and each row's bodies, raw payloads and plugin logs go to the bucket (Bifrost's hybrid store), which

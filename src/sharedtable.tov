@@ -1,0 +1,192 @@
+// A small table of expiring rows that the processes of a node share through one private file (0600): the dashboard's
+// sessions and sign-in flows (oidc.tov) and the CLI's sign-in codes and tokens (agentsignin.tov). Every worker reads
+// and writes the same file, so a session made on one worker works on the others, and the file outlives a restart, so
+// sessions and refresh tokens do too. Callers key rows by a hash of their token, never the token itself, and seal any
+// secret a row holds.
+//
+// A change takes the file's lock (filelock.tov), reads the file again, applies the change, drops expired rows (and,
+// past cap, those that expire first) and writes the file atomically. A read takes the rows from memory while the file
+// is as last read (its size and time), at most RECHECK_MS old, and reads the file again on a miss, so a row another
+// worker wrote is found at once and a row another worker removed is gone within RECHECK_MS. With no file the table is
+// this process's memory (one process, or tests).
+import { readFileSync, rmSync, statSync } from "node:fs"
+import { writeFileAtomic, PRIVATE_FILE } from "./atomicfile"
+import { lockFile, unlockFile } from "./filelock"
+
+export type TableRow = { k: string, v: string, exp: f64 }
+type TableFile = { rows?: TableRow[] }
+
+// how long a read trusts the rows it holds without looking at the file
+const RECHECK_MS: f64 = 1000.0
+
+export class SharedTable {
+  private rows: Map<string, TableRow> = new Map()
+  // the file's size and time when last read or written, and when that was
+  private stamp = ""
+  private readAt: f64 = -1.0e15
+
+  constructor(readonly file: string, readonly cap: int) {}
+
+  private stampNow(): string {
+    try {
+      const s = statSync(this.file)
+      return `${s.size}:${s.mtimeMs}`
+    } catch (e) {
+      return ""
+    }
+  }
+
+  // Reads the file again when it changed since the last read, when the last read is RECHECK_MS old, or when forced.
+  private load(force: bool, nowMs: f64): void {
+    if (this.file === "") return
+    const st = this.stampNow()
+    if (!force && st === this.stamp && nowMs - this.readAt < RECHECK_MS) return
+    this.readAt = nowMs
+    this.stamp = st
+    if (st === "") {
+      // no file (yet): nothing is shared
+      this.rows = new Map()
+      return
+    }
+    try {
+      const f = try JSON.parse(try readFileSync(this.file, "utf8")) as TableFile
+      const m: Map<string, TableRow> = new Map()
+      for (const r of f.rows ?? []) m.set(r.k, r)
+      this.rows = m
+    } catch (e) {
+      // a file that cannot be read leaves what this process holds; the next change writes it again
+      console.error(`raiju: ${this.file}: ${e.message}`)
+    }
+  }
+
+  // The value under key while it lives, or undefined.
+  get(key: string, nowMs: f64): string | undefined {
+    this.load(false, nowMs)
+    let r = this.rows.get(key)
+    if (r === undefined && this.file !== "") {
+      this.load(true, nowMs)
+      r = this.rows.get(key)
+    }
+    if (r === undefined || r.exp <= nowMs) return undefined
+    return r.v
+  }
+
+  // The live rows.
+  entries(nowMs: f64): TableRow[] {
+    this.load(false, nowMs)
+    return this.rows.values().filter((r) => r.exp > nowMs)
+  }
+
+  put(key: string, value: string, expMs: f64, nowMs: f64): void {
+    this.change([{ k: key, v: value, exp: expMs }], [], nowMs)
+  }
+
+  del(keys: string[], nowMs: f64): void {
+    if (keys.length === 0) return
+    this.change([], keys, nowMs)
+  }
+
+  // Removes the row under key and returns its value while it lived (undefined otherwise), in one locked step, so a
+  // one-time code or state is used once even when two workers are handed it at the same moment.
+  take(key: string, nowMs: f64): string | undefined {
+    if (this.file === "") {
+      const r = this.rows.get(key)
+      this.rows.delete(key)
+      return r === undefined || r.exp <= nowMs ? undefined : r.v
+    }
+    const lock = lockFile(this.file)
+    this.load(true, nowMs)
+    const r = this.rows.get(key)
+    if (r !== undefined) this.write([], [key], nowMs)
+    unlockFile(lock)
+    return r === undefined || r.exp <= nowMs ? undefined : r.v
+  }
+
+  // Applies puts and deletions in one write of the file.
+  change(puts: TableRow[], dels: string[], nowMs: f64): void {
+    if (this.file === "") {
+      this.apply(puts, dels, nowMs)
+      return
+    }
+    const lock = lockFile(this.file)
+    this.load(true, nowMs)
+    this.write(puts, dels, nowMs)
+    unlockFile(lock)
+  }
+
+  // Applies a change to the rows read under the lock and writes the file.
+  private write(puts: TableRow[], dels: string[], nowMs: f64): void {
+    this.apply(puts, dels, nowMs)
+    try {
+      try writeFileAtomic(this.file, JSON.stringify({ rows: this.rows.values() }) + "\n", { mode: PRIVATE_FILE, exact: true })
+      this.stamp = this.stampNow()
+      this.readAt = nowMs
+    } catch (e) {
+      console.error(`raiju: could not write ${this.file}: ${e.message}`)
+    }
+  }
+
+  private apply(puts: TableRow[], dels: string[], nowMs: f64): void {
+    for (const k of dels) this.rows.delete(k)
+    for (const r of puts) this.rows.set(r.k, r)
+    let live: TableRow[] = this.rows.values().filter((r) => r.exp > nowMs)
+    if (live.length > this.cap) {
+      // past the cap the rows that expire first go
+      live.sort((a: TableRow, b: TableRow): int => (a.exp < b.exp ? 1 : (a.exp > b.exp ? -1 : 0)))
+      live = live.slice(0, this.cap)
+    }
+    if (live.length === this.rows.size) return
+    const m: Map<string, TableRow> = new Map()
+    for (const r of live) m.set(r.k, r)
+    this.rows = m
+  }
+}
+
+let tableSeq = 0
+
+function tableFile(): string {
+  tableSeq += 1
+  return "/tmp/raiju-sharedtable-test-" + process.pid + "-" + Math.floor(Date.now()) + "-" + tableSeq + ".json"
+}
+
+test("two processes on one file see each other's rows and removals, and a new one reads them back", () => {
+  const file = tableFile()
+  const a = new SharedTable(file, 100)
+  const b = new SharedTable(file, 100)
+  const now = 1000000.0
+  a.put("k1", "v1", now + 5000.0, now)
+  // b finds a's row at once (a miss reads the file)
+  expect(b.get("k1", now)).toBe("v1")
+  b.put("k2", "v2", now + 5000.0, now)
+  expect(a.get("k2", now)).toBe("v2")
+  // both rows are in the file: neither write lost the other's
+  const c = new SharedTable(file, 100)
+  expect(c.entries(now).map((r) => r.k).sort()).toEqual(["k1", "k2"])
+  // a removal on b is seen by a once the file changed
+  b.del(["k1"], now)
+  expect(a.get("k1", now + 1.0)).toBeUndefined()
+  // a one-time row is taken once, whichever process takes it
+  a.put("code", "c", now + 5000.0, now)
+  expect(b.take("code", now)).toBe("c")
+  expect(a.take("code", now)).toBeUndefined()
+  expect(a.get("code", now)).toBeUndefined()
+  // an expired row reads as gone and is dropped at the next write
+  expect(a.get("k2", now + 5000.0)).toBeUndefined()
+  a.put("k3", "v3", now + 99000.0, now + 6000.0)
+  expect(c.entries(now + 6000.0).map((r) => r.k)).toEqual(["k3"])
+  // private file
+  expect((try statSync(file)).mode & 511).toBe(384)
+  try rmSync(file, { force: true })
+})
+
+test("past the cap the rows that expire first go; with no file the table is memory", () => {
+  const t = new SharedTable("", 2)
+  t.put("a", "1", 10.0, 0.0)
+  t.put("b", "2", 30.0, 0.0)
+  t.put("c", "3", 20.0, 0.0)
+  expect(t.get("a", 0.0)).toBeUndefined()
+  expect(t.get("b", 0.0)).toBe("2")
+  expect(t.get("c", 0.0)).toBe("3")
+  t.del(["b"], 0.0)
+  expect(t.entries(0.0).map((r) => r.k)).toEqual(["c"])
+})

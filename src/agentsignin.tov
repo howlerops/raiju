@@ -5,10 +5,14 @@
 // "ck-bf-agent-" (the prefix the CLI checks before it refreshes) and stand for the signed-in user on inference: with
 // x-bf-agent-vk-id the user's chosen assigned key, without it the user's default one (governance.tov selectedKey).
 // Bifrost's server side is Enterprise and not in its OSS source; the shapes here are the ones the CLI reads.
-// Codes and tokens are kept by hash in this process's memory, as the dashboard's sessions are (oidc.tov UiSessions).
+// Codes and tokens are kept by hash, never in clear. With a file (setFile, agent-sessions.json beside config.json, 0600)
+// they are shared by the workers of a node and kept across restarts (sharedtable.tov), as the dashboard's sessions are
+// (oidc.tov UiSessions): a code issued by one worker is traded on another, and a refresh token outlives a restart.
 import { sha256, utf8, toHex, secureHex } from "./crypto"
+import { SharedTable, TableRow } from "./sharedtable"
 import { encodeUrl } from "./base64"
 import { pctEncode } from "./cloud_auth"
+import { readFileSync, rmSync, statSync } from "node:fs"
 
 export const AGENT_TOKEN_PREFIX = "ck-bf-agent-"
 export const REFRESH_TOKEN_PREFIX = "rt-bf-agent-"
@@ -69,107 +73,121 @@ export function callbackUrl(redirect: string, code: string, state: string): stri
   return u.origin + u.pathname + "?" + sp.toString()
 }
 
+// Rows by kind: "c:" codes, "a:" access tokens, "r:" refresh tokens, each followed by the hash of the code or token.
 export class AgentSignIn {
-  codes: Map<string, CodeEntry> = new Map()
-  access: Map<string, TokenEntry> = new Map()
-  refresh: Map<string, TokenEntry> = new Map()
+  private table: SharedTable = new SharedTable("", CAP)
+
+  setFile(file: string): void {
+    this.table = new SharedTable(file, CAP)
+  }
+
+  private tokenEntry(key: string, nowMs: f64): TokenEntry | undefined {
+    const v = this.table.get(key, nowMs)
+    if (v === undefined) return undefined
+    try {
+      return try JSON.parse(v) as TokenEntry
+    } catch (e) {
+      return undefined
+    }
+  }
 
   // A one-time code for a signed-in user, bound to the challenge and the redirect.
   issueCode(who: AgentUser, challenge: string, redirect: string, nowMs: f64): string throws Error {
-    this.sweep(nowMs)
     const code = try secureHex(48)
-    this.codes.set(hashOf(code), { who: who, challenge: challenge, redirect: redirect, expires: nowMs + CODE_TTL_MS })
+    const e: CodeEntry = { who: who, challenge: challenge, redirect: redirect, expires: nowMs + CODE_TTL_MS }
+    this.table.put("c:" + hashOf(code), JSON.stringify(e), e.expires, nowMs)
     return code
   }
 
-  private pair(who: AgentUser, family: string, nowMs: f64): Issued throws Error {
+  private pair(who: AgentUser, family: string, nowMs: f64, drop: string[]): Issued throws Error {
     const access = AGENT_TOKEN_PREFIX + (try secureHex(48))
     const refresh = REFRESH_TOKEN_PREFIX + (try secureHex(48))
-    this.access.set(hashOf(access), { who: who, family: family, expires: nowMs + ACCESS_TTL_S * 1000.0 })
-    this.refresh.set(hashOf(refresh), { who: who, family: family, expires: nowMs + REFRESH_TTL_S * 1000.0 })
+    const a: TokenEntry = { who: who, family: family, expires: nowMs + ACCESS_TTL_S * 1000.0 }
+    const r: TokenEntry = { who: who, family: family, expires: nowMs + REFRESH_TTL_S * 1000.0 }
+    const puts: TableRow[] = [{ k: "a:" + hashOf(access), v: JSON.stringify(a), exp: a.expires }, { k: "r:" + hashOf(refresh), v: JSON.stringify(r), exp: r.expires }]
+    this.table.change(puts, drop, nowMs)
     return { access: access, refresh: refresh, who: who }
   }
 
   // The code traded for a token pair: used once, within its lifetime, with the verifier of its challenge and the same
   // redirect (OAuth's invalid_grant otherwise).
   exchange(code: string, verifier: string, redirect: string, nowMs: f64): Exchange throws Error {
-    const h = hashOf(code)
-    const e = this.codes.get(h)
-    // a code is spent by its first use, right or wrong
-    this.codes.delete(h)
+    // a code is spent by its first use, right or wrong, on whichever worker
+    const v = this.table.take("c:" + hashOf(code), nowMs)
+    let e: CodeEntry | undefined = undefined
+    if (v !== undefined) {
+      try {
+        e = JSON.parse(v) as CodeEntry
+      } catch (err) {
+        e = undefined
+      }
+    }
     if (e === undefined || e.expires <= nowMs) return { kind: "error", status: 400, error: "invalid_grant", message: "the authorization code is invalid or expired" }
     if (e.redirect !== redirect) return { kind: "error", status: 400, error: "invalid_grant", message: "redirect_uri does not match the authorization request" }
     if (verifier === "" || s256(verifier) !== e.challenge) return { kind: "error", status: 400, error: "invalid_grant", message: "code_verifier does not match the code challenge" }
     const family = try secureHex(16)
-    return { kind: "ok", issued: try this.pair(e.who, family, nowMs) }
+    return { kind: "ok", issued: try this.pair(e.who, family, nowMs, []) }
   }
 
   // A refresh token traded for a new pair. The old pair stops working (rotation); a refresh token used twice ends its
   // whole family, as a token that leaked would be.
   rotate(refreshToken: string, nowMs: f64): Exchange throws Error {
-    const h = hashOf(refreshToken)
-    const e = this.refresh.get(h)
-    if (e === undefined) return { kind: "error", status: 401, error: "invalid_grant", message: "the refresh token is invalid, expired or already used" }
-    this.refresh.delete(h)
-    if (e.expires <= nowMs) return { kind: "error", status: 401, error: "invalid_grant", message: "the refresh token is invalid, expired or already used" }
-    this.dropFamily(e.family)
-    return { kind: "ok", issued: try this.pair(e.who, e.family, nowMs) }
+    const v = this.table.take("r:" + hashOf(refreshToken), nowMs)
+    let e: TokenEntry | undefined = undefined
+    if (v !== undefined) {
+      try {
+        e = JSON.parse(v) as TokenEntry
+      } catch (err) {
+        e = undefined
+      }
+    }
+    if (e === undefined || e.expires <= nowMs) return { kind: "error", status: 401, error: "invalid_grant", message: "the refresh token is invalid, expired or already used" }
+    return { kind: "ok", issued: try this.pair(e.who, e.family, nowMs, this.familyKeys(e.family, nowMs)) }
   }
 
   // The user an access token stands for, while it lives.
   identity(token: string, nowMs: f64): AgentUser | undefined {
     if (!token.startsWith(AGENT_TOKEN_PREFIX)) return undefined
-    const e = this.access.get(hashOf(token))
-    if (e === undefined) return undefined
-    if (e.expires <= nowMs) {
-      this.access.delete(hashOf(token))
-      return undefined
-    }
+    const e = this.tokenEntry("a:" + hashOf(token), nowMs)
+    if (e === undefined || e.expires <= nowMs) return undefined
     return e.who
   }
 
   // Logout: the access token's family (it and its refresh token) ends. Unknown tokens are a no-op.
   revoke(token: string): bool {
-    const e = this.access.get(hashOf(token))
+    // whatever its lifetime: a token that is still held is revoked with its family
+    const e = this.tokenEntry("a:" + hashOf(token), 0.0)
     if (e === undefined) return false
-    this.dropFamily(e.family)
+    this.table.del(this.familyKeys(e.family, 0.0), 0.0)
     return true
   }
 
   // Every session of a user ends (a user removed or disabled).
   revokeUser(user: string): void {
-    for (const k of this.access.keys()) {
-      if (this.access.get(k)!.who.user === user) this.access.delete(k)
-    }
-    for (const k of this.refresh.keys()) {
-      if (this.refresh.get(k)!.who.user === user) this.refresh.delete(k)
-    }
-  }
-
-  private dropFamily(family: string): void {
-    for (const k of this.access.keys()) {
-      if (this.access.get(k)!.family === family) this.access.delete(k)
-    }
-    for (const k of this.refresh.keys()) {
-      if (this.refresh.get(k)!.family === family) this.refresh.delete(k)
-    }
-  }
-
-  private sweep(nowMs: f64): void {
-    for (const k of this.codes.keys()) {
-      if (this.codes.get(k)!.expires <= nowMs) this.codes.delete(k)
-    }
-    if (this.codes.size > CAP) this.codes.clear()
-    if (this.access.size > CAP) {
-      for (const k of this.access.keys()) {
-        if (this.access.get(k)!.expires <= nowMs) this.access.delete(k)
+    const keys: string[] = []
+    for (const row of this.table.entries(0.0)) {
+      if (row.k.startsWith("c:")) continue
+      try {
+        if ((JSON.parse(row.v) as TokenEntry).who.user === user) keys.push(row.k)
+      } catch (e) {
+        continue
       }
     }
-    if (this.refresh.size > CAP) {
-      for (const k of this.refresh.keys()) {
-        if (this.refresh.get(k)!.expires <= nowMs) this.refresh.delete(k)
+    this.table.del(keys, 0.0)
+  }
+
+  // The access and refresh rows of a family.
+  private familyKeys(family: string, nowMs: f64): string[] {
+    const keys: string[] = []
+    for (const row of this.table.entries(nowMs)) {
+      if (row.k.startsWith("c:")) continue
+      try {
+        if ((JSON.parse(row.v) as TokenEntry).family === family) keys.push(row.k)
+      } catch (e) {
+        continue
       }
     }
+    return keys
   }
 }
 
@@ -297,4 +315,40 @@ test("the sign-in page carries the authorize parameters, escaped", () => {
   expect(html.includes(`name="state" value="a&quot;&lt;b"`)).toBe(true)
   expect(html.includes(`/api/oidc/login?return_to=%2Fapi%2Fagent%2Fauth%2Fauthorize%3Fstate%3Dx`)).toBe(true)
   expect(signInPage(p, "bad <password>", false, "").includes("bad &lt;password&gt;")).toBe(true)
+})
+
+test("a code issued on one worker is traded on another, and the tokens work on both and after a restart", () => {
+  const file = "/tmp/raiju-agent-sessions-test-" + process.pid + "-" + Math.floor(Date.now()) + ".json"
+  const a = new AgentSignIn()
+  a.setFile(file)
+  const b = new AgentSignIn()
+  b.setFile(file)
+  const who: AgentUser = { user: "cy", role: "viewer", email: "" }
+  const now = Date.now()
+  const code = try a.issueCode(who, CHALLENGE, "http://127.0.0.1:5/callback", now)
+  const ok = try b.exchange(code, VERIFIER, "http://127.0.0.1:5/callback", now)
+  if (ok.kind !== "ok") throw new Error("exchange failed")
+  // spent: a cannot trade it again
+  expect((try a.exchange(code, VERIFIER, "http://127.0.0.1:5/callback", now)).kind).toBe("error")
+  expect(a.identity(ok.issued.access, now)!.user).toBe("cy")
+  // stored hashed, private
+  const text = try readFileSync(file, "utf8")
+  expect(text.includes(ok.issued.access) || text.includes(ok.issued.refresh) || text.includes(code)).toBe(false)
+  expect((try statSync(file)).mode & 511).toBe(384)
+  // a restart keeps the refresh token; rotating on one worker ends the old access token on the other
+  const c = new AgentSignIn()
+  c.setFile(file)
+  const next = try c.rotate(ok.issued.refresh, now + 10.0)
+  if (next.kind !== "ok") throw new Error("rotate failed")
+  expect(a.identity(ok.issued.access, now + 11.0)).toBeUndefined()
+  expect(b.identity(next.issued.access, now + 11.0)!.user).toBe("cy")
+  // the old refresh token reused on another worker is refused
+  expect((try a.rotate(ok.issued.refresh, now + 12.0)).kind).toBe("error")
+  // a logout on one worker ends the family everywhere
+  expect(a.revoke(next.issued.access)).toBe(true)
+  expect(c.identity(next.issued.access, now + 13.0)).toBeUndefined()
+  expect((try b.rotate(next.issued.refresh, now + 14.0)).kind).toBe("error")
+  try {
+    rmSync(file, { force: true })
+  } catch (e) {}
 })

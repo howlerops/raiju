@@ -3,7 +3,9 @@
 // Async: POST /v1/async/<op> answers 202 with a job id; the gateway runs the
 // request in the background and GET /v1/async/jobs/{id} reports the result.
 // Finished jobs are kept for a TTL; unfinished ones also expire, so a request
-// that never completes cannot fill the store.
+// that never completes cannot fill the store. With several workers the worker
+// that runs a job writes its state to the node's share folder (useDir), one file
+// per job, so a poll that lands on any worker finds it.
 //
 // Token counting: exact counts come from the provider's count endpoint when it
 // has one; the estimates here cover the rest.
@@ -17,6 +19,8 @@ import * as gemini from "./providers/gemini"
 import { Hdrs } from "./schemas"
 import { secureHex, sha256, toHex, utf8 } from "./crypto"
 import { isoMs } from "./exports"
+import { existsSync, readdirSync, readFileSync, rmSync } from "node:fs"
+import { writeFileAtomic, mkdirPrivate } from "./atomicfile"
 
 export type Job = {
   id: string,
@@ -98,11 +102,85 @@ function sameOwner(a: string, b: string): bool {
   return d === 0
 }
 
+// how often a worker clears the expired job files of the share folder
+const DIR_SWEEP_MS = 60000
+
 export class JobStore {
   // Insertion order is creation order, which the eviction below relies on.
   private jobs: Map<string, Slot> = new Map()
+  // the node's share folder for jobs ("" for one process), and when it was last swept
+  private dir = ""
+  private dirSweptAt = 0
 
   constructor(readonly ttlMs: int, readonly maxJobs: int) {}
+
+  // Shares the jobs with the other workers of the node through dir (the share folder, private to the node).
+  useDir(dir: string): void {
+    try {
+      mkdirPrivate(dir)
+      this.dir = dir
+    } catch (e) {
+      console.error(`raiju: async jobs stay with the worker that took them: ${e.message}`)
+    }
+  }
+
+  // A job's file: named by a hash of its id, so a polled id never names a path.
+  private fileOf(id: string): string {
+    return this.dir + "/" + toHex(sha256(utf8(id))).slice(0, 40) + ".json"
+  }
+
+  private publish(slot: Slot): void {
+    if (this.dir === "") return
+    try {
+      try writeFileAtomic(this.fileOf(slot.job.id), JSON.stringify(slot), { durable: false })
+    } catch (e) {
+      console.error(`raiju: async job ${slot.job.id}: ${e.message}`)
+    }
+  }
+
+  private unpublish(id: string): void {
+    if (this.dir === "") return
+    try {
+      rmSync(this.fileOf(id), { force: true })
+    } catch (e) {
+      // gone already
+    }
+  }
+
+  // A job another worker of the node runs, as its file holds it now.
+  private shared(id: string): Slot | undefined {
+    if (this.dir === "") return undefined
+    const f = this.fileOf(id)
+    if (!existsSync(f)) return undefined
+    try {
+      const slot = try JSON.parse(try readFileSync(f, "utf8")) as Slot
+      // the file must be the job asked for
+      if (slot.job.id !== id) return undefined
+      return slot
+    } catch (e) {
+      return undefined
+    }
+  }
+
+  // Removes the share folder's expired job files (any worker's), at most once a DIR_SWEEP_MS.
+  private sweepDir(nowMs: int): void {
+    if (this.dir === "" || nowMs - this.dirSweptAt < DIR_SWEEP_MS) return
+    this.dirSweptAt = nowMs
+    try {
+      for (const name of try readdirSync(this.dir)) {
+        if (!name.endsWith(".json")) continue
+        const f = this.dir + "/" + name
+        try {
+          const slot = try JSON.parse(try readFileSync(f, "utf8")) as Slot
+          if (this.expired(slot, nowMs)) rmSync(f, { force: true })
+        } catch (e) {
+          continue
+        }
+      }
+    } catch (e) {
+      return
+    }
+  }
 
   private expired(slot: Slot, nowMs: int): bool {
     const ttl = slot.job.ttl_ms ?? this.ttlMs
@@ -115,6 +193,7 @@ export class JobStore {
       const slot = this.jobs.get(id)
       if (slot !== undefined && isFinished(slot.job)) {
         this.jobs.delete(id)
+        this.unpublish(id)
         return true
       }
     }
@@ -139,6 +218,8 @@ export class JobStore {
     const who: string | undefined = owner === undefined || owner === "" ? undefined : owner
     const job: Job = { id: id, op: op, status: "pending", created_at: Math.floor(nowMs / 1000), ttl_ms: ttlMs, owner: who }
     this.jobs.set(job.id, { job: job, at: nowMs })
+    this.publish({ job: job, at: nowMs })
+    this.sweepDir(nowMs)
     return job
   }
 
@@ -147,6 +228,7 @@ export class JobStore {
     if (slot === undefined || slot.job.status !== "pending") return false
     const job: Job = { id: slot.job.id, op: slot.job.op, status: "processing", created_at: slot.job.created_at, ttl_ms: slot.job.ttl_ms, owner: slot.job.owner }
     this.jobs.set(id, { job: job, at: slot.at })
+    this.publish({ job: job, at: slot.at })
     return true
   }
 
@@ -166,6 +248,7 @@ export class JobStore {
       job = { id: cur.id, op: cur.op, status: "failed", created_at: cur.created_at, completed_at: completed, http_status: httpStatus, error: msg, ttl_ms: cur.ttl_ms, raw: body, owner: cur.owner }
     }
     this.jobs.set(id, { job: job, at: nowMs })
+    this.publish({ job: job, at: nowMs })
     return true
   }
 
@@ -179,11 +262,13 @@ export class JobStore {
     return j
   }
 
+  // A job this worker runs, else one another worker of the node runs (its file in the share folder).
   get(id: string, nowMs: int): Job | undefined {
-    const slot = this.jobs.get(id)
+    const slot = this.jobs.get(id) ?? this.shared(id)
     if (slot === undefined) return undefined
     if (this.expired(slot, nowMs)) {
       this.jobs.delete(id)
+      this.unpublish(id)
       return undefined
     }
     return slot.job
@@ -196,6 +281,7 @@ export class JobStore {
       const slot = this.jobs.get(id)
       if (slot !== undefined && this.expired(slot, nowMs)) {
         this.jobs.delete(id)
+        this.unpublish(id)
         removed += 1
       }
     }
@@ -714,4 +800,32 @@ test("lexicalRerank ranks an exact match first", () => {
   expect(scores[1]!.score).toBe(1)
   expect(scores[2]!.score).toBe(0)
   expect(lexicalRerank("zzz", ["a", "b"])[0]!.score).toBe(0)
+})
+
+test("a job run by one worker is polled on another through the share folder, and its file goes when it expires", () => {
+  const dir = "/tmp/raiju-jobs-test-" + process.pid + "-" + Math.floor(Date.now())
+  const a = new JobStore(60000, 100)
+  const b = new JobStore(60000, 100)
+  a.useDir(dir)
+  b.useDir(dir)
+  const now = Math.floor(Date.now())
+  const j = a.create("chat/completions", now, undefined, "vk:one")!
+  // b sees the job at once, with its owner check
+  expect(b.getFor(j.id, "vk:one", now)?.status ?? "").toBe("pending")
+  expect(b.getFor(j.id, "vk:other", now)).toBeUndefined()
+  a.start(j.id)
+  expect(b.get(j.id, now)?.status ?? "").toBe("processing")
+  a.finish(j.id, 200, `{"ok":true}`, now + 10)
+  const done = b.get(j.id, now + 10)!
+  expect(done.status).toBe("completed")
+  expect(done.result ?? "").toBe(`{"ok":true}`)
+  expect(done.raw ?? "").toBe(`{"ok":true}`)
+  // an id that names no job, or a path, finds nothing
+  expect(b.get("job_none", now)).toBeUndefined()
+  expect(b.get("../" + j.id, now)).toBeUndefined()
+  // expired: gone on every worker, and its file removed
+  expect(b.get(j.id, now + 10 + 60000)).toBeUndefined()
+  expect(a.get(j.id, now + 10)).toBeDefined()
+  expect((try readdirSync(dir)).length).toBe(0)
+  try rmSync(dir, { recursive: true, force: true })
 })

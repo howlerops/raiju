@@ -4,7 +4,9 @@
 // the HTTP calls (discovery, token, JWKS); everything here is pure except the
 // small state held by OidcFlows and UiSessions.
 import { Field, fields, elements, find, rawStr, rawNum, decodeString } from "./json"
-import { sha256, utf8, secureHex } from "./crypto"
+import { sha256, utf8, secureHex, toHex } from "./crypto"
+import { SharedTable } from "./sharedtable"
+import { readFileSync, rmSync } from "node:fs"
 import { encodeUrl, decode } from "./base64"
 import { modPow, signRs256 } from "./jwt"
 
@@ -117,21 +119,44 @@ function decodeText(s: string): string throws Error {
 
 // ---- authorization request and token request ----
 
-type Pending = { verifier: string, nonce: string, expires: number }
+// back: where the sign-in returns (a consent page that sent its user to sign in), "" for the dashboard
+type Pending = { verifier: string, nonce: string, expires: number, back?: string }
 
+// Seals a secret kept in a shared file (the config's encryption key, store.tov sealStored), and opens it again
+// (undefined when it cannot be opened). The default keeps it as it is (0600 file, tests).
+export type Sealer = { seal: (v: string) => string, open: (v: string) => string | undefined }
+
+export function plainSealer(): Sealer {
+  return { seal: (v: string): string => v, open: (v: string): string | undefined => v }
+}
+
+function hashKey(token: string): string {
+  return toHex(sha256(utf8(token)))
+}
+
+// The sign-ins in flight, by a hash of their state. With a file (setFile) they are shared by the workers of a node, so
+// the identity provider's redirect may come back to any worker; the PKCE verifier is sealed there.
 export class OidcFlows {
-  pending: Map<string, Pending> = new Map()
+  private table: SharedTable = new SharedTable("", MAX_PENDING)
+  sealer: Sealer = plainSealer()
 
-  // Starts a login: stores state, nonce and PKCE verifier, and returns the authorize URL.
-  begin(cfg: OidcConfig, disc: Discovery, nowMs: number): { url: string, state: string } throws Error {
+  setFile(file: string): void {
+    this.table = new SharedTable(file, MAX_PENDING)
+  }
+
+  // Starts a login: stores state, nonce and PKCE verifier (and where to return, when back is set), and returns the
+  // authorize URL.
+  begin(cfg: OidcConfig, disc: Discovery, nowMs: number, back?: string): { url: string, state: string } throws Error {
     if (disc.issuer !== cfg.issuer) throw new Error("oidc: discovery issuer does not match the configured issuer")
     const state = try secureHex(32)
     const nonce = try secureHex(32)
     // 64 hex characters are a valid PKCE verifier (43 to 128 unreserved characters).
     const verifier = try secureHex(64)
     const challenge = encodeUrl(sha256(utf8(verifier)))
-    this.sweep(nowMs)
-    this.pending.set(state, { verifier: verifier, nonce: nonce, expires: nowMs + PENDING_TTL_MS })
+    const sealed = this.sealer.seal(verifier)
+    if (sealed === "") throw new Error("oidc: the sign-in could not be sealed")
+    const p: Pending = { verifier: sealed, nonce: nonce, expires: nowMs + PENDING_TTL_MS, back: back === "" ? undefined : back }
+    this.table.put(hashKey(state), JSON.stringify(p), nowMs + PENDING_TTL_MS, nowMs)
     let scopes = cfg.scopes ?? ["openid", "email", "profile"]
     if (!scopes.includes("openid")) scopes = ["openid"].concat(scopes)
     const params = [
@@ -148,23 +173,20 @@ export class OidcFlows {
     return { url: disc.authorization_endpoint + sep + params.join("&"), state: state }
   }
 
-  // Returns the stored verifier and nonce for a state, once. Later calls, and calls after expiry, get undefined.
-  complete(state: string, nowMs: number): { verifier: string, nonce: string } | undefined {
-    const p = this.pending.get(state)
-    if (p === undefined) return undefined
-    this.pending.delete(state)
-    if (p.expires <= nowMs) return undefined
-    return { verifier: p.verifier, nonce: p.nonce }
-  }
-
-  private sweep(nowMs: number): void {
-    for (const k of this.pending.keys()) {
-      const p = this.pending.get(k)
-      if (p !== undefined && p.expires <= nowMs) this.pending.delete(k)
-    }
-    if (this.pending.size >= MAX_PENDING) {
-      const first = this.pending.keys()[0]
-      if (first !== undefined) this.pending.delete(first)
+  // Returns the stored verifier, nonce and return path for a state, once. Later calls, and calls after expiry, get
+  // undefined.
+  complete(state: string, nowMs: number): { verifier: string, nonce: string, back: string } | undefined {
+    if (state === "") return undefined
+    const v = this.table.take(hashKey(state), nowMs)
+    if (v === undefined) return undefined
+    try {
+      const p = try JSON.parse(v) as Pending
+      if (p.expires <= nowMs) return undefined
+      const verifier = this.sealer.open(p.verifier)
+      if (verifier === undefined) return undefined
+      return { verifier: verifier, nonce: p.nonce, back: p.back ?? "" }
+    } catch (e) {
+      return undefined
     }
   }
 }
@@ -399,53 +421,102 @@ export type DueSession = { token: string, sub: string, email?: string, refresh: 
 
 const SESSION_PREFIX = "sk-sess-"
 const SESSION_TTL_S = 28800
+// sessions kept at most (past it the ones that end first go)
+const SESSION_CAP = 50000
 const REFRESH_GRACE_MS = 7.0 * 24 * 3600 * 1000
 
+// The dashboard's sessions (single sign-on and password sign-in), by a hash of their token. With a file (setFile, beside
+// config.json) they are shared by the workers of a node and kept across restarts; the identity provider's refresh token
+// is sealed there. A DueSession's token is the session's key (the hash), which renew and delete take as they take a
+// token.
 export class UiSessions {
-  sessions: Map<string, SessionRecord> = new Map()
+  private table: SharedTable = new SharedTable("", SESSION_CAP)
+  sealer: Sealer = plainSealer()
 
-  readonly ttlSeconds: number
+  ttlSeconds: number
 
   constructor(ttlSeconds?: number) {
     this.ttlSeconds = ttlSeconds ?? SESSION_TTL_S
   }
 
+  setFile(file: string): void {
+    this.table = new SharedTable(file, SESSION_CAP)
+  }
+
+  // A session token, or a key (a DueSession's), as the table's key.
+  private keyOf(token: string): string {
+    return token.startsWith(SESSION_PREFIX) ? hashKey(token) : token
+  }
+
+  private record(key: string, nowMs: number): SessionRecord | undefined {
+    const v = this.table.get(key, nowMs)
+    if (v === undefined) return undefined
+    try {
+      return try JSON.parse(v) as SessionRecord
+    } catch (e) {
+      return undefined
+    }
+  }
+
+  // The last moment a record is kept: its expiry, or with a refresh token the grace for a refresh after it.
+  private until(r: SessionRecord): number {
+    return r.refresh === undefined ? r.expires : r.expires + REFRESH_GRACE_MS
+  }
+
+  private keep(key: string, r: SessionRecord, nowMs: number): void {
+    this.table.put(key, JSON.stringify(r), this.until(r), nowMs)
+  }
+
+  // The refresh token a record holds, opened ("" when it cannot be).
+  private refreshOf(r: SessionRecord): string {
+    const sealed = r.refresh
+    if (sealed === undefined) return ""
+    return this.sealer.open(sealed) ?? ""
+  }
+
   // email is kept so a session can be checked against the user it names (governance lists users by email)
   create(sub: string, role: string, nowMs: number, email?: string, refresh?: string): string throws Error {
-    this.sweep(nowMs)
     const token = SESSION_PREFIX + (try secureHex(48))
-    this.sessions.set(token, { sub: sub, role: role, email: email, expires: nowMs + this.ttlSeconds * 1000.0, refresh: refresh === "" ? undefined : refresh })
+    let sealed: string | undefined = undefined
+    if (refresh !== undefined && refresh !== "") {
+      const s = this.sealer.seal(refresh)
+      // a refresh token that could not be sealed is not kept: the session then ends at its expiry
+      if (s !== "") sealed = s
+    }
+    this.keep(hashKey(token), { sub: sub, role: role, email: email, expires: nowMs + this.ttlSeconds * 1000.0, refresh: sealed }, nowMs)
     return token
   }
 
   get(token: string, nowMs: number): Session | undefined {
-    const s = this.sessions.get(token)
-    if (s === undefined) return undefined
-    if (s.expires <= nowMs) {
-      // an expired session with a refresh token waits for its refresh (refreshable, renew)
-      if (s.refresh === undefined || s.expires + REFRESH_GRACE_MS <= nowMs) this.sessions.delete(token)
-      return undefined
-    }
+    const s = this.record(this.keyOf(token), nowMs)
+    // an expired session with a refresh token waits for its refresh (refreshable, renew) until its row expires
+    if (s === undefined || s.expires <= nowMs) return undefined
     return { sub: s.sub, role: s.role, email: s.email }
   }
 
   // The session behind a token when it has expired and holds a refresh token (the next request refreshes it).
   refreshable(token: string, nowMs: number): DueSession | undefined {
-    const s = this.sessions.get(token)
+    const key = this.keyOf(token)
+    const s = this.record(key, nowMs)
     if (s === undefined || s.expires > nowMs) return undefined
-    const r = s.refresh
-    if (r === undefined || s.expires + REFRESH_GRACE_MS <= nowMs) return undefined
-    return { token: token, sub: s.sub, email: s.email, refresh: r }
+    const r = this.refreshOf(s)
+    if (r === "") return undefined
+    return { token: key, sub: s.sub, email: s.email, refresh: r }
   }
 
   // The sessions with a refresh token that expire before limitMs (the daily sweep refreshes them ahead of time).
-  dueBy(limitMs: number): DueSession[] {
+  dueBy(limitMs: number, nowMs?: number): DueSession[] {
     const out: DueSession[] = []
-    for (const k of this.sessions.keys()) {
-      const s = this.sessions.get(k)
-      if (s === undefined) continue
-      const r = s.refresh
-      if (r !== undefined && s.expires < limitMs) out.push({ token: k, sub: s.sub, email: s.email, refresh: r })
+    for (const row of this.table.entries(nowMs ?? Date.now())) {
+      let s: SessionRecord | undefined = undefined
+      try {
+        s = JSON.parse(row.v) as SessionRecord
+      } catch (e) {
+        continue
+      }
+      if (s === undefined || s.expires >= limitMs) continue
+      const r = this.refreshOf(s)
+      if (r !== "") out.push({ token: row.k, sub: s.sub, email: s.email, refresh: r })
     }
     return out
   }
@@ -453,41 +524,40 @@ export class UiSessions {
   // A refreshed session: a new lifetime from now, the role the fresh claims gave, and the new refresh token when the
   // identity provider rotated it.
   renew(token: string, role: string | undefined, nowMs: number, refresh: string | undefined): void {
-    const s = this.sessions.get(token)
+    const key = this.keyOf(token)
+    const s = this.record(key, nowMs)
     if (s === undefined) return
     let n = s
     if (role !== undefined) n.role = role
     n.expires = nowMs + this.ttlSeconds * 1000.0
-    if (refresh !== undefined && refresh !== "") n.refresh = refresh
-    this.sessions.set(token, n)
+    if (refresh !== undefined && refresh !== "") {
+      const sealed = this.sealer.seal(refresh)
+      if (sealed !== "") n.refresh = sealed
+    }
+    this.keep(key, n, nowMs)
   }
 
   // Ends every session of a user (by subject or email, without regard to case): a removed user is signed out.
-  endUser(names: string[]): int {
+  endUser(names: string[], nowMs?: number): int {
+    const now = nowMs ?? Date.now()
     const lower = names.filter((x) => x !== "").map((x) => x.toLowerCase())
-    let n = 0
-    for (const k of this.sessions.keys()) {
-      const s = this.sessions.get(k)
-      if (s === undefined) continue
-      if (lower.includes(s.sub.toLowerCase()) || lower.includes((s.email ?? "").toLowerCase())) {
-        this.sessions.delete(k)
-        n += 1
+    const gone: string[] = []
+    for (const row of this.table.entries(now)) {
+      let s: SessionRecord | undefined = undefined
+      try {
+        s = JSON.parse(row.v) as SessionRecord
+      } catch (e) {
+        continue
       }
+      if (s === undefined) continue
+      if (lower.includes(s.sub.toLowerCase()) || lower.includes((s.email ?? "").toLowerCase())) gone.push(row.k)
     }
-    return n
+    this.table.del(gone, now)
+    return gone.length
   }
 
   delete(token: string): void {
-    this.sessions.delete(token)
-  }
-
-  private sweep(nowMs: number): void {
-    for (const k of this.sessions.keys()) {
-      const s = this.sessions.get(k)
-      if (s === undefined) continue
-      const until = s.refresh === undefined ? s.expires : s.expires + REFRESH_GRACE_MS
-      if (until <= nowMs) this.sessions.delete(k)
-    }
+    this.table.del([this.keyOf(token)], Date.now())
   }
 }
 
@@ -918,9 +988,66 @@ test("a session with a refresh token waits past its expiry for a refresh, is ren
   store.renew(t, "admin", TEST_NOW_MS + 61000.0, "rt-2")
   const s = store.get(t, TEST_NOW_MS + 62000.0)
   expect(s !== undefined && s.role === "admin").toBe(true)
-  expect(store.dueBy(TEST_NOW_MS + 62000.0).length).toBe(0)
-  const soon = store.dueBy(TEST_NOW_MS + 200000.0)
+  expect(store.dueBy(TEST_NOW_MS + 62000.0, TEST_NOW_MS + 62000.0).length).toBe(0)
+  const soon = store.dueBy(TEST_NOW_MS + 200000.0, TEST_NOW_MS + 62000.0)
   expect(soon.length === 1 && soon[0]!.refresh === "rt-2").toBe(true)
-  expect(store.endUser(["ann@x.io"])).toBe(1)
+  expect(store.endUser(["ann@x.io"], TEST_NOW_MS + 62000.0)).toBe(1)
   expect(store.get(t, TEST_NOW_MS + 62000.0) === undefined).toBe(true)
+})
+
+test("sessions on a shared file: made on one worker, used, refreshed and ended on another, kept across a restart", () => {
+  const file = "/tmp/raiju-ui-sessions-test-" + process.pid + "-" + Math.floor(Date.now()) + ".json"
+  const sealer: Sealer = { seal: (v: string): string => "sealed:" + v, open: (v: string): string | undefined => v.startsWith("sealed:") ? v.slice(7, v.byteLength) : undefined }
+  const a = new UiSessions(60)
+  a.setFile(file)
+  a.sealer = sealer
+  const b = new UiSessions(60)
+  b.setFile(file)
+  b.sealer = sealer
+  const now = Date.now()
+  const t = try a.create("u-1", "admin", now, "ann@x.io", "rt-secret")
+  const plain = try a.create("u-2", "viewer", now)
+  // another worker knows the session at once
+  expect(b.get(t, now)?.sub ?? "").toBe("u-1")
+  // the file holds neither the token nor the refresh token in clear
+  const text = try readFileSync(file, "utf8")
+  expect(text.includes(t) || text.includes(plain)).toBe(false)
+  expect(text.includes("sealed:rt-secret")).toBe(true)
+  // a restart: a new store on the file serves the sessions
+  const c = new UiSessions(60)
+  c.setFile(file)
+  c.sealer = sealer
+  expect(c.get(plain, now)?.role ?? "").toBe("viewer")
+  // a refresh due on one worker, renewed there, is seen by the other
+  const due = c.refreshable(t, now + 61000.0)
+  expect(due !== undefined && due.refresh === "rt-secret").toBe(true)
+  if (due !== undefined) c.renew(due.token, "editor", now + 61000.0, "rt-2")
+  expect(a.get(t, now + 62000.0)?.role ?? "").toBe("editor")
+  // a logout on one worker ends the session on the others
+  b.delete(plain)
+  expect(a.get(plain, now + 1.0)).toBeUndefined()
+  expect(c.endUser(["ANN@x.io"], now + 62000.0)).toBe(1)
+  expect(b.get(t, now + 62001.0)).toBeUndefined()
+  try {
+    rmSync(file, { force: true })
+  } catch (e) {}
+})
+
+test("a sign-in started on one worker completes on another, once, with its return path", () => {
+  const file = "/tmp/raiju-oidc-flows-test-" + process.pid + "-" + Math.floor(Date.now()) + ".json"
+  const a = new OidcFlows()
+  a.setFile(file)
+  const b = new OidcFlows()
+  b.setFile(file)
+  const disc: Discovery = { authorization_endpoint: "https://idp.example.com/auth", token_endpoint: "https://idp.example.com/token", jwks_uri: "https://idp.example.com/jwks", issuer: TEST_ISS }
+  const now = Date.now()
+  const begun = try a.begin(testCfg({}), disc, now, "/mcp/consent?x=1")
+  const done = b.complete(begun.state, now + 1000.0)
+  expect(done !== undefined && done.back === "/mcp/consent?x=1" && done.verifier.byteLength === 64).toBe(true)
+  // used once, on any worker
+  expect(a.complete(begun.state, now + 1000.0)).toBeUndefined()
+  expect((try readFileSync(file, "utf8")).includes(begun.state)).toBe(false)
+  try {
+    rmSync(file, { force: true })
+  } catch (e) {}
 })

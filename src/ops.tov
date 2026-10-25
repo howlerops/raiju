@@ -89,6 +89,7 @@ import { AgentUser, Exchange, AGENT_TOKEN_PREFIX, agentSignIn, authorizeProblem,
 import * as metrics from "./metrics"
 import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, appendFileSync, chmodSync, statSync } from "node:fs"
 import { writeFileAtomic } from "./atomicfile"
+import { FileLock, lockFile, unlockFile } from "./filelock"
 import { Counters, ClusterConfig, BrokerConfig, brokerUrl, syncInterval } from "./cluster"
 import { clusterState, ownerOf } from "./clusterstate"
 import { FeedRing, FeedQueue, FeedItem, feedEnvelope, feedVisible, gapEnvelope, resumedEnvelope, parseFeed, parseItem, parseAnswer, FEED_RING_SIZE, FEED_RING_SECONDS, FEED_QUEUE_MAX, FEED_BATCH_MS, FEED_BATCH_MAX } from "./feed"
@@ -103,7 +104,7 @@ import { ExportCursor, objectKey, putRequest, putBytesRequest, putObjectRequest,
 import { planWindow, maxObjectBytes, archiveIntervalMs, archiveGraceMs, closedWindows } from "./audit_archive"
 import { jobRequest, hiddenDeletes, MAX_ATTEMPTS, RetainQueue } from "./retained"
 import { payloadKeys, decodePayload, hydrate } from "./hybrid"
-import { OidcConfig, Discovery, OidcFlows, Session, UiSessions, DueSession, parseDiscovery, discoveryUrl, tokenRequestBody, refreshRequestBody, verifyIdToken, accessTokenClaims } from "./oidc"
+import { OidcConfig, Discovery, OidcFlows, Session, UiSessions, DueSession, Sealer, parseDiscovery, discoveryUrl, tokenRequestBody, refreshRequestBody, verifyIdToken, accessTokenClaims } from "./oidc"
 import { issuerOf, challengeOf, callerOf, keyById, keyUsable, serverAuthMode, ConsentContext, vkIdentityCut } from "./mcpissuer"
 
 export type Gate = { kind: "ok", actor: string } | { kind: "deny", res: Response }
@@ -1231,8 +1232,6 @@ export class Ops {
   oidcKey: string = ""
   discovery: Discovery | undefined = undefined
   flows = new OidcFlows()
-  // where a sign-in started from an MCP consent page returns, by the sign-in's state
-  oidcReturn: Map<string, string> = new Map()
   sessions = new UiSessions(28800)
   // directory sync (provision.tov, directory.tov): its schedule (the settings it was made for, the timer, the next
   // run), the daily session sweep, and the provisioning jobs (sync, import, reconcile) by operation id
@@ -1406,7 +1405,8 @@ export class Ops {
         if (auds !== undefined) ro.audiences = auds.map((a) => resolveEnv(a))
       }
       this.oidcCfg = ro !== undefined && ro.enabled ? ro : undefined
-      if (ro !== undefined) this.sessions = new UiSessions(ro.session_ttl_seconds ?? 28800)
+      // the sessions themselves stay (they live in a file the workers share and a restart keeps, keepAuthState)
+      if (ro !== undefined) this.sessions.ttlSeconds = ro.session_ttl_seconds ?? 28800
     }
     this.configureDirectory()
   }
@@ -1567,6 +1567,20 @@ export class Ops {
   // Called in each worker after the fork. Usage counters gossip through files in the node's share folder, which the
   // supervisor made before the fork (makeShareDir: private and unpredictable), with the same CRDT merge as clustering,
   // and the response cache keeps its entries there too. dir is "" when the folder could not be made.
+  // The dashboard's sessions, the sign-ins in flight and the CLI's sign-in codes and tokens, in files beside the config
+  // file (<config>.sessions.json, .oidc-flows.json and .agent-sessions.json, 0600): every worker of the node reads and
+  // writes them (sharedtable.tov), so a session made on one works on all, and a restart keeps the sessions and the
+  // refresh tokens. Tokens are kept by hash; the identity provider's refresh token and the PKCE verifier are sealed
+  // with the config's encryption key when one is set.
+  keepAuthState(configPath: string, sealer: Sealer): void {
+    if (configPath === "") return
+    this.sessions.setFile(configPath + ".sessions.json")
+    this.sessions.sealer = sealer
+    this.flows.setFile(configPath + ".oidc-flows.json")
+    this.flows.sealer = sealer
+    agentSignIn().setFile(configPath + ".agent-sessions.json")
+  }
+
   startLocalShare(dir: string): void {
     if (dir === "") return
     this.shareDir = dir
@@ -1576,6 +1590,8 @@ export class Ops {
       console.error(`raiju: can't share state between workers: ${e.message}`)
       return
     }
+    // async jobs: the worker that runs one writes its state here, so a poll on any worker finds it (jobs.tov)
+    this.engine.jobs.useDir(this.shareDir + "/jobs")
     // each worker is its own slot (inherited counters would collide)
     this.counters = new Counters(this.nodeId + "/" + process.pid)
     clusterState().setWriter(this.nodeId + "/" + process.pid)
@@ -2525,6 +2541,12 @@ export class Ops {
   libraryTimer: int = -1
   libraryKey = ""
 
+  // The library file's lock, taken around a read-modify-write of it (the workers of a node all write it).
+  lockLibrary(): FileLock {
+    if (this.store.path === "") return { dir: "", ok: true }
+    return lockFile(this.store.path + ".mcp_library.json")
+  }
+
   // The library as its file holds it now (another worker or node may have synced it).
   library(): McpLibrary {
     const lib = new McpLibrary(this.store.path === "" ? "" : this.store.path + ".mcp_library.json")
@@ -2569,10 +2591,17 @@ export class Ops {
       if (attempt > 0) await new Promise<void>((resolve) => setTimeout(resolve, Math.min(10000, 1000 * Math.pow(2, attempt - 1))))
       try {
         const text = await fetchCatalog(url, 45000)
-        const lib = this.library()
-        const n = lib.sync(text, Date.now())
-        lib.save()
-        return { count: n, error: "" }
+        const lock = this.lockLibrary()
+        try {
+          const lib = this.library()
+          const n = lib.sync(text, Date.now())
+          lib.save()
+          unlockFile(lock)
+          return { count: n, error: "" }
+        } catch (e) {
+          unlockFile(lock)
+          throw e
+        }
       } catch (e) {
         last = e.message
       }
@@ -2596,7 +2625,9 @@ export class Ops {
       }
       if (m === "POST") {
         if (noStore) return reply(503, errorJson("MCP operations unavailable: config store is disabled", "api_error", undefined))
+        const lock = this.lockLibrary()
         const r = createLibraryEntry(this.library(), body, Date.now())
+        unlockFile(lock)
         return reply(r.status, r.body)
       }
       return notAllowed
@@ -2620,7 +2651,9 @@ export class Ops {
     if (segs.length === 5) {
       if (m !== "DELETE") return notAllowed
       if (noStore) return reply(503, errorJson("MCP operations unavailable: config store is disabled", "api_error", undefined))
+      const lock = this.lockLibrary()
       const r = deleteLibraryEntry(this.library(), segs[4]!)
+      unlockFile(lock)
       return reply(r.status, r.body)
     }
     return reply(404, errorJson(`no route for ${path}`, "invalid_request_error", undefined))
@@ -2717,6 +2750,10 @@ export class Ops {
       keys.push(key)
       values.push(parts.length === 0 ? "" : jobj(parts))
     }
+    // the other workers write the same file: the change is applied to the file as it is now, under its lock
+    const lock = lockFile(this.catalogFile())
+    if (!lock.ok) return { status: 503, body: errorJson("the catalog file is locked by another process; retry", "api_error", undefined), contentType: "application/json" }
+    this.loadCatalogAttrs()
     for (let i = 0; i < keys.length; i++) {
       if (values[i]! === "") this.catalogAttrs.delete(keys[i]!)
       else this.catalogAttrs.set(keys[i]!, values[i]!)
@@ -2726,8 +2763,10 @@ export class Ops {
       for (const k of this.catalogAttrs.keys()) pairs.push(jkv(k, this.catalogAttrs.get(k)!))
       writeFileAtomic(this.catalogFile(), jobj(pairs) + "\n")
     } catch (e) {
+      unlockFile(lock)
       return { status: 500, body: errorJson(`could not save the catalog: ${e.message}`, "api_error", undefined), contentType: "application/json" }
     }
+    unlockFile(lock)
     return { status: 204, body: "", contentType: "application/json" }
   }
 
@@ -2744,12 +2783,14 @@ export class Ops {
     return bare !== undefined && bare.provider === provider
   }
 
-  // The catalog attributes saved beside the config file, read once at startup.
+  // The catalog attributes saved beside the config file, read at startup and again before each change.
   private loadCatalogAttrs(): void {
     const path = this.catalogFile()
     if (!existsSync(path)) return
     try {
-      for (const f of fields(readFileSync(path, "utf8"))) this.catalogAttrs.set(f.key, f.raw)
+      const fs = fields(readFileSync(path, "utf8"))
+      this.catalogAttrs = new Map()
+      for (const f of fs) this.catalogAttrs.set(f.key, f.raw)
     } catch (e) {
       console.error(`raiju: could not read ${path}: ${e.message}`)
     }
@@ -5486,13 +5527,11 @@ export class Ops {
     const now = Date.now()
     if (path === "/api/oidc/login") {
       try {
-        const b = this.flows.begin(oc, d, now)
-        // a consent page that sent its user to sign in gets them back (only the gateway's own consent pages)
+        // a consent page that sent its user to sign in gets them back (only the gateway's own consent pages); the
+        // return path is kept with the sign-in, so the callback may come to any worker
         const lu = URL.parse(req.url)
         const back = returnPath(lu === undefined ? "" : (lu.searchParams.get("return_to") ?? ""))
-        // abandoned sign-ins leave entries behind: the table is bounded as the sign-ins in flight are
-        if (this.oidcReturn.size > 10000) this.oidcReturn.clear()
-        if (back !== "") this.oidcReturn.set(b.state, back)
+        const b = this.flows.begin(oc, d, now, back)
         const h: Record<string, string> = new Map()
         h.set("location", b.url)
         h.set("cache-control", "no-store")
@@ -5515,13 +5554,12 @@ export class Ops {
     const u = URL.parse(req.url)
     const params = u === undefined ? new URLSearchParams("") : u.searchParams
     const st = params.get("state") ?? ""
-    const backTo = this.oidcReturn.get(st) ?? "/"
-    this.oidcReturn.delete(st)
     const flow = this.flows.complete(st, now)
     if (flow === undefined) {
       signInGuard().fail(ipKeys, now)
       return html(401, "<p>This sign-in link expired or was already used. <a href=\"/api/oidc/login\">Sign in again</a>.</p>")
     }
+    const backTo = flow.back !== "" ? flow.back : "/"
     const th: Map<string, string> = new Map()
     th.set("content-type", "application/x-www-form-urlencoded")
     th.set("accept", "application/json")

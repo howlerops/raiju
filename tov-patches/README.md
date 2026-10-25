@@ -16,6 +16,7 @@ Patch 0013 (fetch address policy) changes the fetch code in `runtime/tov.c` and 
 Patch 0015 (client certificates, `Request.signal`, gunzip) changes fetch, sockets and the server (and `fetchStart`'s and `netConnect`'s signatures), and is written on top of 0001-0013.
 Patch 0016 (fetch input buffer) changes the fetch connection reads in `runtime/tov.c` and is written on top of 0001-0013 and 0015.
 Patch 0017 (`server.requestIP`) changes the HTTP server in `runtime/tov.c` and `Request`/`Server` in `std/http.tov`, and is written on top of 0001-0016.
+Patch 0019 (worker respawn) changes the worker supervisor in `runtime/tov.c` and is written on top of 0001-0017 (its `docs/spec.md` hunk is on the line 0017 changes).
 
 ## Submitting upstream
 
@@ -768,3 +769,32 @@ from the wire records the address and port when it is filled in (`Request.wire`)
 **Test.** `tests/request_ip.tov` (4 checks: the fetch handler after an await, the client's port, a request built in
 the program, a routes handler) is in `run.sh`. Used by Raiju for `server.trusted_proxies` and the sign-in throttle
 (L198).
+
+## 0019 — a worker killed alone is respawned, with a crash-loop backoff; `Bun.plainAlloc()`
+
+**Problem.** `Bun.serve({ workers })` replaced a worker that crashed by a trap, but treated a worker that died of
+SIGKILL like SIGTERM: as a stop of the whole server. The kernel's OOM killer sends SIGKILL to the single largest
+process, so one worker over its memory took down every other worker on the node, with their open streams, and the
+container restarted. A worker that died within a second of starting was replaced after a fixed 1 s pause, so a
+worker that crashed on every start was restarted once a second forever.
+
+**Design.** SIGKILL of a worker is a crash: the slot is respawned and the other workers keep serving. (A SIGKILL
+sent to the process group kills the supervisor too, so it never needs to read one as a stop.) SIGTERM and SIGINT
+still count as a stop, as before. A worker that dies within 10 s of starting (`TV_HTTP_QUICK_DEATH`) is respawned
+after a pause that starts at 1 s and doubles for each such death in a row, up to 30 s (`TV_HTTP_MAX_BACKOFF`); one
+that ran longer is respawned at once and resets its slot's count. While a slot waits, the supervisor polls
+`waitpid` every 100 ms, so other deaths, the respawn and a stop signal are all seen in time. Each respawn writes
+one line to stderr: `worker 0 (pid 123) was killed by signal 9; restarting it in 2 s (2 quick exits in a row)`.
+
+`Bun.plainAlloc()` (Tov) says whether the runtime was compiled with `TV_PLAIN_ALLOC`. The small-object free lists
+are not thread-safe, and a program built without the flag that allocates off its loop thread (fetch, DNS) crashes
+under concurrency; Raiju checks it at startup and refuses to serve without it.
+
+**Files.** `runtime/tov.c`: `tv_http_supervise`, `tv_http_backoff`, `tv_native_httpPlainAlloc`; `runtime/tov.h`,
+`crates/tov/src/check/builtins.rs`, `crates/tov/src/std/http.tov` (`Bun.plainAlloc`), `docs/spec.md`.
+
+**Tested.** `tests/worker_respawn.tov` with `tests/worker_respawn_client.py` (10 checks, Linux): `Bun.plainAlloc()`
+with and without the flag; a SIGKILLed worker
+is replaced while the other keeps its pid and requests keep succeeding, a second early death waits 2 s, both pauses
+are logged, and SIGTERM during a 4 s pause stops the supervisor and its workers within a second. Raiju's e2e kills
+a gateway worker with `kill -9` (tests/e2e.py `l199_e2e`). Written on top of 0001-0017.

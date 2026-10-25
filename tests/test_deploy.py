@@ -100,6 +100,52 @@ class ComposeTest(unittest.TestCase):
             self.assertEqual(open(os.path.join(data, "config.json")).read(), '{"from": "api"}', "a saved config was overwritten")
 
 
+class EcsTest(unittest.TestCase):
+    """The ECS module (deploy/terraform/modules/aws-ecs): a writable /app/data and /tmp under the read-only root, one
+    task unless the tasks form a Raiju cluster. The module's own terraform test (tests/ecs.tftest.hcl, a mocked AWS
+    provider) runs when TERRAFORM names a terraform binary (1.7 or later); it downloads the AWS provider."""
+
+    def setUp(self):
+        self.dir = os.path.join(ROOT, "deploy", "terraform", "modules", "aws-ecs")
+        self.main = open(os.path.join(self.dir, "main.tf")).read()
+        self.vars = open(os.path.join(self.dir, "variables.tf")).read()
+
+    def test_no_read_only_mount(self):
+        self.assertNotRegex(self.main, r"readOnly\s*=\s*true", "a volume is mounted read-only")
+        self.assertRegex(self.main, r'containerPath\s*=\s*"/app/data",\s*readOnly\s*=\s*false')
+
+    def test_tmp_is_a_volume(self):
+        self.assertRegex(self.main, r'containerPath\s*=\s*"/tmp",\s*readOnly\s*=\s*false')
+        self.assertRegex(self.main, r'volume\s*\{\s*name\s*=\s*"tmp"\s*\}')
+
+    def test_data_without_efs_is_ephemeral_storage(self):
+        self.assertRegex(self.main, r'for_each\s*=\s*local\.efs_enabled \? \[\] : \[1\]\s*content\s*\{\s*name\s*=\s*"data"\s*\}')
+
+    def test_efs_is_written(self):
+        self.assertIn('"elasticfilesystem:ClientWrite"', self.main)
+
+    def test_one_task_unless_clustered(self):
+        m = re.search(r'variable "desired_count" \{.*?default\s*=\s*(\d+)', self.vars, re.S)
+        self.assertEqual(m.group(1), "1")
+        self.assertIn("var.desired_count <= 1 || var.cluster_enabled", self.main)
+        self.assertIn("RAIJU_CLUSTER_SECRET", self.main)
+
+    @unittest.skipUnless(os.environ.get("TERRAFORM"), "set TERRAFORM to a terraform binary to run the module's terraform test")
+    def test_terraform_test(self):
+        tf = os.environ["TERRAFORM"]
+        with tempfile.TemporaryDirectory() as data:
+            env = {**os.environ, "TF_DATA_DIR": data}
+            init = subprocess.run([tf, "init", "-backend=false", "-input=false", "-no-color"], cwd=self.dir, env=env, capture_output=True, text=True)
+            self.assertEqual(init.returncode, 0, init.stdout + init.stderr)
+            try:
+                run = subprocess.run([tf, "test", "-no-color"], cwd=self.dir, env=env, capture_output=True, text=True)
+            finally:
+                lock = os.path.join(self.dir, ".terraform.lock.hcl")
+                if os.path.exists(lock):
+                    os.remove(lock)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+
+
 class HelmPresentTest(unittest.TestCase):
     def test_helm_is_there_when_required(self):
         # CI sets REQUIRE_HELM, so the chart checks never pass by being skipped
@@ -241,6 +287,29 @@ class HelmTest(unittest.TestCase):
         env = self.pod(self.render("setupToken.existingSecret=raiju-setup"))["containers"][0]["env"]
         tok = [e for e in env if e["name"] == "BIFROST_SETUP_TOKEN"]
         self.assertEqual(tok[0]["valueFrom"]["secretKeyRef"], {"name": "raiju-setup", "key": "BIFROST_SETUP_TOKEN"})
+
+    def notes(self, *sets):
+        """The chart's NOTES.txt as installing it would print them (helm template skips NOTES: they are rendered
+        through a ConfigMap in a copy of the chart)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            chart = os.path.join(tmp, "raiju")
+            shutil.copytree(CHART, chart)
+            shutil.copy(os.path.join(chart, "templates", "NOTES.txt"), os.path.join(chart, "notes.txt"))
+            with open(os.path.join(chart, "templates", "notes-render.yaml"), "w") as f:
+                f.write('apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: notes\ndata:\n  notes: |\n{{ tpl (.Files.Get "notes.txt") . | indent 4 }}\n')
+            args = [HELM, "template", "r", chart, "--show-only", "templates/notes-render.yaml"]
+            for s in sets:
+                args += ["--set", s]
+            p = subprocess.run(args, capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            return yaml.safe_load(p.stdout)["data"]["notes"]
+
+    def test_notes_say_inference_is_open_without_a_virtual_key(self):
+        self.assertIn("Inference is open until the config has a virtual key", self.notes())
+        self.assertNotIn("Inference is open", self.notes("config.client.enforce_auth_on_inference=true"))
+        self.assertIn("client.enforce_auth_on_inference is false", self.notes("config.client.enforce_auth_on_inference=false"))
+        keyed = self.notes("config.governance.virtual_keys[0].id=vk-1", "config.governance.virtual_keys[0].value=sk-bf-example")
+        self.assertNotIn("Inference is open", keyed)
 
     def test_peers_service(self):
         self.assertFalse([d for d in self.render() if d["kind"] == "Service" and d["metadata"]["name"].endswith("-peers")])

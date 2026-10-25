@@ -12011,7 +12011,8 @@ def l158_e2e(env):
             if s not in (200, 201):
                 break
         check("five saves through the API succeed", s in (200, 201), (s, b[:200]))
-        names = sorted(os.listdir(d))
+        # (the upgrade notice's marker, L199, is written beside the config at the first start)
+        names = sorted(n for n in os.listdir(d) if n != ".raiju-notices.json")
         check("the saves leave config.json, its .bak and no temporary file", names == ["config.json", "config.json.bak"], names)
         try:
             saved = json.load(open(cfg_path))
@@ -13276,6 +13277,103 @@ def l172_e2e(env):
         check("the body limit is raised through the config API", s == 200, (s, b[:200]))
         s, _, b = call("POST", "/v1/chat/completions", big, None, base=GW_L172, auth=False)
         check("the servers' body limit follows the config change", s == 200 and "Hello from gpt-4o-mini" in b, (s, b[:200]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
+def l196_config() -> dict:
+    """The L196 gateway: auth enforced on inference, one virtual key, and a 4 MB cap on the request bodies in hand."""
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": True},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "server": {"max_buffered_body_mb": 4},
+        "governance": {"virtual_keys": [{"id": "vk-l196", "name": "vk-l196", "value": "sk-bf-l196"}]},
+        "providers": {"openai": {"keys": [{"name": "o-l196", "value": "sk-l196", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+    }
+
+
+def l196_open(port: int, path: str, total: int, headers: dict, sent: int):
+    """A raw POST declaring total bytes, of which the first `sent` go out now; the socket, to finish or read later."""
+    s = socket.create_connection(("127.0.0.1", port), timeout=20)
+    head = "POST %s HTTP/1.1\r\nHost: 127.0.0.1\r\ncontent-type: application/json\r\ncontent-length: %d\r\n" % (path, total)
+    head += "".join("%s: %s\r\n" % (k, v) for k, v in headers.items()) + "\r\n"
+    s.sendall(head.encode())
+    if sent > 0:
+        s.sendall(l196_chat(total)[:sent])
+    return s
+
+
+def l196_chat(total: int) -> bytes:
+    """A chat request of exactly total bytes."""
+    pre = b'{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"l196 '
+    post = b'"}]}'
+    return pre + b"x" * (total - len(pre) - len(post)) + post
+
+
+def l196_read(s) -> tuple:
+    """The status line's code and the head of the answer on a raw socket (0 when the connection closed first)."""
+    data = b""
+    try:
+        while b"\r\n\r\n" not in data:
+            c = s.recv(65536)
+            if not c:
+                break
+            data += c
+    except OSError:
+        pass
+    try:
+        return int(data.split(b" ", 2)[1]), data.decode("latin-1")
+    except Exception:
+        return 0, data.decode("latin-1")
+
+
+def l196_e2e(env):
+    """L196 (production re-audit P0-2): a big body is not read for a caller whose credentials are refused (401 from
+    the headers, on inference and on /api), and the request bodies a process holds at once are capped by
+    server.max_buffered_body_mb (503 unread past it; a lone body up to max_request_body_size_mb is still served).
+    Its own gateway (18348)."""
+    cfg_path = os.path.join(BUILD, "e2e.l196.json")
+    json.dump(l196_config(), open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18348", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l196.log"), "w"))
+    base = "http://127.0.0.1:18348"
+    key = {"x-bf-vk": "sk-bf-l196"}
+    try:
+        wait(base + "/health")
+        hwm0 = l124_vm(gw.pid, "VmHWM")
+        st = declared_post(18348, "/v1/chat/completions", 30 * 1048576)
+        check("l196: a 30 MB body without a virtual key is refused with 401 from the headers", st == 401, st)
+        st = chunked_post(18348, "/v1/chat/completions", 8 * 1048576)
+        check("l196: a chunked body without a virtual key is refused with 401", st == 401, st)
+        st = declared_post(18348, "/anthropic/v1/messages", 4 * 1048576)
+        check("l196: the same on an SDK route", st == 401, st)
+        st = declared_post(18348, "/api/providers", 4 * 1048576)
+        check("l196: a big /api body without credentials is refused by the gate before it is read", st in (401, 403), st)
+        hwm1 = l124_vm(gw.pid, "VmHWM")
+        check("l196: the refused bodies were not held (peak memory grew %d MiB)" % (hwm1 - hwm0), hwm1 - hwm0 < 16, (hwm0, hwm1))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l196 small"}]}, key, base=base, auth=False)
+        check("l196: a small call with the key is served", s == 200 and "Hello from gpt-4o-mini" in b, (s, b[:200]))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l196 small"}]}, None, base=base, auth=False)
+        check("l196: a small call without it gets the usual 401", s == 401, (s, b[:200]))
+        # a body over the stream threshold still streams its answer (the body is read before the route looks at it)
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "stream": True, "messages": [{"role": "user", "content": "l196 " + "y" * 200000}]}, key, base=base, auth=False)
+        check("l196: a 200 KB streaming call with the key streams", s == 200 and "chat.completion.chunk" in b and b.rstrip().endswith("data: [DONE]"), (s, b[:200], b[-200:]))
+        # the cap: a 3 MB body in hand (half sent), then a 2 MB one does not fit in 4 MB and is refused unread
+        first = l196_open(18348, "/v1/chat/completions", 3 * 1048576, key, 1048576)
+        time.sleep(0.5)
+        second = l196_open(18348, "/v1/chat/completions", 2 * 1048576, key, 0)
+        code2, head2 = l196_read(second)
+        second.close()
+        check("l196: a body past server.max_buffered_body_mb is answered 503 with retry-after, unread", code2 == 503 and "retry-after: 1" in head2.lower(), head2[:300])
+        first.sendall(l196_chat(3 * 1048576)[1048576:])
+        code1, head1 = l196_read(first)
+        first.close()
+        check("l196: the body in hand is served", code1 == 200, head1[:300])
+        st, _, b = call("POST", "/v1/chat/completions", l196_chat(2 * 1048576).decode(), key, base=base, auth=False)
+        check("l196: once it is done, the next body fits", st == 200, (st, b[:200]))
+        st, _, b = call("POST", "/v1/chat/completions", l196_chat(6 * 1048576).decode(), key, base=base, auth=False)
+        check("l196: a lone body over the cap is still served (max_request_body_size_mb decides its size)", st == 200, (st, b[:200]))
     finally:
         gw.terminate()
         gw.wait()
@@ -16088,6 +16186,281 @@ def l198_e2e(env):
         gwp.terminate()
 
 
+def l199_children(pid):
+    """The worker processes of a supervisor (the program forks from a thread other than its main one)."""
+    kids = []
+    try:
+        for t in os.listdir(f"/proc/{pid}/task"):
+            kids += [int(x) for x in open(f"/proc/{pid}/task/{t}/children").read().split()]
+    except OSError:
+        pass
+    return sorted(kids)
+
+
+def l199_owner(port, client_port, pids):
+    """Which of pids holds the accepted side of the client's connection to port (/proc/net/tcp and the fds)."""
+    want_local = f"0100007F:{port:04X}"
+    want_remote = f"0100007F:{client_port:04X}"
+    inode = ""
+    for line in open("/proc/net/tcp").read().splitlines()[1:]:
+        f = line.split()
+        if f[1] == want_local and f[2] == want_remote:
+            inode = f[9]
+    for p in pids:
+        try:
+            for fd in os.listdir(f"/proc/{p}/fd"):
+                try:
+                    if os.readlink(f"/proc/{p}/fd/{fd}") == f"socket:[{inode}]":
+                        return p
+                except OSError:
+                    pass
+        except OSError:
+            pass
+    return None
+
+
+def l199_e2e(env):
+    """L199: a worker killed by SIGKILL (as the OOM killer does) is replaced while the other worker and its stream keep
+    going, with the respawn logged and a growing pause for quick deaths (Tov patch 0019); the upgrade notice is shown
+    once and recorded beside the config; state files carry a version and one from a newer Raiju is left alone; the
+    build passes the TV_PLAIN_ALLOC check. Its own gateways (18354: always Bun with two workers, as http1 runs in one
+    process; 18355: the server under test)."""
+    import shutil, signal
+    d = os.path.join(BUILD, "e2e-l199")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    cfg = {
+        "client": {"enforce_auth_on_inference": False, "enable_logging": False, "mcp_server_auth_mode": "both", "oauth2_server_config": {"issuer_url": "http://127.0.0.1:18354"}},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "logs_store": {"enabled": True, "dir": os.path.join(d, "logs"), "required": False},
+        "providers": {
+            "openai": {"keys": [{"name": "l199", "value": "sk-l199", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "slowp": {"keys": [{"name": "s", "value": "sk-slow-l199", "models": [], "weight": 1.0}], "custom_provider_config": {"base_provider_type": "openai"}, "network_config": {"base_url": "http://127.0.0.1:18100", "max_retries": 0}},
+        },
+    }
+    path = os.path.join(d, "config.json")
+    json.dump(cfg, open(path, "w"))
+    log_a = os.path.join(d, "a.log")
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18354", "-host", "127.0.0.1", "-config", path, "-server", "bun", "-workers", "2"], env=env, stderr=open(log_a, "w"))
+    base = "http://127.0.0.1:18354"
+    try:
+        wait(base + "/health")
+        for _ in range(60):
+            if len(l199_children(gw.pid)) == 2:
+                break
+            time.sleep(0.05)
+        first = l199_children(gw.pid)
+        check("L199: the gateway runs two workers", len(first) == 2, first)
+        # a stream in flight on one worker; the other worker is killed with SIGKILL
+        body = json.dumps({"model": "slowp/slow-l199", "stream": True, "messages": [{"role": "user", "content": "l199 stream"}]})
+        s = socket.create_connection(("127.0.0.1", 18354), timeout=10)
+        s.sendall(f"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n{body}".encode())
+        out = s.recv(65536)
+        owner = l199_owner(18354, s.getsockname()[1], first)
+        victim = [p for p in first if p != owner][0] if owner in first else first[0]
+        os.kill(victim, signal.SIGKILL)
+        try:
+            while True:
+                b = s.recv(65536)
+                if not b:
+                    break
+                out += b
+        except OSError as e:
+            out += f"<{e}>".encode()
+        s.close()
+        text = out.decode(errors="replace")
+        check("L199: the other worker's stream ends whole when a worker is killed with SIGKILL", owner is not None and "four" in text and "[DONE]" in text, (owner, text[-300:]))
+        respawned = None
+        for _ in range(80):
+            kids = l199_children(gw.pid)
+            if len(kids) == 2 and victim not in kids:
+                respawned = [k for k in kids if k not in first]
+                break
+            time.sleep(0.05)
+        check("L199: the supervisor keeps running and replaces the killed worker", gw.poll() is None and respawned is not None and len(respawned) == 1, (gw.poll(), l199_children(gw.pid)))
+        check("L199: the worker that was not killed keeps its process", owner in l199_children(gw.pid), (owner, l199_children(gw.pid)))
+        codes = [call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": f"l199 after {i}"}]}, None, base=base, auth=False)[0] for i in range(8)]
+        check("L199: requests are served by both workers after the respawn", codes == [200] * 8, codes)
+        # killed again soon after it started: replaced after a longer pause, logged
+        if respawned:
+            os.kill(respawned[0], signal.SIGKILL)
+            time.sleep(0.3)
+            check("L199: a worker that keeps dying waits out a pause while the other serves", len(l199_children(gw.pid)) == 1 and call("GET", "/health", None, None, base=base, auth=False)[0] == 200, l199_children(gw.pid))
+            for _ in range(80):
+                if len(l199_children(gw.pid)) == 2:
+                    break
+                time.sleep(0.05)
+            check("L199: after the pause the slot is respawned", len(l199_children(gw.pid)) == 2, l199_children(gw.pid))
+        alog = open(log_a).read()
+        check("L199: each respawn is logged with the signal and its pause", "was killed by signal 9; restarting it in 1 s" in alog and "restarting it in 2 s" in alog, alog[-600:])
+        check("L199: the build passes the TV_PLAIN_ALLOC check", "TV_PLAIN_ALLOC" not in alog, alog[-300:])
+        # the upgrade notice: the defaults this config relies on, once, recorded beside the config
+        check("L199: the upgrade notice lists the changed defaults this config relies on", "notice: defaults that changed" in alog and "logs_store.max_disk_mb defaults to 512" in alog and "server.webrtc_enabled" in alog and "listens on 127.0.0.1 by default" not in alog, alog[-1500:])
+        marker = os.path.join(d, ".raiju-notices.json")
+        check("L199: the notice is recorded in .raiju-notices.json", os.path.exists(marker) and json.load(open(marker)).get("defaults_notice") == 25, open(marker).read() if os.path.exists(marker) else "missing")
+        # the generated MCP OAuth state carries its version
+        st = os.path.join(d, "mcp-oauth-state.json")
+        check("L199: mcp-oauth-state.json carries its state version", os.path.exists(st) and json.load(open(st)).get("version") == 1, open(st).read()[:200] if os.path.exists(st) else "missing")
+    finally:
+        if gw.poll() is None:
+            gw.terminate()
+        try:
+            gw.wait(15)
+        except subprocess.TimeoutExpired:
+            gw.kill()
+            gw.wait()
+    check("L199: the gateway stops on SIGTERM after the respawns, with no worker left", not any(os.path.exists(f"/proc/{p}") and open(f"/proc/{p}/stat").read().split()[2] != "Z" for p in first), first)
+    # a second start (the server under test): the notice is not shown again, and a state file from a newer Raiju is left alone
+    newer = '{"version":99,"signing_key":"from-a-newer-build","clients":[]}\n'
+    open(os.path.join(d, "mcp-oauth-state.json"), "w").write(newer)
+    log_b = os.path.join(d, "b.log")
+    gb = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18355", "-host", "127.0.0.1", "-config", path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(log_b, "w"))
+    try:
+        wait("http://127.0.0.1:18355/health")
+        time.sleep(0.3)
+        blog = open(log_b).read()
+        check("L199: the upgrade notice is not shown at the next start", "notice: defaults that changed" not in blog, blog[-800:])
+        check("L199: a state file from a newer Raiju is reported and not written over", "was written by a newer Raiju (state version 99" in blog and open(os.path.join(d, "mcp-oauth-state.json")).read() == newer, blog[-800:])
+        s2, _, _ = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l199 second"}]}, None, base="http://127.0.0.1:18355", auth=False)
+        check("L199: the second gateway serves", s2 == 200, s2)
+    finally:
+        gb.terminate()
+        try:
+            gb.wait(15)
+        except subprocess.TimeoutExpired:
+            gb.kill()
+            gb.wait()
+
+
+
+GW_L197 = "http://127.0.0.1:18350"  # L197: four workers of one node (Bun; one process on http1): config saves, jobs, sessions
+GW_L197_R = "http://127.0.0.1:18351"  # L197: the same config started again (sessions and agent tokens across a restart)
+L197_ADMIN = {"authorization": "Bearer sk-admin-l197"}
+
+def l197_config():
+    """The L197 gateway: an admin token, ana who signs in by password (dashboard sessions and the CLI's agent sign-in),
+    one virtual key of ana's, the shared mock as OpenAI."""
+    import hashlib
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "l197", "value": "sk-l197", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {
+            "users": [{"name": "ana", "role": "admin", "email": "ana@example.com", "salt": "s197", "password_sha256": hashlib.sha256("s197:pw-ana".encode()).hexdigest()},
+                      {"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l197".encode()).hexdigest()}],
+            "virtual_keys": [{"id": "vk-l197-ana", "name": "ana", "value": "sk-bf-l197-ana", "user_id": "ana"}],
+        },
+    }
+
+def l197_start(env, port, cfg_path, name):
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    extra = ["-workers", "4"] if server != "http1" else []
+    return subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", str(port), "-host", "127.0.0.1", "-config", cfg_path, "-server", server] + extra,
+                            env=env, stderr=open(os.path.join(BUILD, f"e2e.l197{name}.log"), "w"))
+
+def l197_e2e(env):
+    """L197: multi-worker state. Four workers of one node (Bun; http1 runs one process, where the same checks hold):
+    40 virtual keys created at once through every worker all persist (each save takes the config file's lock and
+    reapplies its change to the file as another worker left it); an async job polled through every worker is found by
+    each; a dashboard session and an agent sign-in made on one worker work on all, a logout on one ends them on all; and
+    after a restart the session and the agent's refresh token still work, kept hashed in private files. Ports 18350 and
+    18351 (the restart)."""
+    import hashlib, base64 as _b64, secrets as _sec, urllib.parse as _up, stat
+    from concurrent.futures import ThreadPoolExecutor
+    cfg_path = os.path.join(BUILD, "e2e.l197.json")
+    for suffix in ["", ".bak", ".sessions.json", ".oidc-flows.json", ".agent-sessions.json"]:
+        try:
+            os.remove(cfg_path + suffix)
+        except FileNotFoundError:
+            pass
+    json.dump(l197_config(), open(cfg_path, "w"))
+    def jb(text):
+        try:
+            return json.loads(text)
+        except Exception:
+            return {}
+    def many(fn, n, par=8):
+        with ThreadPoolExecutor(max_workers=par) as ex:
+            return list(ex.map(lambda i: fn(i), range(n)))
+    gw = l197_start(env, 18350, cfg_path, "a")
+    gw_r = None
+    try:
+        wait(GW_L197 + "/health")
+        time.sleep(1.0)
+        # ---- P0-3: concurrent creates on every worker all persist ----
+        codes = many(lambda i: call("POST", "/api/governance/virtual-keys", {"name": f"l197-{i}"}, L197_ADMIN, base=GW_L197, auth=False)[0], 40, 20)
+        check("l197: 40 virtual keys created at once through every worker are all acknowledged", all(c in (200, 201) for c in codes), codes)
+        names = [v.get("name") for v in json.load(open(cfg_path)).get("governance", {}).get("virtual_keys", [])]
+        check("l197: the config file holds every acknowledged key (none written over by another worker's save)", all(f"l197-{i}" in names for i in range(40)) and len(names) == 41, (len(names), sorted(set(f"l197-{i}" for i in range(40)) - set(names))))
+        counts = many(lambda i: len(jb(call("GET", "/api/governance/virtual-keys", None, L197_ADMIN, base=GW_L197, auth=False)[2]).get("virtual_keys", [])), 12)
+        check("l197: every worker lists all 41 keys", all(c == 41 for c in counts), counts)
+        # ---- P1-1: an async job polled on any worker ----
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l197-job"}]}, {"x-bf-async": "true"}, base=GW_L197, auth=False)
+        jid = jb(b).get("id", "")
+        check("l197: an async job is accepted", s == 202 and jid.startswith("job_"), (s, b[:200]))
+        time.sleep(0.5)
+        polls = many(lambda i: call("GET", "/v1/chat/completions", None, {"x-bf-async-id": jid}, base=GW_L197, auth=False)[0], 12)
+        check("l197: every poll finds the job, whichever worker takes it", all(c == 200 for c in polls), polls)
+        polls = many(lambda i: call("GET", "/v1/async/jobs/" + jid, None, None, base=GW_L197, auth=False), 12)
+        check("l197: the job route answers the completed job on every worker", all(p[0] == 200 and jb(p[2]).get("status") == "completed" for p in polls), [p[0] for p in polls])
+        # ---- P1-1: a dashboard session made on one worker works on all, and a logout ends it on all ----
+        s, _, b = call("POST", "/api/session/login", {"username": "ana", "password": "pw-ana"}, base=GW_L197, auth=False)
+        stok = jb(b).get("token", "")
+        check("l197: a password sign-in gives a session", s == 200 and stok.startswith("sk-sess-"), (s, b[:200]))
+        SH = {"authorization": "Bearer " + stok}
+        valid = many(lambda i: jb(call("GET", "/api/session/is-auth-enabled", None, SH, base=GW_L197, auth=False)[2]).get("has_valid_token"), 12)
+        check("l197: the session is valid on every worker", all(v is True for v in valid), valid)
+        reads = many(lambda i: call("GET", "/api/governance/virtual-keys", None, SH, base=GW_L197, auth=False)[0], 12)
+        check("l197: the session opens the management API on every worker", all(c == 200 for c in reads), reads)
+        s, _, _ = call("POST", "/api/session/logout", None, SH, base=GW_L197, auth=False)
+        ended = lambda: many(lambda i: call("GET", "/api/governance/virtual-keys", None, SH, base=GW_L197, auth=False)[0], 12)
+        # (a worker trusts the copy it read for at most a second)
+        check("l197: after a logout on one worker the session opens nothing on any", s == 200 and l147_until(lambda: all(c == 401 for c in ended()), 3), (s, ended()))
+        s, _, b = call("POST", "/api/session/login", {"username": "ana", "password": "pw-ana"}, base=GW_L197, auth=False)
+        kept = jb(b).get("token", "")
+        # ---- P1-1: the CLI's agent sign-in: code on one worker, token on another, the token on all ----
+        verifier = _sec.token_urlsafe(48)
+        challenge = _b64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+        redirect = "http://127.0.0.1:18399/callback"
+        q = _up.urlencode({"client_id": "bifrost-cli", "redirect_uri": redirect, "state": "st-197", "code_challenge": challenge, "code_challenge_method": "S256"})
+        tokens = []
+        for _ in range(4):
+            s, h, _ = raw("POST", GW_L197 + "/api/agent/auth/authorize", q + "&username=ana&password=pw-ana")
+            code = _up.parse_qs(_up.urlparse(h.get("location", "") if h else "").query).get("code", [""])[0]
+            s, _, b = call("POST", "/api/agent/auth/token", {"code": code, "code_verifier": verifier, "redirect_uri": redirect}, base=GW_L197, auth=False)
+            tokens.append((s, jb(b)))
+        check("l197: every code issued by one worker is traded on whichever worker takes the token request", all(t[0] == 200 and t[1].get("agent_access_token", "").startswith("ck-bf-agent-") for t in tokens), [t[0] for t in tokens])
+        access = tokens[0][1].get("agent_access_token", "")
+        refresh = tokens[0][1].get("refresh_token", "")
+        A = {"authorization": "Bearer " + access}
+        keys = many(lambda i: call("GET", "/api/agent/virtual-keys", None, A, base=GW_L197, auth=False)[0], 12)
+        check("l197: the agent token works on every worker", all(c == 200 for c in keys), keys)
+        # ---- across a restart: the session and the refresh token still work; the files are private and hold no token ----
+        gw.terminate()
+        gw.wait()
+        gw_r = l197_start(env, 18351, cfg_path, "r")
+        wait(GW_L197_R + "/health")
+        time.sleep(1.0)
+        KH = {"authorization": "Bearer " + kept}
+        after = many(lambda i: call("GET", "/api/governance/virtual-keys", None, KH, base=GW_L197_R, auth=False)[0], 8)
+        check("l197: a dashboard session outlives a restart", all(c == 200 for c in after), after)
+        s, _, b = call("POST", "/api/agent/auth/refresh", {"refresh_token": refresh}, base=GW_L197_R, auth=False)
+        nxt = jb(b).get("agent_access_token", "")
+        check("l197: the agent's refresh token outlives a restart and rotates", s == 200 and nxt.startswith("ck-bf-agent-"), (s, b[:200]))
+        old = many(lambda i: call("GET", "/api/agent/virtual-keys", None, A, base=GW_L197_R, auth=False)[0], 8)
+        check("l197: the rotated access token stops on every worker", all(c == 401 for c in old), old)
+        files = [cfg_path + ".sessions.json", cfg_path + ".agent-sessions.json"]
+        texts = [open(f).read() if os.path.exists(f) else "" for f in files]
+        modes = [stat.S_IMODE(os.stat(f).st_mode) if os.path.exists(f) else -1 for f in files]
+        check("l197: sessions and agent tokens are kept hashed in private (0600) files",
+              all(t != "" for t in texts) and modes == [0o600, 0o600] and not any(x in t for t in texts for x in [kept, stok, access, refresh, nxt]), (modes, [len(t) for t in texts]))
+    finally:
+        for p in [gw, gw_r]:
+            if p is not None:
+                p.terminate()
+                p.wait()
+
 def main():
     unique_ports()
     build()
@@ -18531,6 +18904,8 @@ def main():
         l167_e2e(env, idp_state)
         # L172: Vertex tuned endpoints and body limits that follow the config: its own gateway (18294)
         l172_e2e(env)
+        # L196: credentials checked before a big body is read, and the cap on request bodies in hand: its own gateway (18348)
+        l196_e2e(env)
         # L173: provider leftovers (Bedrock text streams, OpenAI-shaped decisions, Mantle, Replicate, cache points, alias
         # overrides, listings): its own gateway (18296)
         l173_e2e(env)
@@ -18582,9 +18957,15 @@ def main():
         # L198: sign-in throttling (429 with Retry-After) per account and per address, bcrypt hashes and the upgrade of old
         # ones, X-Forwarded-For only from trusted_proxies: its own gateways (18352, 18353)
         l198_e2e(env)
+        # L197: multi-worker state (concurrent config saves on four workers, async jobs, dashboard sessions and agent
+        # sign-in tokens shared by the workers and kept across a restart): its own gateways (18350, then 18351)
+        l197_e2e(env)
         # L189: lifecycle follow-ups (WebSocket and realtime sessions drained at a stop with 1001, the write-stall timeout,
         # broker mode's graceful stop): its own gateways and broker, one after the other (18334)
         l189_e2e(env)
+        # L199: a worker killed with SIGKILL is replaced (Tov patch 0019), the upgrade notice, state file versions, the
+        # allocator check: its own gateways (18354, 18355)
+        l199_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

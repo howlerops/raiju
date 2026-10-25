@@ -1,5 +1,5 @@
 #!/bin/sh
-# Checks patches 0001-0010, 0012, 0013, 0015, 0016 and 0017 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
+# Checks patches 0001-0010, 0012, 0013, 0015, 0016, 0017 and 0019 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
 # (or `make tov-test`). Each program prints "ok" lines and "FAIL" lines; a run passes when no line
 # fails and the expected number of "ok" lines appears.
 set -eu
@@ -165,5 +165,15 @@ expect "$OUT/fetch_buffer.out" 3 "fetch input buffer"
 TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/request_ip.tov" -o "$OUT/request_ip" >/dev/null
 "$OUT/request_ip" > "$OUT/request_ip.out"
 expect "$OUT/request_ip.out" 4 "server.requestIP"
+
+# a worker killed alone (SIGKILL) is replaced, with a growing pause for one that keeps dying; Bun.plainAlloc (patch 0019; Linux /proc)
+if [ -d /proc/self/task ]; then
+  TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/worker_respawn.tov" -o "$OUT/worker_respawn" >/dev/null
+  "$TOV" build "$DIR/worker_respawn.tov" -o "$OUT/worker_respawn_fast" >/dev/null
+  python3 "$DIR/worker_respawn_client.py" "$OUT/worker_respawn" "$OUT" "$OUT/worker_respawn_fast" > "$OUT/worker_respawn_client.out" || true
+  expect "$OUT/worker_respawn_client.out" 10 "Bun.serve workers respawned after SIGKILL, Bun.plainAlloc"
+else
+  echo "skipped: worker respawn (needs /proc)"
+fi
 
 echo "tov-patches tests passed"

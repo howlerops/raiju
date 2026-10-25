@@ -16,7 +16,8 @@
 import { readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync, unlinkSync, rmSync, statSync } from "node:fs"
 import { writeFileAtomic, mkdirPrivate } from "./atomicfile"
 import { sha256, toHex, utf8, secureHex } from "./crypto"
-import { fields, find, rawStr, rawNum, quote } from "./json"
+import { Field, fields, find, rawStr, rawNum, quote } from "./json"
+import { newerProblem } from "./statever"
 import { isPrivateHost, isMetadataHost, urlVerdict, policyOf, peerOf } from "./netguard"
 import { deadline } from "./deadline"
 import { pushEventTaskId } from "./a2a"
@@ -35,6 +36,8 @@ const RETENTION_MS = 7 * 86400000
 const PENDING_TTL_MS = 3600000
 const MAX_PAYLOAD = 1048576
 export const PENDING_PREFIX = "__pending__:"
+// The item files' version (statever.tov): an item written by a newer Raiju is skipped, as one being written is.
+const ITEM_VERSION = 1
 
 // One registered callback. ingress is the SHA-256 of the token the agent was given for it.
 export type PushConfig = {
@@ -99,6 +102,20 @@ function configFile(agent: string, task: string, id: string): string {
 
 function deliveryFile(id: string): string {
   return "d-" + id + ".json"
+}
+
+// The item files from a newer Raiju already named (each is reported once).
+const NEWER_ITEMS: Set<string> = new Set()
+
+// Whether an item file was written by a newer Raiju (its "version" above ITEM_VERSION); it is then skipped.
+function newerItem(fs: Field[], name: string): bool {
+  const v = rawNum(fs, "version") ?? 0.0
+  if (v <= f64(ITEM_VERSION)) return false
+  if (!NEWER_ITEMS.has(name)) {
+    NEWER_ITEMS.add(name)
+    console.error(`raiju: a2a push: ${newerProblem(name, Math.trunc(v), ITEM_VERSION)}: skipped`)
+  }
+  return true
 }
 
 // Configs and queued pushes live in memory and, with a directory (persistTo or useDir), as one file per item, so
@@ -184,6 +201,7 @@ export class PushStore {
   readConfig(name: string): PushConfig | undefined {
     try {
       const fs = try fields(try readFileSync(this.dir + "/" + name, "utf8"))
+      if (newerItem(fs, name)) return undefined
       const c = try JSON.parse(find(fs, "v") ?? "") as PushConfig
       return { agent: c.agent, task: c.task, id: c.id, url: c.url, token: this.open(c.token), scheme: c.scheme, credentials: this.open(c.credentials), ingress: c.ingress, created_at: c.created_at, updated_at: c.updated_at }
     } catch (e) {
@@ -194,6 +212,7 @@ export class PushStore {
   readDelivery(name: string): PushDelivery | undefined {
     try {
       const fs = try fields(try readFileSync(this.dir + "/" + name, "utf8"))
+      if (newerItem(fs, name)) return undefined
       return try JSON.parse(find(fs, "v") ?? "") as PushDelivery
     } catch (e) {
       return undefined
@@ -222,7 +241,7 @@ export class PushStore {
     this.ensureDir()
     const sealed: PushConfig = { agent: c.agent, task: c.task, id: c.id, url: c.url, token: this.seal(c.token), scheme: c.scheme, credentials: this.seal(c.credentials), ingress: c.ingress, created_at: c.created_at, updated_at: c.updated_at }
     try {
-      try writeFileAtomic(this.dir + "/" + configFile(c.agent, c.task, c.id), `{"by":${process.pid},"v":${JSON.stringify(sealed)}}\n`)
+      try writeFileAtomic(this.dir + "/" + configFile(c.agent, c.task, c.id), `{"version":${ITEM_VERSION},"by":${process.pid},"v":${JSON.stringify(sealed)}}\n`)
     } catch (e) {
       this.made = false
       console.error(`raiju: a2a push: could not write in ${this.dir}: ${e.message}`)
@@ -233,7 +252,7 @@ export class PushStore {
     if (this.dir === "") return
     this.ensureDir()
     try {
-      try writeFileAtomic(this.dir + "/" + deliveryFile(d.id), `{"by":${process.pid},"v":${JSON.stringify(d)}}\n`)
+      try writeFileAtomic(this.dir + "/" + deliveryFile(d.id), `{"version":${ITEM_VERSION},"by":${process.pid},"v":${JSON.stringify(d)}}\n`)
     } catch (e) {
       this.made = false
       console.error(`raiju: a2a push: could not write in ${this.dir}: ${e.message}`)
@@ -887,6 +906,24 @@ test("two stores on one directory see each other's configs, replacements and rem
   b.bind("echo", "h4", PENDING_PREFIX + "p", "t4")
   expect(a.config("echo", "t4", "c4")!.id).toBe("c4")
   expect(a.config("echo", PENDING_PREFIX + "p", "c4")).toBeUndefined()
+  try rmSync(dir, { recursive: true, force: true })
+})
+
+test("item files carry their version; one from before versions is read, one from a newer Raiju is skipped", () => {
+  const dir = tmpDir()
+  const a = new PushStore()
+  a.useDir(dir)
+  a.saveConfig(cfg("echo", "t1", "c1", "h1"))
+  const text = try readFileSync(dir + "/" + configFile("echo", "t1", "c1"), "utf8")
+  expect(text.startsWith(`{"version":1,"by":`)).toBe(true)
+  const body = text.slice(text.indexOf(`"v":`))
+  try writeFileSync(dir + "/" + configFile("echo", "t2", "c2"), `{"by":1,` + body.replace(`"task":"t1"`, `"task":"t2"`).replace(`"id":"c1"`, `"id":"c2"`))
+  try writeFileSync(dir + "/" + configFile("echo", "t3", "c3"), `{"version":7,"by":1,` + body.replace(`"task":"t1"`, `"task":"t3"`).replace(`"id":"c1"`, `"id":"c3"`))
+  const b = new PushStore()
+  b.useDir(dir)
+  expect(b.config("echo", "t1", "c1")!.ingress).toBe("h1")
+  expect(b.config("echo", "t2", "c2")!.ingress).toBe("h1")
+  expect(b.config("echo", "t3", "c3")).toBeUndefined()
   try rmSync(dir, { recursive: true, force: true })
 })
 

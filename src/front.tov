@@ -6,8 +6,10 @@ import { serve, Http1Request, Http1Response, BodyQueue } from "./http1"
 import { WsConnection } from "./ws"
 import { Engine, StreamSink, errorResponse, noHeaders } from "./gateway"
 import { Ops } from "./ops"
-import { clientIpFor, dispatch, clusterDispatch, compatPath, streamKind, streamsRequest, routeStream, httpPathLabel, http1Upgrade, largeFront, limitedBody, Served } from "./server"
+import { clientIpFor, dispatch, clusterDispatch, compatPath, streamKind, streamsRequest, routeStream, httpPathLabel, http1Upgrade, largeFront, limitedBody, credentialRefusal, heldBody, Served } from "./server"
+import { bodyBudget } from "./bodybudget"
 import { ServerLimits } from "./lifecycle"
+import { snapshot } from "./schemas"
 import { TransportRun, transportStart, transportEnd, transportDone, transportSink } from "./pluginroute"
 import * as metrics from "./metrics"
 import { CLIENT_WATCH_HEADER, watchStart, watchGone, watchEnd, watched } from "./clientgone"
@@ -120,7 +122,18 @@ async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request,
   const t0 = performance.now()
   // (a streamed body has not arrived: its declared length stands in)
   const inBytes = req.stream === undefined ? req.bytes.length * 1.0 : (parseFloat(req.headers.get("content-length") ?? "0") ?? 0.0)
+  // what this request holds of the process's body budget (heldBody), given back when it is done
+  let held = 0
+  // the body's text, for the streaming check (a streamed body is read below)
+  let bodyText = req.body
   try {
+    // a big body is not read for a caller its credentials already refuse
+    const refused = await credentialRefusal(engine, ops, request, limit > 0 ? limit : NO_LIMIT)
+    if (refused !== undefined) {
+      const n = await write(res, refused)
+      metrics.observeHttp(httpPathLabel(path, refused.status), req.method, refused.status, (performance.now() - t0) / 1000.0, inBytes, n * 1.0, metrics.httpCustomValues(request.headers))
+      return
+    }
     // large_payload_optimization: a big body is refused, streamed on, or read after all
     const lf = await largeFront(engine, request)
     if (lf instanceof Response) {
@@ -128,15 +141,35 @@ async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request,
       metrics.observeHttp(httpPathLabel(path, lf.status), req.method, lf.status, (performance.now() - t0) / 1000.0, inBytes, n * 1.0, metrics.httpCustomValues(request.headers))
       return
     }
-    if (lf instanceof Request) request = lf
-    if (limit > 0) {
-      const within = await limitedBody(request, limit)
-      if (within === undefined) {
-        const n = await write(res, errorResponse(413, "request body too large", "invalid_request_error", noHeaders()))
-        metrics.observeHttp(httpPathLabel(path, 413), req.method, 413, (performance.now() - t0) / 1000.0, inBytes, n * 1.0, metrics.httpCustomValues(request.headers))
+    if (lf instanceof Request) {
+      // (a body the feature streams on is not held here)
+      request = lf
+      if (limit > 0) {
+        const within = await limitedBody(request, limit)
+        if (within === undefined) {
+          const n = await write(res, errorResponse(413, "request body too large", "invalid_request_error", noHeaders()))
+          metrics.observeHttp(httpPathLabel(path, 413), req.method, 413, (performance.now() - t0) / 1000.0, inBytes, n * 1.0, metrics.httpCustomValues(request.headers))
+          return
+        }
+        request = within
+      }
+    } else {
+      // the body is read whole here, charged to the process's body budget first (413 and 503 refuse it unread)
+      const hb = await heldBody(engine, request, limit > 0 ? limit : NO_LIMIT)
+      const no = hb.res
+      if (no !== undefined) {
+        const n = await write(res, no)
+        metrics.observeHttp(httpPathLabel(path, no.status), req.method, no.status, (performance.now() - t0) / 1000.0, inBytes, n * 1.0, metrics.httpCustomValues(request.headers))
         return
       }
-      request = within
+      request = hb.req
+      held = hb.held
+      if (req.stream !== undefined) {
+        // the body stream is spent: the request is rebuilt around what was read, so a later reader of its body
+        // (the plugins' transport hooks on a large body) gets the bytes
+        bodyText = await request.text()
+        request = new Request(request.url, { method: request.method, headers: snapshot(request.headers), body: bodyText })
+      }
     }
     // the plugins' HTTP pre hooks, before the request is routed: they may rewrite it or answer it
     const th = await transportStart(engine, request)
@@ -147,7 +180,7 @@ async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request,
       return
     }
     request = th.request
-    const kind = streamingKind(req, tr === undefined ? req.body : th.body)
+    const kind = streamingKind(req, tr === undefined ? bodyText : th.body)
     if (kind !== "") {
       const sink = new StreamSink(
         (status, headers) => res.writeHead(status, headers),
@@ -179,6 +212,7 @@ async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request,
     }
     console.error(`raiju: ${e.message}`)
   } finally {
+    bodyBudget().give(held)
     transportDone(engine, tr)
     if (wid !== "") {
       res.onGone = undefined
@@ -186,6 +220,9 @@ async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request,
     }
   }
 }
+
+// No body limit of the handler's own (the parser's applies).
+const NO_LIMIT = 1099511627776
 
 function ms(seconds: f64): int {
   return seconds > 0 ? Math.max(1, Math.round(seconds * 1000)) : 0

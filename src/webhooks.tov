@@ -15,8 +15,9 @@
 // Deliveries are the last 500 of them: kept in memory, and written to webhook-deliveries.jsonl in the
 // logs_store folder when that store is on, so they survive a restart. Endpoints are config (the
 // webhooks section), so they survive restarts.
-import { readFileSync, writeFileSync, existsSync } from "node:fs"
+import { readFileSync, writeFileSync, existsSync, rmSync } from "node:fs"
 import { writeFileAtomic } from "./atomicfile"
+import { lockFile, unlockFile } from "./filelock"
 import { hmacSha256, utf8, secureHex } from "./crypto"
 import { encode, decode } from "./base64"
 import { Field, fields, elements, find, rawStr, rawBool, rawNum, decodeString } from "./json"
@@ -95,8 +96,12 @@ export class DeliveryLog {
     }
   }
 
+  // Writes the rows. The workers of a node share the file: under its lock (filelock.tov) the rows another worker
+  // wrote are merged in first (refresh), so no worker's deliveries are written over.
   save(): void {
     if (this.file === "") return
+    const lock = lockFile(this.file)
+    this.refresh()
     try {
       let text = ""
       for (const r of this.rows) text += JSON.stringify(r) + "\n"
@@ -104,6 +109,52 @@ export class DeliveryLog {
     } catch (e) {
       console.error(`raiju: webhook deliveries: could not write ${this.file}: ${e.message}`)
     }
+    unlockFile(lock)
+  }
+
+  // Takes the rows the file holds that this process does not, and the later state of a row another worker updated
+  // since (more attempts, or a later update), so a list on any worker shows every worker's deliveries. Newest last,
+  // within KEEP and the retention.
+  refresh(): void {
+    if (this.file === "" || !existsSync(this.file)) return
+    let text = ""
+    try {
+      text = readFileSync(this.file, "utf8")
+    } catch (e) {
+      return
+    }
+    let merged: Delivery[] = this.rows
+    let changed = false
+    for (const line of text.split("\n")) {
+      if (line === "") continue
+      let d: Delivery | undefined = undefined
+      try {
+        d = JSON.parse(line) as Delivery
+      } catch (e) {
+        continue
+      }
+      if (d === undefined) continue
+      let at = -1
+      for (let i = 0; i < merged.length; i++) {
+        if (merged[i]!.id === d.id) at = i
+      }
+      if (at < 0) {
+        merged.push(d)
+        changed = true
+      } else {
+        const mine = merged[at]!
+        if (d.attempts > mine.attempts || (d.attempts === mine.attempts && d.updated_at > mine.updated_at)) {
+          merged[at] = d
+          changed = true
+        }
+      }
+    }
+    if (!changed) return
+    merged.sort((a: Delivery, b: Delivery): int => a.created_at - b.created_at)
+    const cutoff = Math.floor(Date.now()) - this.retentionMs
+    merged = merged.filter((r) => r.created_at >= cutoff)
+    if (merged.length > KEEP) merged = merged.slice(merged.length - KEEP)
+    this.rows = merged
   }
 
   indexOf(id: string): int {
@@ -145,6 +196,31 @@ test("deliveries older than the retention window are dropped", () => {
   expect(l.rows.length).toBe(1)
   l.setRetentionDays(undefined)
   expect(l.retentionMs).toBe(30 * 86400000)
+})
+
+test("two workers' logs on one file keep each other's deliveries and the later state of a row", () => {
+  const file = "/tmp/raiju-deliveries-test-" + process.pid + "-" + Math.floor(Date.now()) + ".jsonl"
+  const a = new DeliveryLog()
+  const b = new DeliveryLog()
+  a.persistTo(file)
+  b.persistTo(file)
+  const now = Math.floor(Date.now())
+  const row = (id: string, at: int): Delivery => ({ id: id, message_id: "m-" + id, webhook_id: "w", webhook_name: "n", event: "e", status: "pending", attempts: 0, status_code: 0, error: "", body: "", created_at: at, updated_at: at })
+  a.add(row("d1", now))
+  b.add(row("d2", now + 1))
+  a.attempt("d1", 200, "", now + 2)
+  a.settle("d1", "delivered", now + 2)
+  b.add(row("d3", now + 3))
+  const c = new DeliveryLog()
+  c.persistTo(file)
+  expect(c.rows.map((r) => r.id)).toEqual(["d1", "d2", "d3"])
+  expect(c.rows[0]!.status).toBe("delivered")
+  // b, which wrote d1 back as it first saw it, takes its later state on a refresh
+  b.refresh()
+  expect(b.rows.map((r) => r.id + ":" + r.status)).toEqual(["d1:delivered", "d2:pending", "d3:pending"])
+  try {
+    rmSync(file, { force: true })
+  } catch (e) {}
 })
 
 let logInstance: DeliveryLog | undefined = undefined
@@ -663,6 +739,7 @@ function updateEndpoint(list: WebhookEndpoint[], i: int, body: string): WebhookR
 function deliveriesJson(webhookId: string, webhookName: string, query: string): string {
   const sp = new URLSearchParams(query)
   const limit = parseInt(sp.get("limit") ?? "50") ?? 50
+  deliveryLog().refresh()
   const rows = deliveryLog().rows
   const items: string[] = []
   for (let i = rows.length - 1; i >= 0 && items.length < limit; i--) {
@@ -678,6 +755,7 @@ function deliveriesRoute(list: WebhookEndpoint[], method: string, segs: string[]
     const status = sp.get("status") ?? ""
     const limit = parseInt(sp.get("limit") ?? "50") ?? 50
     const items: string[] = []
+    deliveryLog().refresh()
     const rows = deliveryLog().rows
     for (let i = rows.length - 1; i >= 0 && items.length < limit; i--) {
       const d = rows[i]!
@@ -687,6 +765,7 @@ function deliveriesRoute(list: WebhookEndpoint[], method: string, segs: string[]
   }
   if (segs.length === 5 && segs[4] === "redeliver" && method === "POST") {
     const log = deliveryLog()
+    log.refresh()
     const i = log.indexOf(segs[3] ?? "")
     if (i < 0) return fail(404, "delivery not found")
     const old = log.rows[i]!

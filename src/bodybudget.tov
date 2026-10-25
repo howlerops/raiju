@@ -1,0 +1,99 @@
+// The request-body bytes one process holds at once, across requests (server.max_buffered_body_mb). A body is read
+// whole before it is parsed, and parsing a big one costs several times its size, so a few large bodies sent at once
+// could take a worker past its memory limit. Each body is charged here before it is read and given back when its
+// request is done; a body that does not fit is refused with 503, unread.
+//
+// A body is always admitted when the process holds no other body, so a single request up to
+// client.max_request_body_size_mb is still served (Bifrost's limit keeps its meaning); the cap decides how many
+// big bodies are read at once.
+import { ServerSectionConfig } from "./config"
+
+// Sized for the chart's 512Mi pod: a chat body costs about eight times its size while it is parsed and sent on
+// (bench/body_memory.py), so 48 MB of bodies in hand stays near 400 MB.
+export const DEFAULT_BUFFERED_BODY_MB = 48
+
+// Bodies with a declared length up to this reach the gateway already read (the servers' stream threshold); bigger
+// and chunked ones reach it as a stream, so their credentials are checked and their bytes charged before they are read.
+export const UNREAD_ABOVE = 65536
+
+// server.max_buffered_body_mb in bytes: unset or 0 is the default, a negative number is no cap (0 returned).
+export function bufferedCap(s: ServerSectionConfig | undefined): int {
+  const mb = s?.max_buffered_body_mb ?? 0
+  if (mb < 0) return 0
+  return (mb === 0 ? DEFAULT_BUFFERED_BODY_MB : mb) * 1048576
+}
+
+export class BodyBudget {
+  held = 0
+  refused = 0
+
+  // Charges n more bytes to a request that already holds `own` of them. true when they fit under cap (0: no cap),
+  // or when no other request holds any.
+  take(n: int, own: int, cap: int): bool {
+    if (n <= 0) return true
+    if (cap > 0 && this.held - own > 0 && this.held + n > cap) {
+      this.refused += 1
+      return false
+    }
+    this.held += n
+    return true
+  }
+
+  // Gives back what a request held.
+  give(n: int): void {
+    if (n <= 0) return
+    this.held = Math.max(0, this.held - n)
+  }
+}
+
+const budget = new BodyBudget()
+
+// This process's budget.
+export function bodyBudget(): BodyBudget {
+  return budget
+}
+
+test("the cap: bodies are admitted while they fit, a lone body always", () => {
+  const b = new BodyBudget()
+  const cap = 100
+  // a lone body over the cap is admitted (the request limit decides its size)
+  expect(b.take(250, 0, cap)).toBe(true)
+  expect(b.take(1, 0, cap)).toBe(false)
+  b.give(250)
+  expect(b.held).toBe(0)
+  expect(b.take(60, 0, cap)).toBe(true)
+  expect(b.take(40, 0, cap)).toBe(true)
+  expect(b.take(1, 0, cap)).toBe(false)
+  expect(b.refused).toBe(2)
+  b.give(40)
+  expect(b.take(30, 0, cap)).toBe(true)
+  expect(b.held).toBe(90)
+  // no cap
+  expect(b.take(1000000, 0, 0)).toBe(true)
+  // an empty body costs nothing
+  expect(b.take(0, 0, cap)).toBe(true)
+  // give never goes below zero
+  b.give(5000000)
+  expect(b.held).toBe(0)
+})
+
+test("a chunked body is charged as it arrives: its own bytes do not count against it", () => {
+  const b = new BodyBudget()
+  const cap = 100
+  expect(b.take(80, 0, cap)).toBe(true)
+  // alone, it may grow past the cap
+  expect(b.take(80, 80, cap)).toBe(true)
+  expect(b.held).toBe(160)
+  // a second request now does not fit, and the first one cannot grow while the second holds bytes
+  b.give(160)
+  expect(b.take(30, 0, cap)).toBe(true)
+  expect(b.take(50, 0, cap)).toBe(true)
+  expect(b.take(30, 30, cap)).toBe(false)
+})
+
+test("server.max_buffered_body_mb: the default, a value, no cap", () => {
+  expect(bufferedCap(undefined)).toBe(48 * 1048576)
+  expect(bufferedCap({ max_buffered_body_mb: 0 })).toBe(48 * 1048576)
+  expect(bufferedCap({ max_buffered_body_mb: 200 })).toBe(200 * 1048576)
+  expect(bufferedCap({ max_buffered_body_mb: -1 })).toBe(0)
+})

@@ -1,0 +1,225 @@
+// A three-way merge of JSON texts: the change from base to ours applied to theirs. The config store uses it when the
+// file was saved by another process (a sibling worker, or a node sharing the file) since this process read it: the
+// change this process made is reapplied to the file as it is now, so neither save is lost (store.tov save).
+//
+// Rules, per value ("" stands for an absent one):
+//   - a side that left a value as it was in base takes the other side's value; equal sides agree
+//   - objects merge key by key
+//   - arrays merge element by element, an element named by its "id" (or "name") when every element has one, else by
+//     its whole text (a set): additions from both sides are kept (theirs first), a removal on one side removes it
+//   - anything else changed on both sides differently is a conflict (the caller answers 409): a value both sides set,
+//     an element one side changed and the other removed, or a name or value two added elements both claim.
+// The inputs must be written the same way (the store passes them through one JSON.stringify), so that equal values
+// have equal text.
+import { fields, elements, find, quote } from "./json"
+
+export type Merged = { ok: bool, text: string, conflict: string }
+
+function done(text: string): Merged {
+  return { ok: true, text: text, conflict: "" }
+}
+
+function clash(path: string): Merged {
+  return { ok: false, text: "", conflict: path === "" ? "(the whole document)" : path }
+}
+
+function kindOf(raw: string): string {
+  if (raw === "") return ""
+  if (raw.startsWith("{")) return "object"
+  if (raw.startsWith("[")) return "array"
+  return "scalar"
+}
+
+// prefer names members whose value is a cache of something fetched (an agent's card and when it was fetched): when both
+// sides set one differently, ours (the newer fetch) is kept rather than refused.
+export function merge3(base: string, ours: string, theirs: string, prefer?: string[]): Merged throws SyntaxError {
+  return try mergeAt(base.trim(), ours.trim(), theirs.trim(), "", prefer ?? [])
+}
+
+// The member name a path ends with ("" inside a list).
+function lastKey(path: string): string {
+  const parts = path.split(".")
+  const k = parts[parts.length - 1] ?? ""
+  return k.endsWith("]") ? "" : k
+}
+
+function mergeAt(base: string, ours: string, theirs: string, path: string, prefer: string[]): Merged throws SyntaxError {
+  if (ours === base) return done(theirs)
+  if (theirs === base || ours === theirs) return done(ours)
+  const ko = kindOf(ours)
+  const kt = kindOf(theirs)
+  const kb = kindOf(base)
+  if (ko === "object" && kt === "object" && (kb === "object" || kb === "")) return try mergeObjects(kb === "" ? "{}" : base, ours, theirs, path, prefer)
+  if (ko === "array" && kt === "array" && (kb === "array" || kb === "")) return try mergeArrays(kb === "" ? "[]" : base, ours, theirs, path, prefer)
+  if (ours !== "" && theirs !== "" && prefer.includes(lastKey(path))) return done(ours)
+  return clash(path)
+}
+
+function mergeObjects(base: string, ours: string, theirs: string, path: string, prefer: string[]): Merged throws SyntaxError {
+  const b = try fields(base)
+  const o = try fields(ours)
+  const t = try fields(theirs)
+  // theirs' order, then the keys ours added
+  const keys: string[] = []
+  for (const f of t) keys.push(f.key)
+  for (const f of o) {
+    if (!keys.includes(f.key)) keys.push(f.key)
+  }
+  const out: string[] = []
+  for (const k of keys) {
+    const r = try mergeAt(find(b, k) ?? "", find(o, k) ?? "", find(t, k) ?? "", path === "" ? k : path + "." + k, prefer)
+    if (!r.ok) return r
+    if (r.text !== "") out.push(quote(k) + ":" + r.text)
+  }
+  return done("{" + out.join(",") + "}")
+}
+
+// The member every element of every list has as a string or a number ("id", else "name"), or "" (whole text).
+function identityOf(lists: string[][]): string throws SyntaxError {
+  for (const k of ["id", "name"]) {
+    let all = true
+    for (const list of lists) {
+      for (const el of list) {
+        if (!el.startsWith("{")) return ""
+        const raw = find(try fields(el), k) ?? ""
+        if (raw === "" || raw === "null" || raw.startsWith("{") || raw.startsWith("[") || raw === "\"\"") all = false
+      }
+    }
+    if (all) return k
+  }
+  return ""
+}
+
+function idOf(el: string, key: string): string throws SyntaxError {
+  if (key === "") return el
+  return find(try fields(el), key) ?? ""
+}
+
+// The elements by identity, or undefined when two share one (such a list is not merged element by element).
+function indexOf(list: string[], key: string): Map<string, string> | undefined throws SyntaxError {
+  const m: Map<string, string> = new Map()
+  for (const el of list) {
+    const id = try idOf(el, key)
+    if (m.has(id)) return undefined
+    m.set(id, el)
+  }
+  return m
+}
+
+// Whether every element is an object with member k as a string, no two the same.
+function uniqueBy(list: string[], k: string): bool throws SyntaxError {
+  const seen: string[] = []
+  for (const el of list) {
+    if (!el.startsWith("{")) return false
+    const raw = find(try fields(el), k) ?? ""
+    if (!raw.startsWith("\"") || seen.includes(raw)) return false
+    seen.push(raw)
+  }
+  return true
+}
+
+function mergeArrays(base: string, ours: string, theirs: string, path: string, prefer: string[]): Merged throws SyntaxError {
+  const bs = try elements(base)
+  const os = try elements(ours)
+  const ts = try elements(theirs)
+  const key = try identityOf([bs, os, ts])
+  const bi = try indexOf(bs, key)
+  const oi = try indexOf(os, key)
+  const ti = try indexOf(ts, key)
+  if (bi === undefined || oi === undefined || ti === undefined) return clash(path)
+  const out: string[] = []
+  const label = (id: string): string => path + "[" + (key === "" ? "" : key + "=") + id + "]"
+  for (const el of ts) {
+    const id = try idOf(el, key)
+    const r = try mergeAt(bi.get(id) ?? "", oi.get(id) ?? "", el, label(id), prefer)
+    if (!r.ok) return r
+    if (r.text !== "") out.push(r.text)
+  }
+  for (const el of os) {
+    const id = try idOf(el, key)
+    if (ti.has(id)) continue
+    const r = try mergeAt(bi.get(id) ?? "", el, "", label(id), prefer)
+    if (!r.ok) return r
+    if (r.text !== "") out.push(r.text)
+  }
+  // a name or a value unique on each side stays unique: two processes that each added an element with the same name
+  // conflict rather than leave two
+  for (const k of ["name", "value"]) {
+    if (k === key) continue
+    if ((try uniqueBy(os, k)) && (try uniqueBy(ts, k)) && !(try uniqueBy(out, k))) return clash(path + " (two elements with the same " + k + ")")
+  }
+  return done("[" + out.join(",") + "]")
+}
+
+function mustMerge(b: string, o: string, t: string): string {
+  try {
+    const r = try merge3(b, o, t)
+    return r.ok ? r.text : "conflict at " + r.conflict
+  } catch (e) {
+    return "error: " + e.message
+  }
+}
+
+test("a side that did not change a value takes the other side's", () => {
+  expect(mustMerge(`{"a":1,"b":2}`, `{"a":1,"b":2}`, `{"a":1,"b":3}`)).toBe(`{"a":1,"b":3}`)
+  expect(mustMerge(`{"a":1,"b":2}`, `{"a":5,"b":2}`, `{"a":1,"b":2}`)).toBe(`{"a":5,"b":2}`)
+  // different keys changed on each side
+  expect(mustMerge(`{"a":1,"b":2}`, `{"a":5,"b":2}`, `{"a":1,"b":3}`)).toBe(`{"a":5,"b":3}`)
+  // a key added on one side, removed on the other
+  expect(mustMerge(`{"a":1,"b":2}`, `{"a":1,"b":2,"c":true}`, `{"a":1}`)).toBe(`{"a":1,"c":true}`)
+  // the same change on both sides
+  expect(mustMerge(`{"a":1}`, `{"a":2}`, `{"a":2}`)).toBe(`{"a":2}`)
+  // nested objects, and a section new on both sides
+  expect(mustMerge(`{"x":{"p":1}}`, `{"x":{"p":1,"q":2},"g":{"u":1}}`, `{"x":{"p":0},"g":{"v":2}}`)).toBe(`{"x":{"p":0,"q":2},"g":{"v":2,"u":1}}`)
+})
+
+test("lists merge by id: both sides' additions are kept, a removal removes, an untouched element follows the other side", () => {
+  const base = `{"vks":[{"id":"a","name":"A"},{"id":"b","name":"B"}]}`
+  const ours = `{"vks":[{"id":"a","name":"A"},{"id":"b","name":"B"},{"id":"c","name":"C"}]}`
+  const theirs = `{"vks":[{"id":"a","name":"A2"},{"id":"b","name":"B"},{"id":"d","name":"D"}]}`
+  expect(mustMerge(base, ours, theirs)).toBe(`{"vks":[{"id":"a","name":"A2"},{"id":"b","name":"B"},{"id":"d","name":"D"},{"id":"c","name":"C"}]}`)
+  // ours removed b, theirs added d
+  expect(mustMerge(base, `{"vks":[{"id":"a","name":"A"}]}`, theirs)).toBe(`{"vks":[{"id":"a","name":"A2"},{"id":"d","name":"D"}]}`)
+  // forty creates on two sides lose none
+  let b0: string[] = []
+  let o0: string[] = []
+  let t0: string[] = []
+  for (let i = 0; i < 20; i++) {
+    o0.push(`{"id":"o${i}","name":"o${i}"}`)
+    t0.push(`{"id":"t${i}","name":"t${i}"}`)
+  }
+  const m = mustMerge(`[${b0.join(",")}]`, `[${o0.join(",")}]`, `[${t0.join(",")}]`)
+  expect((try elements(m)).length).toBe(40)
+  // elements with no id or name merge as a set
+  expect(mustMerge(`["x","y"]`, `["x","y","z"]`, `["y"]`)).toBe(`["y","z"]`)
+  // by name when there is no id
+  expect(mustMerge(`[{"name":"k1","w":1}]`, `[{"name":"k1","w":2}]`, `[{"name":"k1","w":1},{"name":"k2","w":1}]`)).toBe(`[{"name":"k1","w":2},{"name":"k2","w":1}]`)
+})
+
+test("changes that cannot both hold are conflicts", () => {
+  // the same value set differently
+  expect(mustMerge(`{"a":1}`, `{"a":2}`, `{"a":3}`)).toBe("conflict at a")
+  // an element changed on one side and removed on the other, either way
+  const base = `{"vks":[{"id":"a","on":true}]}`
+  expect(mustMerge(base, `{"vks":[{"id":"a","on":false}]}`, `{"vks":[]}`)).toBe(`conflict at vks[id="a"]`)
+  expect(mustMerge(base, `{"vks":[]}`, `{"vks":[{"id":"a","on":false}]}`)).toBe(`conflict at vks[id="a"]`)
+  // the same element changed on both sides, in the same field
+  expect(mustMerge(base, `{"vks":[{"id":"a","on":false}]}`, `{"vks":[{"id":"a","on":null}]}`)).toBe(`conflict at vks[id="a"].on`)
+  // but in different fields it merges
+  expect(mustMerge(base, `{"vks":[{"id":"a","on":false}]}`, `{"vks":[{"id":"a","on":true,"n":1}]}`)).toBe(`{"vks":[{"id":"a","on":false,"n":1}]}`)
+  // two additions that claim one name (or one value)
+  expect(mustMerge(`[]`, `[{"id":"x","name":"same"}]`, `[{"id":"y","name":"same"}]`)).toBe("conflict at  (two elements with the same name)")
+  expect(mustMerge(`{"k":[]}`, `{"k":[{"id":"x","value":"v"}]}`, `{"k":[{"id":"y","value":"v"}]}`)).toBe("conflict at k (two elements with the same value)")
+  // a scalar against an object
+  expect(mustMerge(`{"a":1}`, `{"a":{"b":1}}`, `{"a":2}`)).toBe("conflict at a")
+})
+
+test("a preferred member (a fetched cache) set on both sides keeps ours", () => {
+  const base = `{"agents":[{"name":"g","url":"u"}]}`
+  const ours = `{"agents":[{"name":"g","url":"u","card":"c2","card_fetched_at":2}]}`
+  const theirs = `{"agents":[{"name":"g","url":"u","card":"c1","card_fetched_at":1}]}`
+  expect((try merge3(base, ours, theirs, ["card", "card_fetched_at"])).text).toBe(ours)
+  expect((try merge3(base, ours, theirs)).ok).toBe(false)
+  // a removal on the other side is still a conflict
+  expect((try merge3(ours, `{"agents":[{"name":"g","url":"u","card":"c3","card_fetched_at":3}]}`, base, ["card", "card_fetched_at"])).ok).toBe(false)
+})

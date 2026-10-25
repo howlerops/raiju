@@ -9,7 +9,7 @@ for each element of a list. Descriptions are the comments in the source; default
 has one. The command-line flags (`-app-dir`, `-config`, `-host`, `-port`, `-workers`, `-server`, `-mode`,
 `-healthcheck`) are in the README.
 
-1365 keys (564 with a description), and 38 Bifrost keys read through config_compat.
+1366 keys (565 with a description), and 38 Bifrost keys read through config_compat.
 
 ## Sections
 
@@ -726,7 +726,7 @@ The request log store (files under the app dir; /api/logs reads it).
 | `logs_store.max_memory_entries` | int |  |
 | `logs_store.content_logging` | bool |  |
 | `logs_store.required` | bool | the start fails when the store cannot open (default true, as Bifrost's start fails); false logs and runs without it |
-| `logs_store.max_file_mb` | int | a day's file is cut into segments of this size (MB, default 32): start-up and shared queries read only the newest ones. max_disk_mb caps all the log files together (oldest segments deleted first; 0, the default: no cap) |
+| `logs_store.max_file_mb` | int | a day's file is cut into segments of this size (MB, default 32): start-up and shared queries read only the newest ones. max_disk_mb caps all the log files together (oldest segments deleted first; default 512, 0: no cap) |
 | `logs_store.max_disk_mb` | int |  |
 | `logs_store.object_storage` | object | Bifrost's logs_store.object_storage: the hybrid store's bucket (each row's payload fields go there, hybrid.tov) and where retained content goes (client.retain_content_in_object_storage) |
 | `logs_store.object_storage.type` | "s3" \| "gcs" |  |
@@ -1619,6 +1619,7 @@ Bifrost's server section; Raiju reads a2a_allow_private_push_callbacks (push cal
 | `server.idle_timeout_seconds` | number | a keep-alive connection with no request closes after this (default 60; 0 off) |
 | `server.body_timeout_seconds` | number | a request body may go this long without a byte (default 60; 0 off) |
 | `server.max_connections` | int | open connections per process (default three quarters of ulimit -n; -1 no cap) |
+| `server.max_buffered_body_mb` | int | request-body megabytes each process reads at once across requests (default 48; -1 no cap; bodybudget.tov) |
 | `server.webrtc_enabled` | bool | webrtc_enabled (Raiju's; Bifrost has no switch) turns on the WebRTC realtime and live calls the gateway terminates on its own peer (POST /v1/realtime/calls, POST /v1/realtime, POST /v1/live/sessions). |
 | `server.metrics_token` | string | Raiju's: when set (env.NAME allowed), /metrics answers only a request with "Authorization: Bearer <token>" (401 otherwise). Unset keeps Bifrost's open /metrics. |
 | `server.trusted_proxies` | string[] | Raiju's own (Bifrost believes no forwarding header): the addresses or CIDR ranges of the reverse proxies in front of the gateway. Only a request from one of them has its X-Forwarded-For / X-Real-IP taken as the client's address (clientip.tov), for the audit log and the sign-in throttle. Empty (the default): the TCP peer is the client. |
