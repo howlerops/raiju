@@ -2865,6 +2865,26 @@ def l97g_config(auth: bool) -> dict:
     return cfg
 
 
+def declared_status(port: int, path: str, total: int, headers: dict) -> int | None:
+    """The status a server answers to a POST that declares total bytes and sends none of them: for a refusal made on
+    the declared length (unread). Sending nothing avoids racing the server's close (a reset while the body is still
+    going out)."""
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    try:
+        conn.putrequest("POST", path)
+        conn.putheader("content-type", "application/json")
+        conn.putheader("content-length", str(total))
+        for k, v in headers.items():
+            conn.putheader(k, v)
+        conn.endheaders()
+        return conn.getresponse().status
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
 def declared_post(port: int, path: str, total: int) -> int | None:
     """A POST declaring a Content-Length of total bytes, sent in 64 KB pieces. A server that refuses on the declared
     length may answer and close before the body is all out, so a broken pipe while sending is expected; the status
@@ -13486,7 +13506,7 @@ def l201_e2e(env):
         hog = l196_open(18358, "/mcp", 50 * 1048576, {}, 5 * 1048576)
         time.sleep(0.5)
         s5, _, b5 = call("POST", "/v1/chat/completions", small, key, base=GW_L201, auth=False)
-        s6, _, _ = call("POST", "/v1/chat/completions", l196_chat(1048576).decode(), key, base=GW_L201, auth=False)
+        s6 = declared_status(18358, "/v1/chat/completions", 1048576, key)
         check("l201: while a stalled body holds the budget, a small POST is still served", s5 == 200, (s5, b5[:200]))
         check("l201: and a 1 MB POST is refused 503 until that body's deadline", s6 == 503, s6)
         code, head = l196_read(hog)
