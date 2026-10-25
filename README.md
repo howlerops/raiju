@@ -179,6 +179,10 @@ gateway process's memory, as dashboard sessions do.
   sign-in applies and the token opens nothing. `client.whitelisted_routes` stay open.
   In the deployments: `BIFROST_SETUP_TOKEN` in compose's `.env`, the chart's `setupToken.existingSecret`,
   or a `secret_arns` entry on ECS ([deploy/README.md](deploy/README.md)).
+- **Sign-in:** passwords are bcrypt hashes (Bifrost's form; old salted SHA-256 ones are replaced at the
+  next sign-in), unknown users cost the same time as real ones, and failed sign-ins are throttled per
+  account and per client address (429 with Retry-After; `server.sign_in_throttle`). Forwarding headers
+  are believed only from `server.trusted_proxies`. See [SECURITY.md](SECURITY.md#sign-in).
 - **Bind address:** 127.0.0.1 by default (Bifrost's `localhost`); `-host` or `BIFROST_HOST` change it.
   The image, compose, the chart and the Terraform modules pass `-host 0.0.0.0`.
 - **Metrics:** label values a caller chooses are bounded. A path no route serves (404, 405, 501), and

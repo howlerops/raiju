@@ -46,7 +46,7 @@ type QuotaRateUsage = { kind: string, used: f64, limit: f64 }
 type QuotaRate = { id: string, token_max_limit?: int, token_reset_duration?: string, request_max_limit?: int, request_reset_duration?: string, usage: QuotaRateUsage[], source_type?: string, source_id?: string, source_name?: string }
 // One per-model limit of a key in the quota view (Bifrost's quotaModelUsage); no provider means every provider.
 type QuotaModel = { model_name: string, provider?: string, budgets: QuotaBudget[], rate_limit?: QuotaRate }
-import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, required, roleAllows, isBuiltinRole, customRole, provisioned, disabledNamed, anyRoleId, userByEmail, systemRole, customRoles } from "./rbac"
+import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, takeUpgrades, THROTTLED, required, roleAllows, isBuiltinRole, customRole, provisioned, disabledNamed, anyRoleId, userByEmail, systemRole, customRoles } from "./rbac"
 import { DataScope, allScope, noScope, scopeOf, inScope } from "./scope"
 import { AuditEvent, AuditLog, actionFor, auditListJson, auditQueryOf, maskDetail, profileAuditJson } from "./audit"
 import { isCacheId } from "./cache"
@@ -80,6 +80,8 @@ import { resolveAll } from "./secrets"
 import { Field, fields, find, rawStr, rawBool, rawNum, isNull, elements, setField, build } from "./json"
 import { trimSlash } from "./providers/types"
 import { snapshot, errorJson, Hdrs, newId } from "./schemas"
+import { CLIENT_IP_HEADER, badProxyEntries } from "./clientip"
+import { addressKey, signInGuard } from "./signinguard"
 import { deadline } from "./deadline"
 import { secureHex, utf8, sha256, toHex } from "./crypto"
 import * as b64 from "./base64"
@@ -562,6 +564,19 @@ function badRequest(message: string): Reply {
 export const LOCKED_MESSAGE = "dashboard auth is not configured and no setup token is set; set setup_token in config.json (or the BIFROST_SETUP_TOKEN env var) and restart the gateway"
 
 // challenge is the WWW-Authenticate value of a 401 (the MCP authorization server's, when it is on).
+// A sign-in the throttle held back (signinguard.tov): 429 with Retry-After in seconds, unchecked.
+function throttled(seconds: int): Response {
+  const h: Record<string, string> = new Map()
+  h.set("content-type", "application/json")
+  h.set("retry-after", `${seconds}`)
+  return new Response(errorJson(THROTTLED, "rate_limit_error", undefined), { status: 429, headers: h })
+}
+
+// The client's address the server put on the request (clientip.tov), or "".
+function clientIp(req: Request): string {
+  return req.headers.get(CLIENT_IP_HEADER) ?? ""
+}
+
 function denied(status: int, message: string, challenge?: string): Response {
   const h: Record<string, string> = new Map()
   h.set("content-type", "application/json")
@@ -1367,6 +1382,10 @@ export class Ops {
     this.configureCluster(cfg.cluster)
     this.configureFeed(cfg.cluster)
     this.configureProxy(cfg.auth_proxy, cfg.oidc)
+    // the sign-in throttle and the proxies whose forwarding headers are believed (server.sign_in_throttle, trusted_proxies)
+    signInGuard().configure(cfg.server?.sign_in_throttle)
+    const badProxies = badProxyEntries(cfg.server?.trusted_proxies ?? [])
+    if (badProxies.length > 0) console.error(`raiju: server.trusted_proxies: ${badProxies.join(", ")} is not an address or CIDR range and matches nothing`)
     this.configureExports(cfg.log_exports)
     this.configureRetained()
     this.configureExporters(cfg.exporters ?? [])
@@ -1576,6 +1595,8 @@ export class Ops {
     if (ps.dir === "") ps.useDir(this.shareDir + "/a2a-push")
     // live sessions (who opened each one) and the UI socket's store updates
     this.liveSessions.share(this.shareDir + "/live")
+    // failed sign-ins, counted for the whole node
+    signInGuard().share(this.shareDir + "/signin")
     this.ui.setShare(this.shareDir + "/ui")
     try {
       mkdirSync(this.shareDir + "/metrics", { recursive: true })
@@ -2833,7 +2854,14 @@ export class Ops {
       if (this.authOn) return json(409, errorJson("the setup lock is not active", "invalid_request_error", undefined))
       const token = this.setupToken()
       const given = req.headers.get("x-bifrost-setup-token") ?? ""
-      if (token === "" || given !== token) return json(403, errorJson("invalid setup token", "invalid_request_error", undefined))
+      // guessing the token is throttled per client address, as password sign-ins are
+      const ipKeys: string[] = clientIp(req) === "" ? [] : [addressKey(clientIp(req))]
+      const wait = signInGuard().retryAfter(ipKeys, Date.now())
+      if (wait > 0) return throttled(wait)
+      if (!sameSecret(given, token)) {
+        signInGuard().fail(ipKeys, Date.now())
+        return json(403, errorJson("invalid setup token", "invalid_request_error", undefined))
+      }
       try {
         const s = try issueSetupSession(token, now)
         const secure = req.url.startsWith("https:") || (req.headers.get("x-forwarded-proto") ?? "") === "https"
@@ -2862,12 +2890,18 @@ export class Ops {
       }
       const hs: Map<string, string> = new Map()
       hs.set("authorization", "Basic " + b64.encode(utf8((who?.username ?? "") + ":" + (who?.password ?? ""))))
+      hs.set(CLIENT_IP_HEADER, clientIp(req))
       const id = authenticate(this.rbac, hs)
       // audited without the body, which holds the password
+      if (id.kind === "denied" && id.retry_after !== undefined) {
+        this.recordChange("unauthenticated", req, path, 429, "")
+        return throttled(id.retry_after ?? 1)
+      }
       if (id.kind !== "user") {
         this.recordChange("unauthenticated", req, path, 401, "")
         return json(401, errorJson("invalid username or password", "invalid_request_error", undefined))
       }
+      this.applyUpgrades()
       this.recordChange(id.name, req, path, 200, "")
       let token = ""
       try {
@@ -2925,7 +2959,7 @@ export class Ops {
     const m = req.method
     const now = Date.now()
     const si = agentSignIn()
-    const signInUsers = this.rbac.users.filter((u) => u.password_sha256 !== undefined && u.disabled !== true).length
+    const signInUsers = this.rbac.users.filter((u) => (u.password_hash !== undefined || u.password_sha256 !== undefined) && u.disabled !== true).length
     if (path === "/api/agent/auth/status") {
       if (m !== "GET") return json(405, errorJson("use GET", "invalid_request_error", undefined))
       return json(200, JSON.stringify({ idp_configured: signInUsers > 0 || this.oidcCfg !== undefined, virtual_key_auth_enabled: this.engine.gov.enforce }))
@@ -2956,10 +2990,20 @@ export class Ops {
       } else {
         const hs: Map<string, string> = new Map()
         hs.set("authorization", "Basic " + b64.encode(utf8((form.get("username") ?? "") + ":" + (form.get("password") ?? ""))))
+        hs.set(CLIENT_IP_HEADER, clientIp(req))
         const id = authenticate(this.rbac, hs)
         if (id.kind === "user") {
           const uc = this.rbac.users.find((x) => x.name === id.name)
           who = { user: id.name, role: id.role, email: uc?.email ?? "" }
+          this.applyUpgrades()
+        } else if (id.kind === "denied" && id.retry_after !== undefined) {
+          const secs = id.retry_after ?? 1
+          this.recordChange("unauthenticated", req, path, 429, "")
+          const th: Record<string, string> = new Map()
+          th.set("content-type", "text/html; charset=utf-8")
+          th.set("cache-control", "no-store")
+          th.set("retry-after", `${secs}`)
+          return new Response(signInPage(params, `Too many failed sign-in attempts. Try again in ${secs} seconds.`, sso, back), { status: 429, headers: th })
         }
       }
       if (who === undefined) {
@@ -5458,13 +5502,26 @@ export class Ops {
       }
     }
     if (path !== "/api/oidc/callback") return json(404, errorJson(`no route for ${path}`, "invalid_request_error", undefined))
+    // failed callbacks (a state or token that does not check out) are throttled per client address
+    const ipKeys: string[] = clientIp(req) === "" ? [] : [addressKey(clientIp(req))]
+    const wait = signInGuard().retryAfter(ipKeys, now)
+    if (wait > 0) {
+      const th: Record<string, string> = new Map()
+      th.set("content-type", "text/html; charset=utf-8")
+      th.set("cache-control", "no-store")
+      th.set("retry-after", `${wait}`)
+      return new Response(`<p>Too many failed sign-ins from this address. Try again in ${wait} seconds.</p>`, { status: 429, headers: th })
+    }
     const u = URL.parse(req.url)
     const params = u === undefined ? new URLSearchParams("") : u.searchParams
     const st = params.get("state") ?? ""
     const backTo = this.oidcReturn.get(st) ?? "/"
     this.oidcReturn.delete(st)
     const flow = this.flows.complete(st, now)
-    if (flow === undefined) return html(401, "<p>This sign-in link expired or was already used. <a href=\"/api/oidc/login\">Sign in again</a>.</p>")
+    if (flow === undefined) {
+      signInGuard().fail(ipKeys, now)
+      return html(401, "<p>This sign-in link expired or was already used. <a href=\"/api/oidc/login\">Sign in again</a>.</p>")
+    }
     const th: Map<string, string> = new Map()
     th.set("content-type", "application/x-www-form-urlencoded")
     th.set("accept", "application/json")
@@ -5485,7 +5542,10 @@ export class Ops {
     const jw = await getText(d.jwks_uri)
     if (jw.status !== 200) return html(502, "<p>Could not read the identity provider's signing keys.</p>")
     let v = verifyIdToken(idToken, jw.body, oc, d.issuer, flow.nonce, Date.now())
-    if (v.kind === "error") return html(401, `<p>Sign-in failed: ${v.message.replace("<", "&lt;")}</p>`)
+    if (v.kind === "error") {
+      signInGuard().fail(ipKeys, now)
+      return html(401, `<p>Sign-in failed: ${v.message.replace("<", "&lt;")}</p>`)
+    }
     // Keycloak puts its roles in the access token: its claims are the ones the mappings read
     if (oc.claims_token === "access_token") {
       const at = accessTokenClaims(accessToken, jw.body, oc, d.issuer, Date.now())
@@ -6024,9 +6084,11 @@ export class Ops {
     const v = authorize(this.rbac, snapshot(req.headers), req.method, path)
     if (v.kind === "ok") {
       if (v.actor.startsWith("key:")) this.keyUsed.set(v.actor.slice(4), rfc3339Of(Date.now()))
+      this.applyUpgrades()
       return { kind: "ok", actor: v.actor }
     }
     this.recordChange("unauthenticated", req, path, v.status, "")
+    if (v.status === 429) return { kind: "deny", res: throttled(v.retry_after ?? 1) }
     return { kind: "deny", res: denied(v.status, v.message) }
   }
 
@@ -6093,7 +6155,14 @@ export class Ops {
     if (want === "") return { kind: "deny", res: denied(403, LOCKED_MESSAGE) }
     const given = req.headers.get("x-bifrost-setup-token") ?? ""
     if (given !== "") {
-      if (!sameSecret(given, want)) return { kind: "deny", res: denied(403, "invalid setup token") }
+      // guesses are throttled per client address
+      const ipKeys: string[] = clientIp(req) === "" ? [] : [addressKey(clientIp(req))]
+      const wait = signInGuard().retryAfter(ipKeys, Date.now())
+      if (wait > 0) return { kind: "deny", res: throttled(wait) }
+      if (!sameSecret(given, want)) {
+        signInGuard().fail(ipKeys, Date.now())
+        return { kind: "deny", res: denied(403, "invalid setup token") }
+      }
       return { kind: "ok", actor: "setup-token" }
     }
     if (validSetupSession(cookieValue(req.headers.get("cookie") ?? "", SETUP_COOKIE), want, Date.now())) return { kind: "ok", actor: "setup-token" }
@@ -6187,13 +6256,23 @@ export class Ops {
     return g.kind === "deny" ? g.res : undefined
   }
 
+  // Saves the bcrypt hashes found for users who signed in with an old salted SHA-256 password (rbac.tov takeUpgrades).
+  applyUpgrades(): void {
+    const ups = takeUpgrades()
+    if (ups.length === 0) return
+    const r = this.store.upgradePasswords(ups)
+    if (r.kind === "error") console.error(`raiju: password upgrade not saved: ${r.message}`)
+  }
+
   recordChange(actor: string, req: Request, path: string, status: int, body: string): void {
     const log = this.audit
     const m = req.method
     if (log === undefined || m === "GET" || m === "HEAD" || m === "OPTIONS") return
     const q = path.indexOf("?")
     const a = actionFor(m, q < 0 ? path : path.slice(0, q))
-    const ip = req.headers.get("x-forwarded-for") ?? req.headers.get("x-real-ip") ?? undefined
+    // the client's address as the server resolved it: the TCP peer, or what a trusted proxy forwarded (clientip.tov)
+    const ip0 = clientIp(req)
+    const ip = ip0 === "" ? undefined : ip0
     const detail = maskDetail(body)
     try {
       // omit_ip_addresses: the event keeps no client address
@@ -6574,7 +6653,7 @@ export class Ops {
     // Bifrost's setup gate: while no admin exists, the first account needs the operator's setup_token, given
     // as the header or as a setup session from POST /api/session/setup
     const want = this.setupToken()
-    if (method === "POST" && !this.authOn && want !== "" && setupToken !== want && !validSetupSession(setupSession, want, Date.now())) {
+    if (method === "POST" && !this.authOn && want !== "" && !sameSecret(setupToken, want) && !validSetupSession(setupSession, want, Date.now())) {
       return { status: 403, body: errorJson("the setup token is required to create the first admin account", "invalid_request_error", undefined), contentType: "application/json" }
     }
     // only stored users are managed here; legacy auth_config credentials stay in the config

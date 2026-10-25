@@ -1,5 +1,5 @@
 #!/bin/sh
-# Checks patches 0001-0010, 0012, 0013, 0015 and 0016 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
+# Checks patches 0001-0010, 0012, 0013, 0015, 0016 and 0017 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
 # (or `make tov-test`). Each program prints "ok" lines and "FAIL" lines; a run passes when no line
 # fails and the expected number of "ok" lines appears.
 set -eu
@@ -160,5 +160,10 @@ FB_PORT=$(sed -n 's/^listening //p' "$OUT/fetch_buffer.port") "$OUT/fetch_buffer
 kill $SRV 2>/dev/null || true
 SRV=""
 expect "$OUT/fetch_buffer.out" 3 "fetch input buffer"
+
+# server.requestIP on Bun.serve (patch 0017)
+TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/request_ip.tov" -o "$OUT/request_ip" >/dev/null
+"$OUT/request_ip" > "$OUT/request_ip.out"
+expect "$OUT/request_ip.out" 4 "server.requestIP"
 
 echo "tov-patches tests passed"

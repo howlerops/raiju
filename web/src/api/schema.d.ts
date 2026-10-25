@@ -8405,6 +8405,17 @@ export interface operations {
                     "application/json": components["schemas"]["ManagementErrorResponse"];
                 };
             };
+            /** @description Too many failed sign-ins from this client address (HTML) */
+            429: {
+                headers: {
+                    /** @description Seconds to wait before the next attempt. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
             /** @description An upstream dependency failed. */
             502: {
                 headers: {
@@ -8506,6 +8517,17 @@ export interface operations {
             /** @description The caller's role or data access scope does not cover this route. */
             403: {
                 headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Too many failed sign-in attempts for this account or from this client address (server.sign_in_throttle): the attempt was not checked. */
+            429: {
+                headers: {
+                    /** @description Seconds to wait before the next attempt. */
+                    "Retry-After"?: number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -8634,6 +8656,17 @@ export interface operations {
             /** @description The credentials were refused; the form again (HTML) */
             401: {
                 headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+            /** @description Too many failed sign-in attempts for this account or from this client address: the form again, with the wait (HTML) */
+            429: {
+                headers: {
+                    /** @description Seconds to wait before the next attempt. */
+                    "Retry-After"?: number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -20596,6 +20629,17 @@ export interface operations {
                 };
                 content: {
                     "application/json": Record<string, never>;
+                };
+            };
+            /** @description Too many wrong setup tokens from this client address: the token was not checked. */
+            429: {
+                headers: {
+                    /** @description Seconds to wait before the next attempt. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
                 };
             };
         };

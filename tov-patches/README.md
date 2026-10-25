@@ -15,6 +15,7 @@ Patch 0012 (server lifecycle) changes the HTTP server in `runtime/tov.c` and `st
 Patch 0013 (fetch address policy) changes the fetch code in `runtime/tov.c` and `std/http.tov` (and `fetchStart`'s signature, also called from `runtime/node.c`), and is written on top of 0001-0012.
 Patch 0015 (client certificates, `Request.signal`, gunzip) changes fetch, sockets and the server (and `fetchStart`'s and `netConnect`'s signatures), and is written on top of 0001-0013.
 Patch 0016 (fetch input buffer) changes the fetch connection reads in `runtime/tov.c` and is written on top of 0001-0013 and 0015.
+Patch 0017 (`server.requestIP`) changes the HTTP server in `runtime/tov.c` and `Request`/`Server` in `std/http.tov`, and is written on top of 0001-0016.
 
 ## Submitting upstream
 
@@ -744,3 +745,26 @@ goes back to the pool keeps a buffer of 16 KB at most, as before.
 allocated per open stream fell by 48 KB. The test (`tests/fetch_buffer.tov` with `tests/fetch_buffer_server.py`,
 3 checks: a 40 KB response head, a 100 KB chunk with a split size line, 2,000 small events read as a stream) is
 in `run.sh`. Written on top of 0001-0013 and 0015.
+
+## 0017 — `server.requestIP(req)` on `Bun.serve`
+
+**Problem.** A `Bun.serve` handler could not learn the client's address: Tov's `Server` had no `requestIP`, so a
+program could not tell a forwarding header written by a trusted proxy from one written by the client, and could not
+key a brute-force throttle or an audit record on the real peer. Raiju's own http1 server had the address (its
+sockets' `remoteAddress`); the default server did not.
+
+**API (as in Bun).** `server.requestIP(req)` returns `{ address, family, port }` (`family` is `"IPv4"` or
+`"IPv6"`) for a request the server received, and `undefined` for a request the program built.
+
+**Design.** The connection keeps the peer's address, read with `getpeername` the first time a request on it asks
+(`tv_http_conn.peer`, `peer_port`); the native `httpPeer(which)` reads it for the request being handled. A request
+from the wire records the address and port when it is filled in (`Request.wire`), so `requestIP` works after an
+`await` too, and in `routes` handlers.
+
+**Files.** `runtime/tov.c`, `runtime/tov.h`: `tv_native_httpPeer`, the connection fields.
+`crates/tov/src/check/builtins.rs`: the native's signature. `crates/tov/src/std/http.tov`: `Request.peer`,
+`Server.requestIP`, `SocketAddress`. `docs/spec.md`.
+
+**Test.** `tests/request_ip.tov` (4 checks: the fetch handler after an await, the client's port, a request built in
+the program, a routes handler) is in `run.sh`. Used by Raiju for `server.trusted_proxies` and the sign-in throttle
+(L198).

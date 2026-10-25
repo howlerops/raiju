@@ -89,6 +89,14 @@ each process's open connections (default: three quarters of its descriptor limit
 -1 for no cap): a request on a connection past it is answered 503, and so is a connection that
 comes when the process is out of descriptors. 0 turns a timeout off. These keys are read at start.
 
+## Behind a proxy or ingress
+
+The audit log and the sign-in throttle use the client's address. Raiju believes `X-Forwarded-For` and
+`X-Real-IP` only from the proxies in `server.trusted_proxies` (addresses or CIDR ranges). Behind a load
+balancer, an ingress controller or the ECS ALB, list its addresses (for a cluster, the pod or node range the
+ingress runs in), or every request is seen as coming from the proxy: the audit log then names the proxy, and
+failed sign-ins from all clients count against one address (`server.sign_in_throttle.ip_failures`, 20 an hour).
+
 ## AWS credentials from the workload
 
 A Bedrock key with neither an API key (`value`) nor `access_key`/`secret_key`, and Vertex's

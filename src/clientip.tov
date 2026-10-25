@@ -1,0 +1,112 @@
+// The address of the client behind a request, for the audit log and the sign-in throttle. The TCP peer is the
+// client unless it is one of server.trusted_proxies (addresses or CIDR ranges): only then are X-Forwarded-For and
+// X-Real-IP believed. Bifrost logs X-Forwarded-For apart from the real peer (http.forwarded_for beside
+// http.remote_addr) for the same reason: the header is whatever the caller wrote.
+import { parseIP, formatIP, allowListed } from "./netguard"
+
+// The resolved address rides on the request in this header, set by the server and never taken from the client
+// (front.tov and server.tov drop a value the client sent).
+export const CLIENT_IP_HEADER = "x-raiju-client-ip"
+
+// An address as written in a forwarding header ("1.2.3.4", "1.2.3.4:5678", "[::1]:80", "::1"), canonical, or "".
+export function addressOf(raw: string): string {
+  let t = raw.trim()
+  if (t.startsWith("[")) {
+    const end = t.indexOf("]")
+    if (end < 0) return ""
+    t = t.slice(1, end)
+  } else {
+    // one colon is an IPv4 address with a port; more is IPv6
+    const c = t.indexOf(":")
+    if (c >= 0 && t.slice(c + 1).indexOf(":") < 0) t = t.slice(0, c)
+  }
+  // only the plain forms: inet_aton's shorthand ("10", "0x7f.1") is not an address a proxy writes
+  if (!t.includes(":") && t.split(".").length !== 4) return ""
+  const b = parseIP(t)
+  return b === undefined ? "" : formatIP(b)
+}
+
+function trustedAddr(a: string, trusted: string[]): bool {
+  if (a === "" || trusted.length === 0) return false
+  const b = parseIP(a)
+  return b !== undefined && allowListed(a, b, trusted)
+}
+
+// The client's address. peer is the TCP peer (server.requestIP, or the http1 socket's remote address), xff and
+// realIp the X-Forwarded-For and X-Real-IP headers. With a trusted peer, X-Forwarded-For is read from the right:
+// trusted hops are skipped and the first address that is not trusted is the client (when every hop is trusted, the
+// leftmost); an entry that is not an address stops the walk at the hop that wrote it. X-Real-IP is used when the
+// trusted peer sent no X-Forwarded-For.
+export function clientAddress(peer: string, xff: string, realIp: string, trusted: string[]): string {
+  const p = addressOf(peer)
+  if (!trustedAddr(p, trusted)) return p
+  if (xff.trim() !== "") {
+    const hops = xff.split(",")
+    let last = p
+    for (let i = hops.length - 1; i >= 0; i--) {
+      const a = addressOf(hops[i]!)
+      if (a === "") return last
+      if (!trustedAddr(a, trusted)) return a
+      last = a
+    }
+    return last
+  }
+  const r = addressOf(realIp)
+  return r === "" ? p : r
+}
+
+// The entries of server.trusted_proxies that are neither an address nor a CIDR range (they match nothing).
+export function badProxyEntries(trusted: string[]): string[] {
+  const out: string[] = []
+  for (const e of trusted) {
+    const slash = e.indexOf("/")
+    const addr = slash >= 0 ? e.slice(0, slash) : e
+    const bits = slash >= 0 ? parseInt(e.slice(slash + 1)) : 0
+    const max = addr.includes(":") ? 128 : 32
+    if (parseIP(addr.trim()) === undefined || bits === undefined || bits < 0 || bits > max) out.push(e)
+  }
+  return out
+}
+
+// ---- tests ----
+
+test("an address from a forwarding header: ports and brackets dropped, canonical, junk refused", () => {
+  expect(addressOf("1.2.3.4")).toBe("1.2.3.4")
+  expect(addressOf(" 1.2.3.4:5678 ")).toBe("1.2.3.4")
+  expect(addressOf("[::1]:80")).toBe("0:0:0:0:0:0:0:1")
+  expect(addressOf("2001:db8::7")).toBe("2001:db8:0:0:0:0:0:7")
+  expect(addressOf("::ffff:10.0.0.9")).toBe("10.0.0.9")
+  expect(addressOf("unknown")).toBe("")
+  expect(addressOf("10")).toBe("")
+  expect(addressOf("")).toBe("")
+  expect(addressOf("[::1")).toBe("")
+})
+
+test("forwarding headers count only when the peer is a trusted proxy", () => {
+  // no trusted proxies (the default): the peer, whatever the headers say
+  expect(clientAddress("127.0.0.1", "10.9.8.7", "10.1.1.1", [])).toBe("127.0.0.1")
+  expect(clientAddress("::ffff:203.0.113.5", "10.9.8.7", "", [])).toBe("203.0.113.5")
+  // a peer that is not trusted
+  expect(clientAddress("198.51.100.2", "10.9.8.7", "", ["10.0.0.0/8"])).toBe("198.51.100.2")
+  // a trusted peer: the client it names
+  expect(clientAddress("10.0.0.2", "203.0.113.9", "", ["10.0.0.0/8"])).toBe("203.0.113.9")
+  // a client that forges an entry: the walk stops at the first untrusted hop from the right
+  expect(clientAddress("10.0.0.2", "1.1.1.1, 203.0.113.9, 10.0.0.3", "", ["10.0.0.0/8"])).toBe("203.0.113.9")
+  // every hop trusted: the leftmost
+  expect(clientAddress("10.0.0.2", "10.0.0.7, 10.0.0.3", "", ["10.0.0.0/8"])).toBe("10.0.0.7")
+  // a hop that is not an address: the hop that wrote it
+  expect(clientAddress("10.0.0.2", "203.0.113.9, garbage", "", ["10.0.0.0/8"])).toBe("10.0.0.2")
+  // X-Real-IP from a trusted peer without X-Forwarded-For
+  expect(clientAddress("10.0.0.2", "", "203.0.113.4", ["10.0.0.2"])).toBe("203.0.113.4")
+  expect(clientAddress("10.0.0.2", "", "nonsense", ["10.0.0.2"])).toBe("10.0.0.2")
+  // IPv6 proxies and loopback
+  expect(clientAddress("::1", "2001:db8::5", "", ["::1/128"])).toBe("2001:db8:0:0:0:0:0:5")
+  expect(clientAddress("127.0.0.1", "203.0.113.9", "", ["127.0.0.1"])).toBe("203.0.113.9")
+  // no peer (a request the program made)
+  expect(clientAddress("", "203.0.113.9", "", ["0.0.0.0/0"])).toBe("")
+})
+
+test("trusted_proxies entries that are not addresses or ranges are reported", () => {
+  expect(badProxyEntries(["10.0.0.0/8", "::1", "192.168.1.5", "fd00::/8"]).length).toBe(0)
+  expect(badProxyEntries(["ingress", "10.0.0.0/33", "10.0.0.0/x", "::/129"])).toEqual(["ingress", "10.0.0.0/33", "10.0.0.0/x", "::/129"])
+})

@@ -51,6 +51,27 @@ sockets) are not checked by the runtime: A2A agents called over gRPC are checked
 (the rebinding window stays open there), and Redis or Valkey vector stores and realtime WebSocket connections to
 providers are not checked.
 
+## Sign-in
+
+- **Passwords** are stored as bcrypt hashes (cost 10, Bifrost's form: `governance.users[].password_hash`, and
+  `auth_config.admin_password` is hashed in memory unless it is already a bcrypt hash). A user still holding the
+  old salted SHA-256 form (`salt` + `password_sha256`) signs in with it once and gets a bcrypt hash saved in its
+  place. A password checked once is remembered in the process for ten minutes (by an HMAC with a per-process key),
+  so Basic credentials on every request cost one bcrypt run; a wrong password is never remembered.
+- **Unknown users** are checked against a dummy hash, so a sign-in takes as long whether or not the account exists.
+- **Brute force:** failed sign-ins are counted per account name and per client address, for the whole node (the
+  workers share the counts): past `server.sign_in_throttle.account_failures` (5) or `ip_failures` (20) failures
+  within an hour, each attempt waits twice as long as the last (1 s up to `max_backoff_seconds`, 900) and is
+  answered 429 with Retry-After without being checked. This covers the dashboard login, Basic credentials on `/api`
+  and on inference (per account only there), the CLI's agent sign-in, the setup token and failed OIDC callbacks (the
+  last two per address).
+  Unknown names are counted like real ones. A lock that someone else caused does not cut off a client whose
+  password the process verified lately. Counts are per node: several replicas each allow their own.
+- **Client addresses:** the audit log and the throttle use the TCP peer. `X-Forwarded-For` and `X-Real-IP` are read
+  only from the proxies listed in `server.trusted_proxies` (addresses or CIDR ranges), from the right, skipping
+  trusted hops. Behind a load balancer or ingress, list its addresses, or every client shares the proxy's address
+  (and its throttle count).
+
 ## Plugins
 
 WebAssembly plugins see every request and response that passes through the chain. A plugin whose `path` is a URL:

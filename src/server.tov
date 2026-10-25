@@ -36,6 +36,7 @@ import { realtimeCall, realtimeMint } from "./realtimecalls"
 import { MINT_ROUTES } from "./rtsession"
 import { sdkRoute, anthropicSdk } from "./anthropic_batch"
 import { snapshot, errorJson, Hdrs, newId } from "./schemas"
+import { CLIENT_IP_HEADER, clientAddress } from "./clientip"
 import { handleApi, proxyWidening, Result, randomId, rotatedKeyIds, isRotatePath, providerBaseUrlProblem } from "./store"
 import { scimAuthorized, scimHandle, errorBody, ScimState, SCIM_CONTENT_TYPE } from "./scim"
 import { deprovisioned } from "./provision"
@@ -1834,6 +1835,30 @@ export function http1Upgrade(engine: Engine, ops: Ops, req: Request, accept: (pr
   return true
 }
 
+// The client's address for a request to this path (clientip.tov), or "" when the route does not read it: the
+// management API, its sign-in routes and the audit log are under /api/. peer is the TCP peer; the forwarding headers
+// count only from server.trusted_proxies.
+export function clientIpFor(engine: Engine, path: string, peer: string, h: Map<string, string>): string {
+  if (!path.startsWith("/api/")) return ""
+  return clientAddress(peer, h.get("x-forwarded-for") ?? "", h.get("x-real-ip") ?? "", engine.cfg.server?.trusted_proxies ?? [])
+}
+
+// The request with CLIENT_IP_HEADER set from the TCP peer where the route reads it, and without the value a client
+// sent (Bun.serve: the request is rebuilt only then; its body passes on as a stream, unread).
+export function withClientIp(engine: Engine, req: Request, peer: string): Request {
+  const u = URL.parse(req.url)
+  const p = u === undefined ? "" : u.pathname
+  const sent = req.headers.get(CLIENT_IP_HEADER) !== undefined
+  if (!p.startsWith("/api/") && !sent) return req
+  let hs: Record<string, string> = snapshot(req.headers)
+  const ip = clientIpFor(engine, p, peer, hs)
+  hs.delete(CLIENT_IP_HEADER)
+  if (ip !== "") hs.set(CLIENT_IP_HEADER, ip)
+  const b = req.method === "GET" || req.method === "HEAD" ? undefined : req.body
+  if (b === undefined) return new Request(req.url, { method: req.method, headers: hs })
+  return new Request(req.url, { method: req.method, headers: hs, body: b })
+}
+
 // One HTTP request on the Bun.serve server: the body limit, then the streamed or whole route.
 // The promise as it is. An async call awaited in place has its frame laid out inside the caller's frame, which
 // lives as long as the request (a stream's whole length); a call passed through here is its own allocation,
@@ -1940,7 +1965,8 @@ export function start(engine: Engine, ops: Ops, opts: ServeOptions): Served {
         if (server.upgrade(req0, { data: wu.session, headers: uh })) return
         return errorResponse(426, "connect with a WebSocket upgrade", "invalid_request_error", noHeaders())
       }
-      return bunHttp(engine, ops, req0, bodyLimits(engine).limit)
+      const peer = server.requestIP(req0)
+      return bunHttp(engine, ops, withClientIp(engine, req0, peer === undefined ? "" : peer.address), bodyLimits(engine).limit)
     },
     websocket: {
       open: (ws) => {

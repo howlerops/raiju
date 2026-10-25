@@ -15960,6 +15960,134 @@ def l194_e2e(env):
         srv.shutdown()
 
 
+GW_L198 = "http://127.0.0.1:18352"  # sign-in hardening: throttled sign-ins, bcrypt hashes and their upgrade, the audit address without trusted proxies
+GW_L198P = "http://127.0.0.1:18353"  # the same behind a trusted proxy: forwarded addresses drive the setup-token throttle and the audit log
+
+# bcrypt of "pw" at cost 4 (golang.org/x/crypto/bcrypt), the form Bifrost writes
+L198_BCRYPT_PW = "$2a$04$0NhAjYqchBfgl769k3bJwO" + "ltn8uAyH5ZpyMvh4NrJHoHsJG4RUjAG"
+
+
+def l198_e2e(env):
+    """L198: failed sign-ins are throttled per account and per client address (429 with Retry-After, on the dashboard
+    login, Basic credentials, the CLI's agent sign-in and the setup token), unknown names are throttled like real ones,
+    an old salted SHA-256 password signs in once and is saved back as a bcrypt hash, bcrypt hashes (Bifrost's form)
+    sign in, and X-Forwarded-For is believed only from server.trusted_proxies (the audit log and the throttle's key).
+    Its own gateways (18352, and 18353 behind a trusted proxy)."""
+    import hashlib, base64 as _b64, urllib.parse as _up
+    audit_a = os.path.join(BUILD, "e2e-l198-audit-a")
+    audit_b = os.path.join(BUILD, "e2e-l198-audit-b")
+    import shutil
+    shutil.rmtree(audit_a, ignore_errors=True)
+    shutil.rmtree(audit_b, ignore_errors=True)
+    throttle = {"account_failures": 3, "ip_failures": 9, "max_backoff_seconds": 2}
+    base = {"client": {"enable_logging": False, "enforce_auth_on_inference": False}, "alerts": {"enabled": False},
+            "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False}}
+    cfg_a = {**base, "audit": {"enabled": True, "dir": audit_a, "key": "e2e-l198-audit"},
+             "server": {"sign_in_throttle": throttle},
+             "governance": {"users": [
+                 {"name": "ana", "role": "viewer", "salt": "s198", "password_sha256": hashlib.sha256("s198:pw-ana-198".encode()).hexdigest()},
+                 {"name": "bo", "role": "editor", "password_hash": L198_BCRYPT_PW},
+                 {"name": "cy", "role": "viewer", "password_hash": L198_BCRYPT_PW},
+                 {"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l198".encode()).hexdigest()}]}}
+    cfg_b = {**base, "audit": {"enabled": True, "dir": audit_b, "key": "e2e-l198-audit"},
+             "server": {"trusted_proxies": ["127.0.0.1", "::1"], "sign_in_throttle": {**throttle, "ip_failures": 3}}}
+    path_a = os.path.join(BUILD, "e2e.l198.json")
+    path_b = os.path.join(BUILD, "e2e.l198p.json")
+    json.dump(cfg_a, open(path_a, "w"))
+    json.dump(cfg_b, open(path_b, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18352", "-host", "127.0.0.1", "-config", path_a, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l198.log"), "w"))
+    gwp = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18353", "-host", "127.0.0.1", "-config", path_b, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l198p.log"), "w"))
+    root = {"authorization": "Bearer sk-admin-l198"}
+
+    def login(user, pw, headers=None, base=GW_L198):
+        return call("POST", "/api/session/login", {"username": user, "password": pw}, headers, base=base, auth=False)
+
+    def basic(user, pw):
+        return {"authorization": "Basic " + _b64.b64encode(f"{user}:{pw}".encode()).decode()}
+
+    def hdr(h, name):
+        for k, v in (h or {}).items():
+            if k.lower() == name:
+                return v
+        return None
+
+    def users_on_disk():
+        return {u["name"]: u for u in json.load(open(path_a)).get("governance", {}).get("users", [])}
+
+    try:
+        wait(GW_L198 + "/health")
+        wait(GW_L198P + "/health")
+
+        # ---- an old salted SHA-256 password signs in once and is saved back as bcrypt ----
+        s, _, b = login("ana", "pw-ana-198", {"x-forwarded-for": "10.9.8.7"})
+        check("l198: an old salted SHA-256 password still signs in", s == 200 and json.loads(b).get("username") == "ana", (s, b[:200]))
+        ana = users_on_disk().get("ana", {})
+        check("l198: the old hash is replaced by a bcrypt hash in config.json at that sign-in",
+              ana.get("password_hash", "").startswith("$2a$10$") and "password_sha256" not in ana and "salt" not in ana, ana)
+        s, _, b = login("ana", "pw-ana-198")
+        check("l198: the upgraded password signs in", s == 200, (s, b[:200]))
+        s, _, b = login("ana", "pw-ana-19")
+        check("l198: a wrong password is refused after the upgrade", s == 401, (s, b[:200]))
+
+        # ---- the audit address: the TCP peer, since no proxy is trusted ----
+        s, _, b = call("GET", "/api/audit-logs?limit=100", None, root, base=GW_L198, auth=False)
+        ev = [e for e in json.loads(b).get("events", []) if "/api/session/login" in json.dumps(e)] if s == 200 else []
+        check("l198: without trusted_proxies the audit log keeps the peer's address, not a forged X-Forwarded-For",
+              s == 200 and ev and "10.9.8.7" not in b and all(e.get("ip") == "127.0.0.1" for e in ev), (s, b[:400]))
+
+        # ---- an account is throttled after its free failures; a bcrypt hash (Bifrost's form) signs in ----
+        codes = [login("bo", f"wrong-{i}")[0] for i in range(3)]
+        s, h, b = login("bo", "pw")
+        check("l198: after 3 failures the account answers 429 with Retry-After, even to the right password",
+              codes == [401, 401, 401] and s == 429 and hdr(h, "retry-after") == "1" and "too many failed sign-in attempts" in b, (codes, s, h, b[:200]))
+        time.sleep(1.2)
+        s, _, b = login("bo", "pw")
+        check("l198: once the wait is over the right password signs in, by its bcrypt hash (Bifrost's form)", s == 200 and json.loads(b).get("role") == "editor", (s, b[:200]))
+        s, _, _ = call("GET", "/api/providers", None, basic("bo", "nope"), base=GW_L198, auth=False)
+        check("l198: Basic credentials on the management API are checked by the same rules", s == 401, s)
+
+        # ---- an unknown name is throttled the same way ----
+        codes = [login("ghost", f"g-{i}")[0] for i in range(3)]
+        s, h, _ = login("ghost", "g-3")
+        check("l198: an unknown name is throttled like a real account (no hint that it does not exist)",
+              codes == [401, 401, 401] and s == 429 and hdr(h, "retry-after") == "1", (codes, s, h))
+
+        # ---- the CLI's agent sign-in counts too; the client address locks every account ----
+        q = _up.urlencode({"client_id": "bifrost-cli", "redirect_uri": "http://127.0.0.1:18399/callback", "state": "st-198",
+                           "code_challenge": _b64.urlsafe_b64encode(hashlib.sha256(b"v" * 43).digest()).decode().rstrip("="), "code_challenge_method": "S256"})
+        s, _, b = raw("POST", GW_L198 + "/api/agent/auth/authorize", q + "&username=dee&password=nope")
+        check("l198: a failed agent sign-in shows the form again", s == 401 and "Invalid username or password" in b, (s, b[:200]))
+        # the address has 9 failures now: a user not seen before is held back, whatever X-Forwarded-For claims
+        s, h, b = login("cy", "pw", {"x-forwarded-for": "198.51.100.9", "x-raiju-client-ip": "198.51.100.10"})
+        check("l198: after 9 failures from one address every account waits, and a forged X-Forwarded-For (or the gateway's own client-address header) does not get around it",
+              s == 429 and hdr(h, "retry-after") is not None, (s, h, b[:200]))
+        s, h, b = raw("POST", GW_L198 + "/api/agent/auth/authorize", q + "&username=cy&password=pw")
+        check("l198: the agent sign-in answers 429 with Retry-After and the form", s == 429 and h.get("retry-after") is not None and 'name="password"' in b, (s, dict(h or {}), b[:200]))
+        # a password this gateway verified lately still works for its client while the address waits
+        s, _, b = login("bo", "pw")
+        check("l198: a client whose password was verified lately is not cut off by a lock others caused", s == 200, (s, b[:200]))
+
+        # ---- behind a trusted proxy: X-Forwarded-For names the client, for the throttle and the audit log ----
+        codes = [call("GET", "/api/providers", None, {"x-bifrost-setup-token": f"wrong-{i}", "x-forwarded-for": "203.0.113.50"}, base=GW_L198P, auth=False)[0] for i in range(3)]
+        s, h, _ = call("GET", "/api/providers", None, {"x-bifrost-setup-token": E2E_SETUP, "x-forwarded-for": "203.0.113.50"}, base=GW_L198P, auth=False)
+        check("l198: wrong setup tokens are throttled per client address (429 with Retry-After, the token unchecked)",
+              codes == [403, 403, 403] and s == 429 and hdr(h, "retry-after") is not None, (codes, s, h))
+        s, _, _ = call("GET", "/api/providers", None, {"x-bifrost-setup-token": "wrong-x", "x-forwarded-for": "203.0.113.51"}, base=GW_L198P, auth=False)
+        check("l198: another client behind the trusted proxy is not held back", s == 403, s)
+        codes = [call("POST", "/api/session/setup", None, {"x-bifrost-setup-token": f"bad-{i}", "x-forwarded-for": "203.0.113.52"}, base=GW_L198P, auth=False)[0] for i in range(3)]
+        s, h, _ = call("POST", "/api/session/setup", None, {"x-bifrost-setup-token": "bad-3", "x-forwarded-for": "203.0.113.52"}, base=GW_L198P, auth=False)
+        check("l198: POST /api/session/setup is throttled the same way", codes == [403, 403, 403] and s == 429 and hdr(h, "retry-after") is not None, (codes, s, h))
+        s, _, b = call("POST", "/api/users", {"name": "first", "role": "admin"}, {"x-bifrost-setup-token": E2E_SETUP, "x-forwarded-for": "198.51.100.1, 203.0.113.7"}, base=GW_L198P, auth=False)
+        tok = json.loads(b).get("token", "") if s == 201 else ""
+        s2, _, b2 = call("GET", "/api/audit-logs?limit=100", None, {"authorization": "Bearer " + tok}, base=GW_L198P, auth=False)
+        ev = [e for e in json.loads(b2).get("events", []) if "/api/users" in json.dumps(e)] if s2 == 200 else []
+        check("l198: with trusted_proxies the audit log keeps the client the proxy names (the rightmost untrusted hop)",
+              s == 201 and s2 == 200 and ev and all(e.get("ip") == "203.0.113.7" for e in ev) and "198.51.100.1" not in b2, (s, b[:200], s2, b2[:400]))
+    finally:
+        gw.terminate()
+        gwp.terminate()
+
+
 def main():
     unique_ports()
     build()
@@ -18451,6 +18579,9 @@ def main():
         # L194: Hugging Face inference providers (chat, embeddings, speech, transcription, images), the CLI's agent sign-in
         # and default key, and the A2A v0.3 REST client: its own gateway (18344) and Hugging Face double (18345)
         l194_e2e(env)
+        # L198: sign-in throttling (429 with Retry-After) per account and per address, bcrypt hashes and the upgrade of old
+        # ones, X-Forwarded-For only from trusted_proxies: its own gateways (18352, 18353)
+        l198_e2e(env)
         # L189: lifecycle follow-ups (WebSocket and realtime sessions drained at a stop with 1001, the write-stall timeout,
         # broker mode's graceful stop): its own gateways and broker, one after the other (18334)
         l189_e2e(env)

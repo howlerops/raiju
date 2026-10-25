@@ -9,7 +9,7 @@ for each element of a list. Descriptions are the comments in the source; default
 has one. The command-line flags (`-app-dir`, `-config`, `-host`, `-port`, `-workers`, `-server`, `-mode`,
 `-healthcheck`) are in the README.
 
-1358 keys (557 with a description), and 38 Bifrost keys read through config_compat.
+1365 keys (564 with a description), and 38 Bifrost keys read through config_compat.
 
 ## Sections
 
@@ -331,6 +331,7 @@ Virtual keys, budgets, rate limits, teams, customers, users, roles, routing rule
 | `governance.users[].email` | string | the user's email address (Bifrost's users carry one; unique, compared without case) |
 | `governance.users[].role` | string | a built-in role (admin, editor, viewer, auditor) or the name of a custom role under governance.roles |
 | `governance.users[].token_sha256` | string |  |
+| `governance.users[].password_hash` | string | the password as a bcrypt hash ($2a$/$2b$/$2y$, Bifrost's form); password_sha256 with salt is the old form, read and replaced by password_hash at the user's next sign-in |
 | `governance.users[].password_sha256` | string |  |
 | `governance.users[].salt` | string |  |
 | `governance.users[].disabled` | bool |  |
@@ -1620,6 +1621,12 @@ Bifrost's server section; Raiju reads a2a_allow_private_push_callbacks (push cal
 | `server.max_connections` | int | open connections per process (default three quarters of ulimit -n; -1 no cap) |
 | `server.webrtc_enabled` | bool | webrtc_enabled (Raiju's; Bifrost has no switch) turns on the WebRTC realtime and live calls the gateway terminates on its own peer (POST /v1/realtime/calls, POST /v1/realtime, POST /v1/live/sessions). |
 | `server.metrics_token` | string | Raiju's: when set (env.NAME allowed), /metrics answers only a request with "Authorization: Bearer <token>" (401 otherwise). Unset keeps Bifrost's open /metrics. |
+| `server.trusted_proxies` | string[] | Raiju's own (Bifrost believes no forwarding header): the addresses or CIDR ranges of the reverse proxies in front of the gateway. Only a request from one of them has its X-Forwarded-For / X-Real-IP taken as the client's address (clientip.tov), for the audit log and the sign-in throttle. Empty (the default): the TCP peer is the client. |
+| `server.sign_in_throttle` | object | Raiju's sign-in throttle (signinguard.tov): past the free failures within an hour, each attempt waits twice as long as the last (1 s, 2 s, 4 s, ...), answered 429 with Retry-After and not checked. On by default. |
+| `server.sign_in_throttle.enabled` | bool | false turns the throttle off (default true) |
+| `server.sign_in_throttle.account_failures` | int | free failed sign-ins per account name within an hour (default 5) |
+| `server.sign_in_throttle.ip_failures` | int | free failed sign-ins per client address within an hour (default 20) |
+| `server.sign_in_throttle.max_backoff_seconds` | int | the longest wait (default 900) |
 
 ## feature_flags
 

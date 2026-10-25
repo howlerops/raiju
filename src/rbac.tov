@@ -5,6 +5,9 @@ import { sha256, toHex, utf8, secureHex } from "./crypto"
 import { decode, encode } from "./base64"
 import { rfc3339Ms } from "./vkexpiry"
 import { AdminAuthConfig, AdminUserConfig, ApiKeyConfig, PermissionPair, RoleConfig } from "./config"
+import { bcryptHash, bcryptVerify, checked, isBcrypt, spendVerify } from "./passhash"
+import { accountKey, addressKey, signInGuard } from "./signinguard"
+import { CLIENT_IP_HEADER } from "./clientip"
 
 // A built-in role (admin, editor, viewer, auditor) or the name of a custom role under governance.roles.
 export type Role = string
@@ -13,11 +16,12 @@ export type UserConfig = AdminUserConfig
 
 export type RbacConfig = { users: UserConfig[], roles?: RoleConfig[], api_keys?: ApiKeyConfig[] }
 
-export type Identity = { kind: "user", name: string, role: Role } | { kind: "anonymous" } | { kind: "denied", reason: string }
+// retry_after (seconds) on a denial: the sign-in throttle (signinguard.tov) held the attempt back unchecked.
+export type Identity = { kind: "user", name: string, role: Role } | { kind: "anonymous" } | { kind: "denied", reason: string, retry_after?: int }
 
 export type Permission = "read" | "write" | "manage_users" | "audit"
 
-export type Verdict = { kind: "ok", actor: string } | { kind: "error", status: int, message: string }
+export type Verdict = { kind: "ok", actor: string } | { kind: "error", status: int, message: string, retry_after?: int }
 
 export type UsersReply = { status: int, body: string, cfg: RbacConfig }
 
@@ -29,8 +33,71 @@ export function hashToken(token: string): string {
   return toHex(sha256(utf8(token)))
 }
 
+// The old password form (salt and one SHA-256), still read: a user who signs in with it gets a bcrypt hash in its
+// place (takeUpgrades). New passwords are bcrypt hashes (password_hash), as Bifrost's.
 export function hashPassword(salt: string, password: string): string {
   return toHex(sha256(utf8(salt + ":" + password)))
+}
+
+// A password hash to replace an old salted SHA-256 one, found at a successful sign-in; the caller saves it if the
+// user still holds the old one.
+export type Upgrade = { name: string, old: string, hash: string }
+
+class Upgrades {
+  list: Upgrade[] = []
+}
+
+let upgradesOne: Upgrades | undefined = undefined
+
+function upgrades(): Upgrades {
+  const u = upgradesOne
+  if (u !== undefined) return u
+  const made = new Upgrades()
+  upgradesOne = made
+  return made
+}
+
+// The upgrades found since the last call.
+export function takeUpgrades(): Upgrade[] {
+  const u = upgrades()
+  const out = u.list
+  u.list = []
+  return out
+}
+
+// What a user's password is checked against, as one string ("" for none).
+function storedOf(u: UserConfig): string {
+  const h = u.password_hash
+  if (h !== undefined && h !== "") return h
+  const salt = u.salt
+  const sha = u.password_sha256
+  if (salt === undefined || sha === undefined) return ""
+  return "sha256:" + salt + ":" + sha
+}
+
+// Whether the password is the user's. Every path runs bcrypt once: an unknown user or one without a password is
+// checked against a dummy hash, and an old SHA-256 match computes its replacement, so the time taken does not say
+// whether the user exists or which form its password is kept in.
+function passwordMatches(u: UserConfig | undefined, pw: string): bool {
+  if (u === undefined) {
+    spendVerify(pw)
+    return false
+  }
+  const h = u.password_hash
+  if (h !== undefined && h !== "") return bcryptVerify(pw, h)
+  const salt = u.salt
+  const sha = u.password_sha256
+  if (salt === undefined || sha === undefined || !safeEq(hashPassword(salt, pw), sha)) {
+    spendVerify(pw)
+    return false
+  }
+  try {
+    upgrades().list.push({ name: u.name, old: sha, hash: try bcryptHash(pw) })
+  } catch (e) {
+    // no random salt: the old hash stays until the next sign-in
+    spendVerify(pw)
+  }
+  return true
 }
 
 // Compares without stopping at the first difference.
@@ -74,7 +141,13 @@ function bearerUser(cfg: RbacConfig, token: string): Identity {
   return live(hit)
 }
 
-function basicUser(cfg: RbacConfig, v: string): Identity {
+export const THROTTLED = "too many failed sign-in attempts; try again later"
+
+// A name and password. ip is the client's address (the server's CLIENT_IP_HEADER), "" when unknown. Failures are
+// counted per account and per address by the sign-in throttle; a throttled attempt is refused unchecked, unless the
+// password is one this process verified lately (only its holder can send it, so a lock someone else caused does not
+// cut off a working client).
+function basicUser(cfg: RbacConfig, v: string, ip: string): Identity {
   const creds = basicCreds(v)
   if (creds === undefined) return { kind: "denied", reason: "malformed basic credentials" }
   const i = creds.indexOf(":")
@@ -85,11 +158,22 @@ function basicUser(cfg: RbacConfig, v: string): Identity {
   for (const u of cfg.users) {
     if (u.name === name) hit = u
   }
-  if (hit === undefined) return { kind: "denied", reason: "invalid credentials" }
-  const salt = hit.salt
-  const stored = hit.password_sha256
-  if (salt === undefined || stored === undefined) return { kind: "denied", reason: "invalid credentials" }
-  if (!safeEq(hashPassword(salt, pw), stored)) return { kind: "denied", reason: "invalid credentials" }
+  const now = Date.now()
+  const stored = hit === undefined ? "" : storedOf(hit)
+  if (hit !== undefined && stored !== "" && checked().has(hit.name, pw, stored, now)) return live(hit)
+  // the same wrong credential checked again within one request: no second bcrypt run or count
+  if (checked().failedLately(name, pw, stored, now)) return { kind: "denied", reason: "invalid credentials" }
+  const g = signInGuard()
+  const keys = ip !== "" ? [accountKey(name), addressKey(ip)] : [accountKey(name)]
+  const wait = g.retryAfter(keys, now)
+  if (wait > 0) return { kind: "denied", reason: THROTTLED, retry_after: wait }
+  if (!passwordMatches(stored === "" ? undefined : hit, pw) || hit === undefined) {
+    g.fail(keys, Date.now())
+    checked().addFailed(name, pw, stored, Date.now())
+    return { kind: "denied", reason: "invalid credentials" }
+  }
+  g.clear(accountKey(name))
+  checked().add(hit.name, pw, stored, now)
   return live(hit)
 }
 
@@ -99,7 +183,7 @@ export function authenticate(cfg: RbacConfig, headers: Map<string, string>): Ide
   const h = headers.get("authorization") ?? ""
   if (h === "") return { kind: "anonymous" }
   if (h.startsWith("Bearer ") || h.startsWith("bearer ")) return bearerUser(cfg, h.slice(7))
-  if (h.startsWith("Basic ") || h.startsWith("basic ")) return basicUser(cfg, h.slice(6))
+  if (h.startsWith("Basic ") || h.startsWith("basic ")) return basicUser(cfg, h.slice(6), headers.get(CLIENT_IP_HEADER) ?? "")
   return { kind: "denied", reason: "unsupported authorization scheme" }
 }
 
@@ -279,7 +363,11 @@ export function authorize(cfg: RbacConfig, headers: Map<string, string>, method:
   }
   const who = authenticate(cfg, headers)
   if (who.kind === "anonymous") return { kind: "error", status: 401, message: "authentication required" }
-  if (who.kind === "denied") return { kind: "error", status: 401, message: who.reason }
+  if (who.kind === "denied") {
+    const ra = who.retry_after
+    if (ra !== undefined) return { kind: "error", status: 429, message: who.reason, retry_after: ra }
+    return { kind: "error", status: 401, message: who.reason }
+  }
   // every signed-in user reads their own permissions (Bifrost's /users/me/permissions)
   if (selfRoute(method, path)) return { kind: "ok", actor: who.name }
   if (!roleAllows(cfg.roles, who.role, method, path))return { kind: "error", status: 403, message: `role ${who.role} may not ${required(method, path)} this route` }
@@ -645,6 +733,7 @@ function updateUser(cfg: RbacConfig, name: string, body: string): UsersReply {
     email: email,
     role: role,
     token_sha256: old.token_sha256,
+    password_hash: old.password_hash,
     password_sha256: old.password_sha256,
     salt: old.salt,
     disabled: disabled,
@@ -698,8 +787,9 @@ export function handleUsers(cfg: RbacConfig, method: string, path: string, body:
   return uerror(405, `method ${m} is not allowed on this route`, cfg)
 }
 
-// The single credential of the old governance.auth_config, as admin users. The
-// password gets a random salt, so this throws if the kernel random source fails.
+// The single credential of the old governance.auth_config, as admin users. The password is kept as a bcrypt
+// hash (one given as a bcrypt hash is used as it is, as Bifrost's isBcryptHash does); a random salt is needed,
+// so this throws if the kernel random source fails.
 export function fromLegacy(auth: AdminAuthConfig | undefined): RbacConfig throws Error {
   const users: UserConfig[] = []
   if (auth === undefined) return { users: users }
@@ -708,8 +798,7 @@ export function fromLegacy(auth: AdminAuthConfig | undefined): RbacConfig throws
   const u = auth.username
   const p = auth.password
   if (u !== undefined && u !== "" && p !== undefined && p !== "") {
-    const salt = try secureHex(16)
-    users.push({ name: u, role: "admin", salt: salt, password_sha256: hashPassword(salt, p) })
+    users.push({ name: u, role: "admin", password_hash: isBcrypt(p) ? p : try checked().hashOf(p) })
   }
   return { users: users }
 }
@@ -1167,4 +1256,136 @@ test("an edited built-in role keeps its id and is judged by its saved pairs", ()
   expect((vi?.permissions ?? []).length).toBe(1)
   expect((systemRole(roles, "editor", rs, ops)?.permissions ?? []).length).toBe(3)
   expect(systemRole(roles, "ops", rs, ops)).toBeUndefined()
+})
+
+// ---- passwords: bcrypt, old hashes upgraded, unknown users, the throttle (L198) ----
+
+// cost 4 keeps these quick; the cost is read from the hash
+const BC_ED = "$2a$04$0NhAjYqchBfgl769k3bJwOltn8uAyH5ZpyMvh4NrJHoHsJG4RUjAG"
+
+function withIp(h: Map<string, string>, ip: string): Map<string, string> {
+  let m = h
+  m.set(CLIENT_IP_HEADER, ip)
+  return m
+}
+
+test("bcrypt password hashes (Bifrost's form) sign in, and wrong passwords do not", () => {
+  const cfg: RbacConfig = { users: [{ name: "ed", role: "editor", password_hash: BC_ED }] }
+  expect(who(authenticate(cfg, basic("ed", "pw")))).toBe("user ed editor")
+  expect(who(authenticate(cfg, basic("ed", "pw2")))).toBe("denied")
+  expect(who(authenticate(cfg, basic("ed", "")))).toBe("denied")
+  // a hash that wins over an old one left beside it
+  const both: RbacConfig = { users: [{ name: "ed", role: "editor", password_hash: BC_ED, salt: "s", password_sha256: hashPassword("s", "old") }] }
+  expect(who(authenticate(both, basic("ed", "pw")))).toBe("user ed editor")
+  expect(who(authenticate(both, basic("ed", "old")))).toBe("denied")
+})
+
+test("an old salted SHA-256 password still signs in once, and its bcrypt replacement is offered", () => {
+  takeUpgrades()
+  // (a password verified by an earlier test would be taken as it is)
+  checked().clear()
+  const cfg = fixture()
+  expect(who(authenticate(cfg, basic("ed", "wrong")))).toBe("denied")
+  expect(takeUpgrades().length).toBe(0)
+  expect(who(authenticate(cfg, basic("ed", "ed-pass")))).toBe("user ed editor")
+  const ups = takeUpgrades()
+  expect(ups.length).toBe(1)
+  expect(ups[0]!.name).toBe("ed")
+  expect(ups[0]!.old).toBe(hashPassword("salt1", "ed-pass"))
+  expect(ups[0]!.hash.startsWith("$2a$10$") && bcryptVerify("ed-pass", ups[0]!.hash)).toBe(true)
+  expect(takeUpgrades().length).toBe(0)
+})
+
+test("an unknown user costs a bcrypt run like a real one, so timing does not reveal accounts", () => {
+  const h10 = try bcryptHash("real-pass")
+  const cfg: RbacConfig = { users: [{ name: "ed", role: "editor", password_hash: h10 }, { name: "tok", role: "admin", token_sha256: hashToken("t") }] }
+  const t0 = Date.now()
+  expect(who(authenticate(cfg, basic("nobody", "x")))).toBe("denied")
+  const unknown = Date.now() - t0
+  const t1 = Date.now()
+  expect(who(authenticate(cfg, basic("ed", "x")))).toBe("denied")
+  const known = Date.now() - t1
+  const t2 = Date.now()
+  expect(who(authenticate(cfg, basic("tok", "x")))).toBe("denied")
+  const noPassword = Date.now() - t2
+  expect(unknown * 2 > known && known * 2 > unknown).toBe(true)
+  expect(noPassword * 2 > known && known * 2 > noPassword).toBe(true)
+  // a legacy user's wrong password costs the same too
+  const legacy = fixture()
+  const t3 = Date.now()
+  expect(who(authenticate(legacy, basic("ed", "x")))).toBe("denied")
+  const old = Date.now() - t3
+  expect(old * 2 > known && known * 2 > old).toBe(true)
+})
+
+test("failed sign-ins are throttled per account and per address: 429 with Retry-After, unchecked", () => {
+  const g = signInGuard()
+  g.configure({ account_failures: 3, ip_failures: 5 })
+  g.reset()
+  checked().clear()
+  const cfg: RbacConfig = { users: [{ name: "ed", role: "editor", password_hash: BC_ED }, { name: "au", role: "auditor", password_hash: BC_ED }] }
+  for (let i = 0; i < 3; i++) expect(who(authenticate(cfg, withIp(basic("ed", "bad" + i), "10.1.1.1")))).toBe("denied")
+  // the account is held back, even with the right password, from any address
+  const r = authenticate(cfg, withIp(basic("ed", "pw"), "10.2.2.2"))
+  expect(r.kind === "denied" ? (r.retry_after ?? 0) : 0).toBe(1)
+  const v = authorize(cfg, withIp(basic("ed", "pw"), "10.2.2.2"), "GET", "/api/providers")
+  expect(v.kind === "error" ? `${v.status} ${v.retry_after ?? 0}` : "ok").toBe("429 1")
+  // an unknown name is counted the same way, so a lock tells nothing about accounts
+  for (let i = 0; i < 3; i++) authenticate(cfg, withIp(basic("ghost", "bad" + i), "10.3.3.3"))
+  const gh = authenticate(cfg, withIp(basic("ghost", "bad"), "10.4.4.4"))
+  expect(gh.kind === "denied" ? (gh.retry_after ?? 0) : 0).toBe(1)
+  // the address 10.1.1.1 has 3 failures; two more on another account lock the address for every account
+  authenticate(cfg, withIp(basic("au", "bad1"), "10.1.1.1"))
+  authenticate(cfg, withIp(basic("au", "bad2"), "10.1.1.1"))
+  const ip = authenticate(cfg, withIp(basic("zz", "x"), "10.1.1.1"))
+  expect(ip.kind === "denied" ? (ip.retry_after ?? 0) : 0).toBe(1)
+  g.configure({ enabled: false })
+  g.reset()
+})
+
+test("the same wrong credential checked twice in a row is one failure and one bcrypt run", () => {
+  const g = signInGuard()
+  g.configure({ account_failures: 2 })
+  g.reset()
+  checked().clear()
+  const cfg: RbacConfig = { users: [{ name: "ed", role: "editor", password_hash: BC_ED }] }
+  for (let i = 0; i < 5; i++) expect(who(authenticate(cfg, basic("ed", "same-wrong")))).toBe("denied")
+  expect(g.retryAfter([accountKey("ed")], Date.now())).toBe(0)
+  authenticate(cfg, basic("ed", "other-wrong"))
+  expect(g.retryAfter([accountKey("ed")], Date.now()) > 0).toBe(true)
+  g.configure({ enabled: false })
+  g.reset()
+})
+
+test("a password verified lately passes while its account is throttled, and a success clears the account", () => {
+  const g = signInGuard()
+  g.configure({ account_failures: 2 })
+  g.reset()
+  checked().clear()
+  const cfg: RbacConfig = { users: [{ name: "ed", role: "editor", password_hash: BC_ED }] }
+  expect(who(authenticate(cfg, basic("ed", "pw")))).toBe("user ed editor")
+  authenticate(cfg, basic("ed", "bad1"))
+  authenticate(cfg, basic("ed", "bad2"))
+  const locked = authenticate(cfg, basic("ed", "bad3"))
+  expect(locked.kind === "denied" && locked.retry_after !== undefined).toBe(true)
+  // the working client keeps working
+  expect(who(authenticate(cfg, basic("ed", "pw")))).toBe("user ed editor")
+  // a password not seen before waits like any other attempt
+  checked().clear()
+  const fresh = authenticate(cfg, basic("ed", "pw"))
+  expect(fresh.kind === "denied" && fresh.retry_after !== undefined).toBe(true)
+  g.configure({ enabled: false })
+  g.reset()
+})
+
+test("auth_config's password becomes a bcrypt hash once per process, and a bcrypt hash given there is used as it is", () => {
+  const a = try fromLegacy({ username: "admin", password: "secret" })
+  const b = try fromLegacy({ username: "admin", password: "secret" })
+  const h = a.users[0]!.password_hash ?? ""
+  expect(h.startsWith("$2a$10$")).toBe(true)
+  expect(b.users[0]!.password_hash).toBe(h)
+  expect(a.users[0]!.password_sha256 === undefined && a.users[0]!.salt === undefined).toBe(true)
+  const given = try fromLegacy({ username: "admin", password: BC_ED })
+  expect(given.users[0]!.password_hash).toBe(BC_ED)
+  expect(who(authenticate(given, basic("admin", "pw")))).toBe("user admin admin")
 })

@@ -1,0 +1,288 @@
+// Brute-force throttling for sign-ins: failed attempts are counted per client address and per account name, and
+// past a few free ones each new attempt waits twice as long as the last (1 s, 2 s, 4 s, ... up to
+// max_backoff_seconds), answered 429 with Retry-After without checking the credential. A success clears the
+// account's count (never the address's: one valid account must not reset an attacker's address). Unknown names are
+// counted like real ones, so a lock says nothing about whether an account exists. With several workers the counts
+// live in the node's share folder (one append-only file per key), so every worker sees the same failures.
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs"
+import { sha256, toHex, utf8 } from "./crypto"
+import { SignInThrottleConfig } from "./config"
+
+// server.sign_in_throttle (config.tov SignInThrottleConfig): enabled (default true), the free failures per account
+// and per address, and the longest wait.
+export type ThrottleConfig = SignInThrottleConfig
+
+export type Policy = { enabled: bool, accountFree: int, ipFree: int, baseMs: f64, maxMs: f64, windowMs: f64 }
+
+// Failures are remembered for an hour, longer than the longest wait, so a lock that expires does not reset the count.
+const WINDOW_MS = 3600000.0
+const KEEP = 64
+const MAX_KEYS = 50000
+
+export function policyOf(c: ThrottleConfig | undefined): Policy {
+  const maxS: int = c?.max_backoff_seconds ?? 900
+  const secs: int = maxS < 1 ? 1 : maxS
+  return {
+    enabled: c?.enabled ?? true,
+    accountFree: c?.account_failures ?? 5,
+    ipFree: c?.ip_failures ?? 20,
+    baseMs: 1000.0,
+    maxMs: secs * 1000.0,
+    windowMs: WINDOW_MS,
+  }
+}
+
+export function accountKey(name: string): string {
+  return "user:" + name.trim().toLowerCase()
+}
+
+export function addressKey(ip: string): string {
+  return "ip:" + ip
+}
+
+// The milliseconds still to wait after n failures, the last at `last`.
+export function waitAfter(p: Policy, free: int, n: int, last: f64, now: f64): f64 {
+  if (n < free) return 0.0
+  const steps = n - free
+  let d = p.baseMs
+  for (let i = 0; i < steps && d < p.maxMs; i++) d = d * 2.0
+  if (d > p.maxMs) d = p.maxMs
+  const left = last + d - now
+  return left > 0.0 ? left : 0.0
+}
+
+export class SignInGuard {
+  policy: Policy = policyOf(undefined)
+  private mem: Map<string, f64[]> = new Map()
+  // the node's share folder for the counts ("" keeps them in this process)
+  dir = ""
+  private writes = 0
+
+  constructor() {
+    // off until configured: a process that never reads a config (a test) throttles nothing
+    this.policy.enabled = false
+  }
+
+  configure(c: ThrottleConfig | undefined): void {
+    this.policy = policyOf(c)
+  }
+
+  // Keeps the counts in this folder (made if missing), shared with the node's other workers.
+  share(dir: string): void {
+    try {
+      mkdirSync(dir, { recursive: true })
+      this.dir = dir
+    } catch (e) {
+      console.error(`raiju: sign-in throttle stays per worker: ${e.message}`)
+    }
+  }
+
+  private file(key: string): string {
+    return this.dir + "/" + toHex(sha256(utf8(key))).slice(0, 40)
+  }
+
+  // The failure times within the window, oldest first.
+  private times(key: string, now: f64): f64[] {
+    let all: f64[] = []
+    if (this.dir !== "") {
+      try {
+        const f = this.file(key)
+        if (existsSync(f)) {
+          for (const line of readFileSync(f, "utf8").split("\n")) {
+            const t = parseFloat(line)
+            if (t !== undefined) all.push(t)
+          }
+        }
+      } catch (e) {
+        all = []
+      }
+    } else {
+      all = this.mem.get(key) ?? []
+    }
+    return all.filter((t) => now - t < this.policy.windowMs)
+  }
+
+  private free(key: string): int {
+    return key.startsWith("ip:") ? this.policy.ipFree : this.policy.accountFree
+  }
+
+  // The seconds the caller must wait before these keys may try again (0: go ahead).
+  retryAfter(keys: string[], now: f64): int {
+    if (!this.policy.enabled) return 0
+    let most = 0.0
+    for (const k of keys) {
+      const ts = this.times(k, now)
+      if (ts.length === 0) continue
+      const w = waitAfter(this.policy, this.free(k), ts.length, ts[ts.length - 1]!, now)
+      if (w > most) most = w
+    }
+    return most <= 0.0 ? 0 : Math.ceil(most / 1000.0)
+  }
+
+  // Counts a failed attempt against each key.
+  fail(keys: string[], now: f64): void {
+    if (!this.policy.enabled) return
+    for (const k of keys) {
+      if (this.dir !== "") {
+        try {
+          appendFileSync(this.file(k), `${now}\n`)
+          const ts = this.times(k, now)
+          // a long file is cut to its last entries (an append racing this one may be lost: a count off by one)
+          if (ts.length > KEEP) writeFileSync(this.file(k), ts.slice(ts.length - KEEP).map((t) => `${t}`).join("\n") + "\n", { mode: 0o600 })
+        } catch (e) {
+          console.error(`raiju: sign-in throttle: ${e.message}`)
+        }
+      } else {
+        let ts = this.times(k, now)
+        ts.push(now)
+        if (ts.length > KEEP) ts = ts.slice(ts.length - KEEP)
+        this.mem.delete(k)
+        this.mem.set(k, ts)
+      }
+    }
+    this.writes += 1
+    if (this.writes % 200 === 0) this.sweep(now)
+    // bounded: the keys that failed longest ago go first (a Map keeps insertion order)
+    if (this.mem.size > MAX_KEYS) {
+      this.sweep(now)
+      const ks = this.mem.keys()
+      for (let i = 0; i < ks.length && this.mem.size > MAX_KEYS; i++) this.mem.delete(ks[i]!)
+    }
+  }
+
+  // Forgets a key's failures (an account that signed in).
+  clear(key: string): void {
+    if (this.dir !== "") {
+      try {
+        const f = this.file(key)
+        if (existsSync(f)) unlinkSync(f)
+      } catch (e) {
+        // a stale count only delays the next failure's lock
+      }
+      return
+    }
+    this.mem.delete(key)
+  }
+
+  // Drops counts whose last failure left the window.
+  sweep(now: f64): void {
+    const w = this.policy.windowMs
+    for (const k of this.mem.keys()) {
+      const ts = this.mem.get(k) ?? []
+      if (ts.length === 0 || now - ts[ts.length - 1]! >= w) this.mem.delete(k)
+    }
+    if (this.dir === "") return
+    try {
+      for (const name of readdirSync(this.dir)) {
+        const f = this.dir + "/" + name
+        try {
+          if (now - statSync(f).mtimeMs >= w) unlinkSync(f)
+        } catch (e) {
+          // another worker removed it
+        }
+      }
+    } catch (e) {
+      // the folder is gone
+    }
+  }
+
+  reset(): void {
+    this.mem = new Map()
+  }
+}
+
+let guardOne: SignInGuard | undefined = undefined
+
+// The process's guard (ops configures it from server.sign_in_throttle and points it at the share folder).
+export function signInGuard(): SignInGuard {
+  const g = guardOne
+  if (g !== undefined) return g
+  const made = new SignInGuard()
+  guardOne = made
+  return made
+}
+
+// ---- tests ----
+
+function on(c?: ThrottleConfig): SignInGuard {
+  const g = new SignInGuard()
+  g.configure(c)
+  return g
+}
+
+test("the waits double after the free failures and stop at the longest wait", () => {
+  const p = policyOf({ max_backoff_seconds: 10 })
+  expect(waitAfter(p, 5, 4, 1000.0, 1000.0)).toBe(0.0)
+  expect(waitAfter(p, 5, 5, 1000.0, 1000.0)).toBe(1000.0)
+  expect(waitAfter(p, 5, 6, 1000.0, 1000.0)).toBe(2000.0)
+  expect(waitAfter(p, 5, 8, 1000.0, 1000.0)).toBe(8000.0)
+  expect(waitAfter(p, 5, 9, 1000.0, 1000.0)).toBe(10000.0)
+  expect(waitAfter(p, 5, 60, 1000.0, 1000.0)).toBe(10000.0)
+  expect(waitAfter(p, 5, 6, 1000.0, 2500.0)).toBe(500.0)
+  expect(waitAfter(p, 5, 6, 1000.0, 9000.0)).toBe(0.0)
+})
+
+test("an account is throttled after its free failures, with Retry-After in seconds, and a success clears it", () => {
+  const g = on(undefined)
+  const keys = [accountKey("Ed"), addressKey("10.0.0.1")]
+  const t = 1000000.0
+  for (let i = 0; i < 5; i++) {
+    expect(g.retryAfter(keys, t)).toBe(0)
+    g.fail(keys, t)
+  }
+  expect(g.retryAfter(keys, t)).toBe(1)
+  expect(g.retryAfter([accountKey("ed")], t + 500.0)).toBe(1)
+  expect(g.retryAfter([accountKey("ed")], t + 1000.0)).toBe(0)
+  g.fail(keys, t + 1000.0)
+  expect(g.retryAfter(keys, t + 1000.0)).toBe(2)
+  // another account from the same address is not locked yet (20 free per address)
+  expect(g.retryAfter([accountKey("other"), addressKey("10.0.0.1")], t + 1000.0)).toBe(0)
+  g.clear(accountKey("ED"))
+  expect(g.retryAfter([accountKey("ed")], t + 1000.0)).toBe(0)
+})
+
+test("an address is throttled across account names, and failures leave after the window", () => {
+  const g = on({ ip_failures: 3 })
+  const t = 5000000.0
+  g.fail([accountKey("a"), addressKey("1.2.3.4")], t)
+  g.fail([accountKey("b"), addressKey("1.2.3.4")], t)
+  g.fail([accountKey("c"), addressKey("1.2.3.4")], t)
+  expect(g.retryAfter([accountKey("d"), addressKey("1.2.3.4")], t)).toBe(1)
+  expect(g.retryAfter([accountKey("d"), addressKey("5.6.7.8")], t)).toBe(0)
+  // a success does not clear the address
+  g.clear(accountKey("c"))
+  expect(g.retryAfter([addressKey("1.2.3.4")], t)).toBe(1)
+  expect(g.retryAfter([addressKey("1.2.3.4")], t + WINDOW_MS + 1.0)).toBe(0)
+  g.sweep(t + WINDOW_MS + 1.0)
+  g.fail([addressKey("1.2.3.4")], t + WINDOW_MS + 2.0)
+  expect(g.retryAfter([addressKey("1.2.3.4")], t + WINDOW_MS + 2.0)).toBe(0)
+})
+
+test("a guard that is off or unconfigured throttles nothing", () => {
+  const g = new SignInGuard()
+  for (let i = 0; i < 30; i++) g.fail([accountKey("x")], 100.0)
+  expect(g.retryAfter([accountKey("x")], 100.0)).toBe(0)
+  const off = on({ enabled: false })
+  for (let i = 0; i < 30; i++) off.fail([accountKey("x")], 100.0)
+  expect(off.retryAfter([accountKey("x")], 100.0)).toBe(0)
+})
+
+test("workers sharing a folder see each other's failures", () => {
+  const dir = "/tmp/raiju-signin-test-" + process.pid
+  const a = on({ account_failures: 2 })
+  const b = on({ account_failures: 2 })
+  a.share(dir)
+  b.share(dir)
+  const t = 9000000.0
+  a.fail([accountKey("root")], t)
+  b.fail([accountKey("root")], t)
+  expect(a.retryAfter([accountKey("root")], t)).toBe(1)
+  expect(b.retryAfter([accountKey("root")], t)).toBe(1)
+  b.clear(accountKey("root"))
+  expect(a.retryAfter([accountKey("root")], t)).toBe(0)
+  // a long run of failures is kept to its last entries
+  for (let i = 0; i < KEEP + 10; i++) a.fail([accountKey("bulk")], t)
+  const lines = (try readFileSync(dir + "/" + toHex(sha256(utf8(accountKey("bulk")))).slice(0, 40), "utf8")).trim().split("\n")
+  expect(lines.length <= KEEP + 1).toBe(true)
+  for (const n of try readdirSync(dir)) try unlinkSync(dir + "/" + n)
+})
