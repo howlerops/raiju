@@ -89,7 +89,7 @@ import { AgentUser, Exchange, AGENT_TOKEN_PREFIX, agentSignIn, authorizeProblem,
 import * as metrics from "./metrics"
 import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, appendFileSync, chmodSync, statSync } from "node:fs"
 import { writeFileAtomic } from "./atomicfile"
-import { FileLock, lockFile, unlockFile } from "./filelock"
+import { FileLock, lockFile, lockFileAsync, unlockFile } from "./filelock"
 import { Counters, ClusterConfig, BrokerConfig, brokerUrl, syncInterval } from "./cluster"
 import { clusterState, ownerOf } from "./clusterstate"
 import { FeedRing, FeedQueue, FeedItem, feedEnvelope, feedVisible, gapEnvelope, resumedEnvelope, parseFeed, parseItem, parseAnswer, FEED_RING_SIZE, FEED_RING_SECONDS, FEED_QUEUE_MAX, FEED_BATCH_MS, FEED_BATCH_MAX } from "./feed"
@@ -1567,18 +1567,24 @@ export class Ops {
   // Called in each worker after the fork. Usage counters gossip through files in the node's share folder, which the
   // supervisor made before the fork (makeShareDir: private and unpredictable), with the same CRDT merge as clustering,
   // and the response cache keeps its entries there too. dir is "" when the folder could not be made.
-  // The dashboard's sessions, the sign-ins in flight and the CLI's sign-in codes and tokens, in files beside the config
-  // file (<config>.sessions.json, .oidc-flows.json and .agent-sessions.json, 0600): every worker of the node reads and
-  // writes them (sharedtable.tov), so a session made on one works on all, and a restart keeps the sessions and the
-  // refresh tokens. Tokens are kept by hash; the identity provider's refresh token and the PKCE verifier are sealed
-  // with the config's encryption key when one is set.
-  keepAuthState(configPath: string, sealer: Sealer): void {
+  // The dashboard's sessions and the CLI's sign-in codes and tokens, in files beside the config file
+  // (<config>.sessions.json and .agent-sessions.json, 0600): every worker of the node reads and writes them
+  // (sharedtable.tov), so a session made on one works on all, and a restart keeps the sessions and the refresh tokens.
+  // Tokens are kept by hash; the identity provider's refresh token is sealed with the config's encryption key when one
+  // is set. Single sign-on logins in flight are kept nowhere: their state value carries them, sealed with stateKey
+  // (oidc.tov OidcFlows), which every worker of the node holds.
+  keepAuthState(configPath: string, sealer: Sealer, stateKey: u8[]): void {
+    this.flows.setKey(stateKey)
     if (configPath === "") return
     this.sessions.setFile(configPath + ".sessions.json")
     this.sessions.sealer = sealer
-    this.flows.setFile(configPath + ".oidc-flows.json")
-    this.flows.sealer = sealer
     agentSignIn().setFile(configPath + ".agent-sessions.json")
+    // the flow file of earlier versions is read no more
+    try {
+      rmSync(configPath + ".oidc-flows.json", { force: true })
+    } catch (e) {
+      // left as it is
+    }
   }
 
   startLocalShare(dir: string): void {
@@ -1731,12 +1737,20 @@ export class Ops {
     return ownerOf(client, this.liveNodes()) === cluster.nodeOf(this.nodeId)
   }
 
+  // whether the sync body has outgrown cluster.max_body_mb (said once)
+  syncTooBig = false
+
   syncCluster(): void {
     const c = this.counters
     const cc = this.clusterCfg
     if (c === undefined || cc === undefined) return
     this.pushLocal(c)
     const body = c.encode()
+    // a peer refuses a body over cluster.max_body_mb unread (413): said once, so the operator can raise it
+    if (!this.syncTooBig && body.byteLength > cluster.clusterBodyCap(cc)) {
+      this.syncTooBig = true
+      console.error(`raiju: cluster: this node's sync body is ${body.byteLength} bytes, over cluster.max_body_mb (${cluster.clusterBodyCap(cc)} bytes): its peers refuse it; raise cluster.max_body_mb on every node`)
+    }
     const h: Map<string, string> = new Map()
     h.set("content-type", "application/json")
     h.set("x-raiju-cluster-sig", cluster.sign(cc.secret, body))
@@ -1770,11 +1784,14 @@ export class Ops {
     }
   }
 
-  // GET /api/cluster/leader: whether this node leads, and by which election. Signed like the sync route, over an empty body.
+  // GET /api/cluster/leader: whether this node leads, and by which election. Signed over the method, the path and the
+  // caller's time in x-raiju-cluster-ts (cluster.signRequest), refused when that time is over a minute off like the
+  // other peer routes, so a captured request does not replay.
   clusterLeader(req: Request): Response {
     const cc = this.clusterCfg
     if (cc === undefined) return json(404, errorJson("clustering is off", "invalid_request_error", undefined))
-    if (!cluster.verify(cc.secret, "", req.headers.get("x-raiju-cluster-sig") ?? "")) return denied(401, "bad cluster signature")
+    const why = cluster.requestRefusal(cc.secret, "GET", "/api/cluster/leader", req.headers.get(cluster.TS_HEADER) ?? "", req.headers.get("x-raiju-cluster-sig") ?? "", Date.now())
+    if (why !== "") return denied(401, why)
     const election = this.lock !== undefined ? "lock" : "rank"
     return json(200, JSON.stringify({ node: this.nodeId, leader: this.isLeader(), election: election }))
   }
@@ -1999,7 +2016,7 @@ export class Ops {
     } catch (e) {
       return json(400, errorJson(e.message, "invalid_request_error", undefined))
     }
-    if (Math.abs(Date.now() - ask.ts) > 60000.0) return denied(401, "stale cluster request")
+    if (!cluster.fresh(ask.ts, Date.now())) return denied(401, "stale cluster request")
     if (ask.sha === "" || ask.sha !== this.store.fileSha || this.store.genText === "") return json(404, errorJson("this node does not hold that configuration", "not_found_error", undefined))
     const hs: Record<string, string> = new Map()
     hs.set("content-type", "application/json")
@@ -2269,7 +2286,7 @@ export class Ops {
     } catch (e) {
       return json(400, errorJson(e.message, "invalid_request_error", undefined))
     }
-    if (Math.abs(Date.now() - ask.ts) > 60000.0) return denied(401, "stale cluster request")
+    if (!cluster.fresh(ask.ts, Date.now())) return denied(401, "stale cluster request")
     const store = this.engine.logStore
     if (store === undefined) return json(200, `{"node":${JSON.stringify(this.nodeId)},"rows":[]}`)
     const w = this.readWindow(ask.path, new URLSearchParams(ask.query), ask.now)
@@ -2541,10 +2558,11 @@ export class Ops {
   libraryTimer: int = -1
   libraryKey = ""
 
-  // The library file's lock, taken around a read-modify-write of it (the workers of a node all write it).
-  lockLibrary(): FileLock {
-    if (this.store.path === "") return { dir: "", ok: true }
-    return lockFile(this.store.path + ".mcp_library.json")
+  // The library file's lock, taken around a read-modify-write of it (the workers of a node all write it); waited for
+  // without pausing the worker. ok is false when another process kept it.
+  async lockLibrary(): Promise<FileLock> {
+    if (this.store.path === "") return { path: "", ok: true }
+    return await lockFileAsync(this.store.path + ".mcp_library.json")
   }
 
   // The library as its file holds it now (another worker or node may have synced it).
@@ -2591,7 +2609,8 @@ export class Ops {
       if (attempt > 0) await new Promise<void>((resolve) => setTimeout(resolve, Math.min(10000, 1000 * Math.pow(2, attempt - 1))))
       try {
         const text = await fetchCatalog(url, 45000)
-        const lock = this.lockLibrary()
+        const lock = await this.lockLibrary()
+        if (!lock.ok) return { count: 0, error: "the MCP library file is locked by another process; retry" }
         try {
           const lib = this.library()
           const n = lib.sync(text, Date.now())
@@ -2625,7 +2644,8 @@ export class Ops {
       }
       if (m === "POST") {
         if (noStore) return reply(503, errorJson("MCP operations unavailable: config store is disabled", "api_error", undefined))
-        const lock = this.lockLibrary()
+        const lock = await this.lockLibrary()
+        if (!lock.ok) return reply(503, errorJson("the MCP library file is locked by another process; retry", "api_error", undefined))
         const r = createLibraryEntry(this.library(), body, Date.now())
         unlockFile(lock)
         return reply(r.status, r.body)
@@ -2651,7 +2671,8 @@ export class Ops {
     if (segs.length === 5) {
       if (m !== "DELETE") return notAllowed
       if (noStore) return reply(503, errorJson("MCP operations unavailable: config store is disabled", "api_error", undefined))
-      const lock = this.lockLibrary()
+      const lock = await this.lockLibrary()
+      if (!lock.ok) return reply(503, errorJson("the MCP library file is locked by another process; retry", "api_error", undefined))
       const r = deleteLibraryEntry(this.library(), segs[4]!)
       unlockFile(lock)
       return reply(r.status, r.body)
@@ -2711,6 +2732,17 @@ export class Ops {
   // PUT /api/models/catalog: sets the additional attributes of catalog entries, each (model, provider)
   // of which must be in the price catalog; the whole batch is refused when one is not. An empty
   // attribute map clears the entry. Kept in <config>.catalog.json next to the config file.
+  // The route's form: the catalog file's lock is waited for without pausing the worker, then catalogUpsert takes it
+  // again at once.
+  async catalogUpsertRoute(req: Request, body: string): Promise<Reply> {
+    if (req.method !== "PUT" || this.store.path === "") return this.catalogUpsert(req, body)
+    const held = await lockFileAsync(this.catalogFile())
+    if (!held.ok) return { status: 503, body: errorJson("the catalog file is locked by another process; retry", "api_error", undefined), contentType: "application/json" }
+    const r = this.catalogUpsert(req, body)
+    unlockFile(held)
+    return r
+  }
+
   catalogUpsert(req: Request, body: string): Reply {
     if (req.method !== "PUT") return { status: 405, body: errorJson("use PUT", "invalid_request_error", undefined), contentType: "application/json" }
     let items: string[] = []
@@ -2948,13 +2980,17 @@ export class Ops {
       try {
         token = this.sessions.create(id.name, id.role, now)
       } catch (e) {
-        return json(500, errorJson("could not create a session", "api_error", undefined))
+        return json(503, errorJson(`could not create a session: ${e.message}`, "api_error", undefined))
       }
       return json(200, JSON.stringify({ message: "Login successful", token: token, username: id.name, role: id.role, expires_in: this.sessions.ttlSeconds }))
     }
     if (path === "/api/session/logout") {
       if (m !== "POST") return json(405, errorJson("use POST", "invalid_request_error", undefined))
-      if (bearer !== "") this.sessions.delete(bearer)
+      try {
+        if (bearer !== "") this.sessions.delete(bearer)
+      } catch (e) {
+        return json(503, errorJson(`could not end the session: ${e.message}`, "api_error", undefined))
+      }
       return json(200, JSON.stringify({ message: "Logged out successfully" }))
     }
     return json(404, errorJson(`no route ${path}`, "invalid_request_error", undefined))
@@ -3087,7 +3123,11 @@ export class Ops {
       if (r.kind === "error") return oauthError(r.status, r.error, r.message)
       // a user disabled since the code was issued gets no token
       if (disabledNamed(this.rbac, [r.issued.who.user, r.issued.who.email.toLowerCase()])) {
-        si.revokeUser(r.issued.who.user)
+        try {
+          si.revokeUser(r.issued.who.user)
+        } catch (e) {
+          return oauthError(503, "temporarily_unavailable", "the account is disabled; its tokens could not be ended yet, retry")
+        }
         return oauthError(401, "invalid_grant", "the account is disabled")
       }
       const keys = this.assignedKeys(r.issued.who.user)
@@ -3096,7 +3136,11 @@ export class Ops {
     if (path === "/api/agent/auth/logout") {
       if (m !== "POST") return json(405, errorJson("use POST", "invalid_request_error", undefined))
       const auth = req.headers.get("authorization") ?? ""
-      if (auth.startsWith("Bearer ")) si.revoke(auth.slice(7).trim())
+      try {
+        if (auth.startsWith("Bearer ")) si.revoke(auth.slice(7).trim())
+      } catch (e) {
+        return json(503, errorJson(`could not end the session: ${e.message}`, "api_error", undefined))
+      }
       return json(200, JSON.stringify({ message: "Logged out successfully" }))
     }
     if (path === "/api/agent/virtual-keys" || path === "/api/agent/usage-summary") {
@@ -5607,7 +5651,7 @@ export class Ops {
       // the refresh token stays on the server: an expired session is refreshed silently with it (refreshSession)
       token = this.sessions.create(v.sub, role, Date.now(), v.email, refreshToken)
     } catch (e) {
-      return html(500, "<p>Could not create a session.</p>")
+      return html(503, "<p>Could not create a session; try again.</p>")
     }
     // the UI keeps its admin token in sessionStorage; the session token takes its place
     return html(200, `<!doctype html><meta charset="utf-8"><title>Signed in</title><script>sessionStorage.setItem("raiju.adminToken", ${JSON.stringify(token)}); location.replace(${JSON.stringify(backTo)});</script><p>Signed in as ${(v.email ?? v.sub).replace("<", "&lt;")}.</p>`)
@@ -5639,7 +5683,7 @@ export class Ops {
     const tr = await postText(d.token_endpoint, th, refreshRequestBody(oc, due.refresh))
     if (tr.status === 0) return false
     if (tr.status !== 200) {
-      this.sessions.delete(due.token)
+      this.endSession(due.token)
       await this.checkGone(due.sub, due.email)
       return false
     }
@@ -5660,7 +5704,7 @@ export class Ops {
       if (jw.status !== 200) return false
       const v = verifyIdToken(idToken, jw.body, oc, d.issuer, undefined, Date.now())
       if (v.kind === "error" || v.sub !== due.sub) {
-        this.sessions.delete(due.token)
+        this.endSession(due.token)
         return false
       }
       let claims = v.claims
@@ -5671,13 +5715,29 @@ export class Ops {
       role = v.role
       const synced = this.syncSignIn(v.sub, v.email ?? due.email, claims)
       if (synced.kind === "refuse") {
-        this.sessions.delete(due.token)
+        this.endSession(due.token)
         return false
       }
       if (synced.kind === "role") role = synced.role
     }
-    this.sessions.renew(due.token, role, Date.now(), rotated)
+    try {
+      this.sessions.renew(due.token, role, Date.now(), rotated)
+    } catch (e) {
+      // the session stays expired with its refresh token: the next request tries again
+      console.error(`raiju: a single sign-on session could not be renewed: ${e.message}`)
+      return false
+    }
     return true
+  }
+
+  // Ends a session whose refresh failed. A session that cannot be ended now (its file's lock is kept by another
+  // process) stays expired, and the next request or sweep ends it.
+  endSession(token: string): void {
+    try {
+      this.sessions.delete(token)
+    } catch (e) {
+      console.error(`raiju: a single sign-on session could not be ended: ${e.message}`)
+    }
   }
 
   // After a refused refresh: Bifrost asks the directory, and removes the user only when it reports them inactive or
@@ -5722,7 +5782,11 @@ export class Ops {
           if (u.email !== undefined) gone.push(u.email)
         }
       }
-      this.sessions.endUser(gone)
+      try {
+        this.sessions.endUser(gone)
+      } catch (e) {
+        return `the removed users' sessions could not be ended: ${e.message}`
+      }
     }
     this.storeUpdated("/api/users")
     if (plan.newTeams.length > 0) this.storeUpdated("/api/governance/teams")
@@ -6180,7 +6244,14 @@ export class Ops {
       else out.push("no admin account and no setup token are configured: /api is locked (403); set setup_token in config.json (or the BIFROST_SETUP_TOKEN env var) and restart to finish setup")
     }
     if (!this.engine.gov.enforce) out.push("inference is not authenticated (client.enforce_auth_on_inference is off): anyone who reaches this port can use the provider keys")
+    if (this.metricsOpen()) out.push("/metrics is open on the main port and its labels name virtual keys, teams and customers: set server.metrics_token, or move it to the cluster listener with cluster.serve_metrics")
     return out
+  }
+
+  // Whether anyone who reaches the main port can read /metrics: no server.metrics_token, and not moved to the cluster
+  // listener (cluster.serve_metrics with cluster.listen_port).
+  metricsOpen(): bool {
+    return (this.engine.cfg.server?.metrics_token ?? "") === "" && !this.metricsOnCluster
   }
 
   // Bifrost's setup lock (SetupLockMiddleware): while no admin account exists, every /api route but the public ones
@@ -7187,6 +7258,18 @@ test("/api is locked without an admin: 403 with no setup token, the token or its
   admin.set("authorization", "Bearer admin-tok")
   expect(gateStatus(lockOps, "/api/providers", admin)).toBe(200)
   expect(lockOps.startupWarnings().some((w) => w.includes("/api is locked"))).toBe(false)
+})
+
+test("a start with /metrics open on the main port warns; a token or the cluster listener does not", () => {
+  const open = (w: string): bool => w.includes("/metrics is open")
+  let o = try lockFor({})
+  expect(o.startupWarnings().some(open)).toBe(true)
+  o = try lockFor({ server: { metrics_token: "m-token-1" } })
+  expect(o.startupWarnings().some(open)).toBe(false)
+  // cluster.serve_metrics moves it only with a cluster listener (main.tov openClusterListener sets metricsOnCluster)
+  o = try lockFor({})
+  o.metricsOnCluster = true
+  expect(o.startupWarnings().some(open)).toBe(false)
 })
 
 test("the worker share folder is private, unpredictable and its stale copies are recognized", () => {

@@ -17,6 +17,7 @@ Patch 0015 (client certificates, `Request.signal`, gunzip) changes fetch, socket
 Patch 0016 (fetch input buffer) changes the fetch connection reads in `runtime/tov.c` and is written on top of 0001-0013 and 0015.
 Patch 0017 (`server.requestIP`) changes the HTTP server in `runtime/tov.c` and `Request`/`Server` in `std/http.tov`, and is written on top of 0001-0016.
 Patch 0019 (worker respawn) changes the worker supervisor in `runtime/tov.c` and is written on top of 0001-0017 (its `docs/spec.md` hunk is on the line 0017 changes).
+Patch 0020 (`node:fs` `flockSync`) adds one native to the shared lists in `builtins.rs` and `tov.h` next to 0009's, and is written on top of 0001-0019.
 
 ## Submitting upstream
 
@@ -798,3 +799,28 @@ with and without the flag; a SIGKILLed worker
 is replaced while the other keeps its pid and requests keep succeeding, a second early death waits 2 s, both pauses
 are logged, and SIGTERM during a 4 s pause stops the supervisor and its workers within a second. Raiju's e2e kills
 a gateway worker with `kill -9` (tests/e2e.py `l199_e2e`). Written on top of 0001-0017.
+
+## 0020 — `flockSync`: flock(2) for `node:fs`
+
+**Problem.** The workers of a node (and nodes sharing a volume) take a lock around each read-modify-write of a shared
+file. Without a real file lock Raiju used a directory made with `mkdir` as the lock. A holder killed between take
+and release left the directory behind, so waiters had to decide when a lock was stale and delete it, which can delete
+a lock a live process has just taken; and a synchronous waiter could only spin, at 100% CPU, with its event loop
+frozen.
+
+**API.** `flockSync(fd, op, waitMs?)` in `node:fs` (Bun and Node have no flock; the name follows the `*Sync`
+descriptor calls): `op` is `"ex"` (exclusive), `"sh"` (shared) or `"un"` (give it back). `waitMs` 0, the default,
+tries once (`LOCK_NB`); above 0 it retries for that long, sleeping 1 ms doubling to 16 ms between tries; below 0 it
+waits until the lock is free. It returns false when another descriptor held the lock all that time and throws on any
+other error (`EBADF: bad file descriptor, flock`). The kernel gives the lock back when the descriptor closes or its
+process dies; descriptors from `openSync` are opened with `O_CLOEXEC`, so a spawned child never inherits one. On
+Linux NFS clients the call is turned into a lock the server holds.
+
+**Files.** `runtime/tov.c` (`tv_native_flock`), `runtime/tov.h`, `crates/tov/src/check/builtins.rs`,
+`crates/tov/src/std/fs.tov`, `docs/spec.md`.
+
+**Tested.** `tests/flock.tov`, driven by `run.sh` (9 checks): an exclusive lock blocks a second descriptor (exclusive
+and shared), unlock and close give it back, shared locks share, a closed descriptor throws EBADF, a lock another
+process (Python's `fcntl.flock`) holds is not taken by a try and a 120 ms timed wait gives up after 120 ms, and once
+that process is killed with SIGKILL the lock is free at once. Raiju's `filelock.tov` unit tests and e2e `l200_e2e`
+use it. Written on top of 0001-0019.

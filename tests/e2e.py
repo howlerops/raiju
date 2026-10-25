@@ -932,8 +932,13 @@ def cluster_sig(secret, body=""):
     import hashlib, hmac
     return hmac.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
 
+def leader_headers(secret, ts=None):
+    """The headers of a signed GET /api/cluster/leader: the signature over the method, the path and the time (L201)."""
+    t = str(int(time.time() * 1000) if ts is None else ts)
+    return {"x-raiju-cluster-ts": t, "x-raiju-cluster-sig": cluster_sig(secret, "GET /api/cluster/leader " + t)}
+
 def cluster_leader(base, secret):
-    s, _, b = call("GET", "/api/cluster/leader", headers={"x-raiju-cluster-sig": cluster_sig(secret)}, base=base, auth=False)
+    s, _, b = call("GET", "/api/cluster/leader", headers=leader_headers(secret), base=base, auth=False)
     return json.loads(b) if s == 200 else {"status": s, "body": b}
 
 def cluster_modes_e2e():
@@ -2858,6 +2863,26 @@ def l97g_config(auth: bool) -> dict:
         cfg["setup_token"] = "l97g-setup"
         cfg["client"]["routing_chain_max_depth"] = 1
     return cfg
+
+
+def declared_status(port: int, path: str, total: int, headers: dict) -> int | None:
+    """The status a server answers to a POST that declares total bytes and sends none of them: for a refusal made on
+    the declared length (unread). Sending nothing avoids racing the server's close (a reset while the body is still
+    going out)."""
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    try:
+        conn.putrequest("POST", path)
+        conn.putheader("content-type", "application/json")
+        conn.putheader("content-length", str(total))
+        for k, v in headers.items():
+            conn.putheader(k, v)
+        conn.endheaders()
+        return conn.getresponse().status
+    except Exception:
+        return None
+    finally:
+        conn.close()
 
 
 def declared_post(port: int, path: str, total: int) -> int | None:
@@ -6016,12 +6041,12 @@ def l195_e2e(env):
     try:
         wait(GW_L195 + "/health")
         wait(GW_L195_CL + "/health")
-        sig = {"x-raiju-cluster-sig": cluster_sig(L195_SECRET)}
+        sig = leader_headers(L195_SECRET)
         s, _, b = call("GET", "/api/cluster/leader", headers=sig, base=GW_L195, auth=False)
         check("l195: with cluster.listen_port the main listener refuses the peer routes", s == 404 and "cluster listener" in b, (s, b[:200]))
         s, _, b = call("GET", "/api/cluster/leader", headers=sig, base=GW_L195_CL, auth=False)
         check("l195: the cluster listener serves the signed peer routes", s == 200 and json.loads(b).get("node") == "l195", (s, b[:200]))
-        s, _, _ = call("GET", "/api/cluster/leader", headers={"x-raiju-cluster-sig": "0" * 64}, base=GW_L195_CL, auth=False)
+        s, _, _ = call("GET", "/api/cluster/leader", headers={**sig, "x-raiju-cluster-sig": "0" * 64}, base=GW_L195_CL, auth=False)
         check("l195: the cluster listener still checks the signature", s == 401, s)
         wire = json.dumps({"node": "l195-peer", "ts": time.time() * 1000, "counters": []})
         s, _, b = call("POST", "/api/cluster/sync", wire, {"x-raiju-cluster-sig": cluster_sig(L195_SECRET, wire)}, base=GW_L195_CL, auth=False)
@@ -12011,9 +12036,10 @@ def l158_e2e(env):
             if s not in (200, 201):
                 break
         check("five saves through the API succeed", s in (200, 201), (s, b[:200]))
-        # (the upgrade notice's marker, L199, is written beside the config at the first start)
+        # (the upgrade notice's marker, L199, is written beside the config at the first start; the flock(2) lock file,
+        # L200, stays: deleting it would let two processes hold locks on two inodes)
         names = sorted(n for n in os.listdir(d) if n != ".raiju-notices.json")
-        check("the saves leave config.json, its .bak and no temporary file", names == ["config.json", "config.json.bak"], names)
+        check("the saves leave config.json, its .bak, its lock file and no temporary file", names == ["config.json", "config.json.bak", "config.json.flock"], names)
         try:
             saved = json.load(open(cfg_path))
         except Exception as e:
@@ -13359,14 +13385,15 @@ def l196_e2e(env):
         # a body over the stream threshold still streams its answer (the body is read before the route looks at it)
         s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "stream": True, "messages": [{"role": "user", "content": "l196 " + "y" * 200000}]}, key, base=base, auth=False)
         check("l196: a 200 KB streaming call with the key streams", s == 200 and "chat.completion.chunk" in b and b.rstrip().endswith("data: [DONE]"), (s, b[:200], b[-200:]))
-        # the cap: a 3 MB body in hand (half sent), then a 2 MB one does not fit in 4 MB and is refused unread
-        first = l196_open(18348, "/v1/chat/completions", 3 * 1048576, key, 1048576)
+        # the cap: a 3 MB body in hand (all but its last KB sent: bytes are charged as they arrive, L201), then a 2 MB one
+        # does not fit beside it in 4 MB and is refused unread
+        first = l196_open(18348, "/v1/chat/completions", 3 * 1048576, key, 3 * 1048576 - 1024)
         time.sleep(0.5)
         second = l196_open(18348, "/v1/chat/completions", 2 * 1048576, key, 0)
         code2, head2 = l196_read(second)
         second.close()
         check("l196: a body past server.max_buffered_body_mb is answered 503 with retry-after, unread", code2 == 503 and "retry-after: 1" in head2.lower(), head2[:300])
-        first.sendall(l196_chat(3 * 1048576)[1048576:])
+        first.sendall(l196_chat(3 * 1048576)[3 * 1048576 - 1024:])
         code1, head1 = l196_read(first)
         first.close()
         check("l196: the body in hand is served", code1 == 200, head1[:300])
@@ -13374,6 +13401,164 @@ def l196_e2e(env):
         check("l196: once it is done, the next body fits", st == 200, (st, b[:200]))
         st, _, b = call("POST", "/v1/chat/completions", l196_chat(6 * 1048576).decode(), key, base=base, auth=False)
         check("l196: a lone body over the cap is still served (max_request_body_size_mb decides its size)", st == 200, (st, b[:200]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
+GW_L201 = "http://127.0.0.1:18358"  # L201: the body budget charged as bytes arrive, the body deadline, small public bodies
+GW_L201_CL = "http://127.0.0.1:18359"  # L201: the cluster listener of the gateway on 18358
+L201_SECRET = "e2e-l201-" + "cluster-secret-0123456789abcdef"
+
+
+def l201_trickle(port: int, path: str, total: int, headers: dict, piece: int, every: float, seconds: float, out: dict):
+    """Sends a POST declaring total bytes, piece bytes every `every` seconds for up to `seconds`, then reads the answer;
+    out gets its status, head and when it came (seconds after the start)."""
+    t0 = time.time()
+    s = l196_open(port, path, total, headers, 0)
+    s.settimeout(0.05)
+    data = b""
+    while time.time() - t0 < seconds:
+        try:
+            s.sendall(b"x" * piece)
+        except OSError:
+            break
+        try:
+            c = s.recv(65536)
+            if not c:
+                break
+            data += c
+            if b"\r\n\r\n" in data:
+                break
+        except socket.timeout:
+            pass
+        except OSError:
+            break
+        time.sleep(every)
+    s.settimeout(5)
+    try:
+        while b"\r\n\r\n" not in data:
+            c = s.recv(65536)
+            if not c:
+                break
+            data += c
+    except OSError:
+        pass
+    s.close()
+    try:
+        out["status"] = int(data.split(b" ", 2)[1])
+    except Exception:
+        out["status"] = 0
+    out["head"] = data.decode("latin-1")[:300]
+    out["after"] = time.time() - t0
+
+
+def l201_e2e(env):
+    """L201 (production re-audit 2, P1-3, P1-4, P2-1, P2-3): a slow body to a route that checks no credential from the
+    headers holds only the bytes it has sent, so the other POSTs keep working (it held its whole declared length before,
+    and every other POST got 503); a body over 64 KB must arrive within server.body_deadline_seconds (408); the public
+    routes read at most 64 KB; the cluster listener refuses a body without a signature header before reading it and caps
+    bodies at cluster.max_body_mb; GET /api/cluster/leader is signed over its method, path and time; a start with
+    /metrics open warns. Its own gateway (18358, cluster listener 18359)."""
+    import threading
+    d = os.path.join(BUILD, "e2e-l201")
+    os.makedirs(d, exist_ok=True)
+    cp = os.path.join(d, "config.json")
+    log = os.path.join(d, "gw.log")
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": True},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "server": {"max_buffered_body_mb": 4, "body_deadline_seconds": 3},
+        "governance": {"virtual_keys": [{"id": "vk-l201", "name": "vk-l201", "value": "sk-bf-l201"}]},
+        "providers": {"openai": {"keys": [{"name": "o-l201", "value": "sk-l201", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "cluster": {"enabled": True, "node_id": "l201", "secret": "env.RAIJU_L201_SECRET", "interval_ms": 200, "peers": [], "listen_port": 18359, "bind": "127.0.0.1", "max_body_mb": 2},
+    }
+    json.dump(cfg, open(cp, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18358", "-host", "127.0.0.1", "-config", cp, "-server", os.environ.get("RAIJU_SERVER", "bun")],
+                          env={**env, "RAIJU_L201_SECRET": L201_SECRET}, stderr=open(log, "w"))
+    key = {"x-bf-vk": "sk-bf-l201"}
+    small = {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l201 small"}]}
+    try:
+        wait(GW_L201 + "/health")
+        wait(GW_L201_CL + "/health")
+        # P2-3: /metrics is open (no server.metrics_token, not moved to the cluster listener)
+        check("l201: a start with /metrics open on the main port warns", "/metrics is open" in open(log).read(), open(log).read()[-600:])
+
+        # P1-4: a declared 50 MB trickled to /mcp (no credential checked from the headers) while other POSTs come in
+        slow: dict = {}
+        t = threading.Thread(target=l201_trickle, args=(18358, "/mcp", 50 * 1048576, {}, 2048, 0.1, 8.0, slow))
+        t.start()
+        time.sleep(0.8)
+        s1, _, b1 = call("POST", "/v1/chat/completions", small, key, base=GW_L201, auth=False)
+        s2, _, b2 = call("POST", "/v1/chat/completions", l196_chat(1048576).decode(), key, base=GW_L201, auth=False)
+        check("l201: while a slow 50 MB body trickles in, a small POST is served (it was 503)", s1 == 200, (s1, b1[:200]))
+        check("l201: and a 1 MB POST is served too: the slow body holds only what it sent", s2 == 200, (s2, b2[:200]))
+        t.join(20)
+        check("l201: the slow body is cut with 408 at server.body_deadline_seconds (3 s)", slow.get("status") == 408 and 2.5 < slow.get("after", 0) < 7.0, slow)
+        s3, _, b3 = call("POST", "/v1/chat/completions", small, key, base=GW_L201, auth=False)
+        check("l201: after the cut the budget is free again", s3 == 200, (s3, b3[:200]))
+        # a body that arrives in time is served whatever its size (a lone one may pass the 4 MB cap)
+        s4, _, b4 = call("POST", "/v1/chat/completions", l196_chat(5 * 1048576).decode(), key, base=GW_L201, auth=False)
+        check("l201: a 5 MB body that arrives in time is served", s4 == 200, (s4, b4[:200]))
+        # a body that holds the whole budget (5 MB sent at once, then nothing) turns other big bodies away until its
+        # deadline, never small calls (their bytes are in memory already)
+        hog = l196_open(18358, "/mcp", 50 * 1048576, {}, 5 * 1048576)
+        time.sleep(0.5)
+        s5, _, b5 = call("POST", "/v1/chat/completions", small, key, base=GW_L201, auth=False)
+        s6 = declared_status(18358, "/v1/chat/completions", 1048576, key)
+        check("l201: while a stalled body holds the budget, a small POST is still served", s5 == 200, (s5, b5[:200]))
+        check("l201: and a 1 MB POST is refused 503 until that body's deadline", s6 == 503, s6)
+        code, head = l196_read(hog)
+        hog.close()
+        check("l201: the stalled body is cut with 408", code == 408, head[:200])
+        s7, _, b7 = call("POST", "/v1/chat/completions", l196_chat(1048576).decode(), key, base=GW_L201, auth=False)
+        check("l201: then the 1 MB POST is served", s7 == 200, (s7, b7[:200]))
+
+        # the public routes read at most 64 KB
+        st = declared_post(18358, "/api/session/login", 1048576)
+        check("l201: a 1 MB declared body to /api/session/login is 413 unread", st == 413, st)
+        st = chunked_post(18358, "/api/oauth2/consent/flows/x", 1048576)
+        check("l201: a 1 MB chunked body to an OAuth route is 413", st == 413, st)
+        st = declared_post(18358, "/oauth2/token", 200000)
+        check("l201: a 200 KB body to the MCP token endpoint is 413", st == 413, st)
+        s, _, b = call("POST", "/api/session/login", {"username": "nobody", "password": "x"}, base=GW_L201, auth=False)
+        check("l201: a normal sign-in body still reaches its route", s not in (413, 503), (s, b[:200]))
+
+        # P1-3: the cluster listener checks the signature header before reading, and caps bodies at max_body_mb (2)
+        t0 = time.time()
+        c = l196_open(18359, "/api/cluster/sync", 30 * 1048576, {}, 0)
+        code, head = l196_read(c)
+        c.close()
+        check("l201: a 30 MB peer body with no signature header is refused 401 before it is read", code == 401 and time.time() - t0 < 3, (code, head[:200]))
+        c = l196_open(18359, "/api/cluster/feed", 30 * 1048576, {"x-raiju-cluster-sig": "not-hex"}, 0)
+        code, head = l196_read(c)
+        c.close()
+        check("l201: a malformed signature header is refused 401 before the body is read", code == 401, (code, head[:200]))
+        st = declared_post(18359, "/api/cluster/sync", 3 * 1048576)
+        check("l201: a 3 MB peer body (over cluster.max_body_mb 2) without a signature is refused", st == 401, st)
+        c = l196_open(18359, "/api/cluster/sync", 3 * 1048576, {"x-raiju-cluster-sig": "0" * 64}, 0)
+        code, head = l196_read(c)
+        c.close()
+        check("l201: a signed-looking 3 MB peer body is 413 unread (cluster.max_body_mb)", code == 413, (code, head[:200]))
+        junk = "x" * 1048576
+        s, _, _ = call("POST", "/api/cluster/sync", junk, {"x-raiju-cluster-sig": "0" * 64}, base=GW_L201_CL, auth=False)
+        check("l201: a 1 MB body with a wrong HMAC is read within the cap and refused 401", s == 401, s)
+        wire = json.dumps({"node": "l201-peer", "ts": time.time() * 1000, "counters": []})
+        s, _, b = call("POST", "/api/cluster/sync", wire, {"x-raiju-cluster-sig": cluster_sig(L201_SECRET, wire)}, base=GW_L201_CL, auth=False)
+        check("l201: a signed peer sync is still merged", s == 200 and '"node":"l201"' in b, (s, b[:200]))
+
+        # P2-1: GET /api/cluster/leader is signed over its method, path and time
+        s, _, b = call("GET", "/api/cluster/leader", headers=leader_headers(L201_SECRET), base=GW_L201_CL, auth=False)
+        check("l201: a fresh signed leader read is answered", s == 200 and json.loads(b).get("node") == "l201", (s, b[:200]))
+        s, _, _ = call("GET", "/api/cluster/leader", headers={"x-raiju-cluster-sig": cluster_sig(L201_SECRET)}, base=GW_L201_CL, auth=False)
+        check("l201: the old empty-body signature is refused", s == 401, s)
+        s, _, b = call("GET", "/api/cluster/leader", headers=leader_headers(L201_SECRET, int(time.time() * 1000) - 120000), base=GW_L201_CL, auth=False)
+        check("l201: a captured leader read two minutes old is refused as stale", s == 401 and "stale" in b, (s, b[:200]))
+        h = leader_headers(L201_SECRET)
+        h["x-raiju-cluster-ts"] = str(int(h["x-raiju-cluster-ts"]) + 1)
+        s, _, _ = call("GET", "/api/cluster/leader", headers=h, base=GW_L201_CL, auth=False)
+        check("l201: a leader read whose time was changed is refused", s == 401, s)
     finally:
         gw.terminate()
         gw.wait()
@@ -16369,7 +16554,7 @@ def l197_e2e(env):
     import hashlib, base64 as _b64, secrets as _sec, urllib.parse as _up, stat
     from concurrent.futures import ThreadPoolExecutor
     cfg_path = os.path.join(BUILD, "e2e.l197.json")
-    for suffix in ["", ".bak", ".sessions.json", ".oidc-flows.json", ".agent-sessions.json"]:
+    for suffix in ["", ".bak", ".sessions.json", ".agent-sessions.json"]:
         try:
             os.remove(cfg_path + suffix)
         except FileNotFoundError:
@@ -16457,6 +16642,181 @@ def l197_e2e(env):
               all(t != "" for t in texts) and modes == [0o600, 0o600] and not any(x in t for t in texts for x in [kept, stok, access, refresh, nxt]), (modes, [len(t) for t in texts]))
     finally:
         for p in [gw, gw_r]:
+            if p is not None:
+                p.terminate()
+                p.wait()
+
+GW_L200_SSO = "http://127.0.0.1:18356"  # L200: single sign-on logins that store nothing (four workers on Bun)
+GW_L200 = "http://127.0.0.1:18357"  # L200: config saves waiting for the file lock (two workers on Bun)
+L200_ADMIN = {"authorization": "Bearer sk-admin-l200"}
+
+L200_FLOOD = """
+import http.client, sys, threading, time
+port, secs, n = int(sys.argv[1]), float(sys.argv[2]), int(sys.argv[3])
+stop = time.time() + secs
+tot = [0, 0]
+lk = threading.Lock()
+def run():
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    a, b = 0, 0
+    while time.time() < stop:
+        c.request("GET", "/api/oidc/login")
+        r = c.getresponse()
+        r.read()
+        a += 1
+        b += 1 if r.status == 302 else 0
+    with lk:
+        tot[0] += a
+        tot[1] += b
+ts = [threading.Thread(target=run) for _ in range(n)]
+for t in ts:
+    t.start()
+for t in ts:
+    t.join()
+print(tot[0], tot[1])
+"""
+
+def l200_start(env, port, cfg_path, name, workers):
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    extra = ["-workers", str(workers)] if server != "http1" and workers > 1 else []
+    return subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", str(port), "-host", "127.0.0.1", "-config", cfg_path, "-server", server] + extra,
+                            env=env, stderr=open(os.path.join(BUILD, f"e2e.l200{name}.log"), "w"))
+
+def l200_holder(path):
+    """Another process holding the flock(2) lock of path until it is killed: (process, its stdout said "held")."""
+    p = subprocess.Popen([sys.executable, "-I", "-c", "import fcntl, sys, time\nf = open(sys.argv[1], 'a')\nfcntl.flock(f, fcntl.LOCK_EX)\nprint('held', flush=True)\ntime.sleep(60)", path], stdout=subprocess.PIPE, text=True)
+    return p, p.stdout.readline().strip() == "held"
+
+def l200_e2e(env, idp_state):
+    """L200: a save waiting for the config file's lock waits without pausing its worker (/health stays fast), a holder
+    killed with SIGKILL gives the lock back at once (flock(2), Tov patch 0020) and every waiting save then lands, none
+    lost; a session write whose lock another process keeps fails the sign-in (503) and writes nothing; an
+    unauthenticated /api/oidc/login flood writes nothing to disk and leaves /health fast, and a sign-in begun on one
+    worker completes on any (its state is sealed, not stored). Ports 18357 (locks) and 18356 (SSO)."""
+    import fcntl, hashlib, shutil, signal, threading, http.client, urllib.parse as _up
+    from concurrent.futures import ThreadPoolExecutor
+    d = os.path.join(BUILD, "e2e-l200")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    users = [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l200".encode()).hexdigest()},
+             {"name": "lia", "role": "admin", "salt": "s200", "password_sha256": hashlib.sha256("s200:pw-lia".encode()).hexdigest()}]
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "l200", "value": "sk-l200", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {"users": users},
+    }
+    path = os.path.join(d, "config.json")
+    json.dump(cfg, open(path, "w"))
+    lock = path + ".flock"
+    def timed(fn):
+        t0 = time.time()
+        r = fn()
+        return r, time.time() - t0
+    def health(base):
+        return timed(lambda: call("GET", "/health", None, None, base=base, auth=False)[0])
+    def names():
+        return [v.get("name") for v in json.load(open(path)).get("governance", {}).get("virtual_keys", [])]
+    gw = l200_start(env, 18357, path, "a", 2)
+    gw_s = None
+    holder = None
+    try:
+        wait(GW_L200 + "/health")
+        time.sleep(0.5)
+        # ---- a save waits for a lock another process holds, and the worker keeps serving ----
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        res = {}
+        def create(name):
+            res[name] = timed(lambda: call("POST", "/api/governance/virtual-keys", {"name": name}, L200_ADMIN, base=GW_L200, auth=False)[0])
+        t = threading.Thread(target=create, args=("l200-wait",))
+        t.start()
+        time.sleep(0.5)
+        hs = [health(GW_L200) for _ in range(6)]
+        pending = t.is_alive()
+        time.sleep(1.0)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+        t.join(15)
+        st, took = res.get("l200-wait", (0, 0.0))
+        check("L200: while another process holds the config lock, /health answers at once (the waiting save does not pause the worker)",
+              all(h[0] == 200 and h[1] < 0.5 for h in hs), hs)
+        check("L200: the save waits for the lock and lands once it is given back", pending and st in (200, 201) and took >= 1.4 and "l200-wait" in names(), (pending, st, took, names()))
+        # ---- a holder killed with SIGKILL: the waiting saves land at once, every one ----
+        holder, held = l200_holder(lock)
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futs = [ex.submit(create, f"l200-k{i}") for i in range(8)]
+            time.sleep(1.0)
+            hs = [health(GW_L200) for _ in range(4)]
+            waiting = sum(1 for f in futs if not f.done())
+            holder.send_signal(signal.SIGKILL)
+            holder.wait()
+            t_kill = time.time()
+            for f in futs:
+                f.result(20)
+        done_after = time.time() - t_kill
+        codes = [res.get(f"l200-k{i}", (0, 0.0))[0] for i in range(8)]
+        got = names()
+        check("L200: saves wait while a live process holds the lock, the worker serving /health meanwhile", held and waiting == 8 and all(h[0] == 200 and h[1] < 0.5 for h in hs), (held, waiting, hs))
+        check("L200: a holder killed with SIGKILL gives the lock back at once: every waiting save lands, none lost", codes == [201] * 8 or all(c in (200, 201) for c in codes), codes)
+        check("L200: the config file holds every save made after the kill", all(f"l200-k{i}" in got for i in range(8)) and len(got) == 9 and done_after < 5.0, (len(got), done_after))
+        check("L200: the lock is a file that is never deleted or taken over (no lock directory)", os.path.isfile(lock) and not os.path.exists(path + ".lock"), os.listdir(d))
+        # ---- a sign-in whose session file's lock another process keeps fails, and writes nothing ----
+        sfd = os.open(path + ".sessions.json.flock", os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(sfd, fcntl.LOCK_EX)
+        s, _, b = call("POST", "/api/session/login", {"username": "lia", "password": "pw-lia"}, base=GW_L200, auth=False)
+        fcntl.flock(sfd, fcntl.LOCK_UN)
+        os.close(sfd)
+        check("L200: a sign-in whose session file is locked by another process fails (503) and gives no token", s == 503 and "sk-sess-" not in b and not os.path.exists(path + ".sessions.json"), (s, b[:200]))
+        s, _, b = call("POST", "/api/session/login", {"username": "lia", "password": "pw-lia"}, base=GW_L200, auth=False)
+        check("L200: once the lock is free the sign-in works", s == 200 and "sk-sess-" in b, (s, b[:200]))
+        gw.terminate()
+        gw.wait()
+        gw = None
+        # ---- single sign-on: an unauthenticated login flood writes nothing and leaves /health fast ----
+        sso_cfg = {**cfg, "oidc": {"enabled": True, "issuer": "http://127.0.0.1:18096", "client_id": "raiju", "redirect_uri": GW_L200_SSO + "/api/oidc/callback", "role_claim": "groups", "role_map": {"raiju-editors": "editor"}}}
+        sso_path = os.path.join(d, "sso.json")
+        json.dump(sso_cfg, open(sso_path, "w"))
+        gw_s = l200_start(env, 18356, sso_path, "s", 4)
+        wait(GW_L200_SSO + "/health")
+        time.sleep(0.5)
+        before = sorted(os.listdir(d))
+        stamps = {n: os.stat(os.path.join(d, n)).st_mtime_ns for n in before}
+        # the flood runs in its own process, so this one measures /health undisturbed
+        flooder = subprocess.Popen([sys.executable, "-I", "-c", L200_FLOOD, "18356", "3.0", "12"], stdout=subprocess.PIPE, text=True)
+        time.sleep(1.0)
+        hs = [health(GW_L200_SSO) for _ in range(10)]
+        out, _ = flooder.communicate(timeout=30)
+        counts = [tuple(int(x) for x in out.split())] if out.strip() else [(0, 0)]
+        sent = sum(c[0] for c in counts)
+        redirected = sum(c[1] for c in counts)
+        after = sorted(os.listdir(d))
+        changed = [n for n in after if n not in stamps or os.stat(os.path.join(d, n)).st_mtime_ns != stamps[n]]
+        lat = sorted(h[1] for h in hs)
+        check("L200: an unauthenticated login flood is answered (302) and writes nothing to disk", sent > 200 and redirected == sent and changed == [] and not os.path.exists(sso_path + ".oidc-flows.json"), (sent, redirected, changed))
+        check("L200: /health stays fast during the login flood", all(h[0] == 200 for h in hs) and lat[len(lat) // 2] < 0.1 and lat[-1] < 1.0, lat)
+        # ---- a sign-in begun on one worker completes on whichever worker takes the callback ----
+        oks = []
+        for i in range(4):
+            c = http.client.HTTPConnection("127.0.0.1", 18356, timeout=10)
+            c.request("GET", "/api/oidc/login?return_to=" + _up.quote("/oauth/consent?l200=" + str(i), safe=""))
+            r = c.getresponse()
+            r.read()
+            loc = r.getheader("location") or ""
+            c.close()
+            q = _up.parse_qs(_up.urlparse(loc).query)
+            st = q.get("state", [""])[0]
+            idp_state["nonce"] = q.get("nonce", [""])[0]
+            s, _, page = call("GET", "/api/oidc/callback?code=abc&state=" + _up.quote(st, safe=""), base=GW_L200_SSO, auth=False)
+            oks.append((s, st.startswith("s1.") and "consent" not in st, "sk-sess-" in page and f"l200={i}" in page))
+        check("L200: sign-ins begun on one worker complete on any, back to their return path; the state is sealed", all(o == (200, True, True) for o in oks), oks)
+        s, _, _ = call("GET", "/api/oidc/callback?code=abc&state=s1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", base=GW_L200_SSO, auth=False)
+        check("L200: a forged state is refused", s == 401, s)
+    finally:
+        if holder is not None and holder.poll() is None:
+            holder.kill()
+            holder.wait()
+        for p in [gw, gw_s]:
             if p is not None:
                 p.terminate()
                 p.wait()
@@ -18951,6 +19311,9 @@ def main():
         # L195: cluster authentication (the secret resolved and enforced, the cluster listener, the /metrics token): its own
         # gateways, one after the other (18346, cluster listener 18347)
         l195_e2e(env)
+        # L201: the body budget charged as bytes arrive, the body deadline, small public bodies, the cluster listener's
+        # signature-first reads and body cap, signed leader reads, the open /metrics warning: its own gateway (18358, 18359)
+        l201_e2e(env)
         # L194: Hugging Face inference providers (chat, embeddings, speech, transcription, images), the CLI's agent sign-in
         # and default key, and the A2A v0.3 REST client: its own gateway (18344) and Hugging Face double (18345)
         l194_e2e(env)
@@ -18966,6 +19329,10 @@ def main():
         # L199: a worker killed with SIGKILL is replaced (Tov patch 0019), the upgrade notice, state file versions, the
         # allocator check: its own gateways (18354, 18355)
         l199_e2e(env)
+        # L200: config saves waiting for the file lock without pausing the worker, a SIGKILLed holder (flock, Tov patch
+        # 0020), a locked session file failing the sign-in, and OIDC logins that store nothing: its own gateways, one after
+        # the other (18357, 18356)
+        l200_e2e(env, idp_state)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

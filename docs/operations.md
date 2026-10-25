@@ -28,8 +28,10 @@ rebuilds its engine, exactly as the saving worker does.
   the key any more.
 - A worker whose share file has not moved for a second is taken for gone and is not waited for.
 - Saves from several workers at once do not overwrite each other. A save takes the config file's lock
-  (`config.json.lock`, a directory; one left by a dead process is taken over after 10 seconds) and reads
-  the file again; when another worker saved since, its own change is reapplied to the file as it is now
+  (flock(2) on `config.json.flock`, a file that stays; the kernel gives the lock back when its holder exits
+  or is killed, so a dead process never leaves it behind) and reads the file again. A management request
+  that changes something waits for the lock (up to 15 seconds, then a save fails with 500) without pausing
+  its worker, which keeps serving other requests; saves made outside a request wait at most half a second; when another worker saved since, its own change is reapplied to the file as it is now
   (a three-way merge: objects key by key, lists by id or name). Two changes that cannot both hold (the
   same value set differently, an element changed on one worker and deleted on another, two new elements
   with one name) answer 409, and the worker takes the file's config, so a retry starts from it. Nodes
@@ -85,11 +87,17 @@ Shared between the workers of one node only:
 - The response cache and the in-process semantic cache.
 - Async jobs (one file per job in the share folder): a poll may reach any worker of the node that took
   the job, not another node.
-- Dashboard sessions, single sign-on logins in flight and the CLI's agent sign-in codes and tokens, in
-  `<config>.sessions.json`, `<config>.oidc-flows.json` and `<config>.agent-sessions.json` beside the
-  config file (0600, tokens by hash, refresh tokens sealed with the encryption key). They outlive a
-  restart; nodes share them only when they share the config folder, so put several nodes behind sticky
-  sessions or a shared volume for dashboard and CLI sign-ins.
+- Dashboard sessions and the CLI's agent sign-in codes and tokens, in `<config>.sessions.json` and
+  `<config>.agent-sessions.json` beside the config file (0600, tokens by hash, refresh tokens sealed with
+  the encryption key). They outlive a restart; nodes share them only when they share the config folder, so
+  put several nodes behind sticky sessions or a shared volume for dashboard and CLI sign-ins. A write that
+  cannot get its file's lock within half a second fails its request (503) and writes nothing.
+- Single sign-on logins in flight are kept nowhere: `/api/oidc/login` seals the PKCE verifier, the nonce,
+  the return path and a 10-minute expiry into the `state` value (AES-256-GCM), and the callback opens it on
+  whichever worker takes it. The key is derived from the encryption key, so with `encryption_key` set every
+  node opens every other node's states, across restarts too; without one each node makes a key at start,
+  and a sign-in begun before a restart or on another node must be started again. A state is accepted once
+  per worker.
 - `/metrics` (each worker's series are summed when scraped).
 - The request log files, when `logs_store` is on (one folder per node).
 

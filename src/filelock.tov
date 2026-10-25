@@ -1,87 +1,139 @@
 // A lock the processes that write one file take around a read-modify-write of it: the workers of a node, and nodes
-// that share the file on a volume. The lock is a directory, <file>.lock, made with mkdir, which only one process can
-// make (on NFS too), and removed on release. A holder that died (a SIGKILL between take and release) leaves it
-// behind: a lock older than staleMs is taken over. The holder's writes are short (a read, a merge, an atomic write),
-// so a waiter spins until the lock is free or waitMs pass. Nested takes of the same file in one process count, so a
-// holder that takes it again does not wait for itself.
-import { existsSync, mkdirSync, rmSync, statSync } from "node:fs"
+// that share the file on a volume. The lock is flock(2) on <file>.flock (tov-patches 0020; on NFS the client turns it
+// into a lock the server holds). The kernel gives it back when its holder exits or is killed, so a dead holder never
+// leaves a lock behind and nothing is ever taken over or deleted: a holder only gives back its own lock.
+//
+// Waiting never spins. lockFileAsync waits with a growing pause between tries (2 ms doubling to 50 ms), so the
+// worker keeps serving while it waits; the routes that change a file wait this way. lockFile, for code that cannot
+// await, tries and then waits at most LOCK_SYNC_MS, sleeping between tries. Takes of the same file in one process
+// count (the second take is not a wait), so a holder that takes it again does not wait for itself, and a request that
+// holds it across an await does not block another request of its process.
+import { openSync, closeSync, flockSync } from "node:fs"
 
-// a save of the config, fsyncs included, takes milliseconds; a lock this old was left by a dead process
-export const LOCK_STALE_MS = 10000.0
-// how long a writer waits for the lock before it gives up (the caller answers 503)
+// how long a waiter waits for the lock before it gives up (the caller answers 503)
 export const LOCK_WAIT_MS = 15000.0
+// how long a take that cannot await waits (sleeping, its worker paused): a holder's write takes milliseconds
+export const LOCK_SYNC_MS = 500.0
 
-// takes held by this process, by lock directory
-const held: Map<string, int> = new Map()
+// the pause between tries of lockFileAsync grows from the first to the last
+const NAP_FIRST_MS = 2
+const NAP_LAST_MS = 50
 
-export type FileLock = { dir: string, ok: bool }
+type Held = { fd: int, depth: int }
 
-export function lockDirOf(path: string): string {
-  return path + ".lock"
+// takes held by this process, by lock file
+const held: Map<string, Held> = new Map()
+// lock files already reported as unusable (said once)
+const unusable: Map<string, bool> = new Map()
+
+// path "" is a lock that guards nothing (no lock file could be made)
+export type FileLock = { path: string, ok: bool }
+
+export function lockPathOf(path: string): string {
+  return path + ".flock"
 }
 
-// Whether a lock directory was made more than staleMs before nowMs. A lock that is gone reads as not stale.
-function stale(dir: string, nowMs: f64, staleMs: f64): bool {
+// One take of path's lock, waiting up to waitMs (0: one try). A folder where no lock file can be made (read-only),
+// or a file system without flock, gives an ok lock that guards nothing: the write that follows fails on its own.
+function take(path: string, waitMs: int): FileLock {
+  const lp = lockPathOf(path)
+  const h = held.get(lp)
+  if (h !== undefined) {
+    held.set(lp, { fd: h.fd, depth: h.depth + 1 })
+    return { path: lp, ok: true }
+  }
+  let fd = -1
   try {
-    return nowMs - statSync(dir).mtimeMs > staleMs
+    fd = openSync(lp, "a", 384)
   } catch (e) {
-    return false
+    return guardsNothing(lp, e.message)
   }
+  let got = false
+  try {
+    got = flockSync(fd, "ex", waitMs)
+  } catch (e) {
+    try {
+      closeSync(fd)
+    } catch (e2) {
+      // closed already
+    }
+    return guardsNothing(lp, e.message)
+  }
+  if (got) {
+    held.set(lp, { fd: fd, depth: 1 })
+    return { path: lp, ok: true }
+  }
+  try {
+    closeSync(fd)
+  } catch (e) {
+    // closed already
+  }
+  return { path: lp, ok: false }
 }
 
-// Takes the lock of path, waiting up to waitMs. ok is false when another process held it all that time. A folder
-// where no lock can be made (read-only) gives an ok lock that guards nothing: the write that follows fails on its own.
-export function lockFile(path: string, waitMs?: f64, staleMs?: f64): FileLock {
-  const dir = lockDirOf(path)
-  const depth = held.get(dir) ?? 0
-  if (depth > 0) {
-    held.set(dir, depth + 1)
-    return { dir: dir, ok: true }
+function guardsNothing(lp: string, why: string): FileLock {
+  if (!unusable.has(lp)) {
+    unusable.set(lp, true)
+    console.error(`raiju: no file lock at ${lp} (${why}); writes to it are not guarded against other processes`)
   }
+  return { path: "", ok: true }
+}
+
+// Takes the lock of path, waiting up to waitMs (LOCK_SYNC_MS by default) with the worker paused. ok is false when
+// another process held it all that time. For code that cannot await; a route waits with lockFileAsync.
+export function lockFile(path: string, waitMs?: f64): FileLock {
+  return take(path, Math.max(0, Math.round(waitMs ?? LOCK_SYNC_MS)))
+}
+
+// Takes the lock of path without waiting: ok is false when another process holds it.
+export function tryLockFile(path: string): FileLock {
+  return take(path, 0)
+}
+
+function nap(ms: int): Promise<void> {
+  return new Promise<void>((resolve) => {
+    setTimeout(() => resolve(), ms)
+  })
+}
+
+// Takes the lock of path, waiting up to waitMs (LOCK_WAIT_MS by default) while the worker serves other requests. ok
+// is false when another process held it all that time.
+export async function lockFileAsync(path: string, waitMs?: f64): Promise<FileLock> {
   const until = Date.now() + (waitMs ?? LOCK_WAIT_MS)
-  const old = staleMs ?? LOCK_STALE_MS
-  let unmade = 0
+  let pause = NAP_FIRST_MS
   for (;;) {
-    try {
-      mkdirSync(dir)
-      held.set(dir, 1)
-      return { dir: dir, ok: true }
-    } catch (e) {
-      // held by another process (it may have given it back since: the next round takes it), or it cannot be made
-      if (!e.message.includes("EEXIST") && !existsSync(dir)) {
-        unmade += 1
-        // not held, and it cannot be made (a read-only folder): nothing to wait for
-        if (unmade >= 3) return { dir: "", ok: true }
-        continue
-      }
-    }
-    const now = Date.now()
-    if (stale(dir, now, old)) {
-      try {
-        rmSync(dir, { recursive: true, force: true })
-      } catch (e) {
-        // another waiter took it over first
-      }
-      continue
-    }
-    if (now >= until) return { dir: dir, ok: false }
+    const l = take(path, 0)
+    if (l.ok || Date.now() >= until) return l
+    await nap(pause)
+    pause = Math.min(pause * 2, NAP_LAST_MS)
   }
 }
 
 // Gives the lock back (a lock that was not taken is a no-op).
 export function unlockFile(l: FileLock): void {
-  if (!l.ok || l.dir === "") return
-  const depth = held.get(l.dir) ?? 0
-  if (depth > 1) {
-    held.set(l.dir, depth - 1)
+  if (!l.ok || l.path === "") return
+  const h = held.get(l.path)
+  if (h === undefined) return
+  if (h.depth > 1) {
+    held.set(l.path, { fd: h.fd, depth: h.depth - 1 })
     return
   }
-  held.delete(l.dir)
+  held.delete(l.path)
   try {
-    rmSync(l.dir, { recursive: true, force: true })
+    flockSync(h.fd, "un")
   } catch (e) {
-    // gone already (taken over as stale)
+    // closing gives it back too
   }
+  try {
+    closeSync(h.fd)
+  } catch (e) {
+    // closed already
+  }
+}
+
+// Whether this process holds path's lock.
+export function holdsLock(path: string): bool {
+  return held.has(lockPathOf(path))
 }
 
 let lockSeq = 0
@@ -91,36 +143,66 @@ function lockPath(): string {
   return "/tmp/raiju-filelock-test-" + process.pid + "-" + Math.floor(Date.now()) + "-" + lockSeq
 }
 
+// Another process's hold on path's lock, as a descriptor of its own (a second descriptor conflicts like a second
+// process does).
+export function holdAsAnother(path: string): int throws Error {
+  const fd = try openSync(lockPathOf(path), "a", 384)
+  if (!(try flockSync(fd, "ex"))) throw new Error("the lock is held")
+  return fd
+}
+
 test("one holder at a time: a second take waits and gives up, a release frees it, nested takes count", () => {
   const path = lockPath()
   const a = lockFile(path, 50.0)
   expect(a.ok).toBe(true)
-  expect(existsSync(lockDirOf(path))).toBe(true)
+  expect(holdsLock(path)).toBe(true)
   // the same process again: counted, not waited for
   const again = lockFile(path, 50.0)
   expect(again.ok).toBe(true)
   unlockFile(again)
-  expect(existsSync(lockDirOf(path))).toBe(true)
+  expect(holdsLock(path)).toBe(true)
+  // another descriptor (another process) cannot take it while this process holds it
+  let other = -1
+  try {
+    other = holdAsAnother(path)
+  } catch (e) {
+    other = -1
+  }
+  expect(other).toBe(-1)
   unlockFile(a)
-  expect(existsSync(lockDirOf(path))).toBe(false)
-  // a lock another process holds (made here by hand): the take waits waitMs and fails
-  try mkdirSync(lockDirOf(path))
+  expect(holdsLock(path)).toBe(false)
+  // a lock another process holds: a take waits waitMs, sleeping, and fails; a try fails at once
+  const fd = try holdAsAnother(path)
   const t0 = Date.now()
   const b = lockFile(path, 60.0)
   expect(b.ok).toBe(false)
   expect(Date.now() - t0 >= 60.0).toBe(true)
   unlockFile(b)
-  expect(existsSync(lockDirOf(path))).toBe(true)
-  // a lock left by a dead holder is taken over once it is stale
-  const c = lockFile(path, 2000.0, 1.0)
+  expect(tryLockFile(path).ok).toBe(false)
+  // the other process ends (its descriptor closes, as at a SIGKILL): the lock is free at once, nothing to take over
+  try closeSync(fd)
+  const c = tryLockFile(path)
   expect(c.ok).toBe(true)
   unlockFile(c)
-  expect(existsSync(lockDirOf(path))).toBe(false)
+  expect(holdsLock(path)).toBe(false)
+})
+
+test("a release gives back only this process's lock", () => {
+  const path = lockPath()
+  const a = lockFile(path, 50.0)
+  unlockFile(a)
+  // a second release of the same take, and a release of a failed take, leave another holder's lock alone
+  const fd = try holdAsAnother(path)
+  unlockFile(a)
+  const failed = tryLockFile(path)
+  unlockFile(failed)
+  expect(tryLockFile(path).ok).toBe(false)
+  try closeSync(fd)
 })
 
 test("a folder where no lock can be made gives a lock that guards nothing", () => {
   const l = lockFile("/nonexistent-raiju-dir/x/config.json", 50.0)
   expect(l.ok).toBe(true)
-  expect(l.dir).toBe("")
+  expect(l.path).toBe("")
   unlockFile(l)
 })

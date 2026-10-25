@@ -11,11 +11,15 @@ session. It sets up the machine, explains the lead/worker loop and points at the
 Worker briefs start from [handoff/worker-prompt-template.md](handoff/worker-prompt-template.md);
 the rules all workers follow are in [handoff/worker-brief.md](handoff/worker-brief.md).
 
-Branch: `claude/affectionate-shannon-pjwi5z`. Waves 1 to 24 are on `main` (PR howlerops/raiju#6).
-The branch carries wave 25 (L195 to L199).
+Branch: `claude/affectionate-shannon-pjwi5z`. Waves 1 to 25 are on `main` (PR howlerops/raiju#7).
+The branch carries wave 26 (L200 and L201).
 
 ## Where things stand
 
+- Wave 26 (L200, L201) fixed the second re-audit (docs/audits/production-reaudit-2-2026-10-25.md): file
+  locks are flock(2) with async waits (tov-patches 0020), OIDC login stores nothing per request, cluster
+  peer routes refuse unsigned bodies before reading and cap them, and the body budget counts bytes as they
+  arrive with a deadline. Behaviour changes are in docs/behaviour-changes-wave-26.md.
 - Wave 25 (L195 to L199) fixed the production re-audit (docs/audits/production-reaudit-2026-10-25.md):
   the cluster secret is resolved from env and enforced (32 bytes or more) with an optional cluster
   listener and a /metrics token (L195); credentials are checked before large bodies are read and a
@@ -72,7 +76,7 @@ The branch carries wave 25 (L195 to L199).
   current Bifrost datasheet.
 - docs/parity.md counts 567 parity rows: done 531, partial 12, missing 0, out of scope 15,
   n/a 9, plus 42 Raiju-only extras.
-- Tests at handoff (compiler from tov-patches 0001 to 0010, 0012, 0013, 0015 to 0017 and 0019): `make unit` 2,435 passed,
+- Tests at handoff (compiler from tov-patches 0001 to 0010, 0012, 0013, 0015 to 0017, 0019 and 0020): `make unit` 2,445 passed,
   0 failed, plus the Python tests (gen_pricing, the h2/gRPC interop suite, crew_priors,
   test_deploy, test_gen_config_doc); e2e "all passed" on Bun and http1; `make ui` all passed;
   `make openapi-check` ok; `make web-check` and `make config-doc-check` up to date. Helm lint and
@@ -84,7 +88,7 @@ The branch carries wave 25 (L195 to L199).
   streamed request bodies, 0009 node:fs rename and fsync, 0010 a WASM wall-clock limit, 0012
   server lifecycle (graceful stop, timeouts, connection cap), 0013 the fetch peer address policy,
   0015 TLS client certificates, Request.signal and gunzip, 0016 a small fetch input buffer, 0017
-  server.requestIP, 0019 worker respawn after SIGKILL and Bun.plainAlloc. 0011, 0014 and 0018 are
+  server.requestIP, 0019 worker respawn after SIGKILL and Bun.plainAlloc, 0020 flockSync. 0011, 0014 and 0018 are
   unused. They apply in order only; `make tov` rebuilds the compiler.
 - Admin UI: SolidJS 2.0 RC in `web/`, embedded through the committed `src/ui_assets.tov`;
   charts with zoom and series toggles, MCP access and virtual MCP screens, role-aware actions
@@ -112,7 +116,7 @@ real accounts. The production items left:
 - Deployment: build and scan the image, install the chart on a real cluster and apply the ECS
   module on AWS (both are checked only by lint, terraform validate and mock-provider tests).
 - Crew routing: fit real priors and a classifier from your own evaluation data.
-- Upstream: offer tov-patches/upstream to Tov (0013, 0015, 0016, 0017 and 0019 have no write-up yet).
+- Upstream: offer tov-patches/upstream to Tov (0013, 0015, 0016, 0017, 0019 and 0020 have no write-up yet).
 
 ## Owner decisions after wave 22 (2026-10-24)
 

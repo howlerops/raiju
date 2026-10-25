@@ -274,7 +274,11 @@ Request bodies over 64 KB reach the gateway unread, so a caller whose credential
 401 or 403 from the headers and its body is never read (inference routes while auth is enforced, and
 the management API's gate). Each process also caps the request-body bytes it reads at once across
 requests, `server.max_buffered_body_mb` (default 48, sized for a 512Mi pod: parsing a chat body costs
-several times its size); a body that does not fit is answered 503 with `retry-after`, unread. A lone
+several times its size); bytes are charged as they arrive, so a slow client holds only what it has
+sent, and a body that does not fit is answered 503 with `retry-after`. A body over 64 KB must arrive
+whole within `server.body_deadline_seconds` (default 120; 408 otherwise). The routes anyone may call
+without a credential (sign-in, setup, agent sign-in, OAuth, OIDC) read at most 64 KB, and the cluster
+peer routes at most `cluster.max_body_mb` (16), after checking that a signature header is there. A lone
 body up to `client.max_request_body_size_mb` is always read, so that limit keeps Bifrost's meaning.
 `bench/body_memory.py` measures both.
 

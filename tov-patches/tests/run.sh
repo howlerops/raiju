@@ -1,5 +1,5 @@
 #!/bin/sh
-# Checks patches 0001-0010, 0012, 0013, 0015, 0016, 0017 and 0019 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
+# Checks patches 0001-0010, 0012, 0013, 0015, 0016, 0017, 0019 and 0020 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
 # (or `make tov-test`). Each program prints "ok" lines and "FAIL" lines; a run passes when no line
 # fails and the expected number of "ok" lines appears.
 set -eu
@@ -133,6 +133,17 @@ expect "$OUT/socket_pause.out" 2 "Socket.pause"
 TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/fs_atomic.tov" -o "$OUT/fs_atomic" >/dev/null
 "$OUT/fs_atomic" > "$OUT/fs_atomic.out"
 expect "$OUT/fs_atomic.out" 17 "node:fs rename and fsync"
+
+# node:fs flockSync: two descriptors, a timed wait, a holder killed with SIGKILL gives the lock back (patch 0020)
+TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/flock.tov" -o "$OUT/flock" >/dev/null
+"$OUT/flock" "$OUT/flock-own.lck" > "$OUT/flock.out"
+python3 -I -c 'import fcntl, sys, time
+f = open(sys.argv[1], "a"); fcntl.flock(f, fcntl.LOCK_EX); print("held", flush=True); time.sleep(30)' "$OUT/flock.lck" > "$OUT/flock_holder.out" & HOLDER=$!
+for i in $(seq 50); do grep -q held "$OUT/flock_holder.out" && break; sleep 0.1; done
+"$OUT/flock" "$OUT/flock.lck" held >> "$OUT/flock.out"
+kill -9 $HOLDER; wait $HOLDER 2>/dev/null || true
+"$OUT/flock" "$OUT/flock.lck" free >> "$OUT/flock.out"
+expect "$OUT/flock.out" 9 "node:fs flockSync"
 
 # Bun.serve's timeouts and connection cap, the spare descriptor, Bun.onStopSignal with and without workers (patch 0012)
 TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/server_lifecycle.tov" -o "$OUT/server_lifecycle" >/dev/null

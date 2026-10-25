@@ -33,7 +33,9 @@ export type FeedConfig = { cluster_wide?: bool, ring_size?: int, ring_seconds?: 
 // listener too (404 on the main one). Read at start.
 // secret: env.NAME allowed. It must hold at least 32 bytes once resolved, or the gateway refuses to start with
 // clustering on (secretProblem).
-export type ClusterConfig = { enabled: bool, node_id?: string, peers: string[], secret: string, interval_ms?: int, discovery?: DiscoveryConfig, type?: string, broker?: BrokerConfig, leader_lock?: LeaderLockConfig, feed?: FeedConfig, config_sync?: string, log_reads?: bool, listen_port?: int, bind?: string, serve_metrics?: bool }
+// max_body_mb (Raiju only): the largest request body a peer route reads (default 16; clusterBodyCap). Bigger is 413
+// unread, and a body without a well-formed signature is refused before it is read.
+export type ClusterConfig = { enabled: bool, node_id?: string, peers: string[], secret: string, interval_ms?: int, discovery?: DiscoveryConfig, type?: string, broker?: BrokerConfig, leader_lock?: LeaderLockConfig, feed?: FeedConfig, config_sync?: string, log_reads?: bool, listen_port?: int, bind?: string, serve_metrics?: bool, max_body_mb?: int }
 
 // The shortest cluster.secret accepted: 32 bytes (256 bits, as long as the HMAC-SHA256 key it becomes).
 export const MIN_SECRET_BYTES = 32
@@ -253,6 +255,59 @@ export class Counters {
   }
 }
 
+// The peer routes' request bodies: counters, state, feed batches and log reads. The largest measured is the sync body,
+// about 300 bytes per counter (a counter has a slot per worker of every node), so 16 MB holds tens of thousands of
+// rate-limit and budget windows.
+export const DEFAULT_CLUSTER_BODY_MB = 16
+
+// cluster.max_body_mb in bytes (unset or 0: the default).
+export function clusterBodyCap(cc: ClusterConfig | undefined): int {
+  const mb = cc?.max_body_mb ?? 0
+  return (mb > 0 ? mb : DEFAULT_CLUSTER_BODY_MB) * 1048576
+}
+
+// A signed peer request is refused when its time is further than this from the receiver's (a captured one does not
+// replay later).
+export const PEER_FRESH_MS: f64 = 60000.0
+
+// Whether a request time (ms since the epoch) is within PEER_FRESH_MS of now.
+export function fresh(ts: f64, nowMs: f64): bool {
+  return Math.abs(nowMs - ts) <= PEER_FRESH_MS
+}
+
+// The header that carries a bodiless peer request's time (GET /api/cluster/leader).
+export const TS_HEADER = "x-raiju-cluster-ts"
+
+// Whether a signature header is shaped like one (64 hex digits): a request without one is refused before its body is read.
+export function wellFormedSig(sig: string): bool {
+  const b = utf8(sig)
+  if (b.length !== 64) return false
+  for (const c of b) {
+    const x = int(c)
+    if (!((x >= 48 && x <= 57) || (x >= 97 && x <= 102) || (x >= 65 && x <= 70))) return false
+  }
+  return true
+}
+
+// What a bodiless peer request signs: its method, path and time (ms), so a signature holds for one route and a minute.
+export function requestText(method: string, path: string, ts: string): string {
+  return method + " " + path + " " + ts
+}
+
+// The signature of a bodiless peer request, sent in x-raiju-cluster-sig with the time in x-raiju-cluster-ts.
+export function signRequest(secret: string, method: string, path: string, ts: string): string {
+  return sign(secret, requestText(method, path, ts))
+}
+
+// A bodiless peer request's check: "" when it is signed and fresh, otherwise why it is refused.
+export function requestRefusal(secret: string, method: string, path: string, ts: string, sig: string, nowMs: f64): string {
+  const t = parseFloat(ts)
+  if (ts === "" || t === undefined) return "bad cluster signature"
+  if (!verify(secret, requestText(method, path, ts), sig)) return "bad cluster signature"
+  if (!fresh(t, nowMs)) return "stale cluster request"
+  return ""
+}
+
 // Hex HMAC-SHA256 of the request body, sent in the x-raiju-cluster-sig header.
 export function sign(secret: string, body: string): string {
   return toHex(hmacSha256(utf8(secret), utf8(body)))
@@ -349,6 +404,37 @@ test("signatures verify and reject tampering", () => {
   expect(verify("s3cret", body + " ", sig)).toBe(false)
   expect(verify("s3cret", body, sig.slice(0, 10))).toBe(false)
   expect(verify("s3cret", body, "")).toBe(false)
+})
+
+test("a bodiless peer request is signed over its method, path and time, and refused when stale", () => {
+  const key = "k".repeat(32)
+  const now = 1800000000000.0
+  const ts = "1800000000000"
+  const sig = signRequest(key, "GET", "/api/cluster/leader", ts)
+  expect(requestRefusal(key, "GET", "/api/cluster/leader", ts, sig, now)).toBe("")
+  // the old empty-body signature no longer passes
+  expect(requestRefusal(key, "GET", "/api/cluster/leader", ts, sign(key, ""), now)).toBe("bad cluster signature")
+  // another path, method or time
+  expect(requestRefusal(key, "GET", "/api/cluster/other", ts, sig, now)).toBe("bad cluster signature")
+  expect(requestRefusal(key, "POST", "/api/cluster/leader", ts, sig, now)).toBe("bad cluster signature")
+  expect(requestRefusal(key, "GET", "/api/cluster/leader", "1800000000001", sig, now)).toBe("bad cluster signature")
+  expect(requestRefusal(key, "GET", "/api/cluster/leader", "", sig, now)).toBe("bad cluster signature")
+  // a minute either way is fresh; past it, the captured request is refused
+  expect(requestRefusal(key, "GET", "/api/cluster/leader", ts, sig, now + 60000.0)).toBe("")
+  expect(requestRefusal(key, "GET", "/api/cluster/leader", ts, sig, now + 60001.0)).toBe("stale cluster request")
+  expect(requestRefusal(key, "GET", "/api/cluster/leader", ts, sig, now - 60001.0)).toBe("stale cluster request")
+})
+
+test("signature headers are checked for shape, and the body cap", () => {
+  expect(wellFormedSig(sign("s", "x"))).toBe(true)
+  expect(wellFormedSig("0".repeat(64))).toBe(true)
+  expect(wellFormedSig("")).toBe(false)
+  expect(wellFormedSig("0".repeat(63))).toBe(false)
+  expect(wellFormedSig("0".repeat(65))).toBe(false)
+  expect(wellFormedSig("g" + "0".repeat(63))).toBe(false)
+  expect(clusterBodyCap(undefined)).toBe(16 * 1048576)
+  expect(clusterBodyCap({ enabled: true, peers: [], secret: "s", max_body_mb: 4 })).toBe(4 * 1048576)
+  expect(clusterBodyCap({ enabled: true, peers: [], secret: "s", max_body_mb: 0 })).toBe(16 * 1048576)
 })
 
 test("peers and forget track who was heard from", () => {

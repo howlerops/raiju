@@ -4,7 +4,8 @@
 // the HTTP calls (discovery, token, JWKS); everything here is pure except the
 // small state held by OidcFlows and UiSessions.
 import { Field, fields, elements, find, rawStr, rawNum, decodeString } from "./json"
-import { sha256, utf8, secureHex, toHex } from "./crypto"
+import { sha256, utf8, secureHex, toHex, hmacSha256 } from "./crypto"
+import { gcmSeal, gcmOpen } from "./aesgcm"
 import { SharedTable } from "./sharedtable"
 import { readFileSync, rmSync } from "node:fs"
 import { encodeUrl, decode } from "./base64"
@@ -44,8 +45,12 @@ const SKEW_S = 60
 // A login must finish within this window; abandoned logins expire.
 const PENDING_TTL_MS = 600000.0
 
-// Upper bound on logins in flight, so unfinished logins cannot grow memory without limit.
-const MAX_PENDING = 10000
+// Upper bound on the used states a worker remembers (until they expire), so callbacks cannot grow memory without limit.
+const MAX_USED = 10000
+
+// A state value: this prefix, then base64url of a 12-byte nonce and the AES-256-GCM sealed sign-in.
+const STATE_PREFIX = "s1."
+const STATE_AAD = "raiju-oidc-state-v1"
 
 const enc = new TextEncoder()
 
@@ -119,8 +124,9 @@ function decodeText(s: string): string throws Error {
 
 // ---- authorization request and token request ----
 
-// back: where the sign-in returns (a consent page that sent its user to sign in), "" for the dashboard
-type Pending = { verifier: string, nonce: string, expires: number, back?: string }
+// A sign-in in flight, as its state carries it: the PKCE verifier, the nonce, the expiry and where the sign-in returns
+// (a consent page that sent its user to sign in; absent for the dashboard).
+type Pending = { v: string, n: string, e: number, b?: string }
 
 // Seals a secret kept in a shared file (the config's encryption key, store.tov sealStored), and opens it again
 // (undefined when it cannot be opened). The default keeps it as it is (0600 file, tests).
@@ -134,29 +140,87 @@ function hashKey(token: string): string {
   return toHex(sha256(utf8(token)))
 }
 
-// The sign-ins in flight, by a hash of their state. With a file (setFile) they are shared by the workers of a node, so
-// the identity provider's redirect may come back to any worker; the PKCE verifier is sealed there.
-export class OidcFlows {
-  private table: SharedTable = new SharedTable("", MAX_PENDING)
-  sealer: Sealer = plainSealer()
+const HEXD = "0123456789abcdef"
 
-  setFile(file: string): void {
-    this.table = new SharedTable(file, MAX_PENDING)
+function randomBytes(n: int): u8[] throws Error {
+  const h = try secureHex(n * 2)
+  const out: u8[] = []
+  for (let i = 0; i + 1 < h.byteLength; i += 2) out.push(u8(HEXD.indexOf(h.slice(i, i + 1)) * 16 + HEXD.indexOf(h.slice(i + 1, i + 2))))
+  return out
+}
+
+// The key that seals sign-in states, from the config's encryption key (its own key, derived), so every node and
+// worker holding that key opens a state another one made, across restarts too.
+export function stateKeyFrom(configKey: u8[]): u8[] {
+  return hmacSha256(configKey, utf8(STATE_AAD))
+}
+
+// A key for sign-in states when the config has no encryption key: made once in the supervisor before the workers
+// fork, so the node's workers share it; a sign-in begun before a restart, or on another node, is then refused.
+export function randomStateKey(): u8[] throws Error {
+  return try randomBytes(32)
+}
+
+// The sign-ins in flight. Nothing is kept per login: begin seals the verifier, nonce, expiry and return path into the
+// state value itself (AES-256-GCM, so it can be neither read nor forged without the key), and the callback, on any
+// worker, opens it. An unauthenticated /login therefore writes nothing. A state opened once is remembered by its worker
+// until it expires and refused after; the identity provider's code it comes back with is single-use there.
+export class OidcFlows {
+  private key: u8[] = []
+  // hashes of states already used here, with their expiry
+  private used: Map<string, number> = new Map()
+
+  setKey(key: u8[]): void {
+    this.key = key
   }
 
-  // Starts a login: stores state, nonce and PKCE verifier (and where to return, when back is set), and returns the
-  // authorize URL.
+  private sealKey(): u8[] throws Error {
+    if (this.key.length !== 32) this.key = try randomStateKey()
+    return this.key
+  }
+
+  private seal(p: Pending): string throws Error {
+    const nonce = try randomBytes(12)
+    return STATE_PREFIX + encodeUrl(nonce.concat(gcmSeal(try this.sealKey(), nonce, utf8(JSON.stringify(p)), utf8(STATE_AAD))))
+  }
+
+  private open(state: string): Pending | undefined {
+    if (!state.startsWith(STATE_PREFIX) || state.byteLength > 4096) return undefined
+    try {
+      const raw = try decode(state.slice(STATE_PREFIX.byteLength))
+      if (raw.length < 28) return undefined
+      const pt = gcmOpen(try this.sealKey(), raw.slice(0, 12), raw.slice(12), utf8(STATE_AAD))
+      if (pt === undefined) return undefined
+      return try JSON.parse(try new TextDecoder().decode(pt)) as Pending
+    } catch (e) {
+      return undefined
+    }
+  }
+
+  // Remembers a used state until it expires; past MAX_USED the ones that expire first are forgotten.
+  private remember(h: string, expires: number, nowMs: number): void {
+    if (this.used.size >= MAX_USED) {
+      for (const k of this.used.keys()) {
+        if ((this.used.get(k) ?? 0.0) <= nowMs) this.used.delete(k)
+      }
+      if (this.used.size >= MAX_USED) {
+        const live = this.used.keys().map((k) => ({ k: k, e: this.used.get(k) ?? 0.0 }))
+        live.sort((a: { k: string, e: number }, b: { k: string, e: number }): int => (a.e < b.e ? -1 : (a.e > b.e ? 1 : 0)))
+        for (let i = 0; i < live.length - MAX_USED / 2; i++) this.used.delete(live[i]!.k)
+      }
+    }
+    this.used.set(h, expires)
+  }
+
+  // Starts a login: seals state, nonce and PKCE verifier (and where to return, when back is set) into the state, and
+  // returns the authorize URL.
   begin(cfg: OidcConfig, disc: Discovery, nowMs: number, back?: string): { url: string, state: string } throws Error {
     if (disc.issuer !== cfg.issuer) throw new Error("oidc: discovery issuer does not match the configured issuer")
-    const state = try secureHex(32)
     const nonce = try secureHex(32)
     // 64 hex characters are a valid PKCE verifier (43 to 128 unreserved characters).
     const verifier = try secureHex(64)
     const challenge = encodeUrl(sha256(utf8(verifier)))
-    const sealed = this.sealer.seal(verifier)
-    if (sealed === "") throw new Error("oidc: the sign-in could not be sealed")
-    const p: Pending = { verifier: sealed, nonce: nonce, expires: nowMs + PENDING_TTL_MS, back: back === "" ? undefined : back }
-    this.table.put(hashKey(state), JSON.stringify(p), nowMs + PENDING_TTL_MS, nowMs)
+    const state = try this.seal({ v: verifier, n: nonce, e: nowMs + PENDING_TTL_MS, b: back === "" ? undefined : back })
     let scopes = cfg.scopes ?? ["openid", "email", "profile"]
     if (!scopes.includes("openid")) scopes = ["openid"].concat(scopes)
     const params = [
@@ -173,21 +237,17 @@ export class OidcFlows {
     return { url: disc.authorization_endpoint + sep + params.join("&"), state: state }
   }
 
-  // Returns the stored verifier, nonce and return path for a state, once. Later calls, and calls after expiry, get
-  // undefined.
+  // Returns the verifier, nonce and return path a state carries, once per worker. A state that was not sealed with this
+  // key, was changed, has expired or was used here already gets undefined.
   complete(state: string, nowMs: number): { verifier: string, nonce: string, back: string } | undefined {
     if (state === "") return undefined
-    const v = this.table.take(hashKey(state), nowMs)
-    if (v === undefined) return undefined
-    try {
-      const p = try JSON.parse(v) as Pending
-      if (p.expires <= nowMs) return undefined
-      const verifier = this.sealer.open(p.verifier)
-      if (verifier === undefined) return undefined
-      return { verifier: verifier, nonce: p.nonce, back: p.back ?? "" }
-    } catch (e) {
-      return undefined
-    }
+    const p = this.open(state)
+    if (p === undefined || p.e <= nowMs || p.v === "" || p.n === "") return undefined
+    const h = hashKey(state)
+    const seen = this.used.get(h)
+    if (seen !== undefined && seen > nowMs) return undefined
+    this.remember(h, p.e, nowMs)
+    return { verifier: p.v, nonce: p.n, back: p.b ?? "" }
   }
 }
 
@@ -463,8 +523,9 @@ export class UiSessions {
     return r.refresh === undefined ? r.expires : r.expires + REFRESH_GRACE_MS
   }
 
-  private keep(key: string, r: SessionRecord, nowMs: number): void {
-    this.table.put(key, JSON.stringify(r), this.until(r), nowMs)
+  // Throws when the sessions file's lock cannot be had (sharedtable.tov): the caller fails its request.
+  private keep(key: string, r: SessionRecord, nowMs: number): void throws Error {
+    try this.table.put(key, JSON.stringify(r), this.until(r), nowMs)
   }
 
   // The refresh token a record holds, opened ("" when it cannot be).
@@ -483,7 +544,7 @@ export class UiSessions {
       // a refresh token that could not be sealed is not kept: the session then ends at its expiry
       if (s !== "") sealed = s
     }
-    this.keep(hashKey(token), { sub: sub, role: role, email: email, expires: nowMs + this.ttlSeconds * 1000.0, refresh: sealed }, nowMs)
+    try this.keep(hashKey(token), { sub: sub, role: role, email: email, expires: nowMs + this.ttlSeconds * 1000.0, refresh: sealed }, nowMs)
     return token
   }
 
@@ -523,7 +584,7 @@ export class UiSessions {
 
   // A refreshed session: a new lifetime from now, the role the fresh claims gave, and the new refresh token when the
   // identity provider rotated it.
-  renew(token: string, role: string | undefined, nowMs: number, refresh: string | undefined): void {
+  renew(token: string, role: string | undefined, nowMs: number, refresh: string | undefined): void throws Error {
     const key = this.keyOf(token)
     const s = this.record(key, nowMs)
     if (s === undefined) return
@@ -534,11 +595,11 @@ export class UiSessions {
       const sealed = this.sealer.seal(refresh)
       if (sealed !== "") n.refresh = sealed
     }
-    this.keep(key, n, nowMs)
+    try this.keep(key, n, nowMs)
   }
 
   // Ends every session of a user (by subject or email, without regard to case): a removed user is signed out.
-  endUser(names: string[], nowMs?: number): int {
+  endUser(names: string[], nowMs?: number): int throws Error {
     const now = nowMs ?? Date.now()
     const lower = names.filter((x) => x !== "").map((x) => x.toLowerCase())
     const gone: string[] = []
@@ -552,12 +613,12 @@ export class UiSessions {
       if (s === undefined) continue
       if (lower.includes(s.sub.toLowerCase()) || lower.includes((s.email ?? "").toLowerCase())) gone.push(row.k)
     }
-    this.table.del(gone, now)
+    try this.table.del(gone, now)
     return gone.length
   }
 
-  delete(token: string): void {
-    this.table.del([this.keyOf(token)], Date.now())
+  delete(token: string): void throws Error {
+    try this.table.del([this.keyOf(token)], Date.now())
   }
 }
 
@@ -918,7 +979,7 @@ test("session store creates, reads, expires and deletes sessions", () => {
   const t2 = try store.create("user-2", "viewer", TEST_NOW_MS)
   expect(t2 === t).toBe(false)
   expect(store.get("sk-sess-nope", TEST_NOW_MS) === undefined).toBe(true)
-  store.delete(t2)
+  try store.delete(t2)
   expect(store.get(t2, TEST_NOW_MS) === undefined).toBe(true)
 })
 
@@ -985,13 +1046,13 @@ test("a session with a refresh token waits past its expiry for a refresh, is ren
   const due = store.refreshable(t, TEST_NOW_MS + 61000.0)
   expect(due !== undefined && due.refresh === "rt-1" && due.sub === "u-1").toBe(true)
   expect(store.refreshable(plain, TEST_NOW_MS + 61000.0) === undefined).toBe(true)
-  store.renew(t, "admin", TEST_NOW_MS + 61000.0, "rt-2")
+  try store.renew(t, "admin", TEST_NOW_MS + 61000.0, "rt-2")
   const s = store.get(t, TEST_NOW_MS + 62000.0)
   expect(s !== undefined && s.role === "admin").toBe(true)
   expect(store.dueBy(TEST_NOW_MS + 62000.0, TEST_NOW_MS + 62000.0).length).toBe(0)
   const soon = store.dueBy(TEST_NOW_MS + 200000.0, TEST_NOW_MS + 62000.0)
   expect(soon.length === 1 && soon[0]!.refresh === "rt-2").toBe(true)
-  expect(store.endUser(["ann@x.io"], TEST_NOW_MS + 62000.0)).toBe(1)
+  expect(try store.endUser(["ann@x.io"], TEST_NOW_MS + 62000.0)).toBe(1)
   expect(store.get(t, TEST_NOW_MS + 62000.0) === undefined).toBe(true)
 })
 
@@ -1021,33 +1082,56 @@ test("sessions on a shared file: made on one worker, used, refreshed and ended o
   // a refresh due on one worker, renewed there, is seen by the other
   const due = c.refreshable(t, now + 61000.0)
   expect(due !== undefined && due.refresh === "rt-secret").toBe(true)
-  if (due !== undefined) c.renew(due.token, "editor", now + 61000.0, "rt-2")
+  if (due !== undefined) try c.renew(due.token, "editor", now + 61000.0, "rt-2")
   expect(a.get(t, now + 62000.0)?.role ?? "").toBe("editor")
   // a logout on one worker ends the session on the others
-  b.delete(plain)
+  try b.delete(plain)
   expect(a.get(plain, now + 1.0)).toBeUndefined()
-  expect(c.endUser(["ANN@x.io"], now + 62000.0)).toBe(1)
+  expect(try c.endUser(["ANN@x.io"], now + 62000.0)).toBe(1)
   expect(b.get(t, now + 62001.0)).toBeUndefined()
   try {
     rmSync(file, { force: true })
   } catch (e) {}
 })
 
-test("a sign-in started on one worker completes on another, once, with its return path", () => {
-  const file = "/tmp/raiju-oidc-flows-test-" + process.pid + "-" + Math.floor(Date.now()) + ".json"
+test("a sign-in begun on one worker completes on another (one key), carrying its return path; nothing is stored", () => {
+  const key = stateKeyFrom(utf8("a config encryption key"))
   const a = new OidcFlows()
-  a.setFile(file)
+  a.setKey(key)
   const b = new OidcFlows()
-  b.setFile(file)
+  b.setKey(key)
   const disc: Discovery = { authorization_endpoint: "https://idp.example.com/auth", token_endpoint: "https://idp.example.com/token", jwks_uri: "https://idp.example.com/jwks", issuer: TEST_ISS }
   const now = Date.now()
   const begun = try a.begin(testCfg({}), disc, now, "/mcp/consent?x=1")
+  // the state reveals neither the verifier nor the return path
+  expect(begun.state.startsWith("s1.")).toBe(true)
+  expect(begun.state.includes("consent")).toBe(false)
   const done = b.complete(begun.state, now + 1000.0)
   expect(done !== undefined && done.back === "/mcp/consent?x=1" && done.verifier.byteLength === 64).toBe(true)
-  // used once, on any worker
-  expect(a.complete(begun.state, now + 1000.0)).toBeUndefined()
-  expect((try readFileSync(file, "utf8")).includes(begun.state)).toBe(false)
-  try {
-    rmSync(file, { force: true })
-  } catch (e) {}
+  if (done !== undefined) expect(encodeUrl(sha256(utf8(done.verifier)))).toBe(paramOf(begun.url, "code_challenge")!)
+  // used once on a worker
+  expect(b.complete(begun.state, now + 2000.0)).toBeUndefined()
+  // another key (another node without the same encryption key, or a restart without one) cannot open it
+  const other = new OidcFlows()
+  other.setKey(stateKeyFrom(utf8("another key")))
+  expect(other.complete(begun.state, now + 1000.0)).toBeUndefined()
+})
+
+test("a forged, changed or expired state is refused", () => {
+  const f = new OidcFlows()
+  f.setKey(stateKeyFrom(utf8("k")))
+  const r = try f.begin(testCfg({}), TEST_DISC, TEST_NOW_MS)
+  // one character changed anywhere in the sealed part fails its tag
+  const mid = r.state.byteLength - 10
+  const flip = r.state.slice(mid, mid + 1) === "A" ? "B" : "A"
+  expect(f.complete(r.state.slice(0, mid) + flip + r.state.slice(mid + 1), TEST_NOW_MS)).toBeUndefined()
+  expect(f.complete("s1." + encodeUrl(utf8(`{"v":"x","n":"y","e":1e15}`)), TEST_NOW_MS)).toBeUndefined()
+  expect(f.complete("s1.%%%", TEST_NOW_MS)).toBeUndefined()
+  expect(f.complete("s1." + "A".repeat(5000), TEST_NOW_MS)).toBeUndefined()
+  expect(f.complete(r.state, TEST_NOW_MS + 600000.0)).toBeUndefined()
+  // a worker with no key set makes one of its own: its states open there
+  const own = new OidcFlows()
+  const o = try own.begin(testCfg({}), TEST_DISC, TEST_NOW_MS)
+  expect(own.complete(o.state, TEST_NOW_MS) === undefined).toBe(false)
+  expect(f.complete(o.state, TEST_NOW_MS)).toBeUndefined()
 })

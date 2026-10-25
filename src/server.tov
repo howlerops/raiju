@@ -53,7 +53,7 @@ import { crewsRoute } from "./crew"
 import { McpSession } from "./mcp"
 import { Ops, Reply, UiSocket } from "./ops"
 import { parseCursor } from "./feed"
-import { cookieValue, SETUP_COOKIE } from "./setupsession"
+import { cookieValue, SETUP_COOKIE, setupPublic } from "./setupsession"
 import { rerank, bedrockRerank, countTokens, responsesInputTokens, asyncSubmit, asyncGet, sdkAsyncSubmit, sdkAsyncPoll, decisionRoute, openaiDecisionPath, Dispatch } from "./extras"
 import { asyncPoll, jobOwner } from "./jobs"
 import { serveUi, uiPath, UI_CSP } from "./uiserve"
@@ -63,7 +63,8 @@ import { EXTRA_PARAMS_HEADER, EXTRA_PARAMS_CARRY, mergeExtraParams, extraParamsC
 import { lifecycle, readyInput, readyReport, ServerLimits } from "./lifecycle"
 import { CLIENT_WATCH_HEADER, watchStart, watchGone, watchEnd, watched } from "./clientgone"
 import { usesChain, withChainCreds } from "./awschain"
-import { bodyBudget, bufferedCap, UNREAD_ABOVE } from "./bodybudget"
+import { bodyBudget, bufferedCap, bodyDeadlineMs, UNREAD_ABOVE } from "./bodybudget"
+import { clusterBodyCap, wellFormedSig } from "./cluster"
 
 type ModelEntry = { id: string, object: string, created: int, owned_by: string }
 
@@ -718,6 +719,15 @@ async function scimRoute(ops: Ops, req: Request, path: string): Promise<Response
   const token = resolveEnv(sc?.config?.provisioningToken ?? "")
   if (!scimAuthorized(req.headers.get("authorization") ?? "", token)) return scimReply(401, errorBody(401, "", "the SCIM provisioning token is missing or wrong"))
   const body = req.method === "GET" ? "" : await req.text()
+  // a change waits for the config file's lock without pausing the worker (see manage)
+  const held = req.method === "GET" ? undefined : await ops.store.holdLock()
+  const res = scimChange(ops, req, path, body)
+  if (held !== undefined) ops.store.releaseLock(held)
+  return res
+}
+
+// The SCIM request once its body is read (and, for a change, the config file's lock held).
+function scimChange(ops: Ops, req: Request, path: string, body: string): Response {
   const u = URL.parse(req.url)
   const origin = u === undefined ? "" : u.origin
   const params = u === undefined ? new URLSearchParams("") : u.searchParams
@@ -742,7 +752,11 @@ async function scimRoute(ops: Ops, req: Request, path: string): Promise<Response
           if (u.email !== undefined) ended.push(u.email)
         }
       }
-      ops.sessions.endUser(ended)
+      try {
+        ops.sessions.endUser(ended)
+      } catch (e) {
+        return scimReply(503, errorBody(503, "", `the users were saved but their sessions could not be ended: ${e.message}`))
+      }
     }
     ops.storeUpdated("/api/users")
     ops.storeUpdated("/api/governance/teams")
@@ -775,6 +789,10 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   const sc = ops.scopeOfActorFor(gate.actor, resourceOf(req.method, path).resource)
   // DELETE reads its body too: DELETE /api/mcp-logs names its ids there
   const body = req.method === "GET" ? "" : await req.text()
+  // a change waits here for the config file's lock while the worker serves other requests, and holds it while the route
+  // runs: the saves it makes take it again at once (filelock.tov). When another process keeps it past LOCK_WAIT_MS the
+  // route still runs, and a save it makes fails after a short wait.
+  const held = req.method === "GET" ? undefined : await ops.store.holdLock()
   // a change saved by this request is answered once the node's other workers run it (ops.settleConfig)
   const genBefore = ops.store.fileSha
   // the equal-split projects this write may redivide (ops.withRedivision)
@@ -837,7 +855,7 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   else if (path === "/api/adaptive-routing/conditions/clear") r = req.method === "POST" ? ops.adaptiveRelease(body) : { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
   else if (path === "/api/vault/flush-cache") r = req.method === "POST" ? ops.vaultFlush() : { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
   else if (path === "/api/models/parameters") r = req.method === "GET" ? await ops.modelParameters(req) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
-  else if (path === "/api/models/catalog") r = ops.catalogUpsert(req, body)
+  else if (path === "/api/models/catalog") r = await ops.catalogUpsertRoute(req, body)
   // changing the global proxy's URL, or turning skip_tls_verify on, needs a real admin session
   else if (path === "/api/proxy-config" && req.method === "PUT" && !ops.authOn && proxyWidening(ops.store.cfg.proxy_config, body).length > 0) {
     r = { status: 403, body: `{"error":{"message":"Changing the global proxy (url or skip_tls_verify) requires an authenticated admin session; dashboard auth is currently disabled or unconfigured. Enable dashboard authentication first.","type":"permission_error"}}`, contentType: "application/json" }
@@ -929,6 +947,7 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   r = ops.withRedivision(req.method, path, r, redivBefore)
   ops.recordChange(gate.actor, req, path, r.status, body)
   if (req.method !== "GET" && r.status < 300) ops.storeUpdated(path)
+  if (held !== undefined) ops.store.releaseLock(held)
   if (ops.store.fileSha !== genBefore) await ops.settleConfig()
   const h: Record<string, string> = new Map()
   h.set("content-type", r.contentType)
@@ -1071,6 +1090,35 @@ function gatedPath(p: string): bool {
   return p !== "/api/governance/virtual-keys/quota"
 }
 
+// The routes anyone may call without a credential the headers carry: sign-in and setup, the CLI's agent sign-in, the
+// OAuth and OIDC endpoints and the MCP authorization server's. Their bodies are small forms, so they are read only up
+// to PUBLIC_BODY_LIMIT (a bigger declared length is 413 unread), and an unauthenticated client cannot hold the body
+// budget with them.
+export const PUBLIC_BODY_LIMIT = 65536
+
+export function publicBodyPath(p: string): bool {
+  for (const pre of ["/api/session/", "/api/agent/", "/api/oauth2/", "/api/oauth/", "/api/oidc/", "/api/scim/oauth/", "/oauth2/", "/oauth/", "/workspace/mcp-sessions/"]) {
+    if (p.startsWith(pre)) return true
+  }
+  return setupPublic(p)
+}
+
+// The body limit of a request to path p: client.max_request_body_size_mb (limit), lowered to PUBLIC_BODY_LIMIT on the
+// public routes and to cluster.max_body_mb on the peer routes.
+export function routeBodyLimit(engine: Engine, p: string, limit: int): int {
+  if (p.startsWith("/api/cluster/")) return Math.min(limit, clusterBodyCap(engine.cfg.cluster))
+  if (publicBodyPath(p)) return Math.min(limit, PUBLIC_BODY_LIMIT)
+  return limit
+}
+
+// A peer route's request without a well-formed signature header, refused before its body is read (the HMAC itself is
+// checked over the bytes once they are read); undefined when the header is there.
+export function unsignedPeerRefusal(req: Request): Response | undefined {
+  if (req.method === "GET" || req.method === "HEAD") return undefined
+  if (wellFormedSig(req.headers.get("x-raiju-cluster-sig") ?? "")) return undefined
+  return errorResponse(401, "bad cluster signature", "authentication_error", noHeaders())
+}
+
 // The answer a request with a big unread body gets for its credentials alone, before the body is read; undefined
 // when its credentials pass (or are not judged from the headers). Inference routes refuse what governance would
 // refuse for any model (a missing credential while auth is enforced, an inactive or expired key), management routes
@@ -1100,6 +1148,7 @@ export function headerRefusal(engine: Engine, ops: Ops, req: Request, limit: int
     const g = ops.gate(req, p)
     return g.kind === "deny" ? g.res : undefined
   }
+  if (p.startsWith("/api/cluster/")) return unsignedPeerRefusal(req)
   if (p === "/scim/v2" || p.startsWith("/scim/v2/")) {
     const sc = ops.store.cfg.scim_config
     if (sc?.enabled !== true) return undefined
@@ -1122,46 +1171,85 @@ function busyResponse(): Response {
   return errorResponse(503, "the gateway is reading too many request bodies at once (server.max_buffered_body_mb); retry shortly", "api_error", h)
 }
 
-// Reads a request's body, charged first to the process's body budget (bodybudget.tov, server.max_buffered_body_mb):
-// a declared length over client.max_request_body_size_mb is 413 and one that does not fit the budget 503, both unread;
-// a chunked body is charged and checked as it arrives.
+function deadlineResponse(): Response {
+  return errorResponse(408, "the request body did not arrive in time (server.body_deadline_seconds)", "invalid_request_error", noHeaders())
+}
+
+// One read of a body stream, or late when the body's deadline passed first.
+type BodyRead = { late: bool, done: bool, value: u8[] | undefined }
+
+async function readChunk(st: ReadableStream): Promise<BodyRead> {
+  try {
+    const r = await st.pull()
+    return { late: false, done: r.done, value: r.value }
+  } catch (e) {
+    // a body cut off reads as what arrived
+    return { late: false, done: true, value: undefined }
+  }
+}
+
+// Reads a request's body, charged to the process's body budget (bodybudget.tov, server.max_buffered_body_mb): a
+// declared length over the limit is 413 unread. A body the server has read already (UNREAD_ABOVE or less) is charged
+// whole and always admitted; a bigger or chunked one is charged as its bytes arrive (a declared length that cannot fit beside what is held
+// is 503 unread, bytes that do not fit are 503 there), stops at the limit (413) and must arrive whole within
+// server.body_deadline_seconds (408).
 export async function heldBody(engine: Engine, req: Request, limit: int): Promise<HeldBody> {
   if (req.method === "GET" || req.method === "HEAD") return { res: undefined, req: req, held: 0 }
   const cap = bufferedCap(engine.cfg.server)
   const b = bodyBudget()
   const declared = req.headers.get("content-length")
+  let max = limit
   if (declared !== undefined) {
     const n = parseInt(declared) ?? 0
     if (n > limit) return { res: errorResponse(413, "request body too large", "invalid_request_error", noHeaders()), req: req, held: 0 }
-    if (!b.take(n, 0, cap)) return { res: busyResponse(), req: req, held: 0 }
-    // read now, under the charge (a body the server has read already is there at once)
-    await req.text()
-    return { res: undefined, req: req, held: n }
+    if (n <= UNREAD_ABOVE) {
+      // read by the server already (or small): charged whole, and never refused, since refusing it saves no memory
+      // (a big body that holds the budget does not turn small calls away)
+      b.hold(n)
+      await req.text()
+      return { res: undefined, req: req, held: n }
+    }
+    if (!b.fits(n, cap)) return { res: busyResponse(), req: req, held: 0 }
+    max = n
   }
   const st = req.body
   if (st === undefined) return { res: undefined, req: req, held: 0 }
+  const ms = bodyDeadlineMs(engine.cfg.server)
+  let timer = -1
+  const late: Promise<BodyRead> = new Promise<BodyRead>((resolve) => {
+    if (ms > 0) timer = setTimeout(() => resolve({ late: true, done: true, value: undefined }), ms)
+  })
   const body: u8[] = []
   let held = 0
-  try {
-    while (true) {
-      const r = await st.pull()
-      const v = r.value
-      if (r.done || v === undefined) break
-      if (body.length + v.length > limit) {
-        await st.cancel()
-        b.give(held)
-        return { res: errorResponse(413, "request body too large", "invalid_request_error", noHeaders()), req: req, held: 0 }
-      }
-      if (!b.take(v.length, held, cap)) {
-        await st.cancel()
-        b.give(held)
-        return { res: busyResponse(), req: req, held: 0 }
-      }
-      held += v.length
-      for (const x of v) body.push(x)
+  let res: Response | undefined = undefined
+  while (true) {
+    const r = ms > 0 ? await Promise.race([readChunk(st), late]) : await readChunk(st)
+    if (r.late) {
+      res = deadlineResponse()
+      break
     }
-  } catch (e) {
-    // a body cut off reads as what arrived
+    const v = r.value
+    if (r.done || v === undefined) break
+    if (body.length + v.length > max) {
+      res = errorResponse(413, "request body too large", "invalid_request_error", noHeaders())
+      break
+    }
+    if (!b.take(v.length, held, cap)) {
+      res = busyResponse()
+      break
+    }
+    held += v.length
+    for (const x of v) body.push(x)
+  }
+  if (timer >= 0) clearTimeout(timer)
+  if (res !== undefined) {
+    try {
+      await st.cancel()
+    } catch (e) {
+      // the stream is gone already
+    }
+    b.give(held)
+    return { res: res, req: req, held: 0 }
   }
   return { res: undefined, req: new Request(req.url, { method: req.method, headers: snapshot(req.headers), body: body }), held: held }
 }
@@ -1248,14 +1336,27 @@ export async function clusterDispatch(engine: Engine, ops: Ops, req: Request): P
   if (p === "/health" && (m === "GET" || m === "HEAD")) return Response.json({ status: "ok" })
   if (p === "/metrics" && (m === "GET" || m === "HEAD")) return metricsRoute(engine, ops, req, true)
   if (p.startsWith("/api/cluster/")) {
-    const cr = await clusterRoute(ops, req, p, m)
-    if (cr !== undefined) return cr
+    // a body is read only for a request that carries a signature, up to cluster.max_body_mb and charged to the body
+    // budget; its HMAC is then checked over the bytes read
+    const unsigned = unsignedPeerRefusal(req)
+    if (unsigned !== undefined) return unsigned
+    const hb = await heldBody(engine, req, clusterBodyCap(engine.cfg.cluster))
+    const no = hb.res
+    if (no !== undefined) return no
+    try {
+      const cr = await clusterRoute(ops, hb.req, p, m)
+      if (cr !== undefined) return cr
+    } finally {
+      bodyBudget().give(hb.held)
+    }
   }
   return errorResponse(404, "not found on the cluster listener", "invalid_request_error", noHeaders())
 }
 
 // The cluster listener on the Bun.serve server: opened before the workers fork, so every worker accepts on it too.
-export function startCluster(engine: Engine, ops: Ops, port: int, hostname: string, lim: ServerLimits, maxBody: int): Served {
+// Bodies over UNREAD_ABOVE reach clusterDispatch unread, which checks the signature header and cluster.max_body_mb
+// (read per request) before reading them.
+export function startCluster(engine: Engine, ops: Ops, port: int, hostname: string, lim: ServerLimits): Served {
   const server = Bun.serve({
     port: port,
     hostname: hostname,
@@ -1263,7 +1364,8 @@ export function startCluster(engine: Engine, ops: Ops, port: int, hostname: stri
     idleTimeout: lim.idleSeconds,
     bodyTimeout: lim.bodySeconds,
     maxConnections: lim.maxConnections,
-    maxRequestBodySize: maxBody,
+    bodyStreamThreshold: UNREAD_ABOVE,
+    maxRequestBodySize: NO_BODY_LIMIT,
     async fetch(req) {
       return await clusterDispatch(engine, ops, req)
     },
@@ -2026,7 +2128,9 @@ async function bunHttp(engine: Engine, ops: Ops, req00: Request, limit: int): Pr
   }
 }
 
-async function bunHttpWatched(engine: Engine, ops: Ops, req00: Request, limit: int, watch: string): Promise<Response, TypeError> {
+async function bunHttpWatched(engine: Engine, ops: Ops, req00: Request, limit0: int, watch: string): Promise<Response, TypeError> {
+  // the public routes and the peer routes read smaller bodies (routeBodyLimit)
+  const limit = routeBodyLimit(engine, pathOfReq(req00), limit0)
   // a big body is not read for a caller its credentials already refuse
   const refused = await outOfLine(credentialRefusal(engine, ops, req00, limit))
   if (refused !== undefined) return refused
@@ -2210,7 +2314,10 @@ test("a big unread body is refused for its credentials alone; a small or over-li
   expect(st(bigPost("/api/providers", []))).toBe(403)
   // routes with their own credentials, and the MCP server, are left to their handlers
   expect(st(bigPost("/api/session/login", []))).toBe(0)
-  expect(st(bigPost("/api/cluster/sync", []))).toBe(0)
+  // a peer route's body is not read without a well-formed signature header (the HMAC is checked over the bytes read)
+  expect(st(bigPost("/api/cluster/sync", []))).toBe(401)
+  expect(st(bigPost("/api/cluster/sync", [["x-raiju-cluster-sig", "nope"]]))).toBe(401)
+  expect(st(bigPost("/api/cluster/sync", [["x-raiju-cluster-sig", "ab".repeat(32)]]))).toBe(0)
   expect(st(bigPost("/mcp", []))).toBe(0)
   expect(st(bigPost("/v1/mcp/tool/execute", []))).toBe(0)
   // a chunked body counts as unread
@@ -2224,6 +2331,28 @@ test("a big unread body is refused for its credentials alone; a small or over-li
   expect(headerRefusal(eng, ops, bigPost("/v1/chat/completions", []), 1000)).toBeUndefined()
   // GET carries no body
   expect(st(new Request("http://gw/v1/models", { method: "GET" }))).toBe(0)
+})
+
+test("the public routes and the peer routes read small bodies", () => {
+  const cfg: Config = { cluster: { enabled: true, peers: [], secret: "s", max_body_mb: 4 } }
+  const eng = new Engine(cfg)
+  const limit = 100 * 1048576
+  for (const p of ["/api/session/login", "/api/session/setup", "/api/agent/auth/token", "/api/oauth2/consent/flows/x", "/api/oidc/login", "/oauth2/token", "/oauth2/register", "/api/oauth/callback", "/api/version", "/api/scim/oauth/refresh"]) {
+    expect(routeBodyLimit(eng, p, limit)).toBe(PUBLIC_BODY_LIMIT)
+  }
+  expect(routeBodyLimit(eng, "/api/cluster/sync", limit)).toBe(4 * 1048576)
+  expect(routeBodyLimit(new Engine({}), "/api/cluster/feed", limit)).toBe(16 * 1048576)
+  // the rest keep client.max_request_body_size_mb, and a smaller configured limit stays
+  expect(routeBodyLimit(eng, "/v1/chat/completions", limit)).toBe(limit)
+  expect(routeBodyLimit(eng, "/api/providers", limit)).toBe(limit)
+  expect(routeBodyLimit(eng, "/mcp", limit)).toBe(limit)
+  expect(routeBodyLimit(eng, "/api/session/login", 1000)).toBe(1000)
+  // a 1 MB sign-in body is over the limit: refused unread with 413 (heldBody), not judged from the headers
+  const ops = new Ops(eng, new ConfigStore("/tmp/raiju-server-public-limit.json", cfg))
+  expect(headerRefusal(eng, ops, bigPost("/api/session/login", []), routeBodyLimit(eng, "/api/session/login", limit))).toBeUndefined()
+  // a signature header the GET leader read does not need, and a signed POST passes the shape check
+  expect(unsignedPeerRefusal(new Request("http://gw/api/cluster/leader", { method: "GET" }))).toBeUndefined()
+  expect(unsignedPeerRefusal(bigPost("/api/cluster/sync", []))!.status).toBe(401)
 })
 
 test("with auth not enforced an inference call passes, and the stream threshold is the smaller of the two", () => {

@@ -1,0 +1,6 @@
+# Behaviour changes in wave 26
+
+Wave 26 (L200 and L201) fixed the findings of the second production re-audit (docs/audits/production-reaudit-2-2026-10-25.md).
+
+- **L201**: public routes (session, agent sign-in, OAuth, OIDC, setup) read at most 64 KB (413); cluster peer routes read at most `cluster.max_body_mb` (16) and refuse a missing or malformed signature before reading; a body over 64 KB must arrive within `server.body_deadline_seconds` (120; 408), so deployments with slow large uploads may need to raise it; GET /api/cluster/leader needs the new timed signature (all nodes must be upgraded together); a start-up warning when /metrics is open.
+- **L200**: shared files are locked with flock(2) on `<file>.flock` (tov-patches 0020), a file that stays beside each locked file; the kernel releases a dead holder's lock, so there is no stale-lock takeover, and waiting no longer blocks the worker; `<config>.oidc-flows.json` is gone: the OIDC state is a sealed, expiring value, so sign-ins in flight across the upgrade must restart (and with no encryption key, across a restart or another node); session login, logout and agent logout answer 503 when their file lock is busy; stop old processes before starting new ones on a shared volume (old and new versions do not lock each other out).
