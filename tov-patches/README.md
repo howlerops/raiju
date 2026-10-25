@@ -13,6 +13,7 @@ Patch 0009 (node:fs rename and fsync) touches the shared lists in `builtins.rs` 
 Patch 0010 (WebAssembly wall-clock limit) changes `std/wasm`, `runtime/wasm.c` and the WAMR interpreter that 0005 adds, and is written on top of 0001-0009.
 Patch 0012 (server lifecycle) changes the HTTP server in `runtime/tov.c` and `std/http.tov`, and is written on top of 0001-0010.
 Patch 0013 (fetch address policy) changes the fetch code in `runtime/tov.c` and `std/http.tov` (and `fetchStart`'s signature, also called from `runtime/node.c`), and is written on top of 0001-0012.
+Patch 0015 (client certificates, `Request.signal`, gunzip) changes fetch, sockets and the server (and `fetchStart`'s and `netConnect`'s signatures), and is written on top of 0001-0013.
 
 ## Submitting upstream
 
@@ -670,3 +671,56 @@ const res = await fetch(url, {
 the default refusal, each switch, address, range, mapped and name entries, a name resolved through `/etc/hosts`,
 0.0.0.0, metadata, ::1, redirect hops and pooled connections) is in `run.sh`; it needs a name other than `localhost`
 that `/etc/hosts` maps to 127.0.0.1 (`PEER_NAME` names one) and is skipped without it.
+
+## 0015 — TLS client certificates, `Request.signal` on `Bun.serve`, `Bun.gunzipSync` and `Bun.inflateSync`
+
+(Numbered 0015 by its ledger task, L190; 0014 is kept for the patch written alongside it. 0015 is written on top
+of 0001-0010, 0012 and 0013: its `identity` argument follows 0013's `peer` and `peerAllow` in `fetchStart`.)
+
+**Problem.** Three things a gateway needs were missing. `fetch` and `Bun.connect` could not present a client
+certificate, so a server that requires mutual TLS (an A2A agent, in Bifrost's `agents[].*.tls`) could not be
+reached. A request on `Bun.serve` had no signal: an async handler never learned that its client went away, so
+the work it started (an upstream call, retries) ran on to the end. And there was no way to decompress gzip or
+DEFLATE data in a program (only `fetch` bodies were decoded), which gRPC's `grpc-encoding: gzip` needs.
+
+**API (as in Bun).**
+
+```ts
+await fetch(url, { tls: { ca, cert, key } })          // cert: PEM, the leaf first, then its chain; key: its PEM key
+await Bun.connect({ hostname, port, tls: { ca, alpn: ["h2"], cert, key }, socket })
+Bun.serve({ async fetch(req) { await fetch(up, { signal: req.signal }) } })  // aborts when the client goes away
+Bun.gunzipSync(bytes, { maxOutputLength: 4 << 20 })   // gzip (every member); throws when corrupt or past the limit
+Bun.inflateSync(bytes)                                // DEFLATE, raw or zlib-wrapped
+```
+
+**Design.**
+- `tls.cert` and `tls.key` go to the runtime as one PEM text (the natives `fetchStart` and `netConnect` take one
+  more string). `runtime/tls.c` keeps a context per (verify, CA, client certificate); the certificate chain and
+  key are loaded into it with `SSL_CTX_use_certificate`, `SSL_CTX_add0_chain_cert` and `SSL_CTX_use_PrivateKey`
+  and checked to match. Pooled fetch connections and resumed sessions are per certificate (the pool key holds a
+  hash of it). A pair that is not a certificate and its key fails the request with `ERR_TLS_CLIENT_CERT`.
+- `req.signal`: the runtime already noted deferred requests whose clients went away (`tv_http_on_gone`, used by
+  the Node compatibility layer). `httpOnGone(fn)` hands those ids to `Bun.serve`, which keeps the async requests
+  waiting for their answer by deferred id and aborts the signal of the one whose client left (an `AbortError`).
+  The signal is made on first use; a request answered before its client left is forgotten when answered.
+- `decompress(bytes, encoding, limit)` decodes with the codecs fetch already links (zlib), bounded by the limit
+  (one byte past it tells a stream over it from one that ends at it). The error is read with `takeError`.
+
+**Files.**
+- `runtime/tls.c`, `runtime/tov.h`: the client certificate in the TLS contexts (`open` takes it).
+- `runtime/tov.c`: the request's certificate and pool key, `httpOnGone`, `decompress`.
+- `runtime/net.c`, `runtime/ws.c`, `runtime/node.c`: `netConnect`'s and `fetchStart`'s new argument.
+- `crates/tov/src/check/builtins.rs`, `crates/tov/src/codegen/mod.rs`: the signatures; `decompress` links the codecs.
+- `crates/tov/src/std/http.tov`: `TLSOptions` and `SocketTLSOptions` (`cert`, `key`), `Request.signal`,
+  `Bun.gunzipSync`, `Bun.inflateSync`.
+- `docs/spec.md`: the fetch, sockets and serving paragraphs.
+
+**Measured in Raiju.** An A2A agent behind mutual TLS (JSON-RPC and gRPC) is reached with its client certificate
+and refuses the gateway without it; a non-streamed request whose caller hangs up stops its upstream call at once
+(no retry, no fallback, logged 499); gzip gRPC messages are read both ways (e2e `l190_e2e`).
+
+**Not covered.** A client certificate's key must not be encrypted (no passphrase option). `Request.signal` covers
+requests whose handler returned a promise (a synchronous answer has nothing to stop) and is not aborted once the
+answer is given (a streamed body's cancel says that). The tests (`tests/client_cert.tov` with
+`tests/client_cert_server.py`, 8 checks; `tests/server_gone.tov` with `tests/server_gone_client.py`, 4 checks;
+`tests/decompress.tov`, 8 checks) are in `run.sh`.

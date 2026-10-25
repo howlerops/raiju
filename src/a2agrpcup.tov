@@ -11,11 +11,12 @@
 // stream of JSON-RPC answers, one per StreamResponse, as they arrive.
 //
 // The caller's forwarded headers and the agent's runtime credentials go as metadata (Bifrost sends them as the SDK's
-// service params). Not built: compressed messages (none is asked for). The gRPC binding speaks v1: a v0.3 caller's
+// service params). Calls offer grpc-accept-encoding gzip, as grpc-go's client does with gzip registered, and an
+// answer the agent compresses with gzip is read. The gRPC binding speaks v1: a v0.3 caller's
 // params and results are translated around it (a2aver.tov, in ops.tov a2aSend).
 import { H2Header, H2Response, H2Sink, H2Tls, H2Conn } from "./h2"
 import { grpcConn, grpcFrame, headerValue, percentDecode } from "./grpc"
-import { GrpcDeframer } from "./grpcwire"
+import { GrpcDeframer, GRPC_ENCODINGS, gzipFrame } from "./grpcwire"
 import { encode, decode, requestOf, responseOf } from "./a2apb"
 import { rpcErrorOfGrpc } from "./grpcstatus"
 import { Call, CallCancel, Interface, interfacesOf, versionProblem, byVersion, isV03Version } from "./a2a"
@@ -311,6 +312,7 @@ export function grpcRequestHeaders(t: GrpcTarget, op: string, md: H2Header[], ti
     { name: "te", value: "trailers" },
   ]
   if (timeoutMs > 0) hs.push({ name: "grpc-timeout", value: `${timeoutMs}m` })
+  hs.push({ name: "grpc-accept-encoding", value: GRPC_ENCODINGS })
   hs.push({ name: "user-agent", value: "raiju" })
   for (const m of md) hs.push(m)
   return hs
@@ -385,6 +387,7 @@ export function unaryAnswer(op: string, rpcId: string, r: H2Response): string {
   if (st.code !== 0) return errorAnswer(rpcId, st.code, st.message, st.details)
   try {
     const df = new GrpcDeframer(MAX_RECV)
+    df.encoding = headerValue(r.headers, "grpc-encoding") ?? ""
     df.push(r.body)
     const m = try df.next()
     if (m === undefined || df.pending() !== 0) return rpcError(rpcId, -32006, "the agent's gRPC answer is not one message")
@@ -551,6 +554,8 @@ async function streamCall(conn: H2Conn, hs: H2Header[], body: u8[], op: string, 
     }
     // a head with the status is a trailers-only answer: the call ends there
     if (headerValue(h, "grpc-status") !== undefined) return
+    // the messages that follow are in the answer's encoding
+    rl.df.encoding = headerValue(h, "grpc-encoding") ?? ""
     rl.head = true
     wakeUp(rl, 1)
   }, (b: u8[]) => relayData(rl, b))
@@ -770,6 +775,7 @@ test("the call's headers become metadata without the transport's fields", () => 
   expect(headerValue(hs, ":authority")).toBe("127.0.0.1:50051")
   expect(headerValue(hs, "te")).toBe("trailers")
   expect(headerValue(hs, "grpc-timeout")).toBe("60000m")
+  expect(headerValue(hs, "grpc-accept-encoding")).toBe("gzip")
   expect(headerValue(grpcRequestHeaders(t, "SubscribeToTask", md, 0), "grpc-timeout")).toBeUndefined()
 })
 
@@ -795,6 +801,11 @@ test("a unary answer is its one message as the result, or its status as the JSON
   expect(unaryAnswer("GetTask", "1", none)).toBe(`{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"the agent answered HTTP 502 without a gRPC status"}}`)
   const empty: H2Response = { headers: [], trailers: [{ name: "grpc-status", value: "0" }], body: grpcFrame([]) }
   expect(unaryAnswer("DeleteTaskPushNotificationConfig", "1", empty)).toBe(`{"jsonrpc":"2.0","id":1,"result":{}}`)
+  // an answer the agent compressed (grpc-encoding gzip) is read; a compressed message without the header is not
+  const gz: H2Response = { headers: [{ name: ":status", value: "200" }, { name: "grpc-encoding", value: "gzip" }], trailers: [{ name: "grpc-status", value: "0" }], body: gzipFrame(task) }
+  expect(unaryAnswer("GetTask", "8", gz)).toBe(`{"jsonrpc":"2.0","id":8,"result":{"id":"t1","status":{"state":"TASK_STATE_COMPLETED"}}}`)
+  const bare: H2Response = { headers: [{ name: ":status", value: "200" }], trailers: [{ name: "grpc-status", value: "0" }], body: gzipFrame(task) }
+  expect(unaryAnswer("GetTask", "9", bare).includes("identity or empty encoding")).toBe(true)
 })
 
 test("streamed DATA is cut into one event per message, and a failed status is the last event", () => {

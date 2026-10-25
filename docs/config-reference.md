@@ -9,7 +9,7 @@ for each element of a list. Descriptions are the comments in the source; default
 has one. The command-line flags (`-app-dir`, `-config`, `-host`, `-port`, `-workers`, `-server`, `-mode`,
 `-healthcheck`) are in the README.
 
-1346 keys (545 with a description), and 38 Bifrost keys read through config_compat.
+1348 keys (547 with a description), and 38 Bifrost keys read through config_compat.
 
 ## Sections
 
@@ -886,10 +886,10 @@ The MCP gateway: client connections, tool execution, tool groups and code mode.
 | `mcp.header_flows[].expires_at` | number | It expires at expires_at, in epoch milliseconds, and is removed once submitted or revoked. |
 | `mcp.header_flows[].created_at` | number |  |
 | `mcp.user_tokens` | object[] | the tokens each caller obtained for the per_user_oauth clients (src/mcpuser.tov); sealed at rest |
-| `mcp.user_tokens[].id` | string | Exactly one of virtual_key_id and session_id is set: session_id in session mode (the x-bf-mcp-session-id header), else virtual_key_id. |
+| `mcp.user_tokens[].id` | string | At most one of virtual_key_id, session_id and user_id is set: user_id for a user-mode token, else virtual_key_id, else session_id in session mode (the x-bf-mcp-session-id header of a request without a key; identityOf). |
 | `mcp.user_tokens[].mcp_client_name` | string |  |
-| `mcp.user_tokens[].virtual_key_id` | string | Exactly one of virtual_key_id and session_id is set: session_id in session mode (the x-bf-mcp-session-id header), else virtual_key_id. |
-| `mcp.user_tokens[].session_id` | string | Exactly one of virtual_key_id and session_id is set: session_id in session mode (the x-bf-mcp-session-id header), else virtual_key_id. |
+| `mcp.user_tokens[].virtual_key_id` | string | At most one of virtual_key_id, session_id and user_id is set: user_id for a user-mode token, else virtual_key_id, else session_id in session mode (the x-bf-mcp-session-id header of a request without a key; identityOf). |
+| `mcp.user_tokens[].session_id` | string | At most one of virtual_key_id, session_id and user_id is set: user_id for a user-mode token, else virtual_key_id, else session_id in session mode (the x-bf-mcp-session-id header of a request without a key; identityOf). |
 | `mcp.user_tokens[].access_token` | string |  |
 | `mcp.user_tokens[].refresh_token` | string |  |
 | `mcp.user_tokens[].token_expires_at` | number | when the access token stops being valid, in epoch milliseconds |
@@ -900,10 +900,10 @@ The MCP gateway: client connections, tool execution, tool groups and code mode.
 | `mcp.user_tokens[].status_reason` | string |  |
 | `mcp.user_tokens[].user_id` | string | user mode: the identity-provider user the row belongs to (virtual_key_id and session_id are then "") |
 | `mcp.exchange_admin` | object[] | the admin discovery credential of each token_exchange client, kept by its verification (verify-exchange): the tools are listed with it, as Bifrost's admin bootstrap token does. Sealed at rest, never returned. |
-| `mcp.exchange_admin[].id` | string | Exactly one of virtual_key_id and session_id is set: session_id in session mode (the x-bf-mcp-session-id header), else virtual_key_id. |
+| `mcp.exchange_admin[].id` | string | At most one of virtual_key_id, session_id and user_id is set: user_id for a user-mode token, else virtual_key_id, else session_id in session mode (the x-bf-mcp-session-id header of a request without a key; identityOf). |
 | `mcp.exchange_admin[].mcp_client_name` | string |  |
-| `mcp.exchange_admin[].virtual_key_id` | string | Exactly one of virtual_key_id and session_id is set: session_id in session mode (the x-bf-mcp-session-id header), else virtual_key_id. |
-| `mcp.exchange_admin[].session_id` | string | Exactly one of virtual_key_id and session_id is set: session_id in session mode (the x-bf-mcp-session-id header), else virtual_key_id. |
+| `mcp.exchange_admin[].virtual_key_id` | string | At most one of virtual_key_id, session_id and user_id is set: user_id for a user-mode token, else virtual_key_id, else session_id in session mode (the x-bf-mcp-session-id header of a request without a key; identityOf). |
+| `mcp.exchange_admin[].session_id` | string | At most one of virtual_key_id, session_id and user_id is set: user_id for a user-mode token, else virtual_key_id, else session_id in session mode (the x-bf-mcp-session-id header of a request without a key; identityOf). |
 | `mcp.exchange_admin[].access_token` | string |  |
 | `mcp.exchange_admin[].refresh_token` | string |  |
 | `mcp.exchange_admin[].token_expires_at` | number | when the access token stops being valid, in epoch milliseconds |
@@ -1201,6 +1201,7 @@ named tool sets from several MCP servers, served at /mcp/{name}
 | `virtual_mcps[].tools[].description` | string |  |
 | `virtual_mcps[].tools[].defaults` | string |  |
 | `virtual_mcps[].allowed_keys` | string[] |  |
+| `virtual_mcps[].created_by_user_id` | string | the stored user who created it through the API (Bifrost's CreatedByUserID), who always sees it under data access control |
 
 ## log_exports
 
@@ -1260,6 +1261,7 @@ Streaming log exporters (Kafka, HTTP sinks, ...).
 | `exporters[].sasl_username` | string | kafka SASL/PLAIN; sasl_password is required with it |
 | `exporters[].sasl_password` | string | kafka SASL/PLAIN |
 | `exporters[].log_repo_id` | string | maxim: the log repository the entries go to |
+| `exporters[].request_headers` | string[] | maxim: request headers (names or prefix* patterns) tagged on the trace as header.<name> |
 | `exporters[].base_url` | string | maxim: default https://app.getmaxim.ai; bigquery and pubsub: the API host (default Google's) |
 
 ## cluster

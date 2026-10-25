@@ -10,6 +10,8 @@ import { dispatch, compatPath, streamKind, streamsRequest, routeStream, httpPath
 import { ServerLimits } from "./lifecycle"
 import { TransportRun, transportStart, transportEnd, transportDone, transportSink } from "./pluginroute"
 import * as metrics from "./metrics"
+import { CLIENT_WATCH_HEADER, watchStart, watchGone, watchEnd, watched } from "./clientgone"
+import { isInferencePath } from "./plughttp"
 
 // streamThreshold: request bodies over this many bytes reach the handler as a stream (0: never; large_payload_optimization).
 // limitBytes: client.max_request_body_size_mb, checked by the handler when maxBodyBytes (the parser's) is looser than it.
@@ -49,8 +51,11 @@ function bodyStream(q: BodyQueue): ReadableStream {
   })
 }
 
-function toRequest(req: Http1Request, host: string): Request {
-  const h: Record<string, string> = req.headers
+// watch: the id of the request's client watch (clientgone.tov), "" for none; a value the client sent is dropped.
+function toRequest(req: Http1Request, host: string, watch: string): Request {
+  let h: Record<string, string> = req.headers
+  h.delete(CLIENT_WATCH_HEADER)
+  if (watch !== "") h.set(CLIENT_WATCH_HEADER, watch)
   const url = "http://" + (req.headers.get("host") ?? host) + req.path
   if (req.method === "GET" || req.method === "HEAD") return new Request(url, { method: req.method, headers: h })
   const q = req.stream
@@ -101,10 +106,13 @@ async function write(res: Http1Response, r: Response): Promise<int> {
 }
 
 async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request, res: Http1Response, limit: int): Promise<void> {
-  let request = toRequest(req, host)
+  const path = pathOf(req.path)
+  // an inference request's client watch: its connection closing before the answer stops the upstream call
+  const wid = watched(req.method, path, isInferencePath(compatPath(path))) ? watchStart() : ""
+  if (wid !== "") res.onGone = () => watchGone(wid)
+  let request = toRequest(req, host, wid)
   let tr: TransportRun | undefined = undefined
   const t0 = performance.now()
-  const path = pathOf(req.path)
   // (a streamed body has not arrived: its declared length stands in)
   const inBytes = req.stream === undefined ? req.bytes.length * 1.0 : (parseFloat(req.headers.get("content-length") ?? "0") ?? 0.0)
   try {
@@ -167,6 +175,10 @@ async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request,
     console.error(`raiju: ${e.message}`)
   } finally {
     transportDone(engine, tr)
+    if (wid !== "") {
+      res.onGone = undefined
+      watchEnd(wid)
+    }
   }
 }
 
@@ -178,7 +190,7 @@ export function startFront(engine: Engine, ops: Ops, opts: FrontOptions): Served
   const host = `${opts.hostname}:${opts.port}`
   const onUpgrade = (req: Http1Request, accept: (protocol: string) => WsConnection | undefined, reject: (status: int, body: string) => void): bool => {
     // every WebSocket route, the realtime relay among them (server.tov's wsUpgrade)
-    return http1Upgrade(engine, ops, toRequest(req, host), accept, reject)
+    return http1Upgrade(engine, ops, toRequest(req, host, ""), accept, reject)
   }
   const lim = opts.limits
   const thresholdOf = lim === undefined ? undefined : () => lim().threshold

@@ -102,6 +102,9 @@ export abstract class VectorStore {
   async deleteWhere(ns: string, filter: Cond[]): Promise<int, Error> {
     throw new Error("this vector store cannot delete entries by field")
   }
+  // Opens a namespace that already exists without creating it, so it needs no dimension (a cache clear before any
+  // request opened the namespace). False when there is no such namespace: it holds nothing to clear.
+  abstract attach(ns: string, tags: string[]): Promise<bool, Error>
 }
 
 // ---- shared helpers ----
@@ -264,7 +267,12 @@ export class QdrantStore extends VectorStore {
 
   private async call(method: string, path: string, body: string): Promise<{ status: int, text: string }, Error> {
     const hs: Record<string, string> = this.apiKey === "" ? { "Content-Type": "application/json" } : { "Content-Type": "application/json", "api-key": this.apiKey }
-    const res = try await fetch(this.base + path, { method: method, headers: hs, body: body, signal: AbortSignal.timeout(10000), peer: STORE_PEER })
+    let res: Response = new Response()
+    if (body === "") {
+      res = try await fetch(this.base + path, { method: method, headers: hs, signal: AbortSignal.timeout(10000), peer: STORE_PEER })
+    } else {
+      res = try await fetch(this.base + path, { method: method, headers: hs, body: body, signal: AbortSignal.timeout(10000), peer: STORE_PEER })
+    }
     const text = try await res.text()
     return { status: res.status, text: text }
   }
@@ -274,6 +282,14 @@ export class QdrantStore extends VectorStore {
     const r = try await this.call("PUT", `/collections/${ns}`, qdrantCreateBody(dim))
     if ((r.status < 200 || r.status >= 300) && r.status !== 409) throw new Error(`qdrant: create ${ns}: HTTP ${r.status}: ${r.text}`)
     this.ready.add(ns)
+  }
+
+  async attach(ns: string, tags: string[]): Promise<bool, Error> {
+    const r = try await this.call("GET", `/collections/${ns}`, "")
+    if (r.status === 404) return false
+    if (r.status < 200 || r.status >= 300) throw new Error(`qdrant: collection ${ns}: HTTP ${r.status}: ${r.text}`)
+    this.ready.add(ns)
+    return true
   }
 
   async add(ns: string, id: string, vector: f64[], payload: Map<string, string>, ttlMs: int): Promise<void, Error> {
@@ -621,6 +637,18 @@ export class RedisStore extends VectorStore {
     this.tags.set(ns, tags)
   }
 
+  // FT.INFO answers an error for an index that does not exist.
+  async attach(ns: string, tags: string[]): Promise<bool, Error> {
+    const r = try await this.client.command(["FT.INFO", ns])
+    if (r.kind === "err") {
+      const t = r.text.toLowerCase()
+      if (t.includes("unknown index") || t.includes("no such index")) return false
+      throw new Error(`redis: info ${ns}: ${r.text}`)
+    }
+    this.tags.set(ns, tags)
+    return true
+  }
+
   async add(ns: string, id: string, vector: f64[], payload: Map<string, string>, ttlMs: int): Promise<void, Error> {
     const tags = try this.tagsOf(ns)
     const expires = Math.trunc(Date.now()) + ttlMs
@@ -811,6 +839,15 @@ export class WeaviateStore extends VectorStore {
     this.tags.set(ns, tags)
   }
 
+  async attach(ns: string, tags: string[]): Promise<bool, Error> {
+    const cls = try weaviateClass(ns)
+    const r = try await this.call("GET", `/v1/schema/${cls}`, "")
+    if (r.status === 404) return false
+    if (r.status < 200 || r.status >= 300) throw new Error(`weaviate: schema ${cls}: HTTP ${r.status}: ${r.text}`)
+    this.tags.set(ns, tags)
+    return true
+  }
+
   // Deletes every object matching the conditions in one batch; a class that does not exist holds nothing.
   async deleteWhere(ns: string, filter: Cond[]): Promise<int, Error> {
     const cls = try weaviateClass(ns)
@@ -939,6 +976,14 @@ export class PineconeStore extends VectorStore {
     const have = rawNum(try fields(r.text), "dimension")
     if (have !== undefined && have > 0.0 && have !== dim) throw new Error(`pinecone: the index holds ${have}-dimension vectors, namespace ${ns} wants ${dim}`)
     this.ready.add(ns)
+  }
+
+  // A namespace exists once something was upserted to it; the index answering is enough to delete from it.
+  async attach(ns: string, tags: string[]): Promise<bool, Error> {
+    const r = try await this.call("POST", "/describe_index_stats", "{}")
+    if (r.status < 200 || r.status >= 300) throw new Error(`pinecone: index stats: HTTP ${r.status}: ${r.text}`)
+    this.ready.add(ns)
+    return true
   }
 
   async add(ns: string, id: string, vector: f64[], payload: Map<string, string>, ttlMs: int): Promise<void, Error> {
@@ -1152,6 +1197,28 @@ class ChromemNs {
   }
 }
 
+// The vector size of the first entry a namespace file holds, or 0 when there is no file or no entry in it.
+export function chromemFileDim(file: string): int {
+  let text = ""
+  try {
+    text = readFileSync(file, "utf8")
+  } catch (e) {
+    return 0
+  }
+  for (const line of text.split("\n")) {
+    if (line.byteLength === 0) continue
+    try {
+      const f = fields(line)
+      if ((rawStr(f, "op") ?? "") !== "add") continue
+      const n = f32Values(decode(rawStr(f, "v") ?? "")).length
+      if (n > 0) return n
+    } catch (e) {
+      continue
+    }
+  }
+  return 0
+}
+
 // A file name for a namespace: characters other than letters, digits, - and _ become _.
 function safeFileName(ns: string): string {
   const ok = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
@@ -1194,6 +1261,16 @@ export class ChromemStore extends VectorStore {
     const st = new ChromemNs(dim, tags, file)
     st.load(Math.trunc(Date.now()))
     this.nss.set(ns, st)
+  }
+
+  // A namespace this process has not opened is read from its file, whose entries give the dimension.
+  async attach(ns: string, tags: string[]): Promise<bool, Error> {
+    if (this.nss.has(ns)) return true
+    if (this.dir === "") return false
+    const dim = chromemFileDim(this.dir + "/" + safeFileName(ns) + ".jsonl")
+    if (dim <= 0) return false
+    try await this.ensure(ns, dim, tags)
+    return true
   }
 
   async add(ns: string, id: string, vector: f64[], payload: Map<string, string>, ttlMs: int): Promise<void, Error> {
@@ -1506,6 +1583,24 @@ test("chromem keeps entries by tag, filters, and drops expired ones", () => {
   st.drop("e2")
   expect(st.meta.size).toBe(0)
   expect(st.parts.size).toBe(0)
+})
+
+test("a chromem namespace file gives its dimension, so a clear can open it before any request did", () => {
+  const dir = "build/chromem-dim-" + Math.floor(Math.random() * 1000000000)
+  try mkdirSync(dir, { recursive: true })
+  const file = dir + "/ns.jsonl"
+  expect(chromemFileDim(file)).toBe(0)
+  const pm: Map<string, string> = new Map()
+  pm.set("cache_key", "k")
+  try appendFileSync(file, `{"op":"del","id":"x"}\n` + chromemAddLine("a", [1.0, 0.0, 0.5], pm, 90000))
+  expect(chromemFileDim(file)).toBe(3)
+  try writeFileSync(file, `{"op":"del","id":"x"}\n`)
+  expect(chromemFileDim(file)).toBe(0)
+  try {
+    rmSync(dir, { recursive: true })
+  } catch (e) {
+    // left behind under build/
+  }
 })
 
 test("a chromem file replays adds and deletes, skips torn lines, and drops expired entries", () => {

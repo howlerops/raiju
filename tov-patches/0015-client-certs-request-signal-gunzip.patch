@@ -1,0 +1,696 @@
+diff --git a/crates/tov/src/check/builtins.rs b/crates/tov/src/check/builtins.rs
+index 949a44c..05e34b9 100644
+--- a/crates/tov/src/check/builtins.rs
++++ b/crates/tov/src/check/builtins.rs
+@@ -49,6 +49,11 @@ pub(super) fn native_sig(types: &mut Types, name: &str) -> Option<(Vec<TyId>, Ty
+             let handler = types.func(vec![p(STR)], VOID);
+             (vec![handler], VOID)
+         }
++        "httpOnGone" => {
++            let p = |ty| FnParam { ty, inout: false, optional: false };
++            let handler = types.func(vec![p(INT)], VOID);
++            (vec![handler], VOID)
++        }
+         "httpWorkers" => (vec![INT], VOID),
+         "urlParse" => (vec![STR, STR], str_arr),
+         "urlDecode" => (vec![STR, BOOL], STR),
+@@ -76,12 +81,16 @@ pub(super) fn native_sig(types: &mut Types, name: &str) -> Option<(Vec<TyId>, Ty
+         "headerValue" => (vec![STR, INT], STR),
+         "headerRemove" => (vec![STR, STR], STR),
+         "headerAppend" => (vec![STR, STR, STR], STR),
+-        "fetchStart" => (vec![STR, STR, STR, STR, INT, INT, STR, STR, STR, INT, INT, INT, INT, INT, STR], INT),
++        "fetchStart" => (vec![STR, STR, STR, STR, INT, INT, STR, STR, STR, INT, INT, INT, INT, INT, STR, STR], INT),
+         "fetchWait" | "fetchBodyWait" | "fetchRead" | "fetchHandle" => (vec![INT], types.promise(INT, NEVER)),
+         "fetchTake" => {
+             let bytes = types.array(U8);
+             (vec![INT], bytes)
+         }
++        "decompress" => {
++            let bytes = types.array(U8);
++            (vec![bytes, INT, INT], bytes)
++        }
+         "fetchWrite" => {
+             let bytes = types.array(U8);
+             (vec![INT, bytes], types.promise(INT, NEVER))
+@@ -111,7 +120,7 @@ pub(super) fn native_sig(types: &mut Types, name: &str) -> Option<(Vec<TyId>, Ty
+         "multipartParse" => (vec![STR, STR], str_arr),
+         "headerEntries" => (vec![STR], str_arr),
+         // sockets (runtime/net.c)
+-        "netConnect" => (vec![STR, INT, INT, BOOL, STR, STR, STR], INT),
++        "netConnect" => (vec![STR, INT, INT, BOOL, STR, STR, STR, STR], INT),
+         "netSpawn" => (vec![STR, STR, STR], INT),
+         "netBind" => {
+             let p = |ty| FnParam { ty, inout: false, optional: false };
+diff --git a/crates/tov/src/codegen/mod.rs b/crates/tov/src/codegen/mod.rs
+index 9e9374a..32eae49 100644
+--- a/crates/tov/src/codegen/mod.rs
++++ b/crates/tov/src/codegen/mod.rs
+@@ -508,7 +508,7 @@ impl<'c, 'a> Gen<'c, 'a> {
+         let mut main_body = main_body;
+         // A program that fetches links TLS (runtime/tls.c with mbedTLS; see build.rs): this call
+         // is what pulls it in.
+-        if self.funcs.contains("tv_native_fetchStart(") || self.funcs.contains("tv_native_netConnect(") || self.funcs.contains("tv_native_netListen(") || self.funcs.contains("tv_native_wsConnect(") {
++        if self.funcs.contains("tv_native_fetchStart(") || self.funcs.contains("tv_native_decompress(") || self.funcs.contains("tv_native_netConnect(") || self.funcs.contains("tv_native_netListen(") || self.funcs.contains("tv_native_wsConnect(") {
+             init.insert_str(0, "    tv_tls_install();\n");
+             self.uses_tls = true;
+         }
+diff --git a/crates/tov/src/std/http.tov b/crates/tov/src/std/http.tov
+index 9a2f17e..ecaf4e9 100644
+--- a/crates/tov/src/std/http.tov
++++ b/crates/tov/src/std/http.tov
+@@ -705,8 +705,21 @@ export type PoolOptions = {
+ }
+ 
+ // `rejectUnauthorized: false` skips certificate checks (as NODE_TLS_REJECT_UNAUTHORIZED=0 does);
+-// `ca` adds trusted certificates (PEM) to the system's.
+-export type TLSOptions = { rejectUnauthorized?: bool, ca?: string }
++// `ca` adds trusted certificates (PEM) to the system's; `cert` (a PEM certificate, the leaf first,
++// then its chain) and `key` (its PEM private key) are the client certificate for servers that ask
++// for one, as in Bun. A pair that isn't a certificate and its key fails the request
++// ("ERR_TLS_CLIENT_CERT").
++export type TLSOptions = { rejectUnauthorized?: bool, ca?: string, cert?: string, key?: string }
++
++// The client certificate and key as one PEM text for the runtime ("" for none).
++function identityOf(cert: string | undefined, key: string | undefined): string {
++  const c = cert ?? ""
++  const k = key ?? ""
++  if (c === "" && k === "") {
++    return ""
++  }
++  return c + "\n" + k
++}
+ 
+ function bodyText(b: BodyInit): string {
+   if (typeof b === "string") {
+@@ -757,6 +770,9 @@ export class Request {
+   private bodyId: int
+   // the body is a stream that text(), json() and the others have yet to read
+   private pending: bool
++  // `signal`, made when it is first asked for; `left`: a request from the wire whose client went away
++  private aborter: AbortController | undefined
++  private left: bool
+ 
+   constructor(input: string, init?: RequestInit) {
+     const m = init?.method
+@@ -766,6 +782,8 @@ export class Request {
+     this.streamBody = undefined
+     this.bodyId = 0
+     this.pending = false
++    this.aborter = undefined
++    this.left = false
+     const h = init?.headers
+     this.rawHeaders = h === undefined ? "" : new Headers(h).wire()
+     const b = init?.body
+@@ -843,6 +861,34 @@ export class Request {
+     return this.verb
+   }
+ 
++  // As in Bun: on a server, aborted when the client goes away (its connection closes, resets or
++  // ends its side) before the response is given, so the work done for it can stop. An async
++  // handler's request is watched; a request that is never answered later is not.
++  get signal(): AbortSignal {
++    let a = this.aborter
++    if (a === undefined) {
++      const made = new AbortController()
++      this.aborter = made
++      a = made
++      if (this.left) {
++        made.abort(new DOMException("The client went away.", "AbortError"))
++      }
++    }
++    return a.signal
++  }
++
++  // Internal: the server heard that this request's client went away.
++  clientLeft(): void {
++    if (this.left) {
++      return
++    }
++    this.left = true
++    const a = this.aborter
++    if (a !== undefined) {
++      a.abort(new DOMException("The client went away.", "AbortError"))
++    }
++  }
++
+   // The full URL ("http://host/path?query").
+   get url(): string {
+     if (!this.fromWire) {
+@@ -1333,6 +1379,11 @@ type Pattern<T> = { segments: string[], wildcard: bool, value: RouteValue<T> }
+ // (a handler that answered nothing: it upgraded, or it's an error)
+ const NO_RESPONSE = new Response("")
+ 
++// The async requests of every server waiting for their answer, by deferred id: their signals abort
++// when their clients go away.
++const goneWatch = new Map<int, Request>()
++let goneHeard = false
++
+ function methodHandler<T>(m: MethodRoutes<T>, method: string): RouteHandler<T> | undefined {
+   switch (method) {
+     case "GET":
+@@ -1403,6 +1454,8 @@ async function respondLater(id: int, pending: Promise<Response | undefined, Erro
+   } catch (e) {
+     res = internalError(e, method, target, onError)
+   }
++  // answered: its client leaving no longer aborts its signal
++  goneWatch.delete(id)
+   // (nothing: an upgrade, whose connection the response no longer goes to, or a mistake)
+   const r = res ?? new Response("", { status: 500 })
+   const st = r.wireStream()
+@@ -1478,6 +1531,18 @@ export function serve<T = undefined>(options: ServeOptions<T>): Server<T> {
+   const onError = options.error
+   const server = new Server<T>(hostname === "0.0.0.0" ? "localhost" : hostname, options.websocket)
+   const noParams: Record<string, string> = {}
++  // the request in hand (its signal is watched once it is deferred)
++  let current: Request | undefined = undefined
++  if (!goneHeard) {
++    goneHeard = true
++    __native.httpOnGone((gid: int): void => {
++      const r = goneWatch.get(gid)
++      if (r !== undefined) {
++        goneWatch.delete(gid)
++        r.clientLeft()
++      }
++    })
++  }
+ 
+   const run = (value: RouteValue<T>, params: Record<string, string>, method: string, target: string, headers: string, body: string): Answer => {
+     if (value instanceof Response) {
+@@ -1489,6 +1554,7 @@ export function serve<T = undefined>(options: ServeOptions<T>): Server<T> {
+     }
+     const req = new BunRequest(target, params)
+     req.wire(method, target, headers, body)
++    current = req
+     try {
+       return h(req, server) ?? NO_RESPONSE
+     } catch (e) {
+@@ -1518,6 +1584,7 @@ export function serve<T = undefined>(options: ServeOptions<T>): Server<T> {
+     if (fetch !== undefined) {
+       const req = new Request(target)
+       req.wire(method, target, headers, body)
++      current = req
+       try {
+         return fetch(req, server) ?? NO_RESPONSE
+       } catch (e) {
+@@ -1529,6 +1596,8 @@ export function serve<T = undefined>(options: ServeOptions<T>): Server<T> {
+ 
+   const id = __native.httpListen(port, hostname, (method: string, target: string, headers: string, body: string): void => {
+     const res = handle(method, target, headers, body)
++    const req = current
++    current = undefined
+     if (res === NO_RESPONSE || res === undefined) {
+       if (!server.tookUpgrade()) {
+         console.error(`error: the handler for ${method} ${target} returned no Response`)
+@@ -1547,7 +1616,11 @@ export function serve<T = undefined>(options: ServeOptions<T>): Server<T> {
+       // Nothing observable follows (the loop runs microtasks next), so the response can go out
+       // at once if the handler's promise is already settled.
+       __native.spawnTail()
+-      respondLater(__native.httpDefer(), res, method, target, onError)
++      const did = __native.httpDefer()
++      if (req !== undefined && did > 0) {
++        goneWatch.set(did, req)
++      }
++      respondLater(did, res, method, target, onError)
+     }
+   })
+   if (id < 0) {
+@@ -2111,6 +2184,7 @@ export async function fetch(input: string | URL | Request, init?: RequestInit):
+   let redirect = 0
+   let flags = 1
+   let ca = ""
++  let identity = ""
+   let unix = ""
+   let proxy = ""
+   let peer = 0
+@@ -2148,6 +2222,7 @@ export async function fetch(input: string | URL | Request, init?: RequestInit):
+         flags += 2
+       }
+       ca = tls.ca ?? ""
++      identity = identityOf(tls.cert, tls.key)
+     }
+     unix = init.unix ?? ""
+     proxy = init.proxy ?? ""
+@@ -2180,7 +2255,7 @@ export async function fetch(input: string | URL | Request, init?: RequestInit):
+       pingMs = (pool.http2PingInterval ?? 0) * 1000
+     }
+   }
+-  const id = __native.fetchStart(method, url, headers, body, redirect, bodyStream !== undefined ? flags + 4 : flags, ca, unix, proxy, keepAliveMs, maxConns, http2, pingMs, peer, peerAllow)
++  const id = __native.fetchStart(method, url, headers, body, redirect, bodyStream !== undefined ? flags + 4 : flags, ca, unix, proxy, keepAliveMs, maxConns, http2, pingMs, peer, peerAllow, identity)
+   if (signal !== undefined) {
+     signal.watch(id)
+   }
+@@ -2239,7 +2314,8 @@ export type SocketHandler<T> = {
+   handshake?: (socket: Socket<T>, success: bool, authorizationError?: Error) => void throws Error
+ }
+ 
+-export type SocketTLSOptions = { rejectUnauthorized?: bool, ca?: string, serverName?: string, alpn?: string[] }
++// `cert` and `key`: a client certificate (PEM, the leaf first) and its private key, as fetch's.
++export type SocketTLSOptions = { rejectUnauthorized?: bool, ca?: string, serverName?: string, alpn?: string[], cert?: string, key?: string }
+ export type ServerTLSOptions = { cert: string, key: string }
+ 
+ export type ConnectOptions<T> = {
+@@ -2502,6 +2578,7 @@ function connectSocket<T>(options: ConnectOptions<T>): Promise<Socket<T>, Error>
+   let ca = ""
+   let serverName = hostname
+   let alpn = ""
++  let identity = ""
+   const t = options.tls
+   if (t !== undefined) {
+     if (typeof t === "boolean") {
+@@ -2513,10 +2590,11 @@ function connectSocket<T>(options: ConnectOptions<T>): Promise<Socket<T>, Error>
+       serverName = t.serverName ?? hostname
+       const protos = t.alpn ?? []
+       alpn = protos.join("\u0000")
++      identity = identityOf(t.cert, t.key)
+     }
+   }
+   const unix = options.unix ?? ""
+-  const id = __native.netConnect(serverName, port, tls, verify, ca, unix, alpn)
++  const id = __native.netConnect(serverName, port, tls, verify, ca, unix, alpn, identity)
+   __native.netHalfOpen(id, options.allowHalfOpen ?? false)
+   const socket = new Socket<T>(id, options.socket, options.data)
+   const p = new Promise<Socket<T>, Error>((resolve, reject) => {
+@@ -3176,11 +3254,37 @@ export class WebSocket {
+ }
+ 
+ // The `Bun` global: Bun.serve, Bun.connect, Bun.listen.
++// What decompression may produce at most (bytes; unset: up to 2 GiB).
++export type DecompressOptions = { maxOutputLength?: int }
++
++function decompressed(data: u8[], enc: int, options: DecompressOptions | undefined): u8[] throws Error {
++  const out = __native.decompress(data, enc, options?.maxOutputLength ?? 0)
++  if (out.length === 0) {
++    const why = __native.takeError()
++    if (why !== "") {
++      throw new Error(why)
++    }
++  }
++  return out
++}
++
+ export class Bun {
+   static serve<T = undefined>(options: ServeOptions<T>): Server<T> {
+     return serve(options)
+   }
+ 
++  // gzip data (RFC 1952; members after the first are read too) decompressed, as in Bun. Throws when
++  // it is corrupt, cut short, or over `maxOutputLength` (Tov).
++  static gunzipSync(data: u8[], options?: DecompressOptions): u8[] throws Error {
++    return try decompressed(data, 1, options)
++  }
++
++  // DEFLATE data decompressed: raw (RFC 1951, as Bun's) or zlib-wrapped (RFC 1950). Throws as
++  // gunzipSync does.
++  static inflateSync(data: u8[], options?: DecompressOptions): u8[] throws Error {
++    return try decompressed(data, 2, options)
++  }
++
+   static connect<T = undefined>(options: ConnectOptions<T>): Promise<Socket<T>, Error> {
+     return connectSocket(options)
+   }
+diff --git a/docs/spec.md b/docs/spec.md
+index 56b6912..949c1e7 100644
+--- a/docs/spec.md
++++ b/docs/spec.md
+@@ -194,7 +194,7 @@ const server = Bun.serve({
+ })
+ console.log(`Listening on ${server.url}`)
+ ```
+-- **Serving.** `Bun.serve` binds right away (an unusable port prints the error and exits, as an uncaught error does in Bun) and returns a `Server` (`port`, `hostname`, `url`, `stop(closeActive?)`); requests are served once the script's top level (or `main`) has finished, until every server is stopped. `workers: n` (Tov only) forks `n` processes sharing the sockets, supervised: a worker that dies is replaced, and SIGTERM/SIGINT stop them all. Limits (seconds; unset or 0: none): `headerTimeout` (a request head from its first byte, or a new connection from its accept), `bodyTimeout` (a body going without a byte) — both answer 408 and close — and `idleTimeout` (a connection with no request in hand; a request being handled is never timed out, unlike Bun's); `maxConnections` (Tov) answers requests on connections past it per process with 503, and out of descriptors a connection is answered 503 at once from a spare descriptor instead of the loop spinning on the listener. `server.openConnections` (Tov) counts the process's open connections. `Bun.onStopSignal(fn)` (Tov) makes SIGTERM and SIGINT call `fn(name)` on the loop instead of ending the process (in every worker, re-armed after the fork; the supervisor forwards the signal, closes its copy of the listeners, and exits 0 once every worker has exited cleanly), so a program can `stop()` its servers, let the requests in hand finish and exit. `Bun.fdLimit()` (Tov) is the soft RLIMIT_NOFILE.
++- **Serving.** `Bun.serve` binds right away (an unusable port prints the error and exits, as an uncaught error does in Bun) and returns a `Server` (`port`, `hostname`, `url`, `stop(closeActive?)`); requests are served once the script's top level (or `main`) has finished, until every server is stopped. `workers: n` (Tov only) forks `n` processes sharing the sockets, supervised: a worker that dies is replaced, and SIGTERM/SIGINT stop them all. Limits (seconds; unset or 0: none): `headerTimeout` (a request head from its first byte, or a new connection from its accept), `bodyTimeout` (a body going without a byte) — both answer 408 and close — and `idleTimeout` (a connection with no request in hand; a request being handled is never timed out, unlike Bun's); `maxConnections` (Tov) answers requests on connections past it per process with 503, and out of descriptors a connection is answered 503 at once from a spare descriptor instead of the loop spinning on the listener. `server.openConnections` (Tov) counts the process's open connections. `Bun.onStopSignal(fn)` (Tov) makes SIGTERM and SIGINT call `fn(name)` on the loop instead of ending the process (in every worker, re-armed after the fork; the supervisor forwards the signal, closes its copy of the listeners, and exits 0 once every worker has exited cleanly), so a program can `stop()` its servers, let the requests in hand finish and exit. `Bun.fdLimit()` (Tov) is the soft RLIMIT_NOFILE. `req.signal`, as in Bun, aborts (an `AbortError`) when the client goes away — its connection closes or resets, or it ends its side — before an async handler has answered, so the handler can stop the work it started for it (pass it to `fetch`).
+ - **Routing** as in Bun: exact paths first, then `:param` and `/*` routes; a route is a `Response`, a handler, or an object of per-method handlers (`GET`, `POST`, ...; others fall through to `fetch`). `req.params` is typed from the route. Unmatched requests go to `fetch`, else `404`.
+ - **Handlers** return a `Response`, or (`async`) a promise of one: their type is `(req, server) => Response | Promise<Response, Error> throws Error`. A synchronous response is written at once; an async one when its promise settles, and responses on a connection still go out in request order (pipelining works either way).
+ - **Errors.** A handler that throws (or whose promise rejects) is logged to stderr and answered by `error(err)` if given, else `500 Something went wrong!`, like Bun in production.
+@@ -215,7 +215,7 @@ const user = try (await res.json()) as User
+ - **Requests.** Methods are sent upper-cased; every method but `GET`/`HEAD` sends `Content-Length` (a `GET`/`HEAD` with a body is an error). Bodies: `string`, `URLSearchParams` (sent as `application/x-www-form-urlencoded;charset=UTF-8`), bytes (`u8[]`), a `Blob` or `File` (its `type` is the `Content-Type`), or a `FormData` (sent as `multipart/form-data` with a random boundary). The defaults follow the caller's headers, as Bun sends them: `Connection: keep-alive`, `User-Agent`, `Accept: */*`, `Host`, `Accept-Encoding: gzip, deflate, br, zstd`; credentials in the URL become `Authorization: Basic`.
+ - **Responses.** `status`, `statusText`, `ok`, `headers`, `url` (after redirects, without the fragment), `redirected`, `type`, `bodyUsed`; `text()` (UTF-8 decoded: a BOM is dropped, invalid bytes become U+FFFD), `json<T>()` (checked against the expected type), `bytes()`/`arrayBuffer()` (`u8[]`), `blob()` (typed by the `Content-Type` as it is), `formData()` (a `multipart/form-data` or `application/x-www-form-urlencoded` body; any other rejects with `ERR_FORMDATA_PARSE_ERROR`), `clone()`. These wait for the whole body and reject if it fails (`ECONNRESET` for a connection that drops mid-body, the signal's reason when it aborts). A body is read once: another read rejects with `ERR_BODY_ALREADY_USED`. A response that's dropped unread frees its request (and closes the connection if the body is still arriving).
+ - **Streaming.** `res.body` is a `ReadableStream` of `u8[]` chunks as they arrive: `getReader()` → `read()` (`{ done, value }`), `cancel()`, `releaseLock()`, `locked`. `for await (const chunk of stream) { ... }` reads it chunk by chunk (it throws, like `try`, if the body fails; leaving the loop early cancels the stream). A reader that falls behind pauses the connection at 4 MB. A compressed body read this way is decoded as it arrives (gzip and deflate with zlib, brotli, zstd), at most 4 MB ahead of the reader, so a small body that decodes to a huge one is decoded only as it's read; one read whole (`text()` and the like) is decoded at once when it's in (gzip and deflate with libdeflate, twice as fast). A stream that ends before its encoding does fails (`ZlibError`, ...). `TextDecoder` (`decode(bytes, { stream: true })` completes characters cut between chunks; `fatal`, `ignoreBOM`) and `TextEncoder` (`encode(text)`) convert between text and `u8[]`.
+-- **HTTPS.** TLS 1.3 and 1.2 (BoringSSL, vendored: AES-GCM with the CPU's AES instructions, else ChaCha20-Poly1305; X25519 and post-quantum ML-KEM key shares; ALPN `http/1.1`; SNI), with sessions resumed per origin. Certificates are checked against the system's CA bundle (`SSL_CERT_FILE` overrides it, `NODE_EXTRA_CA_CERTS` adds to it) and the host name; failures reject with Node's codes (`CERT_HAS_EXPIRED`, `DEPTH_ZERO_SELF_SIGNED_CERT`, `SELF_SIGNED_CERT_IN_CHAIN`, `UNABLE_TO_VERIFY_LEAF_SIGNATURE`, `ERR_TLS_CERT_ALTNAME_INVALID`, ...). `tls: { ca?, rejectUnauthorized? }` adds trusted certificates or turns the checks off, as does `NODE_TLS_REJECT_UNAUTHORIZED=0`.
++- **HTTPS.** TLS 1.3 and 1.2 (BoringSSL, vendored: AES-GCM with the CPU's AES instructions, else ChaCha20-Poly1305; X25519 and post-quantum ML-KEM key shares; ALPN `http/1.1`; SNI), with sessions resumed per origin. Certificates are checked against the system's CA bundle (`SSL_CERT_FILE` overrides it, `NODE_EXTRA_CA_CERTS` adds to it) and the host name; failures reject with Node's codes (`CERT_HAS_EXPIRED`, `DEPTH_ZERO_SELF_SIGNED_CERT`, `SELF_SIGNED_CERT_IN_CHAIN`, `UNABLE_TO_VERIFY_LEAF_SIGNATURE`, `ERR_TLS_CERT_ALTNAME_INVALID`, ...). `tls: { ca?, rejectUnauthorized? }` adds trusted certificates or turns the checks off, as does `NODE_TLS_REJECT_UNAUTHORIZED=0`; `tls: { cert, key }` (PEM text: the certificate, then its chain, and its private key) is the client certificate for servers that ask for one, as in Bun (connections are pooled per certificate; a pair that isn't a certificate and its key rejects with `ERR_TLS_CLIENT_CERT`).
+ - **Protocol.** HTTP/1.1 on pooled keep-alive connections per origin (a pooled connection the server has closed is replaced and the request retried once); `Content-Length`, chunked (extensions and trailers) and close-delimited bodies, interim `1xx` responses, HTTP/1.0 servers; gzip, deflate, brotli and zstd bodies are decoded unless `decompress: false` (`Accept-Encoding: gzip, deflate, br, zstd`, as Bun sends). DNS lookups run on a small thread pool and are cached for 30 s.
+ - **Redirects** (`redirect: "follow"`, the default): up to 20, as the Fetch standard says; 303 (and 301/302 after a `POST`) continue as `GET` without the body; a redirect to another origin drops `Authorization`, `Proxy-Authorization` and `Cookie`. `"manual"` returns the 3xx response; `"error"` rejects.
+ - **Cancelling.** `AbortController` (`signal`, `abort(reason?)`), `AbortSignal` (`aborted`, `reason`, `throwIfAborted()`, `addEventListener("abort", f)`, `onabort`, `AbortSignal.abort(reason?)`, `AbortSignal.timeout(ms)`, `AbortSignal.any(signals)`) and `DOMException` (`name`, `code`). An aborted request's connection is closed. `AbortSignal.timeout`'s timer doesn't keep the program running by itself.
+@@ -227,7 +227,7 @@ const user = try (await res.json()) as User
+ - Not yet: request bodies as streams, client certificates, `https:` proxies.
+ 
+ ## 7e. TCP and TLS sockets (Bun's API)
+-`Bun.connect(options)` and `Bun.listen(options)`, as in Bun: `hostname`, `port` (or `unix`), `tls` (`true`, or `{ ca?, rejectUnauthorized?, serverName? }` to connect; `{ cert, key }`, PEM text, to listen), `data` (the sockets' starting `socket.data`), `allowHalfOpen`, and `socket`, the handlers: `open(socket)`, `data(socket, bytes)` (a `u8[]`), `drain(socket)`, `end(socket)` (the peer finished sending), `close(socket, error?)`, `error(socket, error)`, `connectError(socket, error)`, `handshake(socket, success, authorizationError?)`.
++`Bun.connect(options)` and `Bun.listen(options)`, as in Bun: `hostname`, `port` (or `unix`), `tls` (`true`, or `{ ca?, rejectUnauthorized?, serverName?, alpn?, cert?, key? }` to connect, `cert` and `key` a client certificate as fetch's; `{ cert, key }`, PEM text, to listen), `data` (the sockets' starting `socket.data`), `allowHalfOpen`, and `socket`, the handlers: `open(socket)`, `data(socket, bytes)` (a `u8[]`), `drain(socket)`, `end(socket)` (the peer finished sending), `close(socket, error?)`, `error(socket, error)`, `connectError(socket, error)`, `handshake(socket, success, authorizationError?)`.
+ ```ts
+ type Session = { name: string }
+ const server = Bun.listen<Session>({
+diff --git a/runtime/net.c b/runtime/net.c
+index 28e0f14..ce6ffd1 100644
+--- a/runtime/net.c
++++ b/runtime/net.c
+@@ -47,6 +47,8 @@ typedef struct tv_ns {
+     size_t ca_len;
+     char *alpn;              /* TLS: the protocols offered, NUL-separated (see netConnect) */
+     size_t alpn_len;
++    char *ident;             /* TLS: the client certificate and key (PEM), or NULL */
++    size_t ident_len;
+     tv_addrs addrs;
+     int ai, port;
+     char *out;
+@@ -111,6 +113,7 @@ static void tv_ns_free(tv_ns *s) {
+     free(s->host);
+     free(s->ca);
+     free(s->alpn);
++    free(s->ident);
+     tv_ns_tab[s->id] = NULL;
+     free(s);
+ }
+@@ -410,9 +413,9 @@ static void tv_ns_connected(tv_ns *s) {
+         }
+         char key[300];
+         snprintf(key, sizeof key, "tcp|%s|%d", s->host, s->port);
+-        s->tls = tv_tls_impl->open(s->fd, s->host, key, s->verify, s->ca ? s->ca : "", s->ca_len, s->alpn ? s->alpn : "", s->alpn_len);
++        s->tls = tv_tls_impl->open(s->fd, s->host, key, s->verify, s->ca ? s->ca : "", s->ca_len, s->alpn ? s->alpn : "", s->alpn_len, s->ident ? s->ident : "", s->ident_len);
+         if (!s->tls) {
+-            tv_ns_close(s, "ERR_TLS_INIT");
++            tv_ns_close(s, s->ident_len ? "ERR_TLS_CLIENT_CERT" : "ERR_TLS_INIT");
+             return;
+         }
+         s->state = TV_NS_HANDSHAKE;
+@@ -509,10 +512,10 @@ static void tv_ns_resolved(tv_ns *s, const tv_addrs *addrs, bool failed) {
+ 
+ /* ---- natives */
+ 
+-/* netConnect(host, port, tls, verify, ca, unix, alpn) -> socket id; events follow (open, or
++/* netConnect(host, port, tls, verify, ca, unix, alpn, identity) -> socket id; events follow (open, or
+  * connectError). tls: 0 plain, 1 TLS. alpn: the TLS protocols offered, NUL-separated ("" for the
+- * default). */
+-tv_int tv_native_netConnect(tv_str host, tv_int port, tv_int tls, bool verify, tv_str ca, tv_str unix_path, tv_str alpn) {
++ * default). identity: a client certificate chain and its key, as PEM ("" for none). */
++tv_int tv_native_netConnect(tv_str host, tv_int port, tv_int tls, bool verify, tv_str ca, tv_str unix_path, tv_str alpn, tv_str identity) {
+     tv_ns *s = tv_ns_new();
+     s->io.ready = tv_ns_ready;
+     s->port = (int)port;
+@@ -532,6 +535,11 @@ tv_int tv_native_netConnect(tv_str host, tv_int port, tv_int tls, bool verify, t
+             memcpy(s->alpn, alpn.p->data, (size_t)alpn.p->len + 1);
+             s->alpn_len = (size_t)alpn.p->len;
+         }
++        if (identity.p->len) {
++            s->ident = tv_alloc((size_t)identity.p->len + 1);
++            memcpy(s->ident, identity.p->data, (size_t)identity.p->len + 1);
++            s->ident_len = (size_t)identity.p->len;
++        }
+     }
+     return s->id;
+ }
+diff --git a/runtime/node.c b/runtime/node.c
+index a9ca2c2..de06a04 100644
+--- a/runtime/node.c
++++ b/runtime/node.c
+@@ -3363,7 +3363,7 @@ NATIVE(n_fetch_start) {
+     tv_str args[9];
+     for (size_t i = 0; i < 9; i++) args[i] = i == 4 || i == 5 ? TV_EMPTY_STR : tv_node_arg_str(ctx, n, a, i);
+     tv_int id = tv_native_fetchStart(args[0], args[1], args[2], args[3], (tv_int)arg_num(ctx, n, a, 4, 0), (tv_int)arg_num(ctx, n, a, 5, 1),
+-                                     args[6], args[7], args[8], 0, 0, 0, 0, 0, TV_EMPTY_STR);
++                                     args[6], args[7], args[8], 0, 0, 0, 0, 0, TV_EMPTY_STR, TV_EMPTY_STR);
+     for (size_t i = 0; i < 9; i++) tv_str_release(args[i]);
+     tv_int *box = malloc(sizeof *box);
+     *box = id;
+diff --git a/runtime/tls.c b/runtime/tls.c
+index 2845edf..1a6fd4e 100644
+--- a/runtime/tls.c
++++ b/runtime/tls.c
+@@ -6,7 +6,8 @@
+  *
+  * Certificates are verified against the system's CA bundle (loaded once per configuration):
+  * SSL_CERT_FILE, else the first of the usual locations; NODE_EXTRA_CA_CERTS adds more, and a
+- * request's own `tls.ca` more still. NODE_TLS_REJECT_UNAUTHORIZED=0 turns verification off, as
++ * request's own `tls.ca` more still; `tls.cert` and `tls.key` present a client certificate when the
++ * server asks for one. NODE_TLS_REJECT_UNAUTHORIZED=0 turns verification off, as
+  * in Node and Bun. Sessions are remembered per origin, so pooled and later connections resume
+  * (TLS 1.3 tickets, TLS 1.2 tickets or IDs) instead of repeating the full handshake.
+  *
+@@ -47,12 +48,14 @@ struct tv_tls {
+     char code[64];            /* the last failure's code (ERR_SSL_...), see tv_tls_why */
+ };
+ 
+-/* A context per (verify, extra CA): few in a program. */
++/* A context per (verify, extra CA, client certificate): few in a program. */
+ typedef struct tv_tls_conf {
+     struct tv_tls_conf *next;
+     bool verify;
+     char *ca;                 /* extra PEM, or NULL */
+     size_t ca_len;
++    char *id;                 /* the client certificate chain and its key (PEM), or NULL */
++    size_t id_len;
+     SSL_CTX *ctx;
+     bool *added;              /* which roots its store has (see tv_tls_verify) */
+ } tv_tls_conf;
+@@ -314,11 +317,40 @@ static void tv_tls_add_pem(X509_STORE *store, const char *pem, size_t len) {
+     BIO_free(bio);
+ }
+ 
+-static tv_tls_conf *tv_tls_conf_for(bool verify, const char *ca, size_t ca_len) {
++/* Loads a client certificate into ctx from PEM text holding the certificate (the leaf first, then
++ * its chain) and the private key, in either order. False when either is missing or they don't
++ * match. */
++static bool tv_tls_use_identity(SSL_CTX *ctx, const char *pem, size_t len) {
++    BIO *b = BIO_new_mem_buf(pem, (ptrdiff_t)len);
++    X509 *leaf = b ? PEM_read_bio_X509(b, NULL, NULL, NULL) : NULL;
++    bool ok = leaf && SSL_CTX_use_certificate(ctx, leaf) == 1;
++    X509_free(leaf);
++    if (ok) {
++        X509 *x;
++        while ((x = PEM_read_bio_X509(b, NULL, NULL, NULL)) != NULL) {
++            if (!SSL_CTX_add0_chain_cert(ctx, x)) { X509_free(x); break; }
++        }
++    }
++    BIO_free(b);
++    if (ok) {
++        b = BIO_new_mem_buf(pem, (ptrdiff_t)len);
++        EVP_PKEY *pk = b ? PEM_read_bio_PrivateKey(b, NULL, NULL, NULL) : NULL;
++        BIO_free(b);
++        ok = pk && SSL_CTX_use_PrivateKey(ctx, pk) == 1 && SSL_CTX_check_private_key(ctx) == 1;
++        EVP_PKEY_free(pk);
++    }
++    ERR_clear_error();
++    return ok;
++}
++
++static tv_tls_conf *tv_tls_conf_for(bool verify, const char *ca, size_t ca_len, const char *id, size_t id_len) {
+     for (tv_tls_conf *c = tv_tls_confs; c; c = c->next)
+-        if (c->verify == verify && c->ca_len == ca_len && (ca_len == 0 || memcmp(c->ca, ca, ca_len) == 0)) return c;
++        if (c->verify == verify && c->ca_len == ca_len && (ca_len == 0 || memcmp(c->ca, ca, ca_len) == 0) &&
++            c->id_len == id_len && (id_len == 0 || memcmp(c->id, id, id_len) == 0)) return c;
+     SSL_CTX *ctx = SSL_CTX_new(TLS_method());
+     if (!ctx) return NULL;
++    /* a client certificate that can't be used fails the connection (no context is kept for it) */
++    if (id_len && !tv_tls_use_identity(ctx, id, id_len)) { SSL_CTX_free(ctx); return NULL; }
+     tv_tls_conf *c = calloc(1, sizeof *c);
+     c->verify = verify;
+     c->ctx = ctx;
+@@ -340,6 +372,11 @@ static tv_tls_conf *tv_tls_conf_for(bool verify, const char *ca, size_t ca_len)
+         memcpy(c->ca, ca, ca_len);
+         c->ca_len = ca_len;
+     }
++    if (id_len) {
++        c->id = malloc(id_len);
++        memcpy(c->id, id, id_len);
++        c->id_len = id_len;
++    }
+     c->next = tv_tls_confs;
+     tv_tls_confs = c;
+     return c;
+@@ -365,12 +402,13 @@ static size_t tv_tls_alpn_wire(const char *alpn, size_t alpn_len, uint8_t *wire,
+ }
+ 
+ /* alpn: the protocols this connection offers (NUL-separated, "" for none); the context's default
+- * (http/1.1) is kept when none are given. */
+-static tv_tls *tv_tls_open(int fd, const char *host, const char *key, bool verify, const char *ca, size_t ca_len, const char *alpn, size_t alpn_len) {
++ * (http/1.1) is kept when none are given. id: the client certificate and key (PEM, "" for none);
++ * NULL when it can't be used. */
++static tv_tls *tv_tls_open(int fd, const char *host, const char *key, bool verify, const char *ca, size_t ca_len, const char *alpn, size_t alpn_len, const char *id, size_t id_len) {
+     tv_tls_init();
+     const char *off = getenv("NODE_TLS_REJECT_UNAUTHORIZED");
+     if (off && strcmp(off, "0") == 0) verify = false;
+-    tv_tls_conf *conf = tv_tls_conf_for(verify, ca, ca_len);
++    tv_tls_conf *conf = tv_tls_conf_for(verify, ca, ca_len, id, id_len);
+     if (!conf) return NULL;
+     SSL *ssl = SSL_new(conf->ctx);
+     if (!ssl) return NULL;
+diff --git a/runtime/tov.c b/runtime/tov.c
+index cb492cf..4bc4fab 100644
+--- a/runtime/tov.c
++++ b/runtime/tov.c
+@@ -4047,6 +4047,21 @@ static void tv_http_flush_gone(void) {
+     tv_http_ngone = 0;
+ }
+ 
++/* httpOnGone: Bun.serve's function for the deferred requests whose clients went away (it aborts
++ * their Request.signal). */
++static tv_fn tv_http_gone_fn;
++
++static void tv_http_gone_tov(tv_int id) {
++    if (tv_http_gone_fn.fn) ((void (*)(void *, tv_int))tv_http_gone_fn.fn)(tv_http_gone_fn.env, id);
++}
++
++void tv_native_httpOnGone(tv_fn fn) {
++    if (tv_http_gone_fn.fn) tv_env_release(tv_http_gone_fn.env);
++    tv_env_retain(fn.env);
++    tv_http_gone_fn = fn;
++    tv_http_on_gone = tv_http_gone_tov;
++}
++
+ /* Pipelined requests handled ahead of a slow one, per connection, before reading pauses. */
+ #define TV_HTTP_MAX_PENDING 64
+ 
+@@ -6398,6 +6413,7 @@ typedef struct tv_fr {
+     bool decompress;
+     bool https, insecure;      /* TLS; without certificate checks (tls.rejectUnauthorized: false) */
+     tv_str ca;                 /* extra trusted certificates (PEM), for tls.ca */
++    tv_str identity;           /* the client certificate and key (PEM), for tls.cert and tls.key */
+     tv_str unix_path;          /* Bun's `unix`: connect to this socket instead ("" for TCP) */
+     tv_str proxy;              /* the `proxy` option ("": HTTP_PROXY/HTTPS_PROXY, unless NO_PROXY) */
+     int peer;                  /* the `peer` option: 0 any address, else TV_PEER_* bits */
+@@ -6810,7 +6826,8 @@ static bool tv_fr_prepare(tv_fr *r) {
+     /* connections are pooled per scheme, host, port and TLS options */
+     size_t kl = hl + 64;
+     r->key = tv_alloc(kl);
+-    if (https) snprintf(r->key, kl, "https://%s:%d%s|%08x", r->host, port, r->insecure ? "|insecure" : "", r->ca.p->len ? tv_hash_cstr(r->ca.p->data) : 0);
++    if (https) snprintf(r->key, kl, "https://%s:%d%s|%08x|%08x", r->host, port, r->insecure ? "|insecure" : "", r->ca.p->len ? tv_hash_cstr(r->ca.p->data) : 0,
++                        r->identity.p->len ? tv_hash_cstr(r->identity.p->data) : 0);
+     else snprintf(r->key, kl, "http://%s:%d", r->host, port);
+     if (r->unix_path.p->len) { /* pooled per socket too */
+         size_t used = strlen(r->key);
+@@ -7495,7 +7512,8 @@ static void tv_fc_start_tls(tv_fc *c) {
+         if (r->http2 == 2) { alpn = "h2"; alpn_len = 2; }
+         else { alpn = "h2\0http/1.1"; alpn_len = 11; }
+     }
+-    c->tls = tv_tls_impl->open(c->fd, r->host, r->key, !r->insecure, r->ca.p->data, (size_t)r->ca.p->len, alpn, alpn_len);
++    c->tls = tv_tls_impl->open(c->fd, r->host, r->key, !r->insecure, r->ca.p->data, (size_t)r->ca.p->len, alpn, alpn_len, r->identity.p->data, (size_t)r->identity.p->len);
++    if (!c->tls && r->identity.p->len) { tv_fr_fail(r, "ERR_TLS_CLIENT_CERT", "the TLS client certificate and key (tls.cert, tls.key) aren't a PEM certificate and its private key"); return; }
+     if (!c->tls) { tv_fr_fail(r, "ERR_SSL", "TLS setup failed"); return; }
+     c->handshaking = true;
+     tv_fc_handshake(c);
+@@ -8560,7 +8578,7 @@ static tv_fr *tv_fr_get(tv_int id) {
+     return r && r->id == id ? r : NULL;
+ }
+ 
+-tv_int tv_native_fetchStart(tv_str method, tv_str url, tv_str headers, tv_str body, tv_int redirect, tv_int flags, tv_str ca, tv_str unix_path, tv_str proxy, tv_int keep_alive_ms, tv_int max_conns, tv_int http2, tv_int ping_ms, tv_int peer, tv_str peer_allow) {
++tv_int tv_native_fetchStart(tv_str method, tv_str url, tv_str headers, tv_str body, tv_int redirect, tv_int flags, tv_str ca, tv_str unix_path, tv_str proxy, tv_int keep_alive_ms, tv_int max_conns, tv_int http2, tv_int ping_ms, tv_int peer, tv_str peer_allow, tv_str identity) {
+     tv_io_after_batch = tv_fc_reap;
+     tv_io_after_fork = tv_fetch_after_fork;
+     static bool sigpipe_ignored;   /* (once: it's a syscall) */
+@@ -8596,6 +8614,8 @@ tv_int tv_native_fetchStart(tv_str method, tv_str url, tv_str headers, tv_str bo
+     r->replay = r->body_stream;
+     tv_str_retain(ca);
+     r->ca = ca;
++    tv_str_retain(identity);
++    r->identity = identity;
+     tv_str_retain(unix_path);
+     r->unix_path = unix_path;
+     tv_str_retain(proxy);
+@@ -8872,6 +8892,7 @@ void tv_native_fetchFree(tv_int id) {
+     tv_str_release(r->body);
+     tv_str_release(r->url);
+     tv_str_release(r->ca);
++    tv_str_release(r->identity);
+     tv_str_release(r->unix_path);
+     tv_str_release(r->proxy);
+     tv_str_release(r->peer_allow);
+@@ -8898,6 +8919,37 @@ tv_str tv_native_bytesToString(tv_arr bytes) {
+     return tv_str_from((const char *)tv_arr_data(bytes), (size_t)bytes.len);
+ }
+ 
++/* decompress(data, enc, limit): gzip (1) or deflate (2: zlib-wrapped or raw) data decoded whole, at
++ * most `limit` bytes of output (0: no limit). Empty, with takeError() saying why, when the data is
++ * corrupt, cut short or decodes past the limit. */
++tv_arr tv_native_decompress(tv_arr data, tv_int enc, tv_int limit) {
++    const char *why = NULL;
++    tv_sb out = {0};
++    tv_decoder *d = tv_codec && (enc == 1 || enc == 2) ? tv_codec->open((int)enc) : NULL;
++    if (!d) why = "the data's encoding can't be decoded";
++    else {
++        size_t used = 0;
++        /* one byte past the limit tells a stream that is over it from one that ends at it */
++        int st = tv_codec->step(d, (const uint8_t *)tv_arr_data(data), (size_t)data.len, &used, &out, limit > 0 ? (size_t)limit + 1 : 0);
++        tv_codec->close(d);
++        if (st < 0) why = "the compressed data is corrupt";
++        else if (limit > 0 && out.len > (size_t)limit) why = "the data decompresses past its size limit";
++        else if (st == 0) why = "the compressed data ends early";
++        else if (out.len > INT32_MAX) why = "the data decompresses past its size limit";
++    }
++    if (why) {
++        tv_sb_free(&out);
++        tv_native_err.len = 0;
++        tv_sb_push_cstr(&tv_native_err, why);
++        return TV_EMPTY_ARR;
++    }
++    tv_arr a = tv_arr_with_capacity(&tv_type_u8, (tv_int)out.len);
++    if (out.len) memcpy(tv_arr_data(a), out.data, out.len);
++    a.len = (tv_int)out.len;
++    tv_sb_free(&out);
++    return a;
++}
++
+ tv_arr tv_native_stringToBytes(tv_str s) {
+     tv_arr a = tv_arr_with_capacity(&tv_type_u8, s.p->len);
+     if (s.p->len) memcpy(tv_arr_data(a), s.p->data, (size_t)s.p->len);
+diff --git a/runtime/tov.h b/runtime/tov.h
+index c4689ba..17430e6 100644
+--- a/runtime/tov.h
++++ b/runtime/tov.h
+@@ -723,6 +723,7 @@ void tv_native_httpLimits(tv_int id, tv_int header_ms, tv_int idle_ms, tv_int bo
+ tv_int tv_native_httpOpen(tv_int id);
+ tv_int tv_native_httpFdLimit(void);
+ void tv_native_httpOnSignal(tv_fn fn);
++void tv_native_httpOnGone(tv_fn fn);
+ void tv_native_httpWorkers(tv_int n);
+ /* URLs: parse → [protocol, hostname, port, pathname, search, hash] (empty if invalid; `base`
+  * resolves a relative input, "" for none); percent-decoding (`plus`: '+' is a space) and
+@@ -769,7 +770,7 @@ void tv_http_run(void);   /* after the program: serves registered servers until
+ tv_str tv_native_headerRemove(tv_str block, tv_str name);  /* the block without `name` lines */
+ tv_str tv_native_headerAppend(tv_str block, tv_str name, tv_str value);
+ /* fetch(): see the HTTP client section of tov.c */
+-tv_int tv_native_fetchStart(tv_str method, tv_str url, tv_str headers, tv_str body, tv_int redirect, tv_int flags, tv_str ca, tv_str unix_path, tv_str proxy, tv_int keep_alive_ms, tv_int max_conns, tv_int http2, tv_int ping_ms, tv_int peer, tv_str peer_allow);
++tv_int tv_native_fetchStart(tv_str method, tv_str url, tv_str headers, tv_str body, tv_int redirect, tv_int flags, tv_str ca, tv_str unix_path, tv_str proxy, tv_int keep_alive_ms, tv_int max_conns, tv_int http2, tv_int ping_ms, tv_int peer, tv_str peer_allow, tv_str identity);
+ tv_promise *tv_native_fetchWait(tv_int id);    /* Promise<int>: 0 the head arrived, -1 failed, -2 aborted */
+ tv_promise *tv_native_fetchBodyWait(tv_int id);   /* ... 0 the whole body is in */
+ tv_promise *tv_native_fetchRead(tv_int id);    /* ... > 0 bytes to take, 0 the end */
+@@ -799,8 +800,9 @@ void tv_native_timerUnref(tv_int id);
+  * until then (or in other programs) it is NULL. */
+ typedef struct tv_tls tv_tls;
+ typedef struct tv_tls_ops {
+-    /* A client for `host` on connected socket fd; `key` names the origin (sessions resume per key). */
+-    tv_tls *(*open)(int fd, const char *host, const char *key, bool verify, const char *ca, size_t ca_len, const char *alpn, size_t alpn_len);
++    /* A client for `host` on connected socket fd; `key` names the origin (sessions resume per key);
++     * `id` is a client certificate chain and its private key as PEM ("" for none). */
++    tv_tls *(*open)(int fd, const char *host, const char *key, bool verify, const char *ca, size_t ca_len, const char *alpn, size_t alpn_len, const char *id, size_t id_len);
+     int (*handshake)(tv_tls *t);                          /* 0 done, 1 wants read, 2 wants write, -1 failed */
+     long (*read)(tv_tls *t, void *buf, size_t n);         /* > 0 bytes, 0 ended, -1 wants read, -2 write, -3 failed */
+     long (*write)(tv_tls *t, const void *buf, size_t n);  /* as read */
+@@ -917,6 +919,7 @@ void tv_zlib_install(void);
+ void tv_tls_install(void);
+ tv_str tv_native_bytesToString(tv_arr bytes);
+ tv_arr tv_native_stringToBytes(tv_str s);
++tv_arr tv_native_decompress(tv_arr data, tv_int enc, tv_int limit);
+ tv_str tv_native_utf8Clean(tv_str s);
+ tv_int tv_native_utf8Complete(tv_arr bytes);
+ tv_str tv_native_byteSlice(tv_str s, tv_int start, tv_int end);
+@@ -926,7 +929,7 @@ tv_str tv_native_headerGet(tv_str block, tv_str name);        /* values joined w
+ tv_arr tv_native_headerEntries(tv_str block);                  /* sorted [name, value, ...] */
+ tv_arr tv_native_headerValues(tv_str block, tv_str name);
+ /* sockets (runtime/net.c): Bun.connect, Bun.listen */
+-tv_int tv_native_netConnect(tv_str host, tv_int port, tv_int tls, bool verify, tv_str ca, tv_str unix_path, tv_str alpn);
++tv_int tv_native_netConnect(tv_str host, tv_int port, tv_int tls, bool verify, tv_str ca, tv_str unix_path, tv_str alpn, tv_str identity);
+ tv_str tv_native_netAlpn(tv_int id);
+ tv_int tv_native_netSpawn(tv_str argv, tv_str env, tv_str cwd);
+ void tv_native_netBind(tv_int id, tv_fn events, tv_str host, tv_str unix_path);
+diff --git a/runtime/ws.c b/runtime/ws.c
+index e85271a..86d6682 100644
+--- a/runtime/ws.c
++++ b/runtime/ws.c
+@@ -589,7 +589,7 @@ tv_int tv_native_wsUpgrade(tv_str key, tv_str headers, tv_int max_payload) {
+ /* wsConnect(host, port, path, tls, verify, ca, headers, protocols, maxPayload): a client socket
+  * (netBind starts it); it opens once the server's 101 is in. */
+ tv_int tv_native_wsConnect(tv_str host, tv_int port, tv_str path, bool tls, bool verify, tv_str ca, tv_str headers, tv_str protocols, tv_int max_payload) {
+-    tv_int id = tv_native_netConnect(host, port, tls ? 1 : 0, verify, ca, TV_EMPTY_STR, TV_EMPTY_STR);
++    tv_int id = tv_native_netConnect(host, port, tls ? 1 : 0, verify, ca, TV_EMPTY_STR, TV_EMPTY_STR, TV_EMPTY_STR);
+     tv_ns *s = tv_ns_get(id);
+     tv_ws *w = tv_ws_new(s, true, max_payload);
+     uint8_t nonce[16];

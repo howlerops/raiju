@@ -4820,8 +4820,8 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * The A2A calls that reached the agents, newest first
-         * @description Bifrost's filters and answer (its listHistory), {logs, pagination}. group_sessions=true keeps each context's earliest call (with session_child_count, the other calls in the context) unless context_id, task_id or request_id is given; hydrate=true answers each call's detail with its events.
+         * The A2A calls that reached the agents, and their streams' events, newest first
+         * @description Bifrost's filters and answer (its listHistory), {logs, pagination}. Each event of a streamed call is a row of its own (record_kind event) under the call's request_id. group_sessions=true keeps each context's earliest call (with session_child_count, the other calls in the context) unless context_id, task_id or request_id is given; hydrate=true answers each call's detail with its events. Both list calls only.
          */
         get: operations["getApiAgentsHistory"];
         put?: never;
@@ -4908,7 +4908,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** One A2A call (Bifrost's getHistoryEntry); its stored bodies have their credentials redacted */
+        /**
+         * One A2A call or stream event (Bifrost's getHistoryEntry); its stored bodies have their credentials redacted
+         * @description With hydrate=true the answer is the operation the row belongs to (its call's detail with the call's events), as Bifrost's FindAgentLogOperation.
+         */
         get: operations["getApiAgentsHistoryById"];
         put?: never;
         post?: never;
@@ -5418,7 +5421,7 @@ export interface components {
             security_schemes?: string[];
             /** @description Records that the authentication was configured by hand rather than from the card. */
             advanced?: boolean;
-            /** @description How https connections to the card and the agent are checked. The client certificate and key are stored but not used (no client certificates in Raiju's HTTP client). */
+            /** @description How https connections to the card and the agent are checked, and the client certificate and key presented to the agent (both or neither). */
             tls?: {
                 insecure_skip_verify?: boolean;
                 ca_cert_pem?: string;
@@ -5519,7 +5522,7 @@ export interface components {
                 [key: string]: unknown;
             };
         };
-        /** @description One A2A call that reached an agent. */
+        /** @description One A2A call that reached an agent, or one event of a call's stream (record_kind event). */
         AgentCallLog: {
             id?: string;
             /** Format: date-time */
@@ -5528,7 +5531,30 @@ export interface components {
             method?: string;
             /** @description Bifrost's name for method. */
             operation?: string;
-            record_kind?: string;
+            /** @enum {string} */
+            record_kind?: "request" | "event";
+            /** @description The request the row belongs to; a call's stream event rows share their call's. */
+            request_id?: string;
+            /** @description An event row's place in its call's stream (1-based). */
+            event_sequence?: number;
+            /**
+             * @description An event row's type.
+             * @enum {string}
+             */
+            event_type?: "message" | "task" | "status_update" | "artifact_update";
+            /** @description The task state an event row reports. */
+            task_state?: string;
+            message_id?: string;
+            artifact_id?: string;
+            /** @description The media type of the event's first part that names one. */
+            content_type?: string;
+            user_id?: string;
+            team_id?: string;
+            customer_id?: string;
+            /** @description The business unit of the caller's team. */
+            business_unit_id?: string;
+            /** @description The project the request named (x-bf-project-id or -name), when it admitted the caller. */
+            project_id?: string;
             task_id?: string;
             /** @description The caller's binding (JSONRPC, HTTP+JSON, GRPC). */
             downstream_transport?: string;
@@ -5545,7 +5571,7 @@ export interface components {
                 message?: string;
             } | null;
         };
-        /** @description Bifrost's AgentLogHistoryResult. With hydrate=true each row is the call's detail (AgentLogDetail) with its events (always empty here, a stream being one row); with group_sessions=true each context keeps its earliest call, with session_child_count. */
+        /** @description Bifrost's AgentLogHistoryResult. With hydrate=true each row is the call's detail (AgentLogDetail) with its stream's event rows (events, oldest first, each in the same detail shape with its event_body); with group_sessions=true each context keeps its earliest call, with session_child_count. */
         AgentHistory: {
             logs?: components["schemas"]["AgentCallLog"][];
             pagination?: components["schemas"]["AgentHistoryPagination"];
@@ -5697,6 +5723,22 @@ export interface components {
             status_code?: number;
             request_body?: string;
             response_body?: string;
+            /** @description An event row's event, as the caller was sent it (kept when the call's content is). */
+            event_body?: string;
+            event_sequence?: number;
+            event_type?: string;
+            task_state?: string;
+            message_id?: string;
+            artifact_id?: string;
+            content_type?: string;
+            business_unit_id?: string;
+            business_unit_name?: string;
+            project_id?: string;
+            project_name?: string;
+            /** @description With hydrate=true, the call's stream event rows, oldest first. */
+            events?: {
+                [key: string]: unknown;
+            }[];
             error_details?: {
                 [key: string]: unknown;
             };
@@ -7209,6 +7251,8 @@ export interface components {
                     [key: string]: unknown;
                 }[];
                 allowed_keys?: string[];
+                /** @description The user who created it through the API (Bifrost's CreatedByUserID); under data access control the creator, the holders of an attached key and the members of an attached key's team or customer see it. */
+                created_by_user_id?: string;
             };
         };
         VirtualMCPView: {
@@ -28167,6 +28211,12 @@ export interface operations {
                 request_id?: string;
                 /** @description Text in the agent name, operation, task, context or request id, or the error (not the bodies). */
                 search?: string;
+                /** @description request (the calls) or event (their streams' events); repeated or comma-separated. Unset lists both. */
+                record_kind?: string;
+                /** @description message, task, status_update or artifact_update; repeated or comma-separated. A call matches through its stream's events. */
+                event_type?: string;
+                /** @description Task states; repeated or comma-separated. A call matches by the latest state its stream reported. */
+                task_state?: string;
                 /** @description RFC 3339. */
                 start_time?: string;
                 /** @description RFC 3339. */
@@ -28594,7 +28644,9 @@ export interface operations {
     };
     getApiAgentsHistoryById: {
         parameters: {
-            query?: never;
+            query?: {
+                hydrate?: boolean;
+            };
             header?: never;
             path: {
                 id: string;

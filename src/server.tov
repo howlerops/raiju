@@ -58,6 +58,8 @@ import { TransportRun, transportStart, transportEnd, transportDone, transportSin
 import { kindOfPath, isInferencePath } from "./plughttp"
 import { EXTRA_PARAMS_HEADER, EXTRA_PARAMS_CARRY, mergeExtraParams, extraParamsCarry } from "./extraparams"
 import { lifecycle, readyInput, readyReport, ServerLimits } from "./lifecycle"
+import { CLIENT_WATCH_HEADER, watchStart, watchGone, watchEnd, watched } from "./clientgone"
+import { usesChain, withChainCreds } from "./awschain"
 
 type ModelEntry = { id: string, object: string, created: int, owned_by: string }
 
@@ -185,9 +187,17 @@ async function withDecisionModels(provider: string, t: Target, ids: string[]): P
 // Every page of a Bedrock control-plane listing: each answer's nextToken is sent back as the next
 // page's query until none is left (capped, so a provider that never ends cannot hold the listing).
 // undefined when the first page cannot be read; a later page that fails keeps the ids read so far.
-async function bedrockPages(t: Target, path: string, field: string, idKey: string): Promise<string[] | undefined> {
+async function bedrockPages(t0: Target, path: string, field: string, idKey: string): Promise<string[] | undefined> {
   const out: string[] = []
   let token = ""
+  // a key without credentials of its own lists with the default chain's (awschain.tov), as its calls sign
+  let t = t0
+  const bk = t0.key.bedrock_key_config
+  if (bk !== undefined && usesChain(bk, t0.key.value ?? "")) {
+    const wc = await withChainCreds(bk, t0.key.value ?? "")
+    if (wc.error !== "") return undefined
+    t.key.bedrock_key_config = wc.bk
+  }
   for (let page = 0; page < 50; page++) {
     const query = token === "" ? "" : "nextToken=" + bedrock.encodeSegment(token)
     let body: string | undefined = undefined
@@ -1702,17 +1712,52 @@ function outOfLine<T>(p: Promise<T>): Promise<T> {
   return p
 }
 
+// The request with the id of its client watch in CLIENT_WATCH_HEADER (clientgone.tov), its body read.
+async function withWatch(req: Request, id: string): Promise<Request> {
+  let hs: Record<string, string> = snapshot(req.headers)
+  hs.set(CLIENT_WATCH_HEADER, id)
+  if (req.method === "GET" || req.method === "HEAD") return new Request(req.url, { method: req.method, headers: hs })
+  let body: u8[] = []
+  try {
+    body = await req.bytes()
+  } catch (e) {
+    body = []
+  }
+  return new Request(req.url, { method: req.method, headers: hs, body: body })
+}
+
 async function bunHttp(engine: Engine, ops: Ops, req00: Request, limit: int): Promise<Response, TypeError> {
+  // an inference request's client watch: Bun.serve aborts req.signal when the client goes away before the answer,
+  // which stops the upstream call (a large body that streams on is not watched)
+  const u0 = URL.parse(req00.url)
+  const p0 = u0 === undefined ? "" : u0.pathname
+  const wid = watched(req00.method, p0, isInferencePath(compatPath(p0))) ? watchStart() : ""
+  if (wid !== "") {
+    const id = wid
+    req00.signal.addEventListener("abort", () => watchGone(id))
+  }
+  try {
+    return try await bunHttpWatched(engine, ops, req00, limit, wid)
+  } finally {
+    if (wid !== "") watchEnd(wid)
+  }
+}
+
+async function bunHttpWatched(engine: Engine, ops: Ops, req00: Request, limit: int, watch: string): Promise<Response, TypeError> {
   let req0 = req00
+  let wid = watch
   const lf = await outOfLine(largeFront(engine, req00))
   if (lf instanceof Response) return lf
-  if (lf instanceof Request) req0 = lf
+  if (lf instanceof Request) {
+    req0 = lf
+    wid = ""
+  }
   const within = try await limitedBody(req0, limit)
   if (within === undefined) return errorResponse(413, "request body too large", "invalid_request_error", noHeaders())
   // the plugins' HTTP pre hooks, before the request is routed
   const th = await transportStart(engine, within)
   if (th.response !== undefined) return th.response
-  const req = th.request
+  const req = wid !== "" ? await withWatch(th.request, wid) : th.request
   const tr = th.tr
   const u = URL.parse(req.url)
   const p = u === undefined ? "" : u.pathname

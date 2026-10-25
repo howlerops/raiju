@@ -2,7 +2,8 @@
 # Builds Tov with the patches in tov-patches/ (streamed response bodies for
 # Bun.serve, child processes as sockets, TLS ALPN, UDP sockets, WebAssembly on WAMR, WebRTC on libdatachannel,
 # fetch pool options and HTTP/2, request body streams, node:fs rename and fsync, a WASM time limit, the
-# server lifecycle: stop signals, timeouts and a connection cap, a fetch address policy checked at connect time) into
+# server lifecycle: stop signals, timeouts and a connection cap, a fetch address policy checked at connect time,
+# TLS client certificates, Request.signal and gunzip) into
 # build/tov/target/release/tov, applied in name order. Raiju needs this build
 # until the patches are upstream. Usage: scripts/build-tov.sh  (needs git and cargo)
 set -eu

@@ -1460,7 +1460,8 @@ function virtualJson(v: vmcp.VirtualMcp, keyIds: string[]): string {
   const quotedKeys: string[] = []
   for (const k of keys) quotedKeys.push(quote(k))
   const desc = v.description === undefined ? "" : `,"description":${quote(v.description)}`
-  return `{"id":${quote(v.name)},"name":${quote(v.name)},"endpoint_slug":${quote(v.name)}${desc},"enabled":true,"tools":${JSON.stringify(v.tools)},"virtual_key_ids":[${quotedKeys.join(",")}]}`
+  const by = v.created_by_user_id === undefined || v.created_by_user_id === "" ? "" : `,"created_by_user_id":${quote(v.created_by_user_id)}`
+  return `{"id":${quote(v.name)},"name":${quote(v.name)},"endpoint_slug":${quote(v.name)}${desc},"enabled":true,"tools":${JSON.stringify(v.tools)},"virtual_key_ids":[${quotedKeys.join(",")}]${by}}`
 }
 
 function listVirtuals(store: ConfigStore, scope: DataScope | undefined): McpReply {
@@ -1471,15 +1472,20 @@ function listVirtuals(store: ConfigStore, scope: DataScope | undefined): McpRepl
   return reply(200, `{"virtual_mcps":[${parts.join(",")}],"count":${list.length},"total_count":${list.length}}`)
 }
 
-// Data access control on virtual MCPs (Bifrost's vMCP visibility): a caller with a narrowed data scope sees a virtual
-// MCP when one of its attached keys is in that scope (the key's team or customer); one without allowed_keys is
-// attached to every key and seen by all. An unscoped caller sees every one.
+// Data access control on virtual MCPs (Bifrost's vMCP visibility, enterprise/virtual-mcps.mdx): a caller with a
+// narrowed data scope sees a virtual MCP it created, one attached to a key it holds (the key's user_id), or one with
+// an attached key in that scope (the key's team or customer); one without allowed_keys is attached to every key and
+// seen by all. An unscoped caller sees every one.
 export function virtualVisible(c: Config, v: vmcp.VirtualMcp, scope: DataScope | undefined): bool {
   if (scope === undefined || scope.all) return true
+  const user = scope.user ?? ""
+  if (user !== "" && (v.created_by_user_id ?? "") === user) return true
   const keys = v.allowed_keys
   if (keys === undefined) return true
   for (const vk of c.governance?.virtual_keys ?? []) {
-    if (keys.includes(vk.id) && inScope(scope, vk.team_id ?? "", "", vk.customer_id ?? "", "")) return true
+    if (!keys.includes(vk.id)) continue
+    if (user !== "" && (vk.user_id ?? "") === user) return true
+    if (inScope(scope, vk.team_id ?? "", "", vk.customer_id ?? "", "")) return true
   }
   return false
 }
@@ -1514,7 +1520,8 @@ function virtualNameTaken(store: ConfigStore, name: string, self: string): bool 
 
 const NAME_TAKEN = "a virtual MCP with this name or endpoint already exists"
 
-function createVirtual(store: ConfigStore, body: string): McpReply {
+// creator is the stored user making it ("" for anyone else), recorded as its created_by_user_id.
+function createVirtual(store: ConfigStore, body: string, creator: string): McpReply {
   const fs = checkedFields(body, VMCP_KINDS)
   if (fs === undefined) return fail(400, "Invalid request payload")
   let parsed: VmcpBody = {}
@@ -1539,6 +1546,7 @@ function createVirtual(store: ConfigStore, body: string): McpReply {
   }
   let v: vmcp.VirtualMcp = { name: name, tools: tools }
   v.description = b.description
+  if (creator !== "") v.created_by_user_id = creator
   const problem = vmcp.validate(v)
   if (problem !== "") return fail(400, problem)
   let next: vmcp.VirtualMcp[] = virtualsOf(store.cfg)
@@ -1629,7 +1637,7 @@ function setAttached(store: ConfigStore, id: string, vkId: string, attach: bool)
 function virtualRoute(store: ConfigStore, m: string, segs: string[], body: string, p: string, scope: DataScope | undefined): McpReply {
   if (segs.length === 3) {
     if (m === "GET") return listVirtuals(store, scope)
-    if (m === "POST") return createVirtual(store, body)
+    if (m === "POST") return createVirtual(store, body, scope?.user ?? "")
     return notAllowed(m)
   }
   const id = segs[3]!
@@ -1766,8 +1774,9 @@ function setVirtualKeys(store: ConfigStore, id: string, keys: string[]): McpRepl
   return persist(store, withVirtuals(store.cfg, next))
 }
 
-// POST (id "") and PUT of a tool group. A write that names association fields sets the keys afresh.
-function toolGroupWrite(store: ConfigStore, id: string, body: string): McpReply {
+// POST (id "") and PUT of a tool group. A write that names association fields sets the keys afresh. creator is the
+// stored user making it, as for a virtual MCP.
+function toolGroupWrite(store: ConfigStore, id: string, body: string, creator: string): McpReply {
   const creating = id === ""
   const fs = objectFields(body)
   if (fs === undefined) return fail(400, "Invalid request payload")
@@ -1785,7 +1794,7 @@ function toolGroupWrite(store: ConfigStore, id: string, body: string): McpReply 
     return fail(400, "Invalid request payload")
   }
   const assoc = has(fs, "virtual_key_ids") || has(fs, "team_ids") || has(fs, "customer_ids") || has(fs, "provider_names")
-  const r = creating ? createVirtual(store, vb) : updateVirtual(store, id, vb)
+  const r = creating ? createVirtual(store, vb, creator) : updateVirtual(store, id, vb)
   if (r.status >= 300) return r
   if (creating || assoc) {
     const kr = setVirtualKeys(store, name, groupKeys(store, fs))
@@ -1796,25 +1805,29 @@ function toolGroupWrite(store: ConfigStore, id: string, body: string): McpReply 
   return reply(creating ? 201 : 200, `{"mcp_tool_group":${virtualJson(virtualsOf(store.cfg)[at]!, virtualKeyIds(store.cfg))}}`)
 }
 
-function toolGroupRoute(store: ConfigStore, m: string, segs: string[], body: string, p: string): McpReply {
+// The tool groups are the virtual MCPs, so the same data access control applies (virtualVisible): a group the caller's
+// scope does not reach is left out of the list and not found.
+function toolGroupRoute(store: ConfigStore, m: string, segs: string[], body: string, p: string, scope: DataScope | undefined): McpReply {
   if (segs.length === 3) {
     if (m === "GET") {
-      const list = virtualsOf(store.cfg)
+      const list = virtualsOf(store.cfg).filter((v) => virtualVisible(store.cfg, v, scope))
       const keyIds = virtualKeyIds(store.cfg)
       const parts: string[] = []
       for (const v of list) parts.push(virtualJson(v, keyIds))
       return reply(200, `{"mcp_tool_groups":[${parts.join(",")}],"count":${list.length},"total_count":${list.length}}`)
     }
-    return m === "POST" ? toolGroupWrite(store, "", body) : notAllowed(m)
+    return m === "POST" ? toolGroupWrite(store, "", body, scope?.user ?? "") : notAllowed(m)
   }
   if (segs.length !== 4) return fail(404, `no route for ${p}`)
   const id = segs[3]!
+  const seen = virtualIndex(virtualsOf(store.cfg), id)
+  if (seen >= 0 && !virtualVisible(store.cfg, virtualsOf(store.cfg)[seen]!, scope)) return fail(404, "tool group not found")
   if (m === "GET") {
     const at = virtualIndex(virtualsOf(store.cfg), id)
     if (at < 0) return fail(404, "tool group not found")
     return reply(200, `{"mcp_tool_group":${virtualJson(virtualsOf(store.cfg)[at]!, virtualKeyIds(store.cfg))}}`)
   }
-  if (m === "PUT") return toolGroupWrite(store, id, body)
+  if (m === "PUT") return toolGroupWrite(store, id, body, "")
   if (m === "DELETE") {
     const r = deleteVirtual(store, id)
     return r.status === 200 ? reply(200, `{"success":true}`) : r
@@ -2137,7 +2150,7 @@ export function mcpApi(store: ConfigStore, method: string, path: string, body: s
   if (area === "clients") return m === "GET" ? listClients(store) : notAllowed(m)
   if (area === "client") return clientRoute(store, m, segs, body, p, publicOnly ?? false)
   if (area === "virtual-mcps") return virtualRoute(store, m, segs, body, p, scope)
-  if (area === "tool-groups") return toolGroupRoute(store, m, segs, body, p)
+  if (area === "tool-groups") return toolGroupRoute(store, m, segs, body, p, scope)
   if (area === "per-user-headers") return headersRoute(store, m, segs, body, p)
   return undefined
 }
@@ -2865,4 +2878,41 @@ test("virtual MCPs: data access scope, the granting profiles and the profile-hel
   expect(mcpApi(s, "GET", "/api/mcp/virtual-mcps/none/access-profiles", "")!.status).toBe(404)
   expect(mcpApi(s, "POST", "/api/mcp/virtual-mcps/dev/virtual-keys/vk3", "")!.status).toBe(409)
   expect(mcpApi(s, "POST", "/api/mcp/virtual-mcps/dev/virtual-keys/vk2", "")!.status).toBe(200)
+})
+
+test("virtual MCPs: the creator and the holder of an attached key see one their memberships do not reach", () => {
+  const c: Config = {
+    governance: {
+      virtual_keys: [{ id: "vk1", value: "sk-bf-1", team_id: "t1" }, { id: "vk2", value: "sk-bf-2", team_id: "t2", user_id: "bo" }],
+      users: [{ name: "ann", role: "viewer" }, { name: "bo", role: "viewer" }],
+    },
+  }
+  const none: vmcp.VirtualTool[] = []
+  c.virtual_mcps = [{ name: "ops", tools: none, allowed_keys: ["vk2"] }]
+  const s = new ConfigStore(tmpPath(), c)
+  // ann's scope reaches nothing; her own creation is hers, with its creator recorded
+  const ann: DataScope = { all: false, teams: [], businessUnits: [], customers: [], projects: [], user: "ann" }
+  const made = mcpApi(s, "POST", "/api/mcp/virtual-mcps", `{"name":"mine","tools":[]}`, false, ann)!
+  expect(made.status).toBe(201)
+  expect(made.body.includes(`"created_by_user_id":"ann"`)).toBe(true)
+  let list = mcpApi(s, "GET", "/api/mcp/virtual-mcps", "", false, ann)!.body
+  expect(list.includes(`"name":"mine"`)).toBe(true)
+  expect(list.includes(`"name":"ops"`)).toBe(false)
+  expect(mcpApi(s, "GET", "/api/mcp/virtual-mcps/mine", "", false, ann)!.status).toBe(200)
+  expect(mcpApi(s, "PUT", "/api/mcp/virtual-mcps/ops", `{"description":"x"}`, false, ann)!.status).toBe(404)
+  // bo holds vk2, which ops is attached to; mine has only its creator (its allowed keys are set below)
+  const bo: DataScope = { all: false, teams: [], businessUnits: [], customers: [], projects: [], user: "bo" }
+  expect(mcpApi(s, "POST", "/api/mcp/virtual-mcps/mine/virtual-keys/vk1", "", false, ann)!.status).toBe(200)
+  expect(mcpApi(s, "DELETE", "/api/mcp/virtual-mcps/mine/virtual-keys/vk2", "", false, ann)!.status).toBe(200)
+  list = mcpApi(s, "GET", "/api/mcp/virtual-mcps", "", false, bo)!.body
+  expect(list.includes(`"name":"ops"`)).toBe(true)
+  expect(list.includes(`"name":"mine"`)).toBe(false)
+  expect(mcpApi(s, "GET", "/api/mcp/virtual-mcps/mine", "", false, bo)!.status).toBe(404)
+  // the deprecated tool-groups alias is scoped the same way
+  const groups = mcpApi(s, "GET", "/api/mcp/tool-groups", "", false, bo)!.body
+  expect(groups.includes(`"name":"ops"`)).toBe(true)
+  expect(groups.includes(`"name":"mine"`)).toBe(false)
+  expect(mcpApi(s, "GET", "/api/mcp/tool-groups/mine", "", false, bo)!.status).toBe(404)
+  expect(mcpApi(s, "DELETE", "/api/mcp/tool-groups/mine", "", false, bo)!.status).toBe(404)
+  expect(mcpApi(s, "GET", "/api/mcp/tool-groups/mine", "", false, ann)!.status).toBe(200)
 })

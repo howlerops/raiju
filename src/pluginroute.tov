@@ -10,8 +10,8 @@
 // x-bf-plugin-run header, and the LLM hooks find it in Engine.pluginRuns by that id, so a WebAssembly
 // plugin's context travels from http_pre_hook to pre_hook, post_hook and http_post_hook.
 
-import { Engine, StreamSink, EventStep, eventSink, llmStreamSink, errorResponse, noHeaders } from "./gateway"
-import { PluginChain, PluginRun, PluginContext, PluginTrace, BasePlugin, PostResult, PreResult, HttpChunkResult, RUN_HEADER, TRACE_HEADER, errorPost } from "./plugins"
+import { Engine, StreamSink, EventStep, eventSink, llmStreamSink, errorResponse, noHeaders, AttemptPlugins } from "./gateway"
+import { PluginChain, PluginRun, PluginContext, PluginTrace, BasePlugin, PostResult, PreResult, HttpChunkResult, RUN_HEADER, TRACE_HEADER, ATTEMPT_HEADER, errorPost } from "./plugins"
 import { HttpReq, HttpResp, LlmKind, SseBuffer, HOOK_BODY_LIMIT, emptyReq, queryMap, queryString, sseData, sseWithData, sseErrorEvent, isInferencePath, kindOfOp } from "./plughttp"
 import { snapshot, newId } from "./schemas"
 import { Field, fields, find, rawStr, quote, decodeString, isNull, build, setField } from "./json"
@@ -20,6 +20,7 @@ import { parseModel } from "./router"
 import { EventFrames, EventFrame, encodeEventStreamFrame } from "./streams"
 import { utf8, secureHex } from "./crypto"
 import { objectOwners, ownerKind, addressesObject, notFoundMessage, batchInputFile, batchFiles, itemId, filterList } from "./objowner"
+import { CLIENT_WATCH_HEADER } from "./clientgone"
 
 // The plugin chain, when there is one with plugins.
 function chainOf(engine: Engine): PluginChain | undefined {
@@ -74,6 +75,9 @@ export async function transportStart(engine: Engine, req: Request): Promise<Tran
   if (chain === undefined || u === undefined || req.method === "OPTIONS" || !chain.hasHttp() || !isInferencePath(path)) return { response: undefined, request: req, tr: undefined, body: "" }
   const hs = snapshot(req.headers)
   hs.delete(RUN_HEADER)
+  // the server's client watch (clientgone.tov) is not the plugins' to see or set; it rides on past them
+  const watch = hs.get(CLIENT_WATCH_HEADER)
+  hs.delete(CLIENT_WATCH_HEADER)
   // a body declared bigger than hooks take is not read here (a large upload goes on as it streams in); the hooks still
   // run, with an empty body, as Bifrost runs them on a large payload
   const declaredLarge = (parseFloat(hs.get("content-length") ?? "0") ?? 0.0) > HOOK_BODY_LIMIT
@@ -116,6 +120,8 @@ export async function transportStart(engine: Engine, req: Request): Promise<Tran
   const nh: Map<string, string> = new Map()
   for (const k of hr.headers.keys()) nh.set(k, hr.headers.get(k)!)
   nh.set(RUN_HEADER, id)
+  if (watch !== undefined) nh.set(CLIENT_WATCH_HEADER, watch)
+  else nh.delete(CLIENT_WATCH_HEADER)
   const qs = hr.queryEdited ? queryString(hr.query) : hr.rawQuery
   // a large body the hooks did not replace (they saw it empty) goes on as it came: still streaming when it was not read
   if (large && hr.body.length === 0) {
@@ -392,7 +398,9 @@ export async function llmHooked(engine: Engine, req: Request, op: string, handle
   const chain = chainOf(engine)
   const k = kindOfOp(op)
   if (chain === undefined || k === undefined || !chain.handles(op)) return try await handler(req, sink)
-  const hs = snapshot(req.headers)
+  let hs = snapshot(req.headers)
+  // the gateway's own: a caller never names an attempt run
+  hs.delete(ATTEMPT_HEADER)
   let body = ""
   let fd: FormData | undefined = undefined
   try {
@@ -468,25 +476,54 @@ async function hookedRun(engine: Engine, chain: PluginChain, run: PluginRun, k: 
     const post = chain.runPost(&run.ctx, pre.status, pre.body)
     return shortResponse(k, post.status, post.body, pre.contentType)
   }
+  // a request with fallbacks: before each fallback the failed attempt's post hooks run and the pre hooks run again, on
+  // the request as it came with the fallback's model, as on chat (AttemptPlugins; serve finds it by ATTEMPT_HEADER)
+  let hh = hs
+  let attemptId = ""
+  if (fd === undefined && hasFallbacks(body)) {
+    try {
+      const id = "att_" + secureHex(16)
+      engine.attemptRuns.set(id, new AttemptPlugins(chain, run, body, fields(pre.body), pre.body))
+      hh.set(ATTEMPT_HEADER, id)
+      attemptId = id
+    } catch (e) {
+      // the fallbacks are served with the primary's pre hooks only
+    }
+  }
   let next: Request = req
   if (pre.body === body) {
-    next = rebuild(origin, path, qs, req.method, hs, utf8(body), fd)
+    next = rebuild(origin, path, qs, req.method, hh, utf8(body), fd)
   } else if (fd !== undefined) {
     try {
-      next = rebuild(origin, path, qs, req.method, hs, [], try formWith(fd, pre.body))
+      next = rebuild(origin, path, qs, req.method, hh, [], try formWith(fd, pre.body))
     } catch (e) {
       return errorResponse(500, `a plugin produced an invalid request: ${e.message}`, "api_error", noHeaders())
     }
   } else {
-    next = rebuild(origin, path, qs, req.method, hs, utf8(pre.body), undefined)
+    next = rebuild(origin, path, qs, req.method, hh, utf8(pre.body), undefined)
   }
   const wrapped = sink === undefined ? undefined : llmStreamSink(chain, run, sink)
-  const res = try await handler(next, wrapped)
+  let res: Response = new Response()
+  try {
+    res = try await handler(next, wrapped)
+  } finally {
+    if (attemptId !== "") engine.attemptRuns.delete(attemptId)
+  }
   if (wrapped !== undefined && wrapped.started) {
     chain.finish(&run.ctx)
     return res
   }
   return await postProcess(chain, run, k, res)
+}
+
+// Whether a request body names fallbacks (a non-empty array).
+function hasFallbacks(body: string): bool {
+  try {
+    const raw = find(fields(body), "fallbacks")
+    return raw !== undefined && raw.startsWith("[") && raw.slice(1).trim() !== "]"
+  } catch (e) {
+    return false
+  }
 }
 
 // An answer through the post hooks. A speech answer (audio) goes to them as {"audio": base64, "content_type"};
@@ -932,6 +969,13 @@ function payloadsOf(b: u8[]): string[] {
   for (const f of new EventFrames().push(b)) out.push(f.payload)
   return out
 }
+
+test("a request runs its pre hooks per fallback only when it names fallbacks", () => {
+  expect(hasFallbacks(`{"model":"a","fallbacks":["openai/b"]}`)).toBe(true)
+  expect(hasFallbacks(`{"model":"a","fallbacks":[ ]}`)).toBe(false)
+  expect(hasFallbacks(`{"model":"a"}`)).toBe(false)
+  expect(hasFallbacks(`not json`)).toBe(false)
+})
 
 test("the chunk hooks see each frame of a Bedrock binary event stream: rewrite, drop, or end with an exception", () => {
   const got = new Bytes()

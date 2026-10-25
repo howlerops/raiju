@@ -71,7 +71,7 @@ import { McpUserToken, tokenAction, userTokenOf, identityOf, consentMessage, con
 import { Limiter } from "./limiter"
 import { JobStore } from "./jobs"
 import { fetchPluginUrls, missingPluginUrls, PluginSource } from "./plugindl"
-import { BasePlugin, PreResult, PostResult, PluginChain, PluginContext, PluginEntry, PluginRun, PluginTrace, PluginLogEntry, pluginLogsJson, PostOutcome, RUN_HEADER, TRACE_HEADER, buildChain, jsonStreamEnabled, JsonStreamFixer, pluginErrorMessage, parsePluginError, errorPost } from "./plugins"
+import { BasePlugin, PreResult, PostResult, PluginChain, PluginContext, PluginEntry, PluginRun, PluginTrace, PluginLogEntry, pluginLogsJson, PostOutcome, RUN_HEADER, TRACE_HEADER, ATTEMPT_HEADER, buildChain, jsonStreamEnabled, JsonStreamFixer, pluginErrorMessage, parsePluginError, errorPost } from "./plugins"
 import { SseBuffer, sseData, sseWithData } from "./plughttp"
 import { SemanticCache, SemanticCacheConfig, defaultSemanticConfig, promptText, parseEmbedding, scopeKey, identityScope, hasToolCalls } from "./semcache"
 import { Deadline, deadline, IdleWatch, idleWatch, streamIdleSeconds } from "./deadline"
@@ -83,6 +83,8 @@ import { LargeBody, LargeSettings, BodyTap, UsageTap, largeSettings, scanPrefix,
 import { AnyConv, ConvRef, familyFor, needsHash, newConv, convFor, upstreamFor, convertedStream, spoolConverted, spoolTitan, titanExtras } from "./largeconv"
 import { EMB_TITAN } from "./embconv"
 import { EXTRA_PARAMS_HEADER, EXTRA_PARAMS_CARRY, mergeIntoUpstream } from "./extraparams"
+import { clientSignal, CANCELLED_STATUS, CANCELLED_MESSAGE, CANCELLED_TYPE } from "./clientgone"
+import { usesChain, withChainCreds } from "./awschain"
 
 export type Build = (t: Target) => Upstream throws SyntaxError
 // a chat request for a target, from its shaped body (tc parses the same request as a typed chat)
@@ -859,6 +861,27 @@ async function sleep(ms: int): Promise<void> {
   })
 }
 
+// A retry's backoff, cut short when the caller goes away (Bifrost's backoff waits on the request's context too).
+async function backoffSleep(ms: int, client: AbortSignal | undefined): Promise<void> {
+  if (client === undefined) {
+    await sleep(ms)
+    return
+  }
+  if (client.aborted) return
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => resolve(), ms)
+    client.addEventListener("abort", () => {
+      clearTimeout(timer)
+      resolve()
+    })
+  })
+}
+
+// The outcome of a request whose caller went away: Bifrost's request_cancelled, logged as 499 (cancelled).
+function cancelledOutcome(provider: string, model: string, attempts: int, upstreamMs: f64): Outcome {
+  return { ok: false, status: CANCELLED_STATUS, body: errorJson(CANCELLED_MESSAGE, CANCELLED_TYPE, undefined), contentType: "application/json", provider: provider, model: model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
+}
+
 // A request's plugin logs as its log row keeps them (grouped by plugin, Bifrost's plugin_logs), or undefined.
 function pluginLogsOf(c: ReqCtx): string | undefined {
   const tr = c.pluginTrace
@@ -1174,6 +1197,9 @@ class ReqCtx {
   canonicalModel = ""
   // Bifrost's metric labels for this request, filled once it is routed and admitted
   labels: metrics.RequestLabels = metrics.newLabels("", "", "")
+  // aborted when the caller goes away before its answer (clientgone.tov): the upstream call, the retries and the
+  // fallbacks stop
+  client: AbortSignal | undefined = undefined
   // the log row's extra columns, read from the request's headers (reqlog.tov)
   meta: Record<string, string> | undefined = undefined
   parentId = ""
@@ -1571,6 +1597,9 @@ export class Engine {
   pluginRuns: Map<string, PluginRun> = new Map()
   // the plugin spans and logs of the requests a non-chat route hooked, found by x-bf-plugin-trace (pluginroute.tov)
   pluginTraces: Map<string, PluginTrace> = new Map()
+  // the plugins across the attempts of the requests with fallbacks a non-chat route hooked, found by x-bf-plugin-attempt
+  // (pluginroute.tov hookedRun): serve runs the pre hooks again on each fallback with them, as on chat
+  attemptRuns: Map<string, AttemptPlugins> = new Map()
   // jsonparser with usage all_requests: the JSON of each stream is completed (plugins.tov JsonStreamFixer)
   jsonStreamOn = false
   semantic: SemanticCache | undefined = undefined
@@ -2135,8 +2164,12 @@ export class Engine {
     let attempts = 0
     let upstreamMs = 0.0
     let refIndex = -1
+    // a caller that goes away stops a non-streamed request here: the upstream call is aborted and no retry or fallback
+    // follows (a streamed answer stops when its sink is cancelled)
+    const client = streamed ? undefined : ctx.client
     for (const ref of refs) {
       refIndex += 1
+      if (client !== undefined && client.aborted) return cancelledOutcome(ref.provider, ref.model, attempts, upstreamMs)
       const tried: Set<int> = new Set()
       const p: ProviderConfig = this.providerConf(ref.provider) ?? {}
       // Bifrost's allowed_requests: a request type the provider does not allow is not sent; the next fallback may take it
@@ -2163,6 +2196,7 @@ export class Engine {
       const aff = this.affinity
       if (aff !== undefined && pinned === undefined) soft = resolveSticky(aff, h, ref.provider, ref.model, Date.now())?.keyId
       while (true) {
+        if (client !== undefined && client.aborted) return cancelledOutcome(ref.provider, ref.model, attempts, upstreamMs)
         // the caller's own key serves the primary provider only: a fallback never gets it
         const sel = refIndex === 0 && direct !== undefined ? this.directSel(ref, direct) : this.targetSel(ref, tried, pinned ?? soft)
         if (sel === undefined && soft !== undefined) {
@@ -2228,6 +2262,16 @@ export class Engine {
             break
           }
           t.key.value = tok.token
+        }
+        // a Bedrock key with neither an API key nor keys of its own signs with the default chain (awschain.tov)
+        const bk0 = t.key.bedrock_key_config
+        if ((t.kind === "bedrock" || t.kind === "bedrock_mantle") && bk0 !== undefined && usesChain(bk0, t.key.value ?? "")) {
+          const wc = await withChainCreds(bk0, t.key.value ?? "")
+          if (wc.error !== "") {
+            last = { ok: false, status: 502, body: errorJson(wc.error, "authentication_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
+            break
+          }
+          t.key.bedrock_key_config = wc.bk
         }
         const bk = t.key.bedrock_key_config
         if ((t.kind === "bedrock" || t.kind === "bedrock_mantle") && bk !== undefined && bk.role_arn !== undefined) {
@@ -2325,6 +2369,11 @@ export class Engine {
           const dl = deadline(timeoutMs(p))
           live = dl
           const signal = dl.controller.signal
+          if (client !== undefined) {
+            client.addEventListener("abort", () => {
+              if (!dl.done) dl.controller.abort(new DOMException(CANCELLED_MESSAGE, "AbortError"))
+            })
+          }
           const px = proxyOf(p)
           const res = lg !== undefined ? await fetch(up.url, { method: "POST", headers: hs, body: lg.stream(), signal: signal, proxy: px, tls: tlsOf(t.cfg), pool: poolOf(t.cfg), peer: peerOf(t.cfg) }) : up.body === "" ? await fetch(up.url, { method: "GET", headers: hs, signal: signal, proxy: px, tls: tlsOf(t.cfg), pool: poolOf(t.cfg), peer: peerOf(t.cfg) }) : await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: signal, proxy: px, tls: tlsOf(t.cfg), pool: poolOf(t.cfg), peer: peerOf(t.cfg) })
           status = res.status
@@ -2513,6 +2562,16 @@ export class Engine {
         }
         const tookMs = performance.now() - started
         upstreamMs += tookMs
+        // the caller went away during the call: the provider is not blamed, and nothing is tried again
+        if (client !== undefined && client.aborted) {
+          if (tracer !== undefined && child !== undefined) {
+            child.fail(CANCELLED_MESSAGE)
+            child.end(Date.now())
+            tracer.finish(child)
+          }
+          metrics.observeRequest(tl, { ok: false, status: CANCELLED_STATUS, errorType: metrics.errorTypeForStatus(CANCELLED_STATUS), retries: retry * 1.0 }, tookMs / 1000.0)
+          return cancelledOutcome(ref.provider, ref.model, attempts, upstreamMs)
+        }
         if (tracer !== undefined && child !== undefined) {
           child.setInt("http.response.status_code", status)
           if (status < 200 || status >= 300) child.fail(`HTTP ${status}`)
@@ -2583,7 +2642,7 @@ export class Engine {
         }
         // retry
         if (retry >= retries) break
-        await sleep(backoffMs(p, retry, retryAfter))
+        await backoffSleep(backoffMs(p, retry, retryAfter), client)
         retry += 1
       }
     }
@@ -2913,8 +2972,8 @@ export class Engine {
     return userHeadersFor(this.cfg.mcp?.user_credentials, client, id.vk, id.session, id.user)
   }
 
-  // The identity per-user headers are kept under, as per-user OAuth tokens are (identityOf): the x-bf-mcp-session-id
-  // header, else the user of a user-mode MCP token, else the virtual key.
+  // The identity per-user headers are kept under, as per-user OAuth tokens are (identityOf): the user of a user-mode
+  // MCP token, else the virtual key, else the x-bf-mcp-session-id header.
   headersIdentity(h: Hdrs): { vk: string, session: string, user: string } {
     return identityOf(h.get("x-bf-mcp-session-id"), this.gov.findKey(h)?.id ?? "", userOfMark(h.get(USER_HEADER)))
   }
@@ -2929,7 +2988,7 @@ export class Engine {
     if (hit === undefined) return userAuthOf("none", "", 0, "", "")
     const client = hit.server
     const vk = this.gov.findKey(h)?.id ?? ""
-    // a user-mode MCP token names its user (ops.tov mcp); the session header and the key come after it (identityOf)
+    // a user-mode MCP token names its user (ops.tov mcp); the key and then the session header come after it (identityOf)
     const ident = identityOf(h.get("x-bf-mcp-session-id"), vk, userOfMark(h.get(USER_HEADER)))
     if (ident.vk === "" && ident.session === "" && ident.user === "") return userAuthOf("denial", "", 401, "authentication_error", `per-user OAuth for MCP client ${client} needs a virtual key (x-bf-vk) or an x-bf-mcp-session-id header`)
     const now = Date.now()
@@ -3496,7 +3555,10 @@ export class Engine {
     const h = snapshot(req.headers)
     const ctx = new ReqCtx(h.get("x-request-id") ?? newId("req_"), op, performance.now())
     ctx.large = large
-    ctx.attemptHook = attemptHook
+    // a hooked route's request with fallbacks brings its plugins across the attempts (llmHooked registered them)
+    const hook = attemptHook ?? (op === "chat" ? undefined : this.attemptRuns.get(h.get(ATTEMPT_HEADER) ?? ""))
+    ctx.attemptHook = hook
+    ctx.client = clientSignal(h)
     // the plugin spans and logs: the chat request's plugin run, or the one a hooked route registered for this request
     if (attemptHook !== undefined) ctx.pluginTrace = attemptHook.run.ctx.trace
     else ctx.pluginTrace = this.pluginTraces.get(h.get(TRACE_HEADER) ?? "")
@@ -3518,7 +3580,7 @@ export class Engine {
     const cids = correlationIds(h)
     ctx.parentId = cids.parent
     ctx.agentId = cids.agent
-    const ma = maximAttrs(h)
+    const ma = maximAttrs(h, this.maximHeaders())
     ctx.maximIds = ma?.ids
     ctx.maximTags = ma?.tags
     if (upstreamHeaders !== undefined) ctx.upstreamHeaders = upstreamHeaders
@@ -4001,22 +4063,51 @@ export class Engine {
   }
 
   // Clears semantic cache entries from the vector store: the entry with id (the x-bifrost-cache-id of a hit),
-  // or every entry stored under cacheKey. Returns how many went. The namespace is opened first when no
-  // request has used it yet, which needs semantic_cache.dimension. Throws what the store reports.
+  // or every entry stored under cacheKey. Returns how many went. When no request has used the namespace yet it is
+  // opened as it stands (attach: no dimension is needed, and a namespace that does not exist holds nothing); the
+  // next lookup still ensures it. Throws what the store reports.
   async vectorClear(id: string, cacheKey: string): Promise<int, Error> {
     const vs = this.vstore
     if (vs === undefined) return 0
     if (!this.vsReady) {
       const dim = this.cfg.semantic_cache?.dimension ?? 0
-      if (dim <= 0) return 0
-      try await vs.ensure(this.vsNs, dim, ["scope", "cache_key"])
-      this.vsReady = true
+      if (dim > 0) {
+        try await vs.ensure(this.vsNs, dim, ["scope", "cache_key"])
+        this.vsReady = true
+      } else if (!(try await vs.attach(this.vsNs, ["scope", "cache_key"]))) {
+        return 0
+      }
     }
     if (id !== "") {
       try await vs.delete(this.vsNs, id)
       return 1
     }
     return try await vs.deleteWhere(this.vsNs, [{ key: "cache_key", eq: cacheKey }])
+  }
+
+  // The body the current attempt of a hooked request sends: what its pre hooks made of it for this attempt (a fallback's
+  // run again, AttemptPlugins), or body when the request has no such run.
+  attemptFields(req: Request, body: Field[]): Field[] {
+    const ah = this.attemptRuns.get(req.headers.get(ATTEMPT_HEADER) ?? "")
+    return ah === undefined ? body : ah.body
+  }
+
+  // The same as text.
+  attemptText(req: Request, text: string): string {
+    const ah = this.attemptRuns.get(req.headers.get(ATTEMPT_HEADER) ?? "")
+    return ah === undefined ? text : ah.text
+  }
+
+  // The request headers the enabled Maxim exporters tag their traces with (their request_headers).
+  maximHeaders(): string[] {
+    const out: string[] = []
+    for (const x of this.cfg.exporters ?? []) {
+      if (x.kind !== "maxim" || x.enabled === false) continue
+      for (const p of x.request_headers ?? []) {
+        if (!out.includes(p)) out.push(p)
+      }
+    }
+    return out
   }
 
   // Whether a request's bodies stay out of the log store and exporters: the
@@ -4209,8 +4300,11 @@ export class Engine {
   // duration as the latency, its tokens, what it cost, and its voice seconds in the row's metadata; its
   // cost and tokens are charged to the budgets and token limits now. requestId is the row's own, parentId
   // the session's (the caller's x-bf-parent-request-id wins).
-  recordLive(op: string, h: Hdrs, grant: Grant, provider: string, model: string, status: int, durationMs: f64, promptTokens: int, completionTokens: int, input: string, output: string, error: string, extra: Record<string, string>, cost: LiveCost, requestId: string, parentId: string): void {
+  // trace is the plugin run of a realtime turn whose LLM hooks ran (livehooks.tov TurnPlugins): its plugin logs and spans
+  // go with the row.
+  recordLive(op: string, h: Hdrs, grant: Grant, provider: string, model: string, status: int, durationMs: f64, promptTokens: int, completionTokens: int, input: string, output: string, error: string, extra: Record<string, string>, cost: LiveCost, requestId: string, parentId: string, trace?: PluginTrace): void {
     const c = new ReqCtx(requestId, op, performance.now() - durationMs)
+    c.pluginTrace = trace
     c.provider = provider
     c.model = model
     c.status = status
@@ -5177,7 +5271,8 @@ export class Engine {
     }
     const build: Build = (t) => {
       if (!providers.supportsEmbeddings(t.kind)) throw new SyntaxError(`${t.provider} does not serve embeddings through this gateway yet`)
-      return try providers.embeddingsUpstream(t, body)
+      // the body this attempt's pre hooks left (a fallback's run again), else the request's
+      return try providers.embeddingsUpstream(t, this.attemptFields(req, body))
     }
     const translate: Translate = (t, text, requested) => try providers.embeddingsTranslate(t.kind, t.model, text, requested)
     return try await this.serve(req, "embeddings", undefined, body, text, build, translate, false)
@@ -5196,9 +5291,11 @@ export class Engine {
     const canPipe = stream && sink !== undefined
     const cp = new CompatPlan(withHeader(settingsOf(this.cfg.client?.compat), req.headers.get("x-bf-compat") ?? undefined), "completions", stream)
     const build: Build = (t) => {
-      const sh = try cp.shape(t.provider, t.kind, t.model, body)
+      // the body this attempt's pre hooks left (a fallback's run again), else the request's
+      const cur = this.attemptFields(req, body)
+      const sh = try cp.shape(t.provider, t.kind, t.model, cur)
       if (sh.route === "chat") return try textAsChat(t, sh, stream, canPipe)
-      if (t.kind === "replicate") return try replicateText(t, body)
+      if (t.kind === "replicate") return try replicateText(t, cur)
       // Anthropic's legacy complete API answers whole, as in Bifrost (which has no Anthropic text stream). Bedrock's
       // InvokeModel text models stream on InvokeModelWithResponseStream, as Bifrost's TextCompletionStream; a stream
       // that cannot be piped is asked whole and sent as one frame.

@@ -25,7 +25,7 @@ import { setMcpToolLog, McpToolCall } from "./mcp"
 import { McpLibrary, DEFAULT_LIBRARY_URL, DEFAULT_LIBRARY_SYNC_SECONDS, listLibrary, libraryFilterData, createLibraryEntry, deleteLibraryEntry, fetchCatalog } from "./mcplibrary"
 import { parsePolicy, policyView, policyConfigOf } from "./health"
 import { AccessProfile, AgentConfig, BudgetConfig, BudgetOverride, CircuitPolicyConfig, LogExportsConfig, PermissionPair, ProjectConfig, VirtualKeyConfig } from "./config"
-import { effectiveBudgetLimit } from "./governance"
+import { effectiveBudgetLimit, Attribution } from "./governance"
 import { rfc3339Of } from "./vkexpiry"
 import { flushVaultCache } from "./secrets"
 import { ConfigStore, checkAdmin, sweepExpiredKeys, sealStored, openStored, RESOURCES, OPERATIONS, CONFIG_NS, CONFIG_KEY, ConfigGen, genOf, textSha, randomId } from "./store"
@@ -59,7 +59,7 @@ import { grpcSend, upstreamCandidates, attemptVerdict, Candidate, Demotions, can
 import { versionSupported, paramsTo, resultTo, rpcAnswerTo } from "./a2aver"
 import { checkExtensions, allowedExtensions } from "./a2aext"
 import { mergeConfig, changedTargets, targetAuthMessage } from "./pluginmerge"
-import { agentQuery, selectedCalls, pageOf, agentStatsJson, topAgentsJson, agentHistogramJson, agentFilterDataJson, agentDetailJson, rawCapture, deleteIds, groupingActive, groupedCalls, withChildCount, hydratedJson, historyPageJson, truthy } from "./agenthistory"
+import { agentQuery, selectedCalls, pageOf, agentStatsJson, topAgentsJson, agentHistogramJson, agentFilterDataJson, agentDetailJson, rawCapture, deleteIds, groupingActive, groupedCalls, withChildCount, hydratedJson, historyPageJson, truthy, eventsOf, requestOf, a2aEventOf, A2aEventInfo } from "./agenthistory"
 import { H2Tls } from "./h2"
 import { findAgent, endpointOf, restEndpointOf, gatewayCard, withGrpcInterface, publicBase, aggregateCard, contextOfParams, contextOfResult, refreshAll, withCard, fetchCard, CARD_PATH, JSON_RPC_SUFFIX, REST_PREFIX } from "./agents"
 import { Call, PushSpec, CallCancel, StreamTap, tapped, rpcCall, restCall, restRequestOf, methodOf, rpcIdOf, rpcErrorBody, rpcEvent, restEvent, restErrorBody, restErrorOfStatus, httpOfCode, codeOfRestError, relayMapped, pushSpecOf, pushUpstreamParams, pushViewJson, pushListJson, pushIdOfResult, embeddedPush, rewriteEmbedded, taskIdOfResult, requestTypeOf, unauthorizedInfo, grantDeniedRpc, grantDeniedRest } from "./a2a"
@@ -68,6 +68,7 @@ import { PushDelivery, pushStore, mintToken, acceptPush, callbackConnectProblem,
 import { pushShare, cardShare, cardOf, adoptCard, takePeriod, CardWire, CARD_NS } from "./a2ashare"
 import { FileLease } from "./filelease"
 import { upstreamHeaders, tlsOf, withAcceptedCredential } from "./agentauth"
+import { clientSignal, CLIENT_WATCH_HEADER } from "./clientgone"
 import { tempTokenAllows, USER_HEADER, markUser, flowIdOfPath, userFlowById } from "./mcpuser"
 import * as vmcp from "./vmcp"
 import { handleProfiles } from "./profiles"
@@ -322,7 +323,7 @@ function json(status: int, body: string): Response {
 // The headers of a call that do not go on to the agent: the connection's own, cookies, and the gateway's
 // credentials (the virtual key the caller logged in with is dropped by name where it came in).
 // A2A-Version is the gateway's own to send: each interface is called in the version it speaks.
-const A2A_NOT_FORWARDED: string[] = ["host", "content-length", "content-type", "content-encoding", "accept", "accept-encoding", "connection", "keep-alive", "proxy-connection", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "cookie", "x-bf-vk", "x-bf-agent-vk-id", "x-bf-agent-auth", "a2a-version"]
+const A2A_NOT_FORWARDED: string[] = ["host", "content-length", "content-type", "content-encoding", "accept", "accept-encoding", "connection", "keep-alive", "proxy-connection", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "cookie", "x-bf-vk", "x-bf-agent-vk-id", "x-bf-agent-auth", "a2a-version", CLIENT_WATCH_HEADER]
 
 // The largest raw body a call's log row keeps, each way (Bifrost's capture bound).
 const RAW_LIMIT: int = 1048576
@@ -459,7 +460,18 @@ function a2aCardResponse(body: string, h: Hdrs): Response {
 // binding and the agent's; rawReq and rawResp the bytes sent and received (kept when
 // client.a2a_store_raw_request_response is on); input and output the request params and the result (kept unless
 // content logging is off for the caller).
-type A2aCall = { agent: string, method: string, status: int, latencyMs: f64, context: string, vk: string | undefined, op?: string, error: string, task?: string, down?: string, up?: string, rawReq?: string, rawResp?: string, input?: string, output?: string }
+// requestId links a call's row to its stream's event rows; at is the call's governance attribution (team, customer,
+// business unit and project), when the call had one.
+type A2aCall = { agent: string, method: string, status: int, latencyMs: f64, context: string, vk: string | undefined, op?: string, error: string, task?: string, down?: string, up?: string, rawReq?: string, rawResp?: string, input?: string, output?: string, requestId?: string, at?: Attribution }
+
+// How many events a call's stream has carried so far (the next event row's sequence).
+class EventCount {
+  n = 0
+}
+
+// One event of a call's stream (Ops.recordA2aEvent): the call's row fields it shares, its place in the stream, and what
+// the event says (agenthistory.tov a2aEventOf). body is kept only when the call's content is.
+type A2aEventRow = { agent: string, method: string, requestId: string, vk: string | undefined, at: Attribution, down: string, sequence: int, info: A2aEventInfo, body: string }
 
 // Whether an agent's answer is a JSON-RPC error object (false for a body that is not JSON).
 function rpcFailed(text: string): bool {
@@ -3415,10 +3427,20 @@ export class Ops {
       }
     }
     const opt = (v: string | undefined): string | undefined => (v === undefined || v === "" ? undefined : v)
+    // the governance attribution of the call, when it had one (Bifrost's ApplyGovernanceContext)
+    const at = c.at
+    let bu: string | undefined = undefined
+    let project: string | undefined = undefined
+    if (at !== undefined) {
+      team = opt(at.teamId) ?? team
+      customer = opt(at.customerId) ?? customer
+      bu = opt(at.businessUnitId)
+      project = opt(at.projectId)
+    }
     store.add({
       id: "a2a-" + now + "-" + Math.floor(Math.random() * 1000000000),
       ts: now,
-      request_id: "",
+      request_id: c.requestId ?? "",
       op: c.method,
       provider: "",
       model: "",
@@ -3431,10 +3453,13 @@ export class Ops {
       virtual_key: c.vk,
       team_id: team,
       customer_id: customer,
+      business_unit_id: bu,
+      project_id: project,
       user_id: user,
       session_id: c.context === "" ? undefined : c.context,
       error: c.error === "" ? undefined : c.error,
       kind: "a2a",
+      record_kind: "request",
       agent_name: c.agent,
       task_id: opt(c.task),
       downstream_transport: opt(c.down),
@@ -3443,6 +3468,61 @@ export class Ops {
       raw_response: rawCapture(c.rawResp ?? ""),
       input: opt(c.input),
       output: opt(c.output),
+    })
+  }
+
+  // One event of a call's stream, as its own row (record_kind "event", Bifrost's ObserveA2AEvent), under the call's
+  // request id and attribution. An event is no operation: it has no latency, and it is not metered.
+  recordA2aEvent(r: A2aEventRow): void {
+    const store = this.engine.logStore
+    if (store === undefined) return
+    const now = Date.now()
+    let user: string | undefined = undefined
+    let team: string | undefined = undefined
+    let customer: string | undefined = undefined
+    const kid = r.vk
+    if (kid !== undefined) {
+      for (const k of this.engine.cfg.governance?.virtual_keys ?? []) {
+        if (k.id !== kid) continue
+        team = k.team_id
+        customer = k.customer_id
+        user = k.user_id
+      }
+    }
+    const opt = (v: string | undefined): string | undefined => (v === undefined || v === "" ? undefined : v)
+    const i = r.info
+    store.add({
+      id: "a2a-" + now + "-" + Math.floor(Math.random() * 1000000000),
+      ts: now,
+      request_id: r.requestId,
+      op: r.method,
+      provider: "",
+      model: "",
+      status: 200,
+      latency_ms: 0.0,
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      cost: 0.0,
+      cache_hit: false,
+      virtual_key: r.vk,
+      team_id: opt(r.at.teamId) ?? team,
+      customer_id: opt(r.at.customerId) ?? customer,
+      business_unit_id: opt(r.at.businessUnitId),
+      project_id: opt(r.at.projectId),
+      user_id: user,
+      session_id: opt(i.contextId),
+      kind: "a2a",
+      record_kind: "event",
+      event_sequence: r.sequence,
+      event_type: i.type,
+      task_state: opt(i.state),
+      message_id: opt(i.messageId),
+      artifact_id: opt(i.artifactId),
+      content_type: opt(i.contentType),
+      event_body: opt(r.body),
+      agent_name: r.agent,
+      task_id: opt(i.taskId),
+      downstream_transport: opt(r.down),
     })
   }
 
@@ -3509,8 +3589,17 @@ export class Ops {
       }
       const listNames = (dim: string, id: string): string => this.historyName(dim, id)
       const rows: string[] = []
-      for (const e of pageOf(calls, q.page)) {
-        const row = q.filter.hydrate ? hydratedJson(agentDetailJson(e, listNames)) : a2aLogJson(e)
+      const page = pageOf(calls, q.page)
+      const view = q.filter.hydrate && page.length > 0 ? scopedView(store, sc, 0.0) : []
+      for (const e of page) {
+        let row = ""
+        if (q.filter.hydrate) {
+          const evs: string[] = []
+          for (const x of eventsOf(view, e)) evs.push(agentDetailJson(x, listNames))
+          row = hydratedJson(agentDetailJson(e, listNames), evs)
+        } else {
+          row = a2aLogJson(e)
+        }
         rows.push(withChildCount(row, children.get(e.id) ?? 0))
       }
       return okJson(historyPageJson(rows, q.page, calls.length))
@@ -3537,10 +3626,16 @@ export class Ops {
       return okJson(topAgentsJson(calls, 10))
     }
     const hydrate = truthy((sp.get("hydrate") ?? "").trim())
-    for (const e of scopedView(store, sc, 0.0)) {
+    const all = scopedView(store, sc, 0.0)
+    for (const e of all) {
       if (kindOf(e) !== "a2a" || e.id !== sub) continue
-      const d = agentDetailJson(e, names)
-      return okJson(hydrate ? hydratedJson(d) : d)
+      if (!hydrate) return okJson(agentDetailJson(e, names))
+      // hydrated: the operation the row belongs to (its call, with the call's events), as Bifrost's FindAgentLogOperation
+      const op = requestOf(all, e)
+      if (op === undefined) break
+      const evs: string[] = []
+      for (const x of eventsOf(all, op)) evs.push(agentDetailJson(x, names))
+      return okJson(hydratedJson(agentDetailJson(op, names), evs))
     }
     return { status: 404, body: errorJson("agent history entry not found", "not_found_error", undefined), contentType: "application/json" }
   }
@@ -3910,6 +4005,8 @@ export class Ops {
       const ca = t.ca
       if (ca !== undefined) tls.ca = ca
       if (t.rejectUnauthorized === false) tls.verify = false
+      tls.cert = t.cert
+      tls.key = t.key
     }
     const g = await grpcSend(c.url, tls, call, call.params, rpcId, md, cancel)
     if (g.error !== "") return failed(`the agent did not answer: ${g.error}`)
@@ -3933,9 +4030,15 @@ export class Ops {
     const store = pushStore()
     const accepted = vk === undefined ? undefined : this.engine.gov.credentialHeader(h)
     const cc = cancel ?? new CallCancel()
+    // an HTTP caller that goes away before the answer (clientgone.tov) stops the call upstream, as the gRPC binding's does
+    const gone = cancel === undefined ? clientSignal(h) : undefined
+    if (gone !== undefined) gone.addEventListener("abort", () => cc.fire())
     const down = transportOf(binding)
     const keepContent = !this.engine.contentOff(h)
     const rawOn = this.rawOn()
+    // the id the call's row and its stream's event rows share, and the call's attribution
+    const reqId = (h.get("x-request-id") ?? "").trim() !== "" ? (h.get("x-request-id") ?? "").trim() : newId("a2a-req-")
+    const at = this.engine.gov.attributionOf(h)
     let params = call.params
     let context = contextOfParams(params)
     // the extensions the caller asks for (A2A-Extensions) against the ones the registration relays
@@ -3995,7 +4098,7 @@ export class Ops {
     const rawReq = rawOn ? fwd.rawReq : ""
     if (fwd.error !== "") {
       if (pendingTask !== "") store.removePending(name, pendingHash, pendingTask)
-      this.recordA2a({ agent: name, method: label, op: call.op, status: 502, latencyMs: Date.now() - started, context: context, vk: vkId, error: fwd.error, task: call.taskId, down: down, up: fwd.binding, rawReq: rawReq, input: input })
+      this.recordA2a({ agent: name, method: label, op: call.op, status: 502, latencyMs: Date.now() - started, context: context, vk: vkId, error: fwd.error, task: call.taskId, down: down, up: fwd.binding, rawReq: rawReq, input: input, requestId: reqId, at: at })
       return this.a2aFail(rest, rpcId, 502, -32603, fwd.error)
     }
     const up = fwd.stream
@@ -4005,13 +4108,22 @@ export class Ops {
       sh.set("cache-control", "no-cache")
       // the same binding on both sides passes the events as they are; the other maps each event's payload
       const mapped = !rest && !fwd.rpc ? relayMapped(up, (d: string): string => rpcEvent(rpcId, d)) : (rest && fwd.rpc ? relayMapped(up, restEvent) : relay(up))
-      // the call is logged when its stream ends (or its caller goes away), with what the agent streamed when kept
+      // the call is logged when its stream ends (or its caller goes away), with what the agent streamed when kept; each
+      // event the caller is sent is a row of its own as it passes (Bifrost's ObserveA2AEvent)
       const tap = fwd.tap
       const status = fwd.status
       const err = status >= 400 ? `agent answered HTTP ${status}` : ""
-      const out = tapped(mapped, undefined, () => {
+      const events = new StreamTap(0)
+      const seq = new EventCount()
+      events.watch((d: string): void => {
+        const info = a2aEventOf(d)
+        if (info === undefined) return
+        seq.n += 1
+        this.recordA2aEvent({ agent: name, method: label, requestId: reqId, vk: vkId, at: at, down: down, sequence: seq.n, info: info, body: keepContent ? info.body : "" })
+      })
+      const out = tapped(mapped, events, () => {
         const raw = tap === undefined || tap.dropped ? "" : tap.text
-        this.recordA2a({ agent: name, method: label, op: call.op, status: status, latencyMs: Date.now() - started, context: context, vk: vkId, error: err, task: call.taskId, down: down, up: fwd.binding, rawReq: rawReq, rawResp: raw, input: input })
+        this.recordA2a({ agent: name, method: label, op: call.op, status: status, latencyMs: Date.now() - started, context: context, vk: vkId, error: err, task: call.taskId, down: down, up: fwd.binding, rawReq: rawReq, rawResp: raw, input: input, requestId: reqId, at: at })
       }, cc)
       return new Response(out, { status: fwd.status, headers: sh })
     }
@@ -4020,7 +4132,7 @@ export class Ops {
     const err = u.failed ? `agent answered ${fwd.status >= 400 ? "HTTP " + fwd.status : "a JSON-RPC error"}` : ""
     let task = call.taskId
     if (task === "" && !u.failed) task = taskIdOfResult(u.result)
-    this.recordA2a({ agent: name, method: label, op: call.op, status: fwd.status, latencyMs: Date.now() - started, context: context, vk: vkId, error: err, task: task, down: down, up: fwd.binding, rawReq: rawReq, rawResp: rawOn ? fwd.rawResp : "", input: input, output: keepContent && !u.failed ? u.result : "" })
+    this.recordA2a({ agent: name, method: label, op: call.op, status: fwd.status, latencyMs: Date.now() - started, context: context, vk: vkId, error: err, task: task, down: down, up: fwd.binding, rawReq: rawReq, rawResp: rawOn ? fwd.rawResp : "", input: input, output: keepContent && !u.failed ? u.result : "", requestId: reqId, at: at })
     // an embedded config is bound to the task the send made, or dropped when it made none
     if (pendingTask !== "") {
       const tid = u.failed ? "" : taskIdOfResult(u.result)
@@ -5142,12 +5254,19 @@ export class Ops {
     for (const u of gov?.users ?? []) {
       if (u.name !== name) continue
       const r = customRole(gov?.roles, u.role)
-      if (r === undefined) return allScope()
+      // the scope names its user: what the user created or holds stays theirs (and a creation records them)
+      if (r === undefined) {
+        let a = allScope()
+        a.user = u.name
+        return a
+      }
       let dac = r.dac ?? "all-data"
       for (const e of r.entity_dac ?? []) {
         if (e.resource === resource) dac = e.dac
       }
-      return scopeOf(gov ?? {}, u, dac)
+      let s = scopeOf(gov ?? {}, u, dac)
+      s.user = u.name
+      return s
     }
     return allScope()
   }

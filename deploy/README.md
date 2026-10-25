@@ -73,6 +73,18 @@ each process's open connections (default: three quarters of its descriptor limit
 -1 for no cap): a request on a connection past it is answered 503, and so is a connection that
 comes when the process is out of descriptors. 0 turns a timeout off. These keys are read at start.
 
+## AWS credentials from the workload
+
+A Bedrock key with neither an API key (`value`) nor `access_key`/`secret_key`, and Vertex's
+`aws_workload_identity` (or an AWS `external_account` file), take the AWS SDK's default chain, as
+Bifrost does: the environment (`AWS_ACCESS_KEY_ID`, ...), an EKS IRSA web identity
+(`AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_ROLE_ARN`, which the EKS webhook sets for a service account
+annotated with `eks.amazonaws.com/role-arn`), the shared credentials file, ECS task roles and EKS
+Pod Identity (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` or `_FULL_URI`, which ECS and the Pod
+Identity agent set) and the EC2 instance profile (IMDSv2). The region falls back to the instance
+metadata's. On ECS the module's task role is the identity; give it the Bedrock permissions the keys
+need. `AWS_EC2_METADATA_DISABLED=true` skips the instance metadata.
+
 ## Docker
 
 The image's bases are pinned by tag and digest (`ARG DEBIAN` in the Dockerfile), and rustup-init

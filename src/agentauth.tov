@@ -4,8 +4,8 @@
 //   oauth    a client-credentials grant: the gateway fetches an access token from the token endpoint (given as
 //            token_url, or found through discovery_url or provider_url) and sends it as a bearer token. The token
 //            is kept until 30 seconds before it expires.
-// tls sets how https connections are checked (a CA bundle, or no check). A client certificate and key are kept
-// in the registration but not used: Tov's fetch has no client certificates.
+// tls sets how https connections are checked (a CA bundle, or no check) and the client certificate and key the
+// gateway presents (on the card fetch, the OAuth token calls and every binding's calls, gRPC included).
 import { fields, find, rawStr, rawNum } from "./json"
 import { AgentAuth, AgentOAuth, resolveEnv } from "./config"
 import { connectProblem } from "./webhooks"
@@ -49,14 +49,29 @@ function print(o: AgentOAuth): string {
   return [o.provider_url ?? "", o.discovery_url ?? "", o.token_url ?? "", resolveEnv(o.client_id), resolveEnv(o.client_secret), (o.scopes ?? []).join(" "), o.resource ?? ""].join("\n")
 }
 
-// The fetch options for an auth's TLS settings, undefined for the defaults.
-export function tlsOf(a: AgentAuth | undefined): { rejectUnauthorized?: bool, ca?: string } | undefined {
+// The fetch options for an auth's TLS settings, undefined for the defaults: the CA, certificate checks off, and the
+// client certificate and key presented to the agent (Bifrost's upstreamTLSConfig; used only as a pair).
+export function tlsOf(a: AgentAuth | undefined): { rejectUnauthorized?: bool, ca?: string, cert?: string, key?: string } | undefined {
   const t = a?.tls
   if (t === undefined) return undefined
   const skip = t.insecure_skip_verify === true
   const ca = resolveEnv(t.ca_cert_pem ?? "")
-  if (!skip && ca === "") return undefined
-  return { rejectUnauthorized: !skip, ca: ca === "" ? undefined : ca }
+  const cert = resolveEnv(t.client_cert_pem ?? "")
+  const key = resolveEnv(t.client_key_pem ?? "")
+  const pair = cert !== "" && key !== ""
+  if (!skip && ca === "" && !pair) return undefined
+  return { rejectUnauthorized: !skip, ca: ca === "" ? undefined : ca, cert: pair ? cert : undefined, key: pair ? key : undefined }
+}
+
+// Bifrost refuses a client certificate without its key or the reverse: the message, or "" when the TLS settings are
+// usable.
+export function tlsProblem(a: AgentAuth | undefined): string {
+  const t = a?.tls
+  if (t === undefined) return ""
+  const cert = resolveEnv(t.client_cert_pem ?? "")
+  const key = resolveEnv(t.client_key_pem ?? "")
+  if ((cert === "") !== (key === "")) return "upstream TLS client certificate and key must be configured together"
+  return ""
 }
 
 function originOf(raw: string): string {
@@ -147,6 +162,9 @@ export async function accessToken(id: string, a: AgentAuth, allowPrivate: bool):
 // resolved, and for oauth the bearer token. The names are lower case. An oauth token that cannot be had is an error.
 export async function upstreamHeaders(id: string, a: AgentAuth | undefined, allowPrivate: bool): Promise<AuthHeaders> {
   const out: Map<string, string> = new Map()
+  // (a client certificate without its key fails every call, as in Bifrost's clientFor)
+  const tp = tlsProblem(a)
+  if (tp !== "") return { headers: out, error: tp }
   if (a === undefined || a.type === "none") return { headers: out, error: "" }
   const hs = a.headers
   if (hs !== undefined) {
@@ -178,6 +196,20 @@ test("the TLS options follow the auth's settings", () => {
   const ca = tlsOf({ type: "none", tls: { ca_cert_pem: "PEM-TEXT" } })!
   expect(ca.rejectUnauthorized).toBe(true)
   expect(ca.ca).toBe("PEM-TEXT")
+  expect(ca.cert).toBeUndefined()
+})
+
+test("the client certificate goes to fetch as a pair", () => {
+  const both = tlsOf({ type: "none", tls: { client_cert_pem: "CERT", client_key_pem: "KEY" } })!
+  expect(both.rejectUnauthorized).toBe(true)
+  expect(both.cert).toBe("CERT")
+  expect(both.key).toBe("KEY")
+  expect(both.ca).toBeUndefined()
+  // half a pair is not presented, and is a problem
+  expect(tlsOf({ type: "none", tls: { client_cert_pem: "CERT" } })).toBeUndefined()
+  expect(tlsProblem({ type: "none", tls: { client_cert_pem: "CERT" } }).includes("together")).toBe(true)
+  expect(tlsProblem({ type: "none", tls: { client_cert_pem: "CERT", client_key_pem: "KEY" } })).toBe("")
+  expect(tlsProblem(undefined)).toBe("")
 })
 
 test("the accepted credential is forwarded unless the auth set that header", () => {

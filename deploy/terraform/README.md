@@ -80,6 +80,8 @@ target group checks `GET /ready` (`health_check_path`), the container's own heal
   a Secrets Manager or SSM ARN, which ECS injects. Raiju builds providers from
   well-known variables (`OPENAI_API_KEY`, ...) when no config file exists, so
   ECS needs no config file.
+- A Bedrock key with no credentials of its own signs with the task role (ECS container
+  credentials, the AWS SDK's default chain): add the Bedrock permissions to it.
 - To use a `config.json`, set `efs_file_system_id` and `efs_access_point_id`. The
   file system is mounted read-only at `/app/data`. Put `config.json` on it first.
   The ECS module does not create the file system or the access point.

@@ -1035,6 +1035,8 @@ def sinks_config(sa_text: str, kafka_out: str):
             {"id": "bq", "kind": "bigquery", "project_id": "proj", "dataset_id": "ds", "table_id": "tb", "service_account_key": sa_text, "base_url": MOCK, "interval_seconds": 1},
             {"id": "ps", "kind": "pubsub", "project_id": "proj", "topic_id": "logs-topic", "service_account_key": sa_text, "base_url": MOCK, "interval_seconds": 1},
             {"id": "mx", "kind": "maxim", "api_key": "mk", "log_repo_id": "repo-e2e", "base_url": MOCK, "interval_seconds": 1},
+            # L192: the Maxim plugin's trace with content (as a Bifrost maxim plugin maps) and request_headers tags
+            {"id": "mx2", "kind": "maxim", "api_key": "mk", "log_repo_id": "repo-l192", "base_url": MOCK, "interval_seconds": 1, "include_content": True, "request_headers": ["x-team"]},
             {"id": "kf", "kind": "kafka", "brokers": [f"127.0.0.1:{KAFKA_PORT}"], "topic": "raiju-logs", "interval_seconds": 1},
         ],
         # Parquet objects in their own bucket; the retention sweep deletes the days older than one
@@ -1085,6 +1087,21 @@ def sinks_e2e(env, sa_text: str):
         check("a chat's log entry reaches Pub/Sub publish, with the request id attribute", ps and f'"request_id":"{rid}"' in ps[0]["body"], [x["path"] for x in ps][:2])
         mx = arrived(lambda x: x["path"] == "/api/sdk/v3/log?id=repo-e2e" and rid in x["body"])
         check("a chat's log entry reaches Maxim's log repository", mx and "sink-probe-4417" not in mx[0]["body"], [x["path"] for x in mx][:2])
+        # L192: the trace Bifrost's Maxim plugin writes, in maxim-go's commit log lines: the trace with its input, the
+        # generation with its messages, the result, the ends, and the tags (model, x-bf-maxim-*, request_headers)
+        s2, h2, b2 = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "maxim-probe-5521"}], "temperature": 0.3},
+                          {"x-team": "search", "x-bf-maxim-customer": "acme", "x-bf-maxim-trace-name": "probe-trace"}, base=GW_S)
+        rid2 = {k.lower(): v for k, v in h2.items()}.get("x-bifrost-request-id", "")
+        mx2 = arrived(lambda x: x["path"] == "/api/sdk/v3/log?id=repo-l192" and rid2 in x["body"])
+        body2 = mx2[0]["body"] if mx2 else ""
+        lines2 = body2.split("\n")
+        want = [f'trace{{id={rid2},action=create,data={{"startTimestamp":', '"name":"probe-trace"', f'trace{{id={rid2},action=update,data={{"input":"maxim-probe-5521"}}}}',
+                f'trace{{id={rid2},action=add-generation,', '"messages":[{"role":"user","content":"maxim-probe-5521"}]', '"modelParameters":{"temperature":0.3}',
+                ',action=result,data={"result":{', f'trace{{id={rid2},action=end,', f'trace{{id={rid2},action=update,data={{"tags":{{"model":"gpt-4o-mini"}}}}}}',
+                '"tags":{"customer":"acme"}', '"tags":{"header.x-team":"search"}']
+        check("the Maxim sink writes the plugin's trace as maxim-go commit logs: trace, input, generation with messages and params, result, ends and tags",
+              s2 == 200 and all(w in body2 for w in want) and lines2[0].startswith("trace{id=" + rid2 + ",action=create"), (s2, [w for w in want if w not in body2], body2[:600]))
+        check("the default Maxim exporter still sends no content", not any("maxim-probe-5521" in x["body"] for x in seen() if x["path"] == "/api/sdk/v3/log?id=repo-e2e"), "")
 
         def kafka_hits():
             out = []
@@ -2263,8 +2280,11 @@ def mcp_po_e2e(env):
         s, _, b = tool("sk-bf-po-b")
         fid_b, _ = consent_of(b)
         check("another caller still needs its own consent", s == 401 and fid_b != "" and fid_b != fid_a, (s, b[:200]))
+        # L192: Bifrost's identity order (user, then virtual key, then session): a key with a session header is the key's
         s, _, b = tool("sk-bf-po-a", {"x-bf-mcp-session-id": "s-1"})
-        check("a session without a consent gets its own link", s == 401 and "Authentication required for po" in b, (s, b[:200]))
+        check("a key that also sends a session header is the key's identity: its own token is used", s == 200 and "Sunny in Oslo" in b, (s, b[:200]))
+        s, _, b = call("POST", "/v1/mcp/tool/execute", {"id": "c1", "type": "function", "function": {"name": "po-get_weather", "arguments": "{\"city\":\"Oslo\"}"}}, {"x-bf-mcp-session-id": "s-1"}, base=MCP_PO, auth=False)
+        check("a session without a key and without a consent gets its own link", s == 401 and "Authentication required for po" in b, (s, b[:200]))
 
         s, b, rows = sessions("?kind=token")
         mine = [r for r in rows if r["virtual_key_id"] == "vk-po-a"]
@@ -2560,12 +2580,17 @@ def mcp_peruser_e2e(env):
         check("a revoked credential is no longer used", s == 401 and "Authentication required for tenant" in b and "kind=headers" in b, (s, b[:200]))
         s, _, b = tool("sk-bf-tenant-a")
         check("revoking one key leaves the others", s == 200, (s, b[:200]))
-        # L177: an x-bf-mcp-session-id is an identity of its own (session mode): its values, not the key's, go along
-        def stool(sid):
-            h = {"authorization": "Bearer sk-bf-tenant-a", "x-bf-mcp-session-id": sid}
+        # L177: an x-bf-mcp-session-id is an identity of its own (session mode) for a request without a key; L192: a request
+        # with a key is the key's (Bifrost's order: user, then virtual key, then session)
+        def stool(sid, key=None):
+            h = {"x-bf-mcp-session-id": sid}
+            if key is not None:
+                h["authorization"] = "Bearer " + key
             return call("POST", "/v1/mcp/tool/execute", {"id": "c1", "type": "function", "function": {"name": "tenant-get_weather", "arguments": "{\"city\":\"Oslo\"}"}}, h, base=MCP_PU, auth=False)
+        s, _, b = stool("sess-l177", "sk-bf-tenant-a")
+        check("a key that also sends a session header keeps the key's identity: the key's values go along", s == 200 and sent_tenants()[-1:] == ["tenant-a-key-example"], (s, b[:200], sent_tenants()[-1:]))
         s, _, b = stool("sess-l177")
-        check("a session with no values of its own is refused with a submission link, although its key has values", s == 401 and "kind=headers" in b and "flow=" in b, (s, b[:300]))
+        check("a session with no values of its own is refused with a submission link", s == 401 and "kind=headers" in b and "flow=" in b, (s, b[:300]))
         sflow = b.split("flow=")[1].split("&")[0] if "flow=" in b else ""
         s, _, b = call("GET", "/api/mcp/per-user-headers/flows/" + sflow, base=MCP_PU, auth=False)
         sd = json.loads(b) if s == 200 else {}
@@ -6359,6 +6384,8 @@ def l171_config():
         "governance": {
             "users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l171".encode()).hexdigest()}],
             "teams": [{"id": "t-l171", "name": "Team L171"}],
+            # L192: the team's business unit, which the agent calls carry
+            "business_units": [{"id": "bu-l171", "name": "BU L171", "team_ids": ["t-l171"]}],
             "virtual_keys": [
                 {"id": "vk-l171-a", "name": "alpha", "value": "sk-bf-l171-a", "team_id": "t-l171"},
                 # grants of their own: the key's agent_grants, and an access profile's
@@ -6453,6 +6480,27 @@ def l171_e2e(env):
         ev = sse_events(b) if s == 200 else []
         kinds = [e.get("result", {}).get("kind") for e in ev]
         check("a v0.3 caller's stream from a v1 agent comes as v0.3 events, the last update final", kinds == ["task", "status-update", "status-update"] and ev[2]["result"]["final"] is True and ev[1]["result"]["status"]["state"] == "working", (s, b[:400]))
+        # L192: each event of a stream is a row of its own (record_kind event, Bifrost's stream event rows) under the call's
+        # request id, a hydrated call carries them, and the call is attributed to its team's business unit
+        def stream_call():
+            s, _, b = api("GET", "/api/agents/history?agent_name=v1&operation=message/stream&record_kind=request&limit=5")
+            rows = json.loads(b).get("logs", []) if s == 200 else []
+            return rows[0] if rows else None
+        rq = until(stream_call) or {}
+        s, _, b = api("GET", "/api/agents/history?record_kind=event&order=asc&limit=10&request_id=" + rq.get("request_id", "none"))
+        evs = json.loads(b).get("logs", []) if s == 200 else []
+        check("a stream's events are rows of their own, in order, typed and sequenced, under the call's request id",
+              rq.get("record_kind") == "request" and [e.get("event_type") for e in evs] == ["task", "status_update", "status_update"] and [e.get("event_sequence") for e in evs] == [1, 2, 3]
+              and all(e.get("record_kind") == "event" and e.get("request_id") == rq.get("request_id") and e.get("agent_name") == "v1" for e in evs) and evs[-1].get("task_state") == "completed", (rq, s, b[:600]))
+        s, _, b = api("GET", "/api/agents/history?hydrate=true&request_id=" + rq.get("request_id", "none"))
+        ops = json.loads(b).get("logs", []) if s == 200 else []
+        op = ops[0] if ops else {}
+        check("a hydrated call carries its stream's events with their bodies", len(ops) == 1 and op.get("record_kind") == "request" and [e.get("event_sequence") for e in op.get("events", [])] == [1, 2, 3] and "working" in op["events"][1].get("event_body", ""), (s, b[:600]))
+        check("an agent call carries its team's business unit, as Bifrost's agent logs do", op.get("business_unit_id") == "bu-l171" and op.get("business_unit_name") == "BU L171" and rq.get("business_unit_id") == "bu-l171", (op.get("business_unit_id"), rq))
+        s, _, b = api("GET", "/api/agents/history/top-agents")
+        top = {x["agent_name"]: x["count"] for x in json.loads(b).get("agents", [])} if s == 200 else {}
+        s2, _, b2 = api("GET", "/api/agents/history?agent_name=v1&record_kind=request&limit=1")
+        check("top agents count calls only, not their stream's events", top.get("v1") == json.loads(b2)["pagination"]["total_count"], (top, b2[:200]))
         s, _, b = rest("old", "POST", "/message:send", v1("tr-3"))
         out = json.loads(b) if s == 200 else {}
         check("a v1 REST caller of a v0.3 agent gets a v1 answer: {task}, TASK_STATE_COMPLETED, parts without kind", out.get("task", {}).get("status", {}).get("state") == "TASK_STATE_COMPLETED" and "kind" not in json.dumps(out), (s, b[:300]))
@@ -6499,6 +6547,9 @@ def l171_e2e(env):
         check("an access profile's agent_grants let its keys call the agent", s == 200 and "grant-old" in b, (s, b[:200]))
         s, _, b = gcall("fo", Bk, {"x-bf-project-name": "agents-project"})
         check("a union project's agent_grants add the agent to the caller's", s == 200 and "grant-fo" in b, (s, b[:200]))
+        s, _, b = api("GET", "/api/agents/history?agent_name=fo&project_id=p-l171&limit=5")
+        prow = json.loads(b).get("logs", []) if s == 200 else []
+        check("an agent call names the project the request named (L192)", len(prow) >= 1 and prow[0].get("project_id") == "p-l171", (s, b[:300]))
         s, _, b = gcall("fo", Bk)
         check("without the project header the agent stays refused", s == 200 and json.loads(b).get("error", {}).get("code") == -31403, (s, b[:200]))
         # ---- the history ----
@@ -14504,6 +14555,464 @@ def l187_e2e(env):
         gw.wait()
 
 
+GW_L190 = "http://127.0.0.1:18336"  # L190: client certificates, the unary disconnect signal, gRPC gzip, the AWS credential chain
+L190_GRPC_PORT = 18337  # its A2A gRPC listener
+L190_DOMAIN = "gw.l190.test"
+# credentials the AWS mocks hand out (assembled, so the source holds none)
+L190_WEBID_AK = "ASIA" + "L190WEBIDENTITY1"
+L190_POD_AK = "ASIA" + "L190PODIDENTITY1"
+L190_IMDS_AK = "ASIA" + "L190INSTANCEPRF1"
+
+
+def l190_mocks(tls_dir):
+    """The L190 mocks in this process: AWS STS (AssumeRoleWithWebIdentity), container credentials (EKS Pod Identity),
+    the instance metadata service (IMDSv2), a slow OpenAI-style upstream that notes when its caller hangs up and a
+    fallback that notes when it is called, on one port; and an A2A JSON-RPC agent over TLS that requires a client
+    certificate the e2e CA signed, on another. Returns (servers, base url, agent url, seen list)."""
+    import http.server, ssl, select
+    got = []
+    lock = threading.Lock()
+    def note(x):
+        with lock:
+            got.append(x)
+    creds_json = lambda ak, code=None: json.dumps({**({"Code": code} if code else {}), "AccessKeyId": ak, "SecretAccessKey": "l190-secret-" + ak[-4:], "Token": "l190-token-" + ak[-4:], "Expiration": "2099-01-01T00:00:00Z"})
+    class Aws(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        def log_message(self, *a):
+            pass
+        def send(self, code, body, ctype="application/json"):
+            b = body.encode()
+            self.send_response(code)
+            self.send_header("content-type", ctype)
+            self.send_header("content-length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+        def body(self):
+            return self.rfile.read(int(self.headers.get("content-length", "0") or 0)).decode()
+        def do_PUT(self):
+            self.body()
+            if self.path == "/latest/api/token":
+                note({"path": self.path, "ttl": self.headers.get("x-aws-ec2-metadata-token-ttl-seconds", "")})
+                return self.send(200, "imds-l190-token", "text/plain")
+            self.send(404, "{}")
+        def do_GET(self):
+            tok = self.headers.get("x-aws-ec2-metadata-token", "")
+            note({"path": self.path, "token": tok, "auth": self.headers.get("authorization", "")})
+            if self.path == "/creds/pod":
+                if self.headers.get("authorization", "") != "pod-l190-token":
+                    return self.send(403, json.dumps({"code": "AccessDenied", "message": "bad token"}))
+                return self.send(200, creds_json(L190_POD_AK))
+            if self.path.startswith("/latest/meta-data/"):
+                if tok != "imds-l190-token":
+                    return self.send(401, "", "text/plain")
+                if self.path == "/latest/meta-data/iam/security-credentials/":
+                    return self.send(200, "l190-instance-role\n", "text/plain")
+                if self.path == "/latest/meta-data/iam/security-credentials/l190-instance-role":
+                    return self.send(200, creds_json(L190_IMDS_AK, "Success"))
+                if self.path == "/latest/meta-data/placement/region":
+                    return self.send(200, "eu-west-3", "text/plain")
+            self.send(404, "{}")
+        def do_POST(self):
+            if self.path == "/slow/v1/chat/completions":
+                body = self.body()
+                t0 = time.time()
+                rid = json.loads(body).get("messages", [{}])[-1].get("content", "")
+                note({"path": self.path, "rid": rid, "event": "start"})
+                # wait up to 6 s for an answer the caller may stop waiting for: a closed socket reads as EOF
+                while time.time() - t0 < 6:
+                    r, _, _ = select.select([self.connection], [], [], 0.05)
+                    if r:
+                        try:
+                            if self.connection.recv(1, socket.MSG_PEEK) == b"":
+                                note({"path": self.path, "rid": rid, "event": "aborted", "after": time.time() - t0})
+                                self.close_connection = True
+                                return
+                        except OSError:
+                            note({"path": self.path, "rid": rid, "event": "aborted", "after": time.time() - t0})
+                            self.close_connection = True
+                            return
+                note({"path": self.path, "rid": rid, "event": "answered"})
+                return self.send(200, json.dumps({"id": "slow-1", "object": "chat.completion", "created": 1, "model": "m", "choices": [{"index": 0, "message": {"role": "assistant", "content": "slow answer"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}}))
+            if self.path == "/fb/v1/chat/completions":
+                note({"path": self.path, "body": self.body()})
+                return self.send(200, json.dumps({"id": "fb-1", "object": "chat.completion", "created": 1, "model": "m", "choices": [{"index": 0, "message": {"role": "assistant", "content": "fallback answer"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}}))
+            if self.path == "/sts/":
+                form = urllib.parse.parse_qs(self.body())
+                note({"path": self.path, "form": {k: v[0] for k, v in form.items()}})
+                if form.get("Action", [""])[0] != "AssumeRoleWithWebIdentity" or form.get("WebIdentityToken", [""])[0] != "irsa-l190-jwt":
+                    return self.send(400, "<ErrorResponse><Error><Code>InvalidIdentityToken</Code><Message>bad token</Message></Error></ErrorResponse>", "text/xml")
+                return self.send(200, "<AssumeRoleWithWebIdentityResponse><AssumeRoleWithWebIdentityResult><Credentials><AccessKeyId>%s</AccessKeyId><SecretAccessKey>l190-web-secret</SecretAccessKey><SessionToken>l190-web-session</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration></Credentials></AssumeRoleWithWebIdentityResult></AssumeRoleWithWebIdentityResponse>" % L190_WEBID_AK, "text/xml")
+            self.send(404, "{}")
+    aws = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Aws)
+    threading.Thread(target=aws.serve_forever, daemon=True).start()
+    base = "http://127.0.0.1:%d" % aws.server_address[1]
+
+    class Agent(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+        def send(self, code, obj):
+            b = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+        def peer(self):
+            cn = ""
+            for rdn in (self.connection.getpeercert() or {}).get("subject", ()):
+                for k, v in rdn:
+                    if k == "commonName":
+                        cn = v
+            return cn
+        def do_GET(self):
+            note({"path": "agent:" + self.path, "cn": self.peer()})
+            if self.path == "/card":
+                return self.send(200, {"name": "mtls-agent", "description": "an agent behind mutual TLS", "version": "1.0.0",
+                                       "supportedInterfaces": [{"url": "https://127.0.0.1:%d/rpc" % agent.server_address[1], "protocolBinding": "JSONRPC", "protocolVersion": "1.0"}],
+                                       "capabilities": {"streaming": False, "pushNotifications": False}, "defaultInputModes": ["text/plain"], "defaultOutputModes": ["text/plain"],
+                                       "skills": [{"id": "echo", "name": "echo", "description": "echoes", "tags": ["test"]}]})
+            self.send(404, {})
+        def do_POST(self):
+            req = json.loads(self.rfile.read(int(self.headers.get("content-length", "0") or 0)) or b"{}")
+            note({"path": "agent:" + self.path, "cn": self.peer(), "method": req.get("method", "")})
+            text = json.dumps(req.get("params", {}))
+            self.send(200, {"jsonrpc": "2.0", "id": req.get("id"), "result": {"task": {"id": "mt-1", "contextId": "mc-1", "status": {"state": "TASK_STATE_COMPLETED"},
+                                                                                        "artifacts": [{"artifactId": "a1", "parts": [{"text": "mtls echo " + ("hi-mtls" if "hi-mtls" in text else "")}]}]}}})
+    agent = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Agent)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(os.path.join(tls_dir, "srv.pem"), os.path.join(tls_dir, "srv.key"))
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.load_verify_locations(cafile=os.path.join(tls_dir, "ca.pem"))
+    agent.socket = ctx.wrap_socket(agent.socket, server_side=True)
+    threading.Thread(target=agent.serve_forever, daemon=True).start()
+    return [aws, agent], base, "https://127.0.0.1:%d" % agent.server_address[1], got
+
+
+def l190_client_cert(tls_dir):
+    """A client certificate (CN l190-client) the e2e CA signed, and a self-signed one it did not."""
+    run = lambda *a: subprocess.run(list(a), check=True, capture_output=True, cwd=tls_dir)
+    run("openssl", "req", "-newkey", "rsa:2048", "-nodes", "-keyout", "l190-client.key", "-out", "l190-client.csr", "-subj", "/CN=l190-client")
+    run("openssl", "x509", "-req", "-in", "l190-client.csr", "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial", "-out", "l190-client.pem", "-days", "2")
+    run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", "l190-rogue.key", "-out", "l190-rogue.pem", "-days", "2", "-subj", "/CN=l190-rogue")
+    rd = lambda n: open(os.path.join(tls_dir, n)).read()
+    return rd("l190-client.pem"), rd("l190-client.key"), rd("l190-rogue.pem"), rd("l190-rogue.key")
+
+
+def l190_e2e(env):
+    """L190: an A2A agent behind mutual TLS reached with its client certificate (JSON-RPC card and calls, gRPC), refused
+    without it; gzip-compressed gRPC calls into the gateway's binding and gzip answers from an agent read, another
+    encoding refused as grpc-go refuses it; a non-streamed request whose caller hangs up stops its upstream call (no
+    retry, no fallback, logged 499) on both servers; and the AWS credential chain beyond the environment for Bedrock
+    and Vertex's AWS federation (EKS IRSA web identity, EKS Pod Identity container credentials, IMDSv2 and its region)
+    against mocks. Its own gateway on 18336 (started again for each credential source) with A2A gRPC on 18337."""
+    import shutil
+    try:
+        import grpc
+    except ImportError:
+        print("skip the L190 checks: grpcio is not installed")
+        return
+    sys.path.insert(0, os.path.join(ROOT, "tests"))
+    from a2a_grpc_agent import fld, parse, first, message as pb_message
+    tls_dir = os.path.join(BUILD, "e2e-tls")
+    if not os.path.exists(os.path.join(tls_dir, "ca.key")):
+        make_tls()
+    ca = open(os.path.join(tls_dir, "ca.pem")).read()
+    cert, key, rogue_cert, rogue_key = l190_client_cert(tls_dir)
+    servers, aws, agent_url, got = l190_mocks(tls_dir)
+    gagent = subprocess.Popen([sys.executable, os.path.join(ROOT, "tests/a2a_grpc_agent.py"), os.path.join(tls_dir, "srv.pem"), os.path.join(tls_dir, "srv.key"), os.path.join(tls_dir, "ca.pem")], stdout=subprocess.PIPE, stderr=open(os.path.join(BUILD, "e2e.l190-agent.log"), "w"), text=True)
+    gz = subprocess.Popen([sys.executable, os.path.join(ROOT, "tests/grpc_gzip_agent.py")], stdout=subprocess.PIPE, stderr=open(os.path.join(BUILD, "e2e.l190-gz.log"), "w"), text=True)
+    token_file = os.path.join(BUILD, "e2e.l190.irsa-token")
+    open(token_file, "w").write("irsa-l190-jwt\n")
+    pod_token_file = os.path.join(BUILD, "e2e.l190.pod-token")
+    open(pod_token_file, "w").write("pod-l190-token\n")
+    gw = None
+    def start(extra_env, name):
+        # the workload's AWS identity comes only from the source under test
+        genv = {k: v for k, v in env.items() if not k.startswith("AWS_") and k != "RAIJU_A2A_GRPC_LISTEN_PORT"}
+        genv.update(extra_env)
+        p = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18336", "-host", "127.0.0.1", "-config", os.path.join(BUILD, "e2e.l190.json"), "-server", os.environ.get("RAIJU_SERVER", "bun")], env=genv, stdout=subprocess.DEVNULL, stderr=open(os.path.join(BUILD, f"e2e.l190-{name}.log"), "w"))
+        wait(GW_L190 + "/health")
+        return p
+    def stop(p):
+        if p is not None:
+            p.terminate()
+            try:
+                p.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                p.kill()
+    def jb(text):
+        try:
+            return json.loads(text)
+        except Exception:
+            return {}
+    try:
+        ready = gagent.stdout.readline().split()
+        gready = gz.stdout.readline().split()
+        check("the gRPC agents start (mutual TLS, and the gzip agent)", len(ready) == 5 and len(gready) == 3, (ready, gready))
+        if len(ready) != 5 or len(gready) != 3:
+            return
+        web = f"http://127.0.0.1:{ready[1]}"
+        gzweb = f"http://127.0.0.1:{gready[1]}"
+        import hashlib
+        mtls = {"ca_cert_pem": ca, "client_cert_pem": cert, "client_key_pem": key}
+        vk = ["vk-l190"]
+        cfg = {
+            "client": {"enable_logging": True, "enforce_auth_on_inference": True, "a2a_external_client_url": "https://gw.l190.example/"},
+            "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l190-logs")},
+            "alerts": {"enabled": False},
+            "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+            "server": {"a2a_grpc_base_domain": L190_DOMAIN, "a2a_grpc_port": L190_GRPC_PORT},
+            "providers": {
+                "slowp": {"keys": [{"name": "slow", "value": "sk-slow", "models": [], "weight": 1.0}], "custom_provider_config": {"base_provider_type": "openai"}, "network_config": {"base_url": aws + "/slow", "max_retries": 2, "retry_backoff_initial": 2000, "retry_backoff_max": 2000}},
+                "fbp": {"keys": [{"name": "fb", "value": "sk-fb", "models": [], "weight": 1.0}], "custom_provider_config": {"base_provider_type": "openai"}, "network_config": {"base_url": aws + "/fb", "max_retries": 0}},
+                # no credentials of its own: the default chain's
+                "bedrock": {"keys": [{"name": "bk-chain", "value": "", "models": [], "weight": 1.0, "bedrock_key_config": {"region": "us-west-2"}}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+                "vertex": {"keys": [{"name": "vx", "value": "", "models": [], "weight": 1.0, "vertex_key_config": {"project_id": "proj", "region": "us-central1", "auth_credentials": json.dumps({
+                    "type": "external_account", "audience": "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/aws",
+                    "subject_token_type": "urn:ietf:params:aws:token-type:aws4_request", "token_url": MOCK + "/wif/sts",
+                    "credential_source": {"environment_id": "aws1"}})}}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            },
+            "governance": {
+                "users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l190".encode()).hexdigest()}],
+                "virtual_keys": [{"id": "vk-l190", "value": "sk-bf-l190"}],
+            },
+            "agents": [
+                {"name": "mtls", "agent_card_url": agent_url + "/card", "allow_private_network": True, "virtual_key_ids": vk, "runtime_auth": {"type": "none", "tls": mtls}, "discovery_auth": {"type": "none", "tls": mtls}},
+                {"name": "nocert", "agent_card_url": agent_url + "/card", "allow_private_network": True, "virtual_key_ids": vk, "discovery_auth": {"type": "none", "tls": {"ca_cert_pem": ca}}},
+                {"name": "rogue", "agent_card_url": agent_url + "/card", "allow_private_network": True, "virtual_key_ids": vk, "discovery_auth": {"type": "none", "tls": {"ca_cert_pem": ca, "client_cert_pem": rogue_cert, "client_key_pem": rogue_key}}},
+                {"name": "gmtls", "agent_card_url": web + "/mtls-card", "allow_private_network": True, "virtual_key_ids": vk, "runtime_auth": {"type": "none", "tls": mtls}},
+                {"name": "gnocert", "agent_card_url": web + "/mtls-card", "allow_private_network": True, "virtual_key_ids": vk, "runtime_auth": {"type": "none", "tls": {"ca_cert_pem": ca}}},
+                {"name": "gplain", "agent_card_url": web + "/card", "allow_private_network": True, "virtual_key_ids": vk},
+                {"name": "ggz", "agent_card_url": gzweb + "/card", "allow_private_network": True, "virtual_key_ids": vk},
+            ],
+        }
+        json.dump(cfg, open(os.path.join(BUILD, "e2e.l190.json"), "w"))
+        shutil.rmtree(os.path.join(BUILD, "e2e-l190-logs"), ignore_errors=True)
+        ADM = {"authorization": "Bearer sk-admin-l190"}
+        K = {"authorization": "Bearer sk-bf-l190"}
+        # ---- the first gateway: the workload's identity is an EKS IRSA web identity ----
+        gw = start({"AWS_WEB_IDENTITY_TOKEN_FILE": token_file, "AWS_ROLE_ARN": "arn:aws:iam::123456789012:role/l190-irsa", "AWS_ROLE_SESSION_NAME": "l190-session",
+                    "AWS_ENDPOINT_URL_STS": aws + "/sts", "AWS_REGION": "us-east-1", "AWS_EC2_METADATA_DISABLED": "true"}, "irsa")
+        def refresh(name):
+            s, _, b = call("POST", f"/api/agents/{name}/refresh-card", None, ADM, base=GW_L190, auth=False)
+            return s, b
+        def rpc(name, method, params):
+            s, _, b = call("POST", f"/agents/a2a/{name}/json-rpc", {"jsonrpc": "2.0", "id": "r1", "method": method, "params": params}, K, base=GW_L190, auth=False)
+            return s, jb(b) if b.strip().startswith("{") else {"raw": b}
+        msg = lambda text: {"message": {"messageId": "m-" + text, "role": "ROLE_USER", "parts": [{"text": text}]}}
+
+        # ---- client certificates: a JSON-RPC agent behind mutual TLS ----
+        s, b = refresh("mtls")
+        check("mutual TLS: the card is fetched with the agent's client certificate (discovery_auth.tls)", s == 200, (s, b[:300]))
+        s, r = rpc("mtls", "SendMessage", msg("hi-mtls"))
+        calls = [x for x in got if x["path"] == "agent:/rpc"]
+        check("mutual TLS: a JSON-RPC call reaches the agent with the client certificate the agent's CA signed (runtime_auth.tls)",
+              s == 200 and "mtls echo hi-mtls" in json.dumps(r) and calls and calls[-1]["cn"] == "l190-client", (s, r, calls[-1:]))
+        s, b = refresh("nocert")
+        check("mutual TLS: without a client certificate the agent refuses the card fetch", s != 200, (s, b[:200]))
+        s, b = refresh("rogue")
+        check("mutual TLS: a client certificate the agent's CA did not sign is refused too", s != 200, (s, b[:200]))
+        # ---- client certificates over gRPC (TLS with ALPN h2) ----
+        for name in ("gmtls", "gnocert", "gplain", "ggz"):
+            refresh(name)
+        s, r = rpc("gmtls", "SendMessage", msg("hi-gmtls"))
+        check("mutual TLS: a gRPC agent that requires a client certificate is called with it", s == 200 and "echo: hi-gmtls" in json.dumps(r), (s, r))
+        s, r = rpc("gnocert", "SendMessage", msg("hi-gnocert"))
+        check("mutual TLS: the same gRPC agent without the client certificate is not reached", "echo: hi-gnocert" not in json.dumps(r) and ("error" in r or s != 200), (s, r))
+
+        # ---- gRPC message compression ----
+        s, r = rpc("ggz", "SendMessage", msg("hi-gzip"))
+        gseen = jb(call("GET", "/seen", base=gzweb)[2]) or []
+        check("gzip: the gateway offers grpc-accept-encoding gzip and reads the agent's gzip-compressed answer",
+              s == 200 and "echo: hi-gzip" in json.dumps(r) and gseen and "gzip" in gseen[-1].get("accept", ""), (s, r, gseen[-1:]))
+        ch = grpc.insecure_channel(f"127.0.0.1:{L190_GRPC_PORT}", options=[("grpc.default_authority", "gplain." + L190_DOMAIN)])
+        md = [("authorization", "Bearer sk-bf-l190")]
+        u = ch.unary_unary("/lf.a2a.v1.A2AService/SendMessage", request_serializer=None, response_deserializer=None)
+        try:
+            resp = u(fld(2, pb_message("m-gz-in", "", "", 1, "hi-gzip-in")), metadata=md, timeout=30, compression=grpc.Compression.Gzip)
+            check("gzip: a gzip-compressed call into the gateway's gRPC binding is read and answered", b"echo: hi-gzip-in" in resp, resp[:200])
+        except grpc.RpcError as e:
+            check("gzip: a gzip-compressed call into the gateway's gRPC binding is read and answered", False, (e.code(), e.details()))
+        try:
+            u(fld(2, pb_message("m-df-in", "", "", 1, "hi-deflate")), metadata=md, timeout=30, compression=grpc.Compression.Deflate)
+            check("gzip: a call in another encoding (deflate) is UNIMPLEMENTED, as grpc-go answers it", False, "answered")
+        except grpc.RpcError as e:
+            check("gzip: a call in another encoding (deflate) is UNIMPLEMENTED, as grpc-go answers it", e.code() == grpc.StatusCode.UNIMPLEMENTED and 'grpc-encoding "deflate"' in (e.details() or ""), (e.code(), e.details()))
+        ch.close()
+
+        # ---- the unary disconnect signal ----
+        def hang_up(rid, after):
+            body = json.dumps({"model": "slowp/m", "messages": [{"role": "user", "content": rid}], "fallbacks": ["fbp/m"]}).encode()
+            sk = socket.create_connection(("127.0.0.1", 18336), timeout=5)
+            sk.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\ncontent-type: application/json\r\nauthorization: Bearer sk-bf-l190\r\nx-request-id: " + rid.encode() + b"\r\ncontent-length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+            time.sleep(after)
+            sk.close()
+            return time.time()
+        closed = hang_up("l190-gone-1", 0.6)
+        ev = []
+        for _ in range(60):
+            ev = [x for x in got if x.get("rid") == "l190-gone-1"]
+            if any(x["event"] != "start" for x in ev):
+                break
+            time.sleep(0.05)
+        aborted = [x for x in ev if x["event"] == "aborted"]
+        check("disconnect: a caller that hangs up before the answer stops the upstream call (the gateway closes it)", aborted and aborted[0]["after"] < 2.5, ev)
+        time.sleep(2.5)
+        starts = [x for x in got if x.get("rid") == "l190-gone-1" and x["event"] == "start"]
+        fbs = [x for x in got if x["path"] == "/fb/v1/chat/completions" and "l190-gone-1" in x.get("body", "")]
+        check("disconnect: no retry (max_retries 2) and no fallback follows", len(starts) == 1 and not fbs, (starts, fbs))
+        rows = []
+        for _ in range(50):
+            rows = [e for e in jb(call("GET", "/api/logs?limit=50", None, ADM, base=GW_L190, auth=False)[2]).get("entries", []) if e.get("request_id") == "l190-gone-1"]
+            if rows:
+                break
+            time.sleep(0.1)
+        check("disconnect: the request is logged as cancelled (499, request cancelled by caller)", rows and rows[0].get("status") == 499 and "cancelled" in json.dumps(rows[0]), rows[:1])
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "fbp/m", "messages": [{"role": "user", "content": "still fine"}]}, K, base=GW_L190, auth=False)
+        check("disconnect: a caller that waits still gets its answer", s == 200 and "fallback answer" in b, (s, b[:200]))
+        # an A2A caller on the JSON-RPC binding that hangs up stops the agent's (gRPC) call
+        body = json.dumps({"jsonrpc": "2.0", "id": "h1", "method": "SendMessage", "params": msg("hang")}).encode()
+        sk = socket.create_connection(("127.0.0.1", 18336), timeout=5)
+        sk.sendall(b"POST /agents/a2a/gplain/json-rpc HTTP/1.1\r\nHost: x\r\ncontent-type: application/json\r\nauthorization: Bearer sk-bf-l190\r\ncontent-length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+        time.sleep(0.6)
+        sk.close()
+        hung = []
+        for _ in range(60):
+            hung = [x for x in jb(call("GET", "/seen", base=web)[2]) or [] if x.get("text", "").startswith("hang-")]
+            if hung:
+                break
+            time.sleep(0.05)
+        check("disconnect: an A2A caller that hangs up stops the call to the agent (the agent sees it cancelled)", hung and hung[0]["text"] == "hang-cancelled", hung)
+
+        # ---- the AWS chain: EKS IRSA (web identity) ----
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0", "messages": [{"role": "user", "content": "hi"}]}, K, base=GW_L190, auth=False)
+        sts = [x for x in got if x["path"] == "/sts/"]
+        bed = [x for x in seen() if x["path"].startswith("/model/") and "converse" in x["path"]]
+        check("aws chain (IRSA): the web identity token is exchanged at STS AssumeRoleWithWebIdentity with the role and session name",
+              sts and sts[-1]["form"].get("RoleArn") == "arn:aws:iam::123456789012:role/l190-irsa" and sts[-1]["form"].get("RoleSessionName") == "l190-session", sts[-1:])
+        check("aws chain (IRSA): a Bedrock key without credentials signs with the web identity's", s == 200 and bed and f"Credential={L190_WEBID_AK}/" in bed[-1]["auth"] and "/us-west-2/bedrock/aws4_request" in bed[-1]["auth"], (s, b[:200], bed[-1:]))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "vertex/gemini-2.5-flash", "messages": [{"role": "user", "content": "hi"}]}, K, base=GW_L190, auth=False)
+        wif = [x for x in seen() if x["path"] == "/wif/sts"]
+        sub = urllib.parse.unquote(urllib.parse.unquote(urllib.parse.parse_qs(wif[-1]["body"]).get("subject_token", [""])[0])) if wif else ""
+        check("aws chain (IRSA): Vertex's AWS federation signs GetCallerIdentity with the web identity's credentials", s == 200 and f"Credential={L190_WEBID_AK}/" in sub and "/us-east-1/sts/aws4_request" in sub, (s, b[:200], sub[:300]))
+        stop(gw)
+        gw = None
+
+        # ---- EKS Pod Identity (container credentials) ----
+        gw = start({"AWS_CONTAINER_CREDENTIALS_FULL_URI": aws + "/creds/pod", "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE": pod_token_file, "AWS_REGION": "us-east-1", "AWS_EC2_METADATA_DISABLED": "true"}, "pod")
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0", "messages": [{"role": "user", "content": "hi"}]}, K, base=GW_L190, auth=False)
+        pod = [x for x in got if x["path"] == "/creds/pod"]
+        bed = [x for x in seen() if x["path"].startswith("/model/") and "converse" in x["path"]]
+        check("aws chain (Pod Identity): the container credentials are read with the token file's Authorization", pod and pod[-1]["auth"] == "pod-l190-token", pod[-1:])
+        check("aws chain (Pod Identity): Bedrock signs with the container's credentials", s == 200 and bed and f"Credential={L190_POD_AK}/" in bed[-1]["auth"], (s, b[:200], bed[-1:]))
+        stop(gw)
+        gw = None
+
+        # ---- the instance profile (IMDSv2) and the metadata region ----
+        gw = start({"AWS_EC2_METADATA_SERVICE_ENDPOINT": aws}, "imds")
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "vertex/gemini-2.5-flash", "messages": [{"role": "user", "content": "hi"}]}, K, base=GW_L190, auth=False)
+        wif = [x for x in seen() if x["path"] == "/wif/sts"]
+        sub = urllib.parse.unquote(urllib.parse.unquote(urllib.parse.parse_qs(wif[-1]["body"]).get("subject_token", [""])[0])) if wif else ""
+        tok = [x for x in got if x["path"] == "/latest/api/token"]
+        role = [x for x in got if x["path"] == "/latest/meta-data/iam/security-credentials/l190-instance-role"]
+        check("aws chain (IMDSv2): a session token is asked for, and the role's credentials read with it", tok and tok[-1]["ttl"] == "21600" and role and role[-1]["token"] == "imds-l190-token", (tok[-1:], role[-1:]))
+        check("aws chain (IMDSv2): with no region set, Vertex's federation signs in the instance's region with its credentials",
+              s == 200 and f"Credential={L190_IMDS_AK}/" in sub and "/eu-west-3/sts/aws4_request" in sub, (s, b[:200], sub[:300]))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0", "messages": [{"role": "user", "content": "hi"}]}, K, base=GW_L190, auth=False)
+        bed = [x for x in seen() if x["path"].startswith("/model/") and "converse" in x["path"]]
+        check("aws chain (IMDSv2): Bedrock signs with the instance profile's credentials", s == 200 and bed and f"Credential={L190_IMDS_AK}/" in bed[-1]["auth"], (s, b[:200], bed[-1:]))
+    finally:
+        stop(gw)
+        gagent.terminate()
+        gz.terminate()
+        for srv in servers:
+            srv.shutdown()
+
+
+GW_L192 = "http://127.0.0.1:18340"  # L192: realtime turn hooks over the WebSocket, and per-fallback pre hooks off chat
+
+def l192_e2e(env):
+    """L192: the plugins' LLM hooks on each realtime turn (Bifrost's RunRealtimeTurnPreHooks): a WebAssembly plugin's
+    pre hook runs as a WebSocket realtime turn starts and its output is the turn row's plugin logs; a short-circuit error
+    closes the session with the plugin's error. The pre hooks run again on each fallback of a text completion, as on
+    chat. Its own gateway (18340); the plugin is tests/wasm/plugin.wasm."""
+    import hashlib, shutil
+    shutil.rmtree(os.path.join(BUILD, "e2e-l192-logs"), ignore_errors=True)
+    base = GW_L192
+    wasm = os.path.join(ROOT, "tests", "wasm", "plugin.wasm")
+    cfg_path = os.path.join(BUILD, "e2e.l192.json")
+    adm = {"authorization": "Bearer sk-admin-l192"}
+    cfg = {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l192-logs"), "content_logging": True},
+        "providers": {"openai": {"keys": [{"name": "pool", "value": "sk-pool-l192", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {"users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256(b"sk-admin-l192").hexdigest()}]},
+        "plugins": [{"name": "rtp", "enabled": True, "path": wasm, "config": whole_wasm_config({"mode": "print"})}],
+    }
+    json.dump(cfg, open(cfg_path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18340", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l192.log"), "w"))
+
+    def api(method, p, body=None):
+        return call(method, p, body, adm, base=base, auth=False)
+
+    def plugin_prints(row):
+        logs = json.loads(row.get("plugin_logs") or "{}")
+        return [e for e in logs.get("raiju-test-plugin", []) if "hello from the plugin" in e.get("message", "")]
+
+    def row_of(rid):
+        for _ in range(40):
+            s, _, b = api("GET", "/api/logs/" + rid)
+            if s == 200:
+                return json.loads(b)
+            time.sleep(0.1)
+        return {}
+
+    try:
+        wait(base + "/health")
+        # ---- the pre hooks on each fallback of a text completion ----
+        n = len(seen())
+        s, h, b = call("POST", "/v1/completions", {"model": "openai/textfit-mini", "prompt": "hi l192"}, {}, base=base, auth=False)
+        one = plugin_prints(row_of({k.lower(): v for k, v in h.items()}.get("x-request-id", "")))
+        check("a text completion runs the plugin's pre hook once", s == 200 and len(one) == 1, (s, b[:200], one))
+        n = len(seen())
+        s, h, b = call("POST", "/v1/completions", {"model": "openai/gpt-4o-mini", "prompt": "hi l192", "fallbacks": ["openai/textfit-mini"]}, {}, base=base, auth=False)
+        up = [x for x in seen()[n:] if x["path"] == "/v1/completions"]
+        two = plugin_prints(row_of({k.lower(): v for k, v in h.items()}.get("x-request-id", "")))
+        check("a text completion's fallback runs the pre hooks again (Bifrost's per-attempt pre hooks, off chat)",
+              s == 200 and "textfit" in b and [json.loads(x["body"]).get("model") for x in up] == ["gpt-4o-mini", "textfit-mini"] and len(two) == 2, (s, b[:200], [x["body"][:80] for x in up], two))
+
+        # ---- a WebSocket realtime turn through the plugins' hooks ----
+        c = WsClient("/v1/realtime?model=openai/gpt-realtime", {}, port=18340)
+        c.send(json.dumps({"type": "test.rt.start", "id": "sess_l192_rt"}))
+        ws_collect(c, lambda e: e.get("type") == "session.created")
+        c.send(json.dumps({"type": "conversation.item.create", "item": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello l192"}]}}))
+        c.send(json.dumps({"type": "test.rt.turn", "id": "resp_l192", "text": "good morning", "input": 10, "output": 5}))
+        evs = ws_collect(c, lambda e: e.get("type") == "response.done")
+        c.sock.close()
+        rows = session_rows("realtime", "sess_l192_rt", base, adm)
+        turn = next((r for r in rows if r.get("metadata", {}).get("realtime_unit") == "turn"), {})
+        check("a realtime turn runs the plugin's pre and post hooks: its output is the turn row's plugin logs",
+              evs and evs[-1].get("type") == "response.done" and turn.get("status") == 200 and len(plugin_prints(turn)) == 1, (len(evs), [(r.get("metadata", {}).get("realtime_unit"), r.get("plugin_logs")) for r in rows]))
+        # a short-circuit error refuses the turn: the session is closed with the plugin's error
+        s, _, b = api("PUT", "/api/plugins/rtp", {"config": whole_wasm_config({"mode": "fail"})})
+        check("the plugin is switched to refuse", s == 200, (s, b[:200]))
+        c = WsClient("/v1/realtime?model=openai/gpt-realtime", {}, port=18340)
+        c.send(json.dumps({"type": "test.rt.start", "id": "sess_l192_no"}))
+        ws_collect(c, lambda e: e.get("type") == "session.created")
+        c.send(json.dumps({"type": "response.create"}))
+        evs = ws_collect(c, lambda e: e.get("type") == "error")
+        closed = c.recv() is None
+        check("a turn the plugin's pre hook refuses closes the session with the plugin's error",
+              evs and evs[-1].get("type") == "error" and "blocked by the plugin" in evs[-1].get("error", {}).get("message", "") and closed, (evs, closed))
+        rows = session_rows("realtime", "sess_l192_no", base, adm)
+        check("the refused turn is logged with the plugin's status", any(r.get("status") == 418 for r in rows), [(r.get("status"), r.get("error")) for r in rows])
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
 def main():
     unique_ports()
     build()
@@ -16134,6 +16643,13 @@ def main():
         wait("http://127.0.0.1:18112/health")
         _, vc3, _ = vs_chat(18112, "openai/gpt-4o-mini", "sk-bf-b", "what is the capital of france?")
         check("chromem: entries survive a restart from their file", hl(vc3).get("x-bf-cache") == "semantic-hit" and os.path.exists(os.path.join(BUILD, "e2e-chromem", "E2eSemChromem.jsonl")), vc3)
+        # L192: a clear before any request opened the namespace (and without semantic_cache.dimension) still clears it
+        gw_vc.terminate(); gw_vc.wait()
+        gw_vc = vs_gateway("chromem", 18112)
+        wait("http://127.0.0.1:18112/health")
+        s, _, b = call("DELETE", "/api/cache/clear-by-key/vs-e2e", None, {}, base="http://127.0.0.1:18112", auth=False)
+        _, vc4, _ = vs_chat(18112, "openai/gpt-4o-mini", "sk-bf-b", "what is the capital of france?")
+        check("chromem: clear-by-key right after a restart clears a namespace no request has opened, with no dimension set", s == 200 and json.loads(b).get("removed", 0) >= 1 and hl(vc4).get("x-bf-cache") != "semantic-hit", (s, b[:200], vc4))
         s1, _, _ = bchat("openai/custom-model", BK)
         s2, _, b2 = bchat("openai/custom-model", BK)
         check("pricing_overrides price an unknown model, so its budget runs down", s1 == 200 and s2 == 402, (s1, s2, b2))
@@ -16899,6 +17415,8 @@ def main():
         # L176: the plugin pipeline's remainders (Responses lifecycle and cached contents hooked, a body over 4 MiB through the
         # transport hooks, a stream's error event through post_hook, late post hook spans exported): its own gateway (18304)
         l176_e2e(env)
+        # L192: the plugins' hooks on each realtime turn (WebSocket) and per-fallback pre hooks off chat: its own gateway (18340)
+        l192_e2e(env)
         # serving the web UI: the embedded build and RAIJU_UI_DIR: their own gateways
         l113_ui_e2e(env)
         # network_config pool knobs and upstream HTTP/2 (Tov patch 0007): origins from tov-patches/tests/h2_server.py, their own gateway
@@ -16975,6 +17493,9 @@ def main():
         l184_e2e(env)
         # L187: raiju -healthcheck, the image's Docker HEALTHCHECK: its own gateway (18330; 18331 stays closed)
         l187_e2e(env)
+        # L190: client certificates to agents (JSON-RPC and gRPC), gRPC gzip both ways, the unary disconnect signal, and
+        # the AWS credential chain (IRSA, Pod Identity, IMDSv2) against mocks: its own gateway (18336, gRPC on 18337)
+        l190_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()
