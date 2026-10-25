@@ -1,0 +1,173 @@
+// MCP client configs shared across the cluster, as Bifrost's clients live in its shared config store. A saved config
+// whose MCP clients changed (created, edited or deleted over the API, a verification that kept new headers) puts
+// each changed client on the cluster state (clusterstate.tov, namespace mcp.client, last writer wins) and deletes the
+// removed ones (a tombstone, so a deletion reaches every node). Each node applies what the others write to the
+// config as its file holds it now, and saves it; the save is not sent back. This is for nodes with files of their own
+// (cluster.config_sync "file" or "off"): when the file already holds the change (a sibling worker's save, a file the
+// nodes share) nothing is done here, as the config generation of that save rereads it (ops.takeConfigGen); with
+// config_sync "pull" the whole config travels and the clients are not shared on their own.
+//
+// The entry is the client's JSON as the config file holds it in memory (env.NAME references unresolved, so each node
+// resolves them with its own environment), sealed whole with the encryption key when there is one (store.tov
+// sealStored): every node must share that key to open it. Without a key it travels as written, signed by
+// cluster.secret but not encrypted, as the retained admin credentials do.
+import { Config, loadRawConfig } from "./config"
+import { McpClientConfig, McpConfig } from "./mcp"
+import { ConfigStore, ConfigCipher, openConfig } from "./store"
+
+export const CLIENT_NS = "mcp.client"
+
+// The JSON of each MCP client of a config, by name.
+export function clientTexts(cfg: Config): Map<string, string> {
+  const out: Map<string, string> = new Map()
+  for (const c of cfg.mcp?.client_configs ?? []) out.set(c.name, JSON.stringify(c))
+  return out
+}
+
+export type ClientPut = { name: string, json: string }
+
+export class McpShare {
+  // each client as last seen in a saved config, or as applied from another node
+  private seen: Map<string, string>
+
+  constructor(cfg: Config) {
+    this.seen = clientTexts(cfg)
+  }
+
+  // What a saved config changed in its MCP clients: the clients to put (new or changed) and the names to delete.
+  // The snapshot moves to this config.
+  changes(cfg: Config): { put: ClientPut[], del: string[] } {
+    const now = clientTexts(cfg)
+    const put: ClientPut[] = []
+    const del: string[] = []
+    for (const name of now.keys()) {
+      const json = now.get(name)!
+      if (this.seen.get(name) !== json) put.push({ name: name, json: json })
+    }
+    for (const name of this.seen.keys()) {
+      if (!now.has(name)) del.push(name)
+    }
+    this.seen = now
+    return { put: put, del: del }
+  }
+
+  // The config with a client another node wrote applied to it: replaced or added (json), or removed (undefined).
+  // undefined when the config holds it already. The snapshot takes the change, so the save that follows is not
+  // put back on the cluster state.
+  applied(base: Config, name: string, json: string | undefined): Config | undefined throws SyntaxError {
+    const list = base.mcp?.client_configs ?? []
+    const at = list.findIndex((c) => c.name === name)
+    let next: McpClientConfig[] = []
+    if (json === undefined) {
+      if (at < 0) {
+        this.seen.delete(name)
+        return undefined
+      }
+      for (const c of list) {
+        if (c.name !== name) next.push(c)
+      }
+      this.seen.delete(name)
+    } else {
+      const incoming = try JSON.parse(json) as McpClientConfig
+      if (incoming.name !== name) throw new SyntaxError(`the entry for MCP client ${name} names ${incoming.name}`)
+      const text = JSON.stringify(incoming)
+      this.seen.set(name, text)
+      if (at >= 0 && JSON.stringify(list[at]!) === text) return undefined
+      for (const c of list) next.push(c)
+      if (at >= 0) next[at] = incoming
+      else next.push(incoming)
+    }
+    let c = base
+    let m: McpConfig = c.mcp ?? {}
+    m.client_configs = next
+    c.mcp = m
+    return c
+  }
+}
+
+// The config as the file holds it now, its secrets opened; undefined when it cannot be read or opened (the caller
+// then works on its copy in memory). Other workers and nodes save there.
+export function diskConfig(path: string, cipher: ConfigCipher | undefined): Config | undefined {
+  try {
+    const raw = loadRawConfig(path)
+    const opened = openConfig(raw, cipher)
+    if (opened.errors.length > 0) return undefined
+    return opened.cfg
+  } catch (e) {
+    return undefined
+  }
+}
+
+// Saves a config that took another node's change and notifies the store's listener (the engine reloads). An error
+// text, or "".
+export function saveShared(store: ConfigStore, next: Config): string {
+  const prev = store.cfg
+  store.cfg = next
+  try {
+    store.save()
+  } catch (e) {
+    store.cfg = prev
+    return e.message
+  }
+  store.version += 1
+  const f = store.onChange
+  if (f !== undefined) f(store.cfg)
+  return ""
+}
+
+// Whether the whole config travels between the nodes (cluster.config_sync "pull", store.tov config generations): the
+// clients then go with it and are not shared on their own.
+export function pullsConfig(cfg: Config): bool {
+  return cfg.cluster?.config_sync === "pull"
+}
+
+function client(name: string, url: string): McpClientConfig {
+  return { name: name, connection_type: "http", connection_string: url }
+}
+
+test("a saved config puts its new and changed clients and deletes the removed ones", () => {
+  const a: Config = { mcp: { client_configs: [client("fs", "http://a/mcp"), client("db", "http://b/mcp")] } }
+  const share = new McpShare(a)
+  // nothing changed: nothing to send
+  const none = share.changes(a)
+  expect(none.put.length + none.del.length).toBe(0)
+  const b: Config = { mcp: { client_configs: [client("fs", "http://a2/mcp"), client("web", "http://w/mcp")] } }
+  const ch = share.changes(b)
+  expect(ch.put.map((p) => p.name)).toEqual(["fs", "web"])
+  expect(ch.put[0]!.json.includes("http://a2/mcp")).toBe(true)
+  expect(ch.del).toEqual(["db"])
+  expect(share.changes(b).put.length).toBe(0)
+})
+
+test("another node's client is applied once, and its save is not sent back", () => {
+  const base: Config = { mcp: { client_configs: [client("fs", "http://a/mcp")] } }
+  const share = new McpShare(base)
+  const web = JSON.stringify(client("web", "http://w/mcp"))
+  const added = try share.applied(base, "web", web)
+  expect(added !== undefined).toBe(true)
+  if (added === undefined) return
+  expect(added.mcp!.client_configs!.map((c) => c.name)).toEqual(["fs", "web"])
+  // the save of the applied config sends nothing
+  const after = share.changes(added)
+  expect(after.put.length + after.del.length).toBe(0)
+  // the same entry again changes nothing
+  expect(try share.applied(added, "web", web) === undefined).toBe(true)
+  // a changed client replaces the held one in place
+  const changed = try share.applied(added, "fs", JSON.stringify(client("fs", "http://a3/mcp")))
+  expect(changed !== undefined && changed.mcp!.client_configs![0]!.connection_string === "http://a3/mcp").toBe(true)
+  if (changed === undefined) return
+  // a deletion removes it; a deletion of a client not held changes nothing
+  const removed = try share.applied(changed, "web", undefined)
+  expect(removed !== undefined && removed.mcp!.client_configs!.length === 1).toBe(true)
+  if (removed === undefined) return
+  expect(share.changes(removed).del.length).toBe(0)
+  expect(try share.applied(removed, "web", undefined) === undefined).toBe(true)
+  // an entry that names another client is refused
+  let threw = false
+  try {
+    share.applied(removed, "x", web)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+})

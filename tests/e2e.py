@@ -2518,6 +2518,25 @@ def mcp_peruser_e2e(env):
         check("a revoked credential is no longer used", s == 401 and "Authentication required for tenant" in b and "kind=headers" in b, (s, b[:200]))
         s, _, b = tool("sk-bf-tenant-a")
         check("revoking one key leaves the others", s == 200, (s, b[:200]))
+        # L177: an x-bf-mcp-session-id is an identity of its own (session mode): its values, not the key's, go along
+        def stool(sid):
+            h = {"authorization": "Bearer sk-bf-tenant-a", "x-bf-mcp-session-id": sid}
+            return call("POST", "/v1/mcp/tool/execute", {"id": "c1", "type": "function", "function": {"name": "tenant-get_weather", "arguments": "{\"city\":\"Oslo\"}"}}, h, base=MCP_PU, auth=False)
+        s, _, b = stool("sess-l177")
+        check("a session with no values of its own is refused with a submission link, although its key has values", s == 401 and "kind=headers" in b and "flow=" in b, (s, b[:300]))
+        sflow = b.split("flow=")[1].split("&")[0] if "flow=" in b else ""
+        s, _, b = call("GET", "/api/mcp/per-user-headers/flows/" + sflow, base=MCP_PU, auth=False)
+        sd = json.loads(b) if s == 200 else {}
+        check("the session's flow is in session mode and names the session", sd.get("flow_mode") == "session" and sd.get("session_id") == "sess-l177" and sd.get("has_active_credential") is False, (s, b[:300]))
+        s, _, b = call("PUT", "/api/mcp/per-user-headers/flows/" + sflow, {"headers": {"X-Tenant": "tenant-b-key-example"}}, base=MCP_PU, auth=False)
+        check("the session's submission is stored", s == 200 and json.loads(b)["status"] == "success", (s, b[:200]))
+        s, _, b = stool("sess-l177")
+        check("the session's own values go with its tool call", s == 200 and sent_tenants()[-1:] == ["tenant-b-key-example"], (s, b[:200], sent_tenants()[-1:]))
+        s, _, b = tool("sk-bf-tenant-a")
+        check("the key without the session header keeps its own values", s == 200 and sent_tenants()[-1:] == ["tenant-a-key-example"], (s, b[:200], sent_tenants()[-1:]))
+        s, _, b = call("GET", "/api/mcp/sessions?kind=header", base=MCP_PU, auth=False)
+        rows = json.loads(b).get("sessions", []) if s == 200 else []
+        check("the sessions list shows the session's header credential in session mode", any(r.get("auth_mode") == "session" and r.get("session_id") == "sess-l177" for r in rows), (s, b[:400]))
         s, _, b = call("DELETE", "/api/mcp/per-user-headers/credential/" + cred_a, base=MCP_PU, auth=False)
         check("the remaining credential is revoked too", s == 200, (s, b[:200]))
     finally:
@@ -5313,13 +5332,18 @@ def l133_e2e(env):
         _, _, b = req("POST", "/mcp", {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "executeToolCode", "arguments": {"code": 'result = weather.get_weather(city = "Oslo")'}}}, {"mcp-session-id": sid})
         check("code mode on POST /mcp: executeToolCode runs its program", "Sunny in Oslo" in b and "Return value" in b, b[:400])
 
-        s, _, b = req("POST", "/v1/responses", {"model": "openai/codeagent-1", "input": "weather in Oslo?"})
-        check("code mode on /v1/responses: the program answers the request", s == 200 and "sunny in Oslo" in b, (s, b[:400]))
-        offered = [x for x in seen() if x["path"] == "/v1/chat/completions" and "codeagent-1" in x["body"] and "executeToolCode" in x["body"]]
-        check("code mode on /v1/responses: the four meta-tools go upstream with the request", len(offered) > 0 and "listToolFiles" in offered[-1]["body"], str(len(offered)))
+        n_seen = len(seen())
+        s, h, b = req("POST", "/v1/responses", {"model": "openai/codeagent-1", "input": "weather in Oslo?"})
+        hl = {k.lower(): v for k, v in h.items()}
+        check("code mode on /v1/responses: the program answers the request (agent mode on the Responses API)", s == 200 and "sunny in Oslo" in b and hl.get("x-bf-agent-steps") == "2" and hl.get("x-bf-agent-tool-calls") == "1", (s, b[:400], hl.get("x-bf-agent-steps")))
+        offered = [x for x in seen()[n_seen:] if x["path"] == "/v1/responses" and "codeagent-1" in x["body"]]
+        first = offered[0]["body"] if offered else ""
+        check("code mode on /v1/responses: the meta-tools go upstream beside the plain MCP tools, on the Responses route", len(offered) == 2 and all(n in first for n in ["listToolFiles", "executeToolCode", "jira-get_weather"]) and "weather-get_weather" not in first, str(len(offered)))
+        check("code mode on /v1/responses: the second round carries the call and its output", len(offered) == 2 and '"function_call_output"' in offered[1]["body"] and "Sunny in Oslo" in offered[1]["body"], offered[1]["body"][:400] if len(offered) == 2 else "")
+        check("code mode on /v1/responses: the first round's reasoning item is carried into the final output", '"rs_a"' in b and b.index('"rs_a"') < b.index("sunny in Oslo"), b[:400])
         s, h, b = req("POST", "/v1/responses", {"model": "openai/codeagent-1", "input": "weather in Oslo?", "stream": True})
         hl = {k.lower(): v for k, v in h.items()}
-        check("code mode on /v1/responses: a streamed request is answered as a stream", s == 200 and "sunny in Oslo" in b and "text/event-stream" in hl.get("content-type", ""), (s, b[:300]))
+        check("code mode on /v1/responses: a stream is served live with the call for the caller, as Bifrost runs no agent on streams", s == 200 and "text/event-stream" in hl.get("content-type", "") and "executeToolCode" in b and "sunny in Oslo" not in b, (s, b[:300]))
     finally:
         gw.terminate()
         gw.wait()
@@ -5685,6 +5709,19 @@ def l147_cluster_e2e(env):
         check("cluster: both nodes serve after the 401 renewal", all(c == 200 for c in codes), codes)
         ok = all(l147_jira(u).get("connected") is True and (l147_jira(u).get("credential") or {}).get("status") == "active" for u in [L147_NODE_A, L147_NODE_B])
         check("cluster: both nodes stay connected with an active credential", ok, (l147_jira(L147_NODE_A), l147_jira(L147_NODE_B)))
+        # L177: the MCP client configs are shared across the cluster: created, edited and deleted on one node, on both
+        def client_on(u, name):
+            s, _, b = call("GET", "/api/mcp/clients", None, base=u, auth=False)
+            return l133_find_named(json.loads(b), name) if s == 200 else None
+        s, _, b = call("POST", "/api/mcp/client", {"name": "shared", "connection_type": "http", "connection_string": MOCK + "/mcp", "tool_sync_interval": "1h"}, None, base=L147_NODE_A, auth=False)
+        check("cluster: a client created on node A", s in (200, 201), (s, b[:300]))
+        check("cluster: node B gets the client node A created", l147_until(lambda: client_on(L147_NODE_B, "shared") is not None, 15), client_on(L147_NODE_B, "shared"))
+        s, _, b = call("PUT", "/api/mcp/client/shared", {"name": "shared", "connection_type": "http", "connection_string": MOCK + "/mcp", "tool_sync_interval": "2h"}, None, base=L147_NODE_B, auth=False)
+        check("cluster: the client edited on node B reaches node A", s == 200 and l147_until(lambda: "2h" in json.dumps(client_on(L147_NODE_A, "shared") or {}), 15), (s, b[:200], client_on(L147_NODE_A, "shared")))
+        s, _, b = call("DELETE", "/api/mcp/client/shared", None, None, base=L147_NODE_A, auth=False)
+        check("cluster: a client deleted on node A is deleted on node B too", s == 200 and l147_until(lambda: client_on(L147_NODE_B, "shared") is None, 15), (s, b[:200], client_on(L147_NODE_B, "shared")))
+        saved_b = json.load(open(pb))
+        check("cluster: node B's config file follows (no shared client, its own cluster section kept)", all(c["name"] != "shared" for c in saved_b["mcp"]["client_configs"]) and saved_b.get("cluster", {}).get("node_id") == "l147-b", [c["name"] for c in saved_b["mcp"]["client_configs"]])
     finally:
         for p in [ga, gb]:
             p.terminate()
@@ -11759,6 +11796,91 @@ def l166_e2e(env):
         gw.wait()
 
 
+GW_L177 = "http://127.0.0.1:18306"  # L177: MCP agent mode on Responses (plain tools, server patterns, logs), OpenAPI 3.2 querystring and form styles
+
+L177_SPEC = json.dumps({"openapi": "3.2.0", "info": {"title": "QS", "version": "1"}, "paths": {
+    "/search": {"get": {"operationId": "search", "parameters": [{"name": "filter", "in": "querystring", "required": True, "content": {"application/x-www-form-urlencoded": {"schema": {"type": "object", "required": ["q"], "properties": {"q": {"type": "string"}, "page": {"type": "integer"}}}}}}]}},
+    "/raw": {"get": {"operationId": "rawq", "parameters": [{"name": "raw", "in": "querystring", "content": {"text/plain": {"schema": {"type": "string"}}}}]}},
+    "/form": {"post": {"operationId": "form", "requestBody": {"required": True, "content": {"application/x-www-form-urlencoded": {
+        "schema": {"type": "object", "properties": {"filter": {"type": "object"}, "tags": {"type": "array", "items": {"type": "string"}}}},
+        "encoding": {"filter": {"style": "deepObject"}, "tags": {"style": "pipeDelimited"}}}}}}},
+}})
+
+def l177_e2e(env):
+    """L177: MCP on the Responses API. A plain MCP client whose tools_to_auto_execute is ["*"] (a server pattern the agent
+    now matches) is run by agent mode on /v1/responses: the function call runs, its output goes back as a
+    function_call_output, each round is served (and logged) by the Responses route, and x-bf-mcp-agent: off returns the
+    call. An OpenAPI 3.2 client: a querystring parameter flattened into query arguments, a raw query string, and a form
+    body with deepObject and pipe-delimited fields. Its own gateway on 18306."""
+    import shutil
+    logs = os.path.join(BUILD, "e2e-l177-logs")
+    shutil.rmtree(logs, ignore_errors=True)
+    cfg = {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False},
+        "logs_store": {"enabled": True, "dir": logs},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "l177", "value": "sk-l177", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "mcp": {"tool_sync_interval": "1h", "client_configs": [
+            {"name": "plain", "connection_type": "http", "connection_string": MOCK + "/mcp", "tools_to_auto_execute": ["*"]},
+            {"name": "qs", "connection_type": "openapi", "openapi_config": {"spec": L177_SPEC, "base_url": MOCK + "/mcp-i/_api"}},
+        ]},
+        "governance": {"virtual_keys": [{"id": "vk-l177", "value": "sk-bf-l177", "mcp_configs": [{"mcp_client_name": "plain", "tools_to_execute": ["*"]}, {"mcp_client_name": "qs", "tools_to_execute": ["*"]}]}]},
+    }
+    path = os.path.join(BUILD, "e2e.l177.json")
+    json.dump(cfg, open(path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18306", "-host", "127.0.0.1", "-config", path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l177.log"), "w"))
+    KEY = {"x-bf-vk": "sk-bf-l177"}
+    def gwc(method, p, body=None, headers=None):
+        return call(method, p, body, {**KEY, **(headers or {})}, base=GW_L177, auth=False)
+    def tool(name, args):
+        s, _, b = gwc("POST", "/v1/mcp/tool/execute", {"id": "c1", "type": "function", "function": {"name": name, "arguments": json.dumps(args)}})
+        return s, (json.loads(b).get("content", "") if s == 200 else b)
+    try:
+        wait(GW_L177 + "/health")
+        b = ""
+        for _ in range(120):
+            s, h, _ = gwc("POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "e2e-l177", "version": "1"}}})
+            s, _, b = gwc("POST", "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, {"mcp-session-id": hdr(h, "mcp-session-id") or ""})
+            if all(n in b for n in ["plain-get_weather", "qs-search", "qs-rawq", "qs-form"]):
+                break
+            time.sleep(0.25)
+        check("L177: the plain and OpenAPI clients list their tools", all(n in b for n in ["plain-get_weather", "qs-search", "qs-rawq", "qs-form"]), b[:300])
+
+        # ---- agent mode on /v1/responses with a plain MCP tool ----
+        n0 = len(seen())
+        s, h, b = gwc("POST", "/v1/responses", {"model": "openai/agent-plain", "input": "weather in Oslo?"})
+        hl = {k.lower(): v for k, v in h.items()}
+        check("L177: a plain MCP tool is auto-executed on /v1/responses (tools_to_auto_execute ['*'])", s == 200 and "It is sunny in Oslo" in b and hl.get("x-bf-agent-steps") == "2" and hl.get("x-bf-agent-tool-calls") == "1", (s, b[:300], hl.get("x-bf-agent-steps")))
+        ups = [x for x in seen()[n0:] if x["path"] == "/v1/responses" and "agent-plain" in x["body"]]
+        check("L177: both rounds go upstream on the Responses route, the second with the tool's output", len(ups) == 2 and '"plain-get_weather"' in ups[0]["body"] and '"function_call_output"' in ups[1]["body"] and "Sunny in Oslo" in ups[1]["body"], [u["body"][:200] for u in ups])
+        s, _, b = gwc("POST", "/v1/responses", {"model": "openai/agent-plain", "input": "weather in Oslo?"}, {"x-bf-mcp-agent": "off"})
+        check("L177: x-bf-mcp-agent: off returns the function call to the caller", s == 200 and "plain-get_weather" in b and "sunny" not in b, (s, b[:300]))
+        rows = []
+        for _ in range(40):
+            s, _, lb = call("GET", "/api/logs?limit=50", None, None, base=GW_L177, auth=False)
+            rows = [r for r in (json.loads(lb).get("logs", []) if s == 200 else []) if "agent-plain" in json.dumps(r.get("model", ""))]
+            if len(rows) >= 3:
+                break
+            time.sleep(0.25)
+        check("L177: each round of the agent is a request log entry of the Responses route", len(rows) >= 3, len(rows))
+
+        # ---- OpenAPI 3.2: querystring parameters and form encoding styles ----
+        s, c = tool("qs-search", {"q": "a b", "page": 2})
+        got = json.loads(c) if s == 200 and c.startswith("{") else {}
+        check("L177: a querystring object is sent as query arguments", got.get("path") == "/mcp-i/_api/search" and got.get("query") == "?page=2&q=a+b", (s, c[:300]))
+        s, c = tool("qs-search", {"page": 2})
+        check("L177: a required querystring field must be sent", 'missing required query parameter "q"' in c, (s, c[:300]))
+        s, c = tool("qs-rawq", {"raw": "a=1&b=x%20y"})
+        got = json.loads(c) if s == 200 and c.startswith("{") else {}
+        check("L177: a raw query string is sent as written", got.get("path") == "/mcp-i/_api/raw" and got.get("query") == "?a=1&b=x%20y", (s, c[:300]))
+        s, c = tool("qs-form", {"filter": {"b": 1, "a": "x"}, "tags": ["a", "b"]})
+        got = json.loads(c) if s == 200 and c.startswith("{") else {}
+        check("L177: a form body sends a deepObject field as field[key] and a pipe-delimited array joined", got.get("method") == "POST" and got.get("body") == "filter%5Ba%5D=x&filter%5Bb%5D=1&tags=a%7Cb", (s, c[:300]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
 GW_L165 = "http://127.0.0.1:18284"  # built-in role ids, user emails, quota model_configs, role attachments, complexity status, rotate revoking MCP grants
 
 def l165_e2e(env):
@@ -15281,6 +15403,8 @@ def main():
         l134b_e2e(env)
         # L166: MCP management (SSE heartbeats, OpenAPI YAML/$ref/security and spec_url, the library, ping, tool cost, Responses, project MCP access): its own gateway
         l166_e2e(env)
+        # L177: MCP agent mode on Responses, OpenAPI 3.2 querystring and form styles: its own gateway
+        l177_e2e(env)
         # L138: A2A push state shared by the workers of a node, exactly-once relay across workers: their own gateway
         l138_e2e(env)
         # L148: A2A over gRPC: the lf.a2a.v1 listener, the agent named by the authority, the key from the metadata, the eleven methods (go client): their own gateway

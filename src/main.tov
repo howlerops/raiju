@@ -15,6 +15,7 @@ import { saveUserToken, headersAuthMessage, saveExchangeAdmin, setAdminPublished
 import { readStoredAdmin, sealAdminRow, openAdminRow, sealStored, openStored } from "./store"
 import { setEkSeal } from "./rtsession"
 import { clusterState } from "./clusterstate"
+import { McpShare, CLIENT_NS, diskConfig, saveShared, pullsConfig } from "./mcpshare"
 import { FileLease, FILE_LEASE_MS } from "./filelease"
 import { start, bodyLimits, NO_BODY_LIMIT } from "./server"
 import { serverLimits, stopSettings, beginStop } from "./lifecycle"
@@ -107,7 +108,23 @@ async function applyChange(engine: Engine, ops: Ops, store: ConfigStore, c: Conf
   engine.mcp?.startToolSync()
   // a new or renewed token_exchange admin credential sets the next renewal
   engine.scheduleAdminRenewal()
+  // a token_exchange client added without an authorization_server_url has its token endpoint discovered now
+  await discoverTokenEndpoint(engine)
   ops.configure(next)
+}
+
+// Discovers the identity provider's token endpoint (oidc.issuer) when a token_exchange client names no
+// authorization_server_url, so a discovery problem shows at start and the first exchange does not wait for it.
+async function discoverTokenEndpoint(engine: Engine): Promise<void> {
+  const issuer = engine.cfg.oidc?.issuer ?? ""
+  const needs = (engine.cfg.mcp?.client_configs ?? []).filter((c) => c.auth_type === "token_exchange" && c.disabled !== true && (c.token_exchange?.authorization_server_url ?? "") === "")
+  if (needs.length === 0) return
+  if (issuer === "") {
+    console.error(`raiju: mcp ${needs[0]!.name}: token_exchange names no authorization_server_url and oidc.issuer is not set`)
+    return
+  }
+  const ep = await engine.idp.tokenEndpoint(issuer)
+  if (ep === "") console.error(`raiju: mcp: the token endpoint of ${issuer} could not be discovered; token exchanges will try again`)
 }
 
 async function startStdio(mcp: McpManager): Promise<void> {
@@ -185,7 +202,7 @@ async function main(): Promise<int> {
     saveUserToken(store, r)
   }
   // a tool call of a per_user_headers client whose key has submitted nothing opens a submission and names its page
-  engine.headersAuth = (client: string, vk: string, base: string): string => headersAuthMessage(store, client, vk, base)
+  engine.headersAuth = (client: string, vk: string, session: string, user: string, base: string): string => headersAuthMessage(store, client, vk, session, user, base)
   // token_exchange admin credentials: renewed before they expire and after a 401, and saved to the config file
   engine.adminSaved = (r) => {
     saveExchangeAdmin(store, r)
@@ -244,11 +261,53 @@ async function main(): Promise<int> {
     engine.adoptRemoteAdmin(row)
   })
   setAdminRenew(async (client: string, used: string): Promise<string> => await engine.renewAdminCredential(client, used))
+  // MCP client configs are shared across the cluster (mcpshare.tov): a save that changed them puts the changed clients
+  // on the cluster state and deletes the removed ones; a change another node wrote is applied to the config as the
+  // file holds it now and saved here (that save is not sent back)
+  const share = new McpShare(store.cfg)
   store.onChange = (c) => {
+    const ch = share.changes(c)
+    // with cluster.config_sync "pull" the whole config travels as a generation (store.tov), so the clients need not
+    if (!pullsConfig(engine.cfg)) {
+      for (const p of ch.put) {
+        try {
+          clusterState().put(CLIENT_NS, p.name, sealStored(sealKey, p.json))
+        } catch (e) {
+          console.error(`raiju: mcp ${p.name}: the client config could not be sent to the other nodes: ${e.message}`)
+        }
+      }
+      for (const name of ch.del) clusterState().del(CLIENT_NS, name)
+    }
     applyChange(engine, ops, store, c, appDir)
   }
+  clusterState().onChange(CLIENT_NS, (name: string, value: string | undefined) => {
+    // a pulled config generation carries the clients already
+    if (pullsConfig(engine.cfg)) return
+    let json: string | undefined = undefined
+    if (value !== undefined) {
+      json = openStored(sealKey, value)
+      if (json === undefined) {
+        console.error(`raiju: mcp ${name}: a client config from another node could not be opened (every node needs the same encryption_key)`)
+        return
+      }
+    }
+    try {
+      const disk = diskConfig(configPath, sealKey)
+      const next = share.applied(disk ?? store.cfg, name, json)
+      // the file holds it already (a worker of this node saved it, or the nodes share the file): the config
+      // generation of that save makes this process reread it (ops.takeConfigGen), so it is not applied twice
+      if (next === undefined) return
+      const err = saveShared(store, next)
+      if (err !== "") console.error(`raiju: mcp ${name}: a client config from another node could not be saved: ${err}`)
+    } catch (e) {
+      console.error(`raiju: mcp ${name}: a client config from another node was refused: ${e.message}`)
+    }
+  })
   const mcp = engine.mcp
   if (mcp !== undefined) {
+    // the identity provider's token endpoint, for the token_exchange clients that name none, is discovered now
+    // rather than on the first exchange
+    await discoverTokenEndpoint(engine)
     // an admin credential that ran out while the gateway was down is renewed before the clients connect
     await engine.renewDueAdmins()
     await mcp.connectAll()

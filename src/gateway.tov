@@ -15,7 +15,7 @@ import { Tier, tierTarget, overrideTier } from "./complexity"
 import * as cplx from "./complexity"
 import { parseDecision } from "./decisions"
 import * as typesafe from "./providers/typesafe"
-import { AgentConfig, runAgent } from "./agent"
+import { AgentConfig, runAgent, runResponsesAgent } from "./agent"
 import { SampleRing } from "./alerts"
 import { ExportQueue } from "./exporters"
 import { RetainQueue, HiddenPayload, MAX_JOBS, MAX_BYTES } from "./retained"
@@ -59,7 +59,7 @@ import { LogStore, LogEntry, defaultLogStoreConfig } from "./logstore"
 import { dirProblem } from "./audit"
 import { isoMs } from "./exports"
 import { Tracer, Span, StageTiming, genAiAttributes, exportRequest, traceparentFor, tracesOn, TlsOpts, usesGrpc, exportSpansGrpc } from "./otel"
-import { McpManager, injectTools, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns, sanitizeName, perUserClientNames, perUserOAuthNames, tokenExchangeNames, userHeadersOf, ToolText, chatToolName, patternMatches, adminRowOf, ProjectMcp } from "./mcp"
+import { McpManager, injectTools, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns, sanitizeName, perUserClientNames, perUserOAuthNames, tokenExchangeNames, userHeadersFor, ToolText, chatToolName, patternMatches, adminRowOf, ProjectMcp } from "./mcp"
 import { CodeEntry, codeEntries, runMeta, metaToolDefs, isMetaTool, META_TOOLS, limitsOf, bindingLevelOf, execAutoAllowed } from "./codemode"
 import { McpTokenExchange, ExchangeCache, IdpEndpoints, exchangeKey, exchangeToken, renewAdmin, renewAt, needsReverify, RENEW_RETRY_MS, ADMIN_TAKEOVER_MS, ADMIN_WAIT_MS, ADMIN_POLL_MS } from "./tokenexchange"
 import { McpAuthConfig } from "./mcpauth"
@@ -1539,9 +1539,9 @@ export class Engine {
   private unpriced: Set<string> = new Set()
   // keeps a token row the gateway obtained (a refresh); the server saves it to the config file
   userTokenSaved: ((r: McpUserToken) => void) | undefined = undefined
-  // opens (or renews) a per-user headers submission for a key and answers the message with its link (mcpapi.tov
-  // headersAuthMessage, set by main.tov)
-  headersAuth: ((client: string, vk: string, base: string) => string) | undefined = undefined
+  // opens (or renews) a per-user headers submission for a caller (its key, session or user) and answers the message
+  // with its link (mcpapi.tov headersAuthMessage, set by main.tov)
+  headersAuth: ((client: string, vk: string, session: string, user: string, base: string) => string) | undefined = undefined
   cache: ResponseCache | undefined = undefined
   cacheTtlMs = 300000
   autoPromptCache = false
@@ -2734,12 +2734,15 @@ export class Engine {
     }
     const client = this.perUserClient(name)
     if (client !== undefined && this.userHeaders(name, h) === undefined) {
-      // the caller is sent the submission page of a flow opened for its key (Bifrost's inline 401 with the link)
-      const vk = this.gov.findKey(h)?.id ?? ""
+      // the caller is sent the submission page of a flow opened for its identity (Bifrost's inline 401 with the link)
+      const id = this.headersIdentity(h)
+      if (id.vk === "" && id.session === "" && id.user === "") {
+        return { kind: "denial", status: 401, type: "authentication_error", message: `per-user headers for ${client} requires an identity: send a Virtual Key (x-bf-vk), authenticate as a user, or set x-bf-mcp-session-id to any opaque string you'll re-send on subsequent calls` }
+      }
       const open = this.headersAuth
-      const link = vk === "" || open === undefined ? "" : open(client, vk, originOf(h))
+      const link = open === undefined ? "" : open(client, id.vk, id.session, id.user, originOf(h))
       if (link !== "") return { kind: "denial", status: 401, type: "authentication_error", message: link }
-      return { kind: "denial", status: 401, type: "authentication_error", message: `the per-user headers of MCP client ${client} are not submitted for this key: open a submission with POST /api/mcp/per-user-headers/flows` }
+      return { kind: "denial", status: 401, type: "authentication_error", message: `the per-user headers of MCP client ${client} are not submitted for this caller: open a submission with POST /api/mcp/per-user-headers/flows` }
     }
     return this.gov.admitTool(h)
   }
@@ -2764,7 +2767,14 @@ export class Engine {
   userHeaders(name: string, h: Hdrs): Map<string, string> | undefined {
     const client = this.perUserClient(name)
     if (client === undefined) return undefined
-    return userHeadersOf(this.cfg.mcp?.user_credentials, client, this.gov.findKey(h)?.id ?? "")
+    const id = this.headersIdentity(h)
+    return userHeadersFor(this.cfg.mcp?.user_credentials, client, id.vk, id.session, id.user)
+  }
+
+  // The identity per-user headers are kept under, as per-user OAuth tokens are (identityOf): the x-bf-mcp-session-id
+  // header, else the user of a user-mode MCP token, else the virtual key.
+  headersIdentity(h: Hdrs): { vk: string, session: string, user: string } {
+    return identityOf(h.get("x-bf-mcp-session-id"), this.gov.findKey(h)?.id ?? "", userOfMark(h.get(USER_HEADER)))
   }
 
   // The caller's token for a tool of a per_user_oauth client. "none" for other tools; "bearer" with the token to
@@ -2989,9 +2999,19 @@ export class Engine {
       return ""
     }
     // a refusal is believed only when nothing newer arrived meanwhile: a refresh token that another process has
-    // already rotated is the one that counts
+    // already rotated is the one that counts. In a cluster two nodes can both own the renewal while the membership
+    // changes; the other node's rotated credential reaches this one through the cluster state (adoptRemoteAdmin), so
+    // a refusal waits up to ADMIN_WAIT_MS for it before the credential is marked needs_reauth.
     this.adoptStored(client)
-    const latest = this.adminRowNow(client)
+    let latest = this.adminRowNow(client)
+    if (needsReverify(out.row) && this.cfg.cluster !== undefined) {
+      const until = Date.now() + ADMIN_WAIT_MS
+      while ((latest === undefined || latest.refresh_token === row.refresh_token) && Date.now() < until) {
+        await sleep(ADMIN_POLL_MS)
+        this.adoptStored(client)
+        latest = this.adminRowNow(client)
+      }
+    }
     if (needsReverify(out.row) && latest !== undefined && latest.refresh_token !== row.refresh_token) return needsReverify(latest) ? "" : latest.access_token
     this.adminRetry.delete(client)
     if (needsReverify(out.row)) console.error(`raiju: mcp ${client}: ${out.row.status_reason ?? ""}; verify the client again`)
@@ -4273,21 +4293,69 @@ export class Engine {
     }
     const hdr = snapshot(req.headers)
     const entries = this.codeEntriesFor(m, hdr)
-    const exec = async (name: string, args: string): Promise<{ text: string, isError: bool }, Error> => {
-      if (isMetaTool(name)) return try await this.codeMetaTool(m, hdr, name, args, ag.auto_execute)
-      const real = this.injectedName(name) ?? name
-      return try await this.mcpCall(m, hdr, real, args, undefined)
-    }
-    // the code mode meta-tools join the names the loop may run, and executeToolCode runs when its program
-    // calls only auto-executable tools
-    const names = m.toolNames().concat(this.injectedAll())
-    if (entries.length > 0) {
-      for (const n of META_TOOLS) names.push(n)
-    }
+    const exec = this.agentExec(m, hdr, ag)
+    const names = this.agentNames(m, entries)
     const codeOk = (a: string): bool => execAutoAllowed(a, entries, ag.auto_execute)
     try {
       const r = await runAgent(text, call, exec, ag, names, codeOk)
       // the last model call's headers (request id, cache, attempts), plus the agent's counts
+      const out: Record<string, string> = last.h
+      if (!out.has("content-type")) out.set("content-type", "application/json")
+      out.set("x-bf-agent-steps", "" + r.steps)
+      out.set("x-bf-agent-tool-calls", "" + r.toolCalls)
+      return new Response(r.body, { status: r.status, headers: out })
+    } catch (e) {
+      return errorResponse(502, `agent mode failed: ${e.message}`, "api_error", noHeaders())
+    }
+  }
+
+  // How the agent loop runs one tool call: a code mode meta-tool, or an MCP tool (an injected tool by its real name).
+  agentExec(m: McpManager, hdr: Hdrs, ag: AgentConfig): (name: string, args: string) => Promise<{ text: string, isError: bool }, Error> {
+    return async (name: string, args: string): Promise<{ text: string, isError: bool }, Error> => {
+      if (isMetaTool(name)) return try await this.codeMetaTool(m, hdr, name, args, ag.auto_execute)
+      const real = this.injectedName(name) ?? name
+      return try await this.mcpCall(m, hdr, real, args, undefined)
+    }
+  }
+
+  // The names the agent loop may run: the MCP tools, the injected ones, and the code mode meta-tools when the
+  // caller reaches code mode clients (executeToolCode then runs when its program calls only auto-executable tools).
+  agentNames(m: McpManager, entries: CodeEntry[]): string[] {
+    const names = m.toolNames().concat(this.injectedAll())
+    if (entries.length > 0) {
+      for (const n of META_TOOLS) names.push(n)
+    }
+    return names
+  }
+
+  // Agent mode on a Responses request, as Bifrost's CheckAndExecuteAgentForResponsesRequest: the answer's
+  // auto-executable MCP calls (code mode's meta-tools included) run and the model is asked again, each call
+  // served by `once` (the whole Responses route: log, fallbacks, caches). undefined when agent mode does not
+  // apply (no auto-execute list, no MCP, a stream, x-bf-mcp-agent: off): the caller serves the request itself.
+  async responsesAgent(req: Request, text: string, stream: bool, once: (r: Request, body: string) => Promise<Response>): Promise<Response | undefined> {
+    const ag = this.agent
+    const m = this.mcp
+    if (ag === undefined || m === undefined || stream || req.method !== "POST" || req.headers.get("x-bf-mcp-agent") === "off") return undefined
+    const hs: Record<string, string> = new Map()
+    req.headers.forEach((v, k) => {
+      if (k !== "content-length" && k !== "transfer-encoding") hs.set(k, v)
+    })
+    const url = req.url
+    const last = new LastHeaders()
+    const call = async (b: string): Promise<{ status: int, body: string }, Error> => {
+      const r = await once(new Request(url, { method: "POST", headers: hs, body: b }), b)
+      const kept: Map<string, string> = new Map()
+      r.headers.forEach((v, k) => {
+        if (k !== "content-length") kept.set(k, v)
+      })
+      last.h = kept
+      return { status: r.status, body: try await r.text() }
+    }
+    const hdr = snapshot(req.headers)
+    const entries = this.codeEntriesFor(m, hdr)
+    const codeOk = (a: string): bool => execAutoAllowed(a, entries, ag.auto_execute)
+    try {
+      const r = await runResponsesAgent(text, call, this.agentExec(m, hdr, ag), ag, this.agentNames(m, entries), codeOk)
       const out: Record<string, string> = last.h
       if (!out.has("content-type")) out.set("content-type", "application/json")
       out.set("x-bf-agent-steps", "" + r.steps)
