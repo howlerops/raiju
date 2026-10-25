@@ -1,7 +1,13 @@
 // The request-body bytes one process holds at once, across requests (server.max_buffered_body_mb). A body is read
 // whole before it is parsed, and parsing a big one costs several times its size, so a few large bodies sent at once
-// could take a worker past its memory limit. Each body is charged here before it is read and given back when its
-// request is done; a body that does not fit is refused with 503, unread.
+// could take a worker past its memory limit. A body that has not been read yet (over UNREAD_ABOVE, or chunked) is
+// charged here as its bytes arrive and given back when its request is done; a declared length that cannot fit beside
+// what is held is refused with 503 unread, and a body whose next bytes do not fit is refused with 503 there. A small
+// body the server has read already is charged too, but never refused: turning it away would save no memory.
+//
+// Bytes are charged as they arrive, not by the declared length, so a client that sends a big declared body slowly
+// holds only what it has sent (a declared 100 MB trickled to a route that checks no credential no longer makes every
+// other POST 503), and server.body_deadline_seconds bounds how long a body may take to arrive whole.
 //
 // A body is always admitted when the process holds no other body, so a single request up to
 // client.max_request_body_size_mb is still served (Bifrost's limit keeps its meaning); the cap decides how many
@@ -23,9 +29,29 @@ export function bufferedCap(s: ServerSectionConfig | undefined): int {
   return (mb === 0 ? DEFAULT_BUFFERED_BODY_MB : mb) * 1048576
 }
 
+// server.body_deadline_seconds: a body that reaches the gateway unread must arrive whole within this (Raiju's own;
+// Bifrost's server has no read deadline). The body timeout limits only the gap between bytes, so without it a client
+// could hold a charged body for as long as it sends a byte a minute.
+export const DEFAULT_BODY_DEADLINE_SECONDS = 120.0
+
+// server.body_deadline_seconds in ms: unset is the default, 0 or less is none (0 returned).
+export function bodyDeadlineMs(s: ServerSectionConfig | undefined): int {
+  const v = s?.body_deadline_seconds
+  if (v === undefined) return Math.round(DEFAULT_BODY_DEADLINE_SECONDS * 1000)
+  return v > 0 ? Math.max(1, Math.round(v * 1000)) : 0
+}
+
 export class BodyBudget {
   held = 0
   refused = 0
+
+  // Whether a body of n bytes would fit beside what is held now (nothing is charged): a declared length that cannot is
+  // refused before it is read.
+  fits(n: int, cap: int): bool {
+    if (n <= 0 || cap <= 0 || this.held === 0 || this.held + n <= cap) return true
+    this.refused += 1
+    return false
+  }
 
   // Charges n more bytes to a request that already holds `own` of them. true when they fit under cap (0: no cap),
   // or when no other request holds any.
@@ -37,6 +63,11 @@ export class BodyBudget {
     }
     this.held += n
     return true
+  }
+
+  // Charges n bytes that are in memory already (a small body the server has read): always admitted.
+  hold(n: int): void {
+    if (n > 0) this.held += n
   }
 
   // Gives back what a request held.
@@ -89,6 +120,40 @@ test("a chunked body is charged as it arrives: its own bytes do not count agains
   expect(b.take(30, 0, cap)).toBe(true)
   expect(b.take(50, 0, cap)).toBe(true)
   expect(b.take(30, 30, cap)).toBe(false)
+})
+
+test("a declared length is checked against what is held, without being charged", () => {
+  const b = new BodyBudget()
+  const cap = 100
+  // alone: a declared length over the cap fits (it is charged as it arrives)
+  expect(b.fits(1000, cap)).toBe(true)
+  expect(b.held).toBe(0)
+  // a slow body that has sent little holds little: the next one fits
+  expect(b.take(5, 0, cap)).toBe(true)
+  expect(b.fits(90, cap)).toBe(true)
+  expect(b.fits(96, cap)).toBe(false)
+  expect(b.refused).toBe(1)
+  expect(b.fits(1000, 0)).toBe(true)
+})
+
+test("a body in memory already is charged and always admitted", () => {
+  const b = new BodyBudget()
+  const cap = 100
+  expect(b.take(150, 0, cap)).toBe(true)
+  b.hold(10)
+  expect(b.held).toBe(160)
+  b.hold(0)
+  expect(b.held).toBe(160)
+  b.give(10)
+  expect(b.held).toBe(150)
+})
+
+test("server.body_deadline_seconds: the default, a value, off", () => {
+  expect(bodyDeadlineMs(undefined)).toBe(120000)
+  expect(bodyDeadlineMs({})).toBe(120000)
+  expect(bodyDeadlineMs({ body_deadline_seconds: 2.5 })).toBe(2500)
+  expect(bodyDeadlineMs({ body_deadline_seconds: 0.0 })).toBe(0)
+  expect(bodyDeadlineMs({ body_deadline_seconds: -1.0 })).toBe(0)
 })
 
 test("server.max_buffered_body_mb: the default, a value, no cap", () => {

@@ -12,7 +12,7 @@ Endpoints for probes and scraping: `GET /health` (liveness: 200, `{"status":"ok"
 or when a store that is on could not open) and `GET /metrics` (Prometheus text, Bifrost metric
 names). `/metrics` is open, as in Bifrost, and its labels name virtual keys, teams and customers: set
 `server.metrics_token` (a bearer token, `env.NAME` allowed) to keep tenants on the inference port from
-reading it, or move it to the cluster listener with `cluster.serve_metrics`. The image has no curl; its `HEALTHCHECK` runs `raiju -healthcheck`, which GETs `/health`
+reading it, or move it to the cluster listener with `cluster.serve_metrics` (a start with neither logs a warning). The image has no curl; its `HEALTHCHECK` runs `raiju -healthcheck`, which GETs `/health`
 on 127.0.0.1 at `-port`, `PORT` or 8080 and exits 0 on a 2xx (`raiju -healthcheck /ready` probes
 readiness instead).
 
@@ -113,8 +113,15 @@ Request bodies: a body over 64 KB is not read before the caller's credentials ar
 inference call without a valid virtual key (while `client.enforce_auth_on_inference` is on) or a
 management call the gate refuses is answered 401 or 403 unread. `server.max_buffered_body_mb`
 (default 48; -1 for no cap; read per request) caps the request-body megabytes each process reads at
-once: a body that does not fit is answered 503 with `retry-after: 1`, unread, and is retried by
-well-behaved clients. A body is always read when the process holds no other, so a single request up
+once: a body that does not fit is answered 503 with `retry-after: 1` (unread when its declared length
+cannot fit beside the bytes held), and is retried by well-behaved clients. Bytes are charged as they
+arrive, so a client trickling a big declared body holds only what it has sent, and a body over 64 KB
+must arrive whole within `server.body_deadline_seconds` (default 120, 0 off; 408 otherwise: raise it
+for slow uploaders of big files). The public routes (`/api/session/*`, `/api/agent/*`, `/api/oauth2/*`,
+`/api/oidc/*`, the MCP authorization server's `/oauth2/*`) read at most 64 KB. The cluster peer routes
+refuse a body without a signature header before reading it and read at most `cluster.max_body_mb`
+(default 16 MB; a node whose sync body outgrows it logs so, and every node needs the higher value).
+A body is always read when the process holds no other, so a single request up
 to `client.max_request_body_size_mb` (default 100) is still served; parsing a chat body costs about
 six to eight times its size, so on a small pod lower `max_request_body_size_mb` too (on the chart's
 512Mi limit a lone 90 MB body peaks near 700 MB; 32 MB keeps a lone body near 250 MB). The default of

@@ -6,8 +6,8 @@ import { serve, Http1Request, Http1Response, BodyQueue } from "./http1"
 import { WsConnection } from "./ws"
 import { Engine, StreamSink, errorResponse, noHeaders } from "./gateway"
 import { Ops } from "./ops"
-import { clientIpFor, dispatch, clusterDispatch, compatPath, streamKind, streamsRequest, routeStream, httpPathLabel, http1Upgrade, largeFront, limitedBody, credentialRefusal, heldBody, Served } from "./server"
-import { bodyBudget } from "./bodybudget"
+import { clientIpFor, dispatch, clusterDispatch, compatPath, streamKind, streamsRequest, routeStream, httpPathLabel, http1Upgrade, largeFront, limitedBody, credentialRefusal, heldBody, routeBodyLimit, Served } from "./server"
+import { bodyBudget, UNREAD_ABOVE } from "./bodybudget"
 import { ServerLimits } from "./lifecycle"
 import { snapshot } from "./schemas"
 import { TransportRun, transportStart, transportEnd, transportDone, transportSink } from "./pluginroute"
@@ -112,8 +112,10 @@ async function write(res: Http1Response, r: Response): Promise<int> {
   return body.length
 }
 
-async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request, res: Http1Response, limit: int): Promise<void> {
+async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request, res: Http1Response, limit0: int): Promise<void> {
   const path = pathOf(req.path)
+  // the public routes and the peer routes read smaller bodies (server.tov routeBodyLimit)
+  const limit = routeBodyLimit(engine, path, limit0 > 0 ? limit0 : NO_LIMIT)
   // an inference request's client watch: its connection closing before the answer stops the upstream call
   const wid = watched(req.method, path, isInferencePath(compatPath(path))) ? watchStart() : ""
   if (wid !== "") res.onGone = () => watchGone(wid)
@@ -128,7 +130,7 @@ async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request,
   let bodyText = req.body
   try {
     // a big body is not read for a caller its credentials already refuse
-    const refused = await credentialRefusal(engine, ops, request, limit > 0 ? limit : NO_LIMIT)
+    const refused = await credentialRefusal(engine, ops, request, limit)
     if (refused !== undefined) {
       const n = await write(res, refused)
       metrics.observeHttp(httpPathLabel(path, refused.status), req.method, refused.status, (performance.now() - t0) / 1000.0, inBytes, n * 1.0, metrics.httpCustomValues(request.headers))
@@ -144,7 +146,7 @@ async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request,
     if (lf instanceof Request) {
       // (a body the feature streams on is not held here)
       request = lf
-      if (limit > 0) {
+      if (limit < NO_LIMIT) {
         const within = await limitedBody(request, limit)
         if (within === undefined) {
           const n = await write(res, errorResponse(413, "request body too large", "invalid_request_error", noHeaders()))
@@ -155,7 +157,7 @@ async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request,
       }
     } else {
       // the body is read whole here, charged to the process's body budget first (413 and 503 refuse it unread)
-      const hb = await heldBody(engine, request, limit > 0 ? limit : NO_LIMIT)
+      const hb = await heldBody(engine, request, limit)
       const no = hb.res
       if (no !== undefined) {
         const n = await write(res, no)
@@ -252,11 +254,12 @@ export function startFront(engine: Engine, ops: Ops, opts: FrontOptions): Served
 }
 
 // The cluster listener (cluster.listen_port) on the http1 server: the peer routes, /health and, with
-// cluster.serve_metrics, /metrics (server.tov clusterDispatch). Bodies are read whole, up to maxBody bytes.
-export function startClusterFront(engine: Engine, ops: Ops, hostname: string, port: int, maxBody: int, t: ServerLimits): Served {
+// cluster.serve_metrics, /metrics (server.tov clusterDispatch). Bodies over UNREAD_ABOVE reach clusterDispatch unread,
+// which checks the signature header and cluster.max_body_mb before reading them.
+export function startClusterFront(engine: Engine, ops: Ops, hostname: string, port: int, t: ServerLimits): Served {
   const host = `${hostname}:${port}`
   const limits = { headerMs: ms(t.headerSeconds), idleMs: ms(t.idleSeconds), bodyMs: ms(t.bodySeconds), maxConnections: t.maxConnections }
-  const srv = serve({ hostname: hostname, port: port, maxBodyBytes: maxBody, limits: limits }, (req, res) => {
+  const srv = serve({ hostname: hostname, port: port, maxBodyBytes: NO_LIMIT, streamThreshold: UNREAD_ABOVE, limits: limits }, (req, res) => {
     clusterHandle(engine, ops, host, req, res)
   })
   return {

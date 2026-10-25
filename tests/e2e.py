@@ -932,8 +932,13 @@ def cluster_sig(secret, body=""):
     import hashlib, hmac
     return hmac.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
 
+def leader_headers(secret, ts=None):
+    """The headers of a signed GET /api/cluster/leader: the signature over the method, the path and the time (L201)."""
+    t = str(int(time.time() * 1000) if ts is None else ts)
+    return {"x-raiju-cluster-ts": t, "x-raiju-cluster-sig": cluster_sig(secret, "GET /api/cluster/leader " + t)}
+
 def cluster_leader(base, secret):
-    s, _, b = call("GET", "/api/cluster/leader", headers={"x-raiju-cluster-sig": cluster_sig(secret)}, base=base, auth=False)
+    s, _, b = call("GET", "/api/cluster/leader", headers=leader_headers(secret), base=base, auth=False)
     return json.loads(b) if s == 200 else {"status": s, "body": b}
 
 def cluster_modes_e2e():
@@ -6016,12 +6021,12 @@ def l195_e2e(env):
     try:
         wait(GW_L195 + "/health")
         wait(GW_L195_CL + "/health")
-        sig = {"x-raiju-cluster-sig": cluster_sig(L195_SECRET)}
+        sig = leader_headers(L195_SECRET)
         s, _, b = call("GET", "/api/cluster/leader", headers=sig, base=GW_L195, auth=False)
         check("l195: with cluster.listen_port the main listener refuses the peer routes", s == 404 and "cluster listener" in b, (s, b[:200]))
         s, _, b = call("GET", "/api/cluster/leader", headers=sig, base=GW_L195_CL, auth=False)
         check("l195: the cluster listener serves the signed peer routes", s == 200 and json.loads(b).get("node") == "l195", (s, b[:200]))
-        s, _, _ = call("GET", "/api/cluster/leader", headers={"x-raiju-cluster-sig": "0" * 64}, base=GW_L195_CL, auth=False)
+        s, _, _ = call("GET", "/api/cluster/leader", headers={**sig, "x-raiju-cluster-sig": "0" * 64}, base=GW_L195_CL, auth=False)
         check("l195: the cluster listener still checks the signature", s == 401, s)
         wire = json.dumps({"node": "l195-peer", "ts": time.time() * 1000, "counters": []})
         s, _, b = call("POST", "/api/cluster/sync", wire, {"x-raiju-cluster-sig": cluster_sig(L195_SECRET, wire)}, base=GW_L195_CL, auth=False)
@@ -13359,14 +13364,15 @@ def l196_e2e(env):
         # a body over the stream threshold still streams its answer (the body is read before the route looks at it)
         s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "stream": True, "messages": [{"role": "user", "content": "l196 " + "y" * 200000}]}, key, base=base, auth=False)
         check("l196: a 200 KB streaming call with the key streams", s == 200 and "chat.completion.chunk" in b and b.rstrip().endswith("data: [DONE]"), (s, b[:200], b[-200:]))
-        # the cap: a 3 MB body in hand (half sent), then a 2 MB one does not fit in 4 MB and is refused unread
-        first = l196_open(18348, "/v1/chat/completions", 3 * 1048576, key, 1048576)
+        # the cap: a 3 MB body in hand (all but its last KB sent: bytes are charged as they arrive, L201), then a 2 MB one
+        # does not fit beside it in 4 MB and is refused unread
+        first = l196_open(18348, "/v1/chat/completions", 3 * 1048576, key, 3 * 1048576 - 1024)
         time.sleep(0.5)
         second = l196_open(18348, "/v1/chat/completions", 2 * 1048576, key, 0)
         code2, head2 = l196_read(second)
         second.close()
         check("l196: a body past server.max_buffered_body_mb is answered 503 with retry-after, unread", code2 == 503 and "retry-after: 1" in head2.lower(), head2[:300])
-        first.sendall(l196_chat(3 * 1048576)[1048576:])
+        first.sendall(l196_chat(3 * 1048576)[3 * 1048576 - 1024:])
         code1, head1 = l196_read(first)
         first.close()
         check("l196: the body in hand is served", code1 == 200, head1[:300])
@@ -13374,6 +13380,164 @@ def l196_e2e(env):
         check("l196: once it is done, the next body fits", st == 200, (st, b[:200]))
         st, _, b = call("POST", "/v1/chat/completions", l196_chat(6 * 1048576).decode(), key, base=base, auth=False)
         check("l196: a lone body over the cap is still served (max_request_body_size_mb decides its size)", st == 200, (st, b[:200]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
+GW_L201 = "http://127.0.0.1:18358"  # L201: the body budget charged as bytes arrive, the body deadline, small public bodies
+GW_L201_CL = "http://127.0.0.1:18359"  # L201: the cluster listener of the gateway on 18358
+L201_SECRET = "e2e-l201-" + "cluster-secret-0123456789abcdef"
+
+
+def l201_trickle(port: int, path: str, total: int, headers: dict, piece: int, every: float, seconds: float, out: dict):
+    """Sends a POST declaring total bytes, piece bytes every `every` seconds for up to `seconds`, then reads the answer;
+    out gets its status, head and when it came (seconds after the start)."""
+    t0 = time.time()
+    s = l196_open(port, path, total, headers, 0)
+    s.settimeout(0.05)
+    data = b""
+    while time.time() - t0 < seconds:
+        try:
+            s.sendall(b"x" * piece)
+        except OSError:
+            break
+        try:
+            c = s.recv(65536)
+            if not c:
+                break
+            data += c
+            if b"\r\n\r\n" in data:
+                break
+        except socket.timeout:
+            pass
+        except OSError:
+            break
+        time.sleep(every)
+    s.settimeout(5)
+    try:
+        while b"\r\n\r\n" not in data:
+            c = s.recv(65536)
+            if not c:
+                break
+            data += c
+    except OSError:
+        pass
+    s.close()
+    try:
+        out["status"] = int(data.split(b" ", 2)[1])
+    except Exception:
+        out["status"] = 0
+    out["head"] = data.decode("latin-1")[:300]
+    out["after"] = time.time() - t0
+
+
+def l201_e2e(env):
+    """L201 (production re-audit 2, P1-3, P1-4, P2-1, P2-3): a slow body to a route that checks no credential from the
+    headers holds only the bytes it has sent, so the other POSTs keep working (it held its whole declared length before,
+    and every other POST got 503); a body over 64 KB must arrive within server.body_deadline_seconds (408); the public
+    routes read at most 64 KB; the cluster listener refuses a body without a signature header before reading it and caps
+    bodies at cluster.max_body_mb; GET /api/cluster/leader is signed over its method, path and time; a start with
+    /metrics open warns. Its own gateway (18358, cluster listener 18359)."""
+    import threading
+    d = os.path.join(BUILD, "e2e-l201")
+    os.makedirs(d, exist_ok=True)
+    cp = os.path.join(d, "config.json")
+    log = os.path.join(d, "gw.log")
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": True},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "server": {"max_buffered_body_mb": 4, "body_deadline_seconds": 3},
+        "governance": {"virtual_keys": [{"id": "vk-l201", "name": "vk-l201", "value": "sk-bf-l201"}]},
+        "providers": {"openai": {"keys": [{"name": "o-l201", "value": "sk-l201", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "cluster": {"enabled": True, "node_id": "l201", "secret": "env.RAIJU_L201_SECRET", "interval_ms": 200, "peers": [], "listen_port": 18359, "bind": "127.0.0.1", "max_body_mb": 2},
+    }
+    json.dump(cfg, open(cp, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18358", "-host", "127.0.0.1", "-config", cp, "-server", os.environ.get("RAIJU_SERVER", "bun")],
+                          env={**env, "RAIJU_L201_SECRET": L201_SECRET}, stderr=open(log, "w"))
+    key = {"x-bf-vk": "sk-bf-l201"}
+    small = {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l201 small"}]}
+    try:
+        wait(GW_L201 + "/health")
+        wait(GW_L201_CL + "/health")
+        # P2-3: /metrics is open (no server.metrics_token, not moved to the cluster listener)
+        check("l201: a start with /metrics open on the main port warns", "/metrics is open" in open(log).read(), open(log).read()[-600:])
+
+        # P1-4: a declared 50 MB trickled to /mcp (no credential checked from the headers) while other POSTs come in
+        slow: dict = {}
+        t = threading.Thread(target=l201_trickle, args=(18358, "/mcp", 50 * 1048576, {}, 2048, 0.1, 8.0, slow))
+        t.start()
+        time.sleep(0.8)
+        s1, _, b1 = call("POST", "/v1/chat/completions", small, key, base=GW_L201, auth=False)
+        s2, _, b2 = call("POST", "/v1/chat/completions", l196_chat(1048576).decode(), key, base=GW_L201, auth=False)
+        check("l201: while a slow 50 MB body trickles in, a small POST is served (it was 503)", s1 == 200, (s1, b1[:200]))
+        check("l201: and a 1 MB POST is served too: the slow body holds only what it sent", s2 == 200, (s2, b2[:200]))
+        t.join(20)
+        check("l201: the slow body is cut with 408 at server.body_deadline_seconds (3 s)", slow.get("status") == 408 and 2.5 < slow.get("after", 0) < 7.0, slow)
+        s3, _, b3 = call("POST", "/v1/chat/completions", small, key, base=GW_L201, auth=False)
+        check("l201: after the cut the budget is free again", s3 == 200, (s3, b3[:200]))
+        # a body that arrives in time is served whatever its size (a lone one may pass the 4 MB cap)
+        s4, _, b4 = call("POST", "/v1/chat/completions", l196_chat(5 * 1048576).decode(), key, base=GW_L201, auth=False)
+        check("l201: a 5 MB body that arrives in time is served", s4 == 200, (s4, b4[:200]))
+        # a body that holds the whole budget (5 MB sent at once, then nothing) turns other big bodies away until its
+        # deadline, never small calls (their bytes are in memory already)
+        hog = l196_open(18358, "/mcp", 50 * 1048576, {}, 5 * 1048576)
+        time.sleep(0.5)
+        s5, _, b5 = call("POST", "/v1/chat/completions", small, key, base=GW_L201, auth=False)
+        s6, _, _ = call("POST", "/v1/chat/completions", l196_chat(1048576).decode(), key, base=GW_L201, auth=False)
+        check("l201: while a stalled body holds the budget, a small POST is still served", s5 == 200, (s5, b5[:200]))
+        check("l201: and a 1 MB POST is refused 503 until that body's deadline", s6 == 503, s6)
+        code, head = l196_read(hog)
+        hog.close()
+        check("l201: the stalled body is cut with 408", code == 408, head[:200])
+        s7, _, b7 = call("POST", "/v1/chat/completions", l196_chat(1048576).decode(), key, base=GW_L201, auth=False)
+        check("l201: then the 1 MB POST is served", s7 == 200, (s7, b7[:200]))
+
+        # the public routes read at most 64 KB
+        st = declared_post(18358, "/api/session/login", 1048576)
+        check("l201: a 1 MB declared body to /api/session/login is 413 unread", st == 413, st)
+        st = chunked_post(18358, "/api/oauth2/consent/flows/x", 1048576)
+        check("l201: a 1 MB chunked body to an OAuth route is 413", st == 413, st)
+        st = declared_post(18358, "/oauth2/token", 200000)
+        check("l201: a 200 KB body to the MCP token endpoint is 413", st == 413, st)
+        s, _, b = call("POST", "/api/session/login", {"username": "nobody", "password": "x"}, base=GW_L201, auth=False)
+        check("l201: a normal sign-in body still reaches its route", s not in (413, 503), (s, b[:200]))
+
+        # P1-3: the cluster listener checks the signature header before reading, and caps bodies at max_body_mb (2)
+        t0 = time.time()
+        c = l196_open(18359, "/api/cluster/sync", 30 * 1048576, {}, 0)
+        code, head = l196_read(c)
+        c.close()
+        check("l201: a 30 MB peer body with no signature header is refused 401 before it is read", code == 401 and time.time() - t0 < 3, (code, head[:200]))
+        c = l196_open(18359, "/api/cluster/feed", 30 * 1048576, {"x-raiju-cluster-sig": "not-hex"}, 0)
+        code, head = l196_read(c)
+        c.close()
+        check("l201: a malformed signature header is refused 401 before the body is read", code == 401, (code, head[:200]))
+        st = declared_post(18359, "/api/cluster/sync", 3 * 1048576)
+        check("l201: a 3 MB peer body (over cluster.max_body_mb 2) without a signature is refused", st == 401, st)
+        c = l196_open(18359, "/api/cluster/sync", 3 * 1048576, {"x-raiju-cluster-sig": "0" * 64}, 0)
+        code, head = l196_read(c)
+        c.close()
+        check("l201: a signed-looking 3 MB peer body is 413 unread (cluster.max_body_mb)", code == 413, (code, head[:200]))
+        junk = "x" * 1048576
+        s, _, _ = call("POST", "/api/cluster/sync", junk, {"x-raiju-cluster-sig": "0" * 64}, base=GW_L201_CL, auth=False)
+        check("l201: a 1 MB body with a wrong HMAC is read within the cap and refused 401", s == 401, s)
+        wire = json.dumps({"node": "l201-peer", "ts": time.time() * 1000, "counters": []})
+        s, _, b = call("POST", "/api/cluster/sync", wire, {"x-raiju-cluster-sig": cluster_sig(L201_SECRET, wire)}, base=GW_L201_CL, auth=False)
+        check("l201: a signed peer sync is still merged", s == 200 and '"node":"l201"' in b, (s, b[:200]))
+
+        # P2-1: GET /api/cluster/leader is signed over its method, path and time
+        s, _, b = call("GET", "/api/cluster/leader", headers=leader_headers(L201_SECRET), base=GW_L201_CL, auth=False)
+        check("l201: a fresh signed leader read is answered", s == 200 and json.loads(b).get("node") == "l201", (s, b[:200]))
+        s, _, _ = call("GET", "/api/cluster/leader", headers={"x-raiju-cluster-sig": cluster_sig(L201_SECRET)}, base=GW_L201_CL, auth=False)
+        check("l201: the old empty-body signature is refused", s == 401, s)
+        s, _, b = call("GET", "/api/cluster/leader", headers=leader_headers(L201_SECRET, int(time.time() * 1000) - 120000), base=GW_L201_CL, auth=False)
+        check("l201: a captured leader read two minutes old is refused as stale", s == 401 and "stale" in b, (s, b[:200]))
+        h = leader_headers(L201_SECRET)
+        h["x-raiju-cluster-ts"] = str(int(h["x-raiju-cluster-ts"]) + 1)
+        s, _, _ = call("GET", "/api/cluster/leader", headers=h, base=GW_L201_CL, auth=False)
+        check("l201: a leader read whose time was changed is refused", s == 401, s)
     finally:
         gw.terminate()
         gw.wait()
@@ -18951,6 +19115,9 @@ def main():
         # L195: cluster authentication (the secret resolved and enforced, the cluster listener, the /metrics token): its own
         # gateways, one after the other (18346, cluster listener 18347)
         l195_e2e(env)
+        # L201: the body budget charged as bytes arrive, the body deadline, small public bodies, the cluster listener's
+        # signature-first reads and body cap, signed leader reads, the open /metrics warning: its own gateway (18358, 18359)
+        l201_e2e(env)
         # L194: Hugging Face inference providers (chat, embeddings, speech, transcription, images), the CLI's agent sign-in
         # and default key, and the A2A v0.3 REST client: its own gateway (18344) and Hugging Face double (18345)
         l194_e2e(env)

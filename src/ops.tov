@@ -1731,12 +1731,20 @@ export class Ops {
     return ownerOf(client, this.liveNodes()) === cluster.nodeOf(this.nodeId)
   }
 
+  // whether the sync body has outgrown cluster.max_body_mb (said once)
+  syncTooBig = false
+
   syncCluster(): void {
     const c = this.counters
     const cc = this.clusterCfg
     if (c === undefined || cc === undefined) return
     this.pushLocal(c)
     const body = c.encode()
+    // a peer refuses a body over cluster.max_body_mb unread (413): said once, so the operator can raise it
+    if (!this.syncTooBig && body.byteLength > cluster.clusterBodyCap(cc)) {
+      this.syncTooBig = true
+      console.error(`raiju: cluster: this node's sync body is ${body.byteLength} bytes, over cluster.max_body_mb (${cluster.clusterBodyCap(cc)} bytes): its peers refuse it; raise cluster.max_body_mb on every node`)
+    }
     const h: Map<string, string> = new Map()
     h.set("content-type", "application/json")
     h.set("x-raiju-cluster-sig", cluster.sign(cc.secret, body))
@@ -1770,11 +1778,14 @@ export class Ops {
     }
   }
 
-  // GET /api/cluster/leader: whether this node leads, and by which election. Signed like the sync route, over an empty body.
+  // GET /api/cluster/leader: whether this node leads, and by which election. Signed over the method, the path and the
+  // caller's time in x-raiju-cluster-ts (cluster.signRequest), refused when that time is over a minute off like the
+  // other peer routes, so a captured request does not replay.
   clusterLeader(req: Request): Response {
     const cc = this.clusterCfg
     if (cc === undefined) return json(404, errorJson("clustering is off", "invalid_request_error", undefined))
-    if (!cluster.verify(cc.secret, "", req.headers.get("x-raiju-cluster-sig") ?? "")) return denied(401, "bad cluster signature")
+    const why = cluster.requestRefusal(cc.secret, "GET", "/api/cluster/leader", req.headers.get(cluster.TS_HEADER) ?? "", req.headers.get("x-raiju-cluster-sig") ?? "", Date.now())
+    if (why !== "") return denied(401, why)
     const election = this.lock !== undefined ? "lock" : "rank"
     return json(200, JSON.stringify({ node: this.nodeId, leader: this.isLeader(), election: election }))
   }
@@ -1999,7 +2010,7 @@ export class Ops {
     } catch (e) {
       return json(400, errorJson(e.message, "invalid_request_error", undefined))
     }
-    if (Math.abs(Date.now() - ask.ts) > 60000.0) return denied(401, "stale cluster request")
+    if (!cluster.fresh(ask.ts, Date.now())) return denied(401, "stale cluster request")
     if (ask.sha === "" || ask.sha !== this.store.fileSha || this.store.genText === "") return json(404, errorJson("this node does not hold that configuration", "not_found_error", undefined))
     const hs: Record<string, string> = new Map()
     hs.set("content-type", "application/json")
@@ -2269,7 +2280,7 @@ export class Ops {
     } catch (e) {
       return json(400, errorJson(e.message, "invalid_request_error", undefined))
     }
-    if (Math.abs(Date.now() - ask.ts) > 60000.0) return denied(401, "stale cluster request")
+    if (!cluster.fresh(ask.ts, Date.now())) return denied(401, "stale cluster request")
     const store = this.engine.logStore
     if (store === undefined) return json(200, `{"node":${JSON.stringify(this.nodeId)},"rows":[]}`)
     const w = this.readWindow(ask.path, new URLSearchParams(ask.query), ask.now)
@@ -6180,7 +6191,14 @@ export class Ops {
       else out.push("no admin account and no setup token are configured: /api is locked (403); set setup_token in config.json (or the BIFROST_SETUP_TOKEN env var) and restart to finish setup")
     }
     if (!this.engine.gov.enforce) out.push("inference is not authenticated (client.enforce_auth_on_inference is off): anyone who reaches this port can use the provider keys")
+    if (this.metricsOpen()) out.push("/metrics is open on the main port and its labels name virtual keys, teams and customers: set server.metrics_token, or move it to the cluster listener with cluster.serve_metrics")
     return out
+  }
+
+  // Whether anyone who reaches the main port can read /metrics: no server.metrics_token, and not moved to the cluster
+  // listener (cluster.serve_metrics with cluster.listen_port).
+  metricsOpen(): bool {
+    return (this.engine.cfg.server?.metrics_token ?? "") === "" && !this.metricsOnCluster
   }
 
   // Bifrost's setup lock (SetupLockMiddleware): while no admin account exists, every /api route but the public ones
@@ -7187,6 +7205,18 @@ test("/api is locked without an admin: 403 with no setup token, the token or its
   admin.set("authorization", "Bearer admin-tok")
   expect(gateStatus(lockOps, "/api/providers", admin)).toBe(200)
   expect(lockOps.startupWarnings().some((w) => w.includes("/api is locked"))).toBe(false)
+})
+
+test("a start with /metrics open on the main port warns; a token or the cluster listener does not", () => {
+  const open = (w: string): bool => w.includes("/metrics is open")
+  let o = try lockFor({})
+  expect(o.startupWarnings().some(open)).toBe(true)
+  o = try lockFor({ server: { metrics_token: "m-token-1" } })
+  expect(o.startupWarnings().some(open)).toBe(false)
+  // cluster.serve_metrics moves it only with a cluster listener (main.tov openClusterListener sets metricsOnCluster)
+  o = try lockFor({})
+  o.metricsOnCluster = true
+  expect(o.startupWarnings().some(open)).toBe(false)
 })
 
 test("the worker share folder is private, unpredictable and its stale copies are recognized", () => {

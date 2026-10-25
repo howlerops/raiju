@@ -8014,7 +8014,12 @@ export interface operations {
     getApiClusterLeader: {
         parameters: {
             query?: never;
-            header?: never;
+            header: {
+                /** @description The time of the request in epoch milliseconds; more than a minute away from the node's clock is refused, so a captured request does not replay. */
+                "x-raiju-cluster-ts": string;
+                /** @description Hex HMAC-SHA256, keyed with the cluster secret, of "GET /api/cluster/leader <x-raiju-cluster-ts>". */
+                "x-raiju-cluster-sig": string;
+            };
             path?: never;
             cookie?: never;
         };
@@ -8114,6 +8119,15 @@ export interface operations {
                     "application/json": components["schemas"]["ManagementErrorResponse"];
                 };
             };
+            /** @description The body is over cluster.max_body_mb (16 MB by default). */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
         };
     };
     postApiClusterLogs: {
@@ -8179,6 +8193,15 @@ export interface operations {
                     "application/json": components["schemas"]["ManagementErrorResponse"];
                 };
             };
+            /** @description The body is over cluster.max_body_mb (16 MB by default). */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
         };
     };
     postApiClusterSync: {
@@ -8223,6 +8246,15 @@ export interface operations {
             };
             /** @description No such record (or the route is not served for this input). */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The body is over cluster.max_body_mb (16 MB by default). */
+            413: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -8292,6 +8324,15 @@ export interface operations {
             };
             /** @description No such record (or the route is not served for this input). */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The body is over cluster.max_body_mb (16 MB by default). */
+            413: {
                 headers: {
                     [name: string]: unknown;
                 };
