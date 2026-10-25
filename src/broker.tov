@@ -3,7 +3,9 @@
 // merges it into the joined state of all nodes and answers with that state and the roster of nodes heard
 // from lately. The broker keeps no usage of its own: it only joins what the nodes send. A node merges the
 // answer with Counters.relay, so the other nodes' usage reaches it in two rounds at most.
-import { Counters, ClusterConfig, LEADER_WINDOW_MS, verify, nodeOf, clusterBodyCap } from "./cluster"
+import { Counters, ClusterConfig, LEADER_WINDOW_MS, verify, nodeOf, clusterBodyCap, wellFormedSig, headRefusal, requestRefusal, signRequest, peerHeaders, sign, HEAD_SIG_HEADER, TS_HEADER } from "./cluster"
+import { ServerSectionConfig } from "./config"
+import { peerBudget, bodyRate, readCharged, BodyHold, UNREAD_ABOVE } from "./bodybudget"
 import { ClusterState } from "./clusterstate"
 import { HoldBook, HoldWire } from "./holds"
 import { ServerLimits, lifecycle, readyReport, readyInput } from "./lifecycle"
@@ -73,10 +75,56 @@ function reply(status: int, body: string): Response {
   return new Response(body, { status: status, headers: h })
 }
 
-// The broker's routes. POST carries a node's state; GET lists the roster. Both are signed with the
-// cluster secret over the body (empty for GET), like the peer sync. GET /health is for liveness probes, GET /ready
-// for readiness.
-export async function brokerRoute(relay: Relay, cc: ClusterConfig, req: Request): Promise<Response> {
+// A POST's head check, before its body is read (re-audit 4 P2-H, as the gateway's peerHeadRefusal): the body's
+// signature header must be well formed and the head signature (cluster.HEAD_SIG_HEADER over the method, route, time
+// and Content-Length) must match and be fresh. "" when it passes, otherwise why it is refused.
+export function brokerHeadRefusal(cc: ClusterConfig, req: Request, p: string, nowMs: f64): string {
+  if (!wellFormedSig(req.headers.get("x-raiju-cluster-sig") ?? "")) return "bad cluster signature"
+  const length = req.headers.get("content-length") ?? "chunked"
+  return headRefusal(cc.secret, req.method, p, req.headers.get(TS_HEADER) ?? "", length, req.headers.get(HEAD_SIG_HEADER) ?? "", nowMs)
+}
+
+// A node's body, read only after its head passed: charged to the peers' budget (bodybudget.tov peerBudget, cap
+// cluster.max_body_mb) as it arrives, at server.body_min_kb_per_second and within server.body_max_seconds. The text,
+// or the answer that refuses it; hold is given back by the caller.
+async function brokerBody(cc: ClusterConfig, srv: ServerSectionConfig | undefined, req: Request, hold: BodyHold): Promise<string | Response> {
+  const b = peerBudget()
+  const cap = clusterBodyCap(cc)
+  hold.peer = true
+  const declared = req.headers.get("content-length")
+  let max = cap
+  if (declared !== undefined) {
+    const n = parseInt(declared) ?? 0
+    if (n > cap) return reply(413, `{"error":"request body too large (cluster.max_body_mb)"}`)
+    if (n <= UNREAD_ABOVE) {
+      // read by the server already
+      b.hold(n)
+      hold.held = n
+      hold.cls = "small"
+      return await req.text()
+    }
+    if (!b.fits(n, cap, "checked", 0)) return reply(503, `{"error":"the broker is reading too many bodies at once (cluster.max_body_mb)"}`)
+    max = n
+  }
+  const st = req.body
+  if (st === undefined) return ""
+  hold.cls = "checked"
+  const got = await readCharged(st, b, hold, { max: max, cap: cap, cls: "checked", share: 0, who: "", whoShare: 0, deadlineMs: 0, rate: bodyRate(srv) })
+  if (got.stop === "large") return reply(413, `{"error":"request body too large (cluster.max_body_mb)"}`)
+  if (got.stop === "busy") return reply(503, `{"error":"the broker is reading too many bodies at once (cluster.max_body_mb)"}`)
+  if (got.stop !== "") return reply(408, `{"error":"the request body arrived too slowly"}`)
+  try {
+    return new TextDecoder().decode(got.body)
+  } catch (e) {
+    return reply(400, `{"error":"the body is not UTF-8"}`)
+  }
+}
+
+// The broker's routes. POST carries a node's state and GET lists the roster, as on a node's peer routes: a POST's
+// head is signed (method, route, time, Content-Length) and checked before its body is read, then the body's HMAC; a
+// GET is signed over its method, path and time (x-raiju-cluster-ts), so a captured one stops working after a minute.
+// GET /health is for liveness probes, GET /ready for readiness.
+export async function brokerRoute(relay: Relay, cc: ClusterConfig, req: Request, srv?: ServerSectionConfig): Promise<Response> {
   const u = URL.parse(req.url)
   const p = u === undefined ? "" : u.pathname
   if (p === "/health") return reply(200, `{"status":"ok"}`)
@@ -88,15 +136,27 @@ export async function brokerRoute(relay: Relay, cc: ClusterConfig, req: Request)
   if (p !== BROKER_ROUTE && p !== BROKER_FEED_ROUTE) return reply(404, `{"error":"not found"}`)
   if (req.method !== "POST" && req.method !== "GET") return reply(405, `{"error":"method not allowed"}`)
   if (p === BROKER_FEED_ROUTE && req.method !== "POST") return reply(405, `{"error":"method not allowed"}`)
-  let body = ""
-  if (req.method === "POST") body = await req.text()
-  if (!verify(cc.secret, body, req.headers.get("x-raiju-cluster-sig") ?? "")) return reply(401, `{"error":"bad cluster signature"}`)
-  if (req.method === "GET") return reply(200, JSON.stringify({ roster: relay.roster() }))
+  if (req.method === "GET") {
+    const why = requestRefusal(cc.secret, "GET", p, req.headers.get(TS_HEADER) ?? "", req.headers.get("x-raiju-cluster-sig") ?? "", Date.now())
+    if (why !== "") return reply(401, JSON.stringify({ error: why }))
+    return reply(200, JSON.stringify({ roster: relay.roster() }))
+  }
+  const unsigned = brokerHeadRefusal(cc, req, p, Date.now())
+  if (unsigned !== "") return reply(401, JSON.stringify({ error: unsigned }))
+  const hold = new BodyHold()
   try {
-    if (p === BROKER_FEED_ROUTE) return reply(200, try relay.feedExchange(body, Date.now()))
-    return reply(200, try relay.exchange(body, Date.now()))
-  } catch (e) {
-    return reply(400, JSON.stringify({ error: e.message }))
+    const read = await brokerBody(cc, srv, req, hold)
+    if (read instanceof Response) return read
+    const body = read
+    if (!verify(cc.secret, body, req.headers.get("x-raiju-cluster-sig") ?? "")) return reply(401, `{"error":"bad cluster signature"}`)
+    try {
+      if (p === BROKER_FEED_ROUTE) return reply(200, try relay.feedExchange(body, Date.now()))
+      return reply(200, try relay.exchange(body, Date.now()))
+    } catch (e) {
+      return reply(400, JSON.stringify({ error: e.message }))
+    }
+  } finally {
+    hold.release()
   }
 }
 
@@ -104,8 +164,9 @@ export async function brokerRoute(relay: Relay, cc: ClusterConfig, req: Request)
 export type BrokerServed = { url: string, stopListener: () => void, open: () => int }
 
 // Serves the relay on cluster_config.broker.listen_port (default 50051), with the gateway's header, idle and body
-// timeouts and connection cap (server.*).
-export function startBroker(cc: ClusterConfig, hostname: string, lim: ServerLimits): BrokerServed {
+// timeouts and connection cap (server.*). Bodies over UNREAD_ABOVE reach brokerRoute unread, so a head a node did not
+// sign is refused before the body is read.
+export function startBroker(cc: ClusterConfig, hostname: string, lim: ServerLimits, srv?: ServerSectionConfig): BrokerServed {
   const b = cc.broker
   const port: int = b === undefined ? BROKER_PORT : (b.listen_port ?? BROKER_PORT)
   const relay = new Relay()
@@ -118,8 +179,9 @@ export function startBroker(cc: ClusterConfig, hostname: string, lim: ServerLimi
     maxConnections: lim.maxConnections,
     // the nodes' sync and feed bodies, bounded like the cluster listener's (cluster.max_body_mb)
     maxRequestBodySize: clusterBodyCap(cc),
-    fetch(req) {
-      return brokerRoute(relay, cc, req)
+    bodyStreamThreshold: UNREAD_ABOVE,
+    async fetch(req) {
+      return await brokerRoute(relay, cc, req, srv)
     },
   })
   return {
@@ -263,4 +325,43 @@ test("the broker relays key holds between nodes, and stops relaying the holds of
   const got2 = new Counters("b")
   try got2.relay(again, late)
   expect(got2.takeHolds().length).toBe(0)
+})
+
+test("a broker POST's head is checked before its body is read (re-audit 4 P2-H)", () => {
+  const secret = "broker-test-" + "secret-0123456789abcdef0123456789"
+  const cc: ClusterConfig = { enabled: true, secret: secret, peers: [] }
+  const now = 1800000000000.0
+  const body = `{"node":"a","ts":1,"counters":[]}`
+  const at = (h: Map<string, string>, length: string): Request => {
+    const hs: Map<string, string> = new Map()
+    for (const k of h.keys()) hs.set(k, h.get(k)!)
+    if (length !== "") hs.set("content-length", length)
+    return new Request("http://b" + BROKER_ROUTE, { method: "POST", headers: hs })
+  }
+  const good = peerHeaders(secret, BROKER_ROUTE, body, now)
+  expect(brokerHeadRefusal(cc, at(good, `${body.byteLength}`), BROKER_ROUTE, now)).toBe("")
+  // a head signed for the gateway's sync route, another length, no length, another route, a stale head
+  expect(brokerHeadRefusal(cc, at(peerHeaders(secret, "/api/cluster/sync", body, now), `${body.byteLength}`), BROKER_ROUTE, now)).toBe("bad cluster signature")
+  expect(brokerHeadRefusal(cc, at(good, "15000000"), BROKER_ROUTE, now)).toBe("bad cluster signature")
+  expect(brokerHeadRefusal(cc, at(good, ""), BROKER_ROUTE, now)).toBe("bad cluster signature")
+  expect(brokerHeadRefusal(cc, at(good, `${body.byteLength}`), BROKER_FEED_ROUTE, now)).toBe("bad cluster signature")
+  expect(brokerHeadRefusal(cc, at(good, `${body.byteLength}`), BROKER_ROUTE, now + 120000.0)).toBe("stale cluster request")
+  // the re-audit's request: a well-formed body signature and no head
+  const fake: Map<string, string> = new Map()
+  fake.set("x-raiju-cluster-sig", "ab".repeat(32))
+  expect(brokerHeadRefusal(cc, at(fake, "15000000"), BROKER_ROUTE, now)).toBe("bad cluster signature")
+  const odd: Map<string, string> = new Map()
+  odd.set("x-raiju-cluster-sig", "zz")
+  expect(brokerHeadRefusal(cc, at(odd, "2"), BROKER_ROUTE, now)).toBe("bad cluster signature")
+})
+
+test("the broker's GET roster signature covers the method, path and time", () => {
+  const secret = "broker-test-" + "secret-0123456789abcdef0123456789"
+  const now = 1800000000000.0
+  const ts = "1800000000000"
+  expect(requestRefusal(secret, "GET", BROKER_ROUTE, ts, signRequest(secret, "GET", BROKER_ROUTE, ts), now)).toBe("")
+  // the old constant signature over an empty body no longer passes, nor a captured one after a minute
+  expect(requestRefusal(secret, "GET", BROKER_ROUTE, ts, sign(secret, ""), now)).toBe("bad cluster signature")
+  expect(requestRefusal(secret, "GET", BROKER_ROUTE, "", sign(secret, ""), now)).toBe("bad cluster signature")
+  expect(requestRefusal(secret, "GET", BROKER_ROUTE, ts, signRequest(secret, "GET", BROKER_ROUTE, ts), now + 60001.0)).toBe("stale cluster request")
 })

@@ -123,9 +123,13 @@ unread. `server.max_buffered_body_mb` (default 48; -1 for no cap; read per reque
 request-body megabytes each process reads at once: a body that does not fit is answered 503 with
 `retry-after: 1` (unread when its declared length cannot fit beside the bytes held), and is retried by
 well-behaved clients. Bytes are charged as they arrive, so a client trickling a big declared body holds
-only what it has sent. A body whose credential was checked from the headers must keep an average of
-`server.body_min_kb_per_second` (default 32, 0 off) after `server.body_rate_grace_seconds` (default
-10); a body whose credential was not checked (inference with auth off, the plugins' HTTP hooks, routes
+only what it has sent. A body whose credential was checked from the headers (a virtual key, a direct
+provider key that is one of the configured keys, a sign-in) must keep `server.body_min_kb_per_second`
+(default 32, 0 off) after `server.body_rate_grace_seconds` (default 10), counted over each recent
+`server.body_rate_window_seconds` (default 30), and arrive whole within `server.body_max_seconds`
+(default 600, 0 off; raise it for very large uploads over slow links); the bytes one credential holds
+past `server.credential_body_mb` (default a quarter of the cap; -1 for none) do not count against
+other callers' bodies, so one tenant cannot hold the whole budget; a body whose credential was not checked (inference with auth off, the plugins' HTTP hooks, routes
 that read their credential from the body) must arrive whole within `server.body_deadline_seconds`
 (default 30, 0 off) and, beside other bodies, shares `server.unchecked_body_mb` (default an eighth of
 the cap; -1 for no separate share), so an unauthenticated client cannot turn the authenticated big
@@ -136,7 +140,10 @@ most 64 KB. The cluster peer routes refuse a request before reading its body unl
 route, `x-raiju-cluster-ts` and Content-Length) is signed with `cluster.secret` and fresh, read at most
 `cluster.max_body_mb` (default 16 MB; a node whose sync body outgrows it logs so, and every node needs
 the higher value), and have a body budget of their own. Upgrade every node of a cluster together: a
-node from before L204 does not sign the head, and its peers refuse its sync until it is upgraded.
+node from before L204 does not sign the head, and its peers refuse its sync until it is upgraded. The
+broker (`-mode broker`) checks the same signed head before reading a body (charged to its own budget,
+`cluster.max_body_mb`), and its roster read (GET `/api/cluster/broker`) is signed over its method, path
+and time; upgrade the broker and its nodes together (L205).
 A body is always read when the process holds no other, so a single request up
 to `client.max_request_body_size_mb` (default 100) is still served; parsing a chat body costs about
 six to eight times its size, so on a small pod lower `max_request_body_size_mb` too (on the chart's

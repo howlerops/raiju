@@ -944,6 +944,37 @@ def leader_headers(secret, ts=None):
     t = str(int(time.time() * 1000) if ts is None else ts)
     return {"x-raiju-cluster-ts": t, "x-raiju-cluster-sig": cluster_sig(secret, "GET /api/cluster/leader " + t)}
 
+def broker_get_headers(secret, ts=None):
+    """The headers of a signed GET /api/cluster/broker (the roster): the signature over the method, the path and the time (L205)."""
+    t = str(int(time.time() * 1000) if ts is None else ts)
+    return {"x-raiju-cluster-ts": t, "x-raiju-cluster-sig": cluster_sig(secret, "GET /api/cluster/broker " + t)}
+
+def broker_flood(port, n, size, headers):
+    """n concurrent POSTs of size bytes to the broker's sync route, each sent whole unless the broker answers first; the
+    status codes (0 when the connection dropped)."""
+    payload = b"a" * size
+    codes = []
+    def one():
+        try:
+            s = socket.create_connection(("127.0.0.1", port), timeout=30)
+            head = "POST /api/cluster/broker HTTP/1.1\r\nHost: 127.0.0.1\r\ncontent-length: %d\r\n" % size
+            head += "".join("%s: %s\r\n" % (k, v) for k, v in headers.items()) + "\r\n"
+            s.sendall(head.encode())
+            try:
+                s.sendall(payload)
+            except OSError:
+                pass
+            codes.append(l196_read(s)[0])
+            s.close()
+        except OSError:
+            codes.append(0)
+    ts = [threading.Thread(target=one) for _ in range(n)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(60)
+    return sorted(codes)
+
 def cluster_leader(base, secret):
     s, _, b = call("GET", "/api/cluster/leader", headers=leader_headers(secret), base=base, auth=False)
     return json.loads(b) if s == 200 else {"status": s, "body": b}
@@ -991,15 +1022,38 @@ def cluster_modes_e2e():
         time.sleep(0.8)
         r2 = [call("POST", "/v1/chat/completions", body, vk, base=BROKER_NODES[1])[0] for _ in range(2)]
         check("two nodes with no peers share a rate limit through the broker", r1 == [200, 200] and r2 == [200, 429], (r1, r2))
-        s, _, b = call("GET", "/api/cluster/broker", headers={"x-raiju-cluster-sig": cluster_sig(broker_secret)}, base=BROKER_URL, auth=False)
+        # L205: the roster read is signed over its method, path and time, like /api/cluster/leader
+        s, _, b = call("GET", "/api/cluster/broker", headers=broker_get_headers(broker_secret), base=BROKER_URL, auth=False)
         roster = json.loads(b).get("roster") if s == 200 else None
         check("the broker lists both nodes as its roster", roster == ["bn-a", "bn-b"], (s, b[:200]))
         s, _, b = call("GET", "/api/cluster/broker", headers={"x-raiju-cluster-sig": "00"}, base=BROKER_URL, auth=False)
         check("the broker refuses a node that does not sign", s == 401, s)
+        s, _, b = call("GET", "/api/cluster/broker", headers={"x-raiju-cluster-sig": cluster_sig(broker_secret)}, base=BROKER_URL, auth=False)
+        check("l205: the broker refuses the old constant roster signature (over an empty body)", s == 401, (s, b[:200]))
+        s, _, b = call("GET", "/api/cluster/broker", headers=broker_get_headers(broker_secret, int(time.time() * 1000) - 120000), base=BROKER_URL, auth=False)
+        check("l205: a captured roster read two minutes old is refused as stale", s == 401 and "stale" in b, (s, b[:200]))
         la, lb = cluster_leader(BROKER_NODES[0], broker_secret), cluster_leader(BROKER_NODES[1], broker_secret)
         check("the broker's roster decides leadership by rank: bn-a leads", la.get("leader") is True and lb.get("leader") is False and la.get("election") == "rank", (la, lb))
         s, _, b = call("POST", "/api/cluster/broker", "{}", {"x-raiju-cluster-sig": "00"}, base=BROKER_URL, auth=False)
         check("the broker's sync needs the cluster secret", s == 401, s)
+        # L205 (re-audit 4 P2-H): a POST's head is checked before its body is read, and bodies go through the peers' budget
+        t0 = time.time()
+        st = declared_status(18133, "/api/cluster/broker", 15000000, {"x-raiju-cluster-sig": "ab" * 32})
+        check("l205: a 15 MB broker POST with a well-formed fake signature is refused 401 from its head, unread", st == 401 and time.time() - t0 < 3, (st, round(time.time() - t0, 2)))
+        wire = json.dumps({"node": "zz-l205", "ts": time.time() * 1000, "counters": []})
+        st = declared_status(18133, "/api/cluster/broker", 15000000, peer_headers(broker_secret, "/api/cluster/broker", wire))
+        check("l205: a captured signed broker head sent with a bigger body is refused 401 unread", st == 401, st)
+        s, _, b = call("POST", "/api/cluster/broker", wire, peer_headers(broker_secret, "/api/cluster/sync", wire), base=BROKER_URL, auth=False)
+        check("l205: a broker POST whose head was signed for another route is refused", s == 401, (s, b[:200]))
+        s, _, b = call("POST", "/api/cluster/broker/feed", json.dumps({"node": "zz-l205", "after": 0, "items": []}), {"x-raiju-cluster-sig": "ab" * 32}, base=BROKER_URL, auth=False)
+        check("l205: the broker's feed route checks the head too", s == 401, (s, b[:200]))
+        hwm0 = l124_vm(procs["broker"].pid, "VmHWM")
+        codes = broker_flood(18133, 16, 15000000, {"x-raiju-cluster-sig": "ab" * 32})
+        hwm1 = l124_vm(procs["broker"].pid, "VmHWM")
+        check("l205: 16 unsigned 15 MB broker bodies are not read (peak memory grew %d MiB; about 200 before)" % (hwm1 - hwm0), hwm1 - hwm0 < 40, (hwm0, hwm1, codes))
+        big = json.dumps({"node": "zz-l205", "ts": time.time() * 1000, "counters": [], "pad": "p" * 200000})
+        s, _, b = call("POST", "/api/cluster/broker", big, peer_headers(broker_secret, "/api/cluster/broker", big), base=BROKER_URL, auth=False)
+        check("l205: a signed 200 KB broker sync (read as a stream) is still joined", s == 200 and "counters" in b, (s, b[:200]))
 
         # lock: exactly one node leads; when it stops renewing, the other takes the key
         def leaders():
@@ -13896,6 +13950,78 @@ def l183_e2e(env):
             gw3.wait()
 
 
+GW_L205 = "http://127.0.0.1:18366"  # L205: the sliding-window body rate, the body ceiling, the per-credential share, direct keys counted as checked
+
+
+def l205_e2e(env):
+    """L205 (production re-audit 4, P1-E, P2-K). P1-E: a key that sends a lot at once and then trickles no longer holds
+    the body budget for minutes: the rate of a checked body is counted over each recent server.body_rate_window_seconds
+    (an average from the start let the early bytes buy ~26 minutes), a checked body must arrive within
+    server.body_max_seconds, and the bytes one credential holds past server.credential_body_mb do not count against
+    other callers' bodies (another key's 200 KB and 1 MB chats got 503 for as long as the hog held the cap). P2-K: a
+    direct provider key (client.allow_direct_keys) that is one of the configured keys gets the checked class (it had the
+    unchecked fixed deadline). Its own gateway (18366)."""
+    d = os.path.join(BUILD, "e2e-l205")
+    os.makedirs(d, exist_ok=True)
+    cp = os.path.join(d, "config.json")
+    log = os.path.join(d, "gw.log")
+    direct = "sk-l205-" + "provider-key"
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": True, "allow_direct_keys": True},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        # 4 MB of bodies in hand, a quarter of it (1 MB) per credential against the others; unchecked bodies within 3 s;
+        # checked ones at 64 KB/s after 1 s over 2 s windows, and within 6 s
+        "server": {"max_buffered_body_mb": 4, "body_deadline_seconds": 3, "body_min_kb_per_second": 64, "body_rate_grace_seconds": 1,
+                   "body_rate_window_seconds": 2, "body_max_seconds": 6},
+        "governance": {"virtual_keys": [{"id": "vk-l205a", "name": "vk-l205a", "value": "sk-bf-l205a"}, {"id": "vk-l205b", "name": "vk-l205b", "value": "sk-bf-l205b"}]},
+        "providers": {"openai": {"keys": [{"name": "o-l205", "value": direct, "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+    }
+    json.dump(cfg, open(cp, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18366", "-host", "127.0.0.1", "-config", cp, "-server", os.environ.get("RAIJU_SERVER", "bun")],
+                          env=env, stderr=open(log, "w"))
+    ka, kb = {"x-bf-vk": "sk-bf-l205a"}, {"x-bf-vk": "sk-bf-l205b"}
+    try:
+        wait(GW_L205 + "/health")
+
+        # ---- P1-E: key a sends 4.5 MB of a declared 50 MB at once, then nothing ----
+        t0 = time.time()
+        hog = l196_open(18366, "/v1/chat/completions", 50 * 1048576, ka, 4718592)
+        time.sleep(0.5)
+        s1, _, b1 = call("POST", "/v1/chat/completions", l196_chat(200000).decode(), kb, base=GW_L205, auth=False)
+        check("l205: while key a holds the whole body budget, key b's 200 KB chat is served (it was 503)", s1 == 200 and "Hello from gpt-4o-mini" in b1, (s1, b1[:200]))
+        s2, _, b2 = call("POST", "/v1/chat/completions", l196_chat(1048576).decode(), kb, base=GW_L205, auth=False)
+        check("l205: and key b's 1 MB chat too (a's bytes past server.credential_body_mb do not count against b)", s2 == 200, (s2, b2[:200]))
+        s3 = declared_status(18366, "/v1/chat/completions", 200000, ka)
+        check("l205: key a's own next body still sees all it holds (503)", s3 == 503, s3)
+        hog.settimeout(15)
+        code, head = l196_read(hog)
+        took = time.time() - t0
+        hog.close()
+        check("l205: the stalled body is cut with 408 a window after its grace (about 3 s; the average from the start held it for 73 s)",
+              code == 408 and "body_min_kb_per_second" in head and took < 6.0, (code, round(took, 1), head[:300]))
+        s4, _, b4 = call("POST", "/v1/chat/completions", l196_chat(200000).decode(), ka, base=GW_L205, auth=False)
+        check("l205: after the cut key a is served again", s4 == 200, (s4, b4[:200]))
+
+        # ---- P1-E: server.body_max_seconds ----
+        st, ans, took = l204_send(18366, "/v1/chat/completions", l196_chat(2 * 1048576), ka, 20480, 0.1)
+        check("l205: a key's 2 MB upload at about 200 KB/s (10 s) is cut with 408 at server.body_max_seconds (6 s)",
+              st == 408 and "body_max_seconds" in ans and 5.5 < took < 8.5, (st, round(took, 1), ans[-200:]))
+
+        # ---- P2-K: a direct key that is a configured provider key is checked ----
+        dh = {"x-bf-direct-key": "true", "authorization": "Bearer " + direct}
+        st, ans, took = l204_send(18366, "/v1/chat/completions", l196_chat(800000), dh, 20480, 0.1)
+        check("l205: an 800 KB upload with a configured direct key at about 200 KB/s (past the 3 s unchecked deadline) is served",
+              st == 200 and "Hello from gpt-4o-mini" in ans and took > 3.2, (st, round(took, 1), ans[-200:]))
+        other = {"x-bf-direct-key": "true", "authorization": "Bearer sk-l205-" + "someone-elses"}
+        st, ans, took = l204_send(18366, "/v1/chat/completions", l196_chat(800000), other, 20480, 0.1)
+        check("l205: the same upload with a direct key nobody configured keeps the unchecked deadline (408 at 3 s)",
+              st == 408 and "body_deadline_seconds" in ans and took < 5.0, (st, round(took, 1), ans[-200:]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
 GW_L189 = "http://127.0.0.1:18334"  # L189: WebSocket and realtime drain at shutdown, the write-stall timeout and broker mode's graceful stop (its broker takes the port after the gateways); 18335 is the UI setup gateway (tests/ui_e2e.mjs)
 
 
@@ -19831,6 +19957,9 @@ def main():
         # L204: unchecked bodies' budget share and deadline, /mcp checked from the headers, the rate-based deadline of
         # checked bodies, header-signed peer requests with their own budget: its own gateway (18364, 18365)
         l204_e2e(env)
+        # L205: the sliding-window rate and ceiling of checked bodies, the per-credential share of the body budget, direct
+        # provider keys counted as checked: its own gateway (18366)
+        l205_e2e(env)
         # L194: Hugging Face inference providers (chat, embeddings, speech, transcription, images), the CLI's agent sign-in
         # and default key, and the A2A v0.3 REST client: its own gateway (18344) and Hugging Face double (18345)
         l194_e2e(env)
