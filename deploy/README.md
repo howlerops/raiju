@@ -23,8 +23,15 @@ Raiju is not stateless. In the folder that holds `config.json` (`/app/data` in t
 - `config.json` and `config.json.bak`, on every change made through the management API or the web
   UI (written to a temporary file, then renamed);
 - `mcp-oauth-state.json` (the MCP authorization server's signing key and grants; without it, a
-  restart changes the key and every token it issued stops working) and `mcp-flow-state.json` (MCP
-  OAuth flows in flight);
+  restart changes the key and every token it issued stops working), `mcp-oauth-state-clients.jsonl`
+  (the MCP clients registered and not yet granted: one line per registration, bounded by
+  `client.oauth2_server_config.max_unused_clients`, rewritten when it holds twice that) and
+  `mcp-flow-state.json` (MCP OAuth flows in flight);
+- `config.json.sessions.json` and `config.json.agent-sessions.json` (dashboard sessions and CLI
+  sign-in tokens, by hash). Single sign-on logins in flight are stored nowhere: their state is sealed
+  with a key derived from `encryption_key`, else from `cluster.secret` with clustering on, else a key
+  each node makes at its start (then a callback that reaches another node fails; a start with other
+  nodes configured warns). Set `encryption_key` or clustering when several nodes serve SSO;
 - `logs/` (the request log store, when `logs_store` is on) and `logs/audit/` (the audit log, when
   `audit` is on), private (0700 folders, 0600 files). An enabled store whose folder cannot be written
   stops the start;

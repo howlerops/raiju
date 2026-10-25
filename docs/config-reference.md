@@ -9,7 +9,7 @@ for each element of a list. Descriptions are the comments in the source; default
 has one. The command-line flags (`-app-dir`, `-config`, `-host`, `-port`, `-workers`, `-server`, `-mode`,
 `-healthcheck`) are in the README.
 
-1368 keys (567 with a description), and 38 Bifrost keys read through config_compat.
+1372 keys (571 with a description), and 38 Bifrost keys read through config_compat.
 
 ## Sections
 
@@ -135,6 +135,10 @@ Gateway-wide request handling: logging, auth on inference, CORS, body limits, he
 | `client.oauth2_server_config.allowed_redirect_uris` | string[] |  |
 | `client.oauth2_server_config.disable_vk_identity` | bool |  |
 | `client.oauth2_server_config.signing_key` | string | signing_key is the RS256 private key (PEM, PKCS#1 or PKCS#8) that signs the tokens. issuer_url and signing_key may be env.NAME references. |
+| `client.oauth2_server_config.registrations_per_minute` | int | Raiju's limits on dynamic client registration (Bifrost has none; it only sweeps clients with no grant after an hour). An unused client is one with no grant yet. The address is the TCP peer, or a forwarding header from server.trusted_proxies (an IPv6 address counts by its /64). A negative count turns that limit off. registrations_per_minute: registrations from one address a minute (default 10); past it 429 with Retry-After. |
+| `client.oauth2_server_config.max_unused_clients_per_address` | int | Unused clients one address may hold (default 20); past it 429 with Retry-After. |
+| `client.oauth2_server_config.max_unused_clients` | int | Unused clients in all (default 1000): past it the oldest unused ones are dropped. |
+| `client.oauth2_server_config.unused_client_ttl_seconds` | int | How long a client with no grant lives, in seconds (default 3600, Bifrost's sweep grace; at least 1200). |
 | `client.webhook_config` | object | Bifrost's webhook settings: deliveries older than this many days are dropped (default 30) |
 | `client.webhook_config.delivery_history_retention_days` | int |  |
 

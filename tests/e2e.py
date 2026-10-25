@@ -4311,8 +4311,19 @@ def sso_sign_in(idp_state: dict) -> tuple:
     loc = r.getheader("location") or ""
     q = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)
     idp_state["nonce"] = q.get("nonce", [""])[0]
-    s, _, page = call("GET", "/api/oidc/callback?code=abc&state=" + q.get("state", [""])[0], base=GW_SSO, auth=False)
+    s, _, page = call("GET", "/api/oidc/callback?code=abc&state=" + q.get("state", [""])[0], None, oidc_cookie(r.getheader("set-cookie")), base=GW_SSO, auth=False)
     return s, page
+
+def oidc_cookie(set_cookie):
+    """The Cookie header a browser sends back to /api/oidc/callback after /api/oidc/login set its state cookie (L203: the
+    callback takes a state only from the browser that began the sign-in)."""
+    v = (set_cookie or "").split(";")[0].strip()
+    return {"cookie": v} if v.startswith("raiju_oidc_state=") else {}
+
+def oidc_cookie_for(state):
+    """The state cookie the gateway would have set for this state (its hash), for checks that send a forged state."""
+    import hashlib
+    return {"cookie": "raiju_oidc_state=" + hashlib.sha256(("raiju-oidc-bind:" + state).encode()).hexdigest()}
 
 def l120_e2e(env, idp_state):
     """A SCIM-deactivated user is refused at OIDC sign-in and its open session stops at the next request; reactivated, it signs
@@ -12125,7 +12136,7 @@ def l167_e2e(env, idp_state):
         idp_state["nonce"] = q.get("nonce", [""])[0]
         idp_state["claims"] = {"sub": sub, "email": sub + "@example.com"}
         try:
-            s, _, page = call("GET", "/api/oidc/callback?code=abc&state=" + q.get("state", [""])[0], base=GW_L167, auth=False)
+            s, _, page = call("GET", "/api/oidc/callback?code=abc&state=" + q.get("state", [""])[0], None, oidc_cookie(r.getheader("set-cookie")), base=GW_L167, auth=False)
         finally:
             idp_state["claims"] = {}
         m = _re.search(r'"(sk-sess-[0-9a-f]+)"', page)
@@ -14708,7 +14719,7 @@ def l181_scim_e2e(env, idp_state):
             loc = r.getheader("location") or ""
             q = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)
             idp_state["nonce"] = q.get("nonce", [""])[0]
-            s, _, page = call("GET", "/api/oidc/callback?code=abc&state=" + q.get("state", [""])[0], base=GW_L181S, auth=False)
+            s, _, page = call("GET", "/api/oidc/callback?code=abc&state=" + q.get("state", [""])[0], None, oidc_cookie(r.getheader("set-cookie")), base=GW_L181S, auth=False)
             return s, page, q.get("redirect_uri", [""])[0]
         finally:
             idp_state["claims"] = {}
@@ -15141,7 +15152,7 @@ def l191_e2e(env, idp_state):
             conn.request("GET", "/api/oidc/login"); r = conn.getresponse(); r.read()
             q = urllib.parse.parse_qs(urllib.parse.urlparse(r.getheader("location") or "").query)
             idp_state["nonce"] = q.get("nonce", [""])[0]
-            s, _, page = call("GET", "/api/oidc/callback?code=abc&state=" + q.get("state", [""])[0], base=GW_L191, auth=False)
+            s, _, page = call("GET", "/api/oidc/callback?code=abc&state=" + q.get("state", [""])[0], None, oidc_cookie(r.getheader("set-cookie")), base=GW_L191, auth=False)
             m = _re.search(r'"(sk-sess-[0-9a-f]+)"', page)
             return s, (m.group(1) if m else ""), page
         try:
@@ -16807,10 +16818,11 @@ def l200_e2e(env, idp_state):
             q = _up.parse_qs(_up.urlparse(loc).query)
             st = q.get("state", [""])[0]
             idp_state["nonce"] = q.get("nonce", [""])[0]
-            s, _, page = call("GET", "/api/oidc/callback?code=abc&state=" + _up.quote(st, safe=""), base=GW_L200_SSO, auth=False)
+            s, _, page = call("GET", "/api/oidc/callback?code=abc&state=" + _up.quote(st, safe=""), None, oidc_cookie(r.getheader("set-cookie")), base=GW_L200_SSO, auth=False)
             oks.append((s, st.startswith("s1.") and "consent" not in st, "sk-sess-" in page and f"l200={i}" in page))
         check("L200: sign-ins begun on one worker complete on any, back to their return path; the state is sealed", all(o == (200, True, True) for o in oks), oks)
-        s, _, _ = call("GET", "/api/oidc/callback?code=abc&state=s1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", base=GW_L200_SSO, auth=False)
+        forged = "s1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        s, _, _ = call("GET", "/api/oidc/callback?code=abc&state=" + forged, None, oidc_cookie_for(forged), base=GW_L200_SSO, auth=False)
         check("L200: a forged state is refused", s == 401, s)
     finally:
         if holder is not None and holder.poll() is None:
@@ -16820,6 +16832,206 @@ def l200_e2e(env, idp_state):
             if p is not None:
                 p.terminate()
                 p.wait()
+
+GW_L203 = "http://127.0.0.1:18362"  # L203: MCP client registration limits (four workers on Bun), then OIDC node A
+GW_L203_B = "http://127.0.0.1:18363"  # L203: OIDC node B, then a gateway that warns about its node-local state key
+L203_SECRET = "e2e-l203-" + "cluster-secret-0123456789abcdef"
+
+# Unauthenticated /oauth2/register for a few seconds from many threads: "one" sends from this host's address, "many"
+# from a new forwarded address each time (the gateway trusts 127.0.0.1 as a proxy). Prints the status counts.
+L203_FLOOD = """
+import http.client, json, sys, threading, time
+port, secs, n, mode = int(sys.argv[1]), float(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+stop = time.time() + secs
+codes = {}
+lk = threading.Lock()
+body = json.dumps({"client_name": "l203-flood", "redirect_uris": ["http://127.0.0.1:9999/cb"]})
+def run(k):
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    mine = {}
+    i = 0
+    while time.time() < stop:
+        h = {"content-type": "application/json"}
+        if mode == "many":
+            i += 1
+            h["x-forwarded-for"] = "10.%d.%d.%d" % (k + 1, (i >> 8) & 255, i & 255)
+        try:
+            c.request("POST", "/oauth2/register", body, h)
+            r = c.getresponse()
+            r.read()
+            mine[r.status] = mine.get(r.status, 0) + 1
+        except Exception:
+            c.close()
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            mine[0] = mine.get(0, 0) + 1
+    with lk:
+        for s, v in mine.items():
+            codes[s] = codes.get(s, 0) + v
+ts = [threading.Thread(target=run, args=(k,)) for k in range(n)]
+for t in ts:
+    t.start()
+for t in ts:
+    t.join()
+print(json.dumps(codes))
+"""
+
+def l203_e2e(env, idp_state):
+    """L203: unauthenticated MCP client registration is bounded (registrations a minute and unused clients per address,
+    unused clients in all) and appends one line per client instead of rewriting the state file, so a register flood
+    leaves /health fast and the real grants kept; /oauth2/authorize stores nothing (its consent link carries the
+    request, sealed) and works on every worker at once; without an encryption key two clustered nodes share the OIDC
+    state key through cluster.secret, so a callback on the other node signs in, and a start with neither warns when
+    other nodes are configured; the OIDC state is bound to the browser by an HttpOnly SameSite=Lax cookie. Ports 18362
+    and 18363, one gateway after the other."""
+    import shutil, http.client, urllib.parse as _up
+    d = os.path.join(BUILD, "e2e-l203")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    def timed(fn):
+        t0 = time.time()
+        r = fn()
+        return r, time.time() - t0
+    def health(base):
+        return timed(lambda: call("GET", "/health", None, None, base=base, auth=False)[0])
+    def mtime(p):
+        return os.stat(p).st_mtime_ns if os.path.exists(p) else 0
+    def flood(mode, secs):
+        p = subprocess.Popen([sys.executable, "-I", "-c", L203_FLOOD, "18362", str(secs), "12", mode], stdout=subprocess.PIPE, text=True)
+        time.sleep(1.0)
+        hs = [health(GW_L203) for _ in range(10)]
+        out, _ = p.communicate(timeout=60)
+        return (json.loads(out) if out.strip() else {}), hs
+    def fast(hs):
+        lat = sorted(h[1] for h in hs)
+        return all(h[0] == 200 for h in hs) and lat[len(lat) // 2] < 0.1 and lat[-1] < 1.0, lat
+    base_cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "l203", "value": "sk-l203", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+    }
+    # ---- MCP client registration ----
+    dcr_dir = os.path.join(d, "dcr")
+    os.makedirs(dcr_dir)
+    dcr_path = os.path.join(dcr_dir, "config.json")
+    json.dump({**base_cfg,
+               "client": {**base_cfg["client"], "mcp_server_auth_mode": "both",
+                          "oauth2_server_config": {"issuer_url": GW_L203, "registrations_per_minute": 10, "max_unused_clients_per_address": 20, "max_unused_clients": 60}},
+               "server": {"trusted_proxies": ["127.0.0.1"]},
+               "governance": {"virtual_keys": [{"id": "vk-l203", "name": "l203 key", "value": "sk-bf-l203"}]}}, open(dcr_path, "w"))
+    state = os.path.join(dcr_dir, "mcp-oauth-state.json")
+    registry = os.path.join(dcr_dir, "mcp-oauth-state-clients.jsonl")
+    gw = l200_start(env, 18362, dcr_path, "l203dcr", 4)
+    try:
+        wait(GW_L203 + "/health")
+        time.sleep(0.5)
+        cid, refresh = as_grant(GW_L203, "l203-real", "sk-bf-l203")
+        check("L203: a real MCP client is granted before the flood", cid != "" and refresh != "", (cid, refresh))
+        st_before = mtime(state)
+        codes, hs = flood("one", 3.0)
+        ok, lat = fast(hs)
+        check("L203: a register flood from one address gets at most its registrations of the minute (10), the rest 429",
+              codes.get("201", 0) <= 10 and codes.get("429", 0) > 50 and set(codes) <= {"201", "429"}, codes)
+        check("L203: /health stays fast during the one-address register flood", ok, lat)
+        s, h, b = raw("POST", GW_L203 + "/oauth2/register", {"client_name": "late", "redirect_uris": [AS_REDIRECT]}, {"content-type": "application/json"})
+        check("L203: a refused registration says when to try again (429, Retry-After)", s == 429 and int(h.get("retry-after", "0")) > 0 and "temporarily_unavailable" in b, (s, h.get("retry-after"), b[:200]))
+        codes2, hs2 = flood("many", 3.0)
+        ok2, lat2 = fast(hs2)
+        check("L203: a register flood from many addresses is served (201) and /health stays fast", codes2.get("201", 0) > 100 and ok2, (codes2, lat2))
+        check("L203: no register flood writes the state file (the grants are written only by consent, token and revoke)", mtime(state) == st_before and st_before != 0, (st_before, mtime(state)))
+        lines = open(registry).read().split("\n") if os.path.exists(registry) else []
+        check("L203: the client registry stays bounded (60 unused clients kept; rewritten at twice that plus slack)", 2 <= len(lines) <= 2 * 60 + 64 + 3, len(lines))
+        sj = json.load(open(state))
+        check("L203: the state file keeps the granted client and its refresh row, and no flood client",
+              any(c["client_id"] == cid for c in sj.get("clients", [])) and not any(c.get("client_name") == "l203-flood" for c in sj.get("clients", [])) and len(sj.get("refresh", [])) >= 1, (len(sj.get("clients", [])), len(sj.get("refresh", []))))
+        s, body = as_refresh(GW_L203, cid, refresh)
+        check("L203: the real grant still refreshes after the floods", s == 200 and body.get("refresh_token", "") != "", (s, body))
+        s, _, b = raw("GET", GW_L203 + "/api/oauth2/sessions?q=l203-real")
+        check("L203: the real grant is listed with its client's name", s == 200 and json.loads(b).get("total_count") == 1, (s, b[:200]))
+        # a client registered on one worker is found by every worker at once, and authorize stores nothing
+        s, _, b = raw("POST", GW_L203 + "/oauth2/register", {"client_name": "l203-fresh", "redirect_uris": [AS_REDIRECT]}, {"content-type": "application/json", "x-forwarded-for": "192.0.2.77"})
+        fresh = json.loads(b).get("client_id", "") if s == 201 else ""
+        before = {p: mtime(p) for p in (state, registry)}
+        links = []
+        for i in range(40):
+            verifier, challenge = as_pkce()
+            links.append(as_authorize(GW_L203, fresh, challenge, "st-%d" % i))
+        after = {p: mtime(p) for p in (state, registry)}
+        check("L203: authorize answers on every worker for a client just registered on one (40 of 40)", fresh != "" and all(f != "" and t.startswith("f1.") for f, t in links), (s, fresh, links[:2]))
+        check("L203: authorize writes nothing (its request rides sealed in the consent link)", before == after, (before, after))
+        opened = [raw("GET", GW_L203 + "/api/oauth2/consent/flows/" + f, None, {"x-bifrost-temp-token": t})[0] for f, t in links[:8]]
+        check("L203: the consent links open on any worker", opened == [200] * 8, opened)
+        s, _ = as_approve(GW_L203, links[0][0], links[0][1], "sk-bf-l203")
+        s2, _ = as_approve(GW_L203, links[0][0], links[0][1], "sk-bf-l203")
+        check("L203: a consent link is used once, across workers", s == 200 and s2 == 401, (s, s2))
+    finally:
+        gw.terminate()
+        gw.wait()
+    # ---- OIDC: the state key across nodes, and the browser binding ----
+    env2 = {**env, "RAIJU_L203_SECRET": L203_SECRET}
+    gws = []
+    def sso_node(name, port, base, cluster):
+        nd = os.path.join(d, name)
+        os.makedirs(nd)
+        p = os.path.join(nd, "config.json")
+        cfg = {**base_cfg, "oidc": {"enabled": True, "issuer": "http://127.0.0.1:18096", "client_id": "raiju", "redirect_uri": base + "/api/oidc/callback", "role_claim": "groups", "role_map": {"raiju-editors": "editor"}}}
+        if cluster is not None:
+            cfg["cluster"] = cluster
+        json.dump(cfg, open(p, "w"))
+        g = l200_start(env2, port, p, "l203" + name, 2)
+        gws.append(g)
+        return g
+    def login(port, headers=None):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        c.request("GET", "/api/oidc/login", headers=headers or {})
+        r = c.getresponse()
+        r.read()
+        c.close()
+        q = _up.parse_qs(_up.urlparse(r.getheader("location") or "").query)
+        idp_state["nonce"] = q.get("nonce", [""])[0]
+        return q.get("state", [""])[0], r.getheader("set-cookie") or "", idp_state["nonce"]
+    def callback(base, st, headers):
+        return call("GET", "/api/oidc/callback?code=abc&state=" + _up.quote(st, safe=""), None, headers, base=base, auth=False)
+    try:
+        sso_node("a", 18362, GW_L203, {"enabled": True, "node_id": "l203a", "secret": "env.RAIJU_L203_SECRET", "peers": [], "interval_ms": 1000})
+        sso_node("b", 18363, GW_L203_B, {"enabled": True, "node_id": "l203b", "secret": "env.RAIJU_L203_SECRET", "peers": [], "interval_ms": 1000})
+        wait(GW_L203 + "/health")
+        wait(GW_L203_B + "/health")
+        time.sleep(0.5)
+        st, set_cookie, _ = login(18362)
+        check("L203: the OIDC login sets the state cookie (the state's hash): HttpOnly, SameSite=Lax, Path=/api/oidc, not Secure over http",
+              set_cookie.startswith("raiju_oidc_state=") and len(set_cookie.split(";")[0]) == len("raiju_oidc_state=") + 64 and "HttpOnly" in set_cookie and "SameSite=Lax" in set_cookie and "Path=/api/oidc" in set_cookie and "Secure" not in set_cookie, set_cookie)
+        _, sc_https, _ = login(18362, {"x-forwarded-proto": "https"})
+        check("L203: behind https the state cookie is Secure", sc_https.endswith("; Secure"), sc_https)
+        st, set_cookie, _ = login(18362)
+        s, h, page = callback(GW_L203_B, st, oidc_cookie(set_cookie))
+        check("L203: with no encryption key, a sign-in begun on node A completes on node B (state key from cluster.secret)", s == 200 and "sk-sess-" in page, (s, page[:200]))
+        check("L203: the callback clears the state cookie", "Max-Age=0" in (hdr(h, "set-cookie") or ""), hdr(h, "set-cookie"))
+        # login CSRF: a valid state and code, sent to a browser that did not begin the sign-in, is refused
+        st, set_cookie, nonce = login(18362)
+        s1, _, p1 = callback(GW_L203, st, {})
+        _, other_cookie, _ = login(18362)
+        s2, _, _ = callback(GW_L203, st, oidc_cookie(other_cookie))
+        check("L203: a callback without the state cookie, or with another sign-in's, is refused (401)", s1 == 401 and "not started in this browser" in p1 and s2 == 401, (s1, s2, p1[:200]))
+        # the refused tries did not spend the state: the browser that began it still signs in
+        idp_state["nonce"] = nonce
+        s3, _, p3 = callback(GW_L203, st, oidc_cookie(set_cookie))
+        check("L203: the browser that began the sign-in completes it", s3 == 200 and "sk-sess-" in p3, (s3, p3[:200]))
+    finally:
+        for g in gws:
+            g.terminate()
+            g.wait()
+    # a node with no encryption key and clustering off, while other nodes are configured, warns at the start
+    gws = []
+    try:
+        sso_node("w", 18363, GW_L203_B, {"enabled": False, "node_id": "l203w", "secret": "", "peers": ["http://127.0.0.1:18399"]})
+        wait(GW_L203_B + "/health")
+        time.sleep(0.3)
+        log = open(os.path.join(BUILD, "e2e.l200l203w.log")).read()
+        check("L203: OIDC with neither encryption_key nor clustering, other nodes configured: a warning at the start", "callback reaches another node fails" in log, log[-600:])
+    finally:
+        for g in gws:
+            g.terminate()
+            g.wait()
 
 def main():
     unique_ports()
@@ -18617,7 +18829,8 @@ def main():
         check("SSO login redirects to the provider with PKCE", r.status == 302 and loc.startswith("http://127.0.0.1:18096/authorize?") and q.get("code_challenge_method") == ["S256"] and q.get("client_id") == ["raiju"], loc)
         idp_state["nonce"] = q.get("nonce", [""])[0]
         st = q.get("state", [""])[0]
-        s, _, page = call("GET", "/api/oidc/callback?code=abc&state=" + st, auth=False)
+        sso_cookie = oidc_cookie(r.getheader("set-cookie"))
+        s, _, page = call("GET", "/api/oidc/callback?code=abc&state=" + st, None, sso_cookie, auth=False)
         verifier = idp_state["verifier"]
         check("the token request carries the PKCE verifier", base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode() == q.get("code_challenge", [""])[0], verifier)
         import re as _re
@@ -18628,7 +18841,7 @@ def main():
         s2, _, _ = call("POST", "/api/governance/budgets", {"id": "sso-made", "max_limit": 5, "reset_duration": "1d"}, headers=S)
         s3, _, _ = call("POST", "/api/users", {"name": "x", "role": "admin"}, headers=S)
         check("an SSO editor (from the groups claim) reads and edits but can't manage users", (s1, s3) == (200, 403) and s2 < 300, (s1, s2, s3))
-        s, _, _ = call("GET", "/api/oidc/callback?code=abc&state=" + st, auth=False)
+        s, _, _ = call("GET", "/api/oidc/callback?code=abc&state=" + st, None, sso_cookie, auth=False)
         check("an SSO state can't be reused", s == 401, s)
         s, _, b = call("GET", "/api/audit-logs")
         check("SSO changes are audited under the user", '"actor":"sso:alice"' in b, b[-400:])
@@ -19333,6 +19546,10 @@ def main():
         # 0020), a locked session file failing the sign-in, and OIDC logins that store nothing: its own gateways, one after
         # the other (18357, 18356)
         l200_e2e(env, idp_state)
+        # L203: MCP client registration limits and the registry, authorize that stores nothing, the OIDC state key from
+        # cluster.secret across two nodes and its start warning, and the OIDC state cookie: its own gateways, one after
+        # the other (18362, 18363)
+        l203_e2e(env, idp_state)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

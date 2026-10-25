@@ -104,7 +104,7 @@ import { ExportCursor, objectKey, putRequest, putBytesRequest, putObjectRequest,
 import { planWindow, maxObjectBytes, archiveIntervalMs, archiveGraceMs, closedWindows } from "./audit_archive"
 import { jobRequest, hiddenDeletes, MAX_ATTEMPTS, RetainQueue } from "./retained"
 import { payloadKeys, decodePayload, hydrate } from "./hybrid"
-import { OidcConfig, Discovery, OidcFlows, Session, UiSessions, DueSession, Sealer, parseDiscovery, discoveryUrl, tokenRequestBody, refreshRequestBody, verifyIdToken, accessTokenClaims } from "./oidc"
+import { OidcConfig, Discovery, OidcFlows, Session, UiSessions, DueSession, Sealer, parseDiscovery, discoveryUrl, tokenRequestBody, refreshRequestBody, verifyIdToken, accessTokenClaims, stateCookie, clearStateCookie, stateBound } from "./oidc"
 import { issuerOf, challengeOf, callerOf, keyById, keyUsable, serverAuthMode, ConsentContext, vkIdentityCut } from "./mcpissuer"
 
 export type Gate = { kind: "ok", actor: string } | { kind: "deny", res: Response }
@@ -799,10 +799,12 @@ async function putText(url: string, headers: Map<string, string>, body: string):
   }
 }
 
-function html(status: int, body: string): Response {
+function html(status: int, body: string, cookie?: string): Response {
   const h: Record<string, string> = new Map()
   h.set("content-type", "text/html; charset=utf-8")
   h.set("cache-control", "no-store")
+  const c = cookie ?? ""
+  if (c !== "") h.set("set-cookie", c)
   return new Response(body, { status: status, headers: h })
 }
 
@@ -5569,6 +5571,8 @@ export class Ops {
     const d = await this.disc(oc)
     if (d === undefined) return json(502, errorJson("could not read the identity provider's discovery document", "api_error", undefined))
     const now = Date.now()
+    // the state cookie is Secure over https (as Bifrost's session cookie: TLS, or X-Forwarded-Proto https)
+    const secure = req.url.startsWith("https:") || (req.headers.get("x-forwarded-proto") ?? "") === "https"
     if (path === "/api/oidc/login") {
       try {
         // a consent page that sent its user to sign in gets them back (only the gateway's own consent pages); the
@@ -5579,6 +5583,8 @@ export class Ops {
         const h: Record<string, string> = new Map()
         h.set("location", b.url)
         h.set("cache-control", "no-store")
+        // the browser that begins the sign-in is the only one whose callback is taken (login CSRF)
+        h.set("set-cookie", stateCookie(b.state, secure))
         return new Response(undefined, { status: 302, headers: h })
       } catch (e) {
         return json(500, errorJson(e.message, "api_error", undefined))
@@ -5598,17 +5604,25 @@ export class Ops {
     const u = URL.parse(req.url)
     const params = u === undefined ? new URLSearchParams("") : u.searchParams
     const st = params.get("state") ?? ""
+    // every answer from here on clears the state cookie: a state is tried once per browser
+    const clear = clearStateCookie(secure)
+    // a state is taken only from the browser that began its sign-in (its cookie holds the state's hash), so a link
+    // with an attacker's own state and code cannot sign a victim's browser in as the attacker
+    if (!stateBound(req.headers.get("cookie") ?? "", st)) {
+      signInGuard().fail(ipKeys, now)
+      return html(401, "<p>This sign-in was not started in this browser, or its cookie expired. <a href=\"/api/oidc/login\">Sign in again</a>.</p>", clear)
+    }
     const flow = this.flows.complete(st, now)
     if (flow === undefined) {
       signInGuard().fail(ipKeys, now)
-      return html(401, "<p>This sign-in link expired or was already used. <a href=\"/api/oidc/login\">Sign in again</a>.</p>")
+      return html(401, "<p>This sign-in link expired or was already used. <a href=\"/api/oidc/login\">Sign in again</a>.</p>", clear)
     }
     const backTo = flow.back !== "" ? flow.back : "/"
     const th: Map<string, string> = new Map()
     th.set("content-type", "application/x-www-form-urlencoded")
     th.set("accept", "application/json")
     const tr = await postText(d.token_endpoint, th, tokenRequestBody(oc, params.get("code") ?? "", flow.verifier))
-    if (tr.status !== 200) return html(502, `<p>The identity provider refused the sign-in (HTTP ${tr.status}).</p>`)
+    if (tr.status !== 200) return html(502, `<p>The identity provider refused the sign-in (HTTP ${tr.status}).</p>`, clear)
     let idToken = ""
     let accessToken = ""
     let refreshToken = ""
@@ -5620,30 +5634,30 @@ export class Ops {
     } catch (e) {
       idToken = ""
     }
-    if (idToken === "") return html(502, "<p>The identity provider sent no ID token.</p>")
+    if (idToken === "") return html(502, "<p>The identity provider sent no ID token.</p>", clear)
     const jw = await getText(d.jwks_uri)
-    if (jw.status !== 200) return html(502, "<p>Could not read the identity provider's signing keys.</p>")
+    if (jw.status !== 200) return html(502, "<p>Could not read the identity provider's signing keys.</p>", clear)
     let v = verifyIdToken(idToken, jw.body, oc, d.issuer, flow.nonce, Date.now())
     if (v.kind === "error") {
       signInGuard().fail(ipKeys, now)
-      return html(401, `<p>Sign-in failed: ${v.message.replace("<", "&lt;")}</p>`)
+      return html(401, `<p>Sign-in failed: ${v.message.replace("<", "&lt;")}</p>`, clear)
     }
     // Keycloak puts its roles in the access token: its claims are the ones the mappings read
     if (oc.claims_token === "access_token") {
       const at = accessTokenClaims(accessToken, jw.body, oc, d.issuer, Date.now())
-      if (at.kind === "error") return html(401, `<p>Sign-in failed: ${at.message.replace("<", "&lt;")}</p>`)
+      if (at.kind === "error") return html(401, `<p>Sign-in failed: ${at.message.replace("<", "&lt;")}</p>`, clear)
       v = { kind: "ok", sub: v.sub, email: v.email, role: v.role, claims: at.claims }
     }
     // a user governance lists as disabled (a SCIM deactivation, say) signs in no more; users it does not list are unchanged
     if (disabledNamed(this.rbac, ssoNames(v.sub, v.email))) {
       this.recordChange("sso:" + v.sub, req, path, 403, "")
-      return html(403, "<p>This account is disabled. Ask an administrator to enable it.</p>")
+      return html(403, "<p>This account is disabled. Ask an administrator to enable it.</p>", clear)
     }
     // an identity provider configured through scim_config: its claims decide the role and the memberships
     const synced = this.syncSignIn(v.sub, v.email, v.claims)
     if (synced.kind === "refuse") {
       this.recordChange("sso:" + v.sub, req, path, 403, "")
-      return html(403, `<p>Sign-in refused: ${synced.reason.replace("<", "&lt;")}</p>`)
+      return html(403, `<p>Sign-in refused: ${synced.reason.replace("<", "&lt;")}</p>`, clear)
     }
     const role = synced.kind === "role" ? synced.role : v.role
     let token = ""
@@ -5651,10 +5665,10 @@ export class Ops {
       // the refresh token stays on the server: an expired session is refreshed silently with it (refreshSession)
       token = this.sessions.create(v.sub, role, Date.now(), v.email, refreshToken)
     } catch (e) {
-      return html(503, "<p>Could not create a session; try again.</p>")
+      return html(503, "<p>Could not create a session; try again.</p>", clear)
     }
     // the UI keeps its admin token in sessionStorage; the session token takes its place
-    return html(200, `<!doctype html><meta charset="utf-8"><title>Signed in</title><script>sessionStorage.setItem("raiju.adminToken", ${JSON.stringify(token)}); location.replace(${JSON.stringify(backTo)});</script><p>Signed in as ${(v.email ?? v.sub).replace("<", "&lt;")}.</p>`)
+    return html(200, `<!doctype html><meta charset="utf-8"><title>Signed in</title><script>sessionStorage.setItem("raiju.adminToken", ${JSON.stringify(token)}); location.replace(${JSON.stringify(backTo)});</script><p>Signed in as ${(v.email ?? v.sub).replace("<", "&lt;")}.</p>`, clear)
   }
 
   // ---- session refresh and sweep ----
