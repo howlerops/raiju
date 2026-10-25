@@ -723,7 +723,7 @@ def discovery_and_proxy():
         return 404, "{}", "application/json"
 
     servers = [serve(18084, peer), serve(18085, consul), serve(18086, k8s), serve(18088, etcd), serve(18083, keys, tls=True)]
-    cluster = lambda node, disc, port: {"client": {"enable_logging": False}, "cluster": {"enabled": True, "node_id": node, "secret": "e2e-disc", "interval_ms": 200, "peers": [], "discovery": disc}}
+    cluster = lambda node, disc, port: {"client": {"enable_logging": False}, "cluster": {"enabled": True, "node_id": node, "secret": "e2e-disc-cluster-secret-0123456789ab", "interval_ms": 200, "peers": [], "discovery": disc}}
     cfgs = {
         "consul": (18081, cluster("consul-a", {"enabled": True, "type": "consul", "service_name": "bifrost", "consul_address": "127.0.0.1:18085", "bind_port": 18081, "advertise_address": "127.0.0.1"}, 18081)),
         "dns": (18080, cluster("dns-a", {"enabled": True, "type": "dns", "dns_names": ["localhost"], "bind_port": 18084}, 18080)),
@@ -843,7 +843,7 @@ def feed_cluster_e2e():
     d = os.path.join(BUILD, "e2e-feed")
     os.makedirs(d, exist_ok=True)
     provider = {"openai": {"keys": [{"name": "pool", "value": "sk-pool", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}}
-    secret = "e2e-feed"
+    secret = "e2e-feed-cluster-secret-0123456789ab"
     def write(name, node, peer):
         path = os.path.join(d, name + ".json")
         cfg = {"client": {"enable_logging": True, "enforce_auth_on_inference": False}, "providers": provider,
@@ -947,7 +947,7 @@ def cluster_modes_e2e():
         path = os.path.join(d, name + ".json")
         json.dump(cfg, open(path, "w"))
         return path
-    broker_secret, lock_secret = "e2e-broker", "e2e-lock"
+    broker_secret, lock_secret = "e2e-broker-cluster-secret-0123456789ab", "e2e-lock-cluster-secret-0123456789ab"
     cfgs = {
         "broker": write("broker", {"client": {"enable_logging": False}, "cluster": {"enabled": True, "secret": broker_secret, "peers": [], "type": "broker", "broker": {"address": "127.0.0.1:18133", "listen_port": 18133}}}),
         "bn-a": write("bn-a", {"client": {"enable_logging": False, "enforce_auth_on_inference": False}, "providers": provider,
@@ -1881,7 +1881,7 @@ def l123_config(node, peer, adaptive):
     if adaptive:
         cfg["health"] = {"adaptive": True}
     if peer is not None:
-        cfg["cluster"] = {"enabled": True, "node_id": node, "secret": "e2e-l123", "interval_ms": 200, "peers": [peer]}
+        cfg["cluster"] = {"enabled": True, "node_id": node, "secret": "e2e-l123-cluster-secret-0123456789ab", "interval_ms": 200, "peers": [peer]}
     return cfg
 
 def l123_start(env, name, port, cfg):
@@ -5670,7 +5670,7 @@ def l147_config(node=None, peer=None):
         ]},
     }
     if node is not None:
-        cfg["cluster"] = {"enabled": True, "node_id": node, "secret": "e2e-l147", "interval_ms": 200, "peers": [peer]}
+        cfg["cluster"] = {"enabled": True, "node_id": node, "secret": "e2e-l147-cluster-secret-0123456789ab", "interval_ms": 200, "peers": [peer]}
     return cfg
 
 def l147_jira(base):
@@ -5811,7 +5811,7 @@ def l147_cluster_e2e(env):
 GW_L185_A = "http://127.0.0.1:18326"  # L185: node A with two workers (Bun; one process on http1), then the storage checks
 GW_L185_B = "http://127.0.0.1:18327"  # L185: node B, a config file of its own (cluster.config_sync "pull")
 L185_ADMIN = {"authorization": "Bearer sk-admin-l185"}
-L185_SECRET = "e2e-l185"
+L185_SECRET = "e2e-l185-cluster-secret-0123456789ab"
 
 def l185_config(node, peer):
     """An L185 cluster member: an admin, virtual keys vk-1 and vk-2, the shared mock as OpenAI, config_sync "pull"."""
@@ -5939,10 +5939,125 @@ def l185_e2e(env):
         p.terminate()
         p.wait()
 
+GW_L195 = "http://127.0.0.1:18346"  # L195: the cluster secret checks, then gateways with a cluster listener and a metrics token
+GW_L195_CL = "http://127.0.0.1:18347"  # L195: the cluster listener (cluster.listen_port) of the gateway on 18346
+L195_SECRET = "e2e-l195-" + "cluster-secret-0123456789abcdef"
+
+def l195_e2e(env):
+    """L195: cluster authentication. A cluster.secret that is empty, names an unset variable or is shorter than 32 bytes
+    stops the start. An env.NAME secret is resolved: a signature keyed with the literal reference is refused. With
+    cluster.listen_port the peer routes are served on that listener only (404 on the main one), the listener answers
+    nothing else, and cluster.serve_metrics moves /metrics there. server.metrics_token puts a bearer token on /metrics;
+    without it /metrics stays open, as in Bifrost. Ports 18346 (main) and 18347 (cluster listener)."""
+    import hashlib
+    d = os.path.join(BUILD, "e2e-l195")
+    os.makedirs(d, exist_ok=True)
+    cp = os.path.join(d, "config.json")
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    base_cfg = {"client": {"enable_logging": False, "enforce_auth_on_inference": False}, "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+                "providers": {"openai": {"keys": [{"name": "l195", "value": "sk-l195-provider", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}}}
+    clean = {k: v for k, v in env.items() if k not in ("RAIJU_L195_SECRET", "RAIJU_L195_METRICS")}
+
+    def start(name, cfg, extra_env, args=None):
+        json.dump(cfg, open(cp, "w"))
+        return subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18346", "-host", "127.0.0.1", "-config", cp, "-server", server] + (args or []),
+                                env={**clean, **extra_env}, stderr=open(os.path.join(d, name + ".log"), "w"))
+
+    def stop(p):
+        p.terminate()
+        p.wait()
+
+    # a weak or missing secret stops the start with clustering on
+    for name, secret, extra, want in [
+        ("empty", "", {}, "cluster.secret is empty"),
+        ("unset", "env.RAIJU_L195_SECRET", {}, "RAIJU_L195_SECRET is not set"),
+        ("short", "env.RAIJU_L195_SECRET", {"RAIJU_L195_SECRET": "too-short-secret"}, "it must be at least 32"),
+        ("literal-short", "0123456789abcdef0123456789abcde", {}, "31 bytes"),
+    ]:
+        p = start("refuse-" + name, {**base_cfg, "cluster": {"enabled": True, "node_id": "l195", "secret": secret, "peers": []}}, extra)
+        try:
+            code = p.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            stop(p)
+            code = None
+        log = open(os.path.join(d, "refuse-" + name + ".log")).read()
+        check(f"l195: a cluster secret that is {name} stops the start", code == 1 and want in log and "refusing to start with clustering on" in log, (code, log[-300:]))
+    # broker mode too
+    p = start("refuse-broker", {"cluster": {"enabled": True, "secret": "short", "peers": [], "type": "broker", "broker": {"address": "127.0.0.1:18347", "listen_port": 18347}}}, {}, ["-mode", "broker"])
+    try:
+        code = p.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        stop(p)
+        code = None
+    check("l195: broker mode refuses a short cluster secret", code == 1, code)
+
+    # an env.NAME secret is resolved; the reference itself signs nothing
+    ev = {"RAIJU_L195_SECRET": L195_SECRET}
+    p = start("env", {**base_cfg, "cluster": {"enabled": True, "node_id": "l195", "secret": "env.RAIJU_L195_SECRET", "interval_ms": 200, "peers": []}}, ev)
+    try:
+        wait(GW_L195 + "/health")
+        check("l195: a peer signing with the resolved secret is answered", cluster_leader(GW_L195, L195_SECRET).get("node") == "l195", cluster_leader(GW_L195, L195_SECRET))
+        check("l195: a signature keyed with the literal env.RAIJU_L195_SECRET is refused", cluster_leader(GW_L195, "env.RAIJU_L195_SECRET").get("status") == 401, cluster_leader(GW_L195, "env.RAIJU_L195_SECRET"))
+        sha = hashlib.sha256(open(cp, "rb").read()).hexdigest()
+        raw = json.dumps({"sha": sha, "ts": time.time() * 1000})
+        s, _, b = call("POST", "/api/cluster/config", raw, {"x-raiju-cluster-sig": cluster_sig("env.RAIJU_L195_SECRET", raw)}, base=GW_L195, auth=False)
+        check("l195: the config (with its provider keys) is not handed to a pull signed with the literal reference", s == 401 and "sk-l195-provider" not in b, (s, b[:200]))
+        s, _, b = call("GET", "/metrics", base=GW_L195, auth=False)
+        check("l195: without server.metrics_token /metrics stays open (Bifrost's default)", s == 200 and "# TYPE" in b, s)
+    finally:
+        stop(p)
+
+    # the cluster listener: peer routes and /metrics there only; a bearer token on /metrics
+    ev = {"RAIJU_L195_SECRET": L195_SECRET, "RAIJU_L195_METRICS": "l195-metrics-" + "token"}
+    bearer = {"authorization": "Bearer l195-metrics-token"}
+    cfg = {**base_cfg, "server": {"metrics_token": "env.RAIJU_L195_METRICS"},
+           "cluster": {"enabled": True, "node_id": "l195", "secret": "env.RAIJU_L195_SECRET", "interval_ms": 200, "peers": [], "listen_port": 18347, "bind": "127.0.0.1", "serve_metrics": True}}
+    p = start("listener", cfg, ev)
+    try:
+        wait(GW_L195 + "/health")
+        wait(GW_L195_CL + "/health")
+        sig = {"x-raiju-cluster-sig": cluster_sig(L195_SECRET)}
+        s, _, b = call("GET", "/api/cluster/leader", headers=sig, base=GW_L195, auth=False)
+        check("l195: with cluster.listen_port the main listener refuses the peer routes", s == 404 and "cluster listener" in b, (s, b[:200]))
+        s, _, b = call("GET", "/api/cluster/leader", headers=sig, base=GW_L195_CL, auth=False)
+        check("l195: the cluster listener serves the signed peer routes", s == 200 and json.loads(b).get("node") == "l195", (s, b[:200]))
+        s, _, _ = call("GET", "/api/cluster/leader", headers={"x-raiju-cluster-sig": "0" * 64}, base=GW_L195_CL, auth=False)
+        check("l195: the cluster listener still checks the signature", s == 401, s)
+        wire = json.dumps({"node": "l195-peer", "ts": time.time() * 1000, "counters": []})
+        s, _, b = call("POST", "/api/cluster/sync", wire, {"x-raiju-cluster-sig": cluster_sig(L195_SECRET, wire)}, base=GW_L195_CL, auth=False)
+        check("l195: a peer's signed sync is merged on the cluster listener", s == 200 and '"node":"l195"' in b, (s, b[:200]))
+        s, _, _ = call("POST", "/api/cluster/sync", wire, {"x-raiju-cluster-sig": cluster_sig(L195_SECRET, wire)}, base=GW_L195, auth=False)
+        check("l195: the same sync on the main listener is refused", s == 404, s)
+        s, _, _ = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l195"}]}, base=GW_L195, auth=False)
+        check("l195: inference is served on the main listener", s == 200, s)
+        s, _, _ = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l195"}]}, base=GW_L195_CL, auth=False)
+        s2, _, _ = call("GET", "/api/providers", base=GW_L195_CL, auth=False)
+        check("l195: the cluster listener serves no inference and no management API", s == 404 and s2 == 404, (s, s2))
+        s, _, _ = call("GET", "/metrics", headers=bearer, base=GW_L195, auth=False)
+        check("l195: with cluster.serve_metrics /metrics is not on the main listener", s == 404, s)
+        s, h, _ = call("GET", "/metrics", base=GW_L195_CL, auth=False)
+        check("l195: /metrics without the bearer token is 401", s == 401 and "bearer" in (hdr(h, "www-authenticate") or "").lower(), (s, h))
+        s, _, _ = call("GET", "/metrics", headers={"authorization": "Bearer wrong-token"}, base=GW_L195_CL, auth=False)
+        check("l195: /metrics with a wrong token is 401", s == 401, s)
+        s, _, b = call("GET", "/metrics", headers=bearer, base=GW_L195_CL, auth=False)
+        check("l195: /metrics with server.metrics_token is served on the cluster listener", s == 200 and "http_requests_total" in b, (s, b[:200]))
+    finally:
+        stop(p)
+
+    # the metrics token alone, on the main listener
+    p = start("token", {**base_cfg, "server": {"metrics_token": "env.RAIJU_L195_METRICS"}}, {"RAIJU_L195_METRICS": "l195-metrics-" + "token"})
+    try:
+        wait(GW_L195 + "/health")
+        s, _, _ = call("GET", "/metrics", base=GW_L195, auth=False)
+        s2, _, b = call("GET", "/metrics", headers=bearer, base=GW_L195, auth=False)
+        check("l195: server.metrics_token guards /metrics on the main listener", s == 401 and s2 == 200 and "# TYPE" in b, (s, s2))
+    finally:
+        stop(p)
+
 GW_L193_A = "http://127.0.0.1:18342"  # L193: node A (cross-node log reads, rows beyond max_memory_entries), then the later checks
 GW_L193_B = "http://127.0.0.1:18343"  # L193: node B, a peer with log files of its own
 L193_ADMIN = {"authorization": "Bearer sk-admin-l193"}
-L193_SECRET = "e2e-l193"
+L193_SECRET = "e2e-l193-cluster-secret-0123456789ab"
 
 def l193_config(node, peer, logs, extra=None):
     """An L193 cluster member: an admin, the shared mock as OpenAI, a log store of its own with max_memory_entries 3
@@ -6615,7 +6730,7 @@ def l149_config(tag, card, node=None, peer=None, period=0):
         "agents": [agent],
     }
     if node is not None:
-        cfg["cluster"] = {"enabled": True, "node_id": node, "secret": "e2e-l149", "interval_ms": 200, "peers": [peer]}
+        cfg["cluster"] = {"enabled": True, "node_id": node, "secret": "e2e-l149-cluster-secret-0123456789ab", "interval_ms": 200, "peers": [peer]}
     return cfg
 
 def l149_cluster_e2e(env):
@@ -13435,7 +13550,7 @@ def l189_broker(env, d):
     import signal
     path = os.path.join(BUILD, "e2e.l189-broker.json")
     json.dump({"client": {"enable_logging": False}, "server": {"shutdown_delay_seconds": 1, "shutdown_grace_seconds": 5},
-               "cluster": {"enabled": True, "secret": "e2e-l189-broker", "peers": [], "type": "broker", "broker": {"address": "127.0.0.1:18334", "listen_port": 18334}}}, open(path, "w"))
+               "cluster": {"enabled": True, "secret": "e2e-l189-broker-cluster-secret-0123456789ab", "peers": [], "type": "broker", "broker": {"address": "127.0.0.1:18334", "listen_port": 18334}}}, open(path, "w"))
     gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-mode", "broker", "-host", "127.0.0.1", "-config", path], env=env, stderr=open(os.path.join(BUILD, "e2e.l189-broker.log"), "w"))
     base = "http://127.0.0.1:18334"
     try:
@@ -18330,6 +18445,9 @@ def main():
         l190_e2e(env)
         # L193: cross-node log reads, rows beyond max_memory_entries: its own gateways (18342, 18343)
         l193_e2e(env)
+        # L195: cluster authentication (the secret resolved and enforced, the cluster listener, the /metrics token): its own
+        # gateways, one after the other (18346, cluster listener 18347)
+        l195_e2e(env)
         # L194: Hugging Face inference providers (chat, embeddings, speech, transcription, images), the CLI's agent sign-in
         # and default key, and the A2A v0.3 REST client: its own gateway (18344) and Hugging Face double (18345)
         l194_e2e(env)

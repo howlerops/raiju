@@ -247,6 +247,56 @@ class HelmTest(unittest.TestCase):
         svc = self.kind(self.render("peers.headlessService=true"), "Service", "r-raiju-peers")
         self.assertEqual(svc["spec"]["clusterIP"], "None")
         self.assertTrue(svc["spec"]["publishNotReadyAddresses"])
+        self.assertEqual([p["name"] for p in svc["spec"]["ports"]], ["http"])
+
+    def test_cluster_secret_from_a_secret(self):
+        # clustering on needs a secret, and never one written into the ConfigMap
+        self.assertIn("cluster.secret.existingSecret", self.render("config.cluster.enabled=true", ok=False))
+        self.assertIn("env.NAME reference", self.render("config.cluster.enabled=true", "config.cluster.secret=plain-text-secret", ok=False))
+        docs = self.render("config.cluster.enabled=true", "cluster.secret.existingSecret=raiju-cluster")
+        self.assertEqual(self.config(docs)["cluster"]["secret"], "env.RAIJU_CLUSTER_SECRET")
+        env = self.pod(docs)["containers"][0]["env"]
+        sec = [e for e in env if e["name"] == "RAIJU_CLUSTER_SECRET"]
+        self.assertEqual(sec[0]["valueFrom"]["secretKeyRef"], {"name": "raiju-cluster", "key": "RAIJU_CLUSTER_SECRET"})
+        # an env.NAME reference of the operator's own is kept
+        kept = self.render("config.cluster.enabled=true", "config.cluster.secret=env.MY_SECRET")
+        self.assertEqual(self.config(kept)["cluster"]["secret"], "env.MY_SECRET")
+
+    def test_cluster_listener(self):
+        docs = self.render("config.cluster.enabled=true", "cluster.secret.existingSecret=raiju-cluster")
+        cl = self.config(docs)["cluster"]
+        self.assertEqual((cl["listen_port"], cl["bind"]), (7946, "0.0.0.0"))
+        self.assertNotIn("serve_metrics", cl)
+        ports = {p["name"]: p["containerPort"] for p in self.pod(docs)["containers"][0]["ports"]}
+        self.assertEqual(ports, {"http": 8080, "cluster": 7946})
+        # the peers Service targets the cluster port; the public Service does not carry it
+        peers = self.kind(docs, "Service", "r-raiju-peers")
+        self.assertEqual([(p["name"], p["port"]) for p in peers["spec"]["ports"]], [("cluster", 7946)])
+        self.assertEqual(peers["metadata"]["labels"]["app.kubernetes.io/component"], "peers")
+        self.assertEqual([p["port"] for p in self.kind(docs, "Service", "r-raiju")["spec"]["ports"]], [8080])
+        # listenPort 0 keeps the peer routes on the main port
+        off = self.render("config.cluster.enabled=true", "cluster.secret.existingSecret=raiju-cluster", "cluster.listenPort=0")
+        self.assertNotIn("listen_port", self.config(off)["cluster"])
+        self.assertEqual([p["name"] for p in self.pod(off)["containers"][0]["ports"]], ["http"])
+        self.assertFalse([d for d in off if d["kind"] == "Service" and d["metadata"]["name"].endswith("-peers")])
+        # without clustering no cluster port is opened
+        self.assertEqual([p["name"] for p in self.pod(self.render())["containers"][0]["ports"]], ["http"])
+
+    def test_metrics_token_and_port(self):
+        self.assertNotIn("server", self.config(self.render()))
+        docs = self.render("metricsToken.existingSecret=raiju-metrics", "serviceMonitor.enabled=true")
+        self.assertEqual(self.config(docs)["server"]["metrics_token"], "env.RAIJU_METRICS_TOKEN")
+        env = self.pod(docs)["containers"][0]["env"]
+        self.assertEqual([e for e in env if e["name"] == "RAIJU_METRICS_TOKEN"][0]["valueFrom"]["secretKeyRef"], {"name": "raiju-metrics", "key": "RAIJU_METRICS_TOKEN"})
+        ep = self.kind(docs, "ServiceMonitor")["spec"]["endpoints"][0]
+        self.assertEqual((ep["port"], ep["bearerTokenSecret"]), ("http", {"name": "raiju-metrics", "key": "RAIJU_METRICS_TOKEN"}))
+        # serveMetrics: scraped on the cluster port, through the peers Service
+        on = self.render("config.cluster.enabled=true", "cluster.secret.existingSecret=raiju-cluster", "cluster.serveMetrics=true", "serviceMonitor.enabled=true")
+        self.assertTrue(self.config(on)["cluster"]["serve_metrics"])
+        sm = self.kind(on, "ServiceMonitor")["spec"]
+        self.assertEqual(sm["endpoints"][0]["port"], "cluster")
+        self.assertEqual(sm["selector"]["matchExpressions"], [{"key": "app.kubernetes.io/component", "operator": "In", "values": ["peers"]}])
+        self.assertEqual(self.kind(on, "Deployment")["spec"]["template"]["metadata"]["annotations"]["prometheus.io/port"], "7946")
 
 
 if __name__ == "__main__":

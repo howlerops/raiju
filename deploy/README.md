@@ -10,7 +10,9 @@ JavaScriptCore, which the binary links). It takes a Bifrost-format `config.json`
 Endpoints for probes and scraping: `GET /health` (liveness: 200, `{"status":"ok"}`),
 `GET /ready` (readiness: 200 `{"status":"ready",...}`, or 503 while the process drains for a stop
 or when a store that is on could not open) and `GET /metrics` (Prometheus text, Bifrost metric
-names). The image has no curl; its `HEALTHCHECK` runs `raiju -healthcheck`, which GETs `/health`
+names). `/metrics` is open, as in Bifrost, and its labels name virtual keys, teams and customers: set
+`server.metrics_token` (a bearer token, `env.NAME` allowed) to keep tenants on the inference port from
+reading it, or move it to the cluster listener with `cluster.serve_metrics`. The image has no curl; its `HEALTHCHECK` runs `raiju -healthcheck`, which GETs `/health`
 on 127.0.0.1 at `-port`, `PORT` or 8080 and exits 0 on a 2xx (`raiju -healthcheck /ready` probes
 readiness instead).
 
@@ -148,7 +150,9 @@ service copies `deploy/config.example.json` into it when it has no `config.json`
 in the volume is the one Raiju reads and the API and UI edit (the first admin included), and it survives
 `docker compose down` and restarts. To start over from the file, `docker compose down -v`. To use your own
 config, change the `raiju-config` mount in `docker-compose.yml`. Compose reads the image's HEALTHCHECK,
-and Prometheus starts once Raiju is healthy. `deploy/prometheus.yml` scrapes `raiju:8080/metrics`.
+and Prometheus starts once Raiju is healthy. `deploy/prometheus.yml` scrapes `raiju:8080/metrics`. With
+`server.metrics_token` set (`"env.RAIJU_METRICS_TOKEN"`, the value in `.env`), give Prometheus the same token
+(the commented `authorization` block in `deploy/prometheus.yml`).
 
 ## Helm
 
@@ -187,7 +191,11 @@ Useful values (see `values.yaml`):
 | `probes` | Liveness (`/health`) and readiness (`/ready`) timings. |
 | `replicaCount` | Pods. Ignored when `autoscaling.enabled`. More than one needs shareable storage (below). |
 | `strategy` | Empty: `Recreate` with a ReadWriteOnce claim, `RollingUpdate` otherwise. |
-| `peers.headlessService` | A headless Service, `<release>-peers`, for cluster discovery by DNS. |
+| `peers.headlessService` | A headless Service, `<release>-peers`, for cluster discovery by DNS (always rendered with a cluster listener). |
+| `cluster.secret.existingSecret`, `cluster.secret.key` | The Secret holding `cluster.secret` (at least 32 bytes), injected as `RAIJU_CLUSTER_SECRET`; `config.cluster.secret` defaults to `env.RAIJU_CLUSTER_SECRET`. Required with `config.cluster.enabled`, and the chart refuses a secret written into the config. |
+| `cluster.listenPort` | The cluster listener (`config.cluster.listen_port`, 7946): the peer routes are served there and refused on the main port; the peers Service targets it. `0` keeps them on the main port. |
+| `cluster.serveMetrics` | Serve `/metrics` on the cluster port only; the annotations and the ServiceMonitor follow. |
+| `metricsToken.existingSecret`, `metricsToken.key` | A bearer token for `/metrics` (`config.server.metrics_token`), injected as `RAIJU_METRICS_TOKEN`; the ServiceMonitor sends it. Off: `/metrics` is open. |
 | `service.type`, `service.port` | Service. The pod port is `port`. |
 | `prometheus.annotations` | `prometheus.io/*` annotations on pod and Service (on by default). |
 | `serviceMonitor.enabled` | Prometheus Operator ServiceMonitor (needs its CRDs). Off by default. |
@@ -248,16 +256,25 @@ persistence:
 configMode: always
 peers:
   headlessService: true
+cluster:
+  secret:
+    existingSecret: raiju-cluster      # kubectl create secret generic raiju-cluster --from-literal=RAIJU_CLUSTER_SECRET=$(openssl rand -hex 32)
+  listenPort: 7946                     # the default: peer routes on their own port, off the public Service
 config:
   cluster:
-    enabled: true
-    secret: env.RAIJU_CLUSTER_SECRET   # in existingSecret
+    enabled: true                      # secret: env.RAIJU_CLUSTER_SECRET, listen_port and bind are set by the chart
     discovery:
       enabled: true
       type: dns
-      dns_names: ["raiju-peers"]       # <release>-peers
+      dns_names: ["raiju-peers"]       # <release>-peers; bind_port defaults to the cluster port
       advertise_address: env.POD_IP    # the chart sets POD_IP
 ```
+
+The gateway refuses to start with clustering on when `cluster.secret` is empty, names a variable that is
+not set, or is shorter than 32 bytes: every route under `/api/cluster/` (the config with its stored keys, the
+request logs, the budget counters, the live feed) is signed with it. `env.NAME` references in `cluster.secret`,
+`cluster.bind`, `cluster.broker.address` and `cluster.discovery.advertise_address` / `consul_address` are
+resolved like any other. Static `peers` name the peers' cluster port (`raiju-1.raiju-peers:7946`).
 
 Send management traffic to one pod or accept that the last save wins (docs/operations.md, One
 writer). `workers` is for CPU within a pod (about the number of cores it gets); replicas are for

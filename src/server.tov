@@ -1,6 +1,7 @@
 // HTTP routes: the OpenAI-shaped /v1 API, drop-in SDK routes, models,
 // metrics, health and a read-only management API.
 import { Config, VirtualKeyConfig, OAuthKeyConfig, ProviderConfig, KeyConfig, providerOf, providerNames, resolveEnv } from "./config"
+import { utf8 } from "./crypto"
 import { Engine, LiveHead, StreamSink, errorResponse, headSink, noHeaders } from "./gateway"
 import { anthropicMessages, anthropicLegacy, cursorChat, genai, genaiSdk, bedrockModel, responsesApi, cohereChat, cohereEmbed, cohereRerank, cohereTokenize } from "./native"
 import * as genaiIn from "./genai_in"
@@ -1082,6 +1083,76 @@ function textResponse(body: string, contentType: string): Response {
   return new Response(body, { headers: h })
 }
 
+// Whether a request may read /metrics: always when no server.metrics_token is set (Bifrost's open /metrics), otherwise
+// only with "Authorization: Bearer <token>". The comparison takes the same time wherever the first difference is.
+export function metricsAllowed(token: string, authorization: string): bool {
+  if (token === "") return true
+  if (!authorization.startsWith("Bearer ")) return false
+  const want = utf8(token)
+  const got = utf8(authorization.slice(7).trim())
+  if (want.length !== got.length) return false
+  let diff = 0
+  for (let i = 0; i < want.length; i++) diff = diff | (int(want[i]!) ^ int(got[i]!))
+  return diff === 0
+}
+
+// GET /metrics. The metric labels name tenants (virtual keys, teams, customers), so it can be kept off the inference
+// port: server.metrics_token asks for a bearer token, and cluster.serve_metrics serves it on the cluster listener only.
+function metricsRoute(engine: Engine, ops: Ops, req: Request, onClusterListener: bool): Response {
+  if (ops.metricsOnCluster !== onClusterListener) return errorResponse(404, onClusterListener ? "not found" : "/metrics is served on the cluster listener (cluster.serve_metrics)", "invalid_request_error", noHeaders())
+  if (!metricsAllowed(engine.cfg.server?.metrics_token ?? "", req.headers.get("authorization") ?? "")) {
+    return new Response(errorJson("a bearer token is required for /metrics (server.metrics_token)", "authentication_error", undefined), { status: 401, headers: { "content-type": "application/json", "www-authenticate": `Bearer realm="metrics"` } })
+  }
+  return textResponse(ops.metricsText(), "text/plain; version=0.0.4")
+}
+
+// The peer routes, signed with cluster.secret (ops.tov). undefined: not one of them.
+async function clusterRoute(ops: Ops, req: Request, p: string, m: string): Promise<Response | undefined> {
+  if (p === "/api/cluster/sync" && m === "POST") return await ops.clusterSync(req)
+  if (p === "/api/cluster/feed" && m === "POST") return await ops.clusterFeed(req)
+  if (p === "/api/cluster/leader" && m === "GET") return ops.clusterLeader(req)
+  if (p === "/api/cluster/config" && m === "POST") return await ops.clusterConfig(req)
+  if (p === "/api/cluster/logs" && m === "POST") return await ops.clusterLogs(req)
+  return undefined
+}
+
+// Everything the cluster listener (cluster.listen_port) answers: the peer routes, /health, and /metrics when
+// cluster.serve_metrics moved it there. Nothing else: no inference, no management API, no UI.
+export async function clusterDispatch(engine: Engine, ops: Ops, req: Request): Promise<Response> {
+  const p = pathOfReq(req)
+  const m = req.method
+  if (p === "/health" && (m === "GET" || m === "HEAD")) return Response.json({ status: "ok" })
+  if (p === "/metrics" && (m === "GET" || m === "HEAD")) return metricsRoute(engine, ops, req, true)
+  if (p.startsWith("/api/cluster/")) {
+    const cr = await clusterRoute(ops, req, p, m)
+    if (cr !== undefined) return cr
+  }
+  return errorResponse(404, "not found on the cluster listener", "invalid_request_error", noHeaders())
+}
+
+// The cluster listener on the Bun.serve server: opened before the workers fork, so every worker accepts on it too.
+export function startCluster(engine: Engine, ops: Ops, port: int, hostname: string, lim: ServerLimits, maxBody: int): Served {
+  const server = Bun.serve({
+    port: port,
+    hostname: hostname,
+    headerTimeout: lim.headerSeconds,
+    idleTimeout: lim.idleSeconds,
+    bodyTimeout: lim.bodySeconds,
+    maxConnections: lim.maxConnections,
+    maxRequestBodySize: maxBody,
+    async fetch(req) {
+      return await clusterDispatch(engine, ops, req)
+    },
+  })
+  return {
+    url: server.url.href,
+    stopListener: () => {
+      server.stop()
+    },
+    open: (): int => server.openConnections,
+  }
+}
+
 // A file of the web UI (the embedded build, or the directory RAIJU_UI_DIR names). The page
 // is revalidated on each load; the hashed files under /assets/ are cached for good.
 function uiResponse(p: string, req: Request): Response | undefined {
@@ -1334,7 +1405,7 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
       const ui = uiResponse(p, req)
       if (ui !== undefined) return ui
     }
-    if (p === "/metrics") return textResponse(ops.metricsText(), "text/plain; version=0.0.4")
+    if (p === "/metrics") return metricsRoute(engine, ops, req, false)
     if (p === "/v1/models" || p === "/openai/v1/models") return await cors(engine, req, await listModels(engine, req))
     if (p.startsWith("/v1/models/")) return await cors(engine, req, await outOfLine(retrieveModel(engine, req, p.slice(11))))
     if (p === "/typesafe/v1/models") return await cors(engine, req, await decisionRoute(engine, req, p))
@@ -1384,11 +1455,12 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
     if (p.startsWith("/v1/async/")) return await asyncSubmitHooked(engine.cfg.webhooks, engine.jobs, req, p, dispatcher(engine), (engine.cfg.client?.async_job_result_ttl ?? 3600) * 1000, requestOwner(engine, req))
   }
   // the management API: providers, keys, virtual keys, budgets, rate limits, teams, customers
-  if (p === "/api/cluster/sync" && m === "POST") return await ops.clusterSync(req)
-  if (p === "/api/cluster/feed" && m === "POST") return await ops.clusterFeed(req)
-  if (p === "/api/cluster/leader" && m === "GET") return ops.clusterLeader(req)
-  if (p === "/api/cluster/config" && m === "POST") return await ops.clusterConfig(req)
-  if (p === "/api/cluster/logs" && m === "POST") return await ops.clusterLogs(req)
+  if (p.startsWith("/api/cluster/")) {
+    // with cluster.listen_port the peer routes are served on the cluster listener only
+    if (ops.clusterPort > 0) return errorResponse(404, "the cluster routes are served on the cluster listener (cluster.listen_port)", "invalid_request_error", noHeaders())
+    const cr = await clusterRoute(ops, req, p, m)
+    if (cr !== undefined) return cr
+  }
   if (p.startsWith("/api/oidc/") && m === "GET") return await ops.oidcRoute(req, p)
   // the MCP OAuth callback: the browser comes back here from the authorization server, with no session
   if (p === "/api/oauth/callback" && m === "GET") {
@@ -1922,6 +1994,17 @@ test("the Responses route streams through the sink when the request asks for a s
   expect(streamKind("/v1/responses")).toBe("responses")
   expect(streamsRequest("responses", `{"model":"m","stream":true}`)).toBe(true)
   expect(streamsRequest("responses", `{"model":"m"}`)).toBe(false)
+})
+
+test("/metrics is open without a token and needs the bearer token when one is set", () => {
+  expect(metricsAllowed("", "")).toBe(true)
+  expect(metricsAllowed("", "Bearer anything")).toBe(true)
+  expect(metricsAllowed("m-token-1", "")).toBe(false)
+  expect(metricsAllowed("m-token-1", "Bearer m-token-1")).toBe(true)
+  expect(metricsAllowed("m-token-1", "Bearer m-token-2")).toBe(false)
+  expect(metricsAllowed("m-token-1", "Bearer m-token-12")).toBe(false)
+  expect(metricsAllowed("m-token-1", "Basic m-token-1")).toBe(false)
+  expect(metricsAllowed("m-token-1", "m-token-1")).toBe(false)
 })
 
 test("the governance users path is the users path", () => {

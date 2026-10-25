@@ -7645,6 +7645,24 @@ export interface operations {
                     "text/plain": string;
                 };
             };
+            /** @description server.metrics_token is set and the request carries no matching bearer token. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description cluster.serve_metrics serves /metrics on the cluster listener, not on this one. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
         };
     };
     getMcp: {
@@ -8029,7 +8047,7 @@ export interface operations {
                     "application/json": components["schemas"]["ManagementErrorResponse"];
                 };
             };
-            /** @description Clustering is off. */
+            /** @description Clustering is off, or the request reached the main listener while cluster.listen_port is set. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -8087,7 +8105,7 @@ export interface operations {
                     "application/json": components["schemas"]["ManagementErrorResponse"];
                 };
             };
-            /** @description Clustering is off, or this node does not hold that generation. */
+            /** @description Clustering is off, this node does not hold that generation, or the request reached the main listener while cluster.listen_port is set. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -8152,7 +8170,7 @@ export interface operations {
                     "application/json": components["schemas"]["ManagementErrorResponse"];
                 };
             };
-            /** @description Clustering is off. */
+            /** @description Clustering is off, or the request reached the main listener while cluster.listen_port is set. */
             404: {
                 headers: {
                     [name: string]: unknown;

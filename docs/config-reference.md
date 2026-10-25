@@ -9,7 +9,7 @@ for each element of a list. Descriptions are the comments in the source; default
 has one. The command-line flags (`-app-dir`, `-config`, `-host`, `-port`, `-workers`, `-server`, `-mode`,
 `-healthcheck`) are in the README.
 
-1354 keys (552 with a description), and 38 Bifrost keys read through config_compat.
+1358 keys (557 with a description), and 38 Bifrost keys read through config_compat.
 
 ## Sections
 
@@ -1279,7 +1279,7 @@ Several Raiju nodes sharing usage, state and configuration (docs/operations.md w
 | `cluster.enabled` | bool |  |
 | `cluster.node_id` | string |  |
 | `cluster.peers` | string[] | log_reads (default true): a request log read (/api/logs, its detail, stats, sessions and histograms, the MCP and agent logs) also asks the peers for their rows (POST /api/cluster/logs), since each node keeps its own log files |
-| `cluster.secret` | string |  |
+| `cluster.secret` | string | secret: env.NAME allowed. |
 | `cluster.interval_ms` | int |  |
 | `cluster.discovery` | object |  |
 | `cluster.discovery.enabled` | bool |  |
@@ -1317,6 +1317,9 @@ Several Raiju nodes sharing usage, state and configuration (docs/operations.md w
 | `cluster.feed.batch_ms` | int | batch_ms is the relay interval. |
 | `cluster.config_sync` | string | Raiju only: config_sync is what a node does when another node saves the config (a generation on the cluster state, store.tov). |
 | `cluster.log_reads` | bool | log_reads (default true): a request log read (/api/logs, its detail, stats, sessions and histograms, the MCP and agent logs) also asks the peers for their rows (POST /api/cluster/logs), since each node keeps its own log files |
+| `cluster.listen_port` | int | listen_port (Raiju only): a second listener that serves the peer routes (/api/cluster/*) and /health, so they need not be reachable on the public port |
+| `cluster.bind` | string | bind: the address of that listener (default the gateway's -host). |
+| `cluster.serve_metrics` | bool | serve_metrics: /metrics moves to that listener too (404 on the main one). |
 
 ## oidc
 
@@ -1616,6 +1619,7 @@ Bifrost's server section; Raiju reads a2a_allow_private_push_callbacks (push cal
 | `server.body_timeout_seconds` | number | a request body may go this long without a byte (default 60; 0 off) |
 | `server.max_connections` | int | open connections per process (default three quarters of ulimit -n; -1 no cap) |
 | `server.webrtc_enabled` | bool | webrtc_enabled (Raiju's; Bifrost has no switch) turns on the WebRTC realtime and live calls the gateway terminates on its own peer (POST /v1/realtime/calls, POST /v1/realtime, POST /v1/live/sessions). |
+| `server.metrics_token` | string | Raiju's: when set (env.NAME allowed), /metrics answers only a request with "Authorization: Bearer <token>" (401 otherwise). Unset keeps Bifrost's open /metrics. |
 
 ## feature_flags
 

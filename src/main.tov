@@ -18,13 +18,14 @@ import { setEkSeal } from "./rtsession"
 import { clusterState } from "./clusterstate"
 import { McpShare, CLIENT_NS, diskConfig, saveShared, pullsConfig } from "./mcpshare"
 import { FileLease, FILE_LEASE_MS } from "./filelease"
-import { start, bodyLimits, NO_BODY_LIMIT, startLiveModelRefresher } from "./server"
-import { serverLimits, stopSettings, beginStop } from "./lifecycle"
+import { start, startCluster, bodyLimits, NO_BODY_LIMIT, startLiveModelRefresher, Served } from "./server"
+import { serverLimits, stopSettings, beginStop, ServerLimits } from "./lifecycle"
+import { secretProblem } from "./cluster"
 import { Ops, withSecrets, makeShareDir } from "./ops"
 import { fromBifrost, merge } from "./guardrails_compat"
 import { warnings } from "./config_compat"
 import { existsSync, readFileSync } from "node:fs"
-import { startFront } from "./front"
+import { startFront, startClusterFront } from "./front"
 import { openIssuerState } from "./mcpissuer"
 import { setA2aGrpc, listenA2aGrpc, claimA2aGrpc } from "./a2agrpc"
 import { healthcheckUrl, runHealthcheck } from "./healthcheck"
@@ -144,6 +145,30 @@ async function startStdio(mcp: McpManager): Promise<void> {
   }
 }
 
+// Clustering signs every peer route with cluster.secret, so a secret that is missing, still an unresolved env.NAME
+// reference or shorter than 32 bytes stops the start (rawSecret: as written, first: the resolved config). "" when fine.
+function clusterSecretProblem(rawSecret: string, first: Config, broker: bool): string {
+  const cc = first.cluster
+  if (cc === undefined || !(cc.enabled || broker)) return ""
+  return secretProblem(rawSecret, cc.secret)
+}
+
+// The cluster listener (cluster.listen_port, on cluster.bind or the gateway's host): the peer routes, /health and,
+// with cluster.serve_metrics, /metrics. Opened before the workers fork, so each worker accepts on it. undefined when
+// it is not configured.
+function openClusterListener(engine: Engine, ops: Ops, cfg: Config, host: string, server: string, limits: ServerLimits, maxBody: int): Served | undefined {
+  const cc = cfg.cluster
+  if (cc === undefined) return undefined
+  const port = cc.listen_port ?? 0
+  if (port <= 0 || !(cc.enabled || cc.serve_metrics === true)) return undefined
+  const b = cc.bind ?? ""
+  const bind = b === "" ? host : b
+  const served = server === "http1" ? startClusterFront(engine, ops, bind, port, maxBody, limits) : startCluster(engine, ops, port, bind, limits, maxBody)
+  ops.clusterPort = port
+  ops.metricsOnCluster = cc.serve_metrics === true
+  return served
+}
+
 // Broker mode: the relay only, with no store, providers or gateway. It serves on cluster_config.broker.listen_port
 // and accepts only requests signed with cluster.secret.
 function runBroker(c: Config, host: string): int {
@@ -201,8 +226,14 @@ async function main(): Promise<int> {
   // The store keeps the config as written (env.NAME references intact); the engine runs on a resolved copy.
   const store = new ConfigStore(args.config, raw)
   store.cipher = cipher
+  const rawSecret = raw.cluster?.secret ?? ""
   let first = raw
   resolveConfig(&first)
+  const weak = clusterSecretProblem(rawSecret, first, args.mode === "broker")
+  if (weak !== "") {
+    console.error(`raiju: ${weak}; refusing to start with clustering on`)
+    return 1
+  }
   if (args.mode === "broker") return runBroker(first, args.host)
   reportConfig(args.config)
   const cfg = withBifrostGuardrails(withAppDirs(await withSecrets(first), appDir), store, true)
@@ -363,12 +394,24 @@ async function main(): Promise<int> {
   const limits = serverLimits(cfg.server, Bun.fdLimit())
   const served = server === "http1" ? startFront(engine, ops, { hostname: args.host, port: args.port, maxBodyBytes: NO_BODY_LIMIT, limits: () => bodyLimits(engine), timeouts: limits }) : start(engine, ops, { port: args.port, hostname: args.host, workers: args.workers, maxBodyBytes: maxBody, limits: limits })
   const url = served.url
+  const clusterServed = openClusterListener(engine, ops, cfg, args.host, server, limits, maxBody)
+  if (clusterServed !== undefined) {
+    const cu = clusterServed.url
+    console.error(`raiju: cluster listener on ${cu} (the peer routes${ops.metricsOnCluster ? " and /metrics" : ""}; /api/cluster/* is refused on the main listener)`)
+  }
   // SIGTERM and SIGINT stop gracefully (lifecycle.tov): in every worker, /ready turns 503, the listener closes, the
   // requests and streams in hand get up to server.shutdown_grace_seconds, and what is queued is sent before the exit
   Bun.onStopSignal((sig: string) => {
     beginStop(sig, stopSettings(engine.cfg.server), {
-      stopListener: served.stopListener,
-      open: served.open,
+      stopListener: () => {
+        served.stopListener()
+        const cs = clusterServed
+        if (cs !== undefined) cs.stopListener()
+      },
+      open: (): int => {
+        const cs = clusterServed
+        return served.open() + (cs === undefined ? 0 : cs.open())
+      },
       flush: async (): Promise<void> => {
         await ops.flushForStop()
       },
