@@ -6397,8 +6397,18 @@ export interface components {
         McpLogDelete: {
             ids: string[];
         };
+        /** @description The originals of a logs_only row's placeholders, by phase, keyed by the placeholder without its brackets (EMAIL-1). Only on a log detail, for a caller holding Logs / Reveal. */
+        RedactionMapping: {
+            input?: {
+                [key: string]: string;
+            };
+            output?: {
+                [key: string]: string;
+            };
+        };
         /** @description Raiju MCP tool-call log entry (Bifrost's MCP log shape, Raiju's values). */
         McpLogEntry: {
+            redaction_mapping?: components["schemas"]["RedactionMapping"];
             id: string;
             /** Format: date-time */
             timestamp: string;
@@ -17634,13 +17644,15 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The log, in Bifrost's field names */
+            /** @description The log, in Bifrost's field names. A logs_only row also carries redaction_mapping (the placeholders' originals by phase) when the caller holds Logs / Reveal; that answer is sent with Cache-Control: no-store. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": {
+                        redaction_mapping?: components["schemas"]["RedactionMapping"];
+                    };
                 };
             };
             /** @description The request is not valid. */

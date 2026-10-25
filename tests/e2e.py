@@ -13629,6 +13629,126 @@ def l181_scim_e2e(env, idp_state):
         gw.wait()
 
 
+GW_L179 = "http://127.0.0.1:18310"  # object ownership, logs_only reveal, earlier days in the request log
+
+
+def l179_e2e(env):
+    """L179: client.enforce_vk_object_ownership (files and batches belong to the virtual key that created them: another
+    key gets a 404, list pages are narrowed, a batch cannot run on another key's file, a batch's output file follows
+    the batch, the records survive a restart); the logs_only reveal mapping (redaction_mapping on GET /api/logs/{id}
+    for a caller holding Logs:Reveal, no-store, never on the list or for a viewer); and the log reads of earlier days
+    (a row from yesterday's file is listed and served after start). Its own gateway (18310), started twice."""
+    import hashlib, shutil
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    d = os.path.join(BUILD, "e2e-l179")
+    shutil.rmtree(d, ignore_errors=True)
+    logs = os.path.join(d, "logs")
+    os.makedirs(logs)
+    # a row of yesterday's, in yesterday's day file (written before the gateway starts: memory then holds today only)
+    yts = time.time() * 1000 - 86400000
+    yrow = {"id": "l179-yesterday", "ts": yts, "request_id": "l179-yesterday", "op": "chat", "provider": "openai", "model": "gpt-4o-mini", "status": 200,
+            "latency_ms": 5.0, "prompt_tokens": 1, "completion_tokens": 1, "cost": 0.0, "cache_hit": False}
+    open(os.path.join(logs, "requests-" + time.strftime("%Y-%m-%d", time.gmtime(yts / 1000)) + ".jsonl"), "w").write(json.dumps(yrow) + "\n")
+    tok = lambda t: hashlib.sha256(t.encode()).hexdigest()
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "logs_store": {"enabled": True, "dir": logs, "content_logging": True},
+        "guardrails": {"enabled": True, "detect": ["email"], "mode": "redact", "apply_to": "both", "logs_only": True},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "l179", "value": "sk-l179-pool", "models": [], "weight": 1.0, "use_for_batch_api": True}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": tok("sk-admin-l179-root")},
+                      {"name": "vi", "role": "viewer", "token_sha256": tok("sk-admin-l179-view")}],
+            "virtual_keys": [{"id": "vk-l179-a", "name": "a", "value": "sk-bf-l179-a"}, {"id": "vk-l179-b", "name": "b", "value": "sk-bf-l179-b"}],
+        },
+    }
+    cfg_path = os.path.join(d, "config.json")
+    json.dump(cfg, open(cfg_path, "w"))
+    A, B = {"x-bf-vk": "sk-bf-l179-a"}, {"x-bf-vk": "sk-bf-l179-b"}
+    root, view = {"authorization": "Bearer sk-admin-l179-root"}, {"authorization": "Bearer sk-admin-l179-view"}
+    api = lambda m, p, b=None, h=None: call(m, p, b, h, base=GW_L179, auth=False)
+    line = json.dumps({"custom_id": "l179-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}}) + "\n"
+
+    def start(tag):
+        g = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18310", "-host", "127.0.0.1", "-config", cfg_path, "-server", server], env=env, stderr=open(os.path.join(BUILD, f"e2e.l179.{tag}.log"), "w"))
+        wait(GW_L179 + "/health")
+        return g
+
+    gw = start("a")
+    fid = bid = out_id = ""
+    try:
+        # ---- enforce_vk_object_ownership (on by default, as in Bifrost) ----
+        s, _, b = mp_form(GW_L179, "/v1/files", [("purpose", None, "text/plain", "batch"), ("file", "l179.jsonl", "application/jsonl", line)], A)
+        fid = json.loads(b).get("id", "") if s == 200 else ""
+        check("ownership: key A uploads a file", s == 200 and fid != "", (s, b[:200]))
+        n = len(seen())
+        s, _, b = api("GET", "/v1/files/" + fid, None, B)
+        check("ownership: another key reading the file gets Bifrost's 404, and the provider is not called",
+              s == 404 and f"file '{fid}' not found" in b and json.loads(b)["error"]["type"] == "access_blocked" and len(seen()) == n, (s, b[:200], len(seen()) - n))
+        s, _, _ = api("GET", "/v1/files/" + fid, None, A)
+        s2, _, _ = api("GET", "/v1/files/" + fid)
+        check("ownership: the creating key and a request with no virtual key read the file", s == 200 and s2 == 200, (s, s2))
+        s, _, b = api("GET", "/v1/files", None, B)
+        sa, _, ba = api("GET", "/v1/files", None, A)
+        ids_b = [x.get("id") for x in json.loads(b).get("data", [])] if s == 200 else None
+        ids_a = [x.get("id") for x in json.loads(ba).get("data", [])] if sa == 200 else []
+        check("ownership: the list page leaves another key's files out", ids_b is not None and fid not in ids_b and fid in ids_a, (s, ids_b, ids_a))
+        s, _, b = api("POST", "/v1/batches", {"input_file_id": fid, "endpoint": "/v1/chat/completions", "completion_window": "24h"}, B)
+        check("ownership: a batch cannot run on another key's file", s == 404 and f"file '{fid}' not found" in b, (s, b[:200]))
+        s, _, b = api("POST", "/v1/batches", {"input_file_id": fid, "endpoint": "/v1/chat/completions", "completion_window": "24h"}, A)
+        bj = json.loads(b) if s == 200 else {}
+        bid, out_id = bj.get("id", ""), bj.get("output_file_id", "")
+        check("ownership: the creating key runs a batch on its file", s == 200 and bid != "" and out_id != "", (s, b[:200]))
+        s1, _, b1 = api("GET", "/v1/batches/" + bid, None, B)
+        s2, _, _ = api("POST", f"/v1/batches/{bid}/cancel", None, B)
+        check("ownership: another key's batch retrieve and cancel are 404", s1 == 404 and f"batch '{bid}' not found" in b1 and s2 == 404, (s1, b1[:200], s2))
+        s, _, _ = api("GET", "/v1/batches/" + bid, None, A)
+        s1, _, _ = api("GET", f"/v1/files/{out_id}/content", None, B)
+        s2, _, b2 = api("GET", f"/v1/files/{out_id}/content", None, A)
+        check("ownership: a batch's output file belongs to the batch's key once a retrieve names it", s == 200 and s1 == 404 and s2 == 200 and "l179-1" in b2, (s, s1, s2, b2[:200]))
+        s, _, b = api("GET", "/v1/batches", None, B)
+        check("ownership: the batch list leaves another key's batch out", s == 200 and bid not in [x.get("id") for x in json.loads(b).get("data", [])], (s, b[:300]))
+
+        # ---- logs_only reveal mapping ----
+        s, _, _ = api("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l179 reveal mail ann.l179@example.com"}]}, {"x-request-id": "req-l179-reveal"})
+        time.sleep(0.3)
+        s1, h1, b1 = api("GET", "/api/logs/req-l179-reveal", None, root)
+        det = json.loads(b1) if s1 == 200 else {}
+        check("reveal: an admin's log detail carries the logs_only mapping by phase, marked no-store",
+              s == 200 and det.get("redaction_mapping", {}).get("input", {}).get("EMAIL-1") == "ann.l179@example.com" and hdr(h1, "cache-control") == "no-store" and "ann.l179@example.com" not in json.dumps({k: v for k, v in det.items() if k != "redaction_mapping"}),
+              (s, s1, b1[:400], hdr(h1, "cache-control")))
+        s2, h2, b2 = api("GET", "/api/logs/req-l179-reveal", None, view)
+        check("reveal: a viewer (no Logs:Reveal) gets the placeholders only", s2 == 200 and "redaction_mapping" not in b2 and "ann.l179@example.com" not in b2 and "[EMAIL-1]" in b2, (s2, b2[:300]))
+        s3, _, b3 = api("GET", "/api/logs?limit=50", None, root)
+        check("reveal: the list never carries the mapping or the original", s3 == 200 and "redaction_mapping" not in b3 and "ann.l179@example.com" not in b3, (s3, b3[:200]))
+
+        # ---- earlier days: yesterday's row is read from its file after the start ----
+        s, _, b = api("GET", "/api/logs?limit=200", None, root)
+        ids = [e.get("id") for e in json.loads(b).get("logs", [])] if s == 200 else []
+        s2, _, b2 = api("GET", "/api/logs/l179-yesterday", None, root)
+        check("earlier days: yesterday's row is listed and served after a start", "l179-yesterday" in ids and s2 == 200 and json.loads(b2).get("id") == "l179-yesterday", (s, ids[:10], s2, b2[:200]))
+    finally:
+        gw.terminate()
+        gw.wait()
+    gw = start("b")
+    try:
+        s, _, b = api("GET", "/v1/batches/" + bid, None, B)
+        s2, _, _ = api("GET", "/v1/batches/" + bid, None, A)
+        check("ownership: the records survive a restart (kept in the logs_store folder)", s == 404 and s2 == 200, (s, b[:200], s2))
+        s, _, b = api("DELETE", "/v1/files/" + fid, None, B)
+        s2, _, b2 = api("DELETE", "/v1/files/" + fid, None, A)
+        s3, _, _ = api("GET", "/v1/files/" + fid, None, B)
+        # (the mock keeps a deleted file's metadata, so once the record is gone another key reaches it again)
+        check("ownership: another key cannot delete the file; the creator can, and the record goes with it", s == 404 and s2 == 200 and s3 == 200, (s, b[:200], s2, b2[:200], s3))
+        s, _, b = api("GET", "/api/logs?limit=200", None, root)
+        ids = [e.get("id") for e in json.loads(b).get("logs", [])] if s == 200 else []
+        check("earlier days: after a restart the list holds today's and yesterday's rows", "l179-yesterday" in ids and "req-l179-reveal" in ids, ids[:10])
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
 def main():
     unique_ports()
     build()
@@ -16085,6 +16205,9 @@ def main():
         # claims and token rotation: its own gateways (18314, 18315)
         l181_e2e(env)
         l181_scim_e2e(env, idp_state)
+        # L179: provider files and batches bound to their creating virtual key, the logs_only reveal mapping, and
+        # log reads of earlier days after a restart: its own gateway (18310)
+        l179_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

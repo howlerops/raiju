@@ -98,6 +98,18 @@ export type LogEntry = {
   // the plugin logs of the request, grouped by plugin name (Bifrost's plugin_logs: {"<plugin>": [{plugin_name, level,
   // message, timestamp}]}): a WebAssembly plugin's output and failed hooks, and compat's warnings
   plugin_logs?: string,
+  // the reveal mapping of a logs_only redaction ({"input": {"EMAIL-1": "..."}, "output": {...}}), sealed when the
+  // config has an encryption key. Only GET /api/logs/{id} and /api/mcp-logs/{id} show it, to a caller holding
+  // Logs:Reveal; every other read and export leaves it out (publicEntry).
+  redaction_mapping?: string,
+}
+
+// An entry as reads and exports may show it: without its reveal mapping.
+export function publicEntry(e: LogEntry): LogEntry {
+  if (e.redaction_mapping === undefined) return e
+  let out = e
+  out.redaction_mapping = undefined
+  return out
 }
 
 export type LogStoreConfig = {
@@ -389,6 +401,9 @@ export class LogStore {
   onAdd: ((e: LogEntry) => void) | undefined = undefined
   private viewKey = ""
   private view: LogEntry[] = []
+  // the rows of earlier days read back from the files (earlierRows), and what they were read from
+  private olderKey = ""
+  private older: LogEntry[] = []
   private ring: LogEntry[] = []
   // Where the next entry goes: once the ring is full this is the oldest slot.
   private next: int = 0
@@ -847,6 +862,7 @@ export class LogStore {
       downstream_transport: e.downstream_transport,
       upstream_transport: e.upstream_transport,
       plugin_logs: e.plugin_logs,
+      redaction_mapping: e.redaction_mapping,
     }
   }
 
@@ -864,12 +880,70 @@ export class LogStore {
   // The entries newer than ts, oldest first, as the analytics read them: the day file when the
   // workers share it (so every worker answers with every worker's requests), else memory.
   viewSince(ts: f64): LogEntry[] {
-    if (!this.shared) return this.since(ts)
-    const out: LogEntry[] = []
-    const all = this.recent()
-    for (let k = all.length - 1; k >= 0; k--) {
-      if (all[k]!.ts > ts) out.push(all[k]!)
+    let out: LogEntry[] = []
+    const today = Math.floor(Date.now() / DAY_MS)
+    const dayStart: f64 = today * 1.0 * DAY_MS
+    // the oldest row in hand: memory's, or today's start when the workers read today's files
+    const first: f64 = this.shared ? dayStart : this.oldestTs()
+    if (!this.shared) out = this.since(ts)
+    else {
+      const all = this.recent()
+      for (let k = all.length - 1; k >= 0; k--) {
+        if (all[k]!.ts > ts) out.push(all[k]!)
+      }
     }
+    // a window that starts before the rows in hand also gets the earlier days' rows from the files: the days before
+    // today (after a restart memory holds only today's), or before the oldest row in memory
+    if (ts >= first) return out
+    const cutDay = Math.min(today, Math.floor(first / DAY_MS))
+    const back = this.earlierRows(cutDay, today)
+    const add: LogEntry[] = []
+    for (let k = back.length - 1; k >= 0; k--) {
+      const e = back[k]!
+      if (e.ts > ts && e.ts < first) add.push(e)
+    }
+    if (add.length === 0) return out
+    return add.concat(out)
+  }
+
+  // The time of the oldest row in memory (now when there is none).
+  private oldestTs(): f64 {
+    if (this.ring.length === 0) return Date.now()
+    return this.newest(this.ring.length - 1).ts
+  }
+
+  // Rows of the days before cutDay (and of cutDay itself when it is before today: memory then starts within it),
+  // newest first, up to max_memory_entries rows, read from the newest segments back. They are cached until the files
+  // change (a new segment, a delete or a recost changes their sizes), so a read of earlier days costs one pass.
+  private earlierRows(cutDay: int, today: int): LogEntry[] {
+    const segs = segmentsIn(this.cfg.dir).filter((sg) => sg.day < cutDay || (sg.day === cutDay && cutDay < today))
+    const parts: string[] = [`${cutDay}`]
+    for (const sg of segs) parts.push(`${sg.name}:${sizeOf(join(this.cfg.dir, sg.name))}`)
+    const key = parts.join("|")
+    if (key === this.olderKey) return this.older
+    const out: LogEntry[] = []
+    for (let i = segs.length - 1; i >= 0 && out.length < this.cap; i--) {
+      const path = join(this.cfg.dir, segs[i]!.name)
+      // a segment far over the segment size (written before segments existed) is not read whole on a query either
+      if (sizeOf(path) > this.fileBytes() * LOAD_SKIP_FACTOR) continue
+      let lines: string[] = []
+      try {
+        lines = readFileSync(path, "utf8").split("\n")
+      } catch (err) {
+        continue
+      }
+      for (let k = lines.length - 1; k >= 0 && out.length < this.cap; k--) {
+        const line = lines[k]!
+        if (line === "") continue
+        try {
+          out.push(JSON.parse(line) as LogEntry)
+        } catch (err) {
+          continue
+        }
+      }
+    }
+    this.older = out
+    this.olderKey = key
     return out
   }
 
@@ -2122,6 +2196,39 @@ test("start-up reads only the newest segments of today, and skips one far over t
     const all = try new LogStore(cfg)
     // the oversized segment is not read (its rows stay on disk)
     expect(all.query({}).entries.map((e) => e.id).join(",")).toBe("d,c,b,a")
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("reads of a window before today's rows take the earlier days from the files, after a restart too", () => {
+  const dir = tmpDir()
+  try {
+    try mkdirSync(dir, { recursive: true })
+    const now = Date.now()
+    const row = (id: string, ts: f64): string => JSON.stringify(sample(id, ts, "m", 200, {})) + "\n"
+    const y1 = now - 86400000.0
+    const y2 = now - 2.0 * 86400000.0
+    try writeFileSync(join(dir, segmentName(dayOf(y2), 0)), row("two-days", y2))
+    try writeFileSync(join(dir, segmentName(dayOf(y1), 0)), row("yesterday-a", y1 - 1000.0) + row("yesterday-b", y1))
+    try writeFileSync(join(dir, segmentName(dayOf(now), 0)), row("today", now - 10.0))
+    const s = try new LogStore(defaultLogStoreConfig(dir))
+    // memory holds today's rows only; a window over the last three days reads the rest from the files, oldest first
+    expect(s.viewSince(now - 3.0 * 86400000.0).map((e) => e.id).join(",")).toBe("two-days,yesterday-a,yesterday-b,today")
+    expect(s.viewSince(y1 - 500.0).map((e) => e.id).join(",")).toBe("yesterday-b,today")
+    // a window inside today reads nothing from the files
+    expect(s.viewSince(now - 100.0).map((e) => e.id).join(",")).toBe("today")
+    // workers that share the files read the earlier days the same way
+    const w = try new LogStore(defaultLogStoreConfig(dir))
+    w.shared = true
+    expect(w.viewSince(0.0).map((e) => e.id).join(",")).toBe("two-days,yesterday-a,yesterday-b,today")
+    // a delete reaches the earlier days' rows (the cache follows the files)
+    expect(s.delete(["yesterday-a"])).toBe(1)
+    expect(s.viewSince(0.0).map((e) => e.id).join(",")).toBe("two-days,yesterday-b,today")
+    // no rows in memory at all: every day comes from the files
+    try rmSync(join(dir, segmentName(dayOf(now), 0)), { force: true })
+    const fresh = try new LogStore(defaultLogStoreConfig(dir))
+    expect(fresh.viewSince(0.0).map((e) => e.id).join(",")).toBe("two-days,yesterday-b")
   } finally {
     try rmSync(dir, { recursive: true, force: true })
   }

@@ -19,6 +19,7 @@ import { encode, decode } from "./base64"
 import { parseModel } from "./router"
 import { EventFrames, EventFrame, encodeEventStreamFrame } from "./streams"
 import { utf8, secureHex } from "./crypto"
+import { objectOwners, ownerKind, addressesObject, notFoundMessage, batchInputFile, batchFiles, itemId, filterList } from "./objowner"
 
 // The plugin chain, when there is one with plugins.
 function chainOf(engine: Engine): PluginChain | undefined {
@@ -631,7 +632,77 @@ export function storageChange(call: StorageCall, sr: StorageRequest, changed: st
 // short circuit answers it), post_hook on the answer or its error. A file's content goes to post_hook as
 // {file_id, content_type}: the plugin may turn it into an error, and the bytes go back as they came. Without plugins
 // that handle the call's type the handler just runs.
+// A batch or file call, with its objects bound to the virtual key that created them (objowner.tov), then through
+// the plugins' LLM hooks (storageRun).
 export async function storageHooked(engine: Engine, req: Request, call: StorageCall, handler: Handler): Promise<Response> throws TypeError {
+  const vk = engine.gov.findKey(snapshot(req.headers))
+  const kind = ownerKind(call.op)
+  if (vk === undefined || vk.id === "" || kind === "") return try await storageRun(engine, req, call, handler)
+  const vkId = vk.id
+  const owners = objectOwners()
+  const enforced = engine.cfg.client?.enforce_vk_object_ownership !== false
+  if (enforced && addressesObject(call.op) && call.id !== "") {
+    const o = owners.owner(kind, call.id)
+    if (o !== "" && o !== vkId) return errorResponse(404, notFoundMessage(kind, call.id), "access_blocked", noHeaders())
+  }
+  let next = req
+  if (enforced && call.op === "batch_create" && !(req.headers.get("content-type") ?? "").toLowerCase().includes("multipart/")) {
+    // a batch runs on its input file; another key's file is as closed to it as the file itself
+    let body = ""
+    try {
+      body = try await req.text()
+    } catch (e) {
+      return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+    }
+    const input = batchInputFile(body)
+    if (input !== "") {
+      const o = owners.owner("file", input)
+      if (o !== "" && o !== vkId) return errorResponse(404, notFoundMessage("file", input), "access_blocked", noHeaders())
+    }
+    const rh: Record<string, string> = new Map()
+    req.headers.forEach((v, k) => {
+      if (k !== "content-length" && k !== "transfer-encoding") rh.set(k, v)
+    })
+    next = new Request(req.url, { method: req.method, headers: rh, body: body })
+  }
+  const res = try await storageRun(engine, next, call, handler)
+  const deletes = call.op === "file_delete" || call.op === "batch_delete"
+  const watch = deletes || call.op === "file_upload" || call.op === "batch_create" || call.op === "batch_retrieve" || call.op.endsWith("_list")
+  if (res.status >= 400 || !watch) return res
+  if (deletes) {
+    objectOwners().forget(kind, call.id)
+    return res
+  }
+  // (some providers answer JSON with no content type, or a text one)
+  const ct = res.headers.get("content-type") ?? ""
+  if (ct !== "" && !ct.includes("json") && !ct.startsWith("text/")) return res
+  let bytes: u8[] = []
+  try {
+    bytes = await res.bytes()
+  } catch (e) {
+    return errorResponse(502, `the answer could not be read: ${e.message}`, "api_error", noHeaders())
+  }
+  const t = text(bytes)
+  const now = Math.floor(Date.now())
+  const hs = snapshotRecord(res.headers)
+  if (call.op === "file_upload" || call.op === "batch_create") owners.record(kind, itemId(t), vkId, now)
+  else if (call.op === "batch_retrieve") {
+    // a batch's output and error files exist once it has run: they belong to the batch's creator
+    const creator = owners.owner("batch", call.id)
+    if (creator !== "") {
+      for (const fid of batchFiles(t)) owners.record("file", fid, creator, now)
+    }
+  } else if (enforced) {
+    const out = filterList(t, kind, (id: string): bool => {
+      const o = objectOwners().owner(kind, id)
+      return o !== "" && o !== vkId
+    })
+    if (out !== undefined) return new Response(out, { status: res.status, headers: hs })
+  }
+  return new Response(bytes, { status: res.status, headers: hs })
+}
+
+async function storageRun(engine: Engine, req: Request, call: StorageCall, handler: Handler): Promise<Response> throws TypeError {
   const chain = chainOf(engine)
   const k = kindOfOp(call.op)
   if (chain === undefined || k === undefined || !chain.handles(call.op)) return try await handler(req, undefined)
