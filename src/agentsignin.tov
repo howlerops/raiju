@@ -1,0 +1,300 @@
+// Agent sign-in for the Bifrost CLI (its Enterprise browser SSO, cli/internal/browserauth and sessionauth): the CLI asks
+// GET /api/agent/auth/status, opens /api/agent/auth/authorize in a browser with a loopback redirect, state and a PKCE
+// S256 challenge, takes the one-time code its loopback server receives to POST /api/agent/auth/token, and later rotates
+// the pair at POST /api/agent/auth/refresh and revokes it at /api/agent/auth/logout. Access tokens start with
+// "ck-bf-agent-" (the prefix the CLI checks before it refreshes) and stand for the signed-in user on inference: with
+// x-bf-agent-vk-id the user's chosen assigned key, without it the user's default one (governance.tov selectedKey).
+// Bifrost's server side is Enterprise and not in its OSS source; the shapes here are the ones the CLI reads.
+// Codes and tokens are kept by hash in this process's memory, as the dashboard's sessions are (oidc.tov UiSessions).
+import { sha256, utf8, toHex, secureHex } from "./crypto"
+import { encodeUrl } from "./base64"
+import { pctEncode } from "./cloud_auth"
+
+export const AGENT_TOKEN_PREFIX = "ck-bf-agent-"
+export const REFRESH_TOKEN_PREFIX = "rt-bf-agent-"
+const CODE_TTL_MS = 120000.0
+export const ACCESS_TTL_S = 3600
+export const REFRESH_TTL_S = 2592000
+// abandoned flows and expired sessions are swept; past this many entries the oldest go first
+const CAP = 20000
+
+// Who a token stands for: the governance user name (a virtual key's user_id), the role, and the email when known.
+export type AgentUser = { user: string, role: string, email: string }
+
+type CodeEntry = { who: AgentUser, challenge: string, redirect: string, expires: f64 }
+type TokenEntry = { who: AgentUser, family: string, expires: f64 }
+
+export type Issued = { access: string, refresh: string, who: AgentUser }
+export type Exchange = { kind: "ok", issued: Issued } | { kind: "error", status: int, error: string, message: string }
+
+function hashOf(token: string): string {
+  return toHex(sha256(utf8(token)))
+}
+
+// RFC 7636 S256: base64url(sha256(verifier)) without padding.
+export function s256(verifier: string): string {
+  return encodeUrl(sha256(utf8(verifier)))
+}
+
+// A loopback redirect as RFC 8252 allows it for native apps: http on 127.0.0.1, [::1] or localhost with a port.
+export function loopbackRedirect(uri: string): bool {
+  const u = URL.parse(uri)
+  if (u === undefined) return false
+  if (u.protocol !== "http:") return false
+  const host = u.hostname
+  if (host !== "127.0.0.1" && host !== "localhost" && host !== "[::1]" && host !== "::1") return false
+  if (u.port === "") return false
+  if (uri.includes("@")) return false
+  return true
+}
+
+// The problem with an authorize request's parameters ("" when they are usable): a client id, a loopback redirect, a
+// state and an S256 challenge (43 to 128 characters).
+export function authorizeProblem(clientId: string, redirect: string, state: string, challenge: string, method: string): string {
+  if (clientId === "") return "client_id is required"
+  if (!loopbackRedirect(redirect)) return "redirect_uri must be an http loopback address with a port (127.0.0.1, [::1] or localhost)"
+  if (state === "") return "state is required"
+  if (method !== "S256") return "code_challenge_method must be S256"
+  if (challenge.byteLength < 43 || challenge.byteLength > 128) return "code_challenge must be 43 to 128 characters"
+  return ""
+}
+
+// The redirect back to the CLI's loopback server with the code and the state.
+export function callbackUrl(redirect: string, code: string, state: string): string {
+  const u = URL.parse(redirect)
+  if (u === undefined) return redirect
+  const sp = new URLSearchParams(u.search)
+  sp.set("code", code)
+  sp.set("state", state)
+  return u.origin + u.pathname + "?" + sp.toString()
+}
+
+export class AgentSignIn {
+  codes: Map<string, CodeEntry> = new Map()
+  access: Map<string, TokenEntry> = new Map()
+  refresh: Map<string, TokenEntry> = new Map()
+
+  // A one-time code for a signed-in user, bound to the challenge and the redirect.
+  issueCode(who: AgentUser, challenge: string, redirect: string, nowMs: f64): string throws Error {
+    this.sweep(nowMs)
+    const code = try secureHex(48)
+    this.codes.set(hashOf(code), { who: who, challenge: challenge, redirect: redirect, expires: nowMs + CODE_TTL_MS })
+    return code
+  }
+
+  private pair(who: AgentUser, family: string, nowMs: f64): Issued throws Error {
+    const access = AGENT_TOKEN_PREFIX + (try secureHex(48))
+    const refresh = REFRESH_TOKEN_PREFIX + (try secureHex(48))
+    this.access.set(hashOf(access), { who: who, family: family, expires: nowMs + ACCESS_TTL_S * 1000.0 })
+    this.refresh.set(hashOf(refresh), { who: who, family: family, expires: nowMs + REFRESH_TTL_S * 1000.0 })
+    return { access: access, refresh: refresh, who: who }
+  }
+
+  // The code traded for a token pair: used once, within its lifetime, with the verifier of its challenge and the same
+  // redirect (OAuth's invalid_grant otherwise).
+  exchange(code: string, verifier: string, redirect: string, nowMs: f64): Exchange throws Error {
+    const h = hashOf(code)
+    const e = this.codes.get(h)
+    // a code is spent by its first use, right or wrong
+    this.codes.delete(h)
+    if (e === undefined || e.expires <= nowMs) return { kind: "error", status: 400, error: "invalid_grant", message: "the authorization code is invalid or expired" }
+    if (e.redirect !== redirect) return { kind: "error", status: 400, error: "invalid_grant", message: "redirect_uri does not match the authorization request" }
+    if (verifier === "" || s256(verifier) !== e.challenge) return { kind: "error", status: 400, error: "invalid_grant", message: "code_verifier does not match the code challenge" }
+    const family = try secureHex(16)
+    return { kind: "ok", issued: try this.pair(e.who, family, nowMs) }
+  }
+
+  // A refresh token traded for a new pair. The old pair stops working (rotation); a refresh token used twice ends its
+  // whole family, as a token that leaked would be.
+  rotate(refreshToken: string, nowMs: f64): Exchange throws Error {
+    const h = hashOf(refreshToken)
+    const e = this.refresh.get(h)
+    if (e === undefined) return { kind: "error", status: 401, error: "invalid_grant", message: "the refresh token is invalid, expired or already used" }
+    this.refresh.delete(h)
+    if (e.expires <= nowMs) return { kind: "error", status: 401, error: "invalid_grant", message: "the refresh token is invalid, expired or already used" }
+    this.dropFamily(e.family)
+    return { kind: "ok", issued: try this.pair(e.who, e.family, nowMs) }
+  }
+
+  // The user an access token stands for, while it lives.
+  identity(token: string, nowMs: f64): AgentUser | undefined {
+    if (!token.startsWith(AGENT_TOKEN_PREFIX)) return undefined
+    const e = this.access.get(hashOf(token))
+    if (e === undefined) return undefined
+    if (e.expires <= nowMs) {
+      this.access.delete(hashOf(token))
+      return undefined
+    }
+    return e.who
+  }
+
+  // Logout: the access token's family (it and its refresh token) ends. Unknown tokens are a no-op.
+  revoke(token: string): bool {
+    const e = this.access.get(hashOf(token))
+    if (e === undefined) return false
+    this.dropFamily(e.family)
+    return true
+  }
+
+  // Every session of a user ends (a user removed or disabled).
+  revokeUser(user: string): void {
+    for (const k of this.access.keys()) {
+      if (this.access.get(k)!.who.user === user) this.access.delete(k)
+    }
+    for (const k of this.refresh.keys()) {
+      if (this.refresh.get(k)!.who.user === user) this.refresh.delete(k)
+    }
+  }
+
+  private dropFamily(family: string): void {
+    for (const k of this.access.keys()) {
+      if (this.access.get(k)!.family === family) this.access.delete(k)
+    }
+    for (const k of this.refresh.keys()) {
+      if (this.refresh.get(k)!.family === family) this.refresh.delete(k)
+    }
+  }
+
+  private sweep(nowMs: f64): void {
+    for (const k of this.codes.keys()) {
+      if (this.codes.get(k)!.expires <= nowMs) this.codes.delete(k)
+    }
+    if (this.codes.size > CAP) this.codes.clear()
+    if (this.access.size > CAP) {
+      for (const k of this.access.keys()) {
+        if (this.access.get(k)!.expires <= nowMs) this.access.delete(k)
+      }
+    }
+    if (this.refresh.size > CAP) {
+      for (const k of this.refresh.keys()) {
+        if (this.refresh.get(k)!.expires <= nowMs) this.refresh.delete(k)
+      }
+    }
+  }
+}
+
+let signInInstance: AgentSignIn | undefined = undefined
+
+// The process's sign-in state (created on first use: top-level statements in imported modules do not run).
+export function agentSignIn(): AgentSignIn {
+  let s = signInInstance
+  if (s === undefined) {
+    s = new AgentSignIn()
+    signInInstance = s
+  }
+  return s
+}
+
+// The CLI's TokenResponse: agent_access_token, refresh_token, their lifetimes, the user, and the selected and forced
+// virtual key ids (the user's default key; none is forced).
+export function tokenResponseJson(i: Issued, selected: string): string {
+  const u = `{"id":${JSON.stringify(i.who.user)},"name":${JSON.stringify(i.who.user)},"email":${JSON.stringify(i.who.email)}}`
+  return `{"agent_access_token":${JSON.stringify(i.access)},"refresh_token":${JSON.stringify(i.refresh)},"token_type":"Bearer","expires_in":${ACCESS_TTL_S},"refresh_expires_in":${REFRESH_TTL_S},"user":${u},"selected_virtual_key_id":${JSON.stringify(selected)},"forced_virtual_key_id":""}`
+}
+
+function esc(s: string): string {
+  return s.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll("\"", "&quot;")
+}
+
+// The sign-in page the CLI opens: a username and password form (the gateway's users), a single sign-on link when an
+// identity provider is set up, and a dashboard session already in this browser (sessionStorage) taken as it is. The
+// authorize parameters ride along as hidden fields.
+export function signInPage(params: Map<string, string>, error: string, sso: bool, ssoReturn: string): string {
+  const hidden: string[] = []
+  for (const k of ["client_id", "redirect_uri", "state", "code_challenge", "code_challenge_method"]) {
+    hidden.push(`<input type="hidden" name="${k}" value="${esc(params.get(k) ?? "")}">`)
+  }
+  const err = error === "" ? "" : `<p class="err">${esc(error)}</p>`
+  const ssoLink = sso ? `<p><a href="/api/oidc/login?return_to=${pctEncode(ssoReturn)}">Sign in with single sign-on</a></p>` : ""
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in to the gateway</title>
+<style>body{font-family:system-ui,sans-serif;max-width:420px;margin:48px auto;padding:0 16px}label{display:block;margin:12px 0 4px}input[type=text],input[type=password]{width:100%;padding:8px;box-sizing:border-box}button{margin-top:16px;padding:8px 16px}.err{color:#b00020}</style></head>
+<body><h1>Sign in for the CLI</h1><p>A command-line client asked to sign in as you. It gets a token for your assigned virtual keys.</p>${err}
+<form method="post" action="/api/agent/auth/authorize" id="f">${hidden.join("")}<input type="hidden" name="session" id="session" value="">
+<label for="u">Username</label><input type="text" id="u" name="username" autocomplete="username">
+<label for="p">Password</label><input type="password" id="p" name="password" autocomplete="current-password">
+<button type="submit">Sign in</button></form>${ssoLink}
+<script>try{var t=sessionStorage.getItem("raiju.adminToken")||"";if(t.indexOf("sk-sess-")===0&&${error === "" ? "true" : "false"}){document.getElementById("session").value=t;document.getElementById("f").submit();}}catch(e){}</script></body></html>`
+}
+
+// ---- tests ----
+
+const VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+const CHALLENGE = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+
+test("S256 matches RFC 7636's example", () => {
+  expect(s256(VERIFIER)).toBe(CHALLENGE)
+})
+
+test("authorize parameters: a loopback redirect, a state and an S256 challenge", () => {
+  expect(authorizeProblem("bifrost-cli", "http://127.0.0.1:53111/callback", "st", CHALLENGE, "S256")).toBe("")
+  expect(authorizeProblem("bifrost-cli", "http://localhost:9/callback", "st", CHALLENGE, "S256")).toBe("")
+  expect(authorizeProblem("", "http://127.0.0.1:1/callback", "st", CHALLENGE, "S256")).toBe("client_id is required")
+  expect(authorizeProblem("c", "https://evil.example/callback", "st", CHALLENGE, "S256").includes("loopback")).toBe(true)
+  expect(authorizeProblem("c", "http://127.0.0.1/callback", "st", CHALLENGE, "S256").includes("loopback")).toBe(true)
+  expect(authorizeProblem("c", "http://10.0.0.1:80/callback", "st", CHALLENGE, "S256").includes("loopback")).toBe(true)
+  expect(authorizeProblem("c", "http://127.0.0.1:1/callback", "", CHALLENGE, "S256")).toBe("state is required")
+  expect(authorizeProblem("c", "http://127.0.0.1:1/callback", "s", CHALLENGE, "plain")).toBe("code_challenge_method must be S256")
+  expect(authorizeProblem("c", "http://127.0.0.1:1/callback", "s", "short", "S256").includes("43 to 128")).toBe(true)
+  expect(callbackUrl("http://127.0.0.1:5/callback", "abc", "s 1")).toBe("http://127.0.0.1:5/callback?code=abc&state=s+1")
+})
+
+test("a code is traded once for a pair with the right verifier and redirect", () => {
+  const s = new AgentSignIn()
+  const who: AgentUser = { user: "ana", role: "viewer", email: "ana@example.com" }
+  const now = 1000000.0
+  const code = try s.issueCode(who, CHALLENGE, "http://127.0.0.1:5/callback", now)
+  const wrongRedirect = try s.exchange(code, VERIFIER, "http://127.0.0.1:6/callback", now)
+  expect(wrongRedirect.kind).toBe("error")
+  // the code was spent by the failed try
+  expect((try s.exchange(code, VERIFIER, "http://127.0.0.1:5/callback", now)).kind).toBe("error")
+  const c2 = try s.issueCode(who, CHALLENGE, "http://127.0.0.1:5/callback", now)
+  expect((try s.exchange(c2, "wrong-verifier", "http://127.0.0.1:5/callback", now)).kind).toBe("error")
+  const c3 = try s.issueCode(who, CHALLENGE, "http://127.0.0.1:5/callback", now)
+  expect((try s.exchange(c3, VERIFIER, "http://127.0.0.1:5/callback", now + CODE_TTL_MS + 1.0)).kind).toBe("error")
+  const c4 = try s.issueCode(who, CHALLENGE, "http://127.0.0.1:5/callback", now)
+  const ok = try s.exchange(c4, VERIFIER, "http://127.0.0.1:5/callback", now)
+  expect(ok.kind).toBe("ok")
+  if (ok.kind === "ok") {
+    expect(ok.issued.access.startsWith(AGENT_TOKEN_PREFIX)).toBe(true)
+    expect(ok.issued.refresh.startsWith(REFRESH_TOKEN_PREFIX)).toBe(true)
+    expect(s.identity(ok.issued.access, now)!.user).toBe("ana")
+    expect(s.identity(ok.issued.access, now + ACCESS_TTL_S * 1000.0 + 1.0)).toBeUndefined()
+    const body = tokenResponseJson(ok.issued, "vk-1")
+    expect(body.includes(`"selected_virtual_key_id":"vk-1"`)).toBe(true)
+    expect(body.includes(`"user":{"id":"ana","name":"ana","email":"ana@example.com"}`)).toBe(true)
+  }
+})
+
+test("refresh rotates the pair, and a reused refresh token or a logout ends the family", () => {
+  const s = new AgentSignIn()
+  const who: AgentUser = { user: "bo", role: "admin", email: "" }
+  const now = 5000.0
+  const code = try s.issueCode(who, CHALLENGE, "http://127.0.0.1:5/callback", now)
+  const first = try s.exchange(code, VERIFIER, "http://127.0.0.1:5/callback", now)
+  if (first.kind !== "ok") throw new Error("exchange failed")
+  const second = try s.rotate(first.issued.refresh, now + 10.0)
+  if (second.kind !== "ok") throw new Error("rotate failed")
+  // the old pair is gone, the new one works
+  expect(s.identity(first.issued.access, now + 10.0)).toBeUndefined()
+  expect(s.identity(second.issued.access, now + 10.0)!.user).toBe("bo")
+  // the first refresh token again: refused, and the family it belonged to ends
+  expect((try s.rotate(first.issued.refresh, now + 20.0)).kind).toBe("error")
+  const third = try s.rotate(second.issued.refresh, now + 30.0)
+  expect(third.kind).toBe("ok")
+  if (third.kind === "ok") {
+    expect(s.revoke(third.issued.access)).toBe(true)
+    expect(s.identity(third.issued.access, now + 31.0)).toBeUndefined()
+    expect((try s.rotate(third.issued.refresh, now + 32.0)).kind).toBe("error")
+  }
+  expect(s.identity("sk-bf-other", now)).toBeUndefined()
+})
+
+test("the sign-in page carries the authorize parameters, escaped", () => {
+  const p: Map<string, string> = new Map()
+  p.set("state", `a"<b`)
+  p.set("redirect_uri", "http://127.0.0.1:5/callback")
+  const html = signInPage(p, "", true, "/api/agent/auth/authorize?state=x")
+  expect(html.includes(`name="state" value="a&quot;&lt;b"`)).toBe(true)
+  expect(html.includes(`/api/oidc/login?return_to=%2Fapi%2Fagent%2Fauth%2Fauthorize%3Fstate%3Dx`)).toBe(true)
+  expect(signInPage(p, "bad <password>", false, "").includes("bad &lt;password&gt;")).toBe(true)
+})

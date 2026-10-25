@@ -6,6 +6,7 @@
 import { Counters, ClusterConfig, LEADER_WINDOW_MS, verify, nodeOf } from "./cluster"
 import { ClusterState } from "./clusterstate"
 import { HoldBook, HoldWire } from "./holds"
+import { ServerLimits, lifecycle, readyReport, readyInput } from "./lifecycle"
 import { FeedRing, FeedItem, FeedPull, FeedAnswer, FEED_RING_SIZE, FEED_RING_SECONDS, FEED_BATCH_MAX, checkItems, parseAnswer, feedId } from "./feed"
 
 export const BROKER_ROUTE = "/api/cluster/broker"
@@ -73,11 +74,17 @@ function reply(status: int, body: string): Response {
 }
 
 // The broker's routes. POST carries a node's state; GET lists the roster. Both are signed with the
-// cluster secret over the body (empty for GET), like the peer sync. GET /health is for readiness probes.
+// cluster secret over the body (empty for GET), like the peer sync. GET /health is for liveness probes, GET /ready
+// for readiness.
 export async function brokerRoute(relay: Relay, cc: ClusterConfig, req: Request): Promise<Response> {
   const u = URL.parse(req.url)
   const p = u === undefined ? "" : u.pathname
   if (p === "/health") return reply(200, `{"status":"ok"}`)
+  // readiness: 503 while a graceful stop drains, so a load balancer takes the broker out first
+  if (p === "/ready") {
+    const r = readyReport(readyInput(lifecycle().draining, "", false, false, false, false))
+    return reply(r.status, r.body)
+  }
   if (p !== BROKER_ROUTE && p !== BROKER_FEED_ROUTE) return reply(404, `{"error":"not found"}`)
   if (req.method !== "POST" && req.method !== "GET") return reply(405, `{"error":"method not allowed"}`)
   if (p === BROKER_FEED_ROUTE && req.method !== "POST") return reply(405, `{"error":"method not allowed"}`)
@@ -93,19 +100,33 @@ export async function brokerRoute(relay: Relay, cc: ClusterConfig, req: Request)
   }
 }
 
-// Serves the relay on cluster_config.broker.listen_port (default 50051). Returns the URL it listens on.
-export function startBroker(cc: ClusterConfig, hostname: string): string {
+// The broker's server: where it listens, and what a graceful stop needs (lifecycle.tov).
+export type BrokerServed = { url: string, stopListener: () => void, open: () => int }
+
+// Serves the relay on cluster_config.broker.listen_port (default 50051), with the gateway's header, idle and body
+// timeouts and connection cap (server.*).
+export function startBroker(cc: ClusterConfig, hostname: string, lim: ServerLimits): BrokerServed {
   const b = cc.broker
   const port: int = b === undefined ? BROKER_PORT : (b.listen_port ?? BROKER_PORT)
   const relay = new Relay()
   const server = Bun.serve({
     port: port,
     hostname: hostname,
+    headerTimeout: lim.headerSeconds,
+    idleTimeout: lim.idleSeconds,
+    bodyTimeout: lim.bodySeconds,
+    maxConnections: lim.maxConnections,
     fetch(req) {
       return brokerRoute(relay, cc, req)
     },
   })
-  return server.url.href
+  return {
+    url: server.url.href,
+    stopListener: () => {
+      server.stop()
+    },
+    open: (): int => server.openConnections,
+  }
 }
 
 test("the relay joins what the nodes send and lists them as the roster", () => {

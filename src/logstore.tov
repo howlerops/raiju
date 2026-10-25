@@ -45,6 +45,8 @@ export type LogEntry = {
   raw_response?: string,
   // the request's bodies were kept as a hidden object in object storage (retained.tov), so the row has none
   content_hidden?: bool,
+  // the hybrid store moved the row's payload fields to object storage (hybrid.tov); the log detail reads them back
+  has_object?: bool,
   // the request's row metadata (client.logging_headers, x-bf-lh-*, x-bf-dim-*; reqlog.tov)
   metadata?: Record<string, string>,
   // the caller's parent request id and agent correlation id (x-bf-parent-request-id, x-bf-agent-correlation-id)
@@ -83,6 +85,18 @@ export type LogEntry = {
   canonical_model_name?: string,
   // the registered A2A agent a call went to (kind "a2a"; agents.tov); session_id is the call's context id
   agent_name?: string,
+  // an A2A row's kind: "request" (the call; also when unset) or "event", one event of a call's stream (Bifrost's
+  // ObserveA2AEvent), linked to its call by request_id. An event row carries its 1-based sequence in the stream, its
+  // type (message, task, status_update, artifact_update), the task state, message and artifact it names, the media
+  // type of its first part, and the event itself (content: kept when the call's content is)
+  record_kind?: string,
+  event_sequence?: int,
+  event_type?: string,
+  task_state?: string,
+  message_id?: string,
+  artifact_id?: string,
+  content_type?: string,
+  event_body?: string,
   // the crew routing of a crew/<pool> call (crew.tov): the task, its pool, the role the caller named, the class the
   // task was fixed to, the candidate that served the call and the attempt. Rows from before L153 have none.
   task_id?: string,
@@ -109,6 +123,49 @@ export function publicEntry(e: LogEntry): LogEntry {
   if (e.redaction_mapping === undefined) return e
   let out = e
   out.redaction_mapping = undefined
+  return out
+}
+
+// An entry without its bodies, raw payloads, plugin logs and reveal mapping: what another node needs of a row for
+// stats, histograms and rankings (cross-node log reads, ops.tov clusterLogs).
+export function liteEntry(e: LogEntry): LogEntry {
+  let out = e
+  out.input = undefined
+  out.output = undefined
+  out.raw_request = undefined
+  out.raw_response = undefined
+  out.plugin_logs = undefined
+  out.redaction_mapping = undefined
+  return out
+}
+
+// This node's rows and the rows other nodes sent for the same read, as one list oldest first. A row both have (nodes
+// that share a logs folder) is kept once, as this node holds it.
+export function mergeRows(local: LogEntry[], extra: LogEntry[]): LogEntry[] {
+  if (extra.length === 0) return local
+  const seen: Set<string> = new Set()
+  for (const e of local) seen.add(e.id)
+  const more: LogEntry[] = []
+  for (const e of extra) {
+    if (seen.has(e.id)) continue
+    seen.add(e.id)
+    more.push(e)
+  }
+  if (more.length === 0) return local
+  more.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0))
+  // both lists are oldest first: merge them
+  const out: LogEntry[] = []
+  let i = 0
+  let j = 0
+  while (i < local.length || j < more.length) {
+    if (j >= more.length || (i < local.length && local[i]!.ts <= more[j]!.ts)) {
+      out.push(local[i]!)
+      i += 1
+    } else {
+      out.push(more[j]!)
+      j += 1
+    }
+  }
   return out
 }
 
@@ -220,6 +277,35 @@ function segmentName(day: string, seg: int): string {
 }
 
 type Segment = { name: string, day: int, seg: int }
+
+// what the scan's index knows of a segment: its size when it was read, and its oldest and newest row times
+type SegSpan = { size: int, min: f64, max: f64 }
+
+// The time of a stored row, read from its line without parsing the rest: the first "ts" followed by a colon is the
+// row's own key (rows begin with their id and time; a string value that holds "ts" has no colon after it). A row
+// written by another tool may have spaces around the colon. undefined for a line without one.
+export function lineTs(line: string): f64 | undefined {
+  const n = line.byteLength
+  let from = 0
+  while (from < n) {
+    const at = line.slice(from, n).indexOf(`"ts"`)
+    if (at < 0) return undefined
+    let j = from + at + 4
+    while (j < n && line.slice(j, j + 1) === " ") j += 1
+    if (j < n && line.slice(j, j + 1) === ":") {
+      j += 1
+      let k = j
+      while (k < n) {
+        const c = line.slice(k, k + 1)
+        if (c === "," || c === "}") break
+        k += 1
+      }
+      return parseFloat(line.slice(j, k).trim())
+    }
+    from = from + at + 4
+  }
+  return undefined
+}
 
 // The day and segment of a request log file, or undefined for any other name.
 function segmentOf(name: string): Segment | undefined {
@@ -399,11 +485,16 @@ export class LogStore {
   shared = false
   // called with each entry this store adds, after it is kept
   onAdd: ((e: LogEntry) => void) | undefined = undefined
+  // called with each entry as it is about to be stored (bodies already cut or dropped), for the row that is kept: the
+  // hybrid store moves the payload fields to object storage here (gateway.tov, hybrid.tov)
+  onPrepare: ((e: LogEntry) => LogEntry) | undefined = undefined
   private viewKey = ""
   private view: LogEntry[] = []
   // the rows of earlier days read back from the files (earlierRows), and what they were read from
   private olderKey = ""
   private older: LogEntry[] = []
+  // the oldest and newest row times of each segment read whole, and its size then (scanRows)
+  private segIndex: Map<string, SegSpan> = new Map()
   private ring: LogEntry[] = []
   // Where the next entry goes: once the ring is full this is the oldest slot.
   private next: int = 0
@@ -470,7 +561,8 @@ export class LogStore {
   // Keeps the entry in memory and queues it for its day's file; the file write is batched (flush) in a process alone. A failed write
   // is counted and reported on stderr (at most every ERROR_EVERY_MS); it must not fail the request that was logged.
   add(e: LogEntry): void {
-    const entry = this.prepare(e)
+    const pre = this.onPrepare
+    const entry = pre === undefined ? this.prepare(e) : pre(this.prepare(e))
     this.remember(entry)
     const line = JSON.stringify(entry) + "\n"
     const day = dayOf(entry.ts)
@@ -825,6 +917,14 @@ export class LogStore {
       server: e.server,
       agent_name: e.agent_name,
       task_id: e.task_id,
+      record_kind: e.record_kind,
+      event_sequence: e.event_sequence,
+      event_type: e.event_type,
+      task_state: e.task_state,
+      message_id: e.message_id,
+      artifact_id: e.artifact_id,
+      content_type: e.content_type,
+      event_body: on ? clip(e.event_body, max) : undefined,
       crew_pool: e.crew_pool,
       crew_role: e.crew_role,
       crew_class: e.crew_class,
@@ -835,6 +935,7 @@ export class LogStore {
       raw_request: clip(e.raw_request, RAW_MAX),
       raw_response: clip(e.raw_response, RAW_MAX),
       content_hidden: e.content_hidden,
+      has_object: e.has_object,
       metadata: e.metadata,
       parent_request_id: e.parent_request_id,
       agent_correlation_id: e.agent_correlation_id,
@@ -877,33 +978,41 @@ export class LogStore {
     }
   }
 
-  // The k-th newest entry in memory (k = 0 is the newest).
-  // The entries newer than ts, oldest first, as the analytics read them: the day file when the
-  // workers share it (so every worker answers with every worker's requests), else memory.
-  viewSince(ts: f64): LogEntry[] {
+  // The entries newer than ts (and, with until, logged at or before it), oldest first, as the analytics read them:
+  // the day file when the workers share it (so every worker answers with every worker's requests), else memory.
+  viewSince(ts: f64, until?: f64): LogEntry[] {
     let out: LogEntry[] = []
     const today = Math.floor(Date.now() / DAY_MS)
     const dayStart: f64 = today * 1.0 * DAY_MS
-    // the oldest row in hand: memory's, or today's start when the workers read today's files
-    const first: f64 = this.shared ? dayStart : this.oldestTs()
+    // the oldest row in hand: memory's, or, when the workers read today's files, today's start (or the oldest row
+    // read, when today has more rows than max_memory_entries)
+    let first: f64 = this.oldestTs()
     if (!this.shared) out = this.since(ts)
     else {
       const all = this.recent()
+      first = all.length >= this.cap ? all[all.length - 1]!.ts : dayStart
       for (let k = all.length - 1; k >= 0; k--) {
         if (all[k]!.ts > ts) out.push(all[k]!)
       }
     }
-    // a window that starts before the rows in hand also gets the earlier days' rows from the files: the days before
-    // today (after a restart memory holds only today's), or before the oldest row in memory
+    if (until !== undefined) {
+      const u: f64 = until
+      out = out.filter((e) => e.ts <= u)
+    }
+    // a window that starts before the rows in hand also gets the older rows from the files: today's rows beyond
+    // max_memory_entries, and the days before (after a restart memory holds only today's)
     if (ts >= first) return out
-    const cutDay = Math.min(today, Math.floor(first / DAY_MS))
-    const back = this.earlierRows(cutDay, today)
+    if (until !== undefined && until <= ts) return out
+    const back = this.scanRows(ts, first, until)
+    if (back.length === 0) return out
+    // the scan includes rows at the oldest time in hand (rows logged in the same millisecond can be on either side),
+    // so the rows already in hand are left out by id
+    const held: Set<string> = new Set()
+    for (const e of out) held.add(e.id)
     const add: LogEntry[] = []
     for (let k = back.length - 1; k >= 0; k--) {
-      const e = back[k]!
-      if (e.ts > ts && e.ts < first) add.push(e)
+      if (!held.has(back[k]!.id)) add.push(back[k]!)
     }
-    if (add.length === 0) return out
     return add.concat(out)
   }
 
@@ -913,39 +1022,99 @@ export class LogStore {
     return this.newest(this.ring.length - 1).ts
   }
 
-  // Rows of the days before cutDay (and of cutDay itself when it is before today: memory then starts within it),
-  // newest first, up to max_memory_entries rows, read from the newest segments back. They are cached until the files
-  // change (a new segment, a delete or a recost changes their sizes), so a read of earlier days costs one pass.
-  private earlierRows(cutDay: int, today: int): LogEntry[] {
-    const segs = segmentsIn(this.cfg.dir).filter((sg) => sg.day < cutDay || (sg.day === cutDay && cutDay < today))
-    const parts: string[] = [`${cutDay}`]
+  // Rows logged after from and before to (and at or before until), newest first, up to max_memory_entries of them,
+  // read from the segments back from the newest that can hold them: a paged scan, so the cap bounds the rows of the
+  // window asked for rather than the newest rows. A row's time is read from its line before the line is parsed, and
+  // each segment read whole leaves its oldest and newest times in an index (segIndex, checked against the segment's
+  // size), so later scans skip the segments outside their window unread. The answer is cached until the window or the
+  // files change (a new row, a segment, a delete or a recost changes their sizes).
+  private scanRows(from: f64, to: f64, until?: f64): LogEntry[] {
+    this.flush()
+    const segs = segmentsIn(this.cfg.dir)
+    // rows at until are in the window, and so are rows at to (the oldest row in hand), which the caller leaves out by id
+    const hi: f64 = until === undefined ? to : Math.min(to, until + 0.0005)
+    const parts: string[] = [`${from}:${hi}`]
     for (const sg of segs) parts.push(`${sg.name}:${sizeOf(join(this.cfg.dir, sg.name))}`)
     const key = parts.join("|")
     if (key === this.olderKey) return this.older
     const out: LogEntry[] = []
-    for (let i = segs.length - 1; i >= 0 && out.length < this.cap; i--) {
-      const path = join(this.cfg.dir, segs[i]!.name)
+    let counted = 0
+    for (let i = segs.length - 1; i >= 0 && counted < this.cap; i--) {
+      const sg = segs[i]!
+      const start: f64 = sg.day * 1.0 * DAY_MS
+      if (start >= hi || start + DAY_MS <= from) continue
+      const path = join(this.cfg.dir, sg.name)
+      const size = sizeOf(path)
       // a segment far over the segment size (written before segments existed) is not read whole on a query either
-      if (sizeOf(path) > this.fileBytes() * LOAD_SKIP_FACTOR) continue
+      if (size > this.fileBytes() * LOAD_SKIP_FACTOR) continue
+      const span = this.segIndex.get(sg.name)
+      if (span !== undefined && span.size === size && (span.max <= from || span.min > hi)) continue
       let lines: string[] = []
       try {
         lines = readFileSync(path, "utf8").split("\n")
       } catch (err) {
         continue
       }
-      for (let k = lines.length - 1; k >= 0 && out.length < this.cap; k--) {
+      let lo: f64 = 1.0e308
+      let top: f64 = -1.0e308
+      let whole = true
+      for (let k = lines.length - 1; k >= 0; k--) {
         const line = lines[k]!
         if (line === "") continue
+        const t = lineTs(line)
+        if (t === undefined) continue
+        if (t < lo) lo = t
+        if (t > top) top = t
+        if (t <= from || t > hi) continue
+        // rows at hi share the oldest row's millisecond in hand: mostly rows in hand, so they do not count to the cap
+        if (t < hi && counted >= this.cap) {
+          whole = false
+          break
+        }
+        if (t < hi) counted += 1
+        // a torn or foreign line is skipped, not fatal
         try {
           out.push(JSON.parse(line) as LogEntry)
         } catch (err) {
           continue
         }
       }
+      if (whole && top >= lo) this.segIndex.set(sg.name, { size: size, min: lo, max: top })
     }
     this.older = out
     this.olderKey = key
     return out
+  }
+
+  // One row by id, wherever it is: memory (or today's shared rows), then every segment newest first, rows beyond
+  // max_memory_entries and earlier days alike. A segment or line that does not hold the id is not parsed.
+  findById(id: string): LogEntry | undefined {
+    for (const e of this.recent()) {
+      if (e.id === id) return e
+    }
+    this.flush()
+    // (the quoted id; the line is parsed to check it is the row's id)
+    const needle = JSON.stringify(id)
+    const segs = segmentsIn(this.cfg.dir)
+    for (let i = segs.length - 1; i >= 0; i--) {
+      let text = ""
+      try {
+        text = readFileSync(join(this.cfg.dir, segs[i]!.name), "utf8")
+      } catch (err) {
+        continue
+      }
+      if (!text.includes(needle)) continue
+      for (const line of text.split("\n")) {
+        if (!line.includes(needle)) continue
+        try {
+          const e = JSON.parse(line) as LogEntry
+          if (e.id === id) return e
+        } catch (err) {
+          continue
+        }
+      }
+    }
+    return undefined
   }
 
   // Entries newer than ts, oldest first (for log exports).
@@ -958,6 +1127,7 @@ export class LogStore {
     return out
   }
 
+  // The k-th newest entry in memory (k = 0 is the newest).
   private newest(k: int): LogEntry {
     const n = this.ring.length
     const i = (((this.next - 1 - k) % n) + n) % n
@@ -1827,24 +1997,43 @@ export function mcpLogJson(e: LogEntry): string {
 
 // One A2A call (kind "a2a") as the agent history lists it.
 export function a2aLogJson(e: LogEntry): string {
-  return jobj([
+  const parts: string[] = [
     jkv("id", JSON.stringify(e.id)),
     jkv("timestamp", JSON.stringify(isoMs(e.ts))),
     jkv("agent_name", JSON.stringify(e.agent_name ?? "")),
     jkv("method", JSON.stringify(e.op)),
-    // Bifrost's names for the row: the operation, its kind, the task and the two bindings
+    // Bifrost's names for the row: the operation, its kind, the request it belongs to, the task and the two bindings
     jkv("operation", JSON.stringify(e.op)),
-    jkv("record_kind", JSON.stringify("request")),
-    jkv("task_id", JSON.stringify(e.task_id ?? "")),
-    jkv("downstream_transport", JSON.stringify(e.downstream_transport ?? "")),
-    jkv("upstream_transport", JSON.stringify(e.upstream_transport ?? "")),
-    jkv("context_id", JSON.stringify(e.session_id ?? "")),
-    jkv("virtual_key_id", JSON.stringify(e.virtual_key ?? "")),
-    jkv("latency", jn(e.latency_ms)),
-    jkv("status", JSON.stringify(isSuccess(e) ? "success" : "error")),
-    jkv("status_code", jn(e.status)),
-    jkv("error_details", e.error === undefined ? "null" : jobj([jkv("message", JSON.stringify(e.error))])),
-  ])
+    jkv("record_kind", JSON.stringify(e.record_kind ?? "request")),
+    jkv("request_id", JSON.stringify(e.request_id === "" ? e.id : e.request_id)),
+  ]
+  const opt = (k: string, v: string | undefined): void => {
+    if (v !== undefined && v !== "") parts.push(jkv(k, JSON.stringify(v)))
+  }
+  if (e.record_kind === "event") {
+    parts.push(jkv("event_sequence", jn(e.event_sequence ?? 0)))
+    opt("event_type", e.event_type)
+    opt("task_state", e.task_state)
+    opt("message_id", e.message_id)
+    opt("artifact_id", e.artifact_id)
+    opt("content_type", e.content_type)
+  }
+  parts.push(jkv("task_id", JSON.stringify(e.task_id ?? "")))
+  parts.push(jkv("downstream_transport", JSON.stringify(e.downstream_transport ?? "")))
+  parts.push(jkv("upstream_transport", JSON.stringify(e.upstream_transport ?? "")))
+  parts.push(jkv("context_id", JSON.stringify(e.session_id ?? "")))
+  parts.push(jkv("virtual_key_id", JSON.stringify(e.virtual_key ?? "")))
+  // the governance attribution, as Bifrost's AgentLogSummary carries it when set
+  opt("user_id", e.user_id)
+  opt("team_id", e.team_id)
+  opt("customer_id", e.customer_id)
+  opt("business_unit_id", e.business_unit_id)
+  opt("project_id", e.project_id)
+  parts.push(jkv("latency", jn(e.latency_ms)))
+  parts.push(jkv("status", JSON.stringify(isSuccess(e) ? "success" : "error")))
+  parts.push(jkv("status_code", jn(e.status)))
+  parts.push(jkv("error_details", e.error === undefined ? "null" : jobj([jkv("message", JSON.stringify(e.error))])))
+  return jobj(parts)
 }
 
 // GET /api/mcp-logs/stats
@@ -2233,6 +2422,91 @@ test("reads of a window before today's rows take the earlier days from the files
   } finally {
     try rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test("rows beyond max_memory_entries: a row logged in the same millisecond as the oldest row in memory is read once", () => {
+  const dir = tmpDir()
+  try {
+    try mkdirSync(dir, { recursive: true })
+    const now = Date.now()
+    const t0 = Math.max(Math.floor(now / 86400000.0) * 86400000.0, now - 60000.0)
+    const row = (id: string, ts: f64): string => JSON.stringify(sample(id, ts, "m", 200, {})) + "\n"
+    // five rows; the second and the third share a millisecond, and memory (three) holds the third to the fifth
+    const ts: f64[] = [t0, t0 + 2.0, t0 + 2.0, t0 + 3.0, t0 + 4.0]
+    let text = ""
+    for (let i = 0; i < 5; i++) text += row("s" + i, ts[i]!)
+    try writeFileSync(join(dir, segmentName(dayOf(now), 0)), text)
+    const cfg = defaultLogStoreConfig(dir)
+    cfg.max_memory_entries = 3
+    const s = try new LogStore(cfg)
+    expect(s.viewSince(t0 - 1.0).map((e) => e.id).join(",")).toBe("s0,s1,s2,s3,s4")
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("rows beyond max_memory_entries: today's older rows and a window far back are read from the files", () => {
+  const dir = tmpDir()
+  try {
+    try mkdirSync(dir, { recursive: true })
+    const now = Date.now()
+    const dayStart = Math.floor(now / 86400000.0) * 86400000.0
+    const row = (id: string, ts: f64): string => JSON.stringify(sample(id, ts, "m", 200, {})) + "\n"
+    // three days back: ten rows an hour apart; today: six rows, a second apart, ending a minute ago
+    const back = dayStart - 2.0 * 86400000.0
+    let old = ""
+    for (let i = 0; i < 10; i++) old += row("old" + i, back + i * 3600000.0)
+    try writeFileSync(join(dir, segmentName(dayOf(back), 0)), old)
+    let today = ""
+    const t0 = Math.max(dayStart, now - 60000.0 - 6000.0)
+    for (let i = 0; i < 6; i++) today += row("t" + i, t0 + i * 1000.0)
+    try writeFileSync(join(dir, segmentName(dayOf(now), 0)), today)
+    const cfg = defaultLogStoreConfig(dir)
+    cfg.max_memory_entries = 3
+    const s = try new LogStore(cfg)
+    // memory holds the newest three; a window over today reads today's older rows from the file
+    expect(s.query({}).entries.map((e) => e.id).join(",")).toBe("t5,t4,t3")
+    expect(s.viewSince(t0 - 1.0).map((e) => e.id).join(",")).toBe("t0,t1,t2,t3,t4,t5")
+    // a narrow window three days back gets its rows, though more than max_memory_entries rows are newer
+    expect(s.viewSince(back + 2.5 * 3600000.0, back + 5.0 * 3600000.0).map((e) => e.id).join(",")).toBe("old3,old4,old5")
+    // a wide window takes the newest max_memory_entries rows before memory
+    expect(s.viewSince(0.0).map((e) => e.id).join(",")).toBe("t0,t1,t2,t3,t4,t5")
+    // the index skips segments outside a window: the old day is not read again for a window inside today
+    expect(s.viewSince(t0 + 500.0).map((e) => e.id).join(",")).toBe("t1,t2,t3,t4,t5")
+    // one row by id, wherever it is
+    expect(s.findById("old1")!.ts).toBe(back + 3600000.0)
+    expect(s.findById("t0")!.id).toBe("t0")
+    expect(s.findById("t5")!.id).toBe("t5")
+    expect(s.findById("nope")).toBe(undefined)
+    // shared workers read today's rows beyond the cap the same way
+    const w = try new LogStore(cfg)
+    w.shared = true
+    expect(w.viewSince(t0 - 1.0).map((e) => e.id).join(",")).toBe("t0,t1,t2,t3,t4,t5")
+    expect(lineTs(`{"id":"x","ts":1791979200000.5,"op":"chat"}`)).toBe(1791979200000.5)
+    expect(lineTs(`{"id":"x"}`)).toBe(undefined)
+    expect(lineTs(`{"id": "x", "ts": 1500.0, "op": "chat"}`)).toBe(1500.0)
+    expect(lineTs(`{"id":"ts","ts":42,"op":"chat"}`)).toBe(42.0)
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("rows from other nodes merge in time order, once each, and travel without their bodies when lite", () => {
+  const a = sample("a", 1000.0, "m", 200, {})
+  const c = sample("c", 3000.0, "m", 200, {})
+  const b = sample("b", 2000.0, "m", 200, { input: "secret prompt", output: "answer" })
+  const d = sample("d", 500.0, "m", 200, {})
+  expect(mergeRows([a, c], [b, d, a]).map((e) => e.id).join(",")).toBe("d,a,b,c")
+  expect(mergeRows([a, c], []).map((e) => e.id).join(",")).toBe("a,c")
+  expect(mergeRows([], [c, b]).map((e) => e.id).join(",")).toBe("b,c")
+  const m: LogEntry = { id: b.id, ts: b.ts, request_id: b.request_id, op: b.op, provider: b.provider, model: b.model, status: b.status, latency_ms: 1.0, prompt_tokens: 1, completion_tokens: 1, cost: 0.0, cache_hit: false, input: "secret prompt", redaction_mapping: "sealed", raw_request: "{}" }
+  const l = liteEntry(m)
+  expect(l.input).toBe(undefined)
+  expect(l.output).toBe(undefined)
+  expect(l.raw_request).toBe(undefined)
+  expect(l.redaction_mapping).toBe(undefined)
+  expect(l.model).toBe("m")
+  expect(b.input).toBe("secret prompt")
 })
 
 test("shared stores write each row at once and answer with each other's rows", () => {

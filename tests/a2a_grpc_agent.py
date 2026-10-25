@@ -4,12 +4,14 @@ It serves the A2A service on a plaintext port (h2c) and, with a certificate and 
 over HTTP on a third port:
   GET /card       a v1 card whose one interface is GRPC at http://127.0.0.1:<plaintext port>
   GET /tls-card   the same agent with its one interface at 127.0.0.1:<TLS port> (a bare target: TLS)
+  GET /mtls-card  with a client CA too: the agent on a TLS port that requires a client certificate the CA signed
   GET /seen       the calls it received: method, metadata and the request's text
   POST /reset     forgets the calls
 
 Methods (messages hand-encoded, field numbers from a2a-go v2.5.0's a2a.proto):
   SendMessage            a completed task with an artifact "echo: <text>"; the text "fail" is INTERNAL with
-                         details (a Struct and an ErrorInfo, as a2a-go sends them)
+                         details (a Struct and an ErrorInfo, as a2a-go sends them); the text "hang" waits up to 6 s,
+                         noting in /seen whether the caller cancelled the call first ("hang-cancelled") or not
   SendStreamingMessage   the task submitted, working, its artifact, completed; "fail-stream" sends one event and
                          then fails with details
   GetTask                the task, or NOT_FOUND "task not found" with an ErrorInfo TASK_NOT_FOUND {taskId}
@@ -17,8 +19,8 @@ Methods (messages hand-encoded, field numbers from a2a-go v2.5.0's a2a.proto):
   SubscribeToTask        the task, then its final status
 Anything else is UNIMPLEMENTED (grpcio's answer for an unknown method).
 
-Usage: a2a_grpc_agent.py [CERT.pem KEY.pem]; prints "ready <http port> <grpc port> <tls port>" (tls port 0
-without a certificate). Ports are picked by the system.
+Usage: a2a_grpc_agent.py [CERT.pem KEY.pem [CLIENT_CA.pem]]; prints "ready <http port> <grpc port> <tls port>" (tls
+port 0 without a certificate), and " <mtls port>" with a client CA. Ports are picked by the system.
 """
 import http.server
 import json
@@ -169,6 +171,12 @@ def send_message(req, context):
     note("SendMessage", context, text)
     if text == "fail":
         fail(context, grpc.StatusCode.INTERNAL, "agent failed on request", "INTERNAL_ERROR", {"agent": "grpc-only"}, {"hint": "try again"})
+    if text == "hang":
+        import time
+        t0 = time.time()
+        while context.is_active() and time.time() - t0 < 6:
+            time.sleep(0.05)
+        note("SendMessage", context, "hang-cancelled" if not context.is_active() else "hang-finished")
     return fld(1, task_bytes(new_task(text, ctx)))
 
 
@@ -243,12 +251,15 @@ def card(url):
 
 
 def main():
-    cert = key = None
+    cert = key = client_ca = None
     if len(sys.argv) >= 3:
         cert, key = open(sys.argv[1], "rb").read(), open(sys.argv[2], "rb").read()
+    if len(sys.argv) >= 4:
+        client_ca = open(sys.argv[3], "rb").read()
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=16), handlers=[Handler()])
     gport = server.add_insecure_port("127.0.0.1:0")
     tport = server.add_secure_port("127.0.0.1:0", grpc.ssl_server_credentials([(key, cert)])) if cert else 0
+    mport = server.add_secure_port("127.0.0.1:0", grpc.ssl_server_credentials([(key, cert)], root_certificates=client_ca, require_client_auth=True)) if client_ca else 0
     server.start()
 
     class Cards(http.server.BaseHTTPRequestHandler):
@@ -268,6 +279,8 @@ def main():
                 self.answer(200, card("http://127.0.0.1:%d" % gport))
             elif self.path == "/tls-card":
                 self.answer(200, card("127.0.0.1:%d" % tport))
+            elif self.path == "/mtls-card" and mport:
+                self.answer(200, card("127.0.0.1:%d" % mport))
             elif self.path == "/seen":
                 with LOCK:
                     self.answer(200, list(SEEN))
@@ -285,7 +298,7 @@ def main():
 
     web = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Cards)
     threading.Thread(target=web.serve_forever, daemon=True).start()
-    print("ready %d %d %d" % (web.server_address[1], gport, tport), flush=True)
+    print("ready %d %d %d" % (web.server_address[1], gport, tport) + (" %d" % mport if client_ca else ""), flush=True)
     try:
         server.wait_for_termination()
     except KeyboardInterrupt:

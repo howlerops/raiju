@@ -2,6 +2,7 @@
 // and the mock upstream. Run: NODE_PATH=$(npm root -g) node tests/ui_e2e.mjs   (make ui)
 // Needs build/raiju and build/mock_upstream (make ui builds both) and the committed src/ui_assets.tov.
 // Ports 18107 (gateway) and 18108 (mock upstream) are reserved for this file; UI_E2E_PORT=n uses n and n+1.
+// 18335 (UI_E2E_SETUP_PORT) is a second gateway with no admin account, for the setup screen.
 import { spawn, execFileSync } from "node:child_process"
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -62,9 +63,23 @@ writeFileSync(config, JSON.stringify({
   }] },
 }))
 
+// a gateway with no admin account and a setup token: the setup screen (Bifrost's setup lock)
+const SETUP_PORT = Number(process.env.UI_E2E_SETUP_PORT ?? 18335)
+const SETUP_GW = `http://127.0.0.1:${SETUP_PORT}`
+const SETUP_TOKEN = "ui-setup-" + "token-l189"
+const setupConfig = join(dir, "setup.json")
+writeFileSync(setupConfig, JSON.stringify({
+  setup_token: SETUP_TOKEN,
+  client: { enable_logging: false, enforce_auth_on_inference: false },
+  providers: { openai: { keys: [{ name: "main", value: "sk-ui-setup", models: [], weight: 1 }], network_config: { base_url: MOCK } } },
+}))
+const setupEnv = { ...process.env }
+delete setupEnv.BIFROST_SETUP_TOKEN
+
 const procs = [
   spawn(join(root, "build/mock_upstream"), [], { env: { ...process.env, MOCK_PORT: String(PORT + 1) }, stdio: "ignore" }),
   spawn(join(root, "build/raiju"), ["-port", String(PORT), "-host", "127.0.0.1", "-config", config, "-server", process.env.RAIJU_SERVER ?? "bun"], { stdio: "ignore" }),
+  spawn(join(root, "build/raiju"), ["-port", String(SETUP_PORT), "-host", "127.0.0.1", "-config", setupConfig, "-server", process.env.RAIJU_SERVER ?? "bun"], { env: setupEnv, stdio: "ignore" }),
 ]
 const fails = []
 const check = (name, ok, detail = "") => {
@@ -126,6 +141,12 @@ const logMsg = (e, node) => JSON.stringify({ type: "log", data: e, ...(node ? { 
 let browser
 try {
   await waitUp()
+  for (let i = 0; i < 100; i++) {
+    try {
+      if ((await fetch(SETUP_GW + "/health")).ok) break
+    } catch {}
+    await new Promise((r) => setTimeout(r, 50))
+  }
   // some traffic so logs and stats have something to show
   for (let i = 0; i < 3; i++) await chat("hi " + i)
   browser = await chromium.launch()
@@ -1194,6 +1215,52 @@ try {
     const light = await lpg.evaluate(() => getComputedStyle(document.body).backgroundColor)
     check("light mode follows the system", light === "rgb(246, 247, 249)", light)
     await lctx.close()
+  }
+
+  // ---- the setup screen: no admin account yet, so the API is locked behind the setup token ----
+  {
+    const ctx = await browser.newContext({ viewport: { width: 400, height: 900 } })
+    const sp = await ctx.newPage()
+    sp.on("pageerror", (e) => errors.push("setup: " + String(e)))
+    sp.on("console", (m) => {
+      if (m.type() !== "error" && m.type() !== "warning") return
+      if (/status of (400|401|403|404|409|422)/.test(m.text())) return
+      errors.push("setup: " + m.type() + ": " + m.text())
+    })
+    await sp.goto(SETUP_GW + "/#overview")
+    check("a gateway with no admin shows the setup screen instead of the dashboard", await until(sp, () => !!document.querySelector("#setup-form")), await text(sp, "main"))
+    check("the setup screen asks for no sign-in and hides the sections", (await sp.locator("#auth").count()) === 0 && (await sp.locator("nav.tabs").count()) === 0)
+    check("the setup token field is a password field", (await sp.getAttribute("#setup-token", "type")) === "password")
+    const unnamedSetup = await sp.evaluate(() => [...document.querySelectorAll("main input")].filter((e) => !(e.labels && e.labels.length) && !e.getAttribute("aria-label")).length)
+    check("every field of the setup screen has a name, and it has one h1", unnamedSetup === 0 && (await sp.locator("main h1").count()) === 1, unnamedSetup)
+    check("no horizontal scroll on the setup screen at 400px", (await sp.evaluate(() => document.documentElement.scrollWidth)) <= 400)
+    await sp.fill("#setup-token", "not-the-token")
+    await sp.fill("#setup-name", "root")
+    await sp.click("#setup-submit")
+    check("a wrong setup token is refused on the screen", await until(sp, () => (document.querySelector("#setup-error")?.textContent ?? "").includes("Invalid setup token")), await text(sp, "#setup"))
+    check("a wrong setup token creates no admin", (await (await fetch(SETUP_GW + "/api/session/is-auth-enabled")).json()).setup_required === true)
+    await sp.fill("#setup-token", SETUP_TOKEN)
+    await sp.click("#setup-submit")
+    check("the right setup token creates the first admin and shows its token once", await until(sp, () => (document.querySelector("#setup-new-token")?.value ?? "").length > 10), await text(sp, "#setup"))
+    const newToken = await sp.inputValue("#setup-new-token")
+    const users = await fetch(SETUP_GW + "/api/users", { headers: { authorization: "Bearer " + newToken } })
+    const ujson = await users.json().catch(() => ({}))
+    check("the admin exists on the gateway (POST /api/users with X-Bifrost-Setup-Token) and its token opens the API", users.status === 200 && (ujson.users ?? []).some((u) => u.name === "root" && u.role === "admin"), JSON.stringify(ujson).slice(0, 200))
+    check("the setup lock is lifted", (await (await fetch(SETUP_GW + "/api/session/is-auth-enabled")).json()).setup_required === false)
+    await sp.click("#setup-continue")
+    check("Continue opens the dashboard signed in as the new admin", await until(sp, () => !document.querySelector("#setup") && document.querySelector("#token-btn")?.textContent === "Admin token: set" && /admin/.test(document.querySelector("#role-pill")?.textContent ?? "")), await text(sp, "header"))
+    // (this gateway has no log store, so the request stats are not there; the response cache card reads /api/cache)
+    check("the dashboard loads with the new admin's token", await until(sp, () => (document.querySelector("#ov-cache")?.textContent ?? "").includes("Hit rate") && !(document.querySelector("main")?.textContent ?? "").includes("Unauthorized")) && (await sp.locator("#auth").count()) === 0, await text(sp, "main"))
+    await sp.reload()
+    check("after a reload the setup screen does not come back", await until(sp, () => document.querySelector("nav.tabs") !== null) && (await sp.locator("#setup").count()) === 0)
+    await ctx.close()
+    // a server with no setup token: the screen says how to set one, and offers no form
+    const nctx = await browser.newContext({ viewport: { width: 400, height: 900 } })
+    const np = await nctx.newPage()
+    await np.route("**/api/session/is-auth-enabled", (r) => r.fulfill({ status: 200, contentType: "application/json", body: '{"is_auth_enabled":false,"setup_required":true,"setup_token_configured":false}' }))
+    await np.goto(SETUP_GW + "/#overview")
+    check("with no setup token configured the screen explains how to set one", await until(np, () => !!document.querySelector("#setup-unconfigured")) && (await np.locator("#setup-form").count()) === 0 && (await text(np, "#setup-help")).includes("BIFROST_SETUP_TOKEN"), await text(np, "main"))
+    await nctx.close()
   }
 
   check("no uncaught page errors or console warnings", errors.length === 0, errors.join("; "))

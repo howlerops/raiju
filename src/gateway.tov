@@ -19,14 +19,15 @@ import { AgentConfig, runAgent, runResponsesAgent } from "./agent"
 import { SampleRing } from "./alerts"
 import { ExportQueue } from "./exporters"
 import { RetainQueue, HiddenPayload, MAX_JOBS, MAX_BYTES } from "./retained"
-import { GuardrailProvider, Verdict, appliesTo, checkRequest, parseVerdictFor, isLocal, extractText, completionText } from "./guardrail_providers"
+import { hybridPolicy, offloads, splitEntry } from "./hybrid"
+import { GuardrailProvider, Verdict, LogFinding, appliesTo, checkRequest, parseVerdictFor, isLocal, extractText, completionText } from "./guardrail_providers"
 import { judgeText } from "./guard_judge"
 import { CompiledRule, applyRegex } from "./guard_regex"
 import { compileLocal, localVerdict } from "./guard_local"
 import { ToolGuard, compileToolGuards, checkToolCall } from "./guard_mcp"
 import { OutputStreamGuard, GuardedProvider, StreamFormat } from "./guard_stream"
 import { Vault, tokenizeChatRequest, restoreCompletion, tokenize, tokenizeText } from "./guard_reversible"
-import { Target, Upstream, Translated, proxyOf, tlsOf, poolOf, RS } from "./providers/types"
+import { Target, Upstream, Translated, proxyOf, tlsOf, poolOf, peerOf, RS } from "./providers/types"
 import { anthropicRoute } from "./providers/anthropic_route"
 import * as vertexWif from "./vertexwif"
 import { mantleSurface } from "./providers/bedrock_mantle"
@@ -40,7 +41,7 @@ import { Health, BreakerConfig, defaultBreakerConfig, parsePolicy } from "./heal
 import { errorParts, classifyFailure, holdsKey, retryInfoMs } from "./refusal"
 import { Governance, Grant, Denial, directKeyFrom, Attribution, noAttribution } from "./governance"
 import { Pricing, PriceRow, CostParts, SttUsage } from "./pricing"
-import { MediaRoute, MediaBill, handleMedia, transcriptionUsage, billedMedia, StreamUsage, pump, isEventStream } from "./media"
+import { MediaRoute, MediaBill, handleMedia, transcriptionUsage, billedMedia, StreamUsage, pump, isEventStream, hfEnsure } from "./media"
 import { SocketGate } from "./ws"
 import { ResponseCache, CacheOrigin, cacheKey, keyScope, parseTtl } from "./cache"
 import { appOf, phaseMapping } from "./logapi"
@@ -71,7 +72,7 @@ import { McpUserToken, tokenAction, userTokenOf, identityOf, consentMessage, con
 import { Limiter } from "./limiter"
 import { JobStore } from "./jobs"
 import { fetchPluginUrls, missingPluginUrls, PluginSource } from "./plugindl"
-import { BasePlugin, PreResult, PostResult, PluginChain, PluginContext, PluginEntry, PluginRun, PluginTrace, PluginLogEntry, pluginLogsJson, PostOutcome, RUN_HEADER, TRACE_HEADER, buildChain, jsonStreamEnabled, JsonStreamFixer, pluginErrorMessage, parsePluginError, errorPost } from "./plugins"
+import { BasePlugin, PreResult, PostResult, PluginChain, PluginContext, PluginEntry, PluginRun, PluginTrace, PluginLogEntry, pluginLogsJson, PostOutcome, RUN_HEADER, TRACE_HEADER, ATTEMPT_HEADER, buildChain, jsonStreamEnabled, JsonStreamFixer, pluginErrorMessage, parsePluginError, errorPost } from "./plugins"
 import { SseBuffer, sseData, sseWithData } from "./plughttp"
 import { SemanticCache, SemanticCacheConfig, defaultSemanticConfig, promptText, parseEmbedding, scopeKey, identityScope, hasToolCalls } from "./semcache"
 import { Deadline, deadline, IdleWatch, idleWatch, streamIdleSeconds } from "./deadline"
@@ -83,6 +84,8 @@ import { LargeBody, LargeSettings, BodyTap, UsageTap, largeSettings, scanPrefix,
 import { AnyConv, ConvRef, familyFor, needsHash, newConv, convFor, upstreamFor, convertedStream, spoolConverted, spoolTitan, titanExtras } from "./largeconv"
 import { EMB_TITAN } from "./embconv"
 import { EXTRA_PARAMS_HEADER, EXTRA_PARAMS_CARRY, mergeIntoUpstream } from "./extraparams"
+import { clientSignal, CANCELLED_STATUS, CANCELLED_MESSAGE, CANCELLED_TYPE } from "./clientgone"
+import { usesChain, withChainCreds } from "./awschain"
 
 export type Build = (t: Target) => Upstream throws SyntaxError
 // a chat request for a target, from its shaped body (tc parses the same request as a typed chat)
@@ -92,7 +95,20 @@ type AnswerStep = (s: string) => string throws SyntaxError
 export type Translate = (t: Target, text: string, requestedModel: string) => Translated throws SyntaxError
 
 // shortCircuit: the answer (or error) is a plugin's, not the provider's (x-bf-plugin-short-circuit)
-type Outcome = { ok: bool, status: int, body: string, contentType: string, provider: string, model: string, promptTokens: int, completionTokens: int, attempts: int, upstreamMs: f64, direct?: bool, raw?: bool, key?: string, alias?: string, aliasName?: string, aliasFamily?: string, retryMs?: f64, served?: string, billed?: f64, pass?: Response, finish?: () => void, noBilled?: bool, shortCircuit?: bool, idle?: IdleWatch }
+type Outcome = { ok: bool, status: int, body: string, contentType: string, provider: string, model: string, promptTokens: int, completionTokens: int, attempts: int, upstreamMs: f64, direct?: bool, raw?: bool, key?: string, alias?: string, aliasName?: string, aliasFamily?: string, retryMs?: f64, served?: string, billed?: f64, pass?: Response, finish?: () => void, noBilled?: bool, shortCircuit?: bool, idle?: IdleWatch, run?: StreamRun }
+
+// A converted stream whose answer has started: what pumping it needs. The attempt hands this back instead of pumping
+// the stream itself, so its frame (all its locals and temporaries, about 70 KB) is freed while the stream runs: each
+// open stream held it for its whole length before (L189).
+class StreamRun {
+  constructor(readonly sink: StreamSink, readonly conv: StreamConverter, readonly stream: ReadableStream, readonly dl: Deadline, readonly iw: IdleWatch, readonly ctx: ReqCtx, readonly labels: metrics.RequestLabels, readonly keepRaw: bool, readonly started: f64, readonly retry: int, readonly provider: string, readonly model: string, readonly attempts: int, readonly upstreamMs: f64, readonly ignoreCost: bool, readonly h: Hdrs, readonly stickKey: string | undefined, readonly slot: Limiter | undefined) {}
+}
+
+// The promise as it is: awaited through here, an async call is its own allocation (freed when it is done) rather
+// than laid out inside the caller's frame.
+function separately<T>(p: Promise<T>): Promise<T> {
+  return p
+}
 
 // The answer of a large request whose events are converted as they arrive: the Response is given when the
 // provider's answer starts, and its body is fed by a StreamSink. The server's streamed routes use it too.
@@ -859,6 +875,27 @@ async function sleep(ms: int): Promise<void> {
   })
 }
 
+// A retry's backoff, cut short when the caller goes away (Bifrost's backoff waits on the request's context too).
+async function backoffSleep(ms: int, client: AbortSignal | undefined): Promise<void> {
+  if (client === undefined) {
+    await sleep(ms)
+    return
+  }
+  if (client.aborted) return
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => resolve(), ms)
+    client.addEventListener("abort", () => {
+      clearTimeout(timer)
+      resolve()
+    })
+  })
+}
+
+// The outcome of a request whose caller went away: Bifrost's request_cancelled, logged as 499 (cancelled).
+function cancelledOutcome(provider: string, model: string, attempts: int, upstreamMs: f64): Outcome {
+  return { ok: false, status: CANCELLED_STATUS, body: errorJson(CANCELLED_MESSAGE, CANCELLED_TYPE, undefined), contentType: "application/json", provider: provider, model: model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
+}
+
 // A request's plugin logs as its log row keeps them (grouped by plugin, Bifrost's plugin_logs), or undefined.
 function pluginLogsOf(c: ReqCtx): string | undefined {
   const tr = c.pluginTrace
@@ -1174,6 +1211,9 @@ class ReqCtx {
   canonicalModel = ""
   // Bifrost's metric labels for this request, filled once it is routed and admitted
   labels: metrics.RequestLabels = metrics.newLabels("", "", "")
+  // aborted when the caller goes away before its answer (clientgone.tov): the upstream call, the retries and the
+  // fallbacks stop
+  client: AbortSignal | undefined = undefined
   // the log row's extra columns, read from the request's headers (reqlog.tov)
   meta: Record<string, string> | undefined = undefined
   parentId = ""
@@ -1395,7 +1435,7 @@ async function replicatePoll(t: Target, first: string, signal: AbortSignal): Pro
       if (url === "") break
       await new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 2000))
       const hs: Record<string, string> = replicate.pollHeaders(t)
-      const r = await fetch(url, { headers: hs, signal: signal, proxy: proxyOf(t.cfg), tls: tlsOf(t.cfg), pool: poolOf(t.cfg) })
+      const r = await fetch(url, { headers: hs, signal: signal, proxy: proxyOf(t.cfg), tls: tlsOf(t.cfg), pool: poolOf(t.cfg), peer: peerOf(t.cfg) })
       const tx = await r.text()
       if (r.status < 200 || r.status >= 300) return { status: r.status, text: tx }
       cur = tx
@@ -1470,6 +1510,38 @@ export function logsOnlyText(text: string, g: GuardConfig | undefined, rules: Co
     if (found.length > 0) out = tokenize(out, found, vault)
   }
   return out
+}
+
+// Whether a provider is Presidio or Azure AI Language PII redacting with redaction_mode logs_only: the live text stays
+// raw and its findings become the stored copy's placeholders.
+export function logsOnlyHttp(p: GuardrailProvider): bool {
+  return (p.kind === "presidio" || p.kind === "azure_language_pii") && p.action === "redact" && p.redaction_mode === "logs_only"
+}
+
+// One stored text with an HTTP provider's logs_only findings as numbered placeholders from the request's vault
+// ([EMAIL_ADDRESS-1]): each found value, as written and as it reads inside a JSON string.
+export function logsOnlyFound(text: string, found: LogFinding[], vault: Vault): string {
+  if (text === "" || found.length === 0) return text
+  let out = text
+  for (const f of found) {
+    if (f.value === "") continue
+    const tok = vault.tokenFor(f.kind.toUpperCase(), f.value)
+    out = out.split(f.value).join(tok)
+    const q = JSON.stringify(f.value)
+    const esc = q.slice(1, q.byteLength - 1)
+    if (esc !== f.value) out = out.split(esc).join(tok)
+  }
+  return out
+}
+
+// A request with an x-request-id (made for a caller that sent none), its body given again as text.
+function withRequestId(req: Request, rid: string, body: string): Request {
+  const hs: Record<string, string> = new Map()
+  req.headers.forEach((v, k) => {
+    if (k !== "content-length" && k !== "transfer-encoding") hs.set(k, v)
+  })
+  hs.set("x-request-id", rid)
+  return new Request(req.url, { method: req.method, headers: hs, body: body })
 }
 
 // The guards that check MCP tool calls. A bad pattern is logged and the tool guards are left off.
@@ -1571,6 +1643,9 @@ export class Engine {
   pluginRuns: Map<string, PluginRun> = new Map()
   // the plugin spans and logs of the requests a non-chat route hooked, found by x-bf-plugin-trace (pluginroute.tov)
   pluginTraces: Map<string, PluginTrace> = new Map()
+  // the plugins across the attempts of the requests with fallbacks a non-chat route hooked, found by x-bf-plugin-attempt
+  // (pluginroute.tov hookedRun): serve runs the pre hooks again on each fallback with them, as on chat
+  attemptRuns: Map<string, AttemptPlugins> = new Map()
   // jsonparser with usage all_requests: the JSON of each stream is completed (plugins.tov JsonStreamFixer)
   jsonStreamOn = false
   semantic: SemanticCache | undefined = undefined
@@ -1612,6 +1687,8 @@ export class Engine {
   exportQueues: ExportQueue[] = []
   // hidden content of content-off requests, uploaded by ops.tov (client.retain_content_in_object_storage)
   hiddenQueue: RetainQueue | undefined = undefined
+  // the hybrid store's payload uploads (logs_store.object_storage, hybrid.tov), sent by ops.tov
+  hybridQueue: RetainQueue | undefined = undefined
   guardProviders: GuardrailProvider[] = []
   // compiled regex and secrets providers, by id, and the guards on MCP tool calls
   localRules: Map<string, CompiledRule[]> = new Map()
@@ -1619,6 +1696,10 @@ export class Engine {
   // of a request (its log row, raw payloads, exports and retained content), never live traffic
   logGuard: GuardConfig | undefined = undefined
   logRules: Map<string, CompiledRule[]> = new Map()
+  // logs_only on the HTTP providers: their findings by request id (record turns them into the stored copy's
+  // placeholders), and the rows held until the answer's check is done (undefined: held, not recorded yet)
+  logFindings: Map<string, LogFinding[]> = new Map()
+  heldRecords: Map<string, ReqCtx | undefined> = new Map()
   // seals a log row's reveal mapping with the config's encryption key (ops.tov sets it; identity without a key)
   sealLog: (v: string) => string = (v: string): string => v
   toolGuards: ToolGuard[] = []
@@ -1703,6 +1784,27 @@ export class Engine {
         console.error(`raiju: request log store disabled: ${e.message}`)
       }
     }
+    // Bifrost's hybrid store: with logs_store.object_storage set, each row's payload fields go to the bucket (hybrid.tov),
+    // unless object_storage_offload is false
+    const hob = ls?.object_storage
+    const hstore = this.logStore
+    if (ls !== undefined && ls.enabled === true && hob !== undefined && ls.object_storage_offload !== false && hstore !== undefined) {
+      if (hob.bucket !== "" && (hob.type === "s3" || hob.type === "gcs")) {
+        const pol = hybridPolicy(hob.format, hob.compression, hob.compress === true, ls.object_storage_exclude_fields ?? [], ls.object_storage_exclude_request_types ?? [])
+        for (const w of pol.warnings) console.error(`raiju: ${w}`)
+        const dst: LogExportsConfig = { enabled: true, kind: hob.type, bucket: hob.bucket, region: hob.region, endpoint: hob.endpoint, access_key_id: hob.access_key_id, secret_access_key: hob.secret_access_key, session_token: hob.session_token, path_style: hob.path_style }
+        const q = new RetainQueue(dst, hob.prefix ?? "bifrost", pol.gz, MAX_JOBS, MAX_BYTES)
+        q.policy = pol
+        this.hybridQueue = q
+        hstore.onPrepare = (e: LogEntry): LogEntry => {
+          if (!offloads(pol, e)) return e
+          const sp = splitEntry(pol, e)
+          // a full queue keeps the row whole rather than lose its payload
+          if (!q.add(e.ts, e.id, sp.payload)) return e
+          return sp.row
+        }
+      }
+    }
     // Bifrost's retain_content_in_object_storage: content-off bodies go to logs_store.object_storage, with the store on
     const ob = ls?.object_storage
     if (ls !== undefined && ls.enabled === true && cfg.client?.retain_content_in_object_storage === true && this.logStore !== undefined) {
@@ -1784,8 +1886,11 @@ export class Engine {
 
   // Asks every external guardrail that covers `source` about `text`; stops at the first block.
   // Judges go through the chat path, regex and secrets run in-process, and HTTP providers make one request.
-  async externalGuard(text: string, source: "input" | "output"): Promise<{ action: string, reason: string, text?: string }> {
-    let out: { action: string, reason: string, text?: string } = { action: "allow", reason: "" }
+  // A Presidio or Azure AI Language PII provider that redacts logs_only leaves the live text alone; what it found is
+  // returned as logs, for the request's stored copy (record).
+  async externalGuard(text: string, source: "input" | "output"): Promise<{ action: string, reason: string, text?: string, logs?: LogFinding[] }> {
+    let out: { action: string, reason: string, text?: string, logs?: LogFinding[] } = { action: "allow", reason: "" }
+    let logs: LogFinding[] = []
     for (const p of this.guardProviders) {
       if (!appliesTo(p, source)) continue
       if (!(p.targets ?? ["llm"]).includes("llm")) continue
@@ -1800,12 +1905,17 @@ export class Engine {
       }
       metrics.inc("raiju_guardrail_checks_total", metrics.labels("", p.id, v.action), 1.0)
       if (v.action === "block") return { action: "block", reason: `${p.id}: ${v.reason}` }
+      if (v.action === "redact" && logsOnlyHttp(p)) {
+        for (const f of v.found ?? []) logs.push(f)
+        continue
+      }
       const red = v.text
       if (v.action === "redact" && red !== undefined) {
         text = red
         out = { action: "redact", reason: `${p.id}: ${v.reason}`, text: red }
       }
     }
+    if (logs.length > 0) out.logs = logs
     return out
   }
 
@@ -1953,14 +2063,111 @@ export class Engine {
     return try await r.text()
   }
 
+  // Pumps a converted stream to the client (an attempt's StreamRun): each upstream chunk converted, guarded and sent,
+  // then the tail, the log fields and the metrics. Past this point the client has bytes, so there is no retry.
+  async pumpStream(run: StreamRun): Promise<Outcome> {
+    const sink = run.sink
+    const conv = run.conv
+    const ctx = run.ctx
+    const iw = run.iw
+    const started = run.started
+    // the upstream bytes, kept for the log when store_raw_request_response asks (not under output guards: a match can be split)
+    const keepRaw = run.keepRaw
+    const rawBytes: u8[] = []
+    // the tool names the client was sent, for the log row (a binary stream has none)
+    const sentNames = new ToolNameStream()
+    // whether any event has gone to the client (replay pacing starts after the first)
+    let wrote = false
+    let failed = false
+    try {
+      const reader = run.stream.getReader()
+      let chunkIndex = 0
+      let lastAt = started
+      while (true) {
+        if (sink.cancelled || conv.halted) {
+          await reader.cancel()
+          break
+        }
+        iw.arm()
+        const c = await reader.read()
+        iw.disarm()
+        if (c.done) break
+        const v = c.value
+        if (v !== undefined) {
+          if (keepRaw && rawBytes.length < RAW_CAP) for (const b of v) rawBytes.push(b)
+          const out = conv.guarded(conv.push(v), false)
+          const rep = conv.replay()
+          if (rep.length > 0) {
+            const sentRep = await this.sendPaced(sink, rep, this.replayPace(), !wrote)
+            wrote = true
+            if (this.logStore !== undefined) sentNames.push(sentRep)
+          }
+          if (out !== "") {
+            wrote = true
+            const at = performance.now()
+            metrics.observeStreamChunk(run.labels, chunkIndex, (at - lastAt) / 1000.0)
+            chunkIndex += 1
+            lastAt = at
+            sink.write(out)
+            if (this.logStore !== undefined) sentNames.push(out)
+          }
+          const fb = conv.takeFrames()
+          const wb = sink.writeBytes
+          if (wb !== undefined && fb.length > 0) wb(fb)
+        }
+      }
+    } catch (e) {
+      // a binary stream just ends: a text error would corrupt its frames
+      // (a client that cancelled is owed no error event)
+      failed = true
+      if (!conv.framed() && !sink.cancelled) sink.write(`data: ${errorJson(`the upstream stream failed: ${e.message}`, "api_error", undefined)}\n\ndata: [DONE]\n\n`)
+    }
+    iw.stop()
+    if (keepRaw) ctx.rawResponse = rawText(rawBytes)
+    const tail = conv.guarded(conv.end(), true)
+    // a held answer that passed goes out now, paced; one cut by an upstream failure is dropped
+    const repEnd = conv.replay()
+    if (repEnd.length > 0 && !failed) {
+      const sentRep = await this.sendPaced(sink, repEnd, this.replayPace(), !wrote)
+      if (this.logStore !== undefined) sentNames.push(sentRep)
+    }
+    if (tail !== "") {
+      sink.write(tail)
+      if (this.logStore !== undefined) sentNames.push(tail)
+    }
+    sentNames.end()
+    if (this.logStore !== undefined) {
+      ctx.toolNames = sentNames.names
+      // the stop reason of the streamed answer, from the events the client was sent (Bifrost's FinishReason
+      // of the last chunk)
+      ctx.stopReason = sentNames.stop
+    }
+    const fe = conv.takeFrames()
+    const we = sink.writeBytes
+    if (we !== undefined && fe.length > 0) we(fe)
+    sink.close()
+    run.dl.finish()
+    const q = run.slot
+    if (q !== undefined) q.release()
+    const upstreamMs = run.upstreamMs + performance.now() - started
+    metrics.observeRequest(run.labels, { ok: true, status: 200, errorType: "", retries: run.retry * 1.0 }, (performance.now() - started) / 1000.0)
+    const kid = run.stickKey
+    if (kid !== undefined) this.stickId(run.h, run.provider, run.model, kid)
+    return { ok: true, status: 200, body: "", contentType: "text/event-stream", provider: run.provider, model: run.model, promptTokens: conv.promptTokens(), completionTokens: conv.completionTokens(), attempts: run.attempts, upstreamMs: upstreamMs, direct: true, billed: run.ignoreCost ? undefined : conv.billedCost() }
+  }
+
   // Remembers the key that served a session, so its next requests go to the same key.
   stick(h: Hdrs, ref: ModelRef, t: Target): void {
+    const kid = t.key.id ?? t.key.name
+    if (kid !== undefined) this.stickId(h, ref.provider, ref.model, kid)
+  }
+
+  stickId(h: Hdrs, provider: string, model: string, kid: string): void {
     const aff = this.affinity
     if (aff === undefined || affinityMode(h) === "off") return
     const sid = sessionId(h)
-    const kid = t.key.id ?? t.key.name
-    if (sid === undefined || kid === undefined) return
-    aff.bind(sid, ref.provider, ref.model, kid, sessionTtl(h, aff.cfg), Date.now())
+    if (sid === undefined) return
+    aff.bind(sid, provider, model, kid, sessionTtl(h, aff.cfg), Date.now())
   }
 
   // The heuristic's tier and score; the score is undefined when the text cannot be scored.
@@ -2135,8 +2342,12 @@ export class Engine {
     let attempts = 0
     let upstreamMs = 0.0
     let refIndex = -1
+    // a caller that goes away stops a non-streamed request here: the upstream call is aborted and no retry or fallback
+    // follows (a streamed answer stops when its sink is cancelled)
+    const client = streamed ? undefined : ctx.client
     for (const ref of refs) {
       refIndex += 1
+      if (client !== undefined && client.aborted) return cancelledOutcome(ref.provider, ref.model, attempts, upstreamMs)
       const tried: Set<int> = new Set()
       const p: ProviderConfig = this.providerConf(ref.provider) ?? {}
       // Bifrost's allowed_requests: a request type the provider does not allow is not sent; the next fallback may take it
@@ -2163,6 +2374,7 @@ export class Engine {
       const aff = this.affinity
       if (aff !== undefined && pinned === undefined) soft = resolveSticky(aff, h, ref.provider, ref.model, Date.now())?.keyId
       while (true) {
+        if (client !== undefined && client.aborted) return cancelledOutcome(ref.provider, ref.model, attempts, upstreamMs)
         // the caller's own key serves the primary provider only: a fallback never gets it
         const sel = refIndex === 0 && direct !== undefined ? this.directSel(ref, direct) : this.targetSel(ref, tried, pinned ?? soft)
         if (sel === undefined && soft !== undefined) {
@@ -2229,6 +2441,16 @@ export class Engine {
           }
           t.key.value = tok.token
         }
+        // a Bedrock key with neither an API key nor keys of its own signs with the default chain (awschain.tov)
+        const bk0 = t.key.bedrock_key_config
+        if ((t.kind === "bedrock" || t.kind === "bedrock_mantle") && bk0 !== undefined && usesChain(bk0, t.key.value ?? "")) {
+          const wc = await withChainCreds(bk0, t.key.value ?? "")
+          if (wc.error !== "") {
+            last = { ok: false, status: 502, body: errorJson(wc.error, "authentication_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
+            break
+          }
+          t.key.bedrock_key_config = wc.bk
+        }
         const bk = t.key.bedrock_key_config
         if ((t.kind === "bedrock" || t.kind === "bedrock_mantle") && bk !== undefined && bk.role_arn !== undefined) {
           const ar = await this.assumeRole(bk)
@@ -2250,6 +2472,14 @@ export class Engine {
             break
           }
           t.key.value = tok.token
+        }
+        // a Hugging Face embedding names the provider's model id from the hub mapping: fetched (or cached) before the build
+        if (t.kind === "huggingface" && ctx.op === "embeddings") {
+          const hm = await hfEnsure(t)
+          if (hm.error !== "") {
+            last = { ok: false, status: hm.status, body: errorJson(hm.error, hm.status >= 500 ? "api_error" : "invalid_request_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
+            break
+          }
         }
         // another wire for this attempt, as Bifrost picks it per request: Claude on Azure and use_anthropic_endpoints
         // go as Anthropic Messages, and a Bedrock key's OpenAI-family models go to its Mantle surface
@@ -2325,8 +2555,13 @@ export class Engine {
           const dl = deadline(timeoutMs(p))
           live = dl
           const signal = dl.controller.signal
+          if (client !== undefined) {
+            client.addEventListener("abort", () => {
+              if (!dl.done) dl.controller.abort(new DOMException(CANCELLED_MESSAGE, "AbortError"))
+            })
+          }
           const px = proxyOf(p)
-          const res = lg !== undefined ? await fetch(up.url, { method: "POST", headers: hs, body: lg.stream(), signal: signal, proxy: px, tls: tlsOf(t.cfg), pool: poolOf(t.cfg) }) : up.body === "" ? await fetch(up.url, { method: "GET", headers: hs, signal: signal, proxy: px, tls: tlsOf(t.cfg), pool: poolOf(t.cfg) }) : await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: signal, proxy: px, tls: tlsOf(t.cfg), pool: poolOf(t.cfg) })
+          const res = lg !== undefined ? await fetch(up.url, { method: "POST", headers: hs, body: lg.stream(), signal: signal, proxy: px, tls: tlsOf(t.cfg), pool: poolOf(t.cfg), peer: peerOf(t.cfg) }) : up.body === "" ? await fetch(up.url, { method: "GET", headers: hs, signal: signal, proxy: px, tls: tlsOf(t.cfg), pool: poolOf(t.cfg), peer: peerOf(t.cfg) }) : await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: signal, proxy: px, tls: tlsOf(t.cfg), pool: poolOf(t.cfg), peer: peerOf(t.cfg) })
           status = res.status
           // circuit policies: this response's headers may open the circuit of a policy for this primary
           if (this.health.policyList().length > 0) {
@@ -2337,8 +2572,9 @@ export class Engine {
             this.health.policyObserve(ref.provider, ref.model, t.key.id ?? "", rh, Date.now())
           }
           // a large answer (or a stream) goes back as it comes, without being read whole
-          // (a large request that was converted for this provider has its answer converted back, so it is not passed through)
-          if ((lg !== undefined ? lg.passAnswer : (ctx.passAbove >= 0 && providers.streamsNatively(t.kind))) && status >= 200 && status < 300) {
+          // (a large request that was converted for this provider has its answer converted back, so it is not passed through; nor are
+          // Hugging Face embeddings, whose answers take the provider's shape)
+          if ((lg !== undefined ? lg.passAnswer : (ctx.passAbove >= 0 && providers.streamsNatively(t.kind) && !(t.kind === "huggingface" && ctx.op === "embeddings"))) && status >= 200 && status < 300) {
             const clen = parseInt(res.headers.get("content-length") ?? "") ?? -1
             const ctype = res.headers.get("content-type") ?? ""
             const limit = lg !== undefined ? lg.settings.responseThreshold : ctx.passAbove
@@ -2380,92 +2616,16 @@ export class Engine {
             compatHeaders(&ctx.outHeaders, ctx.compat)
             sink.started = true
             sink.open(200, ctx.outHeaders)
-            const reader = stream.getReader()
-            // the upstream bytes, kept for the log when store_raw_request_response asks (not under output guards: a match can be split)
-            const keepRaw = storeRaw && this.streamGuards(true).length === 0
-            const rawBytes: u8[] = []
             // a cancel while the upstream is silent aborts the pending read, not just the next one
             sink.abort = () => {
               dl.controller.abort()
             }
-            // the tool names the client was sent, for the log row (a binary stream has none)
-            const sentNames = new ToolNameStream()
-            // whether any event has gone to the client (replay pacing starts after the first)
-            let wrote = false
-            let failed = false
-            // a silent upstream is cut (stream_idle_timeout_in_seconds)
-            const iw = idleGuard(dl, p)
-            try {
-              let chunkIndex = 0
-              let lastAt = started
-              while (true) {
-                if (sink.cancelled || conv.halted) {
-                  await reader.cancel()
-                  break
-                }
-                iw.arm()
-                const c = await reader.read()
-                iw.disarm()
-                if (c.done) break
-                const v = c.value
-                if (v !== undefined) {
-                  if (keepRaw && rawBytes.length < RAW_CAP) for (const b of v) rawBytes.push(b)
-                  const out = conv.guarded(conv.push(v), false)
-                  const rep = conv.replay()
-                  if (rep.length > 0) {
-                    const sentRep = await this.sendPaced(sink, rep, this.replayPace(), !wrote)
-                    wrote = true
-                    if (this.logStore !== undefined) sentNames.push(sentRep)
-                  }
-                  if (out !== "") {
-                    wrote = true
-                    const at = performance.now()
-                    metrics.observeStreamChunk(tl, chunkIndex, (at - lastAt) / 1000.0)
-                    chunkIndex += 1
-                    lastAt = at
-                    sink.write(out)
-                    if (this.logStore !== undefined) sentNames.push(out)
-                  }
-                  const fb = conv.takeFrames()
-                  const wb = sink.writeBytes
-                  if (wb !== undefined && fb.length > 0) wb(fb)
-                }
-              }
-            } catch (e) {
-              // a binary stream just ends: a text error would corrupt its frames
-              // (a client that cancelled is owed no error event)
-              failed = true
-              if (!conv.framed() && !sink.cancelled) sink.write(`data: ${errorJson(`the upstream stream failed: ${e.message}`, "api_error", undefined)}\n\ndata: [DONE]\n\n`)
-            }
-            iw.stop()
-            if (keepRaw) ctx.rawResponse = rawText(rawBytes)
-            const tail = conv.guarded(conv.end(), true)
-            // a held answer that passed goes out now, paced; one cut by an upstream failure is dropped
-            const repEnd = conv.replay()
-            if (repEnd.length > 0 && !failed) {
-              const sentRep = await this.sendPaced(sink, repEnd, this.replayPace(), !wrote)
-              if (this.logStore !== undefined) sentNames.push(sentRep)
-            }
-            if (tail !== "") {
-              sink.write(tail)
-              if (this.logStore !== undefined) sentNames.push(tail)
-            }
-            sentNames.end()
-            if (this.logStore !== undefined) {
-              ctx.toolNames = sentNames.names
-              // the stop reason of the streamed answer, from the events the client was sent (Bifrost's FinishReason
-              // of the last chunk)
-              ctx.stopReason = sentNames.stop
-            }
-            const fe = conv.takeFrames()
-            const we = sink.writeBytes
-            if (we !== undefined && fe.length > 0) we(fe)
-            sink.close()
-            dl.finish()
-            upstreamMs += performance.now() - started
-            metrics.observeRequest(tl, { ok: true, status: 200, errorType: "", retries: retry * 1.0 }, (performance.now() - started) / 1000.0)
-            if (sel.keyIndex >= 0) this.stick(h, ref, t)
-            return { ok: true, status: 200, body: "", contentType: "text/event-stream", provider: ref.provider, model: ref.model, promptTokens: conv.promptTokens(), completionTokens: conv.completionTokens(), attempts: attempts, upstreamMs: upstreamMs, direct: true, billed: t.cfg.ignore_provider_cost === true ? undefined : conv.billedCost() }
+            // the stream is pumped by pumpStream once this frame is gone (a silent upstream is cut:
+            // stream_idle_timeout_in_seconds)
+            const run = new StreamRun(sink, conv, stream, dl, idleGuard(dl, p), ctx, tl, storeRaw && this.streamGuards(true).length === 0, started, retry, ref.provider, ref.model, attempts, upstreamMs, t.cfg.ignore_provider_cost === true, h, sel.keyIndex >= 0 ? t.key.id ?? t.key.name : undefined, slot ? lim : undefined)
+            // the provider queue's slot goes with the stream, and is given back when it ends
+            slot = false
+            return { ok: true, status: 200, body: "", contentType: "text/event-stream", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs, direct: true, run: run }
           }
           text = await res.text()
           // a streamed upstream body is not kept when local output guards apply: a match can be split across its events,
@@ -2480,7 +2640,7 @@ export class Engine {
               const xh: Record<string, string> = x.headers
               // (a large request's further bodies are spooled streams)
               const xs = x.stream
-              const xr = xs !== undefined ? await fetch(x.url, { method: "POST", headers: xh, body: xs, signal: signal, proxy: px, tls: tlsOf(t.cfg), pool: poolOf(t.cfg) }) : await fetch(x.url, { method: "POST", headers: xh, body: x.body, signal: signal, proxy: px, tls: tlsOf(t.cfg), pool: poolOf(t.cfg) })
+              const xr = xs !== undefined ? await fetch(x.url, { method: "POST", headers: xh, body: xs, signal: signal, proxy: px, tls: tlsOf(t.cfg), pool: poolOf(t.cfg), peer: peerOf(t.cfg) }) : await fetch(x.url, { method: "POST", headers: xh, body: x.body, signal: signal, proxy: px, tls: tlsOf(t.cfg), pool: poolOf(t.cfg), peer: peerOf(t.cfg) })
               const xt = await xr.text()
               if (xr.status < 200 || xr.status >= 300) {
                 status = xr.status
@@ -2513,6 +2673,16 @@ export class Engine {
         }
         const tookMs = performance.now() - started
         upstreamMs += tookMs
+        // the caller went away during the call: the provider is not blamed, and nothing is tried again
+        if (client !== undefined && client.aborted) {
+          if (tracer !== undefined && child !== undefined) {
+            child.fail(CANCELLED_MESSAGE)
+            child.end(Date.now())
+            tracer.finish(child)
+          }
+          metrics.observeRequest(tl, { ok: false, status: CANCELLED_STATUS, errorType: metrics.errorTypeForStatus(CANCELLED_STATUS), retries: retry * 1.0 }, tookMs / 1000.0)
+          return cancelledOutcome(ref.provider, ref.model, attempts, upstreamMs)
+        }
         if (tracer !== undefined && child !== undefined) {
           child.setInt("http.response.status_code", status)
           if (status < 200 || status >= 300) child.fail(`HTTP ${status}`)
@@ -2583,7 +2753,7 @@ export class Engine {
         }
         // retry
         if (retry >= retries) break
-        await sleep(backoffMs(p, retry, retryAfter))
+        await backoffSleep(backoffMs(p, retry, retryAfter), client)
         retry += 1
       }
     }
@@ -2669,7 +2839,7 @@ export class Engine {
     const up = try providers.embeddingsUpstream(sel.t, try fields(`{"model":${quote(sc.embedding_model)},"input":${quote(text)}}`))
     const hs: Record<string, string> = up.headers
     const dl = deadline(10000)
-    const res = try await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: dl.controller.signal, proxy: proxyOf(sel.t.cfg), tls: tlsOf(sel.t.cfg), pool: poolOf(sel.t.cfg) })
+    const res = try await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: dl.controller.signal, proxy: proxyOf(sel.t.cfg), tls: tlsOf(sel.t.cfg), pool: poolOf(sel.t.cfg), peer: peerOf(sel.t.cfg) })
     const body = try await res.text()
     dl.finish()
     if (!res.ok) throw new Error(`embedding request failed with HTTP ${res.status}`)
@@ -2913,8 +3083,8 @@ export class Engine {
     return userHeadersFor(this.cfg.mcp?.user_credentials, client, id.vk, id.session, id.user)
   }
 
-  // The identity per-user headers are kept under, as per-user OAuth tokens are (identityOf): the x-bf-mcp-session-id
-  // header, else the user of a user-mode MCP token, else the virtual key.
+  // The identity per-user headers are kept under, as per-user OAuth tokens are (identityOf): the user of a user-mode
+  // MCP token, else the virtual key, else the x-bf-mcp-session-id header.
   headersIdentity(h: Hdrs): { vk: string, session: string, user: string } {
     return identityOf(h.get("x-bf-mcp-session-id"), this.gov.findKey(h)?.id ?? "", userOfMark(h.get(USER_HEADER)))
   }
@@ -2929,7 +3099,7 @@ export class Engine {
     if (hit === undefined) return userAuthOf("none", "", 0, "", "")
     const client = hit.server
     const vk = this.gov.findKey(h)?.id ?? ""
-    // a user-mode MCP token names its user (ops.tov mcp); the session header and the key come after it (identityOf)
+    // a user-mode MCP token names its user (ops.tov mcp); the key and then the session header come after it (identityOf)
     const ident = identityOf(h.get("x-bf-mcp-session-id"), vk, userOfMark(h.get(USER_HEADER)))
     if (ident.vk === "" && ident.session === "" && ident.user === "") return userAuthOf("denial", "", 401, "authentication_error", `per-user OAuth for MCP client ${client} needs a virtual key (x-bf-vk) or an x-bf-mcp-session-id header`)
     const now = Date.now()
@@ -2939,7 +3109,7 @@ export class Engine {
     if (act === "valid" && row !== undefined) return userAuthOf("bearer", row.access_token, 0, "", "")
     if (act === "refresh" && a !== undefined && row !== undefined) {
       try {
-        const fresh = try await refreshUserRow(a, row, now)
+        const fresh = try await refreshUserRow(a, row, now, this.cfg.mcp?.oauth_private_allowlist ?? [])
         this.saveUserRow(fresh)
         return userAuthOf("bearer", fresh.access_token, 0, "", "")
       } catch (e) {
@@ -2988,6 +3158,7 @@ export class Engine {
     const hit = this.exchanges.get(key, now)
     if (hit !== undefined) return userAuthOf("bearer", hit, 0, "", "")
     const oc = this.cfg.oidc
+    this.idp.allow = this.cfg.mcp?.oauth_private_allowlist ?? []
     const r = await exchangeToken(te, subject, this.idp, oc?.issuer ?? "", oc?.client_id ?? "", oc?.client_secret ?? "")
     if (r.error !== "") return userAuthOf("denial", "", 401, "authentication_error", `token exchange for MCP client ${client} failed: ${r.error}`)
     this.exchanges.put(key, r.token, r.expiresIn, now)
@@ -3134,6 +3305,7 @@ export class Engine {
     }
     if (te === undefined) return ""
     const oc = this.cfg.oidc
+    this.idp.allow = this.cfg.mcp?.oauth_private_allowlist ?? []
     const out = await renewAdmin(te, row, this.idp, oc?.issuer ?? "", oc?.client_id ?? "", oc?.client_secret ?? "", now)
     if (!out.changed) {
       this.adminRetry.set(client, Date.now() + RENEW_RETRY_MS)
@@ -3267,7 +3439,7 @@ export class Engine {
       if (iam !== undefined && iam !== "") up.url = iam
       const hs: Record<string, string> = up.headers
       const dl = deadline(10000)
-      const res = await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: dl.controller.signal })
+      const res = await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: dl.controller.signal, peer: peerOf(t.cfg) })
       const text = await res.text()
       dl.finish()
       const tok = watsonx.parseIamToken(text)
@@ -3295,7 +3467,7 @@ export class Engine {
       const up = oauthKey.tokenRequest(oc, Math.floor(now / 1000))
       const hs: Record<string, string> = up.headers
       const dl = deadline(10000)
-      const res = await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: dl.controller.signal, proxy: proxyOf(pc), tls: tlsOf(pc), pool: poolOf(pc) })
+      const res = await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: dl.controller.signal, proxy: proxyOf(pc), tls: tlsOf(pc), pool: poolOf(pc), peer: peerOf(pc) })
       const text = await res.text()
       dl.finish()
       const tok = oauthKey.parseOAuthToken(text, now)
@@ -3318,7 +3490,7 @@ export class Engine {
       const up = databricks.oauthTokenRequest(host, dk.client_id ?? "", dk.client_secret ?? "")
       const hs: Record<string, string> = up.headers
       const dl = deadline(10000)
-      const res = await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: dl.controller.signal, proxy: proxyOf(t.cfg), tls: tlsOf(t.cfg), pool: poolOf(t.cfg) })
+      const res = await fetch(up.url, { method: "POST", headers: hs, body: up.body, signal: dl.controller.signal, proxy: proxyOf(t.cfg), tls: tlsOf(t.cfg), pool: poolOf(t.cfg), peer: peerOf(t.cfg) })
       const text = await res.text()
       dl.finish()
       const tok = databricks.parseOAuthToken(text, now)
@@ -3346,11 +3518,11 @@ export class Engine {
       const iu = copilot.installationTokenRequest(api, gc.installation_id, gc.repository_id, jwt)
       const ih: Record<string, string> = iu.headers
       const dl = deadline(10000)
-      const ir = await fetch(iu.url, { method: "POST", headers: ih, body: iu.body, signal: dl.controller.signal })
+      const ir = await fetch(iu.url, { method: "POST", headers: ih, body: iu.body, signal: dl.controller.signal, peer: peerOf(t.cfg) })
       const inst = copilot.parseInstallationToken(await ir.text())
       const cu = copilot.copilotTokenRequest(api, inst.token)
       const ch: Record<string, string> = cu.headers
-      const cr = await fetch(cu.url, { method: "GET", headers: ch, signal: dl.controller.signal })
+      const cr = await fetch(cu.url, { method: "GET", headers: ch, signal: dl.controller.signal, peer: peerOf(t.cfg) })
       const tok = copilot.parseCopilotToken(await cr.text(), domain, now / 1000.0)
       dl.finish()
       this.copilotTokens.put(key, tok.baseURL + "\n" + tok.token, tok.expiresAtSec * 1000.0)
@@ -3494,7 +3666,10 @@ export class Engine {
     const h = snapshot(req.headers)
     const ctx = new ReqCtx(h.get("x-request-id") ?? newId("req_"), op, performance.now())
     ctx.large = large
-    ctx.attemptHook = attemptHook
+    // a hooked route's request with fallbacks brings its plugins across the attempts (llmHooked registered them)
+    const hook = attemptHook ?? (op === "chat" ? undefined : this.attemptRuns.get(h.get(ATTEMPT_HEADER) ?? ""))
+    ctx.attemptHook = hook
+    ctx.client = clientSignal(h)
     // the plugin spans and logs: the chat request's plugin run, or the one a hooked route registered for this request
     if (attemptHook !== undefined) ctx.pluginTrace = attemptHook.run.ctx.trace
     else ctx.pluginTrace = this.pluginTraces.get(h.get(TRACE_HEADER) ?? "")
@@ -3516,7 +3691,7 @@ export class Engine {
     const cids = correlationIds(h)
     ctx.parentId = cids.parent
     ctx.agentId = cids.agent
-    const ma = maximAttrs(h)
+    const ma = maximAttrs(h, this.maximHeaders())
     ctx.maximIds = ma?.ids
     ctx.maximTags = ma?.tags
     if (upstreamHeaders !== undefined) ctx.upstreamHeaders = upstreamHeaders
@@ -3804,7 +3979,10 @@ export class Engine {
     ctx.requested = model
     if (compat !== undefined && compat.enabled) await this.compatLoad(compat, allowed)
     const tAtt = performance.now()
-    const r = try await this.attempt(allowed, h, build, translate, streamed, ctx)
+    let r = try await this.attempt(allowed, h, build, translate, streamed, ctx)
+    // a converted stream is pumped here, once the attempt's frame is gone
+    const run = r.run
+    if (run !== undefined) r = await separately(this.pumpStream(run))
     // translation and retries: the attempt's time less the upstream calls
     const convertUs = Math.max(0.0, (performance.now() - tAtt) * 1000.0 - r.upstreamMs * 1000.0)
     out.set("x-bf-attempts", "" + r.attempts)
@@ -3999,22 +4177,51 @@ export class Engine {
   }
 
   // Clears semantic cache entries from the vector store: the entry with id (the x-bifrost-cache-id of a hit),
-  // or every entry stored under cacheKey. Returns how many went. The namespace is opened first when no
-  // request has used it yet, which needs semantic_cache.dimension. Throws what the store reports.
+  // or every entry stored under cacheKey. Returns how many went. When no request has used the namespace yet it is
+  // opened as it stands (attach: no dimension is needed, and a namespace that does not exist holds nothing); the
+  // next lookup still ensures it. Throws what the store reports.
   async vectorClear(id: string, cacheKey: string): Promise<int, Error> {
     const vs = this.vstore
     if (vs === undefined) return 0
     if (!this.vsReady) {
       const dim = this.cfg.semantic_cache?.dimension ?? 0
-      if (dim <= 0) return 0
-      try await vs.ensure(this.vsNs, dim, ["scope", "cache_key"])
-      this.vsReady = true
+      if (dim > 0) {
+        try await vs.ensure(this.vsNs, dim, ["scope", "cache_key"])
+        this.vsReady = true
+      } else if (!(try await vs.attach(this.vsNs, ["scope", "cache_key"]))) {
+        return 0
+      }
     }
     if (id !== "") {
       try await vs.delete(this.vsNs, id)
       return 1
     }
     return try await vs.deleteWhere(this.vsNs, [{ key: "cache_key", eq: cacheKey }])
+  }
+
+  // The body the current attempt of a hooked request sends: what its pre hooks made of it for this attempt (a fallback's
+  // run again, AttemptPlugins), or body when the request has no such run.
+  attemptFields(req: Request, body: Field[]): Field[] {
+    const ah = this.attemptRuns.get(req.headers.get(ATTEMPT_HEADER) ?? "")
+    return ah === undefined ? body : ah.body
+  }
+
+  // The same as text.
+  attemptText(req: Request, text: string): string {
+    const ah = this.attemptRuns.get(req.headers.get(ATTEMPT_HEADER) ?? "")
+    return ah === undefined ? text : ah.text
+  }
+
+  // The request headers the enabled Maxim exporters tag their traces with (their request_headers).
+  maximHeaders(): string[] {
+    const out: string[] = []
+    for (const x of this.cfg.exporters ?? []) {
+      if (x.kind !== "maxim" || x.enabled === false) continue
+      for (const p of x.request_headers ?? []) {
+        if (!out.includes(p)) out.push(p)
+      }
+    }
+    return out
   }
 
   // Whether a request's bodies stay out of the log store and exporters: the
@@ -4048,15 +4255,23 @@ export class Engine {
     // logs_only: the answer is out; what is stored from here on carries placeholders instead of the findings
     // the placeholders' originals stay with the stored row for a caller holding Logs:Reveal (Bifrost's reveal), unless
     // content logging is off for the request (there is then nothing to reveal)
+    // a row whose answer a logs_only HTTP provider still checks waits for it (chatOnce releaseRecord)
+    if (this.heldRecords.has(c.rid) && this.heldRecords.get(c.rid) === undefined) {
+      this.heldRecords.set(c.rid, c)
+      return
+    }
+    const found = this.logFindings.get(c.rid) ?? []
+    this.logFindings.delete(c.rid)
     let mapping = ""
-    if (this.logGuard !== undefined || this.logRules.size > 0) {
+    if (this.logGuard !== undefined || this.logRules.size > 0 || found.length > 0) {
       const vault = new Vault()
       const rs = this.logRules.values()
-      c.input = logsOnlyText(c.input, this.logGuard, rs, vault)
-      c.output = logsOnlyText(c.output, this.logGuard, rs, vault)
-      c.error = logsOnlyText(c.error, this.logGuard, rs, vault)
-      c.rawRequest = logsOnlyText(c.rawRequest, this.logGuard, rs, vault)
-      c.rawResponse = logsOnlyText(c.rawResponse, this.logGuard, rs, vault)
+      // the HTTP providers' findings first, then the built-in guard and the local rules (one vault, one numbering)
+      c.input = logsOnlyText(logsOnlyFound(c.input, found, vault), this.logGuard, rs, vault)
+      c.output = logsOnlyText(logsOnlyFound(c.output, found, vault), this.logGuard, rs, vault)
+      c.error = logsOnlyText(logsOnlyFound(c.error, found, vault), this.logGuard, rs, vault)
+      c.rawRequest = logsOnlyText(logsOnlyFound(c.rawRequest, found, vault), this.logGuard, rs, vault)
+      c.rawResponse = logsOnlyText(logsOnlyFound(c.rawResponse, found, vault), this.logGuard, rs, vault)
       if (vault.count > 0 && !c.contentOff) mapping = phaseMapping(vault.items, [c.input, c.rawRequest], [c.output, c.rawResponse, c.error])
     }
     const ms = performance.now() - c.started
@@ -4207,8 +4422,11 @@ export class Engine {
   // duration as the latency, its tokens, what it cost, and its voice seconds in the row's metadata; its
   // cost and tokens are charged to the budgets and token limits now. requestId is the row's own, parentId
   // the session's (the caller's x-bf-parent-request-id wins).
-  recordLive(op: string, h: Hdrs, grant: Grant, provider: string, model: string, status: int, durationMs: f64, promptTokens: int, completionTokens: int, input: string, output: string, error: string, extra: Record<string, string>, cost: LiveCost, requestId: string, parentId: string): void {
+  // trace is the plugin run of a realtime turn whose LLM hooks ran (livehooks.tov TurnPlugins): its plugin logs and spans
+  // go with the row.
+  recordLive(op: string, h: Hdrs, grant: Grant, provider: string, model: string, status: int, durationMs: f64, promptTokens: int, completionTokens: int, input: string, output: string, error: string, extra: Record<string, string>, cost: LiveCost, requestId: string, parentId: string, trace?: PluginTrace): void {
     const c = new ReqCtx(requestId, op, performance.now() - durationMs)
+    c.pluginTrace = trace
     c.provider = provider
     c.model = model
     c.status = status
@@ -4901,6 +5119,10 @@ export class Engine {
     const reversible = guard !== undefined && guard.mode === "redact" && this.cfg.guardrails?.reversible === true
     // the prompt the request named and the version it got, for the request log
     let promptUsed: Applied | undefined = undefined
+    // logs_only on an HTTP provider: its findings reach this request's stored copy by the request id (one is made
+    // when the caller sent none); "" when no such provider runs
+    const rid0 = req.headers.get("x-request-id") ?? ""
+    const lo = guardOn && this.httpLogsOnly("") ? (rid0 !== "" ? rid0 : newId("req_")) : ""
     try {
       if (guard !== undefined && this.guardInput && reversible) {
         text = try tokenizeChatRequest(text, guard, vault)
@@ -4919,6 +5141,8 @@ export class Engine {
       if (guardOn && this.guardProviders.length > 0) {
         const v = await this.externalGuard(extractText(text), "input")
         if (v.action === "block") return errorResponse(400, `request blocked by guardrails: ${v.reason}`, "guardrail_violation", noHeaders())
+        const lf = v.logs
+        if (lo !== "" && lf !== undefined && lf.length > 0) this.addLogFindings(lo, lf)
         const red = v.text
         // a redaction replaces the prompt when it is a single text message; otherwise it can't be placed
         if (red !== undefined) {
@@ -5139,22 +5363,36 @@ export class Engine {
       conv.stopAtFinish = quirkStopsAtFinish(t)
       return guardedConv(conv)
     }
-    let res = try await this.serve(req, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers, stream ? pipeSink : undefined, mk, cp, promptUsed, undefined, undefined, plugHook)
+    // a logs_only HTTP provider on the answer: the request's row waits for its findings (record holds it until then)
+    const holdOut = lo !== "" && !stream && this.httpLogsOnly("output")
+    if (holdOut) this.heldRecords.set(lo, undefined)
+    const sreq = lo !== "" && rid0 === "" ? withRequestId(req, lo, text) : req
+    let res = try await this.serve(sreq, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers, stream ? pipeSink : undefined, mk, cp, promptUsed, undefined, undefined, plugHook)
     // post hooks on an error answer (they may recover from it or change it); a stream's hooks ran per chunk
     if (chain !== undefined && run !== undefined) {
       if (pipeSink !== undefined && pipeSink.started) chain.finish(&run.ctx)
       else if (res.status >= 400) res = await errorPost(chain, run, res)
     }
-    // external output guardrails see the whole answer, so they apply to non-streamed answers
-    if (!guardOn || this.guardProviders.length === 0 || stream || res.status !== 200) return res
+    const fin = await this.outputGuarded(res, guardOn && !stream)
+    if (lo !== "") {
+      if (fin.logs.length > 0) this.addLogFindings(lo, fin.logs)
+      this.releaseRecord(lo)
+    }
+    return fin.res
+  }
+
+  // External output guardrails see the whole answer, so they apply to non-streamed answers. logs: what the logs_only
+  // HTTP providers found in it, for the request's stored copy.
+  async outputGuarded(res: Response, on: bool): Promise<{ res: Response, logs: LogFinding[] }> {
+    if (!on || this.guardProviders.length === 0 || res.status !== 200) return { res: res, logs: [] }
     let answer = ""
     try {
       answer = await res.text()
     } catch (e) {
-      return errorResponse(502, `could not read the answer: ${e.message}`, "api_error", noHeaders())
+      return { res: errorResponse(502, `could not read the answer: ${e.message}`, "api_error", noHeaders()), logs: [] }
     }
     const v = await this.externalGuard(completionText(answer), "output")
-    if (v.action === "block") return errorResponse(400, `response blocked by guardrails: ${v.reason}`, "guardrail_violation", noHeaders())
+    if (v.action === "block") return { res: errorResponse(400, `response blocked by guardrails: ${v.reason}`, "guardrail_violation", noHeaders()), logs: [] }
     let out = answer
     const red = v.text
     if (red !== undefined) out = replaceFirstContent(answer, red)
@@ -5162,7 +5400,38 @@ export class Engine {
     res.headers.forEach((value, key) => {
       if (key !== "content-length") hs.set(key, value)
     })
-    return new Response(out, { status: 200, headers: hs })
+    return { res: new Response(out, { status: 200, headers: hs }), logs: v.logs ?? [] }
+  }
+
+  // ---- logs_only on the HTTP guardrail providers (Presidio, Azure AI Language PII) ----
+
+  // Whether a Presidio or Azure AI Language PII provider redacts logs_only on this source ("input", "output", or ""
+  // for either).
+  httpLogsOnly(source: string): bool {
+    for (const p of this.guardProviders) {
+      if (!logsOnlyHttp(p)) continue
+      if (source === "" || appliesTo(p, source === "output" ? "output" : "input")) return true
+    }
+    return false
+  }
+
+  // Findings for the stored copy of request rid (record takes them).
+  addLogFindings(rid: string, found: LogFinding[]): void {
+    const prior = this.logFindings.get(rid) ?? []
+    // (a request refused before it was recorded leaves its entry behind: the oldest go past a bound)
+    if (prior.length === 0 && this.logFindings.size >= 1000) {
+      const first = this.logFindings.keys()[0]
+      if (first !== undefined) this.logFindings.delete(first)
+    }
+    this.logFindings.set(rid, prior.concat(found))
+  }
+
+  // The answer's findings are in: the held row (if record held one) is recorded now, and nothing is kept for rid.
+  releaseRecord(rid: string): void {
+    const held = this.heldRecords.get(rid)
+    this.heldRecords.delete(rid)
+    if (held !== undefined) this.record(held)
+    this.logFindings.delete(rid)
   }
 
   async embeddings(req: Request): Promise<Response> {
@@ -5175,7 +5444,8 @@ export class Engine {
     }
     const build: Build = (t) => {
       if (!providers.supportsEmbeddings(t.kind)) throw new SyntaxError(`${t.provider} does not serve embeddings through this gateway yet`)
-      return try providers.embeddingsUpstream(t, body)
+      // the body this attempt's pre hooks left (a fallback's run again), else the request's
+      return try providers.embeddingsUpstream(t, this.attemptFields(req, body))
     }
     const translate: Translate = (t, text, requested) => try providers.embeddingsTranslate(t.kind, t.model, text, requested)
     return try await this.serve(req, "embeddings", undefined, body, text, build, translate, false)
@@ -5194,9 +5464,11 @@ export class Engine {
     const canPipe = stream && sink !== undefined
     const cp = new CompatPlan(withHeader(settingsOf(this.cfg.client?.compat), req.headers.get("x-bf-compat") ?? undefined), "completions", stream)
     const build: Build = (t) => {
-      const sh = try cp.shape(t.provider, t.kind, t.model, body)
+      // the body this attempt's pre hooks left (a fallback's run again), else the request's
+      const cur = this.attemptFields(req, body)
+      const sh = try cp.shape(t.provider, t.kind, t.model, cur)
       if (sh.route === "chat") return try textAsChat(t, sh, stream, canPipe)
-      if (t.kind === "replicate") return try replicateText(t, body)
+      if (t.kind === "replicate") return try replicateText(t, cur)
       // Anthropic's legacy complete API answers whole, as in Bifrost (which has no Anthropic text stream). Bedrock's
       // InvokeModel text models stream on InvokeModelWithResponseStream, as Bifrost's TextCompletionStream; a stream
       // that cannot be piped is asked whole and sent as one frame.
@@ -5460,6 +5732,23 @@ test("logs_only: moved local rules and the built-in guard put placeholders in th
   const out = logsOnlyText(`{"content":"mail a@b.io about PROJ-12 and ACME-3, then a@b.io again"}`, g, moved.values(), vault)
   expect(out).toBe(`{"content":"mail [EMAIL-1] about [PROJECT_CODE-1] and ACME-3, then [EMAIL-1] again"}`)
   expect(logsOnlyText("", g, moved.values(), vault)).toBe("")
+})
+
+test("logs_only on Presidio and Azure PII: their findings become the stored copy's placeholders", () => {
+  const pres: GuardrailProvider = { id: "p", kind: "presidio", analyzer_url: "http://x", action: "redact", redaction_mode: "logs_only" }
+  const run: GuardrailProvider = { id: "q", kind: "presidio", analyzer_url: "http://x", action: "redact" }
+  const az: GuardrailProvider = { id: "a", kind: "azure_language_pii", endpoint: "http://x", api_key: "k", action: "redact", redaction_mode: "logs_only" }
+  expect(logsOnlyHttp(pres)).toBe(true)
+  expect(logsOnlyHttp(run)).toBe(false)
+  expect(logsOnlyHttp(az)).toBe(true)
+  const vault = new Vault()
+  const found: LogFinding[] = [{ kind: "EMAIL_ADDRESS", value: "a@b.co" }, { kind: "USSocialSecurityNumber", value: "123-45-6789" }]
+  const out = logsOnlyFound(`{"messages":[{"role":"user","content":"mail a@b.co, ssn 123-45-6789, again a@b.co"}]}`, found, vault)
+  expect(out).toBe(`{"messages":[{"role":"user","content":"mail [EMAIL_ADDRESS-1], ssn [USSOCIALSECURITYNUMBER-1], again [EMAIL_ADDRESS-1]"}]}`)
+  // a value that reads escaped inside a JSON string is found too
+  const q = logsOnlyFound(`{"content":"say \\"hi\\" now"}`, [{ kind: "QUOTE", value: `"hi"` }], vault)
+  expect(q).toBe(`{"content":"say [QUOTE-1] now"}`)
+  expect(phaseMapping(vault.items, [out], []).includes("EMAIL_ADDRESS-1")).toBe(true)
 })
 
 // ---- the plugins across attempts (AttemptPlugins) ----

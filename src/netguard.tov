@@ -19,7 +19,11 @@
 // - public: the rest.
 //
 // A host name is resolved and every address it resolves to is checked (resolveVerdict), right before each request,
-// so a public name that points at a private address is refused like the address itself.
+// so a public name that points at a private address is refused like the address itself. The callers also pass the
+// policy to fetch as its peer option (peerOf, tov-patches/0013), so the runtime checks the addresses again when it
+// connects, redirects and new pooled connections included: a name whose DNS answer changes between the two (DNS
+// rebinding) is refused too. Provider connections are checked that way only (providerPeer, as Bifrost's
+// ConfigureDialer checks each dial).
 
 import * as dns from "node:dns"
 
@@ -40,6 +44,49 @@ export function strictPolicy(allow: string[]): Policy {
 
 export function policyOf(allowPrivate: bool): Policy {
   return { private: allowPrivate, loopback: false, allow: [] }
+}
+
+// fetch's peer option (tov-patches/0013): the runtime checks every address the host resolves to right before it
+// connects (each redirect and each new pooled connection too), with the same classes as here, so a name that
+// resolves to a public address when it is checked here and to a private one when the request connects (DNS
+// rebinding) is refused as well. Through a proxy the runtime checks nothing (the proxy resolves the host).
+export type Peer = { private?: bool, loopback?: bool, allow?: string[] }
+
+// The peer option of a policy: allowlist entries as the runtime reads them (an address in any spelling becomes its
+// plain text, so 0x0a000000/8 is 10.0.0.0/8; a name stays a name, matched against the URL's host).
+export function peerOf(p: Policy): Peer {
+  const allow: string[] = []
+  for (const raw of p.allow) {
+    const e = canonicalHost(raw)
+    if (e === "") continue
+    const slash = e.indexOf("/")
+    const head = slash >= 0 ? e.slice(0, slash) : e
+    const b = parseIP(head)
+    if (b === undefined) {
+      if (slash < 0) allow.push(e)
+      continue
+    }
+    const text = formatIP(b)
+    if (slash < 0) {
+      allow.push(text)
+      continue
+    }
+    const n = parseInt(e.slice(slash + 1))
+    if (n === undefined) continue
+    let bits = Math.trunc(n)
+    // an IPv6 range written over a mapped IPv4 address counts its prefix within the IPv4 address
+    if (head.includes(":") && !text.includes(":")) bits = bits - 96
+    if (bits < 0) continue
+    allow.push(`${text}/${bits}`)
+  }
+  return { private: p.private, loopback: p.loopback, allow: allow }
+}
+
+// The peer option of a provider connection, as Bifrost's ConfigureDialer judges it: loopback always allowed,
+// other private addresses only with network_config.allow_private_network, link-local, unspecified and metadata
+// addresses never.
+export function providerPeer(allowPrivate: bool): Peer {
+  return { private: allowPrivate, loopback: true, allow: [] }
 }
 
 const enc = new TextEncoder()
@@ -551,4 +598,18 @@ test("resolved names: every address is checked; private policies and loopback", 
   expect(hostVerdict("10.0.0.1", prov).kind).toBe("private")
   expect(hostVerdict("0.0.0.0", prov).kind).toBe("blocked")
   expect(verdictText(hostVerdict("0x7f000001", strictPolicy([])))).toBe("url points at a private address: 127.0.0.1")
+})
+
+test("the runtime's peer option: allowlist entries as plain addresses and ranges, names kept", () => {
+  const p = peerOf(strictPolicy(["0x0a000000/8", "Internal.Example.", "192.168.1.5", "[::ffff:172.16.0.0]/108", "fd12::/16", "bad/x", "  "]))
+  expect(p.private).toBe(false)
+  expect(p.loopback).toBe(false)
+  expect(p.allow!.join(",")).toBe("10.0.0.0/8,internal.example,192.168.1.5,172.16.0.0/12,fd12:0:0:0:0:0:0:0/16")
+  const open = peerOf(policyOf(true))
+  expect(open.private).toBe(true)
+  expect(open.allow!.length).toBe(0)
+  const prov = providerPeer(false)
+  expect(prov.loopback).toBe(true)
+  expect(prov.private).toBe(false)
+  expect(providerPeer(true).private).toBe(true)
 })

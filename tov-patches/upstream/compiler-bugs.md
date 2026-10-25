@@ -163,7 +163,9 @@ fails the same way.
 
 **Seen again**: a `let grant: Grant` that is changed after closures capture it fails the same way
 ("incomplete type 'R…_Grant'"). Raiju builds the record once with a conditional and binds it with
-`const` instead.
+`const` instead. A third time: a record read from a reassigned `let` and captured by closures
+(`ModelRef` in `src/media.tov` hfMedia) gave a capture cell declared before its struct; the closures
+now capture a string.
 
 ---
 

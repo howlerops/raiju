@@ -5,7 +5,7 @@ import { Engine, LiveHead, StreamSink, errorResponse, headSink, noHeaders } from
 import { anthropicMessages, anthropicLegacy, cursorChat, genai, genaiSdk, bedrockModel, responsesApi, cohereChat, cohereEmbed, cohereRerank, cohereTokenize } from "./native"
 import * as genaiIn from "./genai_in"
 import { kindOf, listingPipeline, listingNeedsUpstream } from "./router"
-import { Target, Upstream, addExtraHeaders } from "./providers/types"
+import { Target, Upstream, addExtraHeaders, peerOf } from "./providers/types"
 import * as openai from "./providers/openai"
 import * as anthropic from "./providers/anthropic"
 import * as gemini from "./providers/gemini"
@@ -13,6 +13,7 @@ import * as bedrock from "./providers/bedrock"
 import * as vertex from "./providers/vertex"
 import * as cloudflare from "./providers/cloudflare"
 import * as replicate from "./providers/replicate"
+import * as hf from "./providers/huggingface"
 import * as openrouter from "./providers/openrouter"
 import * as copilot from "./providers/githubcopilot"
 import * as cohere from "./providers/cohere"
@@ -36,7 +37,8 @@ import { sdkRoute, anthropicSdk } from "./anthropic_batch"
 import { snapshot, errorJson, Hdrs, newId } from "./schemas"
 import { handleApi, proxyWidening, Result, randomId, rotatedKeyIds, isRotatePath, providerBaseUrlProblem } from "./store"
 import { scimAuthorized, scimHandle, errorBody, ScimState, SCIM_CONTENT_TYPE } from "./scim"
-import { passthroughPath, passthroughRoute } from "./passthrough"
+import { deprovisioned } from "./provision"
+import { passthroughPath, passthroughRoute, routeFor } from "./passthrough"
 import { mcpApi, oauthRoute, oauthCallback, oauthConfigRoute, openapiRoute, inlineSpecUrl, headersRouteAsync, exchangeRouteAsync, perUserApi, McpReply } from "./mcpapi"
 import { issuerRoute, keyById, grantsList, grantRevoke, revokeSubject } from "./mcpissuer"
 import { promptRoute } from "./prompts"
@@ -53,10 +55,12 @@ import { cookieValue, SETUP_COOKIE } from "./setupsession"
 import { rerank, bedrockRerank, countTokens, responsesInputTokens, asyncSubmit, asyncGet, sdkAsyncSubmit, sdkAsyncPoll, decisionRoute, openaiDecisionPath, Dispatch } from "./extras"
 import { asyncPoll, jobOwner } from "./jobs"
 import { serveUi, uiPath, UI_CSP } from "./uiserve"
-import { TransportRun, transportStart, transportEnd, transportDone, transportSink, llmHooked, storageHooked, StorageCall, storageOp, storageIdKey, pathWithId } from "./pluginroute"
+import { TransportRun, transportStart, transportEnd, transportDone, transportSink, llmHooked, storageHooked, StorageCall, storageOp, storageIdKey, pathWithId, ownedRequest, passthroughOwned, recordUpload } from "./pluginroute"
 import { kindOfPath, isInferencePath } from "./plughttp"
 import { EXTRA_PARAMS_HEADER, EXTRA_PARAMS_CARRY, mergeExtraParams, extraParamsCarry } from "./extraparams"
 import { lifecycle, readyInput, readyReport, ServerLimits } from "./lifecycle"
+import { CLIENT_WATCH_HEADER, watchStart, watchGone, watchEnd, watched } from "./clientgone"
+import { usesChain, withChainCreds } from "./awschain"
 
 type ModelEntry = { id: string, object: string, created: int, owned_by: string }
 
@@ -143,14 +147,14 @@ function upstreamModels(provider: string, kind: string, t: Target): Upstream | u
 // GitHub Copilot, Bedrock Mantle and Azure answer in OpenAI's shape, but their requests are their own (editor headers
 // and a minted token; the regional host and SigV4; the resource endpoint and api-key or Entra token).
 function nativeList(kind: string): bool {
-  return kind === "bedrock" || kind === "vertex" || kind === "cloudflare" || kind === "databricks" || kind === "replicate" || kind === "github-copilot" || kind === "bedrock_mantle" || kind === "azure" || kind === "watsonx"
+  return kind === "bedrock" || kind === "vertex" || kind === "cloudflare" || kind === "databricks" || kind === "replicate" || kind === "github-copilot" || kind === "bedrock_mantle" || kind === "azure" || kind === "watsonx" || kind === "huggingface"
 }
 
 // One GET on a provider listing: the body when the answer is 2xx, else undefined.
-async function getListing(up: Upstream): Promise<string | undefined> throws Error {
+async function getListing(t: Target, up: Upstream): Promise<string | undefined> throws Error {
   const hs = new Headers()
   for (const k of up.headers.keys()) hs.set(k, up.headers.get(k)!)
-  const res = try await fetch(up.url, { headers: hs, signal: AbortSignal.timeout(5000) })
+  const res = try await fetch(up.url, { headers: hs, signal: AbortSignal.timeout(5000), peer: peerOf(t.cfg) })
   const text = try await res.text()
   return res.ok ? text : undefined
 }
@@ -163,7 +167,7 @@ async function withDecisionModels(provider: string, t: Target, ids: string[]): P
   const req = openai.modelsRequest(t)
   const up: Upstream = { url: openrouter.rootOf(t) + "/v1/models?output_modalities=decisions", headers: req.headers, body: "" }
   try {
-    const text = try await getListing(up)
+    const text = try await getListing(t, up)
     if (text === undefined) return ids
     const out = ids.slice()
     for (const id of try openai.modelIds(text, provider)) {
@@ -184,14 +188,22 @@ async function withDecisionModels(provider: string, t: Target, ids: string[]): P
 // Every page of a Bedrock control-plane listing: each answer's nextToken is sent back as the next
 // page's query until none is left (capped, so a provider that never ends cannot hold the listing).
 // undefined when the first page cannot be read; a later page that fails keeps the ids read so far.
-async function bedrockPages(t: Target, path: string, field: string, idKey: string): Promise<string[] | undefined> {
+async function bedrockPages(t0: Target, path: string, field: string, idKey: string): Promise<string[] | undefined> {
   const out: string[] = []
   let token = ""
+  // a key without credentials of its own lists with the default chain's (awschain.tov), as its calls sign
+  let t = t0
+  const bk = t0.key.bedrock_key_config
+  if (bk !== undefined && usesChain(bk, t0.key.value ?? "")) {
+    const wc = await withChainCreds(bk, t0.key.value ?? "")
+    if (wc.error !== "") return undefined
+    t.key.bedrock_key_config = wc.bk
+  }
   for (let page = 0; page < 50; page++) {
     const query = token === "" ? "" : "nextToken=" + bedrock.encodeSegment(token)
     let body: string | undefined = undefined
     try {
-      body = await getListing(bedrock.listRequest(t, path, query))
+      body = await getListing(t, bedrock.listRequest(t, path, query))
       if (body === undefined) return page === 0 ? undefined : out
       for (const id of try bedrockIds(body, field, idKey)) out.push(id)
       token = rawStr(try fields(body), "nextToken") ?? ""
@@ -241,7 +253,7 @@ async function ownListingIds(engine: Engine | undefined, provider: string, t: Ta
   let up = bedrockMantle.modelsRequest(lt)
   if (lt.kind === "github-copilot") up = try copilot.modelsRequest(lt)
   else if (lt.kind === "azure") up = openai.azureModelsRequest(lt)
-  const text = try await getListing(up)
+  const text = try await getListing(lt, up)
   if (text === undefined) return undefined
   return try openai.modelIds(text, provider)
 }
@@ -264,13 +276,33 @@ async function nativeModelIds(engine: Engine | undefined, provider: string, t: T
       let next = ""
       let any = false
       for (let page = 0; page < 20; page++) {
-        const text = await getListing(watsonx.modelsRequest(wk, token, next))
+        const text = await getListing(t, watsonx.modelsRequest(wk, token, next))
         if (text === undefined) break
         any = true
         const pg = try watsonx.modelsPage(text)
         for (const id of pg.ids) ids.push(provider + "/" + id)
         if (pg.next === "" || pg.next === next) break
         next = pg.next
+      }
+      return any ? ids : undefined
+    }
+    if (t.kind === "huggingface") {
+      // Bifrost's listing: each inference provider's models on the hub (with the key), as huggingface/<provider>/<id>;
+      // a provider whose listing fails is left out, and all failing fails the listing
+      let any = false
+      const v = t.key.value ?? ""
+      const hh: Map<string, string> = new Map()
+      if (v !== "") hh.set("authorization", "Bearer " + v)
+      for (const ip of hf.INFERENCE_PROVIDERS) {
+        let text: string | undefined = undefined
+        try {
+          text = try await getListing(t, { url: hf.listUrl(hf.hubBase(), ip), headers: hh, body: "" })
+        } catch (e) {
+          text = undefined
+        }
+        if (text === undefined) continue
+        any = true
+        for (const id of try hf.listedModelIds(text, ip)) ids.push(provider + "/" + id)
       }
       return any ? ids : undefined
     }
@@ -283,7 +315,7 @@ async function nativeModelIds(engine: Engine | undefined, provider: string, t: T
       let next = first.url
       let any = false
       for (let page = 0; page < 20; page++) {
-        const text = await getListing({ url: next, headers: first.headers, body: "" })
+        const text = await getListing(t, { url: next, headers: first.headers, body: "" })
         if (text === undefined) break
         any = true
         const pp = try replicate.deploymentsPage(text)
@@ -319,7 +351,7 @@ async function nativeModelIds(engine: Engine | undefined, provider: string, t: T
       for (const pub of ["google", "anthropic", "mistralai"]) {
         let page = ""
         for (let i = 0; i < 20; i++) {
-          const text = try await getListing({ url: try vertex.publisherListUrl(t, pub, page), headers: hdr, body: "" })
+          const text = try await getListing(t, { url: try vertex.publisherListUrl(t, pub, page), headers: hdr, body: "" })
           if (text === undefined) break
           any = true
           const pp = try publisherPage(text)
@@ -337,7 +369,7 @@ async function nativeModelIds(engine: Engine | undefined, provider: string, t: T
       addExtraHeaders(&hs, t.cfg)
       let any = false
       for (let page = 1; page <= 20; page++) {
-        const text = try await getListing({ url: base + cloudflareSearchPath(page), headers: hs, body: "" })
+        const text = try await getListing(t, { url: base + cloudflareSearchPath(page), headers: hs, body: "" })
         if (text === undefined) break
         any = true
         const cp = try cloudflarePage(text)
@@ -389,7 +421,7 @@ async function upstreamModelIds(engine: Engine | undefined, provider: string, p:
     try {
       const hs = new Headers()
       for (const k of up.headers.keys()) hs.set(k, up.headers.get(k)!)
-      const res = await fetch(up.url, { headers: hs, signal: AbortSignal.timeout(5000) })
+      const res = await fetch(up.url, { headers: hs, signal: AbortSignal.timeout(5000), peer: peerOf(t.cfg) })
       const text = await res.text()
       if (res.ok) ids = await withDecisionModels(provider, t, openai.modelIds(text, provider).map((id) => id.replace(provider + "/models/", provider + "/")))
     } catch (e) {
@@ -431,7 +463,7 @@ async function refreshModels(engine: Engine | undefined, cfg: Config, provider: 
     try {
       const hs = new Headers()
       for (const k of up.headers.keys()) hs.set(k, up.headers.get(k)!)
-      const res = await fetch(up.url, { headers: hs, signal: AbortSignal.timeout(5000) })
+      const res = await fetch(up.url, { headers: hs, signal: AbortSignal.timeout(5000), peer: peerOf(t.cfg) })
       const text = await res.text()
       if (!res.ok) continue
       const ids = await withDecisionModels(provider, t, openai.modelIds(text, provider).map((id) => id.replace(provider + "/models/", provider + "/")))
@@ -465,7 +497,7 @@ async function retrieveModel(engine: Engine, req: Request, id: string): Promise<
       const hs = new Headers()
       for (const k of up.headers.keys()) hs.set(k, up.headers.get(k)!)
       try {
-        const res = await fetch(up.url, { headers: hs, signal: AbortSignal.timeout(5000) })
+        const res = await fetch(up.url, { headers: hs, signal: AbortSignal.timeout(5000), peer: peerOf(p) })
         const text = await res.text()
         // a 404 is the answer for a model the provider does not have; a listed model whose server has no
         // retrieve route (some OpenAI-compatible servers) keeps the list entry
@@ -689,18 +721,51 @@ async function scimRoute(ops: Ops, req: Request, path: string): Promise<Response
   const g = ops.store.cfg.governance
   const st: ScimState = { users: g?.users ?? [], teams: g?.teams ?? [], roles: g?.roles ?? [], keyTeams: keyTeamIds(g?.virtual_keys) }
   const r = scimHandle(st, req.method, path.slice("/scim/v2".byteLength), params, body, origin + "/scim/v2", () => randomId("team-"))
+  let reply = r.body
   if (r.changed && r.status < 300) {
-    const saved = ops.store.setScim(r.state.users, r.state.teams)
+    // the mapping rules re-decide the users this request changed from what SCIM pushed (claimScimAttributes)
+    const plan = ops.scimResynced(st.users, r.state.users, r.state.teams)
+    const teams = r.state.teams.concat(plan.newTeams)
+    // a deactivation strips the user's memberships and profiles and a delete removes the user; both take the user's
+    // keys and project memberships and end its sessions
+    const dp = deprovisioned(st.users, plan.users)
+    const saved = ops.store.setProvisioned(dp.users, teams, (g?.business_units ?? []).concat(plan.newBusinessUnits), dp.names)
     if (saved.kind !== "ok") return scimReply(saved.status, errorBody(saved.status, "", saved.message))
+    if (dp.names.length > 0) {
+      const ended: string[] = []
+      for (const u of st.users) {
+        if (dp.names.includes(u.name)) {
+          ended.push(u.name)
+          if (u.email !== undefined) ended.push(u.email)
+        }
+      }
+      ops.sessions.endUser(ended)
+    }
     ops.storeUpdated("/api/users")
     ops.storeUpdated("/api/governance/teams")
+    if (plan.newBusinessUnits.length > 0) ops.storeUpdated("/api/governance/business-units")
+    // a user's reply shows the role the rules gave
+    if (plan.changes.length > 0 && path.startsWith("/scim/v2/Users")) {
+      let id = ""
+      try {
+        id = rawStr(fields(r.body), "id") ?? ""
+      } catch (e) {
+        id = ""
+      }
+      if (id !== "") {
+        const again: ScimState = { users: plan.users, teams: teams, roles: st.roles, keyTeams: st.keyTeams }
+        reply = scimHandle(again, "GET", "/Users/" + id, params, "", origin + "/scim/v2", () => randomId("team-")).body
+      }
+    }
   }
   if (req.method !== "GET") ops.recordChange("scim", req, path, r.status, body)
-  return scimReply(r.status, r.body)
+  return scimReply(r.status, reply)
 }
 
 // The management API, behind RBAC; every change lands in the audit log.
 async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
+  // an expired single sign-on session is refreshed with the identity provider first (Bifrost's silent refresh)
+  await ops.refreshDue(req)
   const gate = ops.gate(req, path)
   if (gate.kind === "deny") return gate.res
   // what this caller may see and change (data access scope)
@@ -709,6 +774,8 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   const body = req.method === "GET" ? "" : await req.text()
   // a change saved by this request is answered once the node's other workers run it (ops.settleConfig)
   const genBefore = ops.store.fileSha
+  // the equal-split projects this write may redivide (ops.withRedivision)
+  const redivBefore = ops.redivisionBefore(req.method, path)
   let r: Reply = { status: 404, body: "", contentType: "application/json" }
   if (path === "/api/users/me/permissions") r = req.method === "GET" ? ops.mePermissions(gate.actor) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
   else if (path === "/api/governance/users/me/permissions") r = req.method === "GET" ? ops.mePermissionMap(gate.actor) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
@@ -718,6 +785,8 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   else if (usersPath(path).startsWith("/api/users/") && usersPath(path).split("/")[4] === "access-profiles") r = ops.userProfiles(req.method, usersPath(path), body)
   else if (usersPath(path) === "/api/users" || usersPath(path).startsWith("/api/users/")) r = ops.users(req.method, usersPath(path), body, req.headers.get("x-bifrost-setup-token") ?? "", cookieValue(req.headers.get("cookie") ?? "", SETUP_COOKIE))
   else if (auditTarget(path) !== "") r = ops.auditRoute(req, auditTarget(path))
+  // user provisioning: directory sync, bulk import and its preview, reconcile and its previews, the jobs
+  else if (path === "/api/scim/provision" || path.startsWith("/api/scim/provision/")) r = await ops.provisionRoute(req.method, path, body)
   else if (path === "/api/api-keys" || path.startsWith("/api/api-keys/")) r = ops.apiKeysRoute(req.method, path, req.url, body, gate.actor)
   // the cache clears (DELETE) and the read-only plugin listings
   else if (path.startsWith("/api/cache/")) r = await ops.cacheClear(req.method, path)
@@ -755,7 +824,7 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   else if (path === "/api/models/base" || path === "/api/models/details") r = ops.catalogView(req, path)
   else if (path === "/api/circuit-breaker/state") r = req.method === "GET" ? ops.circuitView() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
   // the request-log analytics and the MCP logs (ops.logsRoute)
-  else if (logsAnalyticsPath(path)) r = ops.logsRoute(req, path, body, sc, req.method === "GET" && ops.mayReveal(gate.actor))
+  else if (logsAnalyticsPath(path)) r = await ops.logsRouteAll(req, path, body, sc, req.method === "GET" && ops.mayReveal(gate.actor))
   else if (path === "/api/circuit-breaker/policies" || path.startsWith("/api/circuit-breaker/policies/")) r = ops.circuitPoliciesRoute(req.method, path, body)
   else if (path === "/api/circuit-breaker/reset") r = req.method === "POST" ? ops.circuitReset(body) : { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
   // adaptive load balancing: the keys held out of rotation, their incidents, and releasing them
@@ -854,6 +923,7 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
       }
     }
   }
+  r = ops.withRedivision(req.method, path, r, redivBefore)
   ops.recordChange(gate.actor, req, path, r.status, body)
   if (req.method !== "GET" && r.status < 300) ops.storeUpdated(path)
   if (ops.store.fileSha !== genBefore) await ops.settleConfig()
@@ -1147,7 +1217,9 @@ export async function markAgentRejection(engine: Engine, req: Request, res: Resp
 }
 
 async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response> throws TypeError {
-  const req = await withExtraParams(req0)
+  const owned = await ownedInference(engine, await withExtraParams(req0))
+  if (owned instanceof Response) return owned
+  const req: Request = owned
   // the compat plugin reads a model's datasheet row through the same handler as GET /api/models/parameters
   if (engine.paramsLookup === undefined) {
     engine.paramsLookup = async (model: string): Promise<string | undefined> => {
@@ -1211,6 +1283,8 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
         return await genaiSdk(engine, r, g2.op, g2.model, g2.id)
       }))
     }
+    // the resumable upload's last step answers the file: its creator is recorded (enforce_vk_object_ownership)
+    if (gop.op === "files.upload") return await cors(engine, req, await recordUpload(engine, req, headerOr(req, "x-model-provider", "gemini"), await outOfLine(genaiSdk(engine, req, gop.op, gop.model, gop.id))))
     return await cors(engine, req, await outOfLine(genaiSdk(engine, req, gop.op, gop.model, gop.id)))
   }
   // Bedrock's jobs and S3 files, and Vertex's regional batch and cache paths: the provider's own bodies
@@ -1271,7 +1345,9 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
     if (p === "/api/cache") return ops.check(req, p) ?? cacheView(engine)
     if (p === "/api/logs" || p === "/api/logs/stats") {
       const cs = ops.checkScope(req, p)
-      return cs.res ?? replyResponse(ops.logsRoute(req, p, "", cs.scope))
+      const denied = cs.res
+      if (denied !== undefined) return denied
+      return replyResponse(await ops.logsRouteAll(req, p, "", cs.scope))
     }
     // self-service: the virtual key in the request is the credential, so no admin session is checked
     if (p === "/api/governance/virtual-keys/quota") return replyResponse(ops.vkQuota(req))
@@ -1312,6 +1388,7 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
   if (p === "/api/cluster/feed" && m === "POST") return await ops.clusterFeed(req)
   if (p === "/api/cluster/leader" && m === "GET") return ops.clusterLeader(req)
   if (p === "/api/cluster/config" && m === "POST") return await ops.clusterConfig(req)
+  if (p === "/api/cluster/logs" && m === "POST") return await ops.clusterLogs(req)
   if (p.startsWith("/api/oidc/") && m === "GET") return await ops.oidcRoute(req, p)
   // the MCP OAuth callback: the browser comes back here from the authorization server, with no session
   if (p === "/api/oauth/callback" && m === "GET") {
@@ -1328,13 +1405,19 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
   if (ia !== undefined) return ia
   // login and logout come before the gate: they are how a caller gets past it
   if (p.startsWith("/api/session/")) return await ops.sessionRoute(req, p)
+  // the CLI's agent sign-in (agentsignin.tov) and the signed-in user's keys and usage, by its agent token
+  if (p.startsWith("/api/agent/")) return await ops.agentRoute(req, p)
   if (p.startsWith("/api/")) return await outOfLine(manage(ops, req, p))
   // a provider's own API, raw: the key's auth, the rest as the caller sent it (passthrough.tov)
   if (passthroughPath(p)) {
     if (engine.gov.enforce && engine.gov.findKey(snapshot(req.headers)) === undefined) {
       return errorResponse(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", noHeaders())
     }
-    return try await passthroughRoute(engine.cfg, req, async (oc: OAuthKeyConfig, pc: ProviderConfig) => await engine.oauthToken(oc, pc))
+    // the provider objects its path and body name, and the lists it reads, follow enforce_vk_object_ownership
+    const pr = routeFor(p)
+    const pass = async (r: Request, s: StreamSink | undefined): Promise<Response, TypeError> => try await passthroughRoute(engine.cfg, r, async (oc: OAuthKeyConfig, pc: ProviderConfig) => await engine.oauthToken(oc, pc))
+    if (pr === undefined) return try await pass(req, undefined)
+    return try await passthroughOwned(engine, req, pr.r.provider, pr.r.kind === "gemini", pr.rest, pass)
   }
   // audio, images, files and batches: passed through to OpenAI-compatible providers
   const media = matchRoute(m, p)
@@ -1481,6 +1564,23 @@ export async function routeStream(engine: Engine, req: Request, kind: string, si
   return await markAgentRejection(engine, req, await routeStreamInner(engine, req, kind, sink))
 }
 
+// The inference routes whose bodies can name provider objects (a file by id or Gemini URI, a cached content):
+// chat, Responses, Messages and GenAI generation, under any of their prefixes.
+function namesObjects(p0: string): bool {
+  const p = compatPath(p0)
+  if (CHAT_PATHS.includes(p) || p === "/v1/responses" || p === "/anthropic/v1/messages") return true
+  return p.startsWith(GENAI) && (p.endsWith(":generateContent") || p.endsWith(":streamGenerateContent"))
+}
+
+// client.enforce_vk_object_ownership on an inference request: a body that names another key's file or cached content
+// is refused before any route reads it (pluginroute.tov ownedRequest).
+async function ownedInference(engine: Engine, req: Request): Promise<Request | Response> {
+  if (req.method !== "POST") return req
+  const u = URL.parse(req.url)
+  if (!namesObjects(u === undefined ? "" : u.pathname)) return req
+  return await ownedRequest(engine, req, "")
+}
+
 // x-bf-passthrough-extra-params: true on an inference route (not a raw passthrough, not a large body, which never
 // gets here): the body's extra_params object is merged into the request before any route reads it (extraparams.tov),
 // and rides along (EXTRA_PARAMS_CARRY) to be merged into the provider's converted body as well, as Bifrost merges it.
@@ -1505,25 +1605,29 @@ export async function withExtraParams(req: Request): Promise<Request> {
   return new Request(req.url, { method: "POST", headers: hs, body: mergeExtraParams(text) })
 }
 
+// (each route is awaited through outOfLine: its frame is then allocated for that route alone, instead of every route's
+// frame being laid out in this one, about 15 KB that each open chat stream held for nothing; L189)
 async function routeStreamInner(engine: Engine, req0: Request, kind: string, sink?: StreamSink): Promise<Response> {
-  const req = await withExtraParams(req0)
+  const owned = await ownedInference(engine, await outOfLine(withExtraParams(req0)))
+  if (owned instanceof Response) return owned
+  const req: Request = owned
   const u = URL.parse(req.url)
   const dep = deploymentRoute(u === undefined ? "" : u.pathname)
-  if (dep !== undefined) return await routeStream(engine, await deploymentRequest(req, dep), kind, sink)
+  if (dep !== undefined) return await outOfLine(routeStream(engine, await outOfLine(deploymentRequest(req, dep)), kind, sink))
   const p = compatPath(u === undefined ? "" : u.pathname)
-  if (kind === "anthropic") return await anthropicMessages(engine, req, sink)
-  if (kind === "legacy") return await anthropicLegacy(engine, req, sink)
-  if (kind === "cursor") return await cursorChat(engine, req, sink)
-  if (kind === "cohere") return await cohereChat(engine, req, sink)
-  if (kind === "genai") return await genai(engine, req, p.slice(GENAI.byteLength), sink)
+  if (kind === "anthropic") return await outOfLine(anthropicMessages(engine, req, sink))
+  if (kind === "legacy") return await outOfLine(anthropicLegacy(engine, req, sink))
+  if (kind === "cursor") return await outOfLine(cursorChat(engine, req, sink))
+  if (kind === "cohere") return await outOfLine(cohereChat(engine, req, sink))
+  if (kind === "genai") return await outOfLine(genai(engine, req, p.slice(GENAI.byteLength), sink))
   if (kind === "bedrock") {
     const segs = p.split("/")
-    return await bedrockModel(engine, req, segs[3]!, segs[4]!, sink)
+    return await outOfLine(bedrockModel(engine, req, segs[3]!, segs[4]!, sink))
   }
   if (kind === "completions" || kind === "responses") {
     try {
-      if (kind === "completions") return try await llmHooked(engine, req, "completions", async (r, s) => await engine.completions(r, s), sink)
-      return try await llmHooked(engine, req, "responses", async (r, s) => await responsesApi(engine, r, s), sink)
+      if (kind === "completions") return try await outOfLineT(llmHooked(engine, req, "completions", async (r, s) => await engine.completions(r, s), sink))
+      return try await outOfLineT(llmHooked(engine, req, "responses", async (r, s) => await responsesApi(engine, r, s), sink))
     } catch (e) {
       return errorResponse(500, "internal error", "api_error", noHeaders())
     }
@@ -1666,17 +1770,57 @@ function outOfLine<T>(p: Promise<T>): Promise<T> {
   return p
 }
 
+// The request with the id of its client watch in CLIENT_WATCH_HEADER (clientgone.tov), its body read.
+async function withWatch(req: Request, id: string): Promise<Request> {
+  let hs: Record<string, string> = snapshot(req.headers)
+  hs.set(CLIENT_WATCH_HEADER, id)
+  if (req.method === "GET" || req.method === "HEAD") return new Request(req.url, { method: req.method, headers: hs })
+  let body: u8[] = []
+  try {
+    body = await req.bytes()
+  } catch (e) {
+    body = []
+  }
+  return new Request(req.url, { method: req.method, headers: hs, body: body })
+}
+
+// The same for a call that can reject with a TypeError.
+function outOfLineT<T>(p: Promise<T, TypeError>): Promise<T, TypeError> {
+  return p
+}
+
 async function bunHttp(engine: Engine, ops: Ops, req00: Request, limit: int): Promise<Response, TypeError> {
+  // an inference request's client watch: Bun.serve aborts req.signal when the client goes away before the answer,
+  // which stops the upstream call (a large body that streams on is not watched)
+  const u0 = URL.parse(req00.url)
+  const p0 = u0 === undefined ? "" : u0.pathname
+  const wid = watched(req00.method, p0, isInferencePath(compatPath(p0))) ? watchStart() : ""
+  if (wid !== "") {
+    const id = wid
+    req00.signal.addEventListener("abort", () => watchGone(id))
+  }
+  try {
+    return try await bunHttpWatched(engine, ops, req00, limit, wid)
+  } finally {
+    if (wid !== "") watchEnd(wid)
+  }
+}
+
+async function bunHttpWatched(engine: Engine, ops: Ops, req00: Request, limit: int, watch: string): Promise<Response, TypeError> {
   let req0 = req00
+  let wid = watch
   const lf = await outOfLine(largeFront(engine, req00))
   if (lf instanceof Response) return lf
-  if (lf instanceof Request) req0 = lf
+  if (lf instanceof Request) {
+    req0 = lf
+    wid = ""
+  }
   const within = try await limitedBody(req0, limit)
   if (within === undefined) return errorResponse(413, "request body too large", "invalid_request_error", noHeaders())
   // the plugins' HTTP pre hooks, before the request is routed
   const th = await transportStart(engine, within)
   if (th.response !== undefined) return th.response
-  const req = th.request
+  const req = wid !== "" ? await withWatch(th.request, wid) : th.request
   const tr = th.tr
   const u = URL.parse(req.url)
   const p = u === undefined ? "" : u.pathname

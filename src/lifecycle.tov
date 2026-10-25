@@ -5,7 +5,11 @@
 // server.shutdown_grace_seconds from the signal for the requests and streams in hand to finish, sends what is
 // queued (exporter batches, retained content, traces, shared counters) and exits. Bifrost does the same on
 // SIGINT and SIGTERM (fasthttp's Shutdown, then its cleanup with a 30 s limit).
+//
+// WebSocket and WebRTC sessions (drain.tov) are part of the drain: the live feed sockets are closed when the
+// listener closes, the others may run until the grace and are then closed with a going-away frame (1001).
 import { ServerSectionConfig } from "./config"
+import { OpenSessions, openSessions, CLOSE_WAIT_MS } from "./drain"
 
 export const DEFAULT_GRACE_SECONDS = 25.0
 export const DEFAULT_HEADER_TIMEOUT_SECONDS = 10.0
@@ -98,12 +102,14 @@ export function readyReport(i: ReadyInput): { status: int, body: string } {
 
 // ---- the stop ----
 
-// What the stop needs from the server it runs on.
+// What the stop needs from the server it runs on. sessions: the WebSocket and WebRTC sessions (openSessions()
+// unless a test gives its own).
 export type StopHooks = {
   stopListener: () => void,
   open: () => int,
   flush: () => Promise<void>,
   exit: (code: int) => void,
+  sessions?: OpenSessions,
 }
 
 // Where a drain stands after `elapsed` ms: go on waiting, or stop (everything finished, or the grace ran out).
@@ -136,9 +142,19 @@ export async function beginStop(signal: string, st: StopSettings, hooks: StopHoo
   console.error(`raiju: ${signal}: draining (pid ${process.pid}; /ready answers 503${st.delayMs > 0 ? `, new connections are taken for ${st.delayMs} ms more` : ""}; up to ${st.graceMs} ms for the requests in hand)`)
   if (st.delayMs > 0) await sleep(Math.min(st.delayMs, st.graceMs))
   hooks.stopListener()
-  while (!drainDone(hooks.open(), performance.now() - t0, st.graceMs)) await sleep(50)
+  const reg = hooks.sessions ?? openSessions()
+  // the live feed sockets go now (their clients resume elsewhere); the other sessions are part of the drain
+  reg.goAway(true)
+  while (!drainDone(hooks.open() + reg.count(false), performance.now() - t0, st.graceMs)) await sleep(50)
   const left = hooks.open()
   if (left > 0) console.error(`raiju: ${signal}: ${left} connection${left === 1 ? "" : "s"} still open after ${st.graceMs} ms, closed`)
+  // the sessions still open get a going-away close frame and CLOSE_WAIT_MS to end (and report what they used)
+  const away = reg.goAway(false)
+  if (away > 0) console.error(`raiju: ${signal}: ${away} session${away === 1 ? "" : "s"} still open after ${st.graceMs} ms, closed with 1001 (going away)`)
+  const c0 = performance.now()
+  while (reg.count(false) + reg.count(true) > 0 && performance.now() - c0 < CLOSE_WAIT_MS * 1.0) await sleep(20)
+  const cut = reg.dropAll()
+  if (cut > 0) console.error(`raiju: ${signal}: ${cut} session${cut === 1 ? "" : "s"} did not close within ${CLOSE_WAIT_MS} ms, cut`)
   // what is queued goes out, within FLUSH_MS
   flushInto(s, hooks.flush)
   const f0 = performance.now()

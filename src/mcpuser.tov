@@ -14,9 +14,11 @@ import { secureHex, sha256, utf8, toHex } from "./crypto"
 import { deadline } from "./deadline"
 import { existsSync, readFileSync, unlinkSync } from "node:fs"
 import { writeFileAtomic } from "./atomicfile"
+import { resolvedTargetProblem, peerOf, strictPolicy } from "./netguard"
 
-// One caller's tokens for one per_user_oauth client. Exactly one of virtual_key_id and session_id is set:
-// session_id in session mode (the x-bf-mcp-session-id header), else virtual_key_id. The tokens are sealed
+// One caller's tokens for one per_user_oauth client. At most one of virtual_key_id, session_id and user_id is set:
+// user_id for a user-mode token, else virtual_key_id, else session_id in session mode (the x-bf-mcp-session-id header
+// of a request without a key; identityOf). The tokens are sealed
 // in the saved file.
 export type McpUserToken = {
   id: string,
@@ -250,15 +252,20 @@ export function userTokenOf(list: McpUserToken[] | undefined, client: string, vk
   return i < 0 ? undefined : all[i]
 }
 
-// The identity a request is keyed by: the x-bf-mcp-session-id header when present, else the user of a user-mode
-// token, else the virtual key.
+// The identity a request is keyed by, in Bifrost's order (BifrostContext.MCPAuthMode): the user of a user-mode token,
+// else the virtual key, else the x-bf-mcp-session-id header. A request with a key and a session header is the key's.
+// A session id over 255 characters is ignored, as Bifrost's NormalizeSessionID ignores it.
 export function identityOf(sessionHeader: string | undefined, vk: string, user?: string): { vk: string, session: string, user: string } {
-  const s = (sessionHeader ?? "").trim()
-  if (s !== "") return { vk: "", session: s, user: "" }
   const u = user ?? ""
   if (u !== "") return { vk: "", session: "", user: u }
-  return { vk: vk, session: "", user: "" }
+  if (vk !== "") return { vk: vk, session: "", user: "" }
+  const s = (sessionHeader ?? "").trim()
+  if (s !== "" && s.chars().length <= MAX_SESSION_ID) return { vk: "", session: s, user: "" }
+  return { vk: "", session: "", user: "" }
 }
+
+// Bifrost's MaxSessionIDLength (runes).
+const MAX_SESSION_ID = 255
 
 // A request header that carries the user of a user-mode MCP token from the /mcp handler to the tool calls it makes.
 // The value is bound to a secret of this process, so a header a caller sends never names a user.
@@ -534,28 +541,33 @@ export function rowFromTokens(json: string, nowMs: f64, client: string, vk: stri
   return row
 }
 
-// Trades a callback's code for the caller's tokens, with the flow's PKCE verifier.
-export async function exchangeUserCode(a: McpAuthConfig, code: string, verifier: string, redirect: string, nowMs: f64): Promise<string> throws Error {
+// Trades a callback's code for the caller's tokens, with the flow's PKCE verifier. allow is mcp.oauth_private_allowlist.
+export async function exchangeUserCode(a: McpAuthConfig, code: string, verifier: string, redirect: string, nowMs: f64, allow: string[]): Promise<string> throws Error {
   const tr = try codeTokenRequest(a, code, verifier, redirect)
-  return try await postForm(tr.url, tr.headers, tr.body)
+  return try await postForm(tr.url, tr.headers, tr.body, allow)
 }
 
 // Refreshes a caller's access token with its refresh token. The result is the new row (same id).
-export async function refreshUserRow(a: McpAuthConfig, row: McpUserToken, nowMs: f64): Promise<McpUserToken> throws Error {
+export async function refreshUserRow(a: McpAuthConfig, row: McpUserToken, nowMs: f64, allow: string[]): Promise<McpUserToken> throws Error {
   if (row.refresh_token === "") throw new Error("no refresh token")
   let req = a
   req.refresh_token = row.refresh_token
   const tr = try tokenRequest(req)
-  const text = try await postForm(tr.url, tr.headers, tr.body)
+  const text = try await postForm(tr.url, tr.headers, tr.body, allow)
   return try rowFromTokens(text, nowMs, row.mcp_client_name, row.virtual_key_id, row.session_id, row.id, row.refresh_token, row.user_id)
 }
 
-// One form POST to an authorization server under a deadline: the body of a 2xx answer, else an error.
-async function postForm(url: string, headers: Map<string, string>, body: string): Promise<string> throws Error {
+// One form POST to an authorization server under a deadline: the body of a 2xx answer, else an error. The token
+// endpoint must be a public address, or one oauth_private_allowlist names (allow), checked on the addresses its host
+// resolves to before the request and again by the runtime when it connects; a redirect is not followed, as Bifrost's
+// OAuth client does not replay a credential-bearing POST elsewhere.
+async function postForm(url: string, headers: Map<string, string>, body: string, allow: string[]): Promise<string> throws Error {
+  const pr = await resolvedTargetProblem(url, allow)
+  if (pr !== "") throw new Error(`${url}: ${pr} (add the host to oauth_private_allowlist to allow it)`)
   const dl = deadline(FLOW_TIMEOUT_MS)
   try {
     const hs: Record<string, string> = headers
-    const r = await fetch(url, { method: "POST", headers: hs, body: body, signal: dl.controller.signal })
+    const r = await fetch(url, { method: "POST", headers: hs, body: body, signal: dl.controller.signal, redirect: "manual", peer: peerOf(strictPolicy(allow)) })
     const text = await r.text()
     if (r.status < 200 || r.status >= 300) throw new Error(`HTTP ${r.status} from ${url}`)
     dl.finish()
@@ -610,11 +622,16 @@ test("rows are keyed by virtual key, or by session id in session mode", () => {
   expect(userTokenIndex(list, "m", "", "s-x")).toBe(-1)
 })
 
-test("the session header takes precedence over the virtual key, and blank headers are ignored", () => {
-  expect(identityOf("abc", "vk1").session).toBe("abc")
-  expect(identityOf("abc", "vk1").vk).toBe("")
+test("the virtual key takes precedence over the session header (Bifrost's order), and blank headers are ignored", () => {
+  expect(identityOf("abc", "vk1")).toEqual({ vk: "vk1", session: "", user: "" })
+  expect(identityOf("abc", "")).toEqual({ vk: "", session: "abc", user: "" })
   expect(identityOf("  ", "vk1").vk).toBe("vk1")
+  expect(identityOf("  ", "")).toEqual({ vk: "", session: "", user: "" })
   expect(identityOf(undefined, "vk1").session).toBe("")
+  let long = ""
+  for (let i = 0; i < 256; i++) long += "s"
+  expect(identityOf(long, "").session).toBe("")
+  expect(identityOf(long.slice(1), "").session).toBe(long.slice(1))
 })
 
 test("the consent message and link carry the flow and the temp-token fragment when on", () => {
@@ -676,7 +693,7 @@ test("user-mode rows are keyed by user, apart from the key and session rows", ()
   expect(userTokenOf(list, "m", "", "", "bob")).toBe(undefined)
   expect(userTokenOf(list, "m", "vk1", "")!.id).toBe("u1")
   expect(identityOf(undefined, "vk1", "alice")).toEqual({ vk: "", session: "", user: "alice" })
-  expect(identityOf("s-1", "vk1", "alice")).toEqual({ vk: "", session: "s-1", user: "" })
+  expect(identityOf("s-1", "vk1", "alice")).toEqual({ vk: "", session: "", user: "alice" })
   expect(userOfMark(markUser("alice"))).toBe("alice")
   expect(userOfMark("forged:alice")).toBe("")
   expect(userOfMark(undefined)).toBe("")

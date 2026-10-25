@@ -10,6 +10,7 @@ import { rfc3339Of } from "./vkexpiry"
 import { deadline } from "./deadline"
 import { sha256, toHex, utf8 } from "./crypto"
 import { discoveryUrl, parseDiscovery } from "./oidc"
+import { resolvedTargetProblem, peerOf, strictPolicy } from "./netguard"
 
 // An MCP client's token_exchange block. client_id and client_secret are the exchange application's own;
 // use_idp_credentials sends the login application's (the oidc block's) instead.
@@ -196,18 +197,25 @@ export class ExchangeCache {
   }
 }
 
-// The token endpoints discovered from identity-provider issuers, fetched once per issuer.
+// The token endpoints discovered from identity-provider issuers, fetched once per issuer. allow is
+// mcp.oauth_private_allowlist (set by the caller from the config in force): the discovery document and the token
+// endpoint must be public addresses or named there, as Bifrost's OAuth client allows them, checked on the resolved
+// addresses before each request and by the runtime when it connects.
 export class IdpEndpoints {
   private found: Map<string, string> = new Map()
+  allow: string[] = []
 
   // The token_endpoint of the issuer's discovery document, or "" when it cannot be read.
   async tokenEndpoint(issuer: string): Promise<string> {
     if (issuer === "") return ""
     const hit = this.found.get(issuer)
     if (hit !== undefined) return hit
+    const url = discoveryUrl(issuer)
+    if (await resolvedTargetProblem(url, this.allow) !== "") return ""
     const dl = deadline(EXCHANGE_TIMEOUT_MS)
     try {
-      const r = await fetch(discoveryUrl(issuer), { signal: dl.controller.signal })
+      // a GET: redirects are followed, each hop's addresses checked when it connects
+      const r = await fetch(url, { signal: dl.controller.signal, peer: peerOf(strictPolicy(this.allow)) })
       if (r.status < 200 || r.status >= 300) return ""
       const d = try parseDiscovery(await r.text())
       this.found.set(issuer, d.token_endpoint)
@@ -227,10 +235,13 @@ async function postForm(cfg: McpTokenExchange, body: string, idp: IdpEndpoints, 
   if ((cfg.authorization_server_url ?? "") === "") discovered = await idp.tokenEndpoint(issuer)
   const endpoint = endpointOf(cfg, discovered)
   if (endpoint === "") return { status: 0, text: "", error: "no token endpoint: set authorization_server_url, or configure oidc with a reachable issuer" }
+  const pr = await resolvedTargetProblem(endpoint, idp.allow)
+  if (pr !== "") return { status: 0, text: "", error: `token endpoint: ${pr} (add the host to oauth_private_allowlist to allow it)` }
   const dl = deadline(EXCHANGE_TIMEOUT_MS)
   try {
     const hs: Record<string, string> = formHeaders()
-    const r = await fetch(endpoint, { method: "POST", headers: hs, body: body, signal: dl.controller.signal })
+    // the form carries the client's credentials: a redirect is not followed (Bifrost's OAuth client refuses one)
+    const r = await fetch(endpoint, { method: "POST", headers: hs, body: body, signal: dl.controller.signal, redirect: "manual", peer: peerOf(strictPolicy(idp.allow)) })
     const text = await r.text()
     return { status: r.status, text: text, error: "" }
   } catch (e) {

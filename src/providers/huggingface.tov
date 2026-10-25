@@ -1,0 +1,926 @@
+// Hugging Face's inference providers, as Bifrost routes them (core/providers/huggingface). A model is named
+// "<inference provider>/<hub model id>" (huggingface/fal-ai/fal-ai/flux/dev, huggingface/cerebras/meta-llama/Llama-3.3-70B);
+// a name with one slash is a hub model id with no provider. Chat goes to the router's OpenAI-compatible
+// /v1/chat/completions as "<hub id>:<provider>". Embeddings, speech, transcription and images go to the provider's own
+// route on the router (/hf-inference/models/..., /fal-ai/..., /nebius/v1/..., ...), with the provider's model id from
+// the hub's inferenceProviderMapping (fetched by media.tov, kept here) and the body shape that provider takes.
+import { Field, fields, find, rawStr, rawNum, rawBool, elements, decodeString, quote, build, setField, isNull } from "../json"
+import { Target, Upstream, Translated, headers, addExtraHeaders, trimSlash } from "./types"
+import * as base64 from "../base64"
+
+export const DEFAULT_ROUTER = "https://router.huggingface.co"
+export const DEFAULT_HUB = "https://huggingface.co"
+
+// The inference providers Bifrost lists (its INFERENCE_PROVIDERS), and the "auto" policy.
+export const INFERENCE_PROVIDERS: string[] = ["baseten", "cerebras", "cohere", "fal-ai", "featherless-ai", "fireworks-ai", "groq", "hf-inference", "hyperbolic", "nebius", "novita", "nscale", "ovhcloud", "publicai", "replicate", "sambanova", "scaleway", "together", "wavespeed", "zai-org"]
+
+export type HfModel = { provider: string, model: string }
+
+// Bifrost's splitIntoModelProvider: more than one slash is "<provider>/<hub id>", one slash is a hub id alone.
+export function splitModel(name: string): HfModel throws SyntaxError {
+  const i = name.indexOf("/")
+  if (i < 0) throw new SyntaxError(`invalid model name format: ${name}`)
+  const rest = name.slice(i + 1)
+  if (!rest.includes("/")) return { provider: "", model: name }
+  return { provider: name.slice(0, i), model: rest }
+}
+
+// The model a chat request names on the router: "<hub id>:<provider>", or the hub id when no provider is given.
+export function chatModel(name: string): string {
+  try {
+    const m = try splitModel(name)
+    return m.provider === "" ? m.model : m.model + ":" + m.provider
+  } catch (e) {
+    return name
+  }
+}
+
+// ---- the hub's provider mapping ----
+
+export type HfMapping = { task: string, providerId: string }
+
+// GET /api/models/<id>?expand[]=pipeline_tag&expand[]=inferenceProviderMapping on the hub (Bifrost's
+// buildModelInferenceProviderURL; url.Values keeps only the last expand[]).
+export function mappingUrl(hub: string, model: string): string {
+  return trimSlash(hub) + "/api/models/" + model + "?expand%5B%5D=inferenceProviderMapping"
+}
+
+// The hub's answer as provider -> {task, providerId}.
+export function parseMappings(text: string): Map<string, HfMapping> throws SyntaxError {
+  const out: Map<string, HfMapping> = new Map()
+  const raw = find(try fields(text), "inferenceProviderMapping")
+  if (raw === undefined || !raw.startsWith("{")) return out
+  for (const f of try fields(raw)) {
+    if (!f.raw.startsWith("{")) continue
+    const fs = try fields(f.raw)
+    out.set(f.key, { task: rawStr(fs, "task") ?? "", providerId: rawStr(fs, "providerId") ?? "" })
+  }
+  return out
+}
+
+class MappingCache {
+  items: Map<string, Map<string, HfMapping>> = new Map()
+}
+
+let cacheInstance: MappingCache | undefined = undefined
+
+function cache(): MappingCache {
+  let c = cacheInstance
+  if (c === undefined) {
+    c = new MappingCache()
+    cacheInstance = c
+  }
+  return c
+}
+
+export function cachedMappings(model: string): Map<string, HfMapping> | undefined {
+  return cache().items.get(model)
+}
+
+export function storeMappings(model: string, m: Map<string, HfMapping>): void {
+  const c = cache()
+  // a bounded table: hub ids come from callers
+  if (c.items.size > 4096) c.items.clear()
+  c.items.set(model, m)
+}
+
+// Drops a model's mapping (a 404 from the provider: the mapping may have moved, as Bifrost clears it).
+export function forgetMappings(model: string): void {
+  cache().items.delete(model)
+}
+
+// The provider's model id for a task, or an error naming why the operation is not served (Bifrost's
+// getValidatedProviderModelID: the provider must map the model, with that task).
+export function providerModelId(m: Map<string, HfMapping> | undefined, provider: string, task: string, op: string): { id: string, error: string } {
+  const unsupported = { id: "", error: `${op} is not supported by huggingface for ${provider === "" ? "a model without an inference provider" : provider} with this model` }
+  if (m === undefined) return unsupported
+  const e = m.get(provider)
+  if (e === undefined || e.providerId === "" || e.task !== task) return unsupported
+  return { id: e.providerId, error: "" }
+}
+
+// The hub task each operation needs.
+export function taskOf(op: string): string {
+  if (op === "embeddings") return "feature-extraction"
+  if (op === "speech") return "text-to-speech"
+  if (op === "transcription") return "automatic-speech-recognition"
+  return "text-to-image"
+}
+
+// The hub the mappings and listings are read from: huggingface.co, or RAIJU_HF_HUB_URL (a mirror, or a test double).
+export function hubBase(): string {
+  const v = process.env.RAIJU_HF_HUB_URL ?? ""
+  return v === "" ? DEFAULT_HUB : trimSlash(v)
+}
+
+// ---- the models listing ----
+
+// One inference provider's models on the hub (Bifrost's buildModelHubURL: the 200 most liked, full records), keys in
+// url.Values' sorted order.
+export function listUrl(hub: string, provider: string): string {
+  return trimSlash(hub) + "/api/models?direction=-1&full=1&inference_provider=" + provider + "&limit=200&sort=likes"
+}
+
+const EMBED_TAGS = ["text-embedding", "sentence-similarity", "feature-extraction", "embeddings", "sentence-transformers"]
+const CHAT_TAGS = ["text-generation", "summarization", "conversational", "chat-completion", "text2text-generation", "question-answering"]
+
+// Bifrost's deriveSupportedMethods, reduced to whether the model serves anything: its pipeline tag, or one of its tags.
+export function servesSomething(pipeline: string, tags: string[]): bool {
+  const p = pipeline.trim().toLowerCase()
+  if (["conversational", "chat-completion", "feature-extraction", "text-to-speech", "automatic-speech-recognition", "text-to-image"].includes(p)) return true
+  for (const tag of tags) {
+    const t = tag.toLowerCase()
+    if (EMBED_TAGS.includes(t) || t.includes("embedding")) return true
+    if (CHAT_TAGS.includes(t) || t.includes("chat") || t.includes("completion")) return true
+    if (t === "tts" || t.includes("text-to-speech")) return true
+    if (t === "speech-to-text" || t.includes("speech-recognition")) return true
+    if (t.includes("text-to-image") || t.includes("image-generation")) return true
+  }
+  return false
+}
+
+// The model ids of one provider's hub listing (a JSON array, or {"models": [...]}) that serve something, as
+// "<provider>/<model id>" (Bifrost lists them as huggingface/<provider>/<model id>).
+export function listedModelIds(text: string, provider: string): string[] throws SyntaxError {
+  let arr = text.trim()
+  if (arr.startsWith("{")) arr = find(try fields(arr), "models") ?? "[]"
+  const out: string[] = []
+  if (!arr.startsWith("[")) return out
+  for (const el of try elements(arr)) {
+    if (!el.startsWith("{")) continue
+    const fs = try fields(el)
+    const id = rawStr(fs, "modelId") ?? rawStr(fs, "id") ?? ""
+    if (id === "") continue
+    const tags: string[] = []
+    const tr = find(fs, "tags")
+    if (tr !== undefined && tr.startsWith("[")) {
+      for (const t of try elements(tr)) {
+        if (t.startsWith("\"")) tags.push(try decodeString(t))
+      }
+    }
+    if (!servesSomething(rawStr(fs, "pipeline_tag") ?? "", tags)) continue
+    const full = provider + "/" + id
+    if (!out.includes(full)) out.push(full)
+  }
+  return out
+}
+
+// ---- routes ----
+
+export function routerBase(t: Target): string {
+  const b = t.cfg.network_config?.base_url ?? ""
+  return b === "" ? DEFAULT_ROUTER : trimSlash(b)
+}
+
+// Bifrost's getInferenceProviderRouteURL: the provider's path on the router for an operation ("" when the provider does
+// not serve it there). op is embeddings, speech, transcription, images or edits.
+export function routePath(provider: string, model: string, op: string): string {
+  if (provider === "fal-ai") return "/fal-ai/" + model
+  if (provider === "hf-inference") {
+    if (op === "images" || op === "transcription") return "/hf-inference/models/" + model
+    if (op === "embeddings") return "/hf-inference/models/" + model + "/pipeline/feature-extraction"
+    if (op === "speech") return "/hf-inference/models/" + model + "/pipeline/text-to-speech"
+    return ""
+  }
+  if (provider === "nebius") return op === "embeddings" ? "/nebius/v1/embeddings" : op === "images" ? "/nebius/v1/images/generations" : ""
+  if (provider === "replicate") return op === "speech" || op === "transcription" ? "/replicate/v1/prediction" : ""
+  if (provider === "together") return op === "images" ? "/together/v1/images/generations" : ""
+  if (provider === "sambanova") return op === "embeddings" ? "/sambanova/v1/embeddings" : ""
+  if (provider === "scaleway") return op === "embeddings" ? "/scaleway/v1/embeddings" : ""
+  return ""
+}
+
+// Whether an image generation skips the hub mapping (fal-ai, nebius and together take the model as it is named).
+export function imageSkipsMapping(provider: string): bool {
+  return provider === "fal-ai" || provider === "nebius" || provider === "together"
+}
+
+export function jsonHeaders(t: Target): Map<string, string> {
+  let h = headers([["content-type", "application/json"]])
+  const v = t.key.value ?? ""
+  if (v !== "") h.set("authorization", "Bearer " + v)
+  addExtraHeaders(&h, t.cfg)
+  return h
+}
+
+// ---- embeddings ----
+
+// The text of one input item: a string, or an array of numbers (tokens), which Hugging Face does not take.
+function inputTexts(raw: string): { one: string, many: string[], single: bool } throws SyntaxError {
+  if (raw.startsWith("\"")) return { one: try decodeString(raw), many: [], single: true }
+  if (!raw.startsWith("[")) throw new SyntaxError("huggingface embedding only supports text input")
+  const many: string[] = []
+  for (const el of try elements(raw)) {
+    if (!el.startsWith("\"")) throw new SyntaxError("huggingface embedding only supports text input")
+    many.push(try decodeString(el))
+  }
+  if (many.length === 1) return { one: many[0]!, many: [], single: true }
+  return { one: "", many: many, single: false }
+}
+
+// Bifrost's ToHuggingFaceEmbeddingRequest: input (inputs for hf-inference), provider and model (not for hf-inference),
+// normalize, prompt_name, truncate and truncation_direction, encoding_format and dimensions; the model field then holds the
+// provider's model id (Bifrost's SetJSONField: replaced in place, appended for hf-inference).
+export function embeddingsBody(provider: string, model: string, body: Field[], providerId: string): string throws SyntaxError {
+  const out: Field[] = []
+  const inp = find(body, "input")
+  let inputRaw = ""
+  if (inp !== undefined && !isNull(inp)) {
+    const it = try inputTexts(inp.trim())
+    inputRaw = it.single ? quote(it.one) : "[" + it.many.map((s) => quote(s)).join(",") + "]"
+  }
+  const hfi = provider === "hf-inference"
+  if (inputRaw !== "") out.push({ key: hfi ? "inputs" : "input", raw: inputRaw })
+  if (!hfi) {
+    out.push({ key: "provider", raw: quote(provider) })
+    out.push({ key: "model", raw: quote(model) })
+  }
+  const nm = rawBool(body, "normalize")
+  if (nm !== undefined) out.push({ key: "normalize", raw: nm ? "true" : "false" })
+  const pn = rawStr(body, "prompt_name")
+  if (pn !== undefined) out.push({ key: "prompt_name", raw: quote(pn) })
+  const tr = rawBool(body, "truncate")
+  if (tr !== undefined) out.push({ key: "truncate", raw: tr ? "true" : "false" })
+  const td = rawStr(body, "truncation_direction")
+  if (td !== undefined) out.push({ key: "truncation_direction", raw: quote(td) })
+  const ef = rawStr(body, "encoding_format")
+  if (ef !== undefined) out.push({ key: "encoding_format", raw: quote(ef) })
+  const dm = rawNum(body, "dimensions")
+  if (dm !== undefined) out.push({ key: "dimensions", raw: `${Math.floor(dm)}` })
+  let fs = out
+  setField(&fs, "model", quote(providerId))
+  return build(fs)
+}
+
+// The embeddings call of a target: its model's provider route with the cached mapping's model id. media.tov fetches the
+// mapping before this is built (hfEnsure); a model without one is refused.
+export function embeddingsRequest(t: Target, body: Field[]): Upstream throws SyntaxError {
+  const m = try splitModel(t.model)
+  const path = routePath(m.provider, m.model, "embeddings")
+  if (path === "") throw new SyntaxError(`embedding is not supported by huggingface for ${m.provider === "" ? "a model without an inference provider" : m.provider}`)
+  const pid = providerModelId(cachedMappings(m.model), m.provider, "feature-extraction", "embedding")
+  if (pid.error !== "") throw new SyntaxError(pid.error)
+  return { url: routerBase(t) + routePath(m.provider, pid.id, "embeddings"), headers: jsonHeaders(t), body: try embeddingsBody(m.provider, m.model, body, pid.id) }
+}
+
+function vector(raw: string): string {
+  return raw.trim()
+}
+
+// Bifrost's UnmarshalHuggingFaceEmbeddingResponse: an OpenAI-shaped object, a 2-D array (one vector per input) or a 1-D
+// array (one vector), as OpenAI's list.
+export function embeddingsResponse(text: string, requestedModel: string): Translated throws SyntaxError {
+  const t = text.trim()
+  if (t.startsWith("{")) {
+    let fs = try fields(t)
+    setField(&fs, "model", quote(requestedModel))
+    if (find(fs, "object") === undefined) setField(&fs, "object", `"list"`)
+    let pt = 0
+    const u = find(fs, "usage")
+    if (u !== undefined && u.startsWith("{")) {
+      const n = rawNum(try fields(u), "prompt_tokens")
+      if (n !== undefined) pt = Math.floor(n)
+    } else setField(&fs, "usage", `{"prompt_tokens":0,"total_tokens":0}`)
+    return { body: build(fs), promptTokens: pt, completionTokens: 0 }
+  }
+  if (!t.startsWith("[")) throw new SyntaxError("failed to unmarshal HuggingFace embedding response: unexpected structure")
+  const els = try elements(t)
+  const vecs: string[] = []
+  if (els.length > 0 && els[0]!.trim().startsWith("[")) {
+    for (const e of els) vecs.push(vector(e))
+  } else vecs.push(t)
+  const data: string[] = []
+  for (let i = 0; i < vecs.length; i++) data.push(`{"object":"embedding","embedding":${vecs[i]!},"index":${i}}`)
+  return { body: `{"object":"list","data":[${data.join(",")}],"model":${quote(requestedModel)},"usage":{"prompt_tokens":0,"total_tokens":0}}`, promptTokens: 0, completionTokens: 0 }
+}
+
+// ---- speech and transcription ----
+
+// The generation parameters Bifrost reads from a speech or transcription request's extra params, as written to
+// parameters.generation_parameters.
+const GENERATION_INTS = ["max_new_tokens", "max_length", "min_length", "min_new_tokens", "num_beams", "num_beam_groups", "top_k"]
+const GENERATION_NUMS = ["penalty_alpha", "temperature", "top_p", "typical_p", "epsilon_cutoff", "eta_cutoff"]
+const GENERATION_BOOLS = ["do_sample", "use_cache"]
+
+// The generation parameters a request carries, in Bifrost's struct order; "" when none.
+export function generationParams(get: (key: string) => string | undefined): string {
+  const out: string[] = []
+  const order = ["do_sample", "early_stopping", "epsilon_cutoff", "eta_cutoff", "max_length", "max_new_tokens", "min_length", "min_new_tokens", "num_beam_groups", "num_beams", "penalty_alpha", "temperature", "top_k", "top_p", "typical_p", "use_cache"]
+  for (const k of order) {
+    const v = get(k)
+    if (v === undefined || v === "") continue
+    if (GENERATION_BOOLS.includes(k)) {
+      if (v === "true" || v === "false") out.push(`${quote(k)}:${v}`)
+    } else if (GENERATION_INTS.includes(k)) {
+      const n = parseFloat(v)
+      if (n !== undefined && Math.floor(n) === n) out.push(`${quote(k)}:${Math.floor(n)}`)
+    } else if (GENERATION_NUMS.includes(k)) {
+      const n = parseFloat(v)
+      if (n !== undefined) out.push(`${quote(k)}:${v}`)
+    } else if (k === "early_stopping") {
+      if (v === "true" || v === "false") out.push(`"early_stopping":${v}`)
+      else out.push(`"early_stopping":${quote(v)}`)
+    }
+  }
+  return out.length === 0 ? "" : "{" + out.join(",") + "}"
+}
+
+function jsonGetter(fs: Field[]): (key: string) => string | undefined {
+  return (key: string): string | undefined => {
+    const raw = find(fs, key)
+    if (raw === undefined || isNull(raw)) return undefined
+    if (raw.startsWith("\"")) {
+      try {
+        return decodeString(raw)
+      } catch (e) {
+        return undefined
+      }
+    }
+    return raw.trim()
+  }
+}
+
+// Bifrost's ToHuggingFaceSpeechRequest: the input as text, the provider and the hub model, and the generation parameters.
+export function speechBody(provider: string, model: string, fs: Field[]): string throws SyntaxError {
+  const input = rawStr(fs, "input") ?? ""
+  if (input === "") throw new SyntaxError("speech request input cannot be empty")
+  let out = `{"text":${quote(input)},"provider":${quote(provider)},"model":${quote(model)}`
+  const gp = generationParams(jsonGetter(fs))
+  if (gp !== "") out += `,"parameters":{"generation_parameters":${gp}}`
+  return out + "}"
+}
+
+// The audio URL of a speech answer ({"audio": {"url": ...}}), and its content type when given.
+export function speechAudio(text: string): { url: string, contentType: string } throws SyntaxError {
+  const a = find(try fields(text), "audio")
+  if (a === undefined || !a.startsWith("{")) throw new SyntaxError("huggingface speech response contained no audio")
+  const fs = try fields(a)
+  const url = rawStr(fs, "url") ?? ""
+  if (url === "") throw new SyntaxError("huggingface speech response contained no audio URL")
+  return { url: url, contentType: rawStr(fs, "content_type") ?? "" }
+}
+
+// Bifrost's DetectAudioMimeType and getMimeTypeForAudioType: the audio's MIME type from its first bytes (MP3 as
+// audio/mpeg, the fallback).
+export function audioMimeOf(b: u8[]): string {
+  const at = (i: int): int => (i < b.length ? int(b[i]!) : 0)
+  const tag = (i: int, s: string): bool => {
+    const e = new TextEncoder().encode(s)
+    for (let j = 0; j < e.length; j++) {
+      if (at(i + j) !== int(e[j]!)) return false
+    }
+    return b.length >= i + e.length
+  }
+  if (b.length < 4) return "audio/mpeg"
+  if (tag(0, "RIFF") && tag(8, "WAVE")) return "audio/wav"
+  if (tag(0, "ID3")) return "audio/mpeg"
+  if (tag(0, "ADIF")) return "audio/aac"
+  if (at(0) === 0xff && (at(1) & 0xf6) === 0xf0) return "audio/aac"
+  if (tag(0, "FORM") && (tag(8, "AIFF") || tag(8, "AIFC"))) return "audio/aiff"
+  if (tag(0, "fLaC")) return "audio/flac"
+  if (tag(0, "OggS")) return "audio/ogg"
+  return "audio/mpeg"
+}
+
+// Bifrost's ToHuggingFaceTranscriptionRequest for providers other than hf-inference (which takes the raw audio): fal-ai
+// takes the audio as a base64 data URI in audio_url (WAV refused), the others the audio's base64 in inputs with the hub
+// model and the provider. get reads the form's fields (the generation parameters and return_timestamps).
+export function transcriptionBody(provider: string, model: string, audio: u8[], get: (key: string) => string | undefined): string throws SyntaxError {
+  if (audio.length === 0) throw new SyntaxError("transcription request audio file cannot be empty")
+  let out = ""
+  if (provider === "fal-ai") {
+    const mime = audioMimeOf(audio)
+    if (mime === "audio/wav") throw new SyntaxError("fal-ai provider does not support audio/wav format; please use a different format like mp3 or ogg")
+    out = `{"audio_url":${quote("data:" + mime + ";base64," + base64.encode(audio))}`
+  } else {
+    out = `{"inputs":${quote(base64.encode(audio))},"provider":${quote(provider)},"model":${quote(model)}`
+  }
+  const gp = generationParams(get)
+  const rt = get("return_timestamps") ?? ""
+  const params: string[] = []
+  if (gp !== "") params.push(`"generation_parameters":${gp}`)
+  if (rt === "true" || rt === "false") params.push(`"return_timestamps":${rt}`)
+  if (params.length > 0) out += `,"parameters":{${params.join(",")}}`
+  return out + "}"
+}
+
+// Bifrost's ToBifrostTranscriptionResponse: the text, and the chunks as segments (their timestamps as start and end).
+export function transcriptionToOpenAI(text: string): string throws SyntaxError {
+  const fs = try fields(text)
+  const body = rawStr(fs, "text") ?? ""
+  const chunks = find(fs, "chunks")
+  const segs: string[] = []
+  if (chunks !== undefined && chunks.startsWith("[")) {
+    const els = try elements(chunks)
+    for (let i = 0; i < els.length; i++) {
+      const cf = try fields(els[i]!)
+      let start = "0"
+      let end = "0"
+      const ts = find(cf, "timestamp")
+      if (ts !== undefined && ts.startsWith("[")) {
+        const tv = try elements(ts)
+        if (tv.length >= 2) {
+          start = isNull(tv[0]!) ? "0" : tv[0]!.trim()
+          end = isNull(tv[1]!) ? "0" : tv[1]!.trim()
+        }
+      }
+      segs.push(`{"id":${i},"start":${start},"end":${end},"text":${quote(rawStr(cf, "text") ?? "")}}`)
+    }
+  }
+  if (segs.length === 0) return `{"text":${quote(body)}}`
+  return `{"text":${quote(body)},"segments":[${segs.join(",")}]}`
+}
+
+// ---- images ----
+
+// "WxH" as numbers; undefined for "auto" or another shape.
+export function sizeOf(size: string): { w: int, h: int } | undefined {
+  if (size === "" || size.toLowerCase() === "auto") return undefined
+  const p = size.toLowerCase().split("x")
+  if (p.length !== 2) return undefined
+  const w = parseInt(p[0]!)
+  const h = parseInt(p[1]!)
+  if (w === undefined || h === undefined) return undefined
+  return { w: w, h: h }
+}
+
+function pushStr(inout out: string[], key: string, v: string | undefined): void {
+  if (v !== undefined) out.push(`${quote(key)}:${quote(v)}`)
+}
+
+function pushRaw(inout out: string[], key: string, v: string | undefined): void {
+  if (v !== undefined && !isNull(v)) out.push(`${quote(key)}:${v.trim()}`)
+}
+
+function intRaw(fs: Field[], key: string): string | undefined {
+  const n = rawNum(fs, key)
+  if (n === undefined) return undefined
+  return `${Math.floor(n)}`
+}
+
+function boolRaw(fs: Field[], key: string): string | undefined {
+  const b = rawBool(fs, key)
+  if (b === undefined) return undefined
+  return b ? "true" : "false"
+}
+
+function falFormat(f: string | undefined): string | undefined {
+  if (f === undefined) return undefined
+  return f.toLowerCase() === "jpg" ? "jpeg" : f
+}
+
+// Bifrost's ToHuggingFaceImageGenerationRequest for each provider: hf-inference's {inputs} (the model set to the mapped id
+// by the caller), fal-ai's options (num_images, image_size, sync_mode for b64_json, the safety checker off for moderation
+// low, its extra params), nebius's (width and height, response_extension, loras) and together's OpenAI-like body.
+export function imageBody(provider: string, model: string, fs: Field[]): string throws SyntaxError {
+  const prompt = rawStr(fs, "prompt") ?? ""
+  if (prompt === "") throw new SyntaxError("the request needs a prompt")
+  let out: string[] = []
+  const size = rawStr(fs, "size") ?? ""
+  const rf = rawStr(fs, "response_format")
+  if (provider === "hf-inference") return `{"inputs":${quote(prompt)}}`
+  if (provider === "fal-ai") {
+    out.push(`"prompt":${quote(prompt)}`)
+    pushRaw(&out, "num_images", intRaw(fs, "n"))
+    pushStr(&out, "response_format", rf)
+    const sz = sizeOf(size)
+    if (sz !== undefined) out.push(`"image_size":{"width":${sz.w},"height":${sz.h}}`)
+    pushStr(&out, "negative_prompt", rawStr(fs, "negative_prompt"))
+    pushRaw(&out, "guidance_scale", find(fs, "guidance_scale"))
+    pushRaw(&out, "num_inference_steps", intRaw(fs, "num_inference_steps"))
+    pushRaw(&out, "seed", intRaw(fs, "seed"))
+    pushStr(&out, "output_format", falFormat(rawStr(fs, "output_format")))
+    if (rf === "b64_json") out.push(`"sync_mode":true`)
+    let safety = boolRaw(fs, "enable_safety_checker")
+    if (safety === undefined && rawStr(fs, "moderation") === "low") safety = "false"
+    pushRaw(&out, "enable_safety_checker", safety)
+    pushStr(&out, "acceleration", rawStr(fs, "acceleration"))
+    pushRaw(&out, "enable_prompt_expansion", boolRaw(fs, "enable_prompt_expansion"))
+    return "{" + out.join(",") + "}"
+  }
+  if (provider === "nebius") {
+    out.push(`"model":${quote(model)}`)
+    out.push(`"prompt":${quote(prompt)}`)
+    const loras = find(fs, "loras")
+    if (loras !== undefined && loras.startsWith("[")) {
+      const ls: string[] = []
+      for (const el of try elements(loras)) {
+        if (!el.startsWith("{")) continue
+        const lf = try fields(el)
+        const u = rawStr(lf, "url")
+        const sc = rawNum(lf, "scale")
+        if (u !== undefined && sc !== undefined) ls.push(`{"url":${quote(u)},"scale":${Math.floor(sc)}}`)
+      }
+      if (ls.length > 0) out.push(`"loras":[${ls.join(",")}]`)
+    }
+    if (size !== "" && size.toLowerCase() !== "auto") {
+      const sz = sizeOf(size)
+      if (sz === undefined) throw new SyntaxError(`invalid size format: expected 'WIDTHxHEIGHT', got ${quote(size)}`)
+      out.push(`"width":${sz.w}`)
+      out.push(`"height":${sz.h}`)
+    }
+    pushRaw(&out, "num_inference_steps", intRaw(fs, "num_inference_steps"))
+    pushRaw(&out, "seed", intRaw(fs, "seed"))
+    pushRaw(&out, "guidance_scale", intRaw(fs, "guidance_scale"))
+    pushStr(&out, "negative_prompt", rawStr(fs, "negative_prompt"))
+    let ext = rawStr(fs, "output_format")
+    if (ext !== undefined && ext.toLowerCase() === "jpeg") ext = "jpg"
+    pushStr(&out, "response_extension", ext)
+    pushStr(&out, "response_format", rf)
+    return "{" + out.join(",") + "}"
+  }
+  if (provider === "together") {
+    out.push(`"prompt":${quote(prompt)}`)
+    out.push(`"model":${quote(model)}`)
+    pushStr(&out, "response_format", rf === "b64_json" ? "base64" : rf)
+    pushStr(&out, "size", size === "" ? undefined : size)
+    pushRaw(&out, "n", intRaw(fs, "n"))
+    pushRaw(&out, "steps", intRaw(fs, "num_inference_steps"))
+    return "{" + out.join(",") + "}"
+  }
+  throw new SyntaxError(`unsupported inference provider for image generation: ${provider === "" ? "(none)" : provider}`)
+}
+
+function imageItem(fs: Field[]): string {
+  const parts: string[] = []
+  const u = rawStr(fs, "url") ?? ""
+  if (u !== "") parts.push(`"url":${quote(u)}`)
+  const b = rawStr(fs, "b64_json") ?? ""
+  if (b !== "") parts.push(`"b64_json":${quote(b)}`)
+  const rp = rawStr(fs, "revised_prompt") ?? ""
+  if (rp !== "") parts.push(`"revised_prompt":${quote(rp)}`)
+  return "{" + parts.join(",") + "}"
+}
+
+// A JSON image answer as OpenAI's images body: fal-ai's images (or data.images), nebius's and together's data list.
+export function imageToOpenAI(provider: string, text: string, created: int): string throws SyntaxError {
+  const fs = try fields(text)
+  let list = provider === "fal-ai" ? find(fs, "images") : find(fs, "data")
+  if (provider === "fal-ai" && (list === undefined || !list.startsWith("[") || list.trim() === "[]")) {
+    const d = find(fs, "data")
+    if (d !== undefined && d.startsWith("{")) list = find(try fields(d), "images")
+  }
+  const items: string[] = []
+  if (list !== undefined && list.startsWith("[")) {
+    for (const el of try elements(list)) {
+      if (el.startsWith("{")) items.push(imageItem(try fields(el)))
+    }
+  }
+  return `{"created":${created},"data":[${items.join(",")}]}`
+}
+
+// hf-inference answers with the image's bytes: one b64_json item.
+export function imageBytesToOpenAI(bytes: u8[], created: int): string {
+  return `{"created":${created},"data":[{"b64_json":${quote(base64.encode(bytes))}}]}`
+}
+
+// The image's MIME type from its first bytes (http.DetectContentType's image types).
+export function imageMimeOf(b: u8[]): string {
+  const byte = (i: int): int => (i < b.length ? int(b[i]!) : 0)
+  const a = byte(0)
+  const c = byte(1)
+  if (a === 0xff && c === 0xd8) return "image/jpeg"
+  if (a === 0x47 && c === 0x49) return "image/gif"
+  if (a === 0x52 && c === 0x49 && byte(8) === 0x57) return "image/webp"
+  if (a === 0x89 && c === 0x50) return "image/png"
+  return "application/octet-stream"
+}
+
+const FAL_MULTI_IMAGE = ["fal-ai/flux-2/edit", "fal-ai/flux-2-pro/edit"]
+const FAL_SINGLE_IMAGE = ["fal-ai/flux-pro/kontext", "fal-ai/flux/dev/image-to-image"]
+
+// Bifrost's ToHuggingFaceImageEditRequest (fal-ai only): the images as data URLs in image_urls (multi-image models) or
+// image_url (single-image ones, or one image), use_image_urls overriding, and the generation options. get reads the
+// form's text fields.
+export function editBody(model: string, images: u8[][], get: (key: string) => string | undefined): string throws SyntaxError {
+  const urls: string[] = []
+  for (const b of images) {
+    if (b.length > 0) urls.push("data:" + imageMimeOf(b) + ";base64," + base64.encode(b))
+  }
+  if (urls.length === 0) throw new SyntaxError("at least one image is required")
+  let out: string[] = [`"prompt":${quote(get("prompt") ?? "")}`]
+  const quoted = urls.map((u) => quote(u))
+  const over = get("use_image_urls") ?? ""
+  let multi = urls.length > 1
+  if (over === "true") multi = true
+  else if (over === "false") {
+    if (urls.length > 1) throw new SyntaxError(`use_image_urls is false but multiple images provided (${urls.length} images)`)
+    multi = false
+  } else if (FAL_MULTI_IMAGE.includes(model)) multi = true
+  else if (FAL_SINGLE_IMAGE.includes(model)) {
+    if (urls.length > 1) throw new SyntaxError(`model ${model} only supports single image, got ${urls.length} images`)
+    multi = false
+  }
+  if (multi) out.push(`"image_urls":[${quoted.join(",")}]`)
+  else out.push(`"image_url":${quoted[0]!}`)
+  const num = (k: string): string | undefined => {
+    const v = get(k) ?? ""
+    if (v === "") return undefined
+    const n = parseFloat(v)
+    return n === undefined ? undefined : v
+  }
+  const whole = (k: string): string | undefined => {
+    const v = num(k)
+    if (v === undefined) return undefined
+    const n = parseFloat(v)!
+    return Math.floor(n) === n ? `${Math.floor(n)}` : undefined
+  }
+  pushRaw(&out, "num_images", whole("n"))
+  const sz = sizeOf(get("size") ?? "")
+  if (sz !== undefined) out.push(`"image_size":{"width":${sz.w},"height":${sz.h}}`)
+  pushRaw(&out, "guidance_scale", num("guidance_scale"))
+  pushRaw(&out, "num_inference_steps", whole("num_inference_steps"))
+  pushRaw(&out, "seed", whole("seed"))
+  const of = get("output_format") ?? ""
+  pushStr(&out, "output_format", of === "" ? undefined : falFormat(of))
+  if ((get("response_format") ?? "") === "b64_json") out.push(`"sync_mode":true`)
+  const es = get("enable_safety_checker") ?? ""
+  if (es === "true" || es === "false") out.push(`"enable_safety_checker":${es}`)
+  const acc = get("acceleration") ?? ""
+  pushStr(&out, "acceleration", acc === "" ? undefined : acc)
+  return "{" + out.join(",") + "}"
+}
+
+// ---- fal-ai image streams ----
+
+function sseEvent(type: string, data: string): string {
+  return `event: ${type}\ndata: ${data}\n\n`
+}
+
+// A fal-ai image stream (POST /fal-ai/<model>/stream) as Bifrost's ImageGenerationStream and ImageEditStream relay it:
+// each image of each event (images, or data.images) is an "<kind>.partial_image" event with its url or b64_json, and
+// when the stream ends the last image again as "<kind>.completed"; an event that carries an error or a message ends the
+// stream with an error event. Events go out as OpenAI's image stream frames (an event line, no [DONE]). kind is
+// image_generation or image_edit. push takes whole lines of the upstream body.
+export class FalStream {
+  kind = "image_generation"
+  pending = ""
+  sent = 0
+  last = ""
+  failed = false
+  created = 0
+
+  constructor(kind: string, created: int) {
+    this.kind = kind
+    this.created = created
+  }
+
+  private onData(data: string): string {
+    if (this.failed) return ""
+    let fs: Field[] = []
+    try {
+      fs = fields(data)
+    } catch (e) {
+      // an event that is not JSON is skipped, as Bifrost skips it
+      return ""
+    }
+    const er = rawStr(fs, "error") ?? ""
+    const msg = rawStr(fs, "message") ?? ""
+    if (er !== "" || msg !== "") {
+      this.failed = true
+      return sseEvent("error", `{"type":"error","error":{"message":${quote(er !== "" ? er : msg)}}}`)
+    }
+    let list = find(fs, "images")
+    const d = find(fs, "data")
+    if (d !== undefined && d.startsWith("{")) {
+      try {
+        const inner = find(fields(d), "images")
+        if (inner !== undefined && inner.startsWith("[") && inner.trim() !== "[]") list = inner
+      } catch (e) {
+        // keep the top-level images
+      }
+    }
+    if (list === undefined || !list.startsWith("[")) return ""
+    let out = ""
+    try {
+      for (const el of elements(list)) {
+        if (!el.startsWith("{")) continue
+        const img = fields(el)
+        const u = rawStr(img, "url") ?? ""
+        const b = rawStr(img, "b64_json") ?? ""
+        const payload = u !== "" ? `"url":${quote(u)}` : `"b64_json":${quote(b)}`
+        this.last = payload
+        this.sent += 1
+        out += sseEvent(this.kind + ".partial_image", `{"type":"${this.kind}.partial_image",${payload},"created_at":${this.created}}`)
+      }
+    } catch (e) {
+      return out
+    }
+    return out
+  }
+
+  // Lines of the upstream body (the text up to and with its last newline); what goes to the caller for them.
+  push(text: string): string {
+    let out = ""
+    const all = this.pending + text
+    const lines = all.split("\n")
+    this.pending = lines[lines.length - 1]!
+    for (let i = 0; i < lines.length - 1; i++) {
+      let line = lines[i]!
+      if (line.endsWith("\r")) line = line.slice(0, line.byteLength - 1)
+      if (!line.startsWith("data:")) continue
+      const data = line.slice(5).trim()
+      if (data === "" || data === "[DONE]") continue
+      out += this.onData(data)
+    }
+    return out
+  }
+
+  // The end of the stream: the completed event with the last image, unless the stream failed or sent none.
+  finish(): string {
+    let out = ""
+    if (this.pending.trim() !== "") out += this.push("\n")
+    if (this.failed || this.sent === 0) return out
+    return out + sseEvent(this.kind + ".completed", `{"type":"${this.kind}.completed",${this.last},"created_at":${this.created}}`)
+  }
+}
+
+// A FalStream (callers in other modules cannot construct a class through its module name).
+export function falStream(kind: string, created: int): FalStream {
+  return new FalStream(kind, created)
+}
+
+// ---- tests ----
+
+test("a fal-ai image stream becomes partial events and a completed one, or ends on an error", () => {
+  const s = new FalStream("image_generation", 7)
+  const a = s.push(`data: {"images":[{"url":"https://f/1.png"}]}\n\nda`)
+  expect(a).toBe(`event: image_generation.partial_image\ndata: {"type":"image_generation.partial_image","url":"https://f/1.png","created_at":7}\n\n`)
+  const b = s.push(`ta: {"data":{"images":[{"b64_json":"QUJD"}]}}\n\n`)
+  expect(b.includes(`"b64_json":"QUJD"`)).toBe(true)
+  expect(s.finish()).toBe(`event: image_generation.completed\ndata: {"type":"image_generation.completed","b64_json":"QUJD","created_at":7}\n\n`)
+  const e = new FalStream("image_edit", 1)
+  expect(e.push(`data: {"error":"bad prompt"}\n\ndata: {"images":[{"url":"u"}]}\n\n`)).toBe(`event: error\ndata: {"type":"error","error":{"message":"bad prompt"}}\n\n`)
+  expect(e.finish()).toBe("")
+  const none = new FalStream("image_edit", 1)
+  expect(none.push("data: not json\n\n")).toBe("")
+  expect(none.finish()).toBe("")
+})
+
+function hfTarget(model: string): Target {
+  return { provider: "huggingface", kind: "huggingface", model: model, key: { value: "hf-key" }, cfg: {} }
+}
+
+test("model names split as Bifrost splits them, and chat names the provider after the hub id", () => {
+  const a = try splitModel("fal-ai/fal-ai/flux/dev")
+  expect(a.provider).toBe("fal-ai")
+  expect(a.model).toBe("fal-ai/flux/dev")
+  const b = try splitModel("meta-llama/Llama-3.1-8B-Instruct")
+  expect(b.provider).toBe("")
+  expect(b.model).toBe("meta-llama/Llama-3.1-8B-Instruct")
+  let threw = false
+  try {
+    try splitModel("gpt2")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  expect(chatModel("cerebras/meta-llama/Llama-3.3-70B-Instruct")).toBe("meta-llama/Llama-3.3-70B-Instruct:cerebras")
+  expect(chatModel("meta-llama/Llama-3.1-8B-Instruct:groq")).toBe("meta-llama/Llama-3.1-8B-Instruct:groq")
+  expect(chatModel("gpt2")).toBe("gpt2")
+})
+
+test("the hub mapping is read and checked for the task", () => {
+  const m = try parseMappings(`{"_id":"x","id":"BAAI/bge-m3","pipeline_tag":"feature-extraction","inferenceProviderMapping":{"hf-inference":{"status":"live","providerId":"BAAI/bge-m3","task":"feature-extraction"},"nebius":{"status":"live","providerId":"BAAI/bge-m3-nb","task":"feature-extraction"},"fal-ai":{"providerId":"fal/x","task":"text-to-image"}}}`)
+  expect(m.size).toBe(3)
+  expect(providerModelId(m, "nebius", "feature-extraction", "embedding").id).toBe("BAAI/bge-m3-nb")
+  expect(providerModelId(m, "fal-ai", "feature-extraction", "embedding").error.includes("not supported")).toBe(true)
+  expect(providerModelId(m, "sambanova", "feature-extraction", "embedding").error.includes("sambanova")).toBe(true)
+  expect(providerModelId(undefined, "nebius", "feature-extraction", "embedding").error !== "").toBe(true)
+  expect(mappingUrl("https://huggingface.co/", "BAAI/bge-m3")).toBe("https://huggingface.co/api/models/BAAI/bge-m3?expand%5B%5D=inferenceProviderMapping")
+})
+
+test("the hub listing keeps the models that serve something, under their provider", () => {
+  expect(listUrl("https://huggingface.co", "cerebras")).toBe("https://huggingface.co/api/models?direction=-1&full=1&inference_provider=cerebras&limit=200&sort=likes")
+  const ids = try listedModelIds(`[{"_id":"1","modelId":"meta-llama/Llama-3.3-70B-Instruct","pipeline_tag":"text-generation","tags":["conversational"]},{"modelId":"x/3d","pipeline_tag":"image-to-3d","tags":["mesh"]},{"modelId":"BAAI/bge-m3","pipeline_tag":"feature-extraction"},{"id":"y/tts","tags":["TTS"]}]`, "cerebras")
+  expect(ids.join(",")).toBe("cerebras/meta-llama/Llama-3.3-70B-Instruct,cerebras/BAAI/bge-m3,cerebras/y/tts")
+  expect((try listedModelIds(`{"models":[{"modelId":"a/b","pipeline_tag":"text-to-image"}]}`, "fal-ai")).join(",")).toBe("fal-ai/a/b")
+  expect(servesSomething("", ["sentence-transformers"])).toBe(true)
+  expect(servesSomething("image-to-3d", [])).toBe(false)
+})
+
+test("routes follow Bifrost's getInferenceProviderRouteURL", () => {
+  expect(routePath("hf-inference", "m/x", "embeddings")).toBe("/hf-inference/models/m/x/pipeline/feature-extraction")
+  expect(routePath("hf-inference", "m/x", "speech")).toBe("/hf-inference/models/m/x/pipeline/text-to-speech")
+  expect(routePath("hf-inference", "m/x", "transcription")).toBe("/hf-inference/models/m/x")
+  expect(routePath("hf-inference", "m/x", "images")).toBe("/hf-inference/models/m/x")
+  expect(routePath("fal-ai", "fal-ai/flux/dev", "images")).toBe("/fal-ai/fal-ai/flux/dev")
+  expect(routePath("nebius", "m", "embeddings")).toBe("/nebius/v1/embeddings")
+  expect(routePath("nebius", "m", "speech")).toBe("")
+  expect(routePath("together", "m", "images")).toBe("/together/v1/images/generations")
+  expect(routePath("together", "m", "embeddings")).toBe("")
+  expect(routePath("sambanova", "m", "embeddings")).toBe("/sambanova/v1/embeddings")
+  expect(routePath("scaleway", "m", "embeddings")).toBe("/scaleway/v1/embeddings")
+  expect(routePath("replicate", "m", "speech")).toBe("/replicate/v1/prediction")
+  expect(routePath("cerebras", "m", "embeddings")).toBe("")
+  expect(routePath("", "m", "embeddings")).toBe("")
+})
+
+test("embeddings: hf-inference takes inputs, the others input with provider and model; the mapped id is the model", () => {
+  const body = try fields(`{"model":"huggingface/nebius/BAAI/bge-m3","input":["a","b"],"dimensions":256,"normalize":true,"user":"u"}`)
+  expect(try embeddingsBody("nebius", "BAAI/bge-m3", body, "BAAI/bge-m3-nb")).toBe(`{"input":["a","b"],"provider":"nebius","model":"BAAI/bge-m3-nb","normalize":true,"dimensions":256}`)
+  const one = try fields(`{"input":["only"]}`)
+  expect(try embeddingsBody("hf-inference", "BAAI/bge-m3", one, "BAAI/bge-m3")).toBe(`{"inputs":"only","model":"BAAI/bge-m3"}`)
+  let threw = false
+  try {
+    try embeddingsBody("nebius", "m", try fields(`{"input":[1,2,3]}`), "m")
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  storeMappings("BAAI/bge-m3", try parseMappings(`{"inferenceProviderMapping":{"hf-inference":{"providerId":"BAAI/bge-m3","task":"feature-extraction"}}}`))
+  const up = try embeddingsRequest(hfTarget("hf-inference/BAAI/bge-m3"), one)
+  expect(up.url).toBe("https://router.huggingface.co/hf-inference/models/BAAI/bge-m3/pipeline/feature-extraction")
+  expect(up.headers.get("authorization")).toBe("Bearer hf-key")
+  forgetMappings("BAAI/bge-m3")
+  let missing = false
+  try {
+    try embeddingsRequest(hfTarget("hf-inference/BAAI/bge-m3"), one)
+  } catch (e) {
+    missing = true
+  }
+  expect(missing).toBe(true)
+})
+
+test("embedding answers in every shape become OpenAI's list", () => {
+  const two = try embeddingsResponse("[[0.1,0.2],[0.3,0.4]]", "huggingface/hf-inference/m")
+  expect(two.body).toBe(`{"object":"list","data":[{"object":"embedding","embedding":[0.1,0.2],"index":0},{"object":"embedding","embedding":[0.3,0.4],"index":1}],"model":"huggingface/hf-inference/m","usage":{"prompt_tokens":0,"total_tokens":0}}`)
+  const one = try embeddingsResponse("[0.5,0.6]", "x")
+  expect(one.body.includes(`"data":[{"object":"embedding","embedding":[0.5,0.6],"index":0}]`)).toBe(true)
+  const obj = try embeddingsResponse(`{"data":[{"embedding":[1],"index":0}],"model":"up","usage":{"prompt_tokens":3,"total_tokens":3}}`, "req")
+  expect(obj.promptTokens).toBe(3)
+  expect(obj.body.includes(`"model":"req"`)).toBe(true)
+})
+
+test("speech and transcription bodies follow Bifrost's", () => {
+  const sp = try speechBody("fal-ai", "hexgrad/Kokoro-82M", try fields(`{"model":"x","input":"hi there","voice":"af","temperature":0.7,"do_sample":true}`))
+  expect(sp).toBe(`{"text":"hi there","provider":"fal-ai","model":"hexgrad/Kokoro-82M","parameters":{"generation_parameters":{"do_sample":true,"temperature":0.7}}}`)
+  expect(try speechBody("replicate", "m", try fields(`{"input":"x"}`))).toBe(`{"text":"x","provider":"replicate","model":"m"}`)
+  const au = try speechAudio(`{"audio":{"url":"https://v3.fal.media/a.wav","content_type":"audio/wav"}}`)
+  expect(au.url).toBe("https://v3.fal.media/a.wav")
+  expect(au.contentType).toBe("audio/wav")
+  const mp3: u8[] = [0x49, 0x44, 0x33, 0x04, 0x00]
+  const wav: u8[] = [0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x41, 0x56, 0x45]
+  expect(audioMimeOf(mp3)).toBe("audio/mpeg")
+  expect(audioMimeOf(wav)).toBe("audio/wav")
+  expect(audioMimeOf([0x4f, 0x67, 0x67, 0x53, 0])).toBe("audio/ogg")
+  const none = (k: string): string | undefined => undefined
+  expect(try transcriptionBody("fal-ai", "openai/whisper-large-v3", mp3, none)).toBe(`{"audio_url":"data:audio/mpeg;base64,SUQzBAA="}`)
+  let refused = false
+  try {
+    try transcriptionBody("fal-ai", "m", wav, none)
+  } catch (e) {
+    refused = e.message.includes("audio/wav")
+  }
+  expect(refused).toBe(true)
+  const ts = (k: string): string | undefined => (k === "return_timestamps" ? "true" : k === "max_new_tokens" ? "64" : undefined)
+  expect(try transcriptionBody("replicate", "m", mp3, ts)).toBe(`{"inputs":"SUQzBAA=","provider":"replicate","model":"m","parameters":{"generation_parameters":{"max_new_tokens":64},"return_timestamps":true}}`)
+  expect(try transcriptionToOpenAI(`{"text":"hello world","chunks":[{"text":"hello","timestamp":[0.0,0.5]},{"text":" world","timestamp":[0.5,1.25]}]}`)).toBe(`{"text":"hello world","segments":[{"id":0,"start":0.0,"end":0.5,"text":"hello"},{"id":1,"start":0.5,"end":1.25,"text":" world"}]}`)
+  expect(try transcriptionToOpenAI(`{"text":"hi"}`)).toBe(`{"text":"hi"}`)
+})
+
+test("image bodies per provider follow Bifrost's converters", () => {
+  const fs = try fields(`{"model":"x","prompt":"a cat","n":2,"size":"1024x768","response_format":"b64_json","output_format":"jpg","moderation":"low","seed":7,"guidance_scale":3.5,"num_inference_steps":20}`)
+  expect(try imageBody("fal-ai", "fal-ai/flux/dev", fs)).toBe(`{"prompt":"a cat","num_images":2,"response_format":"b64_json","image_size":{"width":1024,"height":768},"guidance_scale":3.5,"num_inference_steps":20,"seed":7,"output_format":"jpeg","sync_mode":true,"enable_safety_checker":false}`)
+  expect(try imageBody("hf-inference", "m", fs)).toBe(`{"inputs":"a cat"}`)
+  expect(try imageBody("nebius", "black-forest-labs/flux-schnell", try fields(`{"prompt":"p","size":"512x512","output_format":"jpeg","loras":[{"url":"https://l/1","scale":2}]}`))).toBe(`{"model":"black-forest-labs/flux-schnell","prompt":"p","loras":[{"url":"https://l/1","scale":2}],"width":512,"height":512,"response_extension":"jpg"}`)
+  expect(try imageBody("together", "black-forest-labs/FLUX.1-schnell", fs)).toBe(`{"prompt":"a cat","model":"black-forest-labs/FLUX.1-schnell","response_format":"base64","size":"1024x768","n":2,"steps":20}`)
+  let bad = false
+  try {
+    try imageBody("nebius", "m", try fields(`{"prompt":"p","size":"big"}`))
+  } catch (e) {
+    bad = true
+  }
+  expect(bad).toBe(true)
+  let unsupported = false
+  try {
+    try imageBody("cerebras", "m", fs)
+  } catch (e) {
+    unsupported = true
+  }
+  expect(unsupported).toBe(true)
+})
+
+test("image answers become OpenAI's images body", () => {
+  expect(try imageToOpenAI("fal-ai", `{"images":[{"url":"https://f/1.png","width":1},{"b64_json":"QUJD"}],"seed":1}`, 5)).toBe(`{"created":5,"data":[{"url":"https://f/1.png"},{"b64_json":"QUJD"}]}`)
+  expect(try imageToOpenAI("fal-ai", `{"data":{"images":[{"url":"u"}]}}`, 5)).toBe(`{"created":5,"data":[{"url":"u"}]}`)
+  expect(try imageToOpenAI("together", `{"data":[{"b64_json":"Zg=="}]}`, 1)).toBe(`{"created":1,"data":[{"b64_json":"Zg=="}]}`)
+  expect(imageBytesToOpenAI([0x89, 0x50], 2)).toBe(`{"created":2,"data":[{"b64_json":"iVA="}]}`)
+})
+
+test("edit bodies pick image_url or image_urls as Bifrost does", () => {
+  const png: u8[] = [0x89, 0x50, 0x4e, 0x47]
+  const get = (k: string): string | undefined => (k === "prompt" ? "make it blue" : k === "size" ? "512x512" : k === "output_format" ? "jpg" : k === "n" ? "1" : undefined)
+  expect(try editBody("fal-ai/flux-pro/kontext", [png], get)).toBe(`{"prompt":"make it blue","image_url":"data:image/png;base64,iVBORw==","num_images":1,"image_size":{"width":512,"height":512},"output_format":"jpeg"}`)
+  expect((try editBody("fal-ai/flux-2/edit", [png], get)).includes(`"image_urls":["data:image/png;base64,iVBORw=="]`)).toBe(true)
+  expect((try editBody("fal-ai/other", [png, png], get)).includes(`"image_urls":[`)).toBe(true)
+  let single = false
+  try {
+    try editBody("fal-ai/flux-pro/kontext", [png, png], get)
+  } catch (e) {
+    single = e.message.includes("only supports single image")
+  }
+  expect(single).toBe(true)
+  const over = (k: string): string | undefined => (k === "use_image_urls" ? "true" : undefined)
+  expect((try editBody("fal-ai/flux-pro/kontext", [png], over)).includes(`"image_urls"`)).toBe(true)
+})

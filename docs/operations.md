@@ -81,14 +81,18 @@ Shared between the workers of one node only:
 
 Kept per node:
 
-- The request log and the audit log. `/api/logs` and `/api/audit-logs` answer from the node that
-  is asked.
+- The request log files and the audit log. `/api/audit-logs` answers from the node that is asked. `/api/logs` (the
+  list, one log, stats, sessions, histograms, rankings, dashboard, filterdata) and `/api/mcp-logs` answer with every
+  node's rows: the node asked fetches its peers' rows for the read over the signed `POST /api/cluster/logs` (a few
+  seconds at most per peer; a peer that does not answer is left out). `cluster.log_reads: false` answers with the
+  node's own rows. Broker mode has no peer addresses, so each node reads its own rows there. Deletes and the cost
+  recalculation act on the node asked.
 - The MCP client connections and their tool lists. Each node connects to each MCP server itself.
 - The config file itself, unless the nodes share it.
 
 ## Securing cluster traffic
 
-Cluster traffic (`/api/cluster/sync`, `/api/cluster/feed`, `/api/cluster/config`, the broker) is
+Cluster traffic (`/api/cluster/sync`, `/api/cluster/feed`, `/api/cluster/config`, `/api/cluster/logs`, the broker) is
 signed with HMAC-SHA256 using `cluster.secret`, but it is plain HTTP. Anyone who can read the network
 can read the usage data and, with `config_sync: "pull"`, the configuration text. That text keeps
 `env.NAME` references as references. Values stored in the file itself are readable unless

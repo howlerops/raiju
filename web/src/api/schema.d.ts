@@ -153,6 +153,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/cluster/logs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * This node's request log rows for a peer answering a log read (cluster peers only, Raiju extra)
+         * @description Each node keeps its own log files, so a node answering /api/logs (the list, one log, stats, sessions, histograms, rankings, dashboard, filterdata) or /api/mcp-logs asks each peer for its rows of the read's window (cluster.log_reads, default true) and answers over its rows and theirs. The answer holds only this node's rows, without bodies for stats and histograms, and a row's reveal mapping only for a read of that one row; the asking node applies the caller's data scope and hidden request types.
+         */
+        post: operations["postApiClusterLogs"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/cluster/sync": {
         parameters: {
             query?: never;
@@ -306,6 +326,126 @@ export interface paths {
         put?: never;
         /** Drop the session token sent in the Authorization header */
         post: operations["postApiSessionLogout"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent/auth/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Whether the CLI can sign in here (users with passwords or single sign-on) and whether inference needs a key */
+        get: operations["getApiAgentAuthStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent/auth/authorize": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The browser sign-in page the CLI opens (a loopback redirect_uri, state and an S256 code_challenge) */
+        get: operations["getApiAgentAuthAuthorize"];
+        put?: never;
+        /** The sign-in form; on success a 302 to the redirect_uri with a one-time code and the state */
+        post: operations["postApiAgentAuthAuthorize"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent/auth/token": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Trade the one-time code and its PKCE verifier for an agent token pair */
+        post: operations["postApiAgentAuthToken"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent/auth/refresh": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Rotate an agent token pair with its refresh token (the old pair stops working) */
+        post: operations["postApiAgentAuthRefresh"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent/auth/logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Revoke the agent token in the Authorization header and its refresh token */
+        post: operations["postApiAgentAuthLogout"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent/virtual-keys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The signed-in user's assigned virtual keys (no values) and the default one */
+        get: operations["getApiAgentVirtualKeys"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent/usage-summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The signed-in user's budgets and rate limits over the assigned keys and the user's own budgets */
+        get: operations["getApiAgentUsageSummary"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1440,7 +1580,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List a team's members (the users whose teams name it), as {members} */
+        /** List a team's members (the users whose teams name it), as {members}, each with its source (manual, or synced from the identity provider) */
         get: operations["getApiGovernanceTeamsIdMembers"];
         put?: never;
         post?: never;
@@ -1688,6 +1828,47 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/governance/business-units/{id}/users": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * A business unit's members with how each was granted, as {users, total}
+         * @description source is manual for an admin's assignment and synced for one the identity provider gave (a mapping rule at sign-in, directory sync or a SCIM push), as Bifrost's member list tells them apart.
+         */
+        get: operations["getApiGovernanceBusinessUnitsIdUsers"];
+        put?: never;
+        /** Add users to a business unit (an admin's assignment), answered with the members */
+        post: operations["postApiGovernanceBusinessUnitsIdUsers"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/governance/business-units/{id}/users/{user_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Remove a user's manual membership of a business unit
+         * @description A membership the identity provider gave (source synced) follows the identity provider and is refused with 409; change the mapping rules or the user's attributes instead.
+         */
+        delete: operations["deleteApiGovernanceBusinessUnitsIdUsersUserId"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/governance/access-profiles": {
         parameters: {
             query?: never;
@@ -1849,6 +2030,177 @@ export interface paths {
          * @description Replaces scim_config.config.provisioningToken (an env. reference included) with a new random token. The identity provider's SCIM connector must be given the new token. Refused with 400 while scim_config.enabled is not true.
          */
         post: operations["postApiScimProvisioningToken"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/scim/provision/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The user provisioning state, as {provider, sync_mode, rules_hash, directory_sync, session_sweep}
+         * @description Raiju: sync_mode is off (no SCIM provisioning token), both or scim (claimsSyncMode); directory_sync says whether directory sync and bulk import are available (the provider's directory credentials are set, enableBulkSync is not off and SCIM provisioning is off) with the reason when not, the bulkSyncInterval in seconds and the next scheduled run; rules_hash is the fingerprint a reconcile checks.
+         */
+        get: operations["getApiScimProvisionStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/scim/provision/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Preview a bulk import: up to 50 directory users a filter selects, with what an import would do to each
+         * @description Lists the identity provider's directory (Okta, Entra through Microsoft Graph, Keycloak, Zitadel or Google Workspace) and returns the users in any of the groups, holding any of the roles, in any of the departments, or named in user_ids (each list ignored when empty), with the plan an import would apply (role, teams, business units, projects and access profiles from the mapping rules) and the groups to filter by. Nothing is saved. Refused with 403 while SCIM provisioning is on.
+         */
+        post: operations["postApiScimProvisionPreview"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/scim/provision/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Bulk import the directory users a filter selects (a background job)
+         * @description Creates or updates the selected users with their mapped role, teams, business units, projects and access profiles; nobody is removed. Answers 202 with the job's operation_id (GET /api/scim/provision/jobs/{operation_id}). Refused with 403 while SCIM provisioning is on and 409 while another sync or import runs.
+         */
+        post: operations["postApiScimProvisionImport"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/scim/provision/sync": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run a directory sync now (the job the bulkSyncInterval schedule runs)
+         * @description Re-reads every user of the directory, creates or updates the active ones through the mapping rules, removes identity-provider users the directory reports inactive, and after a complete listing removes the ones it no longer lists once a lookup confirms them inactive or gone (with their virtual keys and project memberships, and their sessions ended). Users an admin made, users with their own credentials and the last enabled admin are never removed. Answers 202 with the job's operation_id. Refused with 403 while SCIM provisioning is on.
+         */
+        post: operations["postApiScimProvisionSync"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/scim/provision/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The recent provisioning jobs (sync, import, reconcile), newest first, as {jobs} */
+        get: operations["getApiScimProvisionJobs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/scim/provision/jobs/{operation_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One provisioning job (Bifrost's GET /api/scim/provision/jobs/{operation_id}) */
+        get: operations["getApiScimProvisionJobsOperationId"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/scim/provision/reconcile": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reconcile existing users with the current mapping rules (Bifrost's identity reconcile)
+         * @description Re-decides each identity-provider user (all, or user_ids) from the data stored at their last sign-in, directory sync or SCIM push (what SCIM sent, in SCIM-only mode) and saves the result. keep_missing leaves a user whose stored data lacks an attribute the rules read unchanged; otherwise a missing attribute counts as empty. Service accounts, users an admin made and users with no stored data are skipped. rules_hash (from a preview) is checked against the current rules, and a changed one is refused with 409.
+         */
+        post: operations["postApiScimProvisionReconcile"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/scim/provision/reconcile/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Preview a reconcile without saving anything
+         * @description The users who would gain or lose a role, team, business unit, project or access profile (a sample of 50), the ones who would lose every access profile, the counts by action, and the rules_hash to send with the reconcile.
+         */
+        post: operations["postApiScimProvisionReconcilePreview"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/scim/provision/reconcile/preview/user": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** What a reconcile would change for one user ({"user_id"}), as {rules_hash, change} */
+        post: operations["postApiScimProvisionReconcilePreviewUser"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4608,8 +4960,8 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * The A2A calls that reached the agents, newest first
-         * @description Bifrost's filters and answer (its listHistory), {logs, pagination}. group_sessions=true keeps each context's earliest call (with session_child_count, the other calls in the context) unless context_id, task_id or request_id is given; hydrate=true answers each call's detail with its events.
+         * The A2A calls that reached the agents, and their streams' events, newest first
+         * @description Bifrost's filters and answer (its listHistory), {logs, pagination}. Each event of a streamed call is a row of its own (record_kind event) under the call's request_id. group_sessions=true keeps each context's earliest call (with session_child_count, the other calls in the context) unless context_id, task_id or request_id is given; hydrate=true answers each call's detail with its events. Both list calls only.
          */
         get: operations["getApiAgentsHistory"];
         put?: never;
@@ -4696,7 +5048,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** One A2A call (Bifrost's getHistoryEntry); its stored bodies have their credentials redacted */
+        /**
+         * One A2A call or stream event (Bifrost's getHistoryEntry); its stored bodies have their credentials redacted
+         * @description With hydrate=true the answer is the operation the row belongs to (its call's detail with the call's events), as Bifrost's FindAgentLogOperation.
+         */
         get: operations["getApiAgentsHistoryById"];
         put?: never;
         post?: never;
@@ -4911,6 +5266,75 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @description Raiju: what a bulk import or its preview selects; each list is ignored when empty and values are compared without regard to case. */
+        ProvisionFilter: {
+            groups?: string[];
+            roles?: string[];
+            departments?: string[];
+            /** @description Directory ids or account names (addresses) */
+            user_ids?: string[];
+        };
+        ReconcileRequest: {
+            user_ids?: string[];
+            /** @description The one user of a reconcile/preview/user request */
+            user_id?: string;
+            /** @description Leave a user whose stored data lacks an attribute the rules read unchanged (default false) */
+            keep_missing?: boolean;
+            /** @description The rules_hash of the preview; a reconcile under other rules is refused with 409 */
+            rules_hash?: string;
+        };
+        ProvisionListChange: {
+            added?: string[];
+            removed?: string[];
+        };
+        /** @description Raiju: what a sync, import or reconcile does to one user. action is create, update, unchanged, refuse, remove or skip; names are shown for ids the gateway knows. */
+        ProvisionChange: {
+            user?: string;
+            email?: string;
+            action?: string;
+            role_from?: string;
+            role_to?: string;
+            teams?: components["schemas"]["ProvisionListChange"];
+            business_units?: components["schemas"]["ProvisionListChange"];
+            projects?: components["schemas"]["ProvisionListChange"];
+            access_profiles?: components["schemas"]["ProvisionListChange"];
+            loses_all_profiles?: boolean;
+            reason?: string;
+        };
+        ProvisionCounts: {
+            created?: number;
+            updated?: number;
+            unchanged?: number;
+            removed?: number;
+            refused?: number;
+            skipped?: number;
+        };
+        ProvisionJobStarted: {
+            operation_id: string;
+            status: string;
+        };
+        ProvisionJob: {
+            operation_id?: string;
+            /** @enum {string} */
+            operation?: "sync" | "import" | "reconcile";
+            /** @enum {string} */
+            status?: "running" | "completed" | "failed";
+            started_at?: string;
+            finished_at?: string;
+            counts?: components["schemas"]["ProvisionCounts"];
+            changes?: components["schemas"]["ProvisionChange"][];
+            error?: string;
+        };
+        BusinessUnitMembers: {
+            users?: {
+                user_id?: string;
+                user_name?: string;
+                user_email?: string;
+                /** @enum {string} */
+                source?: "manual" | "synced";
+            }[];
+            total?: number;
+        };
         /** @description One MCP server of the library (Bifrost's mcp_library row) */
         McpLibraryEntry: {
             id?: number;
@@ -5137,7 +5561,7 @@ export interface components {
             security_schemes?: string[];
             /** @description Records that the authentication was configured by hand rather than from the card. */
             advanced?: boolean;
-            /** @description How https connections to the card and the agent are checked. The client certificate and key are stored but not used (no client certificates in Raiju's HTTP client). */
+            /** @description How https connections to the card and the agent are checked, and the client certificate and key presented to the agent (both or neither). */
             tls?: {
                 insecure_skip_verify?: boolean;
                 ca_cert_pem?: string;
@@ -5238,7 +5662,7 @@ export interface components {
                 [key: string]: unknown;
             };
         };
-        /** @description One A2A call that reached an agent. */
+        /** @description One A2A call that reached an agent, or one event of a call's stream (record_kind event). */
         AgentCallLog: {
             id?: string;
             /** Format: date-time */
@@ -5247,7 +5671,30 @@ export interface components {
             method?: string;
             /** @description Bifrost's name for method. */
             operation?: string;
-            record_kind?: string;
+            /** @enum {string} */
+            record_kind?: "request" | "event";
+            /** @description The request the row belongs to; a call's stream event rows share their call's. */
+            request_id?: string;
+            /** @description An event row's place in its call's stream (1-based). */
+            event_sequence?: number;
+            /**
+             * @description An event row's type.
+             * @enum {string}
+             */
+            event_type?: "message" | "task" | "status_update" | "artifact_update";
+            /** @description The task state an event row reports. */
+            task_state?: string;
+            message_id?: string;
+            artifact_id?: string;
+            /** @description The media type of the event's first part that names one. */
+            content_type?: string;
+            user_id?: string;
+            team_id?: string;
+            customer_id?: string;
+            /** @description The business unit of the caller's team. */
+            business_unit_id?: string;
+            /** @description The project the request named (x-bf-project-id or -name), when it admitted the caller. */
+            project_id?: string;
             task_id?: string;
             /** @description The caller's binding (JSONRPC, HTTP+JSON, GRPC). */
             downstream_transport?: string;
@@ -5264,7 +5711,7 @@ export interface components {
                 message?: string;
             } | null;
         };
-        /** @description Bifrost's AgentLogHistoryResult. With hydrate=true each row is the call's detail (AgentLogDetail) with its events (always empty here, a stream being one row); with group_sessions=true each context keeps its earliest call, with session_child_count. */
+        /** @description Bifrost's AgentLogHistoryResult. With hydrate=true each row is the call's detail (AgentLogDetail) with its stream's event rows (events, oldest first, each in the same detail shape with its event_body); with group_sessions=true each context keeps its earliest call, with session_child_count. */
         AgentHistory: {
             logs?: components["schemas"]["AgentCallLog"][];
             pagination?: components["schemas"]["AgentHistoryPagination"];
@@ -5416,6 +5863,22 @@ export interface components {
             status_code?: number;
             request_body?: string;
             response_body?: string;
+            /** @description An event row's event, as the caller was sent it (kept when the call's content is). */
+            event_body?: string;
+            event_sequence?: number;
+            event_type?: string;
+            task_state?: string;
+            message_id?: string;
+            artifact_id?: string;
+            content_type?: string;
+            business_unit_id?: string;
+            business_unit_name?: string;
+            project_id?: string;
+            project_name?: string;
+            /** @description With hydrate=true, the call's stream event rows, oldest first. */
+            events?: {
+                [key: string]: unknown;
+            }[];
             error_details?: {
                 [key: string]: unknown;
             };
@@ -6459,6 +6922,67 @@ export interface components {
         McpTopTools: {
             [key: string]: unknown;
         };
+        /** @description The Bifrost CLI's TokenResponse (cli/internal/browserauth). */
+        AgentTokenResponse: {
+            /** @description Starts with ck-bf-agent- */
+            agent_access_token: string;
+            refresh_token: string;
+            token_type?: string;
+            expires_in: number;
+            refresh_expires_in: number;
+            user: {
+                id?: string;
+                name?: string;
+                email?: string;
+            };
+            selected_virtual_key_id?: string;
+            forced_virtual_key_id?: string;
+        };
+        AgentOAuthError: {
+            error: string;
+            error_description?: string;
+            message?: string;
+        };
+        /** @description The Bifrost CLI's VirtualKeyListResponse (cli/internal/agentapi). */
+        AgentVirtualKeyList: {
+            virtual_keys: {
+                id?: string;
+                name?: string;
+                description?: string;
+                is_active?: boolean;
+                providers?: string[];
+                budgets?: {
+                    [key: string]: unknown;
+                }[];
+                budget_limit?: number;
+                budget_consumed?: number;
+                budget_available?: number;
+            }[];
+            selected_virtual_key_id?: string;
+            forced_virtual_key_id?: string;
+        };
+        /** @description The Bifrost CLI's UsageSummaryResponse (cli/internal/agentapi). */
+        AgentUsageSummary: {
+            budgets?: {
+                [key: string]: unknown;
+            }[];
+            rate_limits?: {
+                [key: string]: unknown;
+            }[];
+            budget?: {
+                [key: string]: unknown;
+            };
+            top_models?: {
+                [key: string]: unknown;
+            }[];
+            top_apps?: {
+                [key: string]: unknown;
+            }[];
+            generated_at?: string;
+            window?: {
+                [key: string]: unknown;
+            };
+        };
         /** @description Bifrost MessageResponse. */
         MessageResponse: {
             message: string;
@@ -6928,6 +7452,8 @@ export interface components {
                     [key: string]: unknown;
                 }[];
                 allowed_keys?: string[];
+                /** @description The user who created it through the API (Bifrost's CreatedByUserID); under data access control the creator, the holders of an attached key and the members of an attached key's team or customer see it. */
+                created_by_user_id?: string;
             };
         };
         VirtualMCPView: {
@@ -7572,6 +8098,71 @@ export interface operations {
             };
         };
     };
+    postApiClusterLogs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description The log read's path, such as /api/logs or /api/logs/histogram. */
+                    path: string;
+                    /** @description The log read's query string, without the leading question mark. */
+                    query: string;
+                    /** @description The asking node's clock in epoch milliseconds, from which the read's window is computed. */
+                    now: number;
+                    /** @description The time of the request in epoch milliseconds; more than a minute away from the node's clock is refused. */
+                    ts: number;
+                };
+            };
+        };
+        responses: {
+            /** @description This node's rows for the read, oldest first. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        node?: string;
+                        rows?: {
+                            [key: string]: unknown;
+                        }[];
+                    };
+                };
+            };
+            /** @description The body or a parameter is invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Clustering is off. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
     postApiClusterSync: {
         parameters: {
             query?: never;
@@ -7921,6 +8512,285 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MessageResponse"];
+                };
+            };
+        };
+    };
+    getApiAgentAuthStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        idp_configured: boolean;
+                        virtual_key_auth_enabled: boolean;
+                    };
+                };
+            };
+        };
+    };
+    getApiAgentAuthAuthorize: {
+        parameters: {
+            query: {
+                client_id: string;
+                redirect_uri: string;
+                state: string;
+                code_challenge: string;
+                code_challenge_method: "S256";
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The sign-in page (HTML) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+            /** @description The parameters cannot be used (HTML) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+        };
+    };
+    postApiAgentAuthAuthorize: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/x-www-form-urlencoded": {
+                    client_id?: string;
+                    redirect_uri?: string;
+                    state?: string;
+                    code_challenge?: string;
+                    code_challenge_method?: string;
+                    username?: string;
+                    password?: string;
+                    /** @description A dashboard single sign-on session token (sk-sess-...) in place of a password */
+                    session?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Redirect to redirect_uri?code=...&state=... */
+            302: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The parameters cannot be used (HTML) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+            /** @description The credentials were refused; the form again (HTML) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+        };
+    };
+    postApiAgentAuthToken: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    code: string;
+                    code_verifier: string;
+                    redirect_uri: string;
+                    platform?: string;
+                    agent_version?: string;
+                    device_name?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description The token pair (the CLI's TokenResponse) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentTokenResponse"];
+                };
+            };
+            /** @description invalid_request or invalid_grant (OAuth error body) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentOAuthError"];
+                };
+            };
+            /** @description The refresh token is invalid, expired or already used, or the user is disabled */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentOAuthError"];
+                };
+            };
+        };
+    };
+    postApiAgentAuthRefresh: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    refresh_token: string;
+                };
+            };
+        };
+        responses: {
+            /** @description The token pair (the CLI's TokenResponse) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentTokenResponse"];
+                };
+            };
+            /** @description invalid_request or invalid_grant (OAuth error body) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentOAuthError"];
+                };
+            };
+            /** @description The refresh token is invalid, expired or already used, or the user is disabled */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentOAuthError"];
+                };
+            };
+        };
+    };
+    postApiAgentAuthLogout: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MessageResponse"];
+                };
+            };
+        };
+    };
+    getApiAgentVirtualKeys: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentVirtualKeyList"];
+                };
+            };
+            /** @description The agent token is missing, expired or revoked */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiAgentUsageSummary: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentUsageSummary"];
+                };
+            };
+            /** @description The agent token is missing, expired or revoked */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
                 };
             };
         };
@@ -14501,6 +15371,186 @@ export interface operations {
             };
         };
     };
+    getApiGovernanceBusinessUnitsIdUsers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Business unit id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BusinessUnitMembers"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No such business unit. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiGovernanceBusinessUnitsIdUsers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Business unit id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description Users by name or email */
+                    user_ids?: string[];
+                    user_id?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BusinessUnitMembers"];
+                };
+            };
+            /** @description No user_ids, or a user that does not exist. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No such business unit. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    deleteApiGovernanceBusinessUnitsIdUsersUserId: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Business unit id */
+                id: string;
+                /** @description The user's name or email */
+                user_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        deleted?: string;
+                    };
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No such business unit, or the user is not a member. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The identity provider manages this membership. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
     getApiGovernanceAccessProfiles: {
         parameters: {
             query?: never;
@@ -15506,6 +16556,526 @@ export interface operations {
             };
             /** @description The gateway could not save or read back the record. */
             500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiScimProvisionStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        provider?: string;
+                        /** @enum {string} */
+                        sync_mode?: "off" | "both" | "scim";
+                        rules_hash?: string;
+                        directory_sync?: {
+                            available?: boolean;
+                            reason?: string;
+                            interval_seconds?: number;
+                            next_run_at?: string | null;
+                        };
+                        session_sweep?: boolean;
+                    };
+                };
+            };
+            /** @description scim_config is not enabled or names no provider. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiScimProvisionPreview: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ProvisionFilter"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        users?: {
+                            id?: string;
+                            email?: string;
+                            name?: string;
+                            active?: boolean;
+                            groups?: string[];
+                            exists?: boolean;
+                            plan?: components["schemas"]["ProvisionChange"];
+                        }[];
+                        total?: number;
+                        truncated?: boolean;
+                        groups?: string[];
+                    };
+                };
+            };
+            /** @description Directory access is not configured (the reason is given), or the body is invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role does not cover this route, or SCIM provisioning is on. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiScimProvisionImport: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ProvisionFilter"];
+            };
+        };
+        responses: {
+            /** @description The job started. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProvisionJobStarted"];
+                };
+            };
+            /** @description Directory access is not configured (the reason is given), or the body is invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role does not cover this route, or SCIM provisioning is on. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description A directory sync or import is already running. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiScimProvisionSync: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The job started. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProvisionJobStarted"];
+                };
+            };
+            /** @description Directory access is not configured (the reason is given). */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role does not cover this route, or SCIM provisioning is on. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description A directory sync or import is already running. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiScimProvisionJobs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        jobs?: components["schemas"]["ProvisionJob"][];
+                    };
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiScimProvisionJobsOperationId: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The operation_id a sync or import answered with */
+                operation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProvisionJob"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No such job (the newest 50 are kept). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiScimProvisionReconcile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ReconcileRequest"];
+            };
+        };
+        responses: {
+            /** @description Applied; the job's record with each user's change. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProvisionJob"];
+                };
+            };
+            /** @description scim_config is not enabled, or the body is invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The rules changed since the preview; preview again. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The gateway could not save the result. */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProvisionJob"];
+                };
+            };
+        };
+    };
+    postApiScimProvisionReconcilePreview: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ReconcileRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        rules_hash?: string;
+                        sync_mode?: string;
+                        total?: number;
+                        changed?: number;
+                        counts?: components["schemas"]["ProvisionCounts"];
+                        sample?: components["schemas"]["ProvisionChange"][];
+                        losing_all_profiles?: string[];
+                    };
+                };
+            };
+            /** @description scim_config is not enabled, or the body is invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiScimProvisionReconcilePreviewUser: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReconcileRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        rules_hash?: string;
+                        change?: components["schemas"]["ProvisionChange"];
+                    };
+                };
+            };
+            /** @description user_id is missing, scim_config is not enabled, or the body is invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No such user. */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -25828,6 +27398,8 @@ export interface operations {
                 content: {
                     "application/json": {
                         members?: components["schemas"]["ProjectMember"][];
+                        /** @description Present only on a project with split_policy equal whose roster changed; the job's progress is reported on /ws as redivision_progress events under this id. */
+                        redivision_job_id?: string;
                     };
                 };
             };
@@ -25979,6 +27551,8 @@ export interface operations {
                 content: {
                     "application/json": {
                         deleted?: string;
+                        /** @description Present only on a project with split_policy equal whose roster changed; the job's progress is reported on /ws as redivision_progress events under this id. */
+                        redivision_job_id?: string;
                     };
                 };
             };
@@ -27186,6 +28760,12 @@ export interface operations {
                 request_id?: string;
                 /** @description Text in the agent name, operation, task, context or request id, or the error (not the bodies). */
                 search?: string;
+                /** @description request (the calls) or event (their streams' events); repeated or comma-separated. Unset lists both. */
+                record_kind?: string;
+                /** @description message, task, status_update or artifact_update; repeated or comma-separated. A call matches through its stream's events. */
+                event_type?: string;
+                /** @description Task states; repeated or comma-separated. A call matches by the latest state its stream reported. */
+                task_state?: string;
                 /** @description RFC 3339. */
                 start_time?: string;
                 /** @description RFC 3339. */
@@ -27613,7 +29193,9 @@ export interface operations {
     };
     getApiAgentsHistoryById: {
         parameters: {
-            query?: never;
+            query?: {
+                hydrate?: boolean;
+            };
             header?: never;
             path: {
                 id: string;

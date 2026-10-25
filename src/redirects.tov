@@ -1,0 +1,186 @@
+// Redirects followed by hand (fetch with redirect: "manual") where each hop needs a rule: A2A calls stay on the
+// origin they were sent to (Bifrost's core/agent clientFor), and OpenAPI tool calls that carry credentials neither
+// leave their host nor drop from https to http (Bifrost's openapimcp Executor.clientFor). Each hop is still checked
+// by the runtime's address policy when it connects (the peer option the caller passes).
+
+import { Peer } from "./netguard"
+
+// Go's http.Client stops after ten redirects, as Bifrost's clients do.
+export const MAX_REDIRECTS = 10
+
+export function isRedirect(status: int): bool {
+  return status === 301 || status === 302 || status === 303 || status === 307 || status === 308
+}
+
+// The scheme a URL starts with, lower-cased ("" for a relative reference).
+function schemeOf(s: string): string {
+  const b = new TextEncoder().encode(s)
+  for (let i = 0; i < b.length; i++) {
+    const c = int(b[i]!)
+    const letter = (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+    if (c === 58) return i === 0 ? "" : s.slice(0, i).toLowerCase()
+    if (letter) continue
+    if (i > 0 && ((c >= 48 && c <= 57) || c === 43 || c === 45 || c === 46)) continue
+    return ""
+  }
+  return ""
+}
+
+// The URL a Location header names, resolved against the URL that answered: "" when it is not an http(s) URL.
+export function locationUrl(from: string, location: string): string {
+  const loc = location.trim()
+  if (loc === "") return ""
+  const scheme = schemeOf(loc)
+  if (scheme !== "" && scheme !== "http" && scheme !== "https") return ""
+  const u = URL.parse(loc, from)
+  if (u === undefined) return ""
+  if (u.protocol !== "http:" && u.protocol !== "https:") return ""
+  const href = u.href
+  const hash = href.indexOf("#")
+  return hash < 0 ? href : href.slice(0, hash)
+}
+
+// Whether two URLs have the same scheme, host and port.
+export function sameOrigin(a: string, b: string): bool {
+  const x = URL.parse(a)
+  const y = URL.parse(b)
+  if (x === undefined || y === undefined) return false
+  return x.protocol === y.protocol && x.host === y.host
+}
+
+// Whether two URLs name the same host and port (any scheme).
+export function sameHost(a: string, b: string): bool {
+  const x = URL.parse(a)
+  const y = URL.parse(b)
+  if (x === undefined || y === undefined) return false
+  return x.host === y.host
+}
+
+// The method a redirect continues with (Go's redirectBehavior): 301, 302 and 303 turn anything but GET and HEAD into
+// a GET without the body; 307 and 308 repeat the request as it was.
+export function nextMethod(status: int, method: string): string {
+  if (status === 307 || status === 308) return method
+  if (method === "GET" || method === "HEAD") return method
+  return "GET"
+}
+
+// What a rule says about one hop: "" follows it, "stop" hands the 3xx back as the answer, anything else fails the
+// request with that message.
+export type HopRule = (first: string, next: string) => string
+
+// A2A calls: a redirect must stay on the origin the call was sent to.
+export function sameOriginRule(first: string, next: string): string {
+  return sameOrigin(first, next) ? "" : "upstream redirect must remain on the original origin"
+}
+
+// The rule for an OpenAPI tool call: one that carries credentials (a query, or a header besides Accept and
+// Content-Type) gets a redirect to another host, or from https to http, back as the 3xx; others follow it.
+export function credentialRule(carries: bool): HopRule {
+  return (first: string, next: string): string => {
+    if (!carries) return ""
+    if (!sameHost(first, next)) return "stop"
+    if (first.startsWith("https:") && !next.startsWith("https:")) return "stop"
+    return ""
+  }
+}
+
+// Whether a request carries credentials a redirect could leak: a query, or a header besides Accept and Content-Type.
+export function carriesCredentials(url: string, headers: Map<string, string>): bool {
+  const u = URL.parse(url)
+  if (u !== undefined && u.search !== "") return true
+  for (const k of headers.keys()) {
+    const l = k.toLowerCase()
+    if (l !== "accept" && l !== "content-type") return true
+  }
+  return false
+}
+
+export type Hop = { method: string, url: string, headers: Map<string, string>, body?: string }
+export type HopOpts = { signal: AbortSignal, tls?: { rejectUnauthorized?: bool, ca?: string, cert?: string, key?: string }, peer?: Peer }
+
+// The headers of the next hop: a request that lost its body loses its content headers too.
+function nextHeaders(hs: Map<string, string>, keepBody: bool): Map<string, string> {
+  const out: Map<string, string> = new Map()
+  for (const k of hs.keys()) {
+    const l = k.toLowerCase()
+    if (!keepBody && (l === "content-type" || l === "content-length")) continue
+    out.set(k, hs.get(k)!)
+  }
+  return out
+}
+
+// Sends a request and follows its redirects under rule, at most MAX_REDIRECTS of them.
+export async function fetchFollowing(first: Hop, o: HopOpts, rule: HopRule): Promise<Response> throws Error {
+  let cur = first
+  for (let hop = 0; ; hop++) {
+    const hs: Record<string, string> = cur.headers
+    const b = cur.body
+    let res: Response = new Response()
+    if (b === undefined) res = try await fetch(cur.url, { method: cur.method, headers: hs, signal: o.signal, tls: o.tls, peer: o.peer, redirect: "manual" })
+    else res = try await fetch(cur.url, { method: cur.method, headers: hs, body: b, signal: o.signal, tls: o.tls, peer: o.peer, redirect: "manual" })
+    if (!isRedirect(res.status)) return res
+    const next = locationUrl(cur.url, res.headers.get("location") ?? "")
+    if (next === "") return res
+    const verdict = rule(first.url, next)
+    if (verdict === "stop") return res
+    if (verdict !== "") throw new Error(verdict)
+    if (hop + 1 >= MAX_REDIRECTS) throw new Error(`stopped after ${MAX_REDIRECTS} redirects`)
+    const m = nextMethod(res.status, cur.method)
+    const keep = m === cur.method && b !== undefined
+    cur = { method: m, url: next, headers: nextHeaders(cur.headers, keep), body: keep ? b : undefined }
+  }
+}
+
+// ---- tests ----
+
+test("redirect targets, origins and methods", () => {
+  expect(locationUrl("https://a.example/x/y?q=1", "/z")).toBe("https://a.example/z")
+  expect(locationUrl("https://a.example/x/y", "w#frag")).toBe("https://a.example/x/w")
+  expect(locationUrl("https://a.example/x", "http://b.example:8080/p")).toBe("http://b.example:8080/p")
+  expect(locationUrl("https://a.example/x", "file:///etc/passwd")).toBe("")
+  expect(locationUrl("https://a.example/x", "")).toBe("")
+  expect(sameOrigin("https://A.example/x", "https://a.example:443/y")).toBe(true)
+  expect(sameOrigin("https://a.example/x", "http://a.example/x")).toBe(false)
+  expect(sameOrigin("http://a.example:8080/", "http://a.example:8081/")).toBe(false)
+  expect(sameOrigin("http://a.example/", "http://b.example/")).toBe(false)
+  expect(nextMethod(302, "POST")).toBe("GET")
+  expect(nextMethod(303, "PUT")).toBe("GET")
+  expect(nextMethod(307, "POST")).toBe("POST")
+  expect(nextMethod(308, "DELETE")).toBe("DELETE")
+  expect(nextMethod(301, "HEAD")).toBe("HEAD")
+  expect(isRedirect(304)).toBe(false)
+  expect(isRedirect(308)).toBe(true)
+})
+
+test("the A2A rule keeps a call on its origin", () => {
+  expect(sameOriginRule("https://agent.example/rpc", "https://agent.example/v2/rpc")).toBe("")
+  expect(sameOriginRule("https://agent.example/rpc", "https://evil.example/rpc")).toBe("upstream redirect must remain on the original origin")
+  expect(sameOriginRule("https://agent.example/rpc", "http://agent.example/rpc")).toBe("upstream redirect must remain on the original origin")
+})
+
+test("the OpenAPI rule hands back a credential-bearing redirect off its host or to plain http", () => {
+  const hs: Map<string, string> = new Map()
+  hs.set("Accept", "application/json")
+  hs.set("Content-Type", "application/json")
+  expect(carriesCredentials("https://api.example/v1/x", hs)).toBe(false)
+  expect(carriesCredentials("https://api.example/v1/x?key=1", hs)).toBe(true)
+  hs.set("X-Api-Key", "k")
+  expect(carriesCredentials("https://api.example/v1/x", hs)).toBe(true)
+  const carrying = credentialRule(true)
+  expect(carrying("https://api.example/a", "https://api.example/b")).toBe("")
+  expect(carrying("https://api.example/a", "https://other.example/b")).toBe("stop")
+  expect(carrying("https://api.example/a", "http://api.example/b")).toBe("stop")
+  expect(carrying("http://api.example/a", "https://api.example/b")).toBe("")
+  const plain = credentialRule(false)
+  expect(plain("https://api.example/a", "http://other.example/b")).toBe("")
+})
+
+test("a hop without its body drops the content headers", () => {
+  const hs: Map<string, string> = new Map()
+  hs.set("Content-Type", "application/json")
+  hs.set("authorization", "Bearer t")
+  const dropped = nextHeaders(hs, false)
+  expect(dropped.has("Content-Type")).toBe(false)
+  expect(dropped.get("authorization")).toBe("Bearer t")
+  expect(nextHeaders(hs, true).has("Content-Type")).toBe(true)
+})

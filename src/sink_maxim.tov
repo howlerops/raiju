@@ -1,48 +1,37 @@
-// Maxim observability sink. The request goes to the SDK log endpoint that
-// maxim-go's PushLogs uses: POST {base}/api/sdk/v3/log?id={repoId} with the
-// x-maxim-api-key header and a body of one serialized commit per line. Each log
-// entry becomes a trace (create) and a generation (update) with its tokens,
-// cost and latency. The line envelope (entity, id, action, data) follows the
-// action names maxim-go commits; its Serialize method was not readable, so the
-// envelope keys are inferred and not verified against a live repository.
-// The x-bf-maxim-* headers of a request set the trace and generation ids and
-// names, the session and the tags, as Bifrost's Maxim plugin reads them (reqlog.tov).
-import { LogEntry } from "./logstore"
+// Maxim observability sink: the trace Bifrost's Maxim plugin (plugins/maxim) writes for each request, sent as
+// maxim-go's logger sends it. The request goes to the SDK log endpoint that maxim-go's PushLogs uses: POST
+// {base}/api/sdk/v3/log?id={repoId} with the x-maxim-api-key header and a body of one commit log per line, each
+// serialized as maxim-go's CommitLog.Serialize writes it: `<entity>{id=<id>,action=<action>,data=<json>}`.
+//
+// Per log entry, in the plugin's order (its PreLLMHook, then PostLLMHook):
+//   trace create (id, name bifrost_<request type> or x-bf-maxim-trace-name, sessionId, startTimestamp),
+//   trace update {input: the latest message}, trace add-generation (id, provider, model, messages,
+//   modelParameters, name), then generation result (the response, or {error}) and generation end, trace end,
+//   and one update {tags: {k: v}} on the generation and on the trace per tag: the x-bf-maxim-* tags, the row's
+//   metadata (dimensions and logging headers) not already set by them, model, upstream_latency_ms and
+//   overhead_latency_ms, and header.<name> for each header the exporter's request_headers named (sensitive ones
+//   REDACTED, as the plugin redacts them).
+// An x-bf-maxim-generation-id names a generation made elsewhere: no trace or generation is created then (the plugin
+// returns early), the result goes to that generation and the trace is ended only when x-bf-maxim-trace-id names it.
+// Realtime turns and the MCP and A2A rows are not traced, as the plugin traces LLM requests only and skips realtime.
+// The messages, the input and the result come from the row's request and response bodies, so they are sent when the
+// exporter includes content (include_content; config_compat sets it for a Bifrost maxim plugin) and the request's
+// content was logged.
+import { LogEntry, kindOf, bifrostRequestType } from "./logstore"
 import { isoMs } from "./exports"
 import { trimSlash } from "./providers/types"
+import { Field, fields, elements, find, rawStr, quote, build } from "./json"
 
 export const MAXIM_BASE = "https://app.getmaxim.ai"
 
 export type MaximRequest = { url: string, method: "POST", headers: Map<string, string>, body: string }
 
-// Trace data and generation data share one shape; a line sets only its own fields.
-type MaximData = {
-  id?: string,
-  name?: string,
-  startTimestamp?: string,
-  provider: string,
-  model: string,
-  status?: int,
-  virtual_key?: string,
-  prompt_tokens?: int,
-  completion_tokens?: int,
-  cost?: f64,
-  latency_ms?: f64,
-  cache_hit?: bool,
-  error?: string,
-  // the trace's session and tags, and the trace a generation belongs to
-  session_id?: string,
-  tags?: Record<string, string>,
-  traceId?: string,
-}
-
-type MaximLine = { entity: string, id: string, action: string, data: MaximData }
-
 // One x-bf-maxim-* attribute the row carries, if the caller sent it.
 function attr(e: LogEntry, name: string): string | undefined {
   const m = e.maxim
   if (m === undefined) return undefined
-  return m.get(name)
+  const v = m.get(name)
+  return v === undefined || v === "" ? undefined : v
 }
 
 // The log repo a row goes to: the x-bf-maxim-log-repo-id it named, else the exporter's own.
@@ -50,51 +39,216 @@ export function repoOf(e: LogEntry, dflt: string): string {
   return attr(e, "log-repo-id") ?? dflt
 }
 
-// The trace tags: the row's metadata (logging headers and dimensions), then the x-bf-maxim-* tags.
-function tagsOf(e: LogEntry): Record<string, string> {
-  const out: Record<string, string> = new Map()
+// One commit log line, as maxim-go's CommitLog.Serialize writes it.
+export function commitLine(entity: string, id: string, action: string, data: string): string {
+  return `${entity}{id=${id},action=${action},data=${data}}`
+}
+
+// Whether a row is traced: an LLM request that is not a realtime turn.
+export function traced(e: LogEntry): bool {
+  return kindOf(e) === "llm" && e.op !== "realtime"
+}
+
+// The request body's fields, or none when it was not kept or is not a JSON object.
+function bodyFields(raw: string | undefined): Field[] {
+  if (raw === undefined || !raw.trimStart().startsWith("{")) return []
+  try {
+    return fields(raw)
+  } catch (e) {
+    return []
+  }
+}
+
+// The text a message's content gives as the latest message: a string as it is, else its last text block, else "-"
+// (the plugin's placeholder).
+function latestText(content: string | undefined): string {
+  if (content === undefined) return "-"
+  try {
+    if (content.startsWith("\"")) return rawStr([{ key: "c", raw: content }], "c") ?? "-"
+    if (content.startsWith("[")) {
+      const parts = elements(content)
+      for (let i = parts.length - 1; i >= 0; i--) {
+        const t = rawStr(fields(parts[i]!), "text")
+        if (t !== undefined) return t
+      }
+    }
+  } catch (e) {
+    return "-"
+  }
+  return "-"
+}
+
+// The generation's messages ([{role, content}] as raw JSON) and the trace's input, from the request body of each
+// request type the plugin reads: chat messages, a text completion's prompt, Responses input items, an image
+// generation's or edit's prompt. Other types have none.
+export function messagesOf(reqType: string, body: Field[]): { messages: string[], latest: string } {
+  const out: string[] = []
+  let latest = ""
+  const base = reqType.endsWith("_stream") ? reqType.slice(0, reqType.byteLength - 7) : reqType
+  try {
+    if (base === "chat_completion") {
+      const ms = elements(find(body, "messages") ?? "[]")
+      for (const m of ms) {
+        const f = fields(m)
+        out.push(`{"role":${quote(rawStr(f, "role") ?? "user")},"content":${find(f, "content") ?? "null"}}`)
+      }
+      if (ms.length > 0) latest = latestText(find(fields(ms[ms.length - 1]!), "content"))
+    } else if (base === "text_completion") {
+      const p = find(body, "prompt") ?? "\"\""
+      out.push(`{"role":"user","content":${p}}`)
+      if (p.startsWith("[")) {
+        for (const s of elements(p)) latest += rawStr([{ key: "s", raw: s }], "s") ?? ""
+      } else {
+        latest = rawStr([{ key: "p", raw: p }], "p") ?? ""
+      }
+    } else if (base === "responses") {
+      const input = find(body, "input")
+      if (input !== undefined && input.startsWith("\"")) {
+        out.push(`{"role":"user","content":${input}}`)
+        latest = rawStr([{ key: "i", raw: input }], "i") ?? "-"
+      } else if (input !== undefined && input.startsWith("[")) {
+        const items = elements(input)
+        for (const it of items) {
+          const f = fields(it)
+          const c = find(f, "content")
+          if (c === undefined) continue
+          out.push(`{"role":${quote(rawStr(f, "role") ?? "user")},"content":${c}}`)
+        }
+        latest = items.length === 0 ? "" : latestText(find(fields(items[items.length - 1]!), "content"))
+      }
+    } else if (base === "image_generation" || base === "image_edit") {
+      const p = find(body, "prompt")
+      if (p !== undefined) {
+        out.push(`{"role":"user","content":${p}}`)
+        latest = rawStr([{ key: "p", raw: p }], "p") ?? ""
+      }
+    }
+  } catch (e) {
+    return { messages: out, latest: latest }
+  }
+  return { messages: out, latest: latest }
+}
+
+// The request's parameters (its body without the model, the input and Raiju's routing fields), as the plugin
+// sends the request's Params.
+export function paramsOf(body: Field[]): string {
+  const keep: Field[] = []
+  for (const f of body) {
+    if (["model", "messages", "prompt", "input", "fallbacks", "stream"].includes(f.key)) continue
+    keep.push(f)
+  }
+  return build(keep)
+}
+
+// The model as the plugin names it: without the provider prefix the row may carry (provider/model).
+function bareModel(e: LogEntry): string {
+  const pre = e.provider + "/"
+  return e.provider !== "" && e.model.startsWith(pre) ? e.model.slice(pre.byteLength) : e.model
+}
+
+// The tags of a row, in the order the plugin adds them (a later one with the same name replaces an earlier one in
+// Maxim, as each is its own update): the x-bf-maxim-* tags, the metadata not set by them, the model, the latency
+// split, the request headers (already prefixed header. when the row was made).
+export function tagsOf(e: LogEntry): Field[] {
+  const out: Field[] = []
+  const mt = e.maxim_tags
+  const headers: Field[] = []
+  if (mt !== undefined) {
+    for (const k of mt.keys()) {
+      if (k.startsWith("header.")) headers.push({ key: k, raw: mt.get(k) ?? "" })
+      else out.push({ key: k, raw: mt.get(k) ?? "" })
+    }
+  }
   const md = e.metadata
   if (md !== undefined) {
-    for (const k of md.keys()) out.set(k, md.get(k) ?? "")
+    for (const k of md.keys()) {
+      if (mt !== undefined && mt.has(k)) continue
+      out.push({ key: k, raw: md.get(k) ?? "" })
+    }
   }
-  const mt = e.maxim_tags
-  if (mt !== undefined) {
-    for (const k of mt.keys()) out.set(k, mt.get(k) ?? "")
+  if (e.model !== "") out.push({ key: "model", raw: bareModel(e) })
+  const ov = e.overhead_ms
+  if (ov !== undefined) {
+    const up = Math.max(0, Math.round(e.latency_ms - ov))
+    out.push({ key: "upstream_latency_ms", raw: "" + up })
+    out.push({ key: "overhead_latency_ms", raw: "" + Math.round(ov) })
   }
+  for (const h of headers) out.push(h)
   return out
 }
 
-// The envelope lines for one entry: a trace with its request tags, then a
-// generation with the usage numbers.
+// The generation's error, as the plugin sets it from a Bifrost error: its message, code and type (empty when the
+// answer names none).
+function errorData(e: LogEntry): string {
+  let message = e.error ?? ""
+  let code = ""
+  let type = ""
+  const of = bodyFields(e.output)
+  const er = find(of, "error")
+  if (er !== undefined && er.startsWith("{")) {
+    try {
+      const ef = fields(er)
+      message = rawStr(ef, "message") ?? message
+      code = rawStr(ef, "code") ?? ""
+      type = rawStr(ef, "type") ?? ""
+    } catch (x) {
+      // the row's error text stands
+    }
+  }
+  return `{"result":{"error":{"message":${quote(message)},"code":${quote(code)},"type":${quote(type)}}}}`
+}
+
+// The commit log lines of one row (none for a row the plugin does not trace).
 export function maximLines(e: LogEntry): string[] {
-  const traceId = attr(e, "trace-id") ?? e.request_id
-  const trace: MaximLine = {
-    entity: "trace",
-    id: traceId,
-    action: "create",
-    data: {
-      id: traceId, name: attr(e, "trace-name") ?? e.op, startTimestamp: isoMs(e.ts), provider: e.provider, model: e.model, status: e.status,
-      virtual_key: e.virtual_key ?? "", session_id: attr(e, "session-id"), tags: tagsOf(e),
-    },
+  if (!traced(e)) return []
+  const lines: string[] = []
+  const reqType = bifrostRequestType(e.op, e.streamed === true)
+  const givenGen = attr(e, "generation-id")
+  const givenTrace = attr(e, "trace-id")
+  const traceId = givenTrace ?? (e.request_id !== "" ? e.request_id : e.id)
+  const genId = givenGen ?? e.id
+  const start = isoMs(e.ts)
+  const end = isoMs(e.ts + e.latency_ms)
+  // the trace exists when the plugin made it here or the caller named it
+  const hasTrace = givenGen === undefined || givenTrace !== undefined
+  if (givenGen === undefined) {
+    const body = bodyFields(e.input)
+    const msgs = messagesOf(reqType, body)
+    const session = attr(e, "session-id")
+    const tdata: Field[] = [{ key: "startTimestamp", raw: quote(start) }, { key: "name", raw: quote(attr(e, "trace-name") ?? "bifrost_" + reqType) }]
+    if (session !== undefined) tdata.push({ key: "sessionId", raw: quote(session) })
+    tdata.push({ key: "id", raw: quote(traceId) })
+    lines.push(commitLine("trace", traceId, "create", build(tdata)))
+    lines.push(commitLine("trace", traceId, "update", `{"input":${quote(msgs.latest)}}`))
+    const gdata: Field[] = [{ key: "startTimestamp", raw: quote(start) }]
+    const gname = attr(e, "generation-name")
+    if (gname !== undefined) gdata.push({ key: "name", raw: quote(gname) })
+    gdata.push({ key: "provider", raw: quote(e.provider) })
+    gdata.push({ key: "model", raw: quote(bareModel(e)) })
+    if (msgs.messages.length > 0) gdata.push({ key: "messages", raw: "[" + msgs.messages.join(",") + "]" })
+    const params = paramsOf(body)
+    if (params !== "{}") gdata.push({ key: "modelParameters", raw: params })
+    gdata.push({ key: "id", raw: quote(genId) })
+    lines.push(commitLine("trace", traceId, "add-generation", build(gdata)))
   }
-  const gen: MaximLine = {
-    entity: "generation",
-    id: attr(e, "generation-id") ?? e.id,
-    action: "result",
-    data: {
-      name: attr(e, "generation-name"),
-      traceId: traceId,
-      provider: e.provider,
-      model: e.model,
-      prompt_tokens: e.prompt_tokens,
-      completion_tokens: e.completion_tokens,
-      cost: e.cost,
-      latency_ms: e.latency_ms,
-      cache_hit: e.cache_hit,
-      error: e.error ?? "",
-    },
+  const failed = e.status >= 400 || e.error !== undefined
+  if (failed) {
+    lines.push(commitLine("generation", genId, "result", errorData(e)))
+    lines.push(commitLine("generation", genId, "end", `{"endTimestamp":${quote(end)}}`))
+  } else {
+    const out = e.output
+    if (out !== undefined && out.trimStart().startsWith("{")) {
+      lines.push(commitLine("generation", genId, "result", `{"result":${out}}`))
+      lines.push(commitLine("generation", genId, "end", `{"endTimestamp":${quote(end)}}`))
+    }
   }
-  return [JSON.stringify(trace), JSON.stringify(gen)]
+  if (hasTrace) lines.push(commitLine("trace", traceId, "end", `{"endTimestamp":${quote(end)}}`))
+  for (const t of tagsOf(e)) {
+    const data = `{"tags":{${quote(t.key)}:${quote(t.raw)}}}`
+    lines.push(commitLine("generation", genId, "update", data))
+    if (hasTrace) lines.push(commitLine("trace", traceId, "update", data))
+  }
+  return lines
 }
 
 // The PushLogs POST for a batch. The log repo id is required by the endpoint.
@@ -127,8 +281,16 @@ function sample(id: string): LogEntry {
     completion_tokens: 6,
     cost: 0.5,
     cache_hit: false,
-    input: "secret",
   }
+}
+
+// A line's entity, id, action and data.
+function parsed(line: string): { entity: string, id: string, action: string, data: string } {
+  const b = line.indexOf("{")
+  const rest = line.slice(b + 1, line.byteLength - 1)
+  const idEnd = rest.indexOf(",action=")
+  const actEnd = rest.indexOf(",data=")
+  return { entity: line.slice(0, b), id: rest.slice(3, idEnd), action: rest.slice(idEnd + 8, actEnd), data: rest.slice(actEnd + 6) }
 }
 
 test("maxim: PushLogs URL with the repo id, and the API key header", () => {
@@ -143,46 +305,102 @@ test("maxim: default base when none is set", () => {
   expect(maximRequest("", "k", "r", []).url).toBe("https://app.getmaxim.ai/api/sdk/v3/log?id=r")
 })
 
-test("maxim: two newline-separated JSON lines per entry, no content", () => {
-  const r = maximRequest(MAXIM_BASE, "k", "r", [sample("a"), sample("b")])
-  const lines = r.body.split("\n")
-  expect(lines.length).toBe(5)
-  expect(lines[4]).toBe("")
-  const t = try JSON.parse(lines[0]!) as MaximLine
-  expect(t.entity).toBe("trace")
-  expect(t.action).toBe("create")
-  expect(t.id).toBe("req-a")
-  expect(t.data.startTimestamp).toBe("2026-10-14T12:00:00.000Z")
-  const g = try JSON.parse(lines[1]!) as MaximLine
-  expect(g.entity).toBe("generation")
-  expect(g.id).toBe("a")
-  expect(r.body.includes("secret")).toBe(false)
+test("maxim: a chat row is the plugin's trace, in maxim-go's commit log lines", () => {
+  let e = sample("a")
+  e.input = `{"model":"openai/gpt-4o","messages":[{"role":"system","content":"be brief"},{"role":"user","content":[{"type":"text","text":"hi there"}]}],"temperature":0.2,"fallbacks":["x/y"]}`
+  e.output = `{"id":"c1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"hello"}}],"usage":{"prompt_tokens":5,"completion_tokens":6,"total_tokens":11}}`
+  e.overhead_ms = 2.0
+  const lines = maximLines(e)
+  const p = lines.map((l) => parsed(l))
+  expect(lines[0]).toBe(`trace{id=req-a,action=create,data={"startTimestamp":"2026-10-14T12:00:00.000Z","name":"bifrost_chat_completion","id":"req-a"}}`)
+  expect(lines[1]).toBe(`trace{id=req-a,action=update,data={"input":"hi there"}}`)
+  expect(p[2]!.action).toBe("add-generation")
+  const g = try fields(p[2]!.data)
+  expect(rawStr(g, "id")).toBe("a")
+  expect(rawStr(g, "provider")).toBe("openai")
+  expect(rawStr(g, "model")).toBe("gpt-4o")
+  let pref = sample("p")
+  pref.model = "openai/gpt-4o"
+  expect(maximLines(pref).includes(`generation{id=p,action=update,data={"tags":{"model":"gpt-4o"}}}`)).toBe(true)
+  expect(find(g, "messages")).toBe(`[{"role":"system","content":"be brief"},{"role":"user","content":[{"type":"text","text":"hi there"}]}]`)
+  expect(find(g, "modelParameters")).toBe(`{"temperature":0.2}`)
+  expect(lines[3]!.startsWith(`generation{id=a,action=result,data={"result":{"id":"c1"`)).toBe(true)
+  expect(lines[4]).toBe(`generation{id=a,action=end,data={"endTimestamp":"2026-10-14T12:00:00.042Z"}}`)
+  expect(lines[5]).toBe(`trace{id=req-a,action=end,data={"endTimestamp":"2026-10-14T12:00:00.042Z"}}`)
+  expect(lines[6]).toBe(`generation{id=a,action=update,data={"tags":{"model":"gpt-4o"}}}`)
+  expect(lines[7]).toBe(`trace{id=req-a,action=update,data={"tags":{"model":"gpt-4o"}}}`)
+  expect(lines.includes(`generation{id=a,action=update,data={"tags":{"upstream_latency_ms":"40"}}}`)).toBe(true)
+  expect(lines.includes(`trace{id=req-a,action=update,data={"tags":{"overhead_latency_ms":"2"}}}`)).toBe(true)
 })
 
-test("maxim: x-bf-maxim attributes name the trace and generation, and tag the trace", () => {
-  const e = sample("c")
+test("maxim: without the bodies the trace has no messages or result, and an error is the generation's result", () => {
+  const plain = maximLines(sample("b"))
+  expect(plain[1]).toBe(`trace{id=req-b,action=update,data={"input":""}}`)
+  expect(plain.some((l) => l.includes("action=result"))).toBe(false)
+  expect(plain.some((l) => l.includes("\"messages\""))).toBe(false)
+  let e = sample("c")
+  e.status = 429
+  e.error = "slow down"
+  e.output = `{"error":{"message":"rate limited","type":"rate_limit","code":"429"}}`
+  const lines = maximLines(e)
+  expect(lines.includes(`generation{id=c,action=result,data={"result":{"error":{"message":"rate limited","code":"429","type":"rate_limit"}}}}`)).toBe(true)
+  expect(lines.some((l) => l.startsWith("generation{id=c,action=end,"))).toBe(true)
+})
+
+test("maxim: x-bf-maxim attributes name the trace, the session and the generation, and tag both", () => {
+  let e = sample("d")
   const ids: Record<string, string> = new Map()
   ids.set("trace-id", "tr-9")
+  ids.set("trace-name", "support")
   ids.set("generation-name", "answer")
   ids.set("session-id", "sess-1")
   ids.set("log-repo-id", "repo-2")
   const tags: Record<string, string> = new Map()
   tags.set("customer", "acme")
+  tags.set("header.x-team", "search")
   e.maxim = ids
   e.maxim_tags = tags
   const md: Record<string, string> = new Map()
   md.set("env", "prod")
+  md.set("customer", "ignored")
   e.metadata = md
   const lines = maximLines(e)
-  const t = try JSON.parse(lines[0]!) as MaximLine
-  expect(t.id).toBe("tr-9")
-  expect(t.data.session_id).toBe("sess-1")
-  expect(t.data.tags!.get("customer")).toBe("acme")
-  expect(t.data.tags!.get("env")).toBe("prod")
-  const g = try JSON.parse(lines[1]!) as MaximLine
-  expect(g.id).toBe("c")
-  expect(g.data.traceId).toBe("tr-9")
-  expect(g.data.name).toBe("answer")
+  expect(lines[0]).toBe(`trace{id=tr-9,action=create,data={"startTimestamp":"2026-10-14T12:00:00.000Z","name":"support","sessionId":"sess-1","id":"tr-9"}}`)
+  expect(rawStr(try fields(parsed(lines[2]!).data), "name")).toBe("answer")
+  const tagLines = lines.filter((l) => l.startsWith("generation{id=d,action=update"))
+  expect(tagLines.map((l) => parsed(l).data).join("|")).toBe(`{"tags":{"customer":"acme"}}|{"tags":{"env":"prod"}}|{"tags":{"model":"gpt-4o"}}|{"tags":{"header.x-team":"search"}}`)
   expect(repoOf(e, "repo-1")).toBe("repo-2")
-  expect(repoOf(sample("d"), "repo-1")).toBe("repo-1")
+  expect(repoOf(sample("e"), "repo-1")).toBe("repo-1")
+})
+
+test("maxim: a generation named by the caller gets only its result; realtime, MCP and A2A rows are not traced", () => {
+  let e = sample("f")
+  e.output = `{"id":"c2","choices":[]}`
+  const ids: Record<string, string> = new Map()
+  ids.set("generation-id", "gen-x")
+  e.maxim = ids
+  const lines = maximLines(e)
+  expect(lines[0]!.startsWith(`generation{id=gen-x,action=result,`)).toBe(true)
+  expect(lines.some((l) => l.startsWith("trace{"))).toBe(false)
+  ids.set("trace-id", "tr-x")
+  e.maxim = ids
+  expect(maximLines(e).includes(`trace{id=tr-x,action=end,data={"endTimestamp":"2026-10-14T12:00:00.042Z"}}`)).toBe(true)
+  let rt = sample("g")
+  rt.op = "realtime"
+  expect(maximLines(rt).length).toBe(0)
+  let mcp = sample("h")
+  mcp.kind = "mcp"
+  expect(maximLines(mcp).length).toBe(0)
+})
+
+test("maxim: the messages of text completions, Responses and image prompts", () => {
+  const t = messagesOf("text_completion", try fields(`{"prompt":["a","b"]}`))
+  expect(t.messages.join(",")).toBe(`{"role":"user","content":["a","b"]}`)
+  expect(t.latest).toBe("ab")
+  const r = messagesOf("responses_stream", try fields(`{"input":[{"role":"user","content":"q1"},{"type":"function_call_output","output":"x"},{"role":"assistant","content":[{"type":"output_text","text":"a1"}]}]}`))
+  expect(r.messages.length).toBe(2)
+  expect(r.latest).toBe("a1")
+  expect(messagesOf("responses", try fields(`{"input":"just this"}`)).latest).toBe("just this")
+  expect(messagesOf("image_generation", try fields(`{"prompt":"a cat"}`)).messages.join(",")).toBe(`{"role":"user","content":"a cat"}`)
+  expect(messagesOf("embedding", try fields(`{"input":"x"}`)).messages.length).toBe(0)
 })

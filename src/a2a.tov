@@ -265,13 +265,89 @@ function bodyObject(body: string): string | undefined {
   return t.startsWith("{") ? camelKeys(t) : undefined
 }
 
+// A v0.3 HTTP+JSON client's routes sit under /v1 (message:send, message:stream, tasks, tasks/{id}, tasks/{id}:cancel,
+// tasks/{id}:subscribe, tasks/{id}/pushNotificationConfigs[/{id}], and card for the extended card), with v0.3 bodies:
+// the call is in the v0.3 dialect, its params shaped as the v0.3 JSON-RPC method's.
+function restCallV03(method: string, segs: string[], query: string, body: string): Routed {
+  const head = segs[0]!
+  const wrong = (): Routed => failed(405, -32601, `${method} is not allowed on this route`)
+  const noRoute = (): Routed => failed(404, -32601, "no such REST route")
+  if (head === "message:send" || head === "message:stream") {
+    if (segs.length !== 1) return noRoute()
+    if (method !== "POST") return wrong()
+    const p = bodyObject(body)
+    if (p === undefined) return failed(400, -32602, "invalid params: the request body must be a JSON object")
+    return { kind: "call", call: callOf(head === "message:send" ? "SendMessage" : "SendStreamingMessage", true, p) }
+  }
+  if (head === "card") {
+    if (segs.length !== 1) return noRoute()
+    if (method !== "GET") return wrong()
+    return { kind: "call", call: callOf("GetExtendedAgentCard", true, "{}") }
+  }
+  if (head !== "tasks") return noRoute()
+  if (segs.length === 1) {
+    if (method !== "GET") return wrong()
+    return { kind: "call", call: callOf("ListTasks", true, queryParams(query, ["pageSize", "historyLength"], ["includeArtifacts"], [])) }
+  }
+  let id = segs[1]!
+  let verb = ""
+  const pieces = id.split(":")
+  if (pieces.length > 1) {
+    const tail = pieces[pieces.length - 1]!
+    if (tail === "cancel" || tail === "subscribe") {
+      verb = tail
+      id = pieces.slice(0, pieces.length - 1).join(":")
+    }
+  }
+  const idf: Field[] = [{ key: "id", raw: quote(id) }]
+  if (segs.length === 2) {
+    if (verb === "cancel") {
+      if (method !== "POST") return wrong()
+      const extra = bodyObject(body)
+      if (extra === undefined) return failed(400, -32602, "invalid params: the request body must be a JSON object")
+      let fs = objectFields(extra) ?? []
+      setField(&fs, "id", quote(id))
+      return { kind: "call", call: callOf("CancelTask", true, build(fs)) }
+    }
+    if (verb === "subscribe") {
+      if (method !== "POST" && method !== "GET") return wrong()
+      return { kind: "call", call: callOf("SubscribeToTask", true, build(idf)) }
+    }
+    if (method !== "GET") return wrong()
+    return { kind: "call", call: callOf("GetTask", true, queryParams(query, ["historyLength"], [], idf)) }
+  }
+  if (segs[2]! !== "pushNotificationConfigs" || verb !== "") return noRoute()
+  if (segs.length === 3) {
+    if (method === "POST") {
+      const p = bodyObject(body)
+      if (p === undefined) return failed(400, -32602, "invalid params: the request body must be a JSON object")
+      // the body is a TaskPushNotificationConfig ({taskId, pushNotificationConfig}) or the config alone
+      const fs = objectFields(p) ?? []
+      const inner = find(fs, "pushNotificationConfig")
+      const cfg = inner !== undefined && inner.trim().startsWith("{") ? inner : p
+      return { kind: "call", call: callOf("CreateTaskPushNotificationConfig", true, build([{ key: "taskId", raw: quote(id) }, { key: "pushNotificationConfig", raw: cfg }])) }
+    }
+    if (method === "GET") return { kind: "call", call: callOf("ListTaskPushNotificationConfigs", true, build(idf)) }
+    return wrong()
+  }
+  if (segs.length === 4) {
+    const both: Field[] = [{ key: "id", raw: quote(id) }, { key: "pushNotificationConfigId", raw: quote(segs[3]!) }]
+    if (method === "GET") return { kind: "call", call: callOf("GetTaskPushNotificationConfig", true, build(both)) }
+    if (method === "DELETE") return { kind: "call", call: callOf("DeleteTaskPushNotificationConfig", true, build(both)) }
+    return wrong()
+  }
+  return noRoute()
+}
+
 // A REST request under .../rest as a call. path is what follows "rest" (like "/message:send"), query the
-// raw query string without "?". A leading tenant segment is accepted and dropped.
+// raw query string without "?". A leading tenant segment is accepted and dropped; a leading "v1" before a route of
+// v0.3's (or its card) is a v0.3 client (restCallV03).
 export function restCall(method: string, path: string, query: string, body: string): Routed {
   let segs: string[] = []
   for (const s of path.split("/")) {
     if (s !== "") segs.push(pctDecode(s))
   }
+  if (segs.length > 1 && segs[0]! === "v1" && (roots().includes(segs[1]!) || segs[1]! === "card")) return restCallV03(method, segs.slice(1), query, body)
   if (segs.length > 1 && !roots().includes(segs[0]!)) segs = segs.slice(1)
   if (segs.length === 0) return failed(404, -32601, "no such REST route")
   const head = segs[0]!
@@ -689,10 +765,24 @@ export class StreamTap {
   text = ""
   dropped = false
   private size: int = 0
+  // each event's payload goes to each as the stream carries it, whatever the limit (the history's event rows)
+  private each: ((data: string) => void) | undefined = undefined
+  private split: SseSplitter | undefined = undefined
 
   constructor(readonly limit: int) {}
 
+  // Hands each server-sent event's payload to f as it completes.
+  watch(f: (data: string) => void): void {
+    this.each = f
+    this.split = new SseSplitter()
+  }
+
   add(s: string): void {
+    const f = this.each
+    const sp = this.split
+    if (f !== undefined && sp !== undefined) {
+      for (const d of sp.push(s)) f(d)
+    }
     if (this.dropped) return
     const n = new TextEncoder().encode(s).length
     if (this.size + n > this.limit) {
@@ -1161,6 +1251,37 @@ test("REST routes map to operations", () => {
   // an escaped id is decoded
   const esc = restCall("GET", "/tasks/a%2Fb", "", "")
   expect(esc.kind === "call" && esc.call.taskId === "a/b").toBe(true)
+})
+
+test("a v0.3 REST client's /v1 routes are calls in the v0.3 dialect", () => {
+  const send = restCall("POST", "/v1/message:send", "", `{"message":{"kind":"message","messageId":"m1","role":"user","parts":[{"kind":"text","text":"hi"}]}}`)
+  expect(send.kind === "call" && send.call.op === "SendMessage" && send.call.v03 && send.call.params.includes(`"kind":"text"`)).toBe(true)
+  const stream = restCall("POST", "/v1/message:stream", "", "{}")
+  expect(stream.kind === "call" && stream.call.stream && stream.call.v03).toBe(true)
+  const get = restCall("GET", "/v1/tasks/t1", "historyLength=2", "")
+  expect(get.kind === "call" && get.call.op === "GetTask" && get.call.v03 && get.call.taskId === "t1" && get.call.params === `{"id":"t1","historyLength":2}`).toBe(true)
+  const cancel = restCall("POST", "/v1/tasks/t1:cancel", "", "")
+  expect(cancel.kind === "call" && cancel.call.op === "CancelTask" && cancel.call.params === `{"id":"t1"}`).toBe(true)
+  const sub = restCall("POST", "/v1/tasks/t1:subscribe", "", "")
+  expect(sub.kind === "call" && sub.call.op === "SubscribeToTask" && sub.call.v03).toBe(true)
+  const create = restCall("POST", "/v1/tasks/t1/pushNotificationConfigs", "", `{"pushNotificationConfig":{"id":"c1","url":"https://cb.example/h"}}`)
+  expect(create.kind === "call" && create.call.op === "CreateTaskPushNotificationConfig" && create.call.taskId === "t1" && create.call.configId === "c1" && create.call.params === `{"taskId":"t1","pushNotificationConfig":{"id":"c1","url":"https://cb.example/h"}}`).toBe(true)
+  // the config alone is taken too
+  const bare = restCall("POST", "/v1/tasks/t1/pushNotificationConfigs", "", `{"url":"https://cb.example/h"}`)
+  expect(bare.kind === "call" && pushSpecOf(bare.call).url === "https://cb.example/h").toBe(true)
+  const one = restCall("GET", "/v1/tasks/t1/pushNotificationConfigs/c1", "", "")
+  expect(one.kind === "call" && one.call.op === "GetTaskPushNotificationConfig" && one.call.taskId === "t1" && one.call.configId === "c1" && one.call.params === `{"id":"t1","pushNotificationConfigId":"c1"}`).toBe(true)
+  const del = restCall("DELETE", "/v1/tasks/t1/pushNotificationConfigs/c1", "", "")
+  expect(del.kind === "call" && del.call.op === "DeleteTaskPushNotificationConfig" && del.call.v03).toBe(true)
+  const list = restCall("GET", "/v1/tasks/t1/pushNotificationConfigs", "", "")
+  expect(list.kind === "call" && list.call.op === "ListTaskPushNotificationConfigs" && list.call.params === `{"id":"t1"}`).toBe(true)
+  const card = restCall("GET", "/v1/card", "", "")
+  expect(card.kind === "call" && card.call.op === "GetExtendedAgentCard" && card.call.v03).toBe(true)
+  expect(restCall("GET", "/v1/message:send", "", "").kind).toBe("fail")
+  expect(restCall("GET", "/v1/nothing", "", "").kind).toBe("fail")
+  // a v1 route under another tenant stays v1
+  const tenant = restCall("POST", "/acme/message:send", "", "{}")
+  expect(tenant.kind === "call" && !tenant.call.v03).toBe(true)
 })
 
 test("a call maps back to a REST request", () => {

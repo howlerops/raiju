@@ -35,6 +35,7 @@ import { secureHex, utf8, sha256, toHex } from "./crypto"
 import { Policy, Verdict, hostVerdict, urlVerdict } from "./netguard"
 import { rfc3339Ms, rfc3339Of } from "./vkexpiry"
 import { durationMs, effectiveBudgetLimit, cyclesLeft } from "./governance"
+import { membershipSource } from "./provision"
 
 export type AdminAuth = AdminAuthConfig
 
@@ -845,11 +846,19 @@ function redactConfig(c: Config): Config {
     }
     n.governance = g
   }
-  // the SCIM provisioning token is masked too (an env. reference shows as written)
-  if (sc !== undefined && tok !== undefined) {
+  // the SCIM provisioning token and the provider's secrets are masked too (an env. reference shows as written)
+  if (sc !== undefined) {
     let ms = sc
     let mc = sc.config ?? {}
-    mc.provisioningToken = maskSecret(tok)
+    if (tok !== undefined) mc.provisioningToken = maskSecret(tok)
+    const cs = mc.clientSecret
+    if (cs !== undefined) mc.clientSecret = maskSecret(cs)
+    const at = mc.apiToken
+    if (at !== undefined) mc.apiToken = maskSecret(at)
+    const ss = mc.serviceAccountClientSecret
+    if (ss !== undefined) mc.serviceAccountClientSecret = maskSecret(ss)
+    const sj = mc.serviceAccountJson
+    if (sj !== undefined) mc.serviceAccountJson = maskSecret(sj)
     ms.config = mc
     n.scim_config = ms
   }
@@ -1604,6 +1613,31 @@ export class ConfigStore {
     let n: Config = this.cfg
     n.scim_config = sc
     return this.commit(n, "scim-token")
+  }
+
+  // The users, teams and business units a directory sync, import, reconcile or SCIM push left, as one save, with the
+  // removed users' virtual keys (the keys assigned to them) and project memberships gone with them, as Bifrost's
+  // deprovisioning removes a user's keys and memberships.
+  setProvisioned(users: AdminUserConfig[], teams: TeamConfig[], bus: BusinessUnitConfig[], removed: string[]): Result {
+    let g: GovernanceConfig = this.cfg.governance ?? {}
+    g.users = users
+    g.teams = teams
+    g.business_units = bus
+    if (removed.length > 0) {
+      const lower = removed.map((n) => n.toLowerCase())
+      const vks = g.virtual_keys
+      if (vks !== undefined) g.virtual_keys = vks.filter((vk) => !lower.includes((vk.user_id ?? "").toLowerCase()))
+      const pjs = g.projects
+      if (pjs !== undefined) {
+        g.projects = pjs.map((p) => {
+          let n = p
+          const ms = p.members
+          if (ms !== undefined) n.members = ms.filter((m) => !lower.includes(m.user_id.toLowerCase()))
+          return n
+        })
+      }
+    }
+    return this.commit(withGov(this.cfg, g), "provisioning")
   }
 
   // Replaces the users and teams a SCIM request changed, as one save (scim.tov).
@@ -2879,7 +2913,7 @@ function teamMembers(store: ConfigStore, m: string, team: string, scope: DataSco
   if (!recordInScope(store.cfg, "teams", team, scope) || findById(g.teams, team) === undefined) return reply(404, errorBody(`no teams ${team}`))
   const out: { user_id: string, user_name: string, user_email: string, source: string }[] = []
   for (const u of g.users ?? []) {
-    if ((u.teams ?? []).includes(team)) out.push({ user_id: u.name, user_name: u.name, user_email: emailOf(u), source: "manual" })
+    if ((u.teams ?? []).includes(team)) out.push({ user_id: u.name, user_name: u.name, user_email: emailOf(u), source: membershipSource(u, "teams", team) })
   }
   return reply(200, JSON.stringify({ members: out }))
 }
@@ -3336,6 +3370,7 @@ function businessUnitsView(c: Config, sp: URLSearchParams, scope: DataScope): st
 
 // /api/governance/business-units[/{id}]
 function businessUnitRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, sp: URLSearchParams, scope: DataScope): ApiReply {
+  if ((segs.length === 5 || segs.length === 6) && segs[4] === "users") return businessUnitUsers(store, m, segs[3] ?? "", segs[5], body, scope)
   if (segs.length > 4) return notFound(path)
   const id = segs[3]
   if (id === undefined) {
@@ -3363,6 +3398,73 @@ function businessUnitRoute(store: ConfigStore, m: string, segs: string[], body: 
     const r = store.deleteBusinessUnit(id)
     if (r.kind === "error") return errReply(r)
     return reply(200, JSON.stringify({ deleted: id }))
+  }
+  return notAllowed(m)
+}
+
+// The members of a business unit with how each was granted (Bifrost's member list): source "manual" for an admin's
+// assignment, "synced" for one the identity provider gave (a mapping rule).
+function businessUnitMembers(store: ConfigStore, bu: string): string {
+  const out: { user_id: string, user_name: string, user_email: string, source: string }[] = []
+  for (const u of gov(store.cfg).users ?? []) {
+    if ((u.business_units ?? []).includes(bu)) out.push({ user_id: u.name, user_name: u.name, user_email: emailOf(u), source: membershipSource(u, "business_units", bu) })
+  }
+  return JSON.stringify({ users: out, total: out.length })
+}
+
+// GET and POST /api/governance/business-units/{id}/users, DELETE .../users/{user_id}: the members, adding users
+// ({"user_ids": [...]} or {"user_id": ...}, by name or email; an admin's assignment) and removing one. A membership
+// the identity provider gave is removed by the identity provider (the next sync), so its DELETE is refused.
+function businessUnitUsers(store: ConfigStore, m: string, bu: string, member: string | undefined, body: string, scope: DataScope): ApiReply {
+  const g = gov(store.cfg)
+  if (findById(g.business_units, bu) === undefined || !recordInScope(store.cfg, "business-units", bu, scope)) return reply(404, errorBody(`no business unit ${bu}`))
+  if (member === undefined && m === "GET") return reply(200, businessUnitMembers(store, bu))
+  if (m !== "GET" && !scope.all) return scopeDenied()
+  const users: AdminUserConfig[] = g.users ?? []
+  const at = (key: string): int => {
+    const k = key.toLowerCase()
+    for (let i = 0; i < users.length; i++) {
+      const u = users[i]!
+      if (u.name === key || u.name.toLowerCase() === k || emailOf(u).toLowerCase() === k) return i
+    }
+    return -1
+  }
+  if (member === undefined && m === "POST") {
+    let ids: string[] = []
+    try {
+      const b = JSON.parse(body) as { user_ids?: string[], user_id?: string }
+      ids = b.user_ids ?? []
+      const one = b.user_id
+      if (one !== undefined) ids.push(one)
+    } catch (e) {
+      return badBody()
+    }
+    if (ids.length === 0) return reply(400, errorBody("user_ids is required"))
+    let next = users.slice()
+    for (const id of ids) {
+      const i = at(id)
+      if (i < 0) return reply(400, errorBody(`no user ${id}`))
+      let u = next[i]!
+      const held: string[] = u.business_units ?? []
+      if (!held.includes(bu)) held.push(bu)
+      u.business_units = held
+      next[i] = u
+    }
+    const r = store.setUsers(next)
+    if (r.kind === "error") return errReply(r)
+    return reply(200, businessUnitMembers(store, bu))
+  }
+  if (member !== undefined && m === "DELETE") {
+    const i = at(member)
+    if (i < 0 || !(users[i]!.business_units ?? []).includes(bu)) return reply(404, errorBody(`user ${member} is not a member of ${bu}`))
+    if (membershipSource(users[i]!, "business_units", bu) === "synced") return reply(409, errorBody(`the identity provider manages ${member}'s membership of ${bu}; change the mapping rules or the user's attributes instead`))
+    let next = users.slice()
+    let u = next[i]!
+    u.business_units = (u.business_units ?? []).filter((x) => x !== bu)
+    next[i] = u
+    const r = store.setUsers(next)
+    if (r.kind === "error") return errReply(r)
+    return reply(200, JSON.stringify({ deleted: member }))
   }
   return notAllowed(m)
 }
@@ -5383,6 +5485,50 @@ test("team members: the users whose teams name the team", () => {
   expect(body.body.includes("bo")).toBe(false)
   expect(handleApi(s, "GET", "/api/governance/teams/nope/members", "").status).toBe(404)
   expect(handleApi(s, "POST", "/api/governance/teams/t1/members", "{}").status).toBe(405)
+  cleanup(path)
+})
+
+test("business-unit members carry their source; admins add and remove manual ones, not synced ones", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, { governance: {
+    business_units: [{ id: "bu1", name: "Research" }],
+    users: [{ name: "ana", role: "editor", business_units: ["bu1"], synced: { business_units: ["bu1"] } }, { name: "bo", email: "Bo@x.io", role: "viewer" }],
+    teams: [{ id: "t1", name: "core" }],
+  } })
+  let g = gov(s.cfg)
+  let us = g.users ?? []
+  let first = us[0]!
+  first.teams = ["t1"]
+  first.scim_groups = ["t1"]
+  us[0] = first
+  g.users = us
+  let n: Config = s.cfg
+  n.governance = g
+  s.cfg = n
+  const list = handleApi(s, "GET", "/api/governance/business-units/bu1/users", "")
+  expect(list.status === 200 && list.body.includes(`"user_id":"ana"`) && list.body.includes(`"source":"synced"`)).toBe(true)
+  const add = handleApi(s, "POST", "/api/governance/business-units/bu1/users", `{"user_ids":["bo@x.io"]}`)
+  expect(add.status === 200 && add.body.includes(`{"user_id":"bo","user_name":"bo","user_email":"Bo@x.io","source":"manual"}`)).toBe(true)
+  expect(handleApi(s, "POST", "/api/governance/business-units/bu1/users", `{"user_ids":["nobody"]}`).status).toBe(400)
+  expect(handleApi(s, "DELETE", "/api/governance/business-units/bu1/users/ana", "").status).toBe(409)
+  expect(handleApi(s, "DELETE", "/api/governance/business-units/bu1/users/bo", "").status).toBe(200)
+  expect(handleApi(s, "DELETE", "/api/governance/business-units/bu1/users/bo", "").status).toBe(404)
+  expect(handleApi(s, "GET", "/api/governance/business-units/nope/users", "").status).toBe(404)
+  expect(handleApi(s, "GET", "/api/governance/teams/t1/members", "").body.includes(`"source":"synced"`)).toBe(true)
+  cleanup(path)
+})
+
+test("a provisioning save removes the removed users' keys and project memberships", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, { governance: {
+    users: [{ name: "ana", role: "editor" }, { name: "bo", role: "viewer" }],
+    virtual_keys: [{ id: "vk-a", value: "sk-bf-a", user_id: "ana" }, { id: "vk-b", value: "sk-bf-b", user_id: "bo" }],
+    projects: [{ id: "p1", name: "P", members: [{ id: "m1", user_id: "ana" }, { id: "m2", user_id: "bo" }] }],
+  } })
+  expect(statusOf(s.setProvisioned([{ name: "bo", role: "viewer" }], [], [], ["ana"]))).toBe(200)
+  const g = gov(s.cfg)
+  expect((g.virtual_keys ?? []).map((k) => k.id).join(",")).toBe("vk-b")
+  expect(((g.projects ?? [])[0]!.members ?? []).map((m) => m.user_id).join(",")).toBe("bo")
   cleanup(path)
 })
 

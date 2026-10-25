@@ -11,11 +11,21 @@ session. It sets up the machine, explains the lead/worker loop and points at the
 Worker briefs start from [handoff/worker-prompt-template.md](handoff/worker-prompt-template.md);
 the rules all workers follow are in [handoff/worker-brief.md](handoff/worker-brief.md).
 
-Branch: `claude/affectionate-shannon-pjwi5z`. Waves 1 to 22 are on `main` (PR howlerops/raiju#4).
-The branch carries wave 23 and the start of wave 24 (L188 to L194, queued or in progress).
+Branch: `claude/affectionate-shannon-pjwi5z`. Waves 1 to 23 are on `main` (PR howlerops/raiju#5).
+The branch carries wave 24 (L188 to L194).
 
 ## Where things stand
 
+- Wave 24 (L188 to L194): the runtime checks each connection's resolved address (tov-patches 0013,
+  DNS rebinding closed for fetch; every provider connection checked as Bifrost's ConfigureDialer);
+  WebSocket and WebRTC sessions drain at a stop, broker mode stops gracefully, http1 drops stalled
+  readers, per-stream memory is lower (tov-patches 0016) and the UI has a setup-token screen (L189);
+  TLS client certificates, a client-disconnect signal, gRPC gzip and the AWS credential chain
+  (tov-patches 0015; L190); SCIM directory sync for five IdPs against mocks (L191); realtime turn
+  hooks, per-fallback hooks, Maxim tracing and Bifrost's MCP identity order (L192); cross-node log
+  reads, payload offload to object storage and guardrail logs_only (L193); Hugging Face
+  multi-backend routing, agent sign-in tokens and the A2A v0.3 REST client (L194). Behaviour
+  changes are in docs/behaviour-changes-wave-24.md.
 - Wave 23 (L174 to L187) paired a production-readiness audit with the parity work packages.
   Production: secure defaults (/api locked, loopback bind, MCP deny-by-default, WebRTC off,
   bounded metric labels, 0600/0700 files; L184), the streaming memory leak (reference cycles;
@@ -52,19 +62,21 @@ The branch carries wave 23 and the start of wave 24 (L188 to L194, queued or in 
   priors and classifier training, the gateway wiring, outcomes with credibility learning, budget
   pacing and escalation, and the Crews tab with metrics. The price table was regenerated from the
   current Bifrost datasheet.
-- docs/parity.md counts 567 parity rows: done 511, partial 32, missing 0, out of scope 15,
+- docs/parity.md counts 567 parity rows: done 531, partial 12, missing 0, out of scope 15,
   n/a 9, plus 42 Raiju-only extras.
-- Tests at handoff (compiler from tov-patches 0001 to 0010 and 0012): `make unit` 2,291 passed,
+- Tests at handoff (compiler from tov-patches 0001 to 0010, 0012, 0013, 0015 and 0016): `make unit` 2,375 passed,
   0 failed, plus the Python tests (gen_pricing, the h2/gRPC interop suite, crew_priors,
   test_deploy, test_gen_config_doc); e2e "all passed" on Bun and http1; `make ui` all passed;
   `make openapi-check` ok; `make web-check` and `make config-doc-check` up to date. Helm lint and
   terraform validate pass; the Docker image was not built here (no daemon).
 - Test tools now needed: `pip install grpcio protobuf h2 numpy scipy`, and Go with GOTOOLCHAIN=go1.26.9 for
   the A2A gRPC e2e client (tests/a2a_grpc_client; e2e skips it if go is missing).
-- The Tov runtime carries eleven patches (`tov-patches/`): 0001 to 0004, 0005 WAMR (WASM
+- The Tov runtime carries fourteen patches (`tov-patches/`): 0001 to 0004, 0005 WAMR (WASM
   plugins), 0006 libdatachannel (WebRTC), 0007 fetch pool and upstream HTTP/2 (nghttp2), 0008
   streamed request bodies, 0009 node:fs rename and fsync, 0010 a WASM wall-clock limit, 0012
-  server lifecycle (graceful stop, timeouts, connection cap). 0011 is unused. They apply in order only; `make tov` rebuilds the compiler.
+  server lifecycle (graceful stop, timeouts, connection cap), 0013 the fetch peer address policy,
+  0015 TLS client certificates, Request.signal and gunzip, 0016 a small fetch input buffer. 0011
+  and 0014 are unused. They apply in order only; `make tov` rebuilds the compiler.
 - Admin UI: SolidJS 2.0 RC in `web/`, embedded through the committed `src/ui_assets.tov`;
   charts with zoom and series toggles, MCP access and virtual MCP screens, role-aware actions
   (L132), and a Roles tab that edits custom roles (L141). `make web` after any
@@ -80,17 +92,17 @@ The branch carries wave 23 and the start of wave 24 (L188 to L194, queued or in 
 
 ## What's next
 
-Wave 24 is in LEDGER.md (L188 to L194): outbound safety at connect time (DNS rebinding), WebSocket
-drain and the remaining lifecycle items with a UI setup-token screen, TLS client certificates and
-the AWS credential chain, SCIM directory sync, the plugin/MCP/agent remainders, the log store
-remainders (cross-node reads, payload offload), and Hugging Face multi-backend routing with the
-agent-token endpoints. After it:
+The 12 partial parity rows are edge items (listed in their Open notes), owner decisions or need
+real accounts. The production items left:
 
+- Raw-socket connections (A2A gRPC, Redis/Valkey vector stores, realtime WebSockets to providers)
+  have no connect-time address check; Bun.serve has no write-stall limit on upgraded sockets.
+- Agent sign-in tokens, provisioning jobs and dashboard sessions are per process.
 - Real providers: `make smoke` has never run against real keys (none in this environment).
 - Deployment: build and scan the image and install the chart on a real cluster; the ECS module's
   EFS config is read-only, so management API saves fail there.
 - Crew routing: fit real priors and a classifier from your own evaluation data.
-- Upstream: offer tov-patches/upstream to Tov.
+- Upstream: offer tov-patches/upstream to Tov (0013, 0015 and 0016 have no write-up yet).
 
 ## Owner decisions after wave 22 (2026-10-24)
 

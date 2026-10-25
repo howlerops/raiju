@@ -1,0 +1,103 @@
+// TLS client certificates (patch 0015): fetch's tls.cert and tls.key, and Bun.connect's. Run by
+// tov-patches/tests/run.sh, which starts client_cert_server.py (it answers with the common name of
+// the client's certificate) and sets CC_PORT and CC_DIR (where the PEM files are).
+import { readFileSync } from "node:fs"
+
+function pem(name: string): string throws Error {
+  return try readFileSync((process.env.CC_DIR ?? ".") + "/" + name, "utf8")
+}
+
+async function get(port: int, tls: { rejectUnauthorized?: bool, ca?: string, cert?: string, key?: string }): Promise<string, Error> {
+  const r = try await fetch(`https://127.0.0.1:${port}/`, { tls: tls })
+  return try await r.text()
+}
+
+class Box {
+  got = ""
+  closed = false
+}
+
+function pause(ms: int): Promise<void> {
+  return new Promise<void>((resolve) => {
+    setTimeout(() => resolve(), ms)
+  })
+}
+
+// A request over Bun.connect: the body of the answer, or "closed" when the server hung up first.
+async function viaSocket(port: int, cert: string, key: string): Promise<string, Error> {
+  const box = new Box()
+  const s = try await Bun.connect({
+    hostname: "127.0.0.1",
+    port: port,
+    tls: { rejectUnauthorized: false, cert: cert, key: key },
+    socket: {
+      data(socket, data) {
+        try {
+          box.got += try new TextDecoder().decode(data)
+        } catch (e) {}
+      },
+      close(socket) {
+        box.closed = true
+      },
+    },
+  })
+  s.write("GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+  for (let i = 0; i < 250; i++) {
+    const at = box.got.indexOf("\r\n\r\n")
+    if (at >= 0 && box.got.byteLength > at + 4) {
+      s.terminate()
+      return box.got.slice(at + 4)
+    }
+    if (box.closed) return "closed"
+    await pause(20)
+  }
+  s.terminate()
+  return "timeout"
+}
+
+async function main(): Promise<int> {
+  const port = parseInt(process.env.CC_PORT ?? "0") ?? 0
+  const certA = try pem("client_a.pem")
+  const keyA = try pem("client_a.key")
+  const certB = try pem("client_b.pem")
+  const keyB = try pem("client_b.key")
+  const ca = try pem("cert.pem")
+  try {
+    const a = try await get(port, { ca: ca, cert: certA, key: keyA })
+    console.log(a === "client-a" ? "ok fetch presents the client certificate" : `FAIL fetch answered ${JSON.stringify(a)}`)
+    const again = try await get(port, { ca: ca, cert: certA, key: keyA })
+    console.log(again === "client-a" ? "ok a pooled connection keeps the client certificate" : `FAIL second fetch answered ${JSON.stringify(again)}`)
+    const b = try await get(port, { ca: ca, cert: certB, key: keyB })
+    console.log(b === "client-b" ? "ok another client certificate gets its own connection" : `FAIL fetch with b answered ${JSON.stringify(b)}`)
+    const both = try await get(port, { rejectUnauthorized: false, cert: certA + keyA })
+    console.log(both === "client-a" ? "ok one PEM text holding the certificate and the key works" : `FAIL combined pem answered ${JSON.stringify(both)}`)
+  } catch (e) {
+    console.log("FAIL " + e.message)
+  }
+  try {
+    const none = try await get(port, { ca: ca })
+    console.log(`FAIL no client certificate answered ${JSON.stringify(none)}`)
+  } catch (e) {
+    console.log("ok without a client certificate the server refuses")
+  }
+  try {
+    const bad = try await get(port, { ca: ca, cert: certA, key: keyB })
+    console.log(`FAIL a mismatched key answered ${JSON.stringify(bad)}`)
+  } catch (e) {
+    const code = e instanceof FetchError ? e.code : ""
+    console.log(code === "ERR_TLS_CLIENT_CERT" ? "ok a key that isn't the certificate's fails with ERR_TLS_CLIENT_CERT" : `FAIL mismatched key failed with ${code} ${e.message}`)
+  }
+  try {
+    const s = try await viaSocket(port, certB, keyB)
+    console.log(s === "client-b" ? "ok Bun.connect presents the client certificate" : `FAIL socket answered ${JSON.stringify(s)}`)
+  } catch (e) {
+    console.log("FAIL socket " + e.message)
+  }
+  try {
+    const s = try await viaSocket(port, "", "")
+    console.log(s === "closed" ? "ok Bun.connect without a client certificate is refused" : `FAIL socket without a certificate answered ${JSON.stringify(s)}`)
+  } catch (e) {
+    console.log("ok Bun.connect without a client certificate is refused")
+  }
+  return 0
+}

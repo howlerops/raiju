@@ -1,0 +1,496 @@
+// User provisioning from the identity provider besides sign-in, as Bifrost's identity sync describes it
+// (docs/enterprise/how-identity-sync-works.mdx, user-provisioning.mdx): directory sync and bulk import (the directory's
+// users through the same mapping rules, creating and updating users, and after a complete listing deprovisioning the
+// ones it no longer lists), reconcile and its preview (the stored claims, or what SCIM sent, against the current rules),
+// and the rules applied to what SCIM pushes (claimScimAttributes). Pure: each plan takes the users and the directory of
+// teams, business units, projects and profiles, and returns the users after it with what changed for each.
+import { AdminUserConfig, ScimProviderConfig, TeamConfig, BusinessUnitConfig } from "./config"
+import { Claims, applyClaims, RoleBook, Directory, changeOf, UserChange, findUser, scimClaims, completeClaims, missingAttributes, hasRules, ruleAttributes } from "./claimsync"
+import { DirUser } from "./directory"
+import { sha256, utf8, toHex } from "./crypto"
+
+// The users after a plan, the teams and business units it made, the users it removed, and each user's change.
+export type Plan = { users: AdminUserConfig[], newTeams: TeamConfig[], newBusinessUnits: BusinessUnitConfig[], removed: string[], changes: UserChange[] }
+
+// The counts of a plan's changes, by action.
+export type Counts = { created: int, updated: int, unchanged: int, removed: int, refused: int, skipped: int }
+
+export function countsOf(changes: UserChange[]): Counts {
+  let c: Counts = { created: 0, updated: 0, unchanged: 0, removed: 0, refused: 0, skipped: 0 }
+  for (const x of changes) {
+    if (x.action === "create") c.created += 1
+    else if (x.action === "update") c.updated += 1
+    else if (x.action === "unchanged") c.unchanged += 1
+    else if (x.action === "remove") c.removed += 1
+    else if (x.action === "refuse") c.refused += 1
+    else c.skipped += 1
+  }
+  return c
+}
+
+// The sync mode (Bifrost's "Choosing a sync mode"): "off" while no provisioning token is set, else claimsSyncMode
+// ("both" by default, or "scim").
+export function syncMode(c: ScimProviderConfig, token: string): string {
+  if (token === "") return "off"
+  return c.claimsSyncMode === "scim" ? "scim" : "both"
+}
+
+// Whether the identity provider made this account (a sign-in, directory sync or a SCIM push): only those are synced
+// and removed. An account an admin made, and one that holds its own credentials (a password or token), is not.
+export function idpManaged(u: AdminUserConfig): bool {
+  if (u.token_sha256 !== undefined || u.password_sha256 !== undefined) return false
+  return u.source !== undefined || u.claims !== undefined || u.scim_attributes !== undefined
+}
+
+// Where a team or business unit membership came from, as Bifrost's member lists show it: "synced" when the
+// identity provider gave it (a mapping rule or a SCIM group), else "manual".
+export function membershipSource(u: AdminUserConfig, kind: string, id: string): string {
+  const s = u.synced
+  if (kind === "teams") {
+    if ((u.scim_groups ?? []).includes(id)) return "synced"
+    return s !== undefined && (s.teams ?? []).includes(id) ? "synced" : "manual"
+  }
+  return s !== undefined && (s.business_units ?? []).includes(id) ? "synced" : "manual"
+}
+
+// The fingerprint of the rules a preview was made with: a reconcile sent with another one is refused, since the
+// rules changed after the preview.
+export function rulesHash(c: ScimProviderConfig, mode: string): string {
+  const parts = JSON.stringify({
+    mode: mode,
+    roles: c.attributeRoleMappings ?? [],
+    teams: c.attributeTeamMappings ?? [],
+    business_units: c.attributeBusinessUnitMappings ?? [],
+    profiles: c.attributeAccessProfileMappings ?? [],
+    projects: c.attributeProjectMappings ?? [],
+    strategy: c.roleResolutionStrategy ?? "",
+    roles_field: c.rolesField ?? "",
+    team_ids_field: c.teamIdsField ?? "",
+    scim: c.claimScimAttributes ?? new Map(),
+  })
+  return toHex(sha256(utf8(parts))).slice(0, 16)
+}
+
+function activeAdmin(u: AdminUserConfig): bool {
+  return u.role === "admin" && u.disabled !== true
+}
+
+function anyAdmin(users: AdminUserConfig[]): bool {
+  return users.some((u) => activeAdmin(u))
+}
+
+function indexOfName(users: AdminUserConfig[], name: string): int {
+  for (let i = 0; i < users.length; i++) {
+    if (users[i]!.name === name) return i
+  }
+  return -1
+}
+
+// A sync never leaves the gateway without an enabled admin: when the plan would, the admins it demoted or removed
+// keep their old records and their changes become skips.
+function guardAdmins(before: AdminUserConfig[], plan: Plan, d: Directory): Plan {
+  if (!anyAdmin(before) || anyAdmin(plan.users)) return plan
+  let users = plan.users
+  let changes = plan.changes
+  let removed = plan.removed
+  for (const old of before) {
+    if (!activeAdmin(old)) continue
+    const at = indexOfName(users, old.name)
+    if (at >= 0) users[at] = old
+    else users.push(old)
+    removed = removed.filter((n) => n !== old.name)
+    changes = changes.map((c) => c.user === old.name ? changeOf(old, old, d, "skip", "the last enabled admin is kept") : c)
+  }
+  return { users: users, newTeams: plan.newTeams, newBusinessUnits: plan.newBusinessUnits, removed: removed, changes: changes }
+}
+
+// Claims from a fresh source merged with the remembered ones: each attribute the source has replaces the remembered
+// value, one it lacks keeps it.
+export function mergeClaims(fresh: Claims, attrs: string[], remembered: Claims | undefined): Claims {
+  let out: Claims = new Map()
+  for (const a of attrs) {
+    const v = fresh.get(a)
+    if (v !== undefined) out.set(a, v)
+    else if (remembered !== undefined) {
+      const old = remembered.get(a)
+      if (old !== undefined) out.set(a, old)
+    }
+  }
+  return out
+}
+
+// The account name of a directory user: its address, else its user name, in lower case.
+export function accountName(u: DirUser): string {
+  return (u.email !== "" ? u.email : u.userName).toLowerCase()
+}
+
+// Applies one set of claims to the user at `at` (or a new one) inside a plan being built.
+function applyInto(inout users: AdminUserConfig[], inout d: Directory, inout plan: Plan, at: int, fresh: AdminUserConfig, claims: Claims, c: ScimProviderConfig, rb: RoleBook, mint: (prefix: string) => string, createOk: bool): void {
+  const existing: AdminUserConfig | undefined = at >= 0 ? users[at]! : undefined
+  if (existing === undefined && !createOk) {
+    plan.changes.push(changeOf(undefined, undefined, d, "skip", "not a user here"))
+    return
+  }
+  const r = applyClaims(existing, fresh, claims, c, d, rb, mint)
+  for (const t of r.newTeams) {
+    d.teams.push(t)
+    plan.newTeams.push(t)
+  }
+  for (const b of r.newBusinessUnits) {
+    d.businessUnits.push(b)
+    plan.newBusinessUnits.push(b)
+  }
+  const after = r.user
+  if (r.kind === "refuse") {
+    if (after !== undefined && at >= 0) users[at] = after
+    let ch = changeOf(existing, after ?? existing, d, "refuse", r.reason)
+    if (existing === undefined) ch.user = fresh.name
+    plan.changes.push(ch)
+    return
+  }
+  if (after === undefined) return
+  plan.changes.push(changeOf(existing, after, d, existing === undefined ? "create" : "update", ""))
+  if (at >= 0) users[at] = after
+  else users.push(after)
+}
+
+// Directory sync and bulk import: each listed user (all, or those `only` names by account name or directory id)
+// through the mapping rules, created when new; a listed user the directory reports inactive is removed when the
+// identity provider made it. unlisted names the managed users the listing does not show (with a complete listing,
+// the caller confirms each with the directory before removing it).
+export type DirectoryPlan = { plan: Plan, unlisted: string[] }
+
+export function planDirectory(users0: AdminUserConfig[], d0: Directory, listed: DirUser[], c: ScimProviderConfig, rb: RoleBook, mint: (prefix: string) => string, only: string[] | undefined): DirectoryPlan {
+  let users = users0.slice()
+  let d = d0
+  let plan: Plan = { users: [], newTeams: [], newBusinessUnits: [], removed: [], changes: [] }
+  const attrs = ruleAttributes(c)
+  const seen: string[] = []
+  for (const du of listed) {
+    const name = accountName(du)
+    if (name === "") continue
+    if (only !== undefined && !only.includes(name) && !only.includes(du.id)) continue
+    seen.push(name)
+    const at = findUser(users, name, du.email)
+    if (!du.active) {
+      if (at >= 0 && idpManaged(users[at]!)) {
+        plan.changes.push(changeOf(users[at]!, undefined, d, "remove", "the directory reports the user inactive"))
+        plan.removed.push(users[at]!.name)
+      }
+      continue
+    }
+    const remembered = at >= 0 ? users[at]!.claims : undefined
+    const claims = mergeClaims(du.claims, attrs, remembered)
+    const fresh: AdminUserConfig = { name: name, email: du.email === "" ? undefined : du.email, role: "", source: "directory" }
+    applyInto(&users, &d, &plan, at, fresh, claims, c, rb, mint, true)
+  }
+  const unlisted: string[] = []
+  if (only === undefined) {
+    for (const u of users) {
+      if (!idpManaged(u) || u.source === "scim") continue
+      const e = (u.email ?? "").toLowerCase()
+      if (seen.includes(u.name.toLowerCase()) || (e !== "" && seen.includes(e))) continue
+      if (plan.removed.includes(u.name)) continue
+      unlisted.push(u.name)
+    }
+  }
+  plan.users = users.filter((u) => !plan.removed.includes(u.name))
+  return { plan: guardAdmins(users0, plan, d), unlisted: unlisted }
+}
+
+// Removes users the directory confirmed gone or inactive from a plan (the last enabled admin is kept).
+export function withRemovals(users0: AdminUserConfig[], p: Plan, names: string[], d: Directory): Plan {
+  let plan = p
+  for (const n of names) {
+    const at = indexOfName(plan.users, n)
+    if (at < 0) continue
+    plan.changes.push(changeOf(plan.users[at]!, undefined, d, "remove", "the directory no longer lists the user"))
+    plan.removed.push(n)
+  }
+  plan.users = plan.users.filter((u) => !names.includes(u.name))
+  return guardAdmins(users0, plan, d)
+}
+
+// The claims a reconcile replays for a user: what SCIM sent in SCIM-only mode (or for a user only SCIM gave data
+// for), else the claims remembered at the last sign-in, directory sync or SCIM push. undefined: no stored data.
+export function storedClaims(u: AdminUserConfig, teams: TeamConfig[], c: ScimProviderConfig, mode: string): Claims | undefined {
+  const scimData = u.scim_attributes !== undefined || (u.scim_groups ?? []).length > 0
+  if (mode === "scim") return scimData ? scimClaims(u, teams, c) : undefined
+  const cl = u.claims
+  if (cl !== undefined) return cl
+  return scimData ? scimClaims(u, teams, c) : undefined
+}
+
+// Reconcile (and its preview): each identity-provider user (all, or those `only` names) re-decided from its stored
+// data under the current rules. keepMissing leaves a user whose data lacks an attribute the rules read as it is;
+// otherwise a missing attribute counts as empty and whatever it granted is removed. Service accounts, users an admin
+// made and users with no stored data are skipped.
+export function planReconcile(users0: AdminUserConfig[], d0: Directory, c: ScimProviderConfig, mode: string, rb: RoleBook, mint: (prefix: string) => string, only: string[] | undefined, keepMissing: bool): Plan {
+  let users = users0.slice()
+  let d = d0
+  let plan: Plan = { users: [], newTeams: [], newBusinessUnits: [], removed: [], changes: [] }
+  for (let i = 0; i < users0.length; i++) {
+    const u = users0[i]!
+    if (only !== undefined && !only.includes(u.name) && !only.includes((u.email ?? "").toLowerCase())) continue
+    if (!idpManaged(u)) {
+      plan.changes.push(changeOf(u, u, d, "skip", "not managed by the identity provider"))
+      continue
+    }
+    const data = storedClaims(u, d.teams, c, mode)
+    if (data === undefined) {
+      plan.changes.push(changeOf(u, u, d, "skip", "no stored data"))
+      continue
+    }
+    const missing = missingAttributes(data, c)
+    if (keepMissing && missing.length > 0) {
+      plan.changes.push(changeOf(u, u, d, "skip", "missing data: " + missing.join(", ")))
+      continue
+    }
+    const claims = keepMissing ? data : completeClaims(data, c)
+    applyInto(&users, &d, &plan, i, u, claims, c, rb, mint, false)
+  }
+  plan.users = users
+  return guardAdmins(users0, plan, d)
+}
+
+// The user with no role, its SCIM data remembered as its claims.
+function roleless(u: AdminUserConfig, claims: Claims): AdminUserConfig {
+  let n = u
+  n.role = ""
+  n.claims = claims
+  return n
+}
+
+// The users a SCIM request changed (their record differs, or is new), with SCIM's data applied to them through the
+// rules: the role, memberships and profiles re-decided from what SCIM sent (Bifrost's SCIM attribute mapping). A
+// pushed user whose data maps to no role is left with none. Nothing changes when the provider maps nothing.
+export function scimResync(before: AdminUserConfig[], after0: AdminUserConfig[], d0: Directory, c: ScimProviderConfig, rb: RoleBook, mint: (prefix: string) => string): Plan {
+  let users = after0.slice()
+  let d = d0
+  let plan: Plan = { users: [], newTeams: [], newBusinessUnits: [], removed: [], changes: [] }
+  if (!hasRules(c)) {
+    plan.users = after0
+    return plan
+  }
+  for (let i = 0; i < after0.length; i++) {
+    const u = after0[i]!
+    if (u.scim_attributes === undefined && (u.scim_groups ?? []).length === 0) continue
+    const old = indexOfName(before, u.name)
+    if (old >= 0 && JSON.stringify(before[old]!) === JSON.stringify(u)) continue
+    // SCIM sends the whole user: its data replaces what was remembered (one stored copy, as in Bifrost)
+    const claims = scimClaims(u, d.teams, c)
+    const r = applyClaims(u, u, claims, c, d, rb, mint)
+    for (const t of r.newTeams) {
+      d.teams.push(t)
+      plan.newTeams.push(t)
+    }
+    for (const b of r.newBusinessUnits) {
+      d.businessUnits.push(b)
+      plan.newBusinessUnits.push(b)
+    }
+    // over SCIM, data that maps to no role leaves the user with none
+    const after = r.user ?? roleless(u, claims)
+    users[i] = after
+    plan.changes.push(changeOf(u, after, d, r.kind === "refuse" ? "refuse" : "update", r.reason))
+  }
+  plan.users = users
+  return guardAdmins(before, plan, d)
+}
+
+// A deactivated user: no memberships or profiles; its pushed data stays.
+function stripped(u: AdminUserConfig): AdminUserConfig {
+  let n = u
+  n.teams = []
+  n.business_units = []
+  n.projects = []
+  n.access_profile_ids = []
+  n.synced = {}
+  return n
+}
+
+// A reactivated user: back in the SCIM groups it is recorded in (the rules give back the rest).
+function restored(u: AdminUserConfig): AdminUserConfig {
+  let n = u
+  let teams = u.teams ?? []
+  for (const t of u.scim_groups ?? []) {
+    if (!teams.includes(t)) teams.push(t)
+  }
+  n.teams = teams
+  return n
+}
+
+// What a SCIM request deprovisioned (Bifrost: a deactivation removes the user's keys, access profiles and memberships
+// but keeps the stored profile, so a reactivation restores what the rules give; a DELETE removes the user): the users
+// with the newly deactivated ones stripped of their memberships and profiles, and the names whose keys and project
+// memberships go (the deactivated and the deleted).
+export function deprovisioned(before: AdminUserConfig[], after: AdminUserConfig[]): { users: AdminUserConfig[], names: string[] } {
+  const names: string[] = []
+  const users: AdminUserConfig[] = []
+  for (const u of after) {
+    const old = indexOfName(before, u.name)
+    const was = old >= 0 && before[old]!.disabled === true
+    if (u.disabled === true && !was && old >= 0) {
+      names.push(u.name)
+      users.push(stripped(u))
+    } else if (u.disabled !== true && was) users.push(restored(u))
+    else users.push(u)
+  }
+  for (const b of before) {
+    if (indexOfName(after, b.name) < 0) names.push(b.name)
+  }
+  return { users: users, names: names }
+}
+
+// ---- bulk import filters ----
+
+// What an import or its preview selects: users in any of the groups, holding any of the roles, in any of the
+// departments (each list ignored when empty; values compared without regard to case), or named in user_ids.
+export type ImportFilter = { groups?: string[], roles?: string[], departments?: string[], user_ids?: string[] }
+
+function anyOf(have: string[], want: string[]): bool {
+  if (want.length === 0) return true
+  const w = want.map((x) => x.toLowerCase())
+  return have.some((h) => w.includes(h.toLowerCase()))
+}
+
+function claimsAt(u: DirUser, keys: string[]): string[] {
+  let out: string[] = []
+  for (const k of keys) {
+    for (const v of u.claims.get(k) ?? []) {
+      if (!out.includes(v)) out.push(v)
+    }
+  }
+  return out
+}
+
+export function matchesFilter(u: DirUser, f: ImportFilter, c: ScimProviderConfig): bool {
+  const ids = f.user_ids ?? []
+  if (ids.length > 0 && !ids.includes(u.id) && !ids.map((x) => x.toLowerCase()).includes(accountName(u))) return false
+  const teamsField = c.teamIdsField ?? ""
+  if (!anyOf(claimsAt(u, ["groups", teamsField === "" ? "groups" : teamsField]), f.groups ?? [])) return false
+  const rolesField = c.rolesField ?? ""
+  if (!anyOf(claimsAt(u, ["roles", "realm_access.roles", "urn:zitadel:iam:org:project:roles", rolesField === "" ? "roles" : rolesField]), f.roles ?? [])) return false
+  if (!anyOf(claimsAt(u, ["department"]), f.departments ?? [])) return false
+  return true
+}
+
+// ---- tests ----
+
+function rbOf(): RoleBook {
+  const count = (r: string): int => r === "admin" ? 100 : r === "editor" ? 50 : r === "viewer" ? 10 : -1
+  return { names: ["admin", "editor", "viewer"], count: count }
+}
+
+function mintOf(prefix: string): string {
+  return prefix + "new"
+}
+
+function dirUser(id: string, email: string, active: bool, groups: string[], dept: string): DirUser {
+  let c: Claims = new Map()
+  c.set("groups", groups)
+  if (dept !== "") c.set("department", [dept])
+  return { id: id, email: email, userName: email, displayName: email, active: active, claims: c }
+}
+
+const RULES: ScimProviderConfig = {
+  attributeRoleMappings: [{ attribute: "groups", value: "raiju-admins", role: "admin" }, { attribute: "groups", value: "raiju-users", role: "viewer" }],
+  attributeTeamMappings: [{ attribute: "groups", value: "eng", team: "Engineering" }],
+  attributeBusinessUnitMappings: [{ attribute: "department", value: "*" }],
+}
+
+function emptyDir(): Directory {
+  return { teams: [], businessUnits: [], projects: [], profiles: [] }
+}
+
+test("directory sync creates mapped users, refuses unmapped ones, removes inactive ones and lists the unlisted", () => {
+  const users: AdminUserConfig[] = [
+    { name: "root", role: "admin", token_sha256: "x" },
+    { name: "old@acme.com", email: "old@acme.com", role: "viewer", source: "directory", claims: new Map() },
+    { name: "gone@acme.com", email: "gone@acme.com", role: "viewer", source: "sso", claims: new Map() },
+    { name: "manual", role: "viewer" },
+  ]
+  const listed = [dirUser("1", "Ana@Acme.com", true, ["raiju-admins", "eng"], "Research"), dirUser("2", "bo@acme.com", true, ["other"], ""), dirUser("3", "old@acme.com", false, ["raiju-users"], "")]
+  const r = planDirectory(users, emptyDir(), listed, RULES, rbOf(), mintOf, undefined)
+  const ana = r.plan.users.find((u) => u.name === "ana@acme.com")
+  expect(ana !== undefined && ana.role === "admin" && ana.source === "directory" && (ana.teams ?? []).length === 1 && (ana.business_units ?? []).length === 1).toBe(true)
+  expect(r.plan.newTeams[0]!.name + "," + r.plan.newBusinessUnits[0]!.name).toBe("Engineering,Research")
+  expect(r.plan.users.some((u) => u.name === "bo@acme.com")).toBe(false)
+  expect(r.plan.removed.join(",")).toBe("old@acme.com")
+  expect(r.unlisted.join(",")).toBe("gone@acme.com")
+  const n = countsOf(r.plan.changes)
+  expect(`${n.created} ${n.refused} ${n.removed}`).toBe("1 1 1")
+  const after = withRemovals(users, r.plan, r.unlisted, emptyDir())
+  expect(after.users.some((u) => u.name === "gone@acme.com")).toBe(false)
+  expect(after.users.some((u) => u.name === "manual") && after.users.some((u) => u.name === "root")).toBe(true)
+  // an import of one user names it; nothing is unlisted then
+  const one = planDirectory(users, emptyDir(), listed, RULES, rbOf(), mintOf, ["2"])
+  expect(one.unlisted.length + one.plan.changes.length).toBe(1)
+})
+
+test("a sync never removes or demotes the last enabled admin", () => {
+  const users: AdminUserConfig[] = [{ name: "boss@acme.com", email: "boss@acme.com", role: "admin", source: "sso", claims: new Map() }]
+  const r = planDirectory(users, emptyDir(), [dirUser("9", "boss@acme.com", false, [], "")], RULES, rbOf(), mintOf, undefined)
+  expect(r.plan.users.length === 1 && r.plan.removed.length === 0).toBe(true)
+  expect(r.plan.changes[0]!.action).toBe("skip")
+})
+
+test("reconcile replays stored claims, honours keep-missing, and skips manual users and users without data", () => {
+  const stored: Claims = new Map()
+  stored.set("groups", ["raiju-users"])
+  const users: AdminUserConfig[] = [
+    { name: "boss", role: "admin" },
+    { name: "ana", role: "admin", source: "sso", claims: stored },
+    { name: "cy", role: "viewer", source: "sso" },
+  ]
+  const p = planReconcile(users, emptyDir(), RULES, "off", rbOf(), mintOf, undefined, false)
+  const ana = p.users.find((u) => u.name === "ana")
+  expect(ana !== undefined && ana.role === "viewer").toBe(true)
+  // department is missing: with keep-missing on, ana is left alone
+  const kept = planReconcile(users, emptyDir(), RULES, "off", rbOf(), mintOf, ["ana"], true)
+  expect(kept.changes.length === 1 && kept.changes[0]!.action === "skip" && kept.changes[0]!.reason.startsWith("missing data")).toBe(true)
+  const acts = p.changes.map((c) => c.action + ":" + c.reason).join("|")
+  expect(acts.includes("skip:not managed by the identity provider") && acts.includes("skip:no stored data")).toBe(true)
+  expect(rulesHash(RULES, "off") === rulesHash(RULES, "off")).toBe(true)
+  expect(rulesHash(RULES, "off") === rulesHash({}, "off")).toBe(false)
+})
+
+test("SCIM pushes re-decide the users they changed; an unchanged user is left alone", () => {
+  const attrs: Map<string, string[]> = new Map()
+  attrs.set("groups", ["raiju-admins"])
+  const before: AdminUserConfig[] = [{ name: "root", role: "admin", token_sha256: "t" }, { name: "zed", role: "viewer", source: "scim" }]
+  const after: AdminUserConfig[] = [{ name: "root", role: "admin", token_sha256: "t" }, { name: "zed", role: "viewer", source: "scim", scim_attributes: attrs }]
+  const p = scimResync(before, after, emptyDir(), RULES, rbOf(), mintOf)
+  expect(p.users[1]!.role).toBe("admin")
+  expect(scimResync(after, after, emptyDir(), RULES, rbOf(), mintOf).changes.length).toBe(0)
+  expect(scimResync(before, after, emptyDir(), {}, rbOf(), mintOf).users[1]!.role).toBe("viewer")
+})
+
+test("a SCIM deactivation strips memberships and profiles and keeps the pushed data; a delete names the user", () => {
+  const attrs: Map<string, string[]> = new Map()
+  attrs.set("department", ["Ops"])
+  const before: AdminUserConfig[] = [{ name: "ana", role: "editor", teams: ["t1"], access_profile_ids: ["ap1"], scim_attributes: attrs }, { name: "bo", role: "viewer" }, { name: "cy", role: "viewer", disabled: true, teams: ["t2"] }]
+  const after: AdminUserConfig[] = [{ name: "ana", role: "editor", disabled: true, teams: ["t1"], access_profile_ids: ["ap1"], scim_attributes: attrs }, { name: "cy", role: "viewer", disabled: true, teams: ["t2"] }]
+  const d = deprovisioned(before, after)
+  expect(d.names.join(",")).toBe("ana,bo")
+  const ana = d.users[0]!
+  expect((ana.teams ?? []).length + (ana.access_profile_ids ?? []).length).toBe(0)
+  expect(((ana.scim_attributes ?? new Map()).get("department") ?? []).join(",")).toBe("Ops")
+  // already disabled: left as it was
+  expect((d.users[1]!.teams ?? []).join(",")).toBe("t2")
+  // reactivated: back in its SCIM groups
+  const off: AdminUserConfig[] = [{ name: "dee", role: "viewer", disabled: true, teams: [], scim_groups: ["t9"] }]
+  const on: AdminUserConfig[] = [{ name: "dee", role: "viewer", disabled: false, teams: [], scim_groups: ["t9"] }]
+  expect((deprovisioned(off, on).users[0]!.teams ?? []).join(",")).toBe("t9")
+})
+
+test("import filters by groups, roles, departments and ids; membership sources", () => {
+  const u = dirUser("1", "ana@acme.com", true, ["Eng"], "Research")
+  expect(matchesFilter(u, { groups: ["eng"] }, {})).toBe(true)
+  expect(matchesFilter(u, { groups: ["ops"] }, {})).toBe(false)
+  expect(matchesFilter(u, { departments: ["research"], user_ids: ["ANA@acme.com"] }, {})).toBe(true)
+  expect(matchesFilter(u, { roles: ["admin"] }, {})).toBe(false)
+  const m: AdminUserConfig = { name: "a", role: "viewer", teams: ["t1", "t2", "t3"], business_units: ["b1", "b2"], synced: { teams: ["t2"], business_units: ["b2"] }, scim_groups: ["t3"] }
+  expect(membershipSource(m, "teams", "t1") + membershipSource(m, "teams", "t2") + membershipSource(m, "teams", "t3")).toBe("manualsyncedsynced")
+  expect(membershipSource(m, "business_units", "b1") + membershipSource(m, "business_units", "b2")).toBe("manualsynced")
+  expect(syncMode({}, "") + syncMode({}, "t") + syncMode({ claimsSyncMode: "scim" }, "t")).toBe("offbothscim")
+})

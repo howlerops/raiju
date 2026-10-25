@@ -137,6 +137,201 @@ export function gzipBytes(data: u8[]): u8[] {
   return out
 }
 
+// ---- reading: DEFLATE (stored, fixed and dynamic blocks) after Mark Adler's puff, and the gzip wrapper ----
+
+// The input bits, least significant first, as DEFLATE packs them.
+class BitIn {
+  pos: int = 0
+  bitBuf: int = 0
+  bitCnt: int = 0
+  constructor(readonly data: u8[]) {}
+
+  bits(need: int): int throws Error {
+    let val = this.bitBuf
+    while (this.bitCnt < need) {
+      if (this.pos >= this.data.length) throw new Error("deflate data ends early")
+      val = val | (int(this.data[this.pos]!) << this.bitCnt)
+      this.pos += 1
+      this.bitCnt += 8
+    }
+    this.bitBuf = val >> need
+    this.bitCnt -= need
+    return val & ((1 << need) - 1)
+  }
+
+  // Drops the bits left in the current byte (a stored block starts on a byte).
+  align(): void {
+    this.bitBuf = 0
+    this.bitCnt = 0
+  }
+}
+
+// A canonical Huffman code: how many codes have each length, and the symbols in code order.
+type Huff = { count: int[], symbol: int[] }
+
+function huffOf(lengths: int[]): Huff {
+  const count: int[] = []
+  for (let i = 0; i <= 15; i++) count.push(0)
+  for (const l of lengths) count[l] = count[l]! + 1
+  const offs: int[] = [0, 0]
+  for (let l = 1; l < 15; l++) offs.push(offs[l]! + count[l]!)
+  const symbol: int[] = []
+  for (let i = 0; i < lengths.length; i++) symbol.push(0)
+  for (let s = 0; s < lengths.length; s++) {
+    const l = lengths[s]!
+    if (l !== 0) {
+      symbol[offs[l]!] = s
+      offs[l] = offs[l]! + 1
+    }
+  }
+  return { count: count, symbol: symbol }
+}
+
+function decodeSym(b: BitIn, h: Huff): int throws Error {
+  let code = 0
+  let first = 0
+  let index = 0
+  for (let len = 1; len <= 15; len++) {
+    code = code | (try b.bits(1))
+    const c = h.count[len]!
+    if (code - c < first) return h.symbol[index + (code - first)]!
+    index += c
+    first = (first + c) << 1
+    code = code << 1
+  }
+  throw new Error("bad deflate code")
+}
+
+function inflateCodes(b: BitIn, inout out: u8[], lit: Huff, dist: Huff): void throws Error {
+  for (;;) {
+    const sym = try decodeSym(b, lit)
+    if (sym < 256) {
+      out.push(u8(sym))
+      continue
+    }
+    if (sym === 256) return
+    const li = sym - 257
+    if (li >= 29) throw new Error("bad deflate length")
+    const len = LEN_BASE[li]! + (try b.bits(LEN_EXTRA[li]!))
+    const di = try decodeSym(b, dist)
+    if (di >= 30) throw new Error("bad deflate distance")
+    const d = DIST_BASE[di]! + (try b.bits(DIST_EXTRA[di]!))
+    if (d > out.length) throw new Error("deflate distance too far back")
+    const start = out.length - d
+    for (let k = 0; k < len; k++) out.push(out[start + k]!)
+  }
+}
+
+const CL_ORDER: int[] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+
+// Raw DEFLATE data (RFC 1951) as the bytes it stands for.
+export function inflateRaw(data: u8[]): u8[] throws Error {
+  const b = new BitIn(data)
+  let out: u8[] = []
+  let last = 0
+  while (last === 0) {
+    last = try b.bits(1)
+    const type = try b.bits(2)
+    if (type === 0) {
+      b.align()
+      if (b.pos + 4 > data.length) throw new Error("deflate stored block ends early")
+      const len = int(data[b.pos]!) | (int(data[b.pos + 1]!) << 8)
+      b.pos += 4
+      if (b.pos + len > data.length) throw new Error("deflate stored block ends early")
+      for (let k = 0; k < len; k++) out.push(data[b.pos + k]!)
+      b.pos += len
+    } else if (type === 1) {
+      const ll: int[] = []
+      for (let s = 0; s < 288; s++) ll.push(s < 144 ? 8 : s < 256 ? 9 : s < 280 ? 7 : 8)
+      const dl: int[] = []
+      for (let s = 0; s < 30; s++) dl.push(5)
+      try inflateCodes(b, &out, huffOf(ll), huffOf(dl))
+    } else if (type === 2) {
+      const nlen = (try b.bits(5)) + 257
+      const ndist = (try b.bits(5)) + 1
+      const ncode = (try b.bits(4)) + 4
+      const cl: int[] = []
+      for (let i = 0; i < 19; i++) cl.push(0)
+      for (let i = 0; i < ncode; i++) cl[CL_ORDER[i]!] = try b.bits(3)
+      const ch = huffOf(cl)
+      const lens: int[] = []
+      while (lens.length < nlen + ndist) {
+        const sym = try decodeSym(b, ch)
+        if (sym < 16) {
+          lens.push(sym)
+          continue
+        }
+        let rep = 0
+        let v = 0
+        if (sym === 16) {
+          if (lens.length === 0) throw new Error("deflate repeat with no length")
+          v = lens[lens.length - 1]!
+          rep = 3 + (try b.bits(2))
+        } else if (sym === 17) rep = 3 + (try b.bits(3))
+        else rep = 11 + (try b.bits(7))
+        for (let k = 0; k < rep; k++) lens.push(v)
+      }
+      try inflateCodes(b, &out, huffOf(lens.slice(0, nlen)), huffOf(lens.slice(nlen, nlen + ndist)))
+    } else throw new Error("bad deflate block type")
+  }
+  return out
+}
+
+// Whether bytes start with the gzip magic.
+export function isGzip(data: u8[]): bool {
+  return data.length >= 2 && int(data[0]!) === 0x1f && int(data[1]!) === 0x8b
+}
+
+// One gzip member (RFC 1952) as the bytes it holds; the optional header fields are skipped.
+export function gunzip(data: u8[]): u8[] throws Error {
+  if (data.length < 18 || !isGzip(data) || int(data[2]!) !== 8) throw new Error("not gzip data")
+  const flags = int(data[3]!)
+  let p = 10
+  if ((flags & 4) !== 0) p += 2 + (int(data[p]!) | (int(data[p + 1]!) << 8))
+  if ((flags & 8) !== 0) {
+    while (p < data.length && int(data[p]!) !== 0) p += 1
+    p += 1
+  }
+  if ((flags & 16) !== 0) {
+    while (p < data.length && int(data[p]!) !== 0) p += 1
+    p += 1
+  }
+  if ((flags & 2) !== 0) p += 2
+  if (p >= data.length - 8) throw new Error("gzip data ends early")
+  return try inflateRaw(data.slice(p, data.length - 8))
+}
+
+function hexBytes(h: string): u8[] {
+  const digits = "0123456789abcdef"
+  const out: u8[] = []
+  for (let i = 0; i + 1 < h.byteLength; i += 2) out.push(u8(digits.indexOf(h.slice(i, i + 1)) * 16 + digits.indexOf(h.slice(i + 1, i + 2))))
+  return out
+}
+
+test("gunzip reads back what gzipBytes wrote, and a dynamic-Huffman member from another writer", () => {
+  let text = ""
+  for (let i = 0; i < 50; i++) text += "{\"seq\":" + i + ",\"input\":\"hello hello hello\"}\n"
+  const bytes: u8[] = []
+  for (const x of new TextEncoder().encode(text)) bytes.push(x)
+  const back = try gunzip(gzipBytes(bytes))
+  expect(try new TextDecoder().decode(back)).toBe(text)
+  expect((try gunzip(gzipBytes([]))).length).toBe(0)
+  // members Python's gzip wrote: fixed codes (b"abcabcabc " * 20), and a dynamic-Huffman block
+  let want = ""
+  for (let i = 0; i < 20; i++) want += "abcabcabc "
+  expect(try new TextDecoder().decode(try gunzip(hexBytes("1f8b08000000000002ff4b4c4a4e042385c421cd0200d8cb79b3c8000000")))).toBe(want)
+  const dyn = hexBytes("1f8b08000000000002ff1589b10d000008836e05dbff5f50074208d6088374406d4e3de2c8cf8f052ff4237628000000")
+  expect(int(dyn[10]!) >> 1 & 3).toBe(2)
+  expect(try new TextDecoder().decode(try gunzip(dyn))).toBe("bebdbaacabaecaabbbedaabeaabdbcbadbaaeaab")
+  let bad = 0
+  try {
+    gunzip([u8(1), u8(2)])
+  } catch (e) {
+    bad += 1
+  }
+  expect(bad).toBe(1)
+})
+
 test("an empty input is the standard empty gzip member", () => {
   const hex = toHex(gzipBytes([]))
   expect(hex).toBe("1f8b0800000000000003" + "0300" + "00000000" + "00000000")

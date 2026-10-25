@@ -1,0 +1,386 @@
+// The AWS SDK's default credential chain, for a Bedrock key without credentials of its own and for Vertex's
+// aws_workload_identity (Bifrost calls config.LoadDefaultConfig for both: core/providers/bedrock/bedrock.go
+// signAWSRequest, core/providers/vertex/awsfederation.go). In the SDK's order:
+//   1. the environment: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_SESSION_TOKEN
+//   2. a web identity (EKS IRSA): AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_ARN, exchanged at STS
+//      AssumeRoleWithWebIdentity (unsigned; AWS_ROLE_SESSION_NAME names the session)
+//   3. the shared credentials file: AWS_SHARED_CREDENTIALS_FILE or ~/.aws/credentials, the AWS_PROFILE profile
+//      ("default"), when it holds static keys
+//   4. container credentials (ECS task roles, EKS Pod Identity): AWS_CONTAINER_CREDENTIALS_RELATIVE_URI on
+//      169.254.170.2, or AWS_CONTAINER_CREDENTIALS_FULL_URI, with AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE or
+//      AWS_CONTAINER_AUTHORIZATION_TOKEN as its Authorization header
+//   5. the instance profile through IMDSv2 (a session token, the role name, its credentials), falling back to IMDSv1
+//      when the token call is not served; AWS_EC2_METADATA_DISABLED=true skips it and
+//      AWS_EC2_METADATA_SERVICE_ENDPOINT moves it
+// A profile named with AWS_PROFILE comes first, as the SDK reads an explicitly selected profile before the
+// environment. STS is reached at AWS_ENDPOINT_URL_STS or AWS_ENDPOINT_URL when set (the SDK's endpoint settings),
+// else at the region's endpoint. Temporary credentials are cached until a minute before they expire. The instance
+// metadata also gives the region when nothing else names one (imdsRegion).
+import { readFileSync } from "node:fs"
+import { getEnv, BedrockKeyConfig } from "./config"
+import { pctEncode, xmlTag, parseIsoUtcMs, TokenCache } from "./cloud_auth"
+import { deadline } from "./deadline"
+import { fields, rawStr } from "./json"
+
+export type ChainCreds = { accessKey: string, secretKey: string, sessionToken: string, expiresAtMs: f64, source: string }
+
+export type ChainResult = { creds: ChainCreds | undefined, error: string }
+
+const STS_VERSION = "2011-06-15"
+export const ECS_HOST = "http://169.254.170.2"
+export const IMDS_HOST = "http://169.254.169.254"
+const IMDS_TOKEN_TTL = "21600"
+const IMDS_TIMEOUT_MS = 2000
+const CALL_TIMEOUT_MS = 10000
+// static credentials never expire; a far-away stamp keeps them in the same shape
+const NEVER: f64 = 9.0e15
+
+class ChainCache {
+  creds: TokenCache<ChainCreds> = new TokenCache<ChainCreds>()
+  region = ""
+  regionTried = false
+}
+
+const cache = new ChainCache()
+
+function env(name: string): string {
+  return (getEnv(name) ?? "").trim()
+}
+
+function readText(path: string): string throws Error {
+  return try readFileSync(path, "utf8")
+}
+
+// ---- STS AssumeRoleWithWebIdentity ----
+
+// The STS endpoint: AWS_ENDPOINT_URL_STS, AWS_ENDPOINT_URL, the region's (sts.<region>.amazonaws.com, sts.<region>
+// .amazonaws.com.cn in China), or the global one without a region. No trailing slash.
+export function stsEndpoint(region: string, stsOverride: string, generalOverride: string): string {
+  const o = stsOverride !== "" ? stsOverride : generalOverride
+  if (o !== "") return o.endsWith("/") ? o.slice(0, o.byteLength - 1) : o
+  if (region === "") return "https://sts.amazonaws.com"
+  return region.startsWith("cn-") ? `https://sts.${region}.amazonaws.com.cn` : `https://sts.${region}.amazonaws.com`
+}
+
+// The AssumeRoleWithWebIdentity call: an unsigned form POST (the token is the credential).
+export function webIdentityRequest(endpoint: string, roleArn: string, sessionName: string, token: string): { url: string, headers: Map<string, string>, body: string } {
+  const pairs: string[][] = [["Action", "AssumeRoleWithWebIdentity"], ["Version", STS_VERSION], ["RoleArn", roleArn], ["RoleSessionName", sessionName], ["WebIdentityToken", token]]
+  const body = pairs.map((p) => `${p[0]!}=${pctEncode(p[1]!)}`).join("&")
+  const hs: Map<string, string> = new Map()
+  hs.set("content-type", "application/x-www-form-urlencoded; charset=utf-8")
+  hs.set("accept", "application/xml")
+  return { url: endpoint + "/", headers: hs, body: body }
+}
+
+// The credentials of an AssumeRoleWithWebIdentity (or AssumeRole) answer; an <Error> answer throws with its message.
+export function parseStsCreds(xml: string, source: string): ChainCreds throws SyntaxError {
+  const c = xmlTag(xml, "Credentials")
+  if (c === undefined) throw new SyntaxError(`sts: ${xmlTag(xml, "Code") ?? "error"}: ${xmlTag(xml, "Message") ?? "no Credentials in the answer"}`)
+  const ak = xmlTag(c, "AccessKeyId") ?? ""
+  const sk = xmlTag(c, "SecretAccessKey") ?? ""
+  const st = xmlTag(c, "SessionToken") ?? ""
+  const exp = parseIsoUtcMs(xmlTag(c, "Expiration") ?? "")
+  if (ak === "" || sk === "" || exp === undefined) throw new SyntaxError("sts: the answer is missing a credential field")
+  return { accessKey: ak, secretKey: sk, sessionToken: st, expiresAtMs: exp, source: source }
+}
+
+// ---- container credentials (ECS, EKS Pod Identity) ----
+
+// Whether a FULL_URI may be used, as the SDK checks it: https anywhere, http only to a loopback address or the ECS
+// and EKS Pod Identity agents (169.254.170.2, 169.254.170.23, fd00:ec2::23).
+export function containerUriAllowed(uri: string): bool {
+  const u = URL.parse(uri)
+  if (u === undefined) return false
+  if (u.protocol === "https:") return true
+  if (u.protocol !== "http:") return false
+  const h = u.hostname
+  if (h === "localhost" || h === "169.254.170.2" || h === "169.254.170.23" || h === "[fd00:ec2::23]" || h === "[::1]") return true
+  return h.startsWith("127.")
+}
+
+// The URL of the container credentials (the relative URI wins, as in the SDK), or "" when neither is set; error
+// when the full URI is not allowed.
+export function containerUrl(relative: string, full: string): { url: string, error: string } {
+  if (relative !== "") return { url: ECS_HOST + (relative.startsWith("/") ? relative : "/" + relative), error: "" }
+  if (full === "") return { url: "", error: "" }
+  if (!containerUriAllowed(full)) return { url: "", error: `container credentials: ${full} is not https, a loopback address or the ECS or EKS agent` }
+  return { url: full, error: "" }
+}
+
+// The credentials of a container or instance metadata answer ({AccessKeyId, SecretAccessKey, Token, Expiration});
+// an answer with an error code or message throws it.
+export function parseJsonCreds(text: string, source: string): ChainCreds throws SyntaxError {
+  const fs = try fields(text)
+  const code = rawStr(fs, "Code") ?? rawStr(fs, "code") ?? ""
+  if (code !== "" && code !== "Success") throw new SyntaxError(`${source}: ${code}: ${rawStr(fs, "Message") ?? rawStr(fs, "message") ?? ""}`)
+  const ak = rawStr(fs, "AccessKeyId") ?? ""
+  const sk = rawStr(fs, "SecretAccessKey") ?? ""
+  if (ak === "" || sk === "") throw new SyntaxError(`${source}: the answer has no AccessKeyId and SecretAccessKey`)
+  const expText = rawStr(fs, "Expiration") ?? ""
+  const exp = expText === "" ? NEVER : parseIsoUtcMs(expText) ?? NEVER
+  return { accessKey: ak, secretKey: sk, sessionToken: rawStr(fs, "Token") ?? "", expiresAtMs: exp, source: source }
+}
+
+// ---- the shared credentials file ----
+
+// The static keys of a profile in an INI credentials file, or undefined when it has none.
+export function profileCreds(text: string, profile: string): ChainCreds | undefined {
+  let inside = false
+  let ak = ""
+  let sk = ""
+  let st = ""
+  for (const raw of text.split("\n")) {
+    const line = raw.trim()
+    if (line === "" || line.startsWith("#") || line.startsWith(";")) continue
+    if (line.startsWith("[") && line.endsWith("]")) {
+      const name = line.slice(1, line.byteLength - 1).trim()
+      inside = name === profile || name === "profile " + profile
+      continue
+    }
+    if (!inside) continue
+    const eq = line.indexOf("=")
+    if (eq < 0) continue
+    const k = line.slice(0, eq).trim().toLowerCase()
+    const v = line.slice(eq + 1).trim()
+    if (k === "aws_access_key_id") ak = v
+    else if (k === "aws_secret_access_key") sk = v
+    else if (k === "aws_session_token") st = v
+  }
+  if (ak === "" || sk === "") return undefined
+  return { accessKey: ak, secretKey: sk, sessionToken: st, expiresAtMs: NEVER, source: "shared-credentials" }
+}
+
+function sharedCreds(): ChainCreds | undefined {
+  const home = env("HOME")
+  const file = env("AWS_SHARED_CREDENTIALS_FILE") !== "" ? env("AWS_SHARED_CREDENTIALS_FILE") : home === "" ? "" : home + "/.aws/credentials"
+  if (file === "") return undefined
+  let text = ""
+  try {
+    text = try readText(file)
+  } catch (e) {
+    return undefined
+  }
+  const p = env("AWS_PROFILE")
+  return profileCreds(text, p === "" ? "default" : p)
+}
+
+// ---- calls ----
+
+async function call(method: string, url: string, hs: Map<string, string>, body: string, ms: int): Promise<{ status: int, text: string }> throws Error {
+  const h: Record<string, string> = hs
+  const dl = deadline(ms)
+  try {
+    const res = method === "GET" ? try await fetch(url, { method: method, headers: h, signal: dl.controller.signal }) : try await fetch(url, { method: method, headers: h, body: body, signal: dl.controller.signal })
+    const text = try await res.text()
+    dl.finish()
+    return { status: res.status, text: text }
+  } catch (e) {
+    dl.finish()
+    throw e
+  }
+}
+
+async function webIdentity(region: string): Promise<ChainCreds> throws Error {
+  const file = env("AWS_WEB_IDENTITY_TOKEN_FILE")
+  const role = env("AWS_ROLE_ARN")
+  if (role === "") throw new Error("web identity: AWS_WEB_IDENTITY_TOKEN_FILE is set without AWS_ROLE_ARN")
+  const token = (try readText(file)).trim()
+  // the SDK names an unnamed session after the time
+  const named = env("AWS_ROLE_SESSION_NAME")
+  const session = named !== "" ? named : "" + Math.floor(Date.now() * 1000000.0)
+  const up = webIdentityRequest(stsEndpoint(region, env("AWS_ENDPOINT_URL_STS"), env("AWS_ENDPOINT_URL")), role, session, token)
+  const r = try await call("POST", up.url, up.headers, up.body, CALL_TIMEOUT_MS)
+  if (r.status !== 200 && !r.text.includes("<Credentials>")) throw new Error(`web identity: STS answered ${r.status}: ${xmlTag(r.text, "Message") ?? r.text.slice(0, 200)}`)
+  return try parseStsCreds(r.text, "web-identity")
+}
+
+async function container(url: string): Promise<ChainCreds> throws Error {
+  const hs: Map<string, string> = new Map()
+  hs.set("accept", "application/json")
+  // EKS Pod Identity reads its token from a file, ECS can pass one inline
+  const tokenFile = env("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE")
+  let auth = env("AWS_CONTAINER_AUTHORIZATION_TOKEN")
+  if (tokenFile !== "") auth = (try readText(tokenFile)).trim()
+  if (auth.includes("\r") || auth.includes("\n")) throw new Error("container credentials: the authorization token has a line break")
+  if (auth !== "") hs.set("authorization", auth)
+  const r = try await call("GET", url, hs, "", CALL_TIMEOUT_MS)
+  if (r.status !== 200) throw new Error(`container credentials: ${url} answered ${r.status}: ${r.text.slice(0, 200)}`)
+  return try parseJsonCreds(r.text, "container")
+}
+
+function imdsBase(): string {
+  const e = env("AWS_EC2_METADATA_SERVICE_ENDPOINT")
+  if (e === "") return IMDS_HOST
+  return e.endsWith("/") ? e.slice(0, e.byteLength - 1) : e
+}
+
+// An IMDSv2 session token, or "" when the token call is not served (IMDSv1 then, unless it is turned off).
+async function imdsToken(base: string): Promise<string> throws Error {
+  const hs: Map<string, string> = new Map()
+  hs.set("x-aws-ec2-metadata-token-ttl-seconds", IMDS_TOKEN_TTL)
+  const r = try await call("PUT", base + "/latest/api/token", hs, "", IMDS_TIMEOUT_MS)
+  if (r.status === 200 && r.text !== "") return r.text.trim()
+  // a 403 is the instance refusing metadata, which v1 would not get past either
+  if (r.status === 403) throw new Error("instance metadata: the token call was refused (403)")
+  if (env("AWS_EC2_METADATA_V1_DISABLED").toLowerCase() === "true") throw new Error(`instance metadata: the token call answered ${r.status} and IMDSv1 is disabled`)
+  return ""
+}
+
+async function imdsGet(base: string, token: string, path: string): Promise<string> throws Error {
+  const hs: Map<string, string> = new Map()
+  if (token !== "") hs.set("x-aws-ec2-metadata-token", token)
+  const r = try await call("GET", base + path, hs, "", IMDS_TIMEOUT_MS)
+  if (r.status !== 200) throw new Error(`instance metadata: ${path} answered ${r.status}`)
+  return r.text
+}
+
+async function instanceProfile(): Promise<ChainCreds> throws Error {
+  const base = imdsBase()
+  const token = try await imdsToken(base)
+  const roles = (try await imdsGet(base, token, "/latest/meta-data/iam/security-credentials/")).trim()
+  const role = roles.split("\n")[0]!.trim()
+  if (role === "") throw new Error("instance metadata: the instance has no IAM role")
+  return try parseJsonCreds(try await imdsGet(base, token, "/latest/meta-data/iam/security-credentials/" + role), "instance-profile")
+}
+
+function envCreds(): ChainCreds | undefined {
+  const ak = env("AWS_ACCESS_KEY_ID")
+  const sk = env("AWS_SECRET_ACCESS_KEY")
+  if (ak === "" || sk === "") return undefined
+  return { accessKey: ak, secretKey: sk, sessionToken: env("AWS_SESSION_TOKEN"), expiresAtMs: NEVER, source: "environment" }
+}
+
+// The credentials of the default chain; region is the one STS is reached in (for the web identity). error says why
+// none was found, naming each source tried.
+export async function chainCreds(region: string): Promise<ChainResult> {
+  if (env("AWS_PROFILE") !== "") {
+    const pc = sharedCreds()
+    if (pc !== undefined) return { creds: pc, error: "" }
+  }
+  const ec = envCreds()
+  if (ec !== undefined) return { creds: ec, error: "" }
+  const now = Date.now()
+  const tokenFile = env("AWS_WEB_IDENTITY_TOKEN_FILE")
+  const cu = containerUrl(env("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"), env("AWS_CONTAINER_CREDENTIALS_FULL_URI"))
+  const key = [tokenFile, env("AWS_ROLE_ARN"), region, cu.url, imdsBase()].join("|")
+  const held = cache.creds.get(key, now)
+  if (held !== undefined) return { creds: held, error: "" }
+  try {
+    let got: ChainCreds | undefined = undefined
+    if (tokenFile !== "") got = try await webIdentity(region)
+    if (got === undefined) got = sharedCreds()
+    if (got === undefined && cu.error !== "") throw new Error(cu.error)
+    if (got === undefined && cu.url !== "") got = try await container(cu.url)
+    if (got === undefined) {
+      if (env("AWS_EC2_METADATA_DISABLED").toLowerCase() === "true") return { creds: undefined, error: "no AWS credentials: none in the environment, no web identity, shared credentials or container credentials, and the instance metadata is disabled" }
+      got = try await instanceProfile()
+    }
+    if (got.expiresAtMs < NEVER) cache.creds.put(key, got, got.expiresAtMs)
+    return { creds: got, error: "" }
+  } catch (e) {
+    return { creds: undefined, error: `no AWS credentials from the default chain: ${e.message}` }
+  }
+}
+
+// Whether a Bedrock key signs with the default chain: no API key (the key's value) and no access or secret key of its
+// own, as Bifrost's signAWSRequest decides.
+export function usesChain(bk: BedrockKeyConfig | undefined, keyValue: string): bool {
+  if (bk === undefined || keyValue !== "") return false
+  return (bk.access_key ?? "") === "" && (bk.secret_key ?? "") === ""
+}
+
+// A Bedrock key config with the default chain's credentials filled in (when usesChain), so it signs as a key with
+// static ones does; error when the chain has none ("failed to retrieve aws credentials", as Bifrost says it).
+export async function withChainCreds(bk: BedrockKeyConfig, keyValue: string): Promise<{ bk: BedrockKeyConfig, error: string }> {
+  if (!usesChain(bk, keyValue)) return { bk: bk, error: "" }
+  const cc = await chainCreds(bk.region ?? "")
+  const c = cc.creds
+  if (c === undefined) return { bk: bk, error: `failed to retrieve aws credentials: ${cc.error}` }
+  let nb = bk
+  nb.access_key = c.accessKey
+  nb.secret_key = c.secretKey
+  nb.session_token = c.sessionToken === "" ? undefined : c.sessionToken
+  return { bk: nb, error: "" }
+}
+
+// The region the instance metadata gives (/latest/meta-data/placement/region), or "" when it cannot be read. Read
+// once per process.
+export async function imdsRegion(): Promise<string> {
+  if (cache.regionTried) return cache.region
+  if (env("AWS_EC2_METADATA_DISABLED").toLowerCase() === "true") return ""
+  cache.regionTried = true
+  try {
+    const base = imdsBase()
+    const token = try await imdsToken(base)
+    cache.region = (try await imdsGet(base, token, "/latest/meta-data/placement/region")).trim()
+  } catch (e) {
+    cache.region = ""
+  }
+  return cache.region
+}
+
+// ---- tests ----
+
+test("the STS endpoint: the overrides, the region's, the global one", () => {
+  expect(stsEndpoint("eu-west-1", "", "")).toBe("https://sts.eu-west-1.amazonaws.com")
+  expect(stsEndpoint("cn-north-1", "", "")).toBe("https://sts.cn-north-1.amazonaws.com.cn")
+  expect(stsEndpoint("", "", "")).toBe("https://sts.amazonaws.com")
+  expect(stsEndpoint("eu-west-1", "http://127.0.0.1:9/", "http://other")).toBe("http://127.0.0.1:9")
+  expect(stsEndpoint("eu-west-1", "", "http://other")).toBe("http://other")
+})
+
+test("AssumeRoleWithWebIdentity: the unsigned form and its answer", () => {
+  const up = webIdentityRequest("https://sts.us-east-1.amazonaws.com", "arn:aws:iam::123456789012:role/r", "s1", "eyJ.a b")
+  expect(up.url).toBe("https://sts.us-east-1.amazonaws.com/")
+  expect(up.body).toBe("Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn=arn%3Aaws%3Aiam%3A%3A123456789012%3Arole%2Fr&RoleSessionName=s1&WebIdentityToken=eyJ.a%20b")
+  expect(up.headers.get("authorization")).toBeUndefined()
+  const ok = try parseStsCreds("<AssumeRoleWithWebIdentityResponse><AssumeRoleWithWebIdentityResult><Credentials><AccessKeyId>ASIAEXAMPLE</AccessKeyId><SecretAccessKey>sec</SecretAccessKey><SessionToken>tok</SessionToken><Expiration>2030-01-01T00:00:00Z</Expiration></Credentials></AssumeRoleWithWebIdentityResult></AssumeRoleWithWebIdentityResponse>", "web-identity")
+  expect(ok.accessKey).toBe("ASIAEXAMPLE")
+  expect(ok.sessionToken).toBe("tok")
+  expect(ok.expiresAtMs).toBe(1893456000000.0)
+  let msg = ""
+  try {
+    const bad = try parseStsCreds("<ErrorResponse><Error><Code>InvalidIdentityToken</Code><Message>expired</Message></Error></ErrorResponse>", "web-identity")
+  } catch (e) {
+    msg = e.message
+  }
+  expect(msg).toBe("sts: InvalidIdentityToken: expired")
+})
+
+test("container credentials: the URL rules and the answer", () => {
+  expect(containerUrl("/v2/credentials/abc", "http://127.0.0.1:1/x").url).toBe("http://169.254.170.2/v2/credentials/abc")
+  expect(containerUrl("", "http://169.254.170.23/v1/credentials").url).toBe("http://169.254.170.23/v1/credentials")
+  expect(containerUrl("", "http://127.0.0.1:8080/creds").url).toBe("http://127.0.0.1:8080/creds")
+  expect(containerUrl("", "https://creds.example.com/x").url).toBe("https://creds.example.com/x")
+  expect(containerUrl("", "http://creds.example.com/x").error.includes("not https")).toBe(true)
+  expect(containerUrl("", "").url).toBe("")
+  const c = try parseJsonCreds(`{"AccessKeyId":"ASIAC","SecretAccessKey":"s","Token":"t","Expiration":"2030-01-01T00:00:00Z"}`, "container")
+  expect(c.accessKey).toBe("ASIAC")
+  expect(c.sessionToken).toBe("t")
+  let msg = ""
+  try {
+    const bad = try parseJsonCreds(`{"code":"AccessDenied","message":"no association"}`, "container")
+  } catch (e) {
+    msg = e.message
+  }
+  expect(msg).toBe("container: AccessDenied: no association")
+  // the instance metadata's answer carries Code: Success
+  expect((try parseJsonCreds(`{"Code":"Success","AccessKeyId":"ASIAI","SecretAccessKey":"s","Token":"t","Expiration":"2030-01-01T00:00:00Z"}`, "instance-profile")).source).toBe("instance-profile")
+})
+
+test("a Bedrock key signs with the chain only without an API key or keys of its own", () => {
+  expect(usesChain({ region: "us-east-1" }, "")).toBe(true)
+  expect(usesChain({ region: "us-east-1" }, "bedrock-api-key")).toBe(false)
+  expect(usesChain({ access_key: "AKIDEXAMPLE", secret_key: "s" }, "")).toBe(false)
+  expect(usesChain(undefined, "")).toBe(false)
+})
+
+test("the shared credentials file: the profile's static keys", () => {
+  const text = "[default]\naws_access_key_id = AKIADEFAULT\naws_secret_access_key = s1\n\n[dev]\naws_access_key_id=AKIADEV\naws_secret_access_key=s2\naws_session_token = t2\n[empty]\nregion = x\n"
+  expect(profileCreds(text, "default")!.accessKey).toBe("AKIADEFAULT")
+  const dev = profileCreds(text, "dev")!
+  expect(dev.accessKey).toBe("AKIADEV")
+  expect(dev.sessionToken).toBe("t2")
+  expect(profileCreds(text, "empty")).toBeUndefined()
+  expect(profileCreds(text, "missing")).toBeUndefined()
+})

@@ -14,7 +14,9 @@ import { Grant } from "./governance"
 import { Hdrs, newId } from "./schemas"
 import { Pricing, parseDatasheet, SttUsage } from "./pricing"
 import * as metrics from "./metrics"
-import { LiveHooks, ModelTokens, TurnReport, GuardFn, Verdict } from "./webrtc"
+import { LiveHooks, ModelTokens, TurnReport, GuardFn, Verdict, Refusal } from "./webrtc"
+import { PluginChain, PluginRun, PluginTrace, BasePlugin, PluginContext, PreResult, PostResult } from "./plugins"
+import { fields, find, rawStr, quote } from "./json"
 
 // What a session is: "live" or "realtime", the transport that carries it ("webrtc" or "websocket"),
 // and the provider and model it runs.
@@ -150,6 +152,75 @@ function eventsCounter(spec: SessionSpec): string {
   return spec.transport === "webrtc" ? "raiju_live_webrtc_events_total" : "raiju_live_ws_events_total"
 }
 
+// The plugins' LLM hooks on the turns of a realtime session (Bifrost's RunRealtimeTurnPreHooks and the post hooks its
+// turn finalisation runs): each turn is a request of type "realtime" with its own plugin run, from its pre hooks (on
+// the Responses-shaped request LiveCore makes of the turn's inputs) to its post hooks (on its response, or its error).
+// A turn cannot be answered by a plugin: a short-circuit answer is refused as Bifrost refuses it, and a short-circuit
+// error refuses the turn. A post hook that turns a response into an error refuses it too. The run's plugin logs and
+// spans go on the turn's row (takeTrace).
+export class TurnPlugins {
+  private run: PluginRun | undefined = undefined
+  private ended: PluginTrace | undefined = undefined
+
+  constructor(readonly chain: PluginChain, readonly provider: string, readonly model: string) {}
+
+  pre(body: string): Refusal | undefined {
+    const name = this.provider === "" ? this.model : this.provider + "/" + this.model
+    const run = new PluginRun({ requestId: newId("req_"), op: "realtime", model: name, provider: this.provider, headers: new Map(), values: new Map(), trace: new PluginTrace() })
+    this.run = run
+    const full = body.startsWith("{") && body !== "{}" ? `{"model":${quote(name)},` + body.slice(1) : `{"model":${quote(name)}}`
+    const r = this.chain.runPre(&run.ctx, full)
+    if (r.kind === "continue") return undefined
+    const o = this.chain.runPost(&run.ctx, r.status, r.body)
+    this.finishRun()
+    if (o.status < 400) return { status: 500, type: "server_error", message: "realtime turn short-circuit responses are not supported" }
+    return refusalOf(o.status, o.body)
+  }
+
+  post(status: int, body: string): Refusal | undefined {
+    const run = this.run
+    if (run === undefined) return undefined
+    const o = this.chain.runPost(&run.ctx, status, body)
+    this.finishRun()
+    if (status < 400 && o.status >= 400) return refusalOf(o.status, o.body)
+    return undefined
+  }
+
+  // The plugin run of the turn that ended last, once (its row's plugin logs and spans).
+  takeTrace(): PluginTrace | undefined {
+    const t = this.ended
+    this.ended = undefined
+    return t
+  }
+
+  private finishRun(): void {
+    const run = this.run
+    if (run === undefined) return
+    this.chain.finish(&run.ctx)
+    this.ended = run.ctx.trace
+    this.run = undefined
+  }
+}
+
+// A refusal from an error body ({"error": {"message", "type"}}), with its status.
+export function refusalOf(status: int, body: string): Refusal {
+  let message = "the realtime turn was refused by a plugin"
+  let type = status >= 500 ? "server_error" : "invalid_request_error"
+  try {
+    const er = find(fields(body), "error")
+    if (er !== undefined && er.startsWith("{")) {
+      const ef = fields(er)
+      message = rawStr(ef, "message") ?? message
+      type = rawStr(ef, "type") ?? type
+    } else if (er !== undefined && er.startsWith("\"")) {
+      message = rawStr(fields(body), "error") ?? message
+    }
+  } catch (e) {
+    // the generic message stands
+  }
+  return { status: status, type: type, message: message }
+}
+
 // The hooks of one session: it is counted open from here until its report; each window or turn is
 // admitted again by governance; every event is counted; each billing unit that closes (a window of voice
 // time, a delegated response, a realtime turn, the unit that ends the session) counts its voice seconds or
@@ -166,7 +237,10 @@ export function sessionHooks(engine: Engine, h: Hdrs, grant: Grant, spec: Sessio
   // the id every row of the session carries as its parent (unless the caller names its own parent)
   const given = (h.get("x-request-id") ?? "").trim()
   const sessionKey = given !== "" ? given : newId("sess_")
-  return new LiveHooks(() => {
+  // the plugins' LLM hooks on each realtime turn, when a plugin takes part in them (WebAssembly plugins do)
+  const chain = engine.plugins
+  const tp: TurnPlugins | undefined = spec.op === "realtime" && chain !== undefined && chain.plugins.length > 0 && chain.handles("realtime") ? new TurnPlugins(chain, provider, model) : undefined
+  const hooks = new LiveHooks(() => {
     // each window of voice time, and each turn, is admitted again, as Bifrost's meter does for its next unit
     const again = engine.gov.admit(h, provider, model)
     if (again.kind === "denial") return { status: again.status, type: again.type, message: again.message }
@@ -184,8 +258,14 @@ export function sessionHooks(engine: Engine, h: Hdrs, grant: Grant, spec: Sessio
       metrics.inc("raiju_realtime_tokens_total", metrics.labels(provider, model, "input"), t.promptTokens * 1.0)
       metrics.inc("raiju_realtime_tokens_total", metrics.labels(provider, model, "output"), t.completionTokens * 1.0)
     }
-    engine.recordLive(spec.op, h, grant, provider, model, t.status, t.endedMs - t.startedMs, t.promptTokens, t.completionTokens, t.input, t.output, t.error, unitMeta(spec, sessionKey, t), unitCost(engine.pricing, spec.op, provider, model, t), newId("req_"), sessionKey)
+    const trace = tp === undefined ? undefined : tp.takeTrace()
+    engine.recordLive(spec.op, h, grant, provider, model, t.status, t.endedMs - t.startedMs, t.promptTokens, t.completionTokens, t.input, t.output, t.error, unitMeta(spec, sessionKey, t), unitCost(engine.pricing, spec.op, provider, model, t), newId("req_"), sessionKey, trace)
   })
+  if (tp !== undefined) {
+    hooks.turnPre = (body: string): Refusal | undefined => tp.pre(body)
+    hooks.turnPost = (status: int, body: string): Refusal | undefined => tp.post(status, body)
+  }
+  return hooks
 }
 
 async function verdictOf(engine: Engine, text: string, source: string): Promise<Verdict> {
@@ -317,4 +397,66 @@ test("a transcription unit costs its tokens, or its seconds, at the transcriptio
   const f = unitMeta(spec, "k", r)
   expect(f.get("realtime_response_status")).toBe("failed")
   expect(f.get("realtime_status_reason")).toBe("server_error")
+})
+
+// A plugin on realtime turns that records its hooks and refuses as its mode says.
+class TurnProbe extends BasePlugin {
+  seen: string[] = []
+  mode = ""
+
+  name(): string {
+    return "probe"
+  }
+
+  handlesOp(op: string): bool {
+    return op === "realtime"
+  }
+
+  preRequest(inout ctx: PluginContext, body: string): PreResult throws Error {
+    this.seen.push("pre:" + ctx.op + ":" + body)
+    if (this.mode === "fail") return { kind: "short_circuit", status: 418, body: `{"error":{"message":"no turns","type":"policy_error"}}`, contentType: "application/json" }
+    if (this.mode === "answer") return { kind: "short_circuit", status: 200, body: `{}`, contentType: "application/json" }
+    return { kind: "continue", body: body }
+  }
+
+  postResponse(inout ctx: PluginContext, status: int, body: string): PostResult throws Error {
+    this.seen.push("post:" + status)
+    if (this.mode === "posterr") return { kind: "status", status: 429, body: `{"error":{"message":"post says no","type":"plugin_error"}}` }
+    return { kind: "continue", body: body }
+  }
+}
+
+test("a realtime turn's plugin run: pre hooks on its request, post hooks on its response, and their refusals", () => {
+  const p = new TurnProbe()
+  const chain = new PluginChain([p])
+  const tp = new TurnPlugins(chain, "openai", "gpt-realtime")
+  expect(tp.pre(`{"input":[]}`)).toBeUndefined()
+  expect(p.seen[0]).toBe(`pre:realtime:{"model":"openai/gpt-realtime","input":[]}`)
+  expect(tp.post(200, `{"object":"response"}`)).toBeUndefined()
+  expect(p.seen[1]).toBe("post:200")
+  expect(tp.takeTrace() !== undefined).toBe(true)
+  expect(tp.takeTrace()).toBeUndefined()
+  // no run open: nothing to post
+  expect(tp.post(200, `{}`)).toBeUndefined()
+  p.mode = "fail"
+  const r = tp.pre(`{"input":[]}`)!
+  expect(r.status).toBe(418)
+  expect(r.type).toBe("policy_error")
+  expect(r.message).toBe("no turns")
+  // a short-circuit answer cannot answer a turn
+  p.mode = "answer"
+  const a = tp.pre(`{"input":[]}`)!
+  expect(a.status).toBe(500)
+  expect(a.message).toBe("realtime turn short-circuit responses are not supported")
+  p.mode = "posterr"
+  expect(tp.pre(`{}`)).toBeUndefined()
+  expect(p.seen[p.seen.length - 1]).toBe(`pre:realtime:{"model":"openai/gpt-realtime"}`)
+  const pr = tp.post(200, `{}`)!
+  expect(pr.status).toBe(429)
+  expect(pr.message).toBe("post says no")
+  // an error turn that stays an error is not refused again
+  expect(tp.pre(`{}`)).toBeUndefined()
+  expect(tp.post(500, `{"error":{"message":"x"}}`)).toBeUndefined()
+  expect(refusalOf(400, `{"error":"plain"}`).message).toBe("plain")
+  expect(refusalOf(503, `nope`).type).toBe("server_error")
 })

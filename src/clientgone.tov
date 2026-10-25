@@ -1,0 +1,96 @@
+// The callers that went away. Bifrost cancels a request's context when its client closes the socket before the
+// answer (lib/clientdisconnect.go, a peek every 500 ms), so the upstream call, a retry's backoff and the fallbacks stop
+// there; here each server hears it at once (Bun.serve's req.signal, the http1 server's socket close) and aborts the
+// watch of the request. A request is rewritten several times on its way to the engine, so the watch rides along as
+// a header the server sets (any value a client sent is replaced) and the engine reads (clientSignal); the header never
+// goes upstream (headerfilter.tov's denylist).
+
+export const CLIENT_WATCH_HEADER = "x-raiju-client-watch"
+
+// What a cancelled request answers and logs: Bifrost's request_cancelled, logged as 499 (cancelled).
+export const CANCELLED_STATUS: int = 499
+export const CANCELLED_MESSAGE = "request cancelled by caller"
+export const CANCELLED_TYPE = "request_cancelled"
+
+class Watch {
+  readonly controller = new AbortController()
+}
+
+class Watches {
+  items: Map<string, Watch> = new Map()
+  seq = 0
+}
+
+const watches = new Watches()
+
+// A new watch for a request: its id, for the header. End it with watchEnd once the request is answered.
+export function watchStart(): string {
+  watches.seq += 1
+  const id = "w" + watches.seq
+  watches.items.set(id, new Watch())
+  return id
+}
+
+// The request's client went away: its signal aborts (once).
+export function watchGone(id: string): void {
+  const w = watches.items.get(id)
+  if (w === undefined || w.controller.signal.aborted) return
+  w.controller.abort(new DOMException(CANCELLED_MESSAGE, "AbortError"))
+}
+
+// The request is answered: its watch is forgotten.
+export function watchEnd(id: string): void {
+  watches.items.delete(id)
+}
+
+// How many watches are open (tests, and a check that none is left behind).
+export function watchCount(): int {
+  return watches.items.size
+}
+
+// The signal of the request with these headers, or undefined when it has no watch.
+export function clientSignal(h: Map<string, string>): AbortSignal | undefined {
+  const id = h.get(CLIENT_WATCH_HEADER) ?? ""
+  if (id === "") return undefined
+  const w = watches.items.get(id)
+  return w === undefined ? undefined : w.controller.signal
+}
+
+// Whether a request on this path gets a watch: a POST to an inference route, or a call to an A2A agent's routes, whose
+// upstream call it can stop.
+export function watched(method: string, path: string, inference: bool): bool {
+  if (path.startsWith("/agents/a2a/")) return true
+  return method === "POST" && inference && path !== ""
+}
+
+// ---- tests ----
+
+test("a watch aborts its signal when the client goes away, and is forgotten once answered", () => {
+  const before = watchCount()
+  const id = watchStart()
+  const h: Map<string, string> = new Map()
+  h.set(CLIENT_WATCH_HEADER, id)
+  const s = clientSignal(h)!
+  expect(s.aborted).toBe(false)
+  let heard = 0
+  s.addEventListener("abort", () => {
+    heard += 1
+  })
+  watchGone(id)
+  watchGone(id)
+  expect(s.aborted).toBe(true)
+  expect(heard).toBe(1)
+  expect(s.reason!.message).toBe(CANCELLED_MESSAGE)
+  watchEnd(id)
+  expect(clientSignal(h)).toBeUndefined()
+  expect(watchCount()).toBe(before)
+  // no header, or an id nobody holds (a value a client made up), has no signal
+  expect(clientSignal(new Map())).toBeUndefined()
+  const forged: Map<string, string> = new Map()
+  forged.set(CLIENT_WATCH_HEADER, "w999999")
+  expect(clientSignal(forged)).toBeUndefined()
+  expect(watched("POST", "/v1/chat/completions", true)).toBe(true)
+  expect(watched("GET", "/v1/models", true)).toBe(false)
+  expect(watched("GET", "/agents/a2a/echo/rest/tasks/t1", false)).toBe(true)
+  expect(watched("POST", "/api/agents", false)).toBe(false)
+})

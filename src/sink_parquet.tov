@@ -1,10 +1,13 @@
 // A minimal Parquet writer for the log export: one file, one row group, one
 // data page per column, PLAIN values, every column OPTIONAL with RLE
-// definition levels, and no compression. It writes the log entry columns
-// (a null is a missing field). The format is the parquet-format spec, checked
-// by reading the files back with pyarrow.
+// definition levels, and no compression (or GZIP pages, for the hybrid log
+// payloads). It writes the log entry columns (a null is a missing field). The
+// format is the parquet-format spec, checked by reading the files back with
+// pyarrow. parquetRow reads the first row of a file's string columns back
+// (the hybrid log store's payload objects, hybrid.tov).
 import { utf8 } from "./crypto"
 import { LogEntry } from "./logstore"
+import { gzipBytes, gunzip } from "./gzip"
 
 const T_BOOL = 0
 const T_INT32 = 1
@@ -17,6 +20,7 @@ const ENC_RLE = 3
 const REP_OPTIONAL = 1
 const CT_UTF8 = 0
 const CODEC_NONE = 0
+const CODEC_GZIP = 2
 const PAGE_DATA = 0
 
 export type PqKind = "string" | "double" | "int32" | "int64" | "bool"
@@ -238,12 +242,12 @@ function pageOf(col: PqColumn): { bytes: u8[], typ: int } {
   return { bytes: data, typ: typ }
 }
 
-function pageHeader(numValues: int, size: int): u8[] {
+function pageHeader(numValues: int, size: int, stored: int): u8[] {
   const t = new Tw()
   t.beginElem()
   t.i32(1, PAGE_DATA)
   t.i32(2, size)
-  t.i32(3, size)
+  t.i32(3, stored)
   t.beginStruct(5)
   t.i32(1, numValues)
   t.i32(2, ENC_PLAIN)
@@ -256,15 +260,21 @@ function pageHeader(numValues: int, size: int): u8[] {
 
 // A Parquet file for the columns, which must all have the same length.
 export function parquetFile(cols: PqColumn[]): u8[] {
+  return parquetFileWith(cols, false)
+}
+
+// parquetFile, with each page GZIP-compressed when gz (the column chunks then name the GZIP codec).
+export function parquetFileWith(cols: PqColumn[], gz: bool): u8[] {
   const rows = cols.length === 0 ? 0 : cols[0]!.cells.length
   const body: u8[] = utf8("PAR1")
-  const chunks: { off: int, typ: int, size: int, name: string }[] = []
+  const chunks: { off: int, typ: int, size: int, raw: int, name: string }[] = []
   for (const col of cols) {
     const p = pageOf(col)
-    const hdr = pageHeader(rows, p.bytes.length)
-    chunks.push({ off: body.length, typ: p.typ, size: hdr.length + p.bytes.length, name: col.name })
+    const data = gz ? gzipBytes(p.bytes) : p.bytes
+    const hdr = pageHeader(rows, p.bytes.length, data.length)
+    chunks.push({ off: body.length, typ: p.typ, size: hdr.length + data.length, raw: hdr.length + p.bytes.length, name: col.name })
     for (const x of hdr) body.push(x)
-    for (const x of p.bytes) body.push(x)
+    for (const x of data) body.push(x)
   }
   const t = new Tw()
   t.i32(1, 1)
@@ -300,9 +310,9 @@ export function parquetFile(cols: PqColumn[]): u8[] {
     t.elemI32(ENC_RLE)
     t.listOf(3, 8, 1)
     t.elemStr(c.name)
-    t.i32(4, CODEC_NONE)
+    t.i32(4, gz ? CODEC_GZIP : CODEC_NONE)
     t.i64(5, rows)
-    t.i64(6, c.size)
+    t.i64(6, c.raw)
     t.i64(7, c.size)
     t.i64(9, c.off)
     t.endStruct()
@@ -368,6 +378,262 @@ export function logParquet(rows: LogEntry[]): u8[] {
   return parquetFile(logColumns(rows))
 }
 
+// ---- reading the first row of a file's string columns ----
+
+// The thrift compact protocol, read: field headers, the values Parquet's footer uses, and skipping the rest.
+class Tr {
+  pos: int
+  private last: int = 0
+  private saved: int[] = []
+  constructor(readonly b: u8[], start: int) {
+    this.pos = start
+  }
+
+  byte(): int throws Error {
+    if (this.pos >= this.b.length) throw new Error("parquet footer ends early")
+    const v = int(this.b[this.pos]!)
+    this.pos += 1
+    return v
+  }
+
+  uvarint(): int throws Error {
+    let v = 0
+    let shift = 0
+    for (;;) {
+      const x = try this.byte()
+      v = v | ((x & 0x7f) << shift)
+      if ((x & 0x80) === 0) return v
+      shift += 7
+      if (shift > 63) throw new Error("bad varint in parquet footer")
+    }
+  }
+
+  zigzag(): int throws Error {
+    const v = try this.uvarint()
+    return (v & 1) === 1 ? -((v >> 1) + 1) : v >> 1
+  }
+
+  bytes(): u8[] throws Error {
+    const n = try this.uvarint()
+    if (this.pos + n > this.b.length) throw new Error("parquet footer ends early")
+    const out = this.b.slice(this.pos, this.pos + n)
+    this.pos += n
+    return out
+  }
+
+  // The next field of the current struct: its id and type, or type 0 at the struct's end.
+  field(): { id: int, type: int } throws Error {
+    const h = try this.byte()
+    if (h === 0) return { id: 0, type: 0 }
+    const type = h & 0x0f
+    const delta = h >> 4
+    const id = delta === 0 ? (try this.zigzag()) : this.last + delta
+    this.last = id
+    return { id: id, type: type }
+  }
+
+  enter(): void {
+    this.saved.push(this.last)
+    this.last = 0
+  }
+
+  leave(): void {
+    const back = this.saved.pop()
+    this.last = back ?? 0
+  }
+
+  // A list header: its element type and size.
+  list(): { elem: int, n: int } throws Error {
+    const h = try this.byte()
+    const n = (h >> 4) === 15 ? (try this.uvarint()) : h >> 4
+    return { elem: h & 0x0f, n: n }
+  }
+
+  skip(type: int): void throws Error {
+    if (type === 1 || type === 2) return
+    if (type === 3) {
+      try this.byte()
+      return
+    }
+    if (type === 4 || type === 5 || type === 6) {
+      try this.uvarint()
+      return
+    }
+    if (type === 7) {
+      this.pos += 8
+      return
+    }
+    if (type === 8) {
+      try this.bytes()
+      return
+    }
+    if (type === 9 || type === 10) {
+      const l = try this.list()
+      for (let i = 0; i < l.n; i++) try this.skip(l.elem)
+      return
+    }
+    if (type === 11) {
+      const n = try this.uvarint()
+      if (n === 0) return
+      const kv = try this.byte()
+      for (let i = 0; i < n; i++) {
+        try this.skip(kv >> 4)
+        try this.skip(kv & 0x0f)
+      }
+      return
+    }
+    if (type === 12) {
+      this.enter()
+      for (;;) {
+        const f = try this.field()
+        if (f.type === 0) break
+        try this.skip(f.type)
+      }
+      this.leave()
+      return
+    }
+    throw new Error(`unknown thrift type ${type} in parquet footer`)
+  }
+}
+
+function rd32(b: u8[], at: int): int throws Error {
+  if (at < 0 || at + 4 > b.length) throw new Error("parquet data ends early")
+  return int(b[at]!) | (int(b[at + 1]!) << 8) | (int(b[at + 2]!) << 16) | (int(b[at + 3]!) << 24)
+}
+
+type PqLeaf = { name: string, type: int, optional: bool }
+type PqChunk = { name: string, codec: int, offset: int }
+
+function readSchema(t: Tr): PqLeaf[] throws Error {
+  const out: PqLeaf[] = []
+  const l = try t.list()
+  for (let i = 0; i < l.n; i++) {
+    t.enter()
+    let name = ""
+    let type = -1
+    let rep = 0
+    let children = 0
+    for (;;) {
+      const f = try t.field()
+      if (f.type === 0) break
+      if (f.id === 1 && f.type === 5) type = try t.zigzag()
+      else if (f.id === 3 && f.type === 5) rep = try t.zigzag()
+      else if (f.id === 4 && f.type === 8) name = try new TextDecoder().decode(try t.bytes())
+      else if (f.id === 5 && f.type === 5) children = try t.zigzag()
+      else try t.skip(f.type)
+    }
+    t.leave()
+    // the root (and any group) has children and no type
+    if (children === 0 && type >= 0) out.push({ name: name, type: type, optional: rep === 1 })
+  }
+  return out
+}
+
+function readChunks(t: Tr): PqChunk[] throws Error {
+  const out: PqChunk[] = []
+  const groups = try t.list()
+  for (let g = 0; g < groups.n; g++) {
+    t.enter()
+    for (;;) {
+      const f = try t.field()
+      if (f.type === 0) break
+      if (f.id !== 1 || f.type !== 9) {
+        try t.skip(f.type)
+        continue
+      }
+      const cols = try t.list()
+      for (let c = 0; c < cols.n; c++) {
+        t.enter()
+        let chunk: PqChunk = { name: "", codec: 0, offset: -1 }
+        for (;;) {
+          const cf = try t.field()
+          if (cf.type === 0) break
+          if (cf.id !== 3 || cf.type !== 12) {
+            try t.skip(cf.type)
+            continue
+          }
+          t.enter()
+          for (;;) {
+            const mf = try t.field()
+            if (mf.type === 0) break
+            if (mf.id === 3 && mf.type === 9) {
+              const pl = try t.list()
+              const parts: string[] = []
+              for (let k = 0; k < pl.n; k++) parts.push(try new TextDecoder().decode(try t.bytes()))
+              chunk.name = parts.join(".")
+            } else if (mf.id === 4 && mf.type === 5) chunk.codec = try t.zigzag()
+            else if (mf.id === 9 && mf.type === 6) chunk.offset = try t.zigzag()
+            else try t.skip(mf.type)
+          }
+          t.leave()
+        }
+        t.leave()
+        // only the first row group is read: one row is all a payload object holds
+        if (g === 0) out.push(chunk)
+      }
+    }
+    t.leave()
+  }
+  return out
+}
+
+// The first row of a file's string (BYTE_ARRAY) columns, by column name; a null leaves its column out. Pages may be
+// uncompressed or GZIP, data pages (v1) with PLAIN values; anything else (dictionary pages, snappy, zstd) is refused.
+export function parquetRow(file: u8[]): Map<string, string> throws Error {
+  const n = file.length
+  if (n < 12 || try new TextDecoder().decode(file.slice(0, 4)) !== "PAR1" || try new TextDecoder().decode(file.slice(n - 4, n)) !== "PAR1") throw new Error("not a parquet file")
+  const flen = try rd32(file, n - 8)
+  const t = new Tr(file, n - 8 - flen)
+  let leaves: PqLeaf[] = []
+  let chunks: PqChunk[] = []
+  t.enter()
+  for (;;) {
+    const f = try t.field()
+    if (f.type === 0) break
+    if (f.id === 2 && f.type === 9) leaves = try readSchema(t)
+    else if (f.id === 4 && f.type === 9) chunks = try readChunks(t)
+    else try t.skip(f.type)
+  }
+  const out: Map<string, string> = new Map()
+  for (const c of chunks) {
+    let leaf: PqLeaf | undefined = undefined
+    for (const l of leaves) {
+      if (l.name === c.name) leaf = l
+    }
+    if (leaf === undefined || leaf.type !== T_BYTE_ARRAY || c.offset < 0) continue
+    if (c.codec !== CODEC_NONE && c.codec !== CODEC_GZIP) throw new Error(`parquet codec ${c.codec} is not supported`)
+    // the page header
+    const ph = new Tr(file, c.offset)
+    ph.enter()
+    let ptype = -1
+    let stored = -1
+    for (;;) {
+      const f = try ph.field()
+      if (f.type === 0) break
+      if (f.id === 1 && f.type === 5) ptype = try ph.zigzag()
+      else if (f.id === 3 && f.type === 5) stored = try ph.zigzag()
+      else try ph.skip(f.type)
+    }
+    if (ptype !== PAGE_DATA || stored < 0 || ph.pos + stored > n) throw new Error(`column ${c.name}: unsupported page`)
+    const raw = file.slice(ph.pos, ph.pos + stored)
+    const page = c.codec === CODEC_GZIP ? try gunzip(raw) : raw
+    let at = 0
+    if (leaf.optional) {
+      // definition levels: a length, then the RLE/bit-packed hybrid; the first level says whether row 0 is there
+      const len = try rd32(page, 0)
+      if (len < 2 || 4 + len > page.length) throw new Error(`column ${c.name}: bad levels`)
+      const header = int(page[4]!)
+      const first = (header & 1) === 1 ? int(page[5]!) & 1 : int(page[5]!)
+      at = 4 + len
+      if (first === 0) continue
+    }
+    const vlen = try rd32(page, at)
+    if (vlen < 0 || at + 4 + vlen > page.length) throw new Error(`column ${c.name}: bad value`)
+    out.set(c.name, try new TextDecoder().decode(page.slice(at + 4, at + 4 + vlen)))
+  }
+  return out
+}
+
 // ---- tests ----
 
 function hexOf(b: u8[]): string {
@@ -421,6 +687,29 @@ test("log columns: 16 columns, nulls where content is off", () => {
   expect(isNullCell(cols[15]!.cells[0])).toBe(true)
   const f = logParquet([e])
   expect(hexOf(f.slice(0, 4))).toBe("50415231")
+})
+
+test("parquetRow reads back the first row's strings, plain and with GZIP pages; nulls are left out", () => {
+  const cols: PqColumn[] = [
+    { name: "id", kind: "string", cells: [{ s: "log-1", n: 0.0, b: false }] },
+    { name: "n", kind: "double", cells: [{ s: "", n: 2.5, b: false }] },
+    { name: "input", kind: "string", cells: [{ s: `{"messages":[{"role":"user","content":"héllo"}]}`, n: 0.0, b: false }] },
+    { name: "output", kind: "string", cells: [undefined] },
+  ]
+  for (const gz of [false, true]) {
+    const row = try parquetRow(parquetFileWith(cols, gz))
+    expect(row.get("id")).toBe("log-1")
+    expect(row.get("input")).toBe(`{"messages":[{"role":"user","content":"héllo"}]}`)
+    expect(row.has("output")).toBe(false)
+    expect(row.has("n")).toBe(false)
+  }
+  let bad = 0
+  try {
+    parquetRow(utf8("not parquet at all"))
+  } catch (e) {
+    bad += 1
+  }
+  expect(bad).toBe(1)
 })
 
 function isNullCell(c: PqCell | undefined): bool {

@@ -1,0 +1,352 @@
+diff --git a/crates/tov/src/check/builtins.rs b/crates/tov/src/check/builtins.rs
+index 03fcd5e..949a44c 100644
+--- a/crates/tov/src/check/builtins.rs
++++ b/crates/tov/src/check/builtins.rs
+@@ -76,7 +76,7 @@ pub(super) fn native_sig(types: &mut Types, name: &str) -> Option<(Vec<TyId>, Ty
+         "headerValue" => (vec![STR, INT], STR),
+         "headerRemove" => (vec![STR, STR], STR),
+         "headerAppend" => (vec![STR, STR, STR], STR),
+-        "fetchStart" => (vec![STR, STR, STR, STR, INT, INT, STR, STR, STR, INT, INT, INT, INT], INT),
++        "fetchStart" => (vec![STR, STR, STR, STR, INT, INT, STR, STR, STR, INT, INT, INT, INT, INT, STR], INT),
+         "fetchWait" | "fetchBodyWait" | "fetchRead" | "fetchHandle" => (vec![INT], types.promise(INT, NEVER)),
+         "fetchTake" => {
+             let bytes = types.array(U8);
+diff --git a/crates/tov/src/std/http.tov b/crates/tov/src/std/http.tov
+index b1f9746..9a2f17e 100644
+--- a/crates/tov/src/std/http.tov
++++ b/crates/tov/src/std/http.tov
+@@ -665,6 +665,27 @@ export type RequestInit = {
+   keepalive?: bool
+   // fetch() (Tov): how the request's origin pools connections, and whether it speaks HTTP/2
+   pool?: PoolOptions
++  // fetch() (Tov): which addresses the request may connect to, checked on the resolved addresses right
++  // before each connection (redirects included); a refused one fails the request ("AddressNotAllowed")
++  peer?: PeerPolicy
++}
++
++// Tov's fetch() address policy. With it, every address the host resolves to is checked when a connection is
++// made, so a name that resolves elsewhere between a program's own check and the connection (DNS rebinding)
++// is still refused:
++//   always refused:  unspecified (0.0.0.0/8, ::), link-local (169.254.0.0/16, fe80::/10; the cloud metadata
++//                    service 169.254.169.254), Teredo (2001::/32) and the metadata addresses 100.100.100.200
++//                    and fd00:ec2::254
++//   private:         loopback, 10/8, 172.16/12, 192.168/16, 100.64/10, fc00::/7, fec0::/10, multicast and
++//                    240.0.0.0/4; refused unless `private` is true, `loopback` is true (loopback addresses
++//                    only), or `allow` names the address, a CIDR range holding it, or the URL's host
++//   public:          the rest
++// IPv6 forms that carry an IPv4 address (mapped, compatible, 6to4, NAT64) are judged by that address.
++// Through a proxy the proxy resolves the host, so nothing is checked; Unix sockets are not checked.
++export type PeerPolicy = {
++  private?: bool
++  loopback?: bool
++  allow?: string[]
+ }
+ 
+ // Tov's fetch() pool options. Requests whose options differ do not share connections (each set
+@@ -2092,6 +2113,8 @@ export async function fetch(input: string | URL | Request, init?: RequestInit):
+   let ca = ""
+   let unix = ""
+   let proxy = ""
++  let peer = 0
++  let peerAllow = ""
+   let signal: AbortSignal | undefined = undefined
+   if (init !== undefined) {
+     const m = init.method
+@@ -2129,6 +2152,14 @@ export async function fetch(input: string | URL | Request, init?: RequestInit):
+     unix = init.unix ?? ""
+     proxy = init.proxy ?? ""
+     signal = init.signal
++    const pp = init.peer
++    if (pp !== undefined) {
++      peer = 1 + (pp.private === true ? 2 : 0) + (pp.loopback === true ? 4 : 0)
++      const al = pp.allow
++      if (al !== undefined) {
++        peerAllow = al.join(",")
++      }
++    }
+   }
+   if ((method === "GET" || method === "HEAD") && (body !== "" || bodyStream !== undefined)) {
+     throw new FetchError("fetch() request with GET/HEAD method cannot have body.", "ERR_INVALID_ARG_VALUE")
+@@ -2149,7 +2180,7 @@ export async function fetch(input: string | URL | Request, init?: RequestInit):
+       pingMs = (pool.http2PingInterval ?? 0) * 1000
+     }
+   }
+-  const id = __native.fetchStart(method, url, headers, body, redirect, bodyStream !== undefined ? flags + 4 : flags, ca, unix, proxy, keepAliveMs, maxConns, http2, pingMs)
++  const id = __native.fetchStart(method, url, headers, body, redirect, bodyStream !== undefined ? flags + 4 : flags, ca, unix, proxy, keepAliveMs, maxConns, http2, pingMs, peer, peerAllow)
+   if (signal !== undefined) {
+     signal.watch(id)
+   }
+diff --git a/docs/spec.md b/docs/spec.md
+index d5bbbf8..56b6912 100644
+--- a/docs/spec.md
++++ b/docs/spec.md
+@@ -222,6 +222,7 @@ const user = try (await res.json()) as User
+ - **Headers** (client and server): `get` joins repeated names with `", "`; `getSetCookie()` lists each cookie; `forEach`, `keys()`, `values()` and `toJSON()` see names lower-cased and sorted, repeated names combined.
+ - **Unix sockets** (Bun's `unix: "/path/to.sock"`): the request goes over that socket; the URL still gives the path and `Host` (`http://localhost/v1/info` for the Docker API). A socket that can't be opened rejects with `FailedToOpenSocket`.
+ - **Proxies** (Bun's `proxy: "http://user:pass@host:port"`, else `HTTP_PROXY`/`HTTPS_PROXY` (or lower case) unless `NO_PROXY` names the host): plain HTTP goes to the proxy in absolute form; HTTPS through a `CONNECT` tunnel, with TLS and certificate checks end to end. Credentials in the proxy URL become `Proxy-Authorization`. A proxy that refuses the tunnel (`407`) answers the request, as in Bun.
++- **Address policy** (Tov's `peer: { private?, loopback?, allow? }`): every address the host resolves to is checked right before each connection (each redirect and each new pooled connection), so a name that resolves elsewhere between a program's own check and the connection (DNS rebinding) is refused. Unspecified, link-local (the cloud metadata service), Teredo and the metadata addresses 100.100.100.200 and fd00:ec2::254 are always refused; private ones (loopback, RFC 1918, 100.64/10, fc00::/7, fec0::/10, multicast, 240/4) unless `private`, `loopback` (loopback only) or `allow` (addresses, CIDR ranges or the URL's host name) lets them through. IPv6 forms that carry an IPv4 address are judged by it. A refused request rejects with `AddressNotAllowed`; connections made under different policies are not shared. Through a proxy nothing is checked (the proxy resolves the host).
+ - **Blob, File, FormData.** `new Blob(parts?, { type? })` joins strings (as UTF-8), `u8[]` and Blobs: `size`, `type` (lower-cased; `""` unless printable ASCII), `slice(start?, end?, type?)` (negative offsets count from the end), `text()`, `json<T>()`, `bytes()`, `arrayBuffer()`, `stream()`. `new File(parts, name, { type?, lastModified? })` adds `name` and `lastModified`. `FormData`: `append`/`set` (a string, or a Blob added as a `File`: named by the third argument, else its own name, `"blob"` for a plain Blob), `get`, `getAll`, `has`, `delete`, `forEach`, `keys()`, `values()`; values are `string | File`. It's written as browsers write it: newlines in names and text values become CRLF, and `"`, CR and LF in names and file names are percent-escaped. Unlike Bun, a file is sent with its own `type` (Bun sends most as `application/octet-stream`), and a plain Blob is named `"blob"` (as the standard and Node do).
+ - Not yet: request bodies as streams, client certificates, `https:` proxies.
+ 
+diff --git a/runtime/node.c b/runtime/node.c
+index 40fe0a3..a9ca2c2 100644
+--- a/runtime/node.c
++++ b/runtime/node.c
+@@ -3363,7 +3363,7 @@ NATIVE(n_fetch_start) {
+     tv_str args[9];
+     for (size_t i = 0; i < 9; i++) args[i] = i == 4 || i == 5 ? TV_EMPTY_STR : tv_node_arg_str(ctx, n, a, i);
+     tv_int id = tv_native_fetchStart(args[0], args[1], args[2], args[3], (tv_int)arg_num(ctx, n, a, 4, 0), (tv_int)arg_num(ctx, n, a, 5, 1),
+-                                     args[6], args[7], args[8], 0, 0, 0, 0);
++                                     args[6], args[7], args[8], 0, 0, 0, 0, 0, TV_EMPTY_STR);
+     for (size_t i = 0; i < 9; i++) tv_str_release(args[i]);
+     tv_int *box = malloc(sizeof *box);
+     *box = id;
+diff --git a/runtime/tov.c b/runtime/tov.c
+index c54334a..cb492cf 100644
+--- a/runtime/tov.c
++++ b/runtime/tov.c
+@@ -6135,6 +6135,7 @@ tv_str tv_native_urlPart(tv_str href, tv_int k) {
+  * once the whole response has arrived (0) or the request failed (< 0), and the other natives
+  * read the result. Nothing here is referenced unless a program calls fetch. */
+ 
++#include <ctype.h>
+ #include <limits.h>
+ #include <netdb.h>
+ #include <pthread.h>
+@@ -6367,6 +6368,8 @@ typedef struct tv_origin {
+ enum { TV_FR_HEAD, TV_FR_FIXED, TV_FR_CHUNK_SIZE, TV_FR_CHUNK_DATA, TV_FR_CHUNK_END, TV_FR_TRAILERS, TV_FR_UNTIL_CLOSE, TV_FR_DONE };
+ enum { TV_FETCH_FOLLOW, TV_FETCH_MANUAL, TV_FETCH_ERROR };
+ enum { TV_FETCH_DECOMPRESS = 1, TV_FETCH_INSECURE = 2, TV_FETCH_STREAM_BODY = 4 };
++/* the `peer` option: checked (ON), private addresses allowed (PRIVATE), loopback ones allowed (LOOPBACK) */
++enum { TV_PEER_ON = 1, TV_PEER_PRIVATE = 2, TV_PEER_LOOPBACK = 4 };
+ /* A streamed request body keeps what it has sent this long, so a request that fails on a pooled
+  * connection the server had closed can be sent again (past this, it can't). */
+ #define TV_FETCH_REPLAY_MAX ((size_t)1 << 20)
+@@ -6397,6 +6400,8 @@ typedef struct tv_fr {
+     tv_str ca;                 /* extra trusted certificates (PEM), for tls.ca */
+     tv_str unix_path;          /* Bun's `unix`: connect to this socket instead ("" for TCP) */
+     tv_str proxy;              /* the `proxy` option ("": HTTP_PROXY/HTTPS_PROXY, unless NO_PROXY) */
++    int peer;                  /* the `peer` option: 0 any address, else TV_PEER_* bits */
++    tv_str peer_allow;         /* ... its allow list: addresses, CIDR ranges and host names, comma separated */
+     /* where to connect: the host itself, or the proxy (then `via_proxy`) */
+     char *dial_host;
+     int dial_port;
+@@ -6876,6 +6881,11 @@ static bool tv_fr_prepare(tv_fr *r) {
+         r->key = tv_realloc(r->key, kl);
+         snprintf(r->key + used, kl - used, "|pool:%d:%d:%d:%d", r->ka_ms, r->max_conns, r->http2, r->ping_ms);
+     }
++    if (r->peer) { /* a connection made under another address policy isn't reused */
++        size_t used = strlen(r->key), kl = used + 48;
++        r->key = tv_realloc(r->key, kl);
++        snprintf(r->key + used, kl - used, "|peer:%d:%08x", r->peer, r->peer_allow.p->len ? tv_hash_cstr(r->peer_allow.p->data) : 0);
++    }
+     return true;
+ }
+ 
+@@ -7491,8 +7501,166 @@ static void tv_fc_start_tls(tv_fc *c) {
+     tv_fc_handshake(c);
+ }
+ 
++/* ---- the `peer` option: which addresses a request may connect to
++ *
++ * Checked on the addresses the host resolved to, right before connecting (each redirect and each new pooled
++ * connection too), so a name that resolves to a public address when a program checks it and to a private one
++ * when the request connects (DNS rebinding) is refused. Every address must pass:
++ *   blocked (always refused): 0.0.0.0/8 and ::, link-local 169.254.0.0/16 and fe80::/10 (the cloud metadata
++ *     service is 169.254.169.254), Teredo 2001::/32, and the metadata addresses 100.100.100.200 and fd00:ec2::254;
++ *   private (refused unless PRIVATE, LOOPBACK for the loopback ones, or an allow entry): loopback 127.0.0.0/8 and
++ *     ::1, 10/8, 172.16/12, 192.168/16, 100.64/10, fc00::/7, fec0::/10, multicast and 240.0.0.0/4;
++ *   public: the rest.
++ * IPv6 forms that carry an IPv4 address (mapped, compatible, 6to4, NAT64) are judged by that address. Through a
++ * proxy the proxy resolves the host, so nothing is checked here. */
++
++static bool tv_peer_zero(const uint8_t *b, int from, int to) {
++    for (int i = from; i < to; i++) if (b[i]) return false;
++    return true;
++}
++
++/* The IPv4 address an IPv6 address carries, into v4; false when it carries none. */
++static bool tv_peer_v4(const uint8_t *b, uint8_t *v4) {
++    if (tv_peer_zero(b, 0, 10) && b[10] == 255 && b[11] == 255) { memcpy(v4, b + 12, 4); return true; }
++    if (tv_peer_zero(b, 0, 12) && !(tv_peer_zero(b, 12, 15) && b[15] <= 1)) { memcpy(v4, b + 12, 4); return true; }
++    if (b[0] == 0x20 && b[1] == 0x02) { memcpy(v4, b + 2, 4); return true; }
++    if (b[0] == 0 && b[1] == 0x64 && b[2] == 0xff && b[3] == 0x9b) {
++        if (tv_peer_zero(b, 4, 12)) { memcpy(v4, b + 12, 4); return true; }
++        if (b[4] == 0 && b[5] == 1) { v4[0] = b[6]; v4[1] = b[7]; v4[2] = b[9]; v4[3] = b[10]; return true; }
++    }
++    return false;
++}
++
++/* 0 public, 1 private, 2 blocked; *loopback says whether it is a loopback address. */
++static int tv_peer_class(const uint8_t *b, bool *loopback) {
++    uint8_t v[4];
++    *loopback = false;
++    if (tv_peer_v4(b, v)) {
++        if (v[0] == 0 || (v[0] == 169 && v[1] == 254) || (v[0] == 100 && v[1] == 100 && v[2] == 100 && v[3] == 200)) return 2;
++        if (v[0] == 127) { *loopback = true; return 1; }
++        if (v[0] == 10 || (v[0] == 172 && v[1] >= 16 && v[1] <= 31) || (v[0] == 192 && v[1] == 168)) return 1;
++        if (v[0] == 100 && v[1] >= 64 && v[1] <= 127) return 1;
++        if (v[0] >= 224) return 1;
++        return 0;
++    }
++    if (tv_peer_zero(b, 0, 16)) return 2;
++    if (tv_peer_zero(b, 0, 15) && b[15] == 1) { *loopback = true; return 1; }
++    if (b[0] == 0xfe && (b[1] & 0xc0) == 0x80) return 2;
++    if (b[0] == 0x20 && b[1] == 0x01 && b[2] == 0 && b[3] == 0) return 2;
++    static const uint8_t ec2[16] = {0xfd, 0, 0x0e, 0xc2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02, 0x54};
++    if (memcmp(b, ec2, 16) == 0) return 2;
++    if ((b[0] & 0xfe) == 0xfc) return 1;
++    if (b[0] == 0xfe && (b[1] & 0xc0) == 0xc0) return 1;
++    if (b[0] == 0xff) return 1;
++    return 0;
++}
++
++/* An address as sixteen bytes (IPv4 as ::ffff:a.b.c.d); false for other families. */
++static bool tv_peer_bytes(const struct sockaddr_storage *sa, uint8_t *b) {
++    if (sa->ss_family == AF_INET) {
++        memset(b, 0, 10);
++        b[10] = b[11] = 255;
++        memcpy(b + 12, &((const struct sockaddr_in *)sa)->sin_addr, 4);
++        return true;
++    }
++    if (sa->ss_family == AF_INET6) {
++        memcpy(b, &((const struct sockaddr_in6 *)sa)->sin6_addr, 16);
++        return true;
++    }
++    return false;
++}
++
++/* A host without brackets and trailing dots, lower-cased, into out. */
++static void tv_peer_name(const char *s, size_t n, char *out, size_t cap) {
++    if (n >= 2 && s[0] == '[' && s[n - 1] == ']') { s++; n -= 2; }
++    while (n && s[n - 1] == '.') n--;
++    if (n >= cap) n = cap - 1;
++    for (size_t i = 0; i < n; i++) out[i] = (char)tolower((unsigned char)s[i]);
++    out[n] = 0;
++}
++
++/* Whether an allow entry (an address, a CIDR range or a host name) admits the address b of host. */
++static bool tv_peer_entry(const char *e, size_t n, const uint8_t *b, const char *host) {
++    char ent[256];
++    tv_peer_name(e, n, ent, sizeof ent);
++    if (!ent[0]) return false;
++    char *slash = strchr(ent, '/');
++    int bits = -1;
++    if (slash) {
++        *slash = 0;
++        char *end = NULL;
++        long v = strtol(slash + 1, &end, 10);
++        if (!slash[1] || *end || v < 0 || v > 128) return false;
++        bits = (int)v;
++    }
++    uint8_t a[16];
++    struct in_addr a4;
++    struct in6_addr a6;
++    if (inet_pton(AF_INET, ent, &a4) == 1) {
++        memset(a, 0, 10);
++        a[10] = a[11] = 255;
++        memcpy(a + 12, &a4, 4);
++        if (bits > 32) return false;
++        bits = bits < 0 ? 128 : bits + 96;
++    } else if (inet_pton(AF_INET6, ent, &a6) == 1) {
++        memcpy(a, &a6, 16);
++        if (bits < 0) bits = 128;
++    } else {
++        /* a host name: the request's own host */
++        char h[256];
++        tv_peer_name(host, strlen(host), h, sizeof h);
++        return !slash && strcmp(ent, h) == 0;
++    }
++    /* an address carried in an IPv6 form is matched as that IPv4 address */
++    uint8_t m[16], v[4];
++    memcpy(m, b, 16);
++    if (tv_peer_v4(b, v)) { memset(m, 0, 10); m[10] = m[11] = 255; memcpy(m + 12, v, 4); }
++    for (int i = 0; i < 16; i++) {
++        int left = bits - i * 8;
++        if (left <= 0) return true;
++        uint8_t mask = left >= 8 ? 255 : (uint8_t)(255 << (8 - left));
++        if ((m[i] & mask) != (a[i] & mask)) return false;
++    }
++    return true;
++}
++
++static bool tv_peer_listed(const tv_fr *r, const uint8_t *b) {
++    const char *s = r->peer_allow.p->data, *end = s + r->peer_allow.p->len;
++    while (s < end) {
++        const char *comma = memchr(s, ',', (size_t)(end - s));
++        if (!comma) comma = end;
++        const char *a = s, *z = comma;
++        while (a < z && isspace((unsigned char)*a)) a++;
++        while (z > a && isspace((unsigned char)z[-1])) z--;
++        if (z > a && tv_peer_entry(a, (size_t)(z - a), b, r->host)) return true;
++        s = comma + 1;
++    }
++    return false;
++}
++
++/* Fails r (and returns false) when one of the addresses is not allowed by its `peer` option. */
++static bool tv_peer_check(tv_fr *r, const tv_addrs *addrs) {
++    if (!r->peer || r->via_proxy || r->unix_path.p->len) return true;
++    for (int i = 0; i < addrs->n; i++) {
++        uint8_t b[16];
++        if (!tv_peer_bytes(&addrs->a[i], b)) continue;
++        bool loopback;
++        int cls = tv_peer_class(b, &loopback);
++        if (cls == 0) continue;
++        if (cls == 1 && ((r->peer & TV_PEER_PRIVATE) || (loopback && (r->peer & TV_PEER_LOOPBACK)) || tv_peer_listed(r, b))) continue;
++        char ip[INET6_ADDRSTRLEN] = "?";
++        if (addrs->a[i].ss_family == AF_INET) inet_ntop(AF_INET, &((const struct sockaddr_in *)&addrs->a[i])->sin_addr, ip, sizeof ip);
++        else inet_ntop(AF_INET6, b, ip, sizeof ip);
++        tv_fr_fail(r, "AddressNotAllowed", "Connection to %s address %s (host %s) is not allowed",
++                   cls == 2 ? "a link-local, unspecified or metadata" : "a private", ip, r->host);
++        return false;
++    }
++    return true;
++}
++
+ /* Connects to the resolved addresses (DNS done). */
+ static void tv_fr_connect(tv_fr *r, const tv_addrs *addrs) {
++    if (!tv_peer_check(r, addrs)) return;
+     tv_fc *c = tv_alloc(sizeof *c);
+     memset(c, 0, sizeof *c);
+     c->io.ready = tv_fc_ready;
+@@ -8392,7 +8560,7 @@ static tv_fr *tv_fr_get(tv_int id) {
+     return r && r->id == id ? r : NULL;
+ }
+ 
+-tv_int tv_native_fetchStart(tv_str method, tv_str url, tv_str headers, tv_str body, tv_int redirect, tv_int flags, tv_str ca, tv_str unix_path, tv_str proxy, tv_int keep_alive_ms, tv_int max_conns, tv_int http2, tv_int ping_ms) {
++tv_int tv_native_fetchStart(tv_str method, tv_str url, tv_str headers, tv_str body, tv_int redirect, tv_int flags, tv_str ca, tv_str unix_path, tv_str proxy, tv_int keep_alive_ms, tv_int max_conns, tv_int http2, tv_int ping_ms, tv_int peer, tv_str peer_allow) {
+     tv_io_after_batch = tv_fc_reap;
+     tv_io_after_fork = tv_fetch_after_fork;
+     static bool sigpipe_ignored;   /* (once: it's a syscall) */
+@@ -8432,6 +8600,9 @@ tv_int tv_native_fetchStart(tv_str method, tv_str url, tv_str headers, tv_str bo
+     r->unix_path = unix_path;
+     tv_str_retain(proxy);
+     r->proxy = proxy;
++    r->peer = peer & TV_PEER_ON ? (int)(peer & (TV_PEER_ON | TV_PEER_PRIVATE | TV_PEER_LOOPBACK)) : 0;
++    tv_str_retain(peer_allow);
++    r->peer_allow = peer_allow;
+     r->ka_ms = keep_alive_ms > 0 ? (int)(keep_alive_ms < 3600000 ? keep_alive_ms : 3600000) : 0;
+     r->max_conns = max_conns > 0 ? (int)(max_conns < 100000 ? max_conns : 100000) : 0;
+     r->http2 = http2 == 1 || http2 == 2 ? (int)http2 : 0;
+@@ -8703,6 +8874,7 @@ void tv_native_fetchFree(tv_int id) {
+     tv_str_release(r->ca);
+     tv_str_release(r->unix_path);
+     tv_str_release(r->proxy);
++    tv_str_release(r->peer_allow);
+     tv_free(r->dial_host);
+     tv_free(r->proxy_auth);
+     tv_free(r->host);
+diff --git a/runtime/tov.h b/runtime/tov.h
+index 85fe21d..c4689ba 100644
+--- a/runtime/tov.h
++++ b/runtime/tov.h
+@@ -769,7 +769,7 @@ void tv_http_run(void);   /* after the program: serves registered servers until
+ tv_str tv_native_headerRemove(tv_str block, tv_str name);  /* the block without `name` lines */
+ tv_str tv_native_headerAppend(tv_str block, tv_str name, tv_str value);
+ /* fetch(): see the HTTP client section of tov.c */
+-tv_int tv_native_fetchStart(tv_str method, tv_str url, tv_str headers, tv_str body, tv_int redirect, tv_int flags, tv_str ca, tv_str unix_path, tv_str proxy, tv_int keep_alive_ms, tv_int max_conns, tv_int http2, tv_int ping_ms);
++tv_int tv_native_fetchStart(tv_str method, tv_str url, tv_str headers, tv_str body, tv_int redirect, tv_int flags, tv_str ca, tv_str unix_path, tv_str proxy, tv_int keep_alive_ms, tv_int max_conns, tv_int http2, tv_int ping_ms, tv_int peer, tv_str peer_allow);
+ tv_promise *tv_native_fetchWait(tv_int id);    /* Promise<int>: 0 the head arrived, -1 failed, -2 aborted */
+ tv_promise *tv_native_fetchBodyWait(tv_int id);   /* ... 0 the whole body is in */
+ tv_promise *tv_native_fetchRead(tv_int id);    /* ... > 0 bytes to take, 0 the end */

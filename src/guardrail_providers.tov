@@ -12,7 +12,10 @@ export type GuardrailProvider = GuardrailProviderConfig
 
 export type GuardrailRequest = { url: string, method: string, headers: Map<string, string>, body: string }
 
-export type Verdict = { action: "allow" | "block" | "redact", reason: string, text?: string }
+// found: on a redact verdict of Presidio or Azure AI Language PII, what was found (its entity type and the original
+// text), so a provider whose redaction_mode is logs_only can put placeholders in the stored copy instead.
+export type LogFinding = { kind: string, value: string }
+export type Verdict = { action: "allow" | "block" | "redact", reason: string, text?: string, found?: LogFinding[] }
 
 const enc = new TextEncoder()
 const BEDROCK_REGION = "us-east-1"
@@ -331,14 +334,16 @@ function presidioVerdict(p: GuardrailProvider, text: string, body: string): Verd
   found.sort((x: { type: string, start: f64, end: f64 }, y: { type: string, start: f64, end: f64 }) => x.start - y.start)
   let out = ""
   let pos = 0
+  const values: LogFinding[] = []
   for (const f of found) {
     const s = cpToByte(b, f.start)
     const e = cpToByte(b, f.end)
     if (s < pos || e <= s) continue
     out += text.slice(pos, s) + `<${f.type}>`
+    values.push({ kind: f.type, value: text.slice(s, e) })
     pos = e
   }
-  return { action: "redact", reason: `presidio redacted ${types}`, text: out + text.slice(pos, text.byteLength) }
+  return { action: "redact", reason: `presidio redacted ${types}`, text: out + text.slice(pos, text.byteLength), found: values }
 }
 
 // Azure AI Language PII: any entity counts. redact uses Azure's redactedText.
@@ -354,13 +359,20 @@ function azurePiiVerdict(p: GuardrailProvider, body: string): Verdict throws Err
   const ents = entRaw !== undefined && entRaw.startsWith("[") ? try elements(entRaw) : []
   if (ents.length === 0) return { action: "allow", reason: "" }
   const cats: string[] = []
-  for (const e of ents) cats.push(rawStr(try fields(e), "category") ?? "PII")
+  const values: LogFinding[] = []
+  for (const e of ents) {
+    const ef = try fields(e)
+    const cat = rawStr(ef, "category") ?? "PII"
+    cats.push(cat)
+    const t = rawStr(ef, "text") ?? ""
+    if (t !== "") values.push({ kind: cat, value: t })
+  }
   const action = p.action ?? "detect_only"
   if (action === "block") return { action: "block", reason: `azure language pii found ${cats.join(", ")}` }
   if (action === "redact") {
     const red = rawStr(doc, "redactedText")
     if (red === undefined) throw new Error("no redactedText in response")
-    return { action: "redact", reason: `azure language pii redacted ${cats.join(", ")}`, text: red }
+    return { action: "redact", reason: `azure language pii redacted ${cats.join(", ")}`, text: red, found: values }
   }
   return { action: "allow", reason: `azure language pii found ${cats.join(", ")}` }
 }
@@ -770,6 +782,7 @@ test("presidio redacts by codepoint offsets, after multibyte text", () => {
   expect(v.action).toBe("redact")
   expect(v.text).toBe("é mail <EMAIL_ADDRESS> now")
   expect(v.reason).toBe("presidio redacted EMAIL_ADDRESS")
+  expect(v.found).toEqual([{ kind: "EMAIL_ADDRESS", value: "a@b.co" }])
 })
 
 test("presidio thresholds, block and detect_only", () => {
@@ -796,7 +809,8 @@ test("azure language pii request and verdicts", () => {
   expect(r.body.includes(`"piiCategories":["Email"]`)).toBe(true)
   expect(r.body.includes(`"stringIndexType":"UnicodeCodePoint"`)).toBe(true)
   const hit = `{"kind":"PiiEntityRecognitionResults","results":{"documents":[{"id":"1","redactedText":"***","entities":[{"text":"a@b.co","category":"Email","offset":0,"length":6,"confidenceScore":0.9}]}],"errors":[]}}`
-  expect(parseVerdict(p, 200, hit)).toEqual({ action: "redact", reason: "azure language pii redacted Email", text: "***" })
+  // (the findings ride along for a logs_only provider's stored copy)
+  expect(parseVerdict(p, 200, hit)).toEqual({ action: "redact", reason: "azure language pii redacted Email", text: "***", found: [{ kind: "Email", value: "a@b.co" }] })
   const clean = `{"results":{"documents":[{"id":"1","redactedText":"hi","entities":[]}],"errors":[]}}`
   expect(parseVerdict(p, 200, clean)).toEqual({ action: "allow", reason: "" })
   p.action = "block"

@@ -16,8 +16,8 @@ them on SOAK_MOCK_PORT and SOAK_PORT (18320 and 18321 by default; run it under t
    the soak (a leak grows steadily, a heap that has settled does not) fails above --max-growth-mb.
 
 Before the stream leak was fixed (L182), one worker grew about 0.8 MB a second at the default rate and an open
-stream cost about 330 KB; after it, the second half grows under 2 MB and a stream costs about 165 KB (about
-230 KB on the http1 server).
+stream cost about 330 KB; after it, the second half grows under 2 MB and a stream costs about 160 KB (about
+227 KB on the http1 server); L189 brought that to about 135 KB (197 KB on http1).
 
 The load comes from this script (asyncio, keep-alive HTTP/1.1), so it needs nothing but Python 3. A summary line
 `soak: ok ...` or `soak: FAIL ...` ends the output; the gateway's stderr is in build/soak.gateway.log.

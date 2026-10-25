@@ -64,14 +64,40 @@ sends SIGTERM, and sets `terminationGracePeriodSeconds: 40`; it refuses a value 
 `preStopSleepSeconds + shutdown_delay_seconds + shutdown_grace_seconds + 5`. Compose gives the
 container `stop_grace_period: 35s`.
 
+WebSocket and WebRTC sessions are part of the drain. The UI's live feed sockets (`/ws`) are closed
+with code 1001 (going away) when the listener closes: the dashboard reconnects to another instance
+and resumes from its cursor. Realtime, Responses and GPT Live sessions keep running until the grace
+and are then closed with a 1001 close frame ("server shutting down"; a WebRTC call is closed), so
+their usage is billed and logged before the exit; a session that does not close within 3 s more is
+cut. Clients should reconnect on 1001.
+
+Broker mode (`-mode broker`) stops the same way: `/ready` turns 503 (`/health` stays 200), the
+listener closes after `shutdown_delay_seconds`, the exchanges in hand finish within
+`shutdown_grace_seconds`, and it exits 0. Its timeouts and connection cap are the `server.*` keys
+below.
+
 Both servers time out slow or silent clients: a request head must arrive within
 `server.header_timeout_seconds` (default 10; a half-sent head is answered 408), a body must not
 go `server.body_timeout_seconds` (default 60) without a byte (408), and a keep-alive connection
 with no request in hand closes after `server.idle_timeout_seconds` (default 60). A request being
-handled (a slow completion, a stream) is never timed out by these. `server.max_connections` caps
+handled (a slow completion, a stream) is never timed out by these, but a client that stops reading
+is: output the client does not take for `server.idle_timeout_seconds` (a stalled download, an
+abandoned stream or WebSocket on http1) ends the connection. `server.max_connections` caps
 each process's open connections (default: three quarters of its descriptor limit, `ulimit -n`;
 -1 for no cap): a request on a connection past it is answered 503, and so is a connection that
 comes when the process is out of descriptors. 0 turns a timeout off. These keys are read at start.
+
+## AWS credentials from the workload
+
+A Bedrock key with neither an API key (`value`) nor `access_key`/`secret_key`, and Vertex's
+`aws_workload_identity` (or an AWS `external_account` file), take the AWS SDK's default chain, as
+Bifrost does: the environment (`AWS_ACCESS_KEY_ID`, ...), an EKS IRSA web identity
+(`AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_ROLE_ARN`, which the EKS webhook sets for a service account
+annotated with `eks.amazonaws.com/role-arn`), the shared credentials file, ECS task roles and EKS
+Pod Identity (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` or `_FULL_URI`, which ECS and the Pod
+Identity agent set) and the EC2 instance profile (IMDSv2). The region falls back to the instance
+metadata's. On ECS the module's task role is the identity; give it the Bedrock permissions the keys
+need. `AWS_EC2_METADATA_DISABLED=true` skips the instance metadata.
 
 ## Docker
 
@@ -103,7 +129,8 @@ manage through the API or UI: saves would fail.
 
 The management API (`/api` and the dashboard) is locked until an admin exists, as in Bifrost: pass a setup
 token (`-e BIFROST_SETUP_TOKEN=...`, or `setup_token` in the config), create the first admin with it
-(`POST /api/users` with the token in `X-Bifrost-Setup-Token`), and sign in from then on. With no admin and
+(the dashboard's setup screen, or `POST /api/users` with the token in `X-Bifrost-Setup-Token`), and sign
+in from then on. With no admin and
 no setup token, `/api` answers 403. Inference is unaffected.
 
 ## Docker Compose
@@ -260,6 +287,12 @@ capacity and availability.
 - `logs_store.retention_days` (default 7) removes whole days. `logs_store.max_disk_mb` (default 0, no cap)
   also caps the folder: the oldest segments are deleted first. Set it below the volume's size; at 1,500
   requests a second a day of rows is on the order of 100 GB.
+- With `logs_store.object_storage` set (S3, or GCS through its S3 interop API), the rows keep their metadata and a
+  prompt preview and each row's bodies, raw payloads and plugin logs go to the bucket (Bifrost's hybrid store), which
+  keeps the folder small; the log detail reads them back. `object_storage.format` is `json` (default) or `parquet`,
+  `compression` `none` or `gzip` (Parquet's snappy and zstd are written as GZIP pages); set
+  `logs_store.object_storage_offload: false` to keep rows whole. Rows beyond `max_memory_entries` are read from the
+  files when a query's window reaches them.
 
 ## Limits of this packaging
 

@@ -12,6 +12,9 @@ Patch 0008 changes the fetch and HTTP/2 code that 0007 adds, so it is applied on
 Patch 0009 (node:fs rename and fsync) touches the shared lists in `builtins.rs` and `tov.h` and is written on top of 0001-0008.
 Patch 0010 (WebAssembly wall-clock limit) changes `std/wasm`, `runtime/wasm.c` and the WAMR interpreter that 0005 adds, and is written on top of 0001-0009.
 Patch 0012 (server lifecycle) changes the HTTP server in `runtime/tov.c` and `std/http.tov`, and is written on top of 0001-0010.
+Patch 0013 (fetch address policy) changes the fetch code in `runtime/tov.c` and `std/http.tov` (and `fetchStart`'s signature, also called from `runtime/node.c`), and is written on top of 0001-0012.
+Patch 0015 (client certificates, `Request.signal`, gunzip) changes fetch, sockets and the server (and `fetchStart`'s and `netConnect`'s signatures), and is written on top of 0001-0013.
+Patch 0016 (fetch input buffer) changes the fetch connection reads in `runtime/tov.c` and is written on top of 0001-0013 and 0015.
 
 ## Submitting upstream
 
@@ -619,3 +622,125 @@ idle timeout; past the cap or out of descriptors a connection is answered 503.
 **Not covered.** The timeouts have a 250 ms resolution. Upgraded (WebSocket) connections have no timeouts here
 and are not counted by `openConnections`. The signals watched are SIGTERM and SIGINT. The test
 (`tests/server_lifecycle.tov` driven by `tests/server_lifecycle_client.py`, 18 checks) is in `run.sh`.
+
+## 0013 — fetch address policy: refuse private, loopback, link-local and metadata peers at connect time (`RequestInit.peer`)
+
+**Problem.** A program that fetches URLs its users choose (webhooks, callbacks, OAuth endpoints, a provider's base
+URL) must keep them off its own network and the cloud metadata service. It can resolve the host and check the
+addresses before calling `fetch`, but `fetch` resolves the name again when it connects. A DNS server that answers
+with a public address to the first lookup and with 127.0.0.1 or 169.254.169.254 to the second (DNS rebinding, a zero
+TTL) gets the request through, and so does a redirect to such an address, or a pooled connection made earlier by an
+unchecked request.
+
+**API (Tov; not in Bun).**
+
+```ts
+const res = await fetch(url, {
+  peer: {
+    private: false,     // RFC 1918, 100.64/10, fc00::/7, fec0::/10, multicast, 240/4 and loopback (default: refused)
+    loopback: true,     // 127.0.0.0/8 and ::1 only (default: refused)
+    allow: ["10.1.0.0/16", "db.internal"],  // addresses, CIDR ranges, or the URL's host name, let through although private
+  },
+})
+// a refused address rejects with FetchError code "AddressNotAllowed":
+// "Connection to a private address 10.0.0.7 (host rebind.example) is not allowed"
+```
+
+**Design.**
+- The check runs in `tv_fr_connect`, on the addresses the lookup returned (or the numeric host, or `localhost`),
+  right before the socket is opened: for the first request, each redirect hop (which re-dials), and each new pooled or
+  HTTP/2 connection. Every address must pass (the lookup keeps up to eight), not only the one connected to, so a name
+  that mixes public and private answers is refused.
+- Unspecified (0.0.0.0/8, ::), link-local (169.254.0.0/16, fe80::/10), Teredo (2001::/32) and the metadata addresses
+  100.100.100.200 and fd00:ec2::254 are always refused, whatever `private`, `loopback` and `allow` say. IPv6 forms
+  that carry an IPv4 address (IPv4-mapped, IPv4-compatible, 6to4, NAT64) are judged by that address, and so are
+  `allow` ranges. The classes are those of Bifrost's `core/network/ssrf.go`.
+- The policy is part of the pool key (`|peer:<bits>:<hash of allow>`), so a connection made without a policy, or
+  under another one, is never reused by a request that has one.
+- Through a proxy the proxy resolves the host, so nothing is checked (as Go's dialers do behind a proxy); a program
+  checks a literal address in the URL itself. Unix sockets are not checked.
+- `fetchStart` takes two more arguments (the policy bits and the comma-joined allow list); `node:http`'s fetch
+  passes none.
+
+**Files.**
+- `runtime/tov.c`, `runtime/tov.h`: the classes, the allow list, the check in `tv_fr_connect`, the pool key and
+  `fetchStart`'s arguments; `runtime/node.c`: its call.
+- `crates/tov/src/check/builtins.rs`: the signature. `crates/tov/src/std/http.tov`: `RequestInit.peer` and `PeerPolicy`.
+- `docs/spec.md`: the fetch paragraph.
+
+**Not covered.** `Bun.connect` and `WebSocket` have no such option. The test (`tests/peer_policy.tov`, 21 checks:
+the default refusal, each switch, address, range, mapped and name entries, a name resolved through `/etc/hosts`,
+0.0.0.0, metadata, ::1, redirect hops and pooled connections) is in `run.sh`; it needs a name other than `localhost`
+that `/etc/hosts` maps to 127.0.0.1 (`PEER_NAME` names one) and is skipped without it.
+
+## 0015 — TLS client certificates, `Request.signal` on `Bun.serve`, `Bun.gunzipSync` and `Bun.inflateSync`
+
+(Numbered 0015 by its ledger task, L190; 0014 is kept for the patch written alongside it. 0015 is written on top
+of 0001-0010, 0012 and 0013: its `identity` argument follows 0013's `peer` and `peerAllow` in `fetchStart`.)
+
+**Problem.** Three things a gateway needs were missing. `fetch` and `Bun.connect` could not present a client
+certificate, so a server that requires mutual TLS (an A2A agent, in Bifrost's `agents[].*.tls`) could not be
+reached. A request on `Bun.serve` had no signal: an async handler never learned that its client went away, so
+the work it started (an upstream call, retries) ran on to the end. And there was no way to decompress gzip or
+DEFLATE data in a program (only `fetch` bodies were decoded), which gRPC's `grpc-encoding: gzip` needs.
+
+**API (as in Bun).**
+
+```ts
+await fetch(url, { tls: { ca, cert, key } })          // cert: PEM, the leaf first, then its chain; key: its PEM key
+await Bun.connect({ hostname, port, tls: { ca, alpn: ["h2"], cert, key }, socket })
+Bun.serve({ async fetch(req) { await fetch(up, { signal: req.signal }) } })  // aborts when the client goes away
+Bun.gunzipSync(bytes, { maxOutputLength: 4 << 20 })   // gzip (every member); throws when corrupt or past the limit
+Bun.inflateSync(bytes)                                // DEFLATE, raw or zlib-wrapped
+```
+
+**Design.**
+- `tls.cert` and `tls.key` go to the runtime as one PEM text (the natives `fetchStart` and `netConnect` take one
+  more string). `runtime/tls.c` keeps a context per (verify, CA, client certificate); the certificate chain and
+  key are loaded into it with `SSL_CTX_use_certificate`, `SSL_CTX_add0_chain_cert` and `SSL_CTX_use_PrivateKey`
+  and checked to match. Pooled fetch connections and resumed sessions are per certificate (the pool key holds a
+  hash of it). A pair that is not a certificate and its key fails the request with `ERR_TLS_CLIENT_CERT`.
+- `req.signal`: the runtime already noted deferred requests whose clients went away (`tv_http_on_gone`, used by
+  the Node compatibility layer). `httpOnGone(fn)` hands those ids to `Bun.serve`, which keeps the async requests
+  waiting for their answer by deferred id and aborts the signal of the one whose client left (an `AbortError`).
+  The signal is made on first use; a request answered before its client left is forgotten when answered.
+- `decompress(bytes, encoding, limit)` decodes with the codecs fetch already links (zlib), bounded by the limit
+  (one byte past it tells a stream over it from one that ends at it). The error is read with `takeError`.
+
+**Files.**
+- `runtime/tls.c`, `runtime/tov.h`: the client certificate in the TLS contexts (`open` takes it).
+- `runtime/tov.c`: the request's certificate and pool key, `httpOnGone`, `decompress`.
+- `runtime/net.c`, `runtime/ws.c`, `runtime/node.c`: `netConnect`'s and `fetchStart`'s new argument.
+- `crates/tov/src/check/builtins.rs`, `crates/tov/src/codegen/mod.rs`: the signatures; `decompress` links the codecs.
+- `crates/tov/src/std/http.tov`: `TLSOptions` and `SocketTLSOptions` (`cert`, `key`), `Request.signal`,
+  `Bun.gunzipSync`, `Bun.inflateSync`.
+- `docs/spec.md`: the fetch, sockets and serving paragraphs.
+
+**Measured in Raiju.** An A2A agent behind mutual TLS (JSON-RPC and gRPC) is reached with its client certificate
+and refuses the gateway without it; a non-streamed request whose caller hangs up stops its upstream call at once
+(no retry, no fallback, logged 499); gzip gRPC messages are read both ways (e2e `l190_e2e`).
+
+**Not covered.** A client certificate's key must not be encrypted (no passphrase option). `Request.signal` covers
+requests whose handler returned a promise (a synchronous answer has nothing to stop) and is not aborted once the
+answer is given (a streamed body's cancel says that). The tests (`tests/client_cert.tov` with
+`tests/client_cert_server.py`, 8 checks; `tests/server_gone.tov` with `tests/server_gone_client.py`, 4 checks;
+`tests/decompress.tov`, 8 checks) are in `run.sh`.
+
+## 0016 — a fetch connection's input buffer starts small
+
+**Problem.** Each fetch connection's input buffer was allocated at 64 KB on the first read and kept while the
+connection was busy. An LLM gateway holds one upstream connection per open stream, whose events are a few
+hundred bytes, so 64 KB per stream was mostly unused memory: a third of what Raiju allocated per open stream.
+
+**Design.** The buffer starts at 16 KB (`TV_FC_IN_START`) and a read wants 4 KB of room (`TV_FC_IN_ROOM`):
+what is left unparsed is moved to the front and the buffer doubles only while it needs more room (a long
+response head, a chunk size line split across reads). Bodies with a known length are still read straight into
+their own buffer in 64 KB or larger steps, so large answers take no more reads than before. A connection that
+goes back to the pool keeps a buffer of 16 KB at most, as before.
+
+**Files.** `runtime/tov.c`: `tv_fc_ready`, `tv_fc_release`.
+
+**Measured in Raiju.** 200 open streams through one gateway (`tests/soak/soak.py`'s slow streams): the bytes
+allocated per open stream fell by 48 KB. The test (`tests/fetch_buffer.tov` with `tests/fetch_buffer_server.py`,
+3 checks: a 40 KB response head, a 100 KB chunk with a split size line, 2,000 small events read as a stream) is
+in `run.sh`. Written on top of 0001-0013 and 0015.

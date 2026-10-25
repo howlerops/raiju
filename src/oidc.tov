@@ -20,6 +20,11 @@ export type OidcConfig = {
   role_map?: Record<string, string>,
   default_role?: string,
   session_ttl_seconds?: int,
+  // the audiences an ID token may carry (absent: the client id). scim_config's audience and Entra's appIdUri.
+  audiences?: string[],
+  // "access_token": the claims are read from the access token (Keycloak puts its roles there), checked against the
+  // same signing keys; else the ID token's.
+  claims_token?: string,
 }
 
 export type Discovery = { authorization_endpoint: string, token_endpoint: string, jwks_uri: string, issuer: string }
@@ -178,6 +183,14 @@ export function tokenRequestBody(cfg: OidcConfig, code: string, verifier: string
   return parts.join("&")
 }
 
+// The form body that trades a refresh token for fresh tokens (a silent session refresh).
+export function refreshRequestBody(cfg: OidcConfig, refreshToken: string): string {
+  const parts = [kv("grant_type", "refresh_token"), kv("refresh_token", refreshToken), kv("client_id", cfg.client_id)]
+  const secret = cfg.client_secret
+  if (secret !== undefined && secret !== "") parts.push(kv("client_secret", secret))
+  return parts.join("&")
+}
+
 // ---- RS256 verification ----
 
 // Big-endian bytes as a non-negative bigint.
@@ -287,39 +300,57 @@ function roleOf(cfg: OidcConfig, pfs: Field[]): string throws Error {
   return d
 }
 
-function checkToken(idToken: string, jwksJson: string, cfg: OidcConfig, issuer: string, nonce: string, nowMs: number): IdTokenResult throws Error {
-  const parts = idToken.split(".")
-  if (parts.length !== 3) throw new Error("oidc: ID token is not a JWS compact serialization")
+// The payload of an RS256 JWS checked against the JWKS. what names the token in errors.
+function signedPayload(token: string, jwksJson: string, what: string): string throws Error {
+  const parts = token.split(".")
+  if (parts.length !== 3) throw new Error(`oidc: ${what} is not a JWS compact serialization`)
   const hfs = try fields(try decodeText(parts[0]!))
-  if (rawStr(hfs, "alg") !== "RS256") throw new Error("oidc: ID token alg is not RS256")
+  if (rawStr(hfs, "alg") !== "RS256") throw new Error(`oidc: ${what} alg is not RS256`)
   const kid = rawStr(hfs, "kid")
   const payload = try decodeText(parts[1]!)
-  const pfs = try fields(payload)
   const jwk = try findJwk(jwksJson, kid)
   const nB64 = rawStr(jwk, "n")
   const eB64 = rawStr(jwk, "e")
   if (nB64 === undefined || eB64 === undefined) throw new Error("oidc: signing key has no modulus or exponent")
   const signingInput = parts[0]! + "." + parts[1]!
   const ok = try rsaVerify(signingInput, parts[2]!, nB64, eB64)
-  if (!ok) throw new Error("oidc: ID token signature is invalid")
+  if (!ok) throw new Error(`oidc: ${what} signature is invalid`)
+  return payload
+}
+
+// The audiences a token may carry: the configured ones (scim_config's audience, Entra's appIdUri), else the client id.
+export function acceptedAudiences(cfg: OidcConfig): string[] {
+  const out = (cfg.audiences ?? []).filter((a) => a !== "")
+  return out.length > 0 ? out : [cfg.client_id]
+}
+
+function timesValid(pfs: Field[], nowMs: number, what: string): void throws Error {
+  const nowS = nowMs / 1000.0
+  const exp = rawNum(pfs, "exp")
+  if (exp === undefined) throw new Error(`oidc: ${what} has no exp`)
+  if (nowS > exp + SKEW_S) throw new Error(`oidc: ${what} has expired`)
+  const nbf = rawNum(pfs, "nbf")
+  if (nbf !== undefined && nowS + SKEW_S < nbf) throw new Error(`oidc: ${what} is not valid yet`)
+}
+
+// nonce undefined: a token from a refresh, which carries no new nonce (OIDC Core 12.2).
+function checkToken(idToken: string, jwksJson: string, cfg: OidcConfig, issuer: string, nonce: string | undefined, nowMs: number): IdTokenResult throws Error {
+  const payload = try signedPayload(idToken, jwksJson, "ID token")
+  const pfs = try fields(payload)
 
   if (rawStr(pfs, "iss") !== issuer) throw new Error("oidc: ID token issuer does not match")
 
   // aud is a string or an array; the array form also needs azp (OIDC Core 3.1.3.7 step 3 and 5).
   const audList = try stringsOf(find(pfs, "aud"))
-  if (!audList.includes(cfg.client_id)) throw new Error("oidc: ID token audience does not include this client")
+  const accepted = acceptedAudiences(cfg)
+  if (!audList.some((a) => accepted.includes(a))) throw new Error("invalid audience: the ID token audience is not this client's")
   const azp = rawStr(pfs, "azp")
   if (azp !== undefined && azp !== cfg.client_id) throw new Error("oidc: ID token azp is not this client")
   if (audList.length > 1 && azp === undefined) throw new Error("oidc: ID token has several audiences and no azp")
 
-  const nowS = nowMs / 1000.0
-  const exp = rawNum(pfs, "exp")
-  if (exp === undefined) throw new Error("oidc: ID token has no exp")
-  if (nowS > exp + SKEW_S) throw new Error("oidc: ID token has expired")
-  const nbf = rawNum(pfs, "nbf")
-  if (nbf !== undefined && nowS + SKEW_S < nbf) throw new Error("oidc: ID token is not valid yet")
+  try timesValid(pfs, nowMs, "ID token")
 
-  if (rawStr(pfs, "nonce") !== nonce) throw new Error("oidc: ID token nonce does not match")
+  if (nonce !== undefined && rawStr(pfs, "nonce") !== nonce) throw new Error("oidc: ID token nonce does not match")
   const sub = rawStr(pfs, "sub")
   if (sub === undefined || sub === "") throw new Error("oidc: ID token has no sub")
   const email = rawStr(pfs, "email")
@@ -328,7 +359,7 @@ function checkToken(idToken: string, jwksJson: string, cfg: OidcConfig, issuer: 
 }
 
 // Checks an ID token from the token endpoint. Every failure is returned as kind "error".
-export function verifyIdToken(idToken: string, jwksJson: string, cfg: OidcConfig, issuer: string, nonce: string, nowMs: number): IdTokenResult {
+export function verifyIdToken(idToken: string, jwksJson: string, cfg: OidcConfig, issuer: string, nonce: string | undefined, nowMs: number): IdTokenResult {
   try {
     return try checkToken(idToken, jwksJson, cfg, issuer, nonce, nowMs)
   } catch (e) {
@@ -336,12 +367,39 @@ export function verifyIdToken(idToken: string, jwksJson: string, cfg: OidcConfig
   }
 }
 
+// The claims of an access token that is a JWT signed by the same keys (Keycloak's, which carry its roles): the
+// signature, issuer and lifetime are checked, and its audience must be an accepted one or its azp this client
+// (Keycloak's access tokens name the account service as their audience and the client as azp).
+export function accessTokenClaims(token: string, jwksJson: string, cfg: OidcConfig, issuer: string, nowMs: number): { kind: "ok", claims: string } | { kind: "error", message: string } {
+  try {
+    const payload = try signedPayload(token, jwksJson, "access token")
+    const pfs = try fields(payload)
+    if (rawStr(pfs, "iss") !== issuer) throw new Error("oidc: access token issuer does not match")
+    const audList = try stringsOf(find(pfs, "aud"))
+    const accepted = acceptedAudiences(cfg)
+    const azp = rawStr(pfs, "azp")
+    const explicit = (cfg.audiences ?? []).filter((a) => a !== "").length > 0
+    const audOk = audList.some((a) => accepted.includes(a))
+    if (!audOk && (explicit || azp !== cfg.client_id)) throw new Error("invalid audience: the access token audience is not this client's")
+    try timesValid(pfs, nowMs, "access token")
+    return { kind: "ok", claims: payload }
+  } catch (e) {
+    return { kind: "error", message: e.message }
+  }
+}
+
 // ---- UI sessions ----
 
-type SessionRecord = { sub: string, role: string, email?: string, expires: number }
+// refresh: the identity provider's refresh token, kept on the server; a session that has one outlives its expiry by
+// REFRESH_GRACE_MS so the next request can refresh it silently.
+type SessionRecord = { sub: string, role: string, email?: string, expires: number, refresh?: string }
+
+// A session that is due for a silent refresh: its token, user and refresh token.
+export type DueSession = { token: string, sub: string, email?: string, refresh: string }
 
 const SESSION_PREFIX = "sk-sess-"
 const SESSION_TTL_S = 28800
+const REFRESH_GRACE_MS = 7.0 * 24 * 3600 * 1000
 
 export class UiSessions {
   sessions: Map<string, SessionRecord> = new Map()
@@ -353,10 +411,10 @@ export class UiSessions {
   }
 
   // email is kept so a session can be checked against the user it names (governance lists users by email)
-  create(sub: string, role: string, nowMs: number, email?: string): string throws Error {
+  create(sub: string, role: string, nowMs: number, email?: string, refresh?: string): string throws Error {
     this.sweep(nowMs)
     const token = SESSION_PREFIX + (try secureHex(48))
-    this.sessions.set(token, { sub: sub, role: role, email: email, expires: nowMs + this.ttlSeconds * 1000.0 })
+    this.sessions.set(token, { sub: sub, role: role, email: email, expires: nowMs + this.ttlSeconds * 1000.0, refresh: refresh === "" ? undefined : refresh })
     return token
   }
 
@@ -364,10 +422,59 @@ export class UiSessions {
     const s = this.sessions.get(token)
     if (s === undefined) return undefined
     if (s.expires <= nowMs) {
-      this.sessions.delete(token)
+      // an expired session with a refresh token waits for its refresh (refreshable, renew)
+      if (s.refresh === undefined || s.expires + REFRESH_GRACE_MS <= nowMs) this.sessions.delete(token)
       return undefined
     }
     return { sub: s.sub, role: s.role, email: s.email }
+  }
+
+  // The session behind a token when it has expired and holds a refresh token (the next request refreshes it).
+  refreshable(token: string, nowMs: number): DueSession | undefined {
+    const s = this.sessions.get(token)
+    if (s === undefined || s.expires > nowMs) return undefined
+    const r = s.refresh
+    if (r === undefined || s.expires + REFRESH_GRACE_MS <= nowMs) return undefined
+    return { token: token, sub: s.sub, email: s.email, refresh: r }
+  }
+
+  // The sessions with a refresh token that expire before limitMs (the daily sweep refreshes them ahead of time).
+  dueBy(limitMs: number): DueSession[] {
+    const out: DueSession[] = []
+    for (const k of this.sessions.keys()) {
+      const s = this.sessions.get(k)
+      if (s === undefined) continue
+      const r = s.refresh
+      if (r !== undefined && s.expires < limitMs) out.push({ token: k, sub: s.sub, email: s.email, refresh: r })
+    }
+    return out
+  }
+
+  // A refreshed session: a new lifetime from now, the role the fresh claims gave, and the new refresh token when the
+  // identity provider rotated it.
+  renew(token: string, role: string | undefined, nowMs: number, refresh: string | undefined): void {
+    const s = this.sessions.get(token)
+    if (s === undefined) return
+    let n = s
+    if (role !== undefined) n.role = role
+    n.expires = nowMs + this.ttlSeconds * 1000.0
+    if (refresh !== undefined && refresh !== "") n.refresh = refresh
+    this.sessions.set(token, n)
+  }
+
+  // Ends every session of a user (by subject or email, without regard to case): a removed user is signed out.
+  endUser(names: string[]): int {
+    const lower = names.filter((x) => x !== "").map((x) => x.toLowerCase())
+    let n = 0
+    for (const k of this.sessions.keys()) {
+      const s = this.sessions.get(k)
+      if (s === undefined) continue
+      if (lower.includes(s.sub.toLowerCase()) || lower.includes((s.email ?? "").toLowerCase())) {
+        this.sessions.delete(k)
+        n += 1
+      }
+    }
+    return n
   }
 
   delete(token: string): void {
@@ -377,7 +484,9 @@ export class UiSessions {
   private sweep(nowMs: number): void {
     for (const k of this.sessions.keys()) {
       const s = this.sessions.get(k)
-      if (s !== undefined && s.expires <= nowMs) this.sessions.delete(k)
+      if (s === undefined) continue
+      const until = s.refresh === undefined ? s.expires : s.expires + REFRESH_GRACE_MS
+      if (until <= nowMs) this.sessions.delete(k)
     }
   }
 }
@@ -758,4 +867,60 @@ test("session TTL follows session_ttl_seconds", () => {
   const t = try store.create("u", "editor", TEST_NOW_MS)
   expect(store.get(t, TEST_NOW_MS + 59000.0) === undefined).toBe(false)
   expect(store.get(t, TEST_NOW_MS + 60000.0) === undefined).toBe(true)
+})
+
+test("the configured audiences replace the client id; Entra's app ID URI is one of them", () => {
+  const cfg: OidcConfig = { enabled: true, issuer: TEST_ISS, client_id: TEST_CLIENT, audiences: ["api://client-abc", "custom-aud"] }
+  const v1 = try signedToken(claimsJson("").replace(`"aud":"${TEST_CLIENT}"`, `"aud":"api://client-abc"`))
+  expect(verifyIdToken(v1, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("ok")
+  // before: only the client id was accepted
+  expect(verifyIdToken(v1, TEST_JWKS, testCfg({}), TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("error")
+  // the client id itself is no longer enough once audiences are set
+  const plain = try signedToken(claimsJson(""))
+  const r = verifyIdToken(plain, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS)
+  expect(r.kind === "error" && r.message.startsWith("invalid audience")).toBe(true)
+  expect(acceptedAudiences(testCfg({})).join(",")).toBe(TEST_CLIENT)
+})
+
+test("a refreshed ID token needs no nonce; a sign-in's still does", () => {
+  const noNonce = try signedToken(claimsJson("").replace(`"nonce":"n-1",`, ""))
+  expect(verifyIdToken(noNonce, TEST_JWKS, testCfg({}), TEST_ISS, undefined, TEST_NOW_MS).kind).toBe("ok")
+  expect(verifyIdToken(noNonce, TEST_JWKS, testCfg({}), TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("error")
+  const body = refreshRequestBody({ enabled: true, issuer: TEST_ISS, client_id: TEST_CLIENT, client_secret: "s&t" }, "rt/1")
+  expect(body).toBe("grant_type=refresh_token&refresh_token=rt%2F1&client_id=client-abc&client_secret=s%26t")
+})
+
+test("access token claims: signature, issuer, lifetime, and an audience or azp of this client", () => {
+  const cfg = testCfg({})
+  const kc = try signedToken(`{"iss":"${TEST_ISS}","sub":"u-1","aud":"account","azp":"${TEST_CLIENT}","exp":1700003600,"realm_access":{"roles":["raiju-admin"]}}`)
+  const ok = accessTokenClaims(kc, TEST_JWKS, cfg, TEST_ISS, TEST_NOW_MS)
+  expect(ok.kind === "ok" && ok.claims.includes("raiju-admin")).toBe(true)
+  const other = try signedToken(`{"iss":"${TEST_ISS}","sub":"u-1","aud":"account","azp":"another","exp":1700003600}`)
+  expect(accessTokenClaims(other, TEST_JWKS, cfg, TEST_ISS, TEST_NOW_MS).kind).toBe("error")
+  // an explicit audience must be in aud, azp is not enough then
+  const strict: OidcConfig = { enabled: true, issuer: TEST_ISS, client_id: TEST_CLIENT, audiences: ["raiju-api"] }
+  expect(accessTokenClaims(kc, TEST_JWKS, strict, TEST_ISS, TEST_NOW_MS).kind).toBe("error")
+  expect(accessTokenClaims(kc, TEST_JWKS, cfg, "https://evil.example.com", TEST_NOW_MS).kind).toBe("error")
+  expect(accessTokenClaims(kc, TEST_JWKS, cfg, TEST_ISS, 1700009999000.0).kind).toBe("error")
+  expect(accessTokenClaims("opaque-token", TEST_JWKS, cfg, TEST_ISS, TEST_NOW_MS).kind).toBe("error")
+})
+
+test("a session with a refresh token waits past its expiry for a refresh, is renewed, swept and ended", () => {
+  const store = new UiSessions(60)
+  const t = try store.create("u-1", "editor", TEST_NOW_MS, "Ann@x.io", "rt-1")
+  const plain = try store.create("u-2", "viewer", TEST_NOW_MS)
+  expect(store.refreshable(t, TEST_NOW_MS + 1000.0) === undefined).toBe(true)
+  // expired: no session, but it can be refreshed
+  expect(store.get(t, TEST_NOW_MS + 61000.0) === undefined).toBe(true)
+  const due = store.refreshable(t, TEST_NOW_MS + 61000.0)
+  expect(due !== undefined && due.refresh === "rt-1" && due.sub === "u-1").toBe(true)
+  expect(store.refreshable(plain, TEST_NOW_MS + 61000.0) === undefined).toBe(true)
+  store.renew(t, "admin", TEST_NOW_MS + 61000.0, "rt-2")
+  const s = store.get(t, TEST_NOW_MS + 62000.0)
+  expect(s !== undefined && s.role === "admin").toBe(true)
+  expect(store.dueBy(TEST_NOW_MS + 62000.0).length).toBe(0)
+  const soon = store.dueBy(TEST_NOW_MS + 200000.0)
+  expect(soon.length === 1 && soon[0]!.refresh === "rt-2").toBe(true)
+  expect(store.endUser(["ann@x.io"])).toBe(1)
+  expect(store.get(t, TEST_NOW_MS + 62000.0) === undefined).toBe(true)
 })

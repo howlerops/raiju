@@ -14,6 +14,7 @@
 //   - establish: the create handshake with real peer connections
 import { RTCPeerConnection, RTCDataChannel, RTCTrack, RTCConfig } from "std/rtc"
 import { Field, fields, find, rawStr, setField, build, quote, elements } from "./json"
+import { openSessions } from "./drain"
 
 // What OpenAI bills a WebRTC session when it is created, credited against its running time.
 export const LIVE_MINIMUM_SECONDS = 15.0
@@ -353,7 +354,104 @@ export type Refusal = { status: int, type: string, message: string }
 // refusal), record the finished session, bind the provider's session id to the virtual key that
 // opened it (false when it can't be recorded), and the metrics of an event.
 export class LiveHooks {
+  // The plugins' LLM hooks on each realtime turn (livehooks.tov TurnPlugins, Bifrost's RunRealtimeTurnPreHooks), when
+  // a plugin takes part: turnPre gets the turn's Responses-shaped request ({input, instructions, tools}, without the
+  // model) as the turn starts, and a refusal ends the session as a re-admission's does; turnPost gets the turn's
+  // response ({object, model, status, output, usage}) or its error with the HTTP status when the turn ends, and a
+  // refusal (a post hook's error) ends the session after the turn's row.
+  turnPre: ((body: string) => Refusal | undefined) | undefined = undefined
+  turnPost: ((status: int, body: string) => Refusal | undefined) | undefined = undefined
+
   constructor(readonly readmit: () => Refusal | undefined, readonly report: (r: LiveReport) => void, readonly bind: (id: string) => bool, readonly count: (direction: string, type: string) => void, readonly turn: (t: TurnReport) => void) {}
+}
+
+// What a realtime turn's request is made of, as Bifrost's buildRealtimeTurnPreRequest makes it: the caller's messages and
+// tool outputs since the last turn (as Responses input items with their text), then the input items of the
+// response.create that starts the turn, its instructions, and its tools (else the session's).
+export function turnRequestJson(inputs: string[], create: string, sessionTools: string): string {
+  const items = inputs.slice()
+  let instructions: string | undefined = undefined
+  let tools: string | undefined = undefined
+  if (create !== "") {
+    const extra = jsonAt(create, ["response", "input"])
+    if (extra !== undefined && extra.trim().startsWith("[")) {
+      try {
+        for (const it of elements(extra)) items.push(it)
+      } catch (e) {
+        // not a list of items: left out
+      }
+    }
+    const ins = jsonAt(create, ["response", "instructions"])
+    if (ins !== undefined && ins.startsWith("\"")) instructions = ins
+    const t = jsonAt(create, ["response", "tools"])
+    if (t !== undefined && t.trim().startsWith("[")) tools = t
+  }
+  if (tools === undefined && sessionTools !== "") tools = sessionTools
+  let out = `{"input":[${items.join(",")}]`
+  if (instructions !== undefined) out += `,"instructions":${instructions}`
+  if (tools !== undefined) out += `,"tools":${tools}`
+  return out + "}"
+}
+
+// The input item a caller's event adds to the next turn's request ("" for none): a user message's text (its input_text
+// parts) or a function call's output, from conversation.item.create; the caller's transcribed speech, from the
+// provider's input transcription.
+export function turnInputOf(type: string, m: string): string {
+  if (type === INPUT_TRANSCRIPT) {
+    const t = strAt(m, ["transcript"]).trim()
+    return t === "" ? "" : `{"type":"message","role":"user","content":${quote(t)}}`
+  }
+  if (type !== "conversation.item.create") return ""
+  const item = jsonAt(m, ["item"])
+  if (item === undefined) return ""
+  const it = strAt(item, ["type"])
+  if (it === "function_call_output") {
+    const o = strAt(item, ["output"]).trim()
+    return o === "" ? "" : `{"type":"function_call_output","output":${quote(o)}}`
+  }
+  if (it !== "message" || strAt(item, ["role"]) !== "user") return ""
+  const texts: string[] = []
+  const c = jsonAt(item, ["content"])
+  if (c !== undefined && c.trim().startsWith("[")) {
+    try {
+      for (const part of elements(c)) {
+        const t = strAt(part, ["text"])
+        if (t !== "") texts.push(t)
+      }
+    } catch (e) {
+      return ""
+    }
+  }
+  const s = texts.join("\n").trim()
+  return s === "" ? "" : `{"type":"message","role":"user","content":${quote(s)}}`
+}
+
+// A realtime turn's response in the Responses shape, as Bifrost's buildRealtimeTurnPostResponse makes it: the model's
+// text as an assistant message, the function calls the response.done lists, and its usage.
+export function turnResponseJson(model: string, done: string, text: string): string {
+  const out: string[] = []
+  if (text !== "") out.push(`{"type":"message","role":"assistant","content":[{"type":"output_text","text":${quote(text)}}]}`)
+  const items = jsonAt(done, ["response", "output"])
+  if (items !== undefined && items.trim().startsWith("[")) {
+    try {
+      for (const it of elements(items)) {
+        if (strAt(it, ["type"]) !== "function_call") continue
+        out.push(`{"type":"function_call","call_id":${quote(strAt(it, ["call_id"]))},"name":${quote(strAt(it, ["name"]))},"arguments":${quote(strAt(it, ["arguments"]))}}`)
+      }
+    } catch (e) {
+      // no function calls read
+    }
+  }
+  const u = ["response", "usage"]
+  const inT = Math.trunc(numAt(done, u.concat(["input_tokens"])))
+  const outT = Math.trunc(numAt(done, u.concat(["output_tokens"])))
+  const status = strAt(done, ["response", "status"])
+  return `{"object":"response","model":${quote(model)},"status":${quote(status === "" ? "completed" : status)},"output":[${out.join(",")}],"usage":{"input_tokens":${inT},"output_tokens":${outT},"total_tokens":${inT + outT}}}`
+}
+
+// The error body a turn's post hooks get when it did not finish with a response.
+export function turnErrorJson(status: int, message: string): string {
+  return `{"error":{"message":${quote(message)},"type":${quote(status === 400 ? "invalid_request_error" : "server_error")}},"status_code":${status}}`
 }
 
 // The tokens a session's responses used under one model, as the provider reported them: the totals,
@@ -590,6 +688,13 @@ export class LiveCore {
   checkUpdate: ((m: string) => UpdateCheck) | undefined = undefined
   // a turn (a response, from its start to its response.done) is running
   turnActive = false
+  // what the next realtime turn's request is made of (turnRequestJson): the caller's inputs since the last turn, the
+  // response.create that starts it, the session's tools; and whether the running turn's pre hooks ran (its post hooks
+  // are owed)
+  turnInputs: string[] = []
+  pendingCreate = ""
+  sessionTools = ""
+  turnHooked = false
   // the provider's connection ended abnormally
   providerFailed = false
   uses: ModelTokens[] = []
@@ -657,6 +762,12 @@ export class LiveCore {
     if (texts.length > 0) out = rewriteClientTexts(type, m, texts)
     this.hooks.count("in", type)
     this.events += 1
+    // the turn hooks' request: the caller's messages and tool outputs, and the session's tools
+    if (this.realtime) {
+      const inp = turnInputOf(type, out)
+      if (inp !== "" && this.turnInputs.length < 256) this.turnInputs.push(inp)
+      if (type === "session.update") this.noteTools(out)
+    }
     // a realtime turn the caller starts is admitted first; a refusal ends the session and the event goes nowhere. A
     // response.create while a turn is running is refused and goes nowhere either, as Bifrost does (the session goes on)
     if (this.realtime && type === "response.create") {
@@ -664,6 +775,7 @@ export class LiveCore {
         this.io.toClient(errorEvent("invalid_request_error", ACTIVE_RESPONSE))
         return
       }
+      this.pendingCreate = out
       this.startTurn()
       if (this.refused) return
     }
@@ -780,13 +892,50 @@ export class LiveCore {
     this.turnStartMs = this.now
     this.lastUsageMs = this.now
     const why = this.hooks.readmit()
-    if (why !== undefined) this.endForRefusal(why.type, why.message, why.status)
+    if (why !== undefined) {
+      this.endForRefusal(why.type, why.message, why.status)
+      return
+    }
+    // the plugins' pre hooks on the turn's request (Bifrost's RunRealtimeTurnPreHooks): a refusal (a short-circuit error,
+    // or a short-circuit answer, which a turn cannot take) closes the session with its error, as Bifrost closes it
+    const pre = this.hooks.turnPre
+    const create = this.pendingCreate
+    this.pendingCreate = ""
+    if (!this.realtime || pre === undefined) return
+    const r = pre(turnRequestJson(this.turnInputs, create, this.sessionTools))
+    if (r !== undefined) {
+      this.turnInputs = []
+      this.endForRefusal(r.type, r.message, r.status)
+      return
+    }
+    this.turnHooked = true
+  }
+
+  // The session's tools, from a session.update the caller sent or a session.created or session.updated the provider sent.
+  private noteTools(m: string): void {
+    const t = jsonAt(m, ["session", "tools"])
+    if (t !== undefined && t.trim().startsWith("[")) this.sessionTools = t
+  }
+
+  // The turn's post hooks, on its response (status 200) or its error: a refusal is a post hook's error.
+  private turnDone(status: int, body: string): Refusal | undefined {
+    const post = this.hooks.turnPost
+    const hooked = this.turnHooked
+    this.turnHooked = false
+    this.turnInputs = []
+    if (!hooked || post === undefined) return undefined
+    return post(status, body)
   }
 
   // The realtime events that carry state: the turn they start or end, the transcripts and the output
   // text (checked above, repl is what the guard left), and the usage of a finished response.
   private realtimeEvent(type: string, m: string, repl: string | undefined): string {
     let out = m
+    if (type === "session.created" || type === "session.updated") this.noteTools(m)
+    if (type === INPUT_TRANSCRIPT && !this.transcription) {
+      const inp = turnInputOf(type, m)
+      if (inp !== "" && this.turnInputs.length < 256) this.turnInputs.push(inp)
+    }
     if (type === "session.created") {
       const id = strAt(m, ["session", "id"])
       if (id !== "" && this.sessionId === "") this.sessionId = id
@@ -827,7 +976,13 @@ export class LiveCore {
     const text = this.takeText()
     const began = this.turnStartMs > 0.0 ? this.turnStartMs : this.now
     this.turnStartMs = 0.0
-    this.emit("turn", 0.0, 0.0, [used], text.input, text.output, began, this.now, false, doneOutcome(m))
+    let outcome = doneOutcome(m)
+    // the turn's post hooks (its response, or the error a failed or cancelled response is); a post hook's error is the
+    // turn's error, and the session ends after its row, as Bifrost closes it with the error
+    const refused = this.turnDone(outcome.status, outcome.status === 200 ? turnResponseJson(this.model, m, text.output) : turnErrorJson(outcome.status, outcome.error))
+    if (refused !== undefined) outcome = { state: outcome.state, reason: outcome.reason, status: refused.status, error: refused.message }
+    this.emit("turn", 0.0, 0.0, [used], text.input, text.output, began, this.now, false, outcome)
+    if (refused !== undefined) this.endForRefusal(refused.type, refused.message, refused.status)
   }
 
   // A transcription of the caller's audio finished: the unit is admitted if no commit opened it, then its usage (tokens,
@@ -856,7 +1011,10 @@ export class LiveCore {
     const text = this.takeText()
     const began = this.turnStartMs > 0.0 ? this.turnStartMs : this.now
     this.turnStartMs = 0.0
-    this.emit("transcription", seconds, 0.0, [used], text.input, text.output, began, this.now, false, undefined)
+    const refused = this.turnDone(200, turnResponseJson(this.model, `{"response":{"usage":{"input_tokens":${used.prompt},"output_tokens":${used.completion}}}}`, text.output))
+    const outcome: DoneOutcome | undefined = refused === undefined ? undefined : { state: "", reason: "", status: refused.status, error: refused.message }
+    this.emit("transcription", seconds, 0.0, [used], text.input, text.output, began, this.now, false, outcome)
+    if (refused !== undefined) this.endForRefusal(refused.type, refused.message, refused.status)
   }
 
   // Adds tokens to the session's totals and to the model's; what was added is returned.
@@ -1099,6 +1257,11 @@ export class LiveCore {
     const billed = seconds < this.minimum ? this.minimum : seconds
     const text = this.takeText()
     if (this.realtime) {
+      // a turn whose pre hooks ran and that never finished: its post hooks get the error the session ended with
+      if (this.turnHooked) {
+        const st = this.status !== 200 ? this.status : 499
+        this.turnDone(st, turnErrorJson(st, this.error !== "" ? this.error : "the realtime session ended before the turn finished"))
+      }
       if (this.status !== 200 || this.turnActive || text.input !== "" || text.output !== "") {
         this.emit("end", 0.0, 0.0, [], text.input, text.output, this.turnStartMs > 0.0 ? this.turnStartMs : nowMs, nowMs, true, undefined)
       }
@@ -1614,6 +1777,18 @@ function makePeer(cfg: RTCConfig): RTCPeerConnection | undefined {
   }
 }
 
+// Counts a WebRTC session among those a graceful stop ends (drain.tov): once the drain has run out it is closed
+// (what it used is reported, the browser gets what is queued, both peers go), as Bifrost's shutdown closes its
+// relays. The registry forgets it when it closes.
+function track(relay: Relay): void {
+  const id = openSessions().add({ feed: false, goAway: () => {
+    relay.close()
+  }, ended: (): bool => relay.closed, drop: () => {} })
+  relay.onClosed = () => {
+    openSessions().remove(id)
+  }
+}
+
 // Makes the two peer connections, runs the handshake and returns the browser's SDP answer, with the
 // relay running. A failure before the provider created the session bills nothing; after it, the
 // minimum.
@@ -1742,6 +1917,7 @@ export async function establish(s: Setup): Promise<Established> {
   if (relay.closing) return failed(502, "upstream_connection_error", "the WebRTC session closed during setup")
   relay.setupDone = true
   startClock(relay)
+  track(relay)
   return { status: 0, type: "", message: "", answer: answer, sessionId: ex.sessionId, relay: relay, body: "", contentType: "" }
 }
 
@@ -2759,4 +2935,89 @@ test("an idle live session meets its budget check, and logs no row for a window 
   expect(t.cap.turns.length).toBe(1)
   expect(t.cap.turns[0]!.status).toBe(429)
   expect(t.cap.turns[0]!.billedSeconds).toBe(15.0)
+})
+
+class TurnCapture {
+  pre: string[] = []
+  post: string[] = []
+  preWhy = ""
+  postWhy = ""
+}
+
+// A realtime fixture whose turns run plugin hooks that record what they get and refuse when told to.
+function hookedFixture(): { core: LiveCore, cap: Capture, tc: TurnCapture } {
+  const t = realtimeFixture()
+  const tc = new TurnCapture()
+  t.core.hooks.turnPre = (body: string): Refusal | undefined => {
+    tc.pre.push(body)
+    if (tc.preWhy === "") return undefined
+    return { status: 418, type: "policy_error", message: tc.preWhy }
+  }
+  t.core.hooks.turnPost = (status: int, body: string): Refusal | undefined => {
+    tc.post.push(status + " " + body)
+    if (tc.postWhy === "") return undefined
+    return { status: 429, type: "plugin_error", message: tc.postWhy }
+  }
+  return { core: t.core, cap: t.cap, tc: tc }
+}
+
+test("the turn request is made of the caller's inputs, the response.create and the session's tools", () => {
+  expect(turnInputOf("conversation.item.create", `{"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"},{"type":"input_text","text":"there"}]}}`)).toBe(`{"type":"message","role":"user","content":"hi\\nthere"}`)
+  expect(turnInputOf("conversation.item.create", `{"item":{"type":"function_call_output","call_id":"c1","output":"{\\"t\\":20}"}}`)).toBe(`{"type":"function_call_output","output":"{\\"t\\":20}"}`)
+  expect(turnInputOf("conversation.item.create", `{"item":{"type":"message","role":"assistant","content":[{"type":"text","text":"x"}]}}`)).toBe("")
+  expect(turnInputOf(INPUT_TRANSCRIPT, `{"transcript":" said this "}`)).toBe(`{"type":"message","role":"user","content":"said this"}`)
+  expect(turnInputOf("input_audio_buffer.append", `{}`)).toBe("")
+  const tools = `[{"type":"function","name":"weather"}]`
+  expect(turnRequestJson([`{"a":1}`], "", tools)).toBe(`{"input":[{"a":1}],"tools":${tools}}`)
+  expect(turnRequestJson([], `{"type":"response.create","response":{"instructions":"be brief","input":[{"b":2}],"tools":[]}}`, tools)).toBe(`{"input":[{"b":2}],"instructions":"be brief","tools":[]}`)
+  const resp = turnResponseJson("gpt-realtime", `{"response":{"status":"completed","output":[{"type":"function_call","call_id":"c9","name":"weather","arguments":"{}"}],"usage":{"input_tokens":7,"output_tokens":3}}}`, "Sunny")
+  expect(resp).toBe(`{"object":"response","model":"gpt-realtime","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Sunny"}]},{"type":"function_call","call_id":"c9","name":"weather","arguments":"{}"}],"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}`)
+})
+
+test("a realtime turn runs the plugins' pre hooks as it starts and their post hooks on its response", () => {
+  const t = hookedFixture()
+  t.core.fromClient(`{"type":"session.update","session":{"tools":[{"type":"function","name":"weather"}]}}`, [], 1100.0)
+  t.core.fromClient(`{"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_text","text":"weather in Oslo?"}]}}`, [], 1150.0)
+  expect(t.tc.pre.length).toBe(0)
+  t.core.fromClient(`{"type":"response.create","response":{"instructions":"be brief"}}`, [], 1200.0)
+  expect(t.tc.pre.length).toBe(1)
+  expect(t.tc.pre[0]).toBe(`{"input":[{"type":"message","role":"user","content":"weather in Oslo?"}],"instructions":"be brief","tools":[{"type":"function","name":"weather"}]}`)
+  t.core.fromProvider(`{"type":"response.created","response":{"id":"resp_h"}}`, undefined, 1250.0)
+  t.core.fromProvider(`{"type":"response.output_text.delta","delta":"Sunny"}`, undefined, 1300.0)
+  t.core.fromProvider(`{"type":"response.done","response":{"id":"resp_h","status":"completed","usage":{"input_tokens":9,"output_tokens":2}}}`, undefined, 1400.0)
+  expect(t.tc.pre.length).toBe(1)
+  expect(t.tc.post.length).toBe(1)
+  expect(t.tc.post[0]!.startsWith(`200 {"object":"response","model":"gpt-realtime","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Sunny"}]}],"usage":{"input_tokens":9,"output_tokens":2,"total_tokens":11}}`)).toBe(true)
+  expect(t.cap.turns[0]!.status).toBe(200)
+  // the next turn starts from new inputs: the server's own turn (voice activity) has none
+  t.core.fromProvider(`{"type":"response.created","response":{"id":"resp_i"}}`, undefined, 1500.0)
+  expect(t.tc.pre[1]).toBe(`{"input":[],"tools":[{"type":"function","name":"weather"}]}`)
+  // a session that ends during a turn gives its post hooks the error
+  t.core.clientLeft(1600.0)
+  expect(t.tc.post.length).toBe(2)
+  expect(t.tc.post[1]!.startsWith(`499 {"error":`)).toBe(true)
+})
+
+test("a turn the pre hooks refuse closes the session with their error; a post hook's error ends it after the turn", () => {
+  const t = hookedFixture()
+  t.tc.preWhy = "blocked by the plugin"
+  t.core.fromClient(`{"type":"response.create"}`, [], 1100.0)
+  expect(t.tc.pre.length).toBe(1)
+  expect(t.cap.provider.length).toBe(0)
+  expect(t.cap.client[0]!.includes("blocked by the plugin")).toBe(true)
+  expect(t.cap.abandoned).toBe(1)
+  expect(t.cap.turns[t.cap.turns.length - 1]!.status).toBe(418)
+  expect(t.tc.post.length).toBe(0)
+  const u = hookedFixture()
+  u.tc.postWhy = "turned into an error"
+  u.core.fromClient(`{"type":"response.create"}`, [], 1100.0)
+  u.core.fromProvider(`{"type":"response.done","response":{"id":"resp_p","status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}`, undefined, 1200.0)
+  expect(u.cap.turns[0]!.kind).toBe("turn")
+  expect(u.cap.turns[0]!.status).toBe(429)
+  expect(u.cap.turns[0]!.error).toBe("turned into an error")
+  expect(u.cap.abandoned).toBe(1)
+  // a session without turn hooks is untouched
+  const v = realtimeFixture()
+  v.core.fromClient(`{"type":"response.create"}`, [], 1100.0)
+  expect(v.cap.provider.length).toBe(1)
 })

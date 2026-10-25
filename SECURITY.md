@@ -20,6 +20,10 @@ Bifrost's `core/network/ssrf.go`:
   embedded IPv4 address (IPv4-mapped, IPv4-compatible, 6to4, NAT64), zones and trailing dots.
 - Host names are resolved right before each request and every address they resolve to is checked, so a public
   name that points at a private address is refused like the address.
+- The runtime checks again when it connects (`tov-patches/0013`, fetch's `peer` option): every address the host
+  resolves to at that moment, for each redirect and each new pooled connection, under the same rules. A name that
+  resolves to a public address when the guard looks and to a private one when the connection is made (DNS rebinding
+  with a zero TTL) is refused, and connections made under different rules are never shared.
 - Link-local (169.254.0.0/16, fe80::/10), unspecified (0.0.0.0/8, ::), Teredo and the cloud metadata addresses
   (169.254.169.254, 100.100.100.200, fd00:ec2::254, metadata.google.internal) are always refused.
 - Private addresses (loopback, RFC 1918, 100.64.0.0/10, fc00::/7, fec0::/10, multicast) are refused unless the
@@ -27,17 +31,25 @@ Bifrost's `core/network/ssrf.go`:
 
 | Target | Private addresses | Switch or allowlist |
 |---|---|---|
+| Every provider connection (`base_url` from the config file or the API, key-level URLs, model listings, token endpoints configured on a key) | refused (loopback allowed) | the provider's `network_config.allow_private_network` (as Bifrost's `ConfigureDialer`) |
 | A2A push callbacks (set by callers with a virtual key) | refused | `server.a2a_allow_private_push_callbacks` |
 | A2A agents (card, OAuth endpoints, every call) | refused | the agent's `allow_private_network` |
 | Webhook endpoints | refused | the endpoint's `allow_private_network` |
-| MCP servers with `require_public_target`, OpenAPI `spec_url` with dashboard auth off, MCP OAuth discovery | refused | `mcp.oauth_private_allowlist` (hosts, addresses, CIDR ranges) |
+| MCP servers with `require_public_target`, OpenAPI `spec_url` with dashboard auth off | refused | `mcp.oauth_private_allowlist` (hosts, addresses, CIDR ranges) |
+| MCP OAuth (discovery, client registration, code exchange and refresh, per-user OAuth), token exchange endpoints and the identity provider's discovery | refused | `mcp.oauth_private_allowlist` |
 | Plugin downloads | refused | `server.plugin_download_private_allowlist` (hosts, addresses, CIDR ranges) |
-| Provider `base_url` set through `/api/providers` | refused (loopback allowed) | the provider's `network_config.allow_private_network` |
-| Log exporters | allowed | (only link-local and metadata addresses are refused) |
+| The MCP library catalog (`pricing_sync.mcp_library_url`), log exporters, vector stores (Qdrant, Weaviate, Pinecone) | allowed | (only link-local, unspecified and metadata addresses are refused) |
 
-Limit: the guard resolves a name itself just before the request, and the runtime's `fetch` resolves it again to
-connect. A DNS server that answers differently within that moment (DNS rebinding with a zero TTL) is not stopped;
-closing that gap needs the check inside the runtime's connect, which Tov's `fetch` does not offer yet.
+Redirects: webhooks, A2A push callbacks, agent cards and their OAuth endpoints, exporters, and OAuth and token
+exchange POSTs follow none. Plugin downloads check each hop. A2A calls follow a redirect only on the origin they
+were sent to (Bifrost's rule), and an MCP OpenAPI tool call that carries credentials (a query, or a header besides
+`Accept` and `Content-Type`) gets a redirect to another host, or from https to http, back as the 3xx result.
+
+Limits: through a proxy (a provider's `proxy_config`, the global proxy, `HTTP_PROXY`) the proxy resolves the host,
+so only an address written in the URL is checked, as Bifrost does. Connections that do not go through `fetch` (raw
+sockets) are not checked by the runtime: A2A agents called over gRPC are checked by the guard just before each call
+(the rebinding window stays open there), and Redis or Valkey vector stores and realtime WebSocket connections to
+providers are not checked.
 
 ## Plugins
 

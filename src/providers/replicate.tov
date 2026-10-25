@@ -4,7 +4,8 @@
 // that wait ends is an error: the chat translate is synchronous, so it cannot poll. Image
 // predictions are polled by media.tov (replicateSettle). Replicate's wire format is not
 // OpenAI's, so this translates both ways.
-import { Field, fields, find, rawStr, rawNum, decodeString, elements, quote } from "../json"
+import { Field, fields, find, rawStr, rawNum, decodeString, elements, quote, build } from "../json"
+import { mergeFields } from "../extraparams"
 import { Target, Upstream, Translated, headers, addExtraHeaders, trimSlash } from "./types"
 import { ChatRequest, ContentPart, textOf, nowSeconds } from "../schemas"
 import { parseIsoUtcMs, pctEncode } from "../cloud_auth"
@@ -201,26 +202,120 @@ export function chatResponse(text: string, requestedModel: string): Translated t
   return { body: body, promptTokens: pt, completionTokens: ct }
 }
 
-// Image generation as one prediction: the prompt, the count as num_outputs, and the negative prompt
-// and seed when set, in the model's input. The answer is the prediction's output URLs.
-export function imageRequest(t: Target, body: Field[]): Upstream throws SyntaxError {
-  const key = t.key.value ?? ""
-  if (key === "") throw new SyntaxError("replicate: the key needs a value: an API token")
+// The fields Bifrost's image routes read themselves (imageGenerationParamsKnownFields, imageEditParamsKnownFields); every
+// other field of the request is an extra param, merged into the prediction's input.
+const GENERATION_KNOWN = ["model", "prompt", "fallbacks", "stream", "n", "background", "moderation", "partial_images", "size", "quality", "output_compression", "output_format", "style", "response_format", "seed", "negative_prompt", "num_inference_steps", "user", "aspect_ratio", "input_images", "type"]
+const EDIT_KNOWN = ["model", "prompt", "fallbacks", "image", "image[]", "image_url", "image_url[]", "images", "mask", "type", "background", "input_fidelity", "n", "output_compression", "output_format", "partial_images", "quality", "response_format", "size", "user", "negative_prompt", "seed", "num_inference_steps", "upscale_factor", "target_megapixels", "aspect_ratio", "stream"]
+
+// Bifrost's ConvertSizeToAspectRatioAndResolution: "WxH" as an aspect ratio (1:1, 3:4, 4:3, 9:16, 16:9, else none) and a
+// resolution tier (1K up to 1024, 2K up to 2048, 4K up to 4096, else none).
+export function sizeToAspect(size: string): { aspect: string, resolution: string } {
+  const none = { aspect: "", resolution: "" }
+  const p = size.split("x")
+  if (p.length !== 2) return none
+  const w = parseInt(p[0]!)
+  const h = parseInt(p[1]!)
+  if (w === undefined || h === undefined || w <= 0 || h <= 0) return none
+  let res = ""
+  if (w <= 1024 && h <= 1024) res = "1K"
+  else if (w <= 2048 && h <= 2048) res = "2K"
+  else if (w <= 4096 && h <= 4096) res = "4K"
+  const r = w / h
+  let ar = ""
+  if (r >= 0.99 && r <= 1.01) ar = "1:1"
+  else if (r >= 0.74 && r <= 0.76) ar = "3:4"
+  else if (r >= 1.32 && r <= 1.34) ar = "4:3"
+  else if (r >= 0.56 && r <= 0.57) ar = "9:16"
+  else if (r >= 1.77 && r <= 1.78) ar = "16:9"
+  return { aspect: ar, resolution: res }
+}
+
+function numField(body: Field[], key: string): string | undefined {
+  const n = rawNum(body, key)
+  if (n === undefined) {
+    // a form field arrives as a string
+    const s = rawStr(body, key)
+    if (s === undefined) return undefined
+    const v = parseFloat(s)
+    if (v === undefined) return undefined
+    return `${Math.floor(v)}`
+  }
+  return `${Math.floor(n)}`
+}
+
+// The prediction input of an image generation or edit, as Bifrost's ToReplicateImageGenerationInput and
+// ToReplicateImageEditInput build it: the prompt, the images in the model's field, n as number_of_images, size as
+// aspect_ratio and resolution (an explicit aspect_ratio, or one given as an extra param on an edit, and an extra resolution,
+// win), output_format, quality, background, seed, negative_prompt and num_inference_steps, keys in sorted order (Bifrost
+// marshals the input sorted), then the extra params merged in.
+function predictionInput(model: string, body: Field[], images: string[], edit: bool): string throws SyntaxError {
   const prompt = rawStr(body, "prompt") ?? ""
   if (prompt === "") throw new SyntaxError("prompt is required")
-  const input: string[] = [`"prompt":${quote(prompt)}`]
-  const n = rawNum(body, "n")
-  if (n !== undefined) input.push(`"num_outputs":${n}`)
-  const neg = rawStr(body, "negative_prompt") ?? ""
-  if (neg !== "") input.push(`"negative_prompt":${quote(neg)}`)
-  const seed = rawNum(body, "seed")
-  if (seed !== undefined) input.push(`"seed":${seed}`)
+  const known = edit ? EDIT_KNOWN : GENERATION_KNOWN
+  const extras: Field[] = []
+  for (const f of body) {
+    if (!known.includes(f.key)) extras.push(f)
+  }
+  const out: Field[] = [{ key: "prompt", raw: quote(prompt) }]
+  if (images.length > 0) {
+    const field = imageFieldOf(model)
+    const urls = images.map((u) => quote(u))
+    if (field === "input_images") out.push({ key: "input_images", raw: `[${urls.join(",")}]` })
+    else out.push({ key: field, raw: urls[0]! })
+  }
+  const n = numField(body, "n")
+  if (n !== undefined) out.push({ key: "number_of_images", raw: n })
+  const explicit = edit ? undefined : rawStr(body, "aspect_ratio")
+  if (explicit !== undefined) out.push({ key: "aspect_ratio", raw: quote(explicit) })
+  const size = rawStr(body, "size") ?? ""
+  if (size !== "") {
+    const sr = sizeToAspect(size)
+    const extraAspect = edit && find(extras, "aspect_ratio") !== undefined
+    if (sr.aspect !== "" && explicit === undefined && !extraAspect) out.push({ key: "aspect_ratio", raw: quote(sr.aspect) })
+    if (sr.resolution !== "" && find(extras, "resolution") === undefined) out.push({ key: "resolution", raw: quote(sr.resolution) })
+  }
+  for (const k of ["output_format", "quality", "background", "negative_prompt"]) {
+    const v = rawStr(body, k)
+    if (v !== undefined) out.push({ key: k, raw: quote(v) })
+  }
+  const seed = numField(body, "seed")
+  if (seed !== undefined) out.push({ key: "seed", raw: seed })
+  const steps = numField(body, "num_inference_steps")
+  if (steps !== undefined) out.push({ key: "num_inference_steps", raw: steps })
+  out.sort((a: Field, b: Field): int => a.key < b.key ? -1 : (a.key > b.key ? 1 : 0))
+  return build(try mergeFields(out, extras))
+}
+
+function predictionRequest(t: Target, input: string, extras: Field[]): Upstream {
+  const key = t.key.value ?? ""
   const b = t.cfg.network_config?.base_url ?? ""
   const root = b === "" ? DEFAULT_BASE : trimSlash(b)
   let h = headers([["content-type", "application/json"], ["authorization", "Bearer " + key], ["prefer", "wait"]])
   addExtraHeaders(&h, t.cfg)
   const head = isVersion(t.model) && !usesDeployments(t) ? `"version":${quote(t.model)},` : ""
-  return { url: root + predictionPath(t.model, usesDeployments(t)), headers: h, body: "{" + head + `"input":{${input.join(",")}}}` }
+  // webhook and webhook_events_filter from the extra params also go on the prediction itself (Bifrost's request fields)
+  let tail = ""
+  const wh = rawStr(extras, "webhook")
+  if (wh !== undefined) tail += `,"webhook":${quote(wh)}`
+  const wf = find(extras, "webhook_events_filter")
+  if (wf !== undefined && wf.startsWith("[")) tail += `,"webhook_events_filter":${wf}`
+  return { url: root + predictionPath(t.model, usesDeployments(t)), headers: h, body: "{" + head + `"input":${input}${tail}}` }
+}
+
+// Image generation as one prediction: the model's input as Bifrost builds it (predictionInput), with the request's
+// input_images. The answer is the prediction's output URLs.
+export function imageRequest(t: Target, body: Field[]): Upstream throws SyntaxError {
+  const key = t.key.value ?? ""
+  if (key === "") throw new SyntaxError("replicate: the key needs a value: an API token")
+  const images: string[] = []
+  const ii = find(body, "input_images")
+  if (ii !== undefined && ii.startsWith("[")) {
+    for (const el of try elements(ii)) {
+      if (el.startsWith("\"")) images.push(try decodeString(el))
+    }
+  }
+  const input = try predictionInput(t.model, body, images, false)
+  return predictionRequest(t, input, body.filter((f) => !GENERATION_KNOWN.includes(f.key)))
 }
 
 // The images answer: the output URLs (one string or an array) as OpenAI's data list. A prediction
@@ -335,31 +430,16 @@ function imageFieldOf(model: string): string {
   return table.get(id) ?? "input_images"
 }
 
-// An image edit as one prediction: the prompt, the images as data URLs in the model's input field,
-// and the count, negative prompt and seed as in generation. The answer is read as generation's.
+// An image edit as one prediction: the images as data URLs in the model's input field and the form's options, as
+// Bifrost's ToReplicateImageEditInput maps them (predictionInput; the form's other text fields are extra params). The
+// answer is read as generation's.
 export function imageEditRequest(t: Target, body: Field[], images: string[]): Upstream throws SyntaxError {
   const key = t.key.value ?? ""
   if (key === "") throw new SyntaxError("replicate: the key needs a value: an API token")
-  const prompt = rawStr(body, "prompt") ?? ""
-  if (prompt === "") throw new SyntaxError("prompt is required")
+  if ((rawStr(body, "prompt") ?? "") === "") throw new SyntaxError("prompt is required")
   if (images.length === 0) throw new SyntaxError("an image is required")
-  const input: string[] = [`"prompt":${quote(prompt)}`]
-  const field = imageFieldOf(t.model)
-  const urls = images.map((u) => quote(u))
-  if (field === "input_images") input.push(`"input_images":[${urls.join(",")}]`)
-  else input.push(`${quote(field)}:${urls[0]!}`)
-  const n = rawNum(body, "n")
-  if (n !== undefined) input.push(`"num_outputs":${n}`)
-  const neg = rawStr(body, "negative_prompt") ?? ""
-  if (neg !== "") input.push(`"negative_prompt":${quote(neg)}`)
-  const seed = rawNum(body, "seed")
-  if (seed !== undefined) input.push(`"seed":${seed}`)
-  const b = t.cfg.network_config?.base_url ?? ""
-  const root = b === "" ? DEFAULT_BASE : trimSlash(b)
-  let h = headers([["content-type", "application/json"], ["authorization", "Bearer " + key], ["prefer", "wait"]])
-  addExtraHeaders(&h, t.cfg)
-  const head = isVersion(t.model) && !usesDeployments(t) ? `"version":${quote(t.model)},` : ""
-  return { url: root + predictionPath(t.model, usesDeployments(t)), headers: h, body: "{" + head + `"input":{${input.join(",")}}}` }
+  const input = try predictionInput(t.model, body, images, true)
+  return predictionRequest(t, input, body.filter((f) => !EDIT_KNOWN.includes(f.key)))
 }
 
 // The file API under the account's root: the list (one page, from its cursor) and one file.
@@ -418,9 +498,11 @@ test("an image edit posts the images to the model's input field", () => {
   const up = try imageEditRequest(t, body, ["data:image/png;base64,AAAA"])
   expect(up.url).toBe("https://api.replicate.com/v1/models/black-forest-labs/flux-kontext-pro/predictions")
   expect(up.headers.get("prefer")).toBe("wait")
-  expect(up.body).toBe(`{"input":{"prompt":"a red fox","input_image":"data:image/png;base64,AAAA","num_outputs":1,"seed":3}}`)
+  expect(up.body).toBe(`{"input":{"input_image":"data:image/png;base64,AAAA","number_of_images":1,"prompt":"a red fox","seed":3}}`)
   const other: Target = { provider: "replicate", kind: "replicate", model: "acme/model-a", key: { value: "r8_x" }, cfg: {} }
-  expect((try imageEditRequest(other, try fields(`{"prompt":"p"}`), ["u1", "u2"])).body).toBe(`{"input":{"prompt":"p","input_images":["u1","u2"]}}`)
+  // the form's strings: n and seed as numbers, size as aspect ratio and resolution, other fields as extra params
+  expect((try imageEditRequest(other, try fields(`{"prompt":"p","n":"2","size":"1024x1024","strength":"0.4","user":"u"}`), ["u1"])).body).toBe(`{"input":{"aspect_ratio":"1:1","input_images":["u1"],"number_of_images":2,"prompt":"p","resolution":"1K","strength":"0.4"}}`)
+  expect((try imageEditRequest(other, try fields(`{"prompt":"p"}`), ["u1", "u2"])).body).toBe(`{"input":{"input_images":["u1","u2"],"prompt":"p"}}`)
   let none = false
   try {
     imageEditRequest(other, try fields(`{"prompt":"p"}`), [])
@@ -512,7 +594,15 @@ test("an image prediction posts the prompt as input and reads the output URLs", 
   const up = try imageRequest(t, body)
   expect(up.url).toBe("https://api.replicate.com/v1/models/black-forest-labs/flux-schnell/predictions")
   expect(up.headers.get("prefer")).toBe("wait")
-  expect(up.body).toBe(`{"input":{"prompt":"a fox","num_outputs":2,"seed":4}}`)
+  expect(up.body).toBe(`{"input":{"number_of_images":2,"prompt":"a fox","seed":4}}`)
+  // Bifrost's mappings: size as aspect ratio and resolution, the named options, input_images, and the extra params
+  const full = try imageRequest(t, try fields(`{"prompt":"p","size":"1920x1080","quality":"high","background":"transparent","output_format":"webp","num_inference_steps":8,"negative_prompt":"blur","go_fast":true,"webhook":"https://h.example/w","input_images":["https://i.example/a.png"],"user":"u"}`))
+  expect(full.body).toBe(`{"input":{"aspect_ratio":"16:9","background":"transparent","input_images":["https://i.example/a.png"],"negative_prompt":"blur","num_inference_steps":8,"output_format":"webp","prompt":"p","quality":"high","resolution":"2K","go_fast":true,"webhook":"https://h.example/w"},"webhook":"https://h.example/w"}`)
+  // an explicit aspect_ratio wins over the size's, an extra resolution over the size's tier
+  expect((try imageRequest(t, try fields(`{"prompt":"p","size":"1024x1024","aspect_ratio":"3:2","resolution":"4K"}`))).body).toBe(`{"input":{"aspect_ratio":"3:2","prompt":"p","resolution":"4K"}}`)
+  expect(sizeToAspect("768x1024").aspect).toBe("3:4")
+  expect(sizeToAspect("5000x5000").resolution).toBe("")
+  expect(sizeToAspect("auto").aspect).toBe("")
   const v = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
   const vt: Target = { provider: "replicate", kind: "replicate", model: v, key: { value: "r8_x" }, cfg: {} }
   expect((try imageRequest(vt, try fields(`{"prompt":"p"}`))).body).toBe(`{"version":"${v}","input":{"prompt":"p"}}`)

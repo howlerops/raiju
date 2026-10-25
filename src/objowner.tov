@@ -10,30 +10,42 @@
 // option is off too, so turning it on binds objects created meanwhile. A batch's output and error files are bound
 // to the batch's creator when a retrieve names them.
 //
+// Gemini's cached contents are bound the same way, and the objects an inference request names (a file by file_id or
+// Gemini fileUri in a chat, Responses, Messages or GenAI body, a cached content it runs on, a batch's input file), a
+// passthrough call's path (files/<id>, batches/<id>, cachedContents/<id>) and its body are checked like a direct
+// reference (objectRefs, pathRefs); a passthrough list of a collection is narrowed like a native one.
+//
 // Records live in memory and, with a directory (the logs_store folder), as one small file each, so the workers of a
-// node share them and they survive a restart. Bifrost keeps them in its config database. Records are keyed by kind
-// and id, not by provider: provider ids are unique, and a record then also holds for every provider name that
-// reaches the same upstream (Bifrost forgets and checks across those names).
-import { readFileSync, existsSync, unlinkSync } from "node:fs"
+// node share them and they survive a restart. Bifrost keeps them in its config database. A record is found by kind
+// and id and carries the provider it was made through: it holds for that provider and for every provider name that
+// reaches the same upstream (the caller decides which, see owner), as Bifrost checks across equivalent providers. A
+// record from before providers were kept holds for every provider.
+import { readFileSync, existsSync, unlinkSync, readdirSync } from "node:fs"
 import { writeFileAtomic, mkdirPrivate } from "./atomicfile"
 import { sha256, toHex, utf8 } from "./crypto"
-import { Field, fields, elements, find, rawStr, quote, build, setField } from "./json"
+import { Field, fields, elements, find, rawStr, quote, build, setField, decodeString } from "./json"
 
 // The noun a kind goes by in messages.
 export function objectLabel(kind: string): string {
-  return kind === "batch" ? "batch" : kind === "file" ? "file" : "object"
+  return kind === "batch" ? "batch" : kind === "file" ? "file" : kind === "cached" ? "cached content" : "object"
 }
 
 // The kind of object a batch or file operation (pluginroute.tov storageOp) addresses, or "".
 export function ownerKind(op: string): string {
   if (op.startsWith("file_")) return "file"
   if (op.startsWith("batch_")) return "batch"
+  if (op.startsWith("cached_content_")) return "cached"
   return ""
 }
 
 // Whether an operation addresses one existing object by id (the ones a foreign key is refused on).
 export function addressesObject(op: string): bool {
-  return op === "file_retrieve" || op === "file_content" || op === "file_delete" || op === "batch_retrieve" || op === "batch_cancel" || op === "batch_results" || op === "batch_delete"
+  return op === "file_retrieve" || op === "file_content" || op === "file_delete" || op === "batch_retrieve" || op === "batch_cancel" || op === "batch_results" || op === "batch_delete" || op === "cached_content_retrieve" || op === "cached_content_update" || op === "cached_content_delete"
+}
+
+// Whether an operation creates an object whose answer names it (its creator is recorded).
+export function createsObject(op: string): bool {
+  return op === "file_upload" || op === "batch_create" || op === "cached_content_create"
 }
 
 // The trailing id of an ARN (a Bedrock job: arn:aws:bedrock:...:model-invocation-job/<id>), or "".
@@ -57,7 +69,7 @@ export function recordForms(id: string): string[] {
 export function lookupForms(kind: string, id: string): string[] {
   if (id === "") return []
   const out = recordForms(id)
-  const coll = kind === "file" ? "files/" : kind === "batch" ? "batches/" : ""
+  const coll = kind === "file" ? "files/" : kind === "batch" ? "batches/" : kind === "cached" ? "cachedContents/" : ""
   if (coll !== "" && !id.startsWith("arn:") && !id.startsWith("projects/")) {
     const bare = id.startsWith(coll) ? id.slice(coll.byteLength) : id
     for (const f of [bare, coll + bare]) {
@@ -67,9 +79,17 @@ export function lookupForms(kind: string, id: string): string[] {
   return out
 }
 
+// What a record holds: the creating virtual key and the provider it was made through ("" for a record from before
+// providers were kept).
+export type OwnerRecord = { vk: string, provider: string }
+
 export class ObjectOwners {
+  // by kind and id: the virtual key and the provider, joined by a newline
   mem: Map<string, string> = new Map()
   dir = ""
+  // whether any record exists, as last looked (hasRecords), and when
+  private anyAt = -1.0
+  private anySeen = false
 
   // Keeps the records in dir as well (made with the first record).
   useDir(dir: string): void {
@@ -84,42 +104,71 @@ export class ObjectOwners {
     return this.dir + "/" + toHex(sha256(utf8(this.key(kind, id)))) + ".json"
   }
 
-  // The virtual key recorded for one exact form, or "".
-  private read(kind: string, id: string): string {
+  // The record of one exact form, or undefined.
+  private read(kind: string, id: string): OwnerRecord | undefined {
     const k = this.key(kind, id)
-    if (this.dir === "") return this.mem.get(k) ?? ""
+    const m = this.mem.get(k)
+    const fromMem: OwnerRecord | undefined = m === undefined ? undefined : { vk: m.split("\n")[0] ?? "", provider: m.split("\n")[1] ?? "" }
+    if (this.dir === "") return fromMem
     const p = this.file(kind, id)
-    if (!existsSync(p)) return ""
+    if (!existsSync(p)) return undefined
     try {
-      return rawStr(try fields(try readFileSync(p, "utf8")), "virtual_key_id") ?? ""
+      const f = try fields(try readFileSync(p, "utf8"))
+      const vk = rawStr(f, "virtual_key_id") ?? ""
+      if (vk === "") return undefined
+      return { vk: vk, provider: rawStr(f, "provider") ?? "" }
     } catch (e) {
-      return this.mem.get(k) ?? ""
+      return fromMem
     }
   }
 
-  // The virtual key that created the object an id addresses, or "" when none is recorded.
-  owner(kind: string, id: string): string {
+  // The virtual key that created the object an id addresses, or "" when none is recorded. With a provider, a record
+  // made through another provider counts only when same says the two reach the same upstream.
+  owner(kind: string, id: string, provider?: string, same?: (a: string, b: string) => bool): string {
     for (const f of lookupForms(kind, id)) {
-      const o = this.read(kind, f)
-      if (o !== "") return o
+      const r = this.read(kind, f)
+      if (r === undefined) continue
+      if (provider !== undefined && provider !== "" && r.provider !== "" && r.provider !== provider) {
+        if (same === undefined || !same(r.provider, provider)) continue
+      }
+      return r.vk
     }
     return ""
   }
 
-  // Records the creating key; an object already recorded keeps its first creator.
-  record(kind: string, id: string, vk: string, now: int): void {
+  // Records the creating key and the provider; an object already recorded keeps its first creator.
+  record(kind: string, id: string, vk: string, now: int, provider?: string): void {
     if (vk === "") return
+    const pv = provider ?? ""
     for (const f of recordForms(id)) {
-      if (this.read(kind, f) !== "") continue
-      this.mem.set(this.key(kind, f), vk)
+      if (this.read(kind, f) !== undefined) continue
+      this.mem.set(this.key(kind, f), vk + "\n" + pv)
+      this.anySeen = true
       if (this.dir === "") continue
       try {
         if (!existsSync(this.dir)) mkdirPrivate(this.dir)
-        writeFileAtomic(this.file(kind, f), `{"kind":${quote(kind)},"id":${quote(f)},"virtual_key_id":${quote(vk)},"created_at":${now}}`)
+        const prov = pv === "" ? "" : `,"provider":${quote(pv)}`
+        writeFileAtomic(this.file(kind, f), `{"kind":${quote(kind)},"id":${quote(f)},"virtual_key_id":${quote(vk)}${prov},"created_at":${now}}`)
       } catch (e) {
         console.error(`raiju: could not record the creating virtual key of ${objectLabel(kind)} ${f}: ${e.message}`)
       }
     }
+  }
+
+  // Whether any object is recorded at all, so a request that names none skips the body check. With a directory the
+  // answer is looked up at most once a second (another worker may have recorded one).
+  hasRecords(): bool {
+    if (this.anySeen || this.mem.size > 0) return true
+    if (this.dir === "") return false
+    const now = Date.now()
+    if (now - this.anyAt < 1000.0) return this.anySeen
+    this.anyAt = now
+    try {
+      this.anySeen = readdirSync(this.dir).length > 0
+    } catch (e) {
+      this.anySeen = false
+    }
+    return this.anySeen
   }
 
   // Forgets an object a delete confirmed gone, under every form.
@@ -211,7 +260,7 @@ export function batchFiles(body: string): string[] {
 export function filterList(body: string, kind: string, hidden: (id: string) => bool): string | undefined {
   try {
     let f: Field[] = try fields(body)
-    for (const k of ["data", "files", "batches", "operations", "invocationJobSummaries"]) {
+    for (const k of ["data", "files", "batches", "operations", "invocationJobSummaries", "cachedContents"]) {
       const arr = find(f, k)
       if (arr === undefined || !arr.startsWith("[")) continue
       const kept: string[] = []
@@ -229,6 +278,129 @@ export function filterList(body: string, kind: string, hidden: (id: string) => b
     return undefined
   }
   return undefined
+}
+
+// One object a request names: its kind ("file", "batch", "cached") and id.
+export type ObjectRef = { kind: string, id: string }
+
+// The keys a JSON body names a provider object under, and the Gemini file host of a file URI given as any URL; a body
+// without any of them (or a \u escape, which could spell one) names nothing and is not parsed.
+const REF_MARKERS = [`"file_id`, `"fileUri"`, `"file_uri"`, `"cached_content"`, `"cachedContent"`, `"input_file_id"`, `"training_file"`, `"validation_file"`, `"fileName"`, `"file_ids"`, `generativelanguage.googleapis.com`, `\\u`]
+
+export function mayNameObjects(body: string): bool {
+  for (const m of REF_MARKERS) {
+    if (body.includes(m)) return true
+  }
+  return false
+}
+
+// The name a Gemini file URI's file is recorded under ("files/<id>"), or "" when the URL is not one
+// (https://generativelanguage.googleapis.com/<version>/files/<id>).
+export function geminiFileName(url: string): string {
+  const u = url.trim()
+  const host = "generativelanguage.googleapis.com"
+  let rest = ""
+  if (u.startsWith("https://" + host + "/")) rest = u.slice(("https://" + host + "/").byteLength)
+  else if (u.startsWith("http://" + host + "/")) rest = u.slice(("http://" + host + "/").byteLength)
+  else return ""
+  const q = rest.indexOf("?")
+  if (q >= 0) rest = rest.slice(0, q)
+  const segs = rest.split("/")
+  for (let i = 0; i + 1 < segs.length; i++) {
+    if (segs[i] === "files" && segs[i + 1] !== "") return "files/" + (segs[i + 1]!.split(":")[0] ?? "")
+  }
+  return ""
+}
+
+function addRef(inout out: ObjectRef[], kind: string, id: string): void {
+  const t = id.trim()
+  if (t === "") return
+  for (const r of out) {
+    if (r.kind === kind && r.id === t) return
+  }
+  out.push({ kind: kind, id: t })
+}
+
+function walkRefs(raw: string, inout out: ObjectRef[], depth: int): void {
+  if (depth > 64 || raw === "") return
+  const c = raw.slice(0, 1)
+  try {
+    if (c === "[") {
+      for (const el of try elements(raw)) walkRefs(el, &out, depth + 1)
+      return
+    }
+    if (c !== "{") return
+    for (const f of try fields(raw)) {
+      const k = f.key
+      const v = f.raw
+      const str = v.startsWith("\"") ? (try decodeString(v)) : ""
+      if (k === "file_id" || k === "input_file_id" || k === "training_file" || k === "validation_file") addRef(&out, "file", str)
+      else if (k === "fileName" && str.startsWith("files/")) addRef(&out, "file", str)
+      else if (k === "file_ids" && v.startsWith("[")) {
+        for (const el of try elements(v)) {
+          if (el.startsWith("\"")) addRef(&out, "file", try decodeString(el))
+        }
+      } else if (k === "fileUri" || k === "file_uri" || k === "url" || k === "file_url" || k === "image_url") {
+        const name = geminiFileName(str)
+        if (name !== "") addRef(&out, "file", name)
+      } else if (k === "cached_content" || k === "cachedContent") addRef(&out, "cached", str)
+      walkRefs(v, &out, depth + 1)
+    }
+  } catch (e) {
+    return
+  }
+}
+
+// The provider objects a JSON request body names anywhere in it (Bifrost's jsonObjectRefs and inferenceFileIDs): a
+// file by file_id, file_ids, input_file_id, training_file, validation_file, a Gemini batch's fileName or a Gemini file
+// URI (fileUri, a file or image URL), and a cached content (cached_content or cachedContent).
+export function objectRefs(body: string): ObjectRef[] {
+  const out: ObjectRef[] = []
+  if (!mayNameObjects(body)) return out
+  let refs: ObjectRef[] = []
+  walkRefs(body.trim(), &refs, 0)
+  return refs
+}
+
+// The objects a passthrough path addresses (Bifrost's passthroughObjectRefs): a collection segment followed by an id
+// (files/<id>, batches/<id>, cachedContents/<id>; Gemini's names carry their collection). The path is taken as it
+// will be sent, with . and .. resolved.
+export function pathRefs(rest: string, gemini: bool): ObjectRef[] {
+  const segs = cleanSegments(rest)
+  let out: ObjectRef[] = []
+  for (let i = 0; i + 1 < segs.length; i++) {
+    const id = segs[i + 1]!.split(":")[0] ?? ""
+    if (id === "") continue
+    const s = segs[i]!
+    if (s === "files") addRef(&out, "file", gemini ? "files/" + id : id)
+    else if (s === "batches") addRef(&out, "batch", gemini ? "batches/" + id : id)
+    else if (s === "cachedContents") addRef(&out, "cached", "cachedContents/" + id)
+  }
+  return out
+}
+
+// The kind of collection a passthrough GET lists (its last segment is files, batches or cachedContents), or "".
+export function listKind(method: string, rest: string): string {
+  if (method.toUpperCase() !== "GET") return ""
+  const segs = cleanSegments(rest)
+  const last = segs[segs.length - 1] ?? ""
+  return last === "files" ? "file" : last === "batches" ? "batch" : last === "cachedContents" ? "cached" : ""
+}
+
+// A path's segments as a client would send them: no empty ones, . dropped and .. taking the one before.
+function cleanSegments(path: string): string[] {
+  const q = path.indexOf("?")
+  const p = q >= 0 ? path.slice(0, q) : path
+  const out: string[] = []
+  for (const s of p.split("/")) {
+    if (s === "" || s === ".") continue
+    if (s === "..") {
+      if (out.length > 0) out.pop()
+      continue
+    }
+    out.push(s)
+  }
+  return out
 }
 
 // The refusal of a foreign object: Bifrost's 404 access_blocked, so the object is not confirmed to exist.
@@ -272,6 +444,44 @@ test("owners in a directory are shared by two processes", () => {
   expect(b.owner("file", "file-1")).toBe("vk-a")
   b.forget("file", "file-1")
   expect(a.owner("file", "file-1")).toBe("")
+})
+
+test("the objects a body and a passthrough path name", () => {
+  const chat = `{"model":"m","messages":[{"role":"user","content":[{"type":"file","file":{"file_id":"file-a"}},{"type":"image_url","image_url":{"url":"https://generativelanguage.googleapis.com/v1beta/files/g1"}}]}],"cached_content":"cachedContents/c9"}`
+  expect(objectRefs(chat).map((r) => r.kind + ":" + r.id).join(",")).toBe("file:file-a,file:files/g1,cached:cachedContents/c9")
+  const resp = `{"model":"m","input":[{"role":"user","content":[{"type":"input_file","file_id":"file-b"}]}],"tools":[{"type":"code_interpreter","container":{"file_ids":["file-c"]}}]}`
+  expect(objectRefs(resp).map((r) => r.id).join(",")).toBe("file-b,file-c")
+  expect(objectRefs(`{"contents":[{"parts":[{"fileData":{"fileUri":"https://generativelanguage.googleapis.com/v1beta/files/abc:download"}}]}]}`).map((r) => r.id).join(",")).toBe("files/abc")
+  expect(objectRefs(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`).length).toBe(0)
+  expect(objectRefs(`{"a":"file\\u005fid"}`).length).toBe(0)
+  expect(geminiFileName("https://example.com/files/x")).toBe("")
+  expect(pathRefs("/v1/files/file-1/content", false).map((r) => r.kind + ":" + r.id).join(",")).toBe("file:file-1")
+  expect(pathRefs("/v1beta/files/abc", true)[0]!.id).toBe("files/abc")
+  expect(pathRefs("/v1beta/cachedContents/c1", true)[0]!.id).toBe("cachedContents/c1")
+  expect(pathRefs("/v1/files/x/../file-2", false)[0]!.id).toBe("file-2")
+  expect(listKind("GET", "/v1/files")).toBe("file")
+  expect(listKind("GET", "/v1beta/cachedContents?pageSize=5")).toBe("cached")
+  expect(listKind("POST", "/v1/files")).toBe("")
+  expect(listKind("GET", "/v1/files/file-1")).toBe("")
+})
+
+test("a record holds for its provider and the providers that reach the same upstream", () => {
+  const o = new ObjectOwners()
+  o.record("file", "file-p", "vk-a", 1, "openai")
+  expect(o.owner("file", "file-p", "openai")).toBe("vk-a")
+  expect(o.owner("file", "file-p", "other")).toBe("")
+  expect(o.owner("file", "file-p", "other", (a: string, b: string): bool => a === "openai" && b === "other")).toBe("vk-a")
+  expect(o.owner("file", "file-p")).toBe("vk-a")
+  // a record without a provider holds for every provider
+  o.record("file", "file-q", "vk-b", 2)
+  expect(o.owner("file", "file-q", "anything")).toBe("vk-b")
+  o.record("cached", "cachedContents/c1", "vk-a", 3, "gemini")
+  expect(o.owner("cached", "c1", "gemini")).toBe("vk-a")
+  expect(o.hasRecords()).toBe(true)
+  expect(new ObjectOwners().hasRecords()).toBe(false)
+  expect(objectLabel("cached")).toBe("cached content")
+  expect(ownerKind("cached_content_delete")).toBe("cached")
+  expect(addressesObject("cached_content_update")).toBe(true)
 })
 
 test("ids of answers and batch inputs", () => {

@@ -7,6 +7,7 @@
 import { H2Body, H2Header, H2Reply, H2Request, H2Handler } from "./h2"
 import { grpcFrame, percentDecode, headerValue } from "./grpc"
 import { detailsHeader } from "./grpcstatus"
+import { gzipBytes } from "./gzip"
 
 export const GRPC_OK: int = 0
 export const GRPC_CANCELLED: int = 1
@@ -85,9 +86,29 @@ export function percentEncode(s: string): string throws Error {
   return try d.decode(out)
 }
 
+// The message encodings gRPC calls here may use besides identity: gzip, the one compressor Bifrost's gRPC server and
+// client have (grpc-go's, registered by the OpenTelemetry exporters it links).
+export const GRPC_ENCODINGS = "gzip"
+
+// Whether a grpc-encoding value is one messages can be read in ("", identity or gzip).
+export function knownEncoding(enc: string): bool {
+  return enc === "" || enc === "identity" || enc === "gzip"
+}
+
+// A message compressed for grpc-encoding gzip, framed with the compressed flag.
+export function gzipFrame(msg: u8[]): u8[] {
+  const z = gzipBytes(msg)
+  const n = z.length
+  const out: u8[] = [u8(1), u8((n >> 24) & 255), u8((n >> 16) & 255), u8((n >> 8) & 255), u8(n & 255)]
+  for (const b of z) out.push(b)
+  return out
+}
+
 // Splits the request body into messages. Bytes come in pieces, as the body delivers them.
 export class GrpcDeframer {
   private buf: u8[] = []
+  // the stream's grpc-encoding: a message with the compressed flag is decoded with it (grpc-go's checks and messages)
+  encoding: string = ""
 
   constructor(readonly maxRecv: int) {}
 
@@ -100,17 +121,30 @@ export class GrpcDeframer {
     return this.buf.length
   }
 
-  // The next whole message, or undefined while it is incomplete. A compressed message is
-  // refused (no grpc-encoding is accepted), and so is one over maxRecv.
+  // The next whole message, or undefined while it is incomplete. A compressed message is decoded with the stream's
+  // grpc-encoding (gzip), and refused under identity or an encoding that is not known; a message over maxRecv is
+  // refused, before and after it is decompressed.
   next(): u8[] | undefined throws GrpcError {
     if (this.buf.length < 5) return undefined
-    if (int(this.buf[0]!) !== 0) throw new GrpcError(GRPC_UNIMPLEMENTED, "compressed messages are not supported")
+    const flag = int(this.buf[0]!)
+    if (flag > 1) throw new GrpcError(GRPC_INTERNAL, `grpc: received unexpected payload format ${flag}`)
     const n = (int(this.buf[1]!) << 24) | (int(this.buf[2]!) << 16) | (int(this.buf[3]!) << 8) | int(this.buf[4]!)
     if (n > this.maxRecv) throw new GrpcError(GRPC_RESOURCE_EXHAUSTED, `grpc: received message larger than max (${n} vs. ${this.maxRecv})`)
     if (this.buf.length < 5 + n) return undefined
     const msg = this.buf.slice(5, 5 + n)
     this.buf = this.buf.slice(5 + n)
-    return msg
+    if (flag === 0) return msg
+    const enc = this.encoding
+    if (enc === "" || enc === "identity") throw new GrpcError(GRPC_INTERNAL, "grpc: compressed flag set with identity or empty encoding")
+    if (enc !== "gzip") throw new GrpcError(GRPC_UNIMPLEMENTED, `grpc: Decompressor is not installed for grpc-encoding "${enc}"`)
+    let out: u8[] = []
+    try {
+      out = try Bun.gunzipSync(msg, { maxOutputLength: this.maxRecv })
+    } catch (e) {
+      if (e.message.includes("size limit")) throw new GrpcError(GRPC_RESOURCE_EXHAUSTED, `grpc: received message after decompression larger than max ${this.maxRecv}`)
+      throw new GrpcError(GRPC_INTERNAL, `grpc: failed to decompress the received message: ${e.message}`)
+    }
+    return out
   }
 }
 
@@ -131,6 +165,9 @@ export class GrpcCall {
   deadlineMs: int | undefined = undefined
   // extra trailing metadata, sent with the status
   trailers: H2Header[] = []
+  // the request's grpc-encoding when it is gzip: the answer's messages are compressed with it too, as grpc-go's server
+  // answers in the encoding it was called with
+  encoding: string = ""
   private headSent: bool = false
   private ended: bool = false
   private df: GrpcDeframer
@@ -152,8 +189,16 @@ export class GrpcCall {
     if (this.headSent) return
     this.headSent = true
     const hs: H2Header[] = [{ name: "content-type", value: "application/grpc" }]
+    if (this.encoding === "gzip") hs.push({ name: "grpc-encoding", value: "gzip" })
     for (const h of md) hs.push(h)
     this.reply.headers(hs)
+  }
+
+  // The request's grpc-encoding: its compressed messages are read with it, and the answer is sent in it.
+  setEncoding(enc: string): void {
+    const e = enc === "identity" ? "" : enc
+    this.encoding = e
+    this.df.encoding = e
   }
 
   // The next request message, or undefined at the end of the request. A bad frame, or a
@@ -179,7 +224,7 @@ export class GrpcCall {
   // Sends one response message.
   async send(msg: u8[]): Promise<void, Error> {
     this.sendHeaders([])
-    try await this.reply.write(grpcFrame(msg))
+    try await this.reply.write(this.encoding === "gzip" ? gzipFrame(msg) : grpcFrame(msg))
   }
 
   // The status of the call, once. Before any head it is a trailers-only response; after
@@ -273,11 +318,15 @@ export function grpcServe(methods: Map<string, GrpcRun>, maxRecv: int): H2Handle
       return
     }
     const call = new GrpcCall(req, res, maxRecv)
-    const enc = headerValue(req.headers, "grpc-encoding")
-    if (enc !== undefined && enc !== "identity") {
-      try call.finish(GRPC_UNIMPLEMENTED, "grpc-encoding " + enc + " is not supported")
+    // gzip messages are read (and the answer sent in gzip); another encoding is grpc-go's UNIMPLEMENTED, with the
+    // encodings this server reads
+    const enc = headerValue(req.headers, "grpc-encoding") ?? ""
+    if (!knownEncoding(enc)) {
+      call.trailers.push({ name: "grpc-accept-encoding", value: GRPC_ENCODINGS })
+      try call.finish(GRPC_UNIMPLEMENTED, `grpc: Decompressor is not installed for grpc-encoding "${enc}"`)
       return
     }
+    call.setEncoding(enc)
     const to = headerValue(req.headers, "grpc-timeout")
     if (to !== undefined) {
       const ms = parseTimeout(to)
@@ -343,13 +392,14 @@ test("the deframer joins messages across pieces and refuses compressed or oversi
   expect(got).toEqual([[u8(1), u8(2), u8(3)], [u8(9)]])
   expect(d.pending()).toBe(0)
 
+  // the compressed flag under identity is grpc-go's INTERNAL
   let compressed = false
   try {
     const c = new GrpcDeframer(16)
     c.push([u8(1), u8(0), u8(0), u8(0), u8(0)])
     const x = try c.next()
   } catch (e) {
-    compressed = e instanceof GrpcError && e.code === GRPC_UNIMPLEMENTED
+    compressed = e instanceof GrpcError && e.code === GRPC_INTERNAL && e.message.includes("identity or empty encoding")
   }
   expect(compressed).toBe(true)
 
@@ -362,4 +412,35 @@ test("the deframer joins messages across pieces and refuses compressed or oversi
     over = e instanceof GrpcError && e.code === GRPC_RESOURCE_EXHAUSTED
   }
   expect(over).toBe(true)
+})
+
+test("gzip messages: read under grpc-encoding gzip, bounded after decompression, refused otherwise", () => {
+  const text = new TextEncoder().encode("hello ".repeat(40))
+  const d = new GrpcDeframer(1024)
+  d.encoding = "gzip"
+  // a compressed message, then a plain one on the same stream (the flag is per message)
+  d.push(gzipFrame(text).concat(grpcFrame([u8(7)])))
+  expect(try d.next()).toEqual(text)
+  expect(try d.next()).toEqual([u8(7)])
+  expect(d.pending()).toBe(0)
+  const code = (enc: string, max: int, wire: u8[]): string => {
+    try {
+      const x = new GrpcDeframer(max)
+      x.encoding = enc
+      x.push(wire)
+      const m = try x.next()
+      return "ok"
+    } catch (e) {
+      return `${e.code} ${e.message}`
+    }
+  }
+  // inflating past the limit is RESOURCE_EXHAUSTED, as grpc-go says it
+  expect(code("gzip", 100, gzipFrame(text)).startsWith("8 grpc: received message after decompression larger than max 100")).toBe(true)
+  // an encoding nobody registered is UNIMPLEMENTED, a broken stream INTERNAL, a flag above 1 INTERNAL
+  expect(code("deflate", 1024, gzipFrame(text))).toBe(`12 grpc: Decompressor is not installed for grpc-encoding "deflate"`)
+  expect(code("gzip", 1024, [u8(1), u8(0), u8(0), u8(0), u8(3), u8(1), u8(2), u8(3)]).startsWith("13 grpc: failed to decompress")).toBe(true)
+  expect(code("gzip", 1024, [u8(2), u8(0), u8(0), u8(0), u8(0)])).toBe("13 grpc: received unexpected payload format 2")
+  expect(knownEncoding("gzip")).toBe(true)
+  expect(knownEncoding("identity")).toBe(true)
+  expect(knownEncoding("snappy")).toBe(false)
 })
