@@ -1005,8 +1005,14 @@ export class LogStore {
     if (until !== undefined && until <= ts) return out
     const back = this.scanRows(ts, first, until)
     if (back.length === 0) return out
+    // the scan includes rows at the oldest time in hand (rows logged in the same millisecond can be on either side),
+    // so the rows already in hand are left out by id
+    const held: Set<string> = new Set()
+    for (const e of out) held.add(e.id)
     const add: LogEntry[] = []
-    for (let k = back.length - 1; k >= 0; k--) add.push(back[k]!)
+    for (let k = back.length - 1; k >= 0; k--) {
+      if (!held.has(back[k]!.id)) add.push(back[k]!)
+    }
     return add.concat(out)
   }
 
@@ -1025,14 +1031,15 @@ export class LogStore {
   private scanRows(from: f64, to: f64, until?: f64): LogEntry[] {
     this.flush()
     const segs = segmentsIn(this.cfg.dir)
-    // rows at until are in the window; to (the oldest row in hand) is not
+    // rows at until are in the window, and so are rows at to (the oldest row in hand), which the caller leaves out by id
     const hi: f64 = until === undefined ? to : Math.min(to, until + 0.0005)
     const parts: string[] = [`${from}:${hi}`]
     for (const sg of segs) parts.push(`${sg.name}:${sizeOf(join(this.cfg.dir, sg.name))}`)
     const key = parts.join("|")
     if (key === this.olderKey) return this.older
     const out: LogEntry[] = []
-    for (let i = segs.length - 1; i >= 0 && out.length < this.cap; i--) {
+    let counted = 0
+    for (let i = segs.length - 1; i >= 0 && counted < this.cap; i--) {
       const sg = segs[i]!
       const start: f64 = sg.day * 1.0 * DAY_MS
       if (start >= hi || start + DAY_MS <= from) continue
@@ -1041,7 +1048,7 @@ export class LogStore {
       // a segment far over the segment size (written before segments existed) is not read whole on a query either
       if (size > this.fileBytes() * LOAD_SKIP_FACTOR) continue
       const span = this.segIndex.get(sg.name)
-      if (span !== undefined && span.size === size && (span.max <= from || span.min >= hi)) continue
+      if (span !== undefined && span.size === size && (span.max <= from || span.min > hi)) continue
       let lines: string[] = []
       try {
         lines = readFileSync(path, "utf8").split("\n")
@@ -1058,11 +1065,13 @@ export class LogStore {
         if (t === undefined) continue
         if (t < lo) lo = t
         if (t > top) top = t
-        if (t <= from || t >= hi) continue
-        if (out.length >= this.cap) {
+        if (t <= from || t > hi) continue
+        // rows at hi share the oldest row's millisecond in hand: mostly rows in hand, so they do not count to the cap
+        if (t < hi && counted >= this.cap) {
           whole = false
           break
         }
+        if (t < hi) counted += 1
         // a torn or foreign line is skipped, not fatal
         try {
           out.push(JSON.parse(line) as LogEntry)
@@ -2410,6 +2419,27 @@ test("reads of a window before today's rows take the earlier days from the files
     try rmSync(join(dir, segmentName(dayOf(now), 0)), { force: true })
     const fresh = try new LogStore(defaultLogStoreConfig(dir))
     expect(fresh.viewSince(0.0).map((e) => e.id).join(",")).toBe("two-days,yesterday-b")
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("rows beyond max_memory_entries: a row logged in the same millisecond as the oldest row in memory is read once", () => {
+  const dir = tmpDir()
+  try {
+    try mkdirSync(dir, { recursive: true })
+    const now = Date.now()
+    const t0 = Math.max(Math.floor(now / 86400000.0) * 86400000.0, now - 60000.0)
+    const row = (id: string, ts: f64): string => JSON.stringify(sample(id, ts, "m", 200, {})) + "\n"
+    // five rows; the second and the third share a millisecond, and memory (three) holds the third to the fifth
+    const ts: f64[] = [t0, t0 + 2.0, t0 + 2.0, t0 + 3.0, t0 + 4.0]
+    let text = ""
+    for (let i = 0; i < 5; i++) text += row("s" + i, ts[i]!)
+    try writeFileSync(join(dir, segmentName(dayOf(now), 0)), text)
+    const cfg = defaultLogStoreConfig(dir)
+    cfg.max_memory_entries = 3
+    const s = try new LogStore(cfg)
+    expect(s.viewSince(t0 - 1.0).map((e) => e.id).join(",")).toBe("s0,s1,s2,s3,s4")
   } finally {
     try rmSync(dir, { recursive: true, force: true })
   }
