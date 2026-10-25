@@ -5,7 +5,7 @@
 // ones the claims gave, and claimsSyncMode "scim" (SCIM provisioning on) making SCIM the only source. Pure: the
 // caller reads the token, saves the result and creates the session.
 import { fields, elements, find, decodeString, isNull } from "./json"
-import { AdminUserConfig, ScimProviderConfig, ScimAttributeRule, SyncedGrants, TeamConfig, BusinessUnitConfig, ProjectConfig, AccessProfile } from "./config"
+import { AdminUserConfig, ScimProviderConfig, ScimAttributeRule, ScimClaimAttribute, SyncedGrants, TeamConfig, BusinessUnitConfig, ProjectConfig, AccessProfile } from "./config"
 
 export type Claims = Map<string, string[]>
 
@@ -323,6 +323,165 @@ export function appliedUser(u: AdminUserConfig, role: string, claims: Claims, g:
   return n
 }
 
+// The roles a sync may give: their names and how many permissions each holds (-1 for one that does not exist).
+export type RoleBook = { names: string[], count: (role: string) => int }
+
+// What applying a user's claims did (kind "ok", or "refuse" when no role resolved, with the reason): the user after it
+// (undefined when nothing changed: a refusal that keeps the role, or a new user who is not created) and the teams and
+// business units made for it.
+export type Applied = { kind: string, reason: string, user: AdminUserConfig | undefined, newTeams: TeamConfig[], newBusinessUnits: BusinessUnitConfig[] }
+
+// Applies claims to a user (existing) or a new one (fresh): the role decided (no default role), the memberships and
+// profiles resynced, the claims remembered. A user's SCIM group memberships stay whatever the rules say. When the
+// claims take the role away, the user is kept with no role and its memberships are still resynced (Bifrost: "their
+// teams, business units, projects, and other access profiles are still updated").
+export function applyClaims(existing: AdminUserConfig | undefined, fresh: AdminUserConfig, claims: Claims, c: ScimProviderConfig, d: Directory, rb: RoleBook, mint: (prefix: string) => string): Applied {
+  const current = existing === undefined ? undefined : existing.role
+  const dec = resolveRole(claims, c, rb.names, rb.count, current)
+  let reason = ""
+  let role = current ?? ""
+  if (dec.kind === "refuse") {
+    if (!dec.remove || existing === undefined) return { kind: "refuse", reason: dec.reason, user: undefined, newTeams: [], newBusinessUnits: [] }
+    reason = dec.reason
+    role = ""
+  } else if (dec.kind === "set") role = dec.role
+  const grants = resolveGrants(claims, c, d, mint)
+  const base: AdminUserConfig = existing ?? fresh
+  let next = appliedUser(base, role, claims, grants, c)
+  let teams = next.teams ?? []
+  for (const t of base.scim_groups ?? []) addOnce(&teams, t)
+  if ((base.scim_groups ?? []).length > 0) next.teams = teams
+  return { kind: reason === "" ? "ok" : "refuse", reason: reason, user: next, newTeams: grants.newTeams, newBusinessUnits: grants.newBusinessUnits }
+}
+
+// Whether the provider's settings map anything (a mapping rule or a claimScimAttributes entry): only then do SCIM
+// pushes, directory sync and reconcile re-decide users from their attributes.
+export function hasRules(c: ScimProviderConfig): bool {
+  for (const rs of rulesOf(c)) {
+    if (rs.length > 0) return true
+  }
+  const m = c.claimScimAttributes
+  return m !== undefined && m.size > 0
+}
+
+// An attribute of a SCIM-pushed user, by key without regard to case.
+function scimAttr(attrs: Map<string, string[]>, key: string): string[] | undefined {
+  const exact = attrs.get(key)
+  if (exact !== undefined) return exact
+  const k = key.toLowerCase()
+  for (const a of attrs.keys()) {
+    if (a.toLowerCase() === k) return attrs.get(a)
+  }
+  return undefined
+}
+
+// The claims a SCIM-pushed user's data gives the rules (Bifrost's claimScimAttributes): a claim of type "group" (in
+// claimScimAttributes, or on a rule that reads it) is the names of the SCIM groups the user is in (their ids when
+// attributeValue is "id" or "value"); any other claim reads the pushed attribute named attributeValue (by default the
+// claim's own name), without regard to case. SCIM sends the whole user, so an attribute it left out is empty.
+export function scimClaims(u: AdminUserConfig, teams: TeamConfig[], c: ScimProviderConfig): Claims {
+  const attrs: Map<string, string[]> = u.scim_attributes ?? new Map()
+  const groupIds = u.scim_groups ?? []
+  const out: Claims = new Map()
+  const specs = c.claimScimAttributes
+  for (const a of ruleAttributes(c)) {
+    let spec: ScimClaimAttribute | undefined = undefined
+    if (specs !== undefined) spec = specs.get(a)
+    let kind = spec === undefined ? "" : (spec.attributeType ?? "")
+    let field = spec === undefined ? "" : (spec.attributeValue ?? "")
+    for (const rs of rulesOf(c)) {
+      for (const r of rs) {
+        if (r.attribute === a && (r.attributeType ?? "") === "group") {
+          kind = "group"
+          if (field === "") field = r.attributeValue ?? ""
+        }
+      }
+    }
+    if (kind === "group") {
+      const byId = field.toLowerCase() === "id" || field.toLowerCase() === "value"
+      const vals: string[] = []
+      for (const t of teams) {
+        if (groupIds.includes(t.id)) vals.push(byId ? t.id : t.name)
+      }
+      out.set(a, vals)
+      continue
+    }
+    const got = scimAttr(attrs, field === "" ? a : field)
+    out.set(a, got ?? [])
+  }
+  return out
+}
+
+// The claims with every attribute the rules read present: one the stored data lacks counts as empty (a reconcile
+// with keep-missing off), so whatever it granted is removed.
+export function completeClaims(claims: Claims, c: ScimProviderConfig): Claims {
+  let out: Claims = new Map()
+  for (const k of claims.keys()) out.set(k, claims.get(k) ?? [])
+  for (const a of ruleAttributes(c)) {
+    if (!out.has(a)) out.set(a, [])
+  }
+  return out
+}
+
+// Whether stored claims lack an attribute the rules read.
+export function missingAttributes(claims: Claims, c: ScimProviderConfig): string[] {
+  return ruleAttributes(c).filter((a) => !claims.has(a))
+}
+
+// One list's change: the names added and removed.
+export type ListChange = { added: string[], removed: string[] }
+
+// What a sync, import or reconcile does to one user. action: create, update, unchanged, refuse, remove or skip.
+export type UserChange = { user: string, email: string, action: string, role_from: string, role_to: string, teams: ListChange, business_units: ListChange, projects: ListChange, access_profiles: ListChange, loses_all_profiles: bool, reason: string }
+
+function listChange(before: string[], after: string[], label: (id: string) => string): ListChange {
+  return { added: after.filter((x) => !before.includes(x)).map(label), removed: before.filter((x) => !after.includes(x)).map(label) }
+}
+
+function emptyList(l: ListChange): bool {
+  return l.added.length === 0 && l.removed.length === 0
+}
+
+// The change from one user record to the next (undefined: not there). Ids are shown by name where d knows them.
+export function changeOf(before: AdminUserConfig | undefined, after: AdminUserConfig | undefined, d: Directory, action: string, reason: string): UserChange {
+  const b: AdminUserConfig = before ?? { name: "", role: "" }
+  const a: AdminUserConfig = after ?? { name: b.name, role: "" }
+  const teamName = (id: string): string => {
+    for (const t of d.teams) {
+      if (t.id === id) return t.name
+    }
+    return id
+  }
+  const buName = (id: string): string => {
+    for (const x of d.businessUnits) {
+      if (x.id === id) return x.name
+    }
+    return id
+  }
+  const projectName = (id: string): string => {
+    for (const x of d.projects) {
+      if (x.id === id) return x.name
+    }
+    return id
+  }
+  const profileName = (id: string): string => {
+    for (const x of d.profiles) {
+      if (x.id === id) return x.name ?? id
+    }
+    return id
+  }
+  const gone = after === undefined
+  const teams = listChange(b.teams ?? [], gone ? [] : (a.teams ?? []), teamName)
+  const bus = listChange(b.business_units ?? [], gone ? [] : (a.business_units ?? []), buName)
+  const projects = listChange(b.projects ?? [], gone ? [] : (a.projects ?? []), projectName)
+  const profiles = listChange(b.access_profile_ids ?? [], gone ? [] : (a.access_profile_ids ?? []), profileName)
+  const hadProfiles = (b.access_profile_ids ?? []).length > 0
+  const loses = hadProfiles && (gone || (a.access_profile_ids ?? []).length === 0)
+  let act = action
+  if (act === "update" && b.role === a.role && emptyList(teams) && emptyList(bus) && emptyList(projects) && emptyList(profiles)) act = "unchanged"
+  return { user: a.name !== "" ? a.name : b.name, email: (after ?? b).email ?? "", action: act, role_from: b.role, role_to: gone ? "" : a.role, teams: teams, business_units: bus, projects: projects, access_profiles: profiles, loses_all_profiles: loses, reason: reason }
+}
+
 // The user named by a sign-in: by name (the subject or the address) or by email, without regard to case.
 export function findUser(users: AdminUserConfig[], sub: string, email: string | undefined): int {
   const e = (email ?? "").toLowerCase()
@@ -454,4 +613,73 @@ test("a sign-in resyncs what claims gave and keeps what an admin added", () => {
   expect(findUser([u, { name: "bob", email: "Bob@x.io", role: "viewer" }], "sub-9", "bob@X.io")).toBe(1)
   expect(findUser([u], "ana", undefined)).toBe(0)
   expect(findUser([u], "zed", "zed@x.io")).toBe(-1)
+})
+
+const BOOK: RoleBook = { names: ROLES, count: counts }
+
+function noMint(prefix: string): string {
+  return prefix + "made"
+}
+
+test("claimScimAttributes: group claims read the SCIM groups, user claims a renamed attribute, missing ones are empty", () => {
+  const specs: Map<string, ScimClaimAttribute> = new Map()
+  specs.set("groups", { attributeType: "group", attributeValue: "displayName" })
+  specs.set("profile.jobFunction", { attributeType: "user", attributeValue: "jobFunction" })
+  const c: ScimProviderConfig = {
+    claimScimAttributes: specs,
+    attributeRoleMappings: [{ attribute: "groups", value: "platform-team", role: "editor" }],
+    attributeTeamMappings: [{ attribute: "profile.jobFunction", value: "sre", team: "Ops" }, { attribute: "displayName", value: "platform-team", team: "Platform", attributeType: "group" }],
+    attributeBusinessUnitMappings: [{ attribute: "Department", value: "*" }],
+  }
+  const attrs: Map<string, string[]> = new Map()
+  attrs.set("jobFunction", ["SRE"])
+  attrs.set("department", ["Research"])
+  const u: AdminUserConfig = { name: "ana", role: "viewer", scim_attributes: attrs, scim_groups: ["t-plat"] }
+  const teams: TeamConfig[] = [{ id: "t-plat", name: "platform-team" }, { id: "t-other", name: "other" }]
+  const cl = scimClaims(u, teams, c)
+  expect((cl.get("groups") ?? []).join(",")).toBe("platform-team")
+  expect((cl.get("displayName") ?? []).join(",")).toBe("platform-team")
+  expect((cl.get("profile.jobFunction") ?? []).join(",")).toBe("SRE")
+  // attribute names match without regard to case
+  expect((cl.get("Department") ?? []).join(",")).toBe("Research")
+  // a claim SCIM did not send is present and empty
+  expect(cl.has("roles") && (cl.get("roles") ?? ["x"]).length === 0).toBe(true)
+  const d: Directory = { teams: teams, businessUnits: [], projects: [], profiles: [] }
+  const r = applyClaims(u, u, cl, c, d, BOOK, noMint)
+  expect(r.kind).toBe("ok")
+  const ru = r.user
+  expect(ru !== undefined && ru.role === "editor").toBe(true)
+  // Ops is made, Platform is the group rule's team, and the SCIM group stays a membership
+  expect(r.newTeams.map((t) => t.name).join(",")).toBe("Ops,Platform")
+  expect(ru !== undefined && (ru.teams ?? []).includes("t-plat")).toBe(true)
+  expect(r.newBusinessUnits[0]!.name).toBe("Research")
+  // out of the group: the role mapping no longer matches and the role is taken away; the memberships still resync
+  const left: AdminUserConfig = { name: "ana", role: "editor", scim_attributes: attrs, scim_groups: [] }
+  const r2 = applyClaims(left, left, scimClaims(left, teams, c), c, d, BOOK, noMint)
+  const lu = r2.user
+  expect(r2.kind === "refuse" && lu !== undefined && lu.role === "" && (lu.business_units ?? []).length === 1).toBe(true)
+  // a new user who resolves no role is not created
+  expect(applyClaims(undefined, left, scimClaims(left, teams, c), c, d, BOOK, noMint).user === undefined).toBe(true)
+  expect(hasRules(c)).toBe(true)
+  expect(hasRules({})).toBe(false)
+})
+
+test("reconcile helpers: missing attributes, empty claims, and the change of a user", () => {
+  const c: ScimProviderConfig = { attributeRoleMappings: [{ attribute: "dept", value: "eng", role: "editor" }] }
+  const stored: Claims = new Map()
+  stored.set("groups", ["x"])
+  expect(missingAttributes(stored, c).join(",")).toBe("roles,dept")
+  const full = completeClaims(stored, c)
+  expect(full.has("dept") && (full.get("dept") ?? ["x"]).length === 0).toBe(true)
+  const d: Directory = { teams: [{ id: "t1", name: "Core" }], businessUnits: [], projects: [], profiles: [{ id: "ap1", name: "Base" }] }
+  const before: AdminUserConfig = { name: "ana", email: "ana@x.io", role: "editor", teams: ["t1"], access_profile_ids: ["ap1"] }
+  const after: AdminUserConfig = { name: "ana", email: "ana@x.io", role: "", teams: [], access_profile_ids: [] }
+  const ch = changeOf(before, after, d, "update", "")
+  expect(ch.role_from + ">" + ch.role_to).toBe("editor>")
+  expect(ch.teams.removed.join(",")).toBe("Core")
+  expect(ch.access_profiles.removed.join(",")).toBe("Base")
+  expect(ch.loses_all_profiles).toBe(true)
+  expect(changeOf(before, before, d, "update", "").action).toBe("unchanged")
+  expect(changeOf(undefined, before, d, "create", "").teams.added.join(",")).toBe("Core")
+  expect(changeOf(before, undefined, d, "remove", "gone").loses_all_profiles).toBe(true)
 })

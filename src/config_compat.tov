@@ -716,8 +716,51 @@ function mapCluster(inout top: Field[], inout notes: string[]): void throws Synt
 // The claim settings of scim_config.config that Raiju reads (claimsync.tov), kept under their Bifrost names.
 const SCIM_CLAIM_KEYS = ["claimsSyncMode", "roleResolutionStrategy", "userIdField", "rolesField", "teamIdsField", "attributeRoleMappings", "attributeTeamMappings", "attributeBusinessUnitMappings", "attributeAccessProfileMappings", "attributeProjectMappings"]
 
-// The sign-in settings each provider's config carries (they become the oidc section).
+// The sign-in settings each provider's config carries (they become the oidc section, and directory.tov reads them).
 const SCIM_SSO_KEYS = ["issuerUrl", "clientId", "clientSecret", "tenantId", "cloud", "serverUrl", "realm", "domain", "scopes", "additionalScopes"]
+
+// The provider settings kept under their Bifrost names for directory sync, bulk import, the audience checks and
+// claimScimAttributes (directory.tov, provision.tov, claimsync.tov), and Raiju's directoryUrl and directoryTokenUrl.
+const SCIM_KEPT_KEYS = ["issuerUrl", "clientId", "clientSecret", "tenantId", "cloud", "serverUrl", "realm", "domain", "projectId", "audience", "appIdUri", "apiToken", "serviceAccountClientId", "serviceAccountClientSecret", "credentialMode", "serviceAccountJson", "serviceAccountEnvVar", "serviceAccountFile", "adminEmail", "impersonateServiceAccount", "enableBulkSync", "bulkSyncInterval", "claimScimAttributes", "directoryUrl", "directoryTokenUrl"]
+
+const HOUR_MS = 3600000.0
+const DAY_MS = 86400000.0
+
+// bulkSyncInterval in milliseconds (Bifrost's scim_bulk_sync_interval): whole days ("7d") or h/m/s pairs ("12h",
+// "1h30m"), between 1h and 30d (24h when unset). error says why a value was not used as written (it is not a
+// duration, or it is out of range and was clamped). The directory sync schedule reads it (ops.tov).
+export function bulkSyncInterval(s: string | undefined): { ms: f64, error: string } {
+  const v = (s ?? "").trim()
+  const notDuration = { ms: DAY_MS, error: `bulkSyncInterval ${v} is not a duration; 24h is used` }
+  if (v === "") return { ms: DAY_MS, error: "" }
+  let total = 0.0
+  if (v.endsWith("d")) {
+    const n = parseInt(v.slice(0, v.byteLength - 1))
+    if (n === undefined || n < 0) return notDuration
+    total = DAY_MS * parseFloat(`${n}`)!
+  } else {
+    let num = ""
+    let any = false
+    for (const ch of v.chars()) {
+      if ((ch >= "0" && ch <= "9") || ch === ".") {
+        num += ch
+        continue
+      }
+      const f = parseFloat(num)
+      if (num === "" || f === undefined) return notDuration
+      if (ch === "h") total += f * HOUR_MS
+      else if (ch === "m") total += f * 60000.0
+      else if (ch === "s") total += f * 1000.0
+      else return notDuration
+      num = ""
+      any = true
+    }
+    if (!any || num !== "") return notDuration
+  }
+  if (total < HOUR_MS) return { ms: HOUR_MS, error: `bulkSyncInterval ${v} is under 1h; 1h is used` }
+  if (total > 30.0 * DAY_MS) return { ms: 30.0 * DAY_MS, error: `bulkSyncInterval ${v} is over 30d; 30d is used` }
+  return { ms: total, error: "" }
+}
 
 function strOf(fs: Field[], key: string): string throws SyntaxError {
   const r = strRaw(fs, key)
@@ -764,8 +807,23 @@ function scimOidc(provider: string, cf: Field[]): Field[] | undefined throws Syn
   add(&out, "client_secret", strRaw(cf, "clientSecret"))
   const scopes = find(cf, "scopes")
   const extra = (try items(find(cf, "additionalScopes"))).filter((e) => e.startsWith("\""))
+  // Bifrost's scopes: openid profile email offline_access (the refresh token a silent session refresh needs); Google
+  // gives refresh tokens without offline_access and refuses the scope
+  const base: string[] = provider === "google" ? [`"openid"`, `"profile"`, `"email"`] : [`"openid"`, `"profile"`, `"email"`, `"offline_access"`]
   if (scopes !== undefined && scopes.startsWith("[")) add(&out, "scopes", scopes)
-  else if (extra.length > 0) add(&out, "scopes", "[" + [`"openid"`, `"profile"`, `"email"`].concat(extra).join(",") + "]")
+  else add(&out, "scopes", "[" + base.concat(extra).join(",") + "]")
+  // the audiences an ID token may carry: audience (default the client id) and Entra's app ID URI for v1.0 tokens
+  const auds: string[] = []
+  const aud = strRaw(cf, "audience")
+  if (aud !== undefined && aud !== "\"\"") auds.push(aud)
+  const appId = strRaw(cf, "appIdUri")
+  if (provider === "entra" && appId !== undefined && appId !== "\"\"") {
+    if (auds.length === 0) auds.push(client)
+    auds.push(appId)
+  }
+  if (auds.length > 0) add(&out, "audiences", "[" + auds.join(",") + "]")
+  // Keycloak's roles are in the access token, so its claims are read there
+  if (provider === "keycloak") add(&out, "claims_token", quote("access_token"))
   return out
 }
 
@@ -790,6 +848,14 @@ function mapScim(inout top: Field[], inout notes: string[]): void throws SyntaxE
     else add(&cout, "provisioningToken", tok)
   }
   for (const k of SCIM_CLAIM_KEYS) add(&cout, k, find(cf, k))
+  for (const k of SCIM_KEPT_KEYS) {
+    const v = find(cf, k)
+    if (v !== undefined && (v.includes("vault.") || v.includes("aws-sm."))) {
+      notes.push(`config: "scim_config.config.${k}" uses a secret reference, which Raiju does not resolve; use env.VAR_NAME`)
+      continue
+    }
+    add(&cout, k, v)
+  }
   if (cout.length > 0) add(&sout, "config", build(cout))
   const tn = find(sf, "trusted_networks")
   add(&sout, "trusted_networks", tn)
@@ -810,9 +876,14 @@ function mapScim(inout top: Field[], inout notes: string[]): void throws SyntaxE
     else if (have !== build(sso)) notes.push(`config: "oidc" is set, so the sign-in settings of "scim_config.config" are not used`)
   } else if (on && provider !== "" && find(cf, "clientId") !== undefined) notes.push(`config: "scim_config" provider ${provider} has no OIDC sign-in settings Raiju can use; sign-in stays as the oidc section says`)
   for (const f of cf) {
-    if (f.key === "authProxy" || f.key === "provisioningToken" || SCIM_CLAIM_KEYS.includes(f.key) || SCIM_SSO_KEYS.includes(f.key)) continue
+    if (f.key === "authProxy" || f.key === "provisioningToken" || SCIM_CLAIM_KEYS.includes(f.key) || SCIM_SSO_KEYS.includes(f.key) || SCIM_KEPT_KEYS.includes(f.key)) continue
     notes.push(`config: "scim_config.config.${f.key}" is not supported by Raiju and is ignored`)
   }
+  const iv = bulkSyncInterval(try strOf(cf, "bulkSyncInterval"))
+  if (iv.error !== "") notes.push(`config: "scim_config.config.bulkSyncInterval": ${iv.error}`)
+  if (provider === "google" && (try strOf(cf, "credentialMode")) === "inherit") notes.push(`config: "scim_config.config.credentialMode" inherit needs Google's Application Default Credentials, which Raiju does not read; directory sync and bulk import stay off (give serviceAccountJson, or credentialMode env or file)`)
+  if (find(cf, "impersonateServiceAccount") !== undefined) notes.push(`config: "scim_config.config.impersonateServiceAccount" is kept but not used: Raiju signs the service account's own key for domain-wide delegation`)
+  if (provider === "sailpoint") notes.push(`config: "scim_config" provider sailpoint has no OIDC sign-in or directory API in Raiju; SCIM pushes still work`)
   const apRaw = find(cf, "authProxy")
   if (apRaw === undefined) return
   const pf = try members(apRaw)
@@ -2180,7 +2251,8 @@ test("passes cluster discovery through and maps scim_config's authProxy", () => 
   expect(r.notes.includes(`config: "scim_config.config.authProxy.futureKey" is not supported by Raiju and is ignored`)).toBe(true)
   const sc = try fields(find(try fields(r.text), "scim_config")!)
   expect(rawBool(sc, "enabled")).toBe(true)
-  expect(find(sc, "config")).toBe(undefined)
+  // L191: the provider's own settings are kept (directory sync reads them); authProxy is not among them
+  expect(find(sc, "config")).toBe(`{"clientId":"x"}`)
   // an Okta client with no issuer makes no sign-in settings
   expect(r.notes.includes(`config: "scim_config" provider okta has no OIDC sign-in settings Raiju can use; sign-in stays as the oidc section says`)).toBe(true)
   expect(find(try fields(r.text), "oidc")).toBe(undefined)
@@ -2202,8 +2274,44 @@ test("maps scim_config's provisioning token, provider, claim settings and truste
   expect(find(cf, "attributeRoleMappings")).toBe(`[{ "attribute": "roles", "value": "Admins", "role": "admin" }]`)
   expect(find(sc, "trusted_networks")).toBe(`[{ "cidr": "10.0.0.0/8" }]`)
   expect(r.notes.includes(`config: "scim_config.config.claimsSyncMode" is not supported by Raiju and is ignored`)).toBe(false)
-  expect(r.notes.includes(`config: "scim_config.config.bulkSyncInterval" is not supported by Raiju and is ignored`)).toBe(true)
+  // L191: bulkSyncInterval is kept now (the directory sync schedule), so it raises no note
+  expect(find(cf, "bulkSyncInterval")).toBe(`"12h"`)
+  expect(r.notes.some((n) => n.includes("bulkSyncInterval"))).toBe(false)
   expect(r.notes.some((n) => n.startsWith(`config: "scim_config.trusted_networks" is kept but changes nothing`))).toBe(true)
+})
+
+test("scim_config's directory, audience and claimScimAttributes keys are kept; bad intervals and ADC are noted", () => {
+  const r = try normalize(`{ "scim_config": { "enabled": true, "provider": "google", "config": { "domain": "acme.com", "clientId": "g", "adminEmail": "a@acme.com", "credentialMode": "inherit", "audience": "aud-1", "bulkSyncInterval": "10m", "enableBulkSync": false,
+    "claimScimAttributes": { "groups": { "attributeType": "group", "attributeValue": "displayName" } }, "impersonateServiceAccount": "sa@p.iam.gserviceaccount.com" } } }`)
+  const top = try fields(r.text)
+  const cf = try fields(find(try fields(find(top, "scim_config")!), "config")!)
+  expect(rawStr(cf, "adminEmail") + "|" + find(cf, "enableBulkSync") + "|" + rawStr(cf, "audience")).toBe("a@acme.com|false|aud-1")
+  expect(find(cf, "claimScimAttributes")!.includes(`"attributeType": "group"`)).toBe(true)
+  expect(r.notes.some((n) => n.includes("bulkSyncInterval 10m is under 1h"))).toBe(true)
+  expect(r.notes.some((n) => n.includes("Application Default Credentials"))).toBe(true)
+  expect(r.notes.some((n) => n.includes("is not supported by Raiju"))).toBe(false)
+  const o = try fields(find(top, "oidc")!)
+  // Google's scopes leave out offline_access; the audience replaces the client id
+  expect(find(o, "scopes") + "|" + find(o, "audiences")).toBe(`["openid","profile","email"]|["aud-1"]`)
+  const entra = try normalize(`{ "scim_config": { "enabled": true, "provider": "entra", "config": { "tenantId": "t", "clientId": "c-1", "appIdUri": "api://c-1" } } }`)
+  const eo = try fields(find(try fields(entra.text), "oidc")!)
+  expect(find(eo, "audiences") + "|" + find(eo, "scopes")).toBe(`["c-1","api://c-1"]|["openid","profile","email","offline_access"]`)
+  const kc = try normalize(`{ "scim_config": { "enabled": true, "provider": "keycloak", "config": { "serverUrl": "https://kc", "realm": "r", "clientId": "raiju", "clientSecret": "s" } } }`)
+  expect(rawStr(try fields(find(try fields(kc.text), "oidc")!), "claims_token")).toBe("access_token")
+})
+
+test("bulkSyncInterval: days and h/m/s pairs, the 1h to 30d range, and the 24h default", () => {
+  expect(bulkSyncInterval(undefined).ms).toBe(86400000.0)
+  expect(bulkSyncInterval("12h").ms).toBe(43200000.0)
+  expect(bulkSyncInterval("1h30m").ms).toBe(5400000.0)
+  expect(bulkSyncInterval("7d").ms).toBe(604800000.0)
+  expect(bulkSyncInterval("1.5h").ms).toBe(5400000.0)
+  const low = bulkSyncInterval("10m")
+  expect(low.ms === 3600000.0 && low.error.includes("under 1h")).toBe(true)
+  const high = bulkSyncInterval("45d")
+  expect(high.ms === 2592000000.0 && high.error.includes("over 30d")).toBe(true)
+  expect(bulkSyncInterval("soon").error.includes("not a duration")).toBe(true)
+  expect(bulkSyncInterval("5x").error.includes("not a duration")).toBe(true)
 })
 
 test("a scim_config provider's sign-in settings become the oidc section", () => {
@@ -2217,7 +2325,8 @@ test("a scim_config provider's sign-in settings become the oidc section", () => 
   expect(rawStr(try fields(find(try fields(kc.text), "oidc")!), "issuer")).toBe("https://kc.example.com/realms/prod")
   const okta = try normalize(`{ "scim_config": { "enabled": true, "provider": "okta", "config": { "issuerUrl": "https://acme.okta.com/oauth2/default", "clientId": "o", "clientSecret": "s", "additionalScopes": ["groups"] } } }`)
   const ok = try fields(find(try fields(okta.text), "oidc")!)
-  expect(find(ok, "scopes")).toBe(`["openid","profile","email","groups"]`)
+  // L191: Bifrost's default scopes carry offline_access (the refresh token of a silent session refresh)
+  expect(find(ok, "scopes")).toBe(`["openid","profile","email","offline_access","groups"]`)
   expect(rawStr(try fields(find(try fields((try normalize(`{ "scim_config": { "enabled": true, "provider": "google", "config": { "domain": "acme.com", "clientId": "g" } } }`)).text), "oidc")!), "issuer")).toBe("https://accounts.google.com")
   // an oidc section of its own wins
   const own = try normalize(`{ "oidc": { "enabled": true, "issuer": "https://idp.example.com", "client_id": "mine", "redirect_uri": "https://gw/api/oidc/callback" }, "scim_config": { "enabled": true, "provider": "zitadel", "config": { "domain": "z.example.com", "clientId": "z" } } }`)

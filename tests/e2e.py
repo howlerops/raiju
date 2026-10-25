@@ -545,9 +545,23 @@ def start_idp():
                 self.send_response(404); self.end_headers()
         def do_POST(self):
             form = urllib.parse.parse_qs(self.rfile.read(int(self.headers["content-length"])).decode())
-            state["verifier"] = form.get("code_verifier", [""])[0]
             now = int(time.time())
-            self.send(json.dumps({"token_type": "Bearer", "access_token": "at", "id_token": sign({**{"iss": iss, "aud": "raiju", "sub": "alice", "email": "alice@example.com", "iat": now, "exp": now + 300, "nonce": state["nonce"], "groups": ["staff", "raiju-editors"]}, **state.get("claims", {})})}))
+            base = {"iss": iss, "aud": "raiju", "sub": "alice", "email": "alice@example.com", "iat": now, "exp": now + 300, "groups": ["staff", "raiju-editors"]}
+            # L191: a refresh token when the test asks for one, a signed access token (Keycloak's claims), and the
+            # refresh grant (a silent session refresh), refused when the test says so
+            access = sign({**base, "azp": "raiju", "aud": "account", **state["access_claims"]}) if state.get("access_claims") else "at"
+            if form.get("grant_type", [""])[0] == "refresh_token":
+                state.setdefault("grants", []).append(form.get("refresh_token", [""])[0])
+                if state.get("refresh_fail"):
+                    self.send_response(400); self.send_header("content-length", "0"); self.end_headers()
+                    return
+                self.send(json.dumps({"token_type": "Bearer", "access_token": access, "refresh_token": "rt-" + str(len(state["grants"]) + 1), "id_token": sign({**base, **state.get("refresh_claims", state.get("claims", {}))})}))
+                return
+            state["verifier"] = form.get("code_verifier", [""])[0]
+            out = {"token_type": "Bearer", "access_token": access, "id_token": sign({**base, "nonce": state["nonce"], **state.get("claims", {})})}
+            if state.get("refresh_token"):
+                out["refresh_token"] = state["refresh_token"]
+            self.send(json.dumps(out))
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 18096), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv, state
@@ -561,9 +575,14 @@ def serve(port, routes, tls=False):
         def handle_any(self):
             n = int(self.headers.get("content-length", "0") or 0)
             body = self.rfile.read(n).decode() if n else ""
-            status, text, ctype = routes(self.command, self.path, self.headers, body)
+            res = routes(self.command, self.path, self.headers, body)
+            status, text, ctype = res[0], res[1], res[2]
             data = text.encode()
-            self.send_response(status); self.send_header("content-type", ctype); self.send_header("content-length", str(len(data))); self.end_headers(); self.wfile.write(data)
+            self.send_response(status); self.send_header("content-type", ctype); self.send_header("content-length", str(len(data)))
+            # a fourth element: extra response headers (L191's Okta mock pages with a Link header)
+            for k, v in (res[3] if len(res) > 3 else {}).items():
+                self.send_header(k, v)
+            self.end_headers(); self.wfile.write(data)
         do_GET = do_POST = do_PUT = handle_any
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), H)
     if tls:
@@ -13679,7 +13698,9 @@ def l181_scim_config(mode: str) -> dict:
             "attributeRoleMappings": [{"attribute": "groups", "value": "raiju-editors", "role": "editor"}, {"attribute": "groups", "value": "raiju-admins", "role": "admin"}, {"attribute": "groups", "value": "raiju-ghosts", "role": "ghost"}],
             "attributeTeamMappings": [{"attribute": "groups", "value": "*"}],
             "attributeBusinessUnitMappings": [{"attribute": "dept", "value": "*"}],
-            "attributeProjectMappings": [{"attribute": "groups", "value": "staff", "project": "apollo"}]}},
+            "attributeProjectMappings": [{"attribute": "groups", "value": "staff", "project": "apollo"}],
+            # L191: the groups claim reads the SCIM groups a pushed user is in (claimScimAttributes)
+            "claimScimAttributes": {"groups": {"attributeType": "group", "attributeValue": "displayName"}}}},
     }
 
 
@@ -13767,12 +13788,405 @@ def l181_scim_e2e(env, idp_state):
         s, page, _ = sign_in({"sub": "bob", "email": "bob@example.com", "groups": ["raiju-admins"]})
         check("scim only: a user SCIM has not pushed is refused, whatever the token says", s == 403 and "managed by SCIM" in page and stored_user("bob@example.com") == {}, (s, page[:200]))
         auth = {"authorization": "Bearer " + SCIM_TOKEN}
+        # L191: with mapping rules, what SCIM pushed decides the role (a SCIM group here), not a roles attribute
         s, _, b = call("POST", "/scim/v2/Users", {"schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"], "userName": "bob@example.com", "active": True, "roles": [{"value": "viewer"}]}, headers=auth, base=GW_L181S, auth=False)
+        s3, _, b3 = call("POST", "/scim/v2/Groups", {"schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"], "displayName": "raiju-editors", "members": [{"value": "bob@example.com"}]}, headers=auth, base=GW_L181S, auth=False)
         s2, page, _ = sign_in({"sub": "bob", "email": "bob@example.com", "groups": ["raiju-admins"]})
-        check("scim only: a pushed user signs in with the role SCIM gave, the token's claims ignored", s == 201 and s2 == 200 and "sk-sess-" in page and stored_user("bob@example.com").get("role") == "viewer", (s, b[:200], s2, page[:200]))
+        check("scim only: a pushed user signs in with the role SCIM's data maps to, the token's claims ignored", s == 201 and s3 == 201 and s2 == 200 and "sk-sess-" in page and stored_user("bob@example.com").get("role") == "editor", (s, b[:200], s3, b3[:200], s2, page[:200]))
     finally:
         gw.terminate()
         gw.wait()
+
+GW_L191 = "http://127.0.0.1:18338"  # L191: directory sync, bulk import, reconcile, SCIM attribute mapping, session refresh
+DIR_L191 = "http://127.0.0.1:18339"  # L191: mocks of the directory APIs of Okta, Entra (Graph), Keycloak, Zitadel and Google
+
+# The people the L191 directory mocks list: groups (names), realm or app roles, department, and whether they are active.
+L191_PEOPLE = [
+    {"id": "u-ana", "email": "ana@acme.com", "name": "Ana", "active": True, "groups": ["raiju-admins", "eng"], "roles": ["raiju-admin"], "dept": "Research"},
+    {"id": "u-bo", "email": "bo@acme.com", "name": "Bo", "active": True, "groups": ["raiju-users"], "roles": ["raiju-user"], "dept": "Sales"},
+    {"id": "u-cy", "email": "cy@acme.com", "name": "Cy", "active": False, "groups": ["raiju-users"], "roles": ["raiju-user"], "dept": "Sales"},
+    {"id": "u-dan", "email": "dan@acme.com", "name": "Dan", "active": True, "groups": ["outsiders"], "roles": [], "dept": ""},
+]
+
+def l191_directory(seen, pub_pem):
+    """The five directory APIs on 18339, each listing L191_PEOPLE in its provider's shape, with its paging (Okta's Link
+    header, Graph's absolute nextLink, Keycloak's offsets, Zitadel's result lists, Google's page tokens), its groups and
+    roles, single-user lookups (404 for anyone not listed), and its token endpoint. Google's token endpoint checks the
+    service account's RS256 assertion against its public key. seen records (method, path, authorization, body)."""
+    import base64 as _b64, urllib.parse as up
+    P = L191_PEOPLE
+    J = lambda o, st=200: (st, json.dumps(o), "application/json")
+    gid = lambda g: "g-" + g
+    def okta(p):
+        return {"id": p["id"], "status": "ACTIVE" if p["active"] else "SUSPENDED", "profile": {"login": p["email"], "email": p["email"], "firstName": p["name"], "department": p["dept"]}}
+    def graph(p):
+        return {"id": p["id"], "userPrincipalName": p["email"], "mail": p["email"], "displayName": p["name"], "accountEnabled": p["active"], "department": p["dept"]}
+    def kc(p):
+        return {"id": p["id"], "username": p["email"].split("@")[0], "email": p["email"], "firstName": p["name"], "enabled": p["active"], "attributes": {"department": [p["dept"]]}}
+    def zit(p):
+        return {"userId": p["id"], "username": p["email"], "state": "USER_STATE_ACTIVE" if p["active"] else "USER_STATE_INACTIVE", "human": {"profile": {"givenName": p["name"], "displayName": p["name"]}, "email": {"email": p["email"]}}}
+    def goog(p):
+        return {"id": p["id"], "primaryEmail": p["email"], "name": {"fullName": p["name"]}, "suspended": not p["active"], "organizations": [{"department": p["dept"], "primary": True}]}
+    groups = sorted({g for p in P for g in p["groups"]})
+    # rec and part are not listed, but a lookup finds them active: a sync keeps them
+    found = P + [{"id": "u-" + n, "email": n + "@acme.com", "name": n, "active": True, "groups": [], "roles": [], "dept": ""} for n in ("rec", "part")]
+    by_email = lambda e: next((p for p in found if p["email"] == e), None)
+    def assertion_ok(form):
+        a = form.get("assertion", [""])[0].split(".")
+        if len(a) != 3:
+            return False
+        pad = lambda s: s + "=" * (-len(s) % 4)
+        claims = json.loads(_b64.urlsafe_b64decode(pad(a[1])))
+        d = os.path.join(BUILD, "e2e-l191")
+        open(os.path.join(d, "in.txt"), "w").write(a[0] + "." + a[1])
+        open(os.path.join(d, "sig.bin"), "wb").write(_b64.urlsafe_b64decode(pad(a[2])))
+        r = subprocess.run(["openssl", "dgst", "-sha256", "-verify", pub_pem, "-signature", os.path.join(d, "sig.bin"), os.path.join(d, "in.txt")], capture_output=True)
+        return r.returncode == 0 and claims.get("sub") == "admin@acme.com" and claims.get("iss") == "sa@acme-proj.iam.gserviceaccount.com" and "admin.directory.user.readonly" in claims.get("scope", "")
+    def routes(method, path, headers, body):
+        seen.append((method, path, headers.get("authorization", ""), body))
+        u = up.urlparse(path)
+        q = up.parse_qs(u.query)
+        p = u.path
+        # ---- Okta ----
+        if p == "/api/v1/users":
+            if headers.get("authorization") != "SSWS okta-" + "e2e-token":
+                return J({"errorCode": "E0000011"}, 401)
+            if "after" not in q:
+                return (200, json.dumps([okta(x) for x in P[:2]]), "application/json", {"link": f'<{DIR_L191}/api/v1/users?limit=200>; rel="self", <{DIR_L191}/api/v1/users?after=u-bo&limit=200>; rel="next"'})
+            return J([okta(x) for x in P[2:]])
+        if p == "/api/v1/groups":
+            return J([{"id": gid(g), "profile": {"name": g}} for g in groups])
+        if p.startswith("/api/v1/groups/") and p.endswith("/users"):
+            g = p.split("/")[4]
+            return J([{"id": x["id"]} for x in P if any(gid(y) == g for y in x["groups"])])
+        if p.startswith("/api/v1/users/"):
+            x = by_email(up.unquote(p.split("/")[4]))
+            return J(okta(x)) if x else J({"errorCode": "E0000007"}, 404)
+        # ---- Entra (Microsoft Graph) ----
+        if p == "/entra/token":
+            f = up.parse_qs(body)
+            ok = f.get("grant_type") == ["client_credentials"] and f.get("scope") == ["https://graph.microsoft.com/.default"] and f.get("client_secret") == ["entra-secret"]
+            return J({"access_token": "graph-at", "expires_in": 3600}) if ok else J({"error": "invalid_client"}, 401)
+        if p.startswith("/entra/") and headers.get("authorization") != "Bearer graph-at":
+            return J({"error": {"code": "InvalidAuthenticationToken"}}, 401)
+        if p == "/entra/v1.0/users":
+            if "$skiptoken" not in q:
+                return J({"value": [graph(x) for x in P[:2]], "@odata.nextLink": "https://graph.microsoft.com/v1.0/users?$skiptoken=p2"})
+            return J({"value": [graph(x) for x in P[2:]]})
+        if p == "/entra/v1.0/groups":
+            return J({"value": [{"id": gid(g), "displayName": g} for g in groups]})
+        if p.startswith("/entra/v1.0/groups/") and p.endswith("/members"):
+            g = p.split("/")[4]
+            return J({"value": [{"id": x["id"]} for x in P if any(gid(y) == g for y in x["groups"])]})
+        if p == "/entra/v1.0/servicePrincipals":
+            return J({"value": [{"id": "sp-1", "appRoles": [{"id": "r-admin", "value": "Raiju.Admin"}, {"id": "r-user", "value": "Raiju.User"}]}]} if "raiju-app" in q.get("$filter", [""])[0] else {"value": []})
+        if p == "/entra/v1.0/servicePrincipals/sp-1/appRoleAssignedTo":
+            return J({"value": [{"principalId": gid("raiju-admins"), "principalType": "Group", "appRoleId": "r-admin"}, {"principalId": "u-bo", "principalType": "User", "appRoleId": "r-user"}, {"principalId": "u-cy", "principalType": "User", "appRoleId": "r-user"}]})
+        if p.startswith("/entra/v1.0/users/"):
+            x = by_email(up.unquote(p.split("/")[4]))
+            return J(graph(x)) if x else J({"error": {"code": "Request_ResourceNotFound"}}, 404)
+        # ---- Keycloak ----
+        if p == "/kc/realms/acme/protocol/openid-connect/token":
+            f = up.parse_qs(body)
+            return J({"access_token": "kc-at"}) if f.get("client_secret") == ["kc-secret"] and f.get("grant_type") == ["client_credentials"] else J({"error": "unauthorized_client"}, 401)
+        if p.startswith("/kc/admin/") and headers.get("authorization") != "Bearer kc-at":
+            return J({"error": "HTTP 401 Unauthorized"}, 401)
+        if p == "/kc/admin/realms/acme/users":
+            if "email" in q:
+                x = by_email(q["email"][0])
+                return J([kc(x)] if x else [])
+            first = int(q.get("first", ["0"])[0])
+            return J([kc(x) for x in P][first:first + 100])
+        if p.startswith("/kc/admin/realms/acme/users/"):
+            x = next((y for y in P if y["id"] == p.split("/")[6]), None)
+            if x is None:
+                return J({"error": "User not found"}, 404)
+            if p.endswith("/groups"):
+                return J([{"name": g, "path": "/" + g} for g in x["groups"]])
+            if p.endswith("/role-mappings/realm/composite"):
+                return J([{"name": r} for r in x["roles"]] + [{"name": "offline_access"}])
+        # ---- Zitadel ----
+        if p == "/zitadel/oauth/v2/token":
+            f = up.parse_qs(body)
+            ok = f.get("client_id") == ["zsa"] and f.get("client_secret") == ["zsa-secret"] and "urn:zitadel:iam:org:project:id:zitadel:aud" in f.get("scope", [""])[0]
+            return J({"access_token": "z-at"}) if ok else J({"error": "invalid_client"}, 401)
+        if p.startswith("/zitadel/") and headers.get("authorization") != "Bearer z-at":
+            return J({"code": 16}, 401)
+        if p == "/zitadel/v2/users":
+            b = json.loads(body or "{}")
+            for qq in b.get("queries", []):
+                e = qq.get("emailQuery", {}).get("emailAddress")
+                if e:
+                    x = by_email(e)
+                    return J({"result": [zit(x)] if x else []})
+            return J({"details": {"totalResult": str(len(P))}, "result": [zit(x) for x in P] + [{"userId": "bot-1", "username": "bot", "state": "USER_STATE_ACTIVE", "machine": {"name": "bot"}}]})
+        if p == "/zitadel/management/v1/users/grants/_search":
+            b = json.loads(body or "{}")
+            pq = [qq.get("projectIdQuery", {}).get("projectId") for qq in b.get("queries", [])]
+            return J({"result": [{"userId": x["id"], "projectId": "proj-1", "roleKeys": x["roles"]} for x in P if x["roles"]] if pq == ["proj-1"] else []})
+        # ---- Google Workspace ----
+        if p == "/google/token":
+            f = up.parse_qs(body)
+            ok = f.get("grant_type") == ["urn:ietf:params:oauth:grant-type:jwt-bearer"] and assertion_ok(f)
+            return J({"access_token": "g-at", "expires_in": 3600}) if ok else J({"error": "invalid_grant"}, 400)
+        if p.startswith("/google/admin/") and headers.get("authorization") != "Bearer g-at":
+            return J({"error": {"code": 401}}, 401)
+        if p == "/google/admin/directory/v1/users":
+            if q.get("domain") != ["acme.com"]:
+                return J({"error": {"code": 400}}, 400)
+            if "pageToken" not in q:
+                return J({"users": [goog(x) for x in P[:2]], "nextPageToken": "p2"})
+            return J({"users": [goog(x) for x in P[2:]]})
+        if p == "/google/admin/directory/v1/groups":
+            return J({"groups": [{"id": gid(g), "email": g + "@acme.com", "name": g} for g in groups]})
+        if p.startswith("/google/admin/directory/v1/groups/") and p.endswith("/members"):
+            g = p.split("/")[6]
+            return J({"members": [{"email": x["email"], "type": "USER"} for x in P if any(gid(y) == g for y in x["groups"])]})
+        if p.startswith("/google/admin/directory/v1/users/"):
+            x = by_email(up.unquote(p.split("/")[6]))
+            return J(goog(x)) if x else J({"error": {"code": 404}}, 404)
+        return J({"error": "no route " + path}, 404)
+    return routes
+
+def l191_config(provider, extra=None, scim_on=False):
+    """An L191 gateway: one directory provider on the 18339 mocks, its role rules, business units from the department,
+    users to sync, remove, keep and reconcile, and a key that goes with its removed user."""
+    rules = {
+        "okta": ("groups", "raiju-admins", "raiju-users"), "entra": ("roles", "Raiju.Admin", "Raiju.User"),
+        "keycloak": ("realm_access.roles", "raiju-admin", "raiju-user"), "zitadel": ("urn:zitadel:iam:org:project:roles", "raiju-admin", "raiju-user"),
+        "google": ("groups", "raiju-admins@acme.com", "raiju-users@acme.com"),
+    }[provider]
+    sa = json.dumps({"type": "service_account", "client_email": "sa@acme-proj.iam.gserviceaccount.com", "private_key": open(os.path.join(BUILD, "e2e-l191", "sa.key")).read(), "token_uri": DIR_L191 + "/google/token"})
+    cfgs = {
+        "okta": {"issuerUrl": DIR_L191, "clientId": "raiju-app", "apiToken": "env.E2E_OKTA_TOKEN", "bulkSyncInterval": "12h"},
+        "entra": {"tenantId": "acme-tenant", "clientId": "raiju-app", "clientSecret": "entra-secret", "directoryUrl": DIR_L191 + "/entra", "directoryTokenUrl": DIR_L191 + "/entra/token"},
+        "keycloak": {"serverUrl": DIR_L191 + "/kc", "realm": "acme", "clientId": "raiju-app", "clientSecret": "kc-secret"},
+        "zitadel": {"domain": "acme.zitadel.cloud", "clientId": "raiju-app", "projectId": "proj-1", "serviceAccountClientId": "zsa", "serviceAccountClientSecret": "zsa-secret", "directoryUrl": DIR_L191 + "/zitadel", "directoryTokenUrl": DIR_L191 + "/zitadel/oauth/v2/token"},
+        "google": {"domain": "acme.com", "clientId": "raiju-app", "adminEmail": "admin@acme.com", "credentialMode": "env", "serviceAccountEnvVar": "E2E_GOOGLE_SA", "directoryUrl": DIR_L191 + "/google"},
+    }
+    c = {**cfgs[provider], "attributeRoleMappings": [{"attribute": rules[0], "value": rules[1], "role": "admin"}, {"attribute": rules[0], "value": rules[2], "role": "viewer"}],
+         "attributeBusinessUnitMappings": [{"attribute": "department", "value": "*"}], **(extra or {})}
+    if scim_on:
+        c["provisioningToken"] = "env.E2E_SCIM_TOKEN"
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "governance": {
+            "auth_config": {"token": "admin-secret"},
+            "users": [
+                # an admin made by hand: syncs never remove or demote the last enabled admin, and this one leaves the others free to change
+                {"name": "root@acme.com", "email": "root@acme.com", "role": "admin"},
+                {"name": "manual@acme.com", "email": "manual@acme.com", "role": "viewer"},
+                {"name": "gone@acme.com", "email": "gone@acme.com", "role": "viewer", "source": "directory", "claims": {"groups": ["raiju-users"]}},
+                {"name": "rec@acme.com", "email": "rec@acme.com", "role": "viewer", "source": "sso", "claims": {"groups": ["raiju-admins"], "roles": ["raiju-admin"], "realm_access.roles": ["raiju-admin"], "department": ["Ops"]}},
+                {"name": "part@acme.com", "email": "part@acme.com", "role": "editor", "source": "sso", "claims": {"groups": ["raiju-users"]}},
+            ],
+            "virtual_keys": [{"id": "vk-l191-gone", "value": "sk-bf-l191-gone", "user_id": "gone@acme.com"}, {"id": "vk-l191-zed", "value": "sk-bf-l191-zed", "user_id": "zed@acme.com"}],
+        },
+        "scim_config": {"enabled": True, "provider": provider, "config": c},
+    }, sa
+
+def l191_e2e(env, idp_state):
+    """L191, user provisioning: directory sync and bulk import against mocks of Okta, Entra (Microsoft Graph), Keycloak,
+    Zitadel and Google Workspace (each provider's paging, groups, roles, token flow and lookups), the bulkSyncInterval
+    schedule and the import preview; reconcile with its previews and the rules check; the unavailable bulk routes with
+    SCIM provisioning on; claimScimAttributes applied to what SCIM pushes, with the membership source in the team and
+    business-unit member lists; and a silent session refresh (Keycloak-style access-token claims, the fresh claims
+    applied, the sign-in refused notice, a refused refresh that removes a user the directory reports gone). Its own
+    gateway (18338), started once per configuration, and the directory mocks (18339)."""
+    import http.client, re as _re, shutil
+    d = os.path.join(BUILD, "e2e-l191")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    key, pub = os.path.join(d, "sa.key"), os.path.join(d, "sa.pub")
+    subprocess.run(["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out", key], check=True, capture_output=True)
+    subprocess.run(["openssl", "pkey", "-in", key, "-pubout", "-out", pub], check=True, capture_output=True)
+    seen = []
+    srv = serve(18339, l191_directory(seen, pub))
+    cfg_path = os.path.join(d, "config.json")
+    A = {"authorization": "Bearer admin-secret"}
+    gw = None
+    def start(cfg, sa=""):
+        nonlocal gw
+        json.dump(cfg, open(cfg_path, "w"))
+        genv = {**env, "E2E_OKTA_TOKEN": "okta-" + "e2e-token", "E2E_SCIM_TOKEN": SCIM_TOKEN, "E2E_GOOGLE_SA": sa}
+        gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18338", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=genv, stderr=open(os.path.join(d, "gw.log"), "a"))
+        wait(GW_L191 + "/health")
+    def stop():
+        nonlocal gw
+        if gw is not None:
+            gw.terminate()
+            gw.wait()
+            gw = None
+    def api(method, path, body=None, headers=None):
+        s, _, b = call(method, path, body, headers=headers or A, base=GW_L191, auth=False)
+        try:
+            return s, json.loads(b) if b else {}
+        except ValueError:
+            return s, {"raw": b}
+    def job(op_id):
+        for _ in range(100):
+            s, j = api("GET", "/api/scim/provision/jobs/" + op_id)
+            if j.get("status") in ("completed", "failed"):
+                return j
+            time.sleep(0.1)
+        return {}
+    def stored():
+        return {u["name"]: u for u in json.load(open(cfg_path)).get("governance", {}).get("users", [])}
+    def gov():
+        return json.load(open(cfg_path)).get("governance", {})
+    def run_sync():
+        s, b = api("POST", "/api/scim/provision/sync", {})
+        return s, job(b.get("operation_id", ""))
+    try:
+        # ---- Okta: status, the import preview, an import, a full sync with deprovisioning ----
+        cfg, sa = l191_config("okta")
+        start(cfg)
+        s, st = api("GET", "/api/scim/provision/status")
+        ds = st.get("directory_sync", {})
+        check("provisioning status: directory sync is scheduled every bulkSyncInterval (12h) while SCIM provisioning is off",
+              s == 200 and ds.get("available") is True and ds.get("interval_seconds") == 43200 and ds.get("next_run_at") and st.get("sync_mode") == "off", (s, st))
+        s, pv = api("POST", "/api/scim/provision/preview", {"groups": ["raiju-admins"]})
+        pu = pv.get("users", [])
+        check("import preview: the users a group filter selects, with the role and business unit an import would give, and the groups to filter by",
+              s == 200 and pv.get("total") == 1 and len(pu) == 1 and pu[0]["email"] == "ana@acme.com" and pu[0]["exists"] is False and pu[0]["plan"]["role_to"] == "admin"
+              and pu[0]["plan"]["business_units"]["added"] == ["Research"] and "raiju-users" in pv.get("groups", []), (s, pv))
+        check("import preview: nothing is saved", "ana@acme.com" not in stored(), list(stored()))
+        s, b = api("POST", "/api/scim/provision/import", {"groups": ["raiju-admins"]})
+        j = job(b.get("operation_id", ""))
+        ana = stored().get("ana@acme.com", {})
+        bus = {x["id"]: x["name"] for x in gov().get("business_units", [])}
+        check("bulk import: a 202 job that creates the selected user with its mapped role and business unit",
+              s == 202 and j.get("status") == "completed" and j.get("counts", {}).get("created") == 1 and ana.get("role") == "admin" and ana.get("source") == "directory"
+              and [bus.get(x) for x in ana.get("business_units", [])] == ["Research"] and "bo@acme.com" not in stored(), (s, b, j, ana))
+        del seen[:]
+        s, j = run_sync()
+        us = stored()
+        ch = {c["user"]: c for c in j.get("changes", [])}
+        check("directory sync: active listed users are created or updated through the rules (Okta's Link pages followed with its API token)",
+              j.get("status") == "completed" and us.get("bo@acme.com", {}).get("role") == "viewer" and us.get("ana@acme.com", {}).get("role") == "admin"
+              and any("after=" in p for (_, p, a, _) in seen if p.startswith("/api/v1/users?")) and all(a == "SSWS okta-e2e-token" for (_, p, a, _) in seen if p.startswith("/api/v1/")), (j, list(us)))
+        check("directory sync: a user the directory reports inactive is not created; one mapping to no role is refused",
+              "cy@acme.com" not in us and "dan@acme.com" not in us and ch.get("dan@acme.com", {}).get("action") == "refuse", (list(us), ch.get("dan@acme.com")))
+        vks = [k["id"] for k in gov().get("virtual_keys", [])]
+        check("directory sync: an identity-provider user the listing no longer shows, confirmed gone by a lookup, is removed with its keys; manual users stay",
+              "gone@acme.com" not in us and "vk-l191-gone" not in vks and "manual@acme.com" in us and ch.get("gone@acme.com", {}).get("action") == "remove"
+              and any(p == "/api/v1/users/gone%40acme.com" for (_, p, _, _) in seen), (list(us), vks, ch.get("gone@acme.com")))
+        research = next((k for k, v in {x["id"]: x["name"] for x in gov().get("business_units", [])}.items() if v == "Research"), "")
+        s, bl = api("GET", f"/api/governance/business-units/{research}/users")
+        check("business-unit members: each member's source (synced from the identity provider)",
+              s == 200 and any(m["user_id"] == "ana@acme.com" and m["source"] == "synced" for m in bl.get("users", [])), (s, bl))
+        # ---- reconcile: previews, the rules check, keep-missing ----
+        s, pr = api("POST", "/api/scim/provision/reconcile/preview", {"keep_missing": True})
+        sample = {c["user"]: c for c in pr.get("sample", [])}
+        check("reconcile preview: stored claims under the current rules show who would gain a role, without saving",
+              s == 200 and sample.get("rec@acme.com", {}).get("role_to") == "admin" and stored()["rec@acme.com"]["role"] == "viewer" and pr.get("rules_hash"), (s, pr))
+        s, one = api("POST", "/api/scim/provision/reconcile/preview/user", {"user_id": "rec@acme.com"})
+        check("reconcile preview for one user", s == 200 and one.get("change", {}).get("role_from") == "viewer" and one["change"]["role_to"] == "admin", (s, one))
+        s, b = api("POST", "/api/scim/provision/reconcile", {"keep_missing": True, "rules_hash": "stale"})
+        check("reconcile: a preview made with other rules is refused (409)", s == 409, (s, b))
+        s, rc = api("POST", "/api/scim/provision/reconcile", {"keep_missing": True, "rules_hash": pr.get("rules_hash")})
+        rch = {c["user"]: c for c in rc.get("changes", [])}
+        us = stored()
+        check("reconcile: applied; keep-missing leaves a user whose data lacks an attribute alone; manual users are skipped",
+              s == 200 and us["rec@acme.com"]["role"] == "admin" and us["part@acme.com"]["role"] == "editor" and rch.get("part@acme.com", {}).get("reason", "").startswith("missing data")
+              and rch.get("manual@acme.com", {}).get("action") == "skip", (s, rc))
+        s, rc = api("POST", "/api/scim/provision/reconcile", {"user_ids": ["part@acme.com"]})
+        check("reconcile without keep-missing: a missing attribute counts as empty", s == 200 and stored()["part@acme.com"]["role"] == "viewer", (s, rc, stored()["part@acme.com"]))
+        stop()
+        # ---- Entra, Keycloak, Zitadel, Google: a sync each ----
+        for prov, probe in (("entra", lambda: any("$skiptoken=p2" in p for (_, p, _, _) in seen) and any(p == "/entra/token" for (_, p, _, _) in seen)),
+                            ("keycloak", lambda: any(p.endswith("/role-mappings/realm/composite") for (_, p, _, _) in seen)),
+                            ("zitadel", lambda: any(p == "/zitadel/management/v1/users/grants/_search" for (_, p, _, _) in seen)),
+                            ("google", lambda: any(p.startswith("/google/admin/directory/v1/users?") and "pageToken=p2" in p for (_, p, _, _) in seen))):
+            cfg, sa = l191_config(prov)
+            start(cfg, sa)
+            del seen[:]
+            s, j = run_sync()
+            us = stored()
+            check(f"directory sync ({prov}): the directory's roles or groups give ana admin and bo viewer; the inactive and unmapped are not created, the gone one removed",
+                  j.get("status") == "completed" and us.get("ana@acme.com", {}).get("role") == "admin" and us.get("bo@acme.com", {}).get("role") == "viewer"
+                  and "cy@acme.com" not in us and "dan@acme.com" not in us and "gone@acme.com" not in us and "manual@acme.com" in us, (prov, j, {k: v.get("role") for k, v in us.items()}))
+            check(f"directory sync ({prov}): the provider's own token flow, paging and role reads", probe(), [x[:2] for x in seen][:20])
+            stop()
+        # ---- SCIM provisioning on: no bulk routes; claimScimAttributes on what SCIM pushes ----
+        cfg, sa = l191_config("okta", {"claimScimAttributes": {"groups": {"attributeType": "group", "attributeValue": "displayName"}}}, scim_on=True)
+        start(cfg)
+        s1, st = api("GET", "/api/scim/provision/status")
+        s2, _ = api("POST", "/api/scim/provision/import", {})
+        s3, _ = api("POST", "/api/scim/provision/sync", {})
+        s4, _ = api("POST", "/api/scim/provision/preview", {})
+        check("with SCIM provisioning on, directory sync is off and bulk import, its preview and sync answer 403",
+              st.get("directory_sync", {}).get("available") is False and st.get("sync_mode") == "both" and (s2, s3, s4) == (403, 403, 403), (st, s2, s3, s4))
+        S = {"authorization": "Bearer " + SCIM_TOKEN}
+        s, _, b = call("POST", "/scim/v2/Users", {"schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"], "userName": "zed@acme.com", "active": True,
+                       "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": {"department": "Platform"}}, headers=S, base=GW_L191, auth=False)
+        z = stored().get("zed@acme.com", {})
+        check("SCIM push: the pushed attributes are kept and mapped; a user in no mapped group gets no role", s == 201 and z.get("role") == "" and z.get("scim_attributes", {}).get("department") == ["Platform"], (s, b[:300], z))
+        s, _, b = call("POST", "/scim/v2/Groups", {"schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"], "displayName": "raiju-admins", "members": [{"value": "zed@acme.com"}]}, headers=S, base=GW_L191, auth=False)
+        gidz = json.loads(b).get("id", "") if s == 201 else ""
+        z = stored().get("zed@acme.com", {})
+        plat = next((x["id"] for x in gov().get("business_units", []) if x["name"] == "Platform"), "")
+        check("claimScimAttributes: a SCIM group (attributeType group) maps the role, and the department a business unit", s == 201 and z.get("role") == "admin" and plat in z.get("business_units", []), (s, b[:200], z))
+        _, tm = api("GET", f"/api/governance/teams/{gidz}/members")
+        _, bm = api("GET", f"/api/governance/business-units/{plat}/users")
+        check("member lists: the SCIM group membership and the mapped business unit show as synced",
+              any(m["user_id"] == "zed@acme.com" and m["source"] == "synced" for m in tm.get("members", [])) and any(m["user_id"] == "zed@acme.com" and m["source"] == "synced" for m in bm.get("users", [])), (tm, bm))
+        s, _ = api("DELETE", f"/api/governance/business-units/{plat}/users/zed@acme.com")
+        check("a synced business-unit membership is not removed by hand (409)", s == 409, s)
+        s, _, b = call("PATCH", "/scim/v2/Groups/" + gidz, {"schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"], "Operations": [{"op": "remove", "path": "members[value eq \"zed@acme.com\"]"}]}, headers=S, base=GW_L191, auth=False)
+        z = stored().get("zed@acme.com", {})
+        check("leaving the SCIM group takes the mapped role away; the department's business unit stays mapped", s == 200 and z.get("role") == "" and plat in z.get("business_units", []), (s, z))
+        P = {"schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"]}
+        s, _, b = call("PATCH", "/scim/v2/Users/zed@acme.com", {**P, "Operations": [{"op": "replace", "value": {"active": False}}]}, headers=S, base=GW_L191, auth=False)
+        z = stored().get("zed@acme.com", {})
+        vks = [k["id"] for k in gov().get("virtual_keys", [])]
+        check("a SCIM deactivation removes the user's keys and memberships and keeps its pushed profile",
+              s == 200 and z.get("disabled") is True and z.get("business_units") == [] and "vk-l191-zed" not in vks and z.get("scim_attributes", {}).get("department") == ["Platform"], (s, z, vks))
+        s, _, b = call("PATCH", "/scim/v2/Users/zed@acme.com", {**P, "Operations": [{"op": "replace", "path": "active", "value": True}]}, headers=S, base=GW_L191, auth=False)
+        z = stored().get("zed@acme.com", {})
+        check("a reactivation restores what the rules give from the kept profile", s == 200 and z.get("disabled") is False and plat in z.get("business_units", []), (s, z))
+        stop()
+        # ---- session refresh: Keycloak-style access-token claims, the fresh claims, the refused notice, a refused refresh ----
+        cfg, sa = l191_config("okta", {"issuerUrl": "http://127.0.0.1:18096", "clientId": "raiju", "directoryUrl": DIR_L191,
+                                       "attributeRoleMappings": [{"attribute": "groups", "value": "raiju-editors", "role": "editor"}, {"attribute": "groups", "value": "raiju-admins", "role": "admin"}]})
+        cfg["oidc"] = {"enabled": True, "issuer": "http://127.0.0.1:18096", "client_id": "raiju", "session_ttl_seconds": 2, "claims_token": "access_token"}
+        start(cfg)
+        def sign_in():
+            conn = http.client.HTTPConnection("127.0.0.1", 18338, timeout=10)
+            conn.request("GET", "/api/oidc/login"); r = conn.getresponse(); r.read()
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(r.getheader("location") or "").query)
+            idp_state["nonce"] = q.get("nonce", [""])[0]
+            s, _, page = call("GET", "/api/oidc/callback?code=abc&state=" + q.get("state", [""])[0], base=GW_L191, auth=False)
+            m = _re.search(r'"(sk-sess-[0-9a-f]+)"', page)
+            return s, (m.group(1) if m else ""), page
+        try:
+            idp_state.update({"refresh_token": "rt-1", "grants": [], "claims": {"sub": "eve", "email": "eve@acme.com", "groups": ["outsiders"]}, "access_claims": {"sub": "eve", "email": "eve@acme.com", "groups": ["raiju-editors"]}})
+            s, tok, page = sign_in()
+            check("access-token claims: the mappings read the access token's groups (Keycloak's), not the ID token's", s == 200 and tok != "" and stored().get("eve@acme.com", {}).get("role") == "editor", (s, page[:200], stored().get("eve@acme.com")))
+            T = {"authorization": "Bearer " + tok}
+            time.sleep(2.5)
+            s, _ = api("GET", "/api/governance/teams", headers=T)
+            check("session refresh: an expired session is refreshed silently with the server-held refresh token", s == 200 and idp_state.get("grants") == ["rt-1"], (s, idp_state.get("grants")))
+            idp_state["access_claims"] = {"sub": "eve", "email": "eve@acme.com", "groups": ["raiju-admins"]}
+            time.sleep(2.5)
+            s, _ = api("GET", "/api/governance/teams", headers=T)
+            check("session refresh: the fresh claims are applied again (the rotated refresh token used)", s == 200 and stored().get("eve@acme.com", {}).get("role") == "admin" and idp_state.get("grants", [])[-1:] == ["rt-2"], (s, stored().get("eve@acme.com"), idp_state.get("grants")))
+            idp_state.update({"claims": {"sub": "fay", "email": "fay@acme.com", "groups": ["nobody"]}, "access_claims": {"sub": "fay", "email": "fay@acme.com", "groups": ["nobody"]}})
+            s, _, page = sign_in()
+            _, nt = api("GET", "/api/notifications")
+            check("a refused sign-in raises the Sign-in refused notice", s == 403 and any(n.get("title") == "Sign-in refused" and "fay@acme.com" in n.get("message", "") for n in nt.get("notifications", [])), (s, nt))
+            idp_state["refresh_fail"] = True
+            time.sleep(2.5)
+            s, _ = api("GET", "/api/governance/teams", headers=T)
+            check("a refused refresh ends the session, and the user the directory reports gone is removed", s == 401 and "eve@acme.com" not in stored(), (s, list(stored())))
+        finally:
+            for k in ("refresh_token", "grants", "claims", "access_claims", "refresh_fail"):
+                idp_state.pop(k, None)
+    finally:
+        stop()
+        srv.shutdown()
 
 GW_L184 = "http://127.0.0.1:18324"  # L184: no admin and no setup token (the locked /api), virtual keys, MCP, WebRTC off
 GW_L184_SETUP = "http://127.0.0.1:18325"  # L184: a setup token, keys without ids, private files and the share folder
@@ -16550,6 +16964,9 @@ def main():
         # claims and token rotation: its own gateways (18314, 18315)
         l181_e2e(env)
         l181_scim_e2e(env, idp_state)
+        # L191: directory sync and bulk import (Okta, Entra, Keycloak, Zitadel, Google mocks), reconcile, SCIM attribute
+        # mapping and member sources, session refresh: its own gateway (18338) and directory mocks (18339)
+        l191_e2e(env, idp_state)
         # L179: provider files and batches bound to their creating virtual key, the logs_only reveal mapping, and
         # log reads of earlier days after a restart: its own gateway (18310)
         l179_e2e(env)

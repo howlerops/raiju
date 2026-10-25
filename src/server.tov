@@ -36,6 +36,7 @@ import { sdkRoute, anthropicSdk } from "./anthropic_batch"
 import { snapshot, errorJson, Hdrs, newId } from "./schemas"
 import { handleApi, proxyWidening, Result, randomId, rotatedKeyIds, isRotatePath, providerBaseUrlProblem } from "./store"
 import { scimAuthorized, scimHandle, errorBody, ScimState, SCIM_CONTENT_TYPE } from "./scim"
+import { deprovisioned } from "./provision"
 import { passthroughPath, passthroughRoute } from "./passthrough"
 import { mcpApi, oauthRoute, oauthCallback, oauthConfigRoute, openapiRoute, inlineSpecUrl, headersRouteAsync, exchangeRouteAsync, perUserApi, McpReply } from "./mcpapi"
 import { issuerRoute, keyById, grantsList, grantRevoke, revokeSubject } from "./mcpissuer"
@@ -689,18 +690,51 @@ async function scimRoute(ops: Ops, req: Request, path: string): Promise<Response
   const g = ops.store.cfg.governance
   const st: ScimState = { users: g?.users ?? [], teams: g?.teams ?? [], roles: g?.roles ?? [], keyTeams: keyTeamIds(g?.virtual_keys) }
   const r = scimHandle(st, req.method, path.slice("/scim/v2".byteLength), params, body, origin + "/scim/v2", () => randomId("team-"))
+  let reply = r.body
   if (r.changed && r.status < 300) {
-    const saved = ops.store.setScim(r.state.users, r.state.teams)
+    // the mapping rules re-decide the users this request changed from what SCIM pushed (claimScimAttributes)
+    const plan = ops.scimResynced(st.users, r.state.users, r.state.teams)
+    const teams = r.state.teams.concat(plan.newTeams)
+    // a deactivation strips the user's memberships and profiles and a delete removes the user; both take the user's
+    // keys and project memberships and end its sessions
+    const dp = deprovisioned(st.users, plan.users)
+    const saved = ops.store.setProvisioned(dp.users, teams, (g?.business_units ?? []).concat(plan.newBusinessUnits), dp.names)
     if (saved.kind !== "ok") return scimReply(saved.status, errorBody(saved.status, "", saved.message))
+    if (dp.names.length > 0) {
+      const ended: string[] = []
+      for (const u of st.users) {
+        if (dp.names.includes(u.name)) {
+          ended.push(u.name)
+          if (u.email !== undefined) ended.push(u.email)
+        }
+      }
+      ops.sessions.endUser(ended)
+    }
     ops.storeUpdated("/api/users")
     ops.storeUpdated("/api/governance/teams")
+    if (plan.newBusinessUnits.length > 0) ops.storeUpdated("/api/governance/business-units")
+    // a user's reply shows the role the rules gave
+    if (plan.changes.length > 0 && path.startsWith("/scim/v2/Users")) {
+      let id = ""
+      try {
+        id = rawStr(fields(r.body), "id") ?? ""
+      } catch (e) {
+        id = ""
+      }
+      if (id !== "") {
+        const again: ScimState = { users: plan.users, teams: teams, roles: st.roles, keyTeams: st.keyTeams }
+        reply = scimHandle(again, "GET", "/Users/" + id, params, "", origin + "/scim/v2", () => randomId("team-")).body
+      }
+    }
   }
   if (req.method !== "GET") ops.recordChange("scim", req, path, r.status, body)
-  return scimReply(r.status, r.body)
+  return scimReply(r.status, reply)
 }
 
 // The management API, behind RBAC; every change lands in the audit log.
 async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
+  // an expired single sign-on session is refreshed with the identity provider first (Bifrost's silent refresh)
+  await ops.refreshDue(req)
   const gate = ops.gate(req, path)
   if (gate.kind === "deny") return gate.res
   // what this caller may see and change (data access scope)
@@ -718,6 +752,8 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   else if (usersPath(path).startsWith("/api/users/") && usersPath(path).split("/")[4] === "access-profiles") r = ops.userProfiles(req.method, usersPath(path), body)
   else if (usersPath(path) === "/api/users" || usersPath(path).startsWith("/api/users/")) r = ops.users(req.method, usersPath(path), body, req.headers.get("x-bifrost-setup-token") ?? "", cookieValue(req.headers.get("cookie") ?? "", SETUP_COOKIE))
   else if (auditTarget(path) !== "") r = ops.auditRoute(req, auditTarget(path))
+  // user provisioning: directory sync, bulk import and its preview, reconcile and its previews, the jobs
+  else if (path === "/api/scim/provision" || path.startsWith("/api/scim/provision/")) r = await ops.provisionRoute(req.method, path, body)
   else if (path === "/api/api-keys" || path.startsWith("/api/api-keys/")) r = ops.apiKeysRoute(req.method, path, req.url, body, gate.actor)
   // the cache clears (DELETE) and the read-only plugin listings
   else if (path.startsWith("/api/cache/")) r = await ops.cacheClear(req.method, path)

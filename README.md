@@ -90,7 +90,9 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
   too; see [SECURITY.md](SECURITY.md), which also lists the vendored native libraries and how to report a
   vulnerability.
 - **Enterprise:** RBAC for the management API (admin, editor, viewer, auditor;
-  `/api/users`), SSO with OIDC (PKCE, groups mapped to roles), a hash-chained
+  `/api/users`), SSO with OIDC (PKCE, groups mapped to roles), user provisioning from Okta, Entra, Keycloak,
+  Zitadel and Google Workspace (`scim_config`: claim mapping, inbound SCIM 2.0, directory sync and bulk import on
+  `bulkSyncInterval`, reconcile with preview, silent session refresh; `/api/scim/provision/*`), a hash-chained
   HMAC-signed audit log (`/api/audit-logs`, `/export`, `/verify`), alerting
   to webhooks, Slack, Teams and PagerDuty (`alerts`, Bifrost's CEL alert rules), secrets from HashiCorp Vault and AWS Secrets
   Manager (`vault.<path>#<field>`, `aws-sm.<id>`), log exports to S3, MinIO or GCS

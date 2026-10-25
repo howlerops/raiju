@@ -1,0 +1,859 @@
+// The identity providers' directory APIs, which Bifrost's directory sync, bulk import and session checks read
+// (docs/enterprise/user-provisioning.mdx, how-identity-sync-works.mdx): Okta's Users and Groups API behind its
+// apiToken, Microsoft Graph for Entra (client credentials), Keycloak's Admin REST API (the client's service account),
+// Zitadel's user and grant APIs (a service account) and Google's Directory API (a service account with domain-wide
+// delegation). Each user comes back with the attributes its sign-in token would carry (the profile fields, the
+// groups and the roles), so the same mapping rules decide it (claimsync.tov). The request builders and parsers are
+// pure; listDirectory and lookupUser make the calls.
+import { Field, fields, elements, find, rawStr, rawBool, decodeString, quote } from "./json"
+import { ScimConfig, resolveEnv, getEnv } from "./config"
+import { Claims } from "./claimsync"
+import { signRs256 } from "./jwt"
+import { encodeUrl } from "./base64"
+import { utf8 } from "./crypto"
+import { pctEncode } from "./cloud_auth"
+import { deadline } from "./deadline"
+import { readFileSync } from "node:fs"
+
+// A user as the directory lists it. active is false for a user the provider reports disabled, suspended or
+// deprovisioned.
+export type DirUser = { id: string, email: string, userName: string, displayName: string, active: bool, claims: Claims }
+
+// What the calls need, resolved from scim_config (env. references read). base is the API's base URL, tokenUrl the
+// OAuth token endpoint ("" for Okta, whose API token is sent as is).
+export type DirSettings = {
+  provider: string,
+  base: string,
+  tokenUrl: string,
+  rebased: bool,
+  clientId: string,
+  clientSecret: string,
+  apiToken: string,
+  realm: string,
+  projectId: string,
+  domain: string,
+  appClientId: string,
+  saEmail: string,
+  saKey: string,
+  adminEmail: string,
+  scope: string,
+}
+
+export const DIRECTORY_PROVIDERS = ["okta", "entra", "keycloak", "zitadel", "google"]
+
+const PAGE_CAP = 1000
+
+// The Directory API scopes Google's guide grants the service account.
+const GOOGLE_SCOPES = "https://www.googleapis.com/auth/admin.directory.user.readonly https://www.googleapis.com/auth/admin.directory.group.readonly https://www.googleapis.com/auth/admin.directory.group.member.readonly"
+
+function env(v: string | undefined): string {
+  return resolveEnv(v ?? "").trim()
+}
+
+function trimSlash(s: string): string {
+  let out = s
+  while (out.endsWith("/")) out = out.slice(0, out.byteLength - 1)
+  return out
+}
+
+// The scheme and host of a URL ("https://acme.okta.com/oauth2/default" gives "https://acme.okta.com").
+export function originOf(url: string): string {
+  const i = url.indexOf("://")
+  if (i < 0) return ""
+  const rest = url.slice(i + 3)
+  const j = rest.indexOf("/")
+  return j < 0 ? url : url.slice(0, i + 3 + j)
+}
+
+// Microsoft Graph's host for an Entra cloud.
+export function graphHost(cloud: string): string {
+  if (cloud === "gcc-high") return "https://graph.microsoft.us"
+  if (cloud === "dod") return "https://dod-graph.microsoft.us"
+  return "https://graph.microsoft.com"
+}
+
+function loginHost(cloud: string): string {
+  return cloud === "gcc-high" || cloud === "dod" ? "https://login.microsoftonline.us" : "https://login.microsoftonline.com"
+}
+
+// The service account key of a Google config: serviceAccountJson, else the variable credentialMode "env" names, else
+// the file credentialMode "file" names. "" when none is given.
+function googleKeyJson(c: ScimConfig): { json: string, reason: string } {
+  const cf = c.config ?? {}
+  const inline = env(cf.serviceAccountJson)
+  if (inline !== "") return { json: inline, reason: "" }
+  const mode = env(cf.credentialMode)
+  if (mode === "env") {
+    const v = getEnv(env(cf.serviceAccountEnvVar)) ?? ""
+    return v === "" ? { json: "", reason: "the variable serviceAccountEnvVar names is not set" } : { json: v, reason: "" }
+  }
+  if (mode === "file") {
+    try {
+      return { json: readFileSync(env(cf.serviceAccountFile), "utf8"), reason: "" }
+    } catch (e) {
+      return { json: "", reason: "serviceAccountFile cannot be read" }
+    }
+  }
+  if (mode === "inherit") return { json: "", reason: "credentialMode inherit needs Google's Application Default Credentials, which Raiju does not read; give serviceAccountJson, or credentialMode env or file" }
+  return { json: "", reason: "no service account: set serviceAccountJson, or credentialMode env or file" }
+}
+
+// The settings directory calls use, or why there are none (the provider has no directory API here, credentials are
+// missing, or enableBulkSync is off).
+export function directorySettings(sc: ScimConfig | undefined): { settings: DirSettings | undefined, reason: string } {
+  const none = (why: string): { settings: DirSettings | undefined, reason: string } => ({ settings: undefined, reason: why })
+  if (sc === undefined || sc.enabled !== true) return none("scim_config is not enabled")
+  const provider = sc.provider ?? ""
+  if (!DIRECTORY_PROVIDERS.includes(provider)) return none(provider === "" ? "scim_config names no provider" : `provider ${provider} has no directory API Raiju reads`)
+  const cf = sc.config ?? {}
+  if (cf.enableBulkSync === false) return none("enableBulkSync is off")
+  let s: DirSettings = { provider: provider, base: "", tokenUrl: "", rebased: false, clientId: "", clientSecret: "", apiToken: "", realm: "", projectId: "", domain: "", appClientId: env(cf.clientId), saEmail: "", saKey: "", adminEmail: "", scope: "" }
+  if (provider === "okta") {
+    s.apiToken = env(cf.apiToken)
+    s.base = originOf(env(cf.issuerUrl))
+    if (s.apiToken === "") return none("Okta needs apiToken for directory access")
+    if (s.base === "") return none("Okta needs issuerUrl")
+  } else if (provider === "entra") {
+    const tenant = env(cf.tenantId)
+    const cloud = env(cf.cloud)
+    s.clientId = env(cf.clientId)
+    s.clientSecret = env(cf.clientSecret)
+    if (tenant === "" || s.clientId === "" || s.clientSecret === "") return none("Entra needs tenantId, clientId and clientSecret for Microsoft Graph")
+    s.base = graphHost(cloud)
+    s.tokenUrl = `${loginHost(cloud)}/${pctEncode(tenant)}/oauth2/v2.0/token`
+    s.scope = graphHost(cloud) + "/.default"
+  } else if (provider === "keycloak") {
+    const server = trimSlash(env(cf.serverUrl))
+    s.realm = env(cf.realm)
+    s.clientId = env(cf.clientId)
+    s.clientSecret = env(cf.clientSecret)
+    if (server === "" || s.realm === "" || s.clientId === "" || s.clientSecret === "") return none("Keycloak needs serverUrl, realm, clientId and clientSecret (the client's service account)")
+    s.base = server
+    s.tokenUrl = `${server}/realms/${pctEncode(s.realm)}/protocol/openid-connect/token`
+  } else if (provider === "zitadel") {
+    const domain = env(cf.domain)
+    s.clientId = env(cf.serviceAccountClientId)
+    s.clientSecret = env(cf.serviceAccountClientSecret)
+    s.projectId = env(cf.projectId)
+    if (domain === "" || s.clientId === "" || s.clientSecret === "") return none("Zitadel needs domain, serviceAccountClientId and serviceAccountClientSecret")
+    s.base = "https://" + domain
+    s.tokenUrl = s.base + "/oauth/v2/token"
+    s.scope = "openid urn:zitadel:iam:org:project:id:zitadel:aud"
+  } else {
+    s.domain = env(cf.domain)
+    s.adminEmail = env(cf.adminEmail)
+    if (s.domain === "" || s.adminEmail === "") return none("Google needs domain and adminEmail for the Directory API")
+    const k = googleKeyJson(sc)
+    if (k.json === "") return none(k.reason)
+    try {
+      const kf = fields(k.json)
+      s.saEmail = rawStr(kf, "client_email") ?? ""
+      s.saKey = rawStr(kf, "private_key") ?? ""
+      s.tokenUrl = rawStr(kf, "token_uri") ?? "https://oauth2.googleapis.com/token"
+    } catch (e) {
+      return none("the service account key is not JSON")
+    }
+    if (s.saEmail === "" || s.saKey === "") return none("the service account key has no client_email or private_key")
+    s.base = "https://admin.googleapis.com"
+    s.scope = GOOGLE_SCOPES
+  }
+  const over = trimSlash(env(cf.directoryUrl))
+  if (over !== "") {
+    s.base = over
+    s.rebased = true
+  }
+  const tover = env(cf.directoryTokenUrl)
+  if (tover !== "") s.tokenUrl = tover
+  return { settings: s, reason: "" }
+}
+
+// ---- requests ----
+
+export type DirRequest = { method: string, url: string, headers: Map<string, string>, body: string }
+
+function req(method: string, url: string, headers: string[][], body: string): DirRequest {
+  const h: Map<string, string> = new Map()
+  for (const kv of headers) h.set(kv[0]!, kv[1]!)
+  return { method: method, url: url, headers: h, body: body }
+}
+
+// The signed assertion of Google's service account flow, for the admin it acts as (domain-wide delegation).
+export function googleAssertion(s: DirSettings, nowS: int): string throws SyntaxError {
+  const header = encodeUrl(utf8(`{"alg":"RS256","typ":"JWT"}`))
+  const claims = `{"iss":${quote(s.saEmail)},"sub":${quote(s.adminEmail)},"scope":${quote(s.scope)},"aud":${quote(s.tokenUrl)},"iat":${nowS},"exp":${nowS + 3600}}`
+  const input = header + "." + encodeUrl(utf8(claims))
+  return input + "." + (try signRs256(s.saKey, input))
+}
+
+// The token request of a provider that needs one (undefined for Okta): client credentials, or Google's JWT bearer.
+export function tokenRequest(s: DirSettings, nowS: int): DirRequest | undefined throws SyntaxError {
+  if (s.provider === "okta") return undefined
+  const form = [["content-type", "application/x-www-form-urlencoded"], ["accept", "application/json"]]
+  if (s.provider === "google") {
+    const body = "grant_type=" + pctEncode("urn:ietf:params:oauth:grant-type:jwt-bearer") + "&assertion=" + (try googleAssertion(s, nowS))
+    return req("POST", s.tokenUrl, form, body)
+  }
+  let body = `grant_type=client_credentials&client_id=${pctEncode(s.clientId)}&client_secret=${pctEncode(s.clientSecret)}`
+  if (s.scope !== "") body += "&scope=" + pctEncode(s.scope)
+  return req("POST", s.tokenUrl, form, body)
+}
+
+// The access token of a token response.
+export function accessTokenOf(body: string): string throws SyntaxError {
+  const fs = try fields(body)
+  const t = rawStr(fs, "access_token") ?? ""
+  if (t === "") throw new SyntaxError("the token response has no access_token: " + (rawStr(fs, "error_description") ?? rawStr(fs, "error") ?? body.slice(0, 120)))
+  return t
+}
+
+function auth(s: DirSettings, token: string): string[][] {
+  if (s.provider === "okta") return [["authorization", "SSWS " + s.apiToken], ["accept", "application/json"]]
+  return [["authorization", "Bearer " + token], ["accept", "application/json"]]
+}
+
+const GRAPH_SELECT = "id,userPrincipalName,mail,displayName,givenName,surname,accountEnabled,department,jobTitle,companyName,employeeId,employeeType,officeLocation,city,country"
+
+// The first page of the users listing.
+export function usersRequest(s: DirSettings, token: string): DirRequest {
+  const a = auth(s, token)
+  if (s.provider === "okta") return req("GET", `${s.base}/api/v1/users?limit=200`, a, "")
+  if (s.provider === "entra") return req("GET", `${s.base}/v1.0/users?$select=${GRAPH_SELECT}&$top=999`, a, "")
+  if (s.provider === "keycloak") return keycloakUsers(s, token, 0)
+  if (s.provider === "zitadel") return zitadelUsers(s, token, 0)
+  return req("GET", `${s.base}/admin/directory/v1/users?domain=${pctEncode(s.domain)}&maxResults=500&projection=full`, a, "")
+}
+
+export function keycloakUsers(s: DirSettings, token: string, first: int): DirRequest {
+  return req("GET", `${s.base}/admin/realms/${pctEncode(s.realm)}/users?first=${first}&max=100&briefRepresentation=false`, auth(s, token), "")
+}
+
+export function zitadelUsers(s: DirSettings, token: string, offset: int): DirRequest {
+  return req("POST", `${s.base}/v2/users`, auth(s, token).concat([["content-type", "application/json"]]), `{"query":{"offset":"${offset}","limit":100,"asc":true}}`)
+}
+
+// A next-page URL as the provider gave it, moved onto the configured base when directoryUrl replaced the API's host.
+export function follow(s: DirSettings, next: string): string {
+  if (next.startsWith(s.base + "/")) return next
+  if (!s.rebased || !next.startsWith("http")) return next.startsWith("/") ? s.base + next : next
+  const o = originOf(next)
+  return s.base + next.slice(o.byteLength)
+}
+
+// The rel="next" target of a Link header (Okta pages its listings this way; one header or several joined by commas).
+export function nextLink(link: string): string {
+  for (const part of link.split(",")) {
+    const p = part.trim()
+    if (!p.includes("rel=\"next\"") && !p.includes("rel=next")) continue
+    const a = p.indexOf("<")
+    const b = p.indexOf(">")
+    if (a >= 0 && b > a) return p.slice(a + 1, b)
+  }
+  return ""
+}
+
+// ---- parsing ----
+
+function objFields(raw: string | undefined): Field[] {
+  if (raw === undefined || !raw.trim().startsWith("{")) return []
+  try {
+    return fields(raw.trim())
+  } catch (e) {
+    return []
+  }
+}
+
+function arrayOf(raw: string | undefined): string[] {
+  if (raw === undefined || !raw.trim().startsWith("[")) return []
+  try {
+    return elements(raw.trim()).map((e) => e.trim())
+  } catch (e) {
+    return []
+  }
+}
+
+// The scalar values of a JSON value: a string, number or boolean; an array's scalars; none for null or an object.
+export function valuesOf(raw: string | undefined): string[] {
+  if (raw === undefined) return []
+  const r = raw.trim()
+  const out: string[] = []
+  try {
+    if (r.startsWith("\"")) out.push(decodeString(r))
+    else if (r.startsWith("[")) {
+      for (const e of arrayOf(r)) {
+        if (e.startsWith("\"")) out.push(decodeString(e))
+        else if (e !== "null" && !e.startsWith("{") && !e.startsWith("[")) out.push(e)
+      }
+    } else if (r !== "null" && !r.startsWith("{")) out.push(r)
+  } catch (e) {
+    return []
+  }
+  return out
+}
+
+function str(fs: Field[], key: string): string {
+  return rawStr(fs, key) ?? ""
+}
+
+// Every scalar or array field of an object as a claim of the same name.
+function addFields(inout c: Claims, fs: Field[]): void {
+  for (const f of fs) {
+    const r = f.raw.trim()
+    if (r.startsWith("{")) continue
+    const v = valuesOf(r)
+    if (v.length > 0 || r.startsWith("[")) c.set(f.key, v)
+  }
+}
+
+function set1(inout c: Claims, key: string, v: string): void {
+  if (v !== "") c.set(key, [v])
+}
+
+function user(id: string, email: string, userName: string, name: string, active: bool, claims: Claims): DirUser {
+  let c = claims
+  set1(&c, "sub", id)
+  set1(&c, "email", email)
+  set1(&c, "name", name)
+  if (!c.has("groups")) c.set("groups", [])
+  return { id: id, email: email, userName: userName, displayName: name, active: active, claims: c }
+}
+
+// Okta's states of a user who may sign in.
+const OKTA_ACTIVE = ["ACTIVE", "PROVISIONED", "RECOVERY", "PASSWORD_EXPIRED", "LOCKED_OUT"]
+
+// One Okta user object: its profile fields become claims (login as preferred_username).
+export function oktaUser(raw: string): DirUser {
+  const fs = objFields(raw)
+  const pf = objFields(find(fs, "profile"))
+  let c: Claims = new Map()
+  addFields(&c, pf)
+  const login = str(pf, "login")
+  set1(&c, "preferred_username", login)
+  const name = str(pf, "displayName") !== "" ? str(pf, "displayName") : (str(pf, "firstName") + " " + str(pf, "lastName")).trim()
+  const email = str(pf, "email") !== "" ? str(pf, "email") : login
+  return user(str(fs, "id"), email, login, name, OKTA_ACTIVE.includes(str(fs, "status")), c)
+}
+
+// One Microsoft Graph user: its fields become claims (the object id as oid, the UPN as preferred_username and upn).
+export function graphUser(raw: string): DirUser {
+  const fs = objFields(raw)
+  let c: Claims = new Map()
+  addFields(&c, fs)
+  const id = str(fs, "id")
+  const upn = str(fs, "userPrincipalName")
+  set1(&c, "oid", id)
+  set1(&c, "preferred_username", upn)
+  set1(&c, "upn", upn)
+  const email = str(fs, "mail") !== "" ? str(fs, "mail") : upn
+  return user(id, email, upn, str(fs, "displayName"), rawBool(fs, "accountEnabled") !== false, c)
+}
+
+// One Keycloak user (briefRepresentation false): its attributes become claims by name.
+export function keycloakUser(raw: string): DirUser {
+  const fs = objFields(raw)
+  let c: Claims = new Map()
+  addFields(&c, objFields(find(fs, "attributes")))
+  const uname = str(fs, "username")
+  set1(&c, "preferred_username", uname)
+  set1(&c, "given_name", str(fs, "firstName"))
+  set1(&c, "family_name", str(fs, "lastName"))
+  const name = (str(fs, "firstName") + " " + str(fs, "lastName")).trim()
+  return user(str(fs, "id"), str(fs, "email"), uname, name, rawBool(fs, "enabled") !== false, c)
+}
+
+// One Zitadel v2 user. Machine users (service accounts) are left out: undefined.
+export function zitadelUser(raw: string): DirUser | undefined {
+  const fs = objFields(raw)
+  const human = objFields(find(fs, "human"))
+  if (human.length === 0) return undefined
+  const pf = objFields(find(human, "profile"))
+  const em = objFields(find(human, "email"))
+  let c: Claims = new Map()
+  const uname = str(fs, "username") !== "" ? str(fs, "username") : str(fs, "preferredLoginName")
+  set1(&c, "preferred_username", uname)
+  set1(&c, "given_name", str(pf, "givenName"))
+  set1(&c, "family_name", str(pf, "familyName"))
+  const name = str(pf, "displayName") !== "" ? str(pf, "displayName") : (str(pf, "givenName") + " " + str(pf, "familyName")).trim()
+  const state = str(fs, "state")
+  return user(str(fs, "userId"), str(em, "email"), uname, name, state === "" || state === "USER_STATE_ACTIVE", c)
+}
+
+// One Google Directory user: the primary organization's department, title and cost center, the org unit, and the
+// custom schema fields (as "Schema.field" and "field").
+export function googleUser(raw: string, domain: string): DirUser {
+  const fs = objFields(raw)
+  const nm = objFields(find(fs, "name"))
+  let c: Claims = new Map()
+  set1(&c, "given_name", str(nm, "givenName"))
+  set1(&c, "family_name", str(nm, "familyName"))
+  set1(&c, "hd", domain)
+  set1(&c, "orgUnitPath", str(fs, "orgUnitPath"))
+  const orgs = arrayOf(find(fs, "organizations"))
+  let org: Field[] = []
+  for (const o of orgs) {
+    const of = objFields(o)
+    if (org.length === 0 || rawBool(of, "primary") === true) org = of
+  }
+  set1(&c, "department", str(org, "department"))
+  set1(&c, "title", str(org, "title"))
+  set1(&c, "costCenter", str(org, "costCenter"))
+  for (const sch of objFields(find(fs, "customSchemas"))) {
+    for (const f of objFields(sch.raw)) {
+      const v = valuesOf(f.raw)
+      c.set(sch.key + "." + f.key, v)
+      c.set(f.key, v)
+    }
+  }
+  const email = str(fs, "primaryEmail")
+  const active = rawBool(fs, "suspended") !== true && rawBool(fs, "archived") !== true
+  return user(str(fs, "id"), email, email, str(nm, "fullName"), active, c)
+}
+
+export type UsersPage = { users: DirUser[], next: string }
+
+// A page of users and the next page's URL ("" at the end). Keycloak and Zitadel page by offset: next is "more"
+// while the page was full.
+export function parseUsersPage(s: DirSettings, body: string, link: string): UsersPage throws SyntaxError {
+  const out: DirUser[] = []
+  const t = body.trim()
+  if (s.provider === "okta" || s.provider === "keycloak") {
+    if (!t.startsWith("[")) throw new SyntaxError("the users listing is not an array")
+    const els = try elements(t)
+    for (const e of els) out.push(s.provider === "okta" ? oktaUser(e) : keycloakUser(e))
+    if (s.provider === "okta") return { users: out, next: nextLink(link) }
+    return { users: out, next: els.length >= 100 ? "more" : "" }
+  }
+  const fs = try fields(t)
+  if (s.provider === "entra") {
+    for (const e of arrayOf(find(fs, "value"))) out.push(graphUser(e))
+    return { users: out, next: rawStr(fs, "@odata.nextLink") ?? "" }
+  }
+  if (s.provider === "zitadel") {
+    const els = arrayOf(find(fs, "result"))
+    for (const e of els) {
+      const u = zitadelUser(e)
+      if (u !== undefined) out.push(u)
+    }
+    return { users: out, next: els.length >= 100 ? "more" : "" }
+  }
+  for (const e of arrayOf(find(fs, "users"))) out.push(googleUser(e, s.domain))
+  const tok = rawStr(fs, "nextPageToken") ?? ""
+  return { users: out, next: tok === "" ? "" : `${s.base}/admin/directory/v1/users?domain=${pctEncode(s.domain)}&maxResults=500&projection=full&pageToken=${pctEncode(tok)}` }
+}
+
+// ---- the calls ----
+
+type Got = { status: int, body: string, link: string }
+
+async function call(r: DirRequest): Promise<Got> {
+  const dl = deadline(30000)
+  try {
+    const hs: Record<string, string> = r.headers
+    const res = r.method === "GET" ? await fetch(r.url, { headers: hs, signal: dl.controller.signal }) : await fetch(r.url, { method: r.method, headers: hs, body: r.body, signal: dl.controller.signal })
+    const b = await res.text()
+    dl.finish()
+    return { status: res.status, body: b, link: res.headers.get("link") ?? "" }
+  } catch (e) {
+    dl.finish()
+    return { status: 0, body: e.message, link: "" }
+  }
+}
+
+function get(s: DirSettings, token: string, url: string): DirRequest {
+  return req("GET", url, auth(s, token), "")
+}
+
+// The access token for the directory calls ("" for Okta), or an error.
+export async function directoryToken(s: DirSettings): Promise<{ token: string, error: string }> {
+  let r: DirRequest | undefined = undefined
+  try {
+    r = tokenRequest(s, Math.floor(Date.now() / 1000))
+  } catch (e) {
+    return { token: "", error: "could not sign the token request: " + e.message }
+  }
+  if (r === undefined) return { token: "", error: "" }
+  const g = await call(r)
+  if (g.status !== 200) return { token: "", error: `the token endpoint answered HTTP ${g.status}` }
+  try {
+    return { token: accessTokenOf(g.body), error: "" }
+  } catch (e) {
+    return { token: "", error: e.message }
+  }
+}
+
+// The listing of a paged collection whose pages carry their items under key (or are arrays when key is ""), and their
+// next page as a Link header (mode "link"), an @odata.nextLink ("odata") or a nextPageToken added to the first URL
+// ("token").
+async function pages(s: DirSettings, token: string, first: string, key: string, mode: string): Promise<{ items: string[], error: string }> {
+  const items: string[] = []
+  let url = first
+  let n = 0
+  while (url !== "" && n < PAGE_CAP) {
+    n += 1
+    const g = await call(get(s, token, url))
+    if (g.status !== 200) return { items: items, error: `HTTP ${g.status} from ${url}` }
+    const t = g.body.trim()
+    let fs: Field[] = []
+    if (key === "") {
+      for (const e of arrayOf(t)) items.push(e)
+    } else {
+      fs = objFields(t)
+      for (const e of arrayOf(find(fs, key))) items.push(e)
+    }
+    let nx = ""
+    if (mode === "link") nx = nextLink(g.link)
+    else if (mode === "odata") nx = rawStr(fs, "@odata.nextLink") ?? ""
+    else {
+      const pt = rawStr(fs, "nextPageToken") ?? ""
+      if (pt !== "") nx = first + "&pageToken=" + pctEncode(pt)
+    }
+    url = nx === "" ? "" : follow(s, nx)
+  }
+  return { items: items, error: "" }
+}
+
+function addTo(inout m: Map<string, string[]>, id: string, v: string): void {
+  const cur = m.get(id) ?? []
+  if (!cur.includes(v)) cur.push(v)
+  m.set(id, cur)
+}
+
+// Okta: each group's members (tenant-wide groups, as Bifrost reads them) give the users' groups claim (names).
+async function oktaGroups(s: DirSettings): Promise<{ byUser: Map<string, string[]>, names: string[], error: string }> {
+  let byUser: Map<string, string[]> = new Map()
+  const names: string[] = []
+  const gs = await pages(s, "", `${s.base}/api/v1/groups?limit=200`, "", "link")
+  if (gs.error !== "") return { byUser: byUser, names: names, error: gs.error }
+  for (const g of gs.items) {
+    const gf = objFields(g)
+    const name = str(objFields(find(gf, "profile")), "name")
+    if (name === "") continue
+    names.push(name)
+    const ms = await pages(s, "", `${s.base}/api/v1/groups/${pctEncode(str(gf, "id"))}/users?limit=200`, "", "link")
+    if (ms.error !== "") return { byUser: byUser, names: names, error: ms.error }
+    for (const m of ms.items) addTo(&byUser, str(objFields(m), "id"), name)
+  }
+  return { byUser: byUser, names: names, error: "" }
+}
+
+// Entra: group memberships (object ids, as the groups claim carries them) and the app's roles assigned to the user
+// directly or through a group (their values, as the roles claim carries them).
+async function graphGroups(s: DirSettings, token: string): Promise<{ groups: Map<string, string[]>, roles: Map<string, string[]>, names: string[], error: string }> {
+  let groups: Map<string, string[]> = new Map()
+  let roles: Map<string, string[]> = new Map()
+  const names: string[] = []
+  const gs = await pages(s, token, `${s.base}/v1.0/groups?$select=id,displayName&$top=999`, "value", "odata")
+  if (gs.error !== "") return { groups: groups, roles: roles, names: names, error: gs.error }
+  let members: Map<string, string[]> = new Map()
+  for (const g of gs.items) {
+    const gf = objFields(g)
+    const gid = str(gf, "id")
+    names.push(str(gf, "displayName"))
+    const ms = await pages(s, token, `${s.base}/v1.0/groups/${pctEncode(gid)}/members?$select=id&$top=999`, "value", "odata")
+    if (ms.error !== "") return { groups: groups, roles: roles, names: names, error: ms.error }
+    for (const m of ms.items) {
+      const uid = str(objFields(m), "id")
+      addTo(&groups, uid, gid)
+      addTo(&members, gid, uid)
+    }
+  }
+  // the app's service principal: its role catalogue and who holds each role
+  if (s.appClientId === "") return { groups: groups, roles: roles, names: names, error: "" }
+  const sp = await call(get(s, token, `${s.base}/v1.0/servicePrincipals?$filter=appId%20eq%20'${pctEncode(s.appClientId)}'&$select=id,appRoles`))
+  if (sp.status !== 200) return { groups: groups, roles: roles, names: names, error: "" }
+  const spv = arrayOf(find(objFields(sp.body), "value"))
+  if (spv.length === 0) return { groups: groups, roles: roles, names: names, error: "" }
+  const spf = objFields(spv[0]!)
+  const catalogue: Map<string, string> = new Map()
+  for (const ar of arrayOf(find(spf, "appRoles"))) {
+    const af = objFields(ar)
+    catalogue.set(str(af, "id"), str(af, "value"))
+  }
+  const asg = await pages(s, token, `${s.base}/v1.0/servicePrincipals/${pctEncode(str(spf, "id"))}/appRoleAssignedTo?$top=999`, "value", "odata")
+  for (const a of asg.items) {
+    const af = objFields(a)
+    const value = catalogue.get(str(af, "appRoleId")) ?? ""
+    if (value === "") continue
+    const pid = str(af, "principalId")
+    if (str(af, "principalType") === "Group") {
+      for (const uid of members.get(pid) ?? []) addTo(&roles, uid, value)
+    } else addTo(&roles, pid, value)
+  }
+  return { groups: groups, roles: roles, names: names, error: "" }
+}
+
+// Zitadel: the roles each user is granted (on projectId when it is set).
+async function zitadelRoles(s: DirSettings, token: string): Promise<Map<string, string[]>> {
+  let out: Map<string, string[]> = new Map()
+  const q = s.projectId === "" ? "" : `,"queries":[{"projectIdQuery":{"projectId":${quote(s.projectId)}}}]`
+  const g = await call(req("POST", `${s.base}/management/v1/users/grants/_search`, auth(s, token).concat([["content-type", "application/json"]]), `{"query":{"offset":"0","limit":1000}${q}}`))
+  if (g.status !== 200) return out
+  for (const r of arrayOf(find(objFields(g.body), "result"))) {
+    const rf = objFields(r)
+    for (const k of valuesOf(find(rf, "roleKeys"))) addTo(&out, str(rf, "userId"), k)
+  }
+  return out
+}
+
+// Google: each group's members give the users' groups (the groups' addresses).
+async function googleGroups(s: DirSettings, token: string): Promise<{ byEmail: Map<string, string[]>, names: string[], error: string }> {
+  let byEmail: Map<string, string[]> = new Map()
+  const names: string[] = []
+  const first = `${s.base}/admin/directory/v1/groups?domain=${pctEncode(s.domain)}&maxResults=200`
+  const gs = await pages(s, token, first, "groups", "token")
+  if (gs.error !== "") return { byEmail: byEmail, names: names, error: gs.error }
+  for (const g of gs.items) {
+    const gf = objFields(g)
+    const ge = str(gf, "email")
+    names.push(ge)
+    const mf = `${s.base}/admin/directory/v1/groups/${pctEncode(str(gf, "id"))}/members?maxResults=200`
+    const ms = await pages(s, token, mf, "members", "token")
+    if (ms.error !== "") return { byEmail: byEmail, names: names, error: ms.error }
+    for (const m of ms.items) addTo(&byEmail, str(objFields(m), "email").toLowerCase(), ge)
+  }
+  return { byEmail: byEmail, names: names, error: "" }
+}
+
+// Keycloak: one user's groups (their paths, as the Group Membership mapper with full paths sends them) and realm roles
+// (effective ones, under realm_access.roles and roles).
+async function keycloakDetail(s: DirSettings, token: string, u: DirUser): Promise<DirUser> {
+  let c = u.claims
+  const root = `${s.base}/admin/realms/${pctEncode(s.realm)}/users/${pctEncode(u.id)}`
+  const g = await call(get(s, token, root + "/groups"))
+  const paths: string[] = []
+  if (g.status === 200) {
+    for (const e of arrayOf(g.body)) {
+      const gf = objFields(e)
+      paths.push(str(gf, "path") !== "" ? str(gf, "path") : str(gf, "name"))
+    }
+  }
+  c.set("groups", paths)
+  const r = await call(get(s, token, root + "/role-mappings/realm/composite"))
+  const roles: string[] = []
+  if (r.status === 200) {
+    for (const e of arrayOf(r.body)) roles.push(str(objFields(e), "name"))
+  }
+  c.set("realm_access.roles", roles)
+  c.set("roles", roles)
+  return { id: u.id, email: u.email, userName: u.userName, displayName: u.displayName, active: u.active, claims: c }
+}
+
+// The whole directory: every user with its groups and roles, the group names (for the import filter), and whether
+// the listing finished (only a complete listing may deprovision users it no longer shows).
+export type Listing = { users: DirUser[], groups: string[], complete: bool, error: string }
+
+export async function listDirectory(s: DirSettings): Promise<Listing> {
+  const fail = (users: DirUser[], why: string): Listing => ({ users: users, groups: [], complete: false, error: why })
+  const tk = await directoryToken(s)
+  if (tk.error !== "") return fail([], tk.error)
+  const token = tk.token
+  let users: DirUser[] = []
+  let r: DirRequest = usersRequest(s, token)
+  let n = 0
+  let offset = 0
+  while (n < PAGE_CAP) {
+    n += 1
+    const g = await call(r)
+    if (g.status !== 200) return fail(users, `HTTP ${g.status} from the users listing`)
+    let page: UsersPage = { users: [], next: "" }
+    try {
+      page = parseUsersPage(s, g.body, g.link)
+    } catch (e) {
+      return fail(users, e.message)
+    }
+    for (const u of page.users) users.push(u)
+    if (page.next === "") break
+    if (s.provider === "keycloak") {
+      offset += 100
+      r = keycloakUsers(s, token, offset)
+    } else if (s.provider === "zitadel") {
+      offset += 100
+      r = zitadelUsers(s, token, offset)
+    } else r = get(s, token, follow(s, page.next))
+  }
+  let groups: string[] = []
+  if (s.provider === "okta") {
+    const og = await oktaGroups(s)
+    if (og.error !== "") return fail(users, og.error)
+    groups = og.names
+    users = users.map((u) => withClaim(u, "groups", og.byUser.get(u.id) ?? []))
+  } else if (s.provider === "entra") {
+    const eg = await graphGroups(s, token)
+    if (eg.error !== "") return fail(users, eg.error)
+    groups = eg.names
+    users = users.map((u) => withClaim(withClaim(u, "groups", eg.groups.get(u.id) ?? []), "roles", eg.roles.get(u.id) ?? []))
+  } else if (s.provider === "keycloak") {
+    const out: DirUser[] = []
+    for (const u of users) out.push(await keycloakDetail(s, token, u))
+    users = out
+    for (const u of users) {
+      for (const p of u.claims.get("groups") ?? []) {
+        if (!groups.includes(p)) groups.push(p)
+      }
+    }
+  } else if (s.provider === "zitadel") {
+    const roles = await zitadelRoles(s, token)
+    const claimNames = ["roles", "urn:zitadel:iam:org:project:roles"]
+    if (s.projectId !== "") claimNames.push(`urn:zitadel:iam:org:project:${s.projectId}:roles`)
+    users = users.map((u) => {
+      let x = u
+      for (const k of claimNames) x = withClaim(x, k, roles.get(u.id) ?? [])
+      return x
+    })
+  } else {
+    const gg = await googleGroups(s, token)
+    if (gg.error !== "") return fail(users, gg.error)
+    groups = gg.names
+    users = users.map((u) => withClaim(u, "groups", gg.byEmail.get(u.email.toLowerCase()) ?? []))
+  }
+  return { users: users, groups: groups, complete: true, error: "" }
+}
+
+function withClaim(u: DirUser, key: string, v: string[]): DirUser {
+  let c = u.claims
+  c.set(key, v)
+  return { id: u.id, email: u.email, userName: u.userName, displayName: u.displayName, active: u.active, claims: c }
+}
+
+// What the directory says about one user now: active, inactive (disabled or suspended), gone, or unknown when the
+// check failed (the caller then keeps the user).
+export type Lookup = { kind: "active" } | { kind: "inactive" } | { kind: "gone" } | { kind: "error", message: string }
+
+// The request that looks one user up by email (or user name), and how its answer reads.
+export function lookupRequest(s: DirSettings, token: string, key: string): DirRequest {
+  const a = auth(s, token)
+  if (s.provider === "okta") return req("GET", `${s.base}/api/v1/users/${pctEncode(key)}`, a, "")
+  if (s.provider === "entra") return req("GET", `${s.base}/v1.0/users/${pctEncode(key)}?$select=${GRAPH_SELECT}`, a, "")
+  if (s.provider === "keycloak") return req("GET", `${s.base}/admin/realms/${pctEncode(s.realm)}/users?email=${pctEncode(key)}&exact=true&briefRepresentation=false`, a, "")
+  if (s.provider === "zitadel") return req("POST", `${s.base}/v2/users`, a.concat([["content-type", "application/json"]]), `{"queries":[{"emailQuery":{"emailAddress":${quote(key)}}}]}`)
+  return req("GET", `${s.base}/admin/directory/v1/users/${pctEncode(key)}`, a, "")
+}
+
+export function readLookup(s: DirSettings, status: int, body: string): Lookup {
+  if (status === 404) return { kind: "gone" }
+  if (status !== 200) return { kind: "error", message: `HTTP ${status}` }
+  let u: DirUser | undefined = undefined
+  if (s.provider === "okta") u = oktaUser(body)
+  else if (s.provider === "entra") u = graphUser(body)
+  else if (s.provider === "google") u = googleUser(body, s.domain)
+  else if (s.provider === "keycloak") {
+    const els = arrayOf(body)
+    if (els.length === 0) return { kind: "gone" }
+    u = keycloakUser(els[0]!)
+  } else {
+    const els = arrayOf(find(objFields(body), "result"))
+    if (els.length === 0) return { kind: "gone" }
+    u = zitadelUser(els[0]!)
+  }
+  if (u === undefined) return { kind: "error", message: "not a user" }
+  return u.active ? { kind: "active" } : { kind: "inactive" }
+}
+
+export async function lookupUser(s: DirSettings, key: string): Promise<Lookup> {
+  const tk = await directoryToken(s)
+  if (tk.error !== "") return { kind: "error", message: tk.error }
+  const g = await call(lookupRequest(s, tk.token, key))
+  return readLookup(s, g.status, g.body)
+}
+
+// ---- tests ----
+
+function cfgOf(provider: string, c: string): ScimConfig {
+  try {
+    const parsed = JSON.parse(`{"enabled":true,"provider":"${provider}","config":${c}}`) as ScimConfig
+    return parsed
+  } catch (e) {
+    return {}
+  }
+}
+
+function settingsOf(sc: ScimConfig): DirSettings {
+  const r = directorySettings(sc)
+  if (r.settings === undefined) throw new Error(r.reason)
+  return r.settings
+}
+
+test("directory settings: each provider's credentials and hosts, and why a config has none", () => {
+  const okta = try settingsOf(cfgOf("okta", `{"issuerUrl":"https://acme.okta.com/oauth2/default","clientId":"c","apiToken":"tok"}`))
+  expect(okta.base).toBe("https://acme.okta.com")
+  expect(directorySettings(cfgOf("okta", `{"issuerUrl":"https://acme.okta.com"}`)).reason).toBe("Okta needs apiToken for directory access")
+  const entra = try settingsOf(cfgOf("entra", `{"tenantId":"t-1","clientId":"c","clientSecret":"s","cloud":"gcc-high"}`))
+  expect(entra.base).toBe("https://graph.microsoft.us")
+  expect(entra.tokenUrl).toBe("https://login.microsoftonline.us/t-1/oauth2/v2.0/token")
+  expect(entra.scope).toBe("https://graph.microsoft.us/.default")
+  const kc = try settingsOf(cfgOf("keycloak", `{"serverUrl":"https://kc.example.com/","realm":"acme","clientId":"c","clientSecret":"s"}`))
+  expect(kc.tokenUrl).toBe("https://kc.example.com/realms/acme/protocol/openid-connect/token")
+  const z = try settingsOf(cfgOf("zitadel", `{"domain":"acme.zitadel.cloud","clientId":"c","serviceAccountClientId":"sa","serviceAccountClientSecret":"ss","projectId":"p1"}`))
+  expect(z.tokenUrl).toBe("https://acme.zitadel.cloud/oauth/v2/token")
+  expect(directorySettings(cfgOf("zitadel", `{"domain":"acme.zitadel.cloud","clientId":"c"}`)).reason.startsWith("Zitadel needs")).toBe(true)
+  expect(directorySettings(cfgOf("google", `{"domain":"acme.com","clientId":"c","adminEmail":"a@acme.com","credentialMode":"inherit"}`)).reason.includes("Application Default Credentials")).toBe(true)
+  expect(directorySettings(cfgOf("generic", `{"issuerUrl":"https://idp"}`)).reason).toBe("provider generic has no directory API Raiju reads")
+  expect(directorySettings(cfgOf("entra", `{"tenantId":"t","clientId":"c","clientSecret":"s","enableBulkSync":false}`)).reason).toBe("enableBulkSync is off")
+  const moved = try settingsOf(cfgOf("entra", `{"tenantId":"t","clientId":"c","clientSecret":"s","directoryUrl":"http://127.0.0.1:9/graph/","directoryTokenUrl":"http://127.0.0.1:9/token"}`))
+  expect(moved.base + " " + moved.tokenUrl).toBe("http://127.0.0.1:9/graph http://127.0.0.1:9/token")
+  expect(follow(moved, "https://graph.microsoft.com/v1.0/users?$skiptoken=x")).toBe("http://127.0.0.1:9/graph/v1.0/users?$skiptoken=x")
+})
+
+test("requests: Okta's API token, client credentials, Google's delegated assertion, and the first pages", () => {
+  const okta = try settingsOf(cfgOf("okta", `{"issuerUrl":"https://acme.okta.com","apiToken":"tok"}`))
+  expect((try tokenRequest(okta, 1700000000)) === undefined).toBe(true)
+  const ou = usersRequest(okta, "")
+  expect(ou.url + " " + (ou.headers.get("authorization") ?? "")).toBe("https://acme.okta.com/api/v1/users?limit=200 SSWS tok")
+  const kc = try settingsOf(cfgOf("keycloak", `{"serverUrl":"https://kc","realm":"r","clientId":"raiju","clientSecret":"s&1"}`))
+  const kt = try tokenRequest(kc, 1700000000)
+  expect(kt !== undefined && kt.body === "grant_type=client_credentials&client_id=raiju&client_secret=s%261").toBe(true)
+  expect(keycloakUsers(kc, "at", 100).url).toBe("https://kc/admin/realms/r/users?first=100&max=100&briefRepresentation=false")
+  const z = try settingsOf(cfgOf("zitadel", `{"domain":"z.example.com","serviceAccountClientId":"sa","serviceAccountClientSecret":"ss"}`))
+  expect(zitadelUsers(z, "at", 0).body).toBe(`{"query":{"offset":"0","limit":100,"asc":true}}`)
+  const zt = try tokenRequest(z, 1)
+  expect(zt !== undefined && zt.body.includes("scope=openid%20urn%3Azitadel%3Aiam%3Aorg%3Aproject%3Aid%3Azitadel%3Aaud")).toBe(true)
+})
+
+test("parsing: each provider's user objects become the claims their tokens carry", () => {
+  const o = oktaUser(`{"id":"00u1","status":"SUSPENDED","profile":{"login":"ana@acme.com","email":"ana@acme.com","firstName":"Ana","lastName":"Lee","department":"Research","tags":["a","b"]}}`)
+  expect(o.active).toBe(false)
+  expect(o.displayName).toBe("Ana Lee")
+  expect((o.claims.get("department") ?? []).join(",")).toBe("Research")
+  expect((o.claims.get("tags") ?? []).join(",")).toBe("a,b")
+  expect((o.claims.get("groups") ?? ["x"]).length).toBe(0)
+  const g = graphUser(`{"id":"oid-1","userPrincipalName":"bo@acme.onmicrosoft.com","mail":null,"displayName":"Bo","accountEnabled":true,"jobTitle":"SRE"}`)
+  expect(g.email).toBe("bo@acme.onmicrosoft.com")
+  expect((g.claims.get("oid") ?? []).join(",")).toBe("oid-1")
+  expect((g.claims.get("jobTitle") ?? []).join(",")).toBe("SRE")
+  const k = keycloakUser(`{"id":"k1","username":"cy","email":"cy@acme.com","firstName":"Cy","enabled":false,"attributes":{"department":["Ops"]}}`)
+  expect(k.active).toBe(false)
+  expect((k.claims.get("department") ?? []).join(",")).toBe("Ops")
+  const zu = zitadelUser(`{"userId":"z1","username":"di","state":"USER_STATE_ACTIVE","human":{"profile":{"givenName":"Di","familyName":"Ng"},"email":{"email":"di@acme.com"}}}`)
+  expect(zu !== undefined && zu.active && zu.email === "di@acme.com" && zu.displayName === "Di Ng").toBe(true)
+  expect(zitadelUser(`{"userId":"m1","username":"bot","machine":{"name":"bot"}}`) === undefined).toBe(true)
+  const gu = googleUser(`{"id":"g1","primaryEmail":"ed@acme.com","name":{"fullName":"Ed"},"suspended":false,"orgUnitPath":"/Eng","organizations":[{"department":"Sales"},{"department":"Eng","title":"Lead","primary":true}],"customSchemas":{"HR":{"level":"L5"}}}`, "acme.com")
+  expect((gu.claims.get("department") ?? []).join(",")).toBe("Eng")
+  expect((gu.claims.get("HR.level") ?? []).join(",") + (gu.claims.get("level") ?? []).join(",")).toBe("L5L5")
+  expect(googleUser(`{"id":"g2","primaryEmail":"x@acme.com","archived":true}`, "acme.com").active).toBe(false)
+})
+
+test("pages: Link headers, OData next links, offsets and page tokens", () => {
+  expect(nextLink(`<https://acme.okta.com/api/v1/users?limit=200>; rel="self", <https://acme.okta.com/api/v1/users?after=00u2&limit=200>; rel="next"`)).toBe("https://acme.okta.com/api/v1/users?after=00u2&limit=200")
+  expect(nextLink(`<https://acme.okta.com/api/v1/users?limit=200>; rel="self"`)).toBe("")
+  const entra = try settingsOf(cfgOf("entra", `{"tenantId":"t","clientId":"c","clientSecret":"s"}`))
+  const p = try parseUsersPage(entra, `{"value":[{"id":"1","userPrincipalName":"a@x"}],"@odata.nextLink":"https://graph.microsoft.com/v1.0/users?$skiptoken=abc"}`, "")
+  expect(p.users.length === 1 && p.next.endsWith("abc")).toBe(true)
+  const google = try settingsOf(cfgOf("google", `{"domain":"acme.com","adminEmail":"a@acme.com","serviceAccountJson":"{\\"client_email\\":\\"sa@p.iam\\",\\"private_key\\":\\"k\\"}"}`))
+  const gp = try parseUsersPage(google, `{"users":[{"id":"1","primaryEmail":"a@acme.com"}],"nextPageToken":"t 2"}`, "")
+  expect(gp.next).toBe("https://admin.googleapis.com/admin/directory/v1/users?domain=acme.com&maxResults=500&projection=full&pageToken=t%202")
+  expect(google.tokenUrl).toBe("https://oauth2.googleapis.com/token")
+  const kc = try settingsOf(cfgOf("keycloak", `{"serverUrl":"https://kc","realm":"r","clientId":"c","clientSecret":"s"}`))
+  expect((try parseUsersPage(kc, `[{"id":"1","username":"a"}]`, "")).next).toBe("")
+})
+
+test("lookups: active, inactive, gone and failed answers", () => {
+  const okta = try settingsOf(cfgOf("okta", `{"issuerUrl":"https://acme.okta.com","apiToken":"tok"}`))
+  expect(lookupRequest(okta, "", "ana@acme.com").url).toBe("https://acme.okta.com/api/v1/users/ana%40acme.com")
+  expect(readLookup(okta, 200, `{"id":"1","status":"ACTIVE","profile":{"login":"a"}}`).kind).toBe("active")
+  expect(readLookup(okta, 200, `{"id":"1","status":"DEPROVISIONED","profile":{"login":"a"}}`).kind).toBe("inactive")
+  expect(readLookup(okta, 404, "").kind).toBe("gone")
+  expect(readLookup(okta, 500, "").kind).toBe("error")
+  const kc = try settingsOf(cfgOf("keycloak", `{"serverUrl":"https://kc","realm":"r","clientId":"c","clientSecret":"s"}`))
+  expect(readLookup(kc, 200, "[]").kind).toBe("gone")
+  const z = try settingsOf(cfgOf("zitadel", `{"domain":"z.example.com","serviceAccountClientId":"sa","serviceAccountClientSecret":"ss"}`))
+  expect(readLookup(z, 200, `{"result":[{"userId":"1","state":"USER_STATE_INACTIVE","human":{"profile":{},"email":{"email":"a@x"}}}]}`).kind).toBe("inactive")
+})

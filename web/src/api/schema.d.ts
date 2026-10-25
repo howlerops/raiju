@@ -1440,7 +1440,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List a team's members (the users whose teams name it), as {members} */
+        /** List a team's members (the users whose teams name it), as {members}, each with its source (manual, or synced from the identity provider) */
         get: operations["getApiGovernanceTeamsIdMembers"];
         put?: never;
         post?: never;
@@ -1688,6 +1688,47 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/governance/business-units/{id}/users": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * A business unit's members with how each was granted, as {users, total}
+         * @description source is manual for an admin's assignment and synced for one the identity provider gave (a mapping rule at sign-in, directory sync or a SCIM push), as Bifrost's member list tells them apart.
+         */
+        get: operations["getApiGovernanceBusinessUnitsIdUsers"];
+        put?: never;
+        /** Add users to a business unit (an admin's assignment), answered with the members */
+        post: operations["postApiGovernanceBusinessUnitsIdUsers"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/governance/business-units/{id}/users/{user_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Remove a user's manual membership of a business unit
+         * @description A membership the identity provider gave (source synced) follows the identity provider and is refused with 409; change the mapping rules or the user's attributes instead.
+         */
+        delete: operations["deleteApiGovernanceBusinessUnitsIdUsersUserId"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/governance/access-profiles": {
         parameters: {
             query?: never;
@@ -1849,6 +1890,177 @@ export interface paths {
          * @description Replaces scim_config.config.provisioningToken (an env. reference included) with a new random token. The identity provider's SCIM connector must be given the new token. Refused with 400 while scim_config.enabled is not true.
          */
         post: operations["postApiScimProvisioningToken"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/scim/provision/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The user provisioning state, as {provider, sync_mode, rules_hash, directory_sync, session_sweep}
+         * @description Raiju: sync_mode is off (no SCIM provisioning token), both or scim (claimsSyncMode); directory_sync says whether directory sync and bulk import are available (the provider's directory credentials are set, enableBulkSync is not off and SCIM provisioning is off) with the reason when not, the bulkSyncInterval in seconds and the next scheduled run; rules_hash is the fingerprint a reconcile checks.
+         */
+        get: operations["getApiScimProvisionStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/scim/provision/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Preview a bulk import: up to 50 directory users a filter selects, with what an import would do to each
+         * @description Lists the identity provider's directory (Okta, Entra through Microsoft Graph, Keycloak, Zitadel or Google Workspace) and returns the users in any of the groups, holding any of the roles, in any of the departments, or named in user_ids (each list ignored when empty), with the plan an import would apply (role, teams, business units, projects and access profiles from the mapping rules) and the groups to filter by. Nothing is saved. Refused with 403 while SCIM provisioning is on.
+         */
+        post: operations["postApiScimProvisionPreview"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/scim/provision/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Bulk import the directory users a filter selects (a background job)
+         * @description Creates or updates the selected users with their mapped role, teams, business units, projects and access profiles; nobody is removed. Answers 202 with the job's operation_id (GET /api/scim/provision/jobs/{operation_id}). Refused with 403 while SCIM provisioning is on and 409 while another sync or import runs.
+         */
+        post: operations["postApiScimProvisionImport"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/scim/provision/sync": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run a directory sync now (the job the bulkSyncInterval schedule runs)
+         * @description Re-reads every user of the directory, creates or updates the active ones through the mapping rules, removes identity-provider users the directory reports inactive, and after a complete listing removes the ones it no longer lists once a lookup confirms them inactive or gone (with their virtual keys and project memberships, and their sessions ended). Users an admin made, users with their own credentials and the last enabled admin are never removed. Answers 202 with the job's operation_id. Refused with 403 while SCIM provisioning is on.
+         */
+        post: operations["postApiScimProvisionSync"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/scim/provision/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The recent provisioning jobs (sync, import, reconcile), newest first, as {jobs} */
+        get: operations["getApiScimProvisionJobs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/scim/provision/jobs/{operation_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One provisioning job (Bifrost's GET /api/scim/provision/jobs/{operation_id}) */
+        get: operations["getApiScimProvisionJobsOperationId"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/scim/provision/reconcile": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reconcile existing users with the current mapping rules (Bifrost's identity reconcile)
+         * @description Re-decides each identity-provider user (all, or user_ids) from the data stored at their last sign-in, directory sync or SCIM push (what SCIM sent, in SCIM-only mode) and saves the result. keep_missing leaves a user whose stored data lacks an attribute the rules read unchanged; otherwise a missing attribute counts as empty. Service accounts, users an admin made and users with no stored data are skipped. rules_hash (from a preview) is checked against the current rules, and a changed one is refused with 409.
+         */
+        post: operations["postApiScimProvisionReconcile"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/scim/provision/reconcile/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Preview a reconcile without saving anything
+         * @description The users who would gain or lose a role, team, business unit, project or access profile (a sample of 50), the ones who would lose every access profile, the counts by action, and the rules_hash to send with the reconcile.
+         */
+        post: operations["postApiScimProvisionReconcilePreview"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/scim/provision/reconcile/preview/user": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** What a reconcile would change for one user ({"user_id"}), as {rules_hash, change} */
+        post: operations["postApiScimProvisionReconcilePreviewUser"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4911,6 +5123,75 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @description Raiju: what a bulk import or its preview selects; each list is ignored when empty and values are compared without regard to case. */
+        ProvisionFilter: {
+            groups?: string[];
+            roles?: string[];
+            departments?: string[];
+            /** @description Directory ids or account names (addresses) */
+            user_ids?: string[];
+        };
+        ReconcileRequest: {
+            user_ids?: string[];
+            /** @description The one user of a reconcile/preview/user request */
+            user_id?: string;
+            /** @description Leave a user whose stored data lacks an attribute the rules read unchanged (default false) */
+            keep_missing?: boolean;
+            /** @description The rules_hash of the preview; a reconcile under other rules is refused with 409 */
+            rules_hash?: string;
+        };
+        ProvisionListChange: {
+            added?: string[];
+            removed?: string[];
+        };
+        /** @description Raiju: what a sync, import or reconcile does to one user. action is create, update, unchanged, refuse, remove or skip; names are shown for ids the gateway knows. */
+        ProvisionChange: {
+            user?: string;
+            email?: string;
+            action?: string;
+            role_from?: string;
+            role_to?: string;
+            teams?: components["schemas"]["ProvisionListChange"];
+            business_units?: components["schemas"]["ProvisionListChange"];
+            projects?: components["schemas"]["ProvisionListChange"];
+            access_profiles?: components["schemas"]["ProvisionListChange"];
+            loses_all_profiles?: boolean;
+            reason?: string;
+        };
+        ProvisionCounts: {
+            created?: number;
+            updated?: number;
+            unchanged?: number;
+            removed?: number;
+            refused?: number;
+            skipped?: number;
+        };
+        ProvisionJobStarted: {
+            operation_id: string;
+            status: string;
+        };
+        ProvisionJob: {
+            operation_id?: string;
+            /** @enum {string} */
+            operation?: "sync" | "import" | "reconcile";
+            /** @enum {string} */
+            status?: "running" | "completed" | "failed";
+            started_at?: string;
+            finished_at?: string;
+            counts?: components["schemas"]["ProvisionCounts"];
+            changes?: components["schemas"]["ProvisionChange"][];
+            error?: string;
+        };
+        BusinessUnitMembers: {
+            users?: {
+                user_id?: string;
+                user_name?: string;
+                user_email?: string;
+                /** @enum {string} */
+                source?: "manual" | "synced";
+            }[];
+            total?: number;
+        };
         /** @description One MCP server of the library (Bifrost's mcp_library row) */
         McpLibraryEntry: {
             id?: number;
@@ -14501,6 +14782,186 @@ export interface operations {
             };
         };
     };
+    getApiGovernanceBusinessUnitsIdUsers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Business unit id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BusinessUnitMembers"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No such business unit. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiGovernanceBusinessUnitsIdUsers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Business unit id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description Users by name or email */
+                    user_ids?: string[];
+                    user_id?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BusinessUnitMembers"];
+                };
+            };
+            /** @description No user_ids, or a user that does not exist. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No such business unit. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    deleteApiGovernanceBusinessUnitsIdUsersUserId: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Business unit id */
+                id: string;
+                /** @description The user's name or email */
+                user_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        deleted?: string;
+                    };
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No such business unit, or the user is not a member. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The identity provider manages this membership. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
     getApiGovernanceAccessProfiles: {
         parameters: {
             query?: never;
@@ -15506,6 +15967,526 @@ export interface operations {
             };
             /** @description The gateway could not save or read back the record. */
             500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiScimProvisionStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        provider?: string;
+                        /** @enum {string} */
+                        sync_mode?: "off" | "both" | "scim";
+                        rules_hash?: string;
+                        directory_sync?: {
+                            available?: boolean;
+                            reason?: string;
+                            interval_seconds?: number;
+                            next_run_at?: string | null;
+                        };
+                        session_sweep?: boolean;
+                    };
+                };
+            };
+            /** @description scim_config is not enabled or names no provider. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiScimProvisionPreview: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ProvisionFilter"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        users?: {
+                            id?: string;
+                            email?: string;
+                            name?: string;
+                            active?: boolean;
+                            groups?: string[];
+                            exists?: boolean;
+                            plan?: components["schemas"]["ProvisionChange"];
+                        }[];
+                        total?: number;
+                        truncated?: boolean;
+                        groups?: string[];
+                    };
+                };
+            };
+            /** @description Directory access is not configured (the reason is given), or the body is invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role does not cover this route, or SCIM provisioning is on. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiScimProvisionImport: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ProvisionFilter"];
+            };
+        };
+        responses: {
+            /** @description The job started. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProvisionJobStarted"];
+                };
+            };
+            /** @description Directory access is not configured (the reason is given), or the body is invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role does not cover this route, or SCIM provisioning is on. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description A directory sync or import is already running. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiScimProvisionSync: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The job started. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProvisionJobStarted"];
+                };
+            };
+            /** @description Directory access is not configured (the reason is given). */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role does not cover this route, or SCIM provisioning is on. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description A directory sync or import is already running. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiScimProvisionJobs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        jobs?: components["schemas"]["ProvisionJob"][];
+                    };
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiScimProvisionJobsOperationId: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The operation_id a sync or import answered with */
+                operation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProvisionJob"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No such job (the newest 50 are kept). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiScimProvisionReconcile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ReconcileRequest"];
+            };
+        };
+        responses: {
+            /** @description Applied; the job's record with each user's change. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProvisionJob"];
+                };
+            };
+            /** @description scim_config is not enabled, or the body is invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The rules changed since the preview; preview again. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The gateway could not save the result. */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProvisionJob"];
+                };
+            };
+        };
+    };
+    postApiScimProvisionReconcilePreview: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ReconcileRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        rules_hash?: string;
+                        sync_mode?: string;
+                        total?: number;
+                        changed?: number;
+                        counts?: components["schemas"]["ProvisionCounts"];
+                        sample?: components["schemas"]["ProvisionChange"][];
+                        losing_all_profiles?: string[];
+                    };
+                };
+            };
+            /** @description scim_config is not enabled, or the body is invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiScimProvisionReconcilePreviewUser: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReconcileRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        rules_hash?: string;
+                        change?: components["schemas"]["ProvisionChange"];
+                    };
+                };
+            };
+            /** @description user_id is missing, scim_config is not enabled, or the body is invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The caller's role or data access scope does not cover this route. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description No such user. */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

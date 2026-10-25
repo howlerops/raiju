@@ -37,8 +37,9 @@ type Filter = { kind: "none" } | { kind: "eq", value: string } | { kind: "bad" }
 // One PATCH operation: op in lower case, the path ("" when the value is an object of attributes), the raw value.
 type PatchOp = { op: string, path: string, value: string | undefined }
 
-// A user being written: its name, role and state. Attributes not held here are accepted and ignored.
-type Work = { name: string, role: string, disabled: bool }
+// A user being written: its name, role and state, and the attributes pushed (flattened; the mapping rules read them
+// through claimScimAttributes, claimsync.tov).
+type Work = { name: string, role: string, disabled: bool, attrs: Map<string, string[]> }
 
 // A group being written: its id, name, the users with their teams applied, and the teams as they stand.
 type GroupWork = { id: string, name: string, users: AdminUserConfig[], teams: TeamConfig[] }
@@ -289,28 +290,125 @@ function groupJson(t: TeamConfig, users: AdminUserConfig[], base: string): strin
   })
 }
 
-// The same user with a team added (on) or removed.
+// The same user with a team added (on) or removed. The team is a SCIM group, so the membership is SCIM's too
+// (scim_groups): a mapping resync never takes it away.
 function withTeam(u: AdminUserConfig, team: string, on: bool): AdminUserConfig {
   const held: string[] = (u.teams ?? []).filter((t) => t !== team)
   if (on) held.push(team)
-  return userWith(u, u.role, u.disabled === true, held)
+  const pushed: string[] = (u.scim_groups ?? []).filter((t) => t !== team)
+  if (on) pushed.push(team)
+  let n = userWith(u, u.role, u.disabled === true, held)
+  if (on || (u.scim_groups ?? []).length > 0) n.scim_groups = pushed
+  return n
 }
 
-// The user as a new value: its role, state and teams replaced, every other field kept.
+// The user as a new value: its role, state and teams replaced, every other field (memberships, claims, budget
+// overrides, the attributes SCIM pushed) kept.
 function userWith(u: AdminUserConfig, role: string, disabled: bool, teams: string[] | undefined): AdminUserConfig {
-  return {
-    name: u.name,
-    email: u.email,
-    role: role,
-    token_sha256: u.token_sha256,
-    password_sha256: u.password_sha256,
-    salt: u.salt,
-    disabled: disabled,
-    teams: teams,
-    business_units: u.business_units,
-    projects: u.projects,
-    access_profile_ids: u.access_profile_ids,
+  let n = u
+  n.role = role
+  n.disabled = disabled
+  n.teams = teams
+  return n
+}
+
+// ---- pushed attributes ----
+
+// The values of one pushed attribute: a string, number or boolean; an array's strings, or its objects' value fields.
+function attrValues(raw: string): string[] {
+  const r = raw.trim()
+  const out: string[] = []
+  try {
+    if (r.startsWith("\"")) out.push(decodeString(r))
+    else if (r.startsWith("[")) {
+      for (const el of elements(r)) {
+        const e = el.trim()
+        if (e.startsWith("\"")) out.push(decodeString(e))
+        else if (e.startsWith("{")) {
+          const v = rawStr(fields(e), "value")
+          if (v !== undefined) out.push(v)
+        } else if (e !== "null") out.push(e)
+      }
+    } else if (r.startsWith("{")) {
+      const v = rawStr(fields(r), "value")
+      if (v !== undefined) out.push(v)
+    } else if (r !== "null") out.push(r)
+  } catch (e) {
+    return []
   }
+  return out
+}
+
+// Sets one attribute: a core complex value (name) as its dotted sub-attributes (name.givenName), anything else by its
+// values.
+function putAttr(inout m: Map<string, string[]>, key: string, raw: string, nested: bool): void {
+  const r = raw.trim()
+  if (r.startsWith("{") && !nested) {
+    try {
+      const fs = fields(r)
+      if (find(fs, "value") !== undefined) m.set(key, attrValues(r))
+      else {
+        for (const f of fs) m.set(key + "." + f.key, attrValues(f.raw))
+      }
+    } catch (e) {
+      return
+    }
+    return
+  }
+  m.set(key, attrValues(r))
+}
+
+// The attributes a user body pushes, flattened as Bifrost reads them: core attributes by name (complex ones dotted),
+// and the enterprise and custom extensions (urn:... objects) by their field names. schemas, id, meta, groups and
+// password are not attributes.
+function pushedAttrs(fs: Field[], into: Map<string, string[]>): Map<string, string[]> {
+  let m = into
+  for (const f of fs) {
+    const k = f.key
+    const lk = k.toLowerCase()
+    if (lk === "schemas" || lk === "id" || lk === "meta" || lk === "groups" || lk === "password") continue
+    if (lk.startsWith("urn:")) {
+      try {
+        for (const g of fields(f.raw.trim())) putAttr(&m, g.key, g.raw, true)
+      } catch (e) {
+        continue
+      }
+      continue
+    }
+    putAttr(&m, k, f.raw, false)
+  }
+  return m
+}
+
+// The attribute a PATCH path names: an extension's field by its name (urn:...:User:department is department), a
+// filtered path by its attribute (emails[type eq "work"].value is emails).
+function attrKey(path: string): string {
+  let p = path
+  if (p.toLowerCase().startsWith("urn:")) {
+    const parts = p.split(":")
+    p = parts[parts.length - 1] ?? p
+  }
+  const b = p.indexOf("[")
+  if (b >= 0) p = p.slice(0, b)
+  return p
+}
+
+// A PATCH operation on the pushed attributes: remove drops the attribute (and its dotted sub-attributes), add and
+// replace set it; with no path, the value's fields are set.
+function patchAttrs(inout m: Map<string, string[]>, op: string, path: string, raw: string | undefined): void {
+  if (path === "") {
+    const fs = objectFields(raw ?? "")
+    if (fs !== undefined && op !== "remove") m = pushedAttrs(fs, m)
+    return
+  }
+  const key = attrKey(path)
+  if (op === "remove") {
+    for (const k of m.keys()) {
+      if (k.toLowerCase() === key.toLowerCase() || k.toLowerCase().startsWith(key.toLowerCase() + ".")) m.delete(k)
+    }
+    return
+  }
+  if (raw !== undefined) putAttr(&m, key, raw, path.toLowerCase().startsWith("urn:"))
 }
 
 function hasUser(users: AdminUserConfig[], name: string): bool {
@@ -382,10 +480,11 @@ function createUser(st: ScimState, ctx: Ctx): ScimResult {
   if (name === "") return failed(st, 400, "invalidValue", "userName is required")
   if (!validName(name)) return failed(st, 400, "invalidValue", "userName must be 1 to 64 lower-case letters, digits, _, -, @, . or +")
   if (hasUser(st.users, name)) return failed(st, 409, "uniqueness", `user ${name} already exists`)
-  let w: Work = { name: name, role: DEFAULT_ROLE, disabled: false }
+  let w: Work = { name: name, role: DEFAULT_ROLE, disabled: false, attrs: pushedAttrs(fs, new Map()) }
   const bad = applyFields(&w, fs, st.roles)
   if (bad !== undefined) return faulted(st, bad)
-  const u: AdminUserConfig = { name: w.name, role: w.role, disabled: w.disabled }
+  const email = (w.attrs.get("emails") ?? [])[0] ?? (name.includes("@") ? name : undefined)
+  const u: AdminUserConfig = { name: w.name, email: email, role: w.role, disabled: w.disabled, source: "scim", scim_attributes: w.attrs }
   const users: AdminUserConfig[] = []
   for (const x of st.users) users.push(x)
   users.push(u)
@@ -394,7 +493,8 @@ function createUser(st: ScimState, ctx: Ctx): ScimResult {
 
 // Saves a user with the work record's role and state, unless that leaves no enabled admin.
 function saveUser(st: ScimState, old: AdminUserConfig, w: Work, ctx: Ctx): ScimResult {
-  const next = userWith(old, w.role, w.disabled, old.teams)
+  let next = userWith(old, w.role, w.disabled, old.teams)
+  next.scim_attributes = w.attrs
   if (losesLastAdmin(st.users, old, next)) return failed(st, 409, "mutability", "cannot remove or disable the last enabled admin")
   const users = replaceUser(st.users, old.name, next)
   return { status: 200, body: userJson(next, st.teams, ctx.base), state: { users: users, teams: st.teams, roles: st.roles, keyTeams: st.keyTeams }, changed: true }
@@ -403,7 +503,8 @@ function saveUser(st: ScimState, old: AdminUserConfig, w: Work, ctx: Ctx): ScimR
 function replaceFromBody(st: ScimState, old: AdminUserConfig, ctx: Ctx): ScimResult {
   const fs = objectFields(ctx.body)
   if (fs === undefined) return failed(st, 400, "invalidSyntax", "the body must be a JSON object")
-  let w: Work = { name: old.name, role: old.role, disabled: old.disabled === true }
+  // a replace pushes the whole user: its attributes replace the ones pushed before
+  let w: Work = { name: old.name, role: old.role, disabled: old.disabled === true, attrs: pushedAttrs(fs, new Map()) }
   const bad = applyFields(&w, fs, st.roles)
   if (bad !== undefined) return faulted(st, bad)
   return saveUser(st, old, w, ctx)
@@ -412,9 +513,12 @@ function replaceFromBody(st: ScimState, old: AdminUserConfig, ctx: Ctx): ScimRes
 function patchUser(st: ScimState, old: AdminUserConfig, ctx: Ctx): ScimResult {
   const ops = patchOps(ctx.body)
   if (ops === undefined) return failed(st, 400, "invalidSyntax", "the body must be a PATCH request with Operations")
-  let w: Work = { name: old.name, role: old.role, disabled: old.disabled === true }
+  let w: Work = { name: old.name, role: old.role, disabled: old.disabled === true, attrs: old.scim_attributes ?? new Map() }
   for (const o of ops) {
     if (o.op !== "add" && o.op !== "replace" && o.op !== "remove") return failed(st, 400, "invalidSyntax", `op ${o.op} is not supported`)
+    let attrs = w.attrs
+    patchAttrs(&attrs, o.op, o.path, o.value)
+    w.attrs = attrs
     if (o.op === "remove") continue
     if (o.path !== "") {
       const bad = applyUser(&w, o.path, o.value, st.roles)
@@ -822,4 +926,34 @@ test("discovery documents, unknown routes and methods answer in the SCIM error s
   expect(nf.body.includes(`"schemas":["urn:ietf:params:scim:api:messages:2.0:Error"]`)).toBe(true)
   expect(nf.body.includes(`"status":"404"`)).toBe(true)
   expect(run(emptyState(), "DELETE", "/Users", "").status).toBe(405)
+})
+
+test("pushed attributes are kept flattened (extensions by field name), replaced by PUT and patched by path", () => {
+  const body = `{"userName":"ana@example.com","displayName":"Ana","title":"SRE","name":{"givenName":"Ana"},"emails":[{"value":"ana@example.com","primary":true}],"urn:ietf:params:scim:schemas:extension:enterprise:2.0:User":{"department":"Research","manager":{"value":"bo"}},"urn:acme:custom":{"jobFunction":"oncall"}}`
+  const made = run(emptyState(), "POST", "/Users", body)
+  const u = made.state.users[0]!
+  const at = u.scim_attributes ?? new Map()
+  expect((at.get("department") ?? []).join(",") + "|" + (at.get("manager") ?? []).join(",") + "|" + (at.get("jobFunction") ?? []).join(",")).toBe("Research|bo|oncall")
+  expect((at.get("name.givenName") ?? []).join(",") + "|" + (at.get("title") ?? []).join(",")).toBe("Ana|SRE")
+  expect(u.source + " " + (u.email ?? "")).toBe("scim ana@example.com")
+  const p = run(made.state, "PATCH", "/Users/ana@example.com", `{"Operations":[{"op":"replace","path":"urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:department","value":"Sales"},{"op":"remove","path":"title"},{"op":"add","value":{"userType":"Employee"}}]}`)
+  const pa = p.state.users[0]!.scim_attributes ?? new Map()
+  expect((pa.get("department") ?? []).join(",") + "|" + (pa.has("title") ? "t" : "-") + "|" + (pa.get("userType") ?? []).join(",")).toBe("Sales|-|Employee")
+  const put = run(p.state, "PUT", "/Users/ana@example.com", `{"userName":"ana@example.com","title":"Lead"}`)
+  const qa = put.state.users[0]!.scim_attributes ?? new Map()
+  expect(qa.has("department")).toBe(false)
+  expect((qa.get("title") ?? []).join(",")).toBe("Lead")
+})
+
+test("a SCIM write keeps the fields it does not hold, and group memberships are recorded as SCIM's", () => {
+  const synced: AdminUserConfig = { name: "ana@example.com", role: "editor", teams: ["t-manual"], business_units: ["b1"], synced: { business_units: ["b1"] }, claims: new Map() }
+  const st: ScimState = { users: [synced], teams: [{ id: "t-manual", name: "manual" }], roles: [], keyTeams: [] }
+  const r = run(st, "PATCH", "/Users/ana@example.com", `{"Operations":[{"op":"replace","path":"active","value":true}]}`)
+  const u = r.state.users[0]!
+  expect((u.synced?.business_units ?? []).join(",") + "|" + (u.claims === undefined ? "lost" : "kept")).toBe("b1|kept")
+  const g = run(r.state, "POST", "/Groups", `{"displayName":"core","members":[{"value":"ana@example.com"}]}`)
+  const gu = g.state.users[0]!
+  expect((gu.scim_groups ?? []).join(",") + "|" + (gu.teams ?? []).join(",")).toBe("team-new|t-manual,team-new")
+  const out = run(g.state, "PATCH", "/Groups/team-new", `{"Operations":[{"op":"remove","path":"members[value eq \\"ana@example.com\\"]"}]}`)
+  expect((out.state.users[0]!.scim_groups ?? []).length).toBe(0)
 })

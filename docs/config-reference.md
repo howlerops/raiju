@@ -9,7 +9,7 @@ for each element of a list. Descriptions are the comments in the source; default
 has one. The command-line flags (`-app-dir`, `-config`, `-host`, `-port`, `-workers`, `-server`, `-mode`,
 `-healthcheck`) are in the README.
 
-1304 keys (526 with a description), and 38 Bifrost keys read through config_compat.
+1346 keys (545 with a description), and 38 Bifrost keys read through config_compat.
 
 ## Sections
 
@@ -352,6 +352,9 @@ Virtual keys, budgets, rate limits, teams, customers, users, roles, routing rule
 | `governance.users[].synced.projects` | string[] |  |
 | `governance.users[].synced.access_profile_ids` | string[] |  |
 | `governance.users[].claims` | map of string[] |  |
+| `governance.users[].source` | string | where the account came from: "sso" (a sign-in), "directory" (directory sync or bulk import) or "scim" (a SCIM push); absent for an account an admin made. Directory sync removes only accounts the identity provider made. |
+| `governance.users[].scim_attributes` | map of string[] | the attributes SCIM last pushed for the user (flattened; enterprise and custom extensions by field name) and the SCIM groups (team ids) it is in, which claimScimAttributes reads |
+| `governance.users[].scim_groups` | string[] |  |
 | `governance.access_profiles` | object[] |  |
 | `governance.access_profiles[].id` | string |  |
 | `governance.access_profiles[].name` | string |  |
@@ -1324,6 +1327,8 @@ Sign-in to the web UI and API with an OpenID Connect provider.
 | `oidc.role_map` | map of string |  |
 | `oidc.default_role` | string |  |
 | `oidc.session_ttl_seconds` | int |  |
+| `oidc.audiences` | string[] | the audiences an ID token may carry (absent: the client id). scim_config's audience and Entra's appIdUri. |
+| `oidc.claims_token` | string | "access_token": the claims are read from the access token (Keycloak puts its roles there), checked against the same signing keys; else the ID token's. |
 
 ## auth_proxy
 
@@ -1355,14 +1360,41 @@ inbound SCIM 2.0 provisioning at /scim/v2 (scim.tov)
 | `scim_config` | object | inbound SCIM 2.0 provisioning at /scim/v2 (scim.tov) |
 | `scim_config.enabled` | bool |  |
 | `scim_config.provider` | string |  |
-| `scim_config.config` | object |  |
+| `scim_config.config` | object | The provider's own settings are kept as well: the sign-in ones (they also make the oidc section), the audience checks, and the directory API credentials directory sync and bulk import use (directory.tov): Okta's apiToken, Entra's client credentials on Microsoft Graph, Keycloak's service account, Zitadel's service account and Google's service account with domain-wide delegation. bulkSyncInterval and enableBulkSync set the directory sync schedule. directoryUrl and directoryTokenUrl are Raiju's: they replace the directory API's base URL and its token endpoint (a proxy, or a test double). |
 | `scim_config.config.provisioningToken` | string |  |
+| `scim_config.config.issuerUrl` | string |  |
+| `scim_config.config.clientId` | string |  |
+| `scim_config.config.clientSecret` | string |  |
+| `scim_config.config.tenantId` | string |  |
+| `scim_config.config.cloud` | string |  |
+| `scim_config.config.serverUrl` | string |  |
+| `scim_config.config.realm` | string |  |
+| `scim_config.config.domain` | string | The provider's own settings are kept as well: the sign-in ones (they also make the oidc section), the audience checks, and the directory API credentials directory sync and bulk import use (directory.tov): Okta's apiToken, Entra's client credentials on Microsoft Graph, Keycloak's service account, Zitadel's service account and Google's service account with domain-wide delegation. |
+| `scim_config.config.projectId` | string |  |
+| `scim_config.config.audience` | string | The provider's own settings are kept as well: the sign-in ones (they also make the oidc section), the audience checks, and the directory API credentials directory sync and bulk import use (directory.tov): Okta's apiToken, Entra's client credentials on Microsoft Graph, Keycloak's service account, Zitadel's service account and Google's service account with domain-wide delegation. |
+| `scim_config.config.appIdUri` | string |  |
+| `scim_config.config.apiToken` | string | The provider's own settings are kept as well: the sign-in ones (they also make the oidc section), the audience checks, and the directory API credentials directory sync and bulk import use (directory.tov): Okta's apiToken, Entra's client credentials on Microsoft Graph, Keycloak's service account, Zitadel's service account and Google's service account with domain-wide delegation. |
+| `scim_config.config.serviceAccountClientId` | string |  |
+| `scim_config.config.serviceAccountClientSecret` | string |  |
+| `scim_config.config.credentialMode` | string |  |
+| `scim_config.config.serviceAccountJson` | string |  |
+| `scim_config.config.serviceAccountEnvVar` | string |  |
+| `scim_config.config.serviceAccountFile` | string |  |
+| `scim_config.config.adminEmail` | string |  |
+| `scim_config.config.impersonateServiceAccount` | string |  |
+| `scim_config.config.enableBulkSync` | bool | bulkSyncInterval and enableBulkSync set the directory sync schedule. |
+| `scim_config.config.bulkSyncInterval` | string | bulkSyncInterval and enableBulkSync set the directory sync schedule. |
+| `scim_config.config.claimScimAttributes` | map of object | How a claim reads a SCIM-pushed user (Bifrost's claimScimAttributes): "user" reads the pushed attribute named attributeValue, "group" the names of the SCIM groups the user is in. |
+| `scim_config.config.claimScimAttributes.<name>.attributeType` | string |  |
+| `scim_config.config.claimScimAttributes.<name>.attributeValue` | string | How a claim reads a SCIM-pushed user (Bifrost's claimScimAttributes): "user" reads the pushed attribute named attributeValue, "group" the names of the SCIM groups the user is in. |
+| `scim_config.config.directoryUrl` | string | directoryUrl and directoryTokenUrl are Raiju's: they replace the directory API's base URL and its token endpoint (a proxy, or a test double). |
+| `scim_config.config.directoryTokenUrl` | string | directoryUrl and directoryTokenUrl are Raiju's: they replace the directory API's base URL and its token endpoint (a proxy, or a test double). |
 | `scim_config.config.claimsSyncMode` | string |  |
 | `scim_config.config.roleResolutionStrategy` | string |  |
 | `scim_config.config.userIdField` | string |  |
 | `scim_config.config.rolesField` | string |  |
 | `scim_config.config.teamIdsField` | string |  |
-| `scim_config.config.attributeRoleMappings` | object[] | Bifrost's scim_config: enabled switches the identity provider on, and config.provisioningToken is the bearer token its SCIM connector sends to /scim/v2 (env.NAME allowed; SCIM provisioning is on while one is set). provider names the identity provider (okta, entra, keycloak, zitadel, google, sailpoint, generic); its sign-in settings become the oidc section when the config has none (config_compat.tov mapScim). The claim settings drive what a sign-in changes (claimsync.tov): rolesField, teamIdsField and userIdField name claims, the attribute mappings give roles, teams, business units, access profiles and projects, roleResolutionStrategy picks one role among several, and claimsSyncMode "scim" (with provisioning on) makes SCIM the only source. trusted_networks is kept as Bifrost's allowlist for its discovery calls (Raiju's discovery calls have no private-address guard to bypass). |
+| `scim_config.config.attributeRoleMappings` | object[] | Bifrost's scim_config: enabled switches the identity provider on, and config.provisioningToken is the bearer token its SCIM connector sends to /scim/v2 (env.NAME allowed; SCIM provisioning is on while one is set). provider names the identity provider (okta, entra, keycloak, zitadel, google, sailpoint, generic); its sign-in settings become the oidc section when the config has none (config_compat.tov mapScim). The claim settings drive what a sign-in changes (claimsync.tov): rolesField, teamIdsField and userIdField name claims, the attribute mappings give roles, teams, business units, access profiles and projects, roleResolutionStrategy picks one role among several, and claimsSyncMode "scim" (with provisioning on) makes SCIM the only source. trusted_networks is kept as Bifrost's allowlist for its discovery calls (Raiju's discovery calls have no private-address guard to bypass). attributeType "group" on a rule matches the names of the SCIM groups the user is in (claimScimAttributes). |
 | `scim_config.config.attributeRoleMappings[].attribute` | string | The claim settings drive what a sign-in changes (claimsync.tov): rolesField, teamIdsField and userIdField name claims, the attribute mappings give roles, teams, business units, access profiles and projects, roleResolutionStrategy picks one role among several, and claimsSyncMode "scim" (with provisioning on) makes SCIM the only source. |
 | `scim_config.config.attributeRoleMappings[].value` | string |  |
 | `scim_config.config.attributeRoleMappings[].role` | string | The claim settings drive what a sign-in changes (claimsync.tov): rolesField, teamIdsField and userIdField name claims, the attribute mappings give roles, teams, business units, access profiles and projects, roleResolutionStrategy picks one role among several, and claimsSyncMode "scim" (with provisioning on) makes SCIM the only source. |
@@ -1371,7 +1403,9 @@ inbound SCIM 2.0 provisioning at /scim/v2 (scim.tov)
 | `scim_config.config.attributeRoleMappings[].businessUnit` | string |  |
 | `scim_config.config.attributeRoleMappings[].accessProfile` | string |  |
 | `scim_config.config.attributeRoleMappings[].project` | string |  |
-| `scim_config.config.attributeTeamMappings` | object[] | Bifrost's scim_config: enabled switches the identity provider on, and config.provisioningToken is the bearer token its SCIM connector sends to /scim/v2 (env.NAME allowed; SCIM provisioning is on while one is set). provider names the identity provider (okta, entra, keycloak, zitadel, google, sailpoint, generic); its sign-in settings become the oidc section when the config has none (config_compat.tov mapScim). The claim settings drive what a sign-in changes (claimsync.tov): rolesField, teamIdsField and userIdField name claims, the attribute mappings give roles, teams, business units, access profiles and projects, roleResolutionStrategy picks one role among several, and claimsSyncMode "scim" (with provisioning on) makes SCIM the only source. trusted_networks is kept as Bifrost's allowlist for its discovery calls (Raiju's discovery calls have no private-address guard to bypass). |
+| `scim_config.config.attributeRoleMappings[].attributeType` | string | attributeType "group" on a rule matches the names of the SCIM groups the user is in (claimScimAttributes). |
+| `scim_config.config.attributeRoleMappings[].attributeValue` | string |  |
+| `scim_config.config.attributeTeamMappings` | object[] | Bifrost's scim_config: enabled switches the identity provider on, and config.provisioningToken is the bearer token its SCIM connector sends to /scim/v2 (env.NAME allowed; SCIM provisioning is on while one is set). provider names the identity provider (okta, entra, keycloak, zitadel, google, sailpoint, generic); its sign-in settings become the oidc section when the config has none (config_compat.tov mapScim). The claim settings drive what a sign-in changes (claimsync.tov): rolesField, teamIdsField and userIdField name claims, the attribute mappings give roles, teams, business units, access profiles and projects, roleResolutionStrategy picks one role among several, and claimsSyncMode "scim" (with provisioning on) makes SCIM the only source. trusted_networks is kept as Bifrost's allowlist for its discovery calls (Raiju's discovery calls have no private-address guard to bypass). attributeType "group" on a rule matches the names of the SCIM groups the user is in (claimScimAttributes). |
 | `scim_config.config.attributeTeamMappings[].attribute` | string | The claim settings drive what a sign-in changes (claimsync.tov): rolesField, teamIdsField and userIdField name claims, the attribute mappings give roles, teams, business units, access profiles and projects, roleResolutionStrategy picks one role among several, and claimsSyncMode "scim" (with provisioning on) makes SCIM the only source. |
 | `scim_config.config.attributeTeamMappings[].value` | string |  |
 | `scim_config.config.attributeTeamMappings[].role` | string | The claim settings drive what a sign-in changes (claimsync.tov): rolesField, teamIdsField and userIdField name claims, the attribute mappings give roles, teams, business units, access profiles and projects, roleResolutionStrategy picks one role among several, and claimsSyncMode "scim" (with provisioning on) makes SCIM the only source. |
@@ -1380,7 +1414,9 @@ inbound SCIM 2.0 provisioning at /scim/v2 (scim.tov)
 | `scim_config.config.attributeTeamMappings[].businessUnit` | string |  |
 | `scim_config.config.attributeTeamMappings[].accessProfile` | string |  |
 | `scim_config.config.attributeTeamMappings[].project` | string |  |
-| `scim_config.config.attributeBusinessUnitMappings` | object[] | Bifrost's scim_config: enabled switches the identity provider on, and config.provisioningToken is the bearer token its SCIM connector sends to /scim/v2 (env.NAME allowed; SCIM provisioning is on while one is set). provider names the identity provider (okta, entra, keycloak, zitadel, google, sailpoint, generic); its sign-in settings become the oidc section when the config has none (config_compat.tov mapScim). The claim settings drive what a sign-in changes (claimsync.tov): rolesField, teamIdsField and userIdField name claims, the attribute mappings give roles, teams, business units, access profiles and projects, roleResolutionStrategy picks one role among several, and claimsSyncMode "scim" (with provisioning on) makes SCIM the only source. trusted_networks is kept as Bifrost's allowlist for its discovery calls (Raiju's discovery calls have no private-address guard to bypass). |
+| `scim_config.config.attributeTeamMappings[].attributeType` | string | attributeType "group" on a rule matches the names of the SCIM groups the user is in (claimScimAttributes). |
+| `scim_config.config.attributeTeamMappings[].attributeValue` | string |  |
+| `scim_config.config.attributeBusinessUnitMappings` | object[] | Bifrost's scim_config: enabled switches the identity provider on, and config.provisioningToken is the bearer token its SCIM connector sends to /scim/v2 (env.NAME allowed; SCIM provisioning is on while one is set). provider names the identity provider (okta, entra, keycloak, zitadel, google, sailpoint, generic); its sign-in settings become the oidc section when the config has none (config_compat.tov mapScim). The claim settings drive what a sign-in changes (claimsync.tov): rolesField, teamIdsField and userIdField name claims, the attribute mappings give roles, teams, business units, access profiles and projects, roleResolutionStrategy picks one role among several, and claimsSyncMode "scim" (with provisioning on) makes SCIM the only source. trusted_networks is kept as Bifrost's allowlist for its discovery calls (Raiju's discovery calls have no private-address guard to bypass). attributeType "group" on a rule matches the names of the SCIM groups the user is in (claimScimAttributes). |
 | `scim_config.config.attributeBusinessUnitMappings[].attribute` | string | The claim settings drive what a sign-in changes (claimsync.tov): rolesField, teamIdsField and userIdField name claims, the attribute mappings give roles, teams, business units, access profiles and projects, roleResolutionStrategy picks one role among several, and claimsSyncMode "scim" (with provisioning on) makes SCIM the only source. |
 | `scim_config.config.attributeBusinessUnitMappings[].value` | string |  |
 | `scim_config.config.attributeBusinessUnitMappings[].role` | string | The claim settings drive what a sign-in changes (claimsync.tov): rolesField, teamIdsField and userIdField name claims, the attribute mappings give roles, teams, business units, access profiles and projects, roleResolutionStrategy picks one role among several, and claimsSyncMode "scim" (with provisioning on) makes SCIM the only source. |
@@ -1389,7 +1425,9 @@ inbound SCIM 2.0 provisioning at /scim/v2 (scim.tov)
 | `scim_config.config.attributeBusinessUnitMappings[].businessUnit` | string |  |
 | `scim_config.config.attributeBusinessUnitMappings[].accessProfile` | string |  |
 | `scim_config.config.attributeBusinessUnitMappings[].project` | string |  |
-| `scim_config.config.attributeAccessProfileMappings` | object[] | Bifrost's scim_config: enabled switches the identity provider on, and config.provisioningToken is the bearer token its SCIM connector sends to /scim/v2 (env.NAME allowed; SCIM provisioning is on while one is set). provider names the identity provider (okta, entra, keycloak, zitadel, google, sailpoint, generic); its sign-in settings become the oidc section when the config has none (config_compat.tov mapScim). The claim settings drive what a sign-in changes (claimsync.tov): rolesField, teamIdsField and userIdField name claims, the attribute mappings give roles, teams, business units, access profiles and projects, roleResolutionStrategy picks one role among several, and claimsSyncMode "scim" (with provisioning on) makes SCIM the only source. trusted_networks is kept as Bifrost's allowlist for its discovery calls (Raiju's discovery calls have no private-address guard to bypass). |
+| `scim_config.config.attributeBusinessUnitMappings[].attributeType` | string | attributeType "group" on a rule matches the names of the SCIM groups the user is in (claimScimAttributes). |
+| `scim_config.config.attributeBusinessUnitMappings[].attributeValue` | string |  |
+| `scim_config.config.attributeAccessProfileMappings` | object[] | Bifrost's scim_config: enabled switches the identity provider on, and config.provisioningToken is the bearer token its SCIM connector sends to /scim/v2 (env.NAME allowed; SCIM provisioning is on while one is set). provider names the identity provider (okta, entra, keycloak, zitadel, google, sailpoint, generic); its sign-in settings become the oidc section when the config has none (config_compat.tov mapScim). The claim settings drive what a sign-in changes (claimsync.tov): rolesField, teamIdsField and userIdField name claims, the attribute mappings give roles, teams, business units, access profiles and projects, roleResolutionStrategy picks one role among several, and claimsSyncMode "scim" (with provisioning on) makes SCIM the only source. trusted_networks is kept as Bifrost's allowlist for its discovery calls (Raiju's discovery calls have no private-address guard to bypass). attributeType "group" on a rule matches the names of the SCIM groups the user is in (claimScimAttributes). |
 | `scim_config.config.attributeAccessProfileMappings[].attribute` | string | The claim settings drive what a sign-in changes (claimsync.tov): rolesField, teamIdsField and userIdField name claims, the attribute mappings give roles, teams, business units, access profiles and projects, roleResolutionStrategy picks one role among several, and claimsSyncMode "scim" (with provisioning on) makes SCIM the only source. |
 | `scim_config.config.attributeAccessProfileMappings[].value` | string |  |
 | `scim_config.config.attributeAccessProfileMappings[].role` | string | The claim settings drive what a sign-in changes (claimsync.tov): rolesField, teamIdsField and userIdField name claims, the attribute mappings give roles, teams, business units, access profiles and projects, roleResolutionStrategy picks one role among several, and claimsSyncMode "scim" (with provisioning on) makes SCIM the only source. |
@@ -1398,7 +1436,9 @@ inbound SCIM 2.0 provisioning at /scim/v2 (scim.tov)
 | `scim_config.config.attributeAccessProfileMappings[].businessUnit` | string |  |
 | `scim_config.config.attributeAccessProfileMappings[].accessProfile` | string |  |
 | `scim_config.config.attributeAccessProfileMappings[].project` | string |  |
-| `scim_config.config.attributeProjectMappings` | object[] | Bifrost's scim_config: enabled switches the identity provider on, and config.provisioningToken is the bearer token its SCIM connector sends to /scim/v2 (env.NAME allowed; SCIM provisioning is on while one is set). provider names the identity provider (okta, entra, keycloak, zitadel, google, sailpoint, generic); its sign-in settings become the oidc section when the config has none (config_compat.tov mapScim). The claim settings drive what a sign-in changes (claimsync.tov): rolesField, teamIdsField and userIdField name claims, the attribute mappings give roles, teams, business units, access profiles and projects, roleResolutionStrategy picks one role among several, and claimsSyncMode "scim" (with provisioning on) makes SCIM the only source. trusted_networks is kept as Bifrost's allowlist for its discovery calls (Raiju's discovery calls have no private-address guard to bypass). |
+| `scim_config.config.attributeAccessProfileMappings[].attributeType` | string | attributeType "group" on a rule matches the names of the SCIM groups the user is in (claimScimAttributes). |
+| `scim_config.config.attributeAccessProfileMappings[].attributeValue` | string |  |
+| `scim_config.config.attributeProjectMappings` | object[] | Bifrost's scim_config: enabled switches the identity provider on, and config.provisioningToken is the bearer token its SCIM connector sends to /scim/v2 (env.NAME allowed; SCIM provisioning is on while one is set). provider names the identity provider (okta, entra, keycloak, zitadel, google, sailpoint, generic); its sign-in settings become the oidc section when the config has none (config_compat.tov mapScim). The claim settings drive what a sign-in changes (claimsync.tov): rolesField, teamIdsField and userIdField name claims, the attribute mappings give roles, teams, business units, access profiles and projects, roleResolutionStrategy picks one role among several, and claimsSyncMode "scim" (with provisioning on) makes SCIM the only source. trusted_networks is kept as Bifrost's allowlist for its discovery calls (Raiju's discovery calls have no private-address guard to bypass). attributeType "group" on a rule matches the names of the SCIM groups the user is in (claimScimAttributes). |
 | `scim_config.config.attributeProjectMappings[].attribute` | string | The claim settings drive what a sign-in changes (claimsync.tov): rolesField, teamIdsField and userIdField name claims, the attribute mappings give roles, teams, business units, access profiles and projects, roleResolutionStrategy picks one role among several, and claimsSyncMode "scim" (with provisioning on) makes SCIM the only source. |
 | `scim_config.config.attributeProjectMappings[].value` | string |  |
 | `scim_config.config.attributeProjectMappings[].role` | string | The claim settings drive what a sign-in changes (claimsync.tov): rolesField, teamIdsField and userIdField name claims, the attribute mappings give roles, teams, business units, access profiles and projects, roleResolutionStrategy picks one role among several, and claimsSyncMode "scim" (with provisioning on) makes SCIM the only source. |
@@ -1407,6 +1447,8 @@ inbound SCIM 2.0 provisioning at /scim/v2 (scim.tov)
 | `scim_config.config.attributeProjectMappings[].businessUnit` | string |  |
 | `scim_config.config.attributeProjectMappings[].accessProfile` | string |  |
 | `scim_config.config.attributeProjectMappings[].project` | string |  |
+| `scim_config.config.attributeProjectMappings[].attributeType` | string | attributeType "group" on a rule matches the names of the SCIM groups the user is in (claimScimAttributes). |
+| `scim_config.config.attributeProjectMappings[].attributeValue` | string |  |
 | `scim_config.trusted_networks` | object[] |  |
 | `scim_config.trusted_networks[].cidr` | string |  |
 | `scim_config.trusted_networks[].description` | string |  |
