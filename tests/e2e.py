@@ -944,6 +944,37 @@ def leader_headers(secret, ts=None):
     t = str(int(time.time() * 1000) if ts is None else ts)
     return {"x-raiju-cluster-ts": t, "x-raiju-cluster-sig": cluster_sig(secret, "GET /api/cluster/leader " + t)}
 
+def broker_get_headers(secret, ts=None):
+    """The headers of a signed GET /api/cluster/broker (the roster): the signature over the method, the path and the time (L205)."""
+    t = str(int(time.time() * 1000) if ts is None else ts)
+    return {"x-raiju-cluster-ts": t, "x-raiju-cluster-sig": cluster_sig(secret, "GET /api/cluster/broker " + t)}
+
+def broker_flood(port, n, size, headers):
+    """n concurrent POSTs of size bytes to the broker's sync route, each sent whole unless the broker answers first; the
+    status codes (0 when the connection dropped)."""
+    payload = b"a" * size
+    codes = []
+    def one():
+        try:
+            s = socket.create_connection(("127.0.0.1", port), timeout=30)
+            head = "POST /api/cluster/broker HTTP/1.1\r\nHost: 127.0.0.1\r\ncontent-length: %d\r\n" % size
+            head += "".join("%s: %s\r\n" % (k, v) for k, v in headers.items()) + "\r\n"
+            s.sendall(head.encode())
+            try:
+                s.sendall(payload)
+            except OSError:
+                pass
+            codes.append(l196_read(s)[0])
+            s.close()
+        except OSError:
+            codes.append(0)
+    ts = [threading.Thread(target=one) for _ in range(n)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(60)
+    return sorted(codes)
+
 def cluster_leader(base, secret):
     s, _, b = call("GET", "/api/cluster/leader", headers=leader_headers(secret), base=base, auth=False)
     return json.loads(b) if s == 200 else {"status": s, "body": b}
@@ -991,15 +1022,38 @@ def cluster_modes_e2e():
         time.sleep(0.8)
         r2 = [call("POST", "/v1/chat/completions", body, vk, base=BROKER_NODES[1])[0] for _ in range(2)]
         check("two nodes with no peers share a rate limit through the broker", r1 == [200, 200] and r2 == [200, 429], (r1, r2))
-        s, _, b = call("GET", "/api/cluster/broker", headers={"x-raiju-cluster-sig": cluster_sig(broker_secret)}, base=BROKER_URL, auth=False)
+        # L205: the roster read is signed over its method, path and time, like /api/cluster/leader
+        s, _, b = call("GET", "/api/cluster/broker", headers=broker_get_headers(broker_secret), base=BROKER_URL, auth=False)
         roster = json.loads(b).get("roster") if s == 200 else None
         check("the broker lists both nodes as its roster", roster == ["bn-a", "bn-b"], (s, b[:200]))
         s, _, b = call("GET", "/api/cluster/broker", headers={"x-raiju-cluster-sig": "00"}, base=BROKER_URL, auth=False)
         check("the broker refuses a node that does not sign", s == 401, s)
+        s, _, b = call("GET", "/api/cluster/broker", headers={"x-raiju-cluster-sig": cluster_sig(broker_secret)}, base=BROKER_URL, auth=False)
+        check("l205: the broker refuses the old constant roster signature (over an empty body)", s == 401, (s, b[:200]))
+        s, _, b = call("GET", "/api/cluster/broker", headers=broker_get_headers(broker_secret, int(time.time() * 1000) - 120000), base=BROKER_URL, auth=False)
+        check("l205: a captured roster read two minutes old is refused as stale", s == 401 and "stale" in b, (s, b[:200]))
         la, lb = cluster_leader(BROKER_NODES[0], broker_secret), cluster_leader(BROKER_NODES[1], broker_secret)
         check("the broker's roster decides leadership by rank: bn-a leads", la.get("leader") is True and lb.get("leader") is False and la.get("election") == "rank", (la, lb))
         s, _, b = call("POST", "/api/cluster/broker", "{}", {"x-raiju-cluster-sig": "00"}, base=BROKER_URL, auth=False)
         check("the broker's sync needs the cluster secret", s == 401, s)
+        # L205 (re-audit 4 P2-H): a POST's head is checked before its body is read, and bodies go through the peers' budget
+        t0 = time.time()
+        st = declared_status(18133, "/api/cluster/broker", 15000000, {"x-raiju-cluster-sig": "ab" * 32})
+        check("l205: a 15 MB broker POST with a well-formed fake signature is refused 401 from its head, unread", st == 401 and time.time() - t0 < 3, (st, round(time.time() - t0, 2)))
+        wire = json.dumps({"node": "zz-l205", "ts": time.time() * 1000, "counters": []})
+        st = declared_status(18133, "/api/cluster/broker", 15000000, peer_headers(broker_secret, "/api/cluster/broker", wire))
+        check("l205: a captured signed broker head sent with a bigger body is refused 401 unread", st == 401, st)
+        s, _, b = call("POST", "/api/cluster/broker", wire, peer_headers(broker_secret, "/api/cluster/sync", wire), base=BROKER_URL, auth=False)
+        check("l205: a broker POST whose head was signed for another route is refused", s == 401, (s, b[:200]))
+        s, _, b = call("POST", "/api/cluster/broker/feed", json.dumps({"node": "zz-l205", "after": 0, "items": []}), {"x-raiju-cluster-sig": "ab" * 32}, base=BROKER_URL, auth=False)
+        check("l205: the broker's feed route checks the head too", s == 401, (s, b[:200]))
+        hwm0 = l124_vm(procs["broker"].pid, "VmHWM")
+        codes = broker_flood(18133, 16, 15000000, {"x-raiju-cluster-sig": "ab" * 32})
+        hwm1 = l124_vm(procs["broker"].pid, "VmHWM")
+        check("l205: 16 unsigned 15 MB broker bodies are not read (peak memory grew %d MiB; about 200 before)" % (hwm1 - hwm0), hwm1 - hwm0 < 40, (hwm0, hwm1, codes))
+        big = json.dumps({"node": "zz-l205", "ts": time.time() * 1000, "counters": [], "pad": "p" * 200000})
+        s, _, b = call("POST", "/api/cluster/broker", big, peer_headers(broker_secret, "/api/cluster/broker", big), base=BROKER_URL, auth=False)
+        check("l205: a signed 200 KB broker sync (read as a stream) is still joined", s == 200 and "counters" in b, (s, b[:200]))
 
         # lock: exactly one node leads; when it stops renewing, the other takes the key
         def leaders():
@@ -13896,6 +13950,78 @@ def l183_e2e(env):
             gw3.wait()
 
 
+GW_L205 = "http://127.0.0.1:18366"  # L205: the sliding-window body rate, the body ceiling, the per-credential share, direct keys counted as checked
+
+
+def l205_e2e(env):
+    """L205 (production re-audit 4, P1-E, P2-K). P1-E: a key that sends a lot at once and then trickles no longer holds
+    the body budget for minutes: the rate of a checked body is counted over each recent server.body_rate_window_seconds
+    (an average from the start let the early bytes buy ~26 minutes), a checked body must arrive within
+    server.body_max_seconds, and the bytes one credential holds past server.credential_body_mb do not count against
+    other callers' bodies (another key's 200 KB and 1 MB chats got 503 for as long as the hog held the cap). P2-K: a
+    direct provider key (client.allow_direct_keys) that is one of the configured keys gets the checked class (it had the
+    unchecked fixed deadline). Its own gateway (18366)."""
+    d = os.path.join(BUILD, "e2e-l205")
+    os.makedirs(d, exist_ok=True)
+    cp = os.path.join(d, "config.json")
+    log = os.path.join(d, "gw.log")
+    direct = "sk-l205-" + "provider-key"
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": True, "allow_direct_keys": True},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        # 4 MB of bodies in hand, a quarter of it (1 MB) per credential against the others; unchecked bodies within 3 s;
+        # checked ones at 64 KB/s after 1 s over 2 s windows, and within 6 s
+        "server": {"max_buffered_body_mb": 4, "body_deadline_seconds": 3, "body_min_kb_per_second": 64, "body_rate_grace_seconds": 1,
+                   "body_rate_window_seconds": 2, "body_max_seconds": 6},
+        "governance": {"virtual_keys": [{"id": "vk-l205a", "name": "vk-l205a", "value": "sk-bf-l205a"}, {"id": "vk-l205b", "name": "vk-l205b", "value": "sk-bf-l205b"}]},
+        "providers": {"openai": {"keys": [{"name": "o-l205", "value": direct, "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+    }
+    json.dump(cfg, open(cp, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18366", "-host", "127.0.0.1", "-config", cp, "-server", os.environ.get("RAIJU_SERVER", "bun")],
+                          env=env, stderr=open(log, "w"))
+    ka, kb = {"x-bf-vk": "sk-bf-l205a"}, {"x-bf-vk": "sk-bf-l205b"}
+    try:
+        wait(GW_L205 + "/health")
+
+        # ---- P1-E: key a sends 4.5 MB of a declared 50 MB at once, then nothing ----
+        t0 = time.time()
+        hog = l196_open(18366, "/v1/chat/completions", 50 * 1048576, ka, 4718592)
+        time.sleep(0.5)
+        s1, _, b1 = call("POST", "/v1/chat/completions", l196_chat(200000).decode(), kb, base=GW_L205, auth=False)
+        check("l205: while key a holds the whole body budget, key b's 200 KB chat is served (it was 503)", s1 == 200 and "Hello from gpt-4o-mini" in b1, (s1, b1[:200]))
+        s2, _, b2 = call("POST", "/v1/chat/completions", l196_chat(1048576).decode(), kb, base=GW_L205, auth=False)
+        check("l205: and key b's 1 MB chat too (a's bytes past server.credential_body_mb do not count against b)", s2 == 200, (s2, b2[:200]))
+        s3 = declared_status(18366, "/v1/chat/completions", 200000, ka)
+        check("l205: key a's own next body still sees all it holds (503)", s3 == 503, s3)
+        hog.settimeout(15)
+        code, head = l196_read(hog)
+        took = time.time() - t0
+        hog.close()
+        check("l205: the stalled body is cut with 408 a window after its grace (about 3 s; the average from the start held it for 73 s)",
+              code == 408 and "body_min_kb_per_second" in head and took < 6.0, (code, round(took, 1), head[:300]))
+        s4, _, b4 = call("POST", "/v1/chat/completions", l196_chat(200000).decode(), ka, base=GW_L205, auth=False)
+        check("l205: after the cut key a is served again", s4 == 200, (s4, b4[:200]))
+
+        # ---- P1-E: server.body_max_seconds ----
+        st, ans, took = l204_send(18366, "/v1/chat/completions", l196_chat(2 * 1048576), ka, 20480, 0.1)
+        check("l205: a key's 2 MB upload at about 200 KB/s (10 s) is cut with 408 at server.body_max_seconds (6 s)",
+              st == 408 and "body_max_seconds" in ans and 5.5 < took < 8.5, (st, round(took, 1), ans[-200:]))
+
+        # ---- P2-K: a direct key that is a configured provider key is checked ----
+        dh = {"x-bf-direct-key": "true", "authorization": "Bearer " + direct}
+        st, ans, took = l204_send(18366, "/v1/chat/completions", l196_chat(800000), dh, 20480, 0.1)
+        check("l205: an 800 KB upload with a configured direct key at about 200 KB/s (past the 3 s unchecked deadline) is served",
+              st == 200 and "Hello from gpt-4o-mini" in ans and took > 3.2, (st, round(took, 1), ans[-200:]))
+        other = {"x-bf-direct-key": "true", "authorization": "Bearer sk-l205-" + "someone-elses"}
+        st, ans, took = l204_send(18366, "/v1/chat/completions", l196_chat(800000), other, 20480, 0.1)
+        check("l205: the same upload with a direct key nobody configured keeps the unchecked deadline (408 at 3 s)",
+              st == 408 and "body_deadline_seconds" in ans and took < 5.0, (st, round(took, 1), ans[-200:]))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
 GW_L189 = "http://127.0.0.1:18334"  # L189: WebSocket and realtime drain at shutdown, the write-stall timeout and broker mode's graceful stop (its broker takes the port after the gateways); 18335 is the UI setup gateway (tests/ui_e2e.mjs)
 
 
@@ -17047,7 +17173,7 @@ print(json.dumps(codes))
 
 def l203_e2e(env, idp_state):
     """L203: unauthenticated MCP client registration is bounded (registrations a minute and unused clients per address,
-    unused clients in all) and appends one line per client instead of rewriting the state file, so a register flood
+    unused clients in all) and never rewrites the state file (L206: it stores no client at all, only a count line), so a register flood
     leaves /health fast and the real grants kept; /oauth2/authorize stores nothing (its consent link carries the
     request, sealed) and works on every worker at once; without an encryption key two clustered nodes share the OIDC
     state key through cluster.secret, so a callback on the other node signs in, and a start with neither warns when
@@ -17108,8 +17234,13 @@ def l203_e2e(env, idp_state):
         ok2, lat2 = fast(hs2)
         check("L203: a register flood from many addresses is served (201) and /health stays fast", codes2.get("201", 0) > 100 and ok2, (codes2, lat2))
         check("L203: no register flood writes the state file (the grants are written only by consent, token and revoke)", mtime(state) == st_before and st_before != 0, (st_before, mtime(state)))
-        lines = open(registry).read().split("\n") if os.path.exists(registry) else []
-        check("L203: the client registry stays bounded (60 unused clients kept; rewritten at twice that plus slack)", 2 <= len(lines) <= 2 * 60 + 64 + 3, len(lines))
+        # L206: a registration stores no client (its client_id carries it, sealed), so there is no registry to bound;
+        # the count log for the per-address limits holds one short line per counted registration
+        counts = os.path.join(dcr_dir, "mcp-oauth-state-registrations.jsonl")
+        lines = open(counts).read().split("\n") if os.path.exists(counts) else []
+        made = codes.get("201", 0) + codes2.get("201", 0) + 1
+        check("L203: no client registry is written, and the registration count log has a line per counted registration at most",
+              not os.path.exists(registry) and 2 <= len(lines) <= made + 2 and os.path.getsize(counts) < 120 * (made + 1), (os.path.exists(registry), len(lines), made))
         sj = json.load(open(state))
         check("L203: the state file keeps the granted client and its refresh row, and no flood client",
               any(c["client_id"] == cid for c in sj.get("clients", [])) and not any(c.get("client_name") == "l203-flood" for c in sj.get("clients", [])) and len(sj.get("refresh", [])) >= 1, (len(sj.get("clients", [])), len(sj.get("refresh", []))))
@@ -17202,6 +17333,139 @@ def l203_e2e(env, idp_state):
         for g in gws:
             g.terminate()
             g.wait()
+
+GW_L206 = "http://127.0.0.1:18368"  # L206: stateless MCP client registration (four workers on Bun; one process on http1)
+GW_L206_B = "http://127.0.0.1:18369"  # L206: webhook ids on four workers, RAIJU_TRUSTED_PROXIES
+L206_ADMIN = {"authorization": "Bearer sk-admin-l206", "content-type": "application/json"}
+
+# /oauth2/register from NADDR loopback source addresses (127.2.x.y, real TCP peers), each until it is refused (429) or
+# has made 12 tries on one keep-alive connection. Prints the status counts.
+L206_SPREAD = """
+import asyncio, json, sys
+port, naddr = int(sys.argv[1]), int(sys.argv[2])
+REG = json.dumps({"redirect_uris": ["http://127.0.0.1:9999/cb"], "client_name": "l206-flood"}).encode()
+codes = {}
+async def one(src):
+    r, w = await asyncio.open_connection("127.0.0.1", port, local_addr=(src, 0))
+    try:
+        for _ in range(12):
+            w.write(b"POST /oauth2/register HTTP/1.1\\r\\nHost: x\\r\\ncontent-type: application/json\\r\\nContent-Length: %d\\r\\n\\r\\n" % len(REG) + REG)
+            await w.drain()
+            code = int((await r.readline()).split()[1])
+            n = 0
+            while True:
+                h = await r.readline()
+                if h in (b"\\r\\n", b""):
+                    break
+                if h.lower().startswith(b"content-length"):
+                    n = int(h.split(b":")[1])
+            await r.readexactly(n)
+            codes[code] = codes.get(code, 0) + 1
+            if code == 429:
+                break
+    finally:
+        w.close()
+async def main():
+    sem = asyncio.Semaphore(32)
+    async def g(i):
+        async with sem:
+            await one("127.2.%d.%d" % (i // 250, i % 250 + 1))
+    await asyncio.gather(*[g(i) for i in range(naddr)])
+    print(json.dumps(codes))
+asyncio.run(main())
+"""
+
+def l206_e2e(env):
+    """L206: dynamic client registration stores no client: the client_id is the client's metadata sealed under a key
+    derived from the signing key, and the client is written to the state file at its first grant; so 1,500
+    registrations from 150 addresses (past the old max_unused_clients of 1000, which dropped the oldest) leave a user's
+    in-flight sign-in working, and the per-address limits still hold. Entity ids come from the kernel's random source:
+    12 webhooks created at once on four workers get 12 different ids (Math.random was seeded alike in every worker;
+    Tov patch 0021 seeds each from getrandom). RAIJU_TRUSTED_PROXIES stands in for server.trusted_proxies when the config
+    names none (the ECS module sets it). Ports 18368 and 18369, one gateway after the other."""
+    import hashlib, shutil
+    from concurrent.futures import ThreadPoolExecutor
+    d = os.path.join(BUILD, "e2e-l206")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    base_cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "l206", "value": "sk-l206", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+    }
+    # ---- MCP client registration: no client is stored before its grant ----
+    dcr_dir = os.path.join(d, "dcr")
+    os.makedirs(dcr_dir)
+    dcr_path = os.path.join(dcr_dir, "config.json")
+    json.dump({**base_cfg,
+               "client": {**base_cfg["client"], "mcp_server_auth_mode": "both", "oauth2_server_config": {"issuer_url": GW_L206}},
+               "governance": {"users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l206".encode()).hexdigest()}],
+                              "virtual_keys": [{"id": "vk-l206", "name": "l206 key", "value": "sk-bf-l206"}]}}, open(dcr_path, "w"))
+    state = os.path.join(dcr_dir, "mcp-oauth-state.json")
+    gw = l200_start(env, 18368, dcr_path, "l206dcr", 4)
+    try:
+        wait(GW_L206 + "/health")
+        time.sleep(0.5)
+        s, _, b = raw("POST", GW_L206 + "/oauth2/register", {"client_name": "l206-user", "redirect_uris": [AS_REDIRECT]}, {"content-type": "application/json"})
+        cid = json.loads(b).get("client_id", "") if s == 201 else ""
+        check("L206: a client_id is the sealed client (c1. prefix), not a stored row", cid.startswith("c1.") and "l206-user" not in cid, cid[:60])
+        verifier, challenge = as_pkce()
+        fid, tok = as_authorize(GW_L206, cid, challenge, "st-l206")
+        check("L206: the user's sign-in starts (authorize 302 to the consent page)", fid != "" and tok != "", (fid, tok[:20]))
+        st_before = open(state).read()
+        p = subprocess.run([sys.executable, "-I", "-c", L206_SPREAD, "18368", "150"], capture_output=True, text=True, timeout=120)
+        codes = json.loads(p.stdout) if p.stdout.strip() else {}
+        check("L206: 150 addresses register 1,500 clients (ten a minute each, then 429)", codes.get("201", 0) == 1500 and codes.get("429", 0) == 150, (codes, p.stderr[-300:]))
+        check("L206: no registration writes the state file", open(state).read() == st_before, len(st_before))
+        check("L206: no client registry is written", not os.path.exists(os.path.join(dcr_dir, "mcp-oauth-state-clients.jsonl")), os.listdir(dcr_dir))
+        fid2, tok2 = as_authorize(GW_L206, cid, challenge, "st-l206-again")
+        check("L206: after the flood the user's client still authorizes (it was dropped as the oldest of 1000 before)", fid2 != "", (fid2,))
+        s, redirect = as_approve(GW_L206, fid, tok, "sk-bf-l206")
+        check("L206: the in-flight sign-in is approved after the flood", s == 200 and "code=" in redirect, (s, redirect[:120]))
+        s, body = as_token(GW_L206, cid, redirect, verifier)
+        check("L206: and its code exchanges for tokens", s == 200 and body.get("refresh_token", "") != "", (s, body))
+        sj = json.load(open(state))
+        check("L206: the client is stored at its grant (the state file holds it, and no flood client)",
+              [c["client_name"] for c in sj.get("clients", [])] == ["l206-user"], [c.get("client_name") for c in sj.get("clients", [])])
+        bad = cid[:-4] + ("AAAA" if not cid.endswith("AAAA") else "BBBB")
+        q = urllib.parse.urlencode({"client_id": bad, "redirect_uri": AS_REDIRECT, "response_type": "code", "code_challenge": challenge, "code_challenge_method": "S256"})
+        s, _, b = raw("GET", GW_L206 + "/oauth2/authorize?" + q)
+        check("L206: a changed client_id is refused (400 invalid_client)", s == 400 and "invalid_client" in b, (s, b[:200]))
+        s, _, b = raw("GET", GW_L206 + "/api/oauth2/sessions?q=l206-user", None, L206_ADMIN)
+        check("L206: the grant is listed with its client's name", s == 200 and json.loads(b).get("total_count") == 1, (s, b[:200]))
+    finally:
+        gw.terminate()
+        gw.wait()
+    # ---- webhook ids on four workers, and RAIJU_TRUSTED_PROXIES ----
+    wh_dir = os.path.join(d, "wh")
+    os.makedirs(wh_dir)
+    wh_path = os.path.join(wh_dir, "config.json")
+    json.dump({**base_cfg,
+               "client": {**base_cfg["client"], "mcp_server_auth_mode": "both", "oauth2_server_config": {"issuer_url": GW_L206_B, "registrations_per_minute": 3}},
+               "governance": {"users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l206".encode()).hexdigest()}]}}, open(wh_path, "w"))
+    gw = l200_start({**env, "RAIJU_TRUSTED_PROXIES": "127.0.0.1"}, 18369, wh_path, "l206wh", 4)
+    try:
+        wait(GW_L206_B + "/health")
+        time.sleep(0.5)
+        def create(i):
+            body = {"name": "l206-wh%d" % i, "url": "http://127.0.0.1:9/x", "events": ["async_job.completed"], "allow_private_network": True}
+            s, _, b = raw("POST", GW_L206_B + "/api/webhooks", body, L206_ADMIN)
+            return s, (json.loads(b).get("endpoint", {}).get("id", "") if s in (200, 201) else b[:200])
+        with ThreadPoolExecutor(12) as ex:
+            made = list(ex.map(create, range(12)))
+        ids = [m[1] for m in made]
+        check("L206: 12 webhooks created at once on four workers all succeed with 12 different ids",
+              all(m[0] in (200, 201) for m in made) and len(set(ids)) == 12 and all(i.startswith("wh_") and len(i) == 27 for i in ids), made)
+        saved = json.load(open(wh_path)).get("webhooks", [])
+        check("L206: all 12 webhooks are saved", len(saved) == 12 and len({w["id"] for w in saved}) == 12, len(saved))
+        reg = {"client_name": "l206-xff", "redirect_uris": [AS_REDIRECT]}
+        seen = [raw("POST", GW_L206_B + "/oauth2/register", reg, {"content-type": "application/json", "x-forwarded-for": "203.0.113.7"})[0] for _ in range(4)]
+        other = raw("POST", GW_L206_B + "/oauth2/register", reg, {"content-type": "application/json", "x-forwarded-for": "203.0.113.8"})[0]
+        check("L206: with RAIJU_TRUSTED_PROXIES (no server.trusted_proxies) the forwarded address is the client's: 3 a minute each",
+              seen == [201, 201, 201, 429] and other == 201, (seen, other))
+    finally:
+        gw.terminate()
+        gw.wait()
 
 GW_L202 = "http://127.0.0.1:18360"  # L202: the config lock only around a save (four workers on Bun; one process on http1)
 L202_HOLE = 18361  # a provider base_url that accepts connections and never answers
@@ -17333,6 +17597,79 @@ def l202_e2e(env):
                 c.close()
             except OSError:
                 pass
+
+GW_L207 = "http://127.0.0.1:18370"  # L207: group commit of config saves (four workers on Bun; one process on http1)
+L207_ADMIN = {"authorization": "Bearer sk-admin-l207"}
+
+def l207_e2e(env):
+    """L207: group commit. A config of 2,000 virtual keys (every save rewrites the whole file); 120 creates of distinct
+    names and 20 of one name sent at once through every worker: the changes that queue on a worker while one waits for
+    the config file's lock are run by it as one group with one file write, so all 120 succeed and the file holds every
+    one; of the 20 twins exactly one is saved and the other 19 get their own 409 (Bifrost's unique virtual key name), the
+    group's other changes saved regardless. The dashboard notice of a group names its changes. Port 18370."""
+    import hashlib, shutil, http.client
+    from concurrent.futures import ThreadPoolExecutor
+    d = os.path.join(BUILD, "e2e-l207")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    path = os.path.join(d, "config.json")
+    json.dump({
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l207".encode()).hexdigest()}],
+            "virtual_keys": [{"id": f"pre{i}", "name": f"pre{i}", "value": f"sk-bf-l207-pre-{i:05d}"} for i in range(2000)],
+        },
+    }, open(path, "w"))
+    def req(method, p, body=None, timeout=60):
+        c = http.client.HTTPConnection("127.0.0.1", 18370, timeout=timeout)
+        t0 = time.time()
+        try:
+            c.request(method, p, body=None if body is None else json.dumps(body), headers={"content-type": "application/json", **L207_ADMIN})
+            r = c.getresponse()
+            return r.status, r.read().decode(), time.time() - t0
+        except Exception as e:
+            return 0, str(e), time.time() - t0
+        finally:
+            c.close()
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    extra = ["-workers", "4"] if server != "http1" else []
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18370", "-host", "127.0.0.1", "-config", path, "-server", server] + extra,
+                          env=env, stderr=open(os.path.join(BUILD, "e2e.l207.log"), "w"))
+    try:
+        wait(GW_L207 + "/health")
+        time.sleep(1.0)
+        bodies = [{"name": f"l207-{i}"} for i in range(120)] + [{"name": "l207-twin"} for _ in range(20)]
+        # twins spread among the distinct creates, so groups mix both
+        bodies = [bodies[(i * 11) % 140] for i in range(140)]
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=70) as ex:
+            out = list(ex.map(lambda b: (b["name"], req("POST", "/api/governance/virtual-keys", b)), bodies))
+        took = time.time() - t0
+        distinct = [o for o in out if o[0] != "l207-twin"]
+        twins = [o[1] for o in out if o[0] == "l207-twin"]
+        check("L207: 120 creates sent at once through every worker against a 2,000-key config all succeed",
+              len(distinct) == 120 and all(o[1][0] == 201 for o in distinct), (round(took, 2), sorted(set(o[1][0] for o in distinct))))
+        check("L207: of 20 creates of one name exactly one is saved, the others get their own 409",
+              sorted(t[0] for t in twins) == [201] + [409] * 19 and all("already exists" in t[1] for t in twins if t[0] == 409), sorted(t[0] for t in twins))
+        time.sleep(0.5)
+        names = [v.get("name") for v in json.load(open(path)).get("governance", {}).get("virtual_keys", [])]
+        check("L207: the config file holds every acknowledged create and one twin, nothing lost",
+              len(names) == 2121 and all(f"l207-{i}" in names for i in range(120)) and names.count("l207-twin") == 1,
+              (len(names), sorted(set(f"l207-{i}" for i in range(120)) - set(names))[:5], names.count("l207-twin")))
+        msgs = set()
+        for _ in range(16):
+            s, b, _ = req("GET", "/api/notifications?limit=500")
+            if s == 200:
+                for n in json.loads(b).get("notifications", []):
+                    msgs.add(n.get("message", ""))
+        grouped = [m for m in msgs if " changes (" in m and " were saved" in m]
+        check("L207: concurrent creates were saved in groups (a notice names a group of changes written at once)", len(grouped) > 0, sorted(msgs)[:4])
+        s, _, _ = req("POST", "/api/governance/virtual-keys", {"name": "l207-after"})
+        check("L207: a create on its own afterwards still saves (a group of one)", s == 201 and "l207-after" in [v.get("name") for v in json.load(open(path))["governance"]["virtual_keys"]], s)
+    finally:
+        gw.terminate()
+        gw.wait()
 
 def main():
     unique_ports()
@@ -19831,6 +20168,9 @@ def main():
         # L204: unchecked bodies' budget share and deadline, /mcp checked from the headers, the rate-based deadline of
         # checked bodies, header-signed peer requests with their own budget: its own gateway (18364, 18365)
         l204_e2e(env)
+        # L205: the sliding-window rate and ceiling of checked bodies, the per-credential share of the body budget, direct
+        # provider keys counted as checked: its own gateway (18366)
+        l205_e2e(env)
         # L194: Hugging Face inference providers (chat, embeddings, speech, transcription, images), the CLI's agent sign-in
         # and default key, and the A2A v0.3 REST client: its own gateway (18344) and Hugging Face double (18345)
         l194_e2e(env)
@@ -19854,9 +20194,15 @@ def main():
         # cluster.secret across two nodes and its start warning, and the OIDC state cookie: its own gateways, one after
         # the other (18362, 18363)
         l203_e2e(env, idp_state)
+        # L206: stateless MCP client registration under a 1,500-client spread, webhook ids on four workers and
+        # RAIJU_TRUSTED_PROXIES: its own gateways, one after the other (18368, 18369)
+        l206_e2e(env)
         # L202: the config lock held only around a save (a slow refresh-models holds none, 503 on a kept lock) and the
         # upgrade bridge with the old mkdir lock: its own gateway (18360) and silent provider (18361)
         l202_e2e(env)
+        # L207: group commit of concurrent config saves (one file write per group, each change its own reply, 409 per
+        # twin name): its own gateway (18370)
+        l207_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

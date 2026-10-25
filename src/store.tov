@@ -1355,6 +1355,10 @@ export class ConfigStore {
   lockWaitMs: f64 = 0.0
   // set when the last save could not take the file's lock (commit answers 503)
   lockBusy = false
+  // group commit (group): while a group runs, a commit or save changes the config without writing it, and its id is
+  // kept here; the group writes the file once at its end
+  private batching = false
+  private batchIds: string[] = []
 
   // `initial` should be the config as written in the file (env.NAME references
   // unresolved), so save() writes the references and not their values.
@@ -1395,6 +1399,11 @@ export class ConfigStore {
   save(): void throws Error {
     this.conflicted = false
     this.lockBusy = false
+    // inside a group the write waits for the group's end (group)
+    if (this.batching) {
+      this.batchIds.push("config")
+      return
+    }
     const lock = lockFile(this.path, this.lockWaitMs)
     if (!lock.ok) {
       this.lockBusy = true
@@ -1475,6 +1484,75 @@ export class ConfigStore {
     } catch (e) {
       // the extras this process holds stay
     }
+  }
+
+  // Ahead of a group, under the lock: a file another process saved since this one wrote or read it becomes the config
+  // (with anything this process holds unsaved, such as a cached agent card, merged onto it; a part of that which cannot
+  // be merged gives way to the file), so the group's changes run on the config as the file holds it and its one write
+  // needs no merge. onChange applies the taken config.
+  private syncLocked(): void throws Error {
+    const disk = try this.diskNow()
+    if (disk === "" || textSha(disk) === this.diskSha) return
+    const opened = try openConfig(try rawConfigOf(disk), this.cipher)
+    if (opened.errors.length > 0) throw new Error(`the config file another process saved cannot be opened: ${opened.errors.join("; ")}`)
+    let next: Config = opened.cfg
+    // nothing unsaved (the common case): the file's config as it is, without a three-way merge
+    if (JSON.stringify(this.cfg) !== JSON.stringify(this.baseCfg)) {
+      const r = try merge3(try canonical(this.baseCfg), try canonical(this.cfg), try canonical(opened.cfg), CACHED_MEMBERS)
+      if (r.ok) next = try rawConfigOf(r.text)
+    }
+    try {
+      const known = fields(JSON.stringify(next)).map((f) => f.key)
+      this.extras = fields(disk).filter((f) => !known.includes(f.key) && f.key !== "plugins")
+    } catch (e) {
+      // the extras this process holds stay
+    }
+    this.cfg = next
+    this.baseCfg = opened.cfg
+    this.diskSha = textSha(disk)
+    this.fileSha = this.diskSha
+    this.genText = disk
+    this.version += 1
+    setGlobalProxy(next.proxy_config)
+    const f = this.onChange
+    if (f !== undefined) f(this.cfg)
+  }
+
+  // Group commit. Runs changes, each code that may change the config through this store (commit, save) and awaits
+  // nothing, as one group with one file write: the file another process saved meanwhile is taken first (syncLocked),
+  // each change then runs on the config the changes before it left, and the config is written once at the end, with
+  // one generation, one notice and one onChange. Each change keeps its own result: one refused (bad input, a duplicate
+  // name, a 409 from rebased) changes nothing and the others still save. When the file cannot be read first, or the one
+  // write fails, every change that saved gets failed(status, message) in place of its result (409 when another process
+  // wrote a change that cannot be merged, 500 otherwise) and the config is as before the group. Called with the config
+  // file's lock held (Ops.underLock).
+  group<T>(changes: (() => T)[], failed: (status: int, message: string) => T): T[] {
+    const out: T[] = []
+    try {
+      try this.syncLocked()
+    } catch (e) {
+      this.saveError = e.message
+      for (const c of changes) out.push(failed(500, `could not save config: ${e.message}`))
+      return out
+    }
+    const before = this.cfg
+    const saved: bool[] = []
+    this.batching = true
+    this.batchIds = []
+    for (const c of changes) {
+      const n = this.batchIds.length
+      out.push(c())
+      saved.push(this.batchIds.length > n)
+    }
+    this.batching = false
+    const ids = this.batchIds
+    this.batchIds = []
+    if (ids.length === 0) return out
+    const r = this.finish(before, ids)
+    if (r.kind === "ok") return out
+    const kept: T[] = []
+    for (let i = 0; i < out.length; i++) kept.push(saved[i]! ? failed(r.status, r.message) : out[i]!)
+    return kept
   }
 
   private saveLocked(): void throws Error {
@@ -1640,6 +1718,19 @@ export class ConfigStore {
   private commit(next: Config, id: string): Result {
     const prev = this.cfg
     this.cfg = next
+    // inside a group the change is written with the others at its end (group)
+    if (this.batching) {
+      this.batchIds.push(id)
+      return { kind: "ok", id: id }
+    }
+    return this.finish(prev, [id])
+  }
+
+  // Saves the config held, the changes ids made to prev, and notifies; a failed save restores prev.
+  private finish(prev: Config, ids: string[]): Result {
+    const id = ids[0] ?? "config"
+    // a group's notice names its first few changes
+    const what = ids.length === 1 ? `${id} was` : `${ids.length} changes (${ids.slice(0, 5).join(", ")}${ids.length > 5 ? ", ..." : ""}) were`
     try {
       this.save()
     } catch (e) {
@@ -1659,7 +1750,7 @@ export class ConfigStore {
     // what was saved: next, with the changes other processes saved meanwhile merged in
     setGlobalProxy(this.cfg.proxy_config)
     // the dashboard hears of every saved change (notify.tov)
-    notify({ severity: "info", title: "Configuration changed", message: `${id} was saved (configuration version ${this.version}).` })
+    notify({ severity: "info", title: "Configuration changed", message: `${what} saved (configuration version ${this.version}).` })
     const f = this.onChange
     if (f !== undefined) f(this.cfg)
     return { kind: "ok", id: id }
@@ -2083,6 +2174,8 @@ export class ConfigStore {
     if (looksMasked(value)) return fail(400, "the virtual key value is masked but matches no stored key: send the real value, or leave it out to keep it")
     for (const other of g.virtual_keys ?? []) {
       if (other.value === value && other.id !== id) return fail(409, "another virtual key has this value")
+      // names are unique as in Bifrost (two concurrent creates of one name: the second is refused, ConfigStore.group)
+      if (vk.name !== undefined && vk.name !== "" && other.name === vk.name && other.id !== id) return fail(409, "A virtual key with this name already exists")
     }
     const refErr = vkRefError(this.cfg, vk)
     if (refErr !== "") return fail(400, refErr)
@@ -2218,6 +2311,9 @@ export class ConfigStore {
     if (b !== undefined && findById(g.budgets, b) === undefined) return fail(400, `unknown budget ${b}`)
     const bu = t.business_unit_id
     if (bu !== undefined && bu !== "" && findById(g.business_units, bu) === undefined) return fail(400, `unknown business unit ${bu}`)
+    for (const other of g.teams ?? []) {
+      if (other.name === t.name && other.id !== id) return fail(409, "A team with this name already exists")
+    }
     const next: TeamConfig = { id: id, name: t.name, customer_id: cu, budget_id: b, business_unit_id: bu === "" ? undefined : bu }
     g.teams = putById(g.teams ?? [], next)
     return this.commit(withGov(this.cfg, g), id)
@@ -2238,6 +2334,9 @@ export class ConfigStore {
     const g = gov(this.cfg)
     const b = c.budget_id
     if (b !== undefined && findById(g.budgets, b) === undefined) return fail(400, `unknown budget ${b}`)
+    for (const other of g.customers ?? []) {
+      if (other.name === c.name && other.id !== id) return fail(409, "A customer with this name already exists")
+    }
     const next: CustomerConfig = { id: id, name: c.name, budget_id: b }
     g.customers = putById(g.customers ?? [], next)
     return this.commit(withGov(this.cfg, g), id)
@@ -6079,6 +6178,136 @@ test("a change computed before an await is rebased onto what was saved meanwhile
   expect(s.setAgents([{ name: "x", agent_card_url: "https://x.example/two" }]).kind).toBe("ok")
   expect(s.commitRebased(b3, n3, "agents").kind).toBe("error")
   expect(s.cfg.agents![0]!.agent_card_url).toBe("https://x.example/two")
+  cleanup(path)
+})
+
+function groupFailed(status: int, message: string): ApiReply {
+  return { status: status, body: message }
+}
+
+function vkCreate(s: ConfigStore, body: string): () => ApiReply {
+  return () => handleApi(s, "POST", "/api/governance/virtual-keys", body)
+}
+
+function vkIds(c: Config): string {
+  return (c.governance?.virtual_keys ?? []).map((v) => v.id).join(",")
+}
+
+test("group commit: concurrent changes share one write, each keeps its own reply, a twin name and a bad body are refused alone", () => {
+  const path = tmpPath()
+  try writeFileSync(path, `{"governance":{"virtual_keys":[{"id":"vk-0","name":"zero","value":"sk-bf-0"}]}}`)
+  const s = new ConfigStore(path, try loadRawConfig(path))
+  let saves = 0
+  s.onSaved = () => {
+    saves += 1
+  }
+  let changes = 0
+  s.onChange = (c) => {
+    changes += 1
+  }
+  const rs = s.group([
+    vkCreate(s, `{"id":"vk-a","name":"a"}`),
+    vkCreate(s, `{"id":"vk-t1","name":"twin"}`),
+    vkCreate(s, `{not json`),
+    vkCreate(s, `{"id":"vk-t2","name":"twin"}`),
+    vkCreate(s, `{"id":"vk-b","name":"b"}`),
+    () => handleApi(s, "GET", "/api/governance/virtual-keys", ""),
+  ], groupFailed)
+  expect(rs.map((r) => r.status)).toEqual([201, 201, 400, 409, 201, 200])
+  expect(rs[3]!.body.includes("already exists")).toBe(true)
+  // a change sees the ones before it: the listing after three creates holds four keys
+  expect(rs[5]!.body.includes(`"vk-b"`)).toBe(true)
+  // one write, one generation, one onChange for the whole group
+  expect(saves).toBe(1)
+  expect(changes).toBe(1)
+  expect(s.version).toBe(1)
+  expect(vkIds(try loadRawConfig(path))).toBe("vk-0,vk-a,vk-t1,vk-b")
+  // the backup is the file as it was before the group
+  expect(vkIds(try loadRawConfig(path + ".bak"))).toBe("vk-0")
+  // a group that changes nothing writes nothing
+  expect(s.group([() => handleApi(s, "GET", "/api/governance/virtual-keys", "")], groupFailed)[0]!.status).toBe(200)
+  expect(saves).toBe(1)
+  // outside a group every change is still its own save
+  expect(handleApi(s, "POST", "/api/governance/virtual-keys", `{"id":"vk-c","name":"c"}`).status).toBe(201)
+  expect(saves).toBe(2)
+  cleanup(path)
+})
+
+test("group commit: a sibling's save is taken before the group runs, so its changes are kept and a name it took is refused per change", () => {
+  const path = tmpPath()
+  try writeFileSync(path, `{"governance":{"virtual_keys":[{"id":"vk-0","name":"zero","value":"sk-bf-0"}]},"guardrails_config":{"x":1}}`)
+  const first = try loadRawConfig(path)
+  const a = new ConfigStore(path, first)
+  const b = new ConfigStore(path, first)
+  expect(handleApi(a, "POST", "/api/governance/virtual-keys", `{"id":"vk-a","name":"taken"}`).status).toBe(201)
+  // b has not taken a's generation: its group runs on the file as a left it
+  const rs = b.group([vkCreate(b, `{"id":"vk-b1","name":"taken"}`), vkCreate(b, `{"id":"vk-b2","name":"free"}`)], groupFailed)
+  expect(rs.map((r) => r.status)).toEqual([409, 201])
+  expect(vkIds(try loadRawConfig(path))).toBe("vk-0,vk-a,vk-b2")
+  expect(vkIds(b.cfg)).toBe("vk-0,vk-a,vk-b2")
+  expect(b.fileSha).toBe(textSha(try readFileSync(path, "utf8")))
+  // the section Config does not model is kept
+  expect((try readFileSync(path, "utf8")).includes(`"guardrails_config": {"x":1}`)).toBe(true)
+  // and a's next save merges b's group in (the cross-process merge of a single save is unchanged)
+  expect(handleApi(a, "DELETE", "/api/governance/virtual-keys/vk-0", "").status).toBe(200)
+  expect(vkIds(try loadRawConfig(path))).toBe("vk-a,vk-b2")
+  cleanup(path)
+})
+
+test("group commit: a save made inside a group waits for its one write, and a failed write answers every saved change", () => {
+  const path = tmpPath()
+  try writeFileSync(path, `{}`)
+  const s = new ConfigStore(path, try loadRawConfig(path))
+  const before = try readFileSync(path, "utf8")
+  const rs = s.group([
+    () => {
+      // as a route that sets the config and saves it itself does (mcpapi.tov persist)
+      let n = s.cfg
+      n.agents = [{ name: "a1", agent_card_url: "https://a1.example/card" }]
+      s.cfg = n
+      try {
+        s.save()
+        const now = readFileSync(path, "utf8")
+        return { status: now === before ? 200 : 500, body: "" }
+      } catch (e) {
+        return { status: 500, body: e.message }
+      }
+    },
+    vkCreate(s, `{"id":"vk-1","name":"one"}`),
+  ], groupFailed)
+  expect(rs.map((r) => r.status)).toEqual([200, 201])
+  const disk = try loadRawConfig(path)
+  expect((disk.agents ?? []).length).toBe(1)
+  expect(vkIds(disk)).toBe("vk-1")
+  cleanup(path)
+  // a folder that does not exist: the group's one write fails
+  const gone = "/tmp/raiju-store-missing-" + randHex(8) + "/config.json"
+  const f = new ConfigStore(gone, {})
+  const fr = f.group([vkCreate(f, `{"id":"vk-x","name":"x"}`), vkCreate(f, `{bad`), vkCreate(f, `{"id":"vk-y","name":"y"}`)], groupFailed)
+  expect(fr.map((r) => r.status)).toEqual([500, 400, 500])
+  expect(fr[0]!.body.includes("could not save config")).toBe(true)
+  // nothing of the group is kept in memory either
+  expect(vkIds(f.cfg)).toBe("")
+  expect(f.version).toBe(0)
+  expect(f.saveError !== "").toBe(true)
+})
+
+test("virtual key, team and customer names are unique, as in Bifrost (409), and an update keeping its own name passes", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  expect(handleApi(s, "POST", "/api/governance/virtual-keys", `{"id":"vk-1","name":"one"}`).status).toBe(201)
+  const dup = handleApi(s, "POST", "/api/governance/virtual-keys", `{"id":"vk-2","name":"one"}`)
+  expect(dup.status).toBe(409)
+  expect(dup.body.includes("A virtual key with this name already exists")).toBe(true)
+  expect(handleApi(s, "PUT", "/api/governance/virtual-keys/vk-1", `{"name":"one","description":"same name"}`).status).toBe(200)
+  expect(handleApi(s, "POST", "/api/governance/virtual-keys", `{"id":"vk-2","name":"two"}`).status).toBe(201)
+  expect(handleApi(s, "PUT", "/api/governance/virtual-keys/vk-2", `{"name":"one"}`).status).toBe(409)
+  expect(handleApi(s, "POST", "/api/governance/teams", `{"id":"t1","name":"core"}`).status).toBe(201)
+  expect(handleApi(s, "POST", "/api/governance/teams", `{"id":"t2","name":"core"}`).status).toBe(409)
+  expect(handleApi(s, "PUT", "/api/governance/teams/t1", `{"name":"core"}`).status).toBe(200)
+  expect(handleApi(s, "POST", "/api/governance/customers", `{"id":"c1","name":"acme"}`).status).toBe(201)
+  expect(handleApi(s, "POST", "/api/governance/customers", `{"id":"c2","name":"acme"}`).status).toBe(409)
+  expect(handleApi(s, "PUT", "/api/governance/customers/c1", `{"name":"acme"}`).status).toBe(200)
   cleanup(path)
 })
 

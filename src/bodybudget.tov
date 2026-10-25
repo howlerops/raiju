@@ -9,18 +9,23 @@
 // holds only what it has sent.
 //
 // Bodies come in two kinds (production re-audit 3, P1-D). A checked body is one whose credential the gateway verified
-// from the headers before reading it (a virtual key, a management sign-in, the SCIM token, a signed peer request). An
-// unchecked body is one nobody vouched for: inference with auth off or behind the plugins' HTTP hooks (they may add
-// the credential), and the routes that read their credential from the body. Unchecked bodies share a small part of
-// the cap (server.unchecked_body_mb, an eighth by default), and the bytes one of them holds past that share do not
-// count against the checked bodies: an unauthenticated client cannot turn the authenticated big POSTs away. An
-// unchecked body must arrive whole within server.body_deadline_seconds (30); a checked one at an average of
-// server.body_min_kb_per_second (32) after server.body_rate_grace_seconds (10), so a slow but steady authenticated
-// upload is served whatever its size (P2-B).
+// from the headers before reading it (a virtual key, a direct provider key that matches a configured one, a management
+// sign-in, the SCIM token, a signed peer request). An unchecked body is one nobody vouched for: inference with auth off
+// or behind the plugins' HTTP hooks (they may add the credential), and the routes that read their credential from the
+// body. Unchecked bodies share a small part of the cap (server.unchecked_body_mb, an eighth by default), and the bytes
+// one of them holds past that share do not count against the checked bodies: an unauthenticated client cannot turn the
+// authenticated big POSTs away. An unchecked body must arrive whole within server.body_deadline_seconds (30).
+//
+// A checked body must keep server.body_min_kb_per_second (32) after server.body_rate_grace_seconds (10), counted over
+// each recent server.body_rate_window_seconds (30), and arrive whole within server.body_max_seconds (600): a slow but
+// steady authenticated upload is served (P2-B), and one that sends a lot at once and then trickles is cut a window
+// later (re-audit 4 P1-E: an average from the start let the early bytes buy about 26 minutes). The bytes one
+// credential holds past server.credential_body_mb (a quarter of the cap) do not count against other callers' bodies,
+// so a key that holds the whole cap does not turn the other credentials' big bodies away.
 //
 // A body is always admitted when the process holds no other big body, so a single request up to
 // client.max_request_body_size_mb is still served (Bifrost's limit keeps its meaning); the cap decides how many
-// big bodies are read at once. The peer routes have a budget of their own (peerBudget).
+// big bodies are read at once. The peer routes and the broker have a budget of their own (peerBudget).
 import { ServerSectionConfig } from "./config"
 
 // Sized for the chart's 512Mi pod: a chat body costs about eight times its size while it is parsed and sent on
@@ -55,6 +60,20 @@ export function uncheckedShare(s: ServerSectionConfig | undefined, cap: int): in
   return Math.min(cap, mb * 1048576)
 }
 
+// The share of the cap one credential's bodies count for against other callers' when server.credential_body_mb is
+// unset: a quarter.
+export const CREDENTIAL_SHARE_DIVISOR = 4
+
+// server.credential_body_mb in bytes, given the cap (bufferedCap): unset or 0 is a quarter of the cap, a negative
+// number is no per-credential share (0 returned), and it is never above the cap.
+export function credentialShare(s: ServerSectionConfig | undefined, cap: int): int {
+  if (cap <= 0) return 0
+  const mb = s?.credential_body_mb ?? 0
+  if (mb < 0) return 0
+  if (mb === 0) return Math.max(1, Math.floor(cap / CREDENTIAL_SHARE_DIVISOR))
+  return Math.min(cap, mb * 1048576)
+}
+
 // server.body_deadline_seconds: an unchecked body that reaches the gateway unread must arrive whole within this
 // (Raiju's own; Bifrost's server has no read deadline). The body timeout limits only the gap between bytes, so without
 // it a client could hold a charged body for as long as it sends a byte a minute.
@@ -67,25 +86,106 @@ export function bodyDeadlineMs(s: ServerSectionConfig | undefined): int {
   return v > 0 ? Math.max(1, Math.round(v * 1000)) : 0
 }
 
-// server.body_min_kb_per_second and server.body_rate_grace_seconds: a checked body must have sent
-// rate x (elapsed - grace) bytes at every moment, so 100 MB takes up to about 53 minutes at the default 32 KB/s.
+// server.body_min_kb_per_second, server.body_rate_grace_seconds and server.body_rate_window_seconds: in its first
+// window after the grace a checked body must have sent rate x (elapsed - grace) bytes in all, and from then on rate x
+// window bytes in every recent window, so bytes sent early buy no more than a window.
 export const DEFAULT_BODY_MIN_KB_PER_SECOND = 32.0
 export const DEFAULT_BODY_RATE_GRACE_SECONDS = 10.0
+export const DEFAULT_BODY_RATE_WINDOW_SECONDS = 30.0
 
-// The rate rule of checked bodies: bytes per second (0: none) and the grace in ms.
-export type BodyRate = { bytesPerSecond: f64, graceMs: f64 }
+// server.body_max_seconds: a checked body (or a signed peer body) must arrive whole within this, so no credential
+// holds its part of the cap for longer (Raiju's own, like body_deadline_seconds for the unchecked bodies). 100 MB in
+// ten minutes is about 170 KB/s.
+export const DEFAULT_BODY_MAX_SECONDS = 600.0
+
+// The timing rules of checked bodies, in ms: bytes per second (0: none), the grace, the window the rate is counted
+// over (0: an average from the start, as before re-audit 4) and the hard ceiling (0: none).
+export type BodyRate = { bytesPerSecond: f64, graceMs: f64, windowMs: f64, maxMs: f64 }
 
 export function bodyRate(s: ServerSectionConfig | undefined): BodyRate {
   const kb = s?.body_min_kb_per_second ?? DEFAULT_BODY_MIN_KB_PER_SECOND
   const grace = s?.body_rate_grace_seconds ?? DEFAULT_BODY_RATE_GRACE_SECONDS
-  return { bytesPerSecond: kb > 0 ? kb * 1024.0 : 0.0, graceMs: grace > 0 ? grace * 1000.0 : 0.0 }
+  const win = s?.body_rate_window_seconds ?? DEFAULT_BODY_RATE_WINDOW_SECONDS
+  const most = s?.body_max_seconds ?? DEFAULT_BODY_MAX_SECONDS
+  return {
+    bytesPerSecond: kb > 0 ? kb * 1024.0 : 0.0,
+    graceMs: grace > 0 ? grace * 1000.0 : 0.0,
+    windowMs: win > 0 ? Math.max(1000.0, win * 1000.0) : 0.0,
+    maxMs: most > 0 ? most * 1000.0 : 0.0,
+  }
 }
 
-// When (ms after the body's start) a checked body that has sent got bytes falls behind the rate: it is cut once that
-// moment passes without more bytes.
+// When (ms after the body's start) a checked body that has sent got bytes falls behind the average rate: in its first
+// window it is cut once that moment passes without more bytes.
 export function rateDue(got: int, r: BodyRate): f64 {
   if (r.bytesPerSecond <= 0) return 1.0e18
   return r.graceMs + (got * 1.0) / r.bytesPerSecond * 1000.0
+}
+
+// How often a checked body's pace is looked at, at most (ms).
+export const PACE_STEP_MS = 1000.0
+
+// A pace check: late is "" (keep reading and look again in waitMs), "rate" (behind body_min_kb_per_second) or
+// "ceiling" (past body_max_seconds).
+export type PaceVerdict = { late: string, waitMs: f64 }
+
+// The pace of one checked body. check takes the ms since the body's start and the bytes it has sent so far, and keeps a
+// mark of them at each look; the bytes of the last window are those sent since the newest mark a window old. The first
+// window after the grace is judged by the average since the start (rateDue).
+export class BodyPace {
+  private at: f64[] = [0.0]
+  private sent: int[] = [0]
+
+  constructor(public r: BodyRate) {}
+
+  // Whether any rule applies (a body with none is not timed).
+  timed(): bool {
+    return this.r.bytesPerSecond > 0 || this.r.maxMs > 0
+  }
+
+  // When to look first (ms after the start).
+  firstWait(): f64 {
+    let w = PACE_STEP_MS
+    if (this.r.bytesPerSecond > 0) w = Math.min(w, this.r.graceMs)
+    if (this.r.maxMs > 0) w = Math.min(w, this.r.maxMs)
+    return Math.max(1.0, w)
+  }
+
+  check(t: f64, got: int): PaceVerdict {
+    const r = this.r
+    if (r.maxMs > 0 && t >= r.maxMs) return { late: "ceiling", waitMs: 0.0 }
+    let wait = PACE_STEP_MS
+    if (r.bytesPerSecond > 0) {
+      // the newest mark a window old; the marks before it are not needed again
+      let i = 0
+      while (r.windowMs > 0 && i + 1 < this.at.length && this.at[i + 1]! <= t - r.windowMs) i += 1
+      if (i > 0) {
+        this.at = this.at.slice(i)
+        this.sent = this.sent.slice(i)
+      }
+      if (r.windowMs <= 0 || t < r.graceMs + r.windowMs) {
+        const due = rateDue(got, r)
+        if (t >= due) return { late: "rate", waitMs: 0.0 }
+        wait = Math.min(wait, due - t)
+      } else {
+        const inWindow = got - this.sent[0]!
+        if ((inWindow * 1.0) * 1000.0 < r.bytesPerSecond * r.windowMs) return { late: "rate", waitMs: 0.0 }
+      }
+      if (r.windowMs > 0) {
+        this.at.push(t)
+        this.sent.push(got)
+      }
+    } else {
+      wait = r.maxMs - t
+    }
+    if (r.maxMs > 0) wait = Math.min(wait, r.maxMs - t)
+    return { late: "", waitMs: Math.max(1.0, wait) }
+  }
+
+  // The marks kept (about a window's worth of looks).
+  marks(): int {
+    return this.at.length
+  }
 }
 
 export class BodyBudget {
@@ -94,6 +194,8 @@ export class BodyBudget {
   small = 0
   unchecked = 0
   refused = 0
+  // the bytes each credential's bodies hold (BodyHold.who), for server.credential_body_mb
+  private byWho: Map<string, int> = new Map()
 
   // What the checked bodies see as held: the unchecked bytes past their share do not count.
   private seen(share: int): int {
@@ -101,39 +203,64 @@ export class BodyBudget {
     return this.held - (this.unchecked - share)
   }
 
+  // The bytes other credentials than who hold past whoShare: they do not count against who's bodies.
+  private excess(who: string, whoShare: int): int {
+    if (whoShare <= 0) return 0
+    let n = 0
+    for (const k of this.byWho.keys()) {
+      if (k === who) continue
+      const v = this.byWho.get(k) ?? 0
+      if (v > whoShare) n += v - whoShare
+    }
+    return n
+  }
+
+  // The bytes credential who holds now.
+  heldBy(who: string): int {
+    return this.byWho.get(who) ?? 0
+  }
+
   // Whether a body of n bytes of kind cls would fit beside what is held now (nothing is charged): a declared length
-  // that cannot is refused before it is read. share is the unchecked bodies' (uncheckedShare; 0 none).
-  fits(n: int, cap: int, cls: BodyClass, share: int): bool {
-    if (this.admits(n, 0, cap, cls, share)) return true
+  // that cannot is refused before it is read. share is the unchecked bodies' (uncheckedShare; 0 none), who the
+  // credential ("" none) and whoShare the credentials' share (credentialShare; 0 none).
+  fits(n: int, cap: int, cls: BodyClass, share: int, who?: string, whoShare?: int): bool {
+    if (this.admits(n, 0, cap, cls, share, who ?? "", whoShare ?? 0)) return true
     this.refused += 1
     return false
   }
 
   // Charges n more bytes to a request of kind cls that already holds `own` of them. true when they fit under cap
   // (0: no cap), or when no other request holds a big body.
-  take(n: int, own: int, cap: int, cls: BodyClass, share: int): bool {
+  take(n: int, own: int, cap: int, cls: BodyClass, share: int, who?: string, whoShare?: int): bool {
     if (n <= 0) return true
-    if (!this.admits(n, own, cap, cls, share)) {
+    const w = who ?? ""
+    if (!this.admits(n, own, cap, cls, share, w, whoShare ?? 0)) {
       this.refused += 1
       return false
     }
     this.held += n
     if (cls === "unchecked") this.unchecked += n
     if (cls === "small") this.small += n
+    if (w !== "") this.byWho.set(w, (this.byWho.get(w) ?? 0) + n)
     return true
   }
 
-  private admits(n: int, own: int, cap: int, cls: BodyClass, share: int): bool {
+  private admits(n: int, own: int, cap: int, cls: BodyClass, share: int, who: string, whoShare: int): bool {
     if (n <= 0 || cap <= 0) return true
+    // the other credentials' bytes past their share do not count, but the bodies in hand never pass twice the cap
+    // (beside a lone body, which the request limit bounds)
+    const past = this.excess(who, whoShare)
     if (cls === "unchecked" && share > 0) {
       // alone among the big bodies it may pass the share (the request limit decides its size); beside others it
       // stays within the share and the cap
       const others = this.held - this.small - own
       if (others <= 0) return true
-      return this.unchecked + n <= share && this.held + n <= cap
+      return this.unchecked + n <= share && this.held - past + n <= cap && this.held - this.small + n <= 2 * cap
     }
-    const seen = this.seen(share)
-    return seen - own <= 0 || seen + n <= cap
+    const seen = this.seen(share) - past
+    if (seen - own <= 0) return true
+    if (seen + n > cap) return false
+    return past <= 0 || this.held - this.small + n <= 2 * cap
   }
 
   // Charges n bytes that are in memory already (a small body the server has read): always admitted.
@@ -143,12 +270,18 @@ export class BodyBudget {
     this.small += n
   }
 
-  // Gives back what a request of kind cls held.
-  give(n: int, cls: BodyClass): void {
+  // Gives back what a request of kind cls (of credential who) held.
+  give(n: int, cls: BodyClass, who?: string): void {
     if (n <= 0) return
     this.held = Math.max(0, this.held - n)
     if (cls === "unchecked") this.unchecked = Math.max(0, this.unchecked - n)
     if (cls === "small") this.small = Math.max(0, this.small - n)
+    const w = who ?? ""
+    if (w !== "") {
+      const left = (this.byWho.get(w) ?? 0) - n
+      if (left > 0) this.byWho.set(w, left)
+      else this.byWho.delete(w)
+    }
   }
 }
 
@@ -160,10 +293,120 @@ export function bodyBudget(): BodyBudget {
   return budget
 }
 
-// The peer routes' budget (/api/cluster/*, signed with cluster.secret): their bodies neither wait for the clients' nor
-// turn them away. Its cap is cluster.max_body_mb.
+// The peer routes' budget (/api/cluster/*, signed with cluster.secret, and the broker's routes): their bodies neither
+// wait for the clients' nor turn them away. Its cap is cluster.max_body_mb.
 export function peerBudget(): BodyBudget {
   return peers
+}
+
+// What a request holds of a body budget until it is done: release gives it back (once).
+export class BodyHold {
+  held = 0
+  cls: BodyClass = "small"
+  peer = false
+  // the credential its bytes are counted for ("" none)
+  who = ""
+
+  release(): void {
+    const n = this.held
+    this.held = 0
+    if (n <= 0) return
+    if (this.peer) peerBudget().give(n, this.cls, this.who)
+    else bodyBudget().give(n, this.cls, this.who)
+  }
+}
+
+// How a body stream is read and charged: the most bytes (413 past it), the budget's cap and the unchecked share, the
+// credential and its share, an unchecked body's fixed deadline (ms, 0 none) and a checked body's pace.
+export type ReadPlan = { max: int, cap: int, cls: BodyClass, share: int, who: string, whoShare: int, deadlineMs: int, rate: BodyRate }
+
+// What reading a body came to: stop is "" (read whole), "large" (past max), "busy" (its bytes do not fit), "deadline"
+// (an unchecked body past its deadline), "rate" (a checked body behind body_min_kb_per_second) or "ceiling" (past
+// body_max_seconds); body holds the bytes read.
+export type ReadResult = { stop: string, body: u8[] }
+
+// One read of a body stream, or late (why) when a timer fired first.
+type BodyRead = { late: string, done: bool, value: u8[] | undefined }
+
+async function readChunk(st: ReadableStream): Promise<BodyRead> {
+  try {
+    const r = await st.pull()
+    return { late: "", done: r.done, value: r.value }
+  } catch (e) {
+    // a body cut off reads as what arrived
+    return { late: "", done: true, value: undefined }
+  }
+}
+
+// A body's clock: the bytes it has sent, and its timer.
+class BodyClock {
+  got = 0
+  timer = -1
+  start = 0.0
+}
+
+// Arms the next look at a checked body's pace: a body behind the rate or past the ceiling is late.
+function armPace(clock: BodyClock, pace: BodyPace, waitMs: f64, late: (r: BodyRead) => void): void {
+  clock.timer = setTimeout(() => {
+    const v = pace.check(performance.now() - clock.start, clock.got)
+    if (v.late !== "") {
+      clock.timer = -1
+      late({ late: v.late, done: true, value: undefined })
+      return
+    }
+    armPace(clock, pace, v.waitMs, late)
+  }, Math.max(1, Math.ceil(waitMs)))
+}
+
+// Reads a body stream whole, charging its bytes to budget b for hold as they arrive (plan). On any stop the stream is
+// cancelled and hold released.
+export async function readCharged(st: ReadableStream, b: BodyBudget, hold: BodyHold, plan: ReadPlan): Promise<ReadResult> {
+  const clock = new BodyClock()
+  clock.start = performance.now()
+  const pace = new BodyPace(plan.rate)
+  // an unchecked body has a fixed deadline; a checked one a pace and a ceiling
+  const unchecked = plan.cls === "unchecked"
+  const timed = unchecked ? plan.deadlineMs > 0 : pace.timed()
+  const late: Promise<BodyRead> = new Promise<BodyRead>((resolve) => {
+    if (unchecked) {
+      if (plan.deadlineMs > 0) clock.timer = setTimeout(() => resolve({ late: "deadline", done: true, value: undefined }), plan.deadlineMs)
+    } else if (pace.timed()) {
+      armPace(clock, pace, pace.firstWait(), resolve)
+    }
+  })
+  const body: u8[] = []
+  let stop = ""
+  while (true) {
+    const r = timed ? await Promise.race([readChunk(st), late]) : await readChunk(st)
+    if (r.late !== "") {
+      stop = r.late
+      break
+    }
+    const v = r.value
+    if (r.done || v === undefined) break
+    if (body.length + v.length > plan.max) {
+      stop = "large"
+      break
+    }
+    if (!b.take(v.length, hold.held, plan.cap, plan.cls, plan.share, plan.who, plan.whoShare)) {
+      stop = "busy"
+      break
+    }
+    hold.held += v.length
+    clock.got += v.length
+    for (const x of v) body.push(x)
+  }
+  if (clock.timer >= 0) clearTimeout(clock.timer)
+  clock.timer = -1
+  if (stop !== "") {
+    try {
+      await st.cancel()
+    } catch (e) {
+      // the stream is gone already
+    }
+    hold.release()
+  }
+  return { stop: stop, body: body }
 }
 
 test("the cap: bodies are admitted while they fit, a lone body always", () => {
@@ -314,4 +557,164 @@ test("server.body_min_kb_per_second: the rate a checked body keeps after the gra
   expect(rateDue(0, off) > 1.0e17).toBe(true)
   const fast = bodyRate({ body_min_kb_per_second: 1.0, body_rate_grace_seconds: 0.0 })
   expect(rateDue(2048, fast)).toBe(2000.0)
+})
+
+test("server.body_rate_window_seconds and server.body_max_seconds: defaults, values, off", () => {
+  const r = bodyRate(undefined)
+  expect(r.windowMs).toBe(30000.0)
+  expect(r.maxMs).toBe(600000.0)
+  const set = bodyRate({ body_rate_window_seconds: 5.0, body_max_seconds: 60.0 })
+  expect(set.windowMs).toBe(5000.0)
+  expect(set.maxMs).toBe(60000.0)
+  const off = bodyRate({ body_rate_window_seconds: 0.0, body_max_seconds: 0.0 })
+  expect(off.windowMs).toBe(0.0)
+  expect(off.maxMs).toBe(0.0)
+  // a window under a second is a second
+  expect(bodyRate({ body_rate_window_seconds: 0.1 }).windowMs).toBe(1000.0)
+})
+
+test("BodyPace: early bytes buy one window, not the average (re-audit 4 P1-E)", () => {
+  // 32 KB/s after 10 s, over 30 s windows; no ceiling
+  const r: BodyRate = { bytesPerSecond: 32768.0, graceMs: 10000.0, windowMs: 30000.0, maxMs: 0.0 }
+  const p = new BodyPace(r)
+  const big = 48 * 1048576
+  // 48 MB at once, then 1 byte every 2 s: the old average rule kept it until about 1,546 s
+  let got = big
+  let cut = -1.0
+  for (let s = 1; s <= 2000; s++) {
+    if (s % 2 === 0) got += 1
+    const v = p.check(s * 1000.0, got)
+    if (v.late !== "") {
+      expect(v.late).toBe("rate")
+      cut = s * 1.0
+      break
+    }
+  }
+  // cut once the first window after the grace is over (40 s), with a look's slack
+  expect(cut >= 40.0 && cut <= 41.0).toBe(true)
+  expect(rateDue(big, r) > 1500000.0).toBe(true)
+})
+
+test("BodyPace: a steady upload at the rate is served whatever its size, and the marks stay bounded", () => {
+  const r: BodyRate = { bytesPerSecond: 32768.0, graceMs: 10000.0, windowMs: 30000.0, maxMs: 0.0 }
+  const p = new BodyPace(r)
+  let got = 0
+  for (let s = 1; s <= 3600; s++) {
+    got += 40000
+    const v = p.check(s * 1000.0, got)
+    expect(v.late).toBe("")
+    expect(v.waitMs > 0.0 && v.waitMs <= 1000.0).toBe(true)
+  }
+  expect(p.marks() <= 33).toBe(true)
+  // a body that stops for a whole window is cut, whatever it sent before
+  let cut = 0
+  for (let s = 3601; s <= 3700; s++) {
+    if (p.check(s * 1000.0, got).late !== "") {
+      cut = s
+      break
+    }
+  }
+  expect(cut > 3601 && cut <= 3632).toBe(true)
+})
+
+test("BodyPace: the first window keeps the average rule, and nothing sent by the end of the grace is late", () => {
+  const r: BodyRate = { bytesPerSecond: 1024.0, graceMs: 2000.0, windowMs: 30000.0, maxMs: 0.0 }
+  const p = new BodyPace(r)
+  expect(p.firstWait()).toBe(1000.0)
+  expect(p.check(1000.0, 0).late).toBe("")
+  expect(p.check(2000.0, 0).late).toBe("rate")
+  const q = new BodyPace(r)
+  // 4 KB sent: the average holds until 2 + 4 = 6 s
+  expect(q.check(5000.0, 4096).late).toBe("")
+  expect(q.check(5000.0, 4096).waitMs).toBe(1000.0)
+  expect(q.check(5500.0, 4096).waitMs).toBe(500.0)
+  expect(q.check(6000.0, 4096).late).toBe("rate")
+  // window 0: the average from the start, as before (a big early body earns credit)
+  const avg = new BodyPace({ bytesPerSecond: 1024.0, graceMs: 2000.0, windowMs: 0.0, maxMs: 0.0 })
+  expect(avg.check(100000.0, 1048576).late).toBe("")
+  expect(avg.marks()).toBe(1)
+})
+
+test("BodyPace: server.body_max_seconds cuts a body that keeps the rate", () => {
+  const r: BodyRate = { bytesPerSecond: 1024.0, graceMs: 0.0, windowMs: 1000.0, maxMs: 5000.0 }
+  const p = new BodyPace(r)
+  let got = 0
+  for (let s = 1; s <= 4; s++) {
+    got += 100000
+    const v = p.check(s * 1000.0, got)
+    expect(v.late).toBe("")
+  }
+  expect(p.check(4500.0, got + 100000).waitMs).toBe(500.0)
+  expect(p.check(5000.0, got + 200000).late).toBe("ceiling")
+  // only the ceiling: one look when it is due
+  const only = new BodyPace({ bytesPerSecond: 0.0, graceMs: 0.0, windowMs: 0.0, maxMs: 5000.0 })
+  expect(only.timed()).toBe(true)
+  expect(only.check(1.0, 0).waitMs).toBe(4999.0)
+  expect(only.check(5000.0, 0).late).toBe("ceiling")
+  expect(new BodyPace({ bytesPerSecond: 0.0, graceMs: 0.0, windowMs: 0.0, maxMs: 0.0 }).timed()).toBe(false)
+})
+
+test("server.credential_body_mb: a quarter by default, a value within the cap, none", () => {
+  const cap = 48 * 1048576
+  expect(credentialShare(undefined, cap)).toBe(12 * 1048576)
+  expect(credentialShare({ credential_body_mb: 0 }, cap)).toBe(12 * 1048576)
+  expect(credentialShare({ credential_body_mb: 20 }, cap)).toBe(20 * 1048576)
+  expect(credentialShare({ credential_body_mb: 100 }, cap)).toBe(cap)
+  expect(credentialShare({ credential_body_mb: -1 }, cap)).toBe(0)
+  expect(credentialShare(undefined, 0)).toBe(0)
+})
+
+test("one credential that holds the cap does not turn other credentials' bodies away (re-audit 4 P1-E)", () => {
+  const b = new BodyBudget()
+  const cap = 48
+  const ws = 12
+  // a lone body of key a may take the whole cap
+  expect(b.take(48, 0, cap, "checked", 0, "a", ws)).toBe(true)
+  expect(b.heldBy("a")).toBe(48)
+  // key b sees only a's share of it: its bodies fit, up to the cap beside that share
+  expect(b.fits(30, cap, "checked", 0, "b", ws)).toBe(true)
+  expect(b.take(30, 0, cap, "checked", 0, "b", ws)).toBe(true)
+  expect(b.take(6, 30, cap, "checked", 0, "b", ws)).toBe(true)
+  expect(b.take(1, 36, cap, "checked", 0, "b", ws)).toBe(false)
+  // a's own bodies still see everything: a cannot grow or add another body beside b's
+  expect(b.take(1, 48, cap, "checked", 0, "a", ws)).toBe(false)
+  expect(b.fits(1, cap, "checked", 0, "a", ws)).toBe(false)
+  // before the share, the same budget turned b away
+  const old = new BodyBudget()
+  expect(old.take(48, 0, cap, "checked", 0, "a", 0)).toBe(true)
+  expect(old.fits(1, cap, "checked", 0, "b", 0)).toBe(false)
+  // giving back clears the credential's count
+  b.give(48, "checked", "a")
+  expect(b.heldBy("a")).toBe(0)
+  expect(b.held).toBe(36)
+  b.give(36, "checked", "b")
+  expect(b.held).toBe(0)
+})
+
+test("a single credential with several bodies keeps the whole cap when no one else holds a body", () => {
+  const b = new BodyBudget()
+  const cap = 48
+  const ws = 12
+  expect(b.take(20, 0, cap, "checked", 0, "a", ws)).toBe(true)
+  expect(b.take(20, 0, cap, "checked", 0, "a", ws)).toBe(true)
+  expect(b.take(8, 20, cap, "checked", 0, "a", ws)).toBe(true)
+  expect(b.take(1, 0, cap, "checked", 0, "a", ws)).toBe(false)
+})
+
+test("the bytes in hand stay within twice the cap however many credentials pass their share", () => {
+  const b = new BodyBudget()
+  const cap = 48
+  const ws = 12
+  expect(b.take(48, 0, cap, "checked", 0, "a", ws)).toBe(true)
+  expect(b.take(36, 0, cap, "checked", 0, "b", ws)).toBe(true)
+  // c sees 12 + 12 of a and b: 24 fit by the cap, but 96 in hand is the ceiling
+  expect(b.fits(24, cap, "checked", 0, "c", ws)).toBe(false)
+  expect(b.take(12, 0, cap, "checked", 0, "c", ws)).toBe(true)
+  expect(b.held).toBe(96)
+  expect(b.take(1, 0, cap, "checked", 0, "d", ws)).toBe(false)
+  // an unchecked body beside them sees the credentials' shares only, within the same ceiling
+  const u = new BodyBudget()
+  expect(u.take(48, 0, cap, "checked", 6, "a", ws)).toBe(true)
+  expect(u.take(6, 0, cap, "unchecked", 6, "", ws)).toBe(true)
+  expect(u.take(1, 0, cap, "unchecked", 6, "", ws)).toBe(false)
 })

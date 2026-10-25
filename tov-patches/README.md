@@ -18,6 +18,7 @@ Patch 0016 (fetch input buffer) changes the fetch connection reads in `runtime/t
 Patch 0017 (`server.requestIP`) changes the HTTP server in `runtime/tov.c` and `Request`/`Server` in `std/http.tov`, and is written on top of 0001-0016.
 Patch 0019 (worker respawn) changes the worker supervisor in `runtime/tov.c` and is written on top of 0001-0017 (its `docs/spec.md` hunk is on the line 0017 changes).
 Patch 0020 (`node:fs` `flockSync`) adds one native to the shared lists in `builtins.rs` and `tov.h` next to 0009's, and is written on top of 0001-0019.
+Patch 0021 (`Math.random` seeding) changes the generator and the worker fork in `runtime/tov.c` (next to 0019's supervisor), and is written on top of 0001-0020.
 
 ## Submitting upstream
 
@@ -824,3 +825,23 @@ and shared), unlock and close give it back, shared locks share, a closed descrip
 process (Python's `fcntl.flock`) holds is not taken by a try and a 120 ms timed wait gives up after 120 ms, and once
 that process is killed with SIGKILL the lock is free at once. Raiju's `filelock.tov` unit tests and e2e `l200_e2e`
 use it. Written on top of 0001-0019.
+
+## 0021 — `Math.random` seeded from the system, and again in each forked worker
+
+**Problem.** `Math.random` was seeded with a constant unless `TOV_SEED` was set, so every process drew the same
+sequence, and the workers `Bun.serve({ workers })` forks inherited their parent's state. Ids built from it collided:
+two workers minting an id in the same millisecond minted the same one, and so did two nodes.
+
+**Change.** The generator (still xorshift64*, not a CSPRNG) is seeded on first use from getrandom(2) (`arc4random_buf`
+on macOS; the clock, the pid and an address if neither gives anything). Each forked worker reseeds right after the fork
+(`tv_random_after_fork`, called by the supervisor's spawn, so a respawned worker gets a fresh state too). `TOV_SEED=<n>`
+still fixes the seed for reproducible runs, and a worker then derives its seed from `n` and its index, so workers stay
+apart and a run stays reproducible; any other `TOV_SEED` value seeds from the system, as before from the clock.
+
+**Files.** `runtime/tov.c` (`tv_random_os`, `tv_random_fixed`, `tv_random_init`, `tv_random_after_fork`,
+`tv_http_spawn`), `runtime/tov.h`, `runtime/README.md`.
+
+**Tested.** `tests/random_seed.tov`, driven by `random_seed_client.py` (5 checks): two processes draw different
+numbers, `TOV_SEED=42` gives the same draw twice and `TOV_SEED=43` another, and the first draws of four workers differ,
+with and without `TOV_SEED` (before the patch all four were equal, and equal across processes). Raiju's e2e `l206_e2e`
+creates webhooks concurrently on four workers. Written on top of 0001-0020.

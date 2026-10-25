@@ -1,6 +1,6 @@
 // Virtual keys, budgets and rate limits, with Bifrost's Customer → Team → VK
 // hierarchy. State is in memory, per process.
-import { Config, AgentConfig, VirtualKeyConfig, BudgetConfig, BudgetOverride, RateLimitConfig, RateLimitShare, AccessProfile, ModelConfigGovernance, ProviderGovernance, ProjectConfig, ProviderConfigRef, GovernanceConfig } from "./config"
+import { Config, AgentConfig, VirtualKeyConfig, BudgetConfig, BudgetOverride, RateLimitConfig, RateLimitShare, AccessProfile, ModelConfigGovernance, ProviderGovernance, ProjectConfig, ProviderConfigRef, GovernanceConfig, ProviderConfig, resolveEnv, getEnv } from "./config"
 import { Effective, applyProfiles, applyHeld, modelAllowed } from "./profiles"
 import { heldProfiles } from "./govapi"
 import { Hdrs, hdrs } from "./schemas"
@@ -208,6 +208,9 @@ export class Governance {
   required: string[] = []
   // client.allow_direct_keys: a request may carry its own provider key instead of a virtual key
   directKeys = false
+  // the configured provider keys' values (env.NAME resolved), naming "<provider>/<key>": a direct key that is one of
+  // them counts as a checked credential (checkedCredential, re-audit 4 P2-K)
+  providerKeys: Map<string, string> = new Map()
   // the effective policy of each key that uses access profiles, by key id
   policies: Map<string, Effective> = new Map()
   // when each key expires (epoch ms), by key id
@@ -239,6 +242,19 @@ export class Governance {
     this.required = (cfg.client?.required_headers ?? []).map((n) => n.toLowerCase())
     this.dualError = cfg.client?.dual_credential_conflict_behavior === "error"
     this.directKeys = cfg.client?.allow_direct_keys === true
+    if (this.directKeys) {
+      const ps = cfg.providers
+      if (ps !== undefined) {
+        for (const name of ps.keys()) {
+          let i = 0
+          for (const k of ps.get(name)!.keys ?? []) {
+            const v = resolveEnv(k.value ?? "")
+            if (v !== "") this.providerKeys.set(v, name + "/" + (k.name ?? k.id ?? `${i}`))
+            i += 1
+          }
+        }
+      }
+    }
     const g = cfg.governance
     if (g === undefined) return
     this.modelConfigs = g.model_configs ?? []
@@ -538,15 +554,30 @@ export class Governance {
     return this.keyDenial(h, this.findKey(h))
   }
 
-  // Whether the request's headers carry a credential the gateway verified: an active, unexpired virtual key, or an
-  // identity altAuth accepts (a dashboard user's credentials, an agent sign-in token). A direct provider key is the
-  // provider's to judge and does not count. The server gives the bodies of requests without one a small share of
-  // its body budget and a short deadline (bodybudget.tov).
+  // Whether the request's headers carry a credential the gateway verified: an active, unexpired virtual key, a direct
+  // provider key (client.allow_direct_keys) that is one of the configured provider keys, or an identity altAuth accepts
+  // (a dashboard user's credentials, an agent sign-in token). Any other direct key is the provider's to judge and does
+  // not count. The server gives the bodies of requests without one a small share of its body budget and a short
+  // deadline (bodybudget.tov).
   credentialChecked(h: Hdrs): bool {
+    return this.checkedCredential(h) !== ""
+  }
+
+  // The credential credentialChecked verified, as the name the body budget counts its bytes under
+  // (server.credential_body_mb): "vk:<id>", "direct:<provider>/<key>", "user:<name>" or "identity", "" for none.
+  checkedCredential(h: Hdrs): string {
     const vk = this.findKey(h)
-    if (vk !== undefined) return vk.is_active !== false && !this.expired(vk)
+    if (vk !== undefined) return vk.is_active !== false && !this.expired(vk) ? "vk:" + vk.id : ""
+    const direct = directKeyFrom(h, this.directKeys)
+    if (direct !== undefined) {
+      const known = this.providerKeys.get(direct)
+      if (known !== undefined) return "direct:" + known
+    }
     const alt = this.altAuth
-    return alt !== undefined && alt(h)
+    if (alt === undefined || !alt(h)) return ""
+    const who = this.userOf
+    const user = who === undefined ? undefined : who(h)
+    return user === undefined ? "identity" : "user:" + user
   }
 
   // credentialDenial for the key the request's headers name (findKey).
@@ -1929,6 +1960,29 @@ test("credentialChecked: a verified key or identity, not a direct key or nothing
   expect(g.credentialChecked(hdrs([["authorization", "Bearer sk-provider-direct"]]))).toBe(false)
   g.altAuth = (h) => h.get("authorization") === "Bearer admin"
   expect(g.credentialChecked(hdrs([["authorization", "Bearer admin"]]))).toBe(true)
+  expect(g.checkedCredential(hdrs([["authorization", "Bearer admin"]]))).toBe("identity")
+  expect(g.checkedCredential(hdrs([["x-bf-vk", "sk-bf-k"]]))).toBe("vk:k")
+  expect(g.checkedCredential(hdrs([]))).toBe("")
+})
+
+test("credentialChecked: a direct key that matches a configured provider key is checked (re-audit 4 P2-K)", () => {
+  const ps: Map<string, ProviderConfig> = new Map()
+  ps.set("openai", { keys: [{ name: "o1", value: "sk-" + "configured-openai" }] })
+  // a key given as env.NAME counts by its value
+  ps.set("anthropic", { keys: [{ value: "env.HOME" }] })
+  const cfg: Config = { client: { enforce_auth_on_inference: true, allow_direct_keys: true }, providers: ps }
+  const g = new Governance(cfg)
+  const direct = (k: string): Hdrs => hdrs([["x-bf-direct-key", "true"], ["authorization", "Bearer " + k]])
+  expect(g.credentialChecked(direct("sk-configured-openai"))).toBe(true)
+  expect(g.checkedCredential(direct("sk-configured-openai"))).toBe("direct:openai/o1")
+  const home = getEnv("HOME") ?? ""
+  if (home !== "") expect(g.checkedCredential(hdrs([["x-bf-direct-key", "true"], ["x-api-key", home]]))).toBe("direct:anthropic/0")
+  // a direct key nobody configured is still the provider's to judge
+  expect(g.credentialChecked(direct("sk-someone-elses"))).toBe(false)
+  // without x-bf-direct-key, or with direct keys off, the configured value is not a credential here
+  expect(g.credentialChecked(hdrs([["authorization", "Bearer sk-configured-openai"]]))).toBe(false)
+  const off = new Governance({ client: { enforce_auth_on_inference: true }, providers: cfg.providers })
+  expect(off.credentialChecked(direct("sk-configured-openai"))).toBe(false)
 })
 
 test("credentialDenial: the header-only refusals of admit", () => {

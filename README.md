@@ -277,8 +277,12 @@ also caps the request-body bytes it reads at once across requests, `server.max_b
 (default 48, sized for a 512Mi pod: parsing a chat body costs several times its size); bytes are
 charged as they arrive, so a slow client holds only what it has sent, and a body that does not fit is
 answered 503 with `retry-after`. A body whose credential was checked from the headers (a virtual key, a
-management sign-in) must keep an average of `server.body_min_kb_per_second` (default 32) after
-`server.body_rate_grace_seconds` (10), so a slow but steady upload is served whatever its size. A body
+direct provider key that is one of the configured keys, a management sign-in) must keep
+`server.body_min_kb_per_second` (default 32) after `server.body_rate_grace_seconds` (10), counted over
+each recent `server.body_rate_window_seconds` (30), and arrive whole within `server.body_max_seconds`
+(600), so a slow but steady upload is served and one that sends a lot at once and then trickles is cut a
+window later. The bytes one credential holds past `server.credential_body_mb` (a quarter of the cap) do
+not count against other callers' bodies, so one key cannot turn the other tenants' big bodies away. A body
 nobody vouched for (auth off, or behind the plugins' HTTP hooks) shares `server.unchecked_body_mb` (an
 eighth of the cap) beside other bodies and must arrive whole within `server.body_deadline_seconds`
 (default 30); 408 otherwise. The routes anyone may call without a credential (sign-in, setup, agent

@@ -103,11 +103,28 @@ comes when the process is out of descriptors. 0 turns a timeout off. These keys 
 
 ## Behind a proxy or ingress
 
-The audit log and the sign-in throttle use the client's address. Raiju believes `X-Forwarded-For` and
-`X-Real-IP` only from the proxies in `server.trusted_proxies` (addresses or CIDR ranges). Behind a load
-balancer, an ingress controller or the ECS ALB, list its addresses (for a cluster, the pod or node range the
-ingress runs in), or every request is seen as coming from the proxy: the audit log then names the proxy, and
-failed sign-ins from all clients count against one address (`server.sign_in_throttle.ip_failures`, 20 an hour).
+The audit log, the sign-in throttle and the MCP client registration limits use the client's address. Raiju
+believes `X-Forwarded-For` and `X-Real-IP` only from the proxies in `server.trusted_proxies` (addresses or CIDR
+ranges). Behind a load balancer, an ingress controller or the ECS ALB, list its addresses (for a cluster, the pod
+or node range the ingress runs in), or every request is seen as coming from the proxy: the audit log then names
+the proxy, failed sign-ins from all clients count against one address (`server.sign_in_throttle.ip_failures`, 20
+an hour), and so do MCP client registrations (`client.oauth2_server_config.registrations_per_minute`, 10 a minute).
+
+When the config names no `trusted_proxies`, the comma-separated `RAIJU_TRUSTED_PROXIES` environment variable is
+used. The ECS module sets it to the VPC's CIDR block (its `trusted_proxies` variable; `[]` turns it off), where the
+ALB's addresses are; a `trusted_proxies` list in config.json still wins. With the Helm chart, set it in the config,
+to the range your ingress controller's pods (or, with `externalTrafficPolicy: Local` load balancers, the nodes) send
+from:
+
+```yaml
+config:
+  server:
+    trusted_proxies: ["10.0.0.0/8"]   # the cluster's pod range, or the ingress controller's
+```
+
+With `configMode: ifAbsent` this reaches only a fresh volume; on an existing one, set it through the API or the
+config file (or use `configMode: always`). Do not list a range that untrusted clients can send from directly: a
+listed peer's `X-Forwarded-For` is taken as given.
 
 A keep-alive connection that a client or proxy reuses just as the idle timeout closes it gets no
 answer (the request finds the connection closed: an incomplete read, or a 502 from a load
@@ -123,9 +140,13 @@ unread. `server.max_buffered_body_mb` (default 48; -1 for no cap; read per reque
 request-body megabytes each process reads at once: a body that does not fit is answered 503 with
 `retry-after: 1` (unread when its declared length cannot fit beside the bytes held), and is retried by
 well-behaved clients. Bytes are charged as they arrive, so a client trickling a big declared body holds
-only what it has sent. A body whose credential was checked from the headers must keep an average of
-`server.body_min_kb_per_second` (default 32, 0 off) after `server.body_rate_grace_seconds` (default
-10); a body whose credential was not checked (inference with auth off, the plugins' HTTP hooks, routes
+only what it has sent. A body whose credential was checked from the headers (a virtual key, a direct
+provider key that is one of the configured keys, a sign-in) must keep `server.body_min_kb_per_second`
+(default 32, 0 off) after `server.body_rate_grace_seconds` (default 10), counted over each recent
+`server.body_rate_window_seconds` (default 30), and arrive whole within `server.body_max_seconds`
+(default 600, 0 off; raise it for very large uploads over slow links); the bytes one credential holds
+past `server.credential_body_mb` (default a quarter of the cap; -1 for none) do not count against
+other callers' bodies, so one tenant cannot hold the whole budget; a body whose credential was not checked (inference with auth off, the plugins' HTTP hooks, routes
 that read their credential from the body) must arrive whole within `server.body_deadline_seconds`
 (default 30, 0 off) and, beside other bodies, shares `server.unchecked_body_mb` (default an eighth of
 the cap; -1 for no separate share), so an unauthenticated client cannot turn the authenticated big
@@ -136,7 +157,10 @@ most 64 KB. The cluster peer routes refuse a request before reading its body unl
 route, `x-raiju-cluster-ts` and Content-Length) is signed with `cluster.secret` and fresh, read at most
 `cluster.max_body_mb` (default 16 MB; a node whose sync body outgrows it logs so, and every node needs
 the higher value), and have a body budget of their own. Upgrade every node of a cluster together: a
-node from before L204 does not sign the head, and its peers refuse its sync until it is upgraded.
+node from before L204 does not sign the head, and its peers refuse its sync until it is upgraded. The
+broker (`-mode broker`) checks the same signed head before reading a body (charged to its own budget,
+`cluster.max_body_mb`), and its roster read (GET `/api/cluster/broker`) is signed over its method, path
+and time; upgrade the broker and its nodes together (L205).
 A body is always read when the process holds no other, so a single request up
 to `client.max_request_body_size_mb` (default 100) is still served; parsing a chat body costs about
 six to eight times its size, so on a small pod lower `max_request_body_size_mb` too (on the chart's
@@ -305,6 +329,24 @@ wave 26 on (flock on `config.json.flock`), and from wave 27 on also the wave 25 
 release after wave 27, with `strategy: {type: Recreate}` (ECS: `deployment_minimum_healthy_percent = 0`,
 `deployment_maximum_percent = 100`) for that one upgrade. docs/operations.md has the details and what flock
 means on NFS and EFS.
+
+Upgrading with MCP OAuth on (`client.mcp_server_auth_mode` "both" or "oauth") and more than one pod: stop the old
+pods first (`strategy: {type: Recreate}`; ECS: `deployment_minimum_healthy_percent = 0`,
+`deployment_maximum_percent = 100`) whenever the client registration format changes, which it did twice:
+
+- wave 27 moved unused clients from `mcp-oauth-state.json` to `mcp-oauth-state-clients.jsonl`, which a wave 26
+  pod does not read;
+- wave 28 (L206) stores no client at registration: the `client_id` is the client's metadata sealed under a key
+  derived from the signing key (it starts with `c1.`), and the client is written to `mcp-oauth-state.json` only
+  at its first grant. A wave 27 pod does not know such an id, so during a rolling update a client registered on a
+  new pod and sent to an old one gets `400 invalid_client` at `/oauth2/authorize`.
+
+A stop-first upgrade loses nothing: the new release reads the clients and grants the old one stored (and a wave
+27 registry, until its clients' unused hour ends), and a consent link begun before the stop still opens. Clients
+that already hold a grant are in the state file in full and work on either release, so a rollback forgets only
+clients registered on the new release that have no grant yet (they register again). Several nodes must share the
+signing key (a configured `signing_key`, or the generated one on a shared volume) for a `client_id` minted on one to
+open on another, as for consent links.
 
 Each pod's log and audit folders are on its own data volume (`/app/data/logs`, `/app/data/logs/audit`):
 `/api/logs` answers from the pod that is asked. An enabled store that cannot open its folder stops the

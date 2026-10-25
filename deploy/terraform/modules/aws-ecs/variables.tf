@@ -40,6 +40,12 @@ variable "ingress_cidr_blocks" {
   }
 }
 
+variable "trusted_proxies" {
+  description = "Addresses or CIDR ranges whose X-Forwarded-For / X-Real-IP Raiju believes (server.trusted_proxies), passed as RAIJU_TRUSTED_PROXIES; a trusted_proxies list in config.json still wins. Null (the default) is the VPC's CIDR block, where the ALB's addresses are: without it every request seems to come from the ALB, so the audit log names the ALB and the per-address limits (sign-in throttle, MCP client registration) count all clients as one. [] trusts no proxy."
+  type        = list(string)
+  default     = null
+}
+
 variable "certificate_arn" {
   description = "ACM certificate ARN. The ALB serves HTTPS on 443 and redirects HTTP to it. Required unless allow_plain_http is true."
   type        = string

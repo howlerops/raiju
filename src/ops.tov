@@ -80,7 +80,7 @@ import { resolveAll } from "./secrets"
 import { Field, fields, find, rawStr, rawBool, rawNum, isNull, elements, setField, build } from "./json"
 import { trimSlash } from "./providers/types"
 import { snapshot, errorJson, Hdrs, newId } from "./schemas"
-import { CLIENT_IP_HEADER, badProxyEntries } from "./clientip"
+import { CLIENT_IP_HEADER, badProxyEntries, trustedProxies } from "./clientip"
 import { addressKey, signInGuard } from "./signinguard"
 import { deadline } from "./deadline"
 import { secureHex, utf8, sha256, toHex } from "./crypto"
@@ -1170,8 +1170,22 @@ function logEventView(e: LogEntry): LogEvent {
   return { id: e.id, ts: e.ts, request_id: e.request_id, op: e.op, provider: e.provider, model: e.model, status: e.status, latency_ms: e.latency_ms, prompt_tokens: e.prompt_tokens, completion_tokens: e.completion_tokens, cost: e.cost, cache_hit: e.cache_hit, virtual_key: e.virtual_key, error: e.error }
 }
 
+// A change waiting in Ops.underLock for its group: done hands its reply back to the request that queued it.
+class LockWaiter {
+  done: (r: Reply) => void = (r: Reply) => {}
+  constructor(readonly change: () => Reply) {}
+}
+
+// The reply that replaces a change's own when its group could not write the config file (ConfigStore.group).
+function groupFailed(status: int, message: string): Reply {
+  return { status: status, body: errorJson(message, "api_error", undefined), contentType: "application/json" }
+}
+
 export class Ops {
   rbac: RbacConfig = { users: [] }
+  // group commit (underLock): the changes waiting for the next group, and whether a request is leading one
+  private lockQueue: LockWaiter[] = []
+  private lockLeading = false
   authOn = false
   // the A2A gRPC binding's domain and advertised port (server.a2a_grpc_base_domain, a2a_grpc_port), set at start when
   // both are configured: the served cards then list the gRPC interface (a2agrpc.tov)
@@ -1400,7 +1414,7 @@ export class Ops {
     this.configureProxy(cfg.auth_proxy, cfg.oidc)
     // the sign-in throttle and the proxies whose forwarding headers are believed (server.sign_in_throttle, trusted_proxies)
     signInGuard().configure(cfg.server?.sign_in_throttle)
-    const badProxies = badProxyEntries(cfg.server?.trusted_proxies ?? [])
+    const badProxies = badProxyEntries(trustedProxies(cfg.server?.trusted_proxies, process.env.RAIJU_TRUSTED_PROXIES ?? ""))
     if (badProxies.length > 0) console.error(`raiju: server.trusted_proxies: ${badProxies.join(", ")} is not an address or CIDR range and matches nothing`)
     this.configureExports(cfg.log_exports)
     this.configureRetained()
@@ -1768,12 +1782,12 @@ export class Ops {
       this.syncTooBig = true
       console.error(`raiju: cluster: this node's sync body is ${body.byteLength} bytes, over cluster.max_body_mb (${cluster.clusterBodyCap(cc)} bytes): its peers refuse it; raise cluster.max_body_mb on every node`)
     }
-    // signed over the body, and over the head before a peer reads the body (the broker checks the body's signature)
+    // signed over the body, and over the head (method, route, time, length) before a peer or the broker reads the body
     const h = cluster.peerHeaders(cc.secret, "/api/cluster/sync", body, Date.now())
     if (cluster.isBroker(cc)) {
       // one outbound exchange with the broker, which relays to the other nodes
       const b = cc.broker
-      if (b !== undefined) this.syncBroker(c, b, h, body)
+      if (b !== undefined) this.syncBroker(c, b, cluster.peerHeaders(cc.secret, BROKER_ROUTE, body, Date.now()), body)
     } else {
       for (const p of this.peerUrls(cc)) this.pushTo(p + "/api/cluster/sync", h, body, c, cc.secret)
     }
@@ -6423,16 +6437,43 @@ export class Ops {
 
   // Runs change, code that may save the config and does not await, under the config file's lock: waited for without
   // pausing the worker; 503 without running change when another process keeps it. A GET runs change as it is.
+  //
+  // Group commit: the changes of this worker that arrive while one waits for the lock queue behind it, and the one that
+  // gets the lock runs them all, in arrival order, under that one hold with one file write (ConfigStore.group). Each
+  // change still gets its own reply (its own 400 or 409 when refused). Changes that queue while a group runs form the
+  // next group, with a leader of their own.
   async underLock(method: string, change: () => Reply): Promise<Reply> {
     if (method === "GET") return change()
+    const w = new LockWaiter(change)
+    const p = new Promise<Reply>((resolve) => {
+      w.done = resolve
+    })
+    this.lockQueue.push(w)
+    if (!this.lockLeading) await this.leadGroup()
+    return await p
+  }
+
+  // Takes the config file's lock for the changes queued by the time it is held and runs them as one group.
+  private async leadGroup(): Promise<void> {
+    this.lockLeading = true
+    // one turn of the event loop first, so the requests already read join this group even when the lock is free
+    await new Promise<void>((resolve) => {
+      setTimeout(() => resolve(), 0)
+    })
     const held = await this.store.holdLock()
-    if (!held.ok) {
-      this.store.releaseLock(held)
-      return lockBusyReply()
+    const group = this.lockQueue
+    this.lockQueue = []
+    let replies: Reply[] = []
+    if (held.ok) {
+      replies = this.store.group(group.map((w) => w.change), groupFailed)
+    } else {
+      for (const w of group) replies.push(lockBusyReply())
     }
-    const r = change()
     this.store.releaseLock(held)
-    return r
+    this.lockLeading = false
+    for (let i = 0; i < group.length; i++) group[i]!.done(replies[i]!)
+    // the changes that queued meanwhile: the next group
+    if (this.lockQueue.length > 0) this.leadGroup()
   }
 
   // syncSignIn under the config file's lock (a sign-in's claims may save users, teams and business units).

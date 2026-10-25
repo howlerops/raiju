@@ -45,6 +45,47 @@ rebuilds its engine, exactly as the saving worker does.
   that share the file on a volume take the same lock (see "File locks on a shared volume" below). A
   change computed before network I/O is reapplied the same way to what other requests of the worker saved
   meanwhile.
+- Concurrent changes on one worker are saved together (group commit). The management API changes that
+  arrive on a worker while one of them waits for the lock queue behind it; the one that gets the lock
+  rereads the file once, runs them all in arrival order on the config as each left it, and writes the file
+  once: one generation, one `.bak`, one engine rebuild, one dashboard notice ("N changes (...) were
+  saved"). Each request still gets its own answer: a change refused on its own (a bad body, a name another
+  change of the group took first, a 409 from a rebase) changes nothing and the others are saved. If that one
+  write fails, every change of the group that would have saved answers the failure (500, nothing kept).
+  Routes that take the lock themselves (SCIM, the MCP OAuth and token-exchange routes, plugins, background
+  saves) still save one at a time under the same lock.
+
+### Write concurrency (provisioning scripts)
+
+Every write rewrites the whole config file (about 120 bytes per virtual key: 5,000 keys is a 600 KB
+file), so a write costs more as the config grows; group commit makes concurrent writes share that cost.
+Measured on one node with 4 workers and a 5,000-key config (`bulk/run.sh` in the re-audit 4 scripts):
+
+| Concurrent creates | Before group commit | With group commit |
+|---|---|---|
+| 1 | 0.17 s | 0.17 s |
+| 200 | 178-200 x 201, up to 37 x 503, slowest 17-19 s | 200 x 201, slowest 1.7 s |
+| 500 | | 500 x 201, slowest 3.1 s |
+| 1,000 | | 1,000 x 201, slowest 6.4 s |
+
+(One worker: 200 creates took 6.9 s before and 0.75 s after.) None were lost in either case. Guidance for
+scripts that create or change many records:
+
+- Send writes from a bounded pool: 8 to 32 requests in flight per node is enough to reach full
+  throughput; more only queues on the workers. Spread them over the node's workers (any HTTP client with
+  several connections does).
+- Retry 503 (the lock was kept past 15 seconds, or the node is draining): wait the `Retry-After` seconds
+  plus some jitter, and retry a few times. A 503 changed nothing.
+- Treat 409 as an answer, not a transient error: "already exists" means the name or value is taken (look
+  the record up instead of creating it), "changed by another process/request" means re-read and decide
+  again.
+- A change is answered once the node's other workers run it (up to 2 seconds more); there is no need
+  to wait between writes.
+- Several nodes writing one shared file serialize on its lock across the network: run provisioning
+  against one node when you can (see "One writer" below).
+- One write's cost grows with the file (about 40 ms for the 5,000-key config on one worker above). With
+  tens of thousands of records, prefer fewer, larger changes over many small ones: a key created with its
+  budgets and rate limit inline is one write, not three.
 
 ### File locks on a shared volume
 
