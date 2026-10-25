@@ -1,0 +1,128 @@
+// The long-lived sessions of this process that a graceful stop has to end itself: WebSockets (the realtime relay,
+// the Responses socket, GPT Live, the UI socket) and WebRTC calls. Their connections are not counted among the
+// server's open connections (an upgraded one is no longer an HTTP request), so the stop (lifecycle.tov) asks here.
+//
+// The live feed sockets (/ws) go away as soon as the stop begins: their clients resume on another instance with
+// their cursor. The others get the drain (server.shutdown_grace_seconds) to finish on their own; those still open
+// then are closed with a going-away close frame (1001), which lets the session report its usage, and get
+// CLOSE_WAIT_MS for that before what is left is dropped.
+
+export const GOING_AWAY = 1001
+export const GOING_AWAY_REASON = "server shutting down"
+// how long sessions closed with a going-away frame get to end (the close handshake, the session's last log row)
+export const CLOSE_WAIT_MS = 3000
+
+// One open session: feed (a UI socket, closed at the start of the stop), goAway (the close with 1001), ended (it
+// has gone), drop (cuts what did not end in time).
+export type OpenSession = { feed: bool, goAway: () => void, ended: () => bool, drop: () => void }
+
+export class OpenSessions {
+  private items: Map<int, OpenSession> = new Map()
+  private next = 1
+  // the stop has sent its going-away frames to these (feed: the UI sockets only)
+  feedGone = false
+  allGone = false
+
+  // Registers a session; the id is given back to remove() when the session ends. A session that opens after
+  // the stop has closed its kind is closed at once.
+  add(s: OpenSession): int {
+    const id = this.next
+    this.next += 1
+    this.items.set(id, s)
+    if (this.allGone || (s.feed && this.feedGone)) s.goAway()
+    return id
+  }
+
+  remove(id: int): void {
+    if (id > 0) this.items.delete(id)
+  }
+
+  // Sessions still open (feed: UI sockets only; otherwise every one but them).
+  count(feed: bool): int {
+    let n = 0
+    for (const s of this.items.values()) if (s.feed === feed && !s.ended()) n += 1
+    return n
+  }
+
+  // Sends the going-away close to the UI sockets (feed true) or to every session (false). Returns how many.
+  goAway(feed: bool): int {
+    // (UI sockets already sent away are not sent away twice)
+    const was = this.feedGone
+    if (feed) this.feedGone = true
+    else this.allGone = true
+    let n = 0
+    for (const s of this.items.values()) {
+      if (s.ended()) continue
+      if (feed ? !s.feed : s.feed && was) continue
+      s.goAway()
+      n += 1
+    }
+    return n
+  }
+
+  // Cuts the sessions that have not ended.
+  dropAll(): int {
+    let n = 0
+    for (const s of this.items.values()) {
+      if (s.ended()) continue
+      s.drop()
+      n += 1
+    }
+    this.items = new Map()
+    return n
+  }
+}
+
+const sessions = new OpenSessions()
+
+export function openSessions(): OpenSessions {
+  return sessions
+}
+
+class Probe {
+  closed = false
+  away = 0
+  dropped = 0
+}
+
+function probe(p: Probe, feed: bool): OpenSession {
+  return { feed: feed, goAway: () => {
+    p.away += 1
+  }, ended: (): bool => p.closed, drop: () => {
+    p.dropped += 1
+  } }
+}
+
+test("the UI sockets go away first, the other sessions on the second call, and a late one at once", () => {
+  const reg = new OpenSessions()
+  const ui = new Probe()
+  const rt = new Probe()
+  const done = new Probe()
+  done.closed = true
+  reg.add(probe(ui, true))
+  const rtId = reg.add(probe(rt, false))
+  reg.add(probe(done, false))
+  expect(reg.count(true)).toBe(1)
+  expect(reg.count(false)).toBe(1)
+  expect(reg.goAway(true)).toBe(1)
+  expect(ui.away).toBe(1)
+  expect(rt.away).toBe(0)
+  // a UI socket opened while draining is sent away at once; a session is not, yet
+  const late = new Probe()
+  reg.add(probe(late, true))
+  expect(late.away).toBe(1)
+  const lateRt = new Probe()
+  const lateId = reg.add(probe(lateRt, false))
+  expect(lateRt.away).toBe(0)
+  expect(reg.goAway(false)).toBe(2)
+  expect(rt.away).toBe(1)
+  expect(done.away).toBe(0)
+  // one ends on its own, the other is cut
+  rt.closed = true
+  reg.remove(rtId)
+  expect(reg.count(false)).toBe(1)
+  expect(reg.dropAll()).toBe(3)
+  expect(lateRt.dropped).toBe(1)
+  expect(reg.count(false)).toBe(0)
+  reg.remove(lateId)
+})

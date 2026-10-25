@@ -675,6 +675,11 @@ cyclic class Http1Conn {
   reject = false
   // the server is stopping: the connection closes once its responses are out
   draining = false
+  // output: the bytes handed to the socket, how many of them the kernel had taken at the last progress, and when
+  // that was (a client that stops reading is dropped after the idle timeout; see stalled)
+  written = 0
+  taken = 0
+  takenAt = 0.0
   // its key in the server's table
   id = 0
 
@@ -768,7 +773,17 @@ cyclic class Http1Conn {
     if (this.closed) return
     const s = this.sock
     if (s === undefined) this.sent.push(text)
-    else s.write(text)
+    else {
+      s.write(text)
+      this.written += text.byteLength
+    }
+  }
+
+  // Closes now, dropping what the client has not taken (a stalled client never takes it, so end() would wait).
+  cut(): void {
+    this.closed = true
+    const s = this.sock
+    if (s !== undefined) s.terminate()
   }
 
   close(): void {
@@ -863,7 +878,10 @@ cyclic class Http1Conn {
     if (this.closed) return
     const s = this.sock
     if (s === undefined) this.sentBytes.push(b)
-    else s.write(b)
+    else {
+      s.write(b)
+      this.written += b.length
+    }
   }
 }
 
@@ -1065,6 +1083,19 @@ export function expiry(c: Http1Conn, now: f64, lim: Http1Limits): string {
   return lim.bodyMs > 0 && now - c.lastRead > lim.bodyMs * 1.0 ? "408" : ""
 }
 
+// The write-stall limit (as the Bun.serve server's, tov-patches 0012): output the client does not take for idleMs
+// ends the connection, whatever it is doing (a response, a stream, WebSocket frames). `buffered` is what the
+// socket still holds; progress is the kernel taking some of it. True when the connection has stalled too long.
+export function stalled(c: Http1Conn, buffered: int, now: f64, lim: Http1Limits): bool {
+  const taken = c.written - buffered
+  if (buffered <= 0 || taken > c.taken || c.takenAt === 0.0) {
+    c.taken = taken
+    c.takenAt = now
+    return false
+  }
+  return lim.idleMs > 0 && now - c.takenAt > lim.idleMs * 1.0
+}
+
 // A listening server: its socket listener, and what a graceful stop needs.
 export class Http1Server {
   conns: Map<int, Http1Conn> = new Map()
@@ -1095,6 +1126,15 @@ export class Http1Server {
   // Applies the limits to every connection.
   sweep(now: f64): void {
     for (const c of this.conns.values()) {
+      // output the client has not taken yet: only the write-stall limit applies (as on the Bun.serve server), also
+      // to a connection that is closing once its output is out
+      const sk = c.sock
+      const buffered = sk === undefined ? 0 : sk.bufferedAmount
+      if (stalled(c, buffered, now, this.limits)) {
+        c.cut()
+        continue
+      }
+      if (buffered > 0) continue
       const e = expiry(c, now, this.limits)
       if (e === "") continue
       if (e === "408") {
@@ -1633,6 +1673,32 @@ test("a connection over the cap has its request answered 503", () => {
   expect(all.startsWith("HTTP/1.1 503 Service Unavailable\r\n")).toBe(true)
   expect(all.includes("retry-after: 1\r\n")).toBe(true)
   expect(c.closed).toBe(true)
+})
+
+test("a client that stops taking output is dropped after the idle timeout; one that reads slowly is not", () => {
+  const lim: Http1Limits = { headerMs: 0, idleMs: 2000, bodyMs: 0, maxConnections: 0 }
+  const c = new Http1Conn()
+  c.written = 1000
+  // everything taken: never stalled
+  expect(stalled(c, 0, 1000.0, lim)).toBe(false)
+  c.written = 5000000
+  // the socket holds 3 MB and nothing more is taken for 2 s
+  expect(stalled(c, 3000000, 1250.0, lim)).toBe(false)
+  expect(stalled(c, 3000000, 3000.0, lim)).toBe(false)
+  expect(stalled(c, 3000000, 3300.0, lim)).toBe(true)
+  // a slow reader takes a little at a time: each bit of progress starts the wait again, even while more is written
+  const slow = new Http1Conn()
+  slow.written = 4000000
+  expect(stalled(slow, 3000000, 1000.0, lim)).toBe(false)
+  slow.written = 6000000
+  expect(stalled(slow, 4900000, 2900.0, lim)).toBe(false)
+  expect(stalled(slow, 4900000, 4800.0, lim)).toBe(false)
+  expect(stalled(slow, 4900000, 5000.0, lim)).toBe(true)
+  // no idle timeout: no limit
+  const none = new Http1Conn()
+  none.written = 10
+  expect(stalled(none, 10, 1.0, NO_LIMITS)).toBe(false)
+  expect(stalled(none, 10, 100000.0, NO_LIMITS)).toBe(false)
 })
 
 test("a draining connection answers with connection: close and closes after", () => {

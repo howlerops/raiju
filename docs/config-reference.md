@@ -9,7 +9,7 @@ for each element of a list. Descriptions are the comments in the source; default
 has one. The command-line flags (`-app-dir`, `-config`, `-host`, `-port`, `-workers`, `-server`, `-mode`,
 `-healthcheck`) are in the README.
 
-1348 keys (547 with a description), and 38 Bifrost keys read through config_compat.
+1354 keys (552 with a description), and 38 Bifrost keys read through config_compat.
 
 ## Sections
 
@@ -727,9 +727,9 @@ The request log store (files under the app dir; /api/logs reads it).
 | `logs_store.required` | bool | the start fails when the store cannot open (default true, as Bifrost's start fails); false logs and runs without it |
 | `logs_store.max_file_mb` | int | a day's file is cut into segments of this size (MB, default 32): start-up and shared queries read only the newest ones. max_disk_mb caps all the log files together (oldest segments deleted first; 0, the default: no cap) |
 | `logs_store.max_disk_mb` | int |  |
-| `logs_store.object_storage` | object | where retained content goes (client.retain_content_in_object_storage); Bifrost's logs_store.object_storage |
+| `logs_store.object_storage` | object | Bifrost's logs_store.object_storage: the hybrid store's bucket (each row's payload fields go there, hybrid.tov) and where retained content goes (client.retain_content_in_object_storage) |
 | `logs_store.object_storage.type` | "s3" \| "gcs" |  |
-| `logs_store.object_storage.bucket` | string | The bucket that holds retained content: S3, or GCS through its S3-compatible interop API. |
+| `logs_store.object_storage.bucket` | string | The bucket that holds retained content: S3, or GCS through its S3-compatible interop API. Bifrost's logs_store.object_storage: the hybrid store's bucket (each row's payload fields go there, hybrid.tov) and where retained content goes (client.retain_content_in_object_storage) |
 | `logs_store.object_storage.prefix` | string | default "bifrost" |
 | `logs_store.object_storage.region` | string |  |
 | `logs_store.object_storage.endpoint` | string |  |
@@ -737,7 +737,12 @@ The request log store (files under the app dir; /api/logs reads it).
 | `logs_store.object_storage.secret_access_key` | string |  |
 | `logs_store.object_storage.session_token` | string |  |
 | `logs_store.object_storage.path_style` | bool |  |
-| `logs_store.object_storage.compress` | bool | gzip each object (keys end in .json.gz) |
+| `logs_store.object_storage.compress` | bool | gzip each object (keys end in .json.gz); the legacy form of compression "gzip" |
+| `logs_store.object_storage.format` | string | the hybrid store's object format, "json" (default) or "parquet" (a one-row file, keys end in .parquet), and its compression: none or gzip for json; none, gzip, snappy or zstd for parquet (snappy and zstd are written as GZIP pages) |
+| `logs_store.object_storage.compression` | string |  |
+| `logs_store.object_storage_exclude_fields` | string[] | payload fields that stay in the row (Bifrost's column names: input_history, output_message, raw_request, ...), and request types whose rows stay whole (chat_completion, embedding, ...; Raiju's op names work too) |
+| `logs_store.object_storage_exclude_request_types` | string[] |  |
+| `logs_store.object_storage_offload` | bool | Raiju only: false keeps every row whole with object_storage set (it then backs retained content only); default true |
 
 ## otel
 
@@ -1273,7 +1278,7 @@ Several Raiju nodes sharing usage, state and configuration (docs/operations.md w
 | `cluster` | object | Several Raiju nodes sharing usage, state and configuration (docs/operations.md when present). |
 | `cluster.enabled` | bool |  |
 | `cluster.node_id` | string |  |
-| `cluster.peers` | string[] |  |
+| `cluster.peers` | string[] | log_reads (default true): a request log read (/api/logs, its detail, stats, sessions and histograms, the MCP and agent logs) also asks the peers for their rows (POST /api/cluster/logs), since each node keeps its own log files |
 | `cluster.secret` | string |  |
 | `cluster.interval_ms` | int |  |
 | `cluster.discovery` | object |  |
@@ -1311,6 +1316,7 @@ Several Raiju nodes sharing usage, state and configuration (docs/operations.md w
 | `cluster.feed.queue_max` | int | queue_max bounds each destination's backlog (drop-oldest) |
 | `cluster.feed.batch_ms` | int | batch_ms is the relay interval. |
 | `cluster.config_sync` | string | Raiju only: config_sync is what a node does when another node saves the config (a generation on the cluster state, store.tov). |
+| `cluster.log_reads` | bool | log_reads (default true): a request log read (/api/logs, its detail, stats, sessions and histograms, the MCP and agent logs) also asks the peers for their rows (POST /api/cluster/logs), since each node keeps its own log files |
 
 ## oidc
 

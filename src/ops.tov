@@ -20,11 +20,11 @@ import { Vault } from "./guard_reversible"
 import { CostRecalc, RecalcStatus, readShared, requestCancel, sharedInFlight } from "./costrecalc"
 import { issueSetupSession, validSetupSession, setupCookie, cookieValue, SETUP_COOKIE, sameSecret, setupPublic } from "./setupsession"
 import { perModelUsage, ModelSpend } from "./logstore"
-import { agentSessionsOf, a2aLogJson, bifrostRequestType, Filter, LogStore, LogEntry, scopedEntries, visibleTo, defaultLogStoreConfig, publicEntry, applyChains, gridOf, filterFrom, selectAll, selects, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, histogramDimName, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
+import { liteEntry, mergeRows, agentSessionsOf, a2aLogJson, bifrostRequestType, Filter, LogStore, LogEntry, scopedEntries, visibleTo, defaultLogStoreConfig, publicEntry, applyChains, gridOf, filterFrom, selectAll, selects, requestsView, tokensView, costView, modelsView, latencyView, providerView, throughputView, dimensionView, statsView, modelRankingsView, dimensionRankingsView, validDimension, histogramDimName, distinctDim, kindOf, mcpLogJson, mcpStatsView, mcpCostView, topToolsView, jobj, jkv, jarr, jstrs, jn, Grid } from "./logstore"
 import { setMcpToolLog, McpToolCall } from "./mcp"
 import { McpLibrary, DEFAULT_LIBRARY_URL, DEFAULT_LIBRARY_SYNC_SECONDS, listLibrary, libraryFilterData, createLibraryEntry, deleteLibraryEntry, fetchCatalog } from "./mcplibrary"
 import { parsePolicy, policyView, policyConfigOf } from "./health"
-import { AccessProfile, AgentConfig, BudgetConfig, BudgetOverride, CircuitPolicyConfig, LogExportsConfig, PermissionPair, ProjectConfig, VirtualKeyConfig } from "./config"
+import { AccessProfile, AgentConfig, BudgetConfig, BudgetOverride, CircuitPolicyConfig, LogExportsConfig, PermissionPair, ProjectConfig, VirtualKeyConfig, GovernanceConfig } from "./config"
 import { effectiveBudgetLimit, Attribution } from "./governance"
 import { rfc3339Of } from "./vkexpiry"
 import { flushVaultCache } from "./secrets"
@@ -77,12 +77,13 @@ import { notify, notifyOnce } from "./notify"
 import * as exporters from "./exporters"
 import { logParquet } from "./sink_parquet"
 import { resolveAll } from "./secrets"
-import { Field, fields, find, rawStr, rawBool, rawNum, isNull, elements } from "./json"
+import { Field, fields, find, rawStr, rawBool, rawNum, isNull, elements, setField, build } from "./json"
 import { trimSlash } from "./providers/types"
 import { snapshot, errorJson, Hdrs, newId } from "./schemas"
 import { deadline } from "./deadline"
 import { secureHex, utf8, sha256, toHex } from "./crypto"
 import * as b64 from "./base64"
+import { AgentUser, Exchange, AGENT_TOKEN_PREFIX, agentSignIn, authorizeProblem, callbackUrl, signInPage, tokenResponseJson } from "./agentsignin"
 import * as metrics from "./metrics"
 import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, appendFileSync, chmodSync, statSync } from "node:fs"
 import { writeFileAtomic } from "./atomicfile"
@@ -96,9 +97,10 @@ import { LiveRegistry } from "./live"
 import { BROKER_ROUTE, BROKER_FEED_ROUTE } from "./broker"
 import { LockElection } from "./leader"
 import { AuthProxyConfig, ProxyKeys, checkProxyToken, headerOf, mappedRole, proxyProblem } from "./authproxy"
-import { ExportCursor, objectKey, putRequest, putBytesRequest, putObjectRequest, listRequest, deleteRequest, parseListing, expiredKey, isParquet, exportInterval, isoMs, ByteRequest } from "./exports"
+import { ExportCursor, objectKey, putRequest, putBytesRequest, putObjectRequest, listRequest, deleteRequest, parseListing, expiredKey, isParquet, exportInterval, isoMs, ByteRequest, getObjectRequest } from "./exports"
 import { planWindow, maxObjectBytes, archiveIntervalMs, archiveGraceMs, closedWindows } from "./audit_archive"
-import { jobRequest, hiddenDeletes, MAX_ATTEMPTS } from "./retained"
+import { jobRequest, hiddenDeletes, MAX_ATTEMPTS, RetainQueue } from "./retained"
+import { payloadKeys, decodePayload, hydrate } from "./hybrid"
 import { OidcConfig, Discovery, OidcFlows, Session, UiSessions, DueSession, parseDiscovery, discoveryUrl, tokenRequestBody, refreshRequestBody, verifyIdToken, accessTokenClaims } from "./oidc"
 import { issuerOf, challengeOf, callerOf, keyById, keyUsable, serverAuthMode, ConsentContext, vkIdentityCut } from "./mcpissuer"
 
@@ -293,7 +295,7 @@ function ownUserFlow(path: string, sub: string): bool {
 // The page a sign-in may return to: only the gateway's own MCP consent pages, as a path with its query.
 export function returnPath(raw: string): string {
   if (raw.includes("//") || raw.includes("\\") || raw.includes("#")) return ""
-  if (raw.startsWith("/oauth/consent?") || raw.startsWith("/workspace/mcp-sessions/auth?")) return raw
+  if (raw.startsWith("/oauth/consent?") || raw.startsWith("/workspace/mcp-sessions/auth?") || raw.startsWith("/api/agent/auth/authorize?")) return raw
   return ""
 }
 
@@ -683,6 +685,81 @@ async function postText(url: string, headers: Map<string, string>, body: string,
   }
 }
 
+// postText with its own time limit (ms).
+async function postTextWithin(url: string, headers: Map<string, string>, body: string, ms: int): Promise<{ status: int, body: string }> {
+  const dl = deadline(ms)
+  try {
+    const hs: Record<string, string> = headers
+    const r = await fetch(url, { method: "POST", headers: hs, body: body, signal: dl.controller.signal })
+    const b = await r.text()
+    dl.finish()
+    return { status: r.status, body: b }
+  } catch (e) {
+    dl.finish()
+    return { status: 0, body: e.message }
+  }
+}
+
+// A redivision job's progress, in Bifrost's redivision_progress data.
+export type RedivisionProgress = { operation_id: string, project_id: string, phase: string, total: int, processed: int, succeeded: int, failed: int, message: string }
+
+// What an equal-split project's division depends on: its roster and the budgets and rate limits it holds (its own and
+// its provider configs'). "" for a project that is not split equally.
+export function redivisionSig(g: GovernanceConfig, pj: ProjectConfig): string {
+  if (pj.split_policy !== "equal") return ""
+  const parts: string[] = [rosterKey(pj)]
+  const bids: string[] = []
+  const rids: string[] = []
+  if (pj.budget_id !== undefined) bids.push(pj.budget_id)
+  if (pj.rate_limit_id !== undefined) rids.push(pj.rate_limit_id)
+  for (const pc of pj.provider_configs ?? []) {
+    const b = pc.budget_id
+    if (b !== undefined) bids.push(b)
+    const r = pc.rate_limit_id
+    if (r !== undefined) rids.push(r)
+  }
+  for (const id of bids) {
+    for (const b of g.budgets ?? []) {
+      if (b.id === id) parts.push(`b:${id}:${b.max_limit}:${b.reset_duration}`)
+    }
+  }
+  for (const id of rids) {
+    for (const r of g.rate_limits ?? []) {
+      if (r.id === id) parts.push(`r:${id}:${r.token_max_limit ?? -1}:${r.request_max_limit ?? -1}:${r.token_reset_duration ?? ""}:${r.request_reset_duration ?? ""}`)
+    }
+  }
+  return parts.join("|")
+}
+
+// A project's roster as one text (its members' user ids), "" for no project.
+function rosterKey(pj: ProjectConfig | undefined): string {
+  if (pj === undefined) return ""
+  const us: string[] = []
+  for (const m of pj.members ?? []) us.push(m.user_id)
+  us.sort()
+  return "members:" + us.join(",")
+}
+
+// The users routes' path: /api/governance/users[/...] is /api/users[/...] (server.tov usersPath).
+function userRoute(path: string): string {
+  const g = "/api/governance/users"
+  if (path === g || path.startsWith(g + "/")) return "/api/users" + path.slice(g.byteLength)
+  return path
+}
+
+function findProject(c: Config, pid: string): ProjectConfig | undefined {
+  for (const pj of c.governance?.projects ?? []) {
+    if (pj.id === pid) return pj
+  }
+  return undefined
+}
+
+// Cross-node log reads (Ops.logsRouteAll): the rows a log read needs from a node (see Ops.readWindow), how long a
+// peer is waited for, and the most rows one peer sends for a read (its newest).
+export type LogReadWindow = { since: f64, until: f64 | undefined, kind: string, id: string, session: string, lite: bool }
+const PEER_LOG_MS = 5000
+const PEER_LOG_ROWS = 20000
+
 // how long a management API change waits for the other workers to apply it (settleConfig)
 const SETTLE_MS = 2000
 
@@ -749,6 +826,8 @@ export class UiSocket extends SocketExt {
 
   constructor(readonly hub: UiHub, readonly scope: DataScope, readonly batch: bool, readonly since: Map<string, int> | undefined) {
     super()
+    // a graceful stop closes it first: the client resumes elsewhere with its cursor (drain.tov)
+    this.uiFeed = true
   }
 
   onOpen(): void {
@@ -1161,6 +1240,14 @@ export class Ops {
   wsTickets = new WsTickets()
   // the last cost recalculation job (POST /api/logs/recalculate-cost); a job walks the logs between timer ticks
   recalc: CostRecalc | undefined = undefined
+  // the redivision job queued and not yet started, by project (queueRedivision)
+  redivPending: Map<string, string> = new Map()
+  // the rows the peers sent for the log read being answered (logsRouteAll sets them around the synchronous logsRoute)
+  peerRows: LogEntry[] = []
+  // the offloaded row of the log detail being answered, with its payload object merged (hydratedRow)
+  hydratedEntry: LogEntry | undefined = undefined
+  // the last error of a peer's log read, by peer, so each is reported once
+  peerLogErr: Map<string, string> = new Map()
 
   constructor(readonly engine: Engine, readonly store: ConfigStore) {
     this.ui = new UiHub()
@@ -1242,8 +1329,11 @@ export class Ops {
     this.rbac = { users: users.concat(legacy), roles: gov?.roles ?? [], api_keys: gov?.api_keys ?? [] }
     // admin credentials also count as inference auth, as in Bifrost
     const rb = this.rbac
-    this.engine.gov.altAuth = (h) => rb.users.length > 0 && authenticate(rb, h).kind === "user"
+    // an agent token from the CLI's sign-in (agentsignin.tov) names its user too
+    this.engine.gov.altAuth = (h) => this.agentUserOf(h) !== undefined || (rb.users.length > 0 && authenticate(rb, h).kind === "user")
     this.engine.gov.userOf = (h) => {
+      const agent = this.agentUserOf(h)
+      if (agent !== undefined) return agent.user
       if (rb.users.length === 0) return undefined
       const who = authenticate(rb, h)
       return who.kind === "user" ? who.name : undefined
@@ -1863,6 +1953,280 @@ export class Ops {
     hs.set("content-type", "application/json")
     hs.set("cache-control", "no-store")
     return new Response(this.store.genText, { status: 200, headers: hs })
+  }
+
+  // ---- the redivision job of an equal-split project (Bifrost's redivision_job_id and redivision_progress) ----
+
+  // The equal-split projects a management write may redivide, each with what its division depends on (redivisionSig).
+  // Taken before the write; withRedivision compares after it.
+  redivisionBefore(method: string, path: string): Map<string, string> {
+    const out: Map<string, string> = new Map()
+    if (method === "GET" || !(path.startsWith("/api/governance/") || userRoute(path).startsWith("/api/users/"))) return out
+    const g = this.store.cfg.governance
+    if (g === undefined) return out
+    for (const pj of g.projects ?? []) {
+      const sig = redivisionSig(g, pj)
+      if (sig !== "") out.set(pj.id, sig)
+    }
+    return out
+  }
+
+  // After a management write that succeeded: a user deleted leaves every project roster (Bifrost's cascade), and each
+  // equal-split project whose roster or divided caps changed gets a redivision job. The answer of a project or member
+  // route names its job as redivision_job_id; any other write (a user delete, a budget or rate-limit edit) lists them
+  // as redivision_job_ids. A project that is no longer equal-split (or is gone) has nothing to redivide.
+  withRedivision(method: string, path: string, r: Reply, before: Map<string, string>): Reply {
+    if (r.status >= 300 || method === "GET") return r
+    const up = userRoute(path)
+    if (method === "DELETE" && up.startsWith("/api/users/") && up.split("/").length === 4) {
+      const user = pctDecode(up.split("/")[3] ?? "") ?? ""
+      for (const pj of this.store.cfg.governance?.projects ?? []) {
+        for (const m of pj.members ?? []) {
+          if (user !== "" && m.user_id === user) this.store.removeProjectMember(pj.id, m.id)
+        }
+      }
+    }
+    if (before.size === 0) return r
+    const g = this.store.cfg.governance
+    const ids: string[] = []
+    let named = ""
+    const segs = path.split("/")
+    const projectRoute = segs[2] === "governance" && segs[3] === "projects" && segs.length >= 5
+    for (const pj of g?.projects ?? []) {
+      const was = before.get(pj.id)
+      if (was === undefined || g === undefined) continue
+      const now = redivisionSig(g, pj)
+      if (now === "" || now === was) continue
+      const id = this.queueRedivision(pj.id)
+      ids.push(id)
+      if (projectRoute && segs[4] === pj.id) named = id
+    }
+    if (ids.length === 0 || !r.body.trimStart().startsWith("{")) return r
+    try {
+      let fs = fields(r.body)
+      if (projectRoute && named !== "") setField(&fs, "redivision_job_id", JSON.stringify(named))
+      else setField(&fs, "redivision_job_ids", JSON.stringify(ids))
+      return { status: r.status, body: build(fs), contentType: r.contentType }
+    } catch (e) {
+      return r
+    }
+  }
+
+  // Queues the redivision of a project and answers its job id. A job for the same project that has not started yet is
+  // reused, as Bifrost reuses a pending job rather than queueing behind it.
+  queueRedivision(pid: string): string {
+    const pending = this.redivPending.get(pid)
+    if (pending !== undefined) return pending
+    const id = newId("redivision-")
+    this.redivPending.set(pid, id)
+    setTimeout(() => {
+      this.runRedivision(id, pid)
+    }, 0)
+    return id
+  }
+
+  // One redivision: once this process runs the saved roster (the governance is rebuilt from the saved config, which
+  // divides every budget and rate limit the project holds by its roster), each member's slices are counted. Progress
+  // goes out on /ws as Bifrost's redivision_progress events (redividing, then completed or error). The work itself is
+  // the reload; a slice keeps the spend it has counted (redivision moves caps, never spend).
+  async runRedivision(id: string, pid: string): Promise<void> {
+    this.redivPending.delete(pid)
+    const saved = findProject(this.store.cfg, pid)
+    let total = saved === undefined ? 0 : (saved.members ?? []).length
+    this.redivisionProgress({ operation_id: id, project_id: pid, phase: "redividing", total: total, processed: 0, succeeded: 0, failed: 0, message: "" })
+    // the running config takes the saved one within a moment (main.tov applyChange)
+    const want = rosterKey(saved)
+    for (let i = 0; i < 100; i++) {
+      if (rosterKey(findProject(this.engine.cfg, pid)) === want) break
+      await pause(20)
+    }
+    const running = findProject(this.engine.cfg, pid)
+    if (running === undefined || saved === undefined) {
+      this.redivisionProgress({ operation_id: id, project_id: pid, phase: "completed", total: 0, processed: 0, succeeded: 0, failed: 0, message: "the project was deleted; nothing to redivide" })
+      return
+    }
+    if (rosterKey(running) !== want) {
+      this.redivisionProgress({ operation_id: id, project_id: pid, phase: "error", total: total, processed: 0, succeeded: 0, failed: total, message: "the saved roster did not reach the running configuration in time" })
+      return
+    }
+    const members = running.members ?? []
+    total = members.length
+    let ok = 0
+    let failed = 0
+    let slices = 0
+    const gov = this.engine.gov
+    for (const m of members) {
+      const key = pid + "/" + m.user_id
+      const b = gov.memberCaps.get(key)
+      const l = gov.memberRateCaps.get(key)
+      if (b === undefined || l === undefined) failed += 1
+      else {
+        ok += 1
+        slices += b.length + l.length
+      }
+    }
+    const message = `redivided the caps of ${total} member${total === 1 ? "" : "s"} (${slices} slice${slices === 1 ? "" : "s"})`
+    this.redivisionProgress({ operation_id: id, project_id: pid, phase: failed > 0 ? "error" : "completed", total: total, processed: total, succeeded: ok, failed: failed, message: failed > 0 ? `${failed} member${failed === 1 ? "" : "s"} got no slices` : message })
+  }
+
+  // A redivision_progress event on /ws for every client, through the feed like a store update.
+  redivisionProgress(p: RedivisionProgress): void {
+    const it: FeedItem = { node: this.feedProducer(), seq: this.ui.nextSeq(), ts: Date.now(), team: "", bu: "", customer: "", project: "", data: JSON.stringify(p), kind: "redivision_progress" }
+    this.ui.ingest(it, "local")
+  }
+
+  // ---- cross-node log reads: each node keeps its own log files, so a read asks the peers for their rows ----
+
+  // The rows a log read at path needs from a node: the window (since, exclusive, and until), the kind ("" for any),
+  // one row by id or the rows of one session, and whether bodies travel. undefined for a path that reads no rows
+  // (dropped, the cost recalculation, the User-Agent mappings). now is the asking node's clock, so both nodes
+  // compute the same window.
+  readWindow(path: string, sp: URLSearchParams, now: f64): LogReadWindow | undefined {
+    const any: LogReadWindow = { since: 0.0, until: undefined, kind: "", id: "", session: "", lite: true }
+    if (path === "/api/logs" || path === "/api/logs/stats") {
+      const f = listFilter(sp, now)
+      // agent_names selects by the sessions of A2A calls, so those rows travel too
+      const kind = (sp.get("agent_names") ?? "") !== "" ? "" : "llm"
+      return { since: f.since - 1.0, until: f.until, kind: kind, id: "", session: "", lite: path !== "/api/logs" }
+    }
+    if (path.startsWith("/api/mcp-logs")) {
+      const rest = path.slice("/api/mcp-logs".byteLength)
+      if (rest === "" ) return { since: 0.0, until: undefined, kind: "mcp", id: "", session: "", lite: false }
+      if (rest === "/filterdata") return { since: 0.0, until: undefined, kind: "mcp", id: "", session: "", lite: true }
+      if (rest === "/stats" || rest.startsWith("/histogram")) {
+        const end = epochParam(sp.get("end_time") ?? undefined, now)
+        return { since: this.windowStart(sp, end) - 1.0, until: end, kind: "mcp", id: "", session: "", lite: true }
+      }
+      const id = rest.slice(1)
+      if (id !== "" && !id.includes("/")) return { since: 0.0, until: undefined, kind: "mcp", id: id, session: "", lite: false }
+      return undefined
+    }
+    if (!path.startsWith("/api/logs/")) return undefined
+    const sub = path.slice("/api/logs/".byteLength)
+    if (sub.startsWith("sessions/")) {
+      const rest = sub.slice("sessions/".byteLength)
+      const raw = rest.endsWith("/summary") ? rest.slice(0, rest.byteLength - "/summary".byteLength) : rest
+      const sid = pctDecode(raw) ?? ""
+      if (sid === "" || sid.includes("/")) return undefined
+      return { since: 0.0, until: undefined, kind: "llm", id: "", session: sid, lite: true }
+    }
+    if (sub === "filterdata") return any
+    if (sub === "dropped" || sub.startsWith("recalculate-cost") || sub.startsWith("user-agent-mappings")) return undefined
+    if (sub !== "" && !sub.includes("/") && !LOG_ROUTE_NAMES.includes(sub)) return { since: 0.0, until: undefined, kind: "llm", id: sub, session: "", lite: false }
+    // the histograms, rankings and dashboard: the window and the span before it (the rankings' trends)
+    const end = epochParam(sp.get("end_time") ?? undefined, now)
+    const start = this.windowStart(sp, end)
+    if (start >= end) return undefined
+    return { since: start - (end - start) - 1.0, until: end, kind: "", id: "", session: "", lite: true }
+  }
+
+  // This node's own rows for a read window (what POST /api/cluster/logs answers): never the rows of its peers.
+  localRows(store: LogStore, w: LogReadWindow): LogEntry[] {
+    if (w.id !== "") {
+      const e = store.findById(w.id)
+      if (e === undefined || (w.kind !== "" && kindOf(e) !== w.kind)) return []
+      return [e]
+    }
+    const out: LogEntry[] = []
+    for (const e of store.viewSince(w.since, w.until)) {
+      if (w.kind !== "" && kindOf(e) !== w.kind) continue
+      if (w.session !== "" && e.session_id !== w.session) continue
+      out.push(w.lite ? liteEntry(e) : publicEntry(e))
+    }
+    // the newest rows when a node has more than it sends at once
+    if (out.length > PEER_LOG_ROWS) return out.slice(out.length - PEER_LOG_ROWS)
+    return out
+  }
+
+  // A request log read, with the peers' rows when the cluster is on with peers and cluster.log_reads is not false: each
+  // peer is asked at once (POST /api/cluster/logs, signed, a few seconds at most), and the read is answered over this
+  // node's rows and theirs. A peer that does not answer is left out (reported once until it answers again). Broker
+  // mode has no peer addresses, so it reads this node's rows.
+  // A log detail of an offloaded row (the hybrid store) also reads its payload object first (hydratedRow).
+  async logsRouteAll(req: Request, path: string, body: string, scope?: DataScope, reveal?: bool): Promise<Reply> {
+    const store = this.engine.logStore
+    if (req.method !== "GET" || store === undefined) return this.logsRoute(req, path, body, scope, reveal)
+    const rows = await this.askPeers(req, path)
+    const hyd = await this.hydratedRow(path, store, rows)
+    // (set and cleared around the synchronous route, so concurrent reads never see each other's rows)
+    this.peerRows = rows
+    this.hydratedEntry = hyd
+    const r = this.logsRoute(req, path, body, scope, reveal)
+    this.peerRows = []
+    this.hydratedEntry = undefined
+    return r
+  }
+
+  // The peers' rows for a read: none when clustering is off, cluster.log_reads is false, the mode is broker (no peer
+  // addresses), there are no peers or the path reads no rows.
+  async askPeers(req: Request, path: string): Promise<LogEntry[]> {
+    const cc = this.clusterCfg
+    const none: LogEntry[] = []
+    if (cc === undefined || cc.log_reads === false || cluster.isBroker(cc)) return none
+    const peers = this.peerUrls(cc)
+    const u = URL.parse(req.url)
+    const query = u === undefined ? "" : (u.search.startsWith("?") ? u.search.slice(1) : u.search)
+    const now = Date.now()
+    const w = this.readWindow(path, new URLSearchParams(query), now)
+    if (peers.length === 0 || w === undefined) return none
+    const ask = JSON.stringify({ path: path, query: query, now: now, ts: now })
+    const h: Map<string, string> = new Map()
+    h.set("content-type", "application/json")
+    h.set("x-raiju-cluster-sig", cluster.sign(cc.secret, ask))
+    const pending: Promise<LogEntry[]>[] = []
+    for (const p of peers) pending.push(this.peerLogs(p, h, ask))
+    const rows: LogEntry[] = []
+    for (const part of await Promise.all(pending)) {
+      for (const e of part) rows.push(e)
+    }
+    return rows
+  }
+
+  // One peer's rows for a read, or none when it does not answer.
+  async peerLogs(peer: string, h: Map<string, string>, ask: string): Promise<LogEntry[]> {
+    const r = await postTextWithin(peer + "/api/cluster/logs", h, ask, PEER_LOG_MS)
+    const prior = this.peerLogErr.get(peer) ?? ""
+    if (r.status !== 200) {
+      const why = r.status === 0 ? r.body : `HTTP ${r.status}`
+      if (why !== prior) console.error(`raiju: cluster log read: ${peer}: ${why}; answering without its rows`)
+      this.peerLogErr.set(peer, why)
+      return []
+    }
+    if (prior !== "") console.error(`raiju: cluster log read: ${peer} answers again`)
+    this.peerLogErr.delete(peer)
+    try {
+      return (try JSON.parse(r.body) as { rows: LogEntry[] }).rows
+    } catch (e) {
+      console.error(`raiju: cluster log read: bad answer from ${peer}: ${e.message}`)
+      return []
+    }
+  }
+
+  // POST /api/cluster/logs from a peer answering a log read: this node's own rows for the read's window. Signed like
+  // the sync route, over a body naming the read's path and query and the asking node's time (a request older than a
+  // minute is refused, so a captured one does not replay). The caller's data scope and hidden request types are
+  // applied by the asking node; a row's reveal mapping travels only for a read of that one row.
+  async clusterLogs(req: Request): Promise<Response> {
+    const cc = this.clusterCfg
+    if (cc === undefined) return json(404, errorJson("clustering is off", "invalid_request_error", undefined))
+    const body = await req.text()
+    if (!cluster.verify(cc.secret, body, req.headers.get("x-raiju-cluster-sig") ?? "")) return denied(401, "bad cluster signature")
+    let ask: { path: string, query: string, now: f64, ts: f64 } = { path: "", query: "", now: 0.0, ts: 0.0 }
+    try {
+      ask = try JSON.parse(body) as { path: string, query: string, now: f64, ts: f64 }
+    } catch (e) {
+      return json(400, errorJson(e.message, "invalid_request_error", undefined))
+    }
+    if (Math.abs(Date.now() - ask.ts) > 60000.0) return denied(401, "stale cluster request")
+    const store = this.engine.logStore
+    if (store === undefined) return json(200, `{"node":${JSON.stringify(this.nodeId)},"rows":[]}`)
+    const w = this.readWindow(ask.path, new URLSearchParams(ask.query), ask.now)
+    if (w === undefined) return json(400, errorJson(`no log read at ${ask.path}`, "invalid_request_error", undefined))
+    const rows = this.localRows(store, w)
+    const hs: Record<string, string> = new Map()
+    hs.set("content-type", "application/json")
+    hs.set("cache-control", "no-store")
+    return new Response(`{"node":${JSON.stringify(this.nodeId)},"rows":${JSON.stringify(rows)}}`, { status: 200, headers: hs })
   }
 
   // ---- the live feed (/ws) across the workers of a node and the cluster (feed.tov) ----
@@ -2506,6 +2870,228 @@ export class Ops {
     return json(404, errorJson(`no route ${path}`, "invalid_request_error", undefined))
   }
 
+  // ---- agent sign-in for the CLI (agentsignin.tov) ----
+
+  // The governance name of a single sign-on identity: the user governance lists under its subject or email, else the
+  // email, else the subject.
+  ssoUser(sub: string, email: string | undefined): string {
+    const names = ssoNames(sub, email)
+    for (const u of this.rbac.users) {
+      if (names.includes(u.name) || names.includes((u.email ?? "").toLowerCase())) return u.name
+    }
+    const e = email ?? ""
+    return e !== "" ? e : sub
+  }
+
+  // The user an agent access token (Bearer ck-bf-agent-...) stands for, while it lives and its user is not disabled.
+  agentUserOf(h: Hdrs): AgentUser | undefined {
+    const auth = h.get("authorization") ?? ""
+    if (!auth.startsWith("Bearer " + AGENT_TOKEN_PREFIX)) return undefined
+    const who = agentSignIn().identity(auth.slice(7).trim(), Date.now())
+    if (who === undefined) return undefined
+    if (disabledNamed(this.rbac, [who.user, who.email.toLowerCase()])) return undefined
+    return who
+  }
+
+  // The active, unexpired keys assigned to a user, in config order; the first is the user's default (governance.tov
+  // defaultKey picks the same one).
+  assignedKeys(user: string): VirtualKeyConfig[] {
+    const out: VirtualKeyConfig[] = []
+    for (const vk of this.store.cfg.governance?.virtual_keys ?? []) {
+      if (vk.user_id === user && vk.is_active !== false && !this.engine.gov.expired(vk)) out.push(vk)
+    }
+    return out
+  }
+
+  // GET /api/agent/auth/status, GET and POST /api/agent/auth/authorize, POST /api/agent/auth/token, /refresh and /logout,
+  // and the signed-in user's GET /api/agent/virtual-keys and /api/agent/usage-summary (the Bifrost CLI's Enterprise agent
+  // routes). These come before the management gate: the sign-in routes are open, the others take the agent token.
+  async agentRoute(req: Request, path: string): Promise<Response> {
+    const m = req.method
+    const now = Date.now()
+    const si = agentSignIn()
+    const signInUsers = this.rbac.users.filter((u) => u.password_sha256 !== undefined && u.disabled !== true).length
+    if (path === "/api/agent/auth/status") {
+      if (m !== "GET") return json(405, errorJson("use GET", "invalid_request_error", undefined))
+      return json(200, JSON.stringify({ idp_configured: signInUsers > 0 || this.oidcCfg !== undefined, virtual_key_auth_enabled: this.engine.gov.enforce }))
+    }
+    if (path === "/api/agent/auth/authorize") {
+      const u = URL.parse(req.url)
+      let sp = u === undefined ? new URLSearchParams("") : u.searchParams
+      let form = new URLSearchParams("")
+      if (m === "POST") {
+        form = new URLSearchParams(await req.text())
+        sp = form
+      } else if (m !== "GET") return json(405, errorJson("use GET or POST", "invalid_request_error", undefined))
+      const params: Map<string, string> = new Map()
+      for (const k of ["client_id", "redirect_uri", "state", "code_challenge", "code_challenge_method"]) params.set(k, sp.get(k) ?? "")
+      const problem = authorizeProblem(params.get("client_id")!, params.get("redirect_uri")!, params.get("state")!, params.get("code_challenge")!, params.get("code_challenge_method")!)
+      if (problem !== "") return html(400, `<!doctype html><meta charset="utf-8"><title>Sign-in refused</title><p>This sign-in request cannot be used: ${problem.replaceAll("<", "&lt;")}.</p>`)
+      const qs = new URLSearchParams("")
+      for (const k of params.keys()) qs.set(k, params.get(k)!)
+      const back = "/api/agent/auth/authorize?" + qs.toString()
+      const sso = this.oidcCfg !== undefined
+      if (m === "GET") return html(200, signInPage(params, "", sso, back))
+      // a dashboard session already in the browser (single sign-on), or the user's name and password
+      let who: AgentUser | undefined = undefined
+      const sess = form.get("session") ?? ""
+      if (sess !== "") {
+        const s = this.liveSession(sess)
+        if (s !== undefined) who = { user: this.ssoUser(s.sub, s.email), role: s.role, email: s.email ?? "" }
+      } else {
+        const hs: Map<string, string> = new Map()
+        hs.set("authorization", "Basic " + b64.encode(utf8((form.get("username") ?? "") + ":" + (form.get("password") ?? ""))))
+        const id = authenticate(this.rbac, hs)
+        if (id.kind === "user") {
+          const uc = this.rbac.users.find((x) => x.name === id.name)
+          who = { user: id.name, role: id.role, email: uc?.email ?? "" }
+        }
+      }
+      if (who === undefined) {
+        this.recordChange("unauthenticated", req, path, 401, "")
+        return html(401, signInPage(params, sess !== "" ? "Your dashboard session has expired; sign in again." : "Invalid username or password.", sso, back))
+      }
+      let code = ""
+      try {
+        code = try si.issueCode(who, params.get("code_challenge")!, params.get("redirect_uri")!, now)
+      } catch (e) {
+        return html(500, "<p>Could not start the session.</p>")
+      }
+      this.recordChange(who.user, req, path, 302, "")
+      const lh: Record<string, string> = new Map()
+      lh.set("location", callbackUrl(params.get("redirect_uri")!, code, params.get("state")!))
+      lh.set("cache-control", "no-store")
+      return new Response(undefined, { status: 302, headers: lh })
+    }
+    const oauthError = (status: int, error: string, message: string): Response => json(status, JSON.stringify({ error: error, error_description: message, message: message }))
+    if (path === "/api/agent/auth/token" || path === "/api/agent/auth/refresh") {
+      if (m !== "POST") return json(405, errorJson("use POST", "invalid_request_error", undefined))
+      let body: { code?: string, code_verifier?: string, redirect_uri?: string, refresh_token?: string } = {}
+      try {
+        body = JSON.parse(await req.text()) as { code?: string, code_verifier?: string, redirect_uri?: string, refresh_token?: string }
+      } catch (e) {
+        return oauthError(400, "invalid_request", "the body must be a JSON object")
+      }
+      let r: Exchange = { kind: "error", status: 400, error: "invalid_request", message: "" }
+      try {
+        if (path === "/api/agent/auth/token") {
+          if ((body.code ?? "") === "") return oauthError(400, "invalid_request", "code is required")
+          r = try si.exchange(body.code ?? "", body.code_verifier ?? "", body.redirect_uri ?? "", now)
+        } else {
+          if ((body.refresh_token ?? "") === "") return oauthError(400, "invalid_request", "refresh_token is required")
+          r = try si.rotate(body.refresh_token ?? "", now)
+        }
+      } catch (e) {
+        return oauthError(500, "server_error", "could not issue a token")
+      }
+      if (r.kind === "error") return oauthError(r.status, r.error, r.message)
+      // a user disabled since the code was issued gets no token
+      if (disabledNamed(this.rbac, [r.issued.who.user, r.issued.who.email.toLowerCase()])) {
+        si.revokeUser(r.issued.who.user)
+        return oauthError(401, "invalid_grant", "the account is disabled")
+      }
+      const keys = this.assignedKeys(r.issued.who.user)
+      return json(200, tokenResponseJson(r.issued, keys.length > 0 ? keys[0]!.id : ""))
+    }
+    if (path === "/api/agent/auth/logout") {
+      if (m !== "POST") return json(405, errorJson("use POST", "invalid_request_error", undefined))
+      const auth = req.headers.get("authorization") ?? ""
+      if (auth.startsWith("Bearer ")) si.revoke(auth.slice(7).trim())
+      return json(200, JSON.stringify({ message: "Logged out successfully" }))
+    }
+    if (path === "/api/agent/virtual-keys" || path === "/api/agent/usage-summary") {
+      if (m !== "GET") return json(405, errorJson("use GET", "invalid_request_error", undefined))
+      const who = this.agentUserOf(snapshot(req.headers))
+      if (who === undefined) {
+        const rh: Record<string, string> = new Map()
+        rh.set("content-type", "application/json")
+        rh.set("x-bf-agent-auth", "rejected")
+        return new Response(errorJson("the agent token is missing, expired or revoked; sign in again", "authentication_error", undefined), { status: 401, headers: rh })
+      }
+      const keys = this.assignedKeys(who.user)
+      const usage = this.engine.gov.budgetUsage()
+      const budgetDefs = this.store.cfg.governance?.budgets ?? []
+      const budgetJson = (id: string, source: string): string => {
+        const u = usage.find((x) => x.id === id)
+        const base = id.includes("@") ? id.slice(0, id.indexOf("@")) : id
+        const def = budgetDefs.find((b) => b.id === base)
+        const used = u === undefined ? 0.0 : u.used
+        const limit = u === undefined ? (def?.max_limit ?? 0.0) : u.limit
+        const avail = limit - used > 0.0 ? limit - used : 0.0
+        return `{"id":${JSON.stringify(id)},"scope":${JSON.stringify(source)},"reset_duration":${JSON.stringify(def?.reset_duration ?? "")},"used":${used},"limit":${limit},"available":${avail}}`
+      }
+      if (path === "/api/agent/virtual-keys") {
+        const rows: string[] = []
+        for (const vk of keys) {
+          const provs: string[] = []
+          const bids: string[] = []
+          if ((vk.budget_id ?? "") !== "") bids.push(vk.budget_id!)
+          for (const pc of vk.provider_configs ?? []) {
+            if (!provs.includes(pc.provider)) provs.push(pc.provider)
+            if ((pc.budget_id ?? "") !== "" && !bids.includes(pc.budget_id!)) bids.push(pc.budget_id!)
+          }
+          let lim = 0.0
+          let used = 0.0
+          const bs: string[] = []
+          for (const id of bids) {
+            const u = usage.find((x) => x.id === id)
+            const def = budgetDefs.find((b) => b.id === id)
+            const l = u === undefined ? (def?.max_limit ?? 0.0) : u.limit
+            const c = u === undefined ? 0.0 : u.used
+            lim += l
+            used += c
+            bs.push(`{"id":${JSON.stringify(id)},"budget_limit":${l},"budget_consumed":${c},"budget_available":${l - c > 0.0 ? l - c : 0.0},"reset_duration":${JSON.stringify(def?.reset_duration ?? "")}}`)
+          }
+          rows.push(`{"id":${JSON.stringify(vk.id)},"name":${JSON.stringify(vk.name ?? vk.id)},"description":${JSON.stringify(vk.description ?? "")},"is_active":true,"providers":${JSON.stringify(provs)},"budgets":[${bs.join(",")}],"budget_limit":${lim},"budget_consumed":${used},"budget_available":${lim - used > 0.0 ? lim - used : 0.0}}`)
+        }
+        return json(200, `{"virtual_keys":[${rows.join(",")}],"selected_virtual_key_id":${JSON.stringify(keys.length > 0 ? keys[0]!.id : "")},"forced_virtual_key_id":""}`)
+      }
+      // the budgets and rate limits over the user's assigned keys and the user's own (@user) budgets
+      const bids: string[] = []
+      const rids: string[] = []
+      for (const vk of keys) {
+        if ((vk.budget_id ?? "") !== "" && !bids.includes(vk.budget_id!)) bids.push(vk.budget_id!)
+        if ((vk.rate_limit_id ?? "") !== "" && !rids.includes(vk.rate_limit_id!)) rids.push(vk.rate_limit_id!)
+        for (const pc of vk.provider_configs ?? []) {
+          if ((pc.budget_id ?? "") !== "" && !bids.includes(pc.budget_id!)) bids.push(pc.budget_id!)
+          if ((pc.rate_limit_id ?? "") !== "" && !rids.includes(pc.rate_limit_id!)) rids.push(pc.rate_limit_id!)
+        }
+      }
+      const budgets: string[] = []
+      let tl = 0.0
+      let tu = 0.0
+      for (const id of bids) budgets.push(budgetJson(id, "virtual_key"))
+      for (const u of usage) {
+        if (u.id.endsWith("@user/" + who.user)) budgets.push(budgetJson(u.id, "user"))
+      }
+      for (const u of usage) {
+        if (bids.includes(u.id) || u.id.endsWith("@user/" + who.user)) {
+          tl += u.limit
+          tu += u.used
+        }
+      }
+      const rl = this.engine.gov.rateLimitUsage(now)
+      const rates: string[] = []
+      const rdefs = this.store.cfg.governance?.rate_limits ?? []
+      for (const id of rids) {
+        const def = rdefs.find((r) => r.id === id)
+        const counter = (kind: string, reset: string): string => {
+          const e = rl.find((x) => x.id === id && x.kind === kind)
+          if (e === undefined) return ""
+          const used = Math.floor(e.used)
+          const limit = Math.floor(e.limit)
+          return `{"used":${used},"limit":${limit},"available":${limit - used > 0 ? limit - used : 0},"reset_duration":${JSON.stringify(reset)}}`
+        }
+        const tk = counter("token", def?.token_reset_duration ?? "1m")
+        const rq = counter("request", def?.request_reset_duration ?? "1m")
+        rates.push(`{"id":${JSON.stringify(id)},"scope":"virtual_key"${tk === "" ? "" : `,"tokens":${tk}`}${rq === "" ? "" : `,"requests":${rq}`}}`)
+      }
+      const avail = tl - tu > 0.0 ? tl - tu : 0.0
+      return json(200, `{"budgets":[${budgets.join(",")}],"rate_limits":[${rates.join(",")}],"budget":{"used":${tu},"limit":${tl},"available":${avail}},"top_models":[],"top_apps":[],"generated_at":${JSON.stringify(isoMs(now))},"window":{}}`)
+    }
+    return json(404, errorJson(`no route ${path}`, "invalid_request_error", undefined))
+  }
+
   // ---- the priced models, the circuit states and the log histogram ----
 
   // GET /api/models/base (distinct base model names) and /api/models/details (one row per priced
@@ -2751,10 +3337,10 @@ export class Ops {
     if (start >= end) return badRequest("start_time must be before end_time")
     const g = gridOf(start, end)
     if (g.n > 10000) return badRequest("too many buckets; narrow the time range")
-    const es = selectAll(this.readView(store, sc, start - 1.0), filterFrom(sp, "llm", start, end))
+    const es = selectAll(this.readView(store, sc, start - 1.0, end), filterFrom(sp, "llm", start, end))
     // the same span just before the window, for the rankings' trends
     const pf = filterFrom(sp, "llm", start - (end - start), start)
-    const prev = selectAll(this.readView(store, sc, pf.since - 1.0), pf)
+    const prev = selectAll(this.readView(store, sc, pf.since - 1.0, start), pf)
     const dim = sp.get("dimension") ?? ""
     const ranked = this.rankLimit(sp)
     if (ranked < 0) return badRequest("Invalid limit. Expected a positive integer, or all=true for no limit")
@@ -2785,9 +3371,21 @@ export class Ops {
     return { status: 404, body: errorJson(`no route ${path}`, "invalid_request_error", undefined), contentType: "application/json" }
   }
 
+  // The log rows since a time (and up to until) that a data scope may see: this node's, and, during a read that asked
+  // the peers (logsRouteAll), theirs too.
+  logRows(store: LogStore, sc: DataScope, since: f64, until?: f64): LogEntry[] {
+    const local = store.viewSince(since, until)
+    if (this.peerRows.length === 0) return scopedEntries(local, sc)
+    const extra: LogEntry[] = []
+    for (const e of this.peerRows) {
+      if (e.ts > since && (until === undefined || e.ts <= until)) extra.push(e)
+    }
+    return scopedEntries(mergeRows(local, extra), sc)
+  }
+
   // The entries a log read may see: the caller's data scope, without client.hidden_request_types.
-  private readView(store: LogStore, sc: DataScope, since: f64): LogEntry[] {
-    return withoutHidden(scopedView(store, sc, since), this.store.cfg.client?.hidden_request_types)
+  private readView(store: LogStore, sc: DataScope, since: f64, until?: f64): LogEntry[] {
+    return withoutHidden(this.logRows(store, sc, since, until), this.store.cfg.client?.hidden_request_types)
   }
 
   // GET /api/logs: the logs a filter selects, newest first unless sort_by and order say otherwise
@@ -2799,8 +3397,8 @@ export class Ops {
     if (pg.error !== "") return badRequest(pg.error)
     let f = listFilter(sp, Date.now())
     this.withAgents(sp, &f, store, sc)
-    const es = applyChains(selectAll(this.readView(store, sc, f.since - 1.0), f), f)
-    return okJson(listJson(es, pg.page, this.readView(store, sc, 0.0).length > 0))
+    const es = applyChains(selectAll(this.readView(store, sc, f.since - 1.0, f.until), f), f)
+    return okJson(listJson(es, pg.page, es.length > 0 || this.readView(store, sc, 0.0).length > 0))
   }
 
   // GET /api/logs/stats: the totals of the logs a filter selects (Bifrost's SearchStats).
@@ -2809,14 +3407,24 @@ export class Ops {
     if (bad !== "") return badRequest(`the ${bad} filter is not recorded by this gateway`)
     let f = listFilter(sp, Date.now())
     this.withAgents(sp, &f, store, sc)
-    return okJson(statsView(applyChains(selectAll(this.readView(store, sc, f.since - 1.0), f), f)))
+    return okJson(statsView(applyChains(selectAll(this.readView(store, sc, f.since - 1.0, f.until), f), f)))
   }
 
   // GET /api/logs/{id}: one log, with its bodies and raw payloads when the store kept them.
   // reveal: the caller holds Logs:Reveal, so a logs_only row's mapping is added (redaction_mapping).
+  // The row is looked up wherever it is: memory, the files (rows beyond max_memory_entries and earlier days), and the
+  // rows the peers sent for this read (cross-node reads).
   private logById(id: string, store: LogStore, sc: DataScope, reveal: bool): Reply {
-    for (const e of this.readView(store, sc, 0.0)) {
-      if (e.id === id && kindOf(e) === "llm") return okJson(withMapping(detailJson(e), reveal ? this.openedMapping(e) : ""))
+    const hy = this.hydratedEntry
+    let found = hy !== undefined && hy.id === id ? hy : store.findById(id)
+    if (found === undefined) {
+      for (const e of this.peerRows) {
+        if (e.id === id) found = e
+      }
+    }
+    if (found !== undefined && kindOf(found) === "llm" && visibleTo(found, sc) && withoutHidden([found], this.store.cfg.client?.hidden_request_types).length > 0) {
+      const e: LogEntry = found
+      return okJson(withMapping(detailJson(e), reveal ? this.openedMapping(e) : ""))
     }
     return { status: 404, body: errorJson("log not found", "not_found_error", undefined), contentType: "application/json" }
   }
@@ -2850,15 +3458,20 @@ export class Ops {
     if (ids.length === 0) return badRequest("No log IDs provided")
     const doomed: string[] = []
     const hidden: LogEntry[] = []
-    for (const e of scopedView(store, sc, 0.0)) {
-      if (kindOf(e) === "llm" && ids.includes(e.id)) {
-        doomed.push(e.id)
-        if (e.content_hidden === true) hidden.push(e)
-      }
+    const offloaded: LogEntry[] = []
+    // each row wherever it is (memory, or the files beyond max_memory_entries and earlier days)
+    for (const id of ids) {
+      const e = store.findById(id)
+      if (e === undefined || kindOf(e) !== "llm" || doomed.includes(e.id)) continue
+      doomed.push(e.id)
+      if (e.content_hidden === true) hidden.push(e)
+      if (e.has_object === true) offloaded.push(e)
     }
     const removed = store.delete(doomed)
     // a hidden row's content object goes with it (Bifrost's DeleteLogs); a failed delete is only reported
     if (hidden.length > 0) this.deleteHidden(hidden)
+    // and so does an offloaded row's payload object (the hybrid store)
+    if (offloaded.length > 0) this.deletePayloads(offloaded)
     return okJson(JSON.stringify({ message: "Logs deleted successfully", removed: removed }))
   }
 
@@ -3230,7 +3843,7 @@ export class Ops {
   // usage for one window, in one call (Bifrost's shape).
   private dashboard(store: LogStore, sp: URLSearchParams, es: LogEntry[], prev: LogEntry[], g: Grid, start: f64, end: f64, now: f64, sc: DataScope): string {
     const mf = filterFrom(sp, "mcp", start, end)
-    const mcp = selectAll(scopedView(store, sc, start - 1.0), mf)
+    const mcp = selectAll(this.logRows(store, sc, start - 1.0), mf)
     const dims: string[] = []
     if (distinctDim(es, "virtual_key").length > 0) dims.push(jkv("virtual_key", dimensionRankingsView(es, prev, "virtual_key", 10)))
     return jobj([
@@ -3287,13 +3900,13 @@ export class Ops {
     if (req.method !== "GET") return { status: 405, body: errorJson("use GET or DELETE", "invalid_request_error", undefined), contentType: "application/json" }
     if (path === "/api/mcp-logs") {
       const f = filterFrom(sp, "mcp", epochParam(sp.get("start_time") ?? undefined, 0.0), epochParam(sp.get("end_time") ?? undefined, now + 1.0))
-      const es = selectAll(scopedView(store, sc, f.since - 1.0), f)
+      const es = selectAll(this.logRows(store, sc, f.since - 1.0), f)
       const limit = Math.min(1000, Math.max(1, parseInt(sp.get("limit") ?? "25") ?? 25))
       const offset = Math.max(0, parseInt(sp.get("offset") ?? "0") ?? 0)
       const rows: string[] = []
       for (let i = es.length - 1 - offset; i >= 0 && rows.length < limit; i--) rows.push(mcpLogJson(es[i]!))
       let hasLogs = false
-      for (const e of scopedView(store, sc, 0.0)) {
+      for (const e of this.logRows(store, sc, 0.0)) {
         if (kindOf(e) === "mcp") hasLogs = true
       }
       const pg = jobj([jkv("limit", jn(limit)), jkv("offset", jn(offset)), jkv("sort_by", JSON.stringify("timestamp")), jkv("order", JSON.stringify("desc")), jkv("total_count", jn(es.length))])
@@ -3301,7 +3914,7 @@ export class Ops {
     }
     if (path === "/api/mcp-logs/filterdata") {
       const mcp: LogEntry[] = []
-      for (const e of scopedView(store, sc, 0.0)) {
+      for (const e of this.logRows(store, sc, 0.0)) {
         if (kindOf(e) === "mcp") mcp.push(e)
       }
       return okJson(jobj([jkv("tool_names", jstrs(distinctDim(mcp, "tool"))), jkv("server_labels", jstrs(distinctDim(mcp, "server"))), jkv("virtual_keys", "[]")]))
@@ -3312,7 +3925,7 @@ export class Ops {
       if (start >= end) return badRequest("start_time must be before end_time")
       const g = gridOf(start, end)
       if (g.n > 10000) return badRequest("too many buckets; narrow the time range")
-      const es = selectAll(scopedView(store, sc, start - 1.0), filterFrom(sp, "mcp", start, end))
+      const es = selectAll(this.logRows(store, sc, start - 1.0), filterFrom(sp, "mcp", start, end))
       if (path === "/api/mcp-logs/stats") return okJson(mcpStatsView(es))
       if (path === "/api/mcp-logs/histogram") return okJson(requestsView(es, g))
       if (path === "/api/mcp-logs/histogram/cost") return okJson(mcpCostView(es, g))
@@ -3321,7 +3934,7 @@ export class Ops {
     }
     const id = path.slice("/api/mcp-logs/".byteLength)
     if (id !== "" && !id.includes("/")) {
-      for (const e of scopedView(store, sc, 0.0)) {
+      for (const e of this.logRows(store, sc, 0.0)) {
         if (e.id === id && kindOf(e) === "mcp") return okJson(withMapping(mcpLogJson(e), reveal ? this.openedMapping(e) : ""))
       }
       return { status: 404, body: errorJson("MCP log not found", "not_found_error", undefined), contentType: "application/json" }
@@ -3400,7 +4013,7 @@ export class Ops {
   withAgents(sp: URLSearchParams, inout f: Filter, store: LogStore, sc: DataScope): void {
     const names = listNames(sp.get("agent_names") ?? "")
     if (names.length === 0) return
-    f.agentSessions = agentSessionsOf(scopedView(store, sc, f.since - 1.0), names, f.since, f.until)
+    f.agentSessions = agentSessionsOf(this.logRows(store, sc, f.since - 1.0), names, f.since, f.until)
   }
 
   // One A2A call that reached an agent, as a log entry of kind "a2a" under the agent's name, attributed as the caller's
@@ -3907,7 +4520,8 @@ export class Ops {
   // caller's. A JSON-RPC caller speaks the version of its method names; REST and gRPC callers speak v1; the gRPC
   // interface speaks v1.
   async a2aSendOn(agent: AgentConfig, c: Candidate, call: Call, params: string, binding: string, rpcId: string, h: Hdrs, accepted: { header: string, value: string } | undefined, cancel: CallCancel): Promise<Fwd> {
-    const callerV03 = binding === "rpc" && call.v03
+    // a v0.3 REST client (its /v1 routes, a2a.tov restCallV03) speaks v0.3 too
+    const callerV03 = (binding === "rpc" || binding === "rest") && call.v03
     const upV03 = c.binding !== "GRPC" && c.v03
     const upParams = callerV03 === upV03 ? params : paramsTo(call.op, params, upV03)
     const upCall: Call = { op: call.op, v03: upV03, params: upParams, stream: call.stream, taskId: call.taskId, configId: call.configId }
@@ -4464,9 +5078,9 @@ export class Ops {
 
   // ---- retained content (client.retain_content_in_object_storage) ----
 
-  // The queue of hidden objects is uploaded once a second, while the engine has one.
+  // The queue of hidden objects (and the hybrid store's payload objects) is uploaded once a second, while the engine has one.
   configureRetained(): void {
-    if (this.engine.hiddenQueue === undefined || this.retainTimer >= 0) return
+    if ((this.engine.hiddenQueue === undefined && this.engine.hybridQueue === undefined) || this.retainTimer >= 0) return
     this.retainTimer = setInterval(() => {
       this.flushRetained()
     }, 1000)
@@ -4476,22 +5090,93 @@ export class Ops {
   // its pause in the queue and is given up after MAX_ATTEMPTS tries. Nothing waits on this, so a store
   // outage never holds up a request.
   async flushRetained(): Promise<void> {
-    const q = this.engine.hiddenQueue
-    if (q === undefined || this.retainSending) return
+    if (this.retainSending) return
     this.retainSending = true
+    const queues: RetainQueue[] = []
+    const hq = this.engine.hiddenQueue
+    if (hq !== undefined) queues.push(hq)
+    const pq = this.engine.hybridQueue
+    if (pq !== undefined) queues.push(pq)
     try {
-      for (let n = 0; n < 16; n++) {
-        const now = Date.now()
-        const job = q.take(now)
-        if (job === undefined) break
-        const ok = await this.retainPut(jobRequest(q, job, now))
-        if (ok) q.done(job)
-        else if (!q.fail(job, Date.now())) console.error(`raiju: retained content ${job.key}: given up after ${MAX_ATTEMPTS} tries`)
+      for (const q of queues) {
+        const what = q.policy === undefined ? "retained content" : "log payload"
+        for (let n = 0; n < 16; n++) {
+          const now = Date.now()
+          const job = q.take(now)
+          if (job === undefined) break
+          const ok = await this.retainPut(jobRequest(q, job, now))
+          if (ok) q.done(job)
+          else if (!q.fail(job, Date.now())) console.error(`raiju: ${what} ${job.key}: given up after ${MAX_ATTEMPTS} tries`)
+        }
       }
     } catch (e) {
       console.error(`raiju: retained content: ${e.message}`)
     }
     this.retainSending = false
+  }
+
+  // ---- the hybrid store's log detail (hybrid.tov): the row's payload object is read back and merged ----
+
+  // The row a log detail at path names, with its object merged when the row has one (and its content is not hidden).
+  // The object is tried under every key its format may have given it; one that cannot be read leaves the row as it is
+  // (Bifrost logs the failure and answers the row). undefined when the path is no log detail or the row has no object.
+  async hydratedRow(path: string, store: LogStore, peers: LogEntry[]): Promise<LogEntry | undefined> {
+    const q = this.engine.hybridQueue
+    const pol = q === undefined ? undefined : q.policy
+    if (q === undefined || pol === undefined || !path.startsWith("/api/logs/")) return undefined
+    const w = this.readWindow(path, new URLSearchParams(""), Date.now())
+    if (w === undefined || w.id === "") return undefined
+    let row = store.findById(w.id)
+    if (row === undefined) {
+      for (const e of peers) {
+        if (e.id === w.id) row = e
+      }
+    }
+    if (row === undefined || row.has_object !== true || row.content_hidden === true) return undefined
+    const e: LogEntry = row
+    for (const key of payloadKeys(pol, q.prefix, e.ts, e.id)) {
+      const req = getObjectRequest(q.cfg, key, Date.now())
+      const dl = deadline(15000)
+      try {
+        const hs: Record<string, string> = req.headers
+        const r = await fetch(req.url, { method: "GET", headers: hs, signal: dl.controller.signal })
+        const bytes = await r.bytes()
+        dl.finish()
+        if (r.status === 404) continue
+        if (r.status !== 200) {
+          console.error(`raiju: log payload ${key}: HTTP ${r.status}`)
+          return undefined
+        }
+        return hydrate(e, try decodePayload(bytes))
+      } catch (err) {
+        dl.finish()
+        console.error(`raiju: log payload ${key}: ${err.message}`)
+        return undefined
+      }
+    }
+    return undefined
+  }
+
+  // Deletes the payload objects of deleted rows, in the background, under every key they may have.
+  async deletePayloads(es: LogEntry[]): Promise<void> {
+    const q = this.engine.hybridQueue
+    const pol = q === undefined ? undefined : q.policy
+    if (q === undefined || pol === undefined) return
+    for (const e of es) {
+      for (const key of payloadKeys(pol, q.prefix, e.ts, e.id)) {
+        const req = deleteRequest(q.cfg, key, Date.now())
+        const dl = deadline(30000)
+        try {
+          const hs: Record<string, string> = req.headers
+          const r = await fetch(req.url, { method: "DELETE", headers: hs, signal: dl.controller.signal })
+          await r.text()
+          if (r.status >= 300 && r.status !== 404) console.error(`raiju: log payload: delete of ${e.id}: HTTP ${r.status}`)
+        } catch (err) {
+          console.error(`raiju: log payload: delete of ${e.id}: ${err.message}`)
+        }
+        dl.finish()
+      }
+    }
   }
 
   // One upload, with a 30 second deadline. True when the store answered 2xx.
@@ -6703,4 +7388,20 @@ test("storageProblems names a required log store or audit log that could not ope
   } finally {
     try rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test("redivisionSig follows an equal split's roster and the caps it divides, and is empty for any other split", () => {
+  const g: GovernanceConfig = {
+    budgets: [{ id: "b1", max_limit: 100.0, reset_duration: "1M" }],
+    rate_limits: [{ id: "r1", token_max_limit: 1000, token_reset_duration: "1m" }],
+  }
+  const pj: ProjectConfig = { id: "p1", name: "p", split_policy: "equal", budget_id: "b1", rate_limit_id: "r1", members: [{ id: "m1", user_id: "alice" }] }
+  const sig = redivisionSig(g, pj)
+  expect(sig !== "").toBe(true)
+  const more: ProjectConfig = { id: "p1", name: "p", split_policy: "equal", budget_id: "b1", rate_limit_id: "r1", members: [{ id: "m1", user_id: "alice" }, { id: "m2", user_id: "bob" }] }
+  expect(redivisionSig(g, more) !== sig).toBe(true)
+  const g2: GovernanceConfig = { budgets: [{ id: "b1", max_limit: 200.0, reset_duration: "1M" }], rate_limits: g.rate_limits }
+  expect(redivisionSig(g2, pj) !== sig).toBe(true)
+  const none: ProjectConfig = { id: "p1", name: "p", split_policy: "none", budget_id: "b1", members: [{ id: "m1", user_id: "alice" }] }
+  expect(redivisionSig(g, none)).toBe("")
 })

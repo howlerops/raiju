@@ -16,6 +16,7 @@ import { errorJson } from "./schemas"
 import { SessionSpec, sessionHooks, sessionGuard } from "./livehooks"
 import { Relay, Leg, Refusal, startClock, errorEvent } from "./webrtc"
 import { RealtimeCred, realtimeCredential, transcriptionModelOf, pinTranscriptionModel, BOOTSTRAP_MS, BOOTSTRAP_FRAMES, BOOTSTRAP_BYTES } from "./rtsession"
+import { openSessions, GOING_AWAY, GOING_AWAY_REASON } from "./drain"
 
 // What a WebSocket upgrade becomes on the server: the socket's own state in ext.
 export class Session {
@@ -45,6 +46,11 @@ export class SocketExt {
   held = false
   // when the client last answered a ping (ms since the epoch); see the UI socket's heartbeat
   pongAt: f64 = Date.now()
+  // a live feed socket (/ws): a graceful stop closes it first (drain.tov)
+  uiFeed = false
+  // its entry among the sessions a graceful stop closes (0: none)
+  drainId = 0
+  private closeRan = false
   onOpen(): void {}
   onMessage(m: string): void {}
   onClose(): void {}
@@ -73,6 +79,30 @@ export class SocketExt {
       this.ended = true
       p.closeWith(code, reason)
     }
+  }
+  // The client has gone (its close came, or the socket was cut): the route's close runs once.
+  gone(): void {
+    openSessions().remove(this.drainId)
+    this.drainId = 0
+    if (this.closeRan) return
+    this.closeRan = true
+    this.closed = true
+    this.onClose()
+    this.leave()
+  }
+  // Counts the socket among the sessions a graceful stop closes with a going-away frame (drain.tov).
+  track(): void {
+    if (this.drainId !== 0 || this.closed) return
+    const e = this
+    this.drainId = openSessions().add({ feed: this.uiFeed, goAway: () => {
+      e.endWith(GOING_AWAY, GOING_AWAY_REASON)
+    }, ended: (): bool => e.closed, drop: () => {
+      // (after its close frame the socket counts as ended, so drop() would not cut it)
+      e.ended = true
+      const p = e.pipe
+      if (p !== undefined) p.dropWith()
+      e.gone()
+    } })
   }
   // Takes this socket's slot in its route's gate. False when the route is full.
   enter(): bool {
@@ -138,6 +168,7 @@ export function extOpen(ws: ServerWebSocket<Session>): bool {
     e.refuseFull()
     return true
   }
+  e.track()
   e.onOpen()
   return true
 }
@@ -164,9 +195,7 @@ export function extClose(ws: ServerWebSocket<Session>): bool {
   if (s === undefined) return false
   const e = s.ext
   if (e === undefined) return false
-  e.closed = true
-  e.onClose()
-  e.leave()
+  e.gone()
   return true
 }
 
@@ -188,14 +217,13 @@ export function attachHttp1(e: SocketExt, client: WsConnection): void {
     e.onPong()
   }
   client.onClose = (c, r) => {
-    e.closed = true
-    e.onClose()
-    e.leave()
+    e.gone()
   }
   if (!e.enter()) {
     e.refuseFull()
     return
   }
+  e.track()
   e.onOpen()
 }
 

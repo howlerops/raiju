@@ -1,0 +1,331 @@
+// The hybrid log store (Bifrost's logs_store.object_storage, framework/logstore/hybrid.go): with object storage
+// configured, a request log row keeps its metadata and a short preview of its prompt, and its payload fields (the
+// request and answer bodies, the raw provider payloads, the plugin logs) go to the bucket as one object under
+// <prefix>/logs/YYYY/MM/DD/HH/<id>.json (.json.gz gzipped, .parquet as a one-row Parquet file). The log detail
+// (GET /api/logs/{id}) reads the object back and merges it into the row; the list, stats and histograms never need it.
+// object_storage_exclude_fields keeps fields in the row, object_storage_exclude_request_types keeps whole rows, and
+// error_details (Raiju's error) always stays in the row, as Bifrost keeps it for the error breakdowns. A row whose
+// content is hidden (retain_content_in_object_storage, retained.tov) is not offloaded here.
+// This module is pure: the gateway splits rows (LogStore.onPrepare) and queues the uploads, ops.tov sends them and
+// hydrates the detail.
+import { LogEntry, bifrostRequestType, kindOf } from "./logstore"
+import { parquetFileWith, parquetRow, PqColumn, PqCell } from "./sink_parquet"
+import { gzipBytes, gunzip, isGzip } from "./gzip"
+import { isoMs } from "./exports"
+import { fields, elements, rawStr, find, quote } from "./json"
+
+// The row fields that are payload, in the order objects hold them.
+export const PAYLOAD_FIELDS: string[] = ["input", "output", "raw_request", "raw_response", "plugin_logs"]
+
+// The longest prompt preview a row keeps (Bifrost bounds its content summary the same way).
+const PREVIEW_MAX = 2048
+
+// A field name of Bifrost's payload columns (or Raiju's own) as the row field it is here, or "" for one with no
+// counterpart (error_details always stays in the row).
+export function payloadFieldOf(name: string): string {
+  const n = name.trim()
+  if (PAYLOAD_FIELDS.includes(n)) return n
+  if (n.endsWith("_input") || n === "input_history" || n === "responses_input_history" || n === "params" || n === "tools" || n === "passthrough_request_body") return "input"
+  if (n.endsWith("_output") || n === "output_message" || n === "responses_output" || n === "tool_calls" || n === "passthrough_response_body") return "output"
+  return ""
+}
+
+// How rows are offloaded: the object format, gzip (a JSON object as .json.gz, or Parquet's GZIP pages), the row fields
+// that stay in the row, the request types whose rows stay whole, and what the configuration asked for that cannot be
+// done here (logged at start).
+export type HybridPolicy = { format: string, gz: bool, keep: string[], skipTypes: string[], warnings: string[] }
+
+// The policy for logs_store.object_storage's format, compression (and the legacy compress flag) and the exclude lists.
+// Bifrost's rules: json takes none or gzip; parquet takes none, gzip, snappy or zstd (default snappy). Raiju writes
+// Parquet pages uncompressed or GZIP: snappy and zstd are written as GZIP, with a warning.
+export function hybridPolicy(format: string | undefined, compression: string | undefined, compress: bool, excludeFields: string[], excludeTypes: string[]): HybridPolicy {
+  const warnings: string[] = []
+  let f = (format ?? "").trim().toLowerCase()
+  if (f === "") f = "json"
+  if (f !== "json" && f !== "parquet") {
+    warnings.push(`logs_store.object_storage.format "${f}" is not supported (json or parquet); json is used`)
+    f = "json"
+  }
+  let c = (compression ?? "").trim().toLowerCase()
+  if (c === "") c = compress ? "gzip" : f === "parquet" ? "snappy" : "none"
+  let gz = c === "gzip"
+  if (f === "json" && c !== "none" && c !== "gzip") {
+    warnings.push(`logs_store.object_storage.compression "${c}" is not supported for json objects (none or gzip); objects are not compressed`)
+    gz = false
+  }
+  if (f === "parquet" && (c === "snappy" || c === "zstd")) {
+    warnings.push(`logs_store.object_storage.compression "${c}": Parquet pages are written GZIP-compressed here (none and gzip are supported)`)
+    gz = true
+  } else if (f === "parquet" && c !== "none" && c !== "gzip") {
+    warnings.push(`logs_store.object_storage.compression "${c}" is not supported; Parquet pages are not compressed`)
+    gz = false
+  }
+  const keep: string[] = []
+  for (const name of excludeFields) {
+    const k = payloadFieldOf(name)
+    if (k === "") {
+      if (name.trim() !== "error_details" && name.trim() !== "") warnings.push(`logs_store.object_storage_exclude_fields: "${name}" is not a payload field here; it has no effect`)
+      continue
+    }
+    if (!keep.includes(k)) keep.push(k)
+  }
+  const skip: string[] = []
+  for (const t of excludeTypes) {
+    const v = t.trim()
+    if (v !== "" && !skip.includes(v)) skip.push(v)
+  }
+  return { format: f, gz: gz, keep: keep, skipTypes: skip, warnings: warnings }
+}
+
+function fieldOf(e: LogEntry, name: string): string | undefined {
+  if (name === "input") return e.input
+  if (name === "output") return e.output
+  if (name === "raw_request") return e.raw_request
+  if (name === "raw_response") return e.raw_response
+  if (name === "plugin_logs") return e.plugin_logs
+  return undefined
+}
+
+// Whether a row is offloaded: an LLM row whose content is not hidden, whose request type is not excluded (by Bifrost's
+// name or Raiju's op), and that holds a payload field the policy moves.
+export function offloads(p: HybridPolicy, e: LogEntry): bool {
+  if (e.content_hidden === true || kindOf(e) !== "llm") return false
+  if (p.skipTypes.includes(e.op) || p.skipTypes.includes(bifrostRequestType(e.op, e.streamed === true))) return false
+  for (const f of PAYLOAD_FIELDS) {
+    const v = fieldOf(e, f)
+    if (v !== undefined && v !== "" && !p.keep.includes(f)) return true
+  }
+  return false
+}
+
+// The text of a message's content: a string, or the text parts of an array.
+function contentTextOf(raw: string): string {
+  try {
+    if (raw.startsWith("\"")) return JSON.parse(raw) as string
+    if (!raw.startsWith("[")) return ""
+    const out: string[] = []
+    for (const el of elements(raw)) {
+      if (!el.startsWith("{")) continue
+      const t = rawStr(fields(el), "text")
+      if (t !== undefined) out.push(t)
+    }
+    return out.join(" ")
+  } catch (e) {
+    return ""
+  }
+}
+
+// The row's preview of a request body (Bifrost keeps the last user message and a content summary): the last user
+// message's text of a chat or Messages body, a Responses input, or a prompt, as {"messages":[{"role":"user",
+// "content":"..."}]} cut to PREVIEW_MAX bytes. undefined when the body holds none.
+export function previewInput(body: string): string | undefined {
+  let text = ""
+  try {
+    const fs = fields(body.trim())
+    const msgs = find(fs, "messages") ?? find(fs, "contents")
+    if (msgs !== undefined && msgs.startsWith("[")) {
+      for (const el of elements(msgs)) {
+        if (!el.startsWith("{")) continue
+        const mf = fields(el)
+        if ((rawStr(mf, "role") ?? "") !== "user") continue
+        const c = find(mf, "content") ?? find(mf, "parts")
+        if (c !== undefined) text = contentTextOf(c)
+      }
+    }
+    if (text === "") {
+      const inp = find(fs, "input") ?? find(fs, "prompt")
+      if (inp !== undefined && inp.startsWith("\"")) text = JSON.parse(inp) as string
+      else if (inp !== undefined && inp.startsWith("[")) {
+        for (const el of elements(inp)) {
+          if (el.startsWith("\"")) text = JSON.parse(el) as string
+          else if (el.startsWith("{")) {
+            const mf = fields(el)
+            const c = find(mf, "content")
+            if ((rawStr(mf, "role") ?? "user") === "user" && c !== undefined) text = contentTextOf(c)
+          }
+        }
+      }
+    }
+  } catch (e) {
+    return undefined
+  }
+  if (text === "") return undefined
+  if (text.byteLength > PREVIEW_MAX) {
+    const bytes = new TextEncoder().encode(text)
+    let end = PREVIEW_MAX
+    while (end > 0 && (int(bytes[end]!) & 0xc0) === 0x80) end -= 1
+    try {
+      text = new TextDecoder().decode(bytes.slice(0, end))
+    } catch (e) {
+      return undefined
+    }
+  }
+  return `{"messages":[{"role":"user","content":${quote(text)}}]}`
+}
+
+// A row split for the hybrid store: the row as stored (the moved fields cleared, the prompt preview in input unless
+// input stays, has_object set) and the object's JSON text (the row's id and time, then each moved field).
+export function splitEntry(p: HybridPolicy, e: LogEntry): { row: LogEntry, payload: string } {
+  const parts: string[] = [`"id":${quote(e.id)}`, `"timestamp":${quote(isoMs(e.ts))}`]
+  let row = e
+  for (const f of PAYLOAD_FIELDS) {
+    if (p.keep.includes(f)) continue
+    const v = fieldOf(e, f)
+    if (v === undefined || v === "") continue
+    parts.push(`${quote(f)}:${quote(v)}`)
+    if (f === "input") row.input = previewInput(v)
+    else if (f === "output") row.output = undefined
+    else if (f === "raw_request") row.raw_request = undefined
+    else if (f === "raw_response") row.raw_response = undefined
+    else row.plugin_logs = undefined
+  }
+  row.has_object = true
+  return { row: row, payload: "{" + parts.join(",") + "}" }
+}
+
+// The object key of a row: <prefix>/logs/YYYY/MM/DD/HH/<id> with the format's extension (Bifrost's objectKey). Empty
+// prefix segments are dropped.
+export function payloadKey(prefix: string, ts: f64, id: string, format: string, gz: bool): string {
+  const iso = isoMs(ts)
+  const segs = prefix.split("/").filter((s) => s !== "")
+  segs.push("logs", iso.slice(0, 4), iso.slice(5, 7), iso.slice(8, 10), iso.slice(11, 13))
+  const ext = format === "parquet" ? ".parquet" : gz ? ".json.gz" : ".json"
+  return segs.join("/") + "/" + id + ext
+}
+
+// Every key a row's object may have (a format or compression change since it was written): the policy's own first.
+export function payloadKeys(p: HybridPolicy, prefix: string, ts: f64, id: string): string[] {
+  const own = payloadKey(prefix, ts, id, p.format, p.gz)
+  const out: string[] = [own]
+  for (const k of [payloadKey(prefix, ts, id, "json", false), payloadKey(prefix, ts, id, "json", true), payloadKey(prefix, ts, id, "parquet", false)]) {
+    if (!out.includes(k)) out.push(k)
+  }
+  return out
+}
+
+// The object's bytes and content type for the policy: JSON (gzipped when gz), or a one-row Parquet file with a string
+// column per field.
+export function encodePayload(p: HybridPolicy, payload: string): { bytes: u8[], contentType: string } {
+  const raw = new TextEncoder().encode(payload)
+  if (p.format !== "parquet") return p.gz ? { bytes: gzipBytes(raw), contentType: "application/gzip" } : { bytes: raw, contentType: "application/json" }
+  const cols: PqColumn[] = []
+  try {
+    for (const f of fields(payload)) {
+      const cell: PqCell = { s: JSON.parse(f.raw) as string, n: 0.0, b: false }
+      cols.push({ name: f.key, kind: "string", cells: [cell] })
+    }
+  } catch (e) {
+    return { bytes: raw, contentType: "application/json" }
+  }
+  return { bytes: parquetFileWith(cols, p.gz), contentType: "application/vnd.apache.parquet" }
+}
+
+// An object's fields, whatever format it was written in: Parquet (by its magic), gzipped JSON, or JSON.
+export function decodePayload(bytes: u8[]): Map<string, string> throws Error {
+  const out: Map<string, string> = new Map()
+  if (bytes.length >= 4 && int(bytes[0]!) === 0x50 && int(bytes[1]!) === 0x41 && int(bytes[2]!) === 0x52 && int(bytes[3]!) === 0x31) return try parquetRow(bytes)
+  const raw = isGzip(bytes) ? try gunzip(bytes) : bytes
+  const text = try new TextDecoder().decode(raw)
+  for (const f of try fields(text)) {
+    if (f.raw.startsWith("\"")) out.set(f.key, try JSON.parse(f.raw) as string)
+  }
+  return out
+}
+
+// The row with its object's fields merged back (the log detail), as Bifrost's hydrateLog does.
+export function hydrate(e: LogEntry, m: Map<string, string>): LogEntry {
+  let out = e
+  const i = m.get("input")
+  if (i !== undefined) out.input = i
+  const o = m.get("output")
+  if (o !== undefined) out.output = o
+  const rq = m.get("raw_request")
+  if (rq !== undefined) out.raw_request = rq
+  const rs = m.get("raw_response")
+  if (rs !== undefined) out.raw_response = rs
+  const pl = m.get("plugin_logs")
+  if (pl !== undefined) out.plugin_logs = pl
+  return out
+}
+
+// ---- tests ----
+
+function sampleRow(): LogEntry {
+  return {
+    id: "req-h1", ts: 1791979200000.0, request_id: "req-h1", op: "chat", provider: "openai", model: "gpt-4o-mini", status: 200,
+    latency_ms: 5.0, prompt_tokens: 3, completion_tokens: 4, cost: 0.1, cache_hit: false,
+    input: `{"model":"gpt-4o-mini","messages":[{"role":"system","content":"be brief"},{"role":"user","content":"first"},{"role":"assistant","content":"ok"},{"role":"user","content":[{"type":"text","text":"second question"}]}]}`,
+    output: `{"choices":[{"message":{"content":"answer"}}]}`, raw_response: `{"raw":true}`, error: "",
+  }
+}
+
+test("the policy: formats, compression and the exclude lists in Bifrost's names", () => {
+  const j = hybridPolicy(undefined, undefined, false, [], [])
+  expect(j.format).toBe("json")
+  expect(j.gz).toBe(false)
+  expect(hybridPolicy("json", undefined, true, [], []).gz).toBe(true)
+  const pq = hybridPolicy("parquet", undefined, false, ["input_history", "error_details", "nonsense"], ["embedding", " "])
+  expect(pq.format).toBe("parquet")
+  expect(pq.gz).toBe(true)
+  expect(pq.keep).toEqual(["input"])
+  expect(pq.skipTypes).toEqual(["embedding"])
+  expect(pq.warnings.length).toBe(2)
+  expect(hybridPolicy("parquet", "none", false, [], []).gz).toBe(false)
+  expect(hybridPolicy("json", "zstd", false, [], []).warnings.length).toBe(1)
+  expect(payloadFieldOf("responses_output")).toBe("output")
+  expect(payloadFieldOf("raw_request")).toBe("raw_request")
+  expect(payloadFieldOf("token_usage")).toBe("")
+})
+
+test("a row splits into the stored row (with a prompt preview) and its object, and hydrates back", () => {
+  const p = hybridPolicy("json", "none", false, [], [])
+  const e = sampleRow()
+  expect(offloads(p, e)).toBe(true)
+  const sp = splitEntry(p, e)
+  expect(sp.row.has_object).toBe(true)
+  expect(sp.row.input).toBe(`{"messages":[{"role":"user","content":"second question"}]}`)
+  expect(sp.row.output).toBe(undefined)
+  expect(sp.row.raw_response).toBe(undefined)
+  expect(sp.row.error).toBe("")
+  const m = try decodePayload(encodePayload(p, sp.payload).bytes)
+  expect(m.get("output")).toBe(e.output)
+  const back = hydrate(sp.row, m)
+  expect(back.input).toBe(e.input)
+  expect(back.output).toBe(e.output)
+  expect(back.raw_response).toBe(`{"raw":true}`)
+  // gzipped JSON and Parquet (plain and GZIP pages) read back the same
+  for (const q of [hybridPolicy("json", "gzip", false, [], []), hybridPolicy("parquet", "none", false, [], []), hybridPolicy("parquet", "gzip", false, [], [])]) {
+    const mm = try decodePayload(encodePayload(q, sp.payload).bytes)
+    expect(mm.get("input")).toBe(e.input)
+    expect(mm.get("id")).toBe("req-h1")
+  }
+})
+
+test("excluded fields stay in the row, excluded types and hidden rows are not offloaded", () => {
+  const keepIn = hybridPolicy(undefined, undefined, false, ["input_history"], [])
+  const sp = splitEntry(keepIn, sampleRow())
+  expect(sp.row.input).toBe(sampleRow().input)
+  expect(sp.payload.includes(`"input"`)).toBe(false)
+  expect(offloads(hybridPolicy(undefined, undefined, false, [], ["chat_completion"]), sampleRow())).toBe(false)
+  expect(offloads(hybridPolicy(undefined, undefined, false, [], ["chat"]), sampleRow())).toBe(false)
+  let hidden = sampleRow()
+  hidden.content_hidden = true
+  expect(offloads(keepIn, hidden)).toBe(false)
+  let bare = sampleRow()
+  bare.input = undefined
+  bare.output = undefined
+  bare.raw_response = undefined
+  expect(offloads(keepIn, bare)).toBe(false)
+})
+
+test("object keys follow Bifrost's layout, and every format's key is tried on a read", () => {
+  const p = hybridPolicy("parquet", "none", false, [], [])
+  expect(payloadKey("bifrost", 1791979200000.0, "r1", "json", false)).toBe("bifrost/logs/2026/10/14/12/r1.json")
+  expect(payloadKey("/a//b/", 1791979200000.0, "r1", "json", true)).toBe("a/b/logs/2026/10/14/12/r1.json.gz")
+  const ks = payloadKeys(p, "bifrost", 1791979200000.0, "r1")
+  expect(ks[0]).toBe("bifrost/logs/2026/10/14/12/r1.parquet")
+  expect(ks.length).toBe(3)
+  expect(previewInput(`{"input":"plain prompt"}`)).toBe(`{"messages":[{"role":"user","content":"plain prompt"}]}`)
+  expect(previewInput(`{"model":"m"}`)).toBe(undefined)
+  expect(previewInput("not json")).toBe(undefined)
+})

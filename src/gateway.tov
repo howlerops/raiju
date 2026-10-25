@@ -19,7 +19,8 @@ import { AgentConfig, runAgent, runResponsesAgent } from "./agent"
 import { SampleRing } from "./alerts"
 import { ExportQueue } from "./exporters"
 import { RetainQueue, HiddenPayload, MAX_JOBS, MAX_BYTES } from "./retained"
-import { GuardrailProvider, Verdict, appliesTo, checkRequest, parseVerdictFor, isLocal, extractText, completionText } from "./guardrail_providers"
+import { hybridPolicy, offloads, splitEntry } from "./hybrid"
+import { GuardrailProvider, Verdict, LogFinding, appliesTo, checkRequest, parseVerdictFor, isLocal, extractText, completionText } from "./guardrail_providers"
 import { judgeText } from "./guard_judge"
 import { CompiledRule, applyRegex } from "./guard_regex"
 import { compileLocal, localVerdict } from "./guard_local"
@@ -40,7 +41,7 @@ import { Health, BreakerConfig, defaultBreakerConfig, parsePolicy } from "./heal
 import { errorParts, classifyFailure, holdsKey, retryInfoMs } from "./refusal"
 import { Governance, Grant, Denial, directKeyFrom, Attribution, noAttribution } from "./governance"
 import { Pricing, PriceRow, CostParts, SttUsage } from "./pricing"
-import { MediaRoute, MediaBill, handleMedia, transcriptionUsage, billedMedia, StreamUsage, pump, isEventStream } from "./media"
+import { MediaRoute, MediaBill, handleMedia, transcriptionUsage, billedMedia, StreamUsage, pump, isEventStream, hfEnsure } from "./media"
 import { SocketGate } from "./ws"
 import { ResponseCache, CacheOrigin, cacheKey, keyScope, parseTtl } from "./cache"
 import { appOf, phaseMapping } from "./logapi"
@@ -94,7 +95,20 @@ type AnswerStep = (s: string) => string throws SyntaxError
 export type Translate = (t: Target, text: string, requestedModel: string) => Translated throws SyntaxError
 
 // shortCircuit: the answer (or error) is a plugin's, not the provider's (x-bf-plugin-short-circuit)
-type Outcome = { ok: bool, status: int, body: string, contentType: string, provider: string, model: string, promptTokens: int, completionTokens: int, attempts: int, upstreamMs: f64, direct?: bool, raw?: bool, key?: string, alias?: string, aliasName?: string, aliasFamily?: string, retryMs?: f64, served?: string, billed?: f64, pass?: Response, finish?: () => void, noBilled?: bool, shortCircuit?: bool, idle?: IdleWatch }
+type Outcome = { ok: bool, status: int, body: string, contentType: string, provider: string, model: string, promptTokens: int, completionTokens: int, attempts: int, upstreamMs: f64, direct?: bool, raw?: bool, key?: string, alias?: string, aliasName?: string, aliasFamily?: string, retryMs?: f64, served?: string, billed?: f64, pass?: Response, finish?: () => void, noBilled?: bool, shortCircuit?: bool, idle?: IdleWatch, run?: StreamRun }
+
+// A converted stream whose answer has started: what pumping it needs. The attempt hands this back instead of pumping
+// the stream itself, so its frame (all its locals and temporaries, about 70 KB) is freed while the stream runs: each
+// open stream held it for its whole length before (L189).
+class StreamRun {
+  constructor(readonly sink: StreamSink, readonly conv: StreamConverter, readonly stream: ReadableStream, readonly dl: Deadline, readonly iw: IdleWatch, readonly ctx: ReqCtx, readonly labels: metrics.RequestLabels, readonly keepRaw: bool, readonly started: f64, readonly retry: int, readonly provider: string, readonly model: string, readonly attempts: int, readonly upstreamMs: f64, readonly ignoreCost: bool, readonly h: Hdrs, readonly stickKey: string | undefined, readonly slot: Limiter | undefined) {}
+}
+
+// The promise as it is: awaited through here, an async call is its own allocation (freed when it is done) rather
+// than laid out inside the caller's frame.
+function separately<T>(p: Promise<T>): Promise<T> {
+  return p
+}
 
 // The answer of a large request whose events are converted as they arrive: the Response is given when the
 // provider's answer starts, and its body is fed by a StreamSink. The server's streamed routes use it too.
@@ -1498,6 +1512,38 @@ export function logsOnlyText(text: string, g: GuardConfig | undefined, rules: Co
   return out
 }
 
+// Whether a provider is Presidio or Azure AI Language PII redacting with redaction_mode logs_only: the live text stays
+// raw and its findings become the stored copy's placeholders.
+export function logsOnlyHttp(p: GuardrailProvider): bool {
+  return (p.kind === "presidio" || p.kind === "azure_language_pii") && p.action === "redact" && p.redaction_mode === "logs_only"
+}
+
+// One stored text with an HTTP provider's logs_only findings as numbered placeholders from the request's vault
+// ([EMAIL_ADDRESS-1]): each found value, as written and as it reads inside a JSON string.
+export function logsOnlyFound(text: string, found: LogFinding[], vault: Vault): string {
+  if (text === "" || found.length === 0) return text
+  let out = text
+  for (const f of found) {
+    if (f.value === "") continue
+    const tok = vault.tokenFor(f.kind.toUpperCase(), f.value)
+    out = out.split(f.value).join(tok)
+    const q = JSON.stringify(f.value)
+    const esc = q.slice(1, q.byteLength - 1)
+    if (esc !== f.value) out = out.split(esc).join(tok)
+  }
+  return out
+}
+
+// A request with an x-request-id (made for a caller that sent none), its body given again as text.
+function withRequestId(req: Request, rid: string, body: string): Request {
+  const hs: Record<string, string> = new Map()
+  req.headers.forEach((v, k) => {
+    if (k !== "content-length" && k !== "transfer-encoding") hs.set(k, v)
+  })
+  hs.set("x-request-id", rid)
+  return new Request(req.url, { method: req.method, headers: hs, body: body })
+}
+
 // The guards that check MCP tool calls. A bad pattern is logged and the tool guards are left off.
 function compileGuards(providers: GuardrailProvider[]): ToolGuard[] {
   try {
@@ -1641,6 +1687,8 @@ export class Engine {
   exportQueues: ExportQueue[] = []
   // hidden content of content-off requests, uploaded by ops.tov (client.retain_content_in_object_storage)
   hiddenQueue: RetainQueue | undefined = undefined
+  // the hybrid store's payload uploads (logs_store.object_storage, hybrid.tov), sent by ops.tov
+  hybridQueue: RetainQueue | undefined = undefined
   guardProviders: GuardrailProvider[] = []
   // compiled regex and secrets providers, by id, and the guards on MCP tool calls
   localRules: Map<string, CompiledRule[]> = new Map()
@@ -1648,6 +1696,10 @@ export class Engine {
   // of a request (its log row, raw payloads, exports and retained content), never live traffic
   logGuard: GuardConfig | undefined = undefined
   logRules: Map<string, CompiledRule[]> = new Map()
+  // logs_only on the HTTP providers: their findings by request id (record turns them into the stored copy's
+  // placeholders), and the rows held until the answer's check is done (undefined: held, not recorded yet)
+  logFindings: Map<string, LogFinding[]> = new Map()
+  heldRecords: Map<string, ReqCtx | undefined> = new Map()
   // seals a log row's reveal mapping with the config's encryption key (ops.tov sets it; identity without a key)
   sealLog: (v: string) => string = (v: string): string => v
   toolGuards: ToolGuard[] = []
@@ -1732,6 +1784,27 @@ export class Engine {
         console.error(`raiju: request log store disabled: ${e.message}`)
       }
     }
+    // Bifrost's hybrid store: with logs_store.object_storage set, each row's payload fields go to the bucket (hybrid.tov),
+    // unless object_storage_offload is false
+    const hob = ls?.object_storage
+    const hstore = this.logStore
+    if (ls !== undefined && ls.enabled === true && hob !== undefined && ls.object_storage_offload !== false && hstore !== undefined) {
+      if (hob.bucket !== "" && (hob.type === "s3" || hob.type === "gcs")) {
+        const pol = hybridPolicy(hob.format, hob.compression, hob.compress === true, ls.object_storage_exclude_fields ?? [], ls.object_storage_exclude_request_types ?? [])
+        for (const w of pol.warnings) console.error(`raiju: ${w}`)
+        const dst: LogExportsConfig = { enabled: true, kind: hob.type, bucket: hob.bucket, region: hob.region, endpoint: hob.endpoint, access_key_id: hob.access_key_id, secret_access_key: hob.secret_access_key, session_token: hob.session_token, path_style: hob.path_style }
+        const q = new RetainQueue(dst, hob.prefix ?? "bifrost", pol.gz, MAX_JOBS, MAX_BYTES)
+        q.policy = pol
+        this.hybridQueue = q
+        hstore.onPrepare = (e: LogEntry): LogEntry => {
+          if (!offloads(pol, e)) return e
+          const sp = splitEntry(pol, e)
+          // a full queue keeps the row whole rather than lose its payload
+          if (!q.add(e.ts, e.id, sp.payload)) return e
+          return sp.row
+        }
+      }
+    }
     // Bifrost's retain_content_in_object_storage: content-off bodies go to logs_store.object_storage, with the store on
     const ob = ls?.object_storage
     if (ls !== undefined && ls.enabled === true && cfg.client?.retain_content_in_object_storage === true && this.logStore !== undefined) {
@@ -1813,8 +1886,11 @@ export class Engine {
 
   // Asks every external guardrail that covers `source` about `text`; stops at the first block.
   // Judges go through the chat path, regex and secrets run in-process, and HTTP providers make one request.
-  async externalGuard(text: string, source: "input" | "output"): Promise<{ action: string, reason: string, text?: string }> {
-    let out: { action: string, reason: string, text?: string } = { action: "allow", reason: "" }
+  // A Presidio or Azure AI Language PII provider that redacts logs_only leaves the live text alone; what it found is
+  // returned as logs, for the request's stored copy (record).
+  async externalGuard(text: string, source: "input" | "output"): Promise<{ action: string, reason: string, text?: string, logs?: LogFinding[] }> {
+    let out: { action: string, reason: string, text?: string, logs?: LogFinding[] } = { action: "allow", reason: "" }
+    let logs: LogFinding[] = []
     for (const p of this.guardProviders) {
       if (!appliesTo(p, source)) continue
       if (!(p.targets ?? ["llm"]).includes("llm")) continue
@@ -1829,12 +1905,17 @@ export class Engine {
       }
       metrics.inc("raiju_guardrail_checks_total", metrics.labels("", p.id, v.action), 1.0)
       if (v.action === "block") return { action: "block", reason: `${p.id}: ${v.reason}` }
+      if (v.action === "redact" && logsOnlyHttp(p)) {
+        for (const f of v.found ?? []) logs.push(f)
+        continue
+      }
       const red = v.text
       if (v.action === "redact" && red !== undefined) {
         text = red
         out = { action: "redact", reason: `${p.id}: ${v.reason}`, text: red }
       }
     }
+    if (logs.length > 0) out.logs = logs
     return out
   }
 
@@ -1982,14 +2063,111 @@ export class Engine {
     return try await r.text()
   }
 
+  // Pumps a converted stream to the client (an attempt's StreamRun): each upstream chunk converted, guarded and sent,
+  // then the tail, the log fields and the metrics. Past this point the client has bytes, so there is no retry.
+  async pumpStream(run: StreamRun): Promise<Outcome> {
+    const sink = run.sink
+    const conv = run.conv
+    const ctx = run.ctx
+    const iw = run.iw
+    const started = run.started
+    // the upstream bytes, kept for the log when store_raw_request_response asks (not under output guards: a match can be split)
+    const keepRaw = run.keepRaw
+    const rawBytes: u8[] = []
+    // the tool names the client was sent, for the log row (a binary stream has none)
+    const sentNames = new ToolNameStream()
+    // whether any event has gone to the client (replay pacing starts after the first)
+    let wrote = false
+    let failed = false
+    try {
+      const reader = run.stream.getReader()
+      let chunkIndex = 0
+      let lastAt = started
+      while (true) {
+        if (sink.cancelled || conv.halted) {
+          await reader.cancel()
+          break
+        }
+        iw.arm()
+        const c = await reader.read()
+        iw.disarm()
+        if (c.done) break
+        const v = c.value
+        if (v !== undefined) {
+          if (keepRaw && rawBytes.length < RAW_CAP) for (const b of v) rawBytes.push(b)
+          const out = conv.guarded(conv.push(v), false)
+          const rep = conv.replay()
+          if (rep.length > 0) {
+            const sentRep = await this.sendPaced(sink, rep, this.replayPace(), !wrote)
+            wrote = true
+            if (this.logStore !== undefined) sentNames.push(sentRep)
+          }
+          if (out !== "") {
+            wrote = true
+            const at = performance.now()
+            metrics.observeStreamChunk(run.labels, chunkIndex, (at - lastAt) / 1000.0)
+            chunkIndex += 1
+            lastAt = at
+            sink.write(out)
+            if (this.logStore !== undefined) sentNames.push(out)
+          }
+          const fb = conv.takeFrames()
+          const wb = sink.writeBytes
+          if (wb !== undefined && fb.length > 0) wb(fb)
+        }
+      }
+    } catch (e) {
+      // a binary stream just ends: a text error would corrupt its frames
+      // (a client that cancelled is owed no error event)
+      failed = true
+      if (!conv.framed() && !sink.cancelled) sink.write(`data: ${errorJson(`the upstream stream failed: ${e.message}`, "api_error", undefined)}\n\ndata: [DONE]\n\n`)
+    }
+    iw.stop()
+    if (keepRaw) ctx.rawResponse = rawText(rawBytes)
+    const tail = conv.guarded(conv.end(), true)
+    // a held answer that passed goes out now, paced; one cut by an upstream failure is dropped
+    const repEnd = conv.replay()
+    if (repEnd.length > 0 && !failed) {
+      const sentRep = await this.sendPaced(sink, repEnd, this.replayPace(), !wrote)
+      if (this.logStore !== undefined) sentNames.push(sentRep)
+    }
+    if (tail !== "") {
+      sink.write(tail)
+      if (this.logStore !== undefined) sentNames.push(tail)
+    }
+    sentNames.end()
+    if (this.logStore !== undefined) {
+      ctx.toolNames = sentNames.names
+      // the stop reason of the streamed answer, from the events the client was sent (Bifrost's FinishReason
+      // of the last chunk)
+      ctx.stopReason = sentNames.stop
+    }
+    const fe = conv.takeFrames()
+    const we = sink.writeBytes
+    if (we !== undefined && fe.length > 0) we(fe)
+    sink.close()
+    run.dl.finish()
+    const q = run.slot
+    if (q !== undefined) q.release()
+    const upstreamMs = run.upstreamMs + performance.now() - started
+    metrics.observeRequest(run.labels, { ok: true, status: 200, errorType: "", retries: run.retry * 1.0 }, (performance.now() - started) / 1000.0)
+    const kid = run.stickKey
+    if (kid !== undefined) this.stickId(run.h, run.provider, run.model, kid)
+    return { ok: true, status: 200, body: "", contentType: "text/event-stream", provider: run.provider, model: run.model, promptTokens: conv.promptTokens(), completionTokens: conv.completionTokens(), attempts: run.attempts, upstreamMs: upstreamMs, direct: true, billed: run.ignoreCost ? undefined : conv.billedCost() }
+  }
+
   // Remembers the key that served a session, so its next requests go to the same key.
   stick(h: Hdrs, ref: ModelRef, t: Target): void {
+    const kid = t.key.id ?? t.key.name
+    if (kid !== undefined) this.stickId(h, ref.provider, ref.model, kid)
+  }
+
+  stickId(h: Hdrs, provider: string, model: string, kid: string): void {
     const aff = this.affinity
     if (aff === undefined || affinityMode(h) === "off") return
     const sid = sessionId(h)
-    const kid = t.key.id ?? t.key.name
-    if (sid === undefined || kid === undefined) return
-    aff.bind(sid, ref.provider, ref.model, kid, sessionTtl(h, aff.cfg), Date.now())
+    if (sid === undefined) return
+    aff.bind(sid, provider, model, kid, sessionTtl(h, aff.cfg), Date.now())
   }
 
   // The heuristic's tier and score; the score is undefined when the text cannot be scored.
@@ -2295,6 +2473,14 @@ export class Engine {
           }
           t.key.value = tok.token
         }
+        // a Hugging Face embedding names the provider's model id from the hub mapping: fetched (or cached) before the build
+        if (t.kind === "huggingface" && ctx.op === "embeddings") {
+          const hm = await hfEnsure(t)
+          if (hm.error !== "") {
+            last = { ok: false, status: hm.status, body: errorJson(hm.error, hm.status >= 500 ? "api_error" : "invalid_request_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
+            break
+          }
+        }
         // another wire for this attempt, as Bifrost picks it per request: Claude on Azure and use_anthropic_endpoints
         // go as Anthropic Messages, and a Bedrock key's OpenAI-family models go to its Mantle surface
         const ra = matchedAlias(t.key, ref.model)
@@ -2386,8 +2572,9 @@ export class Engine {
             this.health.policyObserve(ref.provider, ref.model, t.key.id ?? "", rh, Date.now())
           }
           // a large answer (or a stream) goes back as it comes, without being read whole
-          // (a large request that was converted for this provider has its answer converted back, so it is not passed through)
-          if ((lg !== undefined ? lg.passAnswer : (ctx.passAbove >= 0 && providers.streamsNatively(t.kind))) && status >= 200 && status < 300) {
+          // (a large request that was converted for this provider has its answer converted back, so it is not passed through; nor are
+          // Hugging Face embeddings, whose answers take the provider's shape)
+          if ((lg !== undefined ? lg.passAnswer : (ctx.passAbove >= 0 && providers.streamsNatively(t.kind) && !(t.kind === "huggingface" && ctx.op === "embeddings"))) && status >= 200 && status < 300) {
             const clen = parseInt(res.headers.get("content-length") ?? "") ?? -1
             const ctype = res.headers.get("content-type") ?? ""
             const limit = lg !== undefined ? lg.settings.responseThreshold : ctx.passAbove
@@ -2429,92 +2616,16 @@ export class Engine {
             compatHeaders(&ctx.outHeaders, ctx.compat)
             sink.started = true
             sink.open(200, ctx.outHeaders)
-            const reader = stream.getReader()
-            // the upstream bytes, kept for the log when store_raw_request_response asks (not under output guards: a match can be split)
-            const keepRaw = storeRaw && this.streamGuards(true).length === 0
-            const rawBytes: u8[] = []
             // a cancel while the upstream is silent aborts the pending read, not just the next one
             sink.abort = () => {
               dl.controller.abort()
             }
-            // the tool names the client was sent, for the log row (a binary stream has none)
-            const sentNames = new ToolNameStream()
-            // whether any event has gone to the client (replay pacing starts after the first)
-            let wrote = false
-            let failed = false
-            // a silent upstream is cut (stream_idle_timeout_in_seconds)
-            const iw = idleGuard(dl, p)
-            try {
-              let chunkIndex = 0
-              let lastAt = started
-              while (true) {
-                if (sink.cancelled || conv.halted) {
-                  await reader.cancel()
-                  break
-                }
-                iw.arm()
-                const c = await reader.read()
-                iw.disarm()
-                if (c.done) break
-                const v = c.value
-                if (v !== undefined) {
-                  if (keepRaw && rawBytes.length < RAW_CAP) for (const b of v) rawBytes.push(b)
-                  const out = conv.guarded(conv.push(v), false)
-                  const rep = conv.replay()
-                  if (rep.length > 0) {
-                    const sentRep = await this.sendPaced(sink, rep, this.replayPace(), !wrote)
-                    wrote = true
-                    if (this.logStore !== undefined) sentNames.push(sentRep)
-                  }
-                  if (out !== "") {
-                    wrote = true
-                    const at = performance.now()
-                    metrics.observeStreamChunk(tl, chunkIndex, (at - lastAt) / 1000.0)
-                    chunkIndex += 1
-                    lastAt = at
-                    sink.write(out)
-                    if (this.logStore !== undefined) sentNames.push(out)
-                  }
-                  const fb = conv.takeFrames()
-                  const wb = sink.writeBytes
-                  if (wb !== undefined && fb.length > 0) wb(fb)
-                }
-              }
-            } catch (e) {
-              // a binary stream just ends: a text error would corrupt its frames
-              // (a client that cancelled is owed no error event)
-              failed = true
-              if (!conv.framed() && !sink.cancelled) sink.write(`data: ${errorJson(`the upstream stream failed: ${e.message}`, "api_error", undefined)}\n\ndata: [DONE]\n\n`)
-            }
-            iw.stop()
-            if (keepRaw) ctx.rawResponse = rawText(rawBytes)
-            const tail = conv.guarded(conv.end(), true)
-            // a held answer that passed goes out now, paced; one cut by an upstream failure is dropped
-            const repEnd = conv.replay()
-            if (repEnd.length > 0 && !failed) {
-              const sentRep = await this.sendPaced(sink, repEnd, this.replayPace(), !wrote)
-              if (this.logStore !== undefined) sentNames.push(sentRep)
-            }
-            if (tail !== "") {
-              sink.write(tail)
-              if (this.logStore !== undefined) sentNames.push(tail)
-            }
-            sentNames.end()
-            if (this.logStore !== undefined) {
-              ctx.toolNames = sentNames.names
-              // the stop reason of the streamed answer, from the events the client was sent (Bifrost's FinishReason
-              // of the last chunk)
-              ctx.stopReason = sentNames.stop
-            }
-            const fe = conv.takeFrames()
-            const we = sink.writeBytes
-            if (we !== undefined && fe.length > 0) we(fe)
-            sink.close()
-            dl.finish()
-            upstreamMs += performance.now() - started
-            metrics.observeRequest(tl, { ok: true, status: 200, errorType: "", retries: retry * 1.0 }, (performance.now() - started) / 1000.0)
-            if (sel.keyIndex >= 0) this.stick(h, ref, t)
-            return { ok: true, status: 200, body: "", contentType: "text/event-stream", provider: ref.provider, model: ref.model, promptTokens: conv.promptTokens(), completionTokens: conv.completionTokens(), attempts: attempts, upstreamMs: upstreamMs, direct: true, billed: t.cfg.ignore_provider_cost === true ? undefined : conv.billedCost() }
+            // the stream is pumped by pumpStream once this frame is gone (a silent upstream is cut:
+            // stream_idle_timeout_in_seconds)
+            const run = new StreamRun(sink, conv, stream, dl, idleGuard(dl, p), ctx, tl, storeRaw && this.streamGuards(true).length === 0, started, retry, ref.provider, ref.model, attempts, upstreamMs, t.cfg.ignore_provider_cost === true, h, sel.keyIndex >= 0 ? t.key.id ?? t.key.name : undefined, slot ? lim : undefined)
+            // the provider queue's slot goes with the stream, and is given back when it ends
+            slot = false
+            return { ok: true, status: 200, body: "", contentType: "text/event-stream", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs, direct: true, run: run }
           }
           text = await res.text()
           // a streamed upstream body is not kept when local output guards apply: a match can be split across its events,
@@ -3868,7 +3979,10 @@ export class Engine {
     ctx.requested = model
     if (compat !== undefined && compat.enabled) await this.compatLoad(compat, allowed)
     const tAtt = performance.now()
-    const r = try await this.attempt(allowed, h, build, translate, streamed, ctx)
+    let r = try await this.attempt(allowed, h, build, translate, streamed, ctx)
+    // a converted stream is pumped here, once the attempt's frame is gone
+    const run = r.run
+    if (run !== undefined) r = await separately(this.pumpStream(run))
     // translation and retries: the attempt's time less the upstream calls
     const convertUs = Math.max(0.0, (performance.now() - tAtt) * 1000.0 - r.upstreamMs * 1000.0)
     out.set("x-bf-attempts", "" + r.attempts)
@@ -4141,15 +4255,23 @@ export class Engine {
     // logs_only: the answer is out; what is stored from here on carries placeholders instead of the findings
     // the placeholders' originals stay with the stored row for a caller holding Logs:Reveal (Bifrost's reveal), unless
     // content logging is off for the request (there is then nothing to reveal)
+    // a row whose answer a logs_only HTTP provider still checks waits for it (chatOnce releaseRecord)
+    if (this.heldRecords.has(c.rid) && this.heldRecords.get(c.rid) === undefined) {
+      this.heldRecords.set(c.rid, c)
+      return
+    }
+    const found = this.logFindings.get(c.rid) ?? []
+    this.logFindings.delete(c.rid)
     let mapping = ""
-    if (this.logGuard !== undefined || this.logRules.size > 0) {
+    if (this.logGuard !== undefined || this.logRules.size > 0 || found.length > 0) {
       const vault = new Vault()
       const rs = this.logRules.values()
-      c.input = logsOnlyText(c.input, this.logGuard, rs, vault)
-      c.output = logsOnlyText(c.output, this.logGuard, rs, vault)
-      c.error = logsOnlyText(c.error, this.logGuard, rs, vault)
-      c.rawRequest = logsOnlyText(c.rawRequest, this.logGuard, rs, vault)
-      c.rawResponse = logsOnlyText(c.rawResponse, this.logGuard, rs, vault)
+      // the HTTP providers' findings first, then the built-in guard and the local rules (one vault, one numbering)
+      c.input = logsOnlyText(logsOnlyFound(c.input, found, vault), this.logGuard, rs, vault)
+      c.output = logsOnlyText(logsOnlyFound(c.output, found, vault), this.logGuard, rs, vault)
+      c.error = logsOnlyText(logsOnlyFound(c.error, found, vault), this.logGuard, rs, vault)
+      c.rawRequest = logsOnlyText(logsOnlyFound(c.rawRequest, found, vault), this.logGuard, rs, vault)
+      c.rawResponse = logsOnlyText(logsOnlyFound(c.rawResponse, found, vault), this.logGuard, rs, vault)
       if (vault.count > 0 && !c.contentOff) mapping = phaseMapping(vault.items, [c.input, c.rawRequest], [c.output, c.rawResponse, c.error])
     }
     const ms = performance.now() - c.started
@@ -4997,6 +5119,10 @@ export class Engine {
     const reversible = guard !== undefined && guard.mode === "redact" && this.cfg.guardrails?.reversible === true
     // the prompt the request named and the version it got, for the request log
     let promptUsed: Applied | undefined = undefined
+    // logs_only on an HTTP provider: its findings reach this request's stored copy by the request id (one is made
+    // when the caller sent none); "" when no such provider runs
+    const rid0 = req.headers.get("x-request-id") ?? ""
+    const lo = guardOn && this.httpLogsOnly("") ? (rid0 !== "" ? rid0 : newId("req_")) : ""
     try {
       if (guard !== undefined && this.guardInput && reversible) {
         text = try tokenizeChatRequest(text, guard, vault)
@@ -5015,6 +5141,8 @@ export class Engine {
       if (guardOn && this.guardProviders.length > 0) {
         const v = await this.externalGuard(extractText(text), "input")
         if (v.action === "block") return errorResponse(400, `request blocked by guardrails: ${v.reason}`, "guardrail_violation", noHeaders())
+        const lf = v.logs
+        if (lo !== "" && lf !== undefined && lf.length > 0) this.addLogFindings(lo, lf)
         const red = v.text
         // a redaction replaces the prompt when it is a single text message; otherwise it can't be placed
         if (red !== undefined) {
@@ -5235,22 +5363,36 @@ export class Engine {
       conv.stopAtFinish = quirkStopsAtFinish(t)
       return guardedConv(conv)
     }
-    let res = try await this.serve(req, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers, stream ? pipeSink : undefined, mk, cp, promptUsed, undefined, undefined, plugHook)
+    // a logs_only HTTP provider on the answer: the request's row waits for its findings (record holds it until then)
+    const holdOut = lo !== "" && !stream && this.httpLogsOnly("output")
+    if (holdOut) this.heldRecords.set(lo, undefined)
+    const sreq = lo !== "" && rid0 === "" ? withRequestId(req, lo, text) : req
+    let res = try await this.serve(sreq, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers, stream ? pipeSink : undefined, mk, cp, promptUsed, undefined, undefined, plugHook)
     // post hooks on an error answer (they may recover from it or change it); a stream's hooks ran per chunk
     if (chain !== undefined && run !== undefined) {
       if (pipeSink !== undefined && pipeSink.started) chain.finish(&run.ctx)
       else if (res.status >= 400) res = await errorPost(chain, run, res)
     }
-    // external output guardrails see the whole answer, so they apply to non-streamed answers
-    if (!guardOn || this.guardProviders.length === 0 || stream || res.status !== 200) return res
+    const fin = await this.outputGuarded(res, guardOn && !stream)
+    if (lo !== "") {
+      if (fin.logs.length > 0) this.addLogFindings(lo, fin.logs)
+      this.releaseRecord(lo)
+    }
+    return fin.res
+  }
+
+  // External output guardrails see the whole answer, so they apply to non-streamed answers. logs: what the logs_only
+  // HTTP providers found in it, for the request's stored copy.
+  async outputGuarded(res: Response, on: bool): Promise<{ res: Response, logs: LogFinding[] }> {
+    if (!on || this.guardProviders.length === 0 || res.status !== 200) return { res: res, logs: [] }
     let answer = ""
     try {
       answer = await res.text()
     } catch (e) {
-      return errorResponse(502, `could not read the answer: ${e.message}`, "api_error", noHeaders())
+      return { res: errorResponse(502, `could not read the answer: ${e.message}`, "api_error", noHeaders()), logs: [] }
     }
     const v = await this.externalGuard(completionText(answer), "output")
-    if (v.action === "block") return errorResponse(400, `response blocked by guardrails: ${v.reason}`, "guardrail_violation", noHeaders())
+    if (v.action === "block") return { res: errorResponse(400, `response blocked by guardrails: ${v.reason}`, "guardrail_violation", noHeaders()), logs: [] }
     let out = answer
     const red = v.text
     if (red !== undefined) out = replaceFirstContent(answer, red)
@@ -5258,7 +5400,38 @@ export class Engine {
     res.headers.forEach((value, key) => {
       if (key !== "content-length") hs.set(key, value)
     })
-    return new Response(out, { status: 200, headers: hs })
+    return { res: new Response(out, { status: 200, headers: hs }), logs: v.logs ?? [] }
+  }
+
+  // ---- logs_only on the HTTP guardrail providers (Presidio, Azure AI Language PII) ----
+
+  // Whether a Presidio or Azure AI Language PII provider redacts logs_only on this source ("input", "output", or ""
+  // for either).
+  httpLogsOnly(source: string): bool {
+    for (const p of this.guardProviders) {
+      if (!logsOnlyHttp(p)) continue
+      if (source === "" || appliesTo(p, source === "output" ? "output" : "input")) return true
+    }
+    return false
+  }
+
+  // Findings for the stored copy of request rid (record takes them).
+  addLogFindings(rid: string, found: LogFinding[]): void {
+    const prior = this.logFindings.get(rid) ?? []
+    // (a request refused before it was recorded leaves its entry behind: the oldest go past a bound)
+    if (prior.length === 0 && this.logFindings.size >= 1000) {
+      const first = this.logFindings.keys()[0]
+      if (first !== undefined) this.logFindings.delete(first)
+    }
+    this.logFindings.set(rid, prior.concat(found))
+  }
+
+  // The answer's findings are in: the held row (if record held one) is recorded now, and nothing is kept for rid.
+  releaseRecord(rid: string): void {
+    const held = this.heldRecords.get(rid)
+    this.heldRecords.delete(rid)
+    if (held !== undefined) this.record(held)
+    this.logFindings.delete(rid)
   }
 
   async embeddings(req: Request): Promise<Response> {
@@ -5559,6 +5732,23 @@ test("logs_only: moved local rules and the built-in guard put placeholders in th
   const out = logsOnlyText(`{"content":"mail a@b.io about PROJ-12 and ACME-3, then a@b.io again"}`, g, moved.values(), vault)
   expect(out).toBe(`{"content":"mail [EMAIL-1] about [PROJECT_CODE-1] and ACME-3, then [EMAIL-1] again"}`)
   expect(logsOnlyText("", g, moved.values(), vault)).toBe("")
+})
+
+test("logs_only on Presidio and Azure PII: their findings become the stored copy's placeholders", () => {
+  const pres: GuardrailProvider = { id: "p", kind: "presidio", analyzer_url: "http://x", action: "redact", redaction_mode: "logs_only" }
+  const run: GuardrailProvider = { id: "q", kind: "presidio", analyzer_url: "http://x", action: "redact" }
+  const az: GuardrailProvider = { id: "a", kind: "azure_language_pii", endpoint: "http://x", api_key: "k", action: "redact", redaction_mode: "logs_only" }
+  expect(logsOnlyHttp(pres)).toBe(true)
+  expect(logsOnlyHttp(run)).toBe(false)
+  expect(logsOnlyHttp(az)).toBe(true)
+  const vault = new Vault()
+  const found: LogFinding[] = [{ kind: "EMAIL_ADDRESS", value: "a@b.co" }, { kind: "USSocialSecurityNumber", value: "123-45-6789" }]
+  const out = logsOnlyFound(`{"messages":[{"role":"user","content":"mail a@b.co, ssn 123-45-6789, again a@b.co"}]}`, found, vault)
+  expect(out).toBe(`{"messages":[{"role":"user","content":"mail [EMAIL_ADDRESS-1], ssn [USSOCIALSECURITYNUMBER-1], again [EMAIL_ADDRESS-1]"}]}`)
+  // a value that reads escaped inside a JSON string is found too
+  const q = logsOnlyFound(`{"content":"say \\"hi\\" now"}`, [{ kind: "QUOTE", value: `"hi"` }], vault)
+  expect(q).toBe(`{"content":"say [QUOTE-1] now"}`)
+  expect(phaseMapping(vault.items, [out], []).includes("EMAIL_ADDRESS-1")).toBe(true)
 })
 
 // ---- the plugins across attempts (AttemptPlugins) ----

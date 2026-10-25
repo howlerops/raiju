@@ -129,7 +129,10 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
   AI21, Upstage, Baseten, Featherless, Inception, Friendli, SiliconFlow, GitHub Models,
   Groq, Mistral, xAI, DeepSeek, Cerebras, Fireworks, Together, Nebius, Parasail,
   OpenRouter, Perplexity, Ollama, vLLM, SGLang, LM Studio, and custom
-  OpenAI-compatible providers (`custom_provider_config`).
+  OpenAI-compatible providers (`custom_provider_config`). Hugging Face models are named
+  `huggingface/<inference provider>/<hub id>` (`huggingface/fal-ai/fal-ai/flux/dev`) and routed as Bifrost
+  routes them: chat through the router, embeddings, speech, transcription and images on the provider's own route
+  with the hub's model mapping (`RAIJU_HF_HUB_URL` points the mapping and listing reads at a hub mirror).
 - **Compat routes and proxies:** `/litellm/*` and `/langchain/*` prefixes, OCR
   pass-through (`/v1/ocr`), per-provider HTTP proxies (`proxy_config`, with credentials).
 - **Reliability:** fallback chains, retries with jittered exponential backoff
@@ -156,6 +159,12 @@ use (virtual keys, admin users or `auth_config`), and leaves it off otherwise. S
 `admin_username`, `admin_password` and `is_enabled`, at the top level or under `governance`.
 While inference is not authenticated the gateway says so at start-up.
 
+The Bifrost CLI signs in with `bifrost auth login` against `/api/agent/auth/*`: a browser page takes a user's
+password (or a dashboard single sign-on session), the CLI trades the one-time code for a `ck-bf-agent-` token
+(one hour, rotated with a 30-day refresh token), and inference with that token runs as the user's chosen assigned
+key (`x-bf-agent-vk-id`) or, when it picks none, the user's first active assigned key. Tokens live in the
+gateway process's memory, as dashboard sessions do.
+
 ## Secure defaults
 
 - **The management API is locked until an admin exists**, as Bifrost's setup lock. With no admin
@@ -165,9 +174,9 @@ While inference is not authenticated the gateway says so at start-up.
   `POST /api/session/setup` trades it for: 401 without it, 403 with a wrong one. The token is
   `setup_token` in the config (`env.NAME` allowed), else the `BIFROST_SETUP_TOKEN` environment
   variable. With neither set, `/api` answers 403 to everything, and the start-up log says how to
-  set one. Create the first admin with the token (`POST /api/users` with `X-Bifrost-Setup-Token`;
-  the dashboard has no setup screen yet); from then on normal sign-in applies and the token opens
-  nothing. `client.whitelisted_routes` stay open.
+  set one. Create the first admin with the token: the dashboard opens on a setup screen that asks for
+  it and an admin name, or send `POST /api/users` with `X-Bifrost-Setup-Token`; from then on normal
+  sign-in applies and the token opens nothing. `client.whitelisted_routes` stay open.
   In the deployments: `BIFROST_SETUP_TOKEN` in compose's `.env`, the chart's `setupToken.existingSecret`,
   or a `secret_arns` entry on ECS ([deploy/README.md](deploy/README.md)).
 - **Bind address:** 127.0.0.1 by default (Bifrost's `localhost`); `-host` or `BIFROST_HOST` change it.
@@ -317,14 +326,18 @@ job. Measured on a 4-core VM (one worker, about 600 requests a second plus 100 s
 |---|---|---|
 | RSS growth while streaming | about 0.8 MB a second, never given back (about 2 KB per stream) | flat once warm (under 2 MB over the last 30 s) |
 | Plain chat at 3,000 RPS for 30 s: p99 / p99.9 / max | 4.6 / 20.5 / 32 ms | 2.3 / 8.7 / 19 ms |
-| Memory per open stream | about 330 KB | about 165 KB (230 KB on http1) |
+| Memory per open stream | about 330 KB | about 135 KB (195 KB on http1) since L189; 160 KB (227 KB) after L182 |
 
 The leak was a reference cycle per streamed answer: the response body's callbacks reached the object that held
 the body (`gateway.tov` LiveHead, headSink). Reference counting frees no cycles, so the head now lets go of the
 body and its controller when the stream ends. Most of an open stream's memory is the frames of the async calls
 that wait on it; whole-config arguments in those calls (the config record is about 6 KB) are made through plain
-methods now, so the frames do not hold copies. Size a deployment from these figures: a worker holding 1,000 open
-streams needs about 170 MB on top of its 20 to 50 MB base.
+methods now, so the frames do not hold copies. L189 freed the largest frame while a stream runs (the attempt's,
+about 70 KB allocated: the stream is now pumped by its own small call), stopped one route's frame being laid out
+with every other route's (15 KB), and cut a fetch connection's input buffer from 64 KB to 16 KB (Tov patch 0016):
+the bytes allocated per open stream fell from about 200 KB to 72 KB (275 KB to 145 KB on http1), the RSS of a
+fresh worker from about 160 KB to 135 KB per stream. Size a deployment from these figures: a worker holding 1,000
+open streams needs about 140 MB on top of its 20 to 50 MB base.
 
 ## Development
 

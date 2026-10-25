@@ -153,6 +153,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/cluster/logs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * This node's request log rows for a peer answering a log read (cluster peers only, Raiju extra)
+         * @description Each node keeps its own log files, so a node answering /api/logs (the list, one log, stats, sessions, histograms, rankings, dashboard, filterdata) or /api/mcp-logs asks each peer for its rows of the read's window (cluster.log_reads, default true) and answers over its rows and theirs. The answer holds only this node's rows, without bodies for stats and histograms, and a row's reveal mapping only for a read of that one row; the asking node applies the caller's data scope and hidden request types.
+         */
+        post: operations["postApiClusterLogs"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/cluster/sync": {
         parameters: {
             query?: never;
@@ -306,6 +326,126 @@ export interface paths {
         put?: never;
         /** Drop the session token sent in the Authorization header */
         post: operations["postApiSessionLogout"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent/auth/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Whether the CLI can sign in here (users with passwords or single sign-on) and whether inference needs a key */
+        get: operations["getApiAgentAuthStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent/auth/authorize": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The browser sign-in page the CLI opens (a loopback redirect_uri, state and an S256 code_challenge) */
+        get: operations["getApiAgentAuthAuthorize"];
+        put?: never;
+        /** The sign-in form; on success a 302 to the redirect_uri with a one-time code and the state */
+        post: operations["postApiAgentAuthAuthorize"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent/auth/token": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Trade the one-time code and its PKCE verifier for an agent token pair */
+        post: operations["postApiAgentAuthToken"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent/auth/refresh": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Rotate an agent token pair with its refresh token (the old pair stops working) */
+        post: operations["postApiAgentAuthRefresh"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent/auth/logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Revoke the agent token in the Authorization header and its refresh token */
+        post: operations["postApiAgentAuthLogout"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent/virtual-keys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The signed-in user's assigned virtual keys (no values) and the default one */
+        get: operations["getApiAgentVirtualKeys"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/agent/usage-summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The signed-in user's budgets and rate limits over the assigned keys and the user's own budgets */
+        get: operations["getApiAgentUsageSummary"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -6782,6 +6922,67 @@ export interface components {
         McpTopTools: {
             [key: string]: unknown;
         };
+        /** @description The Bifrost CLI's TokenResponse (cli/internal/browserauth). */
+        AgentTokenResponse: {
+            /** @description Starts with ck-bf-agent- */
+            agent_access_token: string;
+            refresh_token: string;
+            token_type?: string;
+            expires_in: number;
+            refresh_expires_in: number;
+            user: {
+                id?: string;
+                name?: string;
+                email?: string;
+            };
+            selected_virtual_key_id?: string;
+            forced_virtual_key_id?: string;
+        };
+        AgentOAuthError: {
+            error: string;
+            error_description?: string;
+            message?: string;
+        };
+        /** @description The Bifrost CLI's VirtualKeyListResponse (cli/internal/agentapi). */
+        AgentVirtualKeyList: {
+            virtual_keys: {
+                id?: string;
+                name?: string;
+                description?: string;
+                is_active?: boolean;
+                providers?: string[];
+                budgets?: {
+                    [key: string]: unknown;
+                }[];
+                budget_limit?: number;
+                budget_consumed?: number;
+                budget_available?: number;
+            }[];
+            selected_virtual_key_id?: string;
+            forced_virtual_key_id?: string;
+        };
+        /** @description The Bifrost CLI's UsageSummaryResponse (cli/internal/agentapi). */
+        AgentUsageSummary: {
+            budgets?: {
+                [key: string]: unknown;
+            }[];
+            rate_limits?: {
+                [key: string]: unknown;
+            }[];
+            budget?: {
+                [key: string]: unknown;
+            };
+            top_models?: {
+                [key: string]: unknown;
+            }[];
+            top_apps?: {
+                [key: string]: unknown;
+            }[];
+            generated_at?: string;
+            window?: {
+                [key: string]: unknown;
+            };
+        };
         /** @description Bifrost MessageResponse. */
         MessageResponse: {
             message: string;
@@ -7897,6 +8098,71 @@ export interface operations {
             };
         };
     };
+    postApiClusterLogs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description The log read's path, such as /api/logs or /api/logs/histogram. */
+                    path: string;
+                    /** @description The log read's query string, without the leading question mark. */
+                    query: string;
+                    /** @description The asking node's clock in epoch milliseconds, from which the read's window is computed. */
+                    now: number;
+                    /** @description The time of the request in epoch milliseconds; more than a minute away from the node's clock is refused. */
+                    ts: number;
+                };
+            };
+        };
+        responses: {
+            /** @description This node's rows for the read, oldest first. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        node?: string;
+                        rows?: {
+                            [key: string]: unknown;
+                        }[];
+                    };
+                };
+            };
+            /** @description The body or a parameter is invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Clustering is off. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
     postApiClusterSync: {
         parameters: {
             query?: never;
@@ -8246,6 +8512,285 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MessageResponse"];
+                };
+            };
+        };
+    };
+    getApiAgentAuthStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        idp_configured: boolean;
+                        virtual_key_auth_enabled: boolean;
+                    };
+                };
+            };
+        };
+    };
+    getApiAgentAuthAuthorize: {
+        parameters: {
+            query: {
+                client_id: string;
+                redirect_uri: string;
+                state: string;
+                code_challenge: string;
+                code_challenge_method: "S256";
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The sign-in page (HTML) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+            /** @description The parameters cannot be used (HTML) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+        };
+    };
+    postApiAgentAuthAuthorize: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/x-www-form-urlencoded": {
+                    client_id?: string;
+                    redirect_uri?: string;
+                    state?: string;
+                    code_challenge?: string;
+                    code_challenge_method?: string;
+                    username?: string;
+                    password?: string;
+                    /** @description A dashboard single sign-on session token (sk-sess-...) in place of a password */
+                    session?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Redirect to redirect_uri?code=...&state=... */
+            302: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The parameters cannot be used (HTML) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+            /** @description The credentials were refused; the form again (HTML) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+        };
+    };
+    postApiAgentAuthToken: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    code: string;
+                    code_verifier: string;
+                    redirect_uri: string;
+                    platform?: string;
+                    agent_version?: string;
+                    device_name?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description The token pair (the CLI's TokenResponse) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentTokenResponse"];
+                };
+            };
+            /** @description invalid_request or invalid_grant (OAuth error body) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentOAuthError"];
+                };
+            };
+            /** @description The refresh token is invalid, expired or already used, or the user is disabled */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentOAuthError"];
+                };
+            };
+        };
+    };
+    postApiAgentAuthRefresh: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    refresh_token: string;
+                };
+            };
+        };
+        responses: {
+            /** @description The token pair (the CLI's TokenResponse) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentTokenResponse"];
+                };
+            };
+            /** @description invalid_request or invalid_grant (OAuth error body) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentOAuthError"];
+                };
+            };
+            /** @description The refresh token is invalid, expired or already used, or the user is disabled */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentOAuthError"];
+                };
+            };
+        };
+    };
+    postApiAgentAuthLogout: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MessageResponse"];
+                };
+            };
+        };
+    };
+    getApiAgentVirtualKeys: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentVirtualKeyList"];
+                };
+            };
+            /** @description The agent token is missing, expired or revoked */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    getApiAgentUsageSummary: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentUsageSummary"];
+                };
+            };
+            /** @description The agent token is missing, expired or revoked */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
                 };
             };
         };
@@ -26853,6 +27398,8 @@ export interface operations {
                 content: {
                     "application/json": {
                         members?: components["schemas"]["ProjectMember"][];
+                        /** @description Present only on a project with split_policy equal whose roster changed; the job's progress is reported on /ws as redivision_progress events under this id. */
+                        redivision_job_id?: string;
                     };
                 };
             };
@@ -27004,6 +27551,8 @@ export interface operations {
                 content: {
                     "application/json": {
                         deleted?: string;
+                        /** @description Present only on a project with split_policy equal whose roster changed; the job's progress is reported on /ws as redivision_progress events under this id. */
+                        redivision_job_id?: string;
                     };
                 };
             };

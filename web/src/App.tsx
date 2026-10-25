@@ -1,6 +1,6 @@
 import { createSignal, For, Match, onSettled, Show, Switch, Errored } from "solid-js"
 import { api, send, ApiError } from "./api/client"
-import { clearSignIn, closeSignIn, dialog, onTokenChange, openSignIn, tokenSet } from "./auth"
+import { clearSignIn, closeSignIn, dialog, onTokenChange, openSignIn, setToken, tokenSet } from "./auth"
 import { can, me, refreshMe, roleLabel } from "./perm"
 import { Pill, Toasts, type Tone } from "./ui"
 import { Overview } from "./screens/Overview"
@@ -16,6 +16,7 @@ import { Crews } from "./screens/Crews"
 import { Roles } from "./screens/Roles"
 import { Config } from "./screens/Config"
 import { Playground } from "./screens/Playground"
+import { Setup } from "./screens/Setup"
 
 // [id, label, the resource a role needs to see it (any role may open "")]
 const VIEWS = [
@@ -45,6 +46,43 @@ function viewFromHash(): ViewId {
 const [view, setView] = createSignal<ViewId>(viewFromHash())
 const [health, setHealth] = createSignal<{ text: string; tone: Tone }>({ text: "checking", tone: "" })
 const [sso, setSso] = createSignal(false)
+// the setup lock (no admin account yet): whether the server has a setup token; undefined once an admin exists
+const [setup, setSetup] = createSignal<{ configured: boolean } | undefined>(undefined)
+// the setup check has answered: until then the dashboard is not rendered, so its calls cannot ask for a sign-in first
+const [checked, setChecked] = createSignal(false)
+
+// Asks the gateway whether it is still waiting for its first admin (a public route). True when it is.
+async function checkSetup(): Promise<boolean> {
+  try {
+    const r = await send("GET", "/api/session/is-auth-enabled", { auth: false, quiet: true })
+    const d = (r.data ?? {}) as { setup_required?: boolean; setup_token_configured?: boolean }
+    if (d.setup_required) {
+      setSetup({ configured: !!d.setup_token_configured })
+      setChecked(true)
+      return true
+    }
+  } catch {
+    // an older gateway without the route: carry on to the dashboard
+  }
+  setSetup(undefined)
+  setChecked(true)
+  return false
+}
+
+// Whether the sign-in dialog offers SSO (not asked while the setup lock is on: every other /api route is locked then)
+function checkSso(): void {
+  api
+    .get("/api/oidc/status")
+    .then((j) => setSso(!!j.enabled))
+    .catch(() => {})
+}
+
+function setupDone(token: string): void {
+  setSetup(undefined)
+  setToken(token)
+  void refreshMe()
+  checkSso()
+}
 
 async function checkHealth(): Promise<void> {
   try {
@@ -114,12 +152,13 @@ export function App() {
     const onHash = () => setView(viewFromHash())
     window.addEventListener("hashchange", onHash)
     onTokenChange(() => void refreshMe())
-    void refreshMe()
+    // with no admin account the API is locked: the setup screen comes first, and nothing asks for a sign-in
+    void checkSetup().then((locked) => {
+      if (locked) return
+      void refreshMe()
+      checkSso()
+    })
     void checkHealth()
-    api
-      .get("/api/oidc/status")
-      .then((j) => setSso(!!j.enabled))
-      .catch(() => {})
     const timer = setInterval(() => {
       if (!document.hidden) void checkHealth()
     }, 10000)
@@ -167,6 +206,9 @@ export function App() {
         </div>
       </header>
 
+      <Show when={setup()}>{(st) => <Setup configured={st().configured} done={setupDone} />}</Show>
+
+      <Show when={checked() && !setup()}>
       <nav class="tabs" aria-label="Sections">
         <For each={VIEWS}>
           {(v) => (
@@ -235,6 +277,7 @@ export function App() {
           </Switch>
         </Errored>
       </main>
+      </Show>
 
       <SignIn />
       <Toasts />

@@ -64,11 +64,25 @@ sends SIGTERM, and sets `terminationGracePeriodSeconds: 40`; it refuses a value 
 `preStopSleepSeconds + shutdown_delay_seconds + shutdown_grace_seconds + 5`. Compose gives the
 container `stop_grace_period: 35s`.
 
+WebSocket and WebRTC sessions are part of the drain. The UI's live feed sockets (`/ws`) are closed
+with code 1001 (going away) when the listener closes: the dashboard reconnects to another instance
+and resumes from its cursor. Realtime, Responses and GPT Live sessions keep running until the grace
+and are then closed with a 1001 close frame ("server shutting down"; a WebRTC call is closed), so
+their usage is billed and logged before the exit; a session that does not close within 3 s more is
+cut. Clients should reconnect on 1001.
+
+Broker mode (`-mode broker`) stops the same way: `/ready` turns 503 (`/health` stays 200), the
+listener closes after `shutdown_delay_seconds`, the exchanges in hand finish within
+`shutdown_grace_seconds`, and it exits 0. Its timeouts and connection cap are the `server.*` keys
+below.
+
 Both servers time out slow or silent clients: a request head must arrive within
 `server.header_timeout_seconds` (default 10; a half-sent head is answered 408), a body must not
 go `server.body_timeout_seconds` (default 60) without a byte (408), and a keep-alive connection
 with no request in hand closes after `server.idle_timeout_seconds` (default 60). A request being
-handled (a slow completion, a stream) is never timed out by these. `server.max_connections` caps
+handled (a slow completion, a stream) is never timed out by these, but a client that stops reading
+is: output the client does not take for `server.idle_timeout_seconds` (a stalled download, an
+abandoned stream or WebSocket on http1) ends the connection. `server.max_connections` caps
 each process's open connections (default: three quarters of its descriptor limit, `ulimit -n`;
 -1 for no cap): a request on a connection past it is answered 503, and so is a connection that
 comes when the process is out of descriptors. 0 turns a timeout off. These keys are read at start.
@@ -115,7 +129,8 @@ manage through the API or UI: saves would fail.
 
 The management API (`/api` and the dashboard) is locked until an admin exists, as in Bifrost: pass a setup
 token (`-e BIFROST_SETUP_TOKEN=...`, or `setup_token` in the config), create the first admin with it
-(`POST /api/users` with the token in `X-Bifrost-Setup-Token`), and sign in from then on. With no admin and
+(the dashboard's setup screen, or `POST /api/users` with the token in `X-Bifrost-Setup-Token`), and sign
+in from then on. With no admin and
 no setup token, `/api` answers 403. Inference is unaffected.
 
 ## Docker Compose
@@ -250,7 +265,6 @@ capacity and availability.
 
 ## Config and secrets
 
-<<<<<<< ours
 - `config.json` uses Bifrost's format ([docs/config-reference.md](../docs/config-reference.md)).
   Any value written `env.NAME` is replaced with the environment variable `NAME` when the config
   loads (the process reads `/proc/self/environ`). Keep keys in the environment, not in the file.
@@ -259,49 +273,6 @@ capacity and availability.
   edit to the file on disk applies at the next start.
 - If the config file is missing, Raiju builds providers from well-known variables such as
   `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`.
-=======
-- `config.json` uses Bifrost's format. Any value written `env.NAME` is replaced
-  with the environment variable `NAME` when the config loads (the process
-  reads `/proc/self/environ`). Keep keys in the environment, not in the file.
-- The config is read once at start. Changing it means restarting the process.
-- If the config file is missing, Raiju builds providers from well-known
-  variables such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`.
-- Probes: liveness on `/health`, readiness on `/ready`, port `http` (the container port).
-- Plugins whose `path` is a URL are downloaded into a private (0700) `plugin-cache` folder beside
-  `config.json`; when that folder is read-only (the chart mounts the config from a ConfigMap) they go to
-  `$TMPDIR/raiju-plugins`. With the chart's read-only root filesystem, set `RAIJU_PLUGIN_DIR` to a writable
-  volume of the gateway's user. A plain-http plugin URL needs a `sha256` pin on its entry. See
-  [SECURITY.md](../SECURITY.md) for the outbound address rules and the vendored native libraries.
-- A provider served from a private network (a self-hosted model on a cluster-internal service, an RFC 1918
-  address) needs `"allow_private_network": true` in its `network_config`: every provider connection is checked
-  when it is made, as Bifrost checks it, and only loopback addresses are allowed without it. Link-local and cloud
-  metadata addresses are refused whatever it says. Behind a provider proxy (`proxy_config` or the global proxy) the
-  proxy resolves the host and the gateway checks nothing.
-
-## Workers vs replicas
-
-Governance (budgets, rate limits), the response cache and metrics counters live
-in memory in each worker process. They are not shared:
-
-- Each worker enforces its own budget and rate limit. With 4 replicas of 2
-  workers, a budget of $10 can be spent as up to $80 in total. Divide the limits
-  by the number of processes, or accept that they are per-process.
-- Cache hits only happen within one process. More replicas mean a lower hit rate.
-- `/api/governance/budgets` and `/api/cache` report one process, not the fleet.
-
-Config changes are different: a change saved through the API is applied by every worker of the pod before the API
-answers. Other replicas apply it when they share the config file, or pull it with `cluster.config_sync: "pull"`
-(each pod's ConfigMap copy is then rewritten in memory only, as the mount is read-only). Send management traffic to one
-replica. See [docs/operations.md](../docs/operations.md) for what is shared and how to secure cluster traffic.
-
-The request log and audit folders default to `/app/data/logs` and `/app/data/logs/audit` (the app dir). If
-`logs_store` or `audit` is enabled and the folder cannot be written, the pod does not start. Mount a writable volume
-there, or set `"required": false`.
-
-Use `workers` for CPU use within a pod (about the number of cores the pod gets),
-and replicas for capacity and availability. Each new replica, including one from
-the HPA, adds another full set of per-process limits.
->>>>>>> theirs
 
 ## Memory and the request log
 
@@ -316,6 +287,12 @@ the HPA, adds another full set of per-process limits.
 - `logs_store.retention_days` (default 7) removes whole days. `logs_store.max_disk_mb` (default 0, no cap)
   also caps the folder: the oldest segments are deleted first. Set it below the volume's size; at 1,500
   requests a second a day of rows is on the order of 100 GB.
+- With `logs_store.object_storage` set (S3, or GCS through its S3 interop API), the rows keep their metadata and a
+  prompt preview and each row's bodies, raw payloads and plugin logs go to the bucket (Bifrost's hybrid store), which
+  keeps the folder small; the log detail reads them back. `object_storage.format` is `json` (default) or `parquet`,
+  `compression` `none` or `gzip` (Parquet's snappy and zstd are written as GZIP pages); set
+  `logs_store.object_storage_offload: false` to keep rows whole. Rows beyond `max_memory_entries` are read from the
+  files when a query's window reaches them.
 
 ## Limits of this packaging
 

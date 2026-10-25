@@ -136,6 +136,9 @@ class WsClient:
                 k, v = line.split(":", 1)
                 self.headers[k.strip().lower()] = v.strip()
         self.closed = self.status != 101
+        # the code and reason of the server's close frame, once one came
+        self.close_code = None
+        self.close_reason = ""
 
     def _read(self, k):
         buf = b""
@@ -173,6 +176,9 @@ class WsClient:
             op = b0 & 0x0F
             if op == 0x8:
                 self.closed = True
+                if len(data) >= 2:
+                    self.close_code = struct.unpack(">H", data[:2])[0]
+                    self.close_reason = data[2:].decode(errors="replace")
                 return None
             if op in (0x9, 0xA):
                 continue
@@ -3771,7 +3777,7 @@ def l97q_e2e(env):
         urls = [x.get("url", "") for x in d.get("data", [])]
         check("replicate images: the prediction's output URLs come back as data", s == 200 and len(urls) == 2 and urls[0].endswith("/out/0.png") and urls[1].endswith("/out/1.png"), (s, b[:300]))
         rp = [x for x in seen() if x["path"] == "/v1/models/acme/model-a/predictions"]
-        check("replicate images post the prompt and the count as input, with the token and a synchronous wait", len(rp) > 0 and rp[-1]["auth"] == "Bearer r8_e2e" and json.loads(rp[-1]["body"])["input"] == {"prompt": "a fox", "num_outputs": 2}, rp[-1:])
+        check("replicate images post the prompt and the count as input, with the token and a synchronous wait", len(rp) > 0 and rp[-1]["auth"] == "Bearer r8_e2e" and json.loads(rp[-1]["body"])["input"] == {"prompt": "a fox", "number_of_images": 2}, rp[-1:])
         s, _, b = call("POST", "/v1/images/generations", {"model": "replicate/acme/model-a", "prompt": "fail"}, base=GW_L97Q, auth=False)
         check("replicate: a failed prediction is an error with its reason", s == 502 and "the model refused the prompt" in b, (s, b[:300]))
         s, _, b = mp_form(GW_L97Q, "/v1/files?provider=replicate", [("purpose", None, "text/plain", "batch"), ("file", "pic.png", "image/png", png)])
@@ -3858,7 +3864,7 @@ def l105_e2e(env):
         d = json.loads(b) if s == 200 else {}
         check("replicate image edits answer with the output image", s == 200 and d.get("data", [{}])[0].get("url", "").endswith("/out/edit.png"), (s, b[:300]))
         ed = [x for x in seen() if x["path"] == "/v1/models/black-forest-labs/flux-kontext-pro/predictions"]
-        check("replicate image edits send the image as a data URL in the model's input_image", len(ed) > 0 and '"input_image":"data:image/png;base64,' in ed[-1]["body"] and '"prompt":"a red fox"' in ed[-1]["body"] and '"num_outputs":1' in ed[-1]["body"], ed[-1:])
+        check("replicate image edits send the image as a data URL in the model's input_image", len(ed) > 0 and '"input_image":"data:image/png;base64,' in ed[-1]["body"] and '"prompt":"a red fox"' in ed[-1]["body"] and '"number_of_images":1' in ed[-1]["body"], ed[-1:])
         s, _, b = call("GET", "/v1/files?provider=replicate", base=GW_L105, auth=False)
         lst = json.loads(b) if s == 200 else {}
         check("replicate files list: the first page with its cursor", s == 200 and [x["id"] for x in lst.get("data", [])] == ["file-e2e-1"] and lst.get("has_more") is True and lst.get("after") == "p2" and lst["data"][0]["purpose"] == "batch" and lst["data"][0]["status"] == "processed", (s, b[:300]))
@@ -5933,6 +5939,358 @@ def l185_e2e(env):
         p.terminate()
         p.wait()
 
+GW_L193_A = "http://127.0.0.1:18342"  # L193: node A (cross-node log reads, rows beyond max_memory_entries), then the later checks
+GW_L193_B = "http://127.0.0.1:18343"  # L193: node B, a peer with log files of its own
+L193_ADMIN = {"authorization": "Bearer sk-admin-l193"}
+L193_SECRET = "e2e-l193"
+
+def l193_config(node, peer, logs, extra=None):
+    """An L193 cluster member: an admin, the shared mock as OpenAI, a log store of its own with max_memory_entries 3
+    (so rows beyond memory are read from the files)."""
+    import hashlib
+    cfg = {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "logs_store": {"enabled": True, "dir": logs, "max_memory_entries": 3, "content_logging": True},
+        "providers": {"openai": {"keys": [{"name": "l193", "value": "sk-l193", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {"users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l193".encode()).hexdigest()}]},
+        "cluster": {"enabled": True, "node_id": node, "secret": L193_SECRET, "interval_ms": 200, "peers": [peer]},
+    }
+    for k, v in (extra or {}).items():
+        cfg[k] = v
+    return cfg
+
+def l193_start(env, name, port, cfg_path):
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    return subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", str(port), "-host", "127.0.0.1", "-config", cfg_path, "-server", server],
+                            env=env, stderr=open(os.path.join(BUILD, f"e2e.l193{name}.log"), "w"))
+
+def l193_chat(base, text, session):
+    body = {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": text}]}
+    s, h, _ = call("POST", "/v1/chat/completions", body, {"x-bf-session-id": session}, base=base, auth=False)
+    return s, hdr(h, "x-request-id") or ""
+
+def l193_e2e(env):
+    """L193: the log store remainders. Cross-node reads: node A answers /api/logs (list, one log, stats, sessions,
+    histograms) with node B's rows too, over the signed /api/cluster/logs route, and with cluster.log_reads false only
+    with its own. Rows beyond max_memory_entries (3 here) are listed and served from the files. Ports 18342 (A) and
+    18343 (B)."""
+    import shutil
+    d = os.path.join(BUILD, "e2e-l193")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    pa = os.path.join(d, "a.json")
+    pb = os.path.join(d, "b.json")
+    json.dump(l193_config("l193-a", GW_L193_B, os.path.join(d, "logs-a")), open(pa, "w"))
+    json.dump(l193_config("l193-b", GW_L193_A, os.path.join(d, "logs-b")), open(pb, "w"))
+    ga = l193_start(env, "a", 18342, pa)
+    gb = l193_start(env, "b", 18343, pb)
+    try:
+        wait(GW_L193_A + "/health")
+        wait(GW_L193_B + "/health")
+        # five requests on A (memory holds three), two on B, one session across both nodes
+        codes = [l193_chat(GW_L193_A, f"l193 a{i}", "l193-sess" if i == 0 else f"l193-a{i}")[0] for i in range(5)]
+        sb, bid = l193_chat(GW_L193_B, "l193 b0", "l193-sess")
+        codes += [sb, l193_chat(GW_L193_B, "l193 b1", "l193-b1")[0]]
+        check("l193: the chat calls on both nodes answer", all(c == 200 for c in codes), codes)
+        time.sleep(0.5)
+        s, _, b = call("GET", "/api/logs?limit=100", None, L193_ADMIN, base=GW_L193_A, auth=False)
+        out = json.loads(b) if s == 200 else {}
+        ids = [r["id"] for r in out.get("logs", [])]
+        check("l193: node A lists its five rows (two beyond memory are read from its files) and node B's two",
+              s == 200 and out.get("total") == 7 and bid in ids, (s, out.get("total"), ids, bid))
+        s, _, b = call("GET", "/api/logs?limit=100", None, L193_ADMIN, base=GW_L193_B, auth=False)
+        check("l193: node B lists the same seven rows", s == 200 and json.loads(b).get("total") == 7, (s, b[:200]))
+        s, _, b = call("GET", f"/api/logs/{bid}", None, L193_ADMIN, base=GW_L193_A, auth=False)
+        check("l193: node A serves one of node B's rows by id, with its bodies", s == 200 and json.loads(b).get("id") == bid and "l193 b0" in b, (s, b[:300]))
+        # A's first row (session l193-sess, not B's): the oldest of A's five, beyond its three in memory
+        a_ids = [r["id"] for r in out.get("logs", []) if r.get("session_id") == "l193-sess" and r["id"] != bid]
+        oldest = a_ids[-1] if a_ids else ""
+        s, _, b = call("GET", f"/api/logs/{oldest}", None, L193_ADMIN, base=GW_L193_A, auth=False)
+        check("l193: node A serves its oldest row, beyond max_memory_entries, by id", s == 200 and json.loads(b).get("id") == oldest and "l193 a0" in b, (s, oldest, b[:200]))
+        s, _, b = call("GET", "/api/logs/stats", None, L193_ADMIN, base=GW_L193_A, auth=False)
+        check("l193: the stats on node A count both nodes' requests", s == 200 and json.loads(b).get("total_requests") == 7, (s, b[:300]))
+        s, _, b = call("GET", "/api/logs/histogram", None, L193_ADMIN, base=GW_L193_A, auth=False)
+        hist = json.loads(b) if s == 200 else {}
+        total = sum(x.get("count", 0) for x in hist.get("buckets", []))
+        check("l193: the histogram on node A counts both nodes' requests", total == 7, (s, b[:300]))
+        s, _, b = call("GET", "/api/logs/sessions/l193-sess", None, L193_ADMIN, base=GW_L193_A, auth=False)
+        check("l193: a session that ran on both nodes lists both rows", s == 200 and len(json.loads(b).get("logs", [])) == 2, (s, b[:300]))
+        # the peer route: signed and fresh
+        raw = json.dumps({"path": "/api/logs", "query": "", "now": time.time() * 1000, "ts": time.time() * 1000})
+        s, _, _ = call("POST", "/api/cluster/logs", raw, {"x-raiju-cluster-sig": "0" * 64}, base=GW_L193_B, auth=False)
+        check("l193: an unsigned cluster log read is refused", s == 401, s)
+        stale = json.dumps({"path": "/api/logs", "query": "", "now": time.time() * 1000, "ts": time.time() * 1000 - 120000})
+        s, _, _ = call("POST", "/api/cluster/logs", stale, {"x-raiju-cluster-sig": cluster_sig(L193_SECRET, stale)}, base=GW_L193_B, auth=False)
+        check("l193: a cluster log read older than a minute is refused", s == 401, s)
+        s, _, b = call("POST", "/api/cluster/logs", raw, {"x-raiju-cluster-sig": cluster_sig(L193_SECRET, raw)}, base=GW_L193_B, auth=False)
+        rows = json.loads(b).get("rows", []) if s == 200 else []
+        check("l193: a signed cluster log read answers that node's own rows only", s == 200 and len(rows) == 2, (s, b[:300]))
+        # B stops: A answers with its own rows
+        gb.terminate()
+        gb.wait()
+        s, _, b = call("GET", "/api/logs?limit=100", None, L193_ADMIN, base=GW_L193_A, auth=False)
+        check("l193: with its peer down node A answers with its own rows", s == 200 and json.loads(b).get("total") == 5, (s, b[:200]))
+        ga.terminate()
+        ga.wait()
+        # cluster.log_reads false: each node reads its own rows
+        cfg = l193_config("l193-a", GW_L193_B, os.path.join(d, "logs-a"))
+        cfg["cluster"]["log_reads"] = False
+        json.dump(cfg, open(pa, "w"))
+        ga = l193_start(env, "a2", 18342, pa)
+        gb = l193_start(env, "b2", 18343, pb)
+        wait(GW_L193_A + "/health")
+        wait(GW_L193_B + "/health")
+        s, _, b = call("GET", "/api/logs?limit=100", None, L193_ADMIN, base=GW_L193_A, auth=False)
+        check("l193: with cluster.log_reads false node A lists its own rows only (all five, after a restart)", s == 200 and json.loads(b).get("total") == 5, (s, b[:200]))
+    finally:
+        for p in [ga, gb]:
+            p.terminate()
+            p.wait()
+    l193_redivision(env, d)
+
+def l193_progress(ws, op, tries=10):
+    """The redivision_progress events of job op on a /ws client, up to its completed (or error) one."""
+    out = []
+    for _ in range(tries):
+        for ev in ws.until("redivision_progress"):
+            if ev.get("type") == "redivision_progress" and ev.get("data", {}).get("operation_id") == op:
+                out.append(ev["data"])
+                if ev["data"].get("phase") in ("completed", "error"):
+                    return out
+    return out
+
+def l193_redivision(env, d):
+    """L193: the Projects redivision job. Under split_policy equal a roster change answers a redivision_job_id and /ws
+    reports the job (redividing, then completed with the members counted); a user deleted leaves the rosters and its
+    answer lists the jobs; a split none project queues none. Port 18342."""
+    import hashlib
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "l193", "value": "sk-l193", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l193".encode()).hexdigest()}, {"name": "alice", "role": "viewer"}, {"name": "bob", "role": "viewer"}],
+            "budgets": [{"id": "l193-b", "max_limit": 100.0, "reset_duration": "1M"}],
+            "projects": [{"id": "l193-eq", "name": "l193-eq", "access_rule": "union", "split_policy": "equal", "budget_id": "l193-b"},
+                         {"id": "l193-none", "name": "l193-none", "access_rule": "union", "split_policy": "none"}],
+        },
+    }
+    pc = os.path.join(d, "redivision.json")
+    json.dump(cfg, open(pc, "w"))
+    g = l193_start(env, "redivision", 18342, pc)
+    try:
+        wait(GW_L193_A + "/health")
+        ws = WsClient("/ws", L193_ADMIN, port=18342)
+        check("l193: the UI socket opens for the redivision checks", ws.status == 101, ws.status)
+        s, _, b = call("POST", "/api/governance/projects/l193-eq/members", {"members": [{"user_id": "alice"}, {"user_id": "bob"}]}, L193_ADMIN, base=GW_L193_A, auth=False)
+        out = json.loads(b) if s < 300 else {}
+        op = out.get("redivision_job_id", "")
+        check("l193: adding members to an equal-split project answers a redivision_job_id", s == 201 and op.startswith("redivision-") and len(out.get("members", [])) == 2, (s, b[:300]))
+        evs = l193_progress(ws, op)
+        last = evs[-1] if evs else {}
+        check("l193: /ws reports the job: redividing, then completed with both members counted",
+              len(evs) >= 2 and evs[0].get("phase") == "redividing" and last.get("phase") == "completed" and last.get("total") == 2 and last.get("succeeded") == 2 and last.get("project_id") == "l193-eq", evs)
+        mid = [m["id"] for m in out.get("members", []) if m["user_id"] == "alice"]
+        s, _, b = call("DELETE", f"/api/governance/projects/l193-eq/members/{mid[0] if mid else 'x'}", None, L193_ADMIN, base=GW_L193_A, auth=False)
+        op2 = json.loads(b).get("redivision_job_id", "") if s == 200 else ""
+        check("l193: removing a member answers a new redivision_job_id", s == 200 and op2.startswith("redivision-") and op2 != op, (s, b[:300]))
+        evs = l193_progress(ws, op2)
+        check("l193: the removal's job completes with the one member left", evs and evs[-1].get("phase") == "completed" and evs[-1].get("total") == 1, evs)
+        s, _, b = call("DELETE", "/api/users/bob", None, L193_ADMIN, base=GW_L193_A, auth=False)
+        ops3 = json.loads(b).get("redivision_job_ids", []) if s < 300 and b.strip().startswith("{") else []
+        s2, _, b2 = call("GET", "/api/governance/projects/l193-eq/members", None, L193_ADMIN, base=GW_L193_A, auth=False)
+        check("l193: a deleted user leaves the equal-split roster and the answer lists the redivision job", s < 300 and len(ops3) == 1 and s2 == 200 and json.loads(b2).get("total_count") == 0, (s, b[:300], b2[:300]))
+        s, _, b = call("POST", "/api/governance/projects/l193-none/members", {"members": [{"user_id": "alice"}]}, L193_ADMIN, base=GW_L193_A, auth=False)
+        check("l193: a split none project queues no redivision", s == 201 and "redivision_job_id" not in b, (s, b[:300]))
+        ws.close()
+    finally:
+        g.terminate()
+        g.wait()
+    l193_ownership(env, d)
+    l193_logs_only(env, d)
+    l193_hybrid(env, d)
+
+def l193_hybrid(env, d):
+    """L193: the hybrid log store (logs_store.object_storage). A row keeps its metadata and a prompt preview, its
+    payload goes to the bucket (the mock) as <prefix>/logs/YYYY/MM/DD/HH/<id>.json.gz (gzip) or .parquet, and the log
+    detail reads it back; excluded request types stay whole and excluded fields stay in the row; a deleted row's object
+    is deleted. Port 18342, started once per format."""
+    import re
+    def cfg(fmt, compression):
+        return {
+            "client": {"enable_logging": True, "enforce_auth_on_inference": False},
+            "logs_store": {"enabled": True, "dir": os.path.join(d, "hy-logs-" + fmt), "content_logging": True,
+                           "object_storage": {"type": "s3", "bucket": "logs-hidden", "prefix": "l193", "region": "us-east-1", "endpoint": MOCK, "path_style": True,
+                                              "access_key_id": "AKIAIOSFODNN7EXAMPLE", "secret_access_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                                              "format": fmt, "compression": compression},
+                           "object_storage_exclude_request_types": ["embedding"],
+                           "object_storage_exclude_fields": ["raw_response"] if fmt == "json" else []},
+            "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+            "providers": {"openai": {"keys": [{"name": "h", "value": "sk-l193-hy", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        }
+    for fmt, compression, ext in [("json", "gzip", ".json.gz"), ("parquet", "none", ".parquet")]:
+        pc = os.path.join(d, f"hy-{fmt}.json")
+        json.dump(cfg(fmt, compression), open(pc, "w"))
+        g = l193_start(env, "hy-" + fmt, 18342, pc)
+        api = lambda m, p, b=None, h=None: call(m, p, b, h, base=GW_L193_A, auth=False)
+        try:
+            wait(GW_L193_A + "/health")
+            call("GET", "/_hidden/up", base=MOCK, auth=False)
+            rid = f"req-l193-hy-{fmt}"
+            s, _, _ = api("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "system", "content": "be brief"}, {"role": "user", "content": f"l193 hybrid {fmt} probe"}]}, {"x-request-id": rid})
+            time.sleep(0.3)
+            entries = json.loads(api("GET", "/api/logs?limit=50")[2]).get("entries", [])
+            row = next((e for e in entries if e.get("id") == rid), {})
+            check(f"l193 hybrid {fmt}: the row keeps a preview of the prompt and no answer, marked has_object",
+                  s == 200 and row.get("has_object") is True and row.get("input") == json.dumps({"messages": [{"role": "user", "content": f"l193 hybrid {fmt} probe"}]}, separators=(",", ":")) and not row.get("output"), row)
+            put = []
+            for _ in range(30):
+                put = [x for x in seen(True) if x["path"].startswith("/logs-hidden/l193/logs/") and x["path"].endswith("/" + rid + ext)]
+                if put:
+                    break
+                time.sleep(0.5)
+            check(f"l193 hybrid {fmt}: the payload lands under <prefix>/logs/YYYY/MM/DD/HH/<id>{ext}",
+                  len(put) == 1 and re.match(r"^/logs-hidden/l193/logs/\d{4}/\d{2}/\d{2}/\d{2}/" + re.escape(rid + ext) + "$", put[0]["path"]) is not None, [x["path"] for x in put])
+            s, _, b = api("GET", "/api/logs/" + rid)
+            det = json.loads(b) if s == 200 else {}
+            check(f"l193 hybrid {fmt}: the log detail reads the object back: the whole request and the answer",
+                  s == 200 and "be brief" in json.dumps(det) and "Hello from gpt-4o-mini" in json.dumps(det) and any(x["path"].startswith("GET /logs-hidden/l193/") for x in seen(True)), (s, b[:400]))
+            s, _, _ = api("POST", "/v1/embeddings", {"model": "openai/text-embedding-3-small", "input": "l193 hybrid embed"}, {"x-request-id": rid + "-emb"})
+            time.sleep(0.3)
+            entries = json.loads(api("GET", "/api/logs?limit=50")[2]).get("entries", [])
+            emb = next((e for e in entries if e.get("id") == rid + "-emb"), {})
+            check(f"l193 hybrid {fmt}: an excluded request type stays whole in the row", s == 200 and not emb.get("has_object") and "l193 hybrid embed" in (emb.get("input") or ""), emb)
+            s, _, _ = api("DELETE", "/api/logs", {"ids": [rid]})
+            # the object's PUT and then its DELETE reach the bucket path (a read back is recorded as "GET /logs-hidden/...")
+            hits = lambda: [x for x in seen(True) if x["path"].startswith("/logs-hidden/") and x["path"].endswith("/" + rid + ext)]
+            for _ in range(20):
+                if len(hits()) >= 2:
+                    break
+                time.sleep(0.3)
+            check(f"l193 hybrid {fmt}: a deleted row's object is deleted", s == 200 and len(hits()) >= 2, [x["path"] for x in hits()])
+        finally:
+            g.terminate()
+            g.wait()
+
+def l193_logs_only(env, d):
+    """L193: redaction_mode logs_only on the HTTP guardrail providers. Presidio (input) and Azure AI Language PII
+    (output) leave the live request and answer raw; the stored row carries their findings as numbered placeholders,
+    with the reveal mapping for an admin. Port 18342."""
+    import hashlib
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "logs_store": {"enabled": True, "dir": os.path.join(d, "lo-logs"), "content_logging": True},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "l193", "value": "sk-l193-lo", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {"users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l193".encode()).hexdigest()}]},
+        "guardrails": {"enabled": True, "apply_to": "both", "detect": [], "providers": [
+            {"id": "presidio", "kind": "presidio", "apply_to": "input", "analyzer_url": MOCK + "/guard/presidio", "action": "redact", "redaction_mode": "logs_only", "score_threshold": 0.5},
+            {"id": "azure-pii", "kind": "azure_language_pii", "apply_to": "output", "endpoint": MOCK + "/guard/azure", "api_key": "az-key", "action": "redact", "redaction_mode": "logs_only"}]},
+    }
+    pc = os.path.join(d, "lo.json")
+    json.dump(cfg, open(pc, "w"))
+    g = l193_start(env, "lo", 18342, pc)
+    try:
+        wait(GW_L193_A + "/health")
+        body = {"model": "openai/ssn-123-45-6789", "messages": [{"role": "user", "content": "mail a@b.co please"}]}
+        s, h, b = call("POST", "/v1/chat/completions", body, {"x-request-id": "req-l193-lo"}, base=GW_L193_A, auth=False)
+        sent = [x for x in seen() if x["path"] == "/v1/chat/completions"]
+        check("l193: logs_only Presidio and Azure PII leave the live request and answer raw",
+              s == 200 and "123-45-6789" in b and sent and "a@b.co" in sent[-1]["body"], (s, b[:200], sent[-1:]))
+        time.sleep(0.3)
+        s, _, b = call("GET", "/api/logs/req-l193-lo", None, L193_ADMIN, base=GW_L193_A, auth=False)
+        det = json.loads(b) if s == 200 else {}
+        plain = json.dumps({k: v for k, v in det.items() if k not in ("redaction_mapping", "model")})
+        mp = det.get("redaction_mapping", {})
+        check("l193: the stored row carries the HTTP providers' findings as placeholders, input and output",
+              s == 200 and "a@b.co" not in plain and "[EMAIL_ADDRESS-1]" in plain and "[USSOCIALSECURITYNUMBER-1]" in plain and "123-45-6789" not in plain, (s, b[:600]))
+        check("l193: the reveal mapping holds their originals by phase",
+              mp.get("input", {}).get("EMAIL_ADDRESS-1") == "a@b.co" and "123-45-6789" in [mp.get(ph, {}).get("USSOCIALSECURITYNUMBER-1") for ph in ("input", "output")], mp)
+    finally:
+        g.terminate()
+        g.wait()
+
+def l193_ownership(env, d):
+    """L193: the ownership gaps of enforce_vk_object_ownership. A GenAI SDK resumable upload records its creator;
+    Gemini cached contents are bound to their creator; a chat, Responses or GenAI request that names another key's file
+    (by file_id or Gemini file URI) or cached content is refused with a 404 access_blocked; a passthrough call's path
+    and its collection lists follow the records. Port 18342."""
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "logs_store": {"enabled": True, "dir": os.path.join(d, "own-logs")},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {
+            "openai": {"keys": [{"name": "l193", "value": "sk-l193-own", "models": [], "weight": 1.0, "use_for_batch_api": True}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "gemini": {"keys": [{"name": "g", "value": "g-" + "l193", "models": [], "weight": 1.0, "use_for_batch_api": True}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+        "governance": {"virtual_keys": [{"id": "vk-l193-a", "name": "a", "value": "sk-bf-l193-a"}, {"id": "vk-l193-b", "name": "b", "value": "sk-bf-l193-b"}]},
+    }
+    pc = os.path.join(d, "own.json")
+    json.dump(cfg, open(pc, "w"))
+    A, B = {"x-bf-vk": "sk-bf-l193-a"}, {"x-bf-vk": "sk-bf-l193-b"}
+    api = lambda m, p, b=None, h=None: call(m, p, b, h, base=GW_L193_A, auth=False)
+    g = l193_start(env, "own", 18342, pc)
+    try:
+        wait(GW_L193_A + "/health")
+        # the GenAI SDK's resumable upload, by key A
+        up = {"x-goog-upload-protocol": "resumable", "x-goog-upload-command": "start", "x-goog-upload-header-content-type": "application/jsonl", "x-goog-upload-header-content-length": "5", **A}
+        s, h, b = api("POST", "/genai/upload/v1beta/files", {"file": {"displayName": "l193"}}, up)
+        url = {k.lower(): v for k, v in h.items()}.get("x-goog-upload-url", "")
+        s, _, b = api("POST", "/genai/upload/v1beta/files?upload_id=" + url.split("upload_id=")[-1], "hello", {"x-goog-upload-command": "upload, finalize", "x-goog-upload-offset": "0", "content-type": "application/jsonl", **A})
+        gname = (json.loads(b).get("file", {}) if s == 200 else {}).get("name", "")
+        check("l193: key A uploads a file through the GenAI SDK's resumable upload", s == 200 and gname.startswith("files/"), (s, b[:200]))
+        s, _, b = api("GET", "/genai/v1beta/" + gname, None, B)
+        s2, _, _ = api("GET", "/genai/v1beta/" + gname, None, A)
+        check("l193: the GenAI upload's creator is recorded: another key gets the 404", s == 404 and "access_blocked" in b and s2 == 200, (s, b[:200], s2))
+        # an OpenAI file by key A, named in chat and Responses requests
+        s, _, b = mp_form(GW_L193_A, "/v1/files", [("purpose", None, "text/plain", "user_data"), ("file", "l193.txt", "text/plain", "l193 file")], A)
+        fid = json.loads(b).get("id", "") if s == 200 else ""
+        check("l193: key A uploads an OpenAI file", fid != "", (s, b[:200]))
+        chat = {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": [{"type": "text", "text": "read it"}, {"type": "file", "file": {"file_id": fid}}]}]}
+        s, _, b = api("POST", "/v1/chat/completions", chat, B)
+        check("l193: a chat request naming another key's file by file_id is refused with Bifrost's 404", s == 404 and f"file '{fid}' not found" in b and "access_blocked" in b, (s, b[:200]))
+        s, _, _ = api("POST", "/v1/chat/completions", chat, A)
+        check("l193: the creating key may name its file", s != 404, s)
+        s, _, b = api("POST", "/v1/chat/completions", {**chat, "stream": True}, B)
+        check("l193: a streamed chat request naming another key's file is refused too", s == 404 and "access_blocked" in b, (s, b[:200]))
+        resp = {"model": "openai/gpt-4o-mini", "input": [{"role": "user", "content": [{"type": "input_file", "file_id": fid}]}]}
+        s, _, b = api("POST", "/v1/responses", resp, B)
+        check("l193: a Responses request naming another key's file is refused", s == 404 and "access_blocked" in b, (s, b[:200]))
+        uri = {"model": "gemini/gemini-2.5-flash", "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://generativelanguage.googleapis.com/v1beta/" + gname}}]}]}
+        s, _, b = api("POST", "/v1/chat/completions", uri, B)
+        check("l193: a Gemini file URI of another key's upload is refused", s == 404 and gname in b, (s, b[:200]))
+        # Gemini cached contents
+        cc = {"model": "models/gemini-2.5-flash", "contents": [{"role": "user", "parts": [{"text": "long context"}]}], "ttl": "600s"}
+        s, _, b = api("POST", "/genai/v1beta/cachedContents", cc, A)
+        cname = json.loads(b).get("name", "") if s == 200 else ""
+        check("l193: key A creates a cached content", cname.startswith("cachedContents/"), (s, b[:200]))
+        s, _, b = api("GET", "/genai/v1beta/" + cname, None, B)
+        s2, _, _ = api("GET", "/genai/v1beta/" + cname, None, A)
+        s3, _, _ = api("PATCH", "/genai/v1beta/" + cname, {"ttl": "900s"}, B)
+        check("l193: another key's cached content retrieve and update are 404, its creator's are not", s == 404 and "cached content" in b and s2 == 200 and s3 == 404, (s, b[:200], s2, s3))
+        gen = {"contents": [{"role": "user", "parts": [{"text": "hi"}]}], "cachedContent": cname}
+        s, _, b = api("POST", "/genai/v1beta/models/gemini-2.5-flash:generateContent", gen, B)
+        check("l193: a GenAI request running on another key's cached content is refused", s == 404 and "access_blocked" in b, (s, b[:200]))
+        cfile = {"model": "models/gemini-2.5-flash", "contents": [{"role": "user", "parts": [{"fileData": {"fileUri": "https://generativelanguage.googleapis.com/v1beta/" + gname, "mimeType": "text/plain"}}]}]}
+        s, _, b = api("POST", "/genai/v1beta/cachedContents", cfile, B)
+        check("l193: a cached content built from another key's file is refused", s == 404 and gname in b, (s, b[:200]))
+        # the passthrough routes: the path's object and the collection list
+        s, _, b = api("GET", "/openai_passthrough/v1/files/" + fid, None, B)
+        s2, _, _ = api("GET", "/openai_passthrough/v1/files/" + fid, None, A)
+        check("l193: a passthrough read of another key's file is 404, the creator's goes through", s == 404 and "access_blocked" in b and s2 == 200, (s, b[:200], s2))
+        s, _, b = api("GET", "/openai_passthrough/v1/files", None, B)
+        sa, _, ba = api("GET", "/openai_passthrough/v1/files", None, A)
+        ids_b = [x.get("id") for x in json.loads(b).get("data", [])] if s == 200 else None
+        ids_a = [x.get("id") for x in json.loads(ba).get("data", [])] if sa == 200 else []
+        check("l193: a passthrough list leaves another key's files out", ids_b is not None and fid not in ids_b and fid in ids_a, (s, ids_b, ids_a))
+        s, _, b = api("POST", "/openai_passthrough/v1/chat/completions", {"model": "gpt-4o-mini", "messages": chat["messages"]}, B)
+        check("l193: a passthrough body naming another key's file is refused", s == 404 and "access_blocked" in b, (s, b[:200]))
+    finally:
+        g.terminate()
+        g.wait()
+
+
 GW_L144 = "http://127.0.0.1:18228"  # audio billing: speech by its characters, transcriptions by their usage, budgets and the log rows
 
 
@@ -7880,7 +8238,9 @@ def l125_config() -> dict:
         "client": {"enable_logging": True, "enforce_auth_on_inference": False, "allow_per_request_content_storage_override": True, "retain_content_in_object_storage": True},
         "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l125-logs"), "content_logging": True,
                        "object_storage": {"type": "s3", "bucket": "logs-hidden", "prefix": "bifrost", "region": "us-east-1", "endpoint": MOCK, "path_style": True,
-                                          "access_key_id": "AKIAIOSFODNN7EXAMPLE", "secret_access_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"}},
+                                          "access_key_id": "AKIAIOSFODNN7EXAMPLE", "secret_access_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"},
+                       # (L193) object_storage turns on the hybrid store, as in Bifrost; these checks are about retained content only
+                       "object_storage_offload": False},
         "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
         "providers": {"openai": {"keys": [{"name": "s", "value": "sk-l125", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
     }
@@ -7908,7 +8268,7 @@ def l125_e2e(env):
         rows = json.loads(call("GET", "/api/logs?limit=50", base=GW_L125, auth=False)[2])["entries"]
         plain = rows[0] if rows else {}
         check("a request with content logging on keeps its input in the row, and is not content_hidden", s == 200 and "l125-plain-probe" in (plain.get("input") or "") and not plain.get("content_hidden"), (s, b[:200], plain))
-        check("a request with content logging on writes no object to the retained bucket", not [x for x in seen(True) if x["path"].startswith("/logs-hidden/")], [x["path"] for x in seen(True) if x["path"].startswith("/logs-hidden/")][:3])
+        check("a request with content logging on writes no object to the retained bucket", not [x for x in seen(True) if x["path"].startswith("/logs-hidden/bifrost/")], [x["path"] for x in seen(True) if x["path"].startswith("/logs-hidden/bifrost/")][:3])
 
         s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": msg("l125-hidden-probe")}, hidden_hdr, base=GW_L125, auth=False)
         rows = json.loads(call("GET", "/api/logs?limit=50", base=GW_L125, auth=False)[2])["entries"]
@@ -7965,7 +8325,9 @@ def l168_config() -> dict:
                    "retain_content_in_object_storage": True, "hidden_request_types": ["embedding"]},
         "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l168-logs"), "content_logging": True,
                        "object_storage": {"type": "s3", "bucket": {"value": "logs-hidden", "type": "plain_text"}, "prefix": "bifrost", "region": "us-east-1", "endpoint": MOCK, "path_style": True,
-                                          "access_key_id": "AKIAIOSFODNN7EXAMPLE", "secret_access_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"}},
+                                          "access_key_id": "AKIAIOSFODNN7EXAMPLE", "secret_access_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"},
+                       # (L193) object_storage turns on the hybrid store, as in Bifrost; these checks are about retained content only
+                       "object_storage_offload": False},
         "audit": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l168-audit"), "key": "e2e-l168-audit-key-0123456789abcdef"},
         "guardrails": {"enabled": True, "detect": ["email"], "mode": "redact", "apply_to": "both", "logs_only": True},
         "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
@@ -12955,6 +13317,178 @@ def l183_e2e(env):
             gw3.wait()
 
 
+GW_L189 = "http://127.0.0.1:18334"  # L189: WebSocket and realtime drain at shutdown, the write-stall timeout and broker mode's graceful stop (its broker takes the port after the gateways); 18335 is the UI setup gateway (tests/ui_e2e.mjs)
+
+
+def l189_config(d, extra_server):
+    return {
+        "client": {"enforce_auth_on_inference": False, "enable_logging": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "logs_store": {"enabled": True, "dir": os.path.join(d, "logs")},
+        "server": extra_server,
+        "providers": {"openai": {"keys": [{"name": "l189", "value": "sk-l189", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+    }
+
+
+def l189_rows(logs_dir, session_id):
+    """The realtime rows of one session as the log store wrote them to disk (read after the gateway has exited)."""
+    rows = []
+    for root, _, files in os.walk(logs_dir):
+        for name in files:
+            try:
+                text = open(os.path.join(root, name), errors="replace").read()
+            except OSError:
+                continue
+            for line in text.splitlines():
+                if session_id not in line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if e.get("op") == "realtime" and e.get("metadata", {}).get("realtime_session_id") == session_id:
+                    rows.append(e)
+    return rows
+
+
+def l189_stall(port, label):
+    """A client that sends requests and never reads: once the socket buffers are full and nothing more is taken for
+    idle_timeout_seconds, the gateway drops the connection (the rest of the answers are never sent)."""
+    body = json.dumps({"model": "openai/large-answer", "messages": [{"role": "user", "content": "stall l189"}]})
+    req = f"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n{body}".encode()
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    s.connect(("127.0.0.1", port))
+    # six answers of 3 MB each: far more than the kernel buffers on both sides hold
+    s.sendall(req * 6)
+    time.sleep(6)
+    got, end = 0, "open"
+    s.settimeout(3)
+    try:
+        while True:
+            b = s.recv(1 << 20)
+            if not b:
+                end = "closed"
+                break
+            got += len(b)
+    except ConnectionResetError:
+        end = "reset"
+    except socket.timeout:
+        end = "open"
+    except OSError as e:
+        end = f"error {e}"
+    s.close()
+    check(f"{label}: a client that stops reading is dropped after idle_timeout_seconds (the rest is not sent)", end in ("closed", "reset") and got < 6 * 3000000, (end, got))
+    # the gateway goes on serving
+    st, _, _ = call("GET", "/health", None, None, base=f"http://127.0.0.1:{port}", auth=False)
+    check(f"{label}: the gateway serves on after dropping a stalled client", st == 200, st)
+
+
+def l189_drain(env, d, port, label, workers=1):
+    """SIGTERM with a UI socket and a realtime session open: the UI socket is closed with 1001 at once; the realtime
+    session goes on serving through the drain, gets a 1001 close frame once shutdown_grace_seconds has run out, its
+    turns are logged, and the process exits 0."""
+    import signal, shutil
+    shutil.rmtree(os.path.join(d, "logs"), ignore_errors=True)
+    gw = l183_start(env, f"l189-{label.replace(' ', '-').replace(',', '')}", port, l189_config(d, {"shutdown_grace_seconds": 2, "shutdown_delay_seconds": 0}), workers=workers)
+    sid = "sess_l189_" + label.replace(" ", "_").replace(",", "")
+    try:
+        ui = WsClient("/ws", port=port)
+        rt = WsClient("/v1/realtime?model=openai/gpt-realtime", {}, port=port)
+        rt.send(json.dumps({"type": "test.rt.start", "id": sid}))
+        rt.send(json.dumps({"type": "test.rt.turn", "id": "resp_l189a", "text": "before", "heard": "hi", "input": 100, "output": 50, "audio_in": 0, "audio_out": 0, "cached": 0}))
+        evs = rt.until("response.done")
+        check(f"{label}: a realtime session and a UI socket are open before the stop", ui.status == 101 and rt.status == 101 and evs and evs[-1].get("type") == "response.done", (ui.status, rt.status, [e.get("type") for e in evs]))
+        t0 = time.time()
+        gw.send_signal(signal.SIGTERM)
+        while ui.recv() is not None:
+            pass
+        t_ui = time.time() - t0
+        check(f"{label}: the UI socket is closed with 1001 (going away) when the stop begins", ui.close_code == 1001 and t_ui < 1.5, (ui.close_code, ui.close_reason, t_ui))
+        rt.send(json.dumps({"type": "test.rt.turn", "id": "resp_l189b", "text": "during", "heard": "still there", "input": 200, "output": 70, "audio_in": 0, "audio_out": 0, "cached": 0}))
+        evs = rt.until("response.done")
+        check(f"{label}: the realtime session keeps serving while the gateway drains", evs and evs[-1].get("type") == "response.done" and evs[-1]["response"]["id"] == "resp_l189b", [e.get("type") for e in evs])
+        while rt.recv() is not None:
+            pass
+        t_rt = time.time() - t0
+        check(f"{label}: the realtime session is closed with 1001 (going away) once shutdown_grace_seconds has run out", rt.close_code == 1001 and rt.close_reason == "server shutting down" and 1.8 < t_rt < 6.0, (rt.close_code, rt.close_reason, t_rt))
+        ui.close()
+        rt.close()
+        try:
+            code = gw.wait(10)
+        except subprocess.TimeoutExpired:
+            gw.kill()
+            code = None
+        check(f"{label}: the gateway exits 0 after closing its sessions", code == 0, code)
+        rows = l189_rows(os.path.join(d, "logs"), sid)
+        check(f"{label}: the session closed by the stop is logged with both turns", sum(r.get("prompt_tokens", 0) for r in rows) == 300 and sum(r.get("completion_tokens", 0) for r in rows) == 120, [(r.get("prompt_tokens"), r.get("completion_tokens")) for r in rows])
+    finally:
+        if gw.poll() is None:
+            gw.terminate()
+        gw.wait()
+
+
+def l189_broker(env, d):
+    """Broker mode stops gracefully: /ready turns 503 while /health stays ok, the listener closes after
+    shutdown_delay_seconds, and the process exits 0."""
+    import signal
+    path = os.path.join(BUILD, "e2e.l189-broker.json")
+    json.dump({"client": {"enable_logging": False}, "server": {"shutdown_delay_seconds": 1, "shutdown_grace_seconds": 5},
+               "cluster": {"enabled": True, "secret": "e2e-l189-broker", "peers": [], "type": "broker", "broker": {"address": "127.0.0.1:18334", "listen_port": 18334}}}, open(path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-mode", "broker", "-host", "127.0.0.1", "-config", path], env=env, stderr=open(os.path.join(BUILD, "e2e.l189-broker.log"), "w"))
+    base = "http://127.0.0.1:18334"
+    try:
+        wait(base + "/health")
+        s, _, b = call("GET", "/ready", None, None, base=base, auth=False)
+        check("broker: /ready answers 200 while serving", s == 200 and '"status":"ready"' in b, (s, b))
+        gw.send_signal(signal.SIGTERM)
+        time.sleep(0.2)
+        s, _, b = call("GET", "/ready", None, None, base=base, auth=False)
+        check("broker: /ready answers 503 while it drains for a stop", s == 503 and '"listener":"draining"' in b, (s, b))
+        s, _, _ = call("GET", "/health", None, None, base=base, auth=False)
+        check("broker: /health stays ok while draining", s == 200, s)
+        time.sleep(1.2)
+        try:
+            socket.create_connection(("127.0.0.1", 18334), timeout=2).close()
+            refused = False
+        except OSError:
+            refused = True
+        check("broker: after shutdown_delay_seconds new connections are refused", refused)
+        try:
+            code = gw.wait(10)
+        except subprocess.TimeoutExpired:
+            gw.kill()
+            code = None
+        check("broker: SIGTERM stops it gracefully with exit 0", code == 0, code)
+    finally:
+        if gw.poll() is None:
+            gw.terminate()
+        gw.wait()
+
+
+def l189_e2e(env):
+    """L189: lifecycle follow-ups on both servers (its own gateways on 18334, the broker after them on the same port). A client that stops
+    reading is dropped after idle_timeout_seconds; SIGTERM closes the UI sockets with 1001 at once and the realtime
+    sessions with 1001 once the drain has run out (their turns logged, exit 0), with two bun workers too; broker mode
+    stops gracefully."""
+    import shutil
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    d = os.path.join(BUILD, "e2e-l189")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    gw = l183_start(env, "l189", 18334, l189_config(d, {"idle_timeout_seconds": 2}))
+    try:
+        l189_stall(18334, server)
+    finally:
+        gw.terminate()
+        gw.wait()
+    l189_drain(env, d, 18334, server)
+    if server != "http1":
+        l189_drain(env, d, 18334, "bun, 2 workers", workers=2)
+    l189_broker(env, d)
+
+
 GW_L174 = "http://127.0.0.1:18300"  # L174: inference compatibility leftovers (extra params, auto_inject, listings, counts, Vertex pools, Stability extras, mocker on Responses, stream stop reasons)
 
 def l174_config() -> dict:
@@ -15011,6 +15545,304 @@ def l192_e2e(env):
     finally:
         gw.terminate()
         gw.wait()
+
+
+GW_L194 = "http://127.0.0.1:18344"  # L194: Hugging Face inference providers, agent sign-in tokens and the A2A v0.3 REST client
+L194_MOCK = "http://127.0.0.1:18345"  # L194: the Hugging Face hub and router double
+
+
+def l194_mock():
+    """The Hugging Face hub (provider mappings) and router (chat, provider routes, an audio file) on 18345. Records each
+    request as (method, path, headers, body bytes). Returns (server, records)."""
+    import http.server, threading
+    recs = []
+    maps = {
+        "BAAI/bge-m3": {"hf-inference": {"status": "live", "providerId": "BAAI/bge-m3", "task": "feature-extraction"}, "nebius": {"status": "live", "providerId": "BAAI/bge-m3-fast", "task": "feature-extraction"}},
+        "hexgrad/Kokoro-82M": {"fal-ai": {"status": "live", "providerId": "fal-ai/kokoro/american-english", "task": "text-to-speech"}},
+        "openai/whisper-large-v3": {"hf-inference": {"providerId": "openai/whisper-large-v3", "task": "automatic-speech-recognition"}, "fal-ai": {"providerId": "fal-ai/whisper", "task": "automatic-speech-recognition"}},
+        "stabilityai/sdxl": {"hf-inference": {"providerId": "stabilityai/stable-diffusion-xl-base-1.0", "task": "text-to-image"}},
+    }
+    png = b"\x89PNG\r\n\x1a\nl194-image"
+    def answer(method, path, body):
+        p = path.split("?")[0]
+        if method == "GET" and p == "/api/models":
+            q = urllib.parse.parse_qs(path.split("?", 1)[1] if "?" in path else "")
+            ip = q.get("inference_provider", [""])[0]
+            if ip == "cerebras":
+                return 200, b'[{"_id":"1","modelId":"meta-llama/Llama-3.3-70B-Instruct","pipeline_tag":"text-generation","tags":["conversational"]}]', "application/json"
+            if ip == "hf-inference":
+                return 200, b'[{"modelId":"BAAI/bge-m3","pipeline_tag":"feature-extraction"},{"modelId":"x/mesh","pipeline_tag":"image-to-3d","tags":[]}]', "application/json"
+            if ip == "groq":
+                return 500, b'{"error":"down"}', "application/json"
+            return 200, b"[]", "application/json"
+        if method == "GET" and p.startswith("/api/models/"):
+            m = p[len("/api/models/"):]
+            if m in maps:
+                return 200, json.dumps({"_id": "x", "id": m, "inferenceProviderMapping": maps[m]}).encode(), "application/json"
+            return 404, b'{"error":"Repository Not Found"}', "application/json"
+        if p == "/v1/chat/completions":
+            return 200, json.dumps({"id": "c1", "object": "chat.completion", "created": 1, "model": json.loads(body).get("model"), "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi from hf"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}}).encode(), "application/json"
+        if p == "/hf-inference/models/BAAI/bge-m3/pipeline/feature-extraction":
+            return 200, b"[[0.1,0.2],[0.3,0.4]]", "application/json"
+        if p == "/nebius/v1/embeddings":
+            return 200, b'{"object":"list","data":[{"object":"embedding","embedding":[0.5],"index":0}],"model":"BAAI/bge-m3-fast","usage":{"prompt_tokens":2,"total_tokens":2}}', "application/json"
+        if p == "/fal-ai/fal-ai/kokoro/american-english":
+            return 200, json.dumps({"audio": {"url": L194_MOCK + "/files/speech.mp3", "content_type": "audio/mpeg", "file_name": "speech.mp3", "file_size": 13}}).encode(), "application/json"
+        if p == "/files/speech.mp3":
+            return 200, b"ID3l194-speech", "audio/mpeg"
+        if p == "/hf-inference/models/openai/whisper-large-v3":
+            return 200, b'{"text":"hello hub","chunks":[{"text":"hello","timestamp":[0.0,0.4]},{"text":" hub","timestamp":[0.4,0.9]}]}', "application/json"
+        if p == "/fal-ai/fal-ai/whisper":
+            return 200, b'{"text":"fal text"}', "application/json"
+        if p == "/fal-ai/fal-ai/flux/dev/stream":
+            return 200, b'data: {"images":[{"url":"https://fal.media/p1.png"}]}\n\ndata: {"data":{"images":[{"url":"https://fal.media/final.png"}]}}\n\n', "text/event-stream"
+        if p == "/fal-ai/fal-ai/flux-pro/kontext/stream":
+            return 200, b'data: {"images":[{"b64_json":"RURJVA=="}]}\n\n', "text/event-stream"
+        if p == "/fal-ai/fal-ai/flux/dev":
+            return 200, b'{"images":[{"url":"https://fal.media/l194.png","width":1024,"height":768}],"seed":5}', "application/json"
+        if p == "/hf-inference/models/stabilityai/stable-diffusion-xl-base-1.0":
+            return 200, png, "image/png"
+        if p == "/together/v1/images/generations":
+            return 200, b'{"id":"t1","data":[{"b64_json":"QUJD"}]}', "application/json"
+        if p == "/fal-ai/fal-ai/flux-pro/kontext":
+            return 200, b'{"images":[{"url":"https://fal.media/edit.png"}]}', "application/json"
+        return 404, b'{"error":"no route"}', "application/json"
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+        def handle_any(self):
+            n = int(self.headers.get("content-length", "0") or 0)
+            body = self.rfile.read(n) if n else b""
+            recs.append((self.command, self.path, dict((k.lower(), v) for k, v in self.headers.items()), body))
+            status, data, ctype = answer(self.command, self.path, body)
+            self.send_response(status); self.send_header("content-type", ctype); self.send_header("content-length", str(len(data))); self.end_headers(); self.wfile.write(data)
+        do_GET = do_POST = do_PUT = do_DELETE = handle_any
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 18345), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, recs
+
+
+def l194_config():
+    """The L194 gateway: Hugging Face on the router double (its hub through RAIJU_HF_HUB_URL), OpenAI on the shared mock,
+    users who sign in (ana by password), ana's two assigned keys (the first allows gpt-4o-mini only and carries a budget),
+    and the mock's echo agent (a v0.3 JSON-RPC card) granted to a key."""
+    import hashlib
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": True, "a2a_external_client_url": "https://gw.example.test/"},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {
+            "huggingface": {"keys": [{"name": "hf", "value": "hf-l194", "models": [], "weight": 1.0}], "network_config": {"base_url": L194_MOCK, "allow_private_network": True, "max_retries": 0}},
+            "openai": {"keys": [{"name": "oa", "value": "sk-l194", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+        "governance": {
+            "users": [{"name": "ana", "role": "viewer", "email": "ana@example.com", "salt": "s194", "password_sha256": hashlib.sha256("s194:pw-ana".encode()).hexdigest()},
+                      {"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l194".encode()).hexdigest()}],
+            "budgets": [{"id": "b-ana", "max_limit": 5.0, "reset_duration": "1d"}],
+            "virtual_keys": [
+                {"id": "vk-l194-ana1", "name": "ana default", "value": "sk-bf-l194-ana1", "user_id": "ana", "budget_id": "b-ana", "provider_configs": [{"provider": "openai", "allowed_models": ["gpt-4o-mini"]}]},
+                {"id": "vk-l194-ana2", "name": "ana wide", "value": "sk-bf-l194-ana2", "user_id": "ana", "provider_configs": [{"provider": "openai"}, {"provider": "huggingface"}]},
+                {"id": "vk-l194-a", "value": "sk-bf-l194-a", "provider_configs": [{"provider": "huggingface"}, {"provider": "openai"}]},
+            ],
+        },
+        "agents": [{"name": "echo", "agent_card_url": MOCK + "/a2a/agent/.well-known/agent-card.json", "allow_private_network": True, "virtual_key_ids": ["vk-l194-a"]}],
+    }
+
+
+def l194_e2e(env):
+    """L194: Hugging Face's inference providers as Bifrost routes them (chat as "<hub id>:<provider>", embeddings, speech,
+    transcription, images and edits on each provider's route with the hub's model mapping); the CLI's agent sign-in
+    (status, the authorize page and form, the PKCE code exchange, refresh rotation, logout, the user's keys and usage,
+    the default assigned key on inference); and the A2A v0.3 REST client's /v1 routes. Its own gateway (18344) and
+    router double (18345)."""
+    import hashlib, base64 as _b64, secrets as _sec, urllib.parse as _up
+    cfg_path = os.path.join(BUILD, "e2e.l194.json")
+    json.dump(l194_config(), open(cfg_path, "w"))
+    srv, recs = l194_mock()
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18344", "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env={**env, "RAIJU_HF_HUB_URL": L194_MOCK}, stderr=open(os.path.join(BUILD, "e2e.l194.log"), "w"))
+    K = {"authorization": "Bearer sk-bf-l194-a"}
+    def post(path, body, headers=None):
+        return call("POST", path, body, {**K, **(headers or {})}, base=GW_L194, auth=False)
+    def last(path):
+        rows = [r for r in recs if r[1].split("?")[0] == path]
+        return rows[-1] if rows else ("", "", {}, b"")
+    def jb(text):
+        try:
+            return json.loads(text)
+        except Exception:
+            return {}
+    try:
+        wait(GW_L194 + "/health")
+
+        # ---- Hugging Face: chat on the router names the provider after the hub id ----
+        s, _, b = post("/v1/chat/completions", {"model": "huggingface/cerebras/meta-llama/Llama-3.3-70B-Instruct", "messages": [{"role": "user", "content": "hi"}]})
+        up = last("/v1/chat/completions")
+        check("huggingface chat: the router gets \"<hub id>:<provider>\" with the key, answered as chat", s == 200 and jb(up[3].decode()).get("model") == "meta-llama/Llama-3.3-70B-Instruct:cerebras" and up[2].get("authorization") == "Bearer hf-l194" and jb(b).get("choices", [{}])[0].get("message", {}).get("content") == "hi from hf", (s, b[:200], up[3][:200]))
+
+        # ---- the models listing: each inference provider's hub listing, as huggingface/<provider>/<id> ----
+        s, _, b = call("GET", "/v1/models", None, K, base=GW_L194, auth=False)
+        ids = [m.get("id") for m in jb(b).get("data", [])]
+        lst = [r for r in recs if r[1].startswith("/api/models?")]
+        check("huggingface listing: every inference provider's hub listing with the key; models that serve nothing and failed providers are left out",
+              s == 200 and "huggingface/cerebras/meta-llama/Llama-3.3-70B-Instruct" in ids and "huggingface/hf-inference/BAAI/bge-m3" in ids and not any("x/mesh" in (i or "") for i in ids)
+              and len(lst) >= 20 and lst[0][2].get("authorization") == "Bearer hf-l194" and "inference_provider=" in lst[0][1], (s, [i for i in ids if (i or "").startswith("huggingface/")], len(lst)))
+
+        # ---- embeddings: the hub mapping, the provider's route and body, OpenAI's list back ----
+        s, _, b = post("/v1/embeddings", {"model": "huggingface/hf-inference/BAAI/bge-m3", "input": ["a", "b"]})
+        up = last("/hf-inference/models/BAAI/bge-m3/pipeline/feature-extraction")
+        hub = [r for r in recs if r[1].startswith("/api/models/BAAI/bge-m3")]
+        check("huggingface embeddings: hf-inference takes inputs on its feature-extraction pipeline, the mapped id as model",
+              s == 200 and jb(up[3].decode()) == {"inputs": ["a", "b"], "model": "BAAI/bge-m3"} and len(hub) == 1 and "expand%5B%5D=inferenceProviderMapping" in hub[0][1] and "authorization" not in hub[0][2], (s, b[:200], up[3][:200], [h[1] for h in hub]))
+        check("huggingface embeddings: a 2-D array answer is OpenAI's list", [d.get("embedding") for d in jb(b).get("data", [])] == [[0.1, 0.2], [0.3, 0.4]] and jb(b).get("model") == "huggingface/hf-inference/BAAI/bge-m3", b[:300])
+        s, _, b = post("/v1/embeddings", {"model": "huggingface/nebius/BAAI/bge-m3", "input": "x", "dimensions": 8})
+        up = last("/nebius/v1/embeddings")
+        check("huggingface embeddings: nebius takes input, provider and the mapped model on its route; the mapping is cached",
+              s == 200 and jb(up[3].decode()) == {"input": "x", "provider": "nebius", "model": "BAAI/bge-m3-fast", "dimensions": 8} and len([r for r in recs if r[1].startswith("/api/models/BAAI/bge-m3")]) == 1 and jb(b).get("usage", {}).get("prompt_tokens") == 2, (s, b[:200], up[3][:200]))
+        n = len(recs)
+        s, _, b = post("/v1/embeddings", {"model": "huggingface/sambanova/BAAI/bge-m3", "input": "x"})
+        check("huggingface embeddings: a provider the hub does not map for the task is refused before any provider call", s == 400 and "not supported" in b and not any(r[1].startswith("/sambanova") for r in recs[n:]), (s, b[:200]))
+        s, _, b = post("/v1/embeddings", {"model": "huggingface/hf-inference/nobody/nothing", "input": "x"})
+        check("huggingface embeddings: a model the hub does not know keeps the hub's 404 and message", s == 404 and "Repository Not Found" in b, (s, b[:200]))
+
+        # ---- speech: fal-ai's route with the mapped id, the audio downloaded ----
+        s, h, data = call_bytes("POST", "/v1/audio/speech", {"model": "huggingface/fal-ai/hexgrad/Kokoro-82M", "input": "hello there", "voice": "af", "temperature": 0.5}, K, base=GW_L194)
+        up = last("/fal-ai/fal-ai/kokoro/american-english")
+        check("huggingface speech: fal-ai gets text, provider and hub model on the mapped route; the answer's audio URL is downloaded",
+              s == 200 and data == b"ID3l194-speech" and h.get("content-type", "").startswith("audio/mpeg")
+              and jb(up[3].decode()) == {"text": "hello there", "provider": "fal-ai", "model": "hexgrad/Kokoro-82M", "parameters": {"generation_parameters": {"temperature": 0.5}}} and last("/files/speech.mp3")[0] == "GET", (s, data[:50], up[3][:300]))
+
+        # ---- transcription: hf-inference takes the raw audio, fal-ai a data URI (no WAV) ----
+        wav = b"RIFF\x00\x00\x00\x00WAVEfmt l194"
+        s, _, b = mp_form(GW_L194, "/v1/audio/transcriptions", [("model", None, "text/plain", "huggingface/hf-inference/openai/whisper-large-v3"), ("file", "talk.wav", "audio/wav", wav)], K)
+        up = last("/hf-inference/models/openai/whisper-large-v3")
+        check("huggingface transcription: hf-inference gets the raw audio with its MIME type; chunks become segments",
+              s == 200 and up[3] == wav and up[2].get("content-type") == "audio/wav" and jb(b) == {"text": "hello hub", "segments": [{"id": 0, "start": 0.0, "end": 0.4, "text": "hello"}, {"id": 1, "start": 0.4, "end": 0.9, "text": " hub"}]}, (s, b[:300], up[2].get("content-type")))
+        s, _, b = mp_form(GW_L194, "/v1/audio/transcriptions", [("model", None, "text/plain", "huggingface/fal-ai/openai/whisper-large-v3"), ("file", "talk.wav", "audio/wav", wav)], K)
+        check("huggingface transcription: fal-ai refuses WAV, as Bifrost does", s == 400 and "audio/wav" in b, (s, b[:200]))
+        mp3 = b"ID3\x04\x00l194-audio"
+        s, _, b = mp_form(GW_L194, "/v1/audio/transcriptions", [("model", None, "text/plain", "huggingface/fal-ai/openai/whisper-large-v3"), ("response_format", None, "text/plain", "text"), ("file", "talk.mp3", "audio/mpeg", mp3)], K)
+        up = last("/fal-ai/fal-ai/whisper")
+        check("huggingface transcription: fal-ai gets the audio as a data URI in audio_url; response_format text answers the text",
+              s == 200 and b == "fal text" and jb(up[3].decode()) == {"audio_url": "data:audio/mpeg;base64," + _b64.b64encode(mp3).decode()}, (s, b[:200], up[3][:200]))
+
+        # ---- images: fal-ai, hf-inference (raw bytes, mapped), together; fal-ai edits ----
+        s, _, b = post("/v1/images/generations", {"model": "huggingface/fal-ai/fal-ai/flux/dev", "prompt": "a city", "size": "1024x768", "n": 2, "response_format": "b64_json", "output_format": "jpg"})
+        up = last("/fal-ai/fal-ai/flux/dev")
+        check("huggingface images: fal-ai gets num_images, image_size, sync_mode and jpeg; its images come back as data",
+              s == 200 and jb(up[3].decode()) == {"prompt": "a city", "num_images": 2, "response_format": "b64_json", "image_size": {"width": 1024, "height": 768}, "output_format": "jpeg", "sync_mode": True} and jb(b).get("data") == [{"url": "https://fal.media/l194.png"}], (s, b[:200], up[3][:300]))
+        s, h, b = post("/v1/images/generations", {"model": "huggingface/fal-ai/fal-ai/flux/dev", "prompt": "a city", "stream": True})
+        evs = [json.loads(l[6:]) for l in b.split("\n") if l.startswith("data: ")]
+        up = last("/fal-ai/fal-ai/flux/dev/stream")
+        check("huggingface image stream: fal-ai's /stream events become partial images, then the last as completed",
+              s == 200 and hdr(h, "content-type").startswith("text/event-stream") and [e.get("type") for e in evs] == ["image_generation.partial_image", "image_generation.partial_image", "image_generation.completed"]
+              and evs[-1].get("url") == "https://fal.media/final.png" and "event: image_generation.completed" in b and "[DONE]" not in b and jb(up[3].decode()).get("prompt") == "a city", (s, b[:400]))
+        s, _, b = post("/v1/images/generations", {"model": "huggingface/together/black-forest-labs/FLUX.1-schnell", "prompt": "x", "stream": True})
+        check("huggingface image stream: only fal-ai streams", s == 400 and "only supported for fal-ai" in b, (s, b[:200]))
+        s, _, b = post("/v1/images/generations", {"model": "huggingface/hf-inference/stabilityai/sdxl", "prompt": "a cat"})
+        up = last("/hf-inference/models/stabilityai/stable-diffusion-xl-base-1.0")
+        check("huggingface images: hf-inference goes to the mapped model with {inputs, model}; its bytes come back as b64_json",
+              s == 200 and jb(up[3].decode()) == {"inputs": "a cat", "model": "stabilityai/stable-diffusion-xl-base-1.0"} and jb(b).get("data", [{}])[0].get("b64_json") == _b64.b64encode(b"\x89PNG\r\n\x1a\nl194-image").decode(), (s, b[:200], up[3][:200]))
+        s, _, b = post("/v1/images/generations", {"model": "huggingface/together/black-forest-labs/FLUX.1-schnell", "prompt": "a dog", "response_format": "b64_json", "num_inference_steps": 4})
+        up = last("/together/v1/images/generations")
+        check("huggingface images: together gets base64 and steps without a hub lookup", s == 200 and jb(up[3].decode()) == {"prompt": "a dog", "model": "black-forest-labs/FLUX.1-schnell", "response_format": "base64", "steps": 4} and jb(b).get("data") == [{"b64_json": "QUJD"}] and not any(r[1].startswith("/api/models/black-forest-labs") for r in recs), (s, b[:200], up[3][:200]))
+        png = b"\x89PNG\r\n\x1a\nin"
+        s, _, b = mp_form(GW_L194, "/v1/images/edits", [("model", None, "text/plain", "huggingface/fal-ai/fal-ai/flux-pro/kontext"), ("prompt", None, "text/plain", "make it blue"), ("size", None, "text/plain", "512x512"), ("image", "in.png", "image/png", png)], K)
+        up = last("/fal-ai/fal-ai/flux-pro/kontext")
+        check("huggingface image edits: fal-ai gets the image as a data URL in image_url (a single-image model) and the size",
+              s == 200 and jb(up[3].decode()) == {"prompt": "make it blue", "image_url": "data:image/png;base64," + _b64.b64encode(png).decode(), "image_size": {"width": 512, "height": 512}} and jb(b).get("data") == [{"url": "https://fal.media/edit.png"}], (s, b[:200], up[3][:300]))
+        s, _, b = mp_form(GW_L194, "/v1/images/edits", [("model", None, "text/plain", "huggingface/fal-ai/fal-ai/flux-pro/kontext"), ("prompt", None, "text/plain", "make it red"), ("stream", None, "text/plain", "true"), ("image", "in.png", "image/png", png)], K)
+        evs = [json.loads(l[6:]) for l in b.split("\n") if l.startswith("data: ")]
+        check("huggingface image edit stream: fal-ai's /stream relayed as image_edit events", s == 200 and [e.get("type") for e in evs] == ["image_edit.partial_image", "image_edit.completed"] and evs[-1].get("b64_json") == "RURJVA==" and "make it red" in last("/fal-ai/fal-ai/flux-pro/kontext/stream")[3].decode(), (s, b[:300]))
+        s, _, b = mp_form(GW_L194, "/v1/images/edits", [("model", None, "text/plain", "huggingface/hf-inference/stabilityai/sdxl"), ("prompt", None, "text/plain", "x"), ("image", "in.png", "image/png", png)], K)
+        check("huggingface image edits: only fal-ai edits", s == 400 and "not supported" in b, (s, b[:200]))
+
+        # ---- agent sign-in: status, the authorize page and form, the code exchange ----
+        s, _, b = call("GET", "/api/agent/auth/status", None, base=GW_L194, auth=False)
+        check("agent sign-in: status says sign-in is set up and keys are enforced", s == 200 and jb(b) == {"idp_configured": True, "virtual_key_auth_enabled": True}, (s, b))
+        verifier = _sec.token_urlsafe(48)
+        challenge = _b64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+        redirect = "http://127.0.0.1:18399/callback"
+        q = _up.urlencode({"client_id": "bifrost-cli", "redirect_uri": redirect, "state": "st-194", "code_challenge": challenge, "code_challenge_method": "S256"})
+        s, _, b = raw("GET", GW_L194 + "/api/agent/auth/authorize?" + q)
+        check("agent sign-in: the authorize page is a sign-in form carrying the request", s == 200 and 'name="state" value="st-194"' in b and 'name="password"' in b, (s, b[:200]))
+        s, _, b = raw("GET", GW_L194 + "/api/agent/auth/authorize?" + q.replace(_up.quote(redirect, safe=""), _up.quote("https://evil.example/cb", safe="")))
+        check("agent sign-in: a redirect that is not a loopback address is refused", s == 400 and "loopback" in b, (s, b[:200]))
+        s, _, b = raw("POST", GW_L194 + "/api/agent/auth/authorize", q + "&username=ana&password=wrong")
+        check("agent sign-in: a wrong password shows the form again", s == 401 and "Invalid username or password" in b, (s, b[:200]))
+        s, h, _ = raw("POST", GW_L194 + "/api/agent/auth/authorize", q + "&username=ana&password=pw-ana")
+        loc = _up.urlparse(h.get("location", "") if h else "")
+        lq = _up.parse_qs(loc.query)
+        code = lq.get("code", [""])[0]
+        check("agent sign-in: the right password redirects to the loopback callback with a code and the state", s == 302 and loc.netloc == "127.0.0.1:18399" and loc.path == "/callback" and lq.get("state") == ["st-194"] and code != "", (s, h.get("location") if h else None))
+        s, _, b = call("POST", "/api/agent/auth/token", {"code": code, "code_verifier": "wrong" * 10, "redirect_uri": redirect}, base=GW_L194, auth=False)
+        check("agent sign-in: a wrong verifier is invalid_grant, and spends the code", s == 400 and jb(b).get("error") == "invalid_grant", (s, b))
+        s, h, _ = raw("POST", GW_L194 + "/api/agent/auth/authorize", q + "&username=ana&password=pw-ana")
+        code = _up.parse_qs(_up.urlparse(h.get("location", "")).query).get("code", [""])[0]
+        s, _, b = call("POST", "/api/agent/auth/token", {"code": code, "code_verifier": verifier, "redirect_uri": redirect, "platform": "linux", "agent_version": "1.0", "device_name": "e2e"}, base=GW_L194, auth=False)
+        tok = jb(b)
+        access = tok.get("agent_access_token", "")
+        refresh = tok.get("refresh_token", "")
+        check("agent sign-in: the code and verifier give a ck-bf-agent- token, a refresh token, the user and the default key",
+              s == 200 and access.startswith("ck-bf-agent-") and refresh != "" and tok.get("expires_in") == 3600 and tok.get("user", {}).get("name") == "ana"
+              and tok.get("user", {}).get("email") == "ana@example.com" and tok.get("selected_virtual_key_id") == "vk-l194-ana1" and tok.get("forced_virtual_key_id") == "", (s, b[:300]))
+        s, _, b = call("POST", "/api/agent/auth/token", {"code": code, "code_verifier": verifier, "redirect_uri": redirect}, base=GW_L194, auth=False)
+        check("agent sign-in: a code works once", s == 400 and jb(b).get("error") == "invalid_grant", (s, b))
+        A = {"authorization": "Bearer " + access}
+
+        # ---- the user's keys and usage, and inference under the agent token ----
+        s, _, b = call("GET", "/api/agent/virtual-keys", None, A, base=GW_L194, auth=False)
+        vks = jb(b)
+        check("agent sign-in: the user's assigned keys without their values, the default selected",
+              s == 200 and [k.get("id") for k in vks.get("virtual_keys", [])] == ["vk-l194-ana1", "vk-l194-ana2"] and vks.get("selected_virtual_key_id") == "vk-l194-ana1"
+              and vks["virtual_keys"][0].get("budget_limit") == 5.0 and vks["virtual_keys"][0].get("providers") == ["openai"] and "sk-bf-l194" not in b, (s, b[:400]))
+        s, _, b = call("GET", "/api/agent/usage-summary", None, A, base=GW_L194, auth=False)
+        check("agent sign-in: the usage summary lists the keys' budgets", s == 200 and any(x.get("id") == "b-ana" and x.get("limit") == 5.0 for x in jb(b).get("budgets", [])) and jb(b).get("budget", {}).get("limit") == 5.0, (s, b[:300]))
+        s, h, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}, A, base=GW_L194, auth=False)
+        check("agent sign-in: inference with the agent token and no key choice runs as the default assigned key", s == 200, (s, b[:200]))
+        s, h, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o", "messages": [{"role": "user", "content": "hi"}]}, A, base=GW_L194, auth=False)
+        check("agent sign-in: the default key's model limits apply", s == 403, (s, b[:200]))
+        s, h, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o", "messages": [{"role": "user", "content": "hi"}]}, {**A, "x-bf-agent-vk-id": "vk-l194-ana2"}, base=GW_L194, auth=False)
+        check("agent sign-in: x-bf-agent-vk-id picks another assigned key", s == 200, (s, b[:200]))
+
+        # ---- refresh rotates; logout revokes ----
+        s, _, b = call("POST", "/api/agent/auth/refresh", {"refresh_token": refresh}, base=GW_L194, auth=False)
+        rot = jb(b)
+        check("agent sign-in: refresh gives a new pair", s == 200 and rot.get("agent_access_token", "").startswith("ck-bf-agent-") and rot.get("agent_access_token") != access and rot.get("refresh_token") != refresh, (s, b[:200]))
+        s, h, b = call("GET", "/api/agent/virtual-keys", None, A, base=GW_L194, auth=False)
+        check("agent sign-in: the rotated-out access token is refused, marked for the CLI to sign in again", s == 401 and hdr(h, "x-bf-agent-auth") == "rejected", (s, b[:200]))
+        s, h, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}, A, base=GW_L194, auth=False)
+        check("agent sign-in: the old token is refused on inference too, with x-bf-agent-auth", s == 401 and hdr(h, "x-bf-agent-auth") == "rejected", (s, b[:200]))
+        s, _, b = call("POST", "/api/agent/auth/refresh", {"refresh_token": refresh}, base=GW_L194, auth=False)
+        check("agent sign-in: a refresh token works once", s == 401 and jb(b).get("error") == "invalid_grant", (s, b))
+        A2 = {"authorization": "Bearer " + rot.get("agent_access_token", "")}
+        s, _, b = call("POST", "/api/agent/auth/logout", None, A2, base=GW_L194, auth=False)
+        s2, _, b2 = call("GET", "/api/agent/virtual-keys", None, A2, base=GW_L194, auth=False)
+        check("agent sign-in: logout revokes the token", s == 200 and s2 == 401, (s, s2, b2[:200]))
+
+        # ---- the A2A v0.3 REST client: /v1 routes, v0.3 bodies both ways ----
+        for _ in range(50):
+            s, _, b = call("GET", "/agents/a2a/echo/.well-known/agent-card.json", None, K, base=GW_L194, auth=False)
+            if s == 200:
+                break
+            time.sleep(0.1)
+        body03 = {"message": {"kind": "message", "messageId": "m-194", "role": "user", "parts": [{"kind": "text", "text": "hello rest03"}]}}
+        s, _, b = call("POST", "/agents/a2a/echo/rest/v1/message:send", body03, K, base=GW_L194, auth=False)
+        res = jb(b)
+        ups = [x for x in seen() if x["path"] == "/a2a/agent/json-rpc" and "hello rest03" in x["body"]]
+        upb = jb(ups[-1]["body"]) if ups else {}
+        check("a2a v0.3 REST: /v1/message:send is a v0.3 call (message/send with the parts as sent) answered in v0.3 (kind, lower-case state)",
+              s == 200 and res.get("kind") == "task" and res.get("status", {}).get("state") == "completed" and upb.get("method") == "message/send"
+              and upb.get("params", {}).get("message", {}).get("parts", [{}])[0].get("kind") == "text", (s, b[:300], upb))
+        tid = res.get("id", "")
+        s, _, b = call("GET", "/agents/a2a/echo/rest/v1/tasks/" + tid, None, K, base=GW_L194, auth=False)
+        ups = [x for x in seen() if x["path"] == "/a2a/agent/json-rpc" and '"tasks/get"' in x["body"]]
+        check("a2a v0.3 REST: /v1/tasks/{id} is tasks/get, answered as a v0.3 task", s == 200 and jb(b).get("kind") == "task" and jb(b).get("id") == tid and len(ups) > 0, (s, b[:300]))
+        s, _, b = call("POST", "/agents/a2a/echo/rest/message:send", {"message": {"messageId": "m-194b", "role": "ROLE_USER", "parts": [{"text": "hello rest1"}]}}, K, base=GW_L194, auth=False)
+        check("a2a v0.3 REST: the v1 route still answers in v1", s == 200 and "kind" not in b and "TASK_STATE_COMPLETED" in b, (s, b[:300]))
+    finally:
+        gw.terminate()
+        gw.wait()
+        srv.shutdown()
 
 
 def main():
@@ -17496,6 +18328,14 @@ def main():
         # L190: client certificates to agents (JSON-RPC and gRPC), gRPC gzip both ways, the unary disconnect signal, and
         # the AWS credential chain (IRSA, Pod Identity, IMDSv2) against mocks: its own gateway (18336, gRPC on 18337)
         l190_e2e(env)
+        # L193: cross-node log reads, rows beyond max_memory_entries: its own gateways (18342, 18343)
+        l193_e2e(env)
+        # L194: Hugging Face inference providers (chat, embeddings, speech, transcription, images), the CLI's agent sign-in
+        # and default key, and the A2A v0.3 REST client: its own gateway (18344) and Hugging Face double (18345)
+        l194_e2e(env)
+        # L189: lifecycle follow-ups (WebSocket and realtime sessions drained at a stop with 1001, the write-stall timeout,
+        # broker mode's graceful stop): its own gateways and broker, one after the other (18334)
+        l189_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

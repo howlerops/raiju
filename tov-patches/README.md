@@ -14,6 +14,7 @@ Patch 0010 (WebAssembly wall-clock limit) changes `std/wasm`, `runtime/wasm.c` a
 Patch 0012 (server lifecycle) changes the HTTP server in `runtime/tov.c` and `std/http.tov`, and is written on top of 0001-0010.
 Patch 0013 (fetch address policy) changes the fetch code in `runtime/tov.c` and `std/http.tov` (and `fetchStart`'s signature, also called from `runtime/node.c`), and is written on top of 0001-0012.
 Patch 0015 (client certificates, `Request.signal`, gunzip) changes fetch, sockets and the server (and `fetchStart`'s and `netConnect`'s signatures), and is written on top of 0001-0013.
+Patch 0016 (fetch input buffer) changes the fetch connection reads in `runtime/tov.c` and is written on top of 0001-0013 and 0015.
 
 ## Submitting upstream
 
@@ -724,3 +725,22 @@ requests whose handler returned a promise (a synchronous answer has nothing to s
 answer is given (a streamed body's cancel says that). The tests (`tests/client_cert.tov` with
 `tests/client_cert_server.py`, 8 checks; `tests/server_gone.tov` with `tests/server_gone_client.py`, 4 checks;
 `tests/decompress.tov`, 8 checks) are in `run.sh`.
+
+## 0016 — a fetch connection's input buffer starts small
+
+**Problem.** Each fetch connection's input buffer was allocated at 64 KB on the first read and kept while the
+connection was busy. An LLM gateway holds one upstream connection per open stream, whose events are a few
+hundred bytes, so 64 KB per stream was mostly unused memory: a third of what Raiju allocated per open stream.
+
+**Design.** The buffer starts at 16 KB (`TV_FC_IN_START`) and a read wants 4 KB of room (`TV_FC_IN_ROOM`):
+what is left unparsed is moved to the front and the buffer doubles only while it needs more room (a long
+response head, a chunk size line split across reads). Bodies with a known length are still read straight into
+their own buffer in 64 KB or larger steps, so large answers take no more reads than before. A connection that
+goes back to the pool keeps a buffer of 16 KB at most, as before.
+
+**Files.** `runtime/tov.c`: `tv_fc_ready`, `tv_fc_release`.
+
+**Measured in Raiju.** 200 open streams through one gateway (`tests/soak/soak.py`'s slow streams): the bytes
+allocated per open stream fell by 48 KB. The test (`tests/fetch_buffer.tov` with `tests/fetch_buffer_server.py`,
+3 checks: a 40 KB response head, a 100 KB chunk with a split size line, 2,000 small events read as a stream) is
+in `run.sh`. Written on top of 0001-0013 and 0015.

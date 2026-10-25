@@ -19,8 +19,9 @@ import { encode, decode } from "./base64"
 import { parseModel } from "./router"
 import { EventFrames, EventFrame, encodeEventStreamFrame } from "./streams"
 import { utf8, secureHex } from "./crypto"
-import { objectOwners, ownerKind, addressesObject, notFoundMessage, batchInputFile, batchFiles, itemId, filterList } from "./objowner"
+import { objectOwners, ownerKind, addressesObject, createsObject, notFoundMessage, batchInputFile, batchFiles, itemId, filterList, objectRefs, pathRefs, listKind, ObjectRef } from "./objowner"
 import { CLIENT_WATCH_HEADER } from "./clientgone"
+import { Config } from "./config"
 
 // The plugin chain, when there is one with plugins.
 function chainOf(engine: Engine): PluginChain | undefined {
@@ -678,24 +679,27 @@ export async function storageHooked(engine: Engine, req: Request, call: StorageC
   const vkId = vk.id
   const owners = objectOwners()
   const enforced = engine.cfg.client?.enforce_vk_object_ownership !== false
+  const same = (a: string, b: string): bool => sameUpstream(engine.cfg, a, b)
   if (enforced && addressesObject(call.op) && call.id !== "") {
-    const o = owners.owner(kind, call.id)
+    const o = owners.owner(kind, call.id, call.provider, same)
     if (o !== "" && o !== vkId) return errorResponse(404, notFoundMessage(kind, call.id), "access_blocked", noHeaders())
   }
   let next = req
-  if (enforced && call.op === "batch_create" && !(req.headers.get("content-type") ?? "").toLowerCase().includes("multipart/")) {
-    // a batch runs on its input file; another key's file is as closed to it as the file itself
+  const creates = call.op === "batch_create" || call.op === "cached_content_create"
+  if (enforced && creates && !(req.headers.get("content-type") ?? "").toLowerCase().includes("multipart/")) {
+    // a batch runs on its input file (and its inline items' files and caches), a cached content is built from the files
+    // its contents name: another key's object is as closed to them as the object itself
     let body = ""
     try {
       body = try await req.text()
     } catch (e) {
       return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
     }
+    const refs = objectRefs(body)
     const input = batchInputFile(body)
-    if (input !== "") {
-      const o = owners.owner("file", input)
-      if (o !== "" && o !== vkId) return errorResponse(404, notFoundMessage("file", input), "access_blocked", noHeaders())
-    }
+    if (input !== "") refs.push({ kind: "file", id: input })
+    const foreign = foreignRef(refs, vkId, call.provider, same)
+    if (foreign !== undefined) return errorResponse(404, notFoundMessage(foreign.kind, foreign.id), "access_blocked", noHeaders())
     const rh: Record<string, string> = new Map()
     req.headers.forEach((v, k) => {
       if (k !== "content-length" && k !== "transfer-encoding") rh.set(k, v)
@@ -703,13 +707,20 @@ export async function storageHooked(engine: Engine, req: Request, call: StorageC
     next = new Request(req.url, { method: req.method, headers: rh, body: body })
   }
   const res = try await storageRun(engine, next, call, handler)
-  const deletes = call.op === "file_delete" || call.op === "batch_delete"
-  const watch = deletes || call.op === "file_upload" || call.op === "batch_create" || call.op === "batch_retrieve" || call.op.endsWith("_list")
+  const deletes = call.op === "file_delete" || call.op === "batch_delete" || call.op === "cached_content_delete"
+  const watch = deletes || createsObject(call.op) || call.op === "batch_retrieve" || call.op.endsWith("_list")
   if (res.status >= 400 || !watch) return res
   if (deletes) {
     objectOwners().forget(kind, call.id)
     return res
   }
+  return await ownedAnswer(engine, res, call.op, kind, call.id, vkId, call.provider, enforced)
+}
+
+// An answer that creates, describes or lists objects: a create records its creator (and provider), a batch retrieve
+// binds the batch's output and error files to the batch's creator, and a list leaves out the objects another key
+// created (when enforced).
+async function ownedAnswer(engine: Engine, res: Response, op: string, kind: string, id: string, vkId: string, provider: string, enforced: bool): Promise<Response> {
   // (some providers answer JSON with no content type, or a text one)
   const ct = res.headers.get("content-type") ?? ""
   if (ct !== "" && !ct.includes("json") && !ct.startsWith("text/")) return res
@@ -722,21 +733,116 @@ export async function storageHooked(engine: Engine, req: Request, call: StorageC
   const t = text(bytes)
   const now = Math.floor(Date.now())
   const hs = snapshotRecord(res.headers)
-  if (call.op === "file_upload" || call.op === "batch_create") owners.record(kind, itemId(t), vkId, now)
-  else if (call.op === "batch_retrieve") {
+  const owners = objectOwners()
+  if (createsObject(op)) owners.record(kind, itemId(t), vkId, now, provider)
+  else if (op === "batch_retrieve") {
     // a batch's output and error files exist once it has run: they belong to the batch's creator
-    const creator = owners.owner("batch", call.id)
+    const creator = owners.owner("batch", id)
     if (creator !== "") {
-      for (const fid of batchFiles(t)) owners.record("file", fid, creator, now)
+      for (const fid of batchFiles(t)) owners.record("file", fid, creator, now, provider)
     }
   } else if (enforced) {
-    const out = filterList(t, kind, (id: string): bool => {
-      const o = objectOwners().owner(kind, id)
+    const out = filterList(t, kind, (oid: string): bool => {
+      const o = objectOwners().owner(kind, oid, provider, (a: string, b: string): bool => sameUpstream(engine.cfg, a, b))
       return o !== "" && o !== vkId
     })
     if (out !== undefined) return new Response(out, { status: res.status, headers: hs })
   }
   return new Response(bytes, { status: res.status, headers: hs })
+}
+
+// The first object of refs another virtual key created, or undefined.
+function foreignRef(refs: ObjectRef[], vkId: string, provider: string, same: (a: string, b: string) => bool): ObjectRef | undefined {
+  const owners = objectOwners()
+  for (const r of refs) {
+    const o = owners.owner(r.kind, r.id, provider, same)
+    if (o !== "" && o !== vkId) return r
+  }
+  return undefined
+}
+
+// Whether two provider names reach the same upstream, so an object made through one is the same object through the
+// other (Bifrost's equivalentProviders): the same name, or a custom provider and its base, or two custom providers on
+// one base, with the same base URL (an unset one is the base's default).
+export function sameUpstream(cfg: Config, a: string, b: string): bool {
+  if (a === b) return true
+  const ps = cfg.providers
+  if (ps === undefined) return false
+  const pa = ps.get(a)
+  const pb = ps.get(b)
+  const baseA = pa?.custom_provider_config?.base_provider_type ?? a
+  const baseB = pb?.custom_provider_config?.base_provider_type ?? b
+  if (baseA !== baseB) return false
+  const urlA = pa?.network_config?.base_url ?? ""
+  const urlB = pb?.network_config?.base_url ?? ""
+  return trimSlash(urlA) === trimSlash(urlB)
+}
+
+function trimSlash(u: string): string {
+  return u.endsWith("/") ? u.slice(0, u.byteLength - 1) : u
+}
+
+// An inference request (chat, Responses, Messages, GenAI, a passthrough body) that names another key's object: a
+// file by id or Gemini file URI, a cached content it runs on, a batch's input file (objowner.tov objectRefs). Refused
+// as Bifrost refuses it, with a 404 access_blocked that does not confirm the object exists. Otherwise the request goes
+// on (rebuilt with its body when the body was read). Only a request with a virtual key is checked, only while
+// client.enforce_vk_object_ownership is on and some object is recorded, and only a JSON body.
+export async function ownedRequest(engine: Engine, req: Request, provider: string): Promise<Request | Response> {
+  const m = req.method
+  if (m === "GET" || m === "HEAD" || m === "DELETE") return req
+  if (engine.cfg.client?.enforce_vk_object_ownership === false || !objectOwners().hasRecords()) return req
+  if ((req.headers.get("content-type") ?? "").toLowerCase().includes("multipart/")) return req
+  const vk = engine.gov.findKey(snapshot(req.headers))
+  if (vk === undefined || vk.id === "") return req
+  let body = ""
+  try {
+    body = await req.text()
+  } catch (e) {
+    return errorResponse(400, `invalid request: ${e.message}`, "invalid_request_error", noHeaders())
+  }
+  const prov = provider !== "" ? provider : modelProvider(engine, body)
+  const foreign = foreignRef(objectRefs(body), vk.id, prov, (a: string, b: string): bool => sameUpstream(engine.cfg, a, b))
+  if (foreign !== undefined) return errorResponse(404, notFoundMessage(foreign.kind, foreign.id), "access_blocked", noHeaders())
+  const rh: Record<string, string> = new Map()
+  req.headers.forEach((v, k) => {
+    if (k !== "content-length" && k !== "transfer-encoding") rh.set(k, v)
+  })
+  return new Request(req.url, { method: m, headers: rh, body: body })
+}
+
+// The provider a body's model names ("" when it names none).
+function modelProvider(engine: Engine, body: string): string {
+  try {
+    const model = rawStr(fields(body), "model") ?? ""
+    return model === "" ? "" : parseModel(engine.cfg, model).provider
+  } catch (e) {
+    return ""
+  }
+}
+
+// A passthrough call (a provider's own path, raw): the objects its path addresses and its body names are checked like
+// a direct reference, and a GET of a collection (files, batches, cachedContents) is narrowed to what the key may see
+// (Bifrost's passthroughObjectRefs). rest is the provider path the call is sent to.
+export async function passthroughOwned(engine: Engine, req: Request, provider: string, gemini: bool, rest: string, handler: Handler): Promise<Response> throws TypeError {
+  const vk = engine.gov.findKey(snapshot(req.headers))
+  if (vk === undefined || vk.id === "" || engine.cfg.client?.enforce_vk_object_ownership === false) return try await handler(req, undefined)
+  const same = (a: string, b: string): bool => sameUpstream(engine.cfg, a, b)
+  const foreign = foreignRef(pathRefs(rest, gemini), vk.id, provider, same)
+  if (foreign !== undefined) return errorResponse(404, notFoundMessage(foreign.kind, foreign.id), "access_blocked", noHeaders())
+  const checked = await ownedRequest(engine, req, provider)
+  if (checked instanceof Response) return checked
+  const res = try await handler(checked, undefined)
+  const lk = listKind(req.method, rest)
+  if (lk === "" || res.status >= 400) return res
+  return await ownedAnswer(engine, res, lk + "_list", lk, "", vk.id, provider, true)
+}
+
+// The GenAI SDK's resumable files.upload: its last step answers the file ({file: {name}}), whose creator is recorded
+// as a native upload's is (the protocol's steps do not run the storage hooks).
+export async function recordUpload(engine: Engine, req: Request, provider: string, res: Response): Promise<Response> {
+  const vk = engine.gov.findKey(snapshot(req.headers))
+  if (vk === undefined || vk.id === "" || res.status >= 400) return res
+  return await ownedAnswer(engine, res, "file_upload", "file", "", vk.id, provider, false)
 }
 
 async function storageRun(engine: Engine, req: Request, call: StorageCall, handler: Handler): Promise<Response> throws TypeError {

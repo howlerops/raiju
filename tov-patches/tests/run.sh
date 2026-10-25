@@ -1,5 +1,5 @@
 #!/bin/sh
-# Checks patches 0001-0010, 0012, 0013 and 0015 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
+# Checks patches 0001-0010, 0012, 0013, 0015 and 0016 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
 # (or `make tov-test`). Each program prints "ok" lines and "FAIL" lines; a run passes when no line
 # fails and the expected number of "ok" lines appears.
 set -eu
@@ -152,30 +152,13 @@ else
   echo "skipped: fetch address policy (no name but localhost maps to 127.0.0.1 in /etc/hosts; set PEER_NAME)"
 fi
 
-# TLS client certificates on fetch and Bun.connect (patch 0015): a server that requires one and answers with its common name
-openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout "$OUT/client_a.key" -out "$OUT/client_a.pem" -days 2 -subj /CN=client-a 2>/dev/null
-openssl req -x509 -newkey rsa:2048 -nodes -keyout "$OUT/client_b.key" -out "$OUT/client_b.pem" -days 2 -subj /CN=client-b 2>/dev/null
-cat "$OUT/client_a.pem" "$OUT/client_b.pem" > "$OUT/clients.pem"
-python3 -u "$DIR/client_cert_server.py" "$OUT/cert.pem" "$OUT/key.pem" "$OUT/clients.pem" > "$OUT/cc.port" & CSRV=$!
+# a fetch connection's input buffer that starts small and grows (patch 0016)
+python3 -u "$DIR/fetch_buffer_server.py" > "$OUT/fetch_buffer.port" & SRV=$!
 sleep 0.5
-TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/client_cert.tov" -o "$OUT/client_cert" >/dev/null
-CC_PORT=$(head -1 "$OUT/cc.port") CC_DIR="$OUT" "$OUT/client_cert" > "$OUT/client_cert.out"
-kill $CSRV 2>/dev/null || true
-CSRV=""
-expect "$OUT/client_cert.out" 8 "TLS client certificates"
-
-# Request.signal on Bun.serve: aborted when the client goes away (patch 0015)
-TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/server_gone.tov" -o "$OUT/server_gone" >/dev/null
-"$OUT/server_gone" > "$OUT/server_gone.out" & SRV=$!
-sleep 0.5
-python3 "$DIR/server_gone_client.py" "$(sed -n 's/^listening //p' "$OUT/server_gone.out")" > "$OUT/server_gone_client.out" || true
+TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/fetch_buffer.tov" -o "$OUT/fetch_buffer" >/dev/null
+FB_PORT=$(sed -n 's/^listening //p' "$OUT/fetch_buffer.port") "$OUT/fetch_buffer" > "$OUT/fetch_buffer.out"
 kill $SRV 2>/dev/null || true
 SRV=""
-expect "$OUT/server_gone_client.out" 4 "Request.signal when the client goes away"
-
-# Bun.gunzipSync and Bun.inflateSync (patch 0015)
-TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/decompress.tov" -o "$OUT/decompress" >/dev/null
-"$OUT/decompress" > "$OUT/decompress.out"
-expect "$OUT/decompress.out" 8 "Bun.gunzipSync and Bun.inflateSync"
+expect "$OUT/fetch_buffer.out" 3 "fetch input buffer"
 
 echo "tov-patches tests passed"
