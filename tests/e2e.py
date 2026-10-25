@@ -932,6 +932,13 @@ def cluster_sig(secret, body=""):
     import hashlib, hmac
     return hmac.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
 
+def peer_headers(secret, route, body, ts=None, length=None):
+    """The headers of a signed peer POST (L204): the body's HMAC, the time, and the head signature over the method, the
+    route, the time and the Content-Length (length: a different length to sign, for the replay checks)."""
+    t = str(int(time.time() * 1000) if ts is None else ts)
+    n = len(body.encode()) if length is None else length
+    return {"x-raiju-cluster-sig": cluster_sig(secret, body), "x-raiju-cluster-ts": t, "x-raiju-cluster-head": cluster_sig(secret, "POST %s %s %d" % (route, t, n))}
+
 def leader_headers(secret, ts=None):
     """The headers of a signed GET /api/cluster/leader: the signature over the method, the path and the time (L201)."""
     t = str(int(time.time() * 1000) if ts is None else ts)
@@ -5919,7 +5926,10 @@ def l185_e2e(env):
         sha = hashlib.sha256(open(pb, "rb").read()).hexdigest()
         def pull(body, sig=None):
             raw = json.dumps(body)
-            return call("POST", "/api/cluster/config", raw, {"x-raiju-cluster-sig": sig if sig is not None else cluster_sig(L185_SECRET, raw)}, base=GW_L185_A, auth=False)
+            h = peer_headers(L185_SECRET, "/api/cluster/config", raw)
+            if sig is not None:
+                h["x-raiju-cluster-sig"] = sig
+            return call("POST", "/api/cluster/config", raw, h, base=GW_L185_A, auth=False)
         s, _, _ = pull({"sha": sha, "ts": time.time() * 1000}, "0" * 64)
         check("l185: an unsigned config pull is refused", s == 401, s)
         s, _, _ = pull({"sha": sha, "ts": time.time() * 1000 - 120000})
@@ -6036,7 +6046,7 @@ def l195_e2e(env):
         check("l195: a signature keyed with the literal env.RAIJU_L195_SECRET is refused", cluster_leader(GW_L195, "env.RAIJU_L195_SECRET").get("status") == 401, cluster_leader(GW_L195, "env.RAIJU_L195_SECRET"))
         sha = hashlib.sha256(open(cp, "rb").read()).hexdigest()
         raw = json.dumps({"sha": sha, "ts": time.time() * 1000})
-        s, _, b = call("POST", "/api/cluster/config", raw, {"x-raiju-cluster-sig": cluster_sig("env.RAIJU_L195_SECRET", raw)}, base=GW_L195, auth=False)
+        s, _, b = call("POST", "/api/cluster/config", raw, peer_headers("env.RAIJU_L195_SECRET", "/api/cluster/config", raw), base=GW_L195, auth=False)
         check("l195: the config (with its provider keys) is not handed to a pull signed with the literal reference", s == 401 and "sk-l195-provider" not in b, (s, b[:200]))
         s, _, b = call("GET", "/metrics", base=GW_L195, auth=False)
         check("l195: without server.metrics_token /metrics stays open (Bifrost's default)", s == 200 and "# TYPE" in b, s)
@@ -6060,9 +6070,9 @@ def l195_e2e(env):
         s, _, _ = call("GET", "/api/cluster/leader", headers={**sig, "x-raiju-cluster-sig": "0" * 64}, base=GW_L195_CL, auth=False)
         check("l195: the cluster listener still checks the signature", s == 401, s)
         wire = json.dumps({"node": "l195-peer", "ts": time.time() * 1000, "counters": []})
-        s, _, b = call("POST", "/api/cluster/sync", wire, {"x-raiju-cluster-sig": cluster_sig(L195_SECRET, wire)}, base=GW_L195_CL, auth=False)
+        s, _, b = call("POST", "/api/cluster/sync", wire, peer_headers(L195_SECRET, "/api/cluster/sync", wire), base=GW_L195_CL, auth=False)
         check("l195: a peer's signed sync is merged on the cluster listener", s == 200 and '"node":"l195"' in b, (s, b[:200]))
-        s, _, _ = call("POST", "/api/cluster/sync", wire, {"x-raiju-cluster-sig": cluster_sig(L195_SECRET, wire)}, base=GW_L195, auth=False)
+        s, _, _ = call("POST", "/api/cluster/sync", wire, peer_headers(L195_SECRET, "/api/cluster/sync", wire), base=GW_L195, auth=False)
         check("l195: the same sync on the main listener is refused", s == 404, s)
         s, _, _ = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l195"}]}, base=GW_L195, auth=False)
         check("l195: inference is served on the main listener", s == 200, s)
@@ -6172,9 +6182,9 @@ def l193_e2e(env):
         s, _, _ = call("POST", "/api/cluster/logs", raw, {"x-raiju-cluster-sig": "0" * 64}, base=GW_L193_B, auth=False)
         check("l193: an unsigned cluster log read is refused", s == 401, s)
         stale = json.dumps({"path": "/api/logs", "query": "", "now": time.time() * 1000, "ts": time.time() * 1000 - 120000})
-        s, _, _ = call("POST", "/api/cluster/logs", stale, {"x-raiju-cluster-sig": cluster_sig(L193_SECRET, stale)}, base=GW_L193_B, auth=False)
+        s, _, _ = call("POST", "/api/cluster/logs", stale, peer_headers(L193_SECRET, "/api/cluster/logs", stale), base=GW_L193_B, auth=False)
         check("l193: a cluster log read older than a minute is refused", s == 401, s)
-        s, _, b = call("POST", "/api/cluster/logs", raw, {"x-raiju-cluster-sig": cluster_sig(L193_SECRET, raw)}, base=GW_L193_B, auth=False)
+        s, _, b = call("POST", "/api/cluster/logs", raw, peer_headers(L193_SECRET, "/api/cluster/logs", raw), base=GW_L193_B, auth=False)
         rows = json.loads(b).get("rows", []) if s == 200 else []
         check("l193: a signed cluster log read answers that node's own rows only", s == 200 and len(rows) == 2, (s, b[:300]))
         # B stops: A answers with its own rows
@@ -13480,7 +13490,7 @@ def l201_e2e(env):
         "client": {"enable_logging": False, "enforce_auth_on_inference": True},
         "alerts": {"enabled": False},
         "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
-        "server": {"max_buffered_body_mb": 4, "body_deadline_seconds": 3},
+        "server": {"max_buffered_body_mb": 4, "body_deadline_seconds": 3, "body_min_kb_per_second": 64, "body_rate_grace_seconds": 2},
         "governance": {"virtual_keys": [{"id": "vk-l201", "name": "vk-l201", "value": "sk-bf-l201"}]},
         "providers": {"openai": {"keys": [{"name": "o-l201", "value": "sk-l201", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
         "cluster": {"enabled": True, "node_id": "l201", "secret": "env.RAIJU_L201_SECRET", "interval_ms": 200, "peers": [], "listen_port": 18359, "bind": "127.0.0.1", "max_body_mb": 2},
@@ -13496,9 +13506,11 @@ def l201_e2e(env):
         # P2-3: /metrics is open (no server.metrics_token, not moved to the cluster listener)
         check("l201: a start with /metrics open on the main port warns", "/metrics is open" in open(log).read(), open(log).read()[-600:])
 
-        # P1-4: a declared 50 MB trickled to /mcp (no credential checked from the headers) while other POSTs come in
+        # P1-4: a declared 50 MB trickled in with a key while other POSTs come in. L204: a body whose credential was
+        # checked has no fixed deadline but a minimum average rate (body_min_kb_per_second 64 after 2 s here), and a
+        # trickle to /mcp without a key is refused before it is read (L204 covers the unchecked bodies)
         slow: dict = {}
-        t = threading.Thread(target=l201_trickle, args=(18358, "/mcp", 50 * 1048576, {}, 2048, 0.1, 8.0, slow))
+        t = threading.Thread(target=l201_trickle, args=(18358, "/v1/chat/completions", 50 * 1048576, key, 2048, 0.1, 8.0, slow))
         t.start()
         time.sleep(0.8)
         s1, _, b1 = call("POST", "/v1/chat/completions", small, key, base=GW_L201, auth=False)
@@ -13506,25 +13518,16 @@ def l201_e2e(env):
         check("l201: while a slow 50 MB body trickles in, a small POST is served (it was 503)", s1 == 200, (s1, b1[:200]))
         check("l201: and a 1 MB POST is served too: the slow body holds only what it sent", s2 == 200, (s2, b2[:200]))
         t.join(20)
-        check("l201: the slow body is cut with 408 at server.body_deadline_seconds (3 s)", slow.get("status") == 408 and 2.5 < slow.get("after", 0) < 7.0, slow)
+        check("l201: the slow body (20 KB/s) is cut with 408 once it falls behind server.body_min_kb_per_second (about 3 s)", slow.get("status") == 408 and 2.5 < slow.get("after", 0) < 7.0, slow)
         s3, _, b3 = call("POST", "/v1/chat/completions", small, key, base=GW_L201, auth=False)
         check("l201: after the cut the budget is free again", s3 == 200, (s3, b3[:200]))
         # a body that arrives in time is served whatever its size (a lone one may pass the 4 MB cap)
         s4, _, b4 = call("POST", "/v1/chat/completions", l196_chat(5 * 1048576).decode(), key, base=GW_L201, auth=False)
         check("l201: a 5 MB body that arrives in time is served", s4 == 200, (s4, b4[:200]))
-        # a body that holds the whole budget (5 MB sent at once, then nothing) turns other big bodies away until its
-        # deadline, never small calls (their bytes are in memory already)
-        hog = l196_open(18358, "/mcp", 50 * 1048576, {}, 5 * 1048576)
-        time.sleep(0.5)
-        s5, _, b5 = call("POST", "/v1/chat/completions", small, key, base=GW_L201, auth=False)
-        s6 = declared_status(18358, "/v1/chat/completions", 1048576, key)
-        check("l201: while a stalled body holds the budget, a small POST is still served", s5 == 200, (s5, b5[:200]))
-        check("l201: and a 1 MB POST is refused 503 until that body's deadline", s6 == 503, s6)
+        hog = l196_open(18358, "/mcp", 50 * 1048576, {}, 0)
         code, head = l196_read(hog)
         hog.close()
-        check("l201: the stalled body is cut with 408", code == 408, head[:200])
-        s7, _, b7 = call("POST", "/v1/chat/completions", l196_chat(1048576).decode(), key, base=GW_L201, auth=False)
-        check("l201: then the 1 MB POST is served", s7 == 200, (s7, b7[:200]))
+        check("l201: a 50 MB /mcp body is answered from its headers, unread (L204; no MCP server here)", code == 404, head[:200])
 
         # the public routes read at most 64 KB
         st = declared_post(18358, "/api/session/login", 1048576)
@@ -13548,15 +13551,17 @@ def l201_e2e(env):
         check("l201: a malformed signature header is refused 401 before the body is read", code == 401, (code, head[:200]))
         st = declared_post(18359, "/api/cluster/sync", 3 * 1048576)
         check("l201: a 3 MB peer body (over cluster.max_body_mb 2) without a signature is refused", st == 401, st)
-        c = l196_open(18359, "/api/cluster/sync", 3 * 1048576, {"x-raiju-cluster-sig": "0" * 64}, 0)
+        c = l196_open(18359, "/api/cluster/sync", 3 * 1048576, peer_headers(L201_SECRET, "/api/cluster/sync", "", length=3 * 1048576), 0)
         code, head = l196_read(c)
         c.close()
-        check("l201: a signed-looking 3 MB peer body is 413 unread (cluster.max_body_mb)", code == 413, (code, head[:200]))
+        check("l201: a signed 3 MB peer body is 413 unread (cluster.max_body_mb)", code == 413, (code, head[:200]))
         junk = "x" * 1048576
-        s, _, _ = call("POST", "/api/cluster/sync", junk, {"x-raiju-cluster-sig": "0" * 64}, base=GW_L201_CL, auth=False)
-        check("l201: a 1 MB body with a wrong HMAC is read within the cap and refused 401", s == 401, s)
+        jh = peer_headers(L201_SECRET, "/api/cluster/sync", junk)
+        jh["x-raiju-cluster-sig"] = "0" * 64
+        s, _, _ = call("POST", "/api/cluster/sync", junk, jh, base=GW_L201_CL, auth=False)
+        check("l201: a 1 MB body with a signed head and a wrong body HMAC is read within the cap and refused 401", s == 401, s)
         wire = json.dumps({"node": "l201-peer", "ts": time.time() * 1000, "counters": []})
-        s, _, b = call("POST", "/api/cluster/sync", wire, {"x-raiju-cluster-sig": cluster_sig(L201_SECRET, wire)}, base=GW_L201_CL, auth=False)
+        s, _, b = call("POST", "/api/cluster/sync", wire, peer_headers(L201_SECRET, "/api/cluster/sync", wire), base=GW_L201_CL, auth=False)
         check("l201: a signed peer sync is still merged", s == 200 and '"node":"l201"' in b, (s, b[:200]))
 
         # P2-1: GET /api/cluster/leader is signed over its method, path and time
@@ -13570,6 +13575,171 @@ def l201_e2e(env):
         h["x-raiju-cluster-ts"] = str(int(h["x-raiju-cluster-ts"]) + 1)
         s, _, _ = call("GET", "/api/cluster/leader", headers=h, base=GW_L201_CL, auth=False)
         check("l201: a leader read whose time was changed is refused", s == 401, s)
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
+GW_L204 = "http://127.0.0.1:18364"  # L204: unchecked bodies' share and deadline, the rate-based body deadline, header-signed peer requests
+GW_L204_CL = "http://127.0.0.1:18365"  # L204: the cluster listener of the gateway on 18364
+L204_SECRET = "e2e-l204-" + "cluster-secret-0123456789abcdef"
+
+
+def l204_send(port: int, path: str, payload: bytes, headers: dict, piece: int, every: float) -> tuple:
+    """POSTs payload piece bytes every `every` seconds (stopping early when an answer comes) and reads the whole answer
+    on a connection the server closes: (status, answer text, seconds from the start to the answer)."""
+    t0 = time.time()
+    s = socket.create_connection(("127.0.0.1", port), timeout=20)
+    head = "POST %s HTTP/1.1\r\nHost: 127.0.0.1\r\ncontent-type: application/json\r\ncontent-length: %d\r\nconnection: close\r\n" % (path, len(payload))
+    head += "".join("%s: %s\r\n" % (k, v) for k, v in headers.items()) + "\r\n"
+    s.sendall(head.encode())
+    data = b""
+    s.settimeout(0.02)
+    sent = 0
+    while sent < len(payload):
+        try:
+            s.sendall(payload[sent:sent + piece])
+        except OSError:
+            break
+        sent += piece
+        try:
+            c = s.recv(65536)
+            if not c:
+                break
+            data += c
+            break
+        except socket.timeout:
+            pass
+        except OSError:
+            break
+        time.sleep(every)
+    s.settimeout(10)
+    after = time.time() - t0
+    try:
+        while True:
+            if b"\r\n\r\n" in data:
+                hd, rest = data.split(b"\r\n\r\n", 1)
+                n = [int(x.split(b":", 1)[1]) for x in hd.split(b"\r\n") if x.lower().startswith(b"content-length:")]
+                if n and len(rest) >= n[0]:
+                    break
+            c = s.recv(65536)
+            if not c:
+                break
+            if not data:
+                after = time.time() - t0
+            data += c
+    except OSError:
+        pass
+    if data and after == 0:
+        after = time.time() - t0
+    s.close()
+    try:
+        return int(data.split(b" ", 2)[1]), data.decode("latin-1"), after
+    except Exception:
+        return 0, data.decode("latin-1"), after
+
+
+def l204_e2e(env):
+    """L204 (production re-audit 3, P1-D, P2-A, P2-B). P1-D: with auth off a body nobody vouched for (an anonymous
+    /mcp call) holds at most a small share of the body budget beside other bodies and must arrive within
+    server.body_deadline_seconds, so a client that sends 5 MB at once and stalls no longer turns the authenticated big
+    POSTs away (it did, with 503, for the whole deadline); with auth enforced /mcp refuses a big body from its headers
+    before reading it. P2-B: a body whose key was checked has no fixed deadline, only a minimum average rate after a
+    grace (server.body_min_kb_per_second), so a slow but steady upload is served. P2-A: a peer route reads a body only
+    when its head (method, route, time, Content-Length) is signed with cluster.secret (a fake signature header with a
+    big body is refused unread), and peer bodies have their own budget. Its own gateway (18364, cluster listener 18365)."""
+    d = os.path.join(BUILD, "e2e-l204")
+    os.makedirs(d, exist_ok=True)
+    cp = os.path.join(d, "config.json")
+    log = os.path.join(d, "gw.log")
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        # 4 MB of bodies in hand, half a megabyte of it for the unchecked ones (an eighth); unchecked bodies within 3 s,
+        # checked ones at 64 KB/s after 2 s
+        "server": {"max_buffered_body_mb": 4, "body_deadline_seconds": 3, "body_min_kb_per_second": 64, "body_rate_grace_seconds": 2},
+        "governance": {"virtual_keys": [{"id": "vk-l204", "name": "vk-l204", "value": "sk-bf-l204"}]},
+        "providers": {"openai": {"keys": [{"name": "o-l204", "value": "sk-l204", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "mcp": {"tool_sync_interval": "1h", "client_configs": [{"name": "weather", "connection_type": "http", "connection_string": MOCK + "/mcp"}]},
+        "cluster": {"enabled": True, "node_id": "l204", "secret": "env.RAIJU_L204_SECRET", "interval_ms": 200, "peers": [], "listen_port": 18365, "bind": "127.0.0.1", "max_body_mb": 2},
+    }
+    json.dump(cfg, open(cp, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18364", "-host", "127.0.0.1", "-config", cp, "-server", os.environ.get("RAIJU_SERVER", "bun")],
+                          env={**env, "RAIJU_L204_SECRET": L204_SECRET}, stderr=open(log, "w"))
+    key = {"x-bf-vk": "sk-bf-l204"}
+    small = {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l204 small"}]}
+    mb = l196_chat(1048576)
+    try:
+        wait(GW_L204 + "/health")
+        wait(GW_L204_CL + "/health")
+
+        # ---- P1-D: an anonymous body that holds the budget ----
+        hog = l196_open(18364, "/mcp", 50 * 1048576, {}, 5 * 1048576)
+        time.sleep(0.5)
+        s1, _, b1 = call("POST", "/v1/chat/completions", small, None, base=GW_L204, auth=False)
+        check("l204: while an anonymous 5 MB /mcp body stalls, a small POST is served", s1 == 200, (s1, b1[:200]))
+        s2, _, b2 = call("POST", "/v1/chat/completions", mb.decode(), key, base=GW_L204, auth=False)
+        check("l204: and a 1 MB POST with a key is served (it was 503 for the whole deadline)", s2 == 200, (s2, b2[:200]))
+        s3 = declared_status(18364, "/v1/chat/completions", 1048576, {})
+        check("l204: a 1 MB anonymous POST beside it is 503 (unchecked bodies share server.unchecked_body_mb)", s3 == 503, s3)
+        t0 = time.time()
+        code, head = l196_read(hog)
+        hog.close()
+        check("l204: the stalled anonymous body is cut with 408 at server.body_deadline_seconds (3 s)", code == 408 and "body_deadline_seconds" in head and time.time() - t0 < 5, (code, head[:300]))
+        s4, _, b4 = call("POST", "/v1/chat/completions", mb.decode(), None, base=GW_L204, auth=False)
+        check("l204: then a 1 MB anonymous POST is served", s4 == 200, (s4, b4[:200]))
+
+        # ---- P2-B: the rate-based deadline of checked bodies ----
+        st, ans, took = l204_send(18364, "/v1/chat/completions", mb, key, 20480, 0.1)
+        check("l204: a 1 MB upload with a key at about 200 KB/s (5 s, past the 3 s deadline) is served", st == 200 and "Hello from gpt-4o-mini" in ans and took > 3.5, (st, round(took, 1), ans[-200:]))
+        st, ans, took = l204_send(18364, "/v1/chat/completions", mb, key, 2048, 0.1)
+        check("l204: a key's upload that falls behind server.body_min_kb_per_second (20 KB/s) is cut with 408", st == 408 and "body_min_kb_per_second" in ans and 2.0 < took < 8.0, (st, round(took, 1), ans[-200:]))
+        st, ans, took = l204_send(18364, "/v1/chat/completions", mb, {}, 20480, 0.1)
+        check("l204: the same 200 KB/s upload without a key keeps the fixed deadline (408 at 3 s)", st == 408 and "body_deadline_seconds" in ans and took < 5.0, (st, round(took, 1), ans[-200:]))
+
+        # ---- P2-A: the peer routes check a signed head before reading, and have their own budget ----
+        t0 = time.time()
+        c = l196_open(18365, "/api/cluster/sync", 1572864, {"x-raiju-cluster-sig": "0" * 64}, 0)
+        code, head = l196_read(c)
+        c.close()
+        check("l204: a 1.5 MB peer body with a fake signature header is refused 401 before it is read (it was read)", code == 401 and time.time() - t0 < 3, (code, head[:200]))
+        wire = json.dumps({"node": "l204-peer", "ts": time.time() * 1000, "counters": []})
+        c = l196_open(18365, "/api/cluster/sync", 1572864, peer_headers(L204_SECRET, "/api/cluster/sync", wire), 0)
+        code, head = l196_read(c)
+        c.close()
+        check("l204: a captured signed head sent with a bigger body (another Content-Length) is refused 401 unread", code == 401, (code, head[:200]))
+        old = peer_headers(L204_SECRET, "/api/cluster/sync", wire, int(time.time() * 1000) - 120000)
+        s, _, b = call("POST", "/api/cluster/sync", wire, old, base=GW_L204_CL, auth=False)
+        check("l204: a signed head two minutes old is refused as stale", s == 401 and "stale" in b, (s, b[:200]))
+        s, _, b = call("POST", "/api/cluster/sync", wire, {"x-raiju-cluster-sig": cluster_sig(L204_SECRET, wire)}, base=GW_L204_CL, auth=False)
+        check("l204: a peer body signed only over the body (the old protocol) is refused", s == 401, (s, b[:200]))
+        s, _, b = call("POST", "/api/cluster/sync", wire, peer_headers(L204_SECRET, "/api/cluster/sync", wire), base=GW_L204_CL, auth=False)
+        check("l204: a peer sync signed over its head and body is merged", s == 200 and '"node":"l204"' in b, (s, b[:200]))
+        # a client body with a key that holds the whole client budget (4.5 MB sent, then nothing) does not hold the peers'
+        hog = l196_open(18364, "/v1/chat/completions", 8 * 1048576, key, 4718592)
+        time.sleep(0.5)
+        s5 = declared_status(18364, "/v1/chat/completions", 1048576, key)
+        check("l204: while a stalled body with a key holds the client budget, another 1 MB client POST is 503", s5 == 503, s5)
+        big_wire = json.dumps({"node": "l204-peer", "ts": time.time() * 1000, "counters": [], "pad": "p" * 200000})
+        s, _, b = call("POST", "/api/cluster/sync", big_wire, peer_headers(L204_SECRET, "/api/cluster/sync", big_wire), base=GW_L204_CL, auth=False)
+        check("l204: and a 200 KB signed peer sync is still served (the peer routes have their own budget)", s == 200 and '"node":"l204"' in b, (s, b[:200]))
+        hog.close()
+
+        # ---- P1-D: with auth enforced, /mcp answers a big body from its headers ----
+        s, _, b = call("PUT", "/api/config", {"client_config": {"enable_logging": False, "enforce_auth_on_inference": True}}, None, base=GW_L204, auth=False)
+        check("l204: auth is enforced through the config API", s == 200, (s, b[:200]))
+        time.sleep(0.3)
+        # (nothing of the body is sent: the answer comes from the headers, or not until the body would have arrived)
+        for path in ["/mcp", "/mcp/weather"]:
+            t0 = time.time()
+            c = l196_open(18364, path, 30 * 1048576, {}, 0)
+            c.settimeout(8)
+            code, head = l196_read(c)
+            c.close()
+            check("l204: a 30 MB %s body without a key is refused 401 from the headers, unread (it was read first)" % path, code == 401 and time.time() - t0 < 3, (code, round(time.time() - t0, 2), head[:200]))
+        s, _, b = call("POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, None, base=GW_L204, auth=False)
+        check("l204: a small /mcp call without a key gets the same 401", s == 401, (s, b[:200]))
     finally:
         gw.terminate()
         gw.wait()
@@ -19658,6 +19828,9 @@ def main():
         # L201: the body budget charged as bytes arrive, the body deadline, small public bodies, the cluster listener's
         # signature-first reads and body cap, signed leader reads, the open /metrics warning: its own gateway (18358, 18359)
         l201_e2e(env)
+        # L204: unchecked bodies' budget share and deadline, /mcp checked from the headers, the rate-based deadline of
+        # checked bodies, header-signed peer requests with their own budget: its own gateway (18364, 18365)
+        l204_e2e(env)
         # L194: Hugging Face inference providers (chat, embeddings, speech, transcription, images), the CLI's agent sign-in
         # and default key, and the A2A v0.3 REST client: its own gateway (18344) and Hugging Face double (18345)
         l194_e2e(env)

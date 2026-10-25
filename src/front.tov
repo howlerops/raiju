@@ -6,8 +6,8 @@ import { serve, Http1Request, Http1Response, BodyQueue } from "./http1"
 import { WsConnection } from "./ws"
 import { Engine, StreamSink, errorResponse, noHeaders } from "./gateway"
 import { Ops } from "./ops"
-import { clientIpFor, dispatch, clusterDispatch, compatPath, streamKind, streamsRequest, routeStream, httpPathLabel, http1Upgrade, largeFront, limitedBody, credentialRefusal, heldBody, routeBodyLimit, Served } from "./server"
-import { bodyBudget, UNREAD_ABOVE } from "./bodybudget"
+import { clientIpFor, dispatch, clusterDispatch, compatPath, streamKind, streamsRequest, routeStream, httpPathLabel, http1Upgrade, largeFront, limitedBody, credentialCheck, heldBody, routeBodyLimit, BodyHold, Served } from "./server"
+import { UNREAD_ABOVE } from "./bodybudget"
 import { ServerLimits } from "./lifecycle"
 import { snapshot } from "./schemas"
 import { TransportRun, transportStart, transportEnd, transportDone, transportSink } from "./pluginroute"
@@ -124,13 +124,14 @@ async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request,
   const t0 = performance.now()
   // (a streamed body has not arrived: its declared length stands in)
   const inBytes = req.stream === undefined ? req.bytes.length * 1.0 : (parseFloat(req.headers.get("content-length") ?? "0") ?? 0.0)
-  // what this request holds of the process's body budget (heldBody), given back when it is done
-  let held = 0
+  // what this request holds of a body budget (heldBody), given back when it is done
+  let hold = new BodyHold()
   // the body's text, for the streaming check (a streamed body is read below)
   let bodyText = req.body
   try {
     // a big body is not read for a caller its credentials already refuse
-    const refused = await credentialRefusal(engine, ops, request, limit)
+    const checked = await credentialCheck(engine, ops, request, limit)
+    const refused = checked.res
     if (refused !== undefined) {
       const n = await write(res, refused)
       metrics.observeHttp(httpPathLabel(path, refused.status), req.method, refused.status, (performance.now() - t0) / 1000.0, inBytes, n * 1.0, metrics.httpCustomValues(request.headers))
@@ -157,7 +158,7 @@ async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request,
       }
     } else {
       // the body is read whole here, charged to the process's body budget first (413 and 503 refuse it unread)
-      const hb = await heldBody(engine, request, limit)
+      const hb = await heldBody(engine, request, limit, checked.kind)
       const no = hb.res
       if (no !== undefined) {
         const n = await write(res, no)
@@ -165,7 +166,7 @@ async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request,
         return
       }
       request = hb.req
-      held = hb.held
+      hold = hb.hold
       if (req.stream !== undefined) {
         // the body stream is spent: the request is rebuilt around what was read, so a later reader of its body
         // (the plugins' transport hooks on a large body) gets the bytes
@@ -214,7 +215,7 @@ async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request,
     }
     console.error(`raiju: ${e.message}`)
   } finally {
-    bodyBudget().give(held)
+    hold.release()
     transportDone(engine, tr)
     if (wid !== "") {
       res.onGone = undefined
@@ -255,7 +256,7 @@ export function startFront(engine: Engine, ops: Ops, opts: FrontOptions): Served
 
 // The cluster listener (cluster.listen_port) on the http1 server: the peer routes, /health and, with
 // cluster.serve_metrics, /metrics (server.tov clusterDispatch). Bodies over UNREAD_ABOVE reach clusterDispatch unread,
-// which checks the signature header and cluster.max_body_mb before reading them.
+// which checks the signed head and cluster.max_body_mb before reading them.
 export function startClusterFront(engine: Engine, ops: Ops, hostname: string, port: int, t: ServerLimits): Served {
   const host = `${hostname}:${port}`
   const limits = { headerMs: ms(t.headerSeconds), idleMs: ms(t.idleSeconds), bodyMs: ms(t.bodySeconds), maxConnections: t.maxConnections }

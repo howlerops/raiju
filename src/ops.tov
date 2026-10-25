@@ -591,6 +591,15 @@ function denied(status: int, message: string, challenge?: string): Response {
   return new Response(errorJson(message, status === 401 ? "authentication_error" : "permission_error", undefined), { status: status, headers: h })
 }
 
+// Ops.mcpCaller's answer: res refuses the call; otherwise h are the headers to go on with, and checked whether a
+// credential was verified.
+export type McpCaller = { res: Response | undefined, h: Hdrs, checked: bool }
+
+function mcpRefused(res: Response): McpCaller {
+  const none: Hdrs = new Map()
+  return { res: res, h: none, checked: false }
+}
+
 function num(params: URLSearchParams, name: string): f64 | undefined {
   const v = params.get(name)
   if (v === undefined || v === "") return undefined
@@ -1759,9 +1768,8 @@ export class Ops {
       this.syncTooBig = true
       console.error(`raiju: cluster: this node's sync body is ${body.byteLength} bytes, over cluster.max_body_mb (${cluster.clusterBodyCap(cc)} bytes): its peers refuse it; raise cluster.max_body_mb on every node`)
     }
-    const h: Map<string, string> = new Map()
-    h.set("content-type", "application/json")
-    h.set("x-raiju-cluster-sig", cluster.sign(cc.secret, body))
+    // signed over the body, and over the head before a peer reads the body (the broker checks the body's signature)
+    const h = cluster.peerHeaders(cc.secret, "/api/cluster/sync", body, Date.now())
     if (cluster.isBroker(cc)) {
       // one outbound exchange with the broker, which relays to the other nodes
       const b = cc.broker
@@ -1991,9 +1999,7 @@ export class Ops {
         if (round > 0) await pause(300 * round)
         if (this.latestGen !== g.sha || this.store.fileSha === g.sha) return
         const body = JSON.stringify({ sha: g.sha, ts: Date.now() })
-        const h: Map<string, string> = new Map()
-        h.set("content-type", "application/json")
-        h.set("x-raiju-cluster-sig", cluster.sign(cc.secret, body))
+        const h = cluster.peerHeaders(cc.secret, "/api/cluster/config", body, Date.now())
         for (const p of this.peerUrls(cc)) {
           const r = await postText(p + "/api/cluster/config", h, body)
           if (r.status !== 200 || textSha(r.body) !== g.sha) continue
@@ -2247,9 +2253,7 @@ export class Ops {
     const w = this.readWindow(path, new URLSearchParams(query), now)
     if (peers.length === 0 || w === undefined) return none
     const ask = JSON.stringify({ path: path, query: query, now: now, ts: now })
-    const h: Map<string, string> = new Map()
-    h.set("content-type", "application/json")
-    h.set("x-raiju-cluster-sig", cluster.sign(cc.secret, ask))
+    const h = cluster.peerHeaders(cc.secret, "/api/cluster/logs", ask, now)
     const pending: Promise<LogEntry[]>[] = []
     for (const p of peers) pending.push(this.peerLogs(p, h, ask))
     const rows: LogEntry[] = []
@@ -2368,9 +2372,7 @@ export class Ops {
     q.busy = true
     const items = q.take(FEED_BATCH_MAX)
     const body = JSON.stringify({ items: items })
-    const h: Map<string, string> = new Map()
-    h.set("content-type", "application/json")
-    h.set("x-raiju-cluster-sig", cluster.sign(secret, body))
+    const h = cluster.peerHeaders(secret, "/api/cluster/feed", body, Date.now())
     const r = await postText(url, h, body)
     q.busy = false
     if (r.status === 200) {
@@ -2392,9 +2394,7 @@ export class Ops {
     q.busy = true
     const items = q.take(FEED_BATCH_MAX)
     const body = JSON.stringify({ node: cluster.nodeOf(this.nodeId), after: this.brokerAfter, items: items })
-    const h: Map<string, string> = new Map()
-    h.set("content-type", "application/json")
-    h.set("x-raiju-cluster-sig", cluster.sign(secret, body))
+    const h = cluster.peerHeaders(secret, BROKER_FEED_ROUTE, body, Date.now())
     const r = await postText(url, h, body)
     q.busy = false
     if (r.status !== 200) {
@@ -7061,47 +7061,63 @@ export class Ops {
     return false
   }
 
-  // POST /mcp (every connected tool) and /mcp/{name} (a virtual MCP's tool set).
-  async mcp(req: Request, virtualName: string | undefined): Promise<Response> {
+  // Who calls the MCP server (/mcp, /mcp/{name}), from the request's headers alone: the answer that refuses the
+  // call, or the headers to go on with (the identity a token names set as the key or user) and whether a credential
+  // was verified (a virtual key or a token; an anonymous call while auth is not enforced, or a session-mode token,
+  // carries none). The server reads its body only after this (server.tov
+  // headerCheck runs it before a big body is read, re-audit 3 P1-D).
+  mcpCaller(req: Request): McpCaller {
     const m = this.engine.mcp
-    if (m === undefined || this.engine.cfg.mcp_server?.enabled === false) return json(404, errorJson("no MCP servers are connected", "invalid_request_error", undefined))
+    if (m === undefined || this.engine.cfg.mcp_server?.enabled === false) return mcpRefused(json(404, errorJson("no MCP servers are connected", "invalid_request_error", undefined)))
     const h = snapshot(req.headers)
     // client.mcp_server_auth_mode: a Bifrost-issued JWT stands for the virtual key its sub names; in oauth
     // mode nothing else is accepted. The 401s name the protected resource when the authorization server is on.
     const iss = issuerOf(this.engine.cfg)
     const challenge = iss === undefined ? undefined : challengeOf(iss)
     const caller = callerOf(iss, h.get("authorization"), Date.now())
-    if (caller.kind === "error") return denied(401, caller.message, challenge)
+    if (caller.kind === "error") return mcpRefused(denied(401, caller.message, challenge))
     // a user is named only by a user-mode token checked here (mcpuser.tov markUser), never by a header the caller sent
     h.delete(USER_HEADER)
     if (caller.kind !== "none" && headerKeyOf(h) !== "") {
       // the OAuth token is the request's only identity: a virtual key header beside it is ambiguous (Bifrost)
-      return denied(401, "conflicting credentials: an OAuth token and a virtual key header were both provided; send only the OAuth token", challenge)
+      return mcpRefused(denied(401, "conflicting credentials: an OAuth token and a virtual key header were both provided; send only the OAuth token", challenge))
     }
     let mcpUser = ""
     if (caller.kind === "user") {
       // a dashboard sign-in on the same request must name the same user; a user governance disabled is refused at once
       const su = this.sessionUser(req)
-      if (su !== "" && su !== caller.sub) return denied(401, "session user does not match the authenticated token", challenge)
-      if (!this.userActive(caller.sub)) return denied(401, "user is no longer active", challenge)
+      if (su !== "" && su !== caller.sub) return mcpRefused(denied(401, "session user does not match the authenticated token", challenge))
+      if (!this.userActive(caller.sub)) return mcpRefused(denied(401, "user is no longer active", challenge))
       mcpUser = caller.sub
       h.set(USER_HEADER, markUser(caller.sub))
     } else if (caller.kind === "vk") {
-      if (vkIdentityCut(this.engine.cfg, this.oidcCfg !== undefined)) return denied(401, "virtual-key identity is no longer accepted; re-authenticate", challenge)
+      if (vkIdentityCut(this.engine.cfg, this.oidcCfg !== undefined)) return mcpRefused(denied(401, "virtual-key identity is no longer accepted; re-authenticate", challenge))
       const named = keyById(this.engine.cfg, caller.vk)
-      if (!keyUsable(named, Date.now()) || named === undefined) return denied(401, "the virtual key this token names is not active", challenge)
+      if (!keyUsable(named, Date.now()) || named === undefined) return mcpRefused(denied(401, "the virtual key this token names is not active", challenge))
       h.set("x-bf-vk", named.value)
     } else if (caller.kind === "session") {
       // a session token carries no verified identity (Bifrost): the request is anonymous, refused while auth is enforced,
       // and keys its per-user OAuth tokens by the session id the token names
-      if (this.engine.gov.enforce) return denied(401, "authentication required; session-mode tokens are not accepted when authentication is enforced - re-authenticate with a virtual key", challenge)
+      if (this.engine.gov.enforce) return mcpRefused(denied(401, "authentication required; session-mode tokens are not accepted when authentication is enforced - re-authenticate with a virtual key", challenge))
       h.set("x-bf-mcp-session-id", caller.sub)
     } else if (serverAuthMode(this.engine.cfg) === "oauth") {
-      return denied(401, "this server requires OAuth JWT authentication; header credentials are not accepted in oauth mode", challenge)
+      return mcpRefused(denied(401, "this server requires OAuth JWT authentication; header credentials are not accepted in oauth mode", challenge))
     }
     const vk = this.engine.gov.findKey(h)
     // a user-mode token is an identity of its own, as an upstream-authenticated user is in Bifrost
-    if (this.engine.gov.enforce && vk === undefined && mcpUser === "") return denied(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", challenge)
+    if (this.engine.gov.enforce && vk === undefined && mcpUser === "") return mcpRefused(denied(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", challenge))
+    return { res: undefined, h: h, checked: mcpUser !== "" || (vk !== undefined && keyUsable(vk, Date.now())) }
+  }
+
+  // POST /mcp (every connected tool) and /mcp/{name} (a virtual MCP's tool set).
+  async mcp(req: Request, virtualName: string | undefined): Promise<Response> {
+    const who = this.mcpCaller(req)
+    const refused = who.res
+    if (refused !== undefined) return refused
+    const m = this.engine.mcp
+    if (m === undefined) return json(404, errorJson("no MCP servers are connected", "invalid_request_error", undefined))
+    const h = who.h
+    const vk = this.engine.gov.findKey(h)
     // a key's access profile may limit the tools it sees; allow_by_default opens the clients it does not name
     const allowedTools = this.engine.gov.policyFor(h)?.mcpTools
     let tools = exposedTools(m.allToolsFor(allowedTools, this.engine.keyMcp(h, virtualName), this.engine.projectMcp(h, virtualName)))

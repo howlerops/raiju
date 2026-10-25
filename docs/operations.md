@@ -165,6 +165,12 @@ config saved while running with such a secret turns clustering off and logs why.
 `cluster.secret`, `cluster.bind`, `cluster.broker.address`, `cluster.discovery.advertise_address` and
 `cluster.discovery.consul_address`.
 
+A peer POST is signed twice: over its body (`x-raiju-cluster-sig`) and over its head (`x-raiju-cluster-head`: the
+method, the route, the time in `x-raiju-cluster-ts` and the Content-Length). A node checks the head, and that its
+time is within a minute, before it reads the body, so a request no node sent is refused unread; the body's HMAC is
+checked once it is read. Peer bodies have a body budget of their own (`cluster.max_body_mb`). Nodes from before
+L204 sign only the body and their peers refuse them, so upgrade a cluster's nodes together.
+
 The peer routes can have a listener of their own: `cluster.listen_port` (and `cluster.bind`, default the `-host`
 address) opens a second port that serves only `/api/cluster/*`, `/health` and, with `cluster.serve_metrics: true`,
 `/metrics`. The main listener then answers 404 for `/api/cluster/*` (and for `/metrics` with `serve_metrics`), so a

@@ -34,7 +34,7 @@ export type FeedConfig = { cluster_wide?: bool, ring_size?: int, ring_seconds?: 
 // secret: env.NAME allowed. It must hold at least 32 bytes once resolved, or the gateway refuses to start with
 // clustering on (secretProblem).
 // max_body_mb (Raiju only): the largest request body a peer route reads (default 16; clusterBodyCap). Bigger is 413
-// unread, and a body without a well-formed signature is refused before it is read.
+// unread, and a body whose head (method, route, time, length) no node signed is refused before it is read.
 export type ClusterConfig = { enabled: bool, node_id?: string, peers: string[], secret: string, interval_ms?: int, discovery?: DiscoveryConfig, type?: string, broker?: BrokerConfig, leader_lock?: LeaderLockConfig, feed?: FeedConfig, config_sync?: string, log_reads?: bool, listen_port?: int, bind?: string, serve_metrics?: bool, max_body_mb?: int }
 
 // The shortest cluster.secret accepted: 32 bytes (256 bits, as long as the HMAC-SHA256 key it becomes).
@@ -308,6 +308,37 @@ export function requestRefusal(secret: string, method: string, path: string, ts:
   return ""
 }
 
+// The header that signs a peer request's head (re-audit 3 P2-A): its method, route, time (x-raiju-cluster-ts) and
+// Content-Length, checked before the body is read, so a request a node did not send is refused unread and a captured
+// head cannot carry a bigger body. The body's own HMAC (x-raiju-cluster-sig) is still checked once it is read.
+export const HEAD_SIG_HEADER = "x-raiju-cluster-head"
+
+// What a peer request's head signature covers. length is the Content-Length header as sent ("chunked" without one).
+export function headText(method: string, path: string, ts: string, length: string): string {
+  return method + " " + path + " " + ts + " " + length
+}
+
+// A peer request's head check: "" when its head signature matches and its time is fresh, otherwise why it is refused.
+export function headRefusal(secret: string, method: string, path: string, ts: string, length: string, sig: string, nowMs: f64): string {
+  const t = parseFloat(ts)
+  if (ts === "" || t === undefined) return "bad cluster signature"
+  if (!verify(secret, headText(method, path, ts, length), sig)) return "bad cluster signature"
+  if (!fresh(t, nowMs)) return "stale cluster request"
+  return ""
+}
+
+// The headers of a signed peer POST to route with body: the body's HMAC, the time, and the head signature over the
+// method, route, time and the body's length in bytes.
+export function peerHeaders(secret: string, route: string, body: string, nowMs: f64): Map<string, string> {
+  const ts = `${Math.floor(nowMs)}`
+  const h: Map<string, string> = new Map()
+  h.set("content-type", "application/json")
+  h.set("x-raiju-cluster-sig", sign(secret, body))
+  h.set(TS_HEADER, ts)
+  h.set(HEAD_SIG_HEADER, sign(secret, headText("POST", route, ts, `${body.byteLength}`)))
+  return h
+}
+
 // Hex HMAC-SHA256 of the request body, sent in the x-raiju-cluster-sig header.
 export function sign(secret: string, body: string): string {
   return toHex(hmacSha256(utf8(secret), utf8(body)))
@@ -435,6 +466,32 @@ test("signature headers are checked for shape, and the body cap", () => {
   expect(clusterBodyCap(undefined)).toBe(16 * 1048576)
   expect(clusterBodyCap({ enabled: true, peers: [], secret: "s", max_body_mb: 4 })).toBe(4 * 1048576)
   expect(clusterBodyCap({ enabled: true, peers: [], secret: "s", max_body_mb: 0 })).toBe(16 * 1048576)
+})
+
+test("a peer request's head is signed over its method, route, time and length (re-audit 3 P2-A)", () => {
+  const key = "k".repeat(32)
+  const now = 1800000000000.0
+  const body = `{"node":"n"}`
+  const h = peerHeaders(key, "/api/cluster/sync", body, now)
+  const ts = h.get(TS_HEADER)!
+  expect(ts).toBe("1800000000000")
+  expect(verify(key, body, h.get("x-raiju-cluster-sig")!)).toBe(true)
+  const sig = h.get(HEAD_SIG_HEADER)!
+  const n = `${body.byteLength}`
+  expect(headRefusal(key, "POST", "/api/cluster/sync", ts, n, sig, now)).toBe("")
+  // another route, length, time or key: refused
+  expect(headRefusal(key, "POST", "/api/cluster/config", ts, n, sig, now)).toBe("bad cluster signature")
+  expect(headRefusal(key, "POST", "/api/cluster/sync", ts, "15000000", sig, now)).toBe("bad cluster signature")
+  expect(headRefusal(key, "POST", "/api/cluster/sync", ts, "chunked", sig, now)).toBe("bad cluster signature")
+  expect(headRefusal(key, "POST", "/api/cluster/sync", "1800000000001", n, sig, now)).toBe("bad cluster signature")
+  expect(headRefusal("j".repeat(32), "POST", "/api/cluster/sync", ts, n, sig, now)).toBe("bad cluster signature")
+  expect(headRefusal(key, "POST", "/api/cluster/sync", "", n, sig, now)).toBe("bad cluster signature")
+  expect(headRefusal(key, "POST", "/api/cluster/sync", ts, n, "0".repeat(64), now)).toBe("bad cluster signature")
+  // a captured head replays for a minute at most
+  expect(headRefusal(key, "POST", "/api/cluster/sync", ts, n, sig, now + 60001.0)).toBe("stale cluster request")
+  // the length is the body's in bytes
+  const h2 = peerHeaders(key, "/api/cluster/feed", "é", now)
+  expect(headRefusal(key, "POST", "/api/cluster/feed", h2.get(TS_HEADER)!, "2", h2.get(HEAD_SIG_HEADER)!, now)).toBe("")
 })
 
 test("peers and forget track who was heard from", () => {

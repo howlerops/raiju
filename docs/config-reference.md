@@ -9,7 +9,7 @@ for each element of a list. Descriptions are the comments in the source; default
 has one. The command-line flags (`-app-dir`, `-config`, `-host`, `-port`, `-workers`, `-server`, `-mode`,
 `-healthcheck`) are in the README.
 
-1372 keys (571 with a description), and 38 Bifrost keys read through config_compat.
+1375 keys (574 with a description), and 38 Bifrost keys read through config_compat.
 
 ## Sections
 
@@ -1625,7 +1625,10 @@ Bifrost's server section; Raiju reads a2a_allow_private_push_callbacks (push cal
 | `server.body_timeout_seconds` | number | a request body may go this long without a byte (default 60; 0 off) |
 | `server.max_connections` | int | open connections per process (default three quarters of ulimit -n; -1 no cap) |
 | `server.max_buffered_body_mb` | int | request-body megabytes each process reads at once across requests (default 48; -1 no cap; bodybudget.tov) |
-| `server.body_deadline_seconds` | number | a body over 64 KB must arrive whole within this, or it is answered 408 (default 120; 0 off; bodybudget.tov) |
+| `server.body_deadline_seconds` | number | a body over 64 KB whose credential was not checked from the headers must arrive whole within this, or it is answered 408 (default 30; 0 off; bodybudget.tov) |
+| `server.unchecked_body_mb` | int | the megabytes of max_buffered_body_mb that bodies whose credential was not checked may hold together (default an eighth; -1 no separate share; bodybudget.tov) |
+| `server.body_min_kb_per_second` | number | a body over 64 KB whose credential was checked must arrive at this average rate after body_rate_grace_seconds, or it is answered 408 (default 32; 0 off; bodybudget.tov) |
+| `server.body_rate_grace_seconds` | number | the start of a checked body that body_min_kb_per_second does not count (default 10) |
 | `server.webrtc_enabled` | bool | webrtc_enabled (Raiju's; Bifrost has no switch) turns on the WebRTC realtime and live calls the gateway terminates on its own peer (POST /v1/realtime/calls, POST /v1/realtime, POST /v1/live/sessions). |
 | `server.metrics_token` | string | Raiju's: when set (env.NAME allowed), /metrics answers only a request with "Authorization: Bearer <token>" (401 otherwise). Unset keeps Bifrost's open /metrics. |
 | `server.trusted_proxies` | string[] | Raiju's own (Bifrost believes no forwarding header): the addresses or CIDR ranges of the reverse proxies in front of the gateway. Only a request from one of them has its X-Forwarded-For / X-Real-IP taken as the client's address (clientip.tov), for the audit log and the sign-in throttle. Empty (the default): the TCP peer is the client. |

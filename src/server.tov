@@ -63,8 +63,8 @@ import { EXTRA_PARAMS_HEADER, EXTRA_PARAMS_CARRY, mergeExtraParams, extraParamsC
 import { lifecycle, readyInput, readyReport, ServerLimits } from "./lifecycle"
 import { CLIENT_WATCH_HEADER, watchStart, watchGone, watchEnd, watched } from "./clientgone"
 import { usesChain, withChainCreds } from "./awschain"
-import { bodyBudget, bufferedCap, bodyDeadlineMs, UNREAD_ABOVE } from "./bodybudget"
-import { clusterBodyCap, wellFormedSig } from "./cluster"
+import { bodyBudget, peerBudget, bufferedCap, uncheckedShare, bodyDeadlineMs, bodyRate, rateDue, BodyRate, BodyClass, UNREAD_ABOVE } from "./bodybudget"
+import { clusterBodyCap, wellFormedSig, headRefusal, peerHeaders, HEAD_SIG_HEADER, TS_HEADER } from "./cluster"
 
 type ModelEntry = { id: string, object: string, created: int, owned_by: string }
 
@@ -1112,7 +1112,7 @@ export const NO_BODY_LIMIT = 1099511627776
 // (large_payload_optimization's request threshold; the limit itself while the feature is off, so a body over it
 // is refused unread).
 // Bodies over UNREAD_ABOVE reach the gateway as a stream whatever the feature says, so a request's credentials are
-// checked, and its body charged to the process's budget, before the body is read (credentialRefusal, heldBody).
+// checked, and its body charged to the process's budget, before the body is read (credentialCheck, heldBody).
 export function bodyLimits(engine: Engine): { limit: int, threshold: int } {
   const limit = (engine.cfg.client?.max_request_body_size_mb ?? 100) * 1048576
   const lp = engine.large
@@ -1196,59 +1196,113 @@ export function routeBodyLimit(engine: Engine, p: string, limit: int): int {
   return limit
 }
 
-// A peer route's request without a well-formed signature header, refused before its body is read (the HMAC itself is
-// checked over the bytes once they are read); undefined when the header is there.
-export function unsignedPeerRefusal(req: Request): Response | undefined {
+// A peer route's POST that a node did not sign, refused before its body is read (re-audit 3 P2-A): the body's
+// signature header must be well formed, and the head signature (cluster.HEAD_SIG_HEADER, over the method, route,
+// x-raiju-cluster-ts and Content-Length) must match and be fresh; the body's HMAC is checked over the bytes once they
+// are read. undefined when the head is signed (or the request carries no body). With clustering off the route answers
+// 404 without reading the body.
+export function peerHeadRefusal(ops: Ops, req: Request, p: string): Response | undefined {
   if (req.method === "GET" || req.method === "HEAD") return undefined
-  if (wellFormedSig(req.headers.get("x-raiju-cluster-sig") ?? "")) return undefined
-  return errorResponse(401, "bad cluster signature", "authentication_error", noHeaders())
+  const cc = ops.clusterCfg
+  if (cc === undefined) return errorResponse(404, "clustering is off", "invalid_request_error", noHeaders())
+  if (!wellFormedSig(req.headers.get("x-raiju-cluster-sig") ?? "")) return errorResponse(401, "bad cluster signature", "authentication_error", noHeaders())
+  const length = req.headers.get("content-length") ?? "chunked"
+  const why = headRefusal(cc.secret, req.method, p, req.headers.get(TS_HEADER) ?? "", length, req.headers.get(HEAD_SIG_HEADER) ?? "", Date.now())
+  if (why !== "") return errorResponse(401, why, "authentication_error", noHeaders())
+  return undefined
 }
 
-// The answer a request with a big unread body gets for its credentials alone, before the body is read; undefined
-// when its credentials pass (or are not judged from the headers). Inference routes refuse what governance would
-// refuse for any model (a missing credential while auth is enforced, an inactive or expired key), management routes
-// what the gate refuses, SCIM a wrong provisioning token. The MCP server's routes and requests that plugins' HTTP
-// hooks see first (they may add the credential) are left to their handlers. A small body has already been read by
-// the server and goes the usual way.
-export async function credentialRefusal(engine: Engine, ops: Ops, req: Request, limit: int): Promise<Response | undefined> {
-  if (!unreadBody(req, limit)) return undefined
+// How a request's body is charged (bodybudget.tov): "checked" when its credential was verified from the headers,
+// "unchecked" when it was not, "peer" for a signed peer route (its own budget).
+export type BodyKind = "checked" | "unchecked" | "peer"
+
+// What the headers decide before a big body is read: the answer that refuses the request, or how its body is charged.
+export type HeaderCheck = { res: Response | undefined, kind: BodyKind }
+
+// The answer a request with a big unread body gets for its credentials alone, before the body is read (undefined
+// when its credentials pass or are not judged from the headers), and whether they were verified. A small body has
+// already been read by the server and goes the usual way.
+export async function credentialCheck(engine: Engine, ops: Ops, req: Request, limit: int): Promise<HeaderCheck> {
+  if (!unreadBody(req, limit)) return { res: undefined, kind: "unchecked" }
   const u = URL.parse(req.url)
   const p = u === undefined ? "" : u.pathname
   // (an expired single sign-on session is renewed first, as manage does)
   if (gatedPath(p)) await ops.refreshDue(req)
-  const res = headerRefusal(engine, ops, req, limit)
-  if (res === undefined) return undefined
+  const c = headerCheck(engine, ops, req, limit)
+  const res = c.res
+  if (res === undefined) return c
   // the answer the route would give: inference answers carry the CORS headers, and every answer the agent mark
   // and the caller's request id (dispatch)
-  const shaped = isInferencePath(p) ? await cors(engine, req, res) : res
-  return await echoRequestId(req, await markAgentRejection(engine, req, shaped))
+  const shaped = isInferencePath(p) && p !== "/mcp" && !p.startsWith("/mcp/") ? await cors(engine, req, res) : res
+  return { res: await echoRequestId(req, await markAgentRejection(engine, req, shaped)), kind: c.kind }
 }
 
-// credentialRefusal's decision, as the route answers it before the shared headers are added.
-export function headerRefusal(engine: Engine, ops: Ops, req: Request, limit: int): Response | undefined {
-  if (!unreadBody(req, limit)) return undefined
+// credentialCheck's decision, as the route answers it before the shared headers are added. Inference routes refuse
+// what governance would refuse for any model (a missing credential while auth is enforced, an inactive or expired
+// key), management routes what the gate refuses, SCIM a wrong provisioning token, the MCP server what its handler
+// refuses from the headers (Ops.mcpCaller: client.mcp_server_auth_mode, the OAuth token, the key), the tool execute
+// route an inactive key, the peer routes an unsigned head. Requests that plugins' HTTP hooks see first (they may add
+// the credential) are not refused here, and count as checked only when their headers already carry a verified one.
+export function headerCheck(engine: Engine, ops: Ops, req: Request, limit: int): HeaderCheck {
+  if (!unreadBody(req, limit)) return { res: undefined, kind: "unchecked" }
   const u = URL.parse(req.url)
   const p = u === undefined ? "" : u.pathname
   if (gatedPath(p)) {
     const g = ops.gate(req, p)
-    return g.kind === "deny" ? g.res : undefined
+    if (g.kind === "deny") return { res: g.res, kind: "unchecked" }
+    // a whitelisted route or the setup routes vouch for no one
+    return { res: undefined, kind: g.actor === "anonymous" ? "unchecked" : "checked" }
   }
-  if (p.startsWith("/api/cluster/")) return unsignedPeerRefusal(req)
+  if (p.startsWith("/api/cluster/")) return { res: peerHeadRefusal(ops, req, p), kind: "peer" }
   if (p === "/scim/v2" || p.startsWith("/scim/v2/")) {
     const sc = ops.store.cfg.scim_config
-    if (sc?.enabled !== true) return undefined
-    if (!scimAuthorized(req.headers.get("authorization") ?? "", resolveEnv(sc?.config?.provisioningToken ?? ""))) return scimReply(401, errorBody(401, "", "the SCIM provisioning token is missing or wrong"))
-    return undefined
+    if (sc?.enabled !== true) return { res: undefined, kind: "unchecked" }
+    if (!scimAuthorized(req.headers.get("authorization") ?? "", resolveEnv(sc?.config?.provisioningToken ?? ""))) return { res: scimReply(401, errorBody(401, "", "the SCIM provisioning token is missing or wrong")), kind: "unchecked" }
+    return { res: undefined, kind: "checked" }
   }
-  if (!isInferencePath(p) || p === "/mcp" || p.startsWith("/mcp/") || compatPath(p).startsWith("/v1/mcp/") || httpHooked(engine)) return undefined
-  const d = engine.gov.credentialDenial(snapshot(req.headers))
-  if (d === undefined) return undefined
-  return errorResponse(d.status, d.message, d.type, noHeaders())
+  const h = snapshot(req.headers)
+  const verified: BodyKind = engine.gov.credentialChecked(h) ? "checked" : "unchecked"
+  if (httpHooked(engine)) return { res: undefined, kind: verified }
+  if (p === "/mcp" || (p.startsWith("/mcp/") && p.split("/").length === 3)) {
+    const who = ops.mcpCaller(req)
+    return { res: who.res, kind: who.checked ? "checked" : "unchecked" }
+  }
+  if (compatPath(p).startsWith("/v1/mcp/")) {
+    // the tool route takes other credentials too (an identity-provider token for token exchange): only a named key
+    // that is inactive is refused from the headers, as its gate would (Governance.admitTool)
+    const vk = engine.gov.findKey(h)
+    if (vk !== undefined && vk.is_active === false) return { res: errorResponse(403, `virtual key ${vk.name ?? vk.id} is inactive`, "permission_error", noHeaders()), kind: "unchecked" }
+    return { res: undefined, kind: verified }
+  }
+  if (!isInferencePath(p)) return { res: undefined, kind: verified }
+  const d = engine.gov.credentialDenial(h)
+  if (d !== undefined) return { res: errorResponse(d.status, d.message, d.type, noHeaders()), kind: "unchecked" }
+  return { res: undefined, kind: verified }
 }
 
-// A request with its body read whole, or the answer that refuses it unread; held is what the request holds of the
-// process's body budget until it is done (bodyBudget().give).
-export type HeldBody = { res: Response | undefined, req: Request, held: int }
+// headerCheck's refusal alone.
+export function headerRefusal(engine: Engine, ops: Ops, req: Request, limit: int): Response | undefined {
+  return headerCheck(engine, ops, req, limit).res
+}
+
+// What a request holds of a body budget until it is done: release gives it back (once).
+export class BodyHold {
+  held = 0
+  cls: BodyClass = "small"
+  peer = false
+
+  release(): void {
+    const n = this.held
+    this.held = 0
+    if (n <= 0) return
+    if (this.peer) peerBudget().give(n, this.cls)
+    else bodyBudget().give(n, this.cls)
+  }
+}
+
+// A request with its body read whole, or the answer that refuses it unread; hold is what the request holds of the
+// body budget until it is done (hold.release()).
+export type HeldBody = { res: Response | undefined, req: Request, hold: BodyHold }
 
 function busyResponse(): Response {
   const h: Hdrs = new Map()
@@ -1256,8 +1310,9 @@ function busyResponse(): Response {
   return errorResponse(503, "the gateway is reading too many request bodies at once (server.max_buffered_body_mb); retry shortly", "api_error", h)
 }
 
-function deadlineResponse(): Response {
-  return errorResponse(408, "the request body did not arrive in time (server.body_deadline_seconds)", "invalid_request_error", noHeaders())
+function deadlineResponse(checked: bool): Response {
+  const why = checked ? "the request body arrived too slowly (server.body_min_kb_per_second)" : "the request body did not arrive in time (server.body_deadline_seconds)"
+  return errorResponse(408, why, "invalid_request_error", noHeaders())
 }
 
 // One read of a body stream, or late when the body's deadline passed first.
@@ -1273,44 +1328,83 @@ async function readChunk(st: ReadableStream): Promise<BodyRead> {
   }
 }
 
-// Reads a request's body, charged to the process's body budget (bodybudget.tov, server.max_buffered_body_mb): a
-// declared length over the limit is 413 unread. A body the server has read already (UNREAD_ABOVE or less) is charged
-// whole and always admitted; a bigger or chunked one is charged as its bytes arrive (a declared length that cannot fit beside what is held
-// is 503 unread, bytes that do not fit are 503 there), stops at the limit (413) and must arrive whole within
-// server.body_deadline_seconds (408).
-export async function heldBody(engine: Engine, req: Request, limit: int): Promise<HeldBody> {
-  if (req.method === "GET" || req.method === "HEAD") return { res: undefined, req: req, held: 0 }
-  const cap = bufferedCap(engine.cfg.server)
-  const b = bodyBudget()
+// A body's clock: the bytes it has sent, and its timer.
+class BodyClock {
+  got = 0
+  timer = -1
+  start = 0.0
+}
+
+// Arms the rate check of a checked body: when it fires, a body behind the rate (rateDue) is late, and one that kept
+// up is checked again when it would next fall behind.
+function armRate(clock: BodyClock, waitMs: f64, rate: BodyRate, late: (r: BodyRead) => void): void {
+  clock.timer = setTimeout(() => {
+    const elapsed = performance.now() - clock.start
+    const due = rateDue(clock.got, rate)
+    if (elapsed >= due) {
+      clock.timer = -1
+      late({ late: true, done: true, value: undefined })
+      return
+    }
+    armRate(clock, due - elapsed, rate, late)
+  }, Math.max(1, Math.ceil(waitMs)))
+}
+
+// Reads a request's body, charged to a body budget (bodybudget.tov): the process's for clients (server.max_buffered_body_mb,
+// unchecked bodies within server.unchecked_body_mb beside others), the peers' own for kind "peer" (cluster.max_body_mb).
+// A declared length over the limit is 413 unread. A body the server has read already (UNREAD_ABOVE or less) is charged
+// whole and always admitted; a bigger or chunked one is charged as its bytes arrive (a declared length that cannot fit
+// beside what is held is 503 unread, bytes that do not fit are 503 there) and stops at the limit (413). An unchecked
+// body must arrive whole within server.body_deadline_seconds; a checked or peer one at server.body_min_kb_per_second
+// after server.body_rate_grace_seconds (408 otherwise).
+export async function heldBody(engine: Engine, req: Request, limit: int, kind: BodyKind): Promise<HeldBody> {
+  const hold = new BodyHold()
+  if (req.method === "GET" || req.method === "HEAD") return { res: undefined, req: req, hold: hold }
+  const peer = kind === "peer"
+  const b = peer ? peerBudget() : bodyBudget()
+  const cap = peer ? clusterBodyCap(engine.cfg.cluster) : bufferedCap(engine.cfg.server)
+  const share = peer ? 0 : uncheckedShare(engine.cfg.server, cap)
+  const cls: BodyClass = kind === "unchecked" ? "unchecked" : "checked"
+  hold.peer = peer
   const declared = req.headers.get("content-length")
   let max = limit
   if (declared !== undefined) {
     const n = parseInt(declared) ?? 0
-    if (n > limit) return { res: errorResponse(413, "request body too large", "invalid_request_error", noHeaders()), req: req, held: 0 }
+    if (n > limit) return { res: errorResponse(413, "request body too large", "invalid_request_error", noHeaders()), req: req, hold: hold }
     if (n <= UNREAD_ABOVE) {
       // read by the server already (or small): charged whole, and never refused, since refusing it saves no memory
       // (a big body that holds the budget does not turn small calls away)
       b.hold(n)
+      hold.held = n
+      hold.cls = "small"
       await req.text()
-      return { res: undefined, req: req, held: n }
+      return { res: undefined, req: req, hold: hold }
     }
-    if (!b.fits(n, cap)) return { res: busyResponse(), req: req, held: 0 }
+    if (!b.fits(n, cap, cls, share)) return { res: busyResponse(), req: req, hold: hold }
     max = n
   }
   const st = req.body
-  if (st === undefined) return { res: undefined, req: req, held: 0 }
-  const ms = bodyDeadlineMs(engine.cfg.server)
-  let timer = -1
+  if (st === undefined) return { res: undefined, req: req, hold: hold }
+  hold.cls = cls
+  const clock = new BodyClock()
+  clock.start = performance.now()
+  const rate = bodyRate(engine.cfg.server)
+  // an unchecked body has a fixed deadline; a checked one a minimum average rate
+  const fixed = cls === "unchecked" ? bodyDeadlineMs(engine.cfg.server) : 0
+  const timed = cls === "unchecked" ? fixed > 0 : rate.bytesPerSecond > 0
   const late: Promise<BodyRead> = new Promise<BodyRead>((resolve) => {
-    if (ms > 0) timer = setTimeout(() => resolve({ late: true, done: true, value: undefined }), ms)
+    if (cls === "unchecked") {
+      if (fixed > 0) clock.timer = setTimeout(() => resolve({ late: true, done: true, value: undefined }), fixed)
+    } else if (rate.bytesPerSecond > 0) {
+      armRate(clock, rateDue(0, rate), rate, resolve)
+    }
   })
   const body: u8[] = []
-  let held = 0
   let res: Response | undefined = undefined
   while (true) {
-    const r = ms > 0 ? await Promise.race([readChunk(st), late]) : await readChunk(st)
+    const r = timed ? await Promise.race([readChunk(st), late]) : await readChunk(st)
     if (r.late) {
-      res = deadlineResponse()
+      res = deadlineResponse(cls === "checked")
       break
     }
     const v = r.value
@@ -1319,24 +1413,26 @@ export async function heldBody(engine: Engine, req: Request, limit: int): Promis
       res = errorResponse(413, "request body too large", "invalid_request_error", noHeaders())
       break
     }
-    if (!b.take(v.length, held, cap)) {
+    if (!b.take(v.length, hold.held, cap, cls, share)) {
       res = busyResponse()
       break
     }
-    held += v.length
+    hold.held += v.length
+    clock.got += v.length
     for (const x of v) body.push(x)
   }
-  if (timer >= 0) clearTimeout(timer)
+  if (clock.timer >= 0) clearTimeout(clock.timer)
+  clock.timer = -1
   if (res !== undefined) {
     try {
       await st.cancel()
     } catch (e) {
       // the stream is gone already
     }
-    b.give(held)
-    return { res: res, req: req, held: 0 }
+    hold.release()
+    return { res: res, req: req, hold: hold }
   }
-  return { res: undefined, req: new Request(req.url, { method: req.method, headers: snapshot(req.headers), body: body }), held: held }
+  return { res: undefined, req: new Request(req.url, { method: req.method, headers: snapshot(req.headers), body: body }), hold: hold }
 }
 
 // large_payload_optimization (largepayload.tov) at the front of a server: the Response that refuses or
@@ -1403,8 +1499,13 @@ function metricsRoute(engine: Engine, ops: Ops, req: Request, onClusterListener:
   return textResponse(ops.metricsText(), "text/plain; version=0.0.4")
 }
 
-// The peer routes, signed with cluster.secret (ops.tov). undefined: not one of them.
+// The peer routes, signed with cluster.secret (ops.tov). undefined: not one of them. A POST's head is checked here
+// too (peerHeadRefusal), so a small body the server read already needs the same signatures as a big one.
 async function clusterRoute(ops: Ops, req: Request, p: string, m: string): Promise<Response | undefined> {
+  if (m === "POST" && ops.clusterCfg !== undefined) {
+    const unsigned = peerHeadRefusal(ops, req, p)
+    if (unsigned !== undefined) return unsigned
+  }
   if (p === "/api/cluster/sync" && m === "POST") return await ops.clusterSync(req)
   if (p === "/api/cluster/feed" && m === "POST") return await ops.clusterFeed(req)
   if (p === "/api/cluster/leader" && m === "GET") return ops.clusterLeader(req)
@@ -1421,25 +1522,25 @@ export async function clusterDispatch(engine: Engine, ops: Ops, req: Request): P
   if (p === "/health" && (m === "GET" || m === "HEAD")) return Response.json({ status: "ok" })
   if (p === "/metrics" && (m === "GET" || m === "HEAD")) return metricsRoute(engine, ops, req, true)
   if (p.startsWith("/api/cluster/")) {
-    // a body is read only for a request that carries a signature, up to cluster.max_body_mb and charged to the body
+    // a body is read only for a request whose head a node signed, up to cluster.max_body_mb and charged to the peers'
     // budget; its HMAC is then checked over the bytes read
-    const unsigned = unsignedPeerRefusal(req)
+    const unsigned = peerHeadRefusal(ops, req, p)
     if (unsigned !== undefined) return unsigned
-    const hb = await heldBody(engine, req, clusterBodyCap(engine.cfg.cluster))
+    const hb = await heldBody(engine, req, clusterBodyCap(engine.cfg.cluster), "peer")
     const no = hb.res
     if (no !== undefined) return no
     try {
       const cr = await clusterRoute(ops, hb.req, p, m)
       if (cr !== undefined) return cr
     } finally {
-      bodyBudget().give(hb.held)
+      hb.hold.release()
     }
   }
   return errorResponse(404, "not found on the cluster listener", "invalid_request_error", noHeaders())
 }
 
 // The cluster listener on the Bun.serve server: opened before the workers fork, so every worker accepts on it too.
-// Bodies over UNREAD_ABOVE reach clusterDispatch unread, which checks the signature header and cluster.max_body_mb
+// Bodies over UNREAD_ABOVE reach clusterDispatch unread, which checks the signed head and cluster.max_body_mb
 // (read per request) before reading them.
 export function startCluster(engine: Engine, ops: Ops, port: int, hostname: string, lim: ServerLimits): Served {
   const server = Bun.serve({
@@ -2222,13 +2323,14 @@ async function bunHttpWatched(engine: Engine, ops: Ops, req00: Request, limit0: 
   // the public routes and the peer routes read smaller bodies (routeBodyLimit)
   const limit = routeBodyLimit(engine, pathOfReq(req00), limit0)
   // a big body is not read for a caller its credentials already refuse
-  const refused = await outOfLine(credentialRefusal(engine, ops, req00, limit))
+  const checked = await outOfLine(credentialCheck(engine, ops, req00, limit))
+  const refused = checked.res
   if (refused !== undefined) return refused
   let wid = watch
   const lf = await outOfLine(largeFront(engine, req00))
   if (lf instanceof Response) return lf
   let within: Request = req00
-  let held = 0
+  let hold = new BodyHold()
   if (lf instanceof Request) {
     wid = ""
     // (a body the feature streams on is not held here)
@@ -2236,16 +2338,16 @@ async function bunHttpWatched(engine: Engine, ops: Ops, req00: Request, limit0: 
     if (lim === undefined) return errorResponse(413, "request body too large", "invalid_request_error", noHeaders())
     within = lim
   } else {
-    const hb = await outOfLine(heldBody(engine, req00, limit))
+    const hb = await outOfLine(heldBody(engine, req00, limit, checked.kind))
     const no = hb.res
     if (no !== undefined) return no
     within = hb.req
-    held = hb.held
+    hold = hb.hold
   }
   try {
     return try await bunRouted(engine, ops, within, wid)
   } finally {
-    bodyBudget().give(held)
+    hold.release()
   }
 }
 
@@ -2402,14 +2504,16 @@ test("a big unread body is refused for its credentials alone; a small or over-li
   expect(st(bigPost("/v1/chat/completions", [["x-bf-vk", "sk-bf-off"]]))).toBe(403)
   // the management API: locked (no admin, no setup token) before its body is read
   expect(st(bigPost("/api/providers", []))).toBe(403)
-  // routes with their own credentials, and the MCP server, are left to their handlers
+  // routes with their own credentials are left to their handlers
   expect(st(bigPost("/api/session/login", []))).toBe(0)
-  // a peer route's body is not read without a well-formed signature header (the HMAC is checked over the bytes read)
-  expect(st(bigPost("/api/cluster/sync", []))).toBe(401)
-  expect(st(bigPost("/api/cluster/sync", [["x-raiju-cluster-sig", "nope"]]))).toBe(401)
-  expect(st(bigPost("/api/cluster/sync", [["x-raiju-cluster-sig", "ab".repeat(32)]]))).toBe(0)
-  expect(st(bigPost("/mcp", []))).toBe(0)
+  // the MCP server answers from the headers too (re-audit 3 P1-D): here no MCP server is connected (404, unread)
+  expect(st(bigPost("/mcp", []))).toBe(404)
+  expect(st(bigPost("/mcp/vm", [["x-bf-vk", "sk-bf-k"]]))).toBe(404)
+  // the tool route takes other credentials too: only an inactive key is refused from the headers
   expect(st(bigPost("/v1/mcp/tool/execute", []))).toBe(0)
+  expect(st(bigPost("/v1/mcp/tool/execute", [["x-bf-vk", "sk-bf-off"]]))).toBe(403)
+  // with clustering off a peer route's body is not read
+  expect(st(bigPost("/api/cluster/sync", [["x-raiju-cluster-sig", "ab".repeat(32)]]))).toBe(404)
   // a chunked body counts as unread
   const ch: Record<string, string> = new Map()
   ch.set("transfer-encoding", "chunked")
@@ -2440,9 +2544,61 @@ test("the public routes and the peer routes read small bodies", () => {
   // a 1 MB sign-in body is over the limit: refused unread with 413 (heldBody), not judged from the headers
   const ops = new Ops(eng, new ConfigStore("/tmp/raiju-server-public-limit.json", cfg))
   expect(headerRefusal(eng, ops, bigPost("/api/session/login", []), routeBodyLimit(eng, "/api/session/login", limit))).toBeUndefined()
-  // a signature header the GET leader read does not need, and a signed POST passes the shape check
-  expect(unsignedPeerRefusal(new Request("http://gw/api/cluster/leader", { method: "GET" }))).toBeUndefined()
-  expect(unsignedPeerRefusal(bigPost("/api/cluster/sync", []))!.status).toBe(401)
+})
+
+test("a peer route's body is read only when a node signed its head (re-audit 3 P2-A)", () => {
+  const secret = "e2e-unit-cluster-secret-0123456789abcdef"
+  const ops = new Ops(new Engine({}), new ConfigStore("/tmp/raiju-server-peer-head.json", {}))
+  ops.clusterCfg = { enabled: true, peers: [], secret: secret }
+  const limit = 16 * 1048576
+  const now = Date.now() * 1.0
+  const body = "x".repeat(70000)
+  const signed = (path: string, route: string, length: string, at: f64): Request => {
+    const h = peerHeaders(secret, route, body, at)
+    h.set("content-length", length)
+    return new Request("http://gw" + path, { method: "POST", headers: h })
+  }
+  const st = (r: Request): int => {
+    const c = headerCheck(ops.engine, ops, r, limit)
+    expect(c.kind).toBe("peer")
+    const res = c.res
+    return res === undefined ? 0 : res.status
+  }
+  expect(st(signed("/api/cluster/sync", "/api/cluster/sync", "70000", now))).toBe(0)
+  // no signature, a malformed one, or only the body's (the old shape check let a fake one through)
+  expect(st(bigPost("/api/cluster/sync", []))).toBe(401)
+  expect(st(bigPost("/api/cluster/sync", [["x-raiju-cluster-sig", "nope"]]))).toBe(401)
+  expect(st(bigPost("/api/cluster/sync", [["x-raiju-cluster-sig", "ab".repeat(32)]]))).toBe(401)
+  // a head signed for another route, another length (a captured head with a 15 MB body), or long ago
+  expect(st(signed("/api/cluster/config", "/api/cluster/sync", "70000", now))).toBe(401)
+  expect(st(signed("/api/cluster/sync", "/api/cluster/sync", "15000000", now))).toBe(401)
+  expect(st(signed("/api/cluster/sync", "/api/cluster/sync", "70000", now - 120000.0))).toBe(401)
+  // a head signed with another secret
+  const other = peerHeaders("another-cluster-secret-0123456789abcdef", "/api/cluster/sync", body, now)
+  other.set("content-length", "70000")
+  expect(st(new Request("http://gw/api/cluster/sync", { method: "POST", headers: other }))).toBe(401)
+  // GET carries no body (the leader read is signed on its own)
+  expect(peerHeadRefusal(ops, new Request("http://gw/api/cluster/leader", { method: "GET" }), "/api/cluster/leader")).toBeUndefined()
+  ops.clusterCfg = undefined
+  expect(peerHeadRefusal(ops, signed("/api/cluster/sync", "/api/cluster/sync", "70000", now), "/api/cluster/sync")!.status).toBe(404)
+})
+
+test("a big body's kind: checked with a verified credential, unchecked without one (re-audit 3 P1-D)", () => {
+  const cfg: Config = { client: { enforce_auth_on_inference: false }, governance: { virtual_keys: [{ id: "k", value: "sk-bf-k" }, { id: "off", value: "sk-bf-off", is_active: false }] } }
+  const ops = new Ops(new Engine(cfg), new ConfigStore("/tmp/raiju-server-kind.json", cfg))
+  const limit = 100 * 1048576
+  const kind = (r: Request): string => headerCheck(ops.engine, ops, r, limit).kind
+  expect(kind(bigPost("/v1/chat/completions", [["x-bf-vk", "sk-bf-k"]]))).toBe("checked")
+  // auth off: served, but nobody vouched for it
+  expect(kind(bigPost("/v1/chat/completions", []))).toBe("unchecked")
+  expect(headerRefusal(ops.engine, ops, bigPost("/v1/chat/completions", []), limit)).toBeUndefined()
+  expect(kind(bigPost("/v1/chat/completions", [["x-bf-vk", "sk-bf-nope"]]))).toBe("unchecked")
+  expect(kind(bigPost("/v1/mcp/tool/execute", [["x-bf-vk", "sk-bf-k"]]))).toBe("checked")
+  expect(kind(bigPost("/v1/mcp/tool/execute", [["authorization", "Bearer idp-token"]]))).toBe("unchecked")
+  // routes that read their credential from the body vouch for no one
+  expect(kind(bigPost("/agents/a2a/x/v1/message:send", []))).toBe("unchecked")
+  // the management API locked: refused
+  expect(headerRefusal(ops.engine, ops, bigPost("/api/providers", []), limit)!.status).toBe(403)
 })
 
 test("with auth not enforced an inference call passes, and the stream threshold is the smaller of the two", () => {

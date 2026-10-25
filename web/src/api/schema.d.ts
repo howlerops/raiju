@@ -8066,7 +8066,14 @@ export interface operations {
     postApiClusterConfig: {
         parameters: {
             query?: never;
-            header?: never;
+            header: {
+                /** @description Hex HMAC-SHA256 of the body, keyed with the cluster secret. */
+                "x-raiju-cluster-sig": string;
+                /** @description The time of the request in epoch milliseconds; more than a minute away from the node's clock is refused, so a captured head does not replay. */
+                "x-raiju-cluster-ts": string;
+                /** @description Hex HMAC-SHA256, keyed with the cluster secret, of "POST /api/cluster/config <x-raiju-cluster-ts> <Content-Length>", checked before the body is read. */
+                "x-raiju-cluster-head": string;
+            };
             path?: never;
             cookie?: never;
         };
@@ -8133,7 +8140,14 @@ export interface operations {
     postApiClusterLogs: {
         parameters: {
             query?: never;
-            header?: never;
+            header: {
+                /** @description Hex HMAC-SHA256 of the body, keyed with the cluster secret. */
+                "x-raiju-cluster-sig": string;
+                /** @description The time of the request in epoch milliseconds; more than a minute away from the node's clock is refused, so a captured head does not replay. */
+                "x-raiju-cluster-ts": string;
+                /** @description Hex HMAC-SHA256, keyed with the cluster secret, of "POST /api/cluster/logs <x-raiju-cluster-ts> <Content-Length>", checked before the body is read. */
+                "x-raiju-cluster-head": string;
+            };
             path?: never;
             cookie?: never;
         };
@@ -8207,7 +8221,14 @@ export interface operations {
     postApiClusterSync: {
         parameters: {
             query?: never;
-            header?: never;
+            header: {
+                /** @description Hex HMAC-SHA256 of the body, keyed with the cluster secret. */
+                "x-raiju-cluster-sig": string;
+                /** @description The time of the request in epoch milliseconds; more than a minute away from the node's clock is refused, so a captured head does not replay. */
+                "x-raiju-cluster-ts": string;
+                /** @description Hex HMAC-SHA256, keyed with the cluster secret, of "POST /api/cluster/sync <x-raiju-cluster-ts> <Content-Length>", checked before the body is read. */
+                "x-raiju-cluster-head": string;
+            };
             path?: never;
             cookie?: never;
         };
@@ -8267,7 +8288,14 @@ export interface operations {
     postApiClusterFeed: {
         parameters: {
             query?: never;
-            header?: never;
+            header: {
+                /** @description Hex HMAC-SHA256 of the body, keyed with the cluster secret. */
+                "x-raiju-cluster-sig": string;
+                /** @description The time of the request in epoch milliseconds; more than a minute away from the node's clock is refused, so a captured head does not replay. */
+                "x-raiju-cluster-ts": string;
+                /** @description Hex HMAC-SHA256, keyed with the cluster secret, of "POST /api/cluster/feed <x-raiju-cluster-ts> <Content-Length>", checked before the body is read. */
+                "x-raiju-cluster-head": string;
+            };
             path?: never;
             cookie?: never;
         };
