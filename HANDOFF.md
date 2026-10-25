@@ -11,11 +11,25 @@ session. It sets up the machine, explains the lead/worker loop and points at the
 Worker briefs start from [handoff/worker-prompt-template.md](handoff/worker-prompt-template.md);
 the rules all workers follow are in [handoff/worker-brief.md](handoff/worker-brief.md).
 
-Branch: `claude/affectionate-shannon-pjwi5z`, restarted from `main` after PR howlerops/raiju#2
-(waves 14 to 17) merged. It carries wave 18 and wave 19 so far; not yet in a PR.
+Branch: `claude/affectionate-shannon-pjwi5z`. Waves 1 to 22 are on `main` (PR howlerops/raiju#4).
+The branch carries wave 23 and the start of wave 24 (L188 to L194, queued or in progress).
 
 ## Where things stand
 
+- Wave 23 (L174 to L187) paired a production-readiness audit with the parity work packages.
+  Production: secure defaults (/api locked, loopback bind, MCP deny-by-default, WebRTC off,
+  bounded metric labels, 0600/0700 files; L184), the streaming memory leak (reference cycles;
+  per-stream memory 324 KB to 169 KB, soak growth +23 MB to +2.7 MB; L182, `make soak`), graceful
+  stop, server timeouts, a connection cap and /ready (L183, tov-patches 0012), config changes
+  reaching every worker and node (L185, cluster.config_sync), the netguard rewrite with
+  connect-time DNS checks and pinned plugin downloads (L186, SECURITY.md), and deployment (helm
+  persistence and probes, a setup-token Secret, `raiju -healthcheck`, pinned images, trivy and a
+  generated docs/config-reference.md checked in CI; L187). Parity: extra params and the stop
+  reason (L174), API remainders (L175), plugin pipeline completeness (L176), MCP remainders
+  (L177), virtual-key ownership of provider files and batches, the logs_only reveal mapping and
+  earlier-day log reads (L179), config keys, JWT algorithms and adaptive ranking (L180), and
+  provider long-tail items, SCIM claim sync and Vertex workload identity (L181). Behaviour changes
+  are in docs/behaviour-changes-wave-23.md; read it before upgrading a deployment.
 - Waves 20 to 22 (L156 to L173) followed a triage of every partial parity row: CI
   (`.github/workflows/ci.yml`, `scripts/ci.sh`), an opt-in real-provider smoke suite (`make smoke`),
   tov-patches 0009 (node:fs rename/fsync, atomic state writes) and 0010 (a WASM wall-clock limit),
@@ -38,17 +52,19 @@ Branch: `claude/affectionate-shannon-pjwi5z`, restarted from `main` after PR how
   priors and classifier training, the gateway wiring, outcomes with credibility learning, budget
   pacing and escalation, and the Crews tab with metrics. The price table was regenerated from the
   current Bifrost datasheet.
-- docs/parity.md counts 566 parity rows: done 469, partial 73, missing 0, out of scope 15,
-  n/a 9, plus 41 Raiju-only extras.
-- Tests at handoff (compiler from tov-patches 0001 to 0010): `make unit` 2,164 passed, 0 failed,
-  plus the Python tests (gen_pricing, the h2/gRPC interop suite with grpcio and h2, crew_priors);
-  e2e "all passed" on Bun and http1; `make ui` all passed (333 checks); `make openapi-check` ok;
-  `make web-check` up to date.
+- docs/parity.md counts 567 parity rows: done 511, partial 32, missing 0, out of scope 15,
+  n/a 9, plus 42 Raiju-only extras.
+- Tests at handoff (compiler from tov-patches 0001 to 0010 and 0012): `make unit` 2,291 passed,
+  0 failed, plus the Python tests (gen_pricing, the h2/gRPC interop suite, crew_priors,
+  test_deploy, test_gen_config_doc); e2e "all passed" on Bun and http1; `make ui` all passed;
+  `make openapi-check` ok; `make web-check` and `make config-doc-check` up to date. Helm lint and
+  terraform validate pass; the Docker image was not built here (no daemon).
 - Test tools now needed: `pip install grpcio protobuf h2 numpy scipy`, and Go with GOTOOLCHAIN=go1.26.9 for
   the A2A gRPC e2e client (tests/a2a_grpc_client; e2e skips it if go is missing).
-- The Tov runtime carries ten patches (`tov-patches/`): 0001 to 0004, 0005 WAMR (WASM
+- The Tov runtime carries eleven patches (`tov-patches/`): 0001 to 0004, 0005 WAMR (WASM
   plugins), 0006 libdatachannel (WebRTC), 0007 fetch pool and upstream HTTP/2 (nghttp2), 0008
-  streamed request bodies, 0009 node:fs rename and fsync, 0010 a WASM wall-clock limit. They apply in order only; `make tov` rebuilds the compiler.
+  streamed request bodies, 0009 node:fs rename and fsync, 0010 a WASM wall-clock limit, 0012
+  server lifecycle (graceful stop, timeouts, connection cap). 0011 is unused. They apply in order only; `make tov` rebuilds the compiler.
 - Admin UI: SolidJS 2.0 RC in `web/`, embedded through the committed `src/ui_assets.tov`;
   charts with zoom and series toggles, MCP access and virtual MCP screens, role-aware actions
   (L132), and a Roles tab that edits custom roles (L141). `make web` after any
@@ -64,16 +80,16 @@ Branch: `claude/affectionate-shannon-pjwi5z`, restarted from `main` after PR how
 
 ## What's next
 
-No row is queued; the remainders are the "Open:" notes in LEDGER.md (L156 to L173 list them).
-The larger ones:
+Wave 24 is in LEDGER.md (L188 to L194): outbound safety at connect time (DNS rebinding), WebSocket
+drain and the remaining lifecycle items with a UI setup-token screen, TLS client certificates and
+the AWS credential chain, SCIM directory sync, the plugin/MCP/agent remainders, the log store
+remainders (cross-node reads, payload offload), and Hugging Face multi-backend routing with the
+agent-token endpoints. After it:
 
 - Real providers: `make smoke` has never run against real keys (none in this environment).
-- HuggingFace multi-backend routing (about 5,000 lines in Bifrost); SCIM bulk and ETags (Bifrost
-  enterprise, not in its source); Gitleaks' worst case is over its time budget.
-- Logs: payload offload of normal logs to object storage, cross-node log reads, logs_only reveal.
-- Governance: projects' redivision job, held provider-config budgets, user budget overrides.
+- Deployment: build and scan the image and install the chart on a real cluster; the ECS module's
+  EFS config is read-only, so management API saves fail there.
 - Crew routing: fit real priors and a classifier from your own evaluation data.
-- Cluster: MCP client configs are per node.
 - Upstream: offer tov-patches/upstream to Tov.
 
 ## Owner decisions after wave 22 (2026-10-24)
