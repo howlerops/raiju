@@ -1,5 +1,5 @@
 #!/bin/sh
-# Checks patches 0001-0010 and 0012 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
+# Checks patches 0001-0010, 0012 and 0013 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
 # (or `make tov-test`). Each program prints "ok" lines and "FAIL" lines; a run passes when no line
 # fails and the expected number of "ok" lines appears.
 set -eu
@@ -137,5 +137,18 @@ expect "$OUT/fs_atomic.out" 17 "node:fs rename and fsync"
 TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/server_lifecycle.tov" -o "$OUT/server_lifecycle" >/dev/null
 python3 "$DIR/server_lifecycle_client.py" "$OUT/server_lifecycle" "$OUT" > "$OUT/server_lifecycle_client.out" || true
 expect "$OUT/server_lifecycle_client.out" 18 "Bun.serve timeouts, connection cap and graceful stop"
+
+# fetch's address policy (patch 0013): the peer option on the resolved addresses, redirects and pooled connections.
+# PEER_NAME is a host name the resolver maps to 127.0.0.1 (/etc/hosts), so the check runs after a real lookup.
+if [ -z "${PEER_NAME:-}" ]; then
+  PEER_NAME=$(awk '$1 == "127.0.0.1" && $2 != "localhost" { print $2; exit }' /etc/hosts)
+fi
+if [ -n "$PEER_NAME" ]; then
+  TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/peer_policy.tov" -o "$OUT/peer_policy" >/dev/null
+  PEER_NAME=$PEER_NAME "$OUT/peer_policy" > "$OUT/peer_policy.out"
+  expect "$OUT/peer_policy.out" 21 "fetch address policy (peer)"
+else
+  echo "skipped: fetch address policy (no name but localhost maps to 127.0.0.1 in /etc/hosts; set PEER_NAME)"
+fi
 
 echo "tov-patches tests passed"

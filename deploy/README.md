@@ -238,6 +238,7 @@ capacity and availability.
 
 ## Config and secrets
 
+<<<<<<< ours
 - `config.json` uses Bifrost's format ([docs/config-reference.md](../docs/config-reference.md)).
   Any value written `env.NAME` is replaced with the environment variable `NAME` when the config
   loads (the process reads `/proc/self/environ`). Keep keys in the environment, not in the file.
@@ -246,6 +247,49 @@ capacity and availability.
   edit to the file on disk applies at the next start.
 - If the config file is missing, Raiju builds providers from well-known variables such as
   `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`.
+=======
+- `config.json` uses Bifrost's format. Any value written `env.NAME` is replaced
+  with the environment variable `NAME` when the config loads (the process
+  reads `/proc/self/environ`). Keep keys in the environment, not in the file.
+- The config is read once at start. Changing it means restarting the process.
+- If the config file is missing, Raiju builds providers from well-known
+  variables such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`.
+- Probes: liveness on `/health`, readiness on `/ready`, port `http` (the container port).
+- Plugins whose `path` is a URL are downloaded into a private (0700) `plugin-cache` folder beside
+  `config.json`; when that folder is read-only (the chart mounts the config from a ConfigMap) they go to
+  `$TMPDIR/raiju-plugins`. With the chart's read-only root filesystem, set `RAIJU_PLUGIN_DIR` to a writable
+  volume of the gateway's user. A plain-http plugin URL needs a `sha256` pin on its entry. See
+  [SECURITY.md](../SECURITY.md) for the outbound address rules and the vendored native libraries.
+- A provider served from a private network (a self-hosted model on a cluster-internal service, an RFC 1918
+  address) needs `"allow_private_network": true` in its `network_config`: every provider connection is checked
+  when it is made, as Bifrost checks it, and only loopback addresses are allowed without it. Link-local and cloud
+  metadata addresses are refused whatever it says. Behind a provider proxy (`proxy_config` or the global proxy) the
+  proxy resolves the host and the gateway checks nothing.
+
+## Workers vs replicas
+
+Governance (budgets, rate limits), the response cache and metrics counters live
+in memory in each worker process. They are not shared:
+
+- Each worker enforces its own budget and rate limit. With 4 replicas of 2
+  workers, a budget of $10 can be spent as up to $80 in total. Divide the limits
+  by the number of processes, or accept that they are per-process.
+- Cache hits only happen within one process. More replicas mean a lower hit rate.
+- `/api/governance/budgets` and `/api/cache` report one process, not the fleet.
+
+Config changes are different: a change saved through the API is applied by every worker of the pod before the API
+answers. Other replicas apply it when they share the config file, or pull it with `cluster.config_sync: "pull"`
+(each pod's ConfigMap copy is then rewritten in memory only, as the mount is read-only). Send management traffic to one
+replica. See [docs/operations.md](../docs/operations.md) for what is shared and how to secure cluster traffic.
+
+The request log and audit folders default to `/app/data/logs` and `/app/data/logs/audit` (the app dir). If
+`logs_store` or `audit` is enabled and the folder cannot be written, the pod does not start. Mount a writable volume
+there, or set `"required": false`.
+
+Use `workers` for CPU use within a pod (about the number of cores the pod gets),
+and replicas for capacity and availability. Each new replica, including one from
+the HPA, adds another full set of per-process limits.
+>>>>>>> theirs
 
 ## Memory and the request log
 

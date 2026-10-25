@@ -12,6 +12,7 @@ Patch 0008 changes the fetch and HTTP/2 code that 0007 adds, so it is applied on
 Patch 0009 (node:fs rename and fsync) touches the shared lists in `builtins.rs` and `tov.h` and is written on top of 0001-0008.
 Patch 0010 (WebAssembly wall-clock limit) changes `std/wasm`, `runtime/wasm.c` and the WAMR interpreter that 0005 adds, and is written on top of 0001-0009.
 Patch 0012 (server lifecycle) changes the HTTP server in `runtime/tov.c` and `std/http.tov`, and is written on top of 0001-0010.
+Patch 0013 (fetch address policy) changes the fetch code in `runtime/tov.c` and `std/http.tov` (and `fetchStart`'s signature, also called from `runtime/node.c`), and is written on top of 0001-0012.
 
 ## Submitting upstream
 
@@ -619,3 +620,53 @@ idle timeout; past the cap or out of descriptors a connection is answered 503.
 **Not covered.** The timeouts have a 250 ms resolution. Upgraded (WebSocket) connections have no timeouts here
 and are not counted by `openConnections`. The signals watched are SIGTERM and SIGINT. The test
 (`tests/server_lifecycle.tov` driven by `tests/server_lifecycle_client.py`, 18 checks) is in `run.sh`.
+
+## 0013 — fetch address policy: refuse private, loopback, link-local and metadata peers at connect time (`RequestInit.peer`)
+
+**Problem.** A program that fetches URLs its users choose (webhooks, callbacks, OAuth endpoints, a provider's base
+URL) must keep them off its own network and the cloud metadata service. It can resolve the host and check the
+addresses before calling `fetch`, but `fetch` resolves the name again when it connects. A DNS server that answers
+with a public address to the first lookup and with 127.0.0.1 or 169.254.169.254 to the second (DNS rebinding, a zero
+TTL) gets the request through, and so does a redirect to such an address, or a pooled connection made earlier by an
+unchecked request.
+
+**API (Tov; not in Bun).**
+
+```ts
+const res = await fetch(url, {
+  peer: {
+    private: false,     // RFC 1918, 100.64/10, fc00::/7, fec0::/10, multicast, 240/4 and loopback (default: refused)
+    loopback: true,     // 127.0.0.0/8 and ::1 only (default: refused)
+    allow: ["10.1.0.0/16", "db.internal"],  // addresses, CIDR ranges, or the URL's host name, let through although private
+  },
+})
+// a refused address rejects with FetchError code "AddressNotAllowed":
+// "Connection to a private address 10.0.0.7 (host rebind.example) is not allowed"
+```
+
+**Design.**
+- The check runs in `tv_fr_connect`, on the addresses the lookup returned (or the numeric host, or `localhost`),
+  right before the socket is opened: for the first request, each redirect hop (which re-dials), and each new pooled or
+  HTTP/2 connection. Every address must pass (the lookup keeps up to eight), not only the one connected to, so a name
+  that mixes public and private answers is refused.
+- Unspecified (0.0.0.0/8, ::), link-local (169.254.0.0/16, fe80::/10), Teredo (2001::/32) and the metadata addresses
+  100.100.100.200 and fd00:ec2::254 are always refused, whatever `private`, `loopback` and `allow` say. IPv6 forms
+  that carry an IPv4 address (IPv4-mapped, IPv4-compatible, 6to4, NAT64) are judged by that address, and so are
+  `allow` ranges. The classes are those of Bifrost's `core/network/ssrf.go`.
+- The policy is part of the pool key (`|peer:<bits>:<hash of allow>`), so a connection made without a policy, or
+  under another one, is never reused by a request that has one.
+- Through a proxy the proxy resolves the host, so nothing is checked (as Go's dialers do behind a proxy); a program
+  checks a literal address in the URL itself. Unix sockets are not checked.
+- `fetchStart` takes two more arguments (the policy bits and the comma-joined allow list); `node:http`'s fetch
+  passes none.
+
+**Files.**
+- `runtime/tov.c`, `runtime/tov.h`: the classes, the allow list, the check in `tv_fr_connect`, the pool key and
+  `fetchStart`'s arguments; `runtime/node.c`: its call.
+- `crates/tov/src/check/builtins.rs`: the signature. `crates/tov/src/std/http.tov`: `RequestInit.peer` and `PeerPolicy`.
+- `docs/spec.md`: the fetch paragraph.
+
+**Not covered.** `Bun.connect` and `WebSocket` have no such option. The test (`tests/peer_policy.tov`, 21 checks:
+the default refusal, each switch, address, range, mapped and name entries, a name resolved through `/etc/hosts`,
+0.0.0.0, metadata, ::1, redirect hops and pooled connections) is in `run.sh`; it needs a name other than `localhost`
+that `/etc/hosts` maps to 127.0.0.1 (`PEER_NAME` names one) and is skipped without it.

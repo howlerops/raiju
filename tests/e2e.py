@@ -13163,6 +13163,122 @@ def l186_e2e(env):
         gw.wait()
 
 
+GW_L188 = "http://127.0.0.1:18332"  # L188: connect-time address policy in the runtime, provider connections, same-origin A2A redirects
+
+L188_SPEC = json.dumps({"openapi": "3.0.3", "info": {"title": "Redir", "version": "1"}, "paths": {
+    "/go": {"get": {"operationId": "go", "parameters": [{"name": "X-Api-Key", "in": "header", "required": True, "schema": {"type": "string"}}]}},
+    "/plain": {"get": {"operationId": "plain"}},
+}})
+
+
+def l188_e2e(env):
+    """L188: outbound connections are checked by the runtime when they connect (tov-patches/0013). A provider whose
+    base_url comes from the config file is held to Bifrost's ConfigureDialer rules on every request (0.0.0.0 refused even
+    with allow_private_network, loopback allowed); an MCP library URL on 0.0.0.0 is refused; a token exchange endpoint on
+    a private address is refused without oauth_private_allowlist; an OpenAPI tool call that carries an API key gets a
+    redirect to another host back as the 3xx, while one without credentials follows it; an A2A call follows a redirect
+    on its own origin only. Its own gateway (18332)."""
+    import hashlib
+    base = GW_L188
+    port = MOCK.rsplit(":", 1)[1]
+    zero = f"http://0.0.0.0:{port}"
+    q = urllib.parse.quote
+    same = MOCK + "/_l188/redirect?code=307&to=" + q(MOCK + "/a2a/agent/json-rpc", safe="")
+    cross = MOCK + "/_l188/redirect?code=307&to=" + q(f"http://localhost:{port}/a2a/agent/json-rpc", safe="")
+    key = lambda n: {"keys": [{"name": n, "value": "sk-" + n, "models": [], "weight": 1.0}]}
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False, "a2a_external_client_url": "https://gw.example.test/"},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False, "mcp_library_url": zero + "/mcp-i/_library", "mcp_library_sync_interval": 0},
+        "providers": {
+            "openai": {**key("l188"), "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "zero": {**key("l188z"), "custom_provider_config": {"base_provider_type": "openai"}, "network_config": {"base_url": zero, "max_retries": 0}},
+            "zeropriv": {**key("l188zp"), "custom_provider_config": {"base_provider_type": "openai"}, "network_config": {"base_url": zero, "max_retries": 0, "allow_private_network": True}},
+        },
+        "mcp": {"tool_sync_interval": "1h", "client_configs": [
+            {"name": "redir", "connection_type": "openapi", "openapi_config": {"spec": L188_SPEC, "base_url": MOCK + "/_l188/api"}},
+            {"name": "jira", "connection_type": "http", "connection_string": MOCK + "/mcp-exchange", "auth_type": "token_exchange",
+             "token_exchange": {"audience": "api://jira", "client_id": "exch-client", "client_secret": "exch-secret", "authorization_server_url": MOCK + "/l188-sts/token"}},
+        ]},
+        "agents": [
+            {"name": "same", "agent_card_url": MOCK + "/_l188/card?rpc=" + q(same, safe=""), "allow_private_network": True, "allow_by_default": True},
+            {"name": "cross", "agent_card_url": MOCK + "/_l188/card?rpc=" + q(cross, safe=""), "allow_private_network": True, "allow_by_default": True},
+        ],
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256(b"sk-admin-l188").hexdigest()}],
+            "virtual_keys": [{"id": "vk-l188", "value": "sk-bf-l188", "mcp_configs": [{"mcp_client_name": "redir", "tools_to_execute": ["*"]}]}],
+        },
+    }
+    path = os.path.join(BUILD, "e2e.l188.json")
+    json.dump(cfg, open(path, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18332", "-host", "127.0.0.1", "-config", path, "-server", os.environ.get("RAIJU_SERVER", "bun")], env=env, stderr=open(os.path.join(BUILD, "e2e.l188.log"), "w"))
+    ADM = {"authorization": "Bearer sk-admin-l188"}
+    VK = {"x-bf-vk": "sk-bf-l188"}
+
+    def api(method, p, body=None):
+        return call(method, p, body, ADM, base=base, auth=False)
+
+    def chat(model, text):
+        return call("POST", "/v1/chat/completions", {"model": model, "messages": [{"role": "user", "content": text}]}, VK, base=base, auth=False)
+
+    def tool(name, args):
+        s, _, b = call("POST", "/v1/mcp/tool/execute", {"id": "c1", "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}, VK, base=base, auth=False)
+        return s, b
+
+    def rpc(agent, text):
+        return call("POST", f"/agents/a2a/{agent}/json-rpc", {"jsonrpc": "2.0", "id": "1", "method": "message/send", "params": {"message": {"messageId": "m-" + text, "role": "user", "parts": [{"kind": "text", "text": text}]}}}, VK, base=base, auth=False)
+
+    try:
+        wait(base + "/health")
+
+        # ---- every provider connection is checked when it connects, base_url from the config file included ----
+        s, _, b = chat("openai/gpt-4o-mini", "l188 loopback")
+        check("L188: a provider on the loopback interface is reached, as Bifrost's dialer allows it", s == 200, (s, b[:200]))
+        n0 = len([x for x in seen() if "l188 zero" in x.get("body", "")])
+        s, _, b = chat("zero/gpt-4o-mini", "l188 zero")
+        check("L188: a config-file provider base_url on 0.0.0.0 is refused when the connection is made", s >= 500 and "is not allowed" in b and "0.0.0.0" in b, (s, b[:300]))
+        s, _, b = chat("zeropriv/gpt-4o-mini", "l188 zero")
+        check("L188: allow_private_network does not let a provider reach 0.0.0.0 (unspecified addresses stay refused)", s >= 500 and "is not allowed" in b, (s, b[:300]))
+        n1 = len([x for x in seen() if "l188 zero" in x.get("body", "")])
+        check("L188: the refused provider requests never reached the upstream", n1 == n0, (n0, n1))
+
+        # ---- the MCP library catalog: private addresses allowed, unspecified and metadata ones not ----
+        s, _, b = api("POST", "/api/mcp/library/force-sync")
+        check("L188: an MCP library URL on 0.0.0.0 is refused (Bifrost's ValidateExternalURL with private networks allowed)", s == 500 and "MCP library URL validation failed" in b, (s, b[:300]))
+
+        # ---- token exchange: the endpoint must be public or in mcp.oauth_private_allowlist ----
+        s, _, b = api("POST", "/api/mcp/client/jira/verify-exchange", {"subject_token": "idp-l188"})
+        check("L188: a token exchange endpoint on a private address is refused without oauth_private_allowlist", s == 422 and "private address" in b and "oauth_private_allowlist" in b, (s, b[:300]))
+
+        # ---- OpenAPI tool calls: a credential-bearing redirect to another host comes back as the 3xx ----
+        listed = ""
+        for _ in range(120):
+            _, h, _ = call("POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "e2e-l188", "version": "1"}}}, VK, base=base, auth=False)
+            _, _, listed = call("POST", "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, {**VK, "mcp-session-id": hdr(h, "mcp-session-id") or ""}, base=base, auth=False)
+            if "redir-go" in listed and "redir-plain" in listed:
+                break
+            time.sleep(0.25)
+        check("L188: the OpenAPI client lists its tools", "redir-go" in listed and "redir-plain" in listed, listed[:300])
+        s, b = tool("redir-go", {"X-Api-Key": "key-l188"})
+        landed = [x for x in seen() if x.get("path", "").startswith("/mcp-i/_api/landed")]
+        content = json.loads(b).get("content", "") if s == 200 else b
+        check("L188: an OpenAPI call carrying an API key does not follow a redirect to another host (the 302 is the result)", s == 200 and "HTTP 302" in content and not any("key-l188" in json.dumps(x) for x in landed), (s, b[:300]))
+        s, b = tool("redir-plain", {})
+        content = json.loads(b).get("content", "") if s == 200 else b
+        check("L188: an OpenAPI call without credentials follows the redirect", s == 200 and "/mcp-i/_api/landed" in content, (s, b[:300]))
+
+        # ---- A2A: redirects are followed on the call's own origin only ----
+        s, _, b = rpc("same", "l188 same")
+        check("L188: an A2A call follows a 307 on its own origin", s == 200 and "echo: l188 same" in b, (s, b[:300]))
+        before = len([x for x in seen() if x.get("path") == "/a2a/agent/json-rpc" and "l188 cross" in x.get("body", "")])
+        s, _, b = rpc("cross", "l188 cross")
+        after = len([x for x in seen() if x.get("path") == "/a2a/agent/json-rpc" and "l188 cross" in x.get("body", "")])
+        check("L188: an A2A call does not follow a redirect to another origin", "echo: l188 cross" not in b and "original origin" in b and after == before, (s, b[:300], before, after))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
 GW_L182 = "http://127.0.0.1:18320"  # the request log store's segments, disk cap and batched writes
 
 def l182_e2e(env):
@@ -16425,6 +16541,8 @@ def main():
         l182_e2e(env)
         # L186: outbound safety (address spellings, resolved hosts, pinned plugin downloads, provider base_url): its own gateway (18328)
         l186_e2e(env)
+        # L188: connect-time address policy (provider connections, MCP library, token exchange, OpenAPI and A2A redirects): its own gateway (18332)
+        l188_e2e(env)
         # L180: JWT algorithms, provider ranking, model parameters, the complexity session, fallback and vector store,
         # pinned and restored held keys: its own gateway (18312) and Qdrant mock (18313)
         l180_e2e(env)

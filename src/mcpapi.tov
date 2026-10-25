@@ -16,7 +16,7 @@ import { McpClientConfig, McpConfig, McpTlsConfig, McpUserCredential, McpHeaderF
 import { McpTokenExchange, IdpEndpoints, exchangeToken, adminCredential, needsReverify } from "./tokenexchange"
 import { McpUserToken, UserFlow, userFlowById, userFlowsLive, takeUserFlow, forgetUserFlows, dropUserFlow, startUserFlow, startAdminFlow, adminFlowById, adminFlowsOf, failAdminFlow, endAdminFlow, peekFlow, mayOpenFlow, mintTempToken, endTempTokens, headersLink, exchangeUserCode, rowFromTokens, upsertUserRow, dropUserRow, userTokenIndex, tokenAction, flowIdOfPath, consentLink } from "./mcpuser"
 import { OpenApiConfig, OpenApiCred, OpenApiDoc, OpenApiOp, OpScheme, Unsupported, parseSpec, inputSchema, previewJson, baseUrlOf, operationServersCover } from "./openapi"
-import { resolvedTargetProblem } from "./netguard"
+import { resolvedTargetProblem, peerOf, strictPolicy } from "./netguard"
 import * as vmcp from "./vmcp"
 import { DataScope, inScope } from "./scope"
 import { heldProfiles } from "./govapi"
@@ -826,7 +826,9 @@ async function fetchSpec(url: string, publicOnly: bool): Promise<{ text: string,
     const hs: Record<string, string> = new Map()
     hs.set("accept", "application/json, application/yaml, application/x-yaml, text/yaml, text/plain;q=0.9, */*;q=0.1")
     hs.set("user-agent", "Bifrost-OpenAPI-MCP/1.0")
-    const r = await fetch(u, { headers: hs, signal: dl.controller.signal })
+    // with dashboard auth off, every address the host (or a redirect's) resolves to is checked again when the
+    // runtime connects
+    const r = await fetch(u, { headers: hs, signal: dl.controller.signal, peer: publicOnly ? peerOf(strictPolicy([])) : undefined })
     if (r.status < 200 || r.status >= 300) return { text: "", error: fail(400, `could not load spec_url: fetching spec_url: upstream returned HTTP ${r.status}`) }
     const text = await r.text()
     if (text.byteLength > 5242880) return { text: "", error: fail(413, "could not load spec_url: openapi spec exceeds 5242880 bytes") }
@@ -1370,6 +1372,7 @@ async function verifyExchange(store: ConfigStore, idp: IdpEndpoints, client: Mcp
   const te = client.token_exchange
   if (te === undefined) return fail(400, "the client has no token_exchange settings")
   const oc = store.cfg.oidc
+  idp.allow = store.cfg.mcp?.oauth_private_allowlist ?? []
   const r = await exchangeToken(te, subject, idp, oc?.issuer ?? "", oc?.client_id ?? "", oc?.client_secret ?? "")
   if (r.error !== "") return fail(422, `Admin credential exchange failed: ${r.error}`)
   const hs: Map<string, string> = new Map()
@@ -1920,12 +1923,18 @@ function replaceAt(list: McpClientConfig[], at: int, c: McpClientConfig): McpCli
   return out
 }
 
-// A request to an authorization server under a deadline: the body of a 2xx answer, else an error.
-async function callAuthServer(url: string, method: string, headers: Map<string, string>, body: string): Promise<string> throws Error {
+// A request to an authorization server under a deadline: the body of a 2xx answer, else an error. As Bifrost's OAuth
+// client: the server must be a public address or one mcp.oauth_private_allowlist names (allow), checked on the
+// addresses its host resolves to before the request and by the runtime when each connection is made; a discovery GET
+// follows redirects (each hop checked), a POST (registration, code exchange) follows none.
+async function callAuthServer(url: string, method: string, headers: Map<string, string>, body: string, allow: string[]): Promise<string> throws Error {
+  const pr = await resolvedTargetProblem(url, allow)
+  if (pr !== "") throw new Error(`${url}: ${pr} (add the host to oauth_private_allowlist to allow it)`)
+  const peer = peerOf(strictPolicy(allow))
   const dl = deadline(FLOW_TIMEOUT_MS)
   try {
     const hs: Record<string, string> = headers
-    const r = method === "GET" ? await fetch(url, { signal: dl.controller.signal }) : await fetch(url, { method: "POST", headers: hs, body: body, signal: dl.controller.signal })
+    const r = method === "GET" ? await fetch(url, { signal: dl.controller.signal, peer: peer }) : await fetch(url, { method: "POST", headers: hs, body: body, signal: dl.controller.signal, redirect: "manual", peer: peer })
     const text = await r.text()
     if (r.status < 200 || r.status >= 300) throw new Error(`HTTP ${r.status} from ${url}`)
     dl.finish()
@@ -1937,17 +1946,17 @@ async function callAuthServer(url: string, method: string, headers: Map<string, 
 }
 
 // The authorization server's endpoints, from its metadata at the origin of the MCP server (RFC 8414).
-async function discover(serverUrl: string): Promise<AuthEndpoints> throws Error {
+async function discover(serverUrl: string, allow: string[]): Promise<AuthEndpoints> throws Error {
   const urls = discoveryUrls(serverUrl)
   if (urls.length < 2) throw new Error("connection_string must be an http or https URL")
-  const text = try await callAuthServer(urls[1]!, "GET", new Map(), "")
+  const text = try await callAuthServer(urls[1]!, "GET", new Map(), "", allow)
   return try parseAuthEndpoints(text)
 }
 
 // Dynamic client registration (RFC 7591), with the gateway's callback as the redirect URI.
-async function register(url: string, redirect: string): Promise<{ client_id: string, client_secret: string }> throws Error {
+async function register(url: string, redirect: string, allow: string[]): Promise<{ client_id: string, client_secret: string }> throws Error {
   const rq = try registrationRequest(url, redirect, "Raiju")
-  const text = try await callAuthServer(rq.url, "POST", rq.headers, rq.body)
+  const text = try await callAuthServer(rq.url, "POST", rq.headers, rq.body, allow)
   return try registrationResult(text)
 }
 
@@ -1973,7 +1982,7 @@ async function startFlow(store: ConfigStore, id: string, base: string, mode: str
   if ((a.authorize_url ?? "") === "" || (a.token_url ?? "") === "") {
     let meta: AuthEndpoints = { authorization_endpoint: "", token_endpoint: "", registration_endpoint: "" }
     try {
-      meta = await discover(server)
+      meta = await discover(server, store.cfg.mcp?.oauth_private_allowlist ?? [])
     } catch (e) {
       return fail(502, `OAuth discovery failed: ${e.message}`)
     }
@@ -1987,7 +1996,7 @@ async function startFlow(store: ConfigStore, id: string, base: string, mode: str
     if (reg === "") return fail(400, "MCP client has no client_id, and its authorization server has no registration endpoint: set client_id")
     let got = { client_id: "", client_secret: "" }
     try {
-      got = await register(reg, redirect)
+      got = await register(reg, redirect, store.cfg.mcp?.oauth_private_allowlist ?? [])
     } catch (e) {
       return fail(502, `client registration failed: ${e.message}`)
     }
@@ -2074,7 +2083,7 @@ export async function oauthCallback(store: ConfigStore, query: URLSearchParams):
   let tokens = { access: "", refresh: "", expiresAt: 0.0 }
   try {
     const tr = codeTokenRequest(a, code, flow.verifier, flow.redirect)
-    const text = await callAuthServer(tr.url, "POST", tr.headers, tr.body)
+    const text = await callAuthServer(tr.url, "POST", tr.headers, tr.body, store.cfg.mcp?.oauth_private_allowlist ?? [])
     tokens = tokenFields(text, Date.now())
   } catch (e) {
     failAdminFlow(flow, Date.now())
@@ -2183,7 +2192,7 @@ async function userCallback(store: ConfigStore, f: UserFlow, query: URLSearchPar
     } else {
       id = try secureHex(12)
     }
-    const text = await exchangeUserCode(a, code, f.verifier, f.redirect, now)
+    const text = await exchangeUserCode(a, code, f.verifier, f.redirect, now, store.cfg.mcp?.oauth_private_allowlist ?? [])
     const row = try rowFromTokens(text, now, f.client, f.virtual_key_id, f.session_id, id, oldRefresh, f.user_id)
     const perr = persist(store, withUserTokens(store.cfg, upsertUserRow(list, row)))
     if (perr !== undefined) return callbackPage(500, "The tokens could not be saved.")

@@ -83,9 +83,12 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
   (checked on download and on every load), and the copy is kept in a private `plugin-cache` folder beside the
   config file (`RAIJU_PLUGIN_DIR` overrides).
 - **Outbound safety:** every URL a user or caller sets (A2A agents and push callbacks, webhooks, MCP servers with
-  `require_public_target`, plugin downloads, provider `base_url` through the API, exporters) is checked against
-  private and metadata addresses in every spelling, with host names resolved before each request; see
-  [SECURITY.md](SECURITY.md), which also lists the vendored native libraries and how to report a vulnerability.
+  `require_public_target`, MCP OAuth and token exchange endpoints, the MCP library, plugin downloads, exporters,
+  vector stores) and every provider connection (as Bifrost's dialer: loopback allowed, other private addresses only
+  with `network_config.allow_private_network`) is checked against private and metadata addresses in every spelling,
+  on the addresses the host resolves to when the connection is made (tov-patches/0013), so DNS rebinding is refused
+  too; see [SECURITY.md](SECURITY.md), which also lists the vendored native libraries and how to report a
+  vulnerability.
 - **Enterprise:** RBAC for the management API (admin, editor, viewer, auditor;
   `/api/users`), SSO with OIDC (PKCE, groups mapped to roles), a hash-chained
   HMAC-signed audit log (`/api/audit-logs`, `/export`, `/verify`), alerting
