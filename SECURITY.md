@@ -70,7 +70,16 @@ providers are not checked.
 - **Client addresses:** the audit log and the throttle use the TCP peer. `X-Forwarded-For` and `X-Real-IP` are read
   only from the proxies listed in `server.trusted_proxies` (addresses or CIDR ranges), from the right, skipping
   trusted hops. Behind a load balancer or ingress, list its addresses, or every client shares the proxy's address
-  (and its throttle count).
+  (and its throttle count). The MCP authorization server's open registration (`/oauth2/register`) counts clients
+  by the same address (an IPv6 address by its /64): `client.oauth2_server_config.registrations_per_minute` (10) and
+  `max_unused_clients_per_address` (20) answer 429 with Retry-After, `max_unused_clients` (1000) drops the oldest
+  clients that hold no grant, and such a client lives an hour. Neither registration nor `/oauth2/authorize` writes
+  the grants file (authorize stores nothing: the request is sealed into the consent link).
+- **Single sign-on:** a login stores nothing (its state is sealed with AES-256-GCM under a key derived from
+  `encryption_key`, else from `cluster.secret` with clustering on, else a key the node makes at its start, so set one
+  of the first two when several nodes serve SSO). The state is bound to the browser that began the sign-in: the login
+  sets an HttpOnly, SameSite=Lax cookie with the state's hash (Secure over https), and the callback refuses a state
+  without it, so a link carrying an attacker's own state and code cannot sign a victim in as the attacker.
 
 ## Plugins
 

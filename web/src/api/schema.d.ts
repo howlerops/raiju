@@ -236,7 +236,7 @@ export interface paths {
         };
         /**
          * Start an SSO sign-in: redirects to the identity provider
-         * @description With return_to, the sign-in returns to that page of the gateway once it completes (only the MCP consent pages, /oauth/consent?... and /workspace/mcp-sessions/auth?..., are accepted; anything else returns to /). Nothing is stored per login - the PKCE verifier, nonce, return path and a 10-minute expiry are sealed into the state value.
+         * @description With return_to, the sign-in returns to that page of the gateway once it completes (only the MCP consent pages, /oauth/consent?... and /workspace/mcp-sessions/auth?..., are accepted; anything else returns to /). Nothing is stored per login - the PKCE verifier, nonce, return path and a 10-minute expiry are sealed into the state value. The redirect sets the raiju_oidc_state cookie (the state's SHA-256; HttpOnly, SameSite=Lax, Path=/api/oidc, 10 minutes, Secure over https or with X-Forwarded-Proto https), and the callback takes the state only from the browser that carries it (login CSRF). One sign-in at a time per browser.
          */
         get: operations["getApiOidcLogin"];
         put?: never;
@@ -3975,7 +3975,7 @@ export interface paths {
         };
         /**
          * Read an MCP authorization request on the consent page (the client, its redirect URI and expiry)
-         * @description The request is the one the MCP authorization server's /oauth2/authorize stored. Its consent temp token (the fragment after the hash, t=, of the consent link) is sent in the X-Bifrost-Temp-Token header. The modes offered are listed in the available_modes field. "vk" (unless oauth2_server_config.disable_vk_identity is set while user mode is available), "session" for a dashboard user signed in on this request while inference auth is not enforced, and "user" while the gateway's OIDC sign-in is on. logged_in_user (id, name) names the identity-provider user whose single sign-on session token is sent as the Authorization bearer, so the page can offer to continue as that user; the consent page sends its user to /api/oidc/login?return_to=... to sign in.
+         * @description The request is the one the MCP authorization server's /oauth2/authorize sealed into the consent link (nothing is stored until the consent). Its consent temp token (the fragment after the hash, t=, of the consent link; the request sealed with AES-256-GCM under a key derived from the signing key, so any worker, restart or node with the same signing key opens it) is sent in the X-Bifrost-Temp-Token header. The modes offered are listed in the available_modes field. "vk" (unless oauth2_server_config.disable_vk_identity is set while user mode is available), "session" for a dashboard user signed in on this request while inference auth is not enforced, and "user" while the gateway's OIDC sign-in is on. logged_in_user (id, name) names the identity-provider user whose single sign-on session token is sent as the Authorization bearer, so the page can offer to continue as that user; the consent page sends its user to /api/oidc/login?return_to=... to sign in.
          */
         get: operations["getApiOauth2ConsentFlowsId"];
         /**
@@ -8066,7 +8066,14 @@ export interface operations {
     postApiClusterConfig: {
         parameters: {
             query?: never;
-            header?: never;
+            header: {
+                /** @description Hex HMAC-SHA256 of the body, keyed with the cluster secret. */
+                "x-raiju-cluster-sig": string;
+                /** @description The time of the request in epoch milliseconds; more than a minute away from the node's clock is refused, so a captured head does not replay. */
+                "x-raiju-cluster-ts": string;
+                /** @description Hex HMAC-SHA256, keyed with the cluster secret, of "POST /api/cluster/config <x-raiju-cluster-ts> <Content-Length>", checked before the body is read. */
+                "x-raiju-cluster-head": string;
+            };
             path?: never;
             cookie?: never;
         };
@@ -8133,7 +8140,14 @@ export interface operations {
     postApiClusterLogs: {
         parameters: {
             query?: never;
-            header?: never;
+            header: {
+                /** @description Hex HMAC-SHA256 of the body, keyed with the cluster secret. */
+                "x-raiju-cluster-sig": string;
+                /** @description The time of the request in epoch milliseconds; more than a minute away from the node's clock is refused, so a captured head does not replay. */
+                "x-raiju-cluster-ts": string;
+                /** @description Hex HMAC-SHA256, keyed with the cluster secret, of "POST /api/cluster/logs <x-raiju-cluster-ts> <Content-Length>", checked before the body is read. */
+                "x-raiju-cluster-head": string;
+            };
             path?: never;
             cookie?: never;
         };
@@ -8207,7 +8221,14 @@ export interface operations {
     postApiClusterSync: {
         parameters: {
             query?: never;
-            header?: never;
+            header: {
+                /** @description Hex HMAC-SHA256 of the body, keyed with the cluster secret. */
+                "x-raiju-cluster-sig": string;
+                /** @description The time of the request in epoch milliseconds; more than a minute away from the node's clock is refused, so a captured head does not replay. */
+                "x-raiju-cluster-ts": string;
+                /** @description Hex HMAC-SHA256, keyed with the cluster secret, of "POST /api/cluster/sync <x-raiju-cluster-ts> <Content-Length>", checked before the body is read. */
+                "x-raiju-cluster-head": string;
+            };
             path?: never;
             cookie?: never;
         };
@@ -8267,7 +8288,14 @@ export interface operations {
     postApiClusterFeed: {
         parameters: {
             query?: never;
-            header?: never;
+            header: {
+                /** @description Hex HMAC-SHA256 of the body, keyed with the cluster secret. */
+                "x-raiju-cluster-sig": string;
+                /** @description The time of the request in epoch milliseconds; more than a minute away from the node's clock is refused, so a captured head does not replay. */
+                "x-raiju-cluster-ts": string;
+                /** @description Hex HMAC-SHA256, keyed with the cluster secret, of "POST /api/cluster/feed <x-raiju-cluster-ts> <Content-Length>", checked before the body is read. */
+                "x-raiju-cluster-head": string;
+            };
             path?: never;
             cookie?: never;
         };
@@ -25694,6 +25722,15 @@ export interface operations {
             };
             /** @description The request has already been completed. */
             410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The MCP authorization state file is locked by another process for longer than 5 seconds; nothing was approved. Try again. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

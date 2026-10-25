@@ -10,12 +10,22 @@
 //
 // The signing key is the operator's PEM (client.oauth2_server_config.signing_key). Without one, a key is generated
 // at the first start and kept in the state file beside config.json (openIssuerState), so a restart and every worker
-// of the node sign with the same key. The grants (registered clients and refresh tokens), the pending authorization
-// requests with their consent tokens, and the codes (as hashes) are kept there too, and read back when one is not
-// held in memory, so a restart and a second worker see them.
+// of the node sign with the same key. The grants (refresh tokens and the clients they belong to) and the consented
+// requests (their codes as hashes) are kept there too, and read back when one is not held in memory, so a restart and
+// a second worker see them. Only a consent, a token request, a refresh or a revoke writes that file.
+//
+// The two routes anyone may call store little. /oauth2/authorize stores nothing: the pending request is sealed into
+// the consent link's token (AES-256-GCM under a key derived from the signing key), so any worker, and any node with the
+// same signing key, opens it. /oauth2/register appends one line to the client registry (<state>-clients.jsonl) under
+// the file's lock; that file is rewritten only when it holds twice as many lines as live clients. Registration is
+// bounded (Raiju's limits; Bifrost has none, only an hourly sweep of clients with no grant): per address, a number of
+// registrations a minute and of unused clients (clients with no grant yet); in all, a number of unused clients, the
+// oldest dropped past it; and an unused client lives an hour (Bifrost's sweep grace), as does a client whose grants
+// have all aged out.
 import { Config, OAuth2ServerConfig, VirtualKeyConfig } from "./config"
 import { pkceChallenge } from "./mcpauth"
-import { secureHex, sha256, utf8, toHex } from "./crypto"
+import { secureHex, sha256, utf8, toHex, hmacSha256 } from "./crypto"
+import { gcmSeal, gcmOpen } from "./aesgcm"
 import { encodeUrl, decode } from "./base64"
 import { signRs256, verifyRs256, publicKeyId, publicJwk, generateRsaPem } from "./jwt"
 import { Field, fields, elements, find, rawStr, rawNum, decodeString, isNull } from "./json"
@@ -24,10 +34,12 @@ import { rfc3339Ms } from "./vkexpiry"
 import { rfc3339 } from "./anthropic_batch"
 import { connectPageHtml, consentPageHtml } from "./mcpconsent"
 import { ConfigCipher, sealStored, openStored } from "./store"
-import { existsSync, readFileSync, unlinkSync, writeFileSync, rmSync } from "node:fs"
-import { writeFileAtomic } from "./atomicfile"
+import { existsSync, readFileSync, unlinkSync, writeFileSync, rmSync, statSync } from "node:fs"
+import { writeFileAtomic, appendPrivate } from "./atomicfile"
 import { readState, stateVersion } from "./statever"
-import { lockFile, unlockFile } from "./filelock"
+import { FileLock, lockFile, lockFileAsync, unlockFile } from "./filelock"
+import { parseIP, formatIP } from "./netguard"
+import { CLIENT_IP_HEADER } from "./clientip"
 
 // The lifetimes and limits of Bifrost's defaults (mcpoauth2issuance.go and the table constants).
 const DEFAULT_CODE_TTL_S: f64 = 300.0
@@ -46,9 +58,30 @@ const GENERATED_KEY_BITS = 2048
 // Session list paging (Bifrost's oauth2SessionsDefaultLimit and oauth2SessionsMaxLimit).
 const SESSIONS_DEFAULT_LIMIT = 50
 const SESSIONS_MAX_LIMIT = 500
+// The registration limits' defaults (client.oauth2_server_config; Raiju's own, Bifrost has none). An unused client is
+// one with no grant yet: no refresh token and no consented request.
+const DEFAULT_MAX_UNUSED_CLIENTS = 1000
+const DEFAULT_MAX_UNUSED_PER_ADDRESS = 20
+const DEFAULT_REGISTRATIONS_PER_MINUTE = 10
+// How long a client with no grant lives (Bifrost's orphanClientGrace, one hour). It must outlive a code (MAX_CODE_TTL_S),
+// so a client mid-handshake is not dropped before its first token.
+const DEFAULT_UNUSED_CLIENT_TTL_S = 3600
+const MIN_UNUSED_CLIENT_TTL_S = 1200
+// The unused clients held in memory and in the registry stay under this many bytes too (a client may be 70 KB).
+const MAX_UNUSED_BYTES = 8 * 1048576
+// The addresses whose registrations this process counts (the window of the last minute), at most.
+const MAX_THROTTLED_ADDRESSES = 10000
+// How long a read that is not forced trusts the files as last read while their size and time are unchanged.
+const RECHECK_MS: f64 = 1000.0
+// A consent link's token: this prefix, then base64url of a 12-byte nonce and the AES-256-GCM sealed request.
+const FLOW_PREFIX = "f1."
+const FLOW_AAD = "raiju-mcp-consent-v1"
+// The registry's first line: its format version and a generation that changes when the file is rewritten.
+const REGISTRY_VERSION = 1
 
-// A registered client (RFC 7591) and what a request needs from it.
-export type OAuthClientRow = { client_id: string, client_name: string, redirect_uris: string[], grant_types: string[], scope: string, created_at: f64 }
+// A registered client (RFC 7591) and what a request needs from it. ah names the address it registered from (a hash of
+// the address, an IPv6 one by its /64; "" or absent when unknown), for the per-address limits.
+export type OAuthClientRow = { client_id: string, client_name: string, redirect_uris: string[], grant_types: string[], scope: string, created_at: f64, ah?: string }
 
 // An authorization request: pending until the consent page approves it ("consented", with the identity it names),
 // then "used" once its code is exchanged. mode is "vk" (sub is the key's id), "session" (sub is a random id) or
@@ -61,22 +94,30 @@ export type AuthRequest = { id: string, client_id: string, redirect_uri: string,
 // was first issued and used_at when its token was last refreshed (0 before the first refresh).
 export type RefreshRow = { hash: string, family: string, client_id: string, mode: string, sub: string, scope: string, resource: string, created_at: f64, used_at: f64, revoked: bool }
 
-// The settings the endpoints read. kid names the signing key in the token headers.
-export type Issuer = { issuer: string, resource: string, pem: string, kid: string, codeTtl: f64, accessTtl: f64, allowed: string[] }
+// The registration limits (client.oauth2_server_config): per address, registrations a minute and unused clients; in
+// all, unused clients; and how long an unused client lives (ms). 0 turns a count limit off.
+export type ClientLimits = { perMinute: int, perAddress: int, maxUnused: int, unusedTtlMs: f64 }
+
+// The settings the endpoints read. kid names the signing key in the token headers; flowKey seals the consent links.
+export type Issuer = { issuer: string, resource: string, pem: string, kid: string, codeTtl: f64, accessTtl: f64, allowed: string[], flowKey: u8[], limits: ClientLimits }
 
 // What an endpoint answers. The headers that differ by route are optional.
-export type Answer = { status: int, body: string, contentType: string, location?: string, challenge?: string }
+export type Answer = { status: int, body: string, contentType: string, location?: string, challenge?: string, retryAfter?: int }
 
 // What a request's Bearer token names: a virtual key, a session (no verified identity), an identity-provider user,
 // a rejected token, or nothing (no JWT was sent).
 export type Caller = { kind: "none" } | { kind: "vk", vk: string } | { kind: "session", sub: string } | { kind: "user", sub: string } | { kind: "error", message: string }
 
-// A consent token by its SHA-256: the request it opens, until the request's expiry.
-type ConsentRow = { hash: string, id: string, expires_at: f64 }
+// A pending authorization request as its consent link carries it (sealed): the flow id, client, redirect URI, state,
+// scope, resource, PKCE challenge and expiry.
+type Flow = { i: string, c: string, r: string, s: string, sc: string, rs: string, ch: string, e: f64 }
 
-// The state file: the signing key (sealed with the config's cipher when there is one), the registered clients, the
-// refresh rows, the authorization requests not yet expired, and their consent tokens.
-type StateFile = { version?: int, signing_key?: string, clients?: OAuthClientRow[], refresh?: RefreshRow[], requests?: AuthRequest[], consent?: ConsentRow[] }
+// The state file: the signing key (sealed with the config's cipher when there is one), the clients that hold a grant,
+// the refresh rows, and the consented requests not yet expired. (Files of earlier versions also hold every registered
+// client, the pending requests and their consent tokens: the clients are taken, the rest is not.)
+type StateFile = { version?: int, signing_key?: string, clients?: OAuthClientRow[], refresh?: RefreshRow[], requests?: AuthRequest[] }
+// The registry's first line.
+type RegistryHead = { version?: int, gen?: string }
 // The state file's version (statever.tov): a file from a newer Raiju is neither read nor written over.
 const ISSUER_STATE_VERSION = 1
 
@@ -88,10 +129,11 @@ const ISSUER_STATE_VERSION = 1
 export type ConsentContext = { signedIn: bool, enforce: bool, userAvailable: bool, disableVk: bool, user: string, userName: string, userActive: (sub: string) => bool }
 
 const CLIENTS: Map<string, OAuthClientRow> = new Map()
+// The requests past consent (consented, used or revoked), by flow id: a pending one lives in its consent link only.
 const REQUESTS: Map<string, AuthRequest> = new Map()
 const REFRESH: Map<string, RefreshRow> = new Map()
-// The consent temp tokens, by hash: each opens one request's consent page until the request's expiry.
-const CONSENT_TOKENS: Map<string, ConsentRow> = new Map()
+// The registrations this process admitted in the current minute, by address: [the minute's start, the count].
+const RECENT: Map<string, f64[]> = new Map()
 
 // The key this node signs with when the config names none: the PEM, and its sealed form for the state file.
 let generatedPem = ""
@@ -99,6 +141,17 @@ let sealedKey = ""
 // The state file the grants and the generated key live in, or "" to keep them in memory only (tests).
 let stateFile = ""
 let stateCipher: ConfigCipher | undefined = undefined
+// The state file's size and time when last read or written ("" before), and when that was.
+let stateStamp = ""
+let stateReadAt: f64 = -1.0e15
+// The client registry beside the state file ("" with no state file): its generation and the bytes, lines and stamp
+// already taken into memory, and when it was last read.
+let registryFile = ""
+let registryGen = ""
+let registryAt = 0
+let registryLines = 0
+let registryStamp = ""
+let registryReadAt: f64 = -1.0e15
 
 // Whether the problem note has been printed for the current misconfiguration.
 let warned = false
@@ -134,13 +187,29 @@ export function issuerProblem(c: Config): string {
   return ""
 }
 
+// The client registry beside a state file: mcp-oauth-state.json keeps it in mcp-oauth-state-clients.jsonl.
+export function registryOf(file: string): string {
+  if (file === "") return ""
+  return (file.endsWith(".json") ? file.slice(0, file.byteLength - 5) : file) + "-clients.jsonl"
+}
+
 // Opens the state file beside config.json and takes the signing key from it. When the authorization server is on
 // and the config names no signing_key, the key is generated at the first start and saved there, so every later
-// start (and every worker, which all start after this) signs with it. A configured key always wins. Returns a note
-// to print, or "" when all is well.
+// start (and every worker, which all start after this) signs with it. A configured key always wins. The client
+// registry beside it is read too; with the server on, both are written back once, so a file of an earlier version
+// (every registered client and the pending requests in the state file) is split, and the clients past their limits
+// dropped. Returns a note to print, or "" when all is well.
 export function openIssuerState(c: Config, file: string, cipher: ConfigCipher | undefined): string {
   stateFile = file
   stateCipher = cipher
+  stateStamp = ""
+  stateReadAt = -1.0e15
+  registryFile = registryOf(file)
+  registryGen = ""
+  registryAt = 0
+  registryLines = 0
+  registryStamp = ""
+  registryReadAt = -1.0e15
   generatedPem = ""
   sealedKey = ""
   let st: StateFile = {}
@@ -150,6 +219,7 @@ export function openIssuerState(c: Config, file: string, cipher: ConfigCipher | 
       if (!r.ok && r.from > ISSUER_STATE_VERSION) {
         // nothing is written over it either
         stateFile = ""
+        registryFile = ""
         return `${r.problem}: it is not written over, and the MCP authorization server is off until it is moved aside or removed`
       }
       st = try JSON.parse(r.text) as StateFile
@@ -158,8 +228,14 @@ export function openIssuerState(c: Config, file: string, cipher: ConfigCipher | 
     }
   }
   adoptGrants(st)
+  readRegistry(true, Date.now())
   if (serverAuthMode(c) === "headers") return ""
-  if ((c.client?.oauth2_server_config?.signing_key ?? "") !== "") return ""
+  const oc: OAuth2ServerConfig = c.client?.oauth2_server_config ?? {}
+  trimClients(limitsOf(oc), Date.now())
+  if ((oc.signing_key ?? "") !== "") {
+    tidyFiles(limitsOf(oc))
+    return ""
+  }
   const stored = st.signing_key ?? ""
   const opened = openStored(cipher, stored)
   if (opened === undefined) return `the signing key in ${file} is sealed and cannot be opened: check encryption_key`
@@ -176,31 +252,46 @@ export function openIssuerState(c: Config, file: string, cipher: ConfigCipher | 
       return `could not seal the MCP signing key: ${e.message}`
     }
     generatedPem = pem
-    persistGrants()
+    tidyFiles(limitsOf(oc))
     return ""
   }
   generatedPem = pem
   sealedKey = stored
+  tidyFiles(limitsOf(oc))
   return ""
+}
+
+// Writes the state file and the registry once, with what memory holds (at the start, before the workers fork).
+function tidyFiles(lim: ClientLimits): void {
+  if (stateFile === "") return
+  const lock = lockFile(stateFile)
+  if (!lock.ok) {
+    console.error(`raiju: mcp oauth: ${stateFile} is locked by another process; it is tidied at a later start`)
+    return
+  }
+  // the state file keeps the clients that hold a grant; the others, within their limits, go to the registry
+  writeGrants()
+  trimClients(lim, Date.now())
+  rewriteRegistry()
+  unlockFile(lock)
 }
 
 // How far a request has gone: a later status written by another worker wins.
 function statusRank(s: string): int {
+  if (s === "revoked") return 3
   if (s === "used") return 2
   if (s === "consented") return 1
   return 0
 }
 
-// Takes what the state file holds into memory: clients, refresh rows, requests and consent tokens not known yet, a
-// row another worker revoked, and a request another worker took further. Nothing is removed, so a row this worker
-// has revoked stays revoked.
+// Takes what the state file holds into memory: clients, refresh rows and requests past consent not known yet, a row
+// another worker revoked, and a request another worker took further. Nothing is removed, so a row this worker has
+// revoked stays revoked. Pending requests of earlier versions are not taken (their links no longer open).
 function adoptGrants(st: StateFile): void {
   for (const r of st.requests ?? []) {
+    if (r.status === "pending") continue
     const have = REQUESTS.get(r.id)
     if (have === undefined || statusRank(r.status) > statusRank(have.status)) REQUESTS.set(r.id, r)
-  }
-  for (const c of st.consent ?? []) {
-    if (!CONSENT_TOKENS.has(c.hash)) CONSENT_TOKENS.set(c.hash, c)
   }
   for (const cl of st.clients ?? []) {
     if (!CLIENTS.has(cl.client_id)) CLIENTS.set(cl.client_id, cl)
@@ -215,9 +306,28 @@ function adoptGrants(st: StateFile): void {
   }
 }
 
-// Reads the state file into memory (another worker may have written it since).
-function syncGrants(): void {
-  if (stateFile === "" || !existsSync(stateFile)) return
+// A file's size and time, or "" when it is not there.
+function stampOf(file: string): string {
+  try {
+    const s = statSync(file)
+    return `${s.size}:${s.mtimeMs}`
+  } catch (e) {
+    return ""
+  }
+}
+
+// Reads the state file into memory (another worker may have written it since). Unless forced, a file whose size and
+// time are as last read, at most RECHECK_MS ago, is not read again: a request naming an unknown code, token or flow
+// then costs no read. A read that must see another worker's latest write (before a code is spent, a refresh rotated,
+// a consent recorded, or under the lock before a write) is forced.
+function syncGrants(force: bool): void {
+  if (stateFile === "") return
+  const now = Date.now()
+  const stamp = stampOf(stateFile)
+  if (stamp === "") return
+  if (!force && stamp === stateStamp && now - stateReadAt < RECHECK_MS) return
+  stateStamp = stamp
+  stateReadAt = now
   try {
     const text = try readFileSync(stateFile, "utf8")
     // a newer Raiju wrote it since: its rows are not taken (persistGrants does not write over it either)
@@ -231,7 +341,7 @@ function syncGrants(): void {
 
 // Writes the grants and the signing key to the state file. The file is read first, under its lock (filelock.tov), so
 // the rows another worker wrote are kept too. Refresh rows revoked long ago are dropped. Without a state file this
-// does nothing.
+// does nothing. A route that writes holds the lock already (issuerRoute), so this take does not wait.
 function persistGrants(): void {
   if (stateFile === "") return
   const lock = lockFile(stateFile)
@@ -244,27 +354,37 @@ function persistGrants(): void {
   unlockFile(lock)
 }
 
+// The clients that hold a grant: a refresh row (live, or revoked and kept for reuse detection) or a request past
+// consent that has not expired.
+function heldClients(nowMs: f64): Map<string, bool> {
+  const held: Map<string, bool> = new Map()
+  for (const r of REFRESH.values()) held.set(r.client_id, true)
+  for (const r of REQUESTS.values()) {
+    if (r.expires_at > nowMs) held.set(r.client_id, true)
+  }
+  return held
+}
+
 function writeGrants(): void {
-  syncGrants()
-  const cutoff = Date.now() - REVOKED_KEEP_MS
+  syncGrants(true)
+  const now = Date.now()
+  const cutoff = now - REVOKED_KEEP_MS
   const refresh: RefreshRow[] = []
   for (const r of REFRESH.values()) {
     if (!r.revoked || r.created_at >= cutoff) refresh.push(r)
   }
-  const clients: OAuthClientRow[] = []
-  for (const cl of CLIENTS.values()) clients.push(cl)
-  // requests live until their expiry; a consent token only while its request is still pending
-  const now = Date.now()
+  // requests live until their expiry
   const requests: AuthRequest[] = []
   for (const r of REQUESTS.values()) {
     if (r.expires_at > now) requests.push(r)
   }
-  const consent: ConsentRow[] = []
-  for (const c of CONSENT_TOKENS.values()) {
-    const r = REQUESTS.get(c.id)
-    if (c.expires_at > now && r !== undefined && r.status === "pending") consent.push(c)
+  // the clients of these grants; the unused ones live in the registry
+  const held = heldClients(now)
+  const clients: OAuthClientRow[] = []
+  for (const cl of CLIENTS.values()) {
+    if (held.has(cl.client_id)) clients.push(cl)
   }
-  const st: StateFile = { version: ISSUER_STATE_VERSION, clients: clients, refresh: refresh, requests: requests, consent: consent }
+  const st: StateFile = { version: ISSUER_STATE_VERSION, clients: clients, refresh: refresh, requests: requests }
   if (sealedKey !== "") st.signing_key = sealedKey
   try {
     if (existsSync(stateFile) && stateVersion(try readFileSync(stateFile, "utf8")) > ISSUER_STATE_VERSION) {
@@ -272,8 +392,251 @@ function writeGrants(): void {
       return
     }
     writeFileAtomic(stateFile, JSON.stringify(st) + "\n", { mode: 384 })
+    // what was just written is what memory holds: it is not read back
+    stateStamp = stampOf(stateFile)
+    stateReadAt = now
   } catch (e) {
     console.error(`raiju: mcp oauth: could not write ${stateFile}: ${e.message}`)
+  }
+}
+
+// ---- the client registry ----
+
+// Reads the clients another worker registered since the last read: only the lines past what was read, or the whole
+// file when it was rewritten since (a new generation). Unless forced, a file as last read (size and time), at most
+// RECHECK_MS ago, is not read.
+function readRegistry(force: bool, nowMs: f64): void {
+  if (registryFile === "") return
+  const stamp = stampOf(registryFile)
+  if (stamp === "") return
+  if (!force && stamp === registryStamp && nowMs - registryReadAt < RECHECK_MS) return
+  registryStamp = stamp
+  registryReadAt = nowMs
+  let text = ""
+  try {
+    text = try readFileSync(registryFile, "utf8")
+  } catch (e) {
+    return
+  }
+  const nl = text.indexOf("\n")
+  if (nl < 0) return
+  const head = text.slice(0, nl)
+  let from = registryAt
+  if (head !== registryGen || text.byteLength < registryAt) {
+    try {
+      const h = try JSON.parse(head) as RegistryHead
+      // a registry from a newer Raiju is not read (nor written over: rewriteRegistry checks too)
+      if ((h.version ?? 0) > REGISTRY_VERSION) return
+    } catch (e) {
+      return
+    }
+    registryGen = head
+    registryLines = 0
+    from = nl + 1
+  }
+  const lines = text.slice(from).split("\n")
+  // the last piece is "" or a line still being written
+  let at = from
+  for (let i = 0; i + 1 < lines.length; i++) {
+    const line = lines[i]!
+    at += line.byteLength + 1
+    if (line === "") continue
+    registryLines += 1
+    try {
+      const cl = try JSON.parse(line) as OAuthClientRow
+      if (cl.client_id !== "" && !CLIENTS.has(cl.client_id)) CLIENTS.set(cl.client_id, cl)
+    } catch (e) {
+      // a damaged line is skipped
+    }
+  }
+  registryAt = at
+}
+
+// Appends one client to the registry (the caller holds the lock and has read the registry to its end).
+function appendRegistry(cl: OAuthClientRow): void throws Error {
+  if (registryFile === "") return
+  if (!existsSync(registryFile) || registryGen === "") rewriteRegistry()
+  const line = JSON.stringify(cl) + "\n"
+  try appendPrivate(registryFile, line)
+  registryAt += line.byteLength
+  registryLines += 1
+  registryStamp = stampOf(registryFile)
+}
+
+// Rewrites the registry with the unused clients memory holds, under a new generation (the caller holds the lock).
+function rewriteRegistry(): void {
+  if (registryFile === "") return
+  try {
+    if (existsSync(registryFile)) {
+      const text = try readFileSync(registryFile, "utf8")
+      const nl = text.indexOf("\n")
+      if (nl > 0) {
+        const h = try JSON.parse(text.slice(0, nl)) as RegistryHead
+        if ((h.version ?? 0) > REGISTRY_VERSION) {
+          console.error(`raiju: mcp oauth: ${registryFile} was written by a newer Raiju; it is not written over`)
+          return
+        }
+      }
+    }
+    const held = heldClients(Date.now())
+    const head = JSON.stringify({ version: REGISTRY_VERSION, gen: try secureHex(8) })
+    const out: string[] = [head]
+    let n = 0
+    for (const cl of CLIENTS.values()) {
+      if (held.has(cl.client_id)) continue
+      out.push(JSON.stringify(cl))
+      n += 1
+    }
+    const text = out.join("\n") + "\n"
+    writeFileAtomic(registryFile, text, { mode: 384, durable: false })
+    registryGen = head
+    registryAt = text.byteLength
+    registryLines = n
+    registryStamp = stampOf(registryFile)
+    registryReadAt = Date.now()
+  } catch (e) {
+    console.error(`raiju: mcp oauth: could not write ${registryFile}: ${e.message}`)
+  }
+}
+
+// The size a client takes, roughly (its registry line).
+function clientBytes(cl: OAuthClientRow): int {
+  let n = 160 + cl.client_name.byteLength + cl.scope.byteLength
+  for (const u of cl.redirect_uris) n += u.byteLength + 3
+  return n
+}
+
+// Drops the clients past their limits, the same way on every worker: a client with no grant older than the unused
+// lifetime, then, past maxUnused unused clients (or MAX_UNUSED_BYTES), the oldest unused ones. A client that holds a
+// grant is never dropped. Returns how many unused clients are left.
+function trimClients(lim: ClientLimits, nowMs: f64): int {
+  const held = heldClients(nowMs)
+  const born = nowMs - lim.unusedTtlMs
+  const unused: OAuthClientRow[] = []
+  let bytes = 0
+  for (const k of CLIENTS.keys()) {
+    const cl = CLIENTS.get(k)!
+    if (held.has(k)) continue
+    if (cl.created_at <= born) {
+      CLIENTS.delete(k)
+      continue
+    }
+    unused.push(cl)
+    bytes += clientBytes(cl)
+  }
+  const cap = lim.maxUnused
+  if ((cap > 0 && unused.length > cap) || bytes > MAX_UNUSED_BYTES) {
+    // newest first; the order is the same on every worker
+    unused.sort((a: OAuthClientRow, b: OAuthClientRow): int => a.created_at !== b.created_at ? (a.created_at > b.created_at ? -1 : 1) : (a.client_id < b.client_id ? -1 : 1))
+    let kept = 0
+    let size = 0
+    for (const cl of unused) {
+      size += clientBytes(cl)
+      if ((cap > 0 && kept >= cap) || size > MAX_UNUSED_BYTES) {
+        CLIENTS.delete(cl.client_id)
+      } else {
+        kept += 1
+      }
+    }
+    return kept
+  }
+  return unused.length
+}
+
+// The limits client.oauth2_server_config sets, with Raiju's defaults (a negative count turns that limit off).
+export function limitsOf(oc: OAuth2ServerConfig): ClientLimits {
+  const pm = oc.registrations_per_minute ?? DEFAULT_REGISTRATIONS_PER_MINUTE
+  const pa = oc.max_unused_clients_per_address ?? DEFAULT_MAX_UNUSED_PER_ADDRESS
+  const mu = oc.max_unused_clients ?? DEFAULT_MAX_UNUSED_CLIENTS
+  const ttl = oc.unused_client_ttl_seconds ?? DEFAULT_UNUSED_CLIENT_TTL_S
+  return {
+    perMinute: pm < 0 ? 0 : (pm === 0 ? DEFAULT_REGISTRATIONS_PER_MINUTE : pm),
+    perAddress: pa < 0 ? 0 : (pa === 0 ? DEFAULT_MAX_UNUSED_PER_ADDRESS : pa),
+    maxUnused: mu < 0 ? 0 : (mu === 0 ? DEFAULT_MAX_UNUSED_CLIENTS : mu),
+    unusedTtlMs: (ttl <= 0 ? DEFAULT_UNUSED_CLIENT_TTL_S : Math.max(ttl, MIN_UNUSED_CLIENT_TTL_S)) * 1000.0,
+  }
+}
+
+// The address a client registers from, as the limits count it: an IPv6 address by its /64 (one host may hold a whole
+// /64), hashed so the registry keeps no address. "" when unknown.
+export function addressHash(addr: string): string {
+  const a = addr.trim()
+  if (a === "") return ""
+  let key = a
+  const b = parseIP(a)
+  if (b !== undefined) {
+    const v4 = b[0]! === 0 && b[8]! === 0 && b[10]! === 255 && b[11]! === 255
+    if (v4) {
+      key = formatIP(b)
+    } else {
+      const net: int[] = []
+      for (let i = 0; i < 16; i++) net.push(i < 8 ? b[i]! : 0)
+      key = formatIP(net) + "/64"
+    }
+  }
+  return toHex(sha256(utf8("raiju-dcr:" + key))).slice(0, 24)
+}
+
+// The seconds an address must wait before this process admits another registration from it (0: it may register now),
+// counting the current minute only. take counts the registration when it is admitted.
+function minuteWait(ah: string, perMinute: int, nowMs: f64, take: bool): int {
+  if (ah === "" || perMinute <= 0) return 0
+  const w = RECENT.get(ah)
+  if (w !== undefined && nowMs - w[0]! < 60000.0) {
+    if (w[1]! >= perMinute * 1.0) return Math.max(1, Math.ceil((w[0]! + 60000.0 - nowMs) / 1000.0))
+    if (take) RECENT.set(ah, [w[0]!, w[1]! + 1.0])
+    return 0
+  }
+  if (!take) return 0
+  if (RECENT.size >= MAX_THROTTLED_ADDRESSES) {
+    for (const k of RECENT.keys()) {
+      if (nowMs - RECENT.get(k)![0]! >= 60000.0) RECENT.delete(k)
+    }
+    if (RECENT.size >= MAX_THROTTLED_ADDRESSES) RECENT.clear()
+  }
+  RECENT.set(ah, [nowMs, 1.0])
+  return 0
+}
+
+function slowDown(seconds: int, desc: string): Answer {
+  let a = oauthErr(429, "temporarily_unavailable", desc)
+  a.retryAfter = seconds
+  return a
+}
+
+// ---- consent links ----
+
+// The key that seals consent links: derived from the signing key, so every worker, a restart, and every node that signs
+// with the same key opens a link another one made.
+export function flowKeyOf(pem: string): u8[] {
+  return hmacSha256(utf8(pem), utf8(FLOW_AAD))
+}
+
+const HEXD = "0123456789abcdef"
+
+function randomBytes(n: int): u8[] throws Error {
+  const h = try secureHex(n * 2)
+  const out: u8[] = []
+  for (let i = 0; i + 1 < h.byteLength; i += 2) out.push(u8(HEXD.indexOf(h.slice(i, i + 1)) * 16 + HEXD.indexOf(h.slice(i + 1, i + 2))))
+  return out
+}
+
+function sealFlow(key: u8[], f: Flow): string throws Error {
+  const nonce = try randomBytes(12)
+  return FLOW_PREFIX + encodeUrl(nonce.concat(gcmSeal(key, nonce, utf8(JSON.stringify(f)), utf8(FLOW_AAD))))
+}
+
+// The request a consent link's token carries, or undefined when it was not sealed with this key or was changed.
+function openFlow(key: u8[], token: string): Flow | undefined {
+  if (!token.startsWith(FLOW_PREFIX) || token.byteLength > 65536 || key.length !== 32) return undefined
+  try {
+    const raw = try decode(token.slice(FLOW_PREFIX.byteLength))
+    if (raw.length < 28) return undefined
+    const pt = gcmOpen(key, raw.slice(0, 12), raw.slice(12), utf8(FLOW_AAD))
+    if (pt === undefined) return undefined
+    return try JSON.parse(try new TextDecoder().decode(pt)) as Flow
+  } catch (e) {
+    return undefined
   }
 }
 
@@ -308,6 +671,8 @@ export function issuerOf(c: Config): Issuer | undefined {
     codeTtl: codeTtl <= 0 ? DEFAULT_CODE_TTL_S : Math.min(codeTtl * 1.0, MAX_CODE_TTL_S),
     accessTtl: accessTtl <= 0 ? DEFAULT_ACCESS_TTL_S : accessTtl * 1.0,
     allowed: oc.allowed_redirect_uris ?? [],
+    flowKey: flowKeyOf(pem),
+    limits: limitsOf(oc),
   }
 }
 
@@ -429,8 +794,11 @@ export function authServerMetadata(iss: Issuer): string {
   })
 }
 
-// POST /oauth2/register (RFC 7591): a public client with its redirect URIs, answered with its client_id.
-export function register(body: string, iss: Issuer, nowMs: f64): Answer {
+// POST /oauth2/register (RFC 7591): a public client with its redirect URIs, answered with its client_id. addr is the
+// client's address ("" when unknown; server.trusted_proxies decide whether a forwarding header counts): an address past
+// its registrations of the minute, or holding too many unused clients, is answered 429 with Retry-After. The client is
+// appended to the registry (one line, under the lock), and the oldest unused clients past max_unused_clients dropped.
+export function register(body: string, iss: Issuer, nowMs: f64, addr?: string): Answer {
   const fs = objectOf(body)
   if (fs === undefined) return oauthErr(400, "invalid_request", "malformed request body")
   let uris: string[] = []
@@ -463,14 +831,64 @@ export function register(body: string, iss: Issuer, nowMs: f64): Answer {
     if (r !== "code") return oauthErr(400, "invalid_client_metadata", "unsupported response_type")
   }
   const granted = scope === "" ? "mcp" : scope
+  const lim = iss.limits
+  const ah = addressHash(addr ?? "")
+  // this process's count first: a flood from one address is refused here, before any file is touched
+  const early = minuteWait(ah, lim.perMinute, nowMs, false)
+  if (early > 0) return slowDown(early, "too many client registrations from this address; try again later")
+  const lock: FileLock = stateFile === "" ? { path: "", ok: true } : lockFile(stateFile)
+  if (!lock.ok) return oauthErr(503, "temporarily_unavailable", "the client registry is busy; try again")
+  // the clients the other workers registered, then the limits over all of them
+  readRegistry(true, nowMs)
+  trimClients(lim, nowMs)
+  if (ah !== "") {
+    const held = heldClients(nowMs)
+    let recent = 0
+    let oldestRecent = nowMs
+    let unused = 0
+    let oldestUnused = nowMs
+    for (const cl of CLIENTS.values()) {
+      if ((cl.ah ?? "") !== ah) continue
+      if (nowMs - cl.created_at < 60000.0) {
+        recent += 1
+        if (cl.created_at < oldestRecent) oldestRecent = cl.created_at
+      }
+      if (!held.has(cl.client_id)) {
+        unused += 1
+        if (cl.created_at < oldestUnused) oldestUnused = cl.created_at
+      }
+    }
+    if (lim.perMinute > 0 && recent >= lim.perMinute) {
+      unlockFile(lock)
+      return slowDown(Math.max(1, Math.ceil((oldestRecent + 60000.0 - nowMs) / 1000.0)), "too many client registrations from this address; try again later")
+    }
+    if (lim.perAddress > 0 && unused >= lim.perAddress) {
+      unlockFile(lock)
+      return slowDown(Math.max(1, Math.ceil((oldestUnused + lim.unusedTtlMs - nowMs) / 1000.0)), "too many unused clients registered from this address; finish or abandon a sign-in first")
+    }
+  }
   let id = ""
   try {
     id = try secureHex(16)
   } catch (e) {
+    unlockFile(lock)
     return oauthErr(500, "server_error", "failed to register client")
   }
-  CLIENTS.set(id, { client_id: id, client_name: name, redirect_uris: uris, grant_types: gs, scope: granted, created_at: nowMs })
-  persistGrants()
+  let row: OAuthClientRow = { client_id: id, client_name: name, redirect_uris: uris, grant_types: gs, scope: granted, created_at: nowMs }
+  if (ah !== "") row.ah = ah
+  try {
+    appendRegistry(row)
+  } catch (e) {
+    unlockFile(lock)
+    console.error(`raiju: mcp oauth: could not write ${registryFile}: ${e.message}`)
+    return oauthErr(500, "server_error", "failed to register client")
+  }
+  minuteWait(ah, lim.perMinute, nowMs, true)
+  CLIENTS.set(id, row)
+  const live = trimClients(lim, nowMs)
+  // the registry is rewritten once it holds twice the live clients (plus slack), so its size stays bounded
+  if (registryFile !== "" && registryLines > 2 * live + 64) rewriteRegistry()
+  unlockFile(lock)
   return {
     status: 201,
     body: JSON.stringify({ client_id: id, client_id_issued_at: Math.floor(nowMs / 1000.0), grant_types: gs, response_types: rs, redirect_uris: uris, token_endpoint_auth_method: "none", scope: granted }),
@@ -478,8 +896,9 @@ export function register(body: string, iss: Issuer, nowMs: f64): Answer {
   }
 }
 
-// GET /oauth2/authorize: checks the request, stores it pending, and answers with the consent page's address. A
-// problem the client can act on is sent to its redirect URI; a bad client or redirect URI is answered here.
+// GET /oauth2/authorize: checks the request, seals it into the consent link's token, and answers with the consent
+// page's address. A problem the client can act on is sent to its redirect URI; a bad client or redirect URI is answered
+// here.
 export function authorize(q: URLSearchParams, iss: Issuer, nowMs: f64): Answer {
   const clientId = q.get("client_id") ?? ""
   const redirect = q.get("redirect_uri") ?? ""
@@ -489,7 +908,7 @@ export function authorize(q: URLSearchParams, iss: Issuer, nowMs: f64): Answer {
   if (state.byteLength > MAX_STATE || scope.byteLength > MAX_SCOPE || challenge.byteLength > MAX_CHALLENGE) {
     return oauthErr(400, "invalid_request", "state, scope or code_challenge exceeds the maximum length")
   }
-  const client = CLIENTS.get(clientId)
+  const client = clientById(clientId, nowMs)
   if (client === undefined) return oauthErr(400, "invalid_client", "unknown client_id")
   if (!redirectAllowed(redirect, iss.allowed) || !registeredRedirect(client, redirect)) {
     return oauthErr(400, "invalid_redirect_uri", "redirect_uri not registered for this client")
@@ -510,27 +929,26 @@ export function authorize(q: URLSearchParams, iss: Issuer, nowMs: f64): Answer {
   const resource = q.get("resource") ?? ""
   if (resource !== "" && resource !== iss.resource) return refuse("invalid_target", "resource does not identify this MCP server")
   const expires = nowMs + iss.codeTtl * 1000.0
-  // requests and consent tokens past their time are dropped from memory (the state file keeps only live ones)
-  for (const k of REQUESTS.keys()) {
-    if (REQUESTS.get(k)!.expires_at <= nowMs) REQUESTS.delete(k)
-  }
-  for (const k of CONSENT_TOKENS.keys()) {
-    if (CONSENT_TOKENS.get(k)!.expires_at <= nowMs) CONSENT_TOKENS.delete(k)
-  }
   let id = ""
   let tok = ""
   try {
     id = try secureHex(16)
-    tok = try secureHex(32)
+    // nothing is stored: the request rides in the link's token, sealed, so the page works on any worker and after a restart
+    tok = try sealFlow(iss.flowKey, { i: id, c: client.client_id, r: redirect, s: state, sc: want, rs: iss.resource, ch: challenge, e: expires })
   } catch (e) {
     return refuse("server_error", "failed to create authorization request")
   }
-  REQUESTS.set(id, { id: id, client_id: client.client_id, redirect_uri: redirect, state: state, scope: want, resource: iss.resource, challenge: challenge, expires_at: expires, status: "pending", mode: "", sub: "", code_hash: "" })
-  const th = toHex(sha256(utf8(tok)))
-  CONSENT_TOKENS.set(th, { hash: th, id: id, expires_at: expires })
-  // written before the consent link leaves, so the page works on any worker and after a restart
-  persistGrants()
   return { status: 302, body: "", contentType: "text/plain; charset=utf-8", location: iss.issuer + "/oauth/consent?flow=" + id + "#t=" + tok }
+}
+
+// The client a request names: from memory, else from the registry or the state file when another worker wrote it since.
+function clientById(id: string, nowMs: f64): OAuthClientRow | undefined {
+  if (id === "") return undefined
+  const have = CLIENTS.get(id)
+  if (have !== undefined) return have
+  readRegistry(false, nowMs)
+  syncGrants(false)
+  return CLIENTS.get(id)
 }
 
 // The identity modes a consent page offers (Bifrost's availableModes). "vk" is offered unless disable_vk_identity is
@@ -548,11 +966,10 @@ export function consentModes(signedIn: bool, enforce: bool, userAvailable?: bool
 
 // GET /api/oauth2/consent/flows/{id}: what the consent page shows for a pending request. loggedIn names the signed-in
 // identity-provider user ("" when none), so the page can offer to continue as that user.
-export function consentDetail(id: string, token: string, nowMs: f64, modes: string[], loggedIn?: string, loggedInName?: string): Answer {
-  const r = consentRequest(id, token, nowMs)
+export function consentDetail(id: string, token: string, iss: Issuer, nowMs: f64, modes: string[], loggedIn?: string, loggedInName?: string): Answer {
+  const r = consentRequest(id, token, iss, nowMs, false)
   if (r === undefined) return apiErr(401, "this consent link is invalid or has expired")
-  if (r.status !== "pending") return apiErr(410, "authorization flow has already been completed")
-  const client = CLIENTS.get(r.client_id)
+  const client = clientById(r.client_id, nowMs)
   const name = client === undefined ? "" : client.client_name
   const user = loggedIn ?? ""
   if (user !== "") {
@@ -570,9 +987,9 @@ export function consentDetail(id: string, token: string, nowMs: f64, modes: stri
 // A key that belongs to a user (its user_id) grants user mode for that user while user mode is available, and then
 // only to that user signed in (Bifrost's VK user upgrade).
 export function consentSubmit(id: string, token: string, body: string, iss: Issuer, nowMs: f64, lookup: (value: string) => VirtualKeyConfig | undefined, modes: string[], signedIn: bool, user?: string, userAvailable?: bool): Answer {
-  const r = consentRequest(id, token, nowMs)
+  // read through: a consent another worker recorded a moment ago is seen
+  const r = consentRequest(id, token, iss, nowMs, true)
   if (r === undefined) return apiErr(401, "this consent link is invalid or has expired")
-  if (r.status !== "pending") return apiErr(410, "authorization flow has already been completed")
   const fs = objectOf(body)
   if (fs === undefined) return apiErr(400, "invalid request body")
   const mode = rawStr(fs, "mode") ?? ""
@@ -617,9 +1034,12 @@ export function consentSubmit(id: string, token: string, body: string, iss: Issu
     return apiErr(500, "failed to generate authorization code")
   }
   const hash = toHex(sha256(utf8(code)))
+  // requests past their time are dropped from memory (the state file keeps only live ones)
+  for (const k of REQUESTS.keys()) {
+    if (REQUESTS.get(k)!.expires_at <= nowMs) REQUESTS.delete(k)
+  }
+  // the link ends with the pending state: once this is recorded, the page cannot be submitted twice, on any worker
   REQUESTS.set(id, { id: r.id, client_id: r.client_id, redirect_uri: r.redirect_uri, state: r.state, scope: r.scope, resource: r.resource, challenge: r.challenge, expires_at: r.expires_at, status: "consented", mode: granted, sub: sub, code_hash: hash, consented_at: nowMs })
-  // the consent token ends with the pending state (persistGrants drops it), so the page cannot be submitted twice
-  CONSENT_TOKENS.delete(toHex(sha256(utf8(token))))
   persistGrants()
   const url = withParams(r.redirect_uri, [["code", code], ["state", r.state], ["iss", iss.issuer]])
   return { status: 200, body: JSON.stringify({ redirect_url: url }), contentType: "application/json" }
@@ -653,9 +1073,15 @@ function codeGrant(form: URLSearchParams, iss: Issuer, nowMs: f64, byId: (id: st
   if (code === "" || verifier === "" || clientId === "") return oauthErr(400, "invalid_request", "code, code_verifier and client_id are required")
   const hash = toHex(sha256(utf8(code)))
   let r = requestByCode(hash)
-  if (r === undefined || r.status !== "consented") {
-    // another worker may have consented it, or used it, since this one last read the state file
-    syncGrants()
+  if (r === undefined) {
+    // another worker may have consented it since this one last read the state file (an unknown code reads nothing
+    // while the file is unchanged)
+    syncGrants(false)
+    r = requestByCode(hash)
+  }
+  if (r !== undefined && r.status === "consented") {
+    // a code another worker spent a moment ago is seen spent: the route holds the lock, so no two spend it
+    syncGrants(true)
     r = requestByCode(hash)
   }
   if (r === undefined || r.status !== "consented") return oauthErr(400, "invalid_grant", "authorization code not found or already used")
@@ -686,8 +1112,9 @@ function refreshGrant(form: URLSearchParams, iss: Issuer, nowMs: f64, byId: (id:
   const clientId = form.get("client_id") ?? ""
   if (rt === "" || clientId === "") return oauthErr(400, "invalid_request", "refresh_token and client_id are required")
   const hash = toHex(sha256(utf8(rt)))
-  // another worker may have rotated this grant since this one last read the state file
-  syncGrants()
+  // another worker may have issued or rotated this grant since this one last read the state file: a known token is
+  // read through, an unknown one only when the file changed
+  syncGrants(REFRESH.has(hash))
   const row = REFRESH.get(hash)
   if (row === undefined) return oauthErr(400, "invalid_grant", "refresh token not found or revoked")
   if (row.revoked) {
@@ -740,21 +1167,18 @@ function revokeFamily(family: string): void {
   persistGrants()
 }
 
-// The live request a consent token opens, bound to its flow id, or undefined. A request another worker took, or
-// one from before a restart, is read from the state file.
-function consentRequest(id: string, token: string, nowMs: f64): AuthRequest | undefined {
-  if (token === "") return undefined
-  const th = toHex(sha256(utf8(token)))
-  if (!CONSENT_TOKENS.has(th) || !REQUESTS.has(id)) syncGrants()
-  const bound = CONSENT_TOKENS.get(th)
-  if (bound === undefined || bound.id !== id || nowMs >= bound.expires_at) return undefined
-  // a request another worker has since consented reads as such
-  const held = REQUESTS.get(id)
-  if (held !== undefined && held.status === "pending") syncGrants()
-  const r = REQUESTS.get(id)
-  // the token ends with the pending state (Bifrost deletes it at consent): a used link is refused as unknown
-  if (r === undefined || nowMs >= r.expires_at || r.status !== "pending") return undefined
-  return r
+// The pending request a consent link's token carries, bound to its flow id, or undefined: a token that was not sealed
+// with this issuer's key, names another flow or has expired, or a flow already consented here, on another worker or
+// before a restart (the state file records it). force reads the state file whatever its stamp (before a consent is
+// recorded).
+function consentRequest(id: string, token: string, iss: Issuer, nowMs: f64, force: bool): AuthRequest | undefined {
+  if (token === "" || id === "") return undefined
+  const f = openFlow(iss.flowKey, token)
+  if (f === undefined || f.i !== id || nowMs >= f.e) return undefined
+  if (force || !REQUESTS.has(id)) syncGrants(force)
+  // the link ends with the pending state (Bifrost deletes its token at consent): a used link is refused as unknown
+  if (REQUESTS.has(id)) return undefined
+  return { id: f.i, client_id: f.c, redirect_uri: f.r, state: f.s, scope: f.sc, resource: f.rs, challenge: f.ch, expires_at: f.e, status: "pending", mode: "", sub: "", code_hash: "" }
 }
 
 // ---- the grants: GET and DELETE /api/oauth2/sessions ----
@@ -802,7 +1226,7 @@ export function grantsList(query: URLSearchParams, nameOf: (vkId: string) => str
     if (n < 0) return apiErr(400, "Invalid offset parameter: must be non-negative")
     offset = n
   }
-  syncGrants()
+  syncGrants(true)
   const live: RefreshRow[] = []
   for (const r of REFRESH.values()) {
     if (!r.revoked) live.push(r)
@@ -827,7 +1251,7 @@ export function grantsList(query: URLSearchParams, nameOf: (vkId: string) => str
 // DELETE /api/oauth2/sessions/{id}: revokes the grant of a live refresh row, so its client can no longer refresh it.
 // Access tokens already issued last until they expire, as in Bifrost.
 export function grantRevoke(id: string): Answer {
-  syncGrants()
+  syncGrants(true)
   const r = REFRESH.get(id)
   if (r === undefined || r.revoked) return apiErr(404, "session not found or already revoked")
   revokeFamily(r.family)
@@ -846,7 +1270,7 @@ function rotatedSince(vk: VirtualKeyConfig | undefined, sinceMs: f64): bool {
 // rotation calls this for the key (mode "vk"), since a grant is bound to the key's id, not to its value. Access
 // tokens already issued last until they expire, as in Bifrost. Returns how many grants and codes were revoked.
 export function revokeSubject(mode: string, sub: string): int {
-  syncGrants()
+  syncGrants(true)
   let n = 0
   for (const k of REFRESH.keys()) {
     const x = REFRESH.get(k)
@@ -996,6 +1420,8 @@ function respond(a: Answer): Response {
   if (loc !== undefined) h.set("location", loc)
   const ch = a.challenge
   if (ch !== undefined) h.set("www-authenticate", ch)
+  const ra = a.retryAfter
+  if (ra !== undefined) h.set("retry-after", `${ra}`)
   return new Response(a.status === 302 ? undefined : a.body, { status: a.status, headers: h })
 }
 
@@ -1021,9 +1447,14 @@ export async function issuerRoute(c: Config, req: Request, path: string, lookup:
     if (iss === undefined) return respond(apiErr(404, "the MCP authorization server is off: set client.mcp_server_auth_mode to both or oauth"))
     const token = req.headers.get("x-bifrost-temp-token") ?? ""
     const modes = consentModes(cc.signedIn, cc.enforce, cc.userAvailable, cc.disableVk)
-    if (m === "GET") return respond(consentDetail(id, token, nowMs, modes, cc.user, cc.userName))
+    if (m === "GET") return respond(consentDetail(id, token, iss, nowMs, modes, cc.user, cc.userName))
     const body = await req.text()
-    return respond(consentSubmit(id, token, body, iss, nowMs, lookup, modes, cc.signedIn, cc.user, cc.userAvailable))
+    // a consent writes the state file: under its lock, waited for without pausing the worker
+    const lock = await stateLock()
+    if (!lock.ok) return respond(apiErr(503, "the MCP authorization state is busy; try again"))
+    const done = consentSubmit(id, token, body, iss, Date.now(), lookup, modes, cc.signedIn, cc.user, cc.userAvailable)
+    unlockFile(lock)
+    return respond(done)
   }
   const wellKnown = path === "/.well-known/oauth-protected-resource" || path.startsWith("/.well-known/oauth-protected-resource/") || path === "/.well-known/oauth-authorization-server" || path.startsWith("/.well-known/oauth-authorization-server/") || path === "/.well-known/jwks.json"
   const oauth = path === "/oauth2/register" || path === "/oauth2/authorize" || path === "/oauth2/token" || path === "/oauth/consent"
@@ -1042,16 +1473,42 @@ export async function issuerRoute(c: Config, req: Request, path: string, lookup:
     }
   }
   if (path === "/oauth/consent" && m === "GET") return respond(page(consentPageHtml()))
-  if (path === "/oauth2/register" && m === "POST") return respond(register(await req.text(), iss, Date.now()))
+  if (path === "/oauth2/register" && m === "POST") {
+    const body = await req.text()
+    const addr = req.headers.get(CLIENT_IP_HEADER) ?? ""
+    // an address past its registrations of the minute is refused before the lock is waited for
+    const early = minuteWait(addressHash(addr), iss.limits.perMinute, Date.now(), false)
+    if (early > 0) return respond(slowDown(early, "too many client registrations from this address; try again later"))
+    const lock = await stateLock()
+    if (!lock.ok) return respond(oauthErr(503, "temporarily_unavailable", "the client registry is busy; try again"))
+    const reg = register(body, iss, Date.now(), addr)
+    unlockFile(lock)
+    return respond(reg)
+  }
   if (path === "/oauth2/authorize" && m === "GET") {
     const u = URL.parse(req.url)
     return respond(authorize(u === undefined ? new URLSearchParams("") : u.searchParams, iss, Date.now()))
   }
   if (path === "/oauth2/token" && m === "POST") {
     const form = new URLSearchParams(await req.text())
-    return respond(tokenEndpoint(form, iss, Date.now(), byId, { vkCut: cc.userAvailable && cc.disableVk, userActive: cc.userActive }))
+    // a code is spent and a refresh token rotated under the state file's lock, so no two workers spend one twice
+    const lock = await stateLock()
+    if (!lock.ok) return respond(oauthErr(503, "temporarily_unavailable", "the MCP authorization state is busy; try again"))
+    const tok = tokenEndpoint(form, iss, Date.now(), byId, { vkCut: cc.userAvailable && cc.disableVk, userActive: cc.userActive })
+    unlockFile(lock)
+    return respond(tok)
   }
   return undefined
+}
+
+// How long a route waits for the state file's lock (a holder writes in milliseconds).
+const ROUTE_LOCK_WAIT_MS: f64 = 5000.0
+
+// The state file's lock for a route that writes, waited for while the worker serves other requests (an ok lock that
+// guards nothing without a state file). The writes under it take it again without waiting.
+async function stateLock(): Promise<FileLock> {
+  if (stateFile === "") return { path: "", ok: true }
+  return await lockFileAsync(stateFile, ROUTE_LOCK_WAIT_MS)
 }
 
 test("a registration needs redirect URIs that are loopback, https or approved, and answers a client_id", () => {
@@ -1100,8 +1557,8 @@ test("an authorization request is checked, and approved with a key into a code t
   const flow = loc.slice(loc.indexOf("flow=") + 5, loc.indexOf("#t="))
   const tok = loc.slice(hashAt + 3)
   const vkOnly: string[] = ["vk"]
-  expect(consentDetail(flow, "wrong", 2500.0, vkOnly).status).toBe(401)
-  expect(consentDetail(flow, tok, 2500.0, vkOnly).status).toBe(200)
+  expect(consentDetail(flow, "wrong", iss, 2500.0, vkOnly).status).toBe(401)
+  expect(consentDetail(flow, tok, iss, 2500.0, vkOnly).status).toBe(200)
   const key: VirtualKeyConfig = { id: "vk-x", value: "sk-bf-test-x" }
   const lookup = (v: string): VirtualKeyConfig | undefined => v === "sk-bf-test-x" ? key : undefined
   // no dashboard sign-in on this request, so session mode is refused
@@ -1306,6 +1763,7 @@ test("the state file keeps the generated key and the grants across a restart", (
   openIssuerState(off(), "", undefined)
   try unlinkSync(file)
   try rmSync(file + ".flock", { force: true })
+  try rmSync(registryOf(file), { force: true })
 })
 
 function off(): Config {
@@ -1323,13 +1781,14 @@ test("a state file from a newer Raiju is neither read nor written over, and one 
   persistGrants()
   expect(try readFileSync(file, "utf8")).toBe(newer)
   // a file written before state versions (no "version") is read as version 0 and written back at the current one
-  try writeFileSync(file, `{"clients":[{"client_id":"old-client","client_name":"old","redirect_uris":["http://127.0.0.1/cb"],"grant_types":["authorization_code"],"scope":"","created_at":1}]}`)
+  try writeFileSync(file, `{"clients":[{"client_id":"old-client","client_name":"old","redirect_uris":["http://127.0.0.1/cb"],"grant_types":["authorization_code"],"scope":"","created_at":${Date.now()}}]}`)
   expect(openIssuerState(cfg, file, undefined)).toBe("")
   expect(CLIENTS.has("old-client")).toBe(true)
   expect(stateVersion(try readFileSync(file, "utf8"))).toBe(ISSUER_STATE_VERSION)
   openIssuerState(off(), "", undefined)
   try unlinkSync(file)
   try rmSync(file + ".flock", { force: true })
+  try rmSync(registryOf(file), { force: true })
 })
 
 test("the metadata names the endpoints and the protected resource", () => {
@@ -1382,7 +1841,7 @@ test("user mode grants a token that names the signed-in user, and the user's key
   const now = Date.now()
   const o = try openRequest(iss, "user-client", "8091", now)
   const modes = consentModes(true, false, true, false)
-  const detail = consentDetail(o[1]!, o[2]!, now, modes, "alice", "alice@example.com")
+  const detail = consentDetail(o[1]!, o[2]!, iss, now, modes, "alice", "alice@example.com")
   expect(detail.body.includes("\"logged_in_user\":{\"id\":\"alice\",\"name\":\"alice@example.com\"}")).toBe(true)
   expect(detail.body.includes("\"available_modes\":[\"vk\",\"session\",\"user\"]")).toBe(true)
   const none = (v: string): VirtualKeyConfig | undefined => undefined
@@ -1432,35 +1891,190 @@ test("a pending request and a consented code survive a restart through the state
   expect(openIssuerState(cfg, file, undefined)).toBe("")
   const iss = testIssuer()
   const now = Date.now()
+  const before = try readFileSync(file, "utf8")
   const o = try openRequest(iss, "restart-client", "8094", now)
-  const text = try readFileSync(file, "utf8")
-  // the consent token is kept as its hash only
-  expect(text.includes(o[2]!)).toBe(false)
-  // a restart between authorize and consent: the memory is gone, the file has the request
-  REQUESTS.clear()
-  CONSENT_TOKENS.clear()
-  expect(consentDetail(o[1]!, o[2]!, now, ["vk"]).status).toBe(200)
+  // the registration is one line of the registry; the authorization request is stored nowhere (its link carries it)
+  expect(try readFileSync(file, "utf8")).toBe(before)
+  const reg = try readFileSync(registryOf(file), "utf8")
+  expect(reg.includes(o[0]!)).toBe(true)
+  expect(reg.includes(o[1]!)).toBe(false)
+  // a restart between authorize and consent: the memory is gone, the link still opens, the client read from the registry
+  restartMemory()
+  const detail = consentDetail(o[1]!, o[2]!, iss, now, ["vk"])
+  expect(detail.status).toBe(200)
+  expect(detail.body.includes("restart-client")).toBe(true)
+  // a link with another flow id, or changed, does not open
+  expect(consentDetail("other-flow", o[2]!, iss, now, ["vk"]).status).toBe(401)
+  expect(consentDetail(o[1]!, o[2]!.slice(0, o[2]!.byteLength - 2) + "AA", iss, now, ["vk"]).status).toBe(401)
+  // nor under another signing key, nor after the code lifetime
+  const otherKey: Issuer = { issuer: iss.issuer, resource: iss.resource, pem: iss.pem, kid: iss.kid, codeTtl: iss.codeTtl, accessTtl: iss.accessTtl, allowed: [], flowKey: flowKeyOf("another key"), limits: iss.limits }
+  expect(consentDetail(o[1]!, o[2]!, otherKey, now, ["vk"]).status).toBe(401)
+  expect(consentDetail(o[1]!, o[2]!, iss, now + 301000.0, ["vk"]).status).toBe(401)
   const key: VirtualKeyConfig = { id: "vk-r", value: "sk-bf-restart" }
   const lookup = (v: string): VirtualKeyConfig | undefined => v === "sk-bf-restart" ? key : undefined
   const done = consentSubmit(o[1]!, o[2]!, "{\"mode\":\"vk\",\"value\":\"sk-bf-restart\"}", iss, now, lookup, ["vk"], false)
   expect(done.status).toBe(200)
-  // and a restart between consent and the token request: the code still exchanges, once
-  REQUESTS.clear()
-  CONSENT_TOKENS.clear()
-  expect(consentDetail(o[1]!, o[2]!, now, ["vk"]).status).toBe(401)
+  // the consented client now holds a grant: it is kept in the state file
+  expect((try readFileSync(file, "utf8")).includes(o[0]!)).toBe(true)
+  // and a restart between consent and the token request: the link is spent, the code still exchanges, once
+  restartMemory()
+  expect(consentDetail(o[1]!, o[2]!, iss, now, ["vk"]).status).toBe(401)
+  expect(consentSubmit(o[1]!, o[2]!, "{\"mode\":\"vk\",\"value\":\"sk-bf-restart\"}", iss, now, lookup, ["vk"], false).status).toBe(401)
   const form = `grant_type=authorization_code&code=${try codeOf(done.body)}&code_verifier=${o[3]!}&client_id=${o[0]!}&redirect_uri=http%3A%2F%2F127.0.0.1%3A8094%2Fcb`
   const byId = (id: string): VirtualKeyConfig | undefined => id === "vk-r" ? key : undefined
   expect(tokenEndpoint(new URLSearchParams(form), iss, now, byId).status).toBe(200)
-  REQUESTS.clear()
+  restartMemory()
   expect(tokenEndpoint(new URLSearchParams(form), iss, now, byId).status).toBe(400)
   openIssuerState(off(), "", undefined)
   try unlinkSync(file)
+  try rmSync(registryOf(file), { force: true })
+  try rmSync(file + ".flock", { force: true })
+})
+
+// Forgets what was read from the files, as a new process would.
+function forgetReads(): void {
+  stateStamp = ""
+  stateReadAt = -1.0e15
+  registryStamp = ""
+  registryReadAt = -1.0e15
+  registryGen = ""
+  registryAt = 0
+  registryLines = 0
+}
+
+// Forgets everything in memory (a restart, or another worker that has read nothing yet).
+function restartMemory(): void {
+  REQUESTS.clear()
+  CLIENTS.clear()
+  REFRESH.clear()
+  RECENT.clear()
+  forgetReads()
+}
+
+test("registration is bounded per address (a minute's count, unused clients) and in all, and unused clients expire", () => {
+  restartMemory()
+  const base = testIssuer()
+  const lim: ClientLimits = { perMinute: 3, perAddress: 5, maxUnused: 8, unusedTtlMs: 1200000.0 }
+  const iss: Issuer = { issuer: base.issuer, resource: base.resource, pem: base.pem, kid: base.kid, codeTtl: base.codeTtl, accessTtl: base.accessTtl, allowed: [], flowKey: base.flowKey, limits: lim }
+  const body = "{\"client_name\":\"flood\",\"redirect_uris\":[\"http://127.0.0.1:9/cb\"]}"
+  const t0 = 1.0e12
+  // three a minute from one address, then 429 with the seconds to wait
+  for (let i = 0; i < 3; i++) expect(register(body, iss, t0 + i * 1.0, "10.1.1.1").status).toBe(201)
+  const slow = register(body, iss, t0 + 10.0, "10.1.1.1")
+  expect(slow.status).toBe(429)
+  expect(slow.retryAfter!).toBe(60)
+  // another address is not held back, and an unknown address is not counted
+  expect(register(body, iss, t0 + 11.0, "10.1.1.2").status).toBe(201)
+  expect(register(body, iss, t0 + 12.0, "").status).toBe(201)
+  // a minute later the address registers again, until it holds five unused clients
+  expect(register(body, iss, t0 + 61000.0, "10.1.1.1").status).toBe(201)
+  expect(register(body, iss, t0 + 61001.0, "10.1.1.1").status).toBe(201)
+  const full = register(body, iss, t0 + 122000.0, "10.1.1.1")
+  expect(full.status).toBe(429)
+  expect(full.body.includes("unused clients")).toBe(true)
+  // one IPv6 host is one address over its /64
+  expect(addressHash("2001:db8:1:2::5")).toBe(addressHash("2001:db8:1:2:ffff::9"))
+  expect(addressHash("2001:db8:1:3::5") === addressHash("2001:db8:1:2::5")).toBe(false)
+  expect(addressHash("::ffff:10.1.1.1")).toBe(addressHash("10.1.1.1"))
+  // in all, past eight unused clients the oldest are dropped (seven so far, then four more)
+  let last = ""
+  for (let i = 0; i < 4; i++) {
+    const r = register(body, iss, t0 + 130000.0 + i * 1.0, `10.2.0.${i}`)
+    expect(r.status).toBe(201)
+    last = try clientIdOf(r.body)
+  }
+  let unused = 0
+  for (const cl of CLIENTS.values()) unused += cl.client_name === "flood" ? 1 : 0
+  expect(unused).toBe(8)
+  expect(CLIENTS.has(last)).toBe(true)
+  // a client with a grant is never dropped: it outlives the unused lifetime and the cap
+  const g = try vkGrant(iss, "kept-grant", "8096", t0 + 131000.0)
+  for (let i = 0; i < 9; i++) register(body, iss, t0 + 140000.0 + i * 1.0, `10.3.0.${i}`)
+  expect(CLIENTS.has(g[0]!)).toBe(true)
+  // an unused client expires after its lifetime; the granted one stays
+  register(body, iss, t0 + 140000.0 + 1300000.0, "10.4.0.1")
+  unused = 0
+  for (const cl of CLIENTS.values()) unused += cl.client_name === "flood" ? 1 : 0
+  expect(unused).toBe(1)
+  expect(CLIENTS.has(g[0]!)).toBe(true)
+  // the limits' defaults and bounds
+  const d = limitsOf({})
+  expect(d).toEqual({ perMinute: 10, perAddress: 20, maxUnused: 1000, unusedTtlMs: 3600000.0 })
+  const c = limitsOf({ registrations_per_minute: -1, max_unused_clients_per_address: 3, max_unused_clients: 50, unused_client_ttl_seconds: 60 })
+  expect(c).toEqual({ perMinute: 0, perAddress: 3, maxUnused: 50, unusedTtlMs: 1200000.0 })
+  restartMemory()
+})
+
+test("the registry is appended to, read by another worker from where it left off, and rewritten when it grows", () => {
+  const file = "/tmp/raiju-mcp-registry-test.json"
+  try rmSync(file, { force: true })
+  try rmSync(registryOf(file), { force: true })
+  const cfg: Config = { client: { mcp_server_auth_mode: "both", oauth2_server_config: { issuer_url: "https://gw.example", signing_key: TEST_KEY, max_unused_clients: 20, registrations_per_minute: -1, max_unused_clients_per_address: -1 } } }
+  restartMemory()
+  expect(openIssuerState(cfg, file, undefined)).toBe("")
+  const iss = issuerOf(cfg)!
+  const now = Date.now()
+  const stateBefore = try readFileSync(file, "utf8")
+  const ids: string[] = []
+  for (let i = 0; i < 5; i++) ids.push(try clientIdOf(register(`{"client_name":"r${i}","redirect_uris":["http://127.0.0.1:9/cb"]}`, iss, now + i * 1.0, "10.9.0.1").body))
+  // the state file is not touched by a registration
+  expect(try readFileSync(file, "utf8")).toBe(stateBefore)
+  expect((try readFileSync(registryOf(file), "utf8")).split("\n").length).toBe(7)
+  // another worker (nothing in memory) finds a client on authorize
+  restartMemory()
+  const sp = new URLSearchParams("")
+  sp.set("client_id", ids[3]!)
+  sp.set("redirect_uri", "http://127.0.0.1:9/cb")
+  sp.set("response_type", "code")
+  sp.set("code_challenge", pkceChallenge("w".repeat(50)))
+  sp.set("code_challenge_method", "S256")
+  expect(authorize(sp, iss, now + 10.0).status).toBe(302)
+  expect(CLIENTS.size).toBe(5)
+  // past twice the live clients the registry is rewritten with the live ones only (twenty, the oldest dropped)
+  for (let i = 0; i < 120; i++) register(`{"client_name":"m${i}","redirect_uris":["http://127.0.0.1:9/cb"]}`, iss, now + 100.0 + i * 1.0, "10.9.0.2")
+  const lines = (try readFileSync(registryOf(file), "utf8")).split("\n").length - 2
+  expect(lines <= 2 * 20 + 64 + 1).toBe(true)
+  expect(lines >= 20).toBe(true)
+  // a worker that read the old generation reads the new one whole
+  restartMemory()
+  readRegistry(true, now + 1000.0)
+  trimClients(iss.limits, now + 1000.0)
+  expect(CLIENTS.size).toBe(20)
+  openIssuerState(off(), "", undefined)
+  restartMemory()
+  try rmSync(file, { force: true })
+  try rmSync(registryOf(file), { force: true })
+  try rmSync(file + ".flock", { force: true })
+})
+
+test("a state file of the earlier format is split at the start: unused clients to the registry, pending requests dropped", () => {
+  const file = "/tmp/raiju-mcp-split-test.json"
+  try rmSync(registryOf(file), { force: true })
+  const now = Date.now()
+  const old = `{"version":1,"clients":[{"client_id":"kept-c","client_name":"granted","redirect_uris":["http://127.0.0.1/cb"],"grant_types":["authorization_code"],"scope":"mcp","created_at":1},{"client_id":"fresh-c","client_name":"fresh","redirect_uris":["http://127.0.0.1/cb"],"grant_types":["authorization_code"],"scope":"mcp","created_at":${now}},{"client_id":"stale-c","client_name":"stale","redirect_uris":["http://127.0.0.1/cb"],"grant_types":["authorization_code"],"scope":"mcp","created_at":1}],"refresh":[{"hash":"h1","family":"f1","client_id":"kept-c","mode":"vk","sub":"vk-1","scope":"mcp","resource":"https://gw.example/mcp","created_at":${now},"used_at":0,"revoked":false}],"requests":[{"id":"p1","client_id":"fresh-c","redirect_uri":"http://127.0.0.1/cb","state":"","scope":"mcp","resource":"","challenge":"x","expires_at":${now + 100000.0},"status":"pending","mode":"","sub":"","code_hash":""}],"consent":[{"hash":"t1","id":"p1","expires_at":${now + 100000.0}}]}`
+  try writeFileSync(file, old)
+  restartMemory()
+  const cfg: Config = { client: { mcp_server_auth_mode: "both", oauth2_server_config: { issuer_url: "https://gw.example", signing_key: TEST_KEY } } }
+  expect(openIssuerState(cfg, file, undefined)).toBe("")
+  const st = try readFileSync(file, "utf8")
+  expect(st.includes("kept-c")).toBe(true)
+  expect(st.includes("fresh-c")).toBe(false)
+  expect(st.includes("stale-c")).toBe(false)
+  expect(st.includes("\"consent\"")).toBe(false)
+  expect(st.includes("pending")).toBe(false)
+  const reg = try readFileSync(registryOf(file), "utf8")
+  expect(reg.includes("fresh-c")).toBe(true)
+  expect(reg.includes("stale-c")).toBe(false)
+  openIssuerState(off(), "", undefined)
+  restartMemory()
+  try rmSync(file, { force: true })
+  try rmSync(registryOf(file), { force: true })
   try rmSync(file + ".flock", { force: true })
 })
 
 // The test issuer: the throwaway key the jwt tests use, under a fixed issuer.
 function testIssuer(): Issuer {
-  return { issuer: "https://gw.example", resource: "https://gw.example/mcp", pem: TEST_KEY, kid: "test-kid", codeTtl: 300.0, accessTtl: 600.0, allowed: [] }
+  return { issuer: "https://gw.example", resource: "https://gw.example/mcp", pem: TEST_KEY, kid: "test-kid", codeTtl: 300.0, accessTtl: 600.0, allowed: [], flowKey: flowKeyOf(TEST_KEY), limits: limitsOf({}) }
 }
 
 function clientIdOf(body: string): string throws SyntaxError {

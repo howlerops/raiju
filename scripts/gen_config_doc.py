@@ -58,6 +58,7 @@ ELSEWHERE = {
 COMPAT_LISTS = {
     "topKeys": "",
     "clientKeys": "client",
+    "oauth2ServerKeys": "client.oauth2_server_config",
     "providerKeys": "providers.<name>",
     "clusterKeys": "cluster",
     "clusterFeedKeys": "cluster.feed",

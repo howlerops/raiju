@@ -10,6 +10,7 @@ import { SharedTable } from "./sharedtable"
 import { readFileSync, rmSync } from "node:fs"
 import { encodeUrl, decode } from "./base64"
 import { modPow, signRs256 } from "./jwt"
+import { cookieValue, sameSecret } from "./setupsession"
 
 export type OidcConfig = {
   enabled: bool,
@@ -159,6 +160,51 @@ export function stateKeyFrom(configKey: u8[]): u8[] {
 // fork, so the node's workers share it; a sign-in begun before a restart, or on another node, is then refused.
 export function randomStateKey(): u8[] throws Error {
   return try randomBytes(32)
+}
+
+// The key that seals sign-in states on a cluster with no encryption key: derived from cluster.secret (which every node
+// holds, at least 32 bytes), so a callback that lands on another node opens the state too.
+export function stateKeyFromClusterSecret(secret: string): u8[] {
+  return hmacSha256(utf8(secret), utf8(STATE_AAD + "-cluster"))
+}
+
+// Where the sign-in state key comes from: "encryption_key" (derived from the config's key), "cluster" (derived from
+// cluster.secret, with clustering on), or "random" (made at the start, this node only). note is a warning to print
+// ("" for none): a random key while more than one node is configured, where a callback on another node fails.
+export type StateKeySource = { source: string, note: string }
+
+export function stateKeySource(hasEncryptionKey: bool, clusterOn: bool, clusterSecret: string, otherNodes: bool): StateKeySource {
+  if (hasEncryptionKey) return { source: "encryption_key", note: "" }
+  if (clusterOn && clusterSecret !== "") return { source: "cluster", note: "" }
+  const note = otherNodes ? "single sign-on states are sealed with a key this node made at its start (no encryption_key, clustering off) while other nodes are configured: a sign-in whose callback reaches another node fails; set encryption_key (the same on every node) or turn clustering on with cluster.secret" : ""
+  return { source: "random", note: note }
+}
+
+// The cookie that binds a sign-in to the browser that began it (login CSRF): /api/oidc/login sets the state's hash in
+// it, and the callback accepts a state only from a browser that carries that hash. HttpOnly, SameSite=Lax (the identity
+// provider's redirect back is a top-level navigation, which carries a Lax cookie), Secure over https, and only sent to
+// /api/oidc. One sign-in at a time per browser: a second login replaces the first one's cookie.
+export const STATE_COOKIE = "raiju_oidc_state"
+
+function stateBinding(state: string): string {
+  return toHex(sha256(utf8("raiju-oidc-bind:" + state)))
+}
+
+// The Set-Cookie value /api/oidc/login sends with a state.
+export function stateCookie(state: string, secure: bool): string {
+  return `${STATE_COOKIE}=${stateBinding(state)}; Path=/api/oidc; Max-Age=${Math.floor(PENDING_TTL_MS / 1000.0)}; HttpOnly; SameSite=Lax` + (secure ? "; Secure" : "")
+}
+
+// The Set-Cookie value that clears it (sent by the callback, whatever the outcome).
+export function clearStateCookie(secure: bool): string {
+  return `${STATE_COOKIE}=; Path=/api/oidc; Max-Age=0; HttpOnly; SameSite=Lax` + (secure ? "; Secure" : "")
+}
+
+// Whether the request's Cookie header carries the binding of this state (compared in constant time).
+export function stateBound(cookieHeader: string, state: string): bool {
+  const got = cookieValue(cookieHeader, STATE_COOKIE)
+  if (got === "" || state === "") return false
+  return sameSecret(got, stateBinding(state))
 }
 
 // The sign-ins in flight. Nothing is kept per login: begin seals the verifier, nonce, expiry and return path into the
@@ -1134,4 +1180,61 @@ test("a forged, changed or expired state is refused", () => {
   const o = try own.begin(testCfg({}), TEST_DISC, TEST_NOW_MS)
   expect(own.complete(o.state, TEST_NOW_MS) === undefined).toBe(false)
   expect(f.complete(o.state, TEST_NOW_MS)).toBeUndefined()
+})
+
+test("without an encryption key, two nodes with one cluster secret open each other's states; random keys do not", () => {
+  const secret = "e2e-cluster-" + "secret-0123456789abcdef-padding"
+  const a = new OidcFlows()
+  a.setKey(stateKeyFromClusterSecret(secret))
+  const b = new OidcFlows()
+  b.setKey(stateKeyFromClusterSecret(secret))
+  const r = try a.begin(testCfg({}), TEST_DISC, TEST_NOW_MS)
+  expect(b.complete(r.state, TEST_NOW_MS + 1000.0) === undefined).toBe(false)
+  // the cluster key is its own: not the encryption-key derivation of the same bytes, nor another secret's
+  expect(toHex(stateKeyFromClusterSecret(secret)) === toHex(stateKeyFrom(utf8(secret)))).toBe(false)
+  const c = new OidcFlows()
+  c.setKey(stateKeyFromClusterSecret(secret + "x"))
+  const r2 = try a.begin(testCfg({}), TEST_DISC, TEST_NOW_MS)
+  expect(c.complete(r2.state, TEST_NOW_MS)).toBeUndefined()
+  // two nodes with random keys (the old behaviour without an encryption key): the callback on the other node fails
+  const n1 = new OidcFlows()
+  n1.setKey(try randomStateKey())
+  const n2 = new OidcFlows()
+  n2.setKey(try randomStateKey())
+  const r3 = try n1.begin(testCfg({}), TEST_DISC, TEST_NOW_MS)
+  expect(n2.complete(r3.state, TEST_NOW_MS)).toBeUndefined()
+})
+
+test("the state key comes from the encryption key, else the cluster secret, else a random key with a warning when other nodes are configured", () => {
+  expect(stateKeySource(true, true, "s".repeat(32), true)).toEqual({ source: "encryption_key", note: "" })
+  expect(stateKeySource(false, true, "s".repeat(32), true)).toEqual({ source: "cluster", note: "" })
+  expect(stateKeySource(false, false, "", false)).toEqual({ source: "random", note: "" })
+  const warned = stateKeySource(false, false, "s".repeat(32), true)
+  expect(warned.source).toBe("random")
+  expect(warned.note.includes("another node fails")).toBe(true)
+})
+
+test("the state cookie binds a sign-in to its browser: HttpOnly, SameSite=Lax, Secure over https, checked at the callback", () => {
+  const f = new OidcFlows()
+  f.setKey(stateKeyFrom(utf8("k")))
+  const r = try f.begin(testCfg({}), TEST_DISC, TEST_NOW_MS)
+  const set = stateCookie(r.state, false)
+  expect(set.startsWith(STATE_COOKIE + "=")).toBe(true)
+  expect(set.includes("; HttpOnly")).toBe(true)
+  expect(set.includes("; SameSite=Lax")).toBe(true)
+  expect(set.includes("; Path=/api/oidc")).toBe(true)
+  expect(set.includes("Secure")).toBe(false)
+  expect(stateCookie(r.state, true).endsWith("; Secure")).toBe(true)
+  // the cookie holds the state's hash, not the state
+  const value = set.slice(STATE_COOKIE.byteLength + 1, set.indexOf(";"))
+  expect(value.byteLength).toBe(64)
+  expect(r.state.includes(value)).toBe(false)
+  expect(stateBound(`other=1; ${STATE_COOKIE}=${value}`, r.state)).toBe(true)
+  // no cookie (an attacker's link opened in the victim's browser), another sign-in's cookie, or a changed one: refused
+  expect(stateBound("", r.state)).toBe(false)
+  const r2 = try f.begin(testCfg({}), TEST_DISC, TEST_NOW_MS)
+  expect(stateBound(`${STATE_COOKIE}=${value}`, r2.state)).toBe(false)
+  const changed = value.slice(0, 63) + (value.endsWith("0") ? "1" : "0")
+  expect(stateBound(`${STATE_COOKIE}=${changed}`, r.state)).toBe(false)
+  expect(clearStateCookie(true).includes("Max-Age=0")).toBe(true)
 })

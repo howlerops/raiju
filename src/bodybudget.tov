@@ -6,12 +6,21 @@
 // body the server has read already is charged too, but never refused: turning it away would save no memory.
 //
 // Bytes are charged as they arrive, not by the declared length, so a client that sends a big declared body slowly
-// holds only what it has sent (a declared 100 MB trickled to a route that checks no credential no longer makes every
-// other POST 503), and server.body_deadline_seconds bounds how long a body may take to arrive whole.
+// holds only what it has sent.
 //
-// A body is always admitted when the process holds no other body, so a single request up to
+// Bodies come in two kinds (production re-audit 3, P1-D). A checked body is one whose credential the gateway verified
+// from the headers before reading it (a virtual key, a management sign-in, the SCIM token, a signed peer request). An
+// unchecked body is one nobody vouched for: inference with auth off or behind the plugins' HTTP hooks (they may add
+// the credential), and the routes that read their credential from the body. Unchecked bodies share a small part of
+// the cap (server.unchecked_body_mb, an eighth by default), and the bytes one of them holds past that share do not
+// count against the checked bodies: an unauthenticated client cannot turn the authenticated big POSTs away. An
+// unchecked body must arrive whole within server.body_deadline_seconds (30); a checked one at an average of
+// server.body_min_kb_per_second (32) after server.body_rate_grace_seconds (10), so a slow but steady authenticated
+// upload is served whatever its size (P2-B).
+//
+// A body is always admitted when the process holds no other big body, so a single request up to
 // client.max_request_body_size_mb is still served (Bifrost's limit keeps its meaning); the cap decides how many
-// big bodies are read at once.
+// big bodies are read at once. The peer routes have a budget of their own (peerBudget).
 import { ServerSectionConfig } from "./config"
 
 // Sized for the chart's 512Mi pod: a chat body costs about eight times its size while it is parsed and sent on
@@ -22,6 +31,10 @@ export const DEFAULT_BUFFERED_BODY_MB = 48
 // and chunked ones reach it as a stream, so their credentials are checked and their bytes charged before they are read.
 export const UNREAD_ABOVE = 65536
 
+// What a body is charged as: "small" (read by the server already), "checked" (its credential was verified from the
+// headers), "unchecked" (it was not).
+export type BodyClass = "small" | "checked" | "unchecked"
+
 // server.max_buffered_body_mb in bytes: unset or 0 is the default, a negative number is no cap (0 returned).
 export function bufferedCap(s: ServerSectionConfig | undefined): int {
   const mb = s?.max_buffered_body_mb ?? 0
@@ -29,10 +42,23 @@ export function bufferedCap(s: ServerSectionConfig | undefined): int {
   return (mb === 0 ? DEFAULT_BUFFERED_BODY_MB : mb) * 1048576
 }
 
-// server.body_deadline_seconds: a body that reaches the gateway unread must arrive whole within this (Raiju's own;
-// Bifrost's server has no read deadline). The body timeout limits only the gap between bytes, so without it a client
-// could hold a charged body for as long as it sends a byte a minute.
-export const DEFAULT_BODY_DEADLINE_SECONDS = 120.0
+// The unchecked bodies' share of the cap when server.unchecked_body_mb is unset: an eighth.
+export const UNCHECKED_SHARE_DIVISOR = 8
+
+// server.unchecked_body_mb in bytes, given the cap (bufferedCap): unset or 0 is an eighth of the cap, a negative
+// number is no separate share (0 returned: unchecked bodies count like checked ones), and it is never above the cap.
+export function uncheckedShare(s: ServerSectionConfig | undefined, cap: int): int {
+  if (cap <= 0) return 0
+  const mb = s?.unchecked_body_mb ?? 0
+  if (mb < 0) return 0
+  if (mb === 0) return Math.max(1, Math.floor(cap / UNCHECKED_SHARE_DIVISOR))
+  return Math.min(cap, mb * 1048576)
+}
+
+// server.body_deadline_seconds: an unchecked body that reaches the gateway unread must arrive whole within this
+// (Raiju's own; Bifrost's server has no read deadline). The body timeout limits only the gap between bytes, so without
+// it a client could hold a charged body for as long as it sends a byte a minute.
+export const DEFAULT_BODY_DEADLINE_SECONDS = 30.0
 
 // server.body_deadline_seconds in ms: unset is the default, 0 or less is none (0 returned).
 export function bodyDeadlineMs(s: ServerSectionConfig | undefined): int {
@@ -41,116 +67,217 @@ export function bodyDeadlineMs(s: ServerSectionConfig | undefined): int {
   return v > 0 ? Math.max(1, Math.round(v * 1000)) : 0
 }
 
+// server.body_min_kb_per_second and server.body_rate_grace_seconds: a checked body must have sent
+// rate x (elapsed - grace) bytes at every moment, so 100 MB takes up to about 53 minutes at the default 32 KB/s.
+export const DEFAULT_BODY_MIN_KB_PER_SECOND = 32.0
+export const DEFAULT_BODY_RATE_GRACE_SECONDS = 10.0
+
+// The rate rule of checked bodies: bytes per second (0: none) and the grace in ms.
+export type BodyRate = { bytesPerSecond: f64, graceMs: f64 }
+
+export function bodyRate(s: ServerSectionConfig | undefined): BodyRate {
+  const kb = s?.body_min_kb_per_second ?? DEFAULT_BODY_MIN_KB_PER_SECOND
+  const grace = s?.body_rate_grace_seconds ?? DEFAULT_BODY_RATE_GRACE_SECONDS
+  return { bytesPerSecond: kb > 0 ? kb * 1024.0 : 0.0, graceMs: grace > 0 ? grace * 1000.0 : 0.0 }
+}
+
+// When (ms after the body's start) a checked body that has sent got bytes falls behind the rate: it is cut once that
+// moment passes without more bytes.
+export function rateDue(got: int, r: BodyRate): f64 {
+  if (r.bytesPerSecond <= 0) return 1.0e18
+  return r.graceMs + (got * 1.0) / r.bytesPerSecond * 1000.0
+}
+
 export class BodyBudget {
+  // every byte charged, the small bodies' part of it, and the unchecked bodies' part
   held = 0
+  small = 0
+  unchecked = 0
   refused = 0
 
-  // Whether a body of n bytes would fit beside what is held now (nothing is charged): a declared length that cannot is
-  // refused before it is read.
-  fits(n: int, cap: int): bool {
-    if (n <= 0 || cap <= 0 || this.held === 0 || this.held + n <= cap) return true
+  // What the checked bodies see as held: the unchecked bytes past their share do not count.
+  private seen(share: int): int {
+    if (share <= 0 || this.unchecked <= share) return this.held
+    return this.held - (this.unchecked - share)
+  }
+
+  // Whether a body of n bytes of kind cls would fit beside what is held now (nothing is charged): a declared length
+  // that cannot is refused before it is read. share is the unchecked bodies' (uncheckedShare; 0 none).
+  fits(n: int, cap: int, cls: BodyClass, share: int): bool {
+    if (this.admits(n, 0, cap, cls, share)) return true
     this.refused += 1
     return false
   }
 
-  // Charges n more bytes to a request that already holds `own` of them. true when they fit under cap (0: no cap),
-  // or when no other request holds any.
-  take(n: int, own: int, cap: int): bool {
+  // Charges n more bytes to a request of kind cls that already holds `own` of them. true when they fit under cap
+  // (0: no cap), or when no other request holds a big body.
+  take(n: int, own: int, cap: int, cls: BodyClass, share: int): bool {
     if (n <= 0) return true
-    if (cap > 0 && this.held - own > 0 && this.held + n > cap) {
+    if (!this.admits(n, own, cap, cls, share)) {
       this.refused += 1
       return false
     }
     this.held += n
+    if (cls === "unchecked") this.unchecked += n
+    if (cls === "small") this.small += n
     return true
+  }
+
+  private admits(n: int, own: int, cap: int, cls: BodyClass, share: int): bool {
+    if (n <= 0 || cap <= 0) return true
+    if (cls === "unchecked" && share > 0) {
+      // alone among the big bodies it may pass the share (the request limit decides its size); beside others it
+      // stays within the share and the cap
+      const others = this.held - this.small - own
+      if (others <= 0) return true
+      return this.unchecked + n <= share && this.held + n <= cap
+    }
+    const seen = this.seen(share)
+    return seen - own <= 0 || seen + n <= cap
   }
 
   // Charges n bytes that are in memory already (a small body the server has read): always admitted.
   hold(n: int): void {
-    if (n > 0) this.held += n
+    if (n <= 0) return
+    this.held += n
+    this.small += n
   }
 
-  // Gives back what a request held.
-  give(n: int): void {
+  // Gives back what a request of kind cls held.
+  give(n: int, cls: BodyClass): void {
     if (n <= 0) return
     this.held = Math.max(0, this.held - n)
+    if (cls === "unchecked") this.unchecked = Math.max(0, this.unchecked - n)
+    if (cls === "small") this.small = Math.max(0, this.small - n)
   }
 }
 
 const budget = new BodyBudget()
+const peers = new BodyBudget()
 
 // This process's budget.
 export function bodyBudget(): BodyBudget {
   return budget
 }
 
+// The peer routes' budget (/api/cluster/*, signed with cluster.secret): their bodies neither wait for the clients' nor
+// turn them away. Its cap is cluster.max_body_mb.
+export function peerBudget(): BodyBudget {
+  return peers
+}
+
 test("the cap: bodies are admitted while they fit, a lone body always", () => {
   const b = new BodyBudget()
   const cap = 100
   // a lone body over the cap is admitted (the request limit decides its size)
-  expect(b.take(250, 0, cap)).toBe(true)
-  expect(b.take(1, 0, cap)).toBe(false)
-  b.give(250)
+  expect(b.take(250, 0, cap, "checked", 0)).toBe(true)
+  expect(b.take(1, 0, cap, "checked", 0)).toBe(false)
+  b.give(250, "checked")
   expect(b.held).toBe(0)
-  expect(b.take(60, 0, cap)).toBe(true)
-  expect(b.take(40, 0, cap)).toBe(true)
-  expect(b.take(1, 0, cap)).toBe(false)
+  expect(b.take(60, 0, cap, "checked", 0)).toBe(true)
+  expect(b.take(40, 0, cap, "checked", 0)).toBe(true)
+  expect(b.take(1, 0, cap, "checked", 0)).toBe(false)
   expect(b.refused).toBe(2)
-  b.give(40)
-  expect(b.take(30, 0, cap)).toBe(true)
+  b.give(40, "checked")
+  expect(b.take(30, 0, cap, "checked", 0)).toBe(true)
   expect(b.held).toBe(90)
   // no cap
-  expect(b.take(1000000, 0, 0)).toBe(true)
+  expect(b.take(1000000, 0, 0, "checked", 0)).toBe(true)
   // an empty body costs nothing
-  expect(b.take(0, 0, cap)).toBe(true)
+  expect(b.take(0, 0, cap, "checked", 0)).toBe(true)
   // give never goes below zero
-  b.give(5000000)
+  b.give(5000000, "checked")
   expect(b.held).toBe(0)
 })
 
 test("a chunked body is charged as it arrives: its own bytes do not count against it", () => {
   const b = new BodyBudget()
   const cap = 100
-  expect(b.take(80, 0, cap)).toBe(true)
+  expect(b.take(80, 0, cap, "checked", 0)).toBe(true)
   // alone, it may grow past the cap
-  expect(b.take(80, 80, cap)).toBe(true)
+  expect(b.take(80, 80, cap, "checked", 0)).toBe(true)
   expect(b.held).toBe(160)
   // a second request now does not fit, and the first one cannot grow while the second holds bytes
-  b.give(160)
-  expect(b.take(30, 0, cap)).toBe(true)
-  expect(b.take(50, 0, cap)).toBe(true)
-  expect(b.take(30, 30, cap)).toBe(false)
+  b.give(160, "checked")
+  expect(b.take(30, 0, cap, "checked", 0)).toBe(true)
+  expect(b.take(50, 0, cap, "checked", 0)).toBe(true)
+  expect(b.take(30, 30, cap, "checked", 0)).toBe(false)
 })
 
 test("a declared length is checked against what is held, without being charged", () => {
   const b = new BodyBudget()
   const cap = 100
   // alone: a declared length over the cap fits (it is charged as it arrives)
-  expect(b.fits(1000, cap)).toBe(true)
+  expect(b.fits(1000, cap, "checked", 0)).toBe(true)
   expect(b.held).toBe(0)
   // a slow body that has sent little holds little: the next one fits
-  expect(b.take(5, 0, cap)).toBe(true)
-  expect(b.fits(90, cap)).toBe(true)
-  expect(b.fits(96, cap)).toBe(false)
+  expect(b.take(5, 0, cap, "checked", 0)).toBe(true)
+  expect(b.fits(90, cap, "checked", 0)).toBe(true)
+  expect(b.fits(96, cap, "checked", 0)).toBe(false)
   expect(b.refused).toBe(1)
-  expect(b.fits(1000, 0)).toBe(true)
+  expect(b.fits(1000, 0, "checked", 0)).toBe(true)
 })
 
 test("a body in memory already is charged and always admitted", () => {
   const b = new BodyBudget()
   const cap = 100
-  expect(b.take(150, 0, cap)).toBe(true)
+  expect(b.take(150, 0, cap, "checked", 0)).toBe(true)
   b.hold(10)
   expect(b.held).toBe(160)
+  expect(b.small).toBe(10)
   b.hold(0)
   expect(b.held).toBe(160)
-  b.give(10)
+  b.give(10, "small")
   expect(b.held).toBe(150)
+  expect(b.small).toBe(0)
+})
+
+test("an unchecked body that holds the cap does not turn checked bodies away (re-audit 3 P1-D)", () => {
+  const b = new BodyBudget()
+  const cap = 80
+  const share = 10
+  // a lone unchecked body may pass its share (48 MB sent fast to /mcp, say)
+  expect(b.take(80, 0, cap, "unchecked", share)).toBe(true)
+  expect(b.unchecked).toBe(80)
+  // a checked body sees only the share of it: it fits
+  expect(b.fits(60, cap, "checked", share)).toBe(true)
+  expect(b.take(60, 0, cap, "checked", share)).toBe(true)
+  expect(b.take(10, 60, cap, "checked", share)).toBe(true)
+  expect(b.take(1, 70, cap, "checked", share)).toBe(false)
+  // and the unchecked body, beside a checked one now, cannot grow past its share: its next byte is refused
+  expect(b.take(1, 80, cap, "unchecked", share)).toBe(false)
+  // another unchecked body does not fit beside it either
+  expect(b.fits(5, cap, "unchecked", share)).toBe(false)
+  b.give(80, "unchecked")
+  expect(b.unchecked).toBe(0)
+  expect(b.held).toBe(70)
+  // unchecked bodies beside others share `share`
+  expect(b.take(6, 0, cap, "unchecked", share)).toBe(true)
+  expect(b.take(4, 0, cap, "unchecked", share)).toBe(true)
+  expect(b.take(1, 0, cap, "unchecked", share)).toBe(false)
+  // and the cap as a whole
+  b.give(70, "checked")
+  b.give(10, "unchecked")
+  expect(b.held).toBe(0)
+  expect(b.take(75, 0, cap, "checked", share)).toBe(true)
+  expect(b.take(6, 0, cap, "unchecked", share)).toBe(false)
+  expect(b.take(5, 0, cap, "unchecked", share)).toBe(true)
+})
+
+test("small bodies do not count as another big body for an unchecked one", () => {
+  const b = new BodyBudget()
+  b.hold(1000)
+  expect(b.take(50, 0, 100, "unchecked", 10)).toBe(true)
+  // with no separate share, unchecked bodies count like checked ones
+  const c = new BodyBudget()
+  expect(c.take(90, 0, 100, "unchecked", 0)).toBe(true)
+  expect(c.take(20, 0, 100, "checked", 0)).toBe(false)
+  expect(c.take(10, 0, 100, "checked", 0)).toBe(true)
 })
 
 test("server.body_deadline_seconds: the default, a value, off", () => {
-  expect(bodyDeadlineMs(undefined)).toBe(120000)
-  expect(bodyDeadlineMs({})).toBe(120000)
+  expect(bodyDeadlineMs(undefined)).toBe(30000)
+  expect(bodyDeadlineMs({})).toBe(30000)
   expect(bodyDeadlineMs({ body_deadline_seconds: 2.5 })).toBe(2500)
   expect(bodyDeadlineMs({ body_deadline_seconds: 0.0 })).toBe(0)
   expect(bodyDeadlineMs({ body_deadline_seconds: -1.0 })).toBe(0)
@@ -161,4 +288,30 @@ test("server.max_buffered_body_mb: the default, a value, no cap", () => {
   expect(bufferedCap({ max_buffered_body_mb: 0 })).toBe(48 * 1048576)
   expect(bufferedCap({ max_buffered_body_mb: 200 })).toBe(200 * 1048576)
   expect(bufferedCap({ max_buffered_body_mb: -1 })).toBe(0)
+})
+
+test("server.unchecked_body_mb: an eighth by default, a value within the cap, none", () => {
+  const cap = 48 * 1048576
+  expect(uncheckedShare(undefined, cap)).toBe(6 * 1048576)
+  expect(uncheckedShare({ unchecked_body_mb: 0 }, cap)).toBe(6 * 1048576)
+  expect(uncheckedShare({ unchecked_body_mb: 12 }, cap)).toBe(12 * 1048576)
+  expect(uncheckedShare({ unchecked_body_mb: 100 }, cap)).toBe(cap)
+  expect(uncheckedShare({ unchecked_body_mb: -1 }, cap)).toBe(0)
+  expect(uncheckedShare(undefined, 0)).toBe(0)
+})
+
+test("server.body_min_kb_per_second: the rate a checked body keeps after the grace", () => {
+  const r = bodyRate(undefined)
+  expect(r.bytesPerSecond).toBe(32768.0)
+  expect(r.graceMs).toBe(10000.0)
+  // nothing sent: due when the grace ends; 32 KB sent buys one more second
+  expect(rateDue(0, r)).toBe(10000.0)
+  expect(rateDue(32768, r)).toBe(11000.0)
+  // 100 MB at exactly the rate
+  expect(rateDue(100 * 1048576, r)).toBe(10000.0 + 3200000.0)
+  const off = bodyRate({ body_min_kb_per_second: 0.0 })
+  expect(off.bytesPerSecond).toBe(0.0)
+  expect(rateDue(0, off) > 1.0e17).toBe(true)
+  const fast = bodyRate({ body_min_kb_per_second: 1.0, body_rate_grace_seconds: 0.0 })
+  expect(rateDue(2048, fast)).toBe(2000.0)
 })

@@ -1,6 +1,6 @@
 // HTTP routes: the OpenAI-shaped /v1 API, drop-in SDK routes, models,
 // metrics, health and a read-only management API.
-import { Config, VirtualKeyConfig, OAuthKeyConfig, ProviderConfig, KeyConfig, providerOf, providerNames, resolveEnv } from "./config"
+import { Config, VirtualKeyConfig, OAuthKeyConfig, ProviderConfig, KeyConfig, WebhookEndpoint, AgentConfig, providerOf, providerNames, resolveEnv } from "./config"
 import { utf8 } from "./crypto"
 import { Engine, LiveHead, StreamSink, errorResponse, headSink, noHeaders } from "./gateway"
 import { anthropicMessages, anthropicLegacy, cursorChat, genai, genaiSdk, bedrockModel, responsesApi, cohereChat, cohereEmbed, cohereRerank, cohereTokenize } from "./native"
@@ -51,7 +51,7 @@ import { notifyRoute } from "./notify"
 import { alertingRoute } from "./alertapi"
 import { crewsRoute } from "./crew"
 import { McpSession } from "./mcp"
-import { Ops, Reply, UiSocket } from "./ops"
+import { Ops, Reply, UiSocket, lockBusyReply } from "./ops"
 import { parseCursor } from "./feed"
 import { cookieValue, SETUP_COOKIE, setupPublic } from "./setupsession"
 import { rerank, bedrockRerank, countTokens, responsesInputTokens, asyncSubmit, asyncGet, sdkAsyncSubmit, sdkAsyncPoll, decisionRoute, openaiDecisionPath, Dispatch } from "./extras"
@@ -63,8 +63,8 @@ import { EXTRA_PARAMS_HEADER, EXTRA_PARAMS_CARRY, mergeExtraParams, extraParamsC
 import { lifecycle, readyInput, readyReport, ServerLimits } from "./lifecycle"
 import { CLIENT_WATCH_HEADER, watchStart, watchGone, watchEnd, watched } from "./clientgone"
 import { usesChain, withChainCreds } from "./awschain"
-import { bodyBudget, bufferedCap, bodyDeadlineMs, UNREAD_ABOVE } from "./bodybudget"
-import { clusterBodyCap, wellFormedSig } from "./cluster"
+import { bodyBudget, peerBudget, bufferedCap, uncheckedShare, bodyDeadlineMs, bodyRate, rateDue, BodyRate, BodyClass, UNREAD_ABOVE } from "./bodybudget"
+import { clusterBodyCap, wellFormedSig, headRefusal, peerHeaders, HEAD_SIG_HEADER, TS_HEADER } from "./cluster"
 
 type ModelEntry = { id: string, object: string, created: int, owned_by: string }
 
@@ -719,8 +719,14 @@ async function scimRoute(ops: Ops, req: Request, path: string): Promise<Response
   const token = resolveEnv(sc?.config?.provisioningToken ?? "")
   if (!scimAuthorized(req.headers.get("authorization") ?? "", token)) return scimReply(401, errorBody(401, "", "the SCIM provisioning token is missing or wrong"))
   const body = req.method === "GET" ? "" : await req.text()
-  // a change waits for the config file's lock without pausing the worker (see manage)
+  // a change waits for the config file's lock without pausing the worker and holds it only while scimChange runs (it
+  // awaits nothing); when another process keeps it the change answers 503 and nothing of it runs (see manage)
   const held = req.method === "GET" ? undefined : await ops.store.holdLock()
+  if (held !== undefined && !held.ok) {
+    ops.store.releaseLock(held)
+    ops.recordChange("scim", req, path, 503, body)
+    return scimReply(503, errorBody(503, "", "another process kept the configuration file's lock too long; nothing was changed, retry"))
+  }
   const res = scimChange(ops, req, path, body)
   if (held !== undefined) ops.store.releaseLock(held)
   return res
@@ -780,6 +786,12 @@ function scimChange(ops: Ops, req: Request, path: string, body: string): Respons
 }
 
 // The management API, behind RBAC; every change lands in the audit log.
+//
+// The config file's lock (filelock.tov, shared by the node's workers and by nodes on one volume) is held only around
+// the part of a change that reads the config, changes it and saves it, with nothing awaited in between: a route that
+// reaches the network (a provider's model list, a datasheet, an MCP server or its authorization server, an agent card,
+// a plugin download) does that first, without the lock. The lock is waited for without pausing the worker; when another
+// process keeps it past LOCK_WAIT_MS the change answers 503 and nothing of it runs.
 async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   // an expired single sign-on session is refreshed with the identity provider first (Bifrost's silent refresh)
   await ops.refreshDue(req)
@@ -789,172 +801,245 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   const sc = ops.scopeOfActorFor(gate.actor, resourceOf(req.method, path).resource)
   // DELETE reads its body too: DELETE /api/mcp-logs names its ids there
   const body = req.method === "GET" ? "" : await req.text()
-  // a change waits here for the config file's lock while the worker serves other requests, and holds it while the route
-  // runs: the saves it makes take it again at once (filelock.tov). When another process keeps it past LOCK_WAIT_MS the
-  // route still runs, and a save it makes fails after a short wait.
-  const held = req.method === "GET" ? undefined : await ops.store.holdLock()
   // a change saved by this request is answered once the node's other workers run it (ops.settleConfig)
   const genBefore = ops.store.fileSha
   // the equal-split projects this write may redivide (ops.withRedivision)
   const redivBefore = ops.redivisionBefore(req.method, path)
+  const run = syncRoute(ops, req, path, body, gate.actor, sc)
   let r: Reply = { status: 404, body: "", contentType: "application/json" }
-  if (path === "/api/users/me/permissions") r = req.method === "GET" ? ops.mePermissions(gate.actor) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
-  else if (path === "/api/governance/users/me/permissions") r = req.method === "GET" ? ops.mePermissionMap(gate.actor) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
-  // a user by email address (Bifrost's MDM lookups), on the old and the governance path
-  else if (path.startsWith("/api/users/email/") || path.startsWith("/api/governance/users/email/")) r = ops.userByEmailRoute(req.method, path)
-  else if (usersPath(path) === "/api/users/me/vk-creation-policy") r = req.method === "GET" ? ops.vkCreationPolicy(gate.actor) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
-  else if (usersPath(path).startsWith("/api/users/") && usersPath(path).split("/")[4] === "access-profiles") r = ops.userProfiles(req.method, usersPath(path), body)
-  else if (usersPath(path) === "/api/users" || usersPath(path).startsWith("/api/users/")) r = ops.users(req.method, usersPath(path), body, req.headers.get("x-bifrost-setup-token") ?? "", cookieValue(req.headers.get("cookie") ?? "", SETUP_COOKIE))
-  else if (auditTarget(path) !== "") r = ops.auditRoute(req, auditTarget(path))
-  // user provisioning: directory sync, bulk import and its preview, reconcile and its previews, the jobs
-  else if (path === "/api/scim/provision" || path.startsWith("/api/scim/provision/")) r = await ops.provisionRoute(req.method, path, body)
-  else if (path === "/api/api-keys" || path.startsWith("/api/api-keys/")) r = ops.apiKeysRoute(req.method, path, req.url, body, gate.actor)
-  // the cache clears (DELETE) and the read-only plugin listings
-  else if (path.startsWith("/api/cache/")) r = await ops.cacheClear(req.method, path)
-  else if (path === "/api/plugins" || path.startsWith("/api/plugins/")) r = await ops.pluginsRouteAsync(req.method, path, body)
-  else if (path === "/api/mcp/virtual") r = req.method === "GET" ? ops.virtualView() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
-  // one project member's usage: its slices with their counters and its requests by provider and model
-  else if (req.method === "GET" && path.startsWith("/api/governance/projects/") && path.endsWith("/usage") && path.split("/").length === 8 && path.split("/")[5] === "members") r = ops.memberUsage(path, sc)
-  // the access-profile audit lists (Bifrost serves them on both paths)
-  else if (req.method === "GET" && (path.startsWith("/api/governance/access-profiles/") || path.startsWith("/api/access-profiles/")) && path.endsWith("/audit-logs") && path.split("/").length <= 6) r = ops.profileAudit(req, path)
-  else if (path === "/api/governance/access-profiles" || path.startsWith("/api/governance/access-profiles/")) r = ops.profiles(req.method, path, body)
-  else if (path.startsWith("/api/alerting/")) {
-    const ar = alertingRoute(ops.store.cfg.alerts ?? {}, { usage: (t, id) => ops.engine.gov.scopeUsage(t, id, Date.now()), history: () => ops.cel?.history() ?? [] }, req.method, req.url.slice(req.url.indexOf("/api/")), body)
-    const next = ar.next
-    r = { status: ar.status, body: ar.body, contentType: "application/json" }
-    if (next !== undefined) {
-      const saved = ops.store.setAlerts(next)
-      if (saved.kind !== "ok") r = { status: saved.status, body: JSON.stringify({ error: { message: saved.message, type: "api_error" } }), contentType: "application/json" }
-    }
-  }
-  // the MCP grants of the authorization server: the live grants (GET) and the revoke of one (DELETE)
-  else if (path === "/api/oauth2/sessions" || path.startsWith("/api/oauth2/sessions/")) {
-    const gu = URL.parse(req.url)
-    const gq = gu === undefined ? new URLSearchParams("") : gu.searchParams
-    const vkName = (vk: string): string => keyById(ops.engine.cfg, vk)?.name ?? ""
-    const ga = path === "/api/oauth2/sessions" && req.method === "GET" ? grantsList(gq, vkName) : path !== "/api/oauth2/sessions" && req.method === "DELETE" ? grantRevoke(path.slice("/api/oauth2/sessions/".byteLength)) : undefined
-    if (ga !== undefined) r = { status: ga.status, body: ga.body, contentType: ga.contentType }
-    else r = { status: 405, body: `{"error":{"message":"method ${req.method} is not allowed on this route","type":"invalid_request_error"}}`, contentType: "application/json" }
-  }
-  // crew routing (crew.tov): the pools with their classes and crews, the assign route and a task's detail
-  else if (path === "/api/crews" || path.startsWith("/api/crews/")) {
-    const cr = crewsRoute(req.method, req.url.slice(req.url.indexOf("/api/")), body, ops.engine.logStore, ops.engine.pricing, Date.now())
-    r = { status: cr.status, body: cr.body, contentType: "application/json" }
-  }
-  else if (path === "/api/alerts") r = req.method === "GET" ? ops.alertsView() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
-  else if (path === "/api/models/base" || path === "/api/models/details") r = ops.catalogView(req, path)
-  else if (path === "/api/circuit-breaker/state") r = req.method === "GET" ? ops.circuitView() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
-  // the request-log analytics and the MCP logs (ops.logsRoute)
-  else if (logsAnalyticsPath(path)) r = await ops.logsRouteAll(req, path, body, sc, req.method === "GET" && ops.mayReveal(gate.actor))
-  else if (path === "/api/circuit-breaker/policies" || path.startsWith("/api/circuit-breaker/policies/")) r = ops.circuitPoliciesRoute(req.method, path, body)
-  else if (path === "/api/circuit-breaker/reset") r = req.method === "POST" ? ops.circuitReset(body) : { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
-  // adaptive load balancing: the keys held out of rotation, their incidents, and releasing them
-  else if (path === "/api/adaptive-routing/held-keys") r = req.method === "GET" ? ops.adaptiveHeldKeys() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
-  else if (path === "/api/adaptive-routing/incidents") r = req.method === "GET" ? ops.adaptiveIncidents() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
-  else if (path === "/api/adaptive-routing/history/issues") r = req.method === "GET" ? ops.adaptiveHistory(req) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
-  else if (path === "/api/adaptive-routing/conditions/clear") r = req.method === "POST" ? ops.adaptiveRelease(body) : { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
-  else if (path === "/api/vault/flush-cache") r = req.method === "POST" ? ops.vaultFlush() : { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
-  else if (path === "/api/models/parameters") r = req.method === "GET" ? await ops.modelParameters(req) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
-  else if (path === "/api/models/catalog") r = await ops.catalogUpsertRoute(req, body)
-  // changing the global proxy's URL, or turning skip_tls_verify on, needs a real admin session
-  else if (path === "/api/proxy-config" && req.method === "PUT" && !ops.authOn && proxyWidening(ops.store.cfg.proxy_config, body).length > 0) {
-    r = { status: 403, body: `{"error":{"message":"Changing the global proxy (url or skip_tls_verify) requires an authenticated admin session; dashboard auth is currently disabled or unconfigured. Enable dashboard authentication first.","type":"permission_error"}}`, contentType: "application/json" }
-  }
-  else if (path.startsWith("/api/providers/") && path.endsWith("/refresh-models")) {
-    // /api/providers/{p}/refresh-models or /api/providers/{p}/keys/{id}/refresh-models
-    const parts = path.split("/")
-    const isKey = parts.length === 7 && parts[4] === "keys"
-    if (req.method !== "POST") r = { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
-    else if (!(parts.length === 5 || isKey)) r = { status: 404, body: `{"error":{"message":"no such route","type":"invalid_request_error"}}`, contentType: "application/json" }
-    else r = await refreshModels(undefined, ops.store.cfg, parts[3] ?? "", isKey ? parts[5] : undefined)
-  }
-  // the MCP server library (ops.libraryRoute, src/mcplibrary.tov)
-  else if (path === "/api/mcp/library" || path.startsWith("/api/mcp/library/")) r = await ops.libraryRoute(req, path, body)
-  else if (path === "/api/pricing/force-sync") {
-    if (req.method === "POST") r = await ops.forcePricing()
-    else r = { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
-  }
-  // prompt repository, webhooks, feature flags and notifications (their modules hold the logic)
-  else if (path.startsWith("/api/prompt-repo/")) {
-    const pr = promptRoute(ops.store.cfg.prompt_repo, req.method, req.url.slice(req.url.indexOf("/api/")), body)
-    r = savedReply(pr.status, pr.body, pr.next === undefined ? undefined : ops.store.setPromptRepo(pr.next))
-  }
-  else if (path === "/api/webhooks" || path.startsWith("/api/webhooks/")) {
-    const wr = await webhookApi(ops.store.cfg.webhooks, req.method, req.url.slice(req.url.indexOf("/api/")), body)
-    r = savedReply(wr.status, wr.body, wr.next === undefined ? undefined : ops.store.setWebhooks(wr.next))
-  }
-  // registered A2A agents (agents.tov); the call history is ops.tov's
-  else if (path === "/api/agents" || path.startsWith("/api/agents/")) {
-    if (path === "/api/agents/push-configs" || path.startsWith("/api/agents/push-configs/")) {
-      const pu = URL.parse(req.url)
-      r = ops.pushConfigsRoute(req.method, path, pu === undefined ? new URLSearchParams("") : pu.searchParams)
-    } else if (path === "/api/agents/history" || path.startsWith("/api/agents/history/")) {
-      const hu = URL.parse(req.url)
-      r = ops.agentHistoryRoute(req.method, path, hu === undefined ? new URLSearchParams("") : hu.searchParams, body, sc)
-    } else {
-      const ar = await agentApi(ops.store.cfg.agents, req.method, req.url.slice(req.url.indexOf("/api/")), body, publicBase(ops.store.cfg.client?.a2a_external_client_url, req.url))
-      const saved = ar.next === undefined ? undefined : ops.store.setAgents(ar.next)
-      // a card fetched here reaches the other workers before this answer (ops.publishCards)
-      if (saved !== undefined && saved.kind === "ok") ops.publishCards()
-      r = savedReply(ar.status, ar.body, saved)
-    }
-  }
-  else if (path === "/api/feature-flags" || path.startsWith("/api/feature-flags/")) {
-    const fr = flagRoute(ops.store.cfg.feature_flags, req.method, req.url.slice(req.url.indexOf("/api/")), body)
-    r = savedReply(fr.status, fr.body, fr.next === undefined ? undefined : ops.store.setFeatureFlags(fr.next))
-  }
-  else if (path === "/api/notifications") {
-    const nr = notifyRoute(req.method, req.url.slice(req.url.indexOf("/api/")), body)
-    r = { status: nr.status, body: nr.body, contentType: "application/json" }
-  }
-  else {
-    // the OAuth routes of auth type oauth clients need the gateway's origin (the callback's redirect URI)
-    const mu = URL.parse(req.url)
-    // the status route reads ?flow_id=
-    let oa: McpReply | undefined = oauthConfigRoute(ops.store, req.method, mu === undefined ? path : path + mu.search)
-    if (oa === undefined) oa = await oauthRoute(ops.store, req.method, path, body, mu === undefined ? "" : mu.origin)
-    // a user-mode flow opens for the identity-provider user of the caller's single sign-on session only
-    const ssoUser = gate.actor.startsWith("sso:") ? gate.actor.slice(4) : ""
-    if (oa === undefined) oa = perUserApi(ops.store, req.method, mu === undefined ? path : path + mu.search, body, mu === undefined ? "" : mu.origin, ssoUser)
-    if (oa === undefined) oa = await headersRouteAsync(ops.store, req.method, path, body, ssoUser)
-    if (oa === undefined) oa = await exchangeRouteAsync(ops.store, ops.engine.idp, req.method, path, body)
-    if (oa === undefined) oa = await openapiRoute(req.method, path, body, !ops.authOn)
-    // an openapi client sent with a spec_url keeps the document it names (fetched now, as Bifrost stores it)
-    let mbody = body
-    if (oa === undefined) {
-      const il = await inlineSpecUrl(req.method, path, body, !ops.authOn)
-      if (il.error !== undefined) oa = il.error
-      mbody = il.body
-    }
-    // with dashboard auth off, clients registered here must reach public addresses only
-    const mr = oa ?? mcpApi(ops.store, req.method, path, mbody, !ops.authOn, sc)
-    if (mr !== undefined) {
-      r = { status: mr.status, body: mr.body, contentType: mr.contentType ?? "application/json" }
-      if (mr.status === 200 && mr.action !== undefined) r = await mcpAction(ops, mr.action, mr.id ?? "", r)
-    } else {
-      // the query (search, paging, is_active) reaches the handlers that read it
-      const qu = URL.parse(req.url)
-      // a provider's base_url, with its host resolved now (Bifrost's ValidateExternalURL)
-      const bu = await providerBaseUrlProblem(req.method, path, body)
-      const a = bu !== "" ? { status: 400, body: JSON.stringify({ error: { message: bu } }) } : handleApi(ops.store, req.method, qu === undefined ? path : path + qu.search, body, sc)
-      r = { status: a.status, body: a.body, contentType: "application/json" }
-      // a rotated key's MCP OAuth grants go with its old value (Bifrost revokes them in the rotation)
-      if (a.status === 200 && isRotatePath(path)) {
-        for (const id of rotatedKeyIds(a.body)) revokeSubject("vk", id)
-      }
-    }
-  }
-  r = ops.withRedivision(req.method, path, r, redivBefore)
+  if (run !== undefined) r = await ops.underLock(req.method, () => ops.withRedivision(req.method, path, run(), redivBefore))
+  else r = await ioRoute(ops, req, path, body, gate.actor, sc, redivBefore)
   ops.recordChange(gate.actor, req, path, r.status, body)
   if (req.method !== "GET" && r.status < 300) ops.storeUpdated(path)
-  if (held !== undefined) ops.store.releaseLock(held)
   if (ops.store.fileSha !== genBefore) await ops.settleConfig()
   const h: Record<string, string> = new Map()
   h.set("content-type", r.contentType)
   // a log detail that reveals a logs_only mapping is not cached (Bifrost marks the reveal response no-store)
   if (req.method === "GET" && r.status === 200 && (path.startsWith("/api/logs/") || path.startsWith("/api/mcp-logs/")) && r.body.includes(`"redaction_mapping":`)) h.set("cache-control", "no-store")
+  // a 503 for the lock: a retry may pass
+  if (r.status === 503) h.set("retry-after", "1")
   // a 204 has no body (a response with one would be refused)
   return new Response(r.status === 204 ? undefined : r.body, { status: r.status, headers: h })
+}
+
+// The management routes that answer without awaiting anything: the handler they return runs under the config file's
+// lock for a change (manage). undefined for the routes ioRoute answers.
+function syncRoute(ops: Ops, req: Request, path: string, body: string, actor: string, sc: DataScope): (() => Reply) | undefined {
+  if (path === "/api/users/me/permissions") return () => req.method === "GET" ? ops.mePermissions(actor) : NOT_GET
+  if (path === "/api/governance/users/me/permissions") return () => req.method === "GET" ? ops.mePermissionMap(actor) : NOT_GET
+  // a user by email address (Bifrost's MDM lookups), on the old and the governance path
+  if (path.startsWith("/api/users/email/") || path.startsWith("/api/governance/users/email/")) return () => ops.userByEmailRoute(req.method, path)
+  if (usersPath(path) === "/api/users/me/vk-creation-policy") return () => req.method === "GET" ? ops.vkCreationPolicy(actor) : NOT_GET
+  if (usersPath(path).startsWith("/api/users/") && usersPath(path).split("/")[4] === "access-profiles") return () => ops.userProfiles(req.method, usersPath(path), body)
+  if (usersPath(path) === "/api/users" || usersPath(path).startsWith("/api/users/")) return () => ops.users(req.method, usersPath(path), body, req.headers.get("x-bifrost-setup-token") ?? "", cookieValue(req.headers.get("cookie") ?? "", SETUP_COOKIE))
+  if (auditTarget(path) !== "") return () => ops.auditRoute(req, auditTarget(path))
+  if (path === "/api/api-keys" || path.startsWith("/api/api-keys/")) return () => ops.apiKeysRoute(req.method, path, req.url, body, actor)
+  if (path === "/api/mcp/virtual") return () => req.method === "GET" ? ops.virtualView() : NOT_GET
+  // one project member's usage: its slices with their counters and its requests by provider and model
+  if (req.method === "GET" && path.startsWith("/api/governance/projects/") && path.endsWith("/usage") && path.split("/").length === 8 && path.split("/")[5] === "members") return () => ops.memberUsage(path, sc)
+  // the access-profile audit lists (Bifrost serves them on both paths)
+  if (req.method === "GET" && (path.startsWith("/api/governance/access-profiles/") || path.startsWith("/api/access-profiles/")) && path.endsWith("/audit-logs") && path.split("/").length <= 6) return () => ops.profileAudit(req, path)
+  if (path === "/api/governance/access-profiles" || path.startsWith("/api/governance/access-profiles/")) return () => ops.profiles(req.method, path, body)
+  if (path.startsWith("/api/alerting/")) {
+    return () => {
+      const ar = alertingRoute(ops.store.cfg.alerts ?? {}, { usage: (t, id) => ops.engine.gov.scopeUsage(t, id, Date.now()), history: () => ops.cel?.history() ?? [] }, req.method, req.url.slice(req.url.indexOf("/api/")), body)
+      const next = ar.next
+      if (next !== undefined) {
+        const saved = ops.store.setAlerts(next)
+        if (saved.kind !== "ok") return { status: saved.status, body: JSON.stringify({ error: { message: saved.message, type: "api_error" } }), contentType: "application/json" }
+      }
+      return { status: ar.status, body: ar.body, contentType: "application/json" }
+    }
+  }
+  // the MCP grants of the authorization server: the live grants (GET) and the revoke of one (DELETE)
+  if (path === "/api/oauth2/sessions" || path.startsWith("/api/oauth2/sessions/")) {
+    return () => {
+      const gu = URL.parse(req.url)
+      const gq = gu === undefined ? new URLSearchParams("") : gu.searchParams
+      const vkName = (vk: string): string => keyById(ops.engine.cfg, vk)?.name ?? ""
+      const ga = path === "/api/oauth2/sessions" && req.method === "GET" ? grantsList(gq, vkName) : path !== "/api/oauth2/sessions" && req.method === "DELETE" ? grantRevoke(path.slice("/api/oauth2/sessions/".byteLength)) : undefined
+      if (ga !== undefined) return { status: ga.status, body: ga.body, contentType: ga.contentType }
+      return { status: 405, body: `{"error":{"message":"method ${req.method} is not allowed on this route","type":"invalid_request_error"}}`, contentType: "application/json" }
+    }
+  }
+  // crew routing (crew.tov): the pools with their classes and crews, the assign route and a task's detail
+  if (path === "/api/crews" || path.startsWith("/api/crews/")) {
+    return () => {
+      const cr = crewsRoute(req.method, req.url.slice(req.url.indexOf("/api/")), body, ops.engine.logStore, ops.engine.pricing, Date.now())
+      return { status: cr.status, body: cr.body, contentType: "application/json" }
+    }
+  }
+  if (path === "/api/alerts") return () => req.method === "GET" ? ops.alertsView() : NOT_GET
+  if (path === "/api/models/base" || path === "/api/models/details") return () => ops.catalogView(req, path)
+  if (path === "/api/circuit-breaker/state") return () => req.method === "GET" ? ops.circuitView() : NOT_GET
+  if (path === "/api/circuit-breaker/policies" || path.startsWith("/api/circuit-breaker/policies/")) return () => ops.circuitPoliciesRoute(req.method, path, body)
+  if (path === "/api/circuit-breaker/reset") return () => req.method === "POST" ? ops.circuitReset(body) : NOT_POST
+  // adaptive load balancing: the keys held out of rotation, their incidents, and releasing them
+  if (path === "/api/adaptive-routing/held-keys") return () => req.method === "GET" ? ops.adaptiveHeldKeys() : NOT_GET
+  if (path === "/api/adaptive-routing/incidents") return () => req.method === "GET" ? ops.adaptiveIncidents() : NOT_GET
+  if (path === "/api/adaptive-routing/history/issues") return () => req.method === "GET" ? ops.adaptiveHistory(req) : NOT_GET
+  if (path === "/api/adaptive-routing/conditions/clear") return () => req.method === "POST" ? ops.adaptiveRelease(body) : NOT_POST
+  if (path === "/api/vault/flush-cache") return () => req.method === "POST" ? ops.vaultFlush() : NOT_POST
+  // changing the global proxy's URL, or turning skip_tls_verify on, needs a real admin session
+  if (path === "/api/proxy-config" && req.method === "PUT" && !ops.authOn && proxyWidening(ops.store.cfg.proxy_config, body).length > 0) {
+    return () => ({ status: 403, body: `{"error":{"message":"Changing the global proxy (url or skip_tls_verify) requires an authenticated admin session; dashboard auth is currently disabled or unconfigured. Enable dashboard authentication first.","type":"permission_error"}}`, contentType: "application/json" })
+  }
+  // prompt repository, feature flags and notifications (their modules hold the logic)
+  if (path.startsWith("/api/prompt-repo/")) {
+    return () => {
+      const pr = promptRoute(ops.store.cfg.prompt_repo, req.method, req.url.slice(req.url.indexOf("/api/")), body)
+      return savedReply(pr.status, pr.body, pr.next === undefined ? undefined : ops.store.setPromptRepo(pr.next))
+    }
+  }
+  if (path === "/api/feature-flags" || path.startsWith("/api/feature-flags/")) {
+    return () => {
+      const fr = flagRoute(ops.store.cfg.feature_flags, req.method, req.url.slice(req.url.indexOf("/api/")), body)
+      return savedReply(fr.status, fr.body, fr.next === undefined ? undefined : ops.store.setFeatureFlags(fr.next))
+    }
+  }
+  if (path === "/api/notifications") {
+    return () => {
+      const nr = notifyRoute(req.method, req.url.slice(req.url.indexOf("/api/")), body)
+      return { status: nr.status, body: nr.body, contentType: "application/json" }
+    }
+  }
+  return undefined
+}
+
+const NOT_GET: Reply = { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
+const NOT_POST: Reply = { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
+
+// The management routes that await something (the network, another file's lock): each takes the config file's lock
+// itself, only around its change and save, after its I/O (ops.underLock, persistAfter in mcpapi.tov).
+async function ioRoute(ops: Ops, req: Request, path: string, body: string, actor: string, sc: DataScope, redivBefore: Map<string, string>): Promise<Reply> {
+  // user provisioning: directory sync, bulk import and its preview, reconcile and its previews, the jobs
+  if (path === "/api/scim/provision" || path.startsWith("/api/scim/provision/")) return await ops.provisionRoute(req.method, path, body)
+  // the cache clears (DELETE) and the read-only plugin listings
+  if (path.startsWith("/api/cache/")) return await ops.cacheClear(req.method, path)
+  if (path === "/api/plugins" || path.startsWith("/api/plugins/")) return await ops.pluginsRouteAsync(req.method, path, body)
+  // the request-log analytics and the MCP logs (ops.logsRoute)
+  if (logsAnalyticsPath(path)) return await ops.logsRouteAll(req, path, body, sc, req.method === "GET" && ops.mayReveal(actor))
+  if (path === "/api/models/parameters") return req.method === "GET" ? await ops.modelParameters(req) : NOT_GET
+  if (path === "/api/models/catalog") return await ops.catalogUpsertRoute(req, body)
+  if (path.startsWith("/api/providers/") && path.endsWith("/refresh-models")) {
+    // /api/providers/{p}/refresh-models or /api/providers/{p}/keys/{id}/refresh-models: lists the models live and
+    // saves nothing, so it never takes the config file's lock
+    const parts = path.split("/")
+    const isKey = parts.length === 7 && parts[4] === "keys"
+    if (req.method !== "POST") return NOT_POST
+    if (!(parts.length === 5 || isKey)) return { status: 404, body: `{"error":{"message":"no such route","type":"invalid_request_error"}}`, contentType: "application/json" }
+    return await refreshModels(undefined, ops.store.cfg, parts[3] ?? "", isKey ? parts[5] : undefined)
+  }
+  // the MCP server library (ops.libraryRoute, src/mcplibrary.tov; its own file and lock)
+  if (path === "/api/mcp/library" || path.startsWith("/api/mcp/library/")) return await ops.libraryRoute(req, path, body)
+  if (path === "/api/pricing/force-sync") return req.method === "POST" ? await ops.forcePricing() : NOT_POST
+  // webhooks: an endpoint's address is checked (resolved) first, then the change is saved under the lock
+  if (path === "/api/webhooks" || path.startsWith("/api/webhooks/")) {
+    const base = ops.store.cfg
+    const wr = await webhookApi(base.webhooks, req.method, req.url.slice(req.url.indexOf("/api/")), body)
+    const wnext = wr.next
+    if (wnext === undefined) return savedReply(wr.status, wr.body, undefined)
+    return await ops.underLock(req.method, () => savedReply(wr.status, wr.body, ops.store.commitRebased(base, withWebhooks(base, wnext), "webhooks")))
+  }
+  // registered A2A agents (agents.tov); the call history is ops.tov's
+  if (path === "/api/agents" || path.startsWith("/api/agents/")) {
+    if (path === "/api/agents/push-configs" || path.startsWith("/api/agents/push-configs/")) {
+      const pu = URL.parse(req.url)
+      return await ops.underLock(req.method, () => ops.pushConfigsRoute(req.method, path, pu === undefined ? new URLSearchParams("") : pu.searchParams))
+    }
+    if (path === "/api/agents/history" || path.startsWith("/api/agents/history/")) {
+      const hu = URL.parse(req.url)
+      return await ops.underLock(req.method, () => ops.agentHistoryRoute(req.method, path, hu === undefined ? new URLSearchParams("") : hu.searchParams, body, sc))
+    }
+    // the agent's card is fetched first, without the lock; the registration is saved under it
+    const base = ops.store.cfg
+    const ar = await agentApi(base.agents, req.method, req.url.slice(req.url.indexOf("/api/")), body, publicBase(base.client?.a2a_external_client_url, req.url))
+    const anext = ar.next
+    if (anext === undefined) return savedReply(ar.status, ar.body, undefined)
+    return await ops.underLock(req.method, () => {
+      const saved = ops.store.commitRebased(base, withAgents(base, anext), "agents")
+      // a card fetched here reaches the other workers before this answer (ops.publishCards)
+      if (saved.kind === "ok") ops.publishCards()
+      return savedReply(ar.status, ar.body, saved)
+    })
+  }
+  // the OAuth routes of auth type oauth clients need the gateway's origin (the callback's redirect URI)
+  const mu = URL.parse(req.url)
+  // the MCP and MCP OAuth handlers below serve these paths only; the others need no lock for them
+  const mcpPath = path.startsWith("/api/mcp/") || path.startsWith("/api/oauth/")
+  // the status route reads ?flow_id=; a DELETE saves (under the lock)
+  const held1 = req.method === "GET" || !mcpPath ? undefined : await ops.store.holdLock()
+  if (held1 !== undefined && !held1.ok) {
+    ops.store.releaseLock(held1)
+    return lockBusyReply()
+  }
+  let oa: McpReply | undefined = oauthConfigRoute(ops.store, req.method, mu === undefined ? path : path + mu.search)
+  if (held1 !== undefined) ops.store.releaseLock(held1)
+  if (oa === undefined) oa = await oauthRoute(ops.store, req.method, path, body, mu === undefined ? "" : mu.origin)
+  // a user-mode flow opens for the identity-provider user of the caller's single sign-on session only
+  const ssoUser = actor.startsWith("sso:") ? actor.slice(4) : ""
+  if (oa === undefined) {
+    const held2 = req.method === "GET" || !mcpPath ? undefined : await ops.store.holdLock()
+    if (held2 !== undefined && !held2.ok) {
+      ops.store.releaseLock(held2)
+      return lockBusyReply()
+    }
+    oa = perUserApi(ops.store, req.method, mu === undefined ? path : path + mu.search, body, mu === undefined ? "" : mu.origin, ssoUser)
+    if (held2 !== undefined) ops.store.releaseLock(held2)
+  }
+  if (oa === undefined) oa = await headersRouteAsync(ops.store, req.method, path, body, ssoUser)
+  if (oa === undefined) oa = await exchangeRouteAsync(ops.store, ops.engine.idp, req.method, path, body)
+  if (oa === undefined) oa = await openapiRoute(req.method, path, body, !ops.authOn)
+  // an openapi client sent with a spec_url keeps the document it names (fetched now, as Bifrost stores it)
+  let mbody = body
+  if (oa === undefined) {
+    const il = await inlineSpecUrl(req.method, path, body, !ops.authOn)
+    if (il.error !== undefined) oa = il.error
+    mbody = il.body
+  }
+  // with dashboard auth off, clients registered here must reach public addresses only
+  if (oa === undefined) {
+    const held3 = req.method === "GET" || !mcpPath ? undefined : await ops.store.holdLock()
+    if (held3 !== undefined && !held3.ok) {
+      ops.store.releaseLock(held3)
+      return lockBusyReply()
+    }
+    oa = mcpApi(ops.store, req.method, path, mbody, !ops.authOn, sc)
+    if (held3 !== undefined) ops.store.releaseLock(held3)
+  }
+  const mr = oa
+  if (mr !== undefined) {
+    const out: Reply = { status: mr.status, body: mr.body, contentType: mr.contentType ?? "application/json" }
+    // a reconnect or a tools refresh reaches the MCP server after the save, without the lock
+    const act = mr.action
+    if (mr.status === 200 && act !== undefined) return await mcpAction(ops, act, mr.id ?? "", out)
+    return out
+  }
+  // the query (search, paging, is_active) reaches the handlers that read it
+  const qu = URL.parse(req.url)
+  // a provider's base_url, with its host resolved now (Bifrost's ValidateExternalURL), before the lock
+  const bu = await providerBaseUrlProblem(req.method, path, body)
+  if (bu !== "") return { status: 400, body: JSON.stringify({ error: { message: bu } }), contentType: "application/json" }
+  return await ops.underLock(req.method, () => {
+    const a = handleApi(ops.store, req.method, qu === undefined ? path : path + qu.search, body, sc)
+    // a rotated key's MCP OAuth grants go with its old value (Bifrost revokes them in the rotation)
+    if (a.status === 200 && isRotatePath(path)) {
+      for (const id of rotatedKeyIds(a.body)) revokeSubject("vk", id)
+    }
+    return ops.withRedivision(req.method, path, { status: a.status, body: a.body, contentType: "application/json" }, redivBefore)
+  })
+}
+
+function withWebhooks(c: Config, list: WebhookEndpoint[]): Config {
+  let n = c
+  n.webhooks = list
+  return n
+}
+
+function withAgents(c: Config, list: AgentConfig[]): Config {
+  let n = c
+  n.agents = list
+  return n
 }
 
 function mcpView(engine: Engine): Response {
@@ -1027,7 +1112,7 @@ export const NO_BODY_LIMIT = 1099511627776
 // (large_payload_optimization's request threshold; the limit itself while the feature is off, so a body over it
 // is refused unread).
 // Bodies over UNREAD_ABOVE reach the gateway as a stream whatever the feature says, so a request's credentials are
-// checked, and its body charged to the process's budget, before the body is read (credentialRefusal, heldBody).
+// checked, and its body charged to the process's budget, before the body is read (credentialCheck, heldBody).
 export function bodyLimits(engine: Engine): { limit: int, threshold: int } {
   const limit = (engine.cfg.client?.max_request_body_size_mb ?? 100) * 1048576
   const lp = engine.large
@@ -1111,59 +1196,113 @@ export function routeBodyLimit(engine: Engine, p: string, limit: int): int {
   return limit
 }
 
-// A peer route's request without a well-formed signature header, refused before its body is read (the HMAC itself is
-// checked over the bytes once they are read); undefined when the header is there.
-export function unsignedPeerRefusal(req: Request): Response | undefined {
+// A peer route's POST that a node did not sign, refused before its body is read (re-audit 3 P2-A): the body's
+// signature header must be well formed, and the head signature (cluster.HEAD_SIG_HEADER, over the method, route,
+// x-raiju-cluster-ts and Content-Length) must match and be fresh; the body's HMAC is checked over the bytes once they
+// are read. undefined when the head is signed (or the request carries no body). With clustering off the route answers
+// 404 without reading the body.
+export function peerHeadRefusal(ops: Ops, req: Request, p: string): Response | undefined {
   if (req.method === "GET" || req.method === "HEAD") return undefined
-  if (wellFormedSig(req.headers.get("x-raiju-cluster-sig") ?? "")) return undefined
-  return errorResponse(401, "bad cluster signature", "authentication_error", noHeaders())
+  const cc = ops.clusterCfg
+  if (cc === undefined) return errorResponse(404, "clustering is off", "invalid_request_error", noHeaders())
+  if (!wellFormedSig(req.headers.get("x-raiju-cluster-sig") ?? "")) return errorResponse(401, "bad cluster signature", "authentication_error", noHeaders())
+  const length = req.headers.get("content-length") ?? "chunked"
+  const why = headRefusal(cc.secret, req.method, p, req.headers.get(TS_HEADER) ?? "", length, req.headers.get(HEAD_SIG_HEADER) ?? "", Date.now())
+  if (why !== "") return errorResponse(401, why, "authentication_error", noHeaders())
+  return undefined
 }
 
-// The answer a request with a big unread body gets for its credentials alone, before the body is read; undefined
-// when its credentials pass (or are not judged from the headers). Inference routes refuse what governance would
-// refuse for any model (a missing credential while auth is enforced, an inactive or expired key), management routes
-// what the gate refuses, SCIM a wrong provisioning token. The MCP server's routes and requests that plugins' HTTP
-// hooks see first (they may add the credential) are left to their handlers. A small body has already been read by
-// the server and goes the usual way.
-export async function credentialRefusal(engine: Engine, ops: Ops, req: Request, limit: int): Promise<Response | undefined> {
-  if (!unreadBody(req, limit)) return undefined
+// How a request's body is charged (bodybudget.tov): "checked" when its credential was verified from the headers,
+// "unchecked" when it was not, "peer" for a signed peer route (its own budget).
+export type BodyKind = "checked" | "unchecked" | "peer"
+
+// What the headers decide before a big body is read: the answer that refuses the request, or how its body is charged.
+export type HeaderCheck = { res: Response | undefined, kind: BodyKind }
+
+// The answer a request with a big unread body gets for its credentials alone, before the body is read (undefined
+// when its credentials pass or are not judged from the headers), and whether they were verified. A small body has
+// already been read by the server and goes the usual way.
+export async function credentialCheck(engine: Engine, ops: Ops, req: Request, limit: int): Promise<HeaderCheck> {
+  if (!unreadBody(req, limit)) return { res: undefined, kind: "unchecked" }
   const u = URL.parse(req.url)
   const p = u === undefined ? "" : u.pathname
   // (an expired single sign-on session is renewed first, as manage does)
   if (gatedPath(p)) await ops.refreshDue(req)
-  const res = headerRefusal(engine, ops, req, limit)
-  if (res === undefined) return undefined
+  const c = headerCheck(engine, ops, req, limit)
+  const res = c.res
+  if (res === undefined) return c
   // the answer the route would give: inference answers carry the CORS headers, and every answer the agent mark
   // and the caller's request id (dispatch)
-  const shaped = isInferencePath(p) ? await cors(engine, req, res) : res
-  return await echoRequestId(req, await markAgentRejection(engine, req, shaped))
+  const shaped = isInferencePath(p) && p !== "/mcp" && !p.startsWith("/mcp/") ? await cors(engine, req, res) : res
+  return { res: await echoRequestId(req, await markAgentRejection(engine, req, shaped)), kind: c.kind }
 }
 
-// credentialRefusal's decision, as the route answers it before the shared headers are added.
-export function headerRefusal(engine: Engine, ops: Ops, req: Request, limit: int): Response | undefined {
-  if (!unreadBody(req, limit)) return undefined
+// credentialCheck's decision, as the route answers it before the shared headers are added. Inference routes refuse
+// what governance would refuse for any model (a missing credential while auth is enforced, an inactive or expired
+// key), management routes what the gate refuses, SCIM a wrong provisioning token, the MCP server what its handler
+// refuses from the headers (Ops.mcpCaller: client.mcp_server_auth_mode, the OAuth token, the key), the tool execute
+// route an inactive key, the peer routes an unsigned head. Requests that plugins' HTTP hooks see first (they may add
+// the credential) are not refused here, and count as checked only when their headers already carry a verified one.
+export function headerCheck(engine: Engine, ops: Ops, req: Request, limit: int): HeaderCheck {
+  if (!unreadBody(req, limit)) return { res: undefined, kind: "unchecked" }
   const u = URL.parse(req.url)
   const p = u === undefined ? "" : u.pathname
   if (gatedPath(p)) {
     const g = ops.gate(req, p)
-    return g.kind === "deny" ? g.res : undefined
+    if (g.kind === "deny") return { res: g.res, kind: "unchecked" }
+    // a whitelisted route or the setup routes vouch for no one
+    return { res: undefined, kind: g.actor === "anonymous" ? "unchecked" : "checked" }
   }
-  if (p.startsWith("/api/cluster/")) return unsignedPeerRefusal(req)
+  if (p.startsWith("/api/cluster/")) return { res: peerHeadRefusal(ops, req, p), kind: "peer" }
   if (p === "/scim/v2" || p.startsWith("/scim/v2/")) {
     const sc = ops.store.cfg.scim_config
-    if (sc?.enabled !== true) return undefined
-    if (!scimAuthorized(req.headers.get("authorization") ?? "", resolveEnv(sc?.config?.provisioningToken ?? ""))) return scimReply(401, errorBody(401, "", "the SCIM provisioning token is missing or wrong"))
-    return undefined
+    if (sc?.enabled !== true) return { res: undefined, kind: "unchecked" }
+    if (!scimAuthorized(req.headers.get("authorization") ?? "", resolveEnv(sc?.config?.provisioningToken ?? ""))) return { res: scimReply(401, errorBody(401, "", "the SCIM provisioning token is missing or wrong")), kind: "unchecked" }
+    return { res: undefined, kind: "checked" }
   }
-  if (!isInferencePath(p) || p === "/mcp" || p.startsWith("/mcp/") || compatPath(p).startsWith("/v1/mcp/") || httpHooked(engine)) return undefined
-  const d = engine.gov.credentialDenial(snapshot(req.headers))
-  if (d === undefined) return undefined
-  return errorResponse(d.status, d.message, d.type, noHeaders())
+  const h = snapshot(req.headers)
+  const verified: BodyKind = engine.gov.credentialChecked(h) ? "checked" : "unchecked"
+  if (httpHooked(engine)) return { res: undefined, kind: verified }
+  if (p === "/mcp" || (p.startsWith("/mcp/") && p.split("/").length === 3)) {
+    const who = ops.mcpCaller(req)
+    return { res: who.res, kind: who.checked ? "checked" : "unchecked" }
+  }
+  if (compatPath(p).startsWith("/v1/mcp/")) {
+    // the tool route takes other credentials too (an identity-provider token for token exchange): only a named key
+    // that is inactive is refused from the headers, as its gate would (Governance.admitTool)
+    const vk = engine.gov.findKey(h)
+    if (vk !== undefined && vk.is_active === false) return { res: errorResponse(403, `virtual key ${vk.name ?? vk.id} is inactive`, "permission_error", noHeaders()), kind: "unchecked" }
+    return { res: undefined, kind: verified }
+  }
+  if (!isInferencePath(p)) return { res: undefined, kind: verified }
+  const d = engine.gov.credentialDenial(h)
+  if (d !== undefined) return { res: errorResponse(d.status, d.message, d.type, noHeaders()), kind: "unchecked" }
+  return { res: undefined, kind: verified }
 }
 
-// A request with its body read whole, or the answer that refuses it unread; held is what the request holds of the
-// process's body budget until it is done (bodyBudget().give).
-export type HeldBody = { res: Response | undefined, req: Request, held: int }
+// headerCheck's refusal alone.
+export function headerRefusal(engine: Engine, ops: Ops, req: Request, limit: int): Response | undefined {
+  return headerCheck(engine, ops, req, limit).res
+}
+
+// What a request holds of a body budget until it is done: release gives it back (once).
+export class BodyHold {
+  held = 0
+  cls: BodyClass = "small"
+  peer = false
+
+  release(): void {
+    const n = this.held
+    this.held = 0
+    if (n <= 0) return
+    if (this.peer) peerBudget().give(n, this.cls)
+    else bodyBudget().give(n, this.cls)
+  }
+}
+
+// A request with its body read whole, or the answer that refuses it unread; hold is what the request holds of the
+// body budget until it is done (hold.release()).
+export type HeldBody = { res: Response | undefined, req: Request, hold: BodyHold }
 
 function busyResponse(): Response {
   const h: Hdrs = new Map()
@@ -1171,8 +1310,9 @@ function busyResponse(): Response {
   return errorResponse(503, "the gateway is reading too many request bodies at once (server.max_buffered_body_mb); retry shortly", "api_error", h)
 }
 
-function deadlineResponse(): Response {
-  return errorResponse(408, "the request body did not arrive in time (server.body_deadline_seconds)", "invalid_request_error", noHeaders())
+function deadlineResponse(checked: bool): Response {
+  const why = checked ? "the request body arrived too slowly (server.body_min_kb_per_second)" : "the request body did not arrive in time (server.body_deadline_seconds)"
+  return errorResponse(408, why, "invalid_request_error", noHeaders())
 }
 
 // One read of a body stream, or late when the body's deadline passed first.
@@ -1188,44 +1328,83 @@ async function readChunk(st: ReadableStream): Promise<BodyRead> {
   }
 }
 
-// Reads a request's body, charged to the process's body budget (bodybudget.tov, server.max_buffered_body_mb): a
-// declared length over the limit is 413 unread. A body the server has read already (UNREAD_ABOVE or less) is charged
-// whole and always admitted; a bigger or chunked one is charged as its bytes arrive (a declared length that cannot fit beside what is held
-// is 503 unread, bytes that do not fit are 503 there), stops at the limit (413) and must arrive whole within
-// server.body_deadline_seconds (408).
-export async function heldBody(engine: Engine, req: Request, limit: int): Promise<HeldBody> {
-  if (req.method === "GET" || req.method === "HEAD") return { res: undefined, req: req, held: 0 }
-  const cap = bufferedCap(engine.cfg.server)
-  const b = bodyBudget()
+// A body's clock: the bytes it has sent, and its timer.
+class BodyClock {
+  got = 0
+  timer = -1
+  start = 0.0
+}
+
+// Arms the rate check of a checked body: when it fires, a body behind the rate (rateDue) is late, and one that kept
+// up is checked again when it would next fall behind.
+function armRate(clock: BodyClock, waitMs: f64, rate: BodyRate, late: (r: BodyRead) => void): void {
+  clock.timer = setTimeout(() => {
+    const elapsed = performance.now() - clock.start
+    const due = rateDue(clock.got, rate)
+    if (elapsed >= due) {
+      clock.timer = -1
+      late({ late: true, done: true, value: undefined })
+      return
+    }
+    armRate(clock, due - elapsed, rate, late)
+  }, Math.max(1, Math.ceil(waitMs)))
+}
+
+// Reads a request's body, charged to a body budget (bodybudget.tov): the process's for clients (server.max_buffered_body_mb,
+// unchecked bodies within server.unchecked_body_mb beside others), the peers' own for kind "peer" (cluster.max_body_mb).
+// A declared length over the limit is 413 unread. A body the server has read already (UNREAD_ABOVE or less) is charged
+// whole and always admitted; a bigger or chunked one is charged as its bytes arrive (a declared length that cannot fit
+// beside what is held is 503 unread, bytes that do not fit are 503 there) and stops at the limit (413). An unchecked
+// body must arrive whole within server.body_deadline_seconds; a checked or peer one at server.body_min_kb_per_second
+// after server.body_rate_grace_seconds (408 otherwise).
+export async function heldBody(engine: Engine, req: Request, limit: int, kind: BodyKind): Promise<HeldBody> {
+  const hold = new BodyHold()
+  if (req.method === "GET" || req.method === "HEAD") return { res: undefined, req: req, hold: hold }
+  const peer = kind === "peer"
+  const b = peer ? peerBudget() : bodyBudget()
+  const cap = peer ? clusterBodyCap(engine.cfg.cluster) : bufferedCap(engine.cfg.server)
+  const share = peer ? 0 : uncheckedShare(engine.cfg.server, cap)
+  const cls: BodyClass = kind === "unchecked" ? "unchecked" : "checked"
+  hold.peer = peer
   const declared = req.headers.get("content-length")
   let max = limit
   if (declared !== undefined) {
     const n = parseInt(declared) ?? 0
-    if (n > limit) return { res: errorResponse(413, "request body too large", "invalid_request_error", noHeaders()), req: req, held: 0 }
+    if (n > limit) return { res: errorResponse(413, "request body too large", "invalid_request_error", noHeaders()), req: req, hold: hold }
     if (n <= UNREAD_ABOVE) {
       // read by the server already (or small): charged whole, and never refused, since refusing it saves no memory
       // (a big body that holds the budget does not turn small calls away)
       b.hold(n)
+      hold.held = n
+      hold.cls = "small"
       await req.text()
-      return { res: undefined, req: req, held: n }
+      return { res: undefined, req: req, hold: hold }
     }
-    if (!b.fits(n, cap)) return { res: busyResponse(), req: req, held: 0 }
+    if (!b.fits(n, cap, cls, share)) return { res: busyResponse(), req: req, hold: hold }
     max = n
   }
   const st = req.body
-  if (st === undefined) return { res: undefined, req: req, held: 0 }
-  const ms = bodyDeadlineMs(engine.cfg.server)
-  let timer = -1
+  if (st === undefined) return { res: undefined, req: req, hold: hold }
+  hold.cls = cls
+  const clock = new BodyClock()
+  clock.start = performance.now()
+  const rate = bodyRate(engine.cfg.server)
+  // an unchecked body has a fixed deadline; a checked one a minimum average rate
+  const fixed = cls === "unchecked" ? bodyDeadlineMs(engine.cfg.server) : 0
+  const timed = cls === "unchecked" ? fixed > 0 : rate.bytesPerSecond > 0
   const late: Promise<BodyRead> = new Promise<BodyRead>((resolve) => {
-    if (ms > 0) timer = setTimeout(() => resolve({ late: true, done: true, value: undefined }), ms)
+    if (cls === "unchecked") {
+      if (fixed > 0) clock.timer = setTimeout(() => resolve({ late: true, done: true, value: undefined }), fixed)
+    } else if (rate.bytesPerSecond > 0) {
+      armRate(clock, rateDue(0, rate), rate, resolve)
+    }
   })
   const body: u8[] = []
-  let held = 0
   let res: Response | undefined = undefined
   while (true) {
-    const r = ms > 0 ? await Promise.race([readChunk(st), late]) : await readChunk(st)
+    const r = timed ? await Promise.race([readChunk(st), late]) : await readChunk(st)
     if (r.late) {
-      res = deadlineResponse()
+      res = deadlineResponse(cls === "checked")
       break
     }
     const v = r.value
@@ -1234,24 +1413,26 @@ export async function heldBody(engine: Engine, req: Request, limit: int): Promis
       res = errorResponse(413, "request body too large", "invalid_request_error", noHeaders())
       break
     }
-    if (!b.take(v.length, held, cap)) {
+    if (!b.take(v.length, hold.held, cap, cls, share)) {
       res = busyResponse()
       break
     }
-    held += v.length
+    hold.held += v.length
+    clock.got += v.length
     for (const x of v) body.push(x)
   }
-  if (timer >= 0) clearTimeout(timer)
+  if (clock.timer >= 0) clearTimeout(clock.timer)
+  clock.timer = -1
   if (res !== undefined) {
     try {
       await st.cancel()
     } catch (e) {
       // the stream is gone already
     }
-    b.give(held)
-    return { res: res, req: req, held: 0 }
+    hold.release()
+    return { res: res, req: req, hold: hold }
   }
-  return { res: undefined, req: new Request(req.url, { method: req.method, headers: snapshot(req.headers), body: body }), held: held }
+  return { res: undefined, req: new Request(req.url, { method: req.method, headers: snapshot(req.headers), body: body }), hold: hold }
 }
 
 // large_payload_optimization (largepayload.tov) at the front of a server: the Response that refuses or
@@ -1318,8 +1499,13 @@ function metricsRoute(engine: Engine, ops: Ops, req: Request, onClusterListener:
   return textResponse(ops.metricsText(), "text/plain; version=0.0.4")
 }
 
-// The peer routes, signed with cluster.secret (ops.tov). undefined: not one of them.
+// The peer routes, signed with cluster.secret (ops.tov). undefined: not one of them. A POST's head is checked here
+// too (peerHeadRefusal), so a small body the server read already needs the same signatures as a big one.
 async function clusterRoute(ops: Ops, req: Request, p: string, m: string): Promise<Response | undefined> {
+  if (m === "POST" && ops.clusterCfg !== undefined) {
+    const unsigned = peerHeadRefusal(ops, req, p)
+    if (unsigned !== undefined) return unsigned
+  }
   if (p === "/api/cluster/sync" && m === "POST") return await ops.clusterSync(req)
   if (p === "/api/cluster/feed" && m === "POST") return await ops.clusterFeed(req)
   if (p === "/api/cluster/leader" && m === "GET") return ops.clusterLeader(req)
@@ -1336,25 +1522,25 @@ export async function clusterDispatch(engine: Engine, ops: Ops, req: Request): P
   if (p === "/health" && (m === "GET" || m === "HEAD")) return Response.json({ status: "ok" })
   if (p === "/metrics" && (m === "GET" || m === "HEAD")) return metricsRoute(engine, ops, req, true)
   if (p.startsWith("/api/cluster/")) {
-    // a body is read only for a request that carries a signature, up to cluster.max_body_mb and charged to the body
+    // a body is read only for a request whose head a node signed, up to cluster.max_body_mb and charged to the peers'
     // budget; its HMAC is then checked over the bytes read
-    const unsigned = unsignedPeerRefusal(req)
+    const unsigned = peerHeadRefusal(ops, req, p)
     if (unsigned !== undefined) return unsigned
-    const hb = await heldBody(engine, req, clusterBodyCap(engine.cfg.cluster))
+    const hb = await heldBody(engine, req, clusterBodyCap(engine.cfg.cluster), "peer")
     const no = hb.res
     if (no !== undefined) return no
     try {
       const cr = await clusterRoute(ops, hb.req, p, m)
       if (cr !== undefined) return cr
     } finally {
-      bodyBudget().give(hb.held)
+      hb.hold.release()
     }
   }
   return errorResponse(404, "not found on the cluster listener", "invalid_request_error", noHeaders())
 }
 
 // The cluster listener on the Bun.serve server: opened before the workers fork, so every worker accepts on it too.
-// Bodies over UNREAD_ABOVE reach clusterDispatch unread, which checks the signature header and cluster.max_body_mb
+// Bodies over UNREAD_ABOVE reach clusterDispatch unread, which checks the signed head and cluster.max_body_mb
 // (read per request) before reading them.
 export function startCluster(engine: Engine, ops: Ops, port: int, hostname: string, lim: ServerLimits): Served {
   const server = Bun.serve({
@@ -2061,11 +2247,16 @@ export function http1Upgrade(engine: Engine, ops: Ops, req: Request, accept: (pr
 }
 
 // The client's address for a request to this path (clientip.tov), or "" when the route does not read it: the
-// management API, its sign-in routes and the audit log are under /api/. peer is the TCP peer; the forwarding headers
-// count only from server.trusted_proxies.
+// management API, its sign-in routes and the audit log are under /api/, and the MCP client registration limits its
+// clients per address (mcpissuer.tov). peer is the TCP peer; the forwarding headers count only from
+// server.trusted_proxies.
 export function clientIpFor(engine: Engine, path: string, peer: string, h: Map<string, string>): string {
-  if (!path.startsWith("/api/")) return ""
+  if (!readsClientIp(path)) return ""
   return clientAddress(peer, h.get("x-forwarded-for") ?? "", h.get("x-real-ip") ?? "", engine.cfg.server?.trusted_proxies ?? [])
+}
+
+function readsClientIp(path: string): bool {
+  return path.startsWith("/api/") || path === "/oauth2/register"
 }
 
 // The request with CLIENT_IP_HEADER set from the TCP peer where the route reads it, and without the value a client
@@ -2074,7 +2265,7 @@ export function withClientIp(engine: Engine, req: Request, peer: string): Reques
   const u = URL.parse(req.url)
   const p = u === undefined ? "" : u.pathname
   const sent = req.headers.get(CLIENT_IP_HEADER) !== undefined
-  if (!p.startsWith("/api/") && !sent) return req
+  if (!readsClientIp(p) && !sent) return req
   let hs: Record<string, string> = snapshot(req.headers)
   const ip = clientIpFor(engine, p, peer, hs)
   hs.delete(CLIENT_IP_HEADER)
@@ -2132,13 +2323,14 @@ async function bunHttpWatched(engine: Engine, ops: Ops, req00: Request, limit0: 
   // the public routes and the peer routes read smaller bodies (routeBodyLimit)
   const limit = routeBodyLimit(engine, pathOfReq(req00), limit0)
   // a big body is not read for a caller its credentials already refuse
-  const refused = await outOfLine(credentialRefusal(engine, ops, req00, limit))
+  const checked = await outOfLine(credentialCheck(engine, ops, req00, limit))
+  const refused = checked.res
   if (refused !== undefined) return refused
   let wid = watch
   const lf = await outOfLine(largeFront(engine, req00))
   if (lf instanceof Response) return lf
   let within: Request = req00
-  let held = 0
+  let hold = new BodyHold()
   if (lf instanceof Request) {
     wid = ""
     // (a body the feature streams on is not held here)
@@ -2146,16 +2338,16 @@ async function bunHttpWatched(engine: Engine, ops: Ops, req00: Request, limit0: 
     if (lim === undefined) return errorResponse(413, "request body too large", "invalid_request_error", noHeaders())
     within = lim
   } else {
-    const hb = await outOfLine(heldBody(engine, req00, limit))
+    const hb = await outOfLine(heldBody(engine, req00, limit, checked.kind))
     const no = hb.res
     if (no !== undefined) return no
     within = hb.req
-    held = hb.held
+    hold = hb.hold
   }
   try {
     return try await bunRouted(engine, ops, within, wid)
   } finally {
-    bodyBudget().give(held)
+    hold.release()
   }
 }
 
@@ -2312,14 +2504,16 @@ test("a big unread body is refused for its credentials alone; a small or over-li
   expect(st(bigPost("/v1/chat/completions", [["x-bf-vk", "sk-bf-off"]]))).toBe(403)
   // the management API: locked (no admin, no setup token) before its body is read
   expect(st(bigPost("/api/providers", []))).toBe(403)
-  // routes with their own credentials, and the MCP server, are left to their handlers
+  // routes with their own credentials are left to their handlers
   expect(st(bigPost("/api/session/login", []))).toBe(0)
-  // a peer route's body is not read without a well-formed signature header (the HMAC is checked over the bytes read)
-  expect(st(bigPost("/api/cluster/sync", []))).toBe(401)
-  expect(st(bigPost("/api/cluster/sync", [["x-raiju-cluster-sig", "nope"]]))).toBe(401)
-  expect(st(bigPost("/api/cluster/sync", [["x-raiju-cluster-sig", "ab".repeat(32)]]))).toBe(0)
-  expect(st(bigPost("/mcp", []))).toBe(0)
+  // the MCP server answers from the headers too (re-audit 3 P1-D): here no MCP server is connected (404, unread)
+  expect(st(bigPost("/mcp", []))).toBe(404)
+  expect(st(bigPost("/mcp/vm", [["x-bf-vk", "sk-bf-k"]]))).toBe(404)
+  // the tool route takes other credentials too: only an inactive key is refused from the headers
   expect(st(bigPost("/v1/mcp/tool/execute", []))).toBe(0)
+  expect(st(bigPost("/v1/mcp/tool/execute", [["x-bf-vk", "sk-bf-off"]]))).toBe(403)
+  // with clustering off a peer route's body is not read
+  expect(st(bigPost("/api/cluster/sync", [["x-raiju-cluster-sig", "ab".repeat(32)]]))).toBe(404)
   // a chunked body counts as unread
   const ch: Record<string, string> = new Map()
   ch.set("transfer-encoding", "chunked")
@@ -2350,9 +2544,61 @@ test("the public routes and the peer routes read small bodies", () => {
   // a 1 MB sign-in body is over the limit: refused unread with 413 (heldBody), not judged from the headers
   const ops = new Ops(eng, new ConfigStore("/tmp/raiju-server-public-limit.json", cfg))
   expect(headerRefusal(eng, ops, bigPost("/api/session/login", []), routeBodyLimit(eng, "/api/session/login", limit))).toBeUndefined()
-  // a signature header the GET leader read does not need, and a signed POST passes the shape check
-  expect(unsignedPeerRefusal(new Request("http://gw/api/cluster/leader", { method: "GET" }))).toBeUndefined()
-  expect(unsignedPeerRefusal(bigPost("/api/cluster/sync", []))!.status).toBe(401)
+})
+
+test("a peer route's body is read only when a node signed its head (re-audit 3 P2-A)", () => {
+  const secret = "e2e-unit-cluster-secret-0123456789abcdef"
+  const ops = new Ops(new Engine({}), new ConfigStore("/tmp/raiju-server-peer-head.json", {}))
+  ops.clusterCfg = { enabled: true, peers: [], secret: secret }
+  const limit = 16 * 1048576
+  const now = Date.now() * 1.0
+  const body = "x".repeat(70000)
+  const signed = (path: string, route: string, length: string, at: f64): Request => {
+    const h = peerHeaders(secret, route, body, at)
+    h.set("content-length", length)
+    return new Request("http://gw" + path, { method: "POST", headers: h })
+  }
+  const st = (r: Request): int => {
+    const c = headerCheck(ops.engine, ops, r, limit)
+    expect(c.kind).toBe("peer")
+    const res = c.res
+    return res === undefined ? 0 : res.status
+  }
+  expect(st(signed("/api/cluster/sync", "/api/cluster/sync", "70000", now))).toBe(0)
+  // no signature, a malformed one, or only the body's (the old shape check let a fake one through)
+  expect(st(bigPost("/api/cluster/sync", []))).toBe(401)
+  expect(st(bigPost("/api/cluster/sync", [["x-raiju-cluster-sig", "nope"]]))).toBe(401)
+  expect(st(bigPost("/api/cluster/sync", [["x-raiju-cluster-sig", "ab".repeat(32)]]))).toBe(401)
+  // a head signed for another route, another length (a captured head with a 15 MB body), or long ago
+  expect(st(signed("/api/cluster/config", "/api/cluster/sync", "70000", now))).toBe(401)
+  expect(st(signed("/api/cluster/sync", "/api/cluster/sync", "15000000", now))).toBe(401)
+  expect(st(signed("/api/cluster/sync", "/api/cluster/sync", "70000", now - 120000.0))).toBe(401)
+  // a head signed with another secret
+  const other = peerHeaders("another-cluster-secret-0123456789abcdef", "/api/cluster/sync", body, now)
+  other.set("content-length", "70000")
+  expect(st(new Request("http://gw/api/cluster/sync", { method: "POST", headers: other }))).toBe(401)
+  // GET carries no body (the leader read is signed on its own)
+  expect(peerHeadRefusal(ops, new Request("http://gw/api/cluster/leader", { method: "GET" }), "/api/cluster/leader")).toBeUndefined()
+  ops.clusterCfg = undefined
+  expect(peerHeadRefusal(ops, signed("/api/cluster/sync", "/api/cluster/sync", "70000", now), "/api/cluster/sync")!.status).toBe(404)
+})
+
+test("a big body's kind: checked with a verified credential, unchecked without one (re-audit 3 P1-D)", () => {
+  const cfg: Config = { client: { enforce_auth_on_inference: false }, governance: { virtual_keys: [{ id: "k", value: "sk-bf-k" }, { id: "off", value: "sk-bf-off", is_active: false }] } }
+  const ops = new Ops(new Engine(cfg), new ConfigStore("/tmp/raiju-server-kind.json", cfg))
+  const limit = 100 * 1048576
+  const kind = (r: Request): string => headerCheck(ops.engine, ops, r, limit).kind
+  expect(kind(bigPost("/v1/chat/completions", [["x-bf-vk", "sk-bf-k"]]))).toBe("checked")
+  // auth off: served, but nobody vouched for it
+  expect(kind(bigPost("/v1/chat/completions", []))).toBe("unchecked")
+  expect(headerRefusal(ops.engine, ops, bigPost("/v1/chat/completions", []), limit)).toBeUndefined()
+  expect(kind(bigPost("/v1/chat/completions", [["x-bf-vk", "sk-bf-nope"]]))).toBe("unchecked")
+  expect(kind(bigPost("/v1/mcp/tool/execute", [["x-bf-vk", "sk-bf-k"]]))).toBe("checked")
+  expect(kind(bigPost("/v1/mcp/tool/execute", [["authorization", "Bearer idp-token"]]))).toBe("unchecked")
+  // routes that read their credential from the body vouch for no one
+  expect(kind(bigPost("/agents/a2a/x/v1/message:send", []))).toBe("unchecked")
+  // the management API locked: refused
+  expect(headerRefusal(ops.engine, ops, bigPost("/api/providers", []), limit)!.status).toBe(403)
 })
 
 test("with auth not enforced an inference call passes, and the stream threshold is the smaller of the two", () => {

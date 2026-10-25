@@ -8,7 +8,15 @@
 // await, tries and then waits at most LOCK_SYNC_MS, sleeping between tries. Takes of the same file in one process
 // count (the second take is not a wait), so a holder that takes it again does not wait for itself, and a request that
 // holds it across an await does not block another request of its process.
-import { openSync, closeSync, flockSync } from "node:fs"
+//
+// Upgrade bridge (this release only): the release before flock (wave 25) locked with a directory, <file>.lock, made
+// with mkdir and taken over once 10 s old. Old and new versions on one volume (a rolling update) would not see each
+// other's lock, so a holder of the flock also makes that directory, and removes it before it lets the flock go; a
+// directory an old process holds is waited for like the flock. A directory this bridge made holds a marker file, so one
+// a killed holder left behind is taken over at once by the next flock holder (the flock proves its maker is gone); an
+// empty one (an old process's) only once it is LEGACY_STALE_MS old, as the old version itself does. Drop the bridge in
+// the release after this one, once no node runs the mkdir version (docs/operations.md).
+import { openSync, closeSync, flockSync, mkdirSync, rmSync, statSync, writeFileSync, existsSync } from "node:fs"
 
 // how long a waiter waits for the lock before it gives up (the caller answers 503)
 export const LOCK_WAIT_MS = 15000.0
@@ -19,7 +27,13 @@ export const LOCK_SYNC_MS = 500.0
 const NAP_FIRST_MS = 2
 const NAP_LAST_MS = 50
 
-type Held = { fd: int, depth: int }
+// the old version's rule: a lock directory this old was left by a dead process
+export const LEGACY_STALE_MS = 10000.0
+// the file the bridge writes in the lock directory it makes
+const LEGACY_MARK = "flock-holder"
+
+// legacy: the directory this take made ("" when it made none: a folder where it cannot be made)
+type Held = { fd: int, depth: int, legacy: string }
 
 // takes held by this process, by lock file
 const held: Map<string, Held> = new Map()
@@ -33,15 +47,84 @@ export function lockPathOf(path: string): string {
   return path + ".flock"
 }
 
+// The old version's lock directory for path (the upgrade bridge).
+export function legacyLockOf(path: string): string {
+  return path + ".lock"
+}
+
+// Makes the old version's lock directory, under the flock: "made" (dir is the directory), "busy" (an old process holds
+// it) or "none" (it cannot be made here: nothing to guard against).
+function takeLegacy(path: string, nowMs: f64): { status: "made" | "busy" | "none", dir: string } {
+  const dir = legacyLockOf(path)
+  for (let round = 0; round < 3; round++) {
+    try {
+      mkdirSync(dir)
+      try {
+        writeFileSync(dir + "/" + LEGACY_MARK, `${process.pid}`)
+      } catch (e) {
+        // the directory alone still keeps the old version out
+      }
+      return { status: "made", dir: dir }
+    } catch (e) {
+      if (!existsSync(dir)) {
+        // it cannot be made (a read-only folder), or it was removed meanwhile (the next round makes it)
+        if (!e.message.includes("EEXIST") && round >= 1) return { status: "none", dir: "" }
+        continue
+      }
+    }
+    // one with the marker was left by a flock holder that died (this process holds the flock now); an empty one is an
+    // old process's, taken over once stale as the old version does
+    let leftover = existsSync(dir + "/" + LEGACY_MARK)
+    if (!leftover) {
+      try {
+        leftover = nowMs - statSync(dir).mtimeMs > LEGACY_STALE_MS
+      } catch (e) {
+        // gone meanwhile: the next round makes it
+        continue
+      }
+    }
+    if (!leftover) return { status: "busy", dir: "" }
+    try {
+      rmSync(dir, { recursive: true, force: true })
+    } catch (e) {
+      // the next round sees what is there
+    }
+  }
+  return { status: "busy", dir: "" }
+}
+
+function dropLegacy(dir: string): void {
+  if (dir === "") return
+  try {
+    rmSync(dir, { recursive: true, force: true })
+  } catch (e) {
+    // gone already (an old process took it over as stale)
+  }
+}
+
+function closeQuietly(fd: int): void {
+  try {
+    flockSync(fd, "un")
+  } catch (e) {
+    // closing gives it back too
+  }
+  try {
+    closeSync(fd)
+  } catch (e) {
+    // closed already
+  }
+}
+
 // One take of path's lock, waiting up to waitMs (0: one try). A folder where no lock file can be made (read-only),
 // or a file system without flock, gives an ok lock that guards nothing: the write that follows fails on its own.
 function take(path: string, waitMs: int): FileLock {
   const lp = lockPathOf(path)
   const h = held.get(lp)
   if (h !== undefined) {
-    held.set(lp, { fd: h.fd, depth: h.depth + 1 })
+    held.set(lp, { fd: h.fd, depth: h.depth + 1, legacy: h.legacy })
     return { path: lp, ok: true }
   }
+  const until = Date.now() + waitMs
   let fd = -1
   try {
     fd = openSync(lp, "a", 384)
@@ -59,15 +142,21 @@ function take(path: string, waitMs: int): FileLock {
     }
     return guardsNothing(lp, e.message)
   }
-  if (got) {
-    held.set(lp, { fd: fd, depth: 1 })
-    return { path: lp, ok: true }
+  if (!got) {
+    closeQuietly(fd)
+    return { path: lp, ok: false }
   }
-  try {
-    closeSync(fd)
-  } catch (e) {
-    // closed already
+  // the upgrade bridge: a directory an old process holds is waited for within the same waitMs (a take that cannot
+  // await spins here only while a mixed-version rollout overlaps; lockFileAsync tries once and waits between tries)
+  for (;;) {
+    const lg = takeLegacy(path, Date.now())
+    if (lg.status !== "busy") {
+      held.set(lp, { fd: fd, depth: 1, legacy: lg.dir })
+      return { path: lp, ok: true }
+    }
+    if (Date.now() >= until) break
   }
+  closeQuietly(fd)
   return { path: lp, ok: false }
 }
 
@@ -109,26 +198,19 @@ export async function lockFileAsync(path: string, waitMs?: f64): Promise<FileLoc
   }
 }
 
-// Gives the lock back (a lock that was not taken is a no-op).
+// Gives the lock back (a lock that was not taken is a no-op). The old version's directory goes first, while the flock
+// still keeps the other new processes out.
 export function unlockFile(l: FileLock): void {
   if (!l.ok || l.path === "") return
   const h = held.get(l.path)
   if (h === undefined) return
   if (h.depth > 1) {
-    held.set(l.path, { fd: h.fd, depth: h.depth - 1 })
+    held.set(l.path, { fd: h.fd, depth: h.depth - 1, legacy: h.legacy })
     return
   }
   held.delete(l.path)
-  try {
-    flockSync(h.fd, "un")
-  } catch (e) {
-    // closing gives it back too
-  }
-  try {
-    closeSync(h.fd)
-  } catch (e) {
-    // closed already
-  }
+  dropLegacy(h.legacy)
+  closeQuietly(h.fd)
 }
 
 // Whether this process holds path's lock.
@@ -205,4 +287,57 @@ test("a folder where no lock can be made gives a lock that guards nothing", () =
   expect(l.ok).toBe(true)
   expect(l.path).toBe("")
   unlockFile(l)
+})
+
+test("upgrade bridge: a holder also makes the old version's lock directory and removes it on release", () => {
+  const path = lockPath()
+  const a = lockFile(path, 50.0)
+  expect(a.ok).toBe(true)
+  // an old process (mkdir lock) sees it held
+  expect(existsSync(legacyLockOf(path))).toBe(true)
+  let oldGot = true
+  try {
+    mkdirSync(legacyLockOf(path))
+  } catch (e) {
+    oldGot = false
+  }
+  expect(oldGot).toBe(false)
+  // a nested take keeps it; the last release removes it
+  const again = tryLockFile(path)
+  unlockFile(again)
+  expect(existsSync(legacyLockOf(path))).toBe(true)
+  unlockFile(a)
+  expect(existsSync(legacyLockOf(path))).toBe(false)
+  try rmSync(lockPathOf(path), { force: true })
+})
+
+test("upgrade bridge: an old process's lock directory is waited for, and a failed take gives the flock back", () => {
+  const path = lockPath()
+  // an old process holds the mkdir lock (an empty directory, fresh)
+  try mkdirSync(legacyLockOf(path))
+  expect(tryLockFile(path).ok).toBe(false)
+  const t0 = Date.now()
+  const b = lockFile(path, 60.0)
+  expect(b.ok).toBe(false)
+  expect(Date.now() - t0 >= 60.0).toBe(true)
+  // the failed takes did not keep the flock: another new process can take it
+  const fd = try holdAsAnother(path)
+  try closeSync(fd)
+  // the old process releases (removes its directory): the next take gets both
+  try rmSync(legacyLockOf(path), { recursive: true, force: true })
+  const c = tryLockFile(path)
+  expect(c.ok).toBe(true)
+  unlockFile(c)
+  try rmSync(lockPathOf(path), { force: true })
+})
+
+test("upgrade bridge: a directory a killed flock holder left (with the marker) is taken over at once", () => {
+  const path = lockPath()
+  try mkdirSync(legacyLockOf(path))
+  try writeFileSync(legacyLockOf(path) + "/flock-holder", "1")
+  const c = tryLockFile(path)
+  expect(c.ok).toBe(true)
+  unlockFile(c)
+  expect(existsSync(legacyLockOf(path))).toBe(false)
+  try rmSync(lockPathOf(path), { force: true })
 })

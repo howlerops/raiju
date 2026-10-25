@@ -30,6 +30,10 @@ run "one_task_with_writable_ephemeral_data_and_tmp" {
     error_message = "the default is one task"
   }
   assert {
+    condition     = aws_ecs_service.this.deployment_minimum_healthy_percent == 100 && aws_ecs_service.this.deployment_maximum_percent == 200
+    error_message = "the default deployment starts the new task before the old one stops (both lock config.json the same way)"
+  }
+  assert {
     condition = alltrue([
       for m in jsondecode(aws_ecs_task_definition.this.container_definitions)[0].mountPoints : m.readOnly == false
     ])
@@ -90,6 +94,22 @@ run "a_cluster_needs_efs_and_a_secret" {
   }
 
   expect_failures = [aws_ecs_service.this]
+}
+
+run "rolling_by_default_stop_first_on_request" {
+  command = plan
+
+  variables {
+    efs_file_system_id                 = "fs-0example"
+    efs_access_point_id                = "fsap-0example"
+    deployment_minimum_healthy_percent = 0
+    deployment_maximum_percent         = 100
+  }
+
+  assert {
+    condition     = aws_ecs_service.this.deployment_minimum_healthy_percent == 0 && aws_ecs_service.this.deployment_maximum_percent == 100
+    error_message = "a deployment can stop the old tasks before the new ones start (an upgrade across lock protocols)"
+  }
 }
 
 run "a_cluster_of_tasks" {

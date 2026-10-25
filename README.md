@@ -271,15 +271,21 @@ default; 503 past it). `GET /health` is liveness, `GET /ready` readiness. See
 [deploy/README.md](deploy/README.md#stopping-and-slow-clients).
 
 Request bodies over 64 KB reach the gateway unread, so a caller whose credentials are refused gets its
-401 or 403 from the headers and its body is never read (inference routes while auth is enforced, and
-the management API's gate). Each process also caps the request-body bytes it reads at once across
-requests, `server.max_buffered_body_mb` (default 48, sized for a 512Mi pod: parsing a chat body costs
-several times its size); bytes are charged as they arrive, so a slow client holds only what it has
-sent, and a body that does not fit is answered 503 with `retry-after`. A body over 64 KB must arrive
-whole within `server.body_deadline_seconds` (default 120; 408 otherwise). The routes anyone may call
-without a credential (sign-in, setup, agent sign-in, OAuth, OIDC) read at most 64 KB, and the cluster
-peer routes at most `cluster.max_body_mb` (16), after checking that a signature header is there. A lone
-body up to `client.max_request_body_size_mb` is always read, so that limit keeps Bifrost's meaning.
+401 or 403 from the headers and its body is never read (inference routes while auth is enforced, the
+MCP server's `/mcp` under `client.mcp_server_auth_mode`, and the management API's gate). Each process
+also caps the request-body bytes it reads at once across requests, `server.max_buffered_body_mb`
+(default 48, sized for a 512Mi pod: parsing a chat body costs several times its size); bytes are
+charged as they arrive, so a slow client holds only what it has sent, and a body that does not fit is
+answered 503 with `retry-after`. A body whose credential was checked from the headers (a virtual key, a
+management sign-in) must keep an average of `server.body_min_kb_per_second` (default 32) after
+`server.body_rate_grace_seconds` (10), so a slow but steady upload is served whatever its size. A body
+nobody vouched for (auth off, or behind the plugins' HTTP hooks) shares `server.unchecked_body_mb` (an
+eighth of the cap) beside other bodies and must arrive whole within `server.body_deadline_seconds`
+(default 30); 408 otherwise. The routes anyone may call without a credential (sign-in, setup, agent
+sign-in, OAuth, OIDC) read at most 64 KB, and the cluster peer routes at most `cluster.max_body_mb`
+(16) with a budget of their own, after checking the head signature (method, route, time and
+Content-Length, HMAC with `cluster.secret`). A lone body up to `client.max_request_body_size_mb` is
+always read, so that limit keeps Bifrost's meaning.
 `bench/body_memory.py` measures both.
 
 The workers of one node share budgets, rate limits, the response and semantic

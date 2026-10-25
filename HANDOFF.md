@@ -11,11 +11,17 @@ session. It sets up the machine, explains the lead/worker loop and points at the
 Worker briefs start from [handoff/worker-prompt-template.md](handoff/worker-prompt-template.md);
 the rules all workers follow are in [handoff/worker-brief.md](handoff/worker-brief.md).
 
-Branch: `claude/affectionate-shannon-pjwi5z`. Waves 1 to 25 are on `main` (PR howlerops/raiju#7).
-The branch carries wave 26 (L200 and L201).
+Branch: `claude/affectionate-shannon-pjwi5z`. Waves 1 to 26 are on `main` (PR howlerops/raiju#8).
+The branch carries wave 27 (L202 to L204).
 
 ## Where things stand
 
+- Wave 27 (L202 to L204) fixed the third re-audit (docs/audits/production-reaudit-3-2026-10-25.md): the config
+  lock is held only around reread-merge-save with network I/O outside it and a bridge to the wave 25 lock for
+  rolling upgrades; MCP OAuth registration is bounded and authorize stores nothing; the OIDC state is bound to
+  the browser and its key comes from cluster.secret when clustered; /mcp is judged from the headers, unchecked
+  bodies get a small budget share and a short deadline, checked bodies a minimum rate, and peer POSTs a signed
+  head. Behaviour changes are in docs/behaviour-changes-wave-27.md.
 - Wave 26 (L200, L201) fixed the second re-audit (docs/audits/production-reaudit-2-2026-10-25.md): file
   locks are flock(2) with async waits (tov-patches 0020), OIDC login stores nothing per request, cluster
   peer routes refuse unsigned bodies before reading and cap them, and the body budget counts bytes as they
@@ -76,7 +82,7 @@ The branch carries wave 26 (L200 and L201).
   current Bifrost datasheet.
 - docs/parity.md counts 567 parity rows: done 531, partial 12, missing 0, out of scope 15,
   n/a 9, plus 42 Raiju-only extras.
-- Tests at handoff (compiler from tov-patches 0001 to 0010, 0012, 0013, 0015 to 0017, 0019 and 0020): `make unit` 2,445 passed,
+- Tests at handoff (compiler from tov-patches 0001 to 0010, 0012, 0013, 0015 to 0017, 0019 and 0020): `make unit` 2,464 passed,
   0 failed, plus the Python tests (gen_pricing, the h2/gRPC interop suite, crew_priors,
   test_deploy, test_gen_config_doc); e2e "all passed" on Bun and http1; `make ui` all passed;
   `make openapi-check` ok; `make web-check` and `make config-doc-check` up to date. Helm lint and

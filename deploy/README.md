@@ -23,8 +23,15 @@ Raiju is not stateless. In the folder that holds `config.json` (`/app/data` in t
 - `config.json` and `config.json.bak`, on every change made through the management API or the web
   UI (written to a temporary file, then renamed);
 - `mcp-oauth-state.json` (the MCP authorization server's signing key and grants; without it, a
-  restart changes the key and every token it issued stops working) and `mcp-flow-state.json` (MCP
-  OAuth flows in flight);
+  restart changes the key and every token it issued stops working), `mcp-oauth-state-clients.jsonl`
+  (the MCP clients registered and not yet granted: one line per registration, bounded by
+  `client.oauth2_server_config.max_unused_clients`, rewritten when it holds twice that) and
+  `mcp-flow-state.json` (MCP OAuth flows in flight);
+- `config.json.sessions.json` and `config.json.agent-sessions.json` (dashboard sessions and CLI
+  sign-in tokens, by hash). Single sign-on logins in flight are stored nowhere: their state is sealed
+  with a key derived from `encryption_key`, else from `cluster.secret` with clustering on, else a key
+  each node makes at its start (then a callback that reaches another node fails; a start with other
+  nodes configured warns). Set `encryption_key` or clustering when several nodes serve SSO;
 - `logs/` (the request log store, when `logs_store` is on) and `logs/audit/` (the audit log, when
   `audit` is on), private (0700 folders, 0600 files). An enabled store whose folder cannot be written
   stops the start;
@@ -110,17 +117,26 @@ Raiju, so the ECS module sets the ALB's to 55 s (`alb_idle_timeout`). `tests/soa
 pooled connection idle for 50 s for the same reason.
 
 Request bodies: a body over 64 KB is not read before the caller's credentials are checked, so an
-inference call without a valid virtual key (while `client.enforce_auth_on_inference` is on) or a
-management call the gate refuses is answered 401 or 403 unread. `server.max_buffered_body_mb`
-(default 48; -1 for no cap; read per request) caps the request-body megabytes each process reads at
-once: a body that does not fit is answered 503 with `retry-after: 1` (unread when its declared length
-cannot fit beside the bytes held), and is retried by well-behaved clients. Bytes are charged as they
-arrive, so a client trickling a big declared body holds only what it has sent, and a body over 64 KB
-must arrive whole within `server.body_deadline_seconds` (default 120, 0 off; 408 otherwise: raise it
-for slow uploaders of big files). The public routes (`/api/session/*`, `/api/agent/*`, `/api/oauth2/*`,
-`/api/oidc/*`, the MCP authorization server's `/oauth2/*`) read at most 64 KB. The cluster peer routes
-refuse a body without a signature header before reading it and read at most `cluster.max_body_mb`
-(default 16 MB; a node whose sync body outgrows it logs so, and every node needs the higher value).
+inference call without a valid virtual key (while `client.enforce_auth_on_inference` is on), an MCP
+call `/mcp` refuses from its headers, or a management call the gate refuses is answered 401 or 403
+unread. `server.max_buffered_body_mb` (default 48; -1 for no cap; read per request) caps the
+request-body megabytes each process reads at once: a body that does not fit is answered 503 with
+`retry-after: 1` (unread when its declared length cannot fit beside the bytes held), and is retried by
+well-behaved clients. Bytes are charged as they arrive, so a client trickling a big declared body holds
+only what it has sent. A body whose credential was checked from the headers must keep an average of
+`server.body_min_kb_per_second` (default 32, 0 off) after `server.body_rate_grace_seconds` (default
+10); a body whose credential was not checked (inference with auth off, the plugins' HTTP hooks, routes
+that read their credential from the body) must arrive whole within `server.body_deadline_seconds`
+(default 30, 0 off) and, beside other bodies, shares `server.unchecked_body_mb` (default an eighth of
+the cap; -1 for no separate share), so an unauthenticated client cannot turn the authenticated big
+POSTs away; 408 otherwise. With auth off and slow clients sending big files, raise
+`body_deadline_seconds` or give the clients virtual keys. The public routes (`/api/session/*`,
+`/api/agent/*`, `/api/oauth2/*`, `/api/oidc/*`, the MCP authorization server's `/oauth2/*`) read at
+most 64 KB. The cluster peer routes refuse a request before reading its body unless its head (method,
+route, `x-raiju-cluster-ts` and Content-Length) is signed with `cluster.secret` and fresh, read at most
+`cluster.max_body_mb` (default 16 MB; a node whose sync body outgrows it logs so, and every node needs
+the higher value), and have a body budget of their own. Upgrade every node of a cluster together: a
+node from before L204 does not sign the head, and its peers refuse its sync until it is upgraded.
 A body is always read when the process holds no other, so a single request up
 to `client.max_request_body_size_mb` (default 100) is still served; parsing a chat body costs about
 six to eight times its size, so on a small pod lower `max_request_body_size_mb` too (on the chart's
@@ -229,7 +245,7 @@ Useful values (see `values.yaml`):
 | `preStopSleepSeconds`, `terminationGracePeriodSeconds` | 5 and 40 (see Stopping). |
 | `probes` | Liveness (`/health`) and readiness (`/ready`) timings. |
 | `replicaCount` | Pods. Ignored when `autoscaling.enabled`. More than one needs shareable storage (below). |
-| `strategy` | Empty: `Recreate` with a ReadWriteOnce claim, `RollingUpdate` otherwise. |
+| `strategy` | Empty: `Recreate` with a ReadWriteOnce claim, `RollingUpdate` otherwise. A rolling update on a ReadWriteMany volume runs two versions on one `config.json`; see "Upgrading on a shared volume" below. |
 | `peers.headlessService` | A headless Service, `<release>-peers`, for cluster discovery by DNS (always rendered with a cluster listener). |
 | `cluster.secret.existingSecret`, `cluster.secret.key` | The Secret holding `cluster.secret` (at least 32 bytes), injected as `RAIJU_CLUSTER_SECRET`; `config.cluster.secret` defaults to `env.RAIJU_CLUSTER_SECRET`. Required with `config.cluster.enabled`, and the chart refuses a secret written into the config. |
 | `cluster.listenPort` | The cluster listener (`config.cluster.listen_port`, 7946): the peer routes are served there and refused on the main port; the peers Service targets it. `0` keeps them on the main port. |
@@ -280,6 +296,15 @@ worker before the API answers. Two layouts work:
   like) with `config_sync: "file"`: every pod rereads the same `config.json` when another saves it. The
   pods then also share `logs/` and the MCP OAuth state, so turn the log store off or give it a per-pod
   folder.
+
+Upgrading on a shared volume: a rolling update (the chart's default with ReadWriteMany, and the ECS
+module's default with EFS) runs old and new pods on one `config.json` for a while. Their saves are merged
+under a file lock, so none is lost, as long as both versions take the same lock: any two releases from
+wave 26 on (flock on `config.json.flock`), and from wave 27 on also the wave 25 release (wave 27 takes its
+`config.json.lock` directory too). Upgrade a release before wave 25 (no lock), or wave 25 straight to a
+release after wave 27, with `strategy: {type: Recreate}` (ECS: `deployment_minimum_healthy_percent = 0`,
+`deployment_maximum_percent = 100`) for that one upgrade. docs/operations.md has the details and what flock
+means on NFS and EFS.
 
 Each pod's log and audit folders are on its own data volume (`/app/data/logs`, `/app/data/logs/audit`):
 `/api/logs` answers from the pod that is asked. An enabled store that cannot open its folder stops the
