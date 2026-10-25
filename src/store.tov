@@ -3,9 +3,9 @@
 // config file and handed to the lead through onChange, which rebuilds the
 // engine. Secrets are masked on every read, and a masked value sent back
 // unchanged keeps the stored secret.
-import { readFileSync, writeFileSync, existsSync, unlinkSync, statSync, chmodSync, mkdirSync, rmSync } from "node:fs"
+import { readFileSync, writeFileSync, existsSync, unlinkSync, statSync, chmodSync, mkdirSync, rmSync, closeSync } from "node:fs"
 import { writeFileAtomic, removeStaleTemps, writeTemp, PRIVATE_FILE } from "./atomicfile"
-import { lockFile, unlockFile, lockDirOf, LOCK_WAIT_MS } from "./filelock"
+import { FileLock, lockFile, lockFileAsync, unlockFile, lockPathOf, holdAsAnother, LOCK_SYNC_MS, LOCK_WAIT_MS } from "./filelock"
 import { merge3 } from "./merge3"
 import {
   Config, GovernanceConfig, KeyConfig, ProviderConfig, VirtualKeyConfig, BudgetConfig, resolveEnv, getEnv,
@@ -1349,8 +1349,9 @@ export class ConfigStore {
   // (saveLocked), so the workers of a node, or nodes sharing the file, never lose each other's saves
   private diskSha = ""
   private baseCfg: Config = {}
-  // how long a save waits for another process to give the file's lock back
-  lockWaitMs: f64 = LOCK_WAIT_MS
+  // how long a save waits for another process to give the file's lock back, its worker paused: a route that changes
+  // the config takes the lock first with holdLock, which waits without pausing the worker
+  lockWaitMs: f64 = LOCK_SYNC_MS
 
   // `initial` should be the config as written in the file (env.NAME references
   // unresolved), so save() writes the references and not their values.
@@ -1390,7 +1391,7 @@ export class ConfigStore {
   save(): void throws Error {
     this.conflicted = false
     const lock = lockFile(this.path, this.lockWaitMs)
-    if (!lock.ok) throw new Error(`another process has held the config file's lock (${lockDirOf(this.path)}) for too long; retry`)
+    if (!lock.ok) throw new Error(`another process has held the config file's lock (${lockPathOf(this.path)}) for too long; retry`)
     try {
       try this.saveLocked()
     } catch (e) {
@@ -1398,6 +1399,18 @@ export class ConfigStore {
       throw e
     }
     unlockFile(lock)
+  }
+
+  // Takes the config file's lock ahead of a change, waiting (up to waitMs, LOCK_WAIT_MS by default) while the worker
+  // serves other requests; the saves made while it is held take it again without waiting. ok is false when another
+  // process kept it; the caller gives it back with releaseLock either way. A store with no file holds nothing.
+  async holdLock(waitMs?: f64): Promise<FileLock> {
+    if (this.path === "") return { path: "", ok: true }
+    return await lockFileAsync(this.path, waitMs ?? LOCK_WAIT_MS)
+  }
+
+  releaseLock(l: FileLock): void {
+    unlockFile(l)
   }
 
   // The file's text now, or "" when there is no file.
@@ -4691,6 +4704,11 @@ function cleanup(path: string): void {
   } catch (e) {
     // no backup yet
   }
+  try {
+    unlinkSync(lockPathOf(path))
+  } catch (e) {
+    // never locked
+  }
 }
 
 class Counter {
@@ -5969,16 +5987,21 @@ test("a save waits for the config file's lock, and gives up with an error when a
   try writeFileSync(path, `{}`)
   const s = new ConfigStore(path, try loadRawConfig(path))
   s.lockWaitMs = 50.0
-  // another process holds the lock (made by hand here)
-  try mkdirSync(lockDirOf(path))
+  // another process holds the lock (a descriptor of its own here)
+  const fd = try holdAsAnother(path)
+  const t0 = Date.now()
   const r = handleApi(s, "POST", "/api/governance/virtual-keys", `{"id":"vk-l","name":"locked"}`)
   expect(r.status).toBe(500)
   expect(r.body.includes("lock")).toBe(true)
+  // the save waited lockWaitMs (sleeping), not the 15 s of a route's wait
+  expect(Date.now() - t0 < 5000.0).toBe(true)
   expect((s.cfg.governance?.virtual_keys ?? []).length).toBe(0)
-  try rmSync(lockDirOf(path), { recursive: true, force: true })
+  // the holder ends (closed, as when it is killed): nothing is left to take over
+  try closeSync(fd)
   expect(handleApi(s, "POST", "/api/governance/virtual-keys", `{"id":"vk-l","name":"locked"}`).status).toBe(201)
   // the lock is given back after the save
-  expect(existsSync(lockDirOf(path))).toBe(false)
+  const fd2 = try holdAsAnother(path)
+  try closeSync(fd2)
   cleanup(path)
 })
 

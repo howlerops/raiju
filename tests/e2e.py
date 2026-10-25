@@ -12016,9 +12016,10 @@ def l158_e2e(env):
             if s not in (200, 201):
                 break
         check("five saves through the API succeed", s in (200, 201), (s, b[:200]))
-        # (the upgrade notice's marker, L199, is written beside the config at the first start)
+        # (the upgrade notice's marker, L199, is written beside the config at the first start; the flock(2) lock file,
+        # L200, stays: deleting it would let two processes hold locks on two inodes)
         names = sorted(n for n in os.listdir(d) if n != ".raiju-notices.json")
-        check("the saves leave config.json, its .bak and no temporary file", names == ["config.json", "config.json.bak"], names)
+        check("the saves leave config.json, its .bak, its lock file and no temporary file", names == ["config.json", "config.json.bak", "config.json.flock"], names)
         try:
             saved = json.load(open(cfg_path))
         except Exception as e:
@@ -16533,7 +16534,7 @@ def l197_e2e(env):
     import hashlib, base64 as _b64, secrets as _sec, urllib.parse as _up, stat
     from concurrent.futures import ThreadPoolExecutor
     cfg_path = os.path.join(BUILD, "e2e.l197.json")
-    for suffix in ["", ".bak", ".sessions.json", ".oidc-flows.json", ".agent-sessions.json"]:
+    for suffix in ["", ".bak", ".sessions.json", ".agent-sessions.json"]:
         try:
             os.remove(cfg_path + suffix)
         except FileNotFoundError:
@@ -16621,6 +16622,181 @@ def l197_e2e(env):
               all(t != "" for t in texts) and modes == [0o600, 0o600] and not any(x in t for t in texts for x in [kept, stok, access, refresh, nxt]), (modes, [len(t) for t in texts]))
     finally:
         for p in [gw, gw_r]:
+            if p is not None:
+                p.terminate()
+                p.wait()
+
+GW_L200_SSO = "http://127.0.0.1:18356"  # L200: single sign-on logins that store nothing (four workers on Bun)
+GW_L200 = "http://127.0.0.1:18357"  # L200: config saves waiting for the file lock (two workers on Bun)
+L200_ADMIN = {"authorization": "Bearer sk-admin-l200"}
+
+L200_FLOOD = """
+import http.client, sys, threading, time
+port, secs, n = int(sys.argv[1]), float(sys.argv[2]), int(sys.argv[3])
+stop = time.time() + secs
+tot = [0, 0]
+lk = threading.Lock()
+def run():
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    a, b = 0, 0
+    while time.time() < stop:
+        c.request("GET", "/api/oidc/login")
+        r = c.getresponse()
+        r.read()
+        a += 1
+        b += 1 if r.status == 302 else 0
+    with lk:
+        tot[0] += a
+        tot[1] += b
+ts = [threading.Thread(target=run) for _ in range(n)]
+for t in ts:
+    t.start()
+for t in ts:
+    t.join()
+print(tot[0], tot[1])
+"""
+
+def l200_start(env, port, cfg_path, name, workers):
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    extra = ["-workers", str(workers)] if server != "http1" and workers > 1 else []
+    return subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", str(port), "-host", "127.0.0.1", "-config", cfg_path, "-server", server] + extra,
+                            env=env, stderr=open(os.path.join(BUILD, f"e2e.l200{name}.log"), "w"))
+
+def l200_holder(path):
+    """Another process holding the flock(2) lock of path until it is killed: (process, its stdout said "held")."""
+    p = subprocess.Popen([sys.executable, "-I", "-c", "import fcntl, sys, time\nf = open(sys.argv[1], 'a')\nfcntl.flock(f, fcntl.LOCK_EX)\nprint('held', flush=True)\ntime.sleep(60)", path], stdout=subprocess.PIPE, text=True)
+    return p, p.stdout.readline().strip() == "held"
+
+def l200_e2e(env, idp_state):
+    """L200: a save waiting for the config file's lock waits without pausing its worker (/health stays fast), a holder
+    killed with SIGKILL gives the lock back at once (flock(2), Tov patch 0020) and every waiting save then lands, none
+    lost; a session write whose lock another process keeps fails the sign-in (503) and writes nothing; an
+    unauthenticated /api/oidc/login flood writes nothing to disk and leaves /health fast, and a sign-in begun on one
+    worker completes on any (its state is sealed, not stored). Ports 18357 (locks) and 18356 (SSO)."""
+    import fcntl, hashlib, shutil, signal, threading, http.client, urllib.parse as _up
+    from concurrent.futures import ThreadPoolExecutor
+    d = os.path.join(BUILD, "e2e-l200")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    users = [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l200".encode()).hexdigest()},
+             {"name": "lia", "role": "admin", "salt": "s200", "password_sha256": hashlib.sha256("s200:pw-lia".encode()).hexdigest()}]
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "l200", "value": "sk-l200", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "governance": {"users": users},
+    }
+    path = os.path.join(d, "config.json")
+    json.dump(cfg, open(path, "w"))
+    lock = path + ".flock"
+    def timed(fn):
+        t0 = time.time()
+        r = fn()
+        return r, time.time() - t0
+    def health(base):
+        return timed(lambda: call("GET", "/health", None, None, base=base, auth=False)[0])
+    def names():
+        return [v.get("name") for v in json.load(open(path)).get("governance", {}).get("virtual_keys", [])]
+    gw = l200_start(env, 18357, path, "a", 2)
+    gw_s = None
+    holder = None
+    try:
+        wait(GW_L200 + "/health")
+        time.sleep(0.5)
+        # ---- a save waits for a lock another process holds, and the worker keeps serving ----
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        res = {}
+        def create(name):
+            res[name] = timed(lambda: call("POST", "/api/governance/virtual-keys", {"name": name}, L200_ADMIN, base=GW_L200, auth=False)[0])
+        t = threading.Thread(target=create, args=("l200-wait",))
+        t.start()
+        time.sleep(0.5)
+        hs = [health(GW_L200) for _ in range(6)]
+        pending = t.is_alive()
+        time.sleep(1.0)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+        t.join(15)
+        st, took = res.get("l200-wait", (0, 0.0))
+        check("L200: while another process holds the config lock, /health answers at once (the waiting save does not pause the worker)",
+              all(h[0] == 200 and h[1] < 0.5 for h in hs), hs)
+        check("L200: the save waits for the lock and lands once it is given back", pending and st in (200, 201) and took >= 1.4 and "l200-wait" in names(), (pending, st, took, names()))
+        # ---- a holder killed with SIGKILL: the waiting saves land at once, every one ----
+        holder, held = l200_holder(lock)
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futs = [ex.submit(create, f"l200-k{i}") for i in range(8)]
+            time.sleep(1.0)
+            hs = [health(GW_L200) for _ in range(4)]
+            waiting = sum(1 for f in futs if not f.done())
+            holder.send_signal(signal.SIGKILL)
+            holder.wait()
+            t_kill = time.time()
+            for f in futs:
+                f.result(20)
+        done_after = time.time() - t_kill
+        codes = [res.get(f"l200-k{i}", (0, 0.0))[0] for i in range(8)]
+        got = names()
+        check("L200: saves wait while a live process holds the lock, the worker serving /health meanwhile", held and waiting == 8 and all(h[0] == 200 and h[1] < 0.5 for h in hs), (held, waiting, hs))
+        check("L200: a holder killed with SIGKILL gives the lock back at once: every waiting save lands, none lost", codes == [201] * 8 or all(c in (200, 201) for c in codes), codes)
+        check("L200: the config file holds every save made after the kill", all(f"l200-k{i}" in got for i in range(8)) and len(got) == 9 and done_after < 5.0, (len(got), done_after))
+        check("L200: the lock is a file that is never deleted or taken over (no lock directory)", os.path.isfile(lock) and not os.path.exists(path + ".lock"), os.listdir(d))
+        # ---- a sign-in whose session file's lock another process keeps fails, and writes nothing ----
+        sfd = os.open(path + ".sessions.json.flock", os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(sfd, fcntl.LOCK_EX)
+        s, _, b = call("POST", "/api/session/login", {"username": "lia", "password": "pw-lia"}, base=GW_L200, auth=False)
+        fcntl.flock(sfd, fcntl.LOCK_UN)
+        os.close(sfd)
+        check("L200: a sign-in whose session file is locked by another process fails (503) and gives no token", s == 503 and "sk-sess-" not in b and not os.path.exists(path + ".sessions.json"), (s, b[:200]))
+        s, _, b = call("POST", "/api/session/login", {"username": "lia", "password": "pw-lia"}, base=GW_L200, auth=False)
+        check("L200: once the lock is free the sign-in works", s == 200 and "sk-sess-" in b, (s, b[:200]))
+        gw.terminate()
+        gw.wait()
+        gw = None
+        # ---- single sign-on: an unauthenticated login flood writes nothing and leaves /health fast ----
+        sso_cfg = {**cfg, "oidc": {"enabled": True, "issuer": "http://127.0.0.1:18096", "client_id": "raiju", "redirect_uri": GW_L200_SSO + "/api/oidc/callback", "role_claim": "groups", "role_map": {"raiju-editors": "editor"}}}
+        sso_path = os.path.join(d, "sso.json")
+        json.dump(sso_cfg, open(sso_path, "w"))
+        gw_s = l200_start(env, 18356, sso_path, "s", 4)
+        wait(GW_L200_SSO + "/health")
+        time.sleep(0.5)
+        before = sorted(os.listdir(d))
+        stamps = {n: os.stat(os.path.join(d, n)).st_mtime_ns for n in before}
+        # the flood runs in its own process, so this one measures /health undisturbed
+        flooder = subprocess.Popen([sys.executable, "-I", "-c", L200_FLOOD, "18356", "3.0", "12"], stdout=subprocess.PIPE, text=True)
+        time.sleep(1.0)
+        hs = [health(GW_L200_SSO) for _ in range(10)]
+        out, _ = flooder.communicate(timeout=30)
+        counts = [tuple(int(x) for x in out.split())] if out.strip() else [(0, 0)]
+        sent = sum(c[0] for c in counts)
+        redirected = sum(c[1] for c in counts)
+        after = sorted(os.listdir(d))
+        changed = [n for n in after if n not in stamps or os.stat(os.path.join(d, n)).st_mtime_ns != stamps[n]]
+        lat = sorted(h[1] for h in hs)
+        check("L200: an unauthenticated login flood is answered (302) and writes nothing to disk", sent > 200 and redirected == sent and changed == [] and not os.path.exists(sso_path + ".oidc-flows.json"), (sent, redirected, changed))
+        check("L200: /health stays fast during the login flood", all(h[0] == 200 for h in hs) and lat[len(lat) // 2] < 0.1 and lat[-1] < 1.0, lat)
+        # ---- a sign-in begun on one worker completes on whichever worker takes the callback ----
+        oks = []
+        for i in range(4):
+            c = http.client.HTTPConnection("127.0.0.1", 18356, timeout=10)
+            c.request("GET", "/api/oidc/login?return_to=" + _up.quote("/oauth/consent?l200=" + str(i), safe=""))
+            r = c.getresponse()
+            r.read()
+            loc = r.getheader("location") or ""
+            c.close()
+            q = _up.parse_qs(_up.urlparse(loc).query)
+            st = q.get("state", [""])[0]
+            idp_state["nonce"] = q.get("nonce", [""])[0]
+            s, _, page = call("GET", "/api/oidc/callback?code=abc&state=" + _up.quote(st, safe=""), base=GW_L200_SSO, auth=False)
+            oks.append((s, st.startswith("s1.") and "consent" not in st, "sk-sess-" in page and f"l200={i}" in page))
+        check("L200: sign-ins begun on one worker complete on any, back to their return path; the state is sealed", all(o == (200, True, True) for o in oks), oks)
+        s, _, _ = call("GET", "/api/oidc/callback?code=abc&state=s1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", base=GW_L200_SSO, auth=False)
+        check("L200: a forged state is refused", s == 401, s)
+    finally:
+        if holder is not None and holder.poll() is None:
+            holder.kill()
+            holder.wait()
+        for p in [gw, gw_s]:
             if p is not None:
                 p.terminate()
                 p.wait()
@@ -19133,6 +19309,10 @@ def main():
         # L199: a worker killed with SIGKILL is replaced (Tov patch 0019), the upgrade notice, state file versions, the
         # allocator check: its own gateways (18354, 18355)
         l199_e2e(env)
+        # L200: config saves waiting for the file lock without pausing the worker, a SIGKILLed holder (flock, Tov patch
+        # 0020), a locked session file failing the sign-in, and OIDC logins that store nothing: its own gateways, one after
+        # the other (18357, 18356)
+        l200_e2e(env, idp_state)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

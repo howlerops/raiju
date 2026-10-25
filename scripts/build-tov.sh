@@ -4,7 +4,7 @@
 # fetch pool options and HTTP/2, request body streams, node:fs rename and fsync, a WASM time limit, the
 # server lifecycle: stop signals, timeouts and a connection cap, a fetch address policy checked at connect time,
 # TLS client certificates, Request.signal and gunzip, a small fetch input buffer, server.requestIP, workers
-# respawned after SIGKILL with a crash-loop backoff) into
+# respawned after SIGKILL with a crash-loop backoff, node:fs flockSync) into
 # build/tov/target/release/tov, applied in name order. Raiju needs this build
 # until the patches are upstream. Usage: scripts/build-tov.sh  (needs git and cargo)
 set -eu

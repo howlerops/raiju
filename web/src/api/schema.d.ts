@@ -236,7 +236,7 @@ export interface paths {
         };
         /**
          * Start an SSO sign-in: redirects to the identity provider
-         * @description With return_to, the sign-in returns to that page of the gateway once it completes (only the MCP consent pages, /oauth/consent?... and /workspace/mcp-sessions/auth?..., are accepted; anything else returns to /).
+         * @description With return_to, the sign-in returns to that page of the gateway once it completes (only the MCP consent pages, /oauth/consent?... and /workspace/mcp-sessions/auth?..., are accepted; anything else returns to /). Nothing is stored per login - the PKCE verifier, nonce, return path and a 10-minute expiry are sealed into the state value.
          */
         get: operations["getApiOidcLogin"];
         put?: never;
@@ -8466,6 +8466,15 @@ export interface operations {
                     "application/json": components["schemas"]["ManagementErrorResponse"];
                 };
             };
+            /** @description The session could not be written (another process kept the sessions file's lock); sign in again. HTML. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
         };
     };
     getApiOauthCallback: {
@@ -8575,6 +8584,15 @@ export interface operations {
                     "application/json": components["schemas"]["ManagementErrorResponse"];
                 };
             };
+            /** @description The session could not be written (another process kept the sessions file's lock): no token was made; retry. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
         };
     };
     postApiSessionLogout: {
@@ -8593,6 +8611,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MessageResponse"];
+                };
+            };
+            /** @description The session could not be ended (another process kept the sessions file's lock): it still works; retry. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
                 };
             };
         };
@@ -8825,6 +8852,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MessageResponse"];
+                };
+            };
+            /** @description The tokens could not be revoked (another process kept the agent sessions file's lock): they still work; retry. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
                 };
             };
         };

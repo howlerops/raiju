@@ -719,6 +719,15 @@ async function scimRoute(ops: Ops, req: Request, path: string): Promise<Response
   const token = resolveEnv(sc?.config?.provisioningToken ?? "")
   if (!scimAuthorized(req.headers.get("authorization") ?? "", token)) return scimReply(401, errorBody(401, "", "the SCIM provisioning token is missing or wrong"))
   const body = req.method === "GET" ? "" : await req.text()
+  // a change waits for the config file's lock without pausing the worker (see manage)
+  const held = req.method === "GET" ? undefined : await ops.store.holdLock()
+  const res = scimChange(ops, req, path, body)
+  if (held !== undefined) ops.store.releaseLock(held)
+  return res
+}
+
+// The SCIM request once its body is read (and, for a change, the config file's lock held).
+function scimChange(ops: Ops, req: Request, path: string, body: string): Response {
   const u = URL.parse(req.url)
   const origin = u === undefined ? "" : u.origin
   const params = u === undefined ? new URLSearchParams("") : u.searchParams
@@ -743,7 +752,11 @@ async function scimRoute(ops: Ops, req: Request, path: string): Promise<Response
           if (u.email !== undefined) ended.push(u.email)
         }
       }
-      ops.sessions.endUser(ended)
+      try {
+        ops.sessions.endUser(ended)
+      } catch (e) {
+        return scimReply(503, errorBody(503, "", `the users were saved but their sessions could not be ended: ${e.message}`))
+      }
     }
     ops.storeUpdated("/api/users")
     ops.storeUpdated("/api/governance/teams")
@@ -776,6 +789,10 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   const sc = ops.scopeOfActorFor(gate.actor, resourceOf(req.method, path).resource)
   // DELETE reads its body too: DELETE /api/mcp-logs names its ids there
   const body = req.method === "GET" ? "" : await req.text()
+  // a change waits here for the config file's lock while the worker serves other requests, and holds it while the route
+  // runs: the saves it makes take it again at once (filelock.tov). When another process keeps it past LOCK_WAIT_MS the
+  // route still runs, and a save it makes fails after a short wait.
+  const held = req.method === "GET" ? undefined : await ops.store.holdLock()
   // a change saved by this request is answered once the node's other workers run it (ops.settleConfig)
   const genBefore = ops.store.fileSha
   // the equal-split projects this write may redivide (ops.withRedivision)
@@ -838,7 +855,7 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   else if (path === "/api/adaptive-routing/conditions/clear") r = req.method === "POST" ? ops.adaptiveRelease(body) : { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
   else if (path === "/api/vault/flush-cache") r = req.method === "POST" ? ops.vaultFlush() : { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
   else if (path === "/api/models/parameters") r = req.method === "GET" ? await ops.modelParameters(req) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
-  else if (path === "/api/models/catalog") r = ops.catalogUpsert(req, body)
+  else if (path === "/api/models/catalog") r = await ops.catalogUpsertRoute(req, body)
   // changing the global proxy's URL, or turning skip_tls_verify on, needs a real admin session
   else if (path === "/api/proxy-config" && req.method === "PUT" && !ops.authOn && proxyWidening(ops.store.cfg.proxy_config, body).length > 0) {
     r = { status: 403, body: `{"error":{"message":"Changing the global proxy (url or skip_tls_verify) requires an authenticated admin session; dashboard auth is currently disabled or unconfigured. Enable dashboard authentication first.","type":"permission_error"}}`, contentType: "application/json" }
@@ -930,6 +947,7 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   r = ops.withRedivision(req.method, path, r, redivBefore)
   ops.recordChange(gate.actor, req, path, r.status, body)
   if (req.method !== "GET" && r.status < 300) ops.storeUpdated(path)
+  if (held !== undefined) ops.store.releaseLock(held)
   if (ops.store.fileSha !== genBefore) await ops.settleConfig()
   const h: Record<string, string> = new Map()
   h.set("content-type", r.contentType)

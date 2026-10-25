@@ -1,0 +1,101 @@
+diff --git a/crates/tov/src/check/builtins.rs b/crates/tov/src/check/builtins.rs
+--- a/crates/tov/src/check/builtins.rs
++++ b/crates/tov/src/check/builtins.rs
+@@ -34,6 +34,7 @@
+         "writeFd" => (vec![INT, STR], INT),
+         "fsync" => (vec![INT, BOOL], VOID),
+         "close" => (vec![INT], VOID),
++        "flock" => (vec![INT, INT, INT], BOOL),
+         "httpListen" => {
+             let p = |ty| FnParam { ty, inout: false, optional: false };
+             let handler = types.func(vec![p(STR), p(STR), p(STR), p(STR)], VOID);
+diff --git a/crates/tov/src/std/fs.tov b/crates/tov/src/std/fs.tov
+--- a/crates/tov/src/std/fs.tov
++++ b/crates/tov/src/std/fs.tov
+@@ -135,6 +135,17 @@
+   try check()
+ }
+ 
++// flockSync — flock(2) on a descriptor (Bun and Node have none; this is the POSIX call): "ex" an exclusive lock,
++// "sh" a shared one, "un" gives it back. waitMs 0 (the default) tries once, waitMs > 0 retries for that long
++// (sleeping between tries), waitMs < 0 waits until it is free. Returns false when another descriptor held the lock
++// all that time. The kernel gives a lock back when the descriptor closes or its process dies.
++export function flockSync(fd: int, op: string, waitMs?: int): bool throws Error {
++  const code = op === "sh" ? 1 : (op === "ex" ? 2 : (op === "un" ? 8 : 0))
++  const got = __native.flock(fd, code, waitMs ?? 0)
++  try check()
++  return got
++}
++
+ export function rmSync(path: string, options?: { recursive?: bool, force?: bool }): void throws Error {
+   const recursive = options?.recursive ?? false
+   const force = options?.force ?? false
+diff --git a/docs/spec.md b/docs/spec.md
+--- a/docs/spec.md
++++ b/docs/spec.md
+@@ -156,7 +156,7 @@
+ 
+ ## 7a. Standard library **[M3]**
+ Node's names, so existing habits work:
+-- `import { readFileSync, readFileBytesSync, writeFileSync, appendFileSync, existsSync, readdirSync, mkdirSync, rmSync, unlinkSync, statSync, accessSync, renameSync, rename, chmodSync, openSync, writeSync, fsyncSync, fdatasyncSync, closeSync } from "node:fs"` (also `"fs"`, `"std/fs"`): the synchronous API; failures throw `Error` with Node's messages (`ENOENT: no such file or directory, open 'x'`). `readdirSync` returns sorted names. `readFileBytesSync` returns the file's `u8[]` (what Node's `readFileSync` gives as a Buffer), and `writeFileSync`/`appendFileSync` take `string | u8[]`. `statSync` returns a `Stats` (`size`, `mtimeMs`, `mode`, `isFile()`, `isDirectory()`); `renameSync(from, to)` is POSIX rename (an existing `to` is replaced in one step) and `rename(from, to, callback)` its callback form; `openSync(path, flags?, mode?)` returns a descriptor (Node's flags: `r`, `r+`, `w`, `wx`, `w+`, `a`, `ax`, `a+`; `r` opens a directory too) for `writeSync`, `fsyncSync`, `fdatasyncSync` and `closeSync`; `writeFileSync(path, data, { mode, flush })` sets a created file's mode and fsyncs with `flush: true`; `chmodSync(path, mode)`. Together they make a durable atomic write: write a temporary file in the same directory with `flush: true`, `renameSync` it over the target, then `fsyncSync` the directory; `accessSync(path, mode?)` takes Node's mode flags (0 exists, 4 read, 2 write, 1 execute).
++- `import { readFileSync, readFileBytesSync, writeFileSync, appendFileSync, existsSync, readdirSync, mkdirSync, rmSync, unlinkSync, statSync, accessSync, renameSync, rename, chmodSync, openSync, writeSync, fsyncSync, fdatasyncSync, closeSync, flockSync } from "node:fs"` (also `"fs"`, `"std/fs"`): the synchronous API; failures throw `Error` with Node's messages (`ENOENT: no such file or directory, open 'x'`). `readdirSync` returns sorted names. `readFileBytesSync` returns the file's `u8[]` (what Node's `readFileSync` gives as a Buffer), and `writeFileSync`/`appendFileSync` take `string | u8[]`. `statSync` returns a `Stats` (`size`, `mtimeMs`, `mode`, `isFile()`, `isDirectory()`); `renameSync(from, to)` is POSIX rename (an existing `to` is replaced in one step) and `rename(from, to, callback)` its callback form; `openSync(path, flags?, mode?)` returns a descriptor (Node's flags: `r`, `r+`, `w`, `wx`, `w+`, `a`, `ax`, `a+`; `r` opens a directory too) for `writeSync`, `fsyncSync`, `fdatasyncSync`, `closeSync` and `flockSync(fd, "ex" | "sh" | "un", waitMs?)` (flock(2): `false` when another descriptor held the lock for `waitMs`, 0 tries once; the kernel releases it when the descriptor closes or its process dies); `writeFileSync(path, data, { mode, flush })` sets a created file's mode and fsyncs with `flush: true`; `chmodSync(path, mode)`. Together they make a durable atomic write: write a temporary file in the same directory with `flush: true`, `renameSync` it over the target, then `fsyncSync` the directory; `accessSync(path, mode?)` takes Node's mode flags (0 exists, 4 read, 2 write, 1 execute).
+ - `import * as path from "node:path"`: `join`, `resolve`, `normalize`, `basename`, `dirname`, `extname`, `isAbsolute`, `sep` (POSIX).
+ - `process.argv` (`[binary, binary, ...args]`, so `process.argv.slice(2)` are the arguments), `process.env.NAME` (`string | undefined`), `process.exit(code?)`, `process.cwd()`, `process.platform`, `process.arch`, `process.pid`, `process.stdout.write(s)`, `process.stderr.write(s)`; `console.error` / `console.warn` write to stderr.
+ - `Date.now()` and `performance.now()` (milliseconds).
+diff --git a/runtime/tov.c b/runtime/tov.c
+--- a/runtime/tov.c
++++ b/runtime/tov.c
+@@ -2922,6 +2922,42 @@
+     if (close((int)fd) != 0 && errno != EINTR) tv_native_fail_fd(errno, "close");
+ }
+ 
++#include <sys/file.h>
++
++static uint64_t tv_flock_now_ns(void) {
++    struct timespec t;
++    clock_gettime(CLOCK_MONOTONIC, &t);
++    return (uint64_t)t.tv_sec * 1000000000u + (uint64_t)t.tv_nsec;
++}
++
++/* flock(2) on a descriptor: op 1 shared, 2 exclusive, 8 unlock (LOCK_SH, LOCK_EX, LOCK_UN). waitMs 0 tries once,
++ * waitMs > 0 retries for that long (sleeping 1 ms, doubling to 16 ms, between tries), waitMs < 0 waits until the
++ * lock is free. true when the lock was taken (or given back); false when another descriptor held it all the time.
++ * The kernel gives a lock back when its last descriptor closes, so a holder that dies leaves nothing behind. */
++bool tv_native_flock(tv_int fd, tv_int op, tv_int waitMs) {
++    int how = op == 1 ? LOCK_SH : op == 2 ? LOCK_EX : op == 8 ? LOCK_UN : -1;
++    if (how < 0) { tv_native_fail_fd(EINVAL, "flock"); return false; }
++    if (how == LOCK_UN || waitMs < 0) {
++        int r;
++        do r = flock((int)fd, how); while (r != 0 && errno == EINTR);
++        if (r != 0) { tv_native_fail_fd(errno, "flock"); return false; }
++        return true;
++    }
++    uint64_t until = tv_flock_now_ns() + (uint64_t)waitMs * 1000000u;
++    long nap = 1000000L;
++    for (;;) {
++        if (flock((int)fd, how | LOCK_NB) == 0) return true;
++        if (errno == EINTR) continue;
++        if (errno != EWOULDBLOCK && errno != EAGAIN) { tv_native_fail_fd(errno, "flock"); return false; }
++        uint64_t now = tv_flock_now_ns();
++        if (waitMs == 0 || now >= until) return false;
++        uint64_t left = until - now;
++        struct timespec ts = {0, (long)((uint64_t)nap < left ? (uint64_t)nap : left)};
++        while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {}
++        if (nap < 16000000L) nap *= 2;
++    }
++}
++
+ _Noreturn void tv_process_exit(tv_int code) {
+     tv_out_flush();
+     exit((int)code);
+diff --git a/runtime/tov.h b/runtime/tov.h
+--- a/runtime/tov.h
++++ b/runtime/tov.h
+@@ -677,6 +677,7 @@
+ tv_int tv_native_writeFd(tv_int fd, tv_str data);
+ void tv_native_fsync(tv_int fd, bool dataOnly);
+ void tv_native_close(tv_int fd);
++bool tv_native_flock(tv_int fd, tv_int op, tv_int waitMs); /* false: held by another descriptor */
+ tv_str tv_native_cwd(void);
+ struct tv_arr tv_process_argv(void);                   /* ["tov-binary-path", "program", args...] like Node's */
+ bool tv_process_env(tv_str name, tv_str *out);
