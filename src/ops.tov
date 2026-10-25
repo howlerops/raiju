@@ -557,6 +557,12 @@ function okJson(body: string): Reply {
   return { status: 200, body: body, contentType: "application/json" }
 }
 
+// A change refused because another process kept the config file's lock past LOCK_WAIT_MS: nothing ran, a retry may
+// pass.
+export function lockBusyReply(): Reply {
+  return { status: 503, body: errorJson("another process kept the configuration file's lock too long; nothing was changed, retry", "api_error", undefined), contentType: "application/json" }
+}
+
 function badRequest(message: string): Reply {
   return { status: 400, body: errorJson(message, "invalid_request_error", undefined), contentType: "application/json" }
 }
@@ -3841,7 +3847,8 @@ export class Ops {
         }
       }
     }
-    return this.pluginsRoute(method, path, body)
+    // the download ran without the config file's lock; the change and its save run under it
+    return await this.underLock(method, () => this.pluginsRoute(method, path, body))
   }
 
   // The live chain's statistics for a plugin name (this process's), or "".
@@ -4476,7 +4483,10 @@ export class Ops {
         console.error(`raiju: agent card of ${name}: ${f.error}`)
         return a
       }
+      // fetched without the config file's lock; saved under it
+      const held = await this.store.holdLock()
       this.installCard(name, a.agent_card_url, f.card, Math.floor(Date.now()))
+      this.store.releaseLock(held)
     } catch (e) {
       this.cardMissAt.set(name, now)
       return a
@@ -5027,7 +5037,10 @@ export class Ops {
       for (const f of r.failed) console.error(`raiju: agent card refresh: ${f}`)
       const next = r.next
       if (next !== undefined) {
-        this.store.setAgents(this.mergeCards(next, r.changed))
+        // fetched without the config file's lock; merged and saved under it
+        const held = await this.store.holdLock()
+        if (held.ok) this.store.setAgents(this.mergeCards(next, r.changed))
+        this.store.releaseLock(held)
         this.publishCards()
         console.error(`raiju: agent card changed: ${r.changed.join(", ")}`)
       }
@@ -5098,7 +5111,9 @@ export class Ops {
       const r = await refreshAll([a])
       const next = r.next
       if (next !== undefined) {
-        this.store.setAgents(this.mergeCards(next, r.changed))
+        const held = await this.store.holdLock()
+        if (held.ok) this.store.setAgents(this.mergeCards(next, r.changed))
+        this.store.releaseLock(held)
         this.publishCards()
         console.error(`raiju: agent card changed: ${name}`)
       }
@@ -5654,7 +5669,7 @@ export class Ops {
       return html(403, "<p>This account is disabled. Ask an administrator to enable it.</p>", clear)
     }
     // an identity provider configured through scim_config: its claims decide the role and the memberships
-    const synced = this.syncSignIn(v.sub, v.email, v.claims)
+    const synced = await this.syncSignInLocked(v.sub, v.email, v.claims)
     if (synced.kind === "refuse") {
       this.recordChange("sso:" + v.sub, req, path, 403, "")
       return html(403, `<p>Sign-in refused: ${synced.reason.replace("<", "&lt;")}</p>`, clear)
@@ -5727,7 +5742,7 @@ export class Ops {
         if (at.kind === "ok") claims = at.claims
       }
       role = v.role
-      const synced = this.syncSignIn(v.sub, v.email ?? due.email, claims)
+      const synced = await this.syncSignInLocked(v.sub, v.email ?? due.email, claims)
       if (synced.kind === "refuse") {
         this.endSession(due.token)
         return false
@@ -5767,7 +5782,11 @@ export class Ops {
     if (at < 0 || !idpManaged(users[at]!)) return
     const u = users[at]!
     const l = await lookupUser(ds, (u.email ?? "") !== "" ? (u.email ?? "") : u.name)
-    if (l.kind === "inactive" || l.kind === "gone") this.removeUsersNow([u.name], "the session refresh failed and the directory reports the user " + (l.kind === "gone" ? "gone" : "inactive"))
+    if (l.kind !== "inactive" && l.kind !== "gone") return
+    const held = await this.store.holdLock()
+    if (held.ok) this.removeUsersNow([u.name], "the session refresh failed and the directory reports the user " + (l.kind === "gone" ? "gone" : "inactive"))
+    else console.error(`raiju: ${u.name} was not removed: another process kept the config file's lock`)
+    this.store.releaseLock(held)
   }
 
   // Removes users the identity provider no longer has (their keys and memberships go too) and ends their sessions.
@@ -5928,12 +5947,20 @@ export class Ops {
         if (l.kind === "inactive" || l.kind === "gone") confirmed.push(name)
       }
     }
-    // planned again on the users as they are now, and saved at once
-    const dir = this.dirNow()
-    const users = this.store.cfg.governance?.users ?? []
-    let plan = planDirectory(users, dir, listing.users, c, this.roleBook(), mint, only).plan
-    if (confirmed.length > 0) plan = withRemovals(users, plan, confirmed, dir)
-    const err = this.applyPlan(plan)
+    // planned again on the users as they are now, under the config file's lock (waited for without pausing the
+    // worker), and saved at once
+    const held = await this.store.holdLock()
+    let err = "another process kept the config file's lock; run the sync again"
+    let plan: Plan | undefined = undefined
+    if (held.ok) {
+      const dir = this.dirNow()
+      const users = this.store.cfg.governance?.users ?? []
+      let p = planDirectory(users, dir, listing.users, c, this.roleBook(), mint, only).plan
+      if (confirmed.length > 0) p = withRemovals(users, p, confirmed, dir)
+      plan = p
+      err = this.applyPlan(p)
+    }
+    this.store.releaseLock(held)
     this.jobSet(id, this.jobJson(id, op, err === "" ? "completed" : "failed", started, plan, err))
     this.dirRunning = false
   }
@@ -6013,12 +6040,19 @@ export class Ops {
         return ok(200, `{"rules_hash":${JSON.stringify(hash)},"sync_mode":${JSON.stringify(mode)},"total":${plan.changes.length},"changed":${changed.length},"counts":${JSON.stringify(countsOf(plan.changes))},"sample":${JSON.stringify(changed.slice(0, 50))},"losing_all_profiles":${JSON.stringify(losing)}}`)
       }
       if (ruleHash !== "" && ruleHash !== hash) return bad(409, "the rules changed since the preview; preview again")
-      const id = newId("op_")
-      const started = Date.now()
-      const err = this.applyPlan(plan)
-      const job = this.jobJson(id, "reconcile", err === "" ? "completed" : "failed", started, plan, err)
-      this.jobSet(id, job)
-      return ok(err === "" ? 200 : 500, job)
+      // planned again and saved under the config file's lock (the users may have changed while it was waited for);
+      // the closure reads constants (a captured `let` of a union type does not compile)
+      const ids = userIds
+      const keep = keepMissing
+      return await this.underLock(method, () => {
+        const fresh = planReconcile(this.store.cfg.governance?.users ?? [], this.dirNow(), c, mode, this.roleBook(), (p: string): string => randomId(p), ids, keep)
+        const id = newId("op_")
+        const started = Date.now()
+        const err = this.applyPlan(fresh)
+        const job = this.jobJson(id, "reconcile", err === "" ? "completed" : "failed", started, fresh, err)
+        this.jobSet(id, job)
+        return ok(err === "" ? 200 : 500, job)
+      })
     }
     return bad(404, `no route for ${path}`)
   }
@@ -6385,6 +6419,32 @@ export class Ops {
     if (ups.length === 0) return
     const r = this.store.upgradePasswords(ups)
     if (r.kind === "error") console.error(`raiju: password upgrade not saved: ${r.message}`)
+  }
+
+  // Runs change, code that may save the config and does not await, under the config file's lock: waited for without
+  // pausing the worker; 503 without running change when another process keeps it. A GET runs change as it is.
+  async underLock(method: string, change: () => Reply): Promise<Reply> {
+    if (method === "GET") return change()
+    const held = await this.store.holdLock()
+    if (!held.ok) {
+      this.store.releaseLock(held)
+      return lockBusyReply()
+    }
+    const r = change()
+    this.store.releaseLock(held)
+    return r
+  }
+
+  // syncSignIn under the config file's lock (a sign-in's claims may save users, teams and business units).
+  async syncSignInLocked(sub: string, email: string | undefined, payload: string): Promise<{ kind: "none" } | { kind: "role", role: string } | { kind: "refuse", reason: string }> {
+    const held = await this.store.holdLock()
+    if (!held.ok) {
+      this.store.releaseLock(held)
+      return { kind: "refuse", reason: "another process kept the configuration file's lock; sign in again" }
+    }
+    const r = this.syncSignIn(sub, email, payload)
+    this.store.releaseLock(held)
+    return r
   }
 
   recordChange(actor: string, req: Request, path: string, status: int, body: string): void {

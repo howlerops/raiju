@@ -17033,6 +17033,137 @@ def l203_e2e(env, idp_state):
             g.terminate()
             g.wait()
 
+GW_L202 = "http://127.0.0.1:18360"  # L202: the config lock only around a save (four workers on Bun; one process on http1)
+L202_HOLE = 18361  # a provider base_url that accepts connections and never answers
+L202_ADMIN = {"authorization": "Bearer sk-admin-l202"}
+
+def l202_e2e(env):
+    """L202: the config file's lock is held only around a change's read, merge and save. A refresh-models whose provider
+    never answers (three keys, 5 s each) runs without it: 24 creates sent meanwhile through every worker are all saved at
+    once and /health stays fast. A change whose lock another process keeps past the 15 s wait answers 503 (Retry-After)
+    and nothing of it runs, also not later. The upgrade bridge: a save also takes the old version's mkdir lock
+    (config.json.lock) and removes it after, waits (without pausing the worker) while an old process holds it, and takes
+    over a stale one. Ports 18360 (gateway) and 18361 (the silent provider)."""
+    import fcntl, hashlib, shutil, socket, threading, http.client
+    from concurrent.futures import ThreadPoolExecutor
+    d = os.path.join(BUILD, "e2e-l202")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    path = os.path.join(d, "config.json")
+    hole = f"http://127.0.0.1:{L202_HOLE}"
+    json.dump({
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "governance": {"users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l202".encode()).hexdigest()}]},
+        "providers": {"openai": {"keys": [{"name": f"l202-{i}", "value": f"sk-l202-{i}", "models": [], "weight": 1.0} for i in range(3)], "network_config": {"base_url": hole, "max_retries": 0}}},
+    }, open(path, "w"))
+    # the silent provider: accepts, reads nothing, answers nothing
+    lsock = socket.socket()
+    lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    lsock.bind(("127.0.0.1", L202_HOLE))
+    lsock.listen(64)
+    held_conns = []
+    def accept():
+        while True:
+            try:
+                c, _ = lsock.accept()
+            except OSError:
+                return
+            held_conns.append(c)
+    threading.Thread(target=accept, daemon=True).start()
+    def req(method, p, body=None, timeout=40):
+        c = http.client.HTTPConnection("127.0.0.1", 18360, timeout=timeout)
+        t0 = time.time()
+        try:
+            c.request(method, p, body=None if body is None else json.dumps(body), headers={"content-type": "application/json", **L202_ADMIN})
+            r = c.getresponse()
+            return r.status, {k.lower(): v for k, v in r.getheaders()}, r.read().decode(), time.time() - t0
+        except Exception as e:
+            return 0, {}, str(e), time.time() - t0
+        finally:
+            c.close()
+    def health():
+        s, _, _, took = req("GET", "/health", timeout=10)
+        return s, took
+    def names():
+        return [v.get("name") for v in json.load(open(path)).get("governance", {}).get("virtual_keys", [])]
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    extra = ["-workers", "4"] if server != "http1" else []
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18360", "-host", "127.0.0.1", "-config", path, "-server", server] + extra,
+                          env=env, stderr=open(os.path.join(BUILD, "e2e.l202.log"), "w"))
+    try:
+        wait(GW_L202 + "/health")
+        time.sleep(1.0)
+        # ---- P1-A: a slow refresh-models holds no lock; creates on every worker land at once ----
+        out = {}
+        def refresh():
+            out["refresh"] = req("POST", "/api/providers/openai/refresh-models")
+        rt = threading.Thread(target=refresh)
+        rt.start()
+        time.sleep(0.5)
+        with ThreadPoolExecutor(max_workers=24) as ex:
+            creates = list(ex.map(lambda i: req("POST", "/api/governance/virtual-keys", {"name": f"l202-r{i}"}), range(24)))
+        hs = [health() for _ in range(6)]
+        running = rt.is_alive()
+        rt.join(30)
+        rs = out.get("refresh", (0, {}, "", 0.0))
+        check("L202: refresh-models against a provider that never answers runs for its timeouts (the slow route under test)", rs[0] == 502 and rs[3] >= 10.0 and running, (rs[0], rs[3], running))
+        check("L202: 24 creates sent through every worker during the slow refresh all succeed at once (no lock held across its I/O)",
+              all(c[0] in (200, 201) for c in creates) and max(c[3] for c in creates) < 5.0, [(c[0], round(c[3], 2)) for c in creates])
+        check("L202: /health stays fast while the refresh runs", all(h[0] == 200 and h[1] < 0.5 for h in hs), hs)
+        got = names()
+        check("L202: the config file holds every create", all(f"l202-r{i}" in got for i in range(24)), sorted(set(f"l202-r{i}" for i in range(24)) - set(got)))
+        # ---- P1-A: a change whose lock another process keeps past the wait answers 503 and runs nothing ----
+        lock = path + ".flock"
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        res = {}
+        bt = threading.Thread(target=lambda: res.setdefault("busy", req("POST", "/api/governance/virtual-keys", {"name": "l202-busy"})))
+        bt.start()
+        time.sleep(1.0)
+        hs = [health() for _ in range(4)]
+        bt.join(30)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+        bs = res.get("busy", (0, {}, "", 0.0))
+        check("L202: while another process keeps the lock the waiting change does not pause its worker", all(h[0] == 200 and h[1] < 0.5 for h in hs), hs)
+        check("L202: a change whose lock is kept past the 15 s wait answers 503 with Retry-After", bs[0] == 503 and bs[1].get("retry-after") == "1" and "lock" in bs[2] and 14.0 <= bs[3] < 25.0, (bs[0], bs[1].get("retry-after"), bs[2][:200], bs[3]))
+        s, _, _, _ = req("POST", "/api/governance/virtual-keys", {"name": "l202-after"})
+        time.sleep(0.5)
+        got = names()
+        check("L202: the refused change never ran (not saved, also not once the lock was free); the next one saves", s in (200, 201) and "l202-busy" not in got and "l202-after" in got, (s, got[-3:]))
+        # ---- P1-C: the upgrade bridge with the old version's mkdir lock ----
+        legacy = path + ".lock"
+        check("L202: at rest no old-version lock directory is left behind", not os.path.exists(legacy), os.listdir(d))
+        os.mkdir(legacy)  # an old (mkdir-lock) process holds the lock
+        bt = threading.Thread(target=lambda: res.setdefault("old", req("POST", "/api/governance/virtual-keys", {"name": "l202-old"})))
+        bt.start()
+        time.sleep(0.5)
+        hs = [health() for _ in range(4)]
+        pending = bt.is_alive()
+        time.sleep(1.0)
+        os.rmdir(legacy)  # the old process saves and gives it back
+        bt.join(20)
+        ol = res.get("old", (0, {}, "", 0.0))
+        check("L202: a save waits while an old-version process holds config.json.lock, the worker serving /health meanwhile",
+              pending and all(h[0] == 200 and h[1] < 0.5 for h in hs), (pending, hs))
+        check("L202: the save lands once the old process gives its lock back, and removes the directory it made",
+              ol[0] in (200, 201) and ol[3] >= 1.4 and "l202-old" in names() and not os.path.exists(legacy), (ol[0], ol[3], os.listdir(d)))
+        os.mkdir(legacy)
+        old = time.time() - 60
+        os.utime(legacy, (old, old))  # left by an old process that died
+        s, _, _, took = req("POST", "/api/governance/virtual-keys", {"name": "l202-stale"})
+        check("L202: a stale old-version lock (older than 10 s, as the old version itself rules) is taken over", s in (200, 201) and took < 3.0 and "l202-stale" in names() and not os.path.exists(legacy), (s, took))
+    finally:
+        gw.terminate()
+        gw.wait()
+        lsock.close()
+        for c in held_conns:
+            try:
+                c.close()
+            except OSError:
+                pass
+
 def main():
     unique_ports()
     build()
@@ -19550,6 +19681,9 @@ def main():
         # cluster.secret across two nodes and its start warning, and the OIDC state cookie: its own gateways, one after
         # the other (18362, 18363)
         l203_e2e(env, idp_state)
+        # L202: the config lock held only around a save (a slow refresh-models holds none, 503 on a kept lock) and the
+        # upgrade bridge with the old mkdir lock: its own gateway (18360) and silent provider (18361)
+        l202_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

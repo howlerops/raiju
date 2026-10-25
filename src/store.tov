@@ -5,7 +5,7 @@
 // unchanged keeps the stored secret.
 import { readFileSync, writeFileSync, existsSync, unlinkSync, statSync, chmodSync, mkdirSync, rmSync, closeSync } from "node:fs"
 import { writeFileAtomic, removeStaleTemps, writeTemp, PRIVATE_FILE } from "./atomicfile"
-import { FileLock, lockFile, lockFileAsync, unlockFile, lockPathOf, holdAsAnother, LOCK_SYNC_MS, LOCK_WAIT_MS } from "./filelock"
+import { FileLock, lockFile, lockFileAsync, unlockFile, lockPathOf, holdAsAnother, LOCK_WAIT_MS } from "./filelock"
 import { merge3 } from "./merge3"
 import {
   Config, GovernanceConfig, KeyConfig, ProviderConfig, VirtualKeyConfig, BudgetConfig, resolveEnv, getEnv,
@@ -1349,9 +1349,12 @@ export class ConfigStore {
   // (saveLocked), so the workers of a node, or nodes sharing the file, never lose each other's saves
   private diskSha = ""
   private baseCfg: Config = {}
-  // how long a save waits for another process to give the file's lock back, its worker paused: a route that changes
-  // the config takes the lock first with holdLock, which waits without pausing the worker
-  lockWaitMs: f64 = LOCK_SYNC_MS
+  // how long a save waits for another process to give the file's lock back, its worker paused: 0, one try. Code that
+  // changes the config takes the lock first with holdLock, which waits without pausing the worker, and the save then
+  // takes it again at once; a save whose try fails answers 503 (lockBusy) and never sleeps
+  lockWaitMs: f64 = 0.0
+  // set when the last save could not take the file's lock (commit answers 503)
+  lockBusy = false
 
   // `initial` should be the config as written in the file (env.NAME references
   // unresolved), so save() writes the references and not their values.
@@ -1387,11 +1390,16 @@ export class ConfigStore {
   // Writes the config as JSON, atomically (a temporary file renamed over it), so a crash or another worker never
   // sees half a file. The previous file is kept as <path>.bak. The read-modify-write runs under the file's lock
   // (filelock.tov), which the workers of a node and nodes sharing the file all take, and a file another process saved
-  // since this one read it is merged with (saveLocked).
+  // since this one read it is merged with (saveLocked). The caller holds the lock already (holdLock, waited for without
+  // pausing the worker); otherwise the save tries it once and fails (lockBusy) when another process holds it.
   save(): void throws Error {
     this.conflicted = false
+    this.lockBusy = false
     const lock = lockFile(this.path, this.lockWaitMs)
-    if (!lock.ok) throw new Error(`another process has held the config file's lock (${lockPathOf(this.path)}) for too long; retry`)
+    if (!lock.ok) {
+      this.lockBusy = true
+      throw new Error(`another process holds the config file's lock (${lockPathOf(this.path)}); retry`)
+    }
     try {
       try this.saveLocked()
     } catch (e) {
@@ -1403,7 +1411,9 @@ export class ConfigStore {
 
   // Takes the config file's lock ahead of a change, waiting (up to waitMs, LOCK_WAIT_MS by default) while the worker
   // serves other requests; the saves made while it is held take it again without waiting. ok is false when another
-  // process kept it; the caller gives it back with releaseLock either way. A store with no file holds nothing.
+  // process kept it (the caller answers 503 without making the change); the caller gives it back with releaseLock
+  // either way. Hold it only across code that does not await (the read, the change and the save), never across network
+  // I/O: other processes wait for it. A store with no file holds nothing.
   async holdLock(waitMs?: f64): Promise<FileLock> {
     if (this.path === "") return { path: "", ok: true }
     return await lockFileAsync(this.path, waitMs ?? LOCK_WAIT_MS)
@@ -1411,6 +1421,31 @@ export class ConfigStore {
 
   releaseLock(l: FileLock): void {
     unlockFile(l)
+  }
+
+  // A change computed from base, a config read before an await (network I/O done without the lock), applied to the
+  // config as it is now: next itself when the config did not change meanwhile, else the change from base to next
+  // merged onto it (merge3.tov), so what other requests of this process saved, or a sibling's save it took, is kept.
+  // Throws when the two cannot be merged (the caller answers 409).
+  rebased(base: Config, next: Config): Config throws Error {
+    const b = try canonical(base)
+    const now = try canonical(this.cfg)
+    if (b === now) return next
+    const r = try merge3(b, try canonical(next), now, CACHED_MEMBERS)
+    if (!r.ok) throw new Error(`the configuration was changed by another request at the same time (${r.conflict}); reload and retry`)
+    return try rawConfigOf(r.text)
+  }
+
+  // Saves next, a change computed from base before an await (see rebased): 409 when it cannot be merged with what
+  // changed meanwhile.
+  commitRebased(base: Config, next: Config, id: string): Result {
+    let n: Config = this.cfg
+    try {
+      n = try this.rebased(base, next)
+    } catch (e) {
+      return fail(409, e.message)
+    }
+    return this.commit(n, id)
   }
 
   // The file's text now, or "" when there is no file.
@@ -1614,6 +1649,8 @@ export class ConfigStore {
         this.adoptDisk()
         return fail(409, e.message)
       }
+      // another process holds the lock (the caller did not take it first): nothing was written, a retry may pass
+      if (this.lockBusy) return fail(503, e.message)
       this.saveError = e.message
       return fail(500, `could not save config: ${e.message}`)
     }
@@ -5982,19 +6019,19 @@ test("two workers setting one value differently: the later save is refused with 
   cleanup(path)
 })
 
-test("a save waits for the config file's lock, and gives up with an error when another process keeps it", () => {
+test("a save that cannot take the config file's lock answers 503 at once, without sleeping", () => {
   const path = tmpPath()
   try writeFileSync(path, `{}`)
   const s = new ConfigStore(path, try loadRawConfig(path))
-  s.lockWaitMs = 50.0
   // another process holds the lock (a descriptor of its own here)
   const fd = try holdAsAnother(path)
   const t0 = Date.now()
   const r = handleApi(s, "POST", "/api/governance/virtual-keys", `{"id":"vk-l","name":"locked"}`)
-  expect(r.status).toBe(500)
+  expect(r.status).toBe(503)
   expect(r.body.includes("lock")).toBe(true)
-  // the save waited lockWaitMs (sleeping), not the 15 s of a route's wait
-  expect(Date.now() - t0 < 5000.0).toBe(true)
+  expect(s.lockBusy).toBe(true)
+  // one try: the worker is not paused (a route takes the lock first, waiting without pausing it)
+  expect(Date.now() - t0 < 100.0).toBe(true)
   expect((s.cfg.governance?.virtual_keys ?? []).length).toBe(0)
   // the holder ends (closed, as when it is killed): nothing is left to take over
   try closeSync(fd)
@@ -6002,6 +6039,46 @@ test("a save waits for the config file's lock, and gives up with an error when a
   // the lock is given back after the save
   const fd2 = try holdAsAnother(path)
   try closeSync(fd2)
+  // an old version's mkdir lock (the upgrade bridge) keeps the save out too
+  try mkdirSync(path + ".lock")
+  expect(handleApi(s, "POST", "/api/governance/virtual-keys", `{"id":"vk-m","name":"old-held"}`).status).toBe(503)
+  try rmSync(path + ".lock", { recursive: true, force: true })
+  expect(handleApi(s, "POST", "/api/governance/virtual-keys", `{"id":"vk-m","name":"old-held"}`).status).toBe(201)
+  expect(existsSync(path + ".lock")).toBe(false)
+  cleanup(path)
+})
+
+function agentsSet(c: Config, list: AgentConfig[]): Config {
+  let n = c
+  n.agents = list
+  return n
+}
+
+test("a change computed before an await is rebased onto what was saved meanwhile", () => {
+  const path = tmpPath()
+  try writeFileSync(path, `{"agents":[{"name":"a1","agent_card_url":"https://a1.example/card"}]}`)
+  const s = new ConfigStore(path, try loadRawConfig(path))
+  // a route reads the config, then awaits network I/O without the lock
+  const base = s.cfg
+  const mine = agentsSet(base, (base.agents ?? []).concat([{ name: "a2", agent_card_url: "https://a2.example/card" }]))
+  // meanwhile another request of this process saves a virtual key and drops nothing of the agents
+  expect(handleApi(s, "POST", "/api/governance/virtual-keys", `{"id":"vk-r","name":"meanwhile"}`).status).toBe(201)
+  // the route saves its change: the key saved meanwhile is kept, the agent added
+  expect(s.commitRebased(base, mine, "agents").kind).toBe("ok")
+  const disk = try loadRawConfig(path)
+  expect((disk.governance?.virtual_keys ?? []).length).toBe(1)
+  expect((disk.agents ?? []).length).toBe(2)
+  // unchanged since base: next as it is
+  const b2 = s.cfg
+  expect(s.commitRebased(b2, agentsSet(b2, []), "agents").kind).toBe("ok")
+  expect((s.cfg.agents ?? []).length).toBe(0)
+  expect((s.cfg.governance?.virtual_keys ?? []).length).toBe(1)
+  // a value both changed differently: 409, nothing saved
+  const b3 = s.cfg
+  const n3 = agentsSet(b3, [{ name: "x", agent_card_url: "https://x.example/one" }])
+  expect(s.setAgents([{ name: "x", agent_card_url: "https://x.example/two" }]).kind).toBe("ok")
+  expect(s.commitRebased(b3, n3, "agents").kind).toBe("error")
+  expect(s.cfg.agents![0]!.agent_card_url).toBe("https://x.example/two")
   cleanup(path)
 })
 

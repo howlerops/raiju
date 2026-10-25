@@ -107,7 +107,12 @@ each keeps its own config. A cluster needs:
 
 - `efs_file_system_id` and `efs_access_point_id`: the tasks share `config.json`
   (`config_sync: "file"`). Give each task its own log folder or turn the log store
-  off, as with a shared volume in the chart (deploy/README.md).
+  off, as with a shared volume in the chart (deploy/README.md). A deployment starts
+  the new tasks before the old ones stop (`deployment_minimum_healthy_percent` 100,
+  `deployment_maximum_percent` 200), so two versions write `config.json` for a
+  while: safe when both lock it the same way (deploy/README.md, "Upgrading on a
+  shared volume"). For an upgrade across lock protocols set 0 and 100 for that
+  deployment.
 - `cluster_secret_arn`: a Secrets Manager or SSM ARN of a secret of at least 32
   bytes (`openssl rand -hex 32`; a shorter one stops the tasks at start), injected
   as `RAIJU_CLUSTER_SECRET`.

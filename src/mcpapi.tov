@@ -195,13 +195,35 @@ function persist(store: ConfigStore, next: Config): McpReply | undefined {
     store.save()
   } catch (e) {
     store.cfg = prev
-    return fail(500, `could not save config: ${e.message}`)
+    // another process held the config file's lock: nothing was written, a retry may pass
+    return fail(store.lockBusy ? 503 : 500, `could not save config: ${e.message}`)
   }
   store.version += 1
   const f = store.onChange
   // the store's copy, as saving left it: a save may have kept a newer retained credential from the file
   if (f !== undefined) f(store.cfg)
   return undefined
+}
+
+// Saves next, a change computed from base, a config read before an await: the network I/O of a route runs without the
+// config file's lock. The lock is waited for here without pausing the worker (503 when another process keeps it), the
+// change is rebased onto the config as it is now (409 when it cannot be) and saved, nothing awaited in between.
+async function persistAfter(store: ConfigStore, base: Config, next: Config): Promise<McpReply | undefined> {
+  const held = await store.holdLock()
+  if (!held.ok) {
+    store.releaseLock(held)
+    return fail(503, "another process holds the config file's lock; retry")
+  }
+  let n: Config = next
+  try {
+    n = try store.rebased(base, next)
+  } catch (e) {
+    store.releaseLock(held)
+    return fail(409, e.message)
+  }
+  const err = persist(store, n)
+  store.releaseLock(held)
+  return err
 }
 
 function withClients(c: Config, list: McpClientConfig[]): Config {
@@ -1224,7 +1246,7 @@ async function submitFlow(store: ConfigStore, id: string, body: string, callerUs
   for (const x of list) {
     if (x.id !== id) flows.push(x)
   }
-  const err = persist(store, withHeaderState(cfg, creds, flows))
+  const err = await persistAfter(store, cfg, withHeaderState(cfg, creds, flows))
   if (err !== undefined) return err
   // the submission is done: its temp token ends with it (Bifrost deletes it by the flow's id)
   endTempTokens(id)
@@ -1251,7 +1273,7 @@ async function verifyClient(store: ConfigStore, id: string, body: string): Promi
   if (!v.ok) return fail(422, `Verification failed: ${v.error}`)
   let c = client
   c.headers = merged.values
-  const err = persist(store, withClients(cfg, replaceAt(clients, ci, c)))
+  const err = await persistAfter(store, cfg, withClients(cfg, replaceAt(clients, ci, c)))
   if (err !== undefined) return err
   return { status: 200, body: `{"status":"success","message":${quote(`MCP client verified. ${v.tools} tools discovered. Each virtual key submits its own header values.`)},"tools_count":${v.tools}}`, action: "reconnect", id: id }
 }
@@ -1382,9 +1404,10 @@ async function verifyExchange(store: ConfigStore, idp: IdpEndpoints, client: Mcp
   const now = Date.now()
   // the refresh token, when the identity provider issued one, renews the credential before it expires
   const row: McpUserToken = { id: "exchange-" + client.name, mcp_client_name: client.name, virtual_key_id: "", session_id: "", access_token: r.token, refresh_token: r.refreshToken, token_expires_at: r.expiresIn > 0.0 ? now + r.expiresIn * 1000.0 : 0.0, scopes: [], created_at: now, last_refreshed_at: now, status: "active" }
-  const kept = exchangeAdminWithout(store.cfg.mcp?.exchange_admin ?? [], client.name)
+  const base = store.cfg
+  const kept = exchangeAdminWithout(base.mcp?.exchange_admin ?? [], client.name)
   kept.push(row)
-  const err = persist(store, withExchangeAdmin(store.cfg, kept))
+  const err = await persistAfter(store, base, withExchangeAdmin(base, kept))
   if (err !== undefined) return err
   const pub = adminPublished
   if (pub !== undefined) pub(row)
@@ -1978,7 +2001,8 @@ async function register(url: string, redirect: string, allow: string[]): Promise
 // mode is "initiate", "reauthorize" (the client must be authorized already) or "reregister" (a new
 // client is registered in place of the stored one).
 async function startFlow(store: ConfigStore, id: string, base: string, mode: string): Promise<McpReply> {
-  const list = clientsOf(store.cfg)
+  const before = store.cfg
+  const list = clientsOf(before)
   const at = clientIndex(list, id)
   if (at < 0) return fail(404, `MCP client '${id}' not found`)
   const c = list[at]!
@@ -2035,7 +2059,7 @@ async function startFlow(store: ConfigStore, id: string, base: string, mode: str
   } catch (e) {
     return fail(500, `could not start the flow: ${e.message}`)
   }
-  const perr = persist(store, withClients(store.cfg, replaceAt(list, at, withAuth(c, a))))
+  const perr = await persistAfter(store, before, withClients(before, replaceAt(list, at, withAuth(c, a))))
   if (perr !== undefined) return perr
   // a reauthorize polls its flow: the config may read authorized from an earlier verification all along
   const statusUrl = mode === "reauthorize" ? `/api/oauth/config/${id}/status?flow_id=${flowId}` : `/api/oauth/config/${id}/status`
@@ -2081,7 +2105,8 @@ export async function oauthCallback(store: ConfigStore, query: URLSearchParams):
     failAdminFlow(flow, Date.now())
     return callbackPage(400, "The callback has no authorization code.")
   }
-  const list = clientsOf(store.cfg)
+  const before = store.cfg
+  const list = clientsOf(before)
   const at = clientIndex(list, flow.client)
   if (at < 0) {
     endAdminFlow(flow.id, Date.now())
@@ -2106,7 +2131,7 @@ export async function oauthCallback(store: ConfigStore, query: URLSearchParams):
   next.access_token = tokens.access
   next.token_expires_at = tokens.expiresAt
   if (tokens.refresh !== "") next.refresh_token = tokens.refresh
-  const perr = persist(store, withClients(store.cfg, replaceAt(list, at, withAuth(c, next))))
+  const perr = await persistAfter(store, before, withClients(before, replaceAt(list, at, withAuth(c, next))))
   if (perr !== undefined) {
     failAdminFlow(flow, Date.now())
     return callbackPage(500, "The tokens could not be saved.")
@@ -2195,7 +2220,8 @@ async function userCallback(store: ConfigStore, f: UserFlow, query: URLSearchPar
   if (a === undefined) return callbackPage(400, "The MCP client does not use the OAuth flow.")
   const now = Date.now()
   try {
-    const list = store.cfg.mcp?.user_tokens ?? []
+    const before = store.cfg
+    const list = before.mcp?.user_tokens ?? []
     const ui = userTokenIndex(list, f.client, f.virtual_key_id, f.session_id, f.user_id)
     let id = ""
     let oldRefresh = ""
@@ -2207,7 +2233,7 @@ async function userCallback(store: ConfigStore, f: UserFlow, query: URLSearchPar
     }
     const text = await exchangeUserCode(a, code, f.verifier, f.redirect, now, store.cfg.mcp?.oauth_private_allowlist ?? [])
     const row = try rowFromTokens(text, now, f.client, f.virtual_key_id, f.session_id, id, oldRefresh, f.user_id)
-    const perr = persist(store, withUserTokens(store.cfg, upsertUserRow(list, row)))
+    const perr = await persistAfter(store, before, withUserTokens(before, upsertUserRow(list, row)))
     if (perr !== undefined) return callbackPage(500, "The tokens could not be saved.")
   } catch (e) {
     return callbackPage(502, `The token request failed: ${e.message}`)

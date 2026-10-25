@@ -29,13 +29,55 @@ rebuilds its engine, exactly as the saving worker does.
 - A worker whose share file has not moved for a second is taken for gone and is not waited for.
 - Saves from several workers at once do not overwrite each other. A save takes the config file's lock
   (flock(2) on `config.json.flock`, a file that stays; the kernel gives the lock back when its holder exits
-  or is killed, so a dead process never leaves it behind) and reads the file again. A management request
-  that changes something waits for the lock (up to 15 seconds, then a save fails with 500) without pausing
-  its worker, which keeps serving other requests; saves made outside a request wait at most half a second; when another worker saved since, its own change is reapplied to the file as it is now
+  or is killed, so a dead process never leaves it behind) and reads the file again. The lock is held only
+  around that read, the merge and the write, never across network I/O: a request that reaches the network
+  (refresh-models, a pricing or MCP library sync, an MCP server's spec, tools or authorization server, an
+  agent card, a plugin download, a token exchange) does that first and takes the lock afterwards. A change
+  waits for the lock (up to 15 seconds) without pausing its worker, which keeps serving other requests;
+  when another process keeps it longer, the change answers 503 with `Retry-After: 1` and nothing of it runs
+  (or is saved later). Background saves (renewed credentials and tokens, agent cards, directory sync, a
+  change another node made) wait the same way; no save ever sleeps for the lock. A save that finds the lock
+  taken without having waited for it (a credential renewed in the middle of a tool call, say) fails at
+  once (503 for a request; a background save logs it and runs again when next due). When another worker saved since, its own change is reapplied to the file as it is now
   (a three-way merge: objects key by key, lists by id or name). Two changes that cannot both hold (the
   same value set differently, an element changed on one worker and deleted on another, two new elements
   with one name) answer 409, and the worker takes the file's config, so a retry starts from it. Nodes
-  that share the file on a volume take the same lock.
+  that share the file on a volume take the same lock (see "File locks on a shared volume" below). A
+  change computed before network I/O is reapplied the same way to what other requests of the worker saved
+  meanwhile.
+
+### File locks on a shared volume
+
+The locks (the config file, the session files, the MCP OAuth state, webhooks, the MCP library and the
+catalog) are flock(2) on `<file>.flock`. What that means where the file lives:
+
+- Local disk, one node: the kernel holds the lock and gives it back the moment its holder exits or is
+  killed (SIGKILL and the OOM killer included). Nothing is ever taken over or deleted.
+- NFS (v4, and v3 with the NLM lock manager running; Linux 2.6.12 and later): the client turns flock into a
+  whole-file POSIX lock held by the server, so it serializes the nodes that mount the export. A node that
+  crashes or is cut off keeps its locks until the server's lease (NFSv4, 90 s by default) or the NLM grace
+  period expires: the other nodes' changes wait for it and answer 503 after 15 seconds until then. Mounts
+  with `nolock` or `local_lock=flock`/`all` keep the lock on the client only: nodes do not see each other's
+  lock, so do not share the config file across nodes on such a mount.
+- Amazon EFS: NFSv4.1 with server-held advisory locks, so the same as NFS: a task that dies holding the
+  lock (it holds it for milliseconds per save) blocks the other tasks' changes until its lease expires (on
+  the order of a minute; changes answer 503 meanwhile and can be retried). The ECS module mounts EFS with
+  the defaults, which keep locks on the server. Only real infrastructure can confirm these timings: they
+  were checked here on local disk only.
+- A file system without flock (some FUSE mounts): the lock guards nothing, and Raiju logs once that writes
+  to that file are not guarded against other processes. Run one writer there.
+
+Upgrade bridge (wave 27 only): the wave 25 release locked with a directory, `<file>.lock`, made with mkdir
+and taken over once 10 seconds old; wave 26 moved to flock, and the two did not see each other's lock, so a
+rolling update from wave 25 to 26 on one volume could lose saves. From wave 27 a lock holder also makes that
+directory (with a marker file inside) and removes it before it gives the flock back, and waits, without
+pausing its worker, while a wave 25 process holds it. A directory left by a killed wave 27 holder (it has the
+marker) is taken over by the next flock holder at once; an empty one (a wave 25 process's) once it is 10
+seconds old, as wave 25 itself does. So a wave 27 process excludes both wave 25 and wave 26 processes (wave
+25 and wave 26 still do not exclude each other: never run those two on one volume).
+The bridge can be dropped in the release after wave 27: once every node runs wave 26 or later, nothing takes
+the mkdir lock. An upgrade from wave 25 straight to a release without the bridge must stop the old
+processes first (deploy/README.md, "Upgrading on a shared volume").
 
 ### Nodes of a cluster
 

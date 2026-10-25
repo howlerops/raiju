@@ -107,6 +107,19 @@ function reportConfig(file: string): void {
   }
 }
 
+// A background save (a token or credential renewed, a change another node made): the config file's lock is waited for
+// without pausing the worker, then save runs and the lock is given back. A save never sleeps for the lock.
+async function lockedSave(store: ConfigStore, what: string, save: () => void): Promise<void> {
+  const held = await store.holdLock()
+  if (!held.ok) {
+    store.releaseLock(held)
+    console.error(`raiju: ${what} could not be saved: another process kept the config file's lock`)
+    return
+  }
+  save()
+  store.releaseLock(held)
+}
+
 // A saved config (or one another worker or node saved, store.tov takeGeneration): env and secret references resolved,
 // the log folders read from the app dir, then swapped in.
 async function applyChange(engine: Engine, ops: Ops, store: ConfigStore, c: Config, appDir: string): Promise<void> {
@@ -266,13 +279,13 @@ async function main(): Promise<int> {
   if (storage.length > 0) return 1
   // refreshed per-user OAuth tokens are saved to the config file
   engine.userTokenSaved = (r) => {
-    saveUserToken(store, r)
+    lockedSave(store, "an MCP token", () => saveUserToken(store, r))
   }
   // a tool call of a per_user_headers client whose key has submitted nothing opens a submission and names its page
   engine.headersAuth = (client: string, vk: string, session: string, user: string, base: string): string => headersAuthMessage(store, client, vk, session, user, base)
   // token_exchange admin credentials: renewed before they expire and after a 401, and saved to the config file
   engine.adminSaved = (r) => {
-    saveExchangeAdmin(store, r)
+    lockedSave(store, "an MCP admin credential", () => saveExchangeAdmin(store, r))
   }
   // token_exchange admin credentials. Each is renewed by one node of the cluster (Ops.ownsAdmin) and by one worker of
   // that node at a time (the lease in the supervisor's share folder, shared by its workers). The renewed credential is
@@ -353,7 +366,7 @@ async function main(): Promise<int> {
   })
   clusterState().onChange("mcp.exchange_admin", (client: string, value: string | undefined) => {
     if (value === undefined) {
-      dropExchangeAdmin(store, client)
+      lockedSave(store, "a removed MCP admin credential", () => dropExchangeAdmin(store, client))
       return
     }
     const row = openAdminRow(sealKey, value)
@@ -391,17 +404,20 @@ async function main(): Promise<int> {
         return
       }
     }
-    try {
-      const disk = diskConfig(configPath, sealKey)
-      const next = share.applied(disk ?? store.cfg, name, json)
-      // the file holds it already (a worker of this node saved it, or the nodes share the file): the config
-      // generation of that save makes this process reread it (ops.takeConfigGen), so it is not applied twice
-      if (next === undefined) return
-      const err = saveShared(store, next)
-      if (err !== "") console.error(`raiju: mcp ${name}: a client config from another node could not be saved: ${err}`)
-    } catch (e) {
-      console.error(`raiju: mcp ${name}: a client config from another node was refused: ${e.message}`)
-    }
+    const got = json
+    lockedSave(store, `the MCP client ${name} from another node`, () => {
+      try {
+        const disk = diskConfig(configPath, sealKey)
+        const next = share.applied(disk ?? store.cfg, name, got)
+        // the file holds it already (a worker of this node saved it, or the nodes share the file): the config
+        // generation of that save makes this process reread it (ops.takeConfigGen), so it is not applied twice
+        if (next === undefined) return
+        const err = saveShared(store, next)
+        if (err !== "") console.error(`raiju: mcp ${name}: a client config from another node could not be saved: ${err}`)
+      } catch (e) {
+        console.error(`raiju: mcp ${name}: a client config from another node was refused: ${e.message}`)
+      }
+    })
   })
   const mcp = engine.mcp
   if (mcp !== undefined) {

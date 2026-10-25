@@ -130,6 +130,15 @@ class EcsTest(unittest.TestCase):
         self.assertIn("var.desired_count <= 1 || var.cluster_enabled", self.main)
         self.assertIn("RAIJU_CLUSTER_SECRET", self.main)
 
+    def test_deployment_overlap_is_configurable(self):
+        # old and new tasks on one EFS overlap by default (safe while both lock config.json the same way); an upgrade
+        # across lock protocols sets 0/100 so the old tasks stop first (docs/operations.md)
+        self.assertIn("deployment_minimum_healthy_percent = var.deployment_minimum_healthy_percent", self.main)
+        self.assertIn("deployment_maximum_percent         = var.deployment_maximum_percent", self.main)
+        lo = re.search(r'variable "deployment_minimum_healthy_percent" \{.*?default\s*=\s*(\d+)', self.vars, re.S)
+        hi = re.search(r'variable "deployment_maximum_percent" \{.*?default\s*=\s*(\d+)', self.vars, re.S)
+        self.assertEqual((lo.group(1), hi.group(1)), ("100", "200"))
+
     @unittest.skipUnless(os.environ.get("TERRAFORM"), "set TERRAFORM to a terraform binary to run the module's terraform test")
     def test_terraform_test(self):
         tf = os.environ["TERRAFORM"]

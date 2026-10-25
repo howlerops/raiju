@@ -236,7 +236,7 @@ Useful values (see `values.yaml`):
 | `preStopSleepSeconds`, `terminationGracePeriodSeconds` | 5 and 40 (see Stopping). |
 | `probes` | Liveness (`/health`) and readiness (`/ready`) timings. |
 | `replicaCount` | Pods. Ignored when `autoscaling.enabled`. More than one needs shareable storage (below). |
-| `strategy` | Empty: `Recreate` with a ReadWriteOnce claim, `RollingUpdate` otherwise. |
+| `strategy` | Empty: `Recreate` with a ReadWriteOnce claim, `RollingUpdate` otherwise. A rolling update on a ReadWriteMany volume runs two versions on one `config.json`; see "Upgrading on a shared volume" below. |
 | `peers.headlessService` | A headless Service, `<release>-peers`, for cluster discovery by DNS (always rendered with a cluster listener). |
 | `cluster.secret.existingSecret`, `cluster.secret.key` | The Secret holding `cluster.secret` (at least 32 bytes), injected as `RAIJU_CLUSTER_SECRET`; `config.cluster.secret` defaults to `env.RAIJU_CLUSTER_SECRET`. Required with `config.cluster.enabled`, and the chart refuses a secret written into the config. |
 | `cluster.listenPort` | The cluster listener (`config.cluster.listen_port`, 7946): the peer routes are served there and refused on the main port; the peers Service targets it. `0` keeps them on the main port. |
@@ -287,6 +287,15 @@ worker before the API answers. Two layouts work:
   like) with `config_sync: "file"`: every pod rereads the same `config.json` when another saves it. The
   pods then also share `logs/` and the MCP OAuth state, so turn the log store off or give it a per-pod
   folder.
+
+Upgrading on a shared volume: a rolling update (the chart's default with ReadWriteMany, and the ECS
+module's default with EFS) runs old and new pods on one `config.json` for a while. Their saves are merged
+under a file lock, so none is lost, as long as both versions take the same lock: any two releases from
+wave 26 on (flock on `config.json.flock`), and from wave 27 on also the wave 25 release (wave 27 takes its
+`config.json.lock` directory too). Upgrade a release before wave 25 (no lock), or wave 25 straight to a
+release after wave 27, with `strategy: {type: Recreate}` (ECS: `deployment_minimum_healthy_percent = 0`,
+`deployment_maximum_percent = 100`) for that one upgrade. docs/operations.md has the details and what flock
+means on NFS and EFS.
 
 Each pod's log and audit folders are on its own data volume (`/app/data/logs`, `/app/data/logs/audit`):
 `/api/logs` answers from the pod that is asked. An enabled store that cannot open its folder stops the

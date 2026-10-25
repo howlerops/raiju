@@ -97,6 +97,28 @@ variable "desired_count" {
   default     = 1
 }
 
+variable "deployment_minimum_healthy_percent" {
+  description = "Lower limit of running tasks during a deployment, as a percentage of desired_count. The default (100, with deployment_maximum_percent 200) starts the new tasks before the old ones stop: with EFS, old and new versions then write one config.json at once. That is safe between releases that lock it the same way, and from wave 27 on with the wave 25 release too (flock plus its mkdir lock, docs/operations.md). For an upgrade from a release before wave 25 (no config lock), or from wave 25 straight to a release after wave 27, set 0 (and deployment_maximum_percent 100) for that deployment: the old tasks stop first."
+  type        = number
+  default     = 100
+
+  validation {
+    condition     = var.deployment_minimum_healthy_percent >= 0 && var.deployment_minimum_healthy_percent <= 100
+    error_message = "deployment_minimum_healthy_percent is between 0 and 100."
+  }
+}
+
+variable "deployment_maximum_percent" {
+  description = "Upper limit of running tasks during a deployment, as a percentage of desired_count (see deployment_minimum_healthy_percent). 100 with a minimum of 0 never runs old and new tasks together."
+  type        = number
+  default     = 200
+
+  validation {
+    condition     = var.deployment_maximum_percent >= 100 && var.deployment_maximum_percent <= 200
+    error_message = "deployment_maximum_percent is between 100 and 200."
+  }
+}
+
 variable "cluster_enabled" {
   description = "Run the tasks as one Raiju cluster: a Cloud Map DNS name lists the tasks for discovery, the tasks may reach each other on port, and RAIJU_CLUSTER_SECRET is injected from cluster_secret_arn. Needs efs_file_system_id; config.json on it must hold the cluster block (see deploy/terraform/README.md)."
   type        = bool

@@ -1,6 +1,6 @@
 // HTTP routes: the OpenAI-shaped /v1 API, drop-in SDK routes, models,
 // metrics, health and a read-only management API.
-import { Config, VirtualKeyConfig, OAuthKeyConfig, ProviderConfig, KeyConfig, providerOf, providerNames, resolveEnv } from "./config"
+import { Config, VirtualKeyConfig, OAuthKeyConfig, ProviderConfig, KeyConfig, WebhookEndpoint, AgentConfig, providerOf, providerNames, resolveEnv } from "./config"
 import { utf8 } from "./crypto"
 import { Engine, LiveHead, StreamSink, errorResponse, headSink, noHeaders } from "./gateway"
 import { anthropicMessages, anthropicLegacy, cursorChat, genai, genaiSdk, bedrockModel, responsesApi, cohereChat, cohereEmbed, cohereRerank, cohereTokenize } from "./native"
@@ -51,7 +51,7 @@ import { notifyRoute } from "./notify"
 import { alertingRoute } from "./alertapi"
 import { crewsRoute } from "./crew"
 import { McpSession } from "./mcp"
-import { Ops, Reply, UiSocket } from "./ops"
+import { Ops, Reply, UiSocket, lockBusyReply } from "./ops"
 import { parseCursor } from "./feed"
 import { cookieValue, SETUP_COOKIE, setupPublic } from "./setupsession"
 import { rerank, bedrockRerank, countTokens, responsesInputTokens, asyncSubmit, asyncGet, sdkAsyncSubmit, sdkAsyncPoll, decisionRoute, openaiDecisionPath, Dispatch } from "./extras"
@@ -719,8 +719,14 @@ async function scimRoute(ops: Ops, req: Request, path: string): Promise<Response
   const token = resolveEnv(sc?.config?.provisioningToken ?? "")
   if (!scimAuthorized(req.headers.get("authorization") ?? "", token)) return scimReply(401, errorBody(401, "", "the SCIM provisioning token is missing or wrong"))
   const body = req.method === "GET" ? "" : await req.text()
-  // a change waits for the config file's lock without pausing the worker (see manage)
+  // a change waits for the config file's lock without pausing the worker and holds it only while scimChange runs (it
+  // awaits nothing); when another process keeps it the change answers 503 and nothing of it runs (see manage)
   const held = req.method === "GET" ? undefined : await ops.store.holdLock()
+  if (held !== undefined && !held.ok) {
+    ops.store.releaseLock(held)
+    ops.recordChange("scim", req, path, 503, body)
+    return scimReply(503, errorBody(503, "", "another process kept the configuration file's lock too long; nothing was changed, retry"))
+  }
   const res = scimChange(ops, req, path, body)
   if (held !== undefined) ops.store.releaseLock(held)
   return res
@@ -780,6 +786,12 @@ function scimChange(ops: Ops, req: Request, path: string, body: string): Respons
 }
 
 // The management API, behind RBAC; every change lands in the audit log.
+//
+// The config file's lock (filelock.tov, shared by the node's workers and by nodes on one volume) is held only around
+// the part of a change that reads the config, changes it and saves it, with nothing awaited in between: a route that
+// reaches the network (a provider's model list, a datasheet, an MCP server or its authorization server, an agent card,
+// a plugin download) does that first, without the lock. The lock is waited for without pausing the worker; when another
+// process keeps it past LOCK_WAIT_MS the change answers 503 and nothing of it runs.
 async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   // an expired single sign-on session is refreshed with the identity provider first (Bifrost's silent refresh)
   await ops.refreshDue(req)
@@ -789,172 +801,245 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   const sc = ops.scopeOfActorFor(gate.actor, resourceOf(req.method, path).resource)
   // DELETE reads its body too: DELETE /api/mcp-logs names its ids there
   const body = req.method === "GET" ? "" : await req.text()
-  // a change waits here for the config file's lock while the worker serves other requests, and holds it while the route
-  // runs: the saves it makes take it again at once (filelock.tov). When another process keeps it past LOCK_WAIT_MS the
-  // route still runs, and a save it makes fails after a short wait.
-  const held = req.method === "GET" ? undefined : await ops.store.holdLock()
   // a change saved by this request is answered once the node's other workers run it (ops.settleConfig)
   const genBefore = ops.store.fileSha
   // the equal-split projects this write may redivide (ops.withRedivision)
   const redivBefore = ops.redivisionBefore(req.method, path)
+  const run = syncRoute(ops, req, path, body, gate.actor, sc)
   let r: Reply = { status: 404, body: "", contentType: "application/json" }
-  if (path === "/api/users/me/permissions") r = req.method === "GET" ? ops.mePermissions(gate.actor) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
-  else if (path === "/api/governance/users/me/permissions") r = req.method === "GET" ? ops.mePermissionMap(gate.actor) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
-  // a user by email address (Bifrost's MDM lookups), on the old and the governance path
-  else if (path.startsWith("/api/users/email/") || path.startsWith("/api/governance/users/email/")) r = ops.userByEmailRoute(req.method, path)
-  else if (usersPath(path) === "/api/users/me/vk-creation-policy") r = req.method === "GET" ? ops.vkCreationPolicy(gate.actor) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
-  else if (usersPath(path).startsWith("/api/users/") && usersPath(path).split("/")[4] === "access-profiles") r = ops.userProfiles(req.method, usersPath(path), body)
-  else if (usersPath(path) === "/api/users" || usersPath(path).startsWith("/api/users/")) r = ops.users(req.method, usersPath(path), body, req.headers.get("x-bifrost-setup-token") ?? "", cookieValue(req.headers.get("cookie") ?? "", SETUP_COOKIE))
-  else if (auditTarget(path) !== "") r = ops.auditRoute(req, auditTarget(path))
-  // user provisioning: directory sync, bulk import and its preview, reconcile and its previews, the jobs
-  else if (path === "/api/scim/provision" || path.startsWith("/api/scim/provision/")) r = await ops.provisionRoute(req.method, path, body)
-  else if (path === "/api/api-keys" || path.startsWith("/api/api-keys/")) r = ops.apiKeysRoute(req.method, path, req.url, body, gate.actor)
-  // the cache clears (DELETE) and the read-only plugin listings
-  else if (path.startsWith("/api/cache/")) r = await ops.cacheClear(req.method, path)
-  else if (path === "/api/plugins" || path.startsWith("/api/plugins/")) r = await ops.pluginsRouteAsync(req.method, path, body)
-  else if (path === "/api/mcp/virtual") r = req.method === "GET" ? ops.virtualView() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
-  // one project member's usage: its slices with their counters and its requests by provider and model
-  else if (req.method === "GET" && path.startsWith("/api/governance/projects/") && path.endsWith("/usage") && path.split("/").length === 8 && path.split("/")[5] === "members") r = ops.memberUsage(path, sc)
-  // the access-profile audit lists (Bifrost serves them on both paths)
-  else if (req.method === "GET" && (path.startsWith("/api/governance/access-profiles/") || path.startsWith("/api/access-profiles/")) && path.endsWith("/audit-logs") && path.split("/").length <= 6) r = ops.profileAudit(req, path)
-  else if (path === "/api/governance/access-profiles" || path.startsWith("/api/governance/access-profiles/")) r = ops.profiles(req.method, path, body)
-  else if (path.startsWith("/api/alerting/")) {
-    const ar = alertingRoute(ops.store.cfg.alerts ?? {}, { usage: (t, id) => ops.engine.gov.scopeUsage(t, id, Date.now()), history: () => ops.cel?.history() ?? [] }, req.method, req.url.slice(req.url.indexOf("/api/")), body)
-    const next = ar.next
-    r = { status: ar.status, body: ar.body, contentType: "application/json" }
-    if (next !== undefined) {
-      const saved = ops.store.setAlerts(next)
-      if (saved.kind !== "ok") r = { status: saved.status, body: JSON.stringify({ error: { message: saved.message, type: "api_error" } }), contentType: "application/json" }
-    }
-  }
-  // the MCP grants of the authorization server: the live grants (GET) and the revoke of one (DELETE)
-  else if (path === "/api/oauth2/sessions" || path.startsWith("/api/oauth2/sessions/")) {
-    const gu = URL.parse(req.url)
-    const gq = gu === undefined ? new URLSearchParams("") : gu.searchParams
-    const vkName = (vk: string): string => keyById(ops.engine.cfg, vk)?.name ?? ""
-    const ga = path === "/api/oauth2/sessions" && req.method === "GET" ? grantsList(gq, vkName) : path !== "/api/oauth2/sessions" && req.method === "DELETE" ? grantRevoke(path.slice("/api/oauth2/sessions/".byteLength)) : undefined
-    if (ga !== undefined) r = { status: ga.status, body: ga.body, contentType: ga.contentType }
-    else r = { status: 405, body: `{"error":{"message":"method ${req.method} is not allowed on this route","type":"invalid_request_error"}}`, contentType: "application/json" }
-  }
-  // crew routing (crew.tov): the pools with their classes and crews, the assign route and a task's detail
-  else if (path === "/api/crews" || path.startsWith("/api/crews/")) {
-    const cr = crewsRoute(req.method, req.url.slice(req.url.indexOf("/api/")), body, ops.engine.logStore, ops.engine.pricing, Date.now())
-    r = { status: cr.status, body: cr.body, contentType: "application/json" }
-  }
-  else if (path === "/api/alerts") r = req.method === "GET" ? ops.alertsView() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
-  else if (path === "/api/models/base" || path === "/api/models/details") r = ops.catalogView(req, path)
-  else if (path === "/api/circuit-breaker/state") r = req.method === "GET" ? ops.circuitView() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
-  // the request-log analytics and the MCP logs (ops.logsRoute)
-  else if (logsAnalyticsPath(path)) r = await ops.logsRouteAll(req, path, body, sc, req.method === "GET" && ops.mayReveal(gate.actor))
-  else if (path === "/api/circuit-breaker/policies" || path.startsWith("/api/circuit-breaker/policies/")) r = ops.circuitPoliciesRoute(req.method, path, body)
-  else if (path === "/api/circuit-breaker/reset") r = req.method === "POST" ? ops.circuitReset(body) : { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
-  // adaptive load balancing: the keys held out of rotation, their incidents, and releasing them
-  else if (path === "/api/adaptive-routing/held-keys") r = req.method === "GET" ? ops.adaptiveHeldKeys() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
-  else if (path === "/api/adaptive-routing/incidents") r = req.method === "GET" ? ops.adaptiveIncidents() : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
-  else if (path === "/api/adaptive-routing/history/issues") r = req.method === "GET" ? ops.adaptiveHistory(req) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
-  else if (path === "/api/adaptive-routing/conditions/clear") r = req.method === "POST" ? ops.adaptiveRelease(body) : { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
-  else if (path === "/api/vault/flush-cache") r = req.method === "POST" ? ops.vaultFlush() : { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
-  else if (path === "/api/models/parameters") r = req.method === "GET" ? await ops.modelParameters(req) : { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
-  else if (path === "/api/models/catalog") r = await ops.catalogUpsertRoute(req, body)
-  // changing the global proxy's URL, or turning skip_tls_verify on, needs a real admin session
-  else if (path === "/api/proxy-config" && req.method === "PUT" && !ops.authOn && proxyWidening(ops.store.cfg.proxy_config, body).length > 0) {
-    r = { status: 403, body: `{"error":{"message":"Changing the global proxy (url or skip_tls_verify) requires an authenticated admin session; dashboard auth is currently disabled or unconfigured. Enable dashboard authentication first.","type":"permission_error"}}`, contentType: "application/json" }
-  }
-  else if (path.startsWith("/api/providers/") && path.endsWith("/refresh-models")) {
-    // /api/providers/{p}/refresh-models or /api/providers/{p}/keys/{id}/refresh-models
-    const parts = path.split("/")
-    const isKey = parts.length === 7 && parts[4] === "keys"
-    if (req.method !== "POST") r = { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
-    else if (!(parts.length === 5 || isKey)) r = { status: 404, body: `{"error":{"message":"no such route","type":"invalid_request_error"}}`, contentType: "application/json" }
-    else r = await refreshModels(undefined, ops.store.cfg, parts[3] ?? "", isKey ? parts[5] : undefined)
-  }
-  // the MCP server library (ops.libraryRoute, src/mcplibrary.tov)
-  else if (path === "/api/mcp/library" || path.startsWith("/api/mcp/library/")) r = await ops.libraryRoute(req, path, body)
-  else if (path === "/api/pricing/force-sync") {
-    if (req.method === "POST") r = await ops.forcePricing()
-    else r = { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
-  }
-  // prompt repository, webhooks, feature flags and notifications (their modules hold the logic)
-  else if (path.startsWith("/api/prompt-repo/")) {
-    const pr = promptRoute(ops.store.cfg.prompt_repo, req.method, req.url.slice(req.url.indexOf("/api/")), body)
-    r = savedReply(pr.status, pr.body, pr.next === undefined ? undefined : ops.store.setPromptRepo(pr.next))
-  }
-  else if (path === "/api/webhooks" || path.startsWith("/api/webhooks/")) {
-    const wr = await webhookApi(ops.store.cfg.webhooks, req.method, req.url.slice(req.url.indexOf("/api/")), body)
-    r = savedReply(wr.status, wr.body, wr.next === undefined ? undefined : ops.store.setWebhooks(wr.next))
-  }
-  // registered A2A agents (agents.tov); the call history is ops.tov's
-  else if (path === "/api/agents" || path.startsWith("/api/agents/")) {
-    if (path === "/api/agents/push-configs" || path.startsWith("/api/agents/push-configs/")) {
-      const pu = URL.parse(req.url)
-      r = ops.pushConfigsRoute(req.method, path, pu === undefined ? new URLSearchParams("") : pu.searchParams)
-    } else if (path === "/api/agents/history" || path.startsWith("/api/agents/history/")) {
-      const hu = URL.parse(req.url)
-      r = ops.agentHistoryRoute(req.method, path, hu === undefined ? new URLSearchParams("") : hu.searchParams, body, sc)
-    } else {
-      const ar = await agentApi(ops.store.cfg.agents, req.method, req.url.slice(req.url.indexOf("/api/")), body, publicBase(ops.store.cfg.client?.a2a_external_client_url, req.url))
-      const saved = ar.next === undefined ? undefined : ops.store.setAgents(ar.next)
-      // a card fetched here reaches the other workers before this answer (ops.publishCards)
-      if (saved !== undefined && saved.kind === "ok") ops.publishCards()
-      r = savedReply(ar.status, ar.body, saved)
-    }
-  }
-  else if (path === "/api/feature-flags" || path.startsWith("/api/feature-flags/")) {
-    const fr = flagRoute(ops.store.cfg.feature_flags, req.method, req.url.slice(req.url.indexOf("/api/")), body)
-    r = savedReply(fr.status, fr.body, fr.next === undefined ? undefined : ops.store.setFeatureFlags(fr.next))
-  }
-  else if (path === "/api/notifications") {
-    const nr = notifyRoute(req.method, req.url.slice(req.url.indexOf("/api/")), body)
-    r = { status: nr.status, body: nr.body, contentType: "application/json" }
-  }
-  else {
-    // the OAuth routes of auth type oauth clients need the gateway's origin (the callback's redirect URI)
-    const mu = URL.parse(req.url)
-    // the status route reads ?flow_id=
-    let oa: McpReply | undefined = oauthConfigRoute(ops.store, req.method, mu === undefined ? path : path + mu.search)
-    if (oa === undefined) oa = await oauthRoute(ops.store, req.method, path, body, mu === undefined ? "" : mu.origin)
-    // a user-mode flow opens for the identity-provider user of the caller's single sign-on session only
-    const ssoUser = gate.actor.startsWith("sso:") ? gate.actor.slice(4) : ""
-    if (oa === undefined) oa = perUserApi(ops.store, req.method, mu === undefined ? path : path + mu.search, body, mu === undefined ? "" : mu.origin, ssoUser)
-    if (oa === undefined) oa = await headersRouteAsync(ops.store, req.method, path, body, ssoUser)
-    if (oa === undefined) oa = await exchangeRouteAsync(ops.store, ops.engine.idp, req.method, path, body)
-    if (oa === undefined) oa = await openapiRoute(req.method, path, body, !ops.authOn)
-    // an openapi client sent with a spec_url keeps the document it names (fetched now, as Bifrost stores it)
-    let mbody = body
-    if (oa === undefined) {
-      const il = await inlineSpecUrl(req.method, path, body, !ops.authOn)
-      if (il.error !== undefined) oa = il.error
-      mbody = il.body
-    }
-    // with dashboard auth off, clients registered here must reach public addresses only
-    const mr = oa ?? mcpApi(ops.store, req.method, path, mbody, !ops.authOn, sc)
-    if (mr !== undefined) {
-      r = { status: mr.status, body: mr.body, contentType: mr.contentType ?? "application/json" }
-      if (mr.status === 200 && mr.action !== undefined) r = await mcpAction(ops, mr.action, mr.id ?? "", r)
-    } else {
-      // the query (search, paging, is_active) reaches the handlers that read it
-      const qu = URL.parse(req.url)
-      // a provider's base_url, with its host resolved now (Bifrost's ValidateExternalURL)
-      const bu = await providerBaseUrlProblem(req.method, path, body)
-      const a = bu !== "" ? { status: 400, body: JSON.stringify({ error: { message: bu } }) } : handleApi(ops.store, req.method, qu === undefined ? path : path + qu.search, body, sc)
-      r = { status: a.status, body: a.body, contentType: "application/json" }
-      // a rotated key's MCP OAuth grants go with its old value (Bifrost revokes them in the rotation)
-      if (a.status === 200 && isRotatePath(path)) {
-        for (const id of rotatedKeyIds(a.body)) revokeSubject("vk", id)
-      }
-    }
-  }
-  r = ops.withRedivision(req.method, path, r, redivBefore)
+  if (run !== undefined) r = await ops.underLock(req.method, () => ops.withRedivision(req.method, path, run(), redivBefore))
+  else r = await ioRoute(ops, req, path, body, gate.actor, sc, redivBefore)
   ops.recordChange(gate.actor, req, path, r.status, body)
   if (req.method !== "GET" && r.status < 300) ops.storeUpdated(path)
-  if (held !== undefined) ops.store.releaseLock(held)
   if (ops.store.fileSha !== genBefore) await ops.settleConfig()
   const h: Record<string, string> = new Map()
   h.set("content-type", r.contentType)
   // a log detail that reveals a logs_only mapping is not cached (Bifrost marks the reveal response no-store)
   if (req.method === "GET" && r.status === 200 && (path.startsWith("/api/logs/") || path.startsWith("/api/mcp-logs/")) && r.body.includes(`"redaction_mapping":`)) h.set("cache-control", "no-store")
+  // a 503 for the lock: a retry may pass
+  if (r.status === 503) h.set("retry-after", "1")
   // a 204 has no body (a response with one would be refused)
   return new Response(r.status === 204 ? undefined : r.body, { status: r.status, headers: h })
+}
+
+// The management routes that answer without awaiting anything: the handler they return runs under the config file's
+// lock for a change (manage). undefined for the routes ioRoute answers.
+function syncRoute(ops: Ops, req: Request, path: string, body: string, actor: string, sc: DataScope): (() => Reply) | undefined {
+  if (path === "/api/users/me/permissions") return () => req.method === "GET" ? ops.mePermissions(actor) : NOT_GET
+  if (path === "/api/governance/users/me/permissions") return () => req.method === "GET" ? ops.mePermissionMap(actor) : NOT_GET
+  // a user by email address (Bifrost's MDM lookups), on the old and the governance path
+  if (path.startsWith("/api/users/email/") || path.startsWith("/api/governance/users/email/")) return () => ops.userByEmailRoute(req.method, path)
+  if (usersPath(path) === "/api/users/me/vk-creation-policy") return () => req.method === "GET" ? ops.vkCreationPolicy(actor) : NOT_GET
+  if (usersPath(path).startsWith("/api/users/") && usersPath(path).split("/")[4] === "access-profiles") return () => ops.userProfiles(req.method, usersPath(path), body)
+  if (usersPath(path) === "/api/users" || usersPath(path).startsWith("/api/users/")) return () => ops.users(req.method, usersPath(path), body, req.headers.get("x-bifrost-setup-token") ?? "", cookieValue(req.headers.get("cookie") ?? "", SETUP_COOKIE))
+  if (auditTarget(path) !== "") return () => ops.auditRoute(req, auditTarget(path))
+  if (path === "/api/api-keys" || path.startsWith("/api/api-keys/")) return () => ops.apiKeysRoute(req.method, path, req.url, body, actor)
+  if (path === "/api/mcp/virtual") return () => req.method === "GET" ? ops.virtualView() : NOT_GET
+  // one project member's usage: its slices with their counters and its requests by provider and model
+  if (req.method === "GET" && path.startsWith("/api/governance/projects/") && path.endsWith("/usage") && path.split("/").length === 8 && path.split("/")[5] === "members") return () => ops.memberUsage(path, sc)
+  // the access-profile audit lists (Bifrost serves them on both paths)
+  if (req.method === "GET" && (path.startsWith("/api/governance/access-profiles/") || path.startsWith("/api/access-profiles/")) && path.endsWith("/audit-logs") && path.split("/").length <= 6) return () => ops.profileAudit(req, path)
+  if (path === "/api/governance/access-profiles" || path.startsWith("/api/governance/access-profiles/")) return () => ops.profiles(req.method, path, body)
+  if (path.startsWith("/api/alerting/")) {
+    return () => {
+      const ar = alertingRoute(ops.store.cfg.alerts ?? {}, { usage: (t, id) => ops.engine.gov.scopeUsage(t, id, Date.now()), history: () => ops.cel?.history() ?? [] }, req.method, req.url.slice(req.url.indexOf("/api/")), body)
+      const next = ar.next
+      if (next !== undefined) {
+        const saved = ops.store.setAlerts(next)
+        if (saved.kind !== "ok") return { status: saved.status, body: JSON.stringify({ error: { message: saved.message, type: "api_error" } }), contentType: "application/json" }
+      }
+      return { status: ar.status, body: ar.body, contentType: "application/json" }
+    }
+  }
+  // the MCP grants of the authorization server: the live grants (GET) and the revoke of one (DELETE)
+  if (path === "/api/oauth2/sessions" || path.startsWith("/api/oauth2/sessions/")) {
+    return () => {
+      const gu = URL.parse(req.url)
+      const gq = gu === undefined ? new URLSearchParams("") : gu.searchParams
+      const vkName = (vk: string): string => keyById(ops.engine.cfg, vk)?.name ?? ""
+      const ga = path === "/api/oauth2/sessions" && req.method === "GET" ? grantsList(gq, vkName) : path !== "/api/oauth2/sessions" && req.method === "DELETE" ? grantRevoke(path.slice("/api/oauth2/sessions/".byteLength)) : undefined
+      if (ga !== undefined) return { status: ga.status, body: ga.body, contentType: ga.contentType }
+      return { status: 405, body: `{"error":{"message":"method ${req.method} is not allowed on this route","type":"invalid_request_error"}}`, contentType: "application/json" }
+    }
+  }
+  // crew routing (crew.tov): the pools with their classes and crews, the assign route and a task's detail
+  if (path === "/api/crews" || path.startsWith("/api/crews/")) {
+    return () => {
+      const cr = crewsRoute(req.method, req.url.slice(req.url.indexOf("/api/")), body, ops.engine.logStore, ops.engine.pricing, Date.now())
+      return { status: cr.status, body: cr.body, contentType: "application/json" }
+    }
+  }
+  if (path === "/api/alerts") return () => req.method === "GET" ? ops.alertsView() : NOT_GET
+  if (path === "/api/models/base" || path === "/api/models/details") return () => ops.catalogView(req, path)
+  if (path === "/api/circuit-breaker/state") return () => req.method === "GET" ? ops.circuitView() : NOT_GET
+  if (path === "/api/circuit-breaker/policies" || path.startsWith("/api/circuit-breaker/policies/")) return () => ops.circuitPoliciesRoute(req.method, path, body)
+  if (path === "/api/circuit-breaker/reset") return () => req.method === "POST" ? ops.circuitReset(body) : NOT_POST
+  // adaptive load balancing: the keys held out of rotation, their incidents, and releasing them
+  if (path === "/api/adaptive-routing/held-keys") return () => req.method === "GET" ? ops.adaptiveHeldKeys() : NOT_GET
+  if (path === "/api/adaptive-routing/incidents") return () => req.method === "GET" ? ops.adaptiveIncidents() : NOT_GET
+  if (path === "/api/adaptive-routing/history/issues") return () => req.method === "GET" ? ops.adaptiveHistory(req) : NOT_GET
+  if (path === "/api/adaptive-routing/conditions/clear") return () => req.method === "POST" ? ops.adaptiveRelease(body) : NOT_POST
+  if (path === "/api/vault/flush-cache") return () => req.method === "POST" ? ops.vaultFlush() : NOT_POST
+  // changing the global proxy's URL, or turning skip_tls_verify on, needs a real admin session
+  if (path === "/api/proxy-config" && req.method === "PUT" && !ops.authOn && proxyWidening(ops.store.cfg.proxy_config, body).length > 0) {
+    return () => ({ status: 403, body: `{"error":{"message":"Changing the global proxy (url or skip_tls_verify) requires an authenticated admin session; dashboard auth is currently disabled or unconfigured. Enable dashboard authentication first.","type":"permission_error"}}`, contentType: "application/json" })
+  }
+  // prompt repository, feature flags and notifications (their modules hold the logic)
+  if (path.startsWith("/api/prompt-repo/")) {
+    return () => {
+      const pr = promptRoute(ops.store.cfg.prompt_repo, req.method, req.url.slice(req.url.indexOf("/api/")), body)
+      return savedReply(pr.status, pr.body, pr.next === undefined ? undefined : ops.store.setPromptRepo(pr.next))
+    }
+  }
+  if (path === "/api/feature-flags" || path.startsWith("/api/feature-flags/")) {
+    return () => {
+      const fr = flagRoute(ops.store.cfg.feature_flags, req.method, req.url.slice(req.url.indexOf("/api/")), body)
+      return savedReply(fr.status, fr.body, fr.next === undefined ? undefined : ops.store.setFeatureFlags(fr.next))
+    }
+  }
+  if (path === "/api/notifications") {
+    return () => {
+      const nr = notifyRoute(req.method, req.url.slice(req.url.indexOf("/api/")), body)
+      return { status: nr.status, body: nr.body, contentType: "application/json" }
+    }
+  }
+  return undefined
+}
+
+const NOT_GET: Reply = { status: 405, body: `{"error":{"message":"use GET","type":"invalid_request_error"}}`, contentType: "application/json" }
+const NOT_POST: Reply = { status: 405, body: `{"error":{"message":"use POST","type":"invalid_request_error"}}`, contentType: "application/json" }
+
+// The management routes that await something (the network, another file's lock): each takes the config file's lock
+// itself, only around its change and save, after its I/O (ops.underLock, persistAfter in mcpapi.tov).
+async function ioRoute(ops: Ops, req: Request, path: string, body: string, actor: string, sc: DataScope, redivBefore: Map<string, string>): Promise<Reply> {
+  // user provisioning: directory sync, bulk import and its preview, reconcile and its previews, the jobs
+  if (path === "/api/scim/provision" || path.startsWith("/api/scim/provision/")) return await ops.provisionRoute(req.method, path, body)
+  // the cache clears (DELETE) and the read-only plugin listings
+  if (path.startsWith("/api/cache/")) return await ops.cacheClear(req.method, path)
+  if (path === "/api/plugins" || path.startsWith("/api/plugins/")) return await ops.pluginsRouteAsync(req.method, path, body)
+  // the request-log analytics and the MCP logs (ops.logsRoute)
+  if (logsAnalyticsPath(path)) return await ops.logsRouteAll(req, path, body, sc, req.method === "GET" && ops.mayReveal(actor))
+  if (path === "/api/models/parameters") return req.method === "GET" ? await ops.modelParameters(req) : NOT_GET
+  if (path === "/api/models/catalog") return await ops.catalogUpsertRoute(req, body)
+  if (path.startsWith("/api/providers/") && path.endsWith("/refresh-models")) {
+    // /api/providers/{p}/refresh-models or /api/providers/{p}/keys/{id}/refresh-models: lists the models live and
+    // saves nothing, so it never takes the config file's lock
+    const parts = path.split("/")
+    const isKey = parts.length === 7 && parts[4] === "keys"
+    if (req.method !== "POST") return NOT_POST
+    if (!(parts.length === 5 || isKey)) return { status: 404, body: `{"error":{"message":"no such route","type":"invalid_request_error"}}`, contentType: "application/json" }
+    return await refreshModels(undefined, ops.store.cfg, parts[3] ?? "", isKey ? parts[5] : undefined)
+  }
+  // the MCP server library (ops.libraryRoute, src/mcplibrary.tov; its own file and lock)
+  if (path === "/api/mcp/library" || path.startsWith("/api/mcp/library/")) return await ops.libraryRoute(req, path, body)
+  if (path === "/api/pricing/force-sync") return req.method === "POST" ? await ops.forcePricing() : NOT_POST
+  // webhooks: an endpoint's address is checked (resolved) first, then the change is saved under the lock
+  if (path === "/api/webhooks" || path.startsWith("/api/webhooks/")) {
+    const base = ops.store.cfg
+    const wr = await webhookApi(base.webhooks, req.method, req.url.slice(req.url.indexOf("/api/")), body)
+    const wnext = wr.next
+    if (wnext === undefined) return savedReply(wr.status, wr.body, undefined)
+    return await ops.underLock(req.method, () => savedReply(wr.status, wr.body, ops.store.commitRebased(base, withWebhooks(base, wnext), "webhooks")))
+  }
+  // registered A2A agents (agents.tov); the call history is ops.tov's
+  if (path === "/api/agents" || path.startsWith("/api/agents/")) {
+    if (path === "/api/agents/push-configs" || path.startsWith("/api/agents/push-configs/")) {
+      const pu = URL.parse(req.url)
+      return await ops.underLock(req.method, () => ops.pushConfigsRoute(req.method, path, pu === undefined ? new URLSearchParams("") : pu.searchParams))
+    }
+    if (path === "/api/agents/history" || path.startsWith("/api/agents/history/")) {
+      const hu = URL.parse(req.url)
+      return await ops.underLock(req.method, () => ops.agentHistoryRoute(req.method, path, hu === undefined ? new URLSearchParams("") : hu.searchParams, body, sc))
+    }
+    // the agent's card is fetched first, without the lock; the registration is saved under it
+    const base = ops.store.cfg
+    const ar = await agentApi(base.agents, req.method, req.url.slice(req.url.indexOf("/api/")), body, publicBase(base.client?.a2a_external_client_url, req.url))
+    const anext = ar.next
+    if (anext === undefined) return savedReply(ar.status, ar.body, undefined)
+    return await ops.underLock(req.method, () => {
+      const saved = ops.store.commitRebased(base, withAgents(base, anext), "agents")
+      // a card fetched here reaches the other workers before this answer (ops.publishCards)
+      if (saved.kind === "ok") ops.publishCards()
+      return savedReply(ar.status, ar.body, saved)
+    })
+  }
+  // the OAuth routes of auth type oauth clients need the gateway's origin (the callback's redirect URI)
+  const mu = URL.parse(req.url)
+  // the MCP and MCP OAuth handlers below serve these paths only; the others need no lock for them
+  const mcpPath = path.startsWith("/api/mcp/") || path.startsWith("/api/oauth/")
+  // the status route reads ?flow_id=; a DELETE saves (under the lock)
+  const held1 = req.method === "GET" || !mcpPath ? undefined : await ops.store.holdLock()
+  if (held1 !== undefined && !held1.ok) {
+    ops.store.releaseLock(held1)
+    return lockBusyReply()
+  }
+  let oa: McpReply | undefined = oauthConfigRoute(ops.store, req.method, mu === undefined ? path : path + mu.search)
+  if (held1 !== undefined) ops.store.releaseLock(held1)
+  if (oa === undefined) oa = await oauthRoute(ops.store, req.method, path, body, mu === undefined ? "" : mu.origin)
+  // a user-mode flow opens for the identity-provider user of the caller's single sign-on session only
+  const ssoUser = actor.startsWith("sso:") ? actor.slice(4) : ""
+  if (oa === undefined) {
+    const held2 = req.method === "GET" || !mcpPath ? undefined : await ops.store.holdLock()
+    if (held2 !== undefined && !held2.ok) {
+      ops.store.releaseLock(held2)
+      return lockBusyReply()
+    }
+    oa = perUserApi(ops.store, req.method, mu === undefined ? path : path + mu.search, body, mu === undefined ? "" : mu.origin, ssoUser)
+    if (held2 !== undefined) ops.store.releaseLock(held2)
+  }
+  if (oa === undefined) oa = await headersRouteAsync(ops.store, req.method, path, body, ssoUser)
+  if (oa === undefined) oa = await exchangeRouteAsync(ops.store, ops.engine.idp, req.method, path, body)
+  if (oa === undefined) oa = await openapiRoute(req.method, path, body, !ops.authOn)
+  // an openapi client sent with a spec_url keeps the document it names (fetched now, as Bifrost stores it)
+  let mbody = body
+  if (oa === undefined) {
+    const il = await inlineSpecUrl(req.method, path, body, !ops.authOn)
+    if (il.error !== undefined) oa = il.error
+    mbody = il.body
+  }
+  // with dashboard auth off, clients registered here must reach public addresses only
+  if (oa === undefined) {
+    const held3 = req.method === "GET" || !mcpPath ? undefined : await ops.store.holdLock()
+    if (held3 !== undefined && !held3.ok) {
+      ops.store.releaseLock(held3)
+      return lockBusyReply()
+    }
+    oa = mcpApi(ops.store, req.method, path, mbody, !ops.authOn, sc)
+    if (held3 !== undefined) ops.store.releaseLock(held3)
+  }
+  const mr = oa
+  if (mr !== undefined) {
+    const out: Reply = { status: mr.status, body: mr.body, contentType: mr.contentType ?? "application/json" }
+    // a reconnect or a tools refresh reaches the MCP server after the save, without the lock
+    const act = mr.action
+    if (mr.status === 200 && act !== undefined) return await mcpAction(ops, act, mr.id ?? "", out)
+    return out
+  }
+  // the query (search, paging, is_active) reaches the handlers that read it
+  const qu = URL.parse(req.url)
+  // a provider's base_url, with its host resolved now (Bifrost's ValidateExternalURL), before the lock
+  const bu = await providerBaseUrlProblem(req.method, path, body)
+  if (bu !== "") return { status: 400, body: JSON.stringify({ error: { message: bu } }), contentType: "application/json" }
+  return await ops.underLock(req.method, () => {
+    const a = handleApi(ops.store, req.method, qu === undefined ? path : path + qu.search, body, sc)
+    // a rotated key's MCP OAuth grants go with its old value (Bifrost revokes them in the rotation)
+    if (a.status === 200 && isRotatePath(path)) {
+      for (const id of rotatedKeyIds(a.body)) revokeSubject("vk", id)
+    }
+    return ops.withRedivision(req.method, path, { status: a.status, body: a.body, contentType: "application/json" }, redivBefore)
+  })
+}
+
+function withWebhooks(c: Config, list: WebhookEndpoint[]): Config {
+  let n = c
+  n.webhooks = list
+  return n
+}
+
+function withAgents(c: Config, list: AgentConfig[]): Config {
+  let n = c
+  n.agents = list
+  return n
 }
 
 function mcpView(engine: Engine): Response {
