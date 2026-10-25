@@ -16,7 +16,12 @@ make build                       # build/raiju (3 MB; links only glibc)
 OPENAI_API_KEY=sk-... build/raiju            # no config: providers from env vars
 build/raiju -app-dir ~/.config/bifrost       # or an existing Bifrost config.json
 build/raiju -config config.json -port 8080 -workers 4
+BIFROST_SETUP_TOKEN=$(openssl rand -hex 16) build/raiju   # /api opens to this token until an admin exists
 ```
+
+The gateway listens on 127.0.0.1 unless `-host` (or `BIFROST_HOST`) says otherwise; the image and the
+deploy files pass `-host 0.0.0.0`. The management API is locked until an admin exists (see
+[Secure defaults](#secure-defaults)).
 
 ```sh
 curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '{
@@ -33,8 +38,8 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
   WebSocket mode for OpenAI), `/v1/embeddings`, `/v1/completions` (OpenAI-format providers),
   `/v1/models`, `/v1/realtime` (WebSocket for OpenAI, Azure and xAI, and WebRTC calls for OpenAI
   and Azure at `POST /v1/realtime/calls`) and GPT Live (`/v1/live/sessions`, WebSocket and
-  WebRTC), each session metered, guarded and logged with its cost (client secrets and sessions
-  are routed),
+  WebRTC; the WebRTC calls need `server.webrtc_enabled`), each session metered, guarded and logged
+  with its cost (client secrets and sessions are routed),
   `/v1/rerank`, `/v1/count_tokens`, `/v1/async/*` jobs, and audio, images, files and batches
   (which providers serve each one is in [SCOPE.md](SCOPE.md)).
 - **Drop-in SDK routes:** `/openai/v1/*`; `/anthropic/v1/messages` (to any provider),
@@ -136,6 +141,48 @@ admin credentials. When it is omitted, Raiju turns it on if the config has crede
 use (virtual keys, admin users or `auth_config`), and leaves it off otherwise. Set it to
 `false` to serve anonymous inference with keys configured. `auth_config` takes Bifrost's
 `admin_username`, `admin_password` and `is_enabled`, at the top level or under `governance`.
+While inference is not authenticated the gateway says so at start-up.
+
+## Secure defaults
+
+- **The management API is locked until an admin exists**, as Bifrost's setup lock. With no admin
+  account (no admin users, API keys or `auth_config`), every `/api` route but the public ones
+  (`/api/session/is-auth-enabled`, login, setup, `/api/version`, OAuth callbacks) needs the
+  operator's setup token in `X-Bifrost-Setup-Token`, or the setup session cookie that
+  `POST /api/session/setup` trades it for: 401 without it, 403 with a wrong one. The token is
+  `setup_token` in the config (`env.NAME` allowed), else the `BIFROST_SETUP_TOKEN` environment
+  variable. With neither set, `/api` answers 403 to everything, and the start-up log says how to
+  set one. Create the first admin with the token (`POST /api/users` with `X-Bifrost-Setup-Token`;
+  the dashboard has no setup screen yet); from then on normal sign-in applies and the token opens
+  nothing. `client.whitelisted_routes` stay open.
+- **Bind address:** 127.0.0.1 by default (Bifrost's `localhost`); `-host` or `BIFROST_HOST` change it.
+- **Metrics:** label values a caller chooses are bounded. A path no route serves (404, 405, 501), and
+  a management path the gate refused, is labelled `other`; ids in paths become `{id}` (past the third
+  segment for a failed request); methods outside the HTTP set are `OTHER`; a model (or alias) name
+  becomes a label value once the provider served it or failed for its own reasons (429, 5xx), and is
+  `other` until then; and each label keeps at most 1,000 distinct values, after which a new value is
+  reported as `other`. `bench/metrics_cardinality.py` measures it (10,000 junk requests).
+- **Async jobs:** ids are 128 random bits (`job_` and 32 hex digits). A job submitted with a virtual
+  key is shown only to that key, and one submitted with another credential only to that
+  credential; an anonymous job is open to any poll, as in Bifrost. Another caller's job reads as
+  404.
+- **Masked secrets:** provider reads return each key's effective id (its `id`, else its `name`), and a
+  key sent back with its masked value keeps the stored secret (matched by id, then name, then
+  position). A masked value (`****` or `abcd…wxyz`) that matches no stored secret is refused with
+  400 instead of being saved as the key.
+- **Files:** new config, backup, state, log, audit and cache files are created 0600 and their folders
+  0700; `config.json.bak` is always 0600. The workers' share folder is
+  `$TMPDIR/raiju-<pid>-<16 random hex digits>` (default `/tmp`), made by the supervisor with a fresh
+  `mkdir` (a planted folder or symlink makes it fail rather than be used) and set to 0700.
+- **MCP:** a virtual key with no `mcp_configs` gets no MCP tools but those of `allow_by_default`
+  clients, as in Bifrost. Grant a key its tools with `mcp_configs` (`tools_to_execute: ["*"]` for
+  all of a client's tools), an access profile, or a virtual MCP. A request without a virtual key is
+  not limited by key rules.
+- **WebRTC:** the WebRTC calls the gateway terminates on its own peer (`POST /v1/realtime/calls`,
+  `POST /v1/realtime`, `POST /v1/live/sessions`) are off unless `server.webrtc_enabled` is `true`
+  (403 otherwise). Bifrost has no such switch; Raiju adds it because the peer's DTLS and SCTP stack
+  (libdatachannel, usrsctp) is C code any caller with a virtual key reaches. WebSocket realtime and
+  live sessions are not affected.
 
 ## Owner switches
 
@@ -178,7 +225,7 @@ default; 503 past it). `GET /health` is liveness, `GET /ready` readiness. See
 [deploy/README.md](deploy/README.md#stopping-and-slow-clients).
 
 The workers of one node share budgets, rate limits, the response and semantic
-caches and `/metrics` (summed) through `/tmp/raiju-<pid>` (the clustering CRDT, one slot per worker).
+caches and `/metrics` (summed) through a private share folder, `$TMPDIR/raiju-<pid>-<random>` (the clustering CRDT, one slot per worker).
 Request-log queries are shared only when the log store is shared; otherwise each worker answers from its own log. Usage
 reaches the other workers within about 200 ms, so a burst spread over several
 workers can pass a limit by a few requests, as across cluster nodes. Each

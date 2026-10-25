@@ -31,15 +31,25 @@ variable "task_subnet_ids" {
 }
 
 variable "ingress_cidr_blocks" {
-  description = "CIDR blocks allowed to reach the ALB."
+  description = "CIDR blocks allowed to reach the ALB. Required: name the networks your clients come from. [\"0.0.0.0/0\"] opens the gateway to the internet, so say so explicitly if that is what you want."
   type        = list(string)
-  default     = ["0.0.0.0/0"]
+
+  validation {
+    condition     = length(var.ingress_cidr_blocks) > 0
+    error_message = "ingress_cidr_blocks must name at least one CIDR block."
+  }
 }
 
 variable "certificate_arn" {
-  description = "ACM certificate ARN. When set, the ALB serves HTTPS on 443 and redirects HTTP to it. Null serves plain HTTP on 80."
+  description = "ACM certificate ARN. The ALB serves HTTPS on 443 and redirects HTTP to it. Required unless allow_plain_http is true."
   type        = string
   default     = null
+}
+
+variable "allow_plain_http" {
+  description = "Serve plain HTTP on 80 when certificate_arn is null. Off by default: virtual keys, admin credentials and prompts would cross the network in clear text."
+  type        = bool
+  default     = false
 }
 
 variable "cluster_arn" {

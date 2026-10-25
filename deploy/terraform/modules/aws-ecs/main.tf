@@ -205,6 +205,13 @@ resource "aws_lb_listener" "http" {
   port              = 80
   protocol          = "HTTP"
 
+  lifecycle {
+    precondition {
+      condition     = var.certificate_arn != null || var.allow_plain_http
+      error_message = "Set certificate_arn to serve HTTPS, or allow_plain_http = true to serve plain HTTP on purpose."
+    }
+  }
+
   default_action {
     type             = var.certificate_arn == null ? "forward" : "redirect"
     target_group_arn = var.certificate_arn == null ? aws_lb_target_group.this.arn : null

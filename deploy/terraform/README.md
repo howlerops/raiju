@@ -49,11 +49,22 @@ module "raiju" {
   public_subnet_ids = ["subnet-...", "subnet-..."]
   task_subnet_ids   = ["subnet-...", "subnet-..."]   # private, with NAT
   image             = "123456789012.dkr.ecr.us-east-1.amazonaws.com/raiju:0.1.0"
+  certificate_arn   = "arn:aws:acm:us-east-1:123456789012:certificate/..."
+
+  ingress_cidr_blocks = ["10.0.0.0/8"] # required: who may reach the ALB
+
   secret_arns = {
-    OPENAI_API_KEY = "arn:aws:secretsmanager:us-east-1:123456789012:secret:raiju/openai"
+    OPENAI_API_KEY      = "arn:aws:secretsmanager:us-east-1:123456789012:secret:raiju/openai"
+    BIFROST_SETUP_TOKEN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:raiju/setup"
   }
 }
 ```
+
+`ingress_cidr_blocks` has no default, and the module serves HTTPS only: set
+`certificate_arn`, or `allow_plain_http = true` to serve plain HTTP on purpose.
+The management API is locked until an admin exists: give the tasks a
+`BIFROST_SETUP_TOKEN` (or `setup_token` in a mounted config), create the first
+admin with it, then remove it if you like.
 
 Outputs: `alb_dns_name`, `service_name`, `cluster_arn`, `task_definition_arn`,
 `log_group_name`, `target_group_arn`, `service_security_group_id`.

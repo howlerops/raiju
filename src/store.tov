@@ -3,8 +3,8 @@
 // config file and handed to the lead through onChange, which rebuilds the
 // engine. Secrets are masked on every read, and a masked value sent back
 // unchanged keeps the stored secret.
-import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs"
-import { writeFileAtomic, removeStaleTemps, writeTemp } from "./atomicfile"
+import { readFileSync, writeFileSync, existsSync, unlinkSync, statSync, chmodSync } from "node:fs"
+import { writeFileAtomic, removeStaleTemps, writeTemp, PRIVATE_FILE } from "./atomicfile"
 import {
   Config, GovernanceConfig, KeyConfig, ProviderConfig, VirtualKeyConfig, BudgetConfig, resolveEnv, getEnv,
   RateLimitConfig, TeamConfig, CustomerConfig, ProviderConfigRef, providerOf, AdminAuthConfig, AdminUserConfig, AccessProfile, NetworkConfig, CustomProviderConfig,
@@ -122,6 +122,24 @@ function keepOpt(incoming: string | undefined, existing: string | undefined): st
   if (incoming === undefined) return existing
   return keepSecret(incoming, existing)
 }
+
+// Whether a value is in maskSecret's shape ("****", or four characters, "…", four characters): a masked value that
+// matched no stored secret must not be saved as if it were the secret.
+export function looksMasked(v: string | undefined): bool {
+  if (v === undefined) return false
+  if (v === "****") return true
+  return v.includes("…") && v.byteLength === 4 + "…".byteLength + 4
+}
+
+// The secrets of a key that are still masked after prepKey: masked values that matched no stored key.
+function maskedLeft(k: KeyConfig): bool {
+  return looksMasked(k.value) || looksMasked(k.vertex_key_config?.auth_credentials) || looksMasked(k.bedrock_key_config?.secret_key) || looksMasked(k.bedrock_key_config?.session_token)
+    || looksMasked(k.azure_key_config?.client_secret) || looksMasked(k.bedrock_mantle_key_config?.secret_key) || looksMasked(k.bedrock_mantle_key_config?.session_token)
+    || looksMasked(k.watsonx_key_config?.api_key) || looksMasked(k.databricks_key_config?.client_secret) || looksMasked(k.github_copilot_key_config?.private_key)
+    || looksMasked(k.oauth_key_config?.client_secret) || looksMasked(k.oauth_key_config?.private_key)
+}
+
+const MASKED_KEY = "a key value is masked but matches no stored key: send the real value, or the key's id with its masked value to keep it"
 
 // Provider names: lower-case letters, digits, "_" and "-", 1 to 64 bytes.
 export function validProviderName(name: string): bool {
@@ -343,12 +361,31 @@ function bedrockSecrets(b: BedrockKeyConfig, old: BedrockKeyConfig | undefined, 
   return n
 }
 
-// Gives every key an id, keeping the stored secrets of keys sent back masked.
+// The stored key a key sent back stands for: by id, else by name, else the key at the same position when that one
+// has neither an id nor a name to match by (a GET of a hand-written config, sent back with its keys in order).
+function oldKeyFor(k: KeyConfig, i: int, old: KeyConfig[]): KeyConfig | undefined {
+  const id = k.id ?? ""
+  if (id !== "") return findKey(old, id)
+  const name = k.name ?? ""
+  if (name !== "") {
+    const byName = findKey(old, name)
+    if (byName !== undefined) return byName
+  }
+  const at = old[i]
+  if (name === "" && at !== undefined && (at.id ?? "") === "" && (at.name ?? "") === "") return at
+  return undefined
+}
+
+// Gives every key an id, keeping the stored secrets of keys sent back masked. A key that matches a stored one keeps
+// that key's id (so a GET then PUT changes no id).
 function prepKeys(keys: KeyConfig[], old: KeyConfig[]): KeyConfig[] {
   const out: KeyConfig[] = []
-  for (const k of keys) {
-    const id = k.id === undefined || k.id === "" ? randomId("key-") : k.id
-    out.push(prepKey(k, id, findKey(old, id)))
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i]!
+    const prev = oldKeyFor(k, i, old)
+    const given = k.id ?? ""
+    const id = given !== "" ? given : (prev?.id ?? "") !== "" ? prev!.id! : randomId("key-")
+    out.push(prepKey(k, id, prev))
   }
   return out
 }
@@ -709,7 +746,10 @@ function customerUsers(c: Config, id: string): string {
 
 // Masked copies for reads: the whole key, every block with its secrets masked (keyWithSecrets).
 function redactKey(k: KeyConfig): KeyConfig {
-  return keyWithSecrets(k, undefined, false)
+  let out = keyWithSecrets(k, undefined, false)
+  // the effective id (a hand-written key without one is addressed by its name), so a GET then PUT finds the key
+  out.id = k.id ?? k.name
+  return out
 }
 
 // The whole provider with its secrets masked, so settings added later survive a GET then PUT.
@@ -1323,7 +1363,8 @@ export class ConfigStore {
     }
     if (existsSync(this.path)) {
       const old = try readFileSync(this.path, "utf8")
-      try writeFileAtomic(this.path + ".bak", old)
+      // the backup holds every secret the config held: private, whatever an older version left it as
+      try writeFileAtomic(this.path + ".bak", old, { mode: PRIVATE_FILE, exact: true })
     }
     const out = text + "\n"
     try writeFileAtomic(this.path, out)
@@ -1763,6 +1804,8 @@ export class ConfigStore {
     const oldKeys = old?.keys ?? []
     const keys = p.keys === undefined ? oldKeys : prepKeys(p.keys, oldKeys)
     if (hasDupKeyIds(keys)) return fail(400, "duplicate key id")
+    if (keys.some((k) => maskedLeft(k))) return fail(400, MASKED_KEY)
+    if (looksMasked(p.proxy_config?.password) && (old?.proxy_config?.password === undefined || p.proxy_config?.password !== maskSecret(old?.proxy_config?.password ?? ""))) return fail(400, "proxy_config.password is masked but matches no stored password: send the real value")
     const af = this.aliasFault(name, p.custom_provider_config, p.keys ?? [])
     if (af !== "") return fail(400, af)
     const of = p.keys === undefined ? "" : this.oauthFault(keys)
@@ -1799,6 +1842,7 @@ export class ConfigStore {
     if (of !== "") return fail(400, of)
     const next: KeyConfig[] = []
     for (const x of keys) next.push(x)
+    if (maskedLeft(nk)) return fail(400, MASKED_KEY)
     next.push(nk)
     return this.putProvider(provider, withKeys(p, next), id)
   }
@@ -1814,6 +1858,7 @@ export class ConfigStore {
     const nk = prepKey(k, old.id ?? keyId, old)
     const of = this.oauthFault([nk])
     if (of !== "") return fail(400, of)
+    if (maskedLeft(nk)) return fail(400, MASKED_KEY)
     const next: KeyConfig[] = []
     for (const x of keys) next.push(isKey(x, keyId) ? nk : x)
     return this.putProvider(provider, withKeys(p, next), keyId)
@@ -1840,6 +1885,7 @@ export class ConfigStore {
     const value = vk.value === undefined || vk.value === ""
       ? (old?.value ?? newVkValue())
       : keepSecret(vk.value, old?.value)
+    if (looksMasked(value)) return fail(400, "the virtual key value is masked but matches no stored key: send the real value, or leave it out to keep it")
     for (const other of g.virtual_keys ?? []) {
       if (other.value === value && other.id !== id) return fail(409, "another virtual key has this value")
     }
@@ -4548,6 +4594,54 @@ test("a masked key value sent back keeps the stored secret", () => {
   expect(statusOf(s.updateKey("anthropic", "key-a", { value: "sk-a…1234", name: "renamed" }))).toBe(200)
   expect(providerOf(s.cfg, "anthropic")!.keys![0]!.value).toBe("sk-ant-secret-1234")
   expect(providerOf(s.cfg, "anthropic")!.keys![0]!.name).toBe("renamed")
+  cleanup(path)
+})
+
+test("a GET then PUT of a provider whose keys have no id keeps every stored secret", () => {
+  const path = tmpPath()
+  const ps: Map<string, ProviderConfig> = new Map()
+  // a hand-written (Bifrost-style) config: keys with a name and no id, and one with neither
+  ps.set("openai", { keys: [{ name: "openai-1", value: "sk-REAL-openai-0001-3456", models: [], weight: 1.0 }, { name: "openai-2", value: "sk-REAL-openai-0002-7890", weight: 1.0 }] })
+  ps.set("anon", { keys: [{ value: "sk-REAL-anon-key-0003-1111" }] })
+  const s = new ConfigStore(path, { providers: ps })
+  for (const name of ["openai", "anon"]) {
+    const got = handleApi(s, "GET", "/api/providers/" + name, "")
+    expect(got.status).toBe(200)
+    expect(got.body.includes("sk-REAL")).toBe(false)
+    // the client sends the masked provider back with one setting changed
+    const put = handleApi(s, "PUT", "/api/providers/" + name, got.body.replace(`"keys"`, `"send_back_raw_response":true,"keys"`))
+    expect(put.status).toBe(200)
+  }
+  const ok = providerOf(s.cfg, "openai")!.keys!
+  expect(ok.length).toBe(2)
+  expect(ok[0]!.value).toBe("sk-REAL-openai-0001-3456")
+  expect(ok[1]!.value).toBe("sk-REAL-openai-0002-7890")
+  // the id the GET showed is the one kept
+  expect(ok[0]!.id).toBe("openai-1")
+  expect(providerOf(s.cfg, "anon")!.keys![0]!.value).toBe("sk-REAL-anon-key-0003-1111")
+  expect((try readFileSync(path, "utf8")).includes("…")).toBe(false)
+  // a masked value that matches no stored key is refused, not saved as the key
+  const bad = s.upsertProvider("openai", { keys: [{ name: "new-key", value: "sk-R…3456" }] })
+  expect(statusOf(bad)).toBe(400)
+  expect(statusOf(s.upsertProvider("openai", { keys: [{ id: "openai-1", value: "sk-X…9999" }] }))).toBe(400)
+  expect(statusOf(s.addKey("openai", { name: "short", value: "****" }))).toBe(400)
+  expect(statusOf(s.updateKey("openai", "openai-2", { value: "sk-R…0000" }))).toBe(400)
+  expect(statusOf(s.upsertVirtualKey({ id: "vk-m", name: "m", value: "sk-b…abcd" }))).toBe(400)
+  expect(providerOf(s.cfg, "openai")!.keys![0]!.value).toBe("sk-REAL-openai-0001-3456")
+  cleanup(path)
+})
+
+test("the config file and its backup are written private (0600)", () => {
+  const path = tmpPath()
+  const s = new ConfigStore(path, {})
+  expect(statusOf(s.upsertProvider("openai", { keys: [{ id: "k", value: "sk-REAL-private-0001" }] }))).toBe(200)
+  expect((try statSync(path)).mode & 511).toBe(384)
+  // a backup an older version wrote world-readable is made private on the next save
+  try writeFileSync(path + ".bak", "{}")
+  try chmodSync(path + ".bak", 420)
+  expect(statusOf(s.upsertProvider("anthropic", { keys: [{ id: "a", value: "sk-REAL-private-0002" }] }))).toBe(200)
+  expect((try statSync(path + ".bak")).mode & 511).toBe(384)
+  expect((try statSync(path)).mode & 511).toBe(384)
   cleanup(path)
 })
 

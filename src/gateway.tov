@@ -62,7 +62,7 @@ import { LogStore, LogEntry, defaultLogStoreConfig } from "./logstore"
 import { dirProblem } from "./audit"
 import { isoMs } from "./exports"
 import { Tracer, Span, StageTiming, genAiAttributes, exportRequest, traceparentFor, tracesOn, TlsOpts, usesGrpc, exportSpansGrpc } from "./otel"
-import { McpManager, injectTools, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns, sanitizeName, perUserClientNames, perUserOAuthNames, tokenExchangeNames, userHeadersFor, ToolText, chatToolName, patternMatches, adminRowOf, ProjectMcp } from "./mcp"
+import { McpManager, McpKeyConfig, keyRuleAllows, injectTools, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns, sanitizeName, perUserClientNames, perUserOAuthNames, tokenExchangeNames, userHeadersFor, ToolText, chatToolName, patternMatches, adminRowOf, ProjectMcp } from "./mcp"
 import { CodeEntry, codeEntries, runMeta, metaToolDefs, isMetaTool, META_TOOLS, limitsOf, bindingLevelOf, execAutoAllowed } from "./codemode"
 import { McpTokenExchange, ExchangeCache, IdpEndpoints, exchangeKey, exchangeToken, renewAdmin, renewAt, needsReverify, RENEW_RETRY_MS, ADMIN_TAKEOVER_MS, ADMIN_WAIT_MS, ADMIN_POLL_MS } from "./tokenexchange"
 import { McpAuthConfig } from "./mcpauth"
@@ -2757,7 +2757,7 @@ export class Engine {
       out.push(build(rt))
     }
     setField(&fs, "tools", "[" + out.join(",") + "]")
-    const parts = m.instructionParts(this.gov.policyFor(h)?.mcpTools, this.gov.findKey(h)?.mcp_configs, this.projectMcp(h)).filter((p) => tools.some((t) => t.includes(`"name":"${p.name}-`)))
+    const parts = m.instructionParts(this.gov.policyFor(h)?.mcpTools, this.keyMcp(h), this.projectMcp(h)).filter((p) => tools.some((t) => t.includes(`"name":"${p.name}-`)))
     const block = parts.length === 0 ? "" : m.renderInstructions(parts)
     if (block !== "") {
       const own = rawStr(fs, "instructions") ?? ""
@@ -2774,7 +2774,7 @@ export class Engine {
     if (this.cfg.client?.mcp_disable_auto_tool_inject === true && !named) return []
     // a key's access profile may limit the MCP tools it gets; clients it doesn't name
     // count only with allow_by_default
-    let tools = m.allToolsFor(this.gov.policyFor(h)?.mcpTools, this.gov.findKey(h)?.mcp_configs, this.projectMcp(h))
+    let tools = m.allToolsFor(this.gov.policyFor(h)?.mcpTools, this.keyMcp(h), this.projectMcp(h))
     const only = h.get("x-bf-mcp-include-clients")
     if (only !== undefined) {
       if (only.trim() === "none") return []
@@ -2803,7 +2803,7 @@ export class Engine {
   // The instructions the connected MCP servers sent (capped as mcp.max_instructions_* say) go to the model
   // as a system message ahead of the caller's own, for the servers that still offer a tool in this request.
   withMcpInstructions(text: string, m: McpManager, h: Hdrs, tools: string[]): string throws SyntaxError {
-    const parts = m.instructionParts(this.gov.policyFor(h)?.mcpTools, this.gov.findKey(h)?.mcp_configs, this.projectMcp(h)).filter((p) => tools.some((t) => t.includes(`"name":"${p.name}-`)))
+    const parts = m.instructionParts(this.gov.policyFor(h)?.mcpTools, this.keyMcp(h), this.projectMcp(h)).filter((p) => tools.some((t) => t.includes(`"name":"${p.name}-`)))
     if (parts.length === 0) return text
     const block = m.renderInstructions(parts)
     if (block === "") return text
@@ -2818,7 +2818,7 @@ export class Engine {
 
   // The code mode servers a caller may reach, as the stubs and the runner name them.
   codeEntriesFor(m: McpManager, h: Hdrs): CodeEntry[] {
-    return codeEntries(m.codeToolsFor(this.gov.policyFor(h)?.mcpTools, this.gov.findKey(h)?.mcp_configs, this.projectMcp(h)))
+    return codeEntries(m.codeToolsFor(this.gov.policyFor(h)?.mcpTools, this.keyMcp(h), this.projectMcp(h)))
   }
 
   // One MCP tool call for a request, with the gates a direct call gets: the guardrails on the call, the
@@ -2858,7 +2858,7 @@ export class Engine {
   // allow the tool, and the key's budgets must have room. A tool the gateway does not expose is left to
   // execution, which reports it as unknown.
   toolGate(m: McpManager, h: Hdrs, name: string, via?: string): Grant | Denial {
-    if (m.hasTool(name) && !m.mayRun(this.gov.policyFor(h)?.mcpTools, this.gov.findKey(h)?.mcp_configs, name, this.projectMcp(h, via))) {
+    if (m.hasTool(name) && !m.mayRun(this.gov.policyFor(h)?.mcpTools, this.keyMcp(h, via), name, this.projectMcp(h, via))) {
       return { kind: "denial", status: 403, type: "permission_error", message: `tool ${name} is not allowed for this key` }
     }
     const client = this.perUserClient(name)
@@ -2874,6 +2874,19 @@ export class Engine {
       return { kind: "denial", status: 401, type: "authentication_error", message: `the per-user headers of MCP client ${client} are not submitted for this caller: open a submission with POST /api/mcp/per-user-headers/flows` }
     }
     return this.gov.admitTool(h)
+  }
+
+  // The MCP tool rules of the request's virtual key, as mcp.tov judges them (undefined: not limited). A key with no
+  // mcp_configs gets no tools but those of allow_by_default clients, as in Bifrost (an empty grant), unless its access
+  // profiles name tools (they decide then) or the call comes through a virtual MCP the key was given (via: the
+  // virtual MCP's own allowed keys decide). A request without a virtual key is not limited here.
+  keyMcp(h: Hdrs, via?: string): McpKeyConfig[] | undefined {
+    const vk = this.gov.findKey(h)
+    if (vk === undefined) return undefined
+    const own = vk.mcp_configs
+    if (own !== undefined) return own
+    if (via !== undefined || this.gov.policyFor(h)?.mcpTools !== undefined) return undefined
+    return []
   }
 
   // The MCP access of the project the request names (its mcp_configs and access_rule); undefined when it names
@@ -5632,4 +5645,25 @@ test("an audio request's bill is freed after the request (its gate reaches it th
   const p = new FreedProbe()
   billOnce(e, p)
   expect(p.bill === undefined).toBe(true)
+})
+
+test("a virtual key with no mcp_configs gets no MCP tools but allow_by_default ones, as in Bifrost", () => {
+  const e = new Engine({ governance: { virtual_keys: [
+    { id: "vk-none", value: "sk-bf-none" },
+    { id: "vk-some", value: "sk-bf-some", mcp_configs: [{ mcp_client_name: "fs", tools_to_execute: ["read"] }] },
+  ] } })
+  const h: Hdrs = new Map()
+  h.set("x-bf-vk", "sk-bf-none")
+  // an empty grant (before, a key without the list was not limited at all)
+  const none = e.keyMcp(h)
+  expect(none?.length).toBe(0)
+  expect(keyRuleAllows(none, "fs", "read", false)).toBe(false)
+  expect(keyRuleAllows(none, "open", "anything", true)).toBe(true)
+  // a virtual MCP the key was given decides by its own allowed keys
+  expect(e.keyMcp(h, "my-vmcp")).toBeUndefined()
+  const some: Hdrs = new Map()
+  some.set("x-bf-vk", "sk-bf-some")
+  expect(e.keyMcp(some)?.length).toBe(1)
+  // a request without a virtual key is not limited by key rules
+  expect(e.keyMcp(new Map())).toBeUndefined()
 })

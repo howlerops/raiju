@@ -51,7 +51,7 @@ import { Ops, Reply, UiSocket } from "./ops"
 import { parseCursor } from "./feed"
 import { cookieValue, SETUP_COOKIE } from "./setupsession"
 import { rerank, bedrockRerank, countTokens, responsesInputTokens, asyncSubmit, asyncGet, sdkAsyncSubmit, sdkAsyncPoll, decisionRoute, openaiDecisionPath, Dispatch } from "./extras"
-import { asyncPoll } from "./jobs"
+import { asyncPoll, jobOwner } from "./jobs"
 import { serveUi, uiPath, UI_CSP } from "./uiserve"
 import { TransportRun, transportStart, transportEnd, transportDone, transportSink, llmHooked, storageHooked, StorageCall, storageOp, storageIdKey, pathWithId } from "./pluginroute"
 import { kindOfPath, isInferencePath } from "./plughttp"
@@ -514,17 +514,33 @@ async function listModels(engine: Engine, req: Request): Promise<Response> {
 async function timed(path: string, method: string, t0: f64, reqBytes: f64, headers: Headers, p: Promise<Response, TypeError>): Promise<Response, TypeError> {
   const res = try await p
   const len = parseFloat(res.headers.get("content-length") ?? "0") ?? 0.0
-  metrics.observeHttp(pathLabel(path), method, res.status, (performance.now() - t0) / 1000.0, reqBytes, len, metrics.httpCustomValues(headers))
+  metrics.observeHttp(httpPathLabel(path, res.status), method, res.status, (performance.now() - t0) / 1000.0, reqBytes, len, metrics.httpCustomValues(headers))
   return res
 }
 
-// A bounded path label: ids (segments with digits, or past the fourth) become {id}.
+// The path label of one answered request. A path no route serves (404, 405, 501) is "other", and so is a management
+// path the gate refused (401, 403: the route is not looked up before the gate, and the audit log keeps the path), so
+// requests to made-up paths add no series; the label values are capped as a backstop (metrics.bounded).
+export function httpPathLabel(path: string, status: int): string {
+  if (status === 404 || status === 405 || status === 501) return metrics.OTHER_LABEL
+  if ((status === 401 || status === 403) && path.startsWith("/api/")) return metrics.OTHER_LABEL
+  // a failed request keeps three segments: made-up names past them (a model in the path) add no series
+  if (status >= 400) return pathLabelAt(path, 3)
+  return pathLabel(path)
+}
+
+// A bounded path label: ids (segments with digits, longer than 40 bytes, or past the fourth) become {id}.
 export function pathLabel(path: string): string {
+  return pathLabelAt(path, 4)
+}
+
+// pathLabel with the segments past keep made {id} too.
+function pathLabelAt(path: string, keep: int): string {
   const segs = path.split("/")
   const out: string[] = []
   for (let i = 0; i < segs.length; i++) {
     const s = segs[i]!
-    let id = i > 4
+    let id = i > keep || s.byteLength > 40
     for (const ch of s.chars()) {
       if (ch >= "0" && ch <= "9") id = true
     }
@@ -541,6 +557,45 @@ test("path labels hide ids", () => {
   expect(pathLabel("/genai/v1beta/models/gemini-2.5-flash:generateContent")).toBe("/genai/v1beta/models/{id}")
   expect(pathLabel("/bedrock/model/a/b/c/converse")).toBe("/bedrock/model/a/b/{id}/{id}")
 })
+
+test("unrouted paths and junk label values stay within a fixed set", () => {
+  metrics.resetBounds()
+  expect(httpPathLabel("/abcdef", 404)).toBe("other")
+  expect(httpPathLabel("/v1/chat/completions", 405)).toBe("other")
+  expect(httpPathLabel("/v1/chat/completions", 401)).toBe("/v1/chat/completions")
+  expect(httpPathLabel("/api/made-up-route", 403)).toBe("other")
+  expect(httpPathLabel("/api/providers", 200)).toBe("/api/providers")
+  expect(httpPathLabel("/genai/v1beta/models/made-up:generateContent", 502)).toBe("/genai/v1beta/models/{id}")
+  expect(pathLabel("/api/x/" + "a".repeat(41))).toBe("/api/x/{id}")
+  // 10,000 junk requests (random paths that some route answered, and random model names) add at most the cap
+  for (let i = 0; i < 3000; i++) {
+    const junk = "p" + "abcdefghij".slice(i % 10, i % 10 + 1) + Math.floor(Math.random() * 1000000000)
+    metrics.observeHttp(httpPathLabel("/genai/v1beta/models/" + junk + "x", 200), "BREW" + i, 200, 0.001, 0.0, 0.0, [])
+    metrics.inc("raiju_test_junk_total", metrics.labels("openai", junk, "success"), 1.0)
+    let l = metrics.newLabels("openai", junk, "chat")
+    metrics.observeRequest(l, { ok: true, status: 200, errorType: "", retries: 0.0 }, 0.01)
+  }
+  const text = metrics.render()
+  let junkSeries = 0
+  let upstreamJunk = 0
+  for (const line of text.split("\n")) {
+    if (line.startsWith("raiju_test_junk_total{")) junkSeries += 1
+    if (line.startsWith("bifrost_upstream_requests_total{") && line.includes(`model="p`)) upstreamJunk += 1
+  }
+  // 3,000 distinct models made at most the cap of series, plus the one that folds the rest
+  expect(junkSeries <= metrics.MAX_LABEL_VALUES + 1).toBe(true)
+  expect(upstreamJunk <= metrics.MAX_LABEL_VALUES).toBe(true)
+  expect(text.includes(`model="other"`)).toBe(true)
+  expect(text.includes(`method="OTHER"`)).toBe(true)
+  expect(text.includes("BREW")).toBe(false)
+  metrics.resetBounds()
+})
+
+// The owner of the async jobs a request submits or polls (jobs.tov jobOwner): its virtual key, else its credential.
+function requestOwner(engine: Engine, req: Request): string {
+  const h = snapshot(req.headers)
+  return jobOwner(engine.gov.findKey(h)?.id ?? "", h)
+}
 
 // Runs an internal request (an async job) through the same handlers as live traffic.
 function dispatcher(engine: Engine): Dispatch {
@@ -1110,7 +1165,7 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
   if (m === "POST" && (req.headers.get("x-bf-async") ?? "") !== "" && !p.startsWith("/api/") && !p.startsWith("/v1/async/") && p !== "/mcp" && !p.startsWith("/agents/a2a/")) {
     const again: Dispatch = async (r) => try await dispatch(engine, ops, r)
     const route = compatPath(p)
-    return await sdkAsyncSubmit(engine.jobs, req, again, route.slice(1, route.byteLength))
+    return await sdkAsyncSubmit(engine.jobs, req, again, route.slice(1, route.byteLength), requestOwner(engine, req))
   }
   const dep = deploymentRoute(p)
   if (dep !== undefined && m === "POST") return try await dispatch(engine, ops, await deploymentRequest(req, dep))
@@ -1198,7 +1253,7 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
   if (m === "GET" || m === "HEAD") {
     // x-bf-async-id on an inference route: poll the job that route created
     const aid = req.headers.get("x-bf-async-id") ?? ""
-    if (aid !== "" && !p.startsWith("/api/")) return sdkAsyncPoll(engine.jobs, p.slice(1, p.byteLength), aid)
+    if (aid !== "" && !p.startsWith("/api/")) return sdkAsyncPoll(engine.jobs, p.slice(1, p.byteLength), aid, requestOwner(engine, req))
     if (p === "/health") return Response.json({ status: "ok" })
     if (p === "/ready") return readyResponse(engine, ops)
     if (uiPath(p)) {
@@ -1212,7 +1267,7 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
     if (p === "/genai/v1beta/models") return await cors(engine, req, await outOfLine(genaiModels(engine, "")))
     if (p.startsWith(GENAI)) return await cors(engine, req, await outOfLine(genaiModels(engine, p.slice(GENAI.byteLength))))
     const poll = asyncPoll(p)
-    if (poll !== undefined) return asyncGet(engine.jobs, poll.op, poll.id)
+    if (poll !== undefined) return asyncGet(engine.jobs, poll.op, poll.id, requestOwner(engine, req))
     if (p === "/api/cache") return ops.check(req, p) ?? cacheView(engine)
     if (p === "/api/logs" || p === "/api/logs/stats") {
       const cs = ops.checkScope(req, p)
@@ -1250,7 +1305,7 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
     if (p === "/cohere/v1/tokenize") return await cors(engine, req, await cohereTokenize(engine, req))
     if (p.startsWith(GENAI)) return await cors(engine, req, await genai(engine, req, p.slice(GENAI.byteLength)))
     if (p.startsWith("/bedrock/model/") && segs.length === 5) return await cors(engine, req, await bedrockModel(engine, req, segs[3]!, segs[4]!))
-    if (p.startsWith("/v1/async/")) return await asyncSubmitHooked(engine.cfg.webhooks, engine.jobs, req, p, dispatcher(engine), (engine.cfg.client?.async_job_result_ttl ?? 3600) * 1000)
+    if (p.startsWith("/v1/async/")) return await asyncSubmitHooked(engine.cfg.webhooks, engine.jobs, req, p, dispatcher(engine), (engine.cfg.client?.async_job_result_ttl ?? 3600) * 1000, requestOwner(engine, req))
   }
   // the management API: providers, keys, virtual keys, budgets, rate limits, teams, customers
   if (p === "/api/cluster/sync" && m === "POST") return await ops.clusterSync(req)

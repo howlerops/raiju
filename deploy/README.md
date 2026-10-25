@@ -50,7 +50,15 @@ curl localhost:8080/health
 
 The default command is `-app-dir /app/data -host 0.0.0.0 -port 8080`. If you
 pass arguments, pass all of them, because they replace the default command.
-Use `-workers N` for more processes per container.
+Use `-workers N` for more processes per container. Outside a container the
+binary binds 127.0.0.1 unless told otherwise.
+
+The management API (`/api` and the dashboard) is locked until an admin exists,
+as in Bifrost: pass a setup token (`-e BIFROST_SETUP_TOKEN=...`, or
+`setup_token` in the config), create the first admin with it
+(`POST /api/users` with the token in `X-Bifrost-Setup-Token`), and sign in from
+then on. With no admin and no
+setup token, `/api` answers 403. Inference is unaffected.
 
 ## Docker Compose
 
@@ -60,7 +68,8 @@ docker compose up --build
 docker compose --profile metrics up --build   # adds Prometheus on :9090
 ```
 
-`.env` is optional and is never copied into the image (`.dockerignore`).
+`.env` is optional and is never copied into the image (`.dockerignore`). Put
+`BIFROST_SETUP_TOKEN=...` in it to create the first admin with.
 Compose mounts `deploy/config.example.json` as `/app/data/config.json`. To use
 your own config, change that line in `docker-compose.yml`.
 `deploy/prometheus.yml` scrapes `raiju:8080/metrics`.

@@ -18742,7 +18742,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description A setup session: an HttpOnly, SameSite=Strict cookie (bifrost_setup_session) that stands in for the token for 12 hours: on POST /api/users and, under the setup lock (setup_token set, no admin yet), on every /api route. The body gives expires_at. */
+            /** @description A setup session: an HttpOnly, SameSite=Strict cookie (bifrost_setup_session) that stands in for the token for 12 hours: on POST /api/users and, under the setup lock (no admin yet), on every /api route. The body gives expires_at. */
             200: {
                 headers: {
                     /** @description The setup session cookie. */

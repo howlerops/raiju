@@ -35,6 +35,25 @@ def build():
 
 ADMIN = {"authorization": "Bearer admin-secret"}
 
+# /api is locked on a gateway with no admin account (Bifrost's setup lock, L184): every gateway e2e starts gets this
+# setup token (BIFROST_SETUP_TOKEN, set in main), and every /api request urllib sends carries it unless the request
+# names its own X-Bifrost-Setup-Token (an empty one tests the lock). A gateway with an admin ignores it.
+E2E_SETUP = "e2e-setup-" + "token-l184"
+
+class SetupTokenHandler(urllib.request.BaseHandler):
+    handler_order = 100
+
+    def http_request(self, req):
+        # a request with a setup session cookie tests the cookie, so it gets no token beside it
+        cookie = req.get_header("Cookie") or ""
+        if urllib.parse.urlsplit(req.full_url).path.startswith("/api/") and not req.has_header("X-bifrost-setup-token") and "bifrost_setup_session=" not in cookie:
+            req.add_unredirected_header("X-bifrost-setup-token", E2E_SETUP)
+        return req
+
+    https_request = http_request
+
+urllib.request.install_opener(urllib.request.build_opener(SetupTokenHandler))
+
 def call(method, path, body=None, headers=None, base=GW, auth=True):
     data = None if body is None else (body if isinstance(body, str) else json.dumps(body)).encode()
     extra = ADMIN if auth and base == GW and path.startswith("/api/") else {}
@@ -98,7 +117,11 @@ class WsClient:
         import base64 as b64m, os as _os, socket
         self.sock = socket.create_connection(("127.0.0.1", port), timeout=5)
         key = b64m.b64encode(_os.urandom(16)).decode()
-        extra = "".join(f"{k}: {v}\r\n" for k, v in (headers or {}).items())
+        headers = dict(headers or {})
+        # the UI socket is a management route: the e2e setup token opens it on a gateway with no admin (see E2E_SETUP)
+        if (path == "/ws" or path.startswith("/ws?")) and not any(k.lower() == "x-bifrost-setup-token" for k in headers):
+            headers["x-bifrost-setup-token"] = E2E_SETUP
+        extra = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
         self.sock.sendall(f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n{extra}\r\n".encode())
         head = b""
         while b"\r\n\r\n" not in head:
@@ -2168,7 +2191,7 @@ def mcp_po_e2e(env):
     def authorize(auth_url):
         loc = ""
         try:
-            urllib.request.build_opener(NoRedirect).open(auth_url, timeout=10)
+            urllib.request.build_opener(NoRedirect, SetupTokenHandler).open(auth_url, timeout=10)
         except urllib.error.HTTPError as e:
             loc = e.headers.get("location", "")
         return loc
@@ -2265,7 +2288,7 @@ def raw(method, url, body=None, headers=None):
         data = json.dumps(body).encode()
     req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
     try:
-        with urllib.request.build_opener(NoFollow).open(req, timeout=10) as r:
+        with urllib.request.build_opener(NoFollow, SetupTokenHandler).open(req, timeout=10) as r:
             return r.status, r.headers, r.read().decode()
     except urllib.error.HTTPError as e:
         return e.code, e.headers, e.read().decode()
@@ -3295,10 +3318,10 @@ def l97g_e2e(env):
         s, _, b = call("GET", "/api/session/is-auth-enabled", None, None, base=GW_L97G, auth=False)
         st_json = json.loads(b)
         check("setup_token is reported as configured, with setup required", st_json.get("setup_token_configured") is True and st_json.get("setup_required") is True, b[:300])
-        s, _, b = call("POST", "/api/users", {"name": "first", "role": "admin", "password": "first-pass-1"}, None, base=GW_L97G, auth=False)
+        s, _, b = call("POST", "/api/users", {"name": "first", "role": "admin", "password": "first-pass-1"}, {"x-bifrost-setup-token": ""}, base=GW_L97G, auth=False)
         check("the first admin account needs the setup token (the setup lock's 401)", s == 401 and "X-Bifrost-Setup-Token" in b, (s, b[:200]))
         # Bifrost's setup lock: every other /api route is locked behind the token too, while no admin exists (L172)
-        s, _, b = call("GET", "/api/providers", None, None, base=GW_L97G, auth=False)
+        s, _, b = call("GET", "/api/providers", None, {"x-bifrost-setup-token": ""}, base=GW_L97G, auth=False)
         check("the setup lock refuses a management route without the token", s == 401 and "setup token" in b, (s, b[:200]))
         s, _, b = call("GET", "/api/providers", None, {"x-bifrost-setup-token": "wrong"}, base=GW_L97G, auth=False)
         check("... and with a wrong token", s == 403 and "invalid setup token" in b, (s, b[:200]))
@@ -3904,7 +3927,7 @@ def l97l_e2e(env):
         s, _, b = call("POST", "/api/plugins", {"name": "x-l170", "path": "/tmp/x-l170.wasm"}, {"cookie": "bifrost_setup_session=" + value}, base=GW_L97L_SETUP, auth=False)
         check("a custom plugin path needs genuine admin authentication while dashboard auth is off", s == 403 and "genuine admin authentication" in b, (s, b[:200]))
         s, _, b = call("GET", "/api/config", None, {"cookie": "bifrost_setup_session=" + value}, base=GW_L97L_SETUP, auth=False)
-        s2, _, b2 = call("GET", "/api/config", None, None, base=GW_L97L_SETUP, auth=False)
+        s2, _, b2 = call("GET", "/api/config", None, {"x-bifrost-setup-token": ""}, base=GW_L97L_SETUP, auth=False)
         check("the setup session cookie opens the locked API, which is closed without it", s == 200 and s2 == 401, (s, s2, b2[:200]))
         s, _, b = call("POST", "/api/users", {"name": "first", "role": "admin", "password": "first-pass-1"}, {"cookie": "bifrost_setup_session=" + value}, base=GW_L97L_SETUP, auth=False)
         check("the setup session cookie creates the first admin without the token", s in (200, 201), (s, b[:200]))
@@ -4729,9 +4752,10 @@ def l134b_config():
                 {"name": "ana", "role": "viewer", "token_sha256": hashlib.sha256("ana-session-l134b".encode()).hexdigest()},
             ],
             "virtual_keys": [
-                {"id": "vk-all", "value": "sk-bf-l134b-all", "user_id": "ana"},
+                # a key without mcp_configs gets no MCP tools (L184, as in Bifrost): "all" is granted every client
+                {"id": "vk-all", "value": "sk-bf-l134b-all", "user_id": "ana", "mcp_configs": [{"mcp_client_name": n, "tools_to_execute": ["*"]} for n in ("docs", "notes", "quiet", "code")]},
                 {"id": "vk-notes", "value": "sk-bf-l134b-notes", "mcp_configs": [{"mcp_client_name": "notes", "tools_to_execute": ["*"]}]},
-                {"id": "vk-bo", "value": "sk-bf-l134b-bo", "user_id": "bo"},
+                {"id": "vk-bo", "value": "sk-bf-l134b-bo", "user_id": "bo", "mcp_configs": [{"mcp_client_name": n, "tools_to_execute": ["*"]} for n in ("docs", "notes", "quiet", "code")]},
             ],
         },
     }
@@ -6648,6 +6672,7 @@ def webrtc_e2e(env):
     GW_R = "http://127.0.0.1:18162"
     shutil.rmtree(os.path.join(BUILD, "e2e-live-logs"), ignore_errors=True)
     cfg = {"client": {"enable_logging": False, "enforce_auth_on_inference": True, "allow_per_request_content_storage_override": True},
+           "server": {"webrtc_enabled": True},
            "providers": {"openai": {"keys": [{"name": "pool", "value": "sk-pool", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
            "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-live-logs"), "content_logging": True},
            "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
@@ -6765,6 +6790,7 @@ def realtime_e2e(env):
     # the voice rate per second is set too: a realtime call is billed by its tokens, not by its seconds (Bifrost's RealtimeRequest)
     rt_price = {"input_cost_per_token": 0.000004, "output_cost_per_token": 0.000016, "cache_read_input_token_cost": 0.0000004, "input_cost_per_audio_token": 0.000032, "output_cost_per_audio_token": 0.000064, "input_cost_per_second": 0.001}
     cfg = {"client": {"enable_logging": False, "enforce_auth_on_inference": True, "allow_per_request_content_storage_override": True},
+           "server": {"webrtc_enabled": True},
            "providers": {"openai": {"keys": [{"name": "pool", "value": "sk-pool", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
                          "xai": {"keys": [{"name": "xk", "value": "xai-rt-key", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
            "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-rt-logs"), "content_logging": True},
@@ -6794,6 +6820,7 @@ def realtime_e2e(env):
     json.dump(cfg, open(path, "w"))
     # Azure OpenAI has a WebRTC call API too: its own key, endpoint and price
     acfg = {"client": {"enable_logging": False, "enforce_auth_on_inference": False},
+            "server": {"webrtc_enabled": True},
             "providers": {"azure": {"keys": [{"name": "az", "value": "az-rt-key", "models": [], "weight": 1.0, "azure_key_config": {"endpoint": MOCK, "api_version": "2025-04-01-preview"}}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
             "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-rt-azure-logs"), "content_logging": True},
             "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
@@ -7170,6 +7197,7 @@ def l160_e2e(env):
     rt_price = {"input_cost_per_token": 0.000004, "output_cost_per_token": 0.000016, "cache_read_input_token_cost": 0.0000004, "input_cost_per_audio_token": 0.000032, "output_cost_per_audio_token": 0.000064}
     tr_price = {"input_cost_per_token": 0.0000025, "output_cost_per_token": 0.00001, "input_cost_per_audio_token": 0.000006, "input_cost_per_second": 0.0001}
     cfg = {"client": {"enable_logging": False, "enforce_auth_on_inference": True},
+           "server": {"webrtc_enabled": True},
            "providers": {"openai": {"keys": [{"id": "k-pool", "name": "pool", "value": "sk-pool", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
            "logs_store": {"enabled": True, "dir": os.path.join(BUILD, "e2e-l160-logs"), "content_logging": True},
            "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
@@ -11476,7 +11504,7 @@ def l167_e2e(env, idp_state):
             "client": client_cfg(disable_vk),
             "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
             "providers": {"openai": {"keys": [{"name": "k", "value": "sk-k", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
-            "governance": {"auth_config": {"token": "admin-secret"}, "virtual_keys": [{"id": "vk-l167-a", "value": "sk-bf-l167-a"}]},
+            "governance": {"auth_config": {"token": "admin-secret"}, "virtual_keys": [{"id": "vk-l167-a", "value": "sk-bf-l167-a", "mcp_configs": [{"mcp_client_name": n, "tools_to_execute": ["*"]} for n in ("po", "oa", "tenant", "jira")]}]},
             "oidc": {"enabled": True, "issuer": "http://127.0.0.1:18096", "client_id": "raiju", "redirect_uri": GW_L167 + "/api/oidc/callback", "role_claim": "groups", "role_map": {"raiju-editors": "editor"}},
             "mcp": {"tool_sync_interval": "1h", "oauth_private_allowlist": ["127.0.0.1"], "client_configs": [
                 {"name": "po", "connection_type": "http", "connection_string": MOCK + "/mcp-peruser-oauth", "auth_type": "per_user_oauth", "auth": {"type": "oauth"}},
@@ -11508,7 +11536,7 @@ def l167_e2e(env, idp_state):
         """The authorization server's redirect for an authorize URL: (path, query) of the callback."""
         loc = ""
         try:
-            urllib.request.build_opener(NoFollow).open(url, timeout=10)
+            urllib.request.build_opener(NoFollow, SetupTokenHandler).open(url, timeout=10)
         except urllib.error.HTTPError as e:
             loc = e.headers.get("location", "")
         lu = urllib.parse.urlparse(loc)
@@ -11757,7 +11785,9 @@ def l166_config():
             "budgets": [{"id": "b-l166", "max_limit": 0.4, "reset_duration": "1d"}],
             "customers": [{"id": "c-l166", "name": "Toolco", "budget_id": "b-l166"}],
             "teams": [{"id": "t-l166", "name": "tools", "customer_id": "c-l166"}],
-            "virtual_keys": [{"id": "vk-l166", "value": "sk-bf-l166"}, {"id": "vk-l166-team", "value": "sk-bf-l166-team", "team_id": "t-l166"}],
+            # a key without mcp_configs gets no MCP tools (L184, as in Bifrost): these keys are granted every client
+            "virtual_keys": [{"id": "vk-l166", "value": "sk-bf-l166", "mcp_configs": [{"mcp_client_name": n, "tools_to_execute": ["*"]} for n in ("pingy", "noping", "dyn", "echo", "filed", "escaped")]},
+                             {"id": "vk-l166-team", "value": "sk-bf-l166-team", "team_id": "t-l166", "mcp_configs": [{"mcp_client_name": n, "tools_to_execute": ["*"]} for n in ("pingy", "noping", "dyn", "echo", "filed", "escaped")]}],
             "projects": [{"id": "p-l166", "name": "tool-proj", "membership_mode": "open", "access_rule": "intersect", "provider_configs": [{"provider": "openai"}],
                           "mcp_configs": [{"mcp_client_name": "pingy", "tools_to_execute": ["lookup"]}], "virtual_mcps": ["vdyn"]}],
         },
@@ -13628,6 +13658,165 @@ def l181_scim_e2e(env, idp_state):
         gw.terminate()
         gw.wait()
 
+GW_L184 = "http://127.0.0.1:18324"  # L184: no admin and no setup token (the locked /api), virtual keys, MCP, WebRTC off
+GW_L184_SETUP = "http://127.0.0.1:18325"  # L184: a setup token, keys without ids, private files and the share folder
+
+def l184_e2e(env):
+    """L184, secure defaults. A gateway with no admin and no setup token answers 403 on /api (an unauthenticated PUT can
+    no longer move a provider's base_url); a setup token opens it. /metrics labels stay a fixed set under junk paths and
+    models. Async job ids are random and a job is shown only to the key that submitted it. A provider read and written
+    back masked keeps its keys, and a masked value that matches none is refused. The config, its .bak, the request log
+    and the workers' share folder are private. A virtual key without mcp_configs gets no MCP tools; WebRTC calls are
+    off unless server.webrtc_enabled is set."""
+    import re as _re, shutil, stat
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    d = os.path.join(BUILD, "e2e-l184")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    open_cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": True},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "providers": {"openai": {"keys": [{"name": "l184", "value": "sk-l184-real-0001", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "mcp": {"client_configs": [{"name": "weather", "connection_type": "http", "connection_string": MOCK + "/mcp"}]},
+        "governance": {"virtual_keys": [{"id": "vk-l184-a", "value": "sk-bf-l184-a"}, {"id": "vk-l184-b", "value": "sk-bf-l184-b"},
+                                        {"id": "vk-l184-mcp", "value": "sk-bf-l184-mcp", "mcp_configs": [{"mcp_client_name": "weather", "tools_to_execute": ["*"]}]}]},
+    }
+    open_path = os.path.join(d, "open.json")
+    json.dump(open_cfg, open(open_path, "w"))
+    # keys written by hand without ids, a logs folder, and two workers on bun (the share folder)
+    setup_dir = os.path.join(d, "setup")
+    os.makedirs(setup_dir)
+    setup_path = os.path.join(setup_dir, "config.json")
+    json.dump({
+        "setup_token": "l184-setup",
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "logs_store": {"enabled": True, "dir": os.path.join(setup_dir, "logs")},
+        "providers": {"openai": {"keys": [{"name": "hand-1", "value": "sk-l184-hand-written-0001", "models": [], "weight": 1.0},
+                                          {"name": "hand-2", "value": "sk-l184-hand-written-0002", "models": [], "weight": 1.0}],
+                                 "network_config": {"base_url": MOCK, "max_retries": 0}}},
+    }, open(setup_path, "w"))
+    os.chmod(setup_path, 0o600)
+    # the first gateway must not inherit the e2e setup token: it shows the lock with none configured
+    open_env = {k: v for k, v in env.items() if k != "BIFROST_SETUP_TOKEN"}
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18324", "-host", "127.0.0.1", "-config", open_path, "-server", server], env=open_env, stderr=open(os.path.join(BUILD, "e2e.l184.log"), "w"))
+    args_b = [os.path.join(BUILD, "raiju"), "-port", "18325", "-host", "127.0.0.1", "-config", setup_path, "-server", server]
+    if server != "http1":
+        args_b += ["-workers", "2"]
+    gw_b = subprocess.Popen(cwd=ROOT, args=args_b, env=env, stderr=open(os.path.join(BUILD, "e2e.l184-setup.log"), "w"))
+    A = {"authorization": "Bearer sk-bf-l184-a"}
+    B = {"authorization": "Bearer sk-bf-l184-b"}
+    try:
+        wait(GW_L184 + "/health")
+        wait(GW_L184_SETUP + "/health")
+        none = {"x-bifrost-setup-token": ""}
+        # ---- P0-1: the locked /api ----
+        s, _, b = call("GET", "/api/providers", None, none, base=GW_L184, auth=False)
+        check("with no admin and no setup token, /api answers 403 (Bifrost's lock)", s == 403 and "no setup token is set" in b, (s, b[:200]))
+        s, _, b = call("GET", "/api/config", None, {"x-bifrost-setup-token": "anything"}, base=GW_L184, auth=False)
+        check("... and no setup token opens it", s == 403, (s, b[:200]))
+        s, _, b = call("PUT", "/api/providers/openai", {"keys": [], "network_config": {"base_url": "http://127.0.0.1:9/steal"}}, none, base=GW_L184, auth=False)
+        check("an unauthenticated PUT cannot move a provider's base_url", s == 403, (s, b[:200]))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l184 after put"}]}, A, base=GW_L184, auth=False)
+        check("... and inference still goes to the configured upstream", s == 200 and seen()[-1]["auth"] == "Bearer sk-l184-real-0001", (s, b[:200], seen()[-1:]))
+        s, _, b = call("GET", "/api/session/is-auth-enabled", None, none, base=GW_L184, auth=False)
+        check("the auth state stays readable under the lock", s == 200 and json.loads(b).get("setup_token_configured") is False, (s, b[:200]))
+        s, _, b = call("GET", "/health", base=GW_L184, auth=False)
+        check("/health stays open", s == 200, s)
+        log = open(os.path.join(BUILD, "e2e.l184.log")).read()
+        check("start-up warns that /api is locked and how to set a setup token", "/api is locked (403)" in log and "BIFROST_SETUP_TOKEN" in log, log[-600:])
+        s, _, b = call("GET", "/api/providers", None, none, base=GW_L184_SETUP, auth=False)
+        check("with a setup token, /api without it is a 401", s == 401, (s, b[:200]))
+        s, _, b = call("GET", "/api/providers", None, {"x-bifrost-setup-token": "l184-setup"}, base=GW_L184_SETUP, auth=False)
+        check("... and the token opens it", s == 200, (s, b[:200]))
+        # ---- P0-4: bounded metric labels ----
+        for i in range(60):
+            call("GET", f"/zz-junk-path-{i}x", None, None, base=GW_L184, auth=False)
+            call("POST", "/v1/chat/completions", {"model": f"openai/zz-junk-model-{i}", "messages": [{"role": "user", "content": "x"}]}, None, base=GW_L184, auth=False)
+        _, _, m = call("GET", "/metrics", base=GW_L184, auth=False)
+        check("unrouted paths are labelled other, not one series each", 'path="other"' in m and "zz-junk-path" not in m, [l for l in m.splitlines() if "zz-junk-path" in l][:3])
+        # ---- P1-2: async job ids and owners ----
+        s, _, b = call("POST", "/v1/async/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l184 job"}]}, A, base=GW_L184, auth=False)
+        job = json.loads(b).get("id", "") if s == 202 else ""
+        check("an async job id is 128 random bits", s == 202 and _re.fullmatch(r"job_[0-9a-f]{32}", job) is not None, (s, b[:200]))
+        done = {}
+        for _ in range(50):
+            s2, _, b2 = call("GET", "/v1/async/jobs/" + job, None, A, base=GW_L184, auth=False)
+            done = json.loads(b2) if s2 == 200 else {}
+            if done.get("status") == "completed":
+                break
+            time.sleep(0.1)
+        check("the key that submitted a job reads its result", done.get("status") == "completed", done)
+        s, _, b = call("GET", "/v1/async/jobs/" + job, None, B, base=GW_L184, auth=False)
+        check("another virtual key polling the job gets a 404", s == 404, (s, b[:200]))
+        s, _, b = call("GET", "/v1/async/chat/completions/" + job, None, None, base=GW_L184, auth=False)
+        check("a poll with no credential gets a 404", s == 404, (s, b[:200]))
+        # ---- owner decision 2: MCP denied to a key without mcp_configs ----
+        def tools_for(h):
+            s0, hh, _ = call("POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "e2e-l184", "version": "1"}}}, h, base=GW_L184, auth=False)
+            sid = {k.lower(): v for k, v in hh.items()}.get("mcp-session-id", "")
+            _, _, tb = call("POST", "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, {**h, "mcp-session-id": sid}, base=GW_L184, auth=False)
+            return tb
+        # the key granted the client waits for the tools to be listed (inference auth is enforced here)
+        got = ""
+        for _ in range(120):
+            got = tools_for({"authorization": "Bearer sk-bf-l184-mcp"})
+            if "get_weather" in got:
+                break
+            time.sleep(0.25)
+        check("a key granted the client lists its tools", "get_weather" in got, got[:300])
+        got = tools_for(A)
+        check("a virtual key without mcp_configs lists no MCP tools", '"tools"' in got and "get_weather" not in got, got[:300])
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l184 no tools"}]}, A, base=GW_L184, auth=False)
+        sent = json.loads(seen()[-1]["body"])
+        check("... and its chat requests reach the provider without MCP tools", s == 200 and not any("weather" in json.dumps(t) for t in sent.get("tools", [])), sent.get("tools"))
+        s, _, b = call("POST", "/v1/mcp/tool/execute", {"id": "c1", "type": "function", "function": {"name": "weather-get_weather", "arguments": "{\"city\":\"Oslo\"}"}}, A, base=GW_L184, auth=False)
+        check("... and it may not run them", s == 403 or "not allowed" in b, (s, b[:200]))
+        # ---- owner decision 3: WebRTC off by default ----
+        s, _, b = call("POST", "/v1/realtime/calls?model=openai/gpt-realtime", "v=0", {**A, "content-type": "application/sdp"}, base=GW_L184, auth=False)
+        check("a WebRTC realtime call is refused while server.webrtc_enabled is off", s == 403 and "webrtc_enabled" in b, (s, b[:200]))
+        s, _, b = call("POST", "/v1/live/sessions", {"session": {"model": "openai/gpt-4o-mini"}, "transport": {"type": "webrtc", "sdp": "v=0"}}, A, base=GW_L184, auth=False)
+        check("... and so is a WebRTC live session", s == 403 and "webrtc_enabled" in b, (s, b[:200]))
+        # ---- P1-3: the masked-key round trip ----
+        tok = {"x-bifrost-setup-token": "l184-setup"}
+        s, _, b = call("GET", "/api/providers/openai", None, tok, base=GW_L184_SETUP, auth=False)
+        got = json.loads(b) if s == 200 else {}
+        check("a provider read shows each key's effective id, masked", s == 200 and [k.get("id") for k in got.get("keys", [])] == ["hand-1", "hand-2"] and "hand-written" not in b, (s, b[:300]))
+        got["send_back_raw_response"] = True
+        s, _, b = call("PUT", "/api/providers/openai", got, tok, base=GW_L184_SETUP, auth=False)
+        saved = json.load(open(setup_path))
+        vals = [k.get("value") for k in saved["providers"]["openai"]["keys"]]
+        check("sending the masked provider back keeps the real keys in config.json", s == 200 and vals == ["sk-l184-hand-written-0001", "sk-l184-hand-written-0002"], (s, b[:200], vals))
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l184 keys kept"}]}, None, base=GW_L184_SETUP, auth=False)
+        check("... and inference still uses a real key", s == 200 and seen()[-1]["auth"].startswith("Bearer sk-l184-hand-written-000"), (s, seen()[-1:]))
+        bad = {"keys": [{"name": "new-one", "value": "sk-R…3456", "models": [], "weight": 1.0}]}
+        s, _, b = call("PUT", "/api/providers/openai", bad, tok, base=GW_L184_SETUP, auth=False)
+        check("a masked key value that matches no stored key is refused", s == 400 and "masked" in b, (s, b[:200]))
+        # ---- P1-9: private files and share folder ----
+        mode = lambda p: stat.S_IMODE(os.stat(p).st_mode)
+        check("the config backup is private (0600)", os.path.exists(setup_path + ".bak") and mode(setup_path + ".bak") == 0o600, oct(mode(setup_path + ".bak")) if os.path.exists(setup_path + ".bak") else "no .bak")
+        check("the config keeps 0600 across saves", mode(setup_path) == 0o600, oct(mode(setup_path)))
+        logs = os.path.join(setup_dir, "logs")
+        # (a single process batches its log rows: the file appears within the flush interval)
+        files = []
+        for _ in range(40):
+            files = [f for f in os.listdir(logs) if f.endswith(".jsonl")] if os.path.isdir(logs) else []
+            if files:
+                break
+            time.sleep(0.1)
+        check("the request log folder and its files are private", os.path.isdir(logs) and mode(logs) == 0o700 and files and all(mode(os.path.join(logs, f)) == 0o600 for f in files), (oct(mode(logs)) if os.path.isdir(logs) else "no logs", files))
+        if server != "http1":
+            tmp = os.environ.get("TMPDIR") or "/tmp"
+            shares = [n for n in os.listdir(tmp) if n.startswith(f"raiju-{gw_b.pid}")]
+            check("the workers' share folder has an unpredictable name and is private (0700)", len(shares) == 1 and _re.fullmatch(rf"raiju-{gw_b.pid}-[0-9a-f]{{16}}", shares[0]) is not None and mode(os.path.join(tmp, shares[0])) == 0o700, shares)
+            check("no predictable /tmp/raiju-<pid> folder is made", not os.path.exists(f"/tmp/raiju-{gw_b.pid}"), f"/tmp/raiju-{gw_b.pid}")
+    finally:
+        gw.terminate()
+        gw_b.terminate()
+        gw.wait()
+        gw_b.wait()
 
 GW_L179 = "http://127.0.0.1:18310"  # object ownership, logs_only reveal, earlier days in the request log
 
@@ -13766,6 +13955,8 @@ def main():
     shutil.rmtree(os.path.join(ROOT, "build/e2e-wlogs"), ignore_errors=True)
     shutil.rmtree(os.path.join(ROOT, "build/e2e-chromem"), ignore_errors=True)
     shutil.rmtree(os.path.join(ROOT, "build/e2e-l80-logs"), ignore_errors=True)
+    # every gateway started from here on holds the e2e setup token (see E2E_SETUP); os.environ too, for the ones started from a copy of it
+    os.environ["BIFROST_SETUP_TOKEN"] = E2E_SETUP
     env = {**os.environ, "E2E_OPENAI_KEY": "sk-from-env", "E2E_ADMIN_TOKEN": "admin-secret", "MOCK_PORT": "18099", "RAIJU_WEBRTC_BIND": "127.0.0.1", "MOCK_RTC_BIND": "127.0.0.1"}
     mock = subprocess.Popen([os.path.join(BUILD, "mock_upstream")], env=env, stdout=subprocess.DEVNULL)
     qdrant = subprocess.Popen([sys.executable, os.path.join(ROOT, "tests/qdrant_mock.py"), "18089"])
@@ -15760,7 +15951,7 @@ def main():
                 return None
         loc = ""
         try:
-            urllib.request.build_opener(NoRedirect).open(auth_url, timeout=10)
+            urllib.request.build_opener(NoRedirect, SetupTokenHandler).open(auth_url, timeout=10)
         except urllib.error.HTTPError as e:
             loc = e.headers.get("location", "")
         lu = urllib.parse.urlparse(loc)
@@ -16208,6 +16399,9 @@ def main():
         # L179: provider files and batches bound to their creating virtual key, the logs_only reveal mapping, and
         # log reads of earlier days after a restart: its own gateway (18310)
         l179_e2e(env)
+        # L184: secure defaults (the locked /api, bounded metric labels, owned job ids, the masked-key round trip, private
+        # files and share folder, MCP denied to a key without mcp_configs, WebRTC off): its own gateways (18324, 18325)
+        l184_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

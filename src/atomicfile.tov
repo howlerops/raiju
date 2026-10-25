@@ -2,12 +2,19 @@
 // the same directory, is flushed to disk, and is renamed over the target (rename replaces it in one step), then the
 // directory is flushed so the rename itself survives a power cut. A crash before the rename leaves the old file as
 // it was, plus a temporary file that removeStaleTemps clears. Append-only logs don't need this and keep appending.
-import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs"
+import { appendFileSync, chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { basename, dirname } from "node:path"
 
+// New files are private by default (0600): config, state, logs and caches hold keys and prompts.
+export const PRIVATE_FILE = 384
+// and folders that hold them 0700
+export const PRIVATE_DIR = 448
+
 export type AtomicOptions = {
-  // Permission bits for a new file (an existing file keeps its own). Default 0o666 less the umask.
+  // Permission bits for a new file (an existing file keeps its own unless exact is set). Default 0o600.
   mode?: int
+  // true applies mode to an existing file too (a backup that must not stay readable to others)
+  exact?: bool
   // false skips the fsyncs: still atomic for readers and crashes of the process, not for a power cut. For caches.
   durable?: bool
 }
@@ -23,10 +30,10 @@ function tempPrefix(path: string): string {
 export function writeTemp(path: string, data: string | u8[], opts?: AtomicOptions): string throws Error {
   tempSeq += 1
   const tmp = dirname(path) + "/" + tempPrefix(path) + process.pid + "-" + tempSeq
-  let mode = opts?.mode ?? 438
+  let mode = opts?.mode ?? PRIVATE_FILE
   try {
-    // keep an existing file's permissions (a secrets file stays 0600)
-    if (existsSync(path)) mode = statSync(path).mode & 511
+    // keep an existing file's permissions (a file an operator opened up stays so)
+    if (opts?.exact !== true && existsSync(path)) mode = statSync(path).mode & 511
   } catch (e) {}
   try {
     writeFileSync(tmp, data, { mode: mode, flush: opts?.durable ?? true })
@@ -67,6 +74,23 @@ export function syncDir(dir: string): void {
 export function writeFileAtomic(path: string, data: string | u8[], opts?: AtomicOptions): void throws Error {
   const tmp = try writeTemp(path, data, opts)
   try commitTemp(tmp, path, opts?.durable ?? true)
+}
+
+// Appends to a log file, creating it private (0600) first: appendFileSync alone would create it 0666 less the umask.
+export function appendPrivate(path: string, data: string | u8[]): void throws Error {
+  if (!existsSync(path)) {
+    const fd = try openSync(path, "a", PRIVATE_FILE)
+    try closeSync(fd)
+  }
+  try appendFileSync(path, data)
+}
+
+// Makes a folder (and its parents) and makes the folder itself private (0700). Parents keep their own permissions:
+// they may be shared folders the operator chose.
+export function mkdirPrivate(dir: string): void throws Error {
+  const fresh = !existsSync(dir)
+  try mkdirSync(dir, { recursive: true })
+  if (fresh) try chmodSync(dir, PRIVATE_DIR)
 }
 
 // Removes temporary files of path that a crash left behind: those older than maxAgeMs (another process may be
@@ -167,6 +191,24 @@ test("an existing file keeps its permissions; a new file takes the mode", () => 
   try writeFileAtomic(path, "k2")
   expect((try statSync(path)).mode & 511).toBe(416)
   expect(try readFileSync(path)).toBe("k2")
+  try rmSync(dir, { recursive: true, force: true })
+})
+
+test("new files, logs and folders are private; exact re-applies the mode to an existing file", () => {
+  const dir = testDir()
+  try writeFileAtomic(dir + "/config.json", "{}")
+  expect((try statSync(dir + "/config.json")).mode & 511).toBe(384)
+  // a backup written over one an older version left world-readable is private again
+  try writeFileSync(dir + "/config.json.bak", "old", { mode: 420 })
+  try chmodSync(dir + "/config.json.bak", 420)
+  try writeFileAtomic(dir + "/config.json.bak", "{}", { mode: PRIVATE_FILE, exact: true })
+  expect((try statSync(dir + "/config.json.bak")).mode & 511).toBe(384)
+  try appendPrivate(dir + "/requests.jsonl", "a\n")
+  try appendPrivate(dir + "/requests.jsonl", "b\n")
+  expect((try statSync(dir + "/requests.jsonl")).mode & 511).toBe(384)
+  expect(try readFileSync(dir + "/requests.jsonl")).toBe("a\nb\n")
+  try mkdirPrivate(dir + "/logs/audit")
+  expect((try statSync(dir + "/logs/audit")).mode & 511).toBe(448)
   try rmSync(dir, { recursive: true, force: true })
 })
 

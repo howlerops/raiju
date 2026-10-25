@@ -56,6 +56,9 @@ def _read(path):
         return f.read()
 
 
+SETUP_TOKEN = "smoke-setup-" + os.urandom(8).hex()
+
+
 def build_config(env, logs_dir, read_file=_read):
     """The gateway config for the providers that have credentials in env. Returns (config, extra child environment,
     plan, skipped): plan maps each configured provider to its {model, embed, native} names (models carry the
@@ -106,6 +109,8 @@ def build_config(env, logs_dir, read_file=_read):
         providers[name] = {"keys": [key], "network_config": {"max_retries": 1, "default_request_timeout_in_seconds": 60}}
         plan[name] = {"model": f"{name}/{model}", "embed": f"{name}/{emb}" if emb else "", "native": native}
     cfg = {
+        # /api is locked without an admin (Bifrost's setup lock): the log reads send this throwaway setup token
+        "setup_token": SETUP_TOKEN,
         "client": {"enable_logging": True, "enforce_auth_on_inference": False},
         "logs_store": {"enabled": True, "dir": logs_dir, "content_logging": False},
         "large_payload_optimization": {"enabled": True, "request_threshold_bytes": LARGE_THRESHOLD, "response_threshold_bytes": 1048576,
@@ -168,7 +173,7 @@ def sse_events(text):
 def log_row(rid, want_tokens=True):
     """The request's log row (logging is asynchronous, so it is polled for a few seconds)."""
     for _ in range(30):
-        s, _, b = call("GET", "/api/logs/" + urllib.parse.quote(rid, safe=""), timeout=5)
+        s, _, b = call("GET", "/api/logs/" + urllib.parse.quote(rid, safe=""), {"x-bifrost-setup-token": SETUP_TOKEN}, timeout=5)
         if s == 200:
             row = jget(b) or {}
             if not want_tokens or row.get("prompt_tokens"):

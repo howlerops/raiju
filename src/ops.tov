@@ -78,7 +78,7 @@ import { deadline } from "./deadline"
 import { secureHex, utf8, sha256, toHex } from "./crypto"
 import * as b64 from "./base64"
 import * as metrics from "./metrics"
-import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, appendFileSync, statSync } from "node:fs"
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, appendFileSync, chmodSync, statSync } from "node:fs"
 import { writeFileAtomic } from "./atomicfile"
 import { Counters, ClusterConfig, BrokerConfig, brokerUrl, syncInterval } from "./cluster"
 import { clusterState, ownerOf } from "./clusterstate"
@@ -538,6 +538,9 @@ function okJson(body: string): Reply {
 function badRequest(message: string): Reply {
   return { status: 400, body: errorJson(message, "invalid_request_error", undefined), contentType: "application/json" }
 }
+
+// The answer of a locked /api with no setup token configured (Bifrost's words, with Raiju's ways to set one).
+export const LOCKED_MESSAGE = "dashboard auth is not configured and no setup token is set; set setup_token in config.json (or the BIFROST_SETUP_TOKEN env var) and restart the gateway"
 
 // challenge is the WWW-Authenticate value of a 401 (the MCP authorization server's, when it is on).
 function denied(status: int, message: string, challenge?: string): Response {
@@ -1406,12 +1409,12 @@ export class Ops {
   shareTimer: int = -1
   sweeps = 0
 
-  // Called in each worker after the fork. Usage counters gossip through files in a
-  // directory named after the supervisor (the same CRDT merge as clustering), and the
-  // response cache keeps its entries there too.
-  startLocalShare(supervisorPid: int): void {
-    this.shareDir = `/tmp/raiju-${supervisorPid}`
-    removeStaleShares()
+  // Called in each worker after the fork. Usage counters gossip through files in the node's share folder, which the
+  // supervisor made before the fork (makeShareDir: private and unpredictable), with the same CRDT merge as clustering,
+  // and the response cache keeps its entries there too. dir is "" when the folder could not be made.
+  startLocalShare(dir: string): void {
+    if (dir === "") return
+    this.shareDir = dir
     try {
       mkdirSync(this.shareDir + "/counters", { recursive: true })
     } catch (e) {
@@ -2418,7 +2421,7 @@ export class Ops {
     if (path === "/api/session/setup") {
       if (m !== "POST") return json(405, errorJson("use POST", "invalid_request_error", undefined))
       if (this.authOn) return json(409, errorJson("the setup lock is not active", "invalid_request_error", undefined))
-      const token = resolveEnv(this.store.cfg.setup_token ?? "")
+      const token = this.setupToken()
       const given = req.headers.get("x-bifrost-setup-token") ?? ""
       if (token === "" || given !== token) return json(403, errorJson("invalid setup token", "invalid_request_error", undefined))
       try {
@@ -2436,7 +2439,7 @@ export class Ops {
       if (m !== "GET") return json(405, errorJson("use GET", "invalid_request_error", undefined))
       const valid = bearer !== "" && this.liveSession(bearer) !== undefined
       const enforced = this.store.cfg.client?.enforce_auth_on_inference ?? false
-      return json(200, JSON.stringify({ is_auth_enabled: this.authOn, has_valid_token: valid, auth_type: this.authOn ? "basic" : "none", inference_auth_enforced: enforced, setup_required: !this.authOn, setup_token_configured: resolveEnv(this.store.cfg.setup_token ?? "") !== "" }))
+      return json(200, JSON.stringify({ is_auth_enabled: this.authOn, has_valid_token: valid, auth_type: this.authOn ? "basic" : "none", inference_auth_enforced: enforced, setup_required: !this.authOn, setup_token_configured: this.setupToken() !== "" }))
     }
     if (path === "/api/session/login") {
       if (m !== "POST") return json(405, errorJson("use POST", "invalid_request_error", undefined))
@@ -4838,13 +4841,34 @@ export class Ops {
     return s === undefined ? "" : s.sub
   }
 
+  // The operator's setup token: setup_token (env.NAME allowed), else the BIFROST_SETUP_TOKEN environment variable, as
+  // Bifrost's resolveSetupToken reads them. "" when neither is set.
+  setupToken(): string {
+    const configured = resolveEnv(this.store.cfg.setup_token ?? "").trim()
+    if (configured !== "") return configured
+    return (process.env.BIFROST_SETUP_TOKEN ?? "").trim()
+  }
+
+  // The start-up warnings about open surfaces (Bifrost prints the first as a banner): /api is locked until an admin
+  // exists, and inference is open to anyone who reaches the port while auth is not enforced on it.
+  startupWarnings(): string[] {
+    const out: string[] = []
+    if (!this.authOn) {
+      if (this.setupToken() !== "") out.push("no admin account is configured: /api is locked until one is created; send the setup token in the X-Bifrost-Setup-Token header (POST /api/users creates the first admin)")
+      else out.push("no admin account and no setup token are configured: /api is locked (403); set setup_token in config.json (or the BIFROST_SETUP_TOKEN env var) and restart to finish setup")
+    }
+    if (!this.engine.gov.enforce) out.push("inference is not authenticated (client.enforce_auth_on_inference is off): anyone who reaches this port can use the provider keys")
+    return out
+  }
+
   // Bifrost's setup lock (SetupLockMiddleware): while no admin account exists, every /api route but the public ones
-  // needs the operator's setup_token in X-Bifrost-Setup-Token (a wrong one is a 403) or the setup session cookie that
-  // POST /api/session/setup trades it for (401 without either); the caller then acts as the admin. Bifrost locks the
-  // API even when no token is set (a 403 for everything); Raiju keeps an unlocked API until setup_token is set.
+  // needs the operator's setup token in X-Bifrost-Setup-Token (a wrong one is a 403) or the setup session cookie that
+  // POST /api/session/setup trades it for (401 without either); the caller then acts as the admin. With no setup
+  // token configured the API is locked outright (a 403 for everything but the public routes), as in Bifrost.
   setupLock(req: Request, path: string): Gate {
-    const want = resolveEnv(this.store.cfg.setup_token ?? "")
-    if (want === "" || setupPublic(path)) return { kind: "ok", actor: "anonymous" }
+    if (setupPublic(path)) return { kind: "ok", actor: "anonymous" }
+    const want = this.setupToken()
+    if (want === "") return { kind: "deny", res: denied(403, LOCKED_MESSAGE) }
     const given = req.headers.get("x-bifrost-setup-token") ?? ""
     if (given !== "") {
       if (!sameSecret(given, want)) return { kind: "deny", res: denied(403, "invalid setup token") }
@@ -5327,7 +5351,7 @@ export class Ops {
   users(method: string, path: string, body: string, setupToken: string, setupSession: string): Reply {
     // Bifrost's setup gate: while no admin exists, the first account needs the operator's setup_token, given
     // as the header or as a setup session from POST /api/session/setup
-    const want = resolveEnv(this.store.cfg.setup_token ?? "")
+    const want = this.setupToken()
     if (method === "POST" && !this.authOn && want !== "" && setupToken !== want && !validSetupSession(setupSession, want, Date.now())) {
       return { status: 403, body: errorJson("the setup token is required to create the first admin account", "invalid_request_error", undefined), contentType: "application/json" }
     }
@@ -5596,7 +5620,7 @@ export class Ops {
     if (this.engine.gov.enforce && vk === undefined && mcpUser === "") return denied(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", challenge)
     // a key's access profile may limit the tools it sees; allow_by_default opens the clients it does not name
     const allowedTools = this.engine.gov.policyFor(h)?.mcpTools
-    let tools = exposedTools(m.allToolsFor(allowedTools, vk?.mcp_configs, this.engine.projectMcp(h, virtualName)))
+    let tools = exposedTools(m.allToolsFor(allowedTools, this.engine.keyMcp(h, virtualName), this.engine.projectMcp(h, virtualName)))
     // code mode: the four meta-tools stand in for the code mode clients' tools, as in the tool list Bifrost serves
     // (a virtual MCP lists only its own tools)
     if (virtualName === undefined && this.engine.codeEntriesFor(m, h).length > 0) {
@@ -5671,7 +5695,7 @@ export class Ops {
     } else {
       for (const t of tools) seen.push(t.name)
     }
-    const iparts = m.instructionParts(allowedTools, vk?.mcp_configs, this.engine.projectMcp(h, virtualName)).filter((p) => seen.some((n) => n.startsWith(p.name + "-")))
+    const iparts = m.instructionParts(allowedTools, this.engine.keyMcp(h, virtualName), this.engine.projectMcp(h, virtualName)).filter((p) => seen.some((n) => n.startsWith(p.name + "-")))
     const instructions = m.renderInstructions(iparts)
     const r = await handleMcp(body, h.get("mcp-session-id"), tools, run, this.mcpSessions, now, instructions)
     const out: Record<string, string> = new Map()
@@ -5682,14 +5706,57 @@ export class Ops {
   }
 }
 
+// The folder share directories are made in ($TMPDIR, else /tmp).
+function shareBase(): string {
+  const t = process.env.TMPDIR ?? ""
+  return t === "" ? "/tmp" : t
+}
+
+// The supervisor pid a share directory name carries: raiju-<pid>-<random hex>, or the older raiju-<pid>. undefined
+// for any other name.
+export function sharePid(name: string): int | undefined {
+  if (!name.startsWith("raiju-")) return undefined
+  let rest = name.slice(6)
+  const dash = rest.indexOf("-")
+  if (dash >= 0) {
+    const tag = rest.slice(dash + 1)
+    if (tag.byteLength !== 16) return undefined
+    for (const ch of tag.chars()) {
+      if (!"0123456789abcdef".includes(ch)) return undefined
+    }
+    rest = rest.slice(0, dash)
+  }
+  const pid = parseInt(rest)
+  if (pid === undefined || "" + pid !== rest) return undefined
+  return pid
+}
+
+// The node's share folder, made by the supervisor before its workers fork: raiju-<pid>-<16 random hex digits> under
+// $TMPDIR (or /tmp). The random part makes the name unpredictable, and mkdir refuses a name that already exists (a
+// planted folder or symlink), so another local user can neither pre-create it nor redirect it; it is then made
+// private (0700), which keeps the shared counters, cache entries and metrics from other users. "" when it cannot be
+// made (the workers then keep their state to themselves).
+export function makeShareDir(supervisorPid: int): string {
+  removeStaleShares()
+  try {
+    const dir = `${shareBase()}/raiju-${supervisorPid}-${try secureHex(16)}`
+    mkdirSync(dir)
+    chmodSync(dir, 448)
+    return dir
+  } catch (e) {
+    console.error(`raiju: can't share state between workers: ${e.message}`)
+    return ""
+  }
+}
+
 // Share directories of gateways that are no longer running (their supervisor's pid is gone).
 function removeStaleShares(): void {
+  const base = shareBase()
   try {
-    for (const d of readdirSync("/tmp")) {
-      if (!d.startsWith("raiju-")) continue
-      const pid = parseInt(d.slice(6))
-      if (pid === undefined || "" + pid !== d.slice(6)) continue
-      if (!existsSync(`/proc/${pid}`)) rmSync("/tmp/" + d, { recursive: true, force: true })
+    for (const d of readdirSync(base)) {
+      const pid = sharePid(d)
+      if (pid === undefined) continue
+      if (!existsSync(`/proc/${pid}`)) rmSync(base + "/" + d, { recursive: true, force: true })
     }
   } catch (e) {
     // best effort
@@ -5737,6 +5804,66 @@ test("circuit view lists only the circuits that are not closed", () => {
   expect(ops.circuitView().body).toBe(`{"circuits":{}}`)
   for (let i = 0; i < 20; i++) eng.health.record("openai#k1", false, 100.0, Date.now())
   expect(ops.circuitView().body.includes("\"openai#k1\":\"open\"")).toBe(true)
+})
+
+// An Ops whose engine and store both hold cfg, as at start.
+function lockFor(cfg: Config): Ops throws Error {
+  const path = "/tmp/raiju-ops-lock-" + (try secureHex(6)) + ".json"
+  return new Ops(new Engine(cfg), new ConfigStore(path, cfg))
+}
+
+function gateStatus(ops: Ops, path: string, hs: Record<string, string>): int {
+  const g = ops.gate(new Request("http://gw" + path, { method: "GET", headers: hs }), path)
+  return g.kind === "ok" ? 200 : g.res.status
+}
+
+test("/api is locked without an admin: 403 with no setup token, the token or its session opens it", () => {
+  const none: Record<string, string> = new Map()
+  // no admin and no setup token: everything but the public routes is refused (the old default left it open)
+  let lockOps = try lockFor({})
+  if ((process.env.BIFROST_SETUP_TOKEN ?? "") === "") {
+    expect(gateStatus(lockOps, "/api/providers", none)).toBe(403)
+    expect(gateStatus(lockOps, "/api/config", none)).toBe(403)
+    expect(lockOps.startupWarnings()[0]!.includes("no setup token")).toBe(true)
+  }
+  expect(gateStatus(lockOps, "/api/session/is-auth-enabled", none)).toBe(200)
+  expect(gateStatus(lockOps, "/api/version", none)).toBe(200)
+  expect(lockOps.startupWarnings().some((w) => w.includes("inference is not authenticated"))).toBe(true)
+  // a setup token: missing 401, wrong 403, right opens it
+  lockOps = try lockFor({ setup_token: "s3cret-setup" })
+  expect(gateStatus(lockOps, "/api/providers", none)).toBe(401)
+  const wrong: Record<string, string> = new Map()
+  wrong.set("x-bifrost-setup-token", "nope")
+  expect(gateStatus(lockOps, "/api/providers", wrong)).toBe(403)
+  const right: Record<string, string> = new Map()
+  right.set("x-bifrost-setup-token", "s3cret-setup")
+  expect(gateStatus(lockOps, "/api/providers", right)).toBe(200)
+  // client.whitelisted_routes stay open, as Bifrost's whitelist
+  lockOps = try lockFor({ client: { whitelisted_routes: ["/api/models"] } })
+  expect(gateStatus(lockOps, "/api/models", none)).toBe(200)
+  // once an admin exists the setup token no longer opens anything
+  lockOps = try lockFor({ setup_token: "s3cret-setup", governance: { auth_config: { token: "admin-tok" } } })
+  expect(gateStatus(lockOps, "/api/providers", right)).toBe(401)
+  const admin: Record<string, string> = new Map()
+  admin.set("authorization", "Bearer admin-tok")
+  expect(gateStatus(lockOps, "/api/providers", admin)).toBe(200)
+  expect(lockOps.startupWarnings().some((w) => w.includes("/api is locked"))).toBe(false)
+})
+
+test("the worker share folder is private, unpredictable and its stale copies are recognized", () => {
+  expect(sharePid("raiju-123")).toBe(123)
+  expect(sharePid("raiju-123-0123456789abcdef")).toBe(123)
+  expect(sharePid("raiju-123-0123")).toBeUndefined()
+  expect(sharePid("raiju-123-0123456789abcdeZ")).toBeUndefined()
+  expect(sharePid("raiju-plugins")).toBeUndefined()
+  expect(sharePid("raiju-store-ab.json")).toBeUndefined()
+  const a = makeShareDir(process.pid)
+  const b = makeShareDir(process.pid)
+  expect(a !== "" && b !== "" && a !== b).toBe(true)
+  expect(sharePid(a.slice(a.indexOf("raiju-")))).toBe(process.pid)
+  expect((try statSync(a)).mode & 511).toBe(448)
+  try rmSync(a, { recursive: true, force: true })
+  try rmSync(b, { recursive: true, force: true })
 })
 
 test("circuit reset closes one circuit by id, or all of them", () => {
