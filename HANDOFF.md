@@ -11,11 +11,15 @@ session. It sets up the machine, explains the lead/worker loop and points at the
 Worker briefs start from [handoff/worker-prompt-template.md](handoff/worker-prompt-template.md);
 the rules all workers follow are in [handoff/worker-brief.md](handoff/worker-brief.md).
 
-Branch: `claude/affectionate-shannon-pjwi5z`. Waves 1 to 27 are on `main` (PR howlerops/raiju#9).
-The branch carries wave 28 (L205 to L207).
+Branch: `claude/affectionate-shannon-pjwi5z`. Waves 1 to 28 are on `main` (PR howlerops/raiju#10).
+The branch carries wave 29 (L208 and L209).
 
 ## Where things stand
 
+- Wave 29 (L208, L209) fixed the fifth re-audit (docs/audits/production-reaudit-5-2026-10-26.md): the request-body
+  cap is a hard memory bound again with a per-tenant share and a reserve for idle tenants, declared lengths are
+  reserved at admission, and name uniqueness accepts updates that keep their name. Behaviour changes are in
+  docs/behaviour-changes-wave-29.md.
 - Wave 28 (L205 to L207) fixed the fourth re-audit (docs/audits/production-reaudit-4-2026-10-25.md): checked
   bodies keep a minimum rate over a sliding window with a ceiling and a per-credential share, and the broker checks
   signed heads; MCP OAuth registration is stateless (sealed client_ids); Math.random is seeded from getrandom per
@@ -87,7 +91,7 @@ The branch carries wave 28 (L205 to L207).
   current Bifrost datasheet.
 - docs/parity.md counts 567 parity rows: done 531, partial 12, missing 0, out of scope 15,
   n/a 9, plus 42 Raiju-only extras.
-- Tests at handoff (compiler from tov-patches 0001 to 0010, 0012, 0013, 0015 to 0017, 0019 to 0021): `make unit` 2,485 passed,
+- Tests at handoff (compiler from tov-patches 0001 to 0010, 0012, 0013, 0015 to 0017, 0019 to 0021): `make unit` 2,493 passed,
   0 failed, plus the Python tests (gen_pricing, the h2/gRPC interop suite, crew_priors,
   test_deploy, test_gen_config_doc); e2e "all passed" on Bun and http1; `make ui` all passed;
   `make openapi-check` ok; `make web-check` and `make config-doc-check` up to date. Helm lint and

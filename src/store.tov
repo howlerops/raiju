@@ -214,6 +214,40 @@ function findById<T extends HasId>(xs: T[] | undefined, id: string): T | undefin
   return undefined
 }
 
+// The virtual key, team and customer names that more than one record holds (saved before names were unique), one
+// line each: `team name "core" is held by t1, t2`. Updates keeping such a name still pass; a create or a rename onto
+// it is refused, so renaming all but one fixes it.
+export function duplicateNames(c: Config): string[] {
+  const g = gov(c)
+  let out: string[] = []
+  dupLines("virtual key", (g.virtual_keys ?? []).map((x) => [x.name ?? "", x.id]), &out)
+  dupLines("team", (g.teams ?? []).map((x) => [x.name, x.id]), &out)
+  dupLines("customer", (g.customers ?? []).map((x) => [x.name, x.id]), &out)
+  return out
+}
+
+function dupLines(what: string, named: string[][], inout out: string[]): void {
+  const ids: Map<string, string[]> = new Map()
+  const order: string[] = []
+  for (const p of named) {
+    const name = p[0]!
+    if (name === "") continue
+    const got = ids.get(name)
+    if (got === undefined) {
+      ids.set(name, [p[1]!])
+      order.push(name)
+    } else {
+      let next = got
+      next.push(p[1]!)
+      ids.set(name, next)
+    }
+  }
+  for (const name of order) {
+    const held = ids.get(name)!
+    if (held.length > 1) out.push(`${what} name ${JSON.stringify(name)} is held by ${held.join(", ")}`)
+  }
+}
+
 // Replaces the entry with x's id, or appends x.
 function putById<T extends HasId>(xs: T[], x: T): T[] {
   const out: T[] = []
@@ -2174,8 +2208,9 @@ export class ConfigStore {
     if (looksMasked(value)) return fail(400, "the virtual key value is masked but matches no stored key: send the real value, or leave it out to keep it")
     for (const other of g.virtual_keys ?? []) {
       if (other.value === value && other.id !== id) return fail(409, "another virtual key has this value")
-      // names are unique as in Bifrost (two concurrent creates of one name: the second is refused, ConfigStore.group)
-      if (vk.name !== undefined && vk.name !== "" && other.name === vk.name && other.id !== id) return fail(409, "A virtual key with this name already exists")
+      // names are unique as in Bifrost (two concurrent creates of one name: the second is refused, ConfigStore.group);
+      // an update keeping its stored name passes, so a config with duplicates from before can still be edited
+      if (vk.name !== undefined && vk.name !== "" && vk.name !== old?.name && other.name === vk.name && other.id !== id) return fail(409, "A virtual key with this name already exists")
     }
     const refErr = vkRefError(this.cfg, vk)
     if (refErr !== "") return fail(400, refErr)
@@ -2311,8 +2346,10 @@ export class ConfigStore {
     if (b !== undefined && findById(g.budgets, b) === undefined) return fail(400, `unknown budget ${b}`)
     const bu = t.business_unit_id
     if (bu !== undefined && bu !== "" && findById(g.business_units, bu) === undefined) return fail(400, `unknown business unit ${bu}`)
+    // an update keeping its stored name passes (duplicates saved before names were unique; duplicateNames)
+    const keeps = findById(g.teams, id)?.name === t.name
     for (const other of g.teams ?? []) {
-      if (other.name === t.name && other.id !== id) return fail(409, "A team with this name already exists")
+      if (!keeps && other.name === t.name && other.id !== id) return fail(409, "A team with this name already exists")
     }
     const next: TeamConfig = { id: id, name: t.name, customer_id: cu, budget_id: b, business_unit_id: bu === "" ? undefined : bu }
     g.teams = putById(g.teams ?? [], next)
@@ -2334,8 +2371,9 @@ export class ConfigStore {
     const g = gov(this.cfg)
     const b = c.budget_id
     if (b !== undefined && findById(g.budgets, b) === undefined) return fail(400, `unknown budget ${b}`)
+    const keeps = findById(g.customers, id)?.name === c.name
     for (const other of g.customers ?? []) {
-      if (other.name === c.name && other.id !== id) return fail(409, "A customer with this name already exists")
+      if (!keeps && other.name === c.name && other.id !== id) return fail(409, "A customer with this name already exists")
     }
     const next: CustomerConfig = { id: id, name: c.name, budget_id: b }
     g.customers = putById(g.customers ?? [], next)
@@ -2953,10 +2991,12 @@ function putGov(store: ConfigStore, coll: string, pathId: string | undefined, bo
     const b = parseVk(body)
     if (b === undefined) return badBody()
     const id = resolveId(pathId, b.id, "vk-")
-    const created = findById(g.virtual_keys, id) === undefined
+    const was = findById(g.virtual_keys, id)
+    const created = was === undefined
     const vk: VirtualKeyConfig = {
       id: id,
-      name: b.name,
+      // an update without a name keeps the stored one, as Bifrost's (its other fields are replaced: Raiju's PUT)
+      name: b.name ?? was?.name,
       value: b.value ?? "",
       description: b.description,
       is_active: b.is_active,
@@ -3006,16 +3046,18 @@ function putGov(store: ConfigStore, coll: string, pathId: string | undefined, bo
     const b = parseTeam(body)
     if (b === undefined) return badBody()
     const id = resolveId(pathId, b.id, "team-")
-    const created = findById(g.teams, id) === undefined
-    const r = store.upsertTeam({ id: id, name: b.name ?? "", customer_id: b.customer_id, budget_id: b.budget_id, business_unit_id: b.business_unit_id })
+    const was = findById(g.teams, id)
+    const created = was === undefined
+    const r = store.upsertTeam({ id: id, name: b.name ?? was?.name ?? "", customer_id: b.customer_id, budget_id: b.budget_id, business_unit_id: b.business_unit_id })
     if (r.kind === "error") return errReply(r)
     return storedReply(findById(gov(store.cfg).teams, id), created ? 201 : 200)
   }
   const b = parseCustomer(body)
   if (b === undefined) return badBody()
   const id = resolveId(pathId, b.id, "customer-")
-  const created = findById(g.customers, id) === undefined
-  const r = store.upsertCustomer({ id: id, name: b.name ?? "", budget_id: b.budget_id })
+  const was = findById(g.customers, id)
+  const created = was === undefined
+  const r = store.upsertCustomer({ id: id, name: b.name ?? was?.name ?? "", budget_id: b.budget_id })
   if (r.kind === "error") return errReply(r)
   return storedReply(findById(gov(store.cfg).customers, id), created ? 201 : 200)
 }
@@ -6308,6 +6350,46 @@ test("virtual key, team and customer names are unique, as in Bifrost (409), and 
   expect(handleApi(s, "POST", "/api/governance/customers", `{"id":"c1","name":"acme"}`).status).toBe(201)
   expect(handleApi(s, "POST", "/api/governance/customers", `{"id":"c2","name":"acme"}`).status).toBe(409)
   expect(handleApi(s, "PUT", "/api/governance/customers/c1", `{"name":"acme"}`).status).toBe(200)
+  cleanup(path)
+})
+
+test("duplicate names saved before names were unique: an update keeping the name passes, a rename onto one or a create is refused, and they are listed", () => {
+  const path = tmpPath()
+  const c: Config = {
+    governance: {
+      virtual_keys: [{ id: "vk-1", name: "prod", value: "sk-bf-1" }, { id: "vk-2", name: "prod", value: "sk-bf-2" }, { id: "vk-3", name: "dev", value: "sk-bf-3" }],
+      teams: [{ id: "t1", name: "core" }, { id: "t2", name: "core" }],
+      customers: [{ id: "c1", name: "acme" }, { id: "c2", name: "acme" }],
+    },
+  }
+  const s = new ConfigStore(path, c)
+  const dups = duplicateNames(s.cfg)
+  expect(dups.length).toBe(3)
+  expect(dups[0]!).toBe(`virtual key name "prod" is held by vk-1, vk-2`)
+  expect(dups[1]!).toBe(`team name "core" is held by t1, t2`)
+  expect(dups[2]!).toBe(`customer name "acme" is held by c1, c2`)
+  // deactivating a leaked key keeps its name
+  expect(handleApi(s, "PUT", "/api/governance/virtual-keys/vk-1", `{"name":"prod","is_active":false}`).status).toBe(200)
+  expect(findById(gov(s.cfg).virtual_keys, "vk-1")?.is_active ?? true).toBe(false)
+  // a PUT without a name keeps the stored one, as Bifrost's update does
+  expect(handleApi(s, "PUT", "/api/governance/virtual-keys/vk-2", `{"description":"leaked"}`).status).toBe(200)
+  expect(findById(gov(s.cfg).virtual_keys, "vk-2")?.name ?? "").toBe("prod")
+  // a rename onto a name another record holds, and a create with it, are still refused
+  expect(handleApi(s, "PUT", "/api/governance/virtual-keys/vk-3", `{"name":"prod"}`).status).toBe(409)
+  expect(handleApi(s, "POST", "/api/governance/virtual-keys", `{"id":"vk-4","name":"prod"}`).status).toBe(409)
+  // renaming one of the pair away fixes it
+  expect(handleApi(s, "PUT", "/api/governance/virtual-keys/vk-2", `{"name":"prod-old"}`).status).toBe(200)
+  expect(duplicateNames(s.cfg).length).toBe(2)
+  expect(handleApi(s, "PUT", "/api/governance/teams/t1", `{"name":"core"}`).status).toBe(200)
+  expect(handleApi(s, "PUT", "/api/governance/teams/t2", `{}`).status).toBe(200)
+  expect(findById(gov(s.cfg).teams, "t2")?.name ?? "").toBe("core")
+  expect(handleApi(s, "POST", "/api/governance/teams", `{"id":"t3","name":"core"}`).status).toBe(409)
+  expect(handleApi(s, "POST", "/api/governance/teams", `{"id":"t3"}`).status).toBe(400)
+  expect(handleApi(s, "PUT", "/api/governance/customers/c1", `{"name":"acme"}`).status).toBe(200)
+  expect(handleApi(s, "PUT", "/api/governance/customers/c2", `{}`).status).toBe(200)
+  expect(findById(gov(s.cfg).customers, "c2")?.name ?? "").toBe("acme")
+  expect(handleApi(s, "POST", "/api/governance/customers", `{"id":"c3","name":"acme"}`).status).toBe(409)
+  expect(duplicateNames({}).length).toBe(0)
   cleanup(path)
 })
 

@@ -13545,7 +13545,7 @@ def l201_e2e(env):
         "alerts": {"enabled": False},
         "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
         "server": {"max_buffered_body_mb": 4, "body_deadline_seconds": 3, "body_min_kb_per_second": 64, "body_rate_grace_seconds": 2},
-        "governance": {"virtual_keys": [{"id": "vk-l201", "name": "vk-l201", "value": "sk-bf-l201"}]},
+        "governance": {"virtual_keys": [{"id": "vk-l201", "name": "vk-l201", "value": "sk-bf-l201"}, {"id": "vk-l201b", "name": "vk-l201b", "value": "sk-bf-l201b"}]},
         "providers": {"openai": {"keys": [{"name": "o-l201", "value": "sk-l201", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
         "cluster": {"enabled": True, "node_id": "l201", "secret": "env.RAIJU_L201_SECRET", "interval_ms": 200, "peers": [], "listen_port": 18359, "bind": "127.0.0.1", "max_body_mb": 2},
     }
@@ -13568,9 +13568,13 @@ def l201_e2e(env):
         t.start()
         time.sleep(0.8)
         s1, _, b1 = call("POST", "/v1/chat/completions", small, key, base=GW_L201, auth=False)
-        s2, _, b2 = call("POST", "/v1/chat/completions", l196_chat(1048576).decode(), key, base=GW_L201, auth=False)
+        # (L208: a declared length is reserved whole at admission; another key's body still fits in the reserve
+        # server.body_reserve_mb keeps beside a lone body, the slow body's own key is past its share)
+        s2, _, b2 = call("POST", "/v1/chat/completions", l196_chat(1048576).decode(), {"x-bf-vk": "sk-bf-l201b"}, base=GW_L201, auth=False)
+        s2k = declared_status(18358, "/v1/chat/completions", 1048576, key)
         check("l201: while a slow 50 MB body trickles in, a small POST is served (it was 503)", s1 == 200, (s1, b1[:200]))
-        check("l201: and a 1 MB POST is served too: the slow body holds only what it sent", s2 == 200, (s2, b2[:200]))
+        check("l201: and another key's 1 MB POST is served too", s2 == 200, (s2, b2[:200]))
+        check("l201: the slow body's own key gets 503 for a second 1 MB body (L208: its declared length is reserved)", s2k == 503, s2k)
         t.join(20)
         check("l201: the slow body (20 KB/s) is cut with 408 once it falls behind server.body_min_kb_per_second (about 3 s)", slow.get("status") == 408 and 2.5 < slow.get("after", 0) < 7.0, slow)
         s3, _, b3 = call("POST", "/v1/chat/completions", small, key, base=GW_L201, auth=False)
@@ -13991,7 +13995,7 @@ def l205_e2e(env):
         s1, _, b1 = call("POST", "/v1/chat/completions", l196_chat(200000).decode(), kb, base=GW_L205, auth=False)
         check("l205: while key a holds the whole body budget, key b's 200 KB chat is served (it was 503)", s1 == 200 and "Hello from gpt-4o-mini" in b1, (s1, b1[:200]))
         s2, _, b2 = call("POST", "/v1/chat/completions", l196_chat(1048576).decode(), kb, base=GW_L205, auth=False)
-        check("l205: and key b's 1 MB chat too (a's bytes past server.credential_body_mb do not count against b)", s2 == 200, (s2, b2[:200]))
+        check("l205: and key b's 1 MB chat too (L208: b is within its share, so it may use server.body_reserve_mb past a's lone body)", s2 == 200, (s2, b2[:200]))
         s3 = declared_status(18366, "/v1/chat/completions", 200000, ka)
         check("l205: key a's own next body still sees all it holds (503)", s3 == 503, s3)
         hog.settimeout(15)
@@ -14018,6 +14022,125 @@ def l205_e2e(env):
         check("l205: the same upload with a direct key nobody configured keeps the unchecked deadline (408 at 3 s)",
               st == 408 and "body_deadline_seconds" in ans and took < 5.0, (st, round(took, 1), ans[-200:]))
     finally:
+        gw.terminate()
+        gw.wait()
+
+
+GW_L208 = "http://127.0.0.1:18372"  # L208: the body cap as a hard bound, per-tenant shares with a reserve, declared lengths reserved at admission
+
+
+def l208_chunked_open(port: int, headers: dict, total: int):
+    """A raw chunked chat POST of which total bytes go out now in 64 KB chunks, unfinished; the socket (None when the
+    connection was cut while sending)."""
+    s = socket.create_connection(("127.0.0.1", port), timeout=20)
+    head = "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n"
+    head += "".join("%s: %s\r\n" % (k, v) for k, v in headers.items()) + "\r\n"
+    s.sendall(head.encode())
+    sent = 0
+    try:
+        while sent < total:
+            n = min(65536, total - sent)
+            s.sendall(b"%x\r\n" % n + b"x" * n + b"\r\n")
+            sent += n
+            time.sleep(0.005)
+    except OSError:
+        pass
+    return s
+
+
+def l208_status(s, wait_s: float) -> int:
+    """The status a raw socket has been answered within wait_s seconds (0: none yet, or the connection closed)."""
+    s.settimeout(wait_s)
+    code, _ = l196_read(s)
+    return code
+
+
+def l208_e2e(env):
+    """L208 (production re-audit 5, P1-A, P1-B, P2-A). P1-A: server.max_buffered_body_mb is a hard bound on the bytes
+    in hand again (L205's per-credential discount let three keys' 46 + 24 + 24 MB in at once, about twice the cap):
+    beside a body in hand, another key's body past its share is 503 unread. P1-B: the share counts per tenant (a key's
+    customer, else its team, else the key), and tenants past their share, or chunked bodies that keep growing, leave
+    server.body_reserve_mb free, so four keys of one customer holding bodies no longer turn an outsider's 1 MB chat away
+    (it was 503). P2-A: a declared length is reserved whole at admission, so of eight keys' 1 MB bodies sent at once
+    the ones past the cap are 503 before any byte is sent and every admitted one completes (they failed part way
+    together). Its own gateway (18372)."""
+    d = os.path.join(BUILD, "e2e-l208")
+    os.makedirs(d, exist_ok=True)
+    cp = os.path.join(d, "config.json")
+    log = os.path.join(d, "gw.log")
+    keys = [{"id": "vk-l208-%d" % i, "name": "vk-l208-%d" % i, "value": "sk-bf-l208-%d" % i} for i in range(1, 9)]
+    gang = [{"id": "vk-l208-g%d" % i, "name": "vk-l208-g%d" % i, "value": "sk-bf-l208-g%d" % i, "customer_id": "cu-l208"} for i in range(1, 5)]
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": True},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        # 4 MB of bodies in hand; a quarter (1 MB) per tenant and a quarter kept for tenants within their share (defaults)
+        "server": {"max_buffered_body_mb": 4},
+        "governance": {"customers": [{"id": "cu-l208", "name": "cu-l208"}], "virtual_keys": keys + gang},
+        "providers": {"openai": {"keys": [{"name": "o-l208", "value": "sk-l208", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+    }
+    json.dump(cfg, open(cp, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18372", "-host", "127.0.0.1", "-config", cp, "-server", os.environ.get("RAIJU_SERVER", "bun")],
+                          env=env, stderr=open(log, "w"))
+    k = lambda i: {"x-bf-vk": "sk-bf-l208-%d" % i}
+    socks = []
+    try:
+        wait(GW_L208 + "/health")
+
+        # ---- P1-A: 3.8 MB in hand from key 1, then 2 MB from keys 2 and 3 ----
+        first = l196_open(18372, "/v1/chat/completions", 3984588, k(1), 3984588 - 1024)
+        time.sleep(0.5)
+        s2 = declared_status(18372, "/v1/chat/completions", 2 * 1048576, k(2))
+        s3 = declared_status(18372, "/v1/chat/completions", 2 * 1048576, k(3))
+        check("l208: beside 3.8 MB in hand, other keys' 2 MB bodies are 503 unread (the cap is a hard bound; both were admitted: 7.8 MB in a 4 MB cap)", s2 == 503 and s3 == 503, (s2, s3))
+        first.sendall(l196_chat(3984588)[3984588 - 1024:])
+        code, head = l196_read(first)
+        first.close()
+        check("l208: the body in hand is served", code == 200, head[:300])
+
+        # ---- P1-B: four keys of one customer hold chunked bodies (0.95 MB each, then nothing) ----
+        for i in range(1, 5):
+            socks.append(l208_chunked_open(18372, {"x-bf-vk": "sk-bf-l208-g%d" % i}, 996147))
+            time.sleep(0.2)
+        time.sleep(0.5)
+        cut = [l208_status(s, 0.3) for s in socks]
+        check("l208: the customer's chunked bodies past cap - server.body_reserve_mb are refused 503 (the tenant past its share is refused first)", cut.count(503) >= 1, cut)
+        s1, _, b1 = call("POST", "/v1/chat/completions", l196_chat(1048576).decode(), k(4), base=GW_L208, auth=False)
+        check("l208: while the customer's keys hold bodies, an outsider's 1 MB chat is served (it was 503: each key stayed within a per-key share)", s1 == 200 and "Hello from gpt-4o-mini" in b1, (s1, b1[:200]))
+        s5 = declared_status(18372, "/v1/chat/completions", 1048576, {"x-bf-vk": "sk-bf-l208-g1"})
+        check("l208: the customer's next 1 MB body is 503 (its keys count as one tenant, past its share)", s5 == 503, s5)
+        for s in socks:
+            s.close()
+        socks = []
+        time.sleep(1.0)
+
+        # ---- P2-A: eight keys declare 1 MB at once and send nothing yet ----
+        conns = [l196_open(18372, "/v1/chat/completions", 1048576, k(i), 0) for i in range(1, 9)]
+        socks = conns
+        time.sleep(0.5)
+        early = [l208_status(s, 0.5) for s in conns]
+        check("l208: of eight 1 MB bodies declared at once, the four past the 4 MB cap are 503 before any byte is sent", early.count(503) == 4 and early.count(0) == 4, early)
+        done = []
+        for s, e in zip(conns, early):
+            if e != 0:
+                continue
+            s.sendall(l196_chat(1048576))
+        for s, e in zip(conns, early):
+            if e != 0:
+                continue
+            done.append(l208_status(s, 10))
+        check("l208: and the four admitted bodies all complete (their bytes were reserved; they failed part way together)", done == [200, 200, 200, 200], done)
+        for s in conns:
+            s.close()
+        socks = []
+        st, _, b = call("POST", "/v1/chat/completions", l196_chat(2 * 1048576).decode(), k(5), base=GW_L208, auth=False)
+        check("l208: once they are done the budget is free again", st == 200, (st, b[:200]))
+    finally:
+        for s in socks:
+            try:
+                s.close()
+            except OSError:
+                pass
         gw.terminate()
         gw.wait()
 
@@ -17671,6 +17794,82 @@ def l207_e2e(env):
         gw.terminate()
         gw.wait()
 
+GW_L209 = "http://127.0.0.1:18374"  # L209: duplicate names from before names were unique (two workers on Bun)
+L209_ADMIN = {"authorization": "Bearer sk-admin-l209"}
+
+def l209_e2e(env):
+    """L209: a config holding duplicate virtual key, team and customer names saved before names were unique (wave 28).
+    The gateway warns at start and posts a dashboard notice listing them; a PUT keeping the stored name (deactivating a
+    leaked key "prod") succeeds, a PUT without a name keeps the stored name as Bifrost's update does, and a rename onto
+    a name another record holds or a create with it still gets 409. Port 18374."""
+    import hashlib, shutil, http.client
+    d = os.path.join(BUILD, "e2e-l209")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    path = os.path.join(d, "config.json")
+    json.dump({
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l209".encode()).hexdigest()}],
+            "virtual_keys": [{"id": "vk-1", "name": "prod", "value": "sk-bf-l209-one"}, {"id": "vk-2", "name": "prod", "value": "sk-bf-l209-two"},
+                             {"id": "vk-3", "name": "dev", "value": "sk-bf-l209-three"}],
+            "teams": [{"id": "t1", "name": "core"}, {"id": "t2", "name": "core"}],
+            "customers": [{"id": "c1", "name": "acme"}, {"id": "c2", "name": "acme"}],
+        },
+    }, open(path, "w"))
+    def req(method, p, body=None):
+        c = http.client.HTTPConnection("127.0.0.1", 18374, timeout=30)
+        try:
+            c.request(method, p, body=None if body is None else json.dumps(body), headers={"content-type": "application/json", **L209_ADMIN})
+            r = c.getresponse()
+            return r.status, r.read().decode()
+        except Exception as e:
+            return 0, str(e)
+        finally:
+            c.close()
+    def stored(coll, i):
+        for x in json.load(open(path)).get("governance", {}).get(coll, []):
+            if x.get("id") == i:
+                return x
+        return {}
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    extra = ["-workers", "2"] if server != "http1" else []
+    log = os.path.join(BUILD, "e2e.l209.log")
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18374", "-host", "127.0.0.1", "-config", path, "-server", server] + extra,
+                          env=env, stderr=open(log, "w"))
+    try:
+        wait(GW_L209 + "/health")
+        time.sleep(1.0)
+        text = open(log).read()
+        check("L209: the start warning lists the duplicate virtual key, team and customer names",
+              "duplicates" in text and 'virtual key name "prod" is held by vk-1, vk-2' in text and 'team name "core" is held by t1, t2' in text
+              and 'customer name "acme" is held by c1, c2' in text, text[-600:])
+        seen = set()
+        for _ in range(8):
+            st, b = req("GET", "/api/notifications?limit=500")
+            if st == 200:
+                for n in json.loads(b).get("notifications", []):
+                    if n.get("title") == "Duplicate names":
+                        seen.add(n.get("message", ""))
+        check("L209: every worker's dashboard shows a notice naming the duplicates", len(seen) > 0 and all('"prod" is held by vk-1, vk-2' in m for m in seen), sorted(seen)[:2])
+        st, b = req("PUT", "/api/governance/virtual-keys/vk-1", {"name": "prod", "is_active": False})
+        check("L209: a PUT keeping the duplicate name 'prod' deactivates the leaked key (was 409)", st == 200 and stored("virtual_keys", "vk-1").get("is_active") is False, (st, b[:200]))
+        st, b = req("PUT", "/api/governance/virtual-keys/vk-2", {"description": "rotate me"})
+        check("L209: a PUT without a name keeps the stored name, as Bifrost's update", st == 200 and stored("virtual_keys", "vk-2").get("name") == "prod", (st, stored("virtual_keys", "vk-2")))
+        st, b = req("PUT", "/api/governance/virtual-keys/vk-3", {"name": "prod"})
+        st2, b2 = req("POST", "/api/governance/virtual-keys", {"name": "prod"})
+        check("L209: a rename onto a name another key holds and a create with it still get 409", st == 409 and st2 == 409 and "already exists" in b and "already exists" in b2, (st, st2))
+        st, _ = req("PUT", "/api/governance/teams/t2", {})
+        st2, _ = req("POST", "/api/governance/teams", {"name": "core"})
+        st3, _ = req("PUT", "/api/governance/customers/c1", {"name": "acme"})
+        st4, _ = req("POST", "/api/governance/customers", {"name": "acme"})
+        check("L209: teams and customers: an update keeping the name passes, a create with it gets 409",
+              (st, st2, st3, st4) == (200, 409, 200, 409) and stored("teams", "t2").get("name") == "core", (st, st2, st3, st4))
+    finally:
+        gw.terminate()
+        gw.wait()
+
 def main():
     unique_ports()
     build()
@@ -20171,6 +20370,9 @@ def main():
         # L205: the sliding-window rate and ceiling of checked bodies, the per-credential share of the body budget, direct
         # provider keys counted as checked: its own gateway (18366)
         l205_e2e(env)
+        # L208: the body cap as a hard bound, per-tenant shares with a reserve for tenants within theirs, declared
+        # lengths reserved at admission: its own gateway (18372)
+        l208_e2e(env)
         # L194: Hugging Face inference providers (chat, embeddings, speech, transcription, images), the CLI's agent sign-in
         # and default key, and the A2A v0.3 REST client: its own gateway (18344) and Hugging Face double (18345)
         l194_e2e(env)
@@ -20203,6 +20405,9 @@ def main():
         # L207: group commit of concurrent config saves (one file write per group, each change its own reply, 409 per
         # twin name): its own gateway (18370)
         l207_e2e(env)
+        # L209: duplicate names saved before names were unique (start warning, notice, updates that keep a name): its
+        # own gateway (18374)
+        l209_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

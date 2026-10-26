@@ -912,7 +912,7 @@ export interface paths {
         };
         /** One virtual key (value masked) */
         get: operations["getApiGovernanceVirtualKeysId"];
-        /** Replace a virtual key (an empty value keeps the current one) */
+        /** Replace a virtual key (an empty value keeps the current one, and a missing name the stored one) */
         put: operations["putApiGovernanceVirtualKeysId"];
         post?: never;
         /** Delete a virtual key */
@@ -1599,7 +1599,7 @@ export interface paths {
         };
         /** One team */
         get: operations["getApiGovernanceTeamsId"];
-        /** Replace a team */
+        /** Replace a team (a missing name keeps the stored one) */
         put: operations["putApiGovernanceTeamsId"];
         post?: never;
         /** Delete a team */
@@ -1636,7 +1636,7 @@ export interface paths {
         };
         /** One customer */
         get: operations["getApiGovernanceCustomersId"];
-        /** Replace a customer */
+        /** Replace a customer (a missing name keeps the stored one) */
         put: operations["putApiGovernanceCustomersId"];
         post?: never;
         /** Delete a customer */
