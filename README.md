@@ -276,23 +276,27 @@ MCP server's `/mcp` under `client.mcp_server_auth_mode`, and the management API'
 also caps the request-body bytes it reads at once across requests, `server.max_buffered_body_mb`
 (default 48, sized for a 512Mi pod: parsing a chat body costs several times its size) as a hard bound;
 a declared length is reserved whole when the body is admitted, so a body that does not fit is answered
-503 with `retry-after` before its client sends it, and a chunked body is charged as its bytes arrive. A body whose credential was checked from the headers (a virtual key, a
+503 with `retry-after` before its client sends it, and a chunked body is charged as its bytes arrive.
+Under contention a reservation whose body fell behind its pace (at its rate so far, more than 10 s to go,
+a second after it was admitted) is cut to what it has received plus a small look-ahead, so a client that
+declares a big length and sends slowly or nothing does not hold the cap. A body whose credential was checked from the headers (a virtual key, a
 direct provider key that is one of the configured keys, a management sign-in) must keep
 `server.body_min_kb_per_second` (default 32) after `server.body_rate_grace_seconds` (10), counted over
 each recent `server.body_rate_window_seconds` (30), and arrive whole within `server.body_max_seconds`
 (600), so a slow but steady upload is served and one that sends a lot at once and then trickles is cut a
 window later. Bodies count per tenant (a virtual key's customer, else its team, else the key): a tenant
-past `server.credential_body_mb` (a quarter of the cap), or a chunked body that keeps growing, fills the
-cap only up to `server.body_reserve_mb` (a quarter) short of it, so one tenant, however many keys it
-has, cannot turn the other tenants' big bodies away; it is the one refused first. A body
+that holds bytes past `server.credential_body_mb` (a quarter of the cap) beside other tenants (or while
+another tenant waits), or a chunked body that keeps growing, fills the cap only up to
+`server.body_reserve_mb` (a quarter) short of it, so one tenant, however many keys it has, cannot turn
+the other tenants' big bodies away; it is the one refused first. A tenant's first body may fill the cap. A body
 nobody vouched for (auth off, or behind the plugins' HTTP hooks) shares `server.unchecked_body_mb` (an
 eighth of the cap) beside other bodies and must arrive whole within `server.body_deadline_seconds`
 (default 30); 408 otherwise. The routes anyone may call without a credential (sign-in, setup, agent
 sign-in, OAuth, OIDC) read at most 64 KB, and the cluster peer routes at most `cluster.max_body_mb`
 (16) with a budget of their own, after checking the head signature (method, route, time and
 Content-Length, HMAC with `cluster.secret`). A lone body up to `client.max_request_body_size_mb` is
-always read, so that limit keeps Bifrost's meaning.
-`bench/body_memory.py` measures both.
+always read (small bodies in flight do not count against it), so that limit keeps Bifrost's meaning.
+`bench/body_memory.py` measures both, and `make soak-bodies` checks that big bodies leave no memory behind.
 
 The workers of one node share budgets, rate limits, the response and semantic
 caches and `/metrics` (summed) through a private share folder, `$TMPDIR/raiju-<pid>-<random>` (the clustering CRDT, one slot per worker).
@@ -357,8 +361,10 @@ measure. Raiju's internal overhead (`x-bf-overhead-us`) was ~40 µs mean at
 ### Memory
 
 `make soak` (`tests/soak/soak.py`) drives one worker with streamed and plain chat, slow streams held open and
-the log store on, and fails when its RSS keeps growing or an open stream costs too much. CI runs it as its own
-job. Measured on a 4-core VM (one worker, about 600 requests a second plus 100 slow streams):
+the log store on, and fails when its RSS keeps growing or an open stream costs too much. `make soak-bodies`
+(`tests/soak/bodies.py`) sends 1 MB, 4 MB and 200 KB request bodies to one worker for 60 s and signed 4 MB peer
+bodies to a broker for 20 s, and fails when either grows past 40 MB (before L210 a 1 MB + 4 MB loop grew a worker
+from 20 to 836 MB in 100 s). CI runs both in the memory soak job. Measured on a 4-core VM (one worker, about 600 requests a second plus 100 slow streams):
 
 | | Before L182 | After |
 |---|---|---|
@@ -386,6 +392,7 @@ make tov-test # the patches' own tests
 make unit    # tov test, plus the Python tests (pricing, HTTP/2 and gRPC interop, crew priors)
 make e2e     # gateway against a mock upstream, on both servers
 make soak    # memory soak of one worker; fails when RSS grows (ports 18320-18321)
+make soak-bodies  # big request bodies to one worker and a broker; fails when RSS grows (ports 18320, 18321, 18377)
 make smoke   # opt-in: real providers, for each one with credentials in the environment (below)
 make openapi-check # docs/openapi/management.yaml against a probe gateway
 make parity-count  # recount docs/parity.md and refresh its Summary table
@@ -402,7 +409,7 @@ make bench
 `.github/workflows/ci.yml` runs on pull requests and pushes to `main`: it builds the patched
 compiler once (cached by Tov's revision and a hash of `tov-patches/` and `scripts/build-tov.sh`),
 then check, unit, openapi-check, web-check and the parity count in one job, e2e on Bun and on
-http1, `make ui` in Chromium, and the memory soak (`make soak`); logs are uploaded when a job fails. Pushes to `main` also build
+http1, `make ui` in Chromium, and the memory soaks (`make soak`, `make soak-bodies`); logs are uploaded when a job fails. Pushes to `main` also build
 the Docker image (no push). `scripts/ci.sh` runs the same stages locally: `scripts/ci.sh` for all
 of them, or name some (`scripts/ci.sh check unit`; `--help` lists them; `soak` runs only when named). It uses `TOV` and `BUN`
 when set; with `CI_LOCK=/tmp/raiju-e2e.lock` the stages that bind fixed ports take that lock.

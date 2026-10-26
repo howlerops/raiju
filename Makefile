@@ -1,4 +1,4 @@
-.PHONY: build test unit e2e soak smoke ui web web-check check openapi-check parity-count run bench tov tov-test wasm-fixture config-doc config-doc-check deploy-check
+.PHONY: build test unit e2e soak soak-bodies smoke ui web web-check check openapi-check parity-count run bench tov tov-test wasm-fixture config-doc config-doc-check deploy-check
 
 # Tov's async slab allocator corrupts its free lists once ~30 fetches are in
 # flight (see docs/tov-notes.md); plain malloc avoids it at the same speed.
@@ -65,6 +65,11 @@ build/h2_echo: tests/h2_echo.tov src/h2.tov src/hpack.tov src/grpcwire.tov src/g
 # (tests/soak/soak.py --help; fixed ports 18320-18321, so run it under the e2e lock on a shared machine)
 soak:
 	python3 tests/soak/soak.py
+
+# memory soak of request bodies: 1 MB, 4 MB and 200 KB bodies to one worker, signed 4 MB bodies to a broker; fails
+# when RSS grows (tests/soak/bodies.py --help; fixed ports 18320, 18321 and 18377: run it under the e2e lock)
+soak-bodies:
+	python3 tests/soak/bodies.py
 
 e2e:
 	python3 tests/e2e.py

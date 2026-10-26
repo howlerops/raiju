@@ -139,17 +139,22 @@ call `/mcp` refuses from its headers, or a management call the gate refuses is a
 unread. `server.max_buffered_body_mb` (default 48; -1 for no cap; read per request) caps the
 request-body megabytes each process reads at once: a body that does not fit is answered 503 with
 `retry-after: 1`, and is retried by well-behaved clients. The cap is a hard bound: a declared length is
-reserved whole when the body is admitted (503 unread when it cannot fit, never part way), and a chunked
-body is charged as its bytes arrive. A body whose credential was checked from the headers (a virtual key, a direct
+reserved whole when the body is admitted (503 unread when it cannot fit, never part way while it keeps
+pace), and a chunked body is charged as its bytes arrive. Under contention a reservation whose body fell
+behind its pace (at its rate so far more than 10 s to go, a second after admission) is cut to what it has
+received plus a look-ahead (a 48th of the cap, 64 KB to 1 MB) and charged as its bytes arrive from then on,
+so clients that declare big lengths and send slowly or nothing do not hold the cap. A body whose credential was checked from the headers (a virtual key, a direct
 provider key that is one of the configured keys, a sign-in) must keep `server.body_min_kb_per_second`
 (default 32, 0 off) after `server.body_rate_grace_seconds` (default 10), counted over each recent
 `server.body_rate_window_seconds` (default 30), and arrive whole within `server.body_max_seconds`
 (default 600, 0 off; raise it for very large uploads over slow links). Bodies count per tenant (a
-virtual key's customer, else its team, else the key; another credential on its own): a tenant past
-`server.credential_body_mb` (default a quarter of the cap; -1 for no tenant shares), or a chunked body
-that keeps growing, fills the cap only up to `server.body_reserve_mb` (default a quarter; -1 for none)
-short of it, so a new body that keeps its tenant within its share is admitted while others hold the
-budget, and one tenant cannot hold the whole budget with many keys. Give each customer's keys a
+virtual key's customer, else its team, else the key; another credential on its own): a tenant that
+holds bytes past `server.credential_body_mb` (default a quarter of the cap; -1 for no tenant shares)
+beside other tenants' bodies (or while another tenant waits for room), or a chunked body that keeps
+growing, fills the cap only up to `server.body_reserve_mb` (default a quarter; -1 for none) short of it,
+so a new body that keeps its tenant within its share is admitted while others hold the budget, and one
+tenant cannot hold the whole budget with many keys. A tenant's first body may fill the cap, and small
+bodies in flight do not stop a lone big body. Give each customer's keys a
 `customer_id` (or a team) for this to count them together. A body whose credential was not checked (inference with auth off, the plugins' HTTP hooks, routes
 that read their credential from the body) must arrive whole within `server.body_deadline_seconds`
 (default 30, 0 off) and, beside other bodies, shares `server.unchecked_body_mb` (default an eighth of
