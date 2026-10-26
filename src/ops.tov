@@ -28,7 +28,7 @@ import { AccessProfile, AgentConfig, BudgetConfig, BudgetOverride, CircuitPolicy
 import { effectiveBudgetLimit, Attribution } from "./governance"
 import { rfc3339Of } from "./vkexpiry"
 import { flushVaultCache } from "./secrets"
-import { ConfigStore, checkAdmin, sweepExpiredKeys, sealStored, openStored, RESOURCES, OPERATIONS, CONFIG_NS, CONFIG_KEY, ConfigGen, genOf, textSha, randomId } from "./store"
+import { ConfigStore, checkAdmin, duplicateNames, sweepExpiredKeys, sealStored, openStored, RESOURCES, OPERATIONS, CONFIG_NS, CONFIG_KEY, ConfigGen, genOf, textSha, randomId } from "./store"
 import { mergedClaims, ruleAttributes, findUser, Directory, RoleBook, applyClaims, scimClaims, hasRules, Claims, UserChange } from "./claimsync"
 import { Plan, countsOf, syncMode, planDirectory, withRemovals, planReconcile, scimResync, rulesHash, matchesFilter, accountName, ImportFilter, idpManaged } from "./provision"
 import { DirSettings, DirUser, directorySettings, listDirectory, lookupUser } from "./directory"
@@ -73,7 +73,7 @@ import { tempTokenAllows, USER_HEADER, markUser, flowIdOfPath, userFlowById } fr
 import * as vmcp from "./vmcp"
 import { handleProfiles } from "./profiles"
 import { ExportQueue, SinkSender } from "./exporters"
-import { notify, notifyOnce } from "./notify"
+import { notify, notifyOnce, noticeList } from "./notify"
 import * as exporters from "./exporters"
 import { logParquet } from "./sink_parquet"
 import { resolveAll } from "./secrets"
@@ -115,6 +115,11 @@ export type Reply = { status: int, body: string, contentType: string }
 export type RecalcFilters = { providers?: string[], models?: string[], virtual_key_ids?: string[], user_ids?: string[], team_ids?: string[], period?: string, start_time?: string, end_time?: string, missing_cost_only?: bool }
 
 // An error reply for the plugin routes.
+// The start warning and notice text for duplicate names: each one, and how to fix them.
+function duplicateNamesText(dups: string[]): string {
+  return `names are unique, but this config holds duplicates saved before they were (updates keeping such a name still pass; creates and renames onto one get 409): ${dups.join("; ")}. Rename all but one of each.`
+}
+
 function pluginError(status: int, message: string): Reply {
   return { status: status, body: errorJson(message, status === 404 ? "not_found_error" : "invalid_request_error", undefined), contentType: "application/json" }
 }
@@ -6307,7 +6312,17 @@ export class Ops {
     }
     if (!this.engine.gov.enforce) out.push("inference is not authenticated (client.enforce_auth_on_inference is off): anyone who reaches this port can use the provider keys")
     if (this.metricsOpen()) out.push("/metrics is open on the main port and its labels name virtual keys, teams and customers: set server.metrics_token, or move it to the cluster listener with cluster.serve_metrics")
+    const dups = duplicateNames(this.engine.cfg)
+    if (dups.length > 0) out.push(duplicateNamesText(dups))
     return out
+  }
+
+  // The dashboard notice for duplicate virtual key, team and customer names (saved before names were unique), published
+  // by each serving worker at start; none when there are none.
+  noticeDuplicateNames(): void {
+    const dups = duplicateNames(this.engine.cfg)
+    if (dups.length === 0) return
+    notify({ severity: "warning", title: "Duplicate names", message: duplicateNamesText(dups) })
   }
 
   // Whether anyone who reaches the main port can read /metrics: no server.metrics_token, and not moved to the cluster
@@ -7345,6 +7360,29 @@ test("circuit view lists only the circuits that are not closed", () => {
   expect(ops.circuitView().body).toBe(`{"circuits":{}}`)
   for (let i = 0; i < 20; i++) eng.health.record("openai#k1", false, 100.0, Date.now())
   expect(ops.circuitView().body.includes("\"openai#k1\":\"open\"")).toBe(true)
+})
+
+test("duplicate names saved before names were unique: a start warning and a dashboard notice list them", () => {
+  try {
+    const ops = try lockFor({ governance: { virtual_keys: [{ id: "vk-1", name: "prod", value: "sk-bf-1" }, { id: "vk-2", name: "prod", value: "sk-bf-2" }], teams: [{ id: "t1", name: "core" }] } })
+    const w = ops.startupWarnings().filter((x) => x.includes("duplicates"))
+    expect(w.length).toBe(1)
+    expect(w[0]!.includes(`virtual key name "prod" is held by vk-1, vk-2`)).toBe(true)
+    expect(w[0]!.includes("team name")).toBe(false)
+    const before = noticeList().items.length
+    ops.noticeDuplicateNames()
+    const items = noticeList().items
+    expect(items.length).toBe(before + 1)
+    expect(items[items.length - 1]!.severity).toBe("warning")
+    expect(items[items.length - 1]!.message.includes(`"prod" is held by vk-1, vk-2`)).toBe(true)
+    // none: no warning and no notice
+    const clean = try lockFor({ governance: { virtual_keys: [{ id: "vk-1", name: "prod", value: "sk-bf-1" }] } })
+    expect(clean.startupWarnings().some((x) => x.includes("duplicates"))).toBe(false)
+    clean.noticeDuplicateNames()
+    expect(noticeList().items.length).toBe(before + 1)
+  } catch (e) {
+    expect(e.message).toBe("")
+  }
 })
 
 // An Ops whose engine and store both hold cfg, as at start.

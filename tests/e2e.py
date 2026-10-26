@@ -17671,6 +17671,82 @@ def l207_e2e(env):
         gw.terminate()
         gw.wait()
 
+GW_L209 = "http://127.0.0.1:18374"  # L209: duplicate names from before names were unique (two workers on Bun)
+L209_ADMIN = {"authorization": "Bearer sk-admin-l209"}
+
+def l209_e2e(env):
+    """L209: a config holding duplicate virtual key, team and customer names saved before names were unique (wave 28).
+    The gateway warns at start and posts a dashboard notice listing them; a PUT keeping the stored name (deactivating a
+    leaked key "prod") succeeds, a PUT without a name keeps the stored name as Bifrost's update does, and a rename onto
+    a name another record holds or a create with it still gets 409. Port 18374."""
+    import hashlib, shutil, http.client
+    d = os.path.join(BUILD, "e2e-l209")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    path = os.path.join(d, "config.json")
+    json.dump({
+        "client": {"enable_logging": False, "enforce_auth_on_inference": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "governance": {
+            "users": [{"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l209".encode()).hexdigest()}],
+            "virtual_keys": [{"id": "vk-1", "name": "prod", "value": "sk-bf-l209-one"}, {"id": "vk-2", "name": "prod", "value": "sk-bf-l209-two"},
+                             {"id": "vk-3", "name": "dev", "value": "sk-bf-l209-three"}],
+            "teams": [{"id": "t1", "name": "core"}, {"id": "t2", "name": "core"}],
+            "customers": [{"id": "c1", "name": "acme"}, {"id": "c2", "name": "acme"}],
+        },
+    }, open(path, "w"))
+    def req(method, p, body=None):
+        c = http.client.HTTPConnection("127.0.0.1", 18374, timeout=30)
+        try:
+            c.request(method, p, body=None if body is None else json.dumps(body), headers={"content-type": "application/json", **L209_ADMIN})
+            r = c.getresponse()
+            return r.status, r.read().decode()
+        except Exception as e:
+            return 0, str(e)
+        finally:
+            c.close()
+    def stored(coll, i):
+        for x in json.load(open(path)).get("governance", {}).get(coll, []):
+            if x.get("id") == i:
+                return x
+        return {}
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    extra = ["-workers", "2"] if server != "http1" else []
+    log = os.path.join(BUILD, "e2e.l209.log")
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18374", "-host", "127.0.0.1", "-config", path, "-server", server] + extra,
+                          env=env, stderr=open(log, "w"))
+    try:
+        wait(GW_L209 + "/health")
+        time.sleep(1.0)
+        text = open(log).read()
+        check("L209: the start warning lists the duplicate virtual key, team and customer names",
+              "duplicates" in text and 'virtual key name "prod" is held by vk-1, vk-2' in text and 'team name "core" is held by t1, t2' in text
+              and 'customer name "acme" is held by c1, c2' in text, text[-600:])
+        seen = set()
+        for _ in range(8):
+            st, b = req("GET", "/api/notifications?limit=500")
+            if st == 200:
+                for n in json.loads(b).get("notifications", []):
+                    if n.get("title") == "Duplicate names":
+                        seen.add(n.get("message", ""))
+        check("L209: every worker's dashboard shows a notice naming the duplicates", len(seen) > 0 and all('"prod" is held by vk-1, vk-2' in m for m in seen), sorted(seen)[:2])
+        st, b = req("PUT", "/api/governance/virtual-keys/vk-1", {"name": "prod", "is_active": False})
+        check("L209: a PUT keeping the duplicate name 'prod' deactivates the leaked key (was 409)", st == 200 and stored("virtual_keys", "vk-1").get("is_active") is False, (st, b[:200]))
+        st, b = req("PUT", "/api/governance/virtual-keys/vk-2", {"description": "rotate me"})
+        check("L209: a PUT without a name keeps the stored name, as Bifrost's update", st == 200 and stored("virtual_keys", "vk-2").get("name") == "prod", (st, stored("virtual_keys", "vk-2")))
+        st, b = req("PUT", "/api/governance/virtual-keys/vk-3", {"name": "prod"})
+        st2, b2 = req("POST", "/api/governance/virtual-keys", {"name": "prod"})
+        check("L209: a rename onto a name another key holds and a create with it still get 409", st == 409 and st2 == 409 and "already exists" in b and "already exists" in b2, (st, st2))
+        st, _ = req("PUT", "/api/governance/teams/t2", {})
+        st2, _ = req("POST", "/api/governance/teams", {"name": "core"})
+        st3, _ = req("PUT", "/api/governance/customers/c1", {"name": "acme"})
+        st4, _ = req("POST", "/api/governance/customers", {"name": "acme"})
+        check("L209: teams and customers: an update keeping the name passes, a create with it gets 409",
+              (st, st2, st3, st4) == (200, 409, 200, 409) and stored("teams", "t2").get("name") == "core", (st, st2, st3, st4))
+    finally:
+        gw.terminate()
+        gw.wait()
+
 def main():
     unique_ports()
     build()
@@ -20203,6 +20279,9 @@ def main():
         # L207: group commit of concurrent config saves (one file write per group, each change its own reply, 409 per
         # twin name): its own gateway (18370)
         l207_e2e(env)
+        # L209: duplicate names saved before names were unique (start warning, notice, updates that keep a name): its
+        # own gateway (18374)
+        l209_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()
