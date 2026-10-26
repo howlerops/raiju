@@ -11,11 +11,17 @@ session. It sets up the machine, explains the lead/worker loop and points at the
 Worker briefs start from [handoff/worker-prompt-template.md](handoff/worker-prompt-template.md);
 the rules all workers follow are in [handoff/worker-brief.md](handoff/worker-brief.md).
 
-Branch: `claude/affectionate-shannon-pjwi5z`. Waves 1 to 28 are on `main` (PR howlerops/raiju#10).
-The branch carries wave 29 (L208 and L209).
+Branch: `claude/affectionate-shannon-pjwi5z`. Waves 1 to 29 are on `main` (PR howlerops/raiju#11).
+The branch carries wave 30 (L210 and L211).
 
 ## Where things stand
 
+- Wave 30 (L210, L211): the sixth re-audit (docs/audits/production-reaudit-6-2026-10-26.md) found a memory leak since
+  wave 26 (every body over 64 KB stayed resident); it is fixed and `make soak-bodies` in the CI soak job fails on RSS
+  growth. Declared-length reservations are cut when behind pace, and small requests no longer block a lone big body.
+  The auditor knew of no other code blocker for multi-tenant production once these were fixed. L211 adds the staging
+  validation kit for what only real infrastructure can confirm: docs/staging-validation.md, tests/staging, a manual
+  staging workflow and deploy/terraform/examples/staging. Behaviour changes are in docs/behaviour-changes-wave-30.md.
 - Wave 29 (L208, L209) fixed the fifth re-audit (docs/audits/production-reaudit-5-2026-10-26.md): the request-body
   cap is a hard memory bound again with a per-tenant share and a reserve for idle tenants, declared lengths are
   reserved at admission, and name uniqueness accepts updates that keep their name. Behaviour changes are in
@@ -91,7 +97,7 @@ The branch carries wave 29 (L208 and L209).
   current Bifrost datasheet.
 - docs/parity.md counts 567 parity rows: done 531, partial 12, missing 0, out of scope 15,
   n/a 9, plus 42 Raiju-only extras.
-- Tests at handoff (compiler from tov-patches 0001 to 0010, 0012, 0013, 0015 to 0017, 0019 to 0021): `make unit` 2,493 passed,
+- Tests at handoff (compiler from tov-patches 0001 to 0010, 0012, 0013, 0015 to 0017, 0019 to 0021): `make unit` 2,499 passed,
   0 failed, plus the Python tests (gen_pricing, the h2/gRPC interop suite, crew_priors,
   test_deploy, test_gen_config_doc); e2e "all passed" on Bun and http1; `make ui` all passed;
   `make openapi-check` ok; `make web-check` and `make config-doc-check` up to date. Helm lint and
@@ -120,8 +126,8 @@ The branch carries wave 29 (L208 and L209).
 
 ## What's next
 
-The 12 partial parity rows are edge items (listed in their Open notes), owner decisions or need
-real accounts. The production items left:
+Run the staging validation kit (docs/staging-validation.md) on real infrastructure: it needs an AWS sandbox
+account, provider API keys and an Okta or Entra developer tenant. Then re-audit against what it finds.
 
 - Raw-socket connections (A2A gRPC, Redis/Valkey vector stores, realtime WebSockets to providers)
   have no connect-time address check; Bun.serve has no write-stall limit on upgraded sockets.

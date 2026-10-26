@@ -14107,8 +14107,16 @@ def l208_e2e(env):
         check("l208: the customer's chunked bodies past cap - server.body_reserve_mb are refused 503 (the tenant past its share is refused first)", cut.count(503) >= 1, cut)
         s1, _, b1 = call("POST", "/v1/chat/completions", l196_chat(1048576).decode(), k(4), base=GW_L208, auth=False)
         check("l208: while the customer's keys hold bodies, an outsider's 1 MB chat is served (it was 503: each key stayed within a per-key share)", s1 == 200 and "Hello from gpt-4o-mini" in b1, (s1, b1[:200]))
+        # (L210: a tenant that holds every big body may fill the cap while no other tenant waits, so the customer's next
+        # body is judged beside another tenant's body in hand)
+        other = l196_open(18372, "/v1/chat/completions", 524288, k(5), 1024)
+        socks.append(other)
+        time.sleep(0.3)
         s5 = declared_status(18372, "/v1/chat/completions", 1048576, {"x-bf-vk": "sk-bf-l208-g1"})
-        check("l208: the customer's next 1 MB body is 503 (its keys count as one tenant, past its share)", s5 == 503, s5)
+        check("l208: beside another tenant's body, the customer's next 1 MB body is 503 (its keys count as one tenant, past its share)", s5 == 503, s5)
+        other.sendall(l196_chat(524288)[1024:])
+        code, head = l196_read(other)
+        check("l208: and the other tenant's body is served", code == 200, head[:300])
         for s in socks:
             s.close()
         socks = []
@@ -14135,6 +14143,140 @@ def l208_e2e(env):
         socks = []
         st, _, b = call("POST", "/v1/chat/completions", l196_chat(2 * 1048576).decode(), k(5), base=GW_L208, auth=False)
         check("l208: once they are done the budget is free again", st == 200, (st, b[:200]))
+    finally:
+        for s in socks:
+            try:
+                s.close()
+            except OSError:
+                pass
+        gw.terminate()
+        gw.wait()
+
+
+GW_L210 = "http://127.0.0.1:18376"  # L210: request bodies freed after they are read, slow reservations cut, small bodies out of the lone-body rule
+
+
+def l210_post(body, headers) -> int:
+    """The status of a chat POST to the L210 gateway (0 when the connection broke: a refusal before the body was sent)."""
+    try:
+        return call("POST", "/v1/chat/completions", body, headers, base=GW_L210, auth=False)[0]
+    except Exception:
+        return 0
+
+
+def l210_e2e(env):
+    """L210 (production re-audit 6, P0-A, P1-A, P1-B). P0-A: a body over 64 KB is freed once its request is done (each
+    read raced a promise that never settled, which kept every chunk alive: 1 MB chats grew a worker by their size).
+    P1-A: a declared length is reserved whole only while its body keeps pace; under contention another tenant's body
+    cuts the reservation furthest behind to what it received plus a look-ahead, so tenants that declare big lengths and
+    send nothing or trickle no longer hold the cap (an outsider's 1 MB chats were 503 for minutes). P1-B: small bodies
+    in flight no longer count against the lone-body rule, and the reserve applies only to a tenant that holds bytes
+    already, so a body past cap - reserve is served beside small chats and one key's two bodies within the cap are both
+    served (both were 503). Its own gateway (18376)."""
+    import threading
+    d = os.path.join(BUILD, "e2e-l210")
+    os.makedirs(d, exist_ok=True)
+    cp = os.path.join(d, "config.json")
+    log = os.path.join(d, "gw.log")
+    keys = [{"id": "vk-l210-%s" % n, "name": "vk-l210-%s" % n, "value": "sk-bf-l210-%s" % n} for n in ["a1", "a2", "a3", "a4", "a5", "a6", "o", "k", "s"]]
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": True},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        # 4 MB of bodies in hand; a quarter (1 MB) per tenant and a quarter kept from tenants holding bytes (defaults);
+        # checked bodies at 32 KB/s after 4 s
+        "server": {"max_buffered_body_mb": 4, "body_rate_grace_seconds": 4},
+        "governance": {"virtual_keys": keys},
+        "providers": {
+            "openai": {"keys": [{"name": "o-l210", "value": "sk-l210", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            # every answer 300 ms late (the mock's l180-slow key): small chats stay in flight
+            "slowai": {"keys": [{"name": "s-l210", "value": "sk-l210-l180-slow", "models": [], "weight": 1.0}], "custom_provider_config": {"base_provider_type": "openai"},
+                       "network_config": {"base_url": MOCK, "max_retries": 0}},
+        },
+    }
+    json.dump(cfg, open(cp, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18376", "-host", "127.0.0.1", "-config", cp, "-server", os.environ.get("RAIJU_SERVER", "bun")],
+                          env=env, stderr=open(log, "w"))
+    k = lambda n: {"x-bf-vk": "sk-bf-l210-%s" % n}
+    socks = []
+    try:
+        wait(GW_L210 + "/health")
+
+        # ---- P0-A: 1 MB chats with a key (checked bodies, the rate rules on) leave no memory behind ----
+        mb = l196_chat(1048576).decode()
+        for _ in range(10):
+            call("POST", "/v1/chat/completions", mb, k("o"), base=GW_L210, auth=False)
+        time.sleep(0.5)
+        rss0 = l124_vm(gw.pid, "VmRSS")
+        codes = [l210_post(mb, k("o")) for _ in range(60)]
+        time.sleep(0.5)
+        rss1 = l124_vm(gw.pid, "VmRSS")
+        check("l210: sixty 1 MB chats with a key are served and leave the worker's memory flat (grew %d MiB; each body stayed alive before)" % (rss1 - rss0),
+              codes.count(200) == 60 and rss1 - rss0 < 24, (codes.count(200), rss0, rss1))
+
+        # ---- P1-A: four tenants declare 1 MB each and send nothing: the whole 4 MB is reserved ----
+        for n in ["a1", "a2", "a3", "a4"]:
+            socks.append(l196_open(18376, "/v1/chat/completions", 1048576, k(n), 0))
+            time.sleep(0.1)
+        time.sleep(1.5)
+        got = [l210_post(mb, k("o")) for _ in range(3)]
+        check("l210: while four tenants hold declared 1 MB bodies and send nothing, an outsider's 1 MB chats are served (they were 503 until the rate rule cut them)", got == [200, 200, 200], got)
+        early = [l208_status(s, 0.2) for s in socks]
+        check("l210: the cut reservations are not refused: their bodies may still come (charged as they arrive)", early.count(0) == 4, early)
+        for s in socks:
+            s.close()
+        socks = []
+        time.sleep(0.5)
+        # four tenants declare 1 MB each and trickle 16 KB/s
+        slow = [{}, {}, {}, {}]
+        ts = [threading.Thread(target=l201_trickle, args=(18376, "/v1/chat/completions", 1048576, k(n), 8192, 0.5, 6.0, out)) for n, out in zip(["a1", "a2", "a5", "a6"], slow)]
+        for t in ts:
+            t.start()
+            time.sleep(0.1)
+        time.sleep(1.5)
+        got = [l210_post(mb, k("o")) for _ in range(3)]
+        check("l210: while four tenants trickle declared 1 MB bodies at 16 KB/s, an outsider's 1 MB chats are served (they were 503)", got == [200, 200, 200], got)
+        for t in ts:
+            t.join(20)
+        check("l210: the trickling bodies are still cut by the rate rule (408)", [x.get("status") for x in slow] == [408, 408, 408, 408], slow)
+
+        # ---- P1-B: bodies past cap - reserve beside small chats in flight ----
+        stop = time.time() + 30
+        done = []
+
+        def small_loop():
+            while time.time() < stop:
+                st, _, _ = call("POST", "/v1/chat/completions", {"model": "slowai/gpt-4o-mini", "messages": [{"role": "user", "content": "l210 small"}]}, k("s"), base=GW_L210, auth=False)
+                done.append(st)
+
+        loops = [threading.Thread(target=small_loop) for _ in range(3)]
+        for t in loops:
+            t.start()
+        time.sleep(0.5)
+        big = []
+        for size in [3565158, 4089446, 3565158, 4089446]:
+            big.append(l210_post(l196_chat(size).decode(), k("k")))
+        stop = 0
+        for t in loops:
+            t.join(10)
+        check("l210: 3.4 and 3.9 MB bodies (past cap - reserve) are served while small chats are in flight (they were 503)", big == [200, 200, 200, 200] and len(done) > 0 and all(x == 200 for x in done), (big, len(done), set(done)))
+        # one key's 2.5 MB body in hand, then its 1 MB body: both within the cap, both served (the second was 503)
+        first = l196_open(18376, "/v1/chat/completions", 2621440, k("k"), 2621440 - 1024)
+        socks = [first]
+        time.sleep(0.5)
+        s2 = l210_post(mb, k("k"))
+        first.sendall(l196_chat(2621440)[2621440 - 1024:])
+        code, head = l196_read(first)
+        check("l210: one key's 2.5 MB and 1 MB bodies at once are both served (the reserve applies only beside other tenants)", s2 == 200 and code == 200, (s2, head[:200]))
+        first.close()
+        socks = []
+        # beside another tenant's body in hand, the key holding bytes keeps the reserve free again
+        first = l196_open(18376, "/v1/chat/completions", 2621440, k("k"), 2621440 - 1024)
+        other = l196_open(18376, "/v1/chat/completions", 524288, k("o"), 1024)
+        socks = [first, other]
+        time.sleep(0.5)
+        s3 = declared_status(18376, "/v1/chat/completions", 1048576, k("k"))
+        check("l210: with another tenant's body in hand, the key's next 1 MB body is 503 (it holds bytes past its share)", s3 == 503, s3)
     finally:
         for s in socks:
             try:
@@ -20373,6 +20515,9 @@ def main():
         # L208: the body cap as a hard bound, per-tenant shares with a reserve for tenants within theirs, declared
         # lengths reserved at admission: its own gateway (18372)
         l208_e2e(env)
+        # L210: request bodies freed once read, reservations behind their pace cut under contention, small bodies out of
+        # the lone-body rule and the reserve only for tenants holding bytes: its own gateway (18376)
+        l210_e2e(env)
         # L194: Hugging Face inference providers (chat, embeddings, speech, transcription, images), the CLI's agent sign-in
         # and default key, and the A2A v0.3 REST client: its own gateway (18344) and Hugging Face double (18345)
         l194_e2e(env)

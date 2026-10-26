@@ -1,6 +1,6 @@
 # Terraform for Raiju
 
-Two modules and three examples. Both modules take the image and the provider
+Two modules and four examples. Both modules take the image and the provider
 keys as inputs. Neither builds the image or creates the registry.
 
 | Path | What it does |
@@ -10,6 +10,7 @@ keys as inputs. Neither builds the image or creates the registry.
 | `examples/kind` | Local cluster. Uses the image loaded with `kind load`. |
 | `examples/eks-helm` | Existing EKS cluster, existing `raiju-keys` Secret. |
 | `examples/ecs` | Existing VPC; provider keys from Secrets Manager. |
+| `examples/staging` | A throwaway stack for [docs/staging-validation.md](../../docs/staging-validation.md): the ECS module with EFS made in the same apply (`efs_enabled = true`), a setup token and a cluster secret in Secrets Manager, one task or a three-task cluster, seed and probe tasks, an `expires_at` tag. `terraform destroy` removes all of it. |
 
 Requirements: Terraform >= 1.5. Providers: `helm ~> 2.12`, `kubernetes ~> 2.30`,
 `aws ~> 5.0`.
@@ -96,7 +97,8 @@ target group checks `GET /ready` (`health_check_path`), the container's own heal
   on the first API change. The access point must make its root directory writable
   by the image's user (uid and gid 65532), for example with `posix_user` set to
   them, and the EFS mount targets must allow the `service_security_group_id`. The
-  ECS module does not create the file system or the access point.
+  ECS module does not create the file system or the access point. When they are created in the same apply
+  (their ids unknown at plan time), also set `efs_enabled = true`, as `examples/staging` does.
 
 ## Several tasks
 
