@@ -274,15 +274,17 @@ Request bodies over 64 KB reach the gateway unread, so a caller whose credential
 401 or 403 from the headers and its body is never read (inference routes while auth is enforced, the
 MCP server's `/mcp` under `client.mcp_server_auth_mode`, and the management API's gate). Each process
 also caps the request-body bytes it reads at once across requests, `server.max_buffered_body_mb`
-(default 48, sized for a 512Mi pod: parsing a chat body costs several times its size); bytes are
-charged as they arrive, so a slow client holds only what it has sent, and a body that does not fit is
-answered 503 with `retry-after`. A body whose credential was checked from the headers (a virtual key, a
+(default 48, sized for a 512Mi pod: parsing a chat body costs several times its size) as a hard bound;
+a declared length is reserved whole when the body is admitted, so a body that does not fit is answered
+503 with `retry-after` before its client sends it, and a chunked body is charged as its bytes arrive. A body whose credential was checked from the headers (a virtual key, a
 direct provider key that is one of the configured keys, a management sign-in) must keep
 `server.body_min_kb_per_second` (default 32) after `server.body_rate_grace_seconds` (10), counted over
 each recent `server.body_rate_window_seconds` (30), and arrive whole within `server.body_max_seconds`
 (600), so a slow but steady upload is served and one that sends a lot at once and then trickles is cut a
-window later. The bytes one credential holds past `server.credential_body_mb` (a quarter of the cap) do
-not count against other callers' bodies, so one key cannot turn the other tenants' big bodies away. A body
+window later. Bodies count per tenant (a virtual key's customer, else its team, else the key): a tenant
+past `server.credential_body_mb` (a quarter of the cap), or a chunked body that keeps growing, fills the
+cap only up to `server.body_reserve_mb` (a quarter) short of it, so one tenant, however many keys it
+has, cannot turn the other tenants' big bodies away; it is the one refused first. A body
 nobody vouched for (auth off, or behind the plugins' HTTP hooks) shares `server.unchecked_body_mb` (an
 eighth of the cap) beside other bodies and must arrive whole within `server.body_deadline_seconds`
 (default 30); 408 otherwise. The routes anyone may call without a credential (sign-in, setup, agent

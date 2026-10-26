@@ -1,12 +1,10 @@
 // The request-body bytes one process holds at once, across requests (server.max_buffered_body_mb). A body is read
 // whole before it is parsed, and parsing a big one costs several times its size, so a few large bodies sent at once
 // could take a worker past its memory limit. A body that has not been read yet (over UNREAD_ABOVE, or chunked) is
-// charged here as its bytes arrive and given back when its request is done; a declared length that cannot fit beside
-// what is held is refused with 503 unread, and a body whose next bytes do not fit is refused with 503 there. A small
-// body the server has read already is charged too, but never refused: turning it away would save no memory.
-//
-// Bytes are charged as they arrive, not by the declared length, so a client that sends a big declared body slowly
-// holds only what it has sent.
+// charged here (a declared length when the body is admitted, a chunked body as its bytes arrive) and given back when
+// its request is done; a declared length that cannot fit beside what is held is refused with 503 unread, and a chunked
+// body whose next bytes do not fit is refused with 503 there. A small body the server has read already is charged
+// too, but never refused: turning it away would save no memory.
 //
 // Bodies come in two kinds (production re-audit 3, P1-D). A checked body is one whose credential the gateway verified
 // from the headers before reading it (a virtual key, a direct provider key that matches a configured one, a management
@@ -19,13 +17,24 @@
 // A checked body must keep server.body_min_kb_per_second (32) after server.body_rate_grace_seconds (10), counted over
 // each recent server.body_rate_window_seconds (30), and arrive whole within server.body_max_seconds (600): a slow but
 // steady authenticated upload is served (P2-B), and one that sends a lot at once and then trickles is cut a window
-// later (re-audit 4 P1-E: an average from the start let the early bytes buy about 26 minutes). The bytes one
-// credential holds past server.credential_body_mb (a quarter of the cap) do not count against other callers' bodies,
-// so a key that holds the whole cap does not turn the other credentials' big bodies away.
+// later (re-audit 4 P1-E: an average from the start let the early bytes buy about 26 minutes).
+//
+// The cap is a hard bound on the bytes in hand (re-audit 5 P1-A: a per-credential discount let them reach twice the
+// cap, and three ordinary uploads took the chart's 512Mi pod past its limit). Under contention the tenant decides who
+// is refused first (re-audit 5 P1-B): bodies count per tenant (a virtual key's customer, else its team, else the key;
+// else the credential's name), and only a new body that keeps its tenant within server.credential_body_mb (a quarter
+// of the cap) may use the last server.body_reserve_mb (a quarter) of the cap. A tenant past its share, or a chunked
+// body that keeps growing, fills the cap only up to the reserve, so an idle tenant's first big body is admitted while
+// others hold the budget, and the tenant past its share is the one refused.
+//
+// A declared length is reserved whole when the body is admitted (re-audit 5 P2-A), so a body that cannot fit is 503
+// before its client sends anything and an admitted one is never refused part way; a chunked body is charged as its
+// bytes arrive.
 //
 // A body is always admitted when the process holds no other big body, so a single request up to
 // client.max_request_body_size_mb is still served (Bifrost's limit keeps its meaning); the cap decides how many
-// big bodies are read at once. The peer routes and the broker have a budget of their own (peerBudget).
+// big bodies are read at once. Beside such a lone body bigger than the cap, tenants within their share may still use
+// the reserve past it. The peer routes and the broker have a budget of their own (peerBudget).
 import { ServerSectionConfig } from "./config"
 
 // Sized for the chart's 512Mi pod: a chat body costs about eight times its size while it is parsed and sent on
@@ -60,17 +69,31 @@ export function uncheckedShare(s: ServerSectionConfig | undefined, cap: int): in
   return Math.min(cap, mb * 1048576)
 }
 
-// The share of the cap one credential's bodies count for against other callers' when server.credential_body_mb is
-// unset: a quarter.
+// The share of the cap one tenant's bodies may hold before they give way to other tenants when
+// server.credential_body_mb is unset: a quarter.
 export const CREDENTIAL_SHARE_DIVISOR = 4
 
 // server.credential_body_mb in bytes, given the cap (bufferedCap): unset or 0 is a quarter of the cap, a negative
-// number is no per-credential share (0 returned), and it is never above the cap.
+// number is no per-tenant share (0 returned), and it is never above the cap.
 export function credentialShare(s: ServerSectionConfig | undefined, cap: int): int {
   if (cap <= 0) return 0
   const mb = s?.credential_body_mb ?? 0
   if (mb < 0) return 0
   if (mb === 0) return Math.max(1, Math.floor(cap / CREDENTIAL_SHARE_DIVISOR))
+  return Math.min(cap, mb * 1048576)
+}
+
+// The part of the cap tenants past their share may not fill when server.body_reserve_mb is unset: a quarter, so an
+// idle tenant's first body up to its share fits whatever the others hold.
+export const BODY_RESERVE_DIVISOR = 4
+
+// server.body_reserve_mb in bytes, given the cap (bufferedCap): unset or 0 is a quarter of the cap, a negative number
+// is no reserve (0 returned), and it is never above the cap.
+export function bodyReserve(s: ServerSectionConfig | undefined, cap: int): int {
+  if (cap <= 0) return 0
+  const mb = s?.body_reserve_mb ?? 0
+  if (mb < 0) return 0
+  if (mb === 0) return Math.max(1, Math.floor(cap / BODY_RESERVE_DIVISOR))
   return Math.min(cap, mb * 1048576)
 }
 
@@ -194,47 +217,46 @@ export class BodyBudget {
   small = 0
   unchecked = 0
   refused = 0
-  // the bytes each credential's bodies hold (BodyHold.who), for server.credential_body_mb
+  // the bytes each tenant's bodies hold (BodyHold.who), for server.credential_body_mb
   private byWho: Map<string, int> = new Map()
 
-  // What the checked bodies see as held: the unchecked bytes past their share do not count.
+  // What the checked bodies see as held: the bytes a lone unchecked body holds past the unchecked share do not count.
   private seen(share: int): int {
     if (share <= 0 || this.unchecked <= share) return this.held
     return this.held - (this.unchecked - share)
   }
 
-  // The bytes other credentials than who hold past whoShare: they do not count against who's bodies.
-  private excess(who: string, whoShare: int): int {
-    if (whoShare <= 0) return 0
+  // The most bytes one tenant other than who holds.
+  private biggest(who: string): int {
     let n = 0
     for (const k of this.byWho.keys()) {
       if (k === who) continue
-      const v = this.byWho.get(k) ?? 0
-      if (v > whoShare) n += v - whoShare
+      n = Math.max(n, this.byWho.get(k) ?? 0)
     }
     return n
   }
 
-  // The bytes credential who holds now.
+  // The bytes tenant who holds now.
   heldBy(who: string): int {
     return this.byWho.get(who) ?? 0
   }
 
-  // Whether a body of n bytes of kind cls would fit beside what is held now (nothing is charged): a declared length
-  // that cannot is refused before it is read. share is the unchecked bodies' (uncheckedShare; 0 none), who the
-  // credential ("" none) and whoShare the credentials' share (credentialShare; 0 none).
-  fits(n: int, cap: int, cls: BodyClass, share: int, who?: string, whoShare?: int): bool {
-    if (this.admits(n, 0, cap, cls, share, who ?? "", whoShare ?? 0)) return true
+  // Whether a body of n bytes of kind cls would fit beside what is held now (nothing is charged). share is the
+  // unchecked bodies' (uncheckedShare; 0 none), who the tenant ("" none), whoShare the tenants' share
+  // (credentialShare; 0 none) and reserve the room kept for tenants within their share (bodyReserve; 0 none).
+  fits(n: int, cap: int, cls: BodyClass, share: int, who?: string, whoShare?: int, reserve?: int): bool {
+    if (this.admits(n, 0, cap, cls, share, who ?? "", whoShare ?? 0, reserve ?? 0)) return true
     this.refused += 1
     return false
   }
 
-  // Charges n more bytes to a request of kind cls that already holds `own` of them. true when they fit under cap
-  // (0: no cap), or when no other request holds a big body.
-  take(n: int, own: int, cap: int, cls: BodyClass, share: int, who?: string, whoShare?: int): bool {
+  // Charges n more bytes to a request of kind cls that already holds `own` of them (a declared length is charged
+  // whole when its body is admitted). true when they fit under cap (0: no cap), or when no other request holds a big
+  // body.
+  take(n: int, own: int, cap: int, cls: BodyClass, share: int, who?: string, whoShare?: int, reserve?: int): bool {
     if (n <= 0) return true
     const w = who ?? ""
-    if (!this.admits(n, own, cap, cls, share, w, whoShare ?? 0)) {
+    if (!this.admits(n, own, cap, cls, share, w, whoShare ?? 0, reserve ?? 0)) {
       this.refused += 1
       return false
     }
@@ -245,22 +267,25 @@ export class BodyBudget {
     return true
   }
 
-  private admits(n: int, own: int, cap: int, cls: BodyClass, share: int, who: string, whoShare: int): bool {
+  private admits(n: int, own: int, cap: int, cls: BodyClass, share: int, who: string, whoShare: int, reserve: int): bool {
     if (n <= 0 || cap <= 0) return true
-    // the other credentials' bytes past their share do not count, but the bodies in hand never pass twice the cap
-    // (beside a lone body, which the request limit bounds)
-    const past = this.excess(who, whoShare)
     if (cls === "unchecked" && share > 0) {
       // alone among the big bodies it may pass the share (the request limit decides its size); beside others it
       // stays within the share and the cap
       const others = this.held - this.small - own
       if (others <= 0) return true
-      return this.unchecked + n <= share && this.held - past + n <= cap && this.held - this.small + n <= 2 * cap
+      return this.unchecked + n <= share && this.held + n <= cap
     }
-    const seen = this.seen(share) - past
+    const seen = this.seen(share)
     if (seen - own <= 0) return true
-    if (seen + n > cap) return false
-    return past <= 0 || this.held - this.small + n <= 2 * cap
+    // no tenants: the cap alone
+    if (who === "" || whoShare <= 0 || reserve <= 0) return seen + n <= cap
+    // a new body (a declared length, or a chunked body's first bytes) that keeps its tenant within its share may use
+    // the reserve: up to the cap, or beside a lone body bigger than the cap up to the reserve past it
+    if (own <= 0 && this.heldBy(who) + n <= whoShare) return seen + n <= Math.max(cap, this.biggest(who) + reserve)
+    // a tenant past its share, or a chunked body growing, leaves the reserve to the others: under contention it is
+    // the one refused
+    return seen + n <= cap - reserve
   }
 
   // Charges n bytes that are in memory already (a small body the server has read): always admitted.
@@ -270,7 +295,7 @@ export class BodyBudget {
     this.small += n
   }
 
-  // Gives back what a request of kind cls (of credential who) held.
+  // Gives back what a request of kind cls (of tenant who) held.
   give(n: int, cls: BodyClass, who?: string): void {
     if (n <= 0) return
     this.held = Math.max(0, this.held - n)
@@ -304,7 +329,7 @@ export class BodyHold {
   held = 0
   cls: BodyClass = "small"
   peer = false
-  // the credential its bytes are counted for ("" none)
+  // the tenant its bytes are counted for ("" none)
   who = ""
 
   release(): void {
@@ -317,8 +342,8 @@ export class BodyHold {
 }
 
 // How a body stream is read and charged: the most bytes (413 past it), the budget's cap and the unchecked share, the
-// credential and its share, an unchecked body's fixed deadline (ms, 0 none) and a checked body's pace.
-export type ReadPlan = { max: int, cap: int, cls: BodyClass, share: int, who: string, whoShare: int, deadlineMs: int, rate: BodyRate }
+// tenant, its share and the reserve, an unchecked body's fixed deadline (ms, 0 none) and a checked body's pace.
+export type ReadPlan = { max: int, cap: int, cls: BodyClass, share: int, who: string, whoShare: int, reserve: int, deadlineMs: int, rate: BodyRate }
 
 // What reading a body came to: stop is "" (read whole), "large" (past max), "busy" (its bytes do not fit), "deadline"
 // (an unchecked body past its deadline), "rate" (a checked body behind body_min_kb_per_second) or "ceiling" (past
@@ -358,8 +383,8 @@ function armPace(clock: BodyClock, pace: BodyPace, waitMs: f64, late: (r: BodyRe
   }, Math.max(1, Math.ceil(waitMs)))
 }
 
-// Reads a body stream whole, charging its bytes to budget b for hold as they arrive (plan). On any stop the stream is
-// cancelled and hold released.
+// Reads a body stream whole, charging its bytes to budget b for hold as they arrive (plan); bytes hold has reserved
+// already (a declared length) are not charged again. On any stop the stream is cancelled and hold released.
 export async function readCharged(st: ReadableStream, b: BodyBudget, hold: BodyHold, plan: ReadPlan): Promise<ReadResult> {
   const clock = new BodyClock()
   clock.start = performance.now()
@@ -388,11 +413,14 @@ export async function readCharged(st: ReadableStream, b: BodyBudget, hold: BodyH
       stop = "large"
       break
     }
-    if (!b.take(v.length, hold.held, plan.cap, plan.cls, plan.share, plan.who, plan.whoShare)) {
-      stop = "busy"
-      break
+    const more = body.length + v.length - hold.held
+    if (more > 0) {
+      if (!b.take(more, hold.held, plan.cap, plan.cls, plan.share, plan.who, plan.whoShare, plan.reserve)) {
+        stop = "busy"
+        break
+      }
+      hold.held += more
     }
-    hold.held += v.length
     clock.got += v.length
     for (const x of v) body.push(x)
   }
@@ -664,34 +692,122 @@ test("server.credential_body_mb: a quarter by default, a value within the cap, n
   expect(credentialShare(undefined, 0)).toBe(0)
 })
 
-test("one credential that holds the cap does not turn other credentials' bodies away (re-audit 4 P1-E)", () => {
+test("the cap is a hard bound: a tenant's share no longer lets the bodies in hand pass it (re-audit 5 P1-A)", () => {
+  const cap = 48
+  const ws = 12
+  const rs = 12
+  // 46 then 24 + 24 from three keys: wave 28 admitted all three (94 in hand); now the two past their share are refused
+  const b = new BodyBudget()
+  expect(b.take(46, 0, cap, "checked", 0, "vk:a", ws, rs)).toBe(true)
+  expect(b.fits(24, cap, "checked", 0, "vk:b", ws, rs)).toBe(false)
+  expect(b.take(24, 0, cap, "checked", 0, "vk:b", ws, rs)).toBe(false)
+  expect(b.take(24, 0, cap, "checked", 0, "vk:c", ws, rs)).toBe(false)
+  expect(b.held).toBe(46)
+  // a body within its share still fits beside the lone one, up to the reserve past it
+  expect(b.take(12, 0, cap, "checked", 0, "vk:c", ws, rs)).toBe(true)
+  expect(b.take(1, 0, cap, "checked", 0, "vk:d", ws, rs)).toBe(false)
+  expect(b.held).toBe(58)
+  // with no reserve the cap alone decides
+  const n = new BodyBudget()
+  expect(n.take(40, 0, cap, "checked", 0, "vk:a", ws, 0)).toBe(true)
+  expect(n.take(8, 0, cap, "checked", 0, "vk:b", ws, 0)).toBe(true)
+  expect(n.take(1, 0, cap, "checked", 0, "vk:c", ws, 0)).toBe(false)
+  // 3 x 24 from three keys: one in hand, the others past their share
+  const t = new BodyBudget()
+  expect(t.take(24, 0, cap, "checked", 0, "vk:a", ws, rs)).toBe(true)
+  expect(t.take(24, 0, cap, "checked", 0, "vk:b", ws, rs)).toBe(false)
+  expect(t.take(12, 0, cap, "checked", 0, "vk:b", ws, rs)).toBe(true)
+  expect(t.take(12, 0, cap, "checked", 0, "vk:c", ws, rs)).toBe(true)
+  expect(t.take(1, 0, cap, "checked", 0, "vk:d", ws, rs)).toBe(false)
+  expect(t.held).toBe(cap)
+})
+
+test("a tenant past its share leaves the reserve to the tenants within theirs (re-audit 5 P1-B)", () => {
   const b = new BodyBudget()
   const cap = 48
   const ws = 12
-  // a lone body of key a may take the whole cap
-  expect(b.take(48, 0, cap, "checked", 0, "a", ws)).toBe(true)
-  expect(b.heldBy("a")).toBe(48)
-  // key b sees only a's share of it: its bodies fit, up to the cap beside that share
-  expect(b.fits(30, cap, "checked", 0, "b", ws)).toBe(true)
-  expect(b.take(30, 0, cap, "checked", 0, "b", ws)).toBe(true)
-  expect(b.take(6, 30, cap, "checked", 0, "b", ws)).toBe(true)
-  expect(b.take(1, 36, cap, "checked", 0, "b", ws)).toBe(false)
-  // a's own bodies still see everything: a cannot grow or add another body beside b's
-  expect(b.take(1, 48, cap, "checked", 0, "a", ws)).toBe(false)
-  expect(b.fits(1, cap, "checked", 0, "a", ws)).toBe(false)
-  // before the share, the same budget turned b away
+  const rs = 12
+  // several keys of one customer count as one tenant: past its share it fills only cap - reserve
+  expect(b.take(12, 0, cap, "checked", 0, "customer:x", ws, rs)).toBe(true)
+  expect(b.take(12, 0, cap, "checked", 0, "customer:x", ws, rs)).toBe(true)
+  expect(b.take(12, 0, cap, "checked", 0, "customer:x", ws, rs)).toBe(true)
+  expect(b.take(1, 0, cap, "checked", 0, "customer:x", ws, rs)).toBe(false)
+  expect(b.take(1, 12, cap, "checked", 0, "customer:x", ws, rs)).toBe(false)
+  expect(b.heldBy("customer:x")).toBe(36)
+  // idle tenants' bodies are admitted while it holds the rest
+  expect(b.fits(4, cap, "checked", 0, "vk:o", ws, rs)).toBe(true)
+  expect(b.take(4, 0, cap, "checked", 0, "vk:o", ws, rs)).toBe(true)
+  expect(b.take(8, 0, cap, "checked", 0, "vk:p", ws, rs)).toBe(true)
+  // the cap still bounds them
+  expect(b.take(1, 0, cap, "checked", 0, "vk:q", ws, rs)).toBe(false)
+  expect(b.held).toBe(cap)
+  // a second body that keeps the tenant within its share may use the reserve too; one past it may not
+  b.give(8, "checked", "vk:p")
+  expect(b.take(9, 0, cap, "checked", 0, "vk:o", ws, rs)).toBe(false)
+  expect(b.take(8, 0, cap, "checked", 0, "vk:o", ws, rs)).toBe(true)
+  expect(b.held).toBe(cap)
+  // counted per key (as before), four keys of one customer each stayed within a share, took the whole cap and turned
+  // the idle tenant away
   const old = new BodyBudget()
-  expect(old.take(48, 0, cap, "checked", 0, "a", 0)).toBe(true)
-  expect(old.fits(1, cap, "checked", 0, "b", 0)).toBe(false)
-  // giving back clears the credential's count
-  b.give(48, "checked", "a")
-  expect(b.heldBy("a")).toBe(0)
-  expect(b.held).toBe(36)
-  b.give(36, "checked", "b")
-  expect(b.held).toBe(0)
+  for (const k of ["vk:1", "vk:2", "vk:3", "vk:4"]) expect(old.take(12, 0, cap, "checked", 0, k, ws, 0)).toBe(true)
+  expect(old.fits(1, cap, "checked", 0, "vk:o", ws, 0)).toBe(false)
 })
 
-test("a single credential with several bodies keeps the whole cap when no one else holds a body", () => {
+test("under contention the tenant past its share is the one refused, and a lone body leaves the reserve open", () => {
+  const b = new BodyBudget()
+  const cap = 48
+  const ws = 12
+  const rs = 12
+  // a lone chunked body grows past the cap (the request limit bounds it)
+  expect(b.take(46, 0, cap, "checked", 0, "vk:a", ws, rs)).toBe(true)
+  expect(b.take(2, 46, cap, "checked", 0, "vk:a", ws, rs)).toBe(true)
+  // another tenant's first body fits within the reserve past it
+  expect(b.take(4, 0, cap, "checked", 0, "vk:b", ws, rs)).toBe(true)
+  // and the tenant past its share is refused its next bytes
+  expect(b.take(1, 48, cap, "checked", 0, "vk:a", ws, rs)).toBe(false)
+  b.give(48, "checked", "vk:a")
+  expect(b.held).toBe(4)
+  // a single tenant on its own keeps cap - reserve beside its first body
+  const s = new BodyBudget()
+  expect(s.take(20, 0, cap, "checked", 0, "vk:a", ws, rs)).toBe(true)
+  expect(s.take(20, 0, cap, "checked", 0, "vk:a", ws, rs)).toBe(false)
+  expect(s.take(16, 0, cap, "checked", 0, "vk:a", ws, rs)).toBe(true)
+})
+
+test("chunked bodies grow only into cap - reserve, whatever their tenants' shares", () => {
+  const b = new BodyBudget()
+  const cap = 48
+  const ws = 12
+  const rs = 12
+  // four keys with no customer, each within its share, trickling chunked bodies
+  expect(b.take(11, 0, cap, "checked", 0, "vk:1", ws, rs)).toBe(true)
+  expect(b.take(1, 0, cap, "checked", 0, "vk:2", ws, rs)).toBe(true)
+  expect(b.take(10, 1, cap, "checked", 0, "vk:2", ws, rs)).toBe(true)
+  expect(b.take(1, 0, cap, "checked", 0, "vk:3", ws, rs)).toBe(true)
+  expect(b.take(13, 1, cap, "checked", 0, "vk:3", ws, rs)).toBe(true)
+  expect(b.held).toBe(36)
+  // a new body's first bytes may use the reserve, its growth may not
+  expect(b.take(1, 0, cap, "checked", 0, "vk:4", ws, rs)).toBe(true)
+  expect(b.take(1, 1, cap, "checked", 0, "vk:4", ws, rs)).toBe(false)
+  expect(b.take(1, 11, cap, "checked", 0, "vk:1", ws, rs)).toBe(false)
+  // so an idle tenant's declared body is admitted
+  expect(b.take(4, 0, cap, "checked", 0, "vk:o", ws, rs)).toBe(true)
+  expect(b.held).toBe(41)
+})
+
+test("declared lengths reserved at admission: of 8 x 12 the ones admitted fit together (re-audit 5 P2-A)", () => {
+  const b = new BodyBudget()
+  const cap = 48
+  let admitted = 0
+  for (const k of ["1", "2", "3", "4", "5", "6", "7", "8"]) {
+    if (b.take(12, 0, cap, "checked", 0, "vk:" + k, 12, 12)) admitted += 1
+  }
+  expect(admitted).toBe(4)
+  expect(b.held).toBe(48)
+  expect(b.refused).toBe(4)
+})
+
+test("a single credential with several bodies keeps the whole cap when there is no reserve", () => {
   const b = new BodyBudget()
   const cap = 48
   const ws = 12
@@ -701,20 +817,21 @@ test("a single credential with several bodies keeps the whole cap when no one el
   expect(b.take(1, 0, cap, "checked", 0, "a", ws)).toBe(false)
 })
 
-test("the bytes in hand stay within twice the cap however many credentials pass their share", () => {
-  const b = new BodyBudget()
-  const cap = 48
-  const ws = 12
-  expect(b.take(48, 0, cap, "checked", 0, "a", ws)).toBe(true)
-  expect(b.take(36, 0, cap, "checked", 0, "b", ws)).toBe(true)
-  // c sees 12 + 12 of a and b: 24 fit by the cap, but 96 in hand is the ceiling
-  expect(b.fits(24, cap, "checked", 0, "c", ws)).toBe(false)
-  expect(b.take(12, 0, cap, "checked", 0, "c", ws)).toBe(true)
-  expect(b.held).toBe(96)
-  expect(b.take(1, 0, cap, "checked", 0, "d", ws)).toBe(false)
-  // an unchecked body beside them sees the credentials' shares only, within the same ceiling
+test("server.body_reserve_mb: a quarter by default, a value within the cap, none", () => {
+  const cap = 48 * 1048576
+  expect(bodyReserve(undefined, cap)).toBe(12 * 1048576)
+  expect(bodyReserve({ body_reserve_mb: 0 }, cap)).toBe(12 * 1048576)
+  expect(bodyReserve({ body_reserve_mb: 4 }, cap)).toBe(4 * 1048576)
+  expect(bodyReserve({ body_reserve_mb: 100 }, cap)).toBe(cap)
+  expect(bodyReserve({ body_reserve_mb: -1 }, cap)).toBe(0)
+  expect(bodyReserve(undefined, 0)).toBe(0)
+})
+
+test("an unchecked body beside checked ones keeps within its share and the cap", () => {
   const u = new BodyBudget()
-  expect(u.take(48, 0, cap, "checked", 6, "a", ws)).toBe(true)
-  expect(u.take(6, 0, cap, "unchecked", 6, "", ws)).toBe(true)
-  expect(u.take(1, 0, cap, "unchecked", 6, "", ws)).toBe(false)
+  const cap = 48
+  expect(u.take(42, 0, cap, "checked", 6, "a", 12, 12)).toBe(true)
+  expect(u.take(6, 0, cap, "unchecked", 6, "", 12, 12)).toBe(true)
+  expect(u.take(1, 0, cap, "unchecked", 6, "", 12, 12)).toBe(false)
+  expect(u.held).toBe(cap)
 })

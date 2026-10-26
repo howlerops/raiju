@@ -9,7 +9,7 @@ for each element of a list. Descriptions are the comments in the source; default
 has one. The command-line flags (`-app-dir`, `-config`, `-host`, `-port`, `-workers`, `-server`, `-mode`,
 `-healthcheck`) are in the README.
 
-1378 keys (577 with a description), and 38 Bifrost keys read through config_compat.
+1379 keys (578 with a description), and 38 Bifrost keys read through config_compat.
 
 ## Sections
 
@@ -1631,7 +1631,8 @@ Bifrost's server section; Raiju reads a2a_allow_private_push_callbacks (push cal
 | `server.body_rate_grace_seconds` | number | the start of a checked body that body_min_kb_per_second does not count (default 10) |
 | `server.body_rate_window_seconds` | number | the sliding window body_min_kb_per_second is counted over once a checked body is past its grace (default 30; 0 an average from the start) |
 | `server.body_max_seconds` | number | a body over 64 KB whose credential was checked (or a signed peer body) must arrive whole within this, or it is answered 408 (default 600; 0 off; bodybudget.tov) |
-| `server.credential_body_mb` | int | the megabytes of max_buffered_body_mb one credential's bodies count for against other callers' bodies (default a quarter; -1 no per-credential share; bodybudget.tov) |
+| `server.credential_body_mb` | int | the megabytes of max_buffered_body_mb one tenant's bodies (a key's customer, else its team, else the key) may hold before they give way to other tenants (default a quarter; -1 no per-tenant share; bodybudget.tov) |
+| `server.body_reserve_mb` | int | the megabytes of max_buffered_body_mb that tenants past credential_body_mb may not fill, kept for tenants within their share (default a quarter; -1 none; bodybudget.tov) |
 | `server.webrtc_enabled` | bool | webrtc_enabled (Raiju's; Bifrost has no switch) turns on the WebRTC realtime and live calls the gateway terminates on its own peer (POST /v1/realtime/calls, POST /v1/realtime, POST /v1/live/sessions). |
 | `server.metrics_token` | string | Raiju's: when set (env.NAME allowed), /metrics answers only a request with "Authorization: Bearer <token>" (401 otherwise). Unset keeps Bifrost's open /metrics. |
 | `server.trusted_proxies` | string[] | Raiju's own (Bifrost believes no forwarding header): the addresses or CIDR ranges of the reverse proxies in front of the gateway. Only a request from one of them has its X-Forwarded-For / X-Real-IP taken as the client's address (clientip.tov), for the audit log, the sign-in throttle and the MCP client registration limits. Empty: the TCP peer is the client. Unset: the comma-separated RAIJU_TRUSTED_PROXIES environment variable (the ECS module sets it to the VPC's range), else empty. |

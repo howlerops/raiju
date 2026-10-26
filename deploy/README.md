@@ -138,15 +138,19 @@ inference call without a valid virtual key (while `client.enforce_auth_on_infere
 call `/mcp` refuses from its headers, or a management call the gate refuses is answered 401 or 403
 unread. `server.max_buffered_body_mb` (default 48; -1 for no cap; read per request) caps the
 request-body megabytes each process reads at once: a body that does not fit is answered 503 with
-`retry-after: 1` (unread when its declared length cannot fit beside the bytes held), and is retried by
-well-behaved clients. Bytes are charged as they arrive, so a client trickling a big declared body holds
-only what it has sent. A body whose credential was checked from the headers (a virtual key, a direct
+`retry-after: 1`, and is retried by well-behaved clients. The cap is a hard bound: a declared length is
+reserved whole when the body is admitted (503 unread when it cannot fit, never part way), and a chunked
+body is charged as its bytes arrive. A body whose credential was checked from the headers (a virtual key, a direct
 provider key that is one of the configured keys, a sign-in) must keep `server.body_min_kb_per_second`
 (default 32, 0 off) after `server.body_rate_grace_seconds` (default 10), counted over each recent
 `server.body_rate_window_seconds` (default 30), and arrive whole within `server.body_max_seconds`
-(default 600, 0 off; raise it for very large uploads over slow links); the bytes one credential holds
-past `server.credential_body_mb` (default a quarter of the cap; -1 for none) do not count against
-other callers' bodies, so one tenant cannot hold the whole budget; a body whose credential was not checked (inference with auth off, the plugins' HTTP hooks, routes
+(default 600, 0 off; raise it for very large uploads over slow links). Bodies count per tenant (a
+virtual key's customer, else its team, else the key; another credential on its own): a tenant past
+`server.credential_body_mb` (default a quarter of the cap; -1 for no tenant shares), or a chunked body
+that keeps growing, fills the cap only up to `server.body_reserve_mb` (default a quarter; -1 for none)
+short of it, so a new body that keeps its tenant within its share is admitted while others hold the
+budget, and one tenant cannot hold the whole budget with many keys. Give each customer's keys a
+`customer_id` (or a team) for this to count them together. A body whose credential was not checked (inference with auth off, the plugins' HTTP hooks, routes
 that read their credential from the body) must arrive whole within `server.body_deadline_seconds`
 (default 30, 0 off) and, beside other bodies, shares `server.unchecked_body_mb` (default an eighth of
 the cap; -1 for no separate share), so an unauthenticated client cannot turn the authenticated big

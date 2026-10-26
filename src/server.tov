@@ -64,7 +64,7 @@ import { EXTRA_PARAMS_HEADER, EXTRA_PARAMS_CARRY, mergeExtraParams, extraParamsC
 import { lifecycle, readyInput, readyReport, ServerLimits } from "./lifecycle"
 import { CLIENT_WATCH_HEADER, watchStart, watchGone, watchEnd, watched } from "./clientgone"
 import { usesChain, withChainCreds } from "./awschain"
-import { bodyBudget, peerBudget, bufferedCap, uncheckedShare, credentialShare, bodyDeadlineMs, bodyRate, readCharged, ReadPlan, BodyClass, BodyHold, UNREAD_ABOVE } from "./bodybudget"
+import { bodyBudget, peerBudget, bufferedCap, uncheckedShare, credentialShare, bodyReserve, bodyDeadlineMs, bodyRate, readCharged, ReadPlan, BodyClass, BodyHold, UNREAD_ABOVE } from "./bodybudget"
 import { clusterBodyCap, wellFormedSig, headRefusal, peerHeaders, HEAD_SIG_HEADER, TS_HEADER } from "./cluster"
 
 type ModelEntry = { id: string, object: string, created: int, owned_by: string }
@@ -1218,7 +1218,7 @@ export function peerHeadRefusal(ops: Ops, req: Request, p: string): Response | u
 export type BodyKind = "checked" | "unchecked" | "peer"
 
 // What the headers decide before a big body is read: the answer that refuses the request, or how its body is charged
-// (who: the verified credential its bytes count for, server.credential_body_mb).
+// (who: the tenant of the verified credential, whose bytes count together for server.credential_body_mb).
 export type HeaderCheck = { res: Response | undefined, kind: BodyKind, who?: string }
 
 // The answer a request with a big unread body gets for its credentials alone, before the body is read (undefined
@@ -1263,13 +1263,13 @@ export function headerCheck(engine: Engine, ops: Ops, req: Request, limit: int):
     return { res: undefined, kind: "checked", who: "scim" }
   }
   const h = snapshot(req.headers)
-  const cred = engine.gov.checkedCredential(h)
+  const cred = engine.gov.bodyTenant(h)
   const verified: BodyKind = cred !== "" ? "checked" : "unchecked"
   if (httpHooked(engine)) return { res: undefined, kind: verified, who: cred }
   if (p === "/mcp" || (p.startsWith("/mcp/") && p.split("/").length === 3)) {
     const who = ops.mcpCaller(req)
     // the key or user the token names (a user-mode token is an identity governance does not know)
-    let id = who.checked ? engine.gov.checkedCredential(who.h) : ""
+    let id = who.checked ? engine.gov.bodyTenant(who.h) : ""
     if (who.checked && id === "") id = "mcp-user:" + (who.h.get(USER_HEADER) ?? "")
     return { res: who.res, kind: who.checked ? "checked" : "unchecked", who: id }
   }
@@ -1309,15 +1309,15 @@ function deadlineResponse(why: string): Response {
   return errorResponse(408, text, "invalid_request_error", noHeaders())
 }
 
-// Reads a request's body, charged to a body budget (bodybudget.tov): the process's for clients (server.max_buffered_body_mb,
-// unchecked bodies within server.unchecked_body_mb beside others, a credential's bytes past server.credential_body_mb
-// not counted against other callers), the peers' own for kind "peer" (cluster.max_body_mb). A declared length over the
-// limit is 413 unread. A body the server has read already (UNREAD_ABOVE or less) is charged whole and always admitted; a
-// bigger or chunked one is charged as its bytes arrive (a declared length that cannot fit beside what is held is 503
-// unread, bytes that do not fit are 503 there) and stops at the limit (413). An unchecked body must arrive whole within
+// Reads a request's body, charged to a body budget (bodybudget.tov): the process's for clients (server.max_buffered_body_mb
+// as a hard bound, unchecked bodies within server.unchecked_body_mb beside others, a tenant's bytes past
+// server.credential_body_mb kept out of server.body_reserve_mb), the peers' own for kind "peer" (cluster.max_body_mb).
+// A declared length over the limit is 413 unread. A body the server has read already (UNREAD_ABOVE or less) is charged
+// whole and always admitted; a bigger declared length is reserved whole before it is read (503 unread when it cannot
+// fit), a chunked body is charged as its bytes arrive (503 when they do not fit), and both stop at the limit (413). An unchecked body must arrive whole within
 // server.body_deadline_seconds; a checked or peer one at server.body_min_kb_per_second over each recent
 // server.body_rate_window_seconds after server.body_rate_grace_seconds, and within server.body_max_seconds (408
-// otherwise). who is the credential headerCheck verified ("" none).
+// otherwise). who is the tenant headerCheck verified ("" none).
 export async function heldBody(engine: Engine, req: Request, limit: int, kind: BodyKind, who?: string): Promise<HeldBody> {
   const hold = new BodyHold()
   if (req.method === "GET" || req.method === "HEAD") return { res: undefined, req: req, hold: hold }
@@ -1326,6 +1326,7 @@ export async function heldBody(engine: Engine, req: Request, limit: int, kind: B
   const cap = peer ? clusterBodyCap(engine.cfg.cluster) : bufferedCap(engine.cfg.server)
   const share = peer ? 0 : uncheckedShare(engine.cfg.server, cap)
   const whoShare = peer ? 0 : credentialShare(engine.cfg.server, cap)
+  const reserve = peer ? 0 : bodyReserve(engine.cfg.server, cap)
   const cls: BodyClass = kind === "unchecked" ? "unchecked" : "checked"
   const w = peer || cls === "unchecked" ? "" : (who ?? "")
   hold.peer = peer
@@ -1343,14 +1344,19 @@ export async function heldBody(engine: Engine, req: Request, limit: int, kind: B
       await req.text()
       return { res: undefined, req: req, hold: hold }
     }
-    if (!b.fits(n, cap, cls, share, w, whoShare)) return { res: busyResponse(), req: req, hold: hold }
+    // reserved whole before it is read, so a body that cannot fit is refused before its client sends it, and an
+    // admitted one is never refused part way (re-audit 5 P2-A)
+    if (!b.take(n, 0, cap, cls, share, w, whoShare, reserve)) return { res: busyResponse(), req: req, hold: hold }
+    hold.held = n
+    hold.cls = cls
+    hold.who = w
     max = n
   }
   const st = req.body
   if (st === undefined) return { res: undefined, req: req, hold: hold }
   hold.cls = cls
   hold.who = w
-  const plan: ReadPlan = { max: max, cap: cap, cls: cls, share: share, who: w, whoShare: whoShare, deadlineMs: bodyDeadlineMs(engine.cfg.server), rate: bodyRate(engine.cfg.server) }
+  const plan: ReadPlan = { max: max, cap: cap, cls: cls, share: share, who: w, whoShare: whoShare, reserve: reserve, deadlineMs: bodyDeadlineMs(engine.cfg.server), rate: bodyRate(engine.cfg.server) }
   const got = await readCharged(st, b, hold, plan)
   if (got.stop === "large") return { res: errorResponse(413, "request body too large", "invalid_request_error", noHeaders()), req: req, hold: hold }
   if (got.stop === "busy") return { res: busyResponse(), req: req, hold: hold }
