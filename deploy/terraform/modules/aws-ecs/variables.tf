@@ -213,6 +213,12 @@ variable "efs_access_point_id" {
   }
 }
 
+variable "efs_enabled" {
+  description = "Whether efs_file_system_id is set. Null (the default) works it out, which needs the id known at plan time; set true when the file system is created in the same apply (deploy/terraform/examples/staging)."
+  type        = bool
+  default     = null
+}
+
 variable "readonly_root_filesystem" {
   description = "Mount the container root filesystem read-only, as the chart does."
   type        = bool

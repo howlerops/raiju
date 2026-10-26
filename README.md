@@ -447,6 +447,16 @@ disk (the Vertex key file's content reaches the gateway in its environment only)
 bodies have credential values masked. The gateway's own log is `build/smoke.log`. A rejected
 credential fails the chat check and skips that provider's other checks.
 
+### Staging validation
+
+What the production audits say only real infrastructure can confirm (real providers and a 24-hour soak at
+512Mi, the ECS module on AWS behind its ALB, Okta and Entra through TLS, flock on EFS, rolling upgrades, a
+three-node cluster with a partition) is a runbook with pass and fail criteria:
+[docs/staging-validation.md](docs/staging-validation.md). It uses a throwaway Terraform stack
+(`deploy/terraform/examples/staging`), the audits' repro scripts pointed at a URL (`tests/staging/`, each printing
+PASS or FAIL with its numbers; `tests/staging/run.py --checks ...` runs a set), and a workflow started by hand
+(`.github/workflows/staging.yml`, secrets from a `staging` environment). It has not been run yet.
+
 ### The web UI
 
 The admin client is a browser app in [`web/`](web/): SolidJS 2.0 (release candidate), TypeScript,

@@ -9,15 +9,18 @@ data "aws_vpc" "this" {
 
 locals {
   cluster_arn = var.cluster_arn != null ? var.cluster_arn : one(aws_ecs_cluster.this[*].arn)
-  efs_enabled = var.efs_file_system_id != null
+  # efs_enabled says it when efs_file_system_id comes from a resource made in the same apply (unknown at plan time)
+  efs_enabled = var.efs_enabled != null ? var.efs_enabled : var.efs_file_system_id != null
 
   # Raiju clustering (cluster_enabled): the tasks find each other through a Cloud Map DNS name
   # (discovery type "dns") and share config.json on the EFS volume (config_sync "file").
   namespace_id     = var.cluster_enabled ? (var.service_discovery_namespace_id != null ? var.service_discovery_namespace_id : one(aws_service_discovery_private_dns_namespace.this[*].id)) : null
   namespace_name   = var.service_discovery_namespace_id != null ? var.service_discovery_namespace_name : "${var.name}.local"
   cluster_dns_name = var.cluster_enabled ? "${var.name}.${local.namespace_name}" : null
-  cluster_secrets  = var.cluster_enabled && var.cluster_secret_arn != null ? { RAIJU_CLUSTER_SECRET = var.cluster_secret_arn } : {}
-  all_secrets      = merge(var.secret_arns, local.cluster_secrets)
+  # keyed on cluster_enabled alone, so an ARN made in the same apply does not leave the secrets unknown at plan time
+  # (a missing ARN is caught by the service precondition)
+  cluster_secrets = var.cluster_enabled ? { RAIJU_CLUSTER_SECRET = var.cluster_secret_arn } : {}
+  all_secrets     = merge(var.secret_arns, local.cluster_secrets)
 
   # Same flags as the image's CMD, with -workers added. The image's ENTRYPOINT
   # is the raiju binary, so this list replaces the CMD only.

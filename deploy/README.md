@@ -428,6 +428,11 @@ capacity and availability.
 
 ## Limits of this packaging
 
+What these deployments do on real infrastructure (the ECS module applied, EFS locks, rolling upgrades, a cluster
+over a real network, memory at 512Mi under real traffic) is checked by the staging runbook,
+[docs/staging-validation.md](../docs/staging-validation.md), with the throwaway stack in
+`terraform/examples/staging`. Until it has been run, these remain unconfirmed:
+
 - The image builds Tov from source (the installer needs network access and takes several minutes).
   The binary is dynamically linked against glibc, libstdc++ and WebKitGTK's JavaScriptCore (Tov
   links it for `node:*` modules), so the runtime is `debian:bookworm-slim` with
