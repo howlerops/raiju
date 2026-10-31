@@ -19,6 +19,7 @@ Patch 0017 (`server.requestIP`) changes the HTTP server in `runtime/tov.c` and `
 Patch 0019 (worker respawn) changes the worker supervisor in `runtime/tov.c` and is written on top of 0001-0017 (its `docs/spec.md` hunk is on the line 0017 changes).
 Patch 0020 (`node:fs` `flockSync`) adds one native to the shared lists in `builtins.rs` and `tov.h` next to 0009's, and is written on top of 0001-0019.
 Patch 0021 (`Math.random` seeding) changes the generator and the worker fork in `runtime/tov.c` (next to 0019's supervisor), and is written on top of 0001-0020.
+Patch 0022 (address policy on `Bun.connect` and `WebSocket`, write-stall limit on upgraded sockets) reuses 0013's address classes in `runtime/tov.c`, changes the sockets in `runtime/net.c` and `runtime/ws.c` and the server sweep 0012 adds, and is written on top of 0001-0021.
 
 ## Submitting upstream
 
@@ -672,7 +673,7 @@ const res = await fetch(url, {
 - `crates/tov/src/check/builtins.rs`: the signature. `crates/tov/src/std/http.tov`: `RequestInit.peer` and `PeerPolicy`.
 - `docs/spec.md`: the fetch paragraph.
 
-**Not covered.** `Bun.connect` and `WebSocket` have no such option. The test (`tests/peer_policy.tov`, 21 checks:
+**Not covered.** `Bun.connect` and `WebSocket` had no such option until 0022. The test (`tests/peer_policy.tov`, 21 checks:
 the default refusal, each switch, address, range, mapped and name entries, a name resolved through `/etc/hosts`,
 0.0.0.0, metadata, ::1, redirect hops and pooled connections) is in `run.sh`; it needs a name other than `localhost`
 that `/etc/hosts` maps to 127.0.0.1 (`PEER_NAME` names one) and is skipped without it.
@@ -845,3 +846,47 @@ apart and a run stays reproducible; any other `TOV_SEED` value seeds from the sy
 numbers, `TOV_SEED=42` gives the same draw twice and `TOV_SEED=43` another, and the first draws of four workers differ,
 with and without `TOV_SEED` (before the patch all four were equal, and equal across processes). Raiju's e2e `l206_e2e`
 creates webhooks concurrently on four workers. Written on top of 0001-0020.
+
+## 0022 — the address policy on `Bun.connect` and `WebSocket`; a write-stall limit on upgraded sockets
+
+**Problem.** 0013 checks fetch's connections only. A program that opens raw sockets to addresses its users choose
+(an HTTP/2 client for gRPC, a Redis client, a WebSocket to a provider) has the same DNS rebinding window: it can
+check the host first, but `Bun.connect` resolves the name again when it connects. And `Bun.serve`'s idle timeout
+drops HTTP connections whose client stops reading (0012), but a WebSocket's socket leaves the server at the upgrade,
+so a client that stops reading a socket the server keeps sending to holds its buffers for good.
+
+**API (Tov; not in Bun).**
+
+```ts
+const sock = await Bun.connect({ hostname, port, peer: { loopback: true }, socket: { ... } })
+// rejects with a SocketError, code "AddressNotAllowed": "Connection to a private address 10.0.0.7 (host x) is not allowed"
+const ws = new WebSocket(url, { headers, peer: { private: false, allow: ["10.1.0.0/16"] } })
+// a refused address is an error event ("AddressNotAllowed: ...") and a close with code 1006
+Bun.serve({ idleTimeout: 60, websocket: { ... } })   // also: output a WebSocket client does not take for 60 s closes it
+```
+
+**Design.**
+- `peer` is fetch's `PeerPolicy`, with the same classes and allow list (0013's code, shared as `tv_peer_refuses`).
+  A new native `netPeer(id, bits, allow)` sets it on a socket before it starts; the check runs in `tv_ns_resolved`,
+  on every address the lookup returned (or the numeric host), right before the first connect. Unix sockets are not
+  checked. The WebSocket client starts connecting in a microtask now, so a refusal known at once (a numeric host, a
+  cached name) reaches the handlers the constructor's caller sets.
+- The write-stall limit: `server.upgrade` gives the socket the server's `idleTimeout` as its stall time. net.c keeps
+  such sockets on a list, and the server's sweep (every 250 ms while a server has a timeout, also when only upgraded
+  sockets are left) closes one whose output has waited longer than that since the kernel last took any of it (close
+  code 1006 to the program). A socket past its time is offered its output once more first, since the kernel reports a
+  socket writable only once much of its buffer is free: a slow reader that keeps reading stays.
+
+**Files.** `runtime/net.c` (`netPeer`, the check in `tv_ns_resolved`, `tv_ns_stall_watch`, `tv_ns_stall_sweep`),
+`runtime/ws.c` (`wsUpgrade`), `runtime/tov.c` (`tv_peer_refuses`, the sweep hook `tv_http_sweep_net`),
+`runtime/tov.h`, `crates/tov/src/check/builtins.rs`, `crates/tov/src/std/http.tov` (`ConnectOptions.peer`,
+`WebSocketOptions.peer`), `docs/spec.md`.
+
+**Tested.** `tests/socket_peer.tov` (16 checks: Bun.connect's default refusal, each switch, a CIDR entry, a name
+resolved through `/etc/hosts` refused and allowed by name, an IPv4-mapped loopback address, metadata and 0.0.0.0
+refused whatever the policy says, a Unix socket unchecked; the WebSocket client without the option, refused by name,
+allowed with `loopback`, refused on the metadata address) needs `PEER_NAME` as 0013's test does.
+`tests/ws_stall.tov` with `ws_stall_client.py` (5 checks): with `idleTimeout: 1` and 8 MB sent to each of two
+WebSockets, the one whose client reads nothing is closed (1006) within a few sweeps and its connection ends, while one
+whose client reads 32 KB every 100 ms stays open (before the patch neither was ever closed). Written on top of
+0001-0021.

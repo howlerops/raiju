@@ -96,7 +96,7 @@ go `server.body_timeout_seconds` (default 60) without a byte (408), and a keep-a
 with no request in hand closes after `server.idle_timeout_seconds` (default 60). A request being
 handled (a slow completion, a stream) is never timed out by these, but a client that stops reading
 is: output the client does not take for `server.idle_timeout_seconds` (a stalled download, an
-abandoned stream or WebSocket on http1) ends the connection. `server.max_connections` caps
+abandoned stream or WebSocket, on both servers) ends the connection. `server.max_connections` caps
 each process's open connections (default: three quarters of its descriptor limit, `ulimit -n`;
 -1 for no cap): a request on a connection past it is answered 503, and so is a connection that
 comes when the process is out of descriptors. 0 turns a timeout off. These keys are read at start.

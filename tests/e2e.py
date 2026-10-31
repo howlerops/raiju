@@ -14167,6 +14167,171 @@ def l210_post(body, headers) -> int:
         return 0
 
 
+def l212_ws(port, path):
+    """A raw WebSocket upgrade with a small receive buffer: the socket and whether the gateway answered 101."""
+    import base64 as b64m
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    s.settimeout(5)
+    s.connect(("127.0.0.1", port))
+    key = b64m.b64encode(os.urandom(16)).decode()
+    s.sendall(f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n".encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
+        b = s.recv(1)
+        if not b:
+            break
+        head += b
+    return s, head.startswith(b"HTTP/1.1 101")
+
+
+def l212_frame(text):
+    """A masked text frame (a client's)."""
+    mask = os.urandom(4)
+    payload = text.encode()
+    n = len(payload)
+    if n < 126:
+        hdr = bytes([0x81, 0x80 | n])
+    elif n < 65536:
+        hdr = bytes([0x81, 0x80 | 126]) + struct.pack(">H", n)
+    else:
+        hdr = bytes([0x81, 0x80 | 127]) + struct.pack(">Q", n)
+    return hdr + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+
+def l212_e2e(env):
+    """L212: the connect-time address policy on raw-socket connections (tov-patches/0022) and the write-stall limit of
+    upgraded sockets on Bun.serve. Realtime WebSockets to providers are checked as every provider connection is
+    (loopback allowed, link-local, unspecified and metadata addresses never, other private ones only with
+    allow_private_network); the Redis/Valkey vector store as the HTTP stores (private networks allowed); the A2A gRPC
+    client under the agent's allow_private_network (tests/peer_paths.tov calls each client past the gateway's guards,
+    once, on the Bun run). Hosts are names the resolver maps to an address ("0" is 0.0.0.0, "0x7f000001" 127.0.0.1),
+    so the check runs on what the lookup returned at connect time (before the patch the realtime session to "0"
+    reached the mock: Linux connects 0.0.0.0 to the loopback interface). A WebSocket client that stops reading is
+    dropped after idle_timeout_seconds on both servers (Bun.serve kept it forever). Its own gateway (18380) and a TCP
+    listener standing in for Redis (18381)."""
+    import threading
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    d = os.path.join(BUILD, "e2e-l212")
+    os.makedirs(d, exist_ok=True)
+    # the raw-socket clients called directly (server-independent: once)
+    if server != "http1":
+        bin_path = os.path.join(BUILD, "peer_paths")
+        b = subprocess.run([os.environ.get("TOV", "tov"), "build", os.path.join(ROOT, "tests/peer_paths.tov"), "-o", bin_path], capture_output=True, text=True,
+                           env={**os.environ, "TOV_CFLAGS": os.environ.get("TOV_CFLAGS", "-DTV_PLAIN_ALLOC")})
+        out = ""
+        if b.returncode == 0:
+            try:
+                out = subprocess.run([bin_path], capture_output=True, text=True, timeout=120, cwd=ROOT).stdout
+            except subprocess.TimeoutExpired as e:
+                out = f"timeout {e}"
+        lines = [x for x in out.splitlines() if x.startswith("ok ") or x.startswith("FAIL ")]
+        check("L212: the A2A gRPC, Redis and provider WebSocket clients refuse a name that resolves to a refused address at connect (tests/peer_paths.tov)",
+              b.returncode == 0 and len(lines) == 8 and all(x.startswith("ok ") for x in lines), (b.stderr[-800:], out[-2000:]))
+    # a listener standing in for Redis: it only counts the connections it is offered
+    conns = []
+    lst = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    lst.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    lst.bind(("127.0.0.1", 18381))
+    lst.listen(16)
+    lst.settimeout(0.2)
+    stop = []
+
+    def accept():
+        while not stop:
+            try:
+                c, _ = lst.accept()
+                conns.append(1)
+                c.close()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+    t = threading.Thread(target=accept, daemon=True)
+    t.start()
+    mock_port = MOCK.rsplit(":", 1)[1]
+
+    def prov(name, base, extra=None):
+        return {"keys": [{"name": name, "value": "sk-" + name, "models": [], "weight": 1.0}], "custom_provider_config": {"base_provider_type": "openai"},
+                "network_config": {"base_url": base, "max_retries": 0, **(extra or {})}}
+    cfg = {
+        "client": {"enforce_auth_on_inference": False, "enable_logging": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "server": {"idle_timeout_seconds": 2},
+        "providers": {
+            "openai": {"keys": [{"name": "l212", "value": "sk-l212", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}},
+            "rtname": prov("rtname", f"http://0x7f000001:{mock_port}"),
+            "rtzero": prov("rtzero", f"http://0:{mock_port}"),
+            "rtzeropriv": prov("rtzeropriv", f"http://0:{mock_port}", {"allow_private_network": True}),
+        },
+        "plugins": [{"name": "semantic_cache", "enabled": True, "config": {"provider": "openai", "embedding_model": "text-embedding-3-small", "threshold": 0.95, "ttl": "5m", "vector_store_namespace": "l212-ns"}}],
+        "vector_store": {"enabled": True, "type": "redis", "config": {"addr": "0:18381"}},
+    }
+    gw = l183_start(env, "l212", 18380, cfg)
+    log = os.path.join(BUILD, "e2e.l212.log")
+    try:
+        # realtime: a provider reached through a name that resolves to the loopback address works
+        c = WsClient("/v1/realtime?model=rtname/gpt-realtime", {}, port=18380)
+        c.send(json.dumps({"type": "test.rt.start", "id": "sess_l212_ok"}))
+        evs = c.until("session.created")
+        c.close()
+        check(f"L212 {server}: a realtime provider whose base_url host resolves to a loopback address is reached", c.status == 101 and evs and evs[-1].get("type") == "session.created", (c.status, evs))
+        for name, label in [("rtzero", "without allow_private_network"), ("rtzeropriv", "even with allow_private_network")]:
+            c = WsClient(f"/v1/realtime?model={name}/gpt-realtime", {}, port=18380)
+            c.send(json.dumps({"type": "test.rt.start", "id": "sess_l212_" + name}))
+            evs = c.until("session.created")
+            code = c.close_code
+            c.close()
+            got = any(e.get("type") == "session.created" for e in evs)
+            check(f"L212 {server}: a realtime provider whose host resolves to 0.0.0.0 is refused at connect {label}", c.status == 101 and not got and code == 1011, (c.status, code, evs))
+        time.sleep(0.3)
+        text = open(log, errors="replace").read()
+        check(f"L212 {server}: the refused realtime connection is logged with the address", "realtime upstream refused: AddressNotAllowed" in text and "0.0.0.0 (host 0)" in text, text[-1500:])
+        # the Redis vector store on a name that resolves to 0.0.0.0: refused at connect, the request is served (a miss)
+        s, h, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l212 cache"}]}, {"x-bf-cache-key": "l212"}, base="http://127.0.0.1:18380")
+        time.sleep(0.5)
+        text = open(log, errors="replace").read()
+        check(f"L212 {server}: a Redis vector store whose host resolves to 0.0.0.0 is refused at connect (nothing reaches it, the request is served)",
+              s == 200 and not conns and "vector_store search" in text and "0.0.0.0 (host 0) is not allowed" in text, (s, len(conns), text[-1500:]))
+        # a WebSocket client that stops reading: the provider's echoes pile up, and the gateway drops it after the
+        # idle timeout (Bun.serve kept it forever before the patch; the http1 server since L189)
+        ws, ok = l212_ws(18380, "/v1/realtime?model=rtname/gpt-realtime")
+        pad = "a" * 60000
+        sent = 0
+        try:
+            for i in range(120):
+                ws.sendall(l212_frame(json.dumps({"type": "l212.pad", "i": i, "pad": pad})))
+                sent += 1
+        except OSError:
+            pass
+        time.sleep(7)
+        got, end = 0, "open"
+        ws.settimeout(3)
+        try:
+            while True:
+                part = ws.recv(1 << 20)
+                if not part:
+                    end = "closed"
+                    break
+                got += len(part)
+        except ConnectionResetError:
+            end = "reset"
+        except socket.timeout:
+            end = "open"
+        except OSError as e:
+            end = f"error {e}"
+        ws.close()
+        check(f"L212 {server}: a WebSocket client that stops reading is dropped after idle_timeout_seconds", ok and sent > 20 and end in ("closed", "reset") and got < sent * 60000, (ok, sent, end, got))
+        st, _, _ = call("GET", "/health", None, None, base="http://127.0.0.1:18380", auth=False)
+        check(f"L212 {server}: the gateway serves on after dropping the stalled WebSocket", st == 200, st)
+    finally:
+        stop.append(1)
+        lst.close()
+        gw.terminate()
+        gw.wait()
+
+
 def l210_e2e(env):
     """L210 (production re-audit 6, P0-A, P1-A, P1-B). P0-A: a body over 64 KB is freed once its request is done (each
     read raced a promise that never settled, which kept every chunk alive: 1 MB chats grew a worker by their size).
@@ -20556,6 +20721,10 @@ def main():
         # L209: duplicate names saved before names were unique (start warning, notice, updates that keep a name): its
         # own gateway (18374)
         l209_e2e(env)
+        # L212: the connect-time address policy on raw-socket connections (realtime WebSockets to providers, the Redis
+        # vector store, A2A gRPC through tests/peer_paths.tov) and the write-stall limit of WebSockets on Bun.serve: its
+        # own gateway (18380) and a Redis stand-in (18381)
+        l212_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

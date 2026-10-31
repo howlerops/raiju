@@ -1,0 +1,400 @@
+diff --git a/crates/tov/src/check/builtins.rs b/crates/tov/src/check/builtins.rs
+index f27697b..3964dff 100644
+--- a/crates/tov/src/check/builtins.rs
++++ b/crates/tov/src/check/builtins.rs
+@@ -142,6 +142,7 @@ pub(super) fn native_sig(types: &mut Types, name: &str) -> Option<(Vec<TyId>, Ty
+         "netAddress" => (vec![INT, INT], STR),
+         "netBuffered" | "netListenPort" => (vec![INT], INT),
+         "netAlpn" => (vec![INT], STR),
++        "netPeer" => (vec![INT, INT, STR], VOID),
+         // UDP (runtime/net.c)
+         "udpOpen" => (vec![INT], INT),
+         "udpBind" => (vec![INT, STR, INT, BOOL], INT),
+diff --git a/crates/tov/src/std/http.tov b/crates/tov/src/std/http.tov
+index 2ff3af2..b11687a 100644
+--- a/crates/tov/src/std/http.tov
++++ b/crates/tov/src/std/http.tov
+@@ -2350,6 +2350,25 @@ export type ConnectOptions<T> = {
+   data?: T
+   allowHalfOpen?: bool
+   socket: SocketHandler<T>
++  // Tov: which addresses the socket may connect to, as fetch's `peer`: every address the host resolves to is checked
++  // right before connecting, and a refused one fails the connection (a SocketError "AddressNotAllowed")
++  peer?: PeerPolicy
++}
++
++// The `peer` option as the natives take it: TV_PEER_* bits (0: none) and the allow list.
++function peerBits(pp: PeerPolicy | undefined): int {
++  if (pp === undefined) {
++    return 0
++  }
++  return 1 + (pp.private === true ? 2 : 0) + (pp.loopback === true ? 4 : 0)
++}
++
++function peerAllowOf(pp: PeerPolicy | undefined): string {
++  if (pp === undefined) {
++    return ""
++  }
++  const al = pp.allow
++  return al === undefined ? "" : al.join(",")
+ }
+ 
+ // Bun.spawnSocket (Tov): a child process whose stdin and stdout are a Socket.
+@@ -2620,6 +2639,9 @@ function connectSocket<T>(options: ConnectOptions<T>): Promise<Socket<T>, Error>
+   const unix = options.unix ?? ""
+   const id = __native.netConnect(serverName, port, tls, verify, ca, unix, alpn, identity)
+   __native.netHalfOpen(id, options.allowHalfOpen ?? false)
++  if (options.peer !== undefined) {
++    __native.netPeer(id, peerBits(options.peer), peerAllowOf(options.peer))
++  }
+   const socket = new Socket<T>(id, options.socket, options.data)
+   const p = new Promise<Socket<T>, Error>((resolve, reject) => {
+     socket.waits(resolve, reject)
+@@ -3109,7 +3131,9 @@ export class WebSocketEvent {
+ export type MessageEvent = WebSocketEvent
+ export type CloseEvent = WebSocketEvent
+ export type WebSocketListener = (event: WebSocketEvent) => void throws Error
+-export type WebSocketOptions = { protocols?: string | string[], headers?: HeadersInit, tls?: SocketTLSOptions }
++// `peer` (Tov): which addresses the client may connect to, as fetch's; a refused one is an error event
++// ("AddressNotAllowed") and a close with code 1006.
++export type WebSocketOptions = { protocols?: string | string[], headers?: HeadersInit, tls?: SocketTLSOptions, peer?: PeerPolicy }
+ 
+ // The WebSocket client, as browsers and Bun have it: `new WebSocket("wss://host/path")`, then
+ // `onopen`, `onmessage`, `onclose`, `onerror` (or addEventListener). Messages sent before it's
+@@ -3156,6 +3180,7 @@ export class WebSocket {
+     let headers = ""
+     let verify = true
+     let ca = ""
++    let peer: PeerPolicy | undefined = undefined
+     if (protocols !== undefined) {
+       if (typeof protocols === "string") {
+         wanted = protocols
+@@ -3175,14 +3200,23 @@ export class WebSocket {
+           verify = t.rejectUnauthorized ?? true
+           ca = t.ca ?? ""
+         }
++        peer = protocols.peer
+       }
+     }
+     const port = u.port === "" ? (secure ? 443 : 80) : parseInt(u.port) ?? 80
+     const path = (u.pathname === "" ? "/" : u.pathname) + u.search
+     const host = u.hostname.startsWith("[") ? u.hostname : u.hostname
+     this.id = __native.wsConnect(host, port, path, secure, verify, ca, headers, wanted, 100 * 1024 * 1024)
++    if (peer !== undefined) {
++      __native.netPeer(this.id, peerBits(peer), peerAllowOf(peer))
++    }
+     const w = this
+-    __native.netBind(this.id, (kind: int, bytes: u8[], text: string, code: int): void => w.event(kind, bytes, text, code), host, "")
++    const id = this.id
++    // connecting starts once the constructor's caller has set its handlers: an address refused at once (the `peer`
++    // option on a numeric host or a cached name) is still heard
++    queueMicrotask(() => {
++      __native.netBind(id, (kind: int, bytes: u8[], text: string, code: int): void => w.event(kind, bytes, text, code), host, "")
++    })
+   }
+ 
+   get readyState(): int {
+@@ -3246,7 +3280,7 @@ export class WebSocket {
+         this.dispatch(this.onclose, new WebSocketEvent("close", "", code, text, code !== 1006, ""))
+         return
+       case 25:
+-        this.dispatch(this.onerror, new WebSocketEvent("error", "", 0, "", false, text))
++        this.dispatch(this.onerror, new WebSocketEvent("error", "", 0, "", false, text.replace("\t", ": ")))
+         return
+     }
+   }
+diff --git a/docs/spec.md b/docs/spec.md
+index 53e382c..f331e64 100644
+--- a/docs/spec.md
++++ b/docs/spec.md
+@@ -201,8 +201,8 @@ console.log(`Listening on ${server.url}`)
+ - **Types.** `Request`: `method`, `url`, `headers`, `text()` (a `Promise<string>`), `json<T>()` (a `Promise<T, SyntaxError>`, parsed against the expected type). `Response(body?, { status?, statusText?, headers? })`, `Response.json(value, init?)`, `Response.redirect(url, status?)`, `status`, `ok`, `headers`, `text()`, `json<T>()` (promises, as on `Request`). `Headers(init?)`: `get`/`has`/`set`/`append`/`delete`/`forEach`/`toJSON`, case-insensitive; CR/LF in names and values are dropped. `URL(input, base?)` (throws `TypeError`): `href`, `protocol`, `host`, `hostname`, `port`, `pathname`, `search`, `hash`, `origin`, `searchParams`; `URL.parse`, `URL.canParse`. `URLSearchParams`: `get`/`getAll`/`has`/`set`/`append`/`delete`/`size`/`forEach`/`keys`/`values`/`toString`. `Request` also has `formData()`, `blob()`, `bytes()` and `arrayBuffer()`; a `Response` body can be a `Blob` or a `FormData`.
+ - **Protocol.** HTTP/1.1 with keep-alive, pipelining, `Content-Length` and chunked request bodies, `Expect: 100-continue` and `HEAD`; `content-length` and `date` are added, and `content-type: text/plain;charset=utf-8` when a body has none. Malformed or oversized requests get `400`/`413`/`431` and are closed.
+ - Not yet: TLS for `Bun.serve`, HTTP/2, streaming bodies, `Bun.file`.
+-- **WebSockets** as in Bun: `Bun.serve<T>({ fetch(req, server) { if (server.upgrade(req, { data, headers })) return; ... }, websocket: { open, message, close, drain, ping, pong, maxPayloadLength } })`. A handler that upgrades returns nothing. `ServerWebSocket<T>`: `data` (`T | undefined`), `send(text | bytes)`, `sendText`, `sendBinary`, `ping`, `pong`, `close(code?, reason?)`, `terminate()`, `subscribe`, `unsubscribe`, `isSubscribed`, `subscriptions`, `publish(topic, data)` (to the other subscribers; `publishToSelf` includes it), `readyState`, `remoteAddress`; `server.publish(topic, data)` and `server.subscriberCount(topic)`. `message` gets a `string` for text and `u8[]` for binary. Frames are checked as RFC 6455 says (Autobahn's test suite passes); text must be UTF-8; a message over `maxPayloadLength` (16 MB) closes with 1009. Compression (`perMessageDeflate`) and idle timeouts aren't there yet.
+-- The **`WebSocket` client**: `new WebSocket(url, protocols? | { protocols?, headers?, tls? })` (`ws:`, `wss:`; `try`: a bad URL throws a `SyntaxError`), `onopen`/`onmessage`/`onclose`/`onerror` and `addEventListener`, `send` (messages sent before it opens go out once it does), `close(code?, reason?)`, `readyState`, `protocol`. Events are `WebSocketEvent`s: `data` (`string | u8[]`), `code`, `reason`, `wasClean`.
++- **WebSockets** as in Bun: `Bun.serve<T>({ fetch(req, server) { if (server.upgrade(req, { data, headers })) return; ... }, websocket: { open, message, close, drain, ping, pong, maxPayloadLength } })`. A handler that upgrades returns nothing. `ServerWebSocket<T>`: `data` (`T | undefined`), `send(text | bytes)`, `sendText`, `sendBinary`, `ping`, `pong`, `close(code?, reason?)`, `terminate()`, `subscribe`, `unsubscribe`, `isSubscribed`, `subscriptions`, `publish(topic, data)` (to the other subscribers; `publishToSelf` includes it), `readyState`, `remoteAddress`; `server.publish(topic, data)` and `server.subscriberCount(topic)`. `message` gets a `string` for text and `u8[]` for binary. Frames are checked as RFC 6455 says (Autobahn's test suite passes); text must be UTF-8; a message over `maxPayloadLength` (16 MB) closes with 1009. With the server's `idleTimeout` (Tov), output an upgraded socket's client does not take for that long closes it (close code 1006), as for HTTP connections; progress is the kernel taking some of it. Compression (`perMessageDeflate`) and idle timeouts on silent sockets aren't there yet.
++- The **`WebSocket` client**: `new WebSocket(url, protocols? | { protocols?, headers?, tls?, peer? })` (`ws:`, `wss:`; `try`: a bad URL throws a `SyntaxError`), `onopen`/`onmessage`/`onclose`/`onerror` and `addEventListener`, `send` (messages sent before it opens go out once it does), `close(code?, reason?)`, `readyState`, `protocol`. Events are `WebSocketEvent`s: `data` (`string | u8[]`), `code`, `reason`, `wasClean`. `peer` (Tov) is fetch's address policy: a refused address is an error event (`AddressNotAllowed: ...`) and a close with 1006.
+ 
+ ## 7d. fetch (Bun's client)
+ `fetch(input, init?)` is a global, as in Bun: `input` is a URL string, a `URL` or a `Request`; `init` is `{ method?, headers?, body?, redirect?, signal?, decompress?, tls?, unix?, proxy?, keepalive? }`. It returns `Promise<Response, Error>`: it resolves once the response's head has arrived (an HTTP error status still resolves, `ok` is false) and the body follows, and rejects with a `FetchError` (a `TypeError` with Bun's `message` and `code`: `ConnectionRefused`, `ENOTFOUND`, `ECONNRESET`, `TooManyRedirects`, `UnexpectedRedirect`, `Malformed_HTTP_Response`, `ZlibError`, `BrotliDecompressionError`, `ZstdDecompressionError`, `ERR_INVALID_URL`, ...) or, when its `signal` aborts, with the signal's reason.
+@@ -227,7 +227,7 @@ const user = try (await res.json()) as User
+ - Not yet: request bodies as streams, client certificates, `https:` proxies.
+ 
+ ## 7e. TCP and TLS sockets (Bun's API)
+-`Bun.connect(options)` and `Bun.listen(options)`, as in Bun: `hostname`, `port` (or `unix`), `tls` (`true`, or `{ ca?, rejectUnauthorized?, serverName?, alpn?, cert?, key? }` to connect, `cert` and `key` a client certificate as fetch's; `{ cert, key }`, PEM text, to listen), `data` (the sockets' starting `socket.data`), `allowHalfOpen`, and `socket`, the handlers: `open(socket)`, `data(socket, bytes)` (a `u8[]`), `drain(socket)`, `end(socket)` (the peer finished sending), `close(socket, error?)`, `error(socket, error)`, `connectError(socket, error)`, `handshake(socket, success, authorizationError?)`.
++`Bun.connect(options)` and `Bun.listen(options)`, as in Bun: `hostname`, `port` (or `unix`), `tls` (`true`, or `{ ca?, rejectUnauthorized?, serverName?, alpn?, cert?, key? }` to connect, `cert` and `key` a client certificate as fetch's; `{ cert, key }`, PEM text, to listen), `data` (the sockets' starting `socket.data`), `allowHalfOpen`, `peer` (to connect, Tov: see below), and `socket`, the handlers: `open(socket)`, `data(socket, bytes)` (a `u8[]`), `drain(socket)`, `end(socket)` (the peer finished sending), `close(socket, error?)`, `error(socket, error)`, `connectError(socket, error)`, `handshake(socket, success, authorizationError?)`.
+ ```ts
+ type Session = { name: string }
+ const server = Bun.listen<Session>({
+@@ -241,7 +241,7 @@ const server = Bun.listen<Session>({
+ const client = try await Bun.connect({ hostname: "localhost", port: 7000, socket: { data(socket, data) { console.log(data.length) } } })
+ client.write("hello")
+ ```
+-- `Bun.connect` resolves once the socket is open (with TLS, once the handshake is done and the certificate checked) and rejects with a `SocketError` (`code`: `ECONNREFUSED`, `ENOTFOUND`, `CERT_HAS_EXPIRED`, ...) when it can't connect. `Bun.listen` returns a `TCPSocketListener` (`port`, `hostname`, `stop(closeActive?)`, `ref`, `unref`); a port that can't be bound prints the error and exits, as an uncaught error does in Bun.
++- `Bun.connect` resolves once the socket is open (with TLS, once the handshake is done and the certificate checked) and rejects with a `SocketError` (`code`: `ECONNREFUSED`, `ENOTFOUND`, `CERT_HAS_EXPIRED`, ...) when it can't connect. `peer` (Tov) is fetch's address policy, checked on every address the host resolves to right before connecting: a refused one rejects with `AddressNotAllowed` (Unix sockets are not checked). `Bun.listen` returns a `TCPSocketListener` (`port`, `hostname`, `stop(closeActive?)`, `ref`, `unref`); a port that can't be bound prints the error and exits, as an uncaught error does in Bun.
+ - `Socket`: `write(text | bytes)`, `end(data?)`, `flush()`, `terminate()`, `shutdown()`, `setNoDelay(on?)`, `ref()`, `unref()`, `data`, `remoteAddress`, `remotePort`, `localAddress`, `localPort`, `bufferedAmount` (Tov). Unlike Bun's, `write` takes everything: what the kernel can't take yet is buffered (Bun returns a short count and drops the rest), and `drain` follows once it's out. Writes made in a handler go out together when it returns: one system call for many small writes.
+ - `end()` closes the socket once its data is out (`close` runs); with `allowHalfOpen` it shuts only the sending side, and the peer can keep sending. A handler that throws hands the error to `error`, else it's logged and the socket closes. A connect's `socket.data` is `T | undefined` (`T` from `data`, or the type argument: `Bun.listen<Session>(...)`).
+ 
+diff --git a/runtime/net.c b/runtime/net.c
+index ce6ffd1..9662971 100644
+--- a/runtime/net.c
++++ b/runtime/net.c
+@@ -56,6 +56,12 @@ typedef struct tv_ns {
+     uint64_t timeout_ms, last_active;
+     struct tv_ns *dns_next, *dirty_next;
+     struct tv_ws *ws;        /* a WebSocket's framing (runtime/ws.c), or NULL */
++    int peer;                /* netPeer: the address policy checked on the resolved addresses (TV_PEER_* bits; 0 none) */
++    char *peer_allow;        /* ... its allow list (addresses, CIDR ranges, host names; comma separated), or NULL */
++    char *peer_host;         /* ... the host connected to, which allow entries may name */
++    uint64_t stall_ms;       /* an upgraded server socket: output the client does not take for this long closes it */
++    uint64_t at_take;        /* ... loop milliseconds the kernel last took output (or output began to wait) */
++    struct tv_ns *stall_prev, *stall_next;
+ } tv_ns;
+ 
+ /* (runtime/ws.c, later in the translation unit) */
+@@ -106,7 +112,18 @@ static tv_ns *tv_ns_new(void) {
+     return s;
+ }
+ 
++/* Upgraded server sockets with a write-stall limit (tv_ns_stall_watch), swept with the server's timeouts. */
++static tv_ns *tv_ns_stalling;
++
+ static void tv_ns_free(tv_ns *s) {
++    if (s->stall_ms) {
++        if (s->stall_prev) s->stall_prev->stall_next = s->stall_next;
++        else tv_ns_stalling = s->stall_next;
++        if (s->stall_next) s->stall_next->stall_prev = s->stall_prev;
++        if (!tv_ns_stalling) tv_http_sweep_net = NULL;
++    }
++    free(s->peer_allow);
++    free(s->peer_host);
+     if (s->ws) tv_ws_free(s);
+     if (s->bound) tv_env_release(s->cb.env);
+     free(s->out);
+@@ -224,6 +241,7 @@ static bool tv_ns_flush_held(tv_ns *s) {
+             }
+         }
+         s->out_off += (size_t)w;
++        s->at_take = tv_loop_ms;   /* (the kernel took some: the write-stall clock starts again) */
+     }
+     s->out_off = s->out_len = 0;
+     if (s->out_cap > (1 << 20)) {
+@@ -251,6 +269,7 @@ static bool tv_ns_flush_held(tv_ns *s) {
+ }
+ 
+ static void tv_ns_append(tv_ns *s, const char *p, size_t n) {
++    if (s->out_len == s->out_off) s->at_take = tv_loop_ms;   /* output starts to wait now */
+     if (s->out_len + n > s->out_cap) {
+         if (s->out_off) {
+             memmove(s->out, s->out + s->out_off, s->out_len - s->out_off);
+@@ -312,6 +331,42 @@ static void tv_ns_settle(tv_ns *s) {
+     if (s->state == TV_NS_CLOSED && !s->busy && !s->dirty) tv_ns_free(s);
+ }
+ 
++/* ---- the write-stall limit of upgraded server sockets (the server's idle timeout, as its HTTP connections have it):
++ * output the client does not take for stall_ms closes the socket, whatever it carries. Progress is the kernel taking
++ * some of it, so a slow reader that keeps reading stays: a socket past its time is offered its output once more first
++ * (the kernel reports a socket writable only once much of its buffer is free, which a slow reader may take seconds
++ * to free). */
++
++static void tv_ns_stall_sweep(uint64_t now) {
++    /* ids first: a close handler may close (and free) other sockets of the list */
++    tv_int ids[256];
++    int n = 0;
++    for (tv_ns *s = tv_ns_stalling; s && n < 256; s = s->stall_next) {
++        if (s->state != TV_NS_OPEN || s->out_len <= s->out_off) continue;
++        if (now > s->at_take && now - s->at_take > s->stall_ms) ids[n++] = s->id;
++    }
++    for (int i = 0; i < n; i++) {
++        tv_ns *s = tv_ns_get(ids[i]);
++        if (!s || s->state != TV_NS_OPEN) continue;
++        s->busy++;
++        tv_ns_flush(s);
++        if (s->state == TV_NS_OPEN && s->out_len > s->out_off && now > s->at_take && now - s->at_take > s->stall_ms) tv_ns_close(s, "ETIMEDOUT");
++        s->busy--;
++        tv_ns_settle(s);
++    }
++}
++
++static void tv_ns_stall_watch(tv_ns *s, uint64_t ms) {
++    if (!ms || s->stall_ms) return;
++    s->stall_ms = ms;
++    s->at_take = tv_loop_update();
++    s->stall_prev = NULL;
++    s->stall_next = tv_ns_stalling;
++    if (tv_ns_stalling) tv_ns_stalling->stall_prev = s;
++    tv_ns_stalling = s;
++    tv_http_sweep_net = tv_ns_stall_sweep;
++}
++
+ /* ---- reading */
+ 
+ static uint8_t tv_net_buf[65536];
+@@ -505,6 +560,16 @@ static void tv_ns_resolved(tv_ns *s, const tv_addrs *addrs, bool failed) {
+         tv_ns_close(s, msg);
+         return;
+     }
++    /* the address policy (netPeer), on every address the host resolved to, right before connecting (fetch's check,
++     * runtime/tov.c): a name that resolves elsewhere since the program checked it (DNS rebinding) is refused too */
++    char why[400];
++    if (s->peer && tv_peer_refuses(s->peer, s->peer_allow ? s->peer_allow : "", s->peer_allow ? strlen(s->peer_allow) : 0,
++                                   s->peer_host ? s->peer_host : "", addrs, why, sizeof why)) {
++        static char msg[420];
++        snprintf(msg, sizeof msg, "AddressNotAllowed\t%s", why);
++        tv_ns_close(s, msg);
++        return;
++    }
+     s->addrs = *addrs;
+     s->ai = 0;
+     tv_ns_try_connect(s);
+@@ -544,6 +609,22 @@ tv_int tv_native_netConnect(tv_str host, tv_int port, tv_int tls, bool verify, t
+     return s->id;
+ }
+ 
++/* netPeer(id, peer, allow): the address policy of a socket that has not started connecting (Bun.connect's and
++ * WebSocket's `peer` option, as fetch's): peer is TV_PEER_* bits (0 none), allow the allow list, comma separated.
++ * Every address the host resolves to is checked right before connecting; a refused one fails the connection with
++ * AddressNotAllowed. Unix sockets are not checked. */
++void tv_native_netPeer(tv_int id, tv_int peer, tv_str allow) {
++    tv_ns *s = tv_ns_get(id);
++    if (!s || s->state != TV_NS_RESOLVING || s->bound) return;
++    s->peer = peer & TV_PEER_ON ? (int)(peer & (TV_PEER_ON | TV_PEER_PRIVATE | TV_PEER_LOOPBACK)) : 0;
++    free(s->peer_allow);
++    s->peer_allow = NULL;
++    if (s->peer && allow.p->len) {
++        s->peer_allow = tv_alloc((size_t)allow.p->len + 1);
++        memcpy(s->peer_allow, allow.p->data, (size_t)allow.p->len + 1);
++    }
++}
++
+ /* netAlpn(id): the ALPN protocol the server picked for a TLS socket ("" for none or not TLS). */
+ tv_str tv_native_netAlpn(tv_int id) {
+     tv_ns *s = tv_ns_get(id);
+@@ -576,6 +657,10 @@ static void tv_ns_start(tv_ns *s, tv_str host, tv_str unix_path) {
+         return;
+     }
+     const char *h = host.p->data;
++    if (s->peer && !s->peer_host) {
++        s->peer_host = tv_alloc((size_t)host.p->len + 1);
++        memcpy(s->peer_host, h, (size_t)host.p->len + 1);
++    }
+     if (tv_numeric_host(h, &addrs)) {
+         tv_ns_resolved(s, &addrs, false);
+         return;
+diff --git a/runtime/tov.c b/runtime/tov.c
+index 8865289..f7932c7 100644
+--- a/runtime/tov.c
++++ b/runtime/tov.c
+@@ -5477,6 +5477,9 @@ void tv_native_httpOnSignal(tv_fn fn) {
+ #define TV_HTTP_SWEEP_MS 250
+ static bool tv_http_timeouts;           /* some server has a timeout */
+ static uint64_t tv_http_sweep_due;
++/* the write-stall limit of upgraded (WebSocket) connections: set by runtime/net.c while it holds one, and run by
++ * each sweep (an upgraded connection is a socket of net.c's, no longer one of the server's) */
++static void (*tv_http_sweep_net)(uint64_t now);
+ 
+ /* A connection that ran out of time: a request that was being read is answered 408 first (best
+  * effort: the socket takes it or it is lost), then the connection closes. Runs between event
+@@ -5567,7 +5570,7 @@ static void tv_http_loop(void) {
+         uint64_t host = tv_loop_host(now_ms, waits), idle = tv_loop_idle_due();
+         if (host && (!due || host < due)) due = host;
+         if (idle && (!due || idle < due)) due = idle;
+-        if (tv_http_timeouts && tv_http_conns) {
++        if (tv_http_timeouts && (tv_http_conns || tv_http_sweep_net)) {
+             if (!tv_http_sweep_due) tv_http_sweep_due = now_ms + TV_HTTP_SWEEP_MS;
+             if (!due || tv_http_sweep_due < due) due = tv_http_sweep_due;
+         }
+@@ -5644,6 +5647,7 @@ static void tv_http_loop(void) {
+         if (tv_http_sweep_due && tv_loop_update() >= tv_http_sweep_due) {
+             tv_http_sweep_due = 0;
+             tv_http_sweep(tv_loop_ms);
++            if (tv_http_sweep_net) tv_http_sweep_net(tv_loop_ms);
+         }
+         tv_run_microtasks();
+         tv_loop_run_check();
+@@ -7816,38 +7820,48 @@ static bool tv_peer_entry(const char *e, size_t n, const uint8_t *b, const char
+     return true;
+ }
+ 
+-static bool tv_peer_listed(const tv_fr *r, const uint8_t *b) {
+-    const char *s = r->peer_allow.p->data, *end = s + r->peer_allow.p->len;
++/* Whether the allow list (comma separated) admits the address b of host. */
++static bool tv_peer_listed(const char *s, size_t len, const uint8_t *b, const char *host) {
++    const char *end = s + len;
+     while (s < end) {
+         const char *comma = memchr(s, ',', (size_t)(end - s));
+         if (!comma) comma = end;
+         const char *a = s, *z = comma;
+         while (a < z && isspace((unsigned char)*a)) a++;
+         while (z > a && isspace((unsigned char)z[-1])) z--;
+-        if (z > a && tv_peer_entry(a, (size_t)(z - a), b, r->host)) return true;
++        if (z > a && tv_peer_entry(a, (size_t)(z - a), b, host)) return true;
+         s = comma + 1;
+     }
+     return false;
+ }
+ 
+-/* Fails r (and returns false) when one of the addresses is not allowed by its `peer` option. */
+-static bool tv_peer_check(tv_fr *r, const tv_addrs *addrs) {
+-    if (!r->peer || r->via_proxy || r->unix_path.p->len) return true;
++/* Why a policy (TV_PEER_* bits and an allow list) refuses one of host's addresses, into why (the message); false
++ * when every address passes. fetch's `peer` option and Bun.connect's and WebSocket's (runtime/net.c) share it. */
++static bool tv_peer_refuses(int peer, const char *allow, size_t allow_len, const char *host, const tv_addrs *addrs, char *why, size_t cap) {
+     for (int i = 0; i < addrs->n; i++) {
+         uint8_t b[16];
+         if (!tv_peer_bytes(&addrs->a[i], b)) continue;
+         bool loopback;
+         int cls = tv_peer_class(b, &loopback);
+         if (cls == 0) continue;
+-        if (cls == 1 && ((r->peer & TV_PEER_PRIVATE) || (loopback && (r->peer & TV_PEER_LOOPBACK)) || tv_peer_listed(r, b))) continue;
++        if (cls == 1 && ((peer & TV_PEER_PRIVATE) || (loopback && (peer & TV_PEER_LOOPBACK)) || tv_peer_listed(allow, allow_len, b, host))) continue;
+         char ip[INET6_ADDRSTRLEN] = "?";
+         if (addrs->a[i].ss_family == AF_INET) inet_ntop(AF_INET, &((const struct sockaddr_in *)&addrs->a[i])->sin_addr, ip, sizeof ip);
+         else inet_ntop(AF_INET6, b, ip, sizeof ip);
+-        tv_fr_fail(r, "AddressNotAllowed", "Connection to %s address %s (host %s) is not allowed",
+-                   cls == 2 ? "a link-local, unspecified or metadata" : "a private", ip, r->host);
+-        return false;
++        snprintf(why, cap, "Connection to %s address %s (host %s) is not allowed",
++                 cls == 2 ? "a link-local, unspecified or metadata" : "a private", ip, host);
++        return true;
+     }
+-    return true;
++    return false;
++}
++
++/* Fails r (and returns false) when one of the addresses is not allowed by its `peer` option. */
++static bool tv_peer_check(tv_fr *r, const tv_addrs *addrs) {
++    if (!r->peer || r->via_proxy || r->unix_path.p->len) return true;
++    char why[400];
++    if (!tv_peer_refuses(r->peer, r->peer_allow.p->data, (size_t)r->peer_allow.p->len, r->host, addrs, why, sizeof why)) return true;
++    tv_fr_fail(r, "AddressNotAllowed", "%s", why);
++    return false;
+ }
+ 
+ /* Connects to the resolved addresses (DNS done). */
+diff --git a/runtime/tov.h b/runtime/tov.h
+index 509afe0..a2881ac 100644
+--- a/runtime/tov.h
++++ b/runtime/tov.h
+@@ -935,6 +935,7 @@ tv_arr tv_native_headerValues(tv_str block, tv_str name);
+ /* sockets (runtime/net.c): Bun.connect, Bun.listen */
+ tv_int tv_native_netConnect(tv_str host, tv_int port, tv_int tls, bool verify, tv_str ca, tv_str unix_path, tv_str alpn, tv_str identity);
+ tv_str tv_native_netAlpn(tv_int id);
++void tv_native_netPeer(tv_int id, tv_int peer, tv_str allow);   /* the address policy, before netBind */
+ tv_int tv_native_netSpawn(tv_str argv, tv_str env, tv_str cwd);
+ void tv_native_netBind(tv_int id, tv_fn events, tv_str host, tv_str unix_path);
+ tv_int tv_native_netWrite(tv_int id, tv_arr bytes);
+diff --git a/runtime/ws.c b/runtime/ws.c
+index 86d6682..5200ae2 100644
+--- a/runtime/ws.c
++++ b/runtime/ws.c
+@@ -559,6 +559,8 @@ tv_int tv_native_wsUpgrade(tv_str key, tv_str headers, tv_int max_payload) {
+     s->server = true;
+     s->state = TV_NS_CONNECTING;   /* (opens when it's bound) */
+     tv_ws_new(s, false, max_payload);
++    /* the server's idle timeout is the upgraded socket's write-stall limit, as for its HTTP connections */
++    if (c->srv && c->srv->idle_ms > 0) tv_ns_stall_watch(s, (uint64_t)c->srv->idle_ms);
+     /* responses to earlier requests on the connection not yet written go first */
+     if (c->out_len > c->out_off) tv_ns_append(s, c->out + c->out_off, c->out_len - c->out_off);
+     static const char head[] = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ";

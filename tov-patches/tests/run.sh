@@ -1,5 +1,5 @@
 #!/bin/sh
-# Checks patches 0001-0010, 0012, 0013, 0015, 0016, 0017, 0019, 0020 and 0021 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
+# Checks patches 0001-0010, 0012, 0013, 0015, 0016, 0017, 0019, 0020, 0021 and 0022 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
 # (or `make tov-test`). Each program prints "ok" lines and "FAIL" lines; a run passes when no line
 # fails and the expected number of "ok" lines appears.
 set -eu
@@ -159,9 +159,19 @@ if [ -n "$PEER_NAME" ]; then
   TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/peer_policy.tov" -o "$OUT/peer_policy" >/dev/null
   PEER_NAME=$PEER_NAME "$OUT/peer_policy" > "$OUT/peer_policy.out"
   expect "$OUT/peer_policy.out" 21 "fetch address policy (peer)"
+  # the same policy on Bun.connect and the WebSocket client (patch 0022)
+  TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/socket_peer.tov" -o "$OUT/socket_peer" >/dev/null
+  PEER_NAME=$PEER_NAME TMPDIR="$OUT" "$OUT/socket_peer" > "$OUT/socket_peer.out"
+  expect "$OUT/socket_peer.out" 16 "Bun.connect and WebSocket address policy (peer)"
 else
-  echo "skipped: fetch address policy (no name but localhost maps to 127.0.0.1 in /etc/hosts; set PEER_NAME)"
+  echo "skipped: fetch, Bun.connect and WebSocket address policy (no name but localhost maps to 127.0.0.1 in /etc/hosts; set PEER_NAME)"
 fi
+
+# the write-stall limit of upgraded (WebSocket) sockets on Bun.serve: a client that stops reading is dropped after
+# idleTimeout, one that keeps reading slowly stays (patch 0022)
+TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/ws_stall.tov" -o "$OUT/ws_stall" >/dev/null
+python3 "$DIR/ws_stall_client.py" "$OUT/ws_stall" "$OUT" > "$OUT/ws_stall_client.out" || true
+expect "$OUT/ws_stall_client.out" 5 "Bun.serve write-stall limit on WebSockets"
 
 # a fetch connection's input buffer that starts small and grows (patch 0016)
 python3 -u "$DIR/fetch_buffer_server.py" > "$OUT/fetch_buffer.port" & SRV=$!

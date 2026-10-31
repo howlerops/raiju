@@ -31,25 +31,29 @@ Bifrost's `core/network/ssrf.go`:
 
 | Target | Private addresses | Switch or allowlist |
 |---|---|---|
-| Every provider connection (`base_url` from the config file or the API, key-level URLs, model listings, token endpoints configured on a key) | refused (loopback allowed) | the provider's `network_config.allow_private_network` (as Bifrost's `ConfigureDialer`) |
+| Every provider connection (`base_url` from the config file or the API, key-level URLs, model listings, token endpoints configured on a key, realtime and live WebSockets) | refused (loopback allowed) | the provider's `network_config.allow_private_network` (as Bifrost's `ConfigureDialer`) |
 | A2A push callbacks (set by callers with a virtual key) | refused | `server.a2a_allow_private_push_callbacks` |
-| A2A agents (card, OAuth endpoints, every call) | refused | the agent's `allow_private_network` |
+| A2A agents (card, OAuth endpoints, every call, gRPC included) | refused | the agent's `allow_private_network` |
 | Webhook endpoints | refused | the endpoint's `allow_private_network` |
 | MCP servers with `require_public_target`, OpenAPI `spec_url` with dashboard auth off | refused | `mcp.oauth_private_allowlist` (hosts, addresses, CIDR ranges) |
 | MCP OAuth (discovery, client registration, code exchange and refresh, per-user OAuth), token exchange endpoints and the identity provider's discovery | refused | `mcp.oauth_private_allowlist` |
 | Plugin downloads | refused | `server.plugin_download_private_allowlist` (hosts, addresses, CIDR ranges) |
-| The MCP library catalog (`pricing_sync.mcp_library_url`), log exporters, vector stores (Qdrant, Weaviate, Pinecone) | allowed | (only link-local, unspecified and metadata addresses are refused) |
+| The MCP library catalog (`pricing_sync.mcp_library_url`), log exporters, vector stores (Qdrant, Weaviate, Pinecone, Redis, Valkey) | allowed | (only link-local, unspecified and metadata addresses are refused) |
 
 Redirects: webhooks, A2A push callbacks, agent cards and their OAuth endpoints, exporters, and OAuth and token
 exchange POSTs follow none. Plugin downloads check each hop. A2A calls follow a redirect only on the origin they
 were sent to (Bifrost's rule), and an MCP OpenAPI tool call that carries credentials (a query, or a header besides
 `Accept` and `Content-Type`) gets a redirect to another host, or from https to http, back as the 3xx result.
 
+Raw-socket connections are checked by the runtime the same way (`tov-patches/0022`, the `peer` option of
+`Bun.connect` and of the WebSocket client): A2A agents called over gRPC (under the agent's `allow_private_network`),
+Redis or Valkey vector stores (as the HTTP stores), and realtime and live WebSocket connections to providers (as every
+provider connection; Bifrost dials those unchecked).
+
 Limits: through a proxy (a provider's `proxy_config`, the global proxy, `HTTP_PROXY`) the proxy resolves the host,
-so only an address written in the URL is checked, as Bifrost does. Connections that do not go through `fetch` (raw
-sockets) are not checked by the runtime: A2A agents called over gRPC are checked by the guard just before each call
-(the rebinding window stays open there), and Redis or Valkey vector stores and realtime WebSocket connections to
-providers are not checked.
+so only an address written in the URL is checked, as Bifrost does. WebRTC media goes to the ICE candidates the
+provider's SDP answer names, which are not checked (the SDP exchange is). The OTLP gRPC exporter and Kafka brokers
+(operator-configured raw sockets) are not checked.
 
 ## Sign-in
 
