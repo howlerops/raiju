@@ -4,9 +4,17 @@
 // account's count (never the address's: one valid account must not reset an attacker's address). Unknown names are
 // counted like real ones, so a lock says nothing about whether an account exists. With several workers the counts
 // live in the node's share folder (one append-only file per key), so every worker sees the same failures.
+//
+// Across the nodes of a cluster (L213) each process also puts the failures it counted itself on the cluster state
+// (useState: namespace SIGNIN_NS, one entry per key and writer, keyed by a hash of the key so no account name or address
+// travels, holding the count within the window and the last time), and a check adds the other nodes' entries to this
+// node's own count: an attacker spreading guesses over the nodes meets the same waits. The namespace is bounded
+// (ClusterState.limit: entries older than the window, and past SIGNIN_STATE_MAX keys the oldest, are dropped), and a
+// success deletes the account's entries on every node.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { sha256, toHex, utf8 } from "./crypto"
 import { SignInThrottleConfig } from "./config"
+import { ClusterState } from "./clusterstate"
 
 // server.sign_in_throttle (config.tov SignInThrottleConfig): enabled (default true), the free failures per account
 // and per address, and the longest wait.
@@ -18,6 +26,18 @@ export type Policy = { enabled: bool, accountFree: int, ipFree: int, baseMs: f64
 const WINDOW_MS = 3600000.0
 const KEEP = 64
 const MAX_KEYS = 50000
+// the cluster state namespace of the counts, and the most entries it keeps (about 100 bytes each on the wire)
+export const SIGNIN_NS = "signin.fail"
+export const SIGNIN_STATE_MAX = 4096
+
+// A key's entry on the cluster state: the failures one process counted within the window, and the last one's time.
+type SharedCount = { n: int, last: f64 }
+
+// The node part of a cluster state writer id ("node" or "node/pid").
+function nodeOf(writer: string): string {
+  const i = writer.indexOf("/")
+  return i < 0 ? writer : writer.slice(0, i)
+}
 
 export function policyOf(c: ThrottleConfig | undefined): Policy {
   const maxS: int = c?.max_backoff_seconds ?? 900
@@ -57,6 +77,10 @@ export class SignInGuard {
   // the node's share folder for the counts ("" keeps them in this process)
   dir = ""
   private writes = 0
+  // the cluster state the counts are shared on (undefined: this node only), and the failures this process counted
+  // itself by key hash, which are what it puts there
+  private state: ClusterState | undefined = undefined
+  private own: Map<string, f64[]> = new Map()
 
   constructor() {
     // off until configured: a process that never reads a config (a test) throttles nothing
@@ -77,8 +101,65 @@ export class SignInGuard {
     }
   }
 
+  // Shares the counts with the other nodes through the cluster state (ops.tov: the process's clusterState()). A success
+  // on another node that deleted this process's entry for an account clears its own count of it too.
+  useState(cs: ClusterState): void {
+    if (this.state === cs) return
+    this.state = cs
+    cs.limit(SIGNIN_NS, WINDOW_MS, SIGNIN_STATE_MAX)
+    cs.onChange(SIGNIN_NS, (key: string, value: string | undefined) => {
+      if (value !== undefined) return
+      const bar = key.indexOf("|")
+      if (bar > 0 && key.slice(bar + 1) === cs.writerId()) this.own.delete(key.slice(0, bar))
+    })
+  }
+
+  private hashOf(key: string): string {
+    return toHex(sha256(utf8(key))).slice(0, 40)
+  }
+
   private file(key: string): string {
-    return this.dir + "/" + toHex(sha256(utf8(key))).slice(0, 40)
+    return this.dir + "/" + this.hashOf(key)
+  }
+
+  // The other nodes' failures for key within the window: their count and the last time (0 and 0.0 without any).
+  private remote(key: string, now: f64): SharedCount {
+    const cs = this.state
+    const out: SharedCount = { n: 0, last: 0.0 }
+    if (cs === undefined) return out
+    const prefix = this.hashOf(key) + "|"
+    const mine = nodeOf(cs.writerId())
+    for (const e of cs.entriesOf(SIGNIN_NS)) {
+      // this node's workers are counted already, through the share folder
+      if (!e.key.startsWith(prefix) || nodeOf(e.key.slice(prefix.byteLength)) === mine) continue
+      try {
+        const c = try JSON.parse(e.value) as SharedCount
+        if (now - c.last >= this.policy.windowMs || c.n <= 0) continue
+        out.n += c.n
+        if (c.last > out.last) out.last = c.last
+      } catch (err) {
+        continue
+      }
+    }
+    return out
+  }
+
+  // Puts this process's own count of key on the cluster state.
+  private publish(key: string, now: f64): void {
+    const cs = this.state
+    if (cs === undefined) return
+    const h = this.hashOf(key)
+    let ts = (this.own.get(h) ?? []).filter((t) => now - t < this.policy.windowMs)
+    ts.push(now)
+    if (ts.length > KEEP) ts = ts.slice(ts.length - KEEP)
+    this.own.delete(h)
+    this.own.set(h, ts)
+    // bounded like the counts in memory: the keys that failed longest ago go first
+    if (this.own.size > SIGNIN_STATE_MAX) {
+      const ks = this.own.keys()
+      for (let i = 0; i < ks.length && this.own.size > SIGNIN_STATE_MAX; i++) this.own.delete(ks[i]!)
+    }
+    cs.put(SIGNIN_NS, h + "|" + cs.writerId(), JSON.stringify({ n: ts.length, last: now }), now)
   }
 
   // The failure times within the window, oldest first.
@@ -112,8 +193,12 @@ export class SignInGuard {
     let most = 0.0
     for (const k of keys) {
       const ts = this.times(k, now)
-      if (ts.length === 0) continue
-      const w = waitAfter(this.policy, this.free(k), ts.length, ts[ts.length - 1]!, now)
+      // with the other nodes' failures for the key (the cluster state)
+      const far = this.remote(k, now)
+      const n = ts.length + far.n
+      if (n === 0) continue
+      const last = ts.length > 0 && ts[ts.length - 1]! > far.last ? ts[ts.length - 1]! : far.last
+      const w = waitAfter(this.policy, this.free(k), n, last, now)
       if (w > most) most = w
     }
     return most <= 0.0 ? 0 : Math.ceil(most / 1000.0)
@@ -123,6 +208,7 @@ export class SignInGuard {
   fail(keys: string[], now: f64): void {
     if (!this.policy.enabled) return
     for (const k of keys) {
+      this.publish(k, now)
       if (this.dir !== "") {
         try {
           appendFileSync(this.file(k), `${now}\n`)
@@ -150,8 +236,16 @@ export class SignInGuard {
     }
   }
 
-  // Forgets a key's failures (an account that signed in).
+  // Forgets a key's failures (an account that signed in), on every node.
   clear(key: string): void {
+    const cs = this.state
+    if (cs !== undefined) {
+      const h = this.hashOf(key)
+      this.own.delete(h)
+      for (const e of cs.entriesOf(SIGNIN_NS)) {
+        if (e.key.startsWith(h + "|")) cs.del(SIGNIN_NS, e.key)
+      }
+    }
     if (this.dir !== "") {
       try {
         const f = this.file(key)
@@ -265,6 +359,62 @@ test("a guard that is off or unconfigured throttles nothing", () => {
   const off = on({ enabled: false })
   for (let i = 0; i < 30; i++) off.fail([accountKey("x")], 100.0)
   expect(off.retryAfter([accountKey("x")], 100.0)).toBe(0)
+})
+
+// Carries the cluster state between two nodes, as a sync tick does.
+function sync(a: ClusterState, b: ClusterState, now: f64): void {
+  b.merge(a.wire(now), now)
+  a.merge(b.wire(now), now)
+}
+
+test("nodes of a cluster add up each other's failures through the cluster state, bounded, and a success clears them everywhere", () => {
+  const sa = new ClusterState("node-a")
+  const sb = new ClusterState("node-b")
+  const a = on({ account_failures: 4 })
+  const b = on({ account_failures: 4 })
+  a.useState(sa)
+  b.useState(sb)
+  const t = 7000000.0
+  const k = [accountKey("Root")]
+  // two failures on each node: neither alone is past the four free ones; together they are
+  a.fail(k, t)
+  a.fail(k, t)
+  b.fail(k, t)
+  b.fail(k, t)
+  expect(a.retryAfter(k, t)).toBe(0)
+  sync(sa, sb, t)
+  expect(a.retryAfter(k, t)).toBe(1)
+  expect(b.retryAfter(k, t)).toBe(1)
+  // no account name travels: the entries are keyed by a hash
+  for (const e of sa.wire(t)) expect(e.key.includes("root")).toBe(false)
+  // a node's own entries are not counted twice (four failures wait 1 s, six would wait 4 s): another process of node a
+  // that counted nothing itself adds only node b's two (node a's own reach it through the share folder)
+  expect(a.retryAfter(k, t + 999.0)).toBe(1)
+  const again = on({ account_failures: 4 })
+  again.useState(sa)
+  expect(again.retryAfter(k, t)).toBe(0)
+  // a success on node b clears the account on node a too, once the deletion arrives
+  b.clear(accountKey("root"))
+  expect(b.retryAfter(k, t)).toBe(0)
+  sync(sa, sb, t + 1.0)
+  a.clear(accountKey("root"))
+  expect(a.retryAfter(k, t + 1.0)).toBe(0)
+  b.fail(k, t + 2.0)
+  sync(sa, sb, t + 2.0)
+  expect(a.retryAfter(k, t + 2.0)).toBe(0)
+  // the failures leave with the window
+  for (let i = 0; i < 6; i++) b.fail([addressKey("9.9.9.9")], t + 3.0)
+  sync(sa, sb, t + 3.0)
+  expect(a.retryAfter([addressKey("9.9.9.9")], t + 3.0)).toBe(0)
+  for (let i = 0; i < 20; i++) b.fail([addressKey("9.9.9.9")], t + 3.0)
+  sync(sa, sb, t + 3.0)
+  expect(a.retryAfter([addressKey("9.9.9.9")], t + 3.0) > 0).toBe(true)
+  expect(a.retryAfter([addressKey("9.9.9.9")], t + 3.0 + WINDOW_MS)).toBe(0)
+  // the shared counts are bounded: a spray of addresses keeps at most SIGNIN_STATE_MAX entries
+  for (let i = 0; i < SIGNIN_STATE_MAX + 50; i++) b.fail([addressKey(`10.1.${Math.floor(i / 250)}.${i % 250}`)], t + 10.0 + i * 1.0)
+  sync(sa, sb, t + 10.0 + SIGNIN_STATE_MAX * 1.0 + 60.0)
+  expect(sa.entriesOf(SIGNIN_NS).length <= SIGNIN_STATE_MAX).toBe(true)
+  expect(sb.entriesOf(SIGNIN_NS).length <= SIGNIN_STATE_MAX).toBe(true)
 })
 
 test("workers sharing a folder see each other's failures", () => {

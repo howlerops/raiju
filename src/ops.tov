@@ -31,6 +31,8 @@ import { flushVaultCache } from "./secrets"
 import { ConfigStore, checkAdmin, duplicateNames, sweepExpiredKeys, sealStored, openStored, RESOURCES, OPERATIONS, CONFIG_NS, CONFIG_KEY, ConfigGen, genOf, textSha, randomId } from "./store"
 import { mergedClaims, ruleAttributes, findUser, Directory, RoleBook, applyClaims, scimClaims, hasRules, Claims, UserChange } from "./claimsync"
 import { Plan, countsOf, syncMode, planDirectory, withRemovals, planReconcile, scimResync, rulesHash, matchesFilter, accountName, ImportFilter, idpManaged } from "./provision"
+import { ProvisionJobs } from "./provjobs"
+import { JOB_BEAT_MS, slotText } from "./jobs"
 import { DirSettings, DirUser, directorySettings, listDirectory, lookupUser } from "./directory"
 import { bulkSyncInterval } from "./config_compat"
 import { Held, KeyCtx, handleApiKeys, newKeyValue } from "./apikeys"
@@ -118,6 +120,25 @@ export type RecalcFilters = { providers?: string[], models?: string[], virtual_k
 // The start warning and notice text for duplicate names: each one, and how to fix them.
 function duplicateNamesText(dups: string[]): string {
   return `names are unique, but this config holds duplicates saved before they were (updates keeping such a name still pass; creates and renames onto one get 409): ${dups.join("; ")}. Rename all but one of each.`
+}
+
+// The virtual keys with neither a customer_id nor a team_id, by name (else id). Each is its own tenant for the
+// request-body budget's share (server.credential_body_mb; governance.tov bodyTenant), so one party holding several of
+// them gets several shares.
+export function ungroupedKeys(c: Config): string[] {
+  const out: string[] = []
+  for (const vk of c.governance?.virtual_keys ?? []) {
+    if ((vk.customer_id ?? "") === "" && (vk.team_id ?? "") === "") out.push(vk.name ?? vk.id)
+  }
+  return out
+}
+
+// The start warning and dashboard notice for keys with no customer or team: how many, the first few, and the docs.
+// "" when fewer than two (a lone ungrouped key shares with nobody).
+export function ungroupedKeysText(names: string[]): string {
+  if (names.length < 2) return ""
+  const few = names.slice(0, 5).join(", ") + (names.length > 5 ? `, and ${names.length - 5} more` : "")
+  return `${names.length} virtual keys have no customer_id or team_id (${few}): each counts as its own tenant for the request-body budget (server.credential_body_mb), so a party holding several of them gets several shares. Give each customer's keys a customer_id or a team; see deploy/README.md, "Stopping and slow clients".`
 }
 
 function pluginError(status: int, message: string): Reply {
@@ -1270,7 +1291,8 @@ export class Ops {
   flows = new OidcFlows()
   sessions = new UiSessions(28800)
   // directory sync (provision.tov, directory.tov): its schedule (the settings it was made for, the timer, the next
-  // run), the daily session sweep, and the provisioning jobs (sync, import, reconcile) by operation id
+  // run), the daily session sweep, and the provisioning jobs (sync, import, reconcile) by operation id (provjobs.tov:
+  // beside the config when there is one)
   dirKey = ""
   dirTimer: int = -1
   dirNextMs = 0.0
@@ -1278,8 +1300,9 @@ export class Ops {
   dirRunning = false
   provisionOn = false
   sweepTimer: int = -1
-  provJobs: Map<string, string> = new Map()
-  provOrder: string[] = []
+  provJobs = new ProvisionJobs()
+  // the timer that refreshes the beat of the async and provisioning jobs this process runs
+  jobBeat: int = -1
   // the /ws clients, and the virtual key that opened each live session (/v1/live/sessions)
   ui: UiHub
   // the live feed's relay (feed.tov): one queue per peer (and one for the broker), the broker cursor, the relay
@@ -1318,6 +1341,8 @@ export class Ops {
       this.nodeId = "node"
     }
     this.configure(engine.cfg)
+    // failed sign-ins are counted across the nodes of a cluster through the cluster state (signinguard.tov)
+    signInGuard().useState(clusterState())
     // a card another worker or node fetched arrives through the cluster state (a2ashare.tov)
     clusterState().onChange(CARD_NS, (name: string, value: string | undefined): void => {
       this.adoptRemoteCard(name, value)
@@ -1613,6 +1638,10 @@ export class Ops {
     this.flows.setKey(stateKey)
     if (configPath === "") return
     this.sessions.setFile(configPath + ".sessions.json")
+    // async jobs and provisioning jobs beside the config: every worker, a node sharing the folder and the next start
+    // find them (jobs.tov, provjobs.tov)
+    this.engine.jobs.useDir(configPath + ".jobs")
+    this.provJobs.useFile(configPath + ".provision-jobs.json")
     this.sessions.sealer = sealer
     agentSignIn().setFile(configPath + ".agent-sessions.json")
     // the flow file of earlier versions is read no more
@@ -1632,8 +1661,9 @@ export class Ops {
       console.error(`raiju: can't share state between workers: ${e.message}`)
       return
     }
-    // async jobs: the worker that runs one writes its state here, so a poll on any worker finds it (jobs.tov)
-    this.engine.jobs.useDir(this.shareDir + "/jobs")
+    // async jobs: kept beside the config (keepAuthState); with no config file the worker that runs one writes its
+    // state here, so a poll on any worker finds it (jobs.tov)
+    if (this.engine.jobs.dirOf() === "") this.engine.jobs.useDir(this.shareDir + "/jobs")
     // each worker is its own slot (inherited counters would collide)
     this.counters = new Counters(this.nodeId + "/" + process.pid)
     clusterState().setWriter(this.nodeId + "/" + process.pid)
@@ -5902,15 +5932,81 @@ export class Ops {
     this.configureDirectory()
   }
 
-  // Records a provisioning job's state (the newest 50 are kept).
+  // Records a provisioning job's state (the newest 50 are kept; provjobs.tov).
   jobSet(id: string, body: string): void {
-    if (!this.provJobs.has(id)) this.provOrder.push(id)
-    this.provJobs.set(id, body)
-    while (this.provOrder.length > 50) {
-      const old = this.provOrder[0]!
-      this.provOrder = this.provOrder.slice(1)
-      this.provJobs.delete(old)
+    this.provJobs.set(id, body, Date.now())
+  }
+
+  // Refreshes the beat of the async and provisioning jobs this process runs, every JOB_BEAT_MS, so a poll elsewhere
+  // tells a running job from one whose gateway stopped (jobs.tov, provjobs.tov). In every serving process.
+  startJobBeat(): void {
+    if (this.jobBeat >= 0) return
+    this.jobBeat = setInterval(() => {
+      this.engine.jobs.beatAll(Math.floor(Date.now()))
+      this.provJobs.beat(Date.now())
+    }, JOB_BEAT_MS)
+  }
+
+  // A job this node does not hold ("async": a slot, jobs.tov slotText; "provision": a provisioning job's answer),
+  // asked of every peer at once (POST /api/cluster/jobs, signed, PEER_LOG_MS at most): the first that has it. undefined
+  // when clustering is off, in broker mode (no peer addresses), with no peers, or when none has it.
+  async jobFromPeers(kind: string, id: string): Promise<string | undefined> {
+    const cc = this.clusterCfg
+    if (cc === undefined || cluster.isBroker(cc)) return undefined
+    const peers = this.peerUrls(cc)
+    if (peers.length === 0) return undefined
+    const now = Date.now()
+    const ask = JSON.stringify({ kind: kind, id: id, ts: now })
+    const h = cluster.peerHeaders(cc.secret, "/api/cluster/jobs", ask, now)
+    const pending: Promise<string>[] = []
+    for (const p of peers) pending.push(this.peerJob(p, h, ask))
+    for (const got of await Promise.all(pending)) {
+      if (got !== "") return got
     }
+    return undefined
+  }
+
+  // One peer's copy of a job ("" when it does not answer or has none).
+  async peerJob(peer: string, h: Map<string, string>, ask: string): Promise<string> {
+    const r = await postTextWithin(peer + "/api/cluster/jobs", h, ask, PEER_LOG_MS)
+    if (r.status !== 200) return ""
+    try {
+      const a = try JSON.parse(r.body) as { found: bool, job?: string }
+      return a.found ? (a.job ?? "") : ""
+    } catch (e) {
+      return ""
+    }
+  }
+
+  // POST /api/cluster/jobs from a peer polling a job it does not hold: this node's copy (an async job's slot with its
+  // owner, which the asking node checks against its caller, or a provisioning job's answer). Signed like the sync
+  // route, over a body naming the kind, the id and the asking node's time (a request older than a minute is refused).
+  async clusterJobs(req: Request): Promise<Response> {
+    const cc = this.clusterCfg
+    if (cc === undefined) return json(404, errorJson("clustering is off", "invalid_request_error", undefined))
+    const body = await req.text()
+    if (!cluster.verify(cc.secret, body, req.headers.get("x-raiju-cluster-sig") ?? "")) return denied(401, "bad cluster signature")
+    let ask: { kind: string, id: string, ts: f64 } = { kind: "", id: "", ts: 0.0 }
+    try {
+      ask = try JSON.parse(body) as { kind: string, id: string, ts: f64 }
+    } catch (e) {
+      return json(400, errorJson(e.message, "invalid_request_error", undefined))
+    }
+    if (!cluster.fresh(ask.ts, Date.now())) return denied(401, "stale cluster request")
+    let found: string | undefined = undefined
+    if (ask.kind === "async") {
+      const slot = this.engine.jobs.slotFor(ask.id, Math.floor(Date.now()))
+      if (slot !== undefined) found = slotText(slot)
+    } else if (ask.kind === "provision") {
+      found = this.provJobs.get(ask.id, Date.now())
+    } else {
+      return json(400, errorJson(`no job kind ${ask.kind}`, "invalid_request_error", undefined))
+    }
+    const hs: Record<string, string> = new Map()
+    hs.set("content-type", "application/json")
+    hs.set("cache-control", "no-store")
+    const out = found === undefined ? `{"found":false}` : `{"found":true,"job":${JSON.stringify(found)}}`
+    return new Response(out, { status: 200, headers: hs })
   }
 
   jobJson(id: string, op: string, status: string, startedMs: f64, plan: Plan | undefined, error: string): string {
@@ -6005,13 +6101,14 @@ export class Ops {
       return ok(200, jobj([jkv("provider", JSON.stringify(sc.provider ?? "")), jkv("sync_mode", JSON.stringify(mode)), jkv("rules_hash", JSON.stringify(rulesHash(c, mode))), jkv("directory_sync", dir), jkv("session_sweep", this.sweepTimer >= 0 && mode === "off" ? "true" : "false")]))
     }
     if (sub === "/jobs" && method === "GET") {
-      const out: string[] = []
-      for (const id of this.provOrder.slice().reverse()) out.push(this.provJobs.get(id) ?? "{}")
-      return ok(200, `{"jobs":[${out.join(",")}]}`)
+      return ok(200, `{"jobs":[${this.provJobs.list(Date.now()).join(",")}]}`)
     }
     if (sub.startsWith("/jobs/") && method === "GET") {
-      const j = this.provJobs.get(sub.slice(6))
-      return j === undefined ? bad(404, `no provisioning job ${sub.slice(6)}`) : ok(200, j)
+      const id = sub.slice(6)
+      // a job another node ran, when this node does not share its folder (only ids this gateway makes are asked for)
+      let j = this.provJobs.get(id, Date.now())
+      if (j === undefined && id.startsWith("op_")) j = await this.jobFromPeers("provision", id)
+      return j === undefined ? bad(404, `no provisioning job ${id}`) : ok(200, j)
     }
     let filter: ImportFilter = {}
     let ruleHash = ""
@@ -6314,7 +6411,17 @@ export class Ops {
     if (this.metricsOpen()) out.push("/metrics is open on the main port and its labels name virtual keys, teams and customers: set server.metrics_token, or move it to the cluster listener with cluster.serve_metrics")
     const dups = duplicateNames(this.engine.cfg)
     if (dups.length > 0) out.push(duplicateNamesText(dups))
+    const loose = ungroupedKeysText(ungroupedKeys(this.engine.cfg))
+    if (loose !== "") out.push(loose)
     return out
+  }
+
+  // The dashboard notice for virtual keys with no customer or team (ungroupedKeysText), published by each serving
+  // worker at start; none when fewer than two.
+  noticeUngroupedKeys(): void {
+    const text = ungroupedKeysText(ungroupedKeys(this.engine.cfg))
+    if (text === "") return
+    notify({ severity: "warning", title: "Virtual keys without a customer or team", message: text })
   }
 
   // The dashboard notice for duplicate virtual key, team and customer names (saved before names were unique), published
@@ -7379,6 +7486,41 @@ test("duplicate names saved before names were unique: a start warning and a dash
     const clean = try lockFor({ governance: { virtual_keys: [{ id: "vk-1", name: "prod", value: "sk-bf-1" }] } })
     expect(clean.startupWarnings().some((x) => x.includes("duplicates"))).toBe(false)
     clean.noticeDuplicateNames()
+    expect(noticeList().items.length).toBe(before + 1)
+  } catch (e) {
+    expect(e.message).toBe("")
+  }
+})
+
+test("virtual keys with no customer or team: a start warning and a dashboard notice say how many and point to the docs", () => {
+  try {
+    const keys: VirtualKeyConfig[] = [
+      { id: "vk-1", name: "alpha", value: "sk-bf-1" },
+      { id: "vk-2", name: "beta", value: "sk-bf-2" },
+      { id: "vk-3", name: "gamma", value: "sk-bf-3", customer_id: "c1" },
+      { id: "vk-4", name: "delta", value: "sk-bf-4", team_id: "t1" },
+      { id: "vk-5", value: "sk-bf-5" },
+    ]
+    const ops = try lockFor({ governance: { virtual_keys: keys } })
+    expect(ungroupedKeys(ops.engine.cfg)).toEqual(["alpha", "beta", "vk-5"])
+    const w = ops.startupWarnings().filter((x) => x.includes("no customer_id or team_id"))
+    expect(w.length).toBe(1)
+    expect(w[0]!.startsWith("3 virtual keys have no customer_id or team_id (alpha, beta, vk-5)")).toBe(true)
+    expect(w[0]!.includes("deploy/README.md")).toBe(true)
+    const before = noticeList().items.length
+    ops.noticeUngroupedKeys()
+    const items = noticeList().items
+    expect(items.length).toBe(before + 1)
+    expect(items[items.length - 1]!.title).toBe("Virtual keys without a customer or team")
+    expect(items[items.length - 1]!.message.includes("3 virtual keys")).toBe(true)
+    // many: the first five and how many more
+    const names: string[] = []
+    for (let i = 0; i < 8; i++) names.push(`k${i}`)
+    expect(ungroupedKeysText(names).includes("(k0, k1, k2, k3, k4, and 3 more)")).toBe(true)
+    // one ungrouped key shares with nobody: no warning and no notice
+    const one = try lockFor({ governance: { virtual_keys: [keys[0]!, keys[2]!] } })
+    expect(one.startupWarnings().some((x) => x.includes("no customer_id or team_id"))).toBe(false)
+    one.noticeUngroupedKeys()
     expect(noticeList().items.length).toBe(before + 1)
   } catch (e) {
     expect(e.message).toBe("")

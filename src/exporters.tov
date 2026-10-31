@@ -9,7 +9,7 @@ import { trimSlash } from "./providers/types"
 import { LogExporterConfig } from "./config"
 import { GcpToken, bigqueryRequest, bigqueryRefused, pubsubRequest, PUBSUB_MAX_MESSAGES } from "./sink_gcp"
 import { KafkaSink } from "./sink_kafka"
-import { maximRequest, repoOf } from "./sink_maxim"
+import { maximRequest, repoOf, attachmentsOf, attachmentKey, attachmentLine, uploadUrlRequest, parseUploadUrl, MaximAttachment } from "./sink_maxim"
 import { deadline } from "./deadline"
 import { urlVerdict, policyOf, verdictText, peerOf } from "./netguard"
 
@@ -263,12 +263,54 @@ export class SinkSender {
       }
       for (const repo of byRepo.keys()) {
         const rows: LogEntry[] = byRepo.get(repo) ?? []
-        const s = await this.post(maximRequest(this.cfg.base_url ?? "", this.cfg.api_key ?? "", repo, rows))
+        let req = maximRequest(this.cfg.base_url ?? "", this.cfg.api_key ?? "", repo, rows)
+        // the generations' attachments: file data is uploaded first, and each attachment that is in place is
+        // announced after the batch's other lines, as maxim-go's writer flushes them
+        for (const e of rows) {
+          for (const a of attachmentsOf(e)) {
+            if (a.kind === "fileData" && !(await this.uploadAttachment(repo, a))) continue
+            req.body += attachmentLine(repo, a) + "\n"
+          }
+        }
+        const s = await this.post(req)
         if (s !== 200) return s
       }
       return 200
     }
     return await this.post(batchRequest(this.cfg, entries, bearer))
+  }
+
+  // Uploads one Maxim attachment's data: the signed URL from GetUploadUrl, then a PUT of the bytes; tried three times,
+  // as maxim-go retries a failed upload. false when it did not land (its add-attachment line is then left out).
+  private async uploadAttachment(repo: string, a: MaximAttachment): Promise<bool> {
+    const mime = a.mimeType === "" ? "application/octet-stream" : a.mimeType
+    let why = ""
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const dl = deadline(EXPORT_TIMEOUT_MS)
+      try {
+        const ur = uploadUrlRequest(this.cfg.base_url ?? "", this.cfg.api_key ?? "", attachmentKey(repo, a), mime, a.data.length)
+        const v = await urlVerdict(ur.url, policyOf(true))
+        if (v.kind !== "") throw new Error(`upload url refused: ${verdictText(v)}`)
+        const r1 = await fetch(ur.url, { method: "GET", headers: ur.headers, signal: dl.controller.signal, redirect: "manual", peer: peerOf(policyOf(true)) })
+        const t1 = await r1.text()
+        if (r1.status !== 200) throw new Error(`GetUploadUrl answered ${r1.status}`)
+        const signed = parseUploadUrl(t1)
+        const v2 = await urlVerdict(signed, policyOf(true))
+        if (v2.kind !== "") throw new Error(`signed upload url refused: ${verdictText(v2)}`)
+        const hs: Map<string, string> = new Map()
+        hs.set("content-type", mime)
+        const r2 = await fetch(signed, { method: "PUT", headers: hs, body: a.data, signal: dl.controller.signal, redirect: "manual", peer: peerOf(policyOf(true)) })
+        await r2.text()
+        dl.finish()
+        if (r2.status >= 200 && r2.status < 300) return true
+        why = `upload failed with status: ${r2.status}`
+      } catch (e) {
+        dl.finish()
+        why = e.message
+      }
+    }
+    console.error(`raiju: exporter ${this.cfg.id}: maxim attachment ${a.name}: ${why}`)
+    return false
   }
 
   // POSTs one batch request; the status send() reports for it.

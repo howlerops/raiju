@@ -12,6 +12,8 @@
 //   onChange(ns, fn)        calls fn(key, value) for each change merged in from another process, value undefined
 //                           on a deletion. Writes made here do not call it.
 //   setWriter(id)           the id this process writes under (its node, or node/pid for a worker)
+//   limit(ns, ms, n)        bounds a namespace of short-lived counts: an entry older than ms, and past the newest n
+//                           entries, is dropped (no tombstone; every process drops it by the same rule)
 //
 // Merging: an entry replaces the held one when its ver is higher, or equal and its writer id greater. ver is the
 // write time in epoch milliseconds, or one past the held entry's ver when that is later, so the later write wins even
@@ -25,6 +27,9 @@ import { sha256, toHex, utf8 } from "./crypto"
 export type StateWire = { ns: string, key: string, value: string, ver: int, by: string, deleted: bool, at: f64 }
 
 export type StateListener = (key: string, value: string | undefined) => void
+
+// A namespace's bound (ClusterState.limit): the oldest write time kept and the most live entries.
+type NsLimit = { maxAgeMs: f64, maxKeys: int }
 
 // a deletion is kept this long so that every node learns of it
 const TOMB_MS: f64 = 600000.0
@@ -53,6 +58,7 @@ function newer(ver: int, by: string, cur: int, curBy: string): bool {
 export class ClusterState {
   private entries: Map<string, StateWire> = new Map()
   private listeners: Map<string, StateListener[]> = new Map()
+  private limits: Map<string, NsLimit> = new Map()
   private writer: string
 
   constructor(writer: string) {
@@ -103,6 +109,22 @@ export class ClusterState {
     return out
   }
 
+  // Bounds namespace ns: entries written more than maxAgeMs ago are dropped, and past maxKeys live entries the oldest
+  // writes go. Nothing is sent for them (no tombstone): every process applies the same rule, so an old entry another
+  // process still sends is dropped again on arrival. For short-lived counts (signinguard.tov) whose loss only forgets.
+  limit(ns: string, maxAgeMs: f64, maxKeys: int): void {
+    this.limits.set(ns, { maxAgeMs: maxAgeMs, maxKeys: maxKeys })
+  }
+
+  // The live entries of namespace ns, each with its writer, for a reader that sums them (signinguard.tov).
+  entriesOf(ns: string): StateWire[] {
+    const out: StateWire[] = []
+    for (const e of this.entries.values()) {
+      if (e.ns === ns && !e.deleted) out.push(e)
+    }
+    return out
+  }
+
   // Calls fn for each change of the namespace merged in from another process.
   onChange(ns: string, fn: StateListener): void {
     const ls = this.listeners.get(ns) ?? []
@@ -122,6 +144,9 @@ export class ClusterState {
     const changed: StateWire[] = []
     for (const r of list) {
       if (stateProblem(r) !== "") continue
+      // an entry its namespace's bound has dropped already is not taken back
+      const lim = this.limits.get(r.ns)
+      if (lim !== undefined && r.at < nowMs - lim.maxAgeMs) continue
       const k = entryKey(r.ns, r.key)
       const cur = this.entries.get(k)
       if (cur !== undefined && !newer(r.ver, r.by, cur.ver, cur.by)) continue
@@ -141,11 +166,31 @@ export class ClusterState {
     }
   }
 
-  // Forgets the deletions older than TOMB_MS.
+  // Forgets the deletions older than TOMB_MS, and applies the namespaces' bounds (limit).
   private prune(nowMs: f64): void {
+    const counts: Map<string, int> = new Map()
     for (const k of this.entries.keys()) {
       const e = this.entries.get(k)!
-      if (e.deleted && e.at < nowMs - TOMB_MS) this.entries.delete(k)
+      if (e.deleted && e.at < nowMs - TOMB_MS) {
+        this.entries.delete(k)
+        continue
+      }
+      const lim = this.limits.get(e.ns)
+      if (lim === undefined) continue
+      if (e.at < nowMs - lim.maxAgeMs) {
+        this.entries.delete(k)
+        continue
+      }
+      if (!e.deleted) counts.set(e.ns, (counts.get(e.ns) ?? 0) + 1)
+    }
+    for (const ns of counts.keys()) {
+      const lim = this.limits.get(ns)!
+      const n = counts.get(ns) ?? 0
+      if (n <= lim.maxKeys) continue
+      // past the bound the oldest writes go
+      const live: StateWire[] = this.entriesOf(ns)
+      live.sort((a: StateWire, b: StateWire): int => (a.at < b.at ? -1 : (a.at > b.at ? 1 : 0)))
+      for (let i = 0; i < n - lim.maxKeys; i++) this.entries.delete(entryKey(live[i]!.ns, live[i]!.key))
     }
   }
 }
@@ -272,6 +317,29 @@ test("keys are kept apart by namespace, and a bad entry changes nothing", () => 
   a.merge(bad, 1000.0)
   expect(a.get("x", "k") === undefined).toBe(true)
   expect(a.keys("x").length).toBe(1)
+})
+
+test("a bounded namespace drops old entries and the oldest past its size, and does not take them back", () => {
+  const a = new ClusterState("a")
+  a.limit("n", 10000.0, 3)
+  for (let i = 0; i < 5; i++) a.put("n", `k${i}`, `${i}`, 1000.0 + i * 1.0)
+  // the next payload holds the newest three
+  const w = a.wire(1010.0)
+  expect(w.map((e) => e.key).sort()).toEqual(["k2", "k3", "k4"])
+  expect(a.get("n", "k0") === undefined).toBe(true)
+  expect(a.entriesOf("n").length).toBe(3)
+  // too old: dropped, without a tombstone
+  expect(a.wire(1000.0 + 10003.5).length).toBe(1)
+  expect(a.wire(1000.0 + 20000.0).length).toBe(0)
+  // a process that still sends an old entry does not bring it back
+  const b = new ClusterState("b")
+  b.put("n", "old", `1`, 1000.0)
+  a.merge(b.wire(1000.0), 30000.0)
+  expect(a.get("n", "old") === undefined).toBe(true)
+  // other namespaces are not bounded
+  a.put("free", "x", `1`, 1.0)
+  expect(a.get("free", "x")).toBe("1")
+  expect(a.wire(1.0e9).length).toBe(1)
 })
 
 test("ownerOf picks the same node from the same roster, and the next one when the owner leaves", () => {

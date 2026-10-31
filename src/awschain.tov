@@ -4,21 +4,25 @@
 //   1. the environment: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_SESSION_TOKEN
 //   2. a web identity (EKS IRSA): AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_ARN, exchanged at STS
 //      AssumeRoleWithWebIdentity (unsigned; AWS_ROLE_SESSION_NAME names the session)
-//   3. the shared credentials file: AWS_SHARED_CREDENTIALS_FILE or ~/.aws/credentials, the AWS_PROFILE profile
-//      ("default"), when it holds static keys
+//   3. the selected profile (AWS_PROFILE, else "default") of the shared config file (AWS_CONFIG_FILE or ~/.aws/config)
+//      and the shared credentials file (AWS_SHARED_CREDENTIALS_FILE or ~/.aws/credentials), read together
+//      (awsprofile.tov): static keys, source_profile and role_arn chains, credential_source,
+//      web_identity_token_file, SSO and credential_process; a profile that names none of these falls through
 //   4. container credentials (ECS task roles, EKS Pod Identity): AWS_CONTAINER_CREDENTIALS_RELATIVE_URI on
 //      169.254.170.2, or AWS_CONTAINER_CREDENTIALS_FULL_URI, with AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE or
 //      AWS_CONTAINER_AUTHORIZATION_TOKEN as its Authorization header
 //   5. the instance profile through IMDSv2 (a session token, the role name, its credentials), falling back to IMDSv1
 //      when the token call is not served; AWS_EC2_METADATA_DISABLED=true skips it and
 //      AWS_EC2_METADATA_SERVICE_ENDPOINT moves it
-// A profile named with AWS_PROFILE comes first, as the SDK reads an explicitly selected profile before the
-// environment. STS is reached at AWS_ENDPOINT_URL_STS or AWS_ENDPOINT_URL when set (the SDK's endpoint settings),
+// As in the SDK, AWS_PROFILE selects the profile of step 3 but does not put it before the environment (only a
+// profile chosen in code would), and a profile it names that neither file has is an error. STS is reached at
+// AWS_ENDPOINT_URL_STS or AWS_ENDPOINT_URL when set (the SDK's endpoint settings),
 // else at the region's endpoint. Temporary credentials are cached until a minute before they expire. The instance
 // metadata also gives the region when nothing else names one (imdsRegion).
 import { readFileSync } from "node:fs"
 import { getEnv, BedrockKeyConfig } from "./config"
-import { pctEncode, xmlTag, parseIsoUtcMs, TokenCache } from "./cloud_auth"
+import { pctEncode, xmlTag, parseIsoUtcMs, TokenCache, signV4, parseAssumeRole } from "./cloud_auth"
+import { ProfilePlan, BaseStep, RoleStep, loadPlan, profileName, profileRegion, namesCredentials, ssoCreds, processCreds } from "./awsprofile"
 import { deadline } from "./deadline"
 import { fields, rawStr } from "./json"
 
@@ -150,20 +154,6 @@ export function profileCreds(text: string, profile: string): ChainCreds | undefi
   return { accessKey: ak, secretKey: sk, sessionToken: st, expiresAtMs: NEVER, source: "shared-credentials" }
 }
 
-function sharedCreds(): ChainCreds | undefined {
-  const home = env("HOME")
-  const file = env("AWS_SHARED_CREDENTIALS_FILE") !== "" ? env("AWS_SHARED_CREDENTIALS_FILE") : home === "" ? "" : home + "/.aws/credentials"
-  if (file === "") return undefined
-  let text = ""
-  try {
-    text = try readText(file)
-  } catch (e) {
-    return undefined
-  }
-  const p = env("AWS_PROFILE")
-  return profileCreds(text, p === "" ? "default" : p)
-}
-
 // ---- calls ----
 
 async function call(method: string, url: string, hs: Map<string, string>, body: string, ms: int): Promise<{ status: int, text: string }> throws Error {
@@ -181,12 +171,13 @@ async function call(method: string, url: string, hs: Map<string, string>, body: 
 }
 
 async function webIdentity(region: string): Promise<ChainCreds> throws Error {
-  const file = env("AWS_WEB_IDENTITY_TOKEN_FILE")
-  const role = env("AWS_ROLE_ARN")
-  if (role === "") throw new Error("web identity: AWS_WEB_IDENTITY_TOKEN_FILE is set without AWS_ROLE_ARN")
+  return try await webIdentityWith(region, env("AWS_WEB_IDENTITY_TOKEN_FILE"), env("AWS_ROLE_ARN"), env("AWS_ROLE_SESSION_NAME"))
+}
+
+async function webIdentityWith(region: string, file: string, role: string, named: string): Promise<ChainCreds> throws Error {
+  if (role === "") throw new Error("web identity: a web identity token file is set without a role ARN")
   const token = (try readText(file)).trim()
   // the SDK names an unnamed session after the time
-  const named = env("AWS_ROLE_SESSION_NAME")
   const session = named !== "" ? named : "" + Math.floor(Date.now() * 1000000.0)
   const up = webIdentityRequest(stsEndpoint(region, env("AWS_ENDPOINT_URL_STS"), env("AWS_ENDPOINT_URL")), role, session, token)
   const r = try await call("POST", up.url, up.headers, up.body, CALL_TIMEOUT_MS)
@@ -250,17 +241,104 @@ function envCreds(): ChainCreds | undefined {
   return { accessKey: ak, secretKey: sk, sessionToken: env("AWS_SESSION_TOKEN"), expiresAtMs: NEVER, source: "environment" }
 }
 
+// ---- profiles (the shared config file) ----
+
+// The STS AssumeRole call of a profile's role_arn, signed with the credentials so far, at AWS_ENDPOINT_URL_STS (or
+// AWS_ENDPOINT_URL) or the region's endpoint. The SDK names an unnamed session after the time.
+export function profileAssumeRequest(c: ChainCreds, region: string, r: RoleStep, endpoint: string, nowMs: f64): { url: string, headers: Map<string, string>, body: string } {
+  const session = r.session !== "" ? r.session : "aws-go-sdk-" + Math.floor(nowMs * 1000000.0)
+  const pairs: string[][] = [["Action", "AssumeRole"], ["Version", STS_VERSION], ["RoleArn", r.roleArn], ["RoleSessionName", session], ["DurationSeconds", "" + r.durationSeconds]]
+  if (r.externalId !== "") pairs.push(["ExternalId", r.externalId])
+  const body = pairs.map((p) => `${p[0]!}=${pctEncode(p[1]!)}`).join("&")
+  const u = URL.parse(endpoint + "/")
+  const host = u === undefined ? "sts.amazonaws.com" : u.host
+  const signRegion = region === "" ? "us-east-1" : region
+  const hs = signV4({ accessKey: c.accessKey, secretKey: c.secretKey, sessionToken: c.sessionToken === "" ? undefined : c.sessionToken }, signRegion, "sts", host, "/", "application/x-www-form-urlencoded; charset=utf-8", body, nowMs, [])
+  return { url: endpoint + "/", headers: hs, body: body }
+}
+
+// The first credentials of a profile's plan.
+async function baseCreds(b: BaseStep, region: string): Promise<ChainCreds> throws Error {
+  if (b.kind === "static") return { accessKey: b.accessKey, secretKey: b.secretKey, sessionToken: b.sessionToken, expiresAtMs: NEVER, source: "profile:" + b.profile }
+  if (b.kind === "env") {
+    const ec = envCreds()
+    if (ec === undefined) throw new Error(`profile ${b.profile}: credential_source Environment, but AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are not set`)
+    return ec
+  }
+  if (b.kind === "webid") return try await webIdentityWith(region, b.file, b.roleArn, b.session)
+  if (b.kind === "sso") {
+    const r = try await ssoCreds(b)
+    return { accessKey: r.accessKey, secretKey: r.secretKey, sessionToken: r.sessionToken, expiresAtMs: r.expiresAtMs, source: "sso:" + b.profile }
+  }
+  if (b.kind === "process") {
+    const r = try await processCreds(b.command)
+    return { accessKey: r.accessKey, secretKey: r.secretKey, sessionToken: r.sessionToken, expiresAtMs: r.expiresAtMs, source: "process:" + b.profile }
+  }
+  if (b.kind === "container") {
+    const cu = containerUrl(env("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"), env("AWS_CONTAINER_CREDENTIALS_FULL_URI"))
+    if (cu.error !== "") throw new Error(cu.error)
+    if (cu.url === "") throw new Error(`profile ${b.profile}: credential_source EcsContainer, but no container credentials URI is set`)
+    return try await container(cu.url)
+  }
+  if (env("AWS_EC2_METADATA_DISABLED").toLowerCase() === "true") throw new Error(`profile ${b.profile}: the instance metadata is disabled`)
+  return try await instanceProfile()
+}
+
+// A profile's credentials: its base, then each role assumed in turn (the soonest expiry is the chain's). region is
+// the caller's, else the profile's.
+async function runPlan(p: ProfilePlan, region0: string): Promise<ChainCreds> throws Error {
+  if (p.error !== "") throw new Error(p.error)
+  const region = region0 !== "" ? region0 : p.region
+  let c = try await baseCreds(p.base, region)
+  for (const r of p.roles) {
+    if (r.mfaSerial !== "") throw new Error(`profile ${r.profile}: role_arn with mfa_serial needs a token code, which a server cannot prompt for`)
+    const now = Date.now()
+    const up = profileAssumeRequest(c, region, r, stsEndpoint(region, env("AWS_ENDPOINT_URL_STS"), env("AWS_ENDPOINT_URL")), now)
+    const res = try await call("POST", up.url, up.headers, up.body, CALL_TIMEOUT_MS)
+    if (res.status !== 200 && !res.text.includes("<Credentials>")) throw new Error(`profile ${r.profile}: STS AssumeRole answered ${res.status}: ${xmlTag(res.text, "Message") ?? res.text.slice(0, 200)}`)
+    const a = try parseAssumeRole(res.text)
+    c = { accessKey: a.accessKey, secretKey: a.secretKey, sessionToken: a.sessionToken, expiresAtMs: Math.min(a.expiresAtMs, c.expiresAtMs), source: "assume-role:" + r.profile }
+  }
+  return c
+}
+
+// A profile's credentials, cached until a minute before they expire.
+async function planCreds(p: ProfilePlan, name: string, region: string): Promise<ChainCreds> throws Error {
+  const key = ["profile", name, region, env("AWS_CONFIG_FILE"), env("AWS_SHARED_CREDENTIALS_FILE"), env("HOME")].join("|")
+  const now = Date.now()
+  const held = cache.creds.get(key, now)
+  if (held !== undefined) return held
+  const c = try await runPlan(p, region)
+  if (c.expiresAtMs < NEVER) cache.creds.put(key, c, c.expiresAtMs)
+  return c
+}
+
+// The region of the selected profile in the shared config file ("" when it names none): the SDK reads it after
+// AWS_REGION and AWS_DEFAULT_REGION and before the instance metadata.
+export function sharedRegion(): string {
+  return profileRegion()
+}
+
 // The credentials of the default chain; region is the one STS is reached in (for the web identity). error says why
 // none was found, naming each source tried.
 export async function chainCreds(region: string): Promise<ChainResult> {
-  if (env("AWS_PROFILE") !== "") {
-    const pc = sharedCreds()
-    if (pc !== undefined) return { creds: pc, error: "" }
-  }
   const ec = envCreds()
   if (ec !== undefined) return { creds: ec, error: "" }
   const now = Date.now()
   const tokenFile = env("AWS_WEB_IDENTITY_TOKEN_FILE")
+  if (tokenFile === "") {
+    const name = profileName()
+    const plan = loadPlan(name)
+    if (!plan.found && env("AWS_PROFILE") !== "") return { creds: undefined, error: `no AWS credentials: the profile ${name} (AWS_PROFILE) is in neither the shared config file nor the shared credentials file` }
+    // a profile that names no credentials of its own (only a region, say) leaves the chain's own steps
+    if (plan.found && (plan.error !== "" || namesCredentials(plan))) {
+      try {
+        return { creds: try await planCreds(plan, name, region), error: "" }
+      } catch (e) {
+        return { creds: undefined, error: `no AWS credentials from the profile ${name}: ${e.message}` }
+      }
+    }
+  }
   const cu = containerUrl(env("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"), env("AWS_CONTAINER_CREDENTIALS_FULL_URI"))
   const key = [tokenFile, env("AWS_ROLE_ARN"), region, cu.url, imdsBase()].join("|")
   const held = cache.creds.get(key, now)
@@ -268,7 +346,6 @@ export async function chainCreds(region: string): Promise<ChainResult> {
   try {
     let got: ChainCreds | undefined = undefined
     if (tokenFile !== "") got = try await webIdentity(region)
-    if (got === undefined) got = sharedCreds()
     if (got === undefined && cu.error !== "") throw new Error(cu.error)
     if (got === undefined && cu.url !== "") got = try await container(cu.url)
     if (got === undefined) {
@@ -383,4 +460,19 @@ test("the shared credentials file: the profile's static keys", () => {
   expect(dev.sessionToken).toBe("t2")
   expect(profileCreds(text, "empty")).toBeUndefined()
   expect(profileCreds(text, "missing")).toBeUndefined()
+})
+
+test("a profile's role_arn is assumed with a signed AssumeRole at the STS endpoint, with its options", () => {
+  const c: ChainCreds = { accessKey: "AKIAIOSFODNN7EXAMPLE", secretKey: "s", sessionToken: "tok", expiresAtMs: NEVER, source: "x" }
+  const r: RoleStep = { roleArn: "arn:aws:iam::123456789012:role/app", externalId: "ext 1", session: "s1", durationSeconds: 1800, mfaSerial: "", profile: "app" }
+  const up = profileAssumeRequest(c, "eu-west-1", r, "http://127.0.0.1:9/sts", 1.7e12)
+  expect(up.url).toBe("http://127.0.0.1:9/sts/")
+  expect(up.body).toBe("Action=AssumeRole&Version=2011-06-15&RoleArn=arn%3Aaws%3Aiam%3A%3A123456789012%3Arole%2Fapp&RoleSessionName=s1&DurationSeconds=1800&ExternalId=ext%201")
+  expect(up.headers.get("authorization")!.includes("Credential=AKIAIOSFODNN7EXAMPLE/")).toBe(true)
+  expect(up.headers.get("authorization")!.includes("/eu-west-1/sts/aws4_request")).toBe(true)
+  expect(up.headers.get("x-amz-security-token")).toBe("tok")
+  // an unnamed session is named after the time, as the SDK names it
+  const un: RoleStep = { roleArn: "a", externalId: "", session: "", durationSeconds: 900, mfaSerial: "", profile: "p" }
+  expect(profileAssumeRequest(c, "", un, stsEndpoint("", "", ""), 1.7e12).body.includes("RoleSessionName=aws-go-sdk-")).toBe(true)
+  expect(profileAssumeRequest(c, "", un, stsEndpoint("", "", ""), 1.7e12).url).toBe("https://sts.amazonaws.com/")
 })

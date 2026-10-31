@@ -221,7 +221,12 @@ export class BodyPace {
 // body keeps what it has received plus a look-ahead (reserveLookahead) and is charged as its bytes arrive from then on, like a
 // chunked body. A body is cut only RESERVE_GRACE_MS after it was admitted, and only when at its rate so far the rest
 // would take longer than RESERVE_HORIZON_MS, so bodies that arrive briskly are never refused part way (re-audit 5 P2-A).
+// A body that has received nothing at all may be cut after RESERVE_EMPTY_GRACE_MS (a client sends its body right after
+// the head), and a tenant's grace is counted once (L213, re-audit 6's open item: tenants that reconnected at once kept
+// a fresh, uncuttable reservation and outsiders got about 4% 503): a reservation admitted while the same tenant held
+// another, or within RESERVE_GRACE_MS after one ended, has its grace counted from the first of that run.
 export const RESERVE_GRACE_MS = 1000.0
+export const RESERVE_EMPTY_GRACE_MS = 200.0
 export const RESERVE_HORIZON_MS = 10000.0
 export const RESERVE_LOOKAHEAD = 1048576
 
@@ -258,6 +263,10 @@ export class BodyHold {
   }
 }
 
+// A tenant's run of reservations (BodyBudget.runs): its grace counts from `since` while it holds one (`live`) or
+// ended one less than RESERVE_GRACE_MS ago (`ended`).
+type TenantRun = { since: f64, live: int, ended: f64 }
+
 export class BodyBudget {
   // every byte charged, the small bodies' part of it, and the unchecked bodies' part
   held = 0
@@ -275,6 +284,9 @@ export class BodyBudget {
   private nextId = 0
   // the tenants refused a body lately, and until when they count as waiting
   private waiting: Map<string, f64> = new Map()
+  // per tenant with reservations lately: when its run of reservations began (the grace counts from it), how many it
+  // holds, and when its last one ended
+  private runs: Map<string, TenantRun> = new Map()
 
   now(): f64 {
     return this.clock >= 0 ? this.clock : performance.now()
@@ -309,12 +321,46 @@ export class BodyBudget {
     h.got = 0
     h.start = this.now()
     this.reserved.set(h.id, h)
+    if (h.who !== "") this.runStart(h.who, h.start)
   }
 
   // h no longer holds a reservation (its body is read, refused or cut).
   untrack(h: BodyHold): void {
-    if (h.id > 0) this.reserved.delete(h.id)
+    if (h.id > 0) {
+      this.reserved.delete(h.id)
+      if (h.who !== "") this.runEnd(h.who, this.now())
+    }
     h.id = 0
+  }
+
+  // A reservation of tenant who begins at t: it joins the tenant's run when one holds a reservation or ended one less
+  // than RESERVE_GRACE_MS ago, else starts a new run. Runs that ended long ago are forgotten here, so the map stays as
+  // small as the tenants reserving lately.
+  private runStart(who: string, t: f64): void {
+    for (const k of this.runs.keys()) {
+      const r = this.runs.get(k)
+      if (r !== undefined && r.live <= 0 && t - r.ended >= RESERVE_GRACE_MS) this.runs.delete(k)
+    }
+    const r = this.runs.get(who)
+    if (r === undefined) {
+      this.runs.set(who, { since: t, live: 1, ended: 0.0 })
+      return
+    }
+    this.runs.set(who, { since: r.since, live: r.live + 1, ended: r.ended })
+  }
+
+  private runEnd(who: string, t: f64): void {
+    const r = this.runs.get(who)
+    if (r === undefined) return
+    this.runs.set(who, { since: r.since, live: Math.max(0, r.live - 1), ended: t })
+  }
+
+  // When the grace of h's reservation began: its own start, or its tenant's run's when that began earlier.
+  private graceFrom(h: BodyHold): f64 {
+    if (h.who === "") return h.start
+    const r = this.runs.get(h.who)
+    if (r === undefined) return h.start
+    return Math.min(h.start, r.since)
   }
 
   // The reservations held now.
@@ -326,10 +372,11 @@ export class BodyBudget {
   // -1 (it keeps its reservation): a body that has sent nothing after the grace is as late as can be.
   private behind(h: BodyHold, t: f64): f64 {
     const age = t - h.start
-    if (age < RESERVE_GRACE_MS) return -1.0
     const rest = h.declared - h.got
     if (rest <= 0) return -1.0
-    if (h.got <= 0) return 1.0e15 + rest * 1.0
+    // a body that has sent nothing: past its short grace, as late as can be
+    if (h.got <= 0) return t - h.start >= RESERVE_EMPTY_GRACE_MS || t - this.graceFrom(h) >= RESERVE_GRACE_MS ? 1.0e15 + rest * 1.0 : -1.0
+    if (t - this.graceFrom(h) < RESERVE_GRACE_MS) return -1.0
     const need = (rest * 1.0) * age / (h.got * 1.0)
     return need > RESERVE_HORIZON_MS ? need : -1.0
   }
@@ -1080,8 +1127,9 @@ test("reservations that fell behind their pace are cut for other tenants' bodies
   for (const k of ["vk:1", "vk:2", "vk:3", "vk:4"]) hs.push(declared(b, 12 * M, cap, k))
   expect(b.held).toBe(cap)
   expect(b.reservations()).toBe(4)
-  // an outsider's 4 MB body half a second later: the reservations are young, nothing is cut, it is refused
-  b.clock = 500.0
+  // an outsider's 4 MB body a tenth of a second later: the reservations are young, nothing is cut, it is refused
+  // (L213: half a second was within the grace; an empty reservation's grace is now RESERVE_EMPTY_GRACE_MS)
+  b.clock = 100.0
   expect(b.take(4 * M, 0, cap, "checked", 0, "vk:o", 12 * M, 12 * M)).toBe(false)
   expect(b.cuts).toBe(0)
   // two seconds in, with nothing sent: one reservation is cut to its look-ahead and the outsider is served
@@ -1142,6 +1190,65 @@ test("a body on pace keeps its reservation; the one furthest behind is cut first
   u.clock = 5000.0
   expect(u.take(5 * M, 0, cap, "unchecked", 3 * M)).toBe(false)
   expect(u.cuts).toBe(0)
+})
+
+// Lets go of a test budget's reservation (BodyHold.release works on the process's budget).
+function letGo(b: BodyBudget, h: BodyHold): void {
+  b.untrack(h)
+  b.give(h.held, h.cls, h.who)
+  h.held = 0
+}
+
+test("an empty reservation is cut after its short grace, and a reconnecting tenant's grace counts once (L213)", () => {
+  const M = 1048576
+  const cap = 4 * M
+  const b = new BodyBudget()
+  b.clock = 0.0
+  // four tenants declare 1 MB each and send nothing
+  const hs: BodyHold[] = []
+  for (const k of ["vk:1", "vk:2", "vk:3", "vk:4"]) hs.push(declared(b, M, cap, k))
+  expect(b.held).toBe(cap)
+  // within the empty grace nothing is cut
+  b.clock = RESERVE_EMPTY_GRACE_MS - 1.0
+  expect(b.take(M, 0, cap, "checked", 0, "vk:o", M, M)).toBe(false)
+  // past it (well within the second-long grace) they are cut (two: each keeps its look-ahead) and the outsider served
+  b.clock = RESERVE_EMPTY_GRACE_MS + 1.0
+  expect(b.take(M, 0, cap, "checked", 0, "vk:o", M, M)).toBe(true)
+  expect(b.cuts).toBe(2)
+  // a body that has started sending keeps the full grace
+  const g = new BodyBudget()
+  g.clock = 0.0
+  const sending = declared(g, 3 * M, cap, "vk:s")
+  sending.got = 1000
+  g.clock = 500.0
+  expect(g.take(2 * M, 0, cap, "checked", 0, "vk:o", M, M)).toBe(false)
+  g.clock = RESERVE_GRACE_MS + 1.0
+  expect(g.take(2 * M, 0, cap, "checked", 0, "vk:o", M, M)).toBe(true)
+  // a tenant that reconnects at once (its request ended, a new one sent): the new reservation's grace counts from the
+  // first of the run, so it is cut as soon as it is needed, however young
+  const r = new BodyBudget()
+  r.clock = 0.0
+  const first = declared(r, 3 * M, cap, "vk:r")
+  first.got = 1000
+  r.clock = 900.0
+  letGo(r, first)
+  const again = declared(r, 3 * M, cap, "vk:r")
+  again.got = 1000
+  r.clock = RESERVE_GRACE_MS + 50.0
+  expect(r.take(2 * M, 0, cap, "checked", 0, "vk:o", M, M)).toBe(true)
+  expect(again.id).toBe(0)
+  // after a quiet second its next reservation has a grace of its own again
+  const q = new BodyBudget()
+  q.clock = 0.0
+  const one = declared(q, 3 * M, cap, "vk:q")
+  q.clock = 500.0
+  letGo(q, one)
+  q.clock = 500.0 + RESERVE_GRACE_MS
+  const two = declared(q, 3 * M, cap, "vk:q")
+  two.got = 1000
+  q.clock = 500.0 + RESERVE_GRACE_MS + 500.0
+  expect(q.take(2 * M, 0, cap, "checked", 0, "vk:o", M, M)).toBe(false)
+  expect(two.id > 0).toBe(true)
 })
 
 test("a reservation is let go when its request is done", () => {

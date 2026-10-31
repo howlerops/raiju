@@ -199,7 +199,9 @@ gateway process's memory, as dashboard sessions do.
 - **Async jobs:** ids are 128 random bits (`job_` and 32 hex digits). A job submitted with a virtual
   key is shown only to that key, and one submitted with another credential only to that
   credential; an anonymous job is open to any poll, as in Bifrost. Another caller's job reads as
-  404.
+  404. Jobs are kept beside the config (`<config>.jobs/`), so a poll after a restart or on another
+  node finds them (a node with its own folder asks its peers); a job whose gateway stopped while it
+  ran reads as failed.
 - **Masked secrets:** provider reads return each key's effective id (its `id`, else its `name`), and a
   key sent back with its masked value keeps the stored secret (matched by id, then name, then
   position). A masked value (`****` or `abcd…wxyz`) that matches no stored secret is refused with
@@ -278,7 +280,8 @@ also caps the request-body bytes it reads at once across requests, `server.max_b
 a declared length is reserved whole when the body is admitted, so a body that does not fit is answered
 503 with `retry-after` before its client sends it, and a chunked body is charged as its bytes arrive.
 Under contention a reservation whose body fell behind its pace (at its rate so far, more than 10 s to go,
-a second after it was admitted) is cut to what it has received plus a small look-ahead, so a client that
+a second after it was admitted, 200 ms when it has received nothing, with one grace for a tenant that
+reconnects at once) is cut to what it has received plus a small look-ahead, so a client that
 declares a big length and sends slowly or nothing does not hold the cap. A body whose credential was checked from the headers (a virtual key, a
 direct provider key that is one of the configured keys, a management sign-in) must keep
 `server.body_min_kb_per_second` (default 32) after `server.body_rate_grace_seconds` (10), counted over
@@ -288,7 +291,8 @@ window later. Bodies count per tenant (a virtual key's customer, else its team, 
 that holds bytes past `server.credential_body_mb` (a quarter of the cap) beside other tenants (or while
 another tenant waits), or a chunked body that keeps growing, fills the cap only up to
 `server.body_reserve_mb` (a quarter) short of it, so one tenant, however many keys it has, cannot turn
-the other tenants' big bodies away; it is the one refused first. A tenant's first body may fill the cap. A body
+the other tenants' big bodies away; it is the one refused first (a start warning and a dashboard notice
+count the virtual keys with no customer or team). A tenant's first body may fill the cap. A body
 nobody vouched for (auth off, or behind the plugins' HTTP hooks) shares `server.unchecked_body_mb` (an
 eighth of the cap) beside other bodies and must arrive whole within `server.body_deadline_seconds`
 (default 30); 408 otherwise. The routes anyone may call without a credential (sign-in, setup, agent

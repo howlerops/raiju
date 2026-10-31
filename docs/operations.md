@@ -163,13 +163,18 @@ Shared between the workers of a node and between nodes:
   credentials (sealed), A2A push configurations and agent cards, and realtime client-secret mappings
   (provider tokens sealed).
 - The live log feed (`/ws`), unless `cluster.feed.cluster_wide` is false.
+- Failed sign-in counts (`signinguard.tov`): each process puts its own counts on the replicated state, keyed
+  by a hash of the account or address, at most 4,096 entries, each kept an hour after its last failure; a
+  check adds the other nodes' counts to its node's own, and a success clears the account on every node.
+- Async and provisioning jobs: kept beside the config (`<config>.jobs/`, `<config>.provision-jobs.json`),
+  so nodes that share the folder see each other's; a node with its own folder asks its peers for a job it
+  does not hold (signed `POST /api/cluster/jobs`; not in broker mode). Both survive a restart; a job whose
+  gateway stopped while it ran reads as failed once its beat is 45 s old.
 - Leadership (the lowest live node id, or the etcd lock in `cluster.leader_lock`).
 
 Shared between the workers of one node only:
 
 - The response cache and the in-process semantic cache.
-- Async jobs (one file per job in the share folder): a poll may reach any worker of the node that took
-  the job, not another node.
 - Dashboard sessions and the CLI's agent sign-in codes and tokens, in `<config>.sessions.json` and
   `<config>.agent-sessions.json` beside the config file (0600, tokens by hash, refresh tokens sealed with
   the encryption key). They outlive a restart; nodes share them only when they share the config folder, so

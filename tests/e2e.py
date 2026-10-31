@@ -14455,6 +14455,173 @@ def l210_e2e(env):
         gw.wait()
 
 
+
+GW_L213_A = "http://127.0.0.1:18382"  # L213: async jobs across nodes and restarts, sign-in counts across nodes, empty reservations cut early, ungrouped keys notice
+GW_L213_B = "http://127.0.0.1:18383"  # L213: the second node of that cluster
+L213_ADMIN = {"authorization": "Bearer sk-admin-l213"}
+L213_SECRET = "e2e-l213-cluster-secret-0123456789abcdef"
+
+
+def l213_config(node, peer):
+    """An L213 cluster member: an admin token, a password user, sign-in throttling with four free failures per account,
+    a 4 MB body cap, the shared mock as OpenAI, and virtual keys with no customer or team."""
+    import hashlib
+    keys = [{"id": "vk-l213-%s" % n, "name": "vk-l213-%s" % n, "value": "sk-bf-l213-%s" % n} for n in ["a1", "a2", "a3", "a4", "o", "p"]]
+    return {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": True},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "server": {"max_buffered_body_mb": 4, "body_rate_grace_seconds": 4,
+                   "sign_in_throttle": {"account_failures": 4, "ip_failures": 100, "max_backoff_seconds": 8}},
+        "governance": {"virtual_keys": keys, "users": [
+            {"name": "root", "role": "admin", "token_sha256": hashlib.sha256("sk-admin-l213".encode()).hexdigest()},
+            {"name": "eve", "role": "viewer", "password_hash": L198_BCRYPT_PW}]},
+        "providers": {"openai": {"keys": [{"name": "o-l213", "value": "sk-l213", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "cluster": {"enabled": True, "node_id": node, "secret": L213_SECRET, "interval_ms": 200, "peers": [peer]},
+    }
+
+
+def l213_start(env, name, port, cfg_path):
+    return subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", str(port), "-host", "127.0.0.1", "-config", cfg_path, "-server", os.environ.get("RAIJU_SERVER", "bun")],
+                            env=env, stderr=open(os.path.join(BUILD, f"e2e.l213{name}.log"), "a"))
+
+
+def l213_e2e(env):
+    """L213: known gaps from HANDOFF.md and re-audit 6. Async jobs are kept beside the config (<config>.jobs, private,
+    versioned), so a poll after a restart finds the job, and a node that does not share the folder asks its peers (POST
+    /api/cluster/jobs); a job its gateway left unfinished reads as failed (it was processing forever). Failed sign-ins
+    are counted across the cluster (the cluster state): three on each node lock the account on both (each node alone let
+    the right password in). A reservation that has received nothing is cut after a short grace and a reconnecting
+    tenant's grace counts once, so four tenants that reconnect every 0.3 s declaring 1 MB no longer turn an outsider's
+    1 MB chats away (re-audit 6's open item: they were 503 while every reservation was under a second old). Keys with no
+    customer or team get a start warning and a dashboard notice. Ports 18382 (A, restarted) and 18383 (B)."""
+    import hashlib, shutil, threading
+    d = os.path.join(BUILD, "e2e-l213")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    pa = os.path.join(d, "a", "config.json")
+    pb = os.path.join(d, "b", "config.json")
+    os.makedirs(os.path.dirname(pa))
+    os.makedirs(os.path.dirname(pb))
+    json.dump(l213_config("l213-a", GW_L213_B), open(pa, "w"))
+    json.dump(l213_config("l213-b", GW_L213_A), open(pb, "w"))
+    for n in ["a", "b"]:
+        open(os.path.join(BUILD, f"e2e.l213{n}.log"), "w").close()
+    ga = l213_start(env, "a", 18382, pa)
+    gb = l213_start(env, "b", 18383, pb)
+    k = lambda n: {"x-bf-vk": "sk-bf-l213-%s" % n}
+    jb = lambda b: json.loads(b) if b.startswith("{") else {}
+    stop = [0.0]
+    floods = []
+    try:
+        wait(GW_L213_A + "/health")
+        wait(GW_L213_B + "/health")
+        time.sleep(0.5)
+
+        # ---- keys with no customer or team: a start warning and a dashboard notice ----
+        text = open(os.path.join(BUILD, "e2e.l213a.log")).read()
+        check("l213: the start warns that 6 virtual keys have no customer or team, pointing to the docs",
+              "6 virtual keys have no customer_id or team_id" in text and "deploy/README.md" in text, text[-600:])
+        s, _, b = call("GET", "/api/notifications?limit=500", None, L213_ADMIN, base=GW_L213_A, auth=False)
+        notes = [n for n in jb(b).get("notifications", []) if n.get("title") == "Virtual keys without a customer or team"]
+        check("l213: the dashboard shows a notice with how many keys have no customer or team", s == 200 and len(notes) == 1 and "6 virtual keys" in notes[0].get("message", ""), (s, b[:300]))
+
+        # ---- async jobs: polled on the other node, and after a restart ----
+        s, _, b = call("POST", "/v1/async/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l213-job"}]}, k("o"), base=GW_L213_A, auth=False)
+        jid = jb(b).get("id", "")
+        check("l213: an async job is accepted on node A", s == 202 and jid.startswith("job_"), (s, b[:200]))
+        done = {}
+        for _ in range(50):
+            s, _, b = call("GET", "/v1/async/jobs/" + jid, None, k("o"), base=GW_L213_A, auth=False)
+            done = jb(b)
+            if done.get("status") == "completed":
+                break
+            time.sleep(0.1)
+        check("l213: the job completes on node A", done.get("status") == "completed", done)
+        jobs_dir = pa + ".jobs"
+        files = os.listdir(jobs_dir) if os.path.isdir(jobs_dir) else []
+        mode = oct(os.stat(os.path.join(jobs_dir, files[0])).st_mode & 0o777) if files else ""
+        first = open(os.path.join(jobs_dir, files[0])).read() if files else ""
+        check("l213: the job is kept beside the config in a private, versioned file", len(files) == 1 and mode == "0o600" and first.startswith('{"version":1,'), (files, mode, first[:80]))
+        s, _, b = call("GET", "/v1/async/jobs/" + jid, None, k("o"), base=GW_L213_B, auth=False)
+        check("l213: node B (its own folder) answers the job node A ran, asked of its peer (it was 404)", s == 200 and jb(b).get("status") == "completed" and jb(b).get("id") == jid, (s, b[:200]))
+        # an SDK-route job (x-bf-async) run on A, polled on B with x-bf-async-id
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "l213-sdk-job"}]}, {**k("o"), "x-bf-async": "true"}, base=GW_L213_A, auth=False)
+        sid = jb(b).get("id", "")
+        for _ in range(50):
+            if jb(call("GET", "/v1/async/jobs/" + sid, None, k("o"), base=GW_L213_A, auth=False)[2]).get("status") == "completed":
+                break
+            time.sleep(0.1)
+        s, _, b = call("GET", "/v1/chat/completions", None, {**k("o"), "x-bf-async-id": sid}, base=GW_L213_B, auth=False)
+        check("l213: node B answers the SDK poll (x-bf-async-id) of a job node A ran with the route's answer (it was 404)", sid.startswith("job_") and s == 200 and "chat.completion" in b, (sid, s, b[:200]))
+        s, _, b = call("GET", "/v1/async/jobs/" + jid, None, k("p"), base=GW_L213_B, auth=False)
+        check("l213: another key polling it on node B still gets 404", s == 404, (s, b[:200]))
+        # a job its gateway was running when it stopped (written as it was left: processing, its beat two minutes old)
+        lost = "job_" + hashlib.sha256(b"l213-lost").hexdigest()[:32]
+        now_ms = int(time.time() * 1000)
+        slot = {"version": 1, "job": {"id": lost, "op": "chat/completions", "status": "processing", "created_at": now_ms // 1000 - 120, "owner": "vk:vk-l213-o"}, "at": now_ms - 120000, "beat": now_ms - 120000}
+        os.makedirs(jobs_dir, exist_ok=True)
+        with open(os.path.join(jobs_dir, hashlib.sha256(lost.encode()).hexdigest()[:40] + ".json"), "w") as f:
+            json.dump(slot, f)
+        ga.terminate()
+        ga.wait()
+        ga = l213_start(env, "a", 18382, pa)
+        wait(GW_L213_A + "/health")
+        s, _, b = call("GET", "/v1/async/jobs/" + jid, None, k("o"), base=GW_L213_A, auth=False)
+        check("l213: after a restart node A still answers the completed job (it was 404)", s == 200 and jb(b).get("status") == "completed" and "result" in jb(b), (s, b[:200]))
+        s, _, b = call("GET", "/v1/async/jobs/" + lost, None, k("o"), base=GW_L213_A, auth=False)
+        got = jb(b)
+        check("l213: a job its gateway left unfinished reads as failed, saying why (it read processing forever)",
+              s == 200 and got.get("status") == "failed" and "stopped before it finished" in json.dumps(got.get("error", {})), (s, b[:300]))
+
+        # ---- sign-in throttle counts across the nodes ----
+        def login(base, pw):
+            return call("POST", "/api/session/login", {"username": "eve", "password": pw}, None, base=base, auth=False)[0]
+        codes = [login(GW_L213_A, "wrong-a%d" % i) for i in range(3)] + [login(GW_L213_B, "wrong-b%d" % i) for i in range(3)]
+        time.sleep(0.8)
+        sa, sb = login(GW_L213_A, "pw"), login(GW_L213_B, "pw")
+        check("l213: three failures on each node lock the account on both (429; each node alone let the right password in)",
+              codes == [401] * 6 and sa == 429 and sb == 429, (codes, sa, sb))
+
+        # ---- a reconnecting flood of empty reservations no longer blocks an outsider ----
+        stop[0] = time.time() + 7.0
+
+        def flood(n):
+            while time.time() < stop[0]:
+                try:
+                    s = l196_open(18382, "/v1/chat/completions", 1048576, k(n), 0)
+                    time.sleep(0.3)
+                    s.close()
+                except OSError:
+                    time.sleep(0.05)
+
+        floods = [threading.Thread(target=flood, args=(n,)) for n in ["a1", "a2", "a3", "a4"]]
+        for t in floods:
+            t.start()
+            time.sleep(0.05)
+        time.sleep(1.5)
+        mb = l196_chat(1048576).decode()
+        out = []
+        while time.time() < stop[0] - 0.5:
+            try:
+                out.append(call("POST", "/v1/chat/completions", mb, k("o"), base=GW_L213_A, auth=False)[0])
+            except Exception:
+                out.append(0)
+            time.sleep(0.1)
+        stop[0] = 0.0
+        for t in floods:
+            t.join(10)
+        check("l213: while four tenants reconnect every 0.3 s declaring 1 MB and sending nothing, an outsider's 1 MB chats are all served (they were 503)",
+              len(out) >= 5 and all(c == 200 for c in out), (len(out), sorted(set(out)), out.count(200)))
+    finally:
+        stop[0] = 0.0
+        for t in floods:
+            t.join(10)
+        for g in [ga, gb]:
+            g.terminate()
+            g.wait()
+
+
 GW_L189 = "http://127.0.0.1:18334"  # L189: WebSocket and realtime drain at shutdown, the write-stall timeout and broker mode's graceful stop (its broker takes the port after the gateways); 18335 is the UI setup gateway (tests/ui_e2e.mjs)
 
 
@@ -18180,6 +18347,278 @@ def l209_e2e(env):
         gw.terminate()
         gw.wait()
 
+GW_L214 = "http://127.0.0.1:18384"  # L214: the AWS shared config file's profiles (role_arn chains, credential_process, SSO)
+GW_L214B = "http://127.0.0.1:18385"  # L214: Maxim attachments, and a Bedrock rerank fallback with its own pre hooks
+L214_BASE_AK = "AKIA" + "L214SOURCEPROF01"
+L214_ROLE_AK = "ASIA" + "L214ASSUMEDROLE1"
+L214_PROC_AK = "ASIA" + "L214CREDPROCESS1"
+L214_SSO_AK = "ASIA" + "L214SSOROLECRED1"
+
+
+def l214_mocks():
+    """The L214 doubles in this process, on one port: AWS STS (AssumeRole, signed), SSO OIDC (CreateToken by refresh
+    token) and the SSO portal (GetRoleCredentials), Bedrock (Converse, and Agent Runtime rerank that fails for a model
+    named l214-fail), Vertex (GCP STS and generateContent), an OpenAI-style chat, and Maxim (GetUploadUrl, the signed
+    PUT and the log endpoint). Returns (server, base url, seen list)."""
+    import http.server
+    got = []
+    lock = threading.Lock()
+
+    def note(x):
+        with lock:
+            got.append(x)
+
+    class H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def send(self, code, body, ctype="application/json"):
+            b = body if isinstance(body, bytes) else body.encode()
+            self.send_response(code)
+            self.send_header("content-type", ctype)
+            self.send_header("content-length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+
+        def raw(self):
+            return self.rfile.read(int(self.headers.get("content-length", "0") or 0))
+
+        def do_GET(self):
+            u = urllib.parse.urlparse(self.path)
+            q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+            note({"method": "GET", "path": u.path, "query": q, "bearer": self.headers.get("x-amz-sso_bearer_token", ""), "key": self.headers.get("x-maxim-api-key", "")})
+            if u.path == "/sso/federation/credentials":
+                if self.headers.get("x-amz-sso_bearer_token", "") != "sso-l214-fresh":
+                    return self.send(401, json.dumps({"message": "Session token not found or invalid"}))
+                return self.send(200, json.dumps({"roleCredentials": {"accessKeyId": L214_SSO_AK, "secretAccessKey": "l214-sso-secret", "sessionToken": "l214-sso-session", "expiration": 4070908800000}}))
+            if u.path == "/api/sdk/v1/log-repositories/attachments/upload-url":
+                return self.send(200, json.dumps({"data": {"url": "http://127.0.0.1:%d/bucket/%s" % (self.server.server_address[1], q.get("key", ""))}}))
+            self.send(404, "{}")
+
+        def do_PUT(self):
+            b = self.raw()
+            note({"method": "PUT", "path": urllib.parse.urlparse(self.path).path, "bytes": b, "ctype": self.headers.get("content-type", "")})
+            self.send(200, "")
+
+        def do_POST(self):
+            u = urllib.parse.urlparse(self.path)
+            b = self.raw()
+            text = b.decode("utf-8", "replace")
+            rec = {"method": "POST", "path": u.path, "query": u.query, "body": text, "auth": self.headers.get("authorization", "")}
+            note(rec)
+            if u.path == "/sts/":
+                form = {k: v[0] for k, v in urllib.parse.parse_qs(text).items()}
+                rec["form"] = form
+                if form.get("Action") != "AssumeRole":
+                    return self.send(400, "<ErrorResponse><Error><Code>InvalidAction</Code><Message>not AssumeRole</Message></Error></ErrorResponse>", "text/xml")
+                return self.send(200, "<AssumeRoleResponse><AssumeRoleResult><Credentials><AccessKeyId>%s</AccessKeyId><SecretAccessKey>l214-role-secret</SecretAccessKey><SessionToken>l214-role-session</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration></Credentials></AssumeRoleResult></AssumeRoleResponse>" % L214_ROLE_AK, "text/xml")
+            if u.path == "/oidc/token":
+                j = json.loads(text or "{}")
+                if j.get("grantType") != "refresh_token" or j.get("refreshToken") != "sso-l214-refresh" or j.get("clientId") != "l214-client":
+                    return self.send(400, json.dumps({"error": "invalid_grant"}))
+                return self.send(200, json.dumps({"accessToken": "sso-l214-fresh", "expiresIn": 3600, "refreshToken": "sso-l214-refresh-2", "tokenType": "Bearer"}))
+            if u.path.startswith("/model/") and u.path.endswith("/converse"):
+                return self.send(200, json.dumps({"output": {"message": {"role": "assistant", "content": [{"text": "hello from l214 bedrock"}]}}, "stopReason": "end_turn", "usage": {"inputTokens": 3, "outputTokens": 4, "totalTokens": 7}}))
+            if u.path == "/rerank":
+                if "l214-fail" in text:
+                    return self.send(500, json.dumps({"message": "the primary rerank model is down"}))
+                return self.send(200, json.dumps({"results": [{"index": 1, "relevanceScore": 0.9}, {"index": 0, "relevanceScore": 0.2}]}))
+            if u.path == "/wif/sts":
+                return self.send(200, json.dumps({"access_token": "ya29.l214", "issued_token_type": "urn:ietf:params:oauth:token-type:access_token", "token_type": "Bearer", "expires_in": 3600}))
+            if u.path.endswith(":generateContent"):
+                return self.send(200, json.dumps({"candidates": [{"content": {"role": "model", "parts": [{"text": "hello from l214 vertex"}]}, "finishReason": "STOP"}], "usageMetadata": {"promptTokenCount": 2, "candidatesTokenCount": 3, "totalTokenCount": 5}}))
+            if u.path == "/v1/chat/completions":
+                return self.send(200, json.dumps({"id": "c-l214", "object": "chat.completion", "created": 1, "model": "gpt-4o-mini", "choices": [{"index": 0, "message": {"role": "assistant", "content": "seen"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}))
+            if u.path == "/api/sdk/v3/log":
+                return self.send(200, json.dumps({"success": True}))
+            self.send(404, "{}")
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, "http://127.0.0.1:%d" % srv.server_address[1], got
+
+
+def l214_e2e(env):
+    """L214: the AWS SDK's shared config file in the default credential chain (Bedrock without keys, Vertex's AWS
+    federation): a role_arn with source_profile assumed with the source's keys (external_id, role_session_name), a
+    credential_process in the default profile and that profile's region, and an sso-session profile whose expired token
+    is refreshed through SSO OIDC before GetRoleCredentials; the Maxim sink's attachments (file data uploaded to the
+    signed URL GetUploadUrl gives, then an add-attachment line, and URL attachments); and a Bedrock rerank fallback that
+    sends what its own pre hooks made of the request. Its own gateways (18384, restarted per profile, and 18385)."""
+    import hashlib, shutil
+    srv, base, got = l214_mocks()
+    work = os.path.join(BUILD, "e2e-l214")
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work, exist_ok=True)
+    cfg_path = os.path.join(BUILD, "e2e.l214.json")
+    cfg = {
+        "client": {"enable_logging": True, "enforce_auth_on_inference": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": base + "/nodatasheet", "enabled": False},
+        "providers": {
+            "bedrock": {"keys": [{"name": "bk-chain", "value": "", "models": [], "weight": 1.0, "bedrock_key_config": {"region": "us-west-2"}}], "network_config": {"base_url": base, "max_retries": 0}},
+            "vertex": {"keys": [{"name": "vx", "value": "", "models": [], "weight": 1.0, "vertex_key_config": {"project_id": "proj", "region": "us-central1", "auth_credentials": json.dumps({
+                "type": "external_account", "audience": "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/aws",
+                "subject_token_type": "urn:ietf:params:aws:token-type:aws4_request", "token_url": base + "/wif/sts",
+                "credential_source": {"environment_id": "aws1"}})}}], "network_config": {"base_url": base, "max_retries": 0}},
+        },
+    }
+    json.dump(cfg, open(cfg_path, "w"))
+    gw = None
+
+    def start(extra_env, name, port=18384, path=cfg_path):
+        genv = {k: v for k, v in env.items() if not k.startswith("AWS_")}
+        genv.update(extra_env)
+        p = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", str(port), "-host", "127.0.0.1", "-config", path, "-server", os.environ.get("RAIJU_SERVER", "bun")],
+                             env=genv, stdout=subprocess.DEVNULL, stderr=open(os.path.join(BUILD, f"e2e.l214-{name}.log"), "w"))
+        wait(f"http://127.0.0.1:{port}/health")
+        return p
+
+    def stop(p):
+        if p is not None:
+            p.terminate()
+            try:
+                p.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                p.kill()
+
+    def bedrock_chat():
+        return call("POST", "/v1/chat/completions", {"model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0", "messages": [{"role": "user", "content": "hi"}]}, {}, base=GW_L214, auth=False)
+
+    def converse_auth():
+        c = [x for x in got if x["method"] == "POST" and x["path"].startswith("/model/") and x["path"].endswith("/converse")]
+        return c[-1]["auth"] if c else ""
+
+    config_file = os.path.join(work, "config")
+    creds_file = os.path.join(work, "credentials")
+    gw2 = None
+    try:
+        # ---- role_arn with source_profile: the role is assumed with the source profile's keys ----
+        open(config_file, "w").write("[profile base]\nregion = eu-west-1\n\n[profile app]\nrole_arn = arn:aws:iam::123456789012:role/l214-app\nsource_profile = base\nexternal_id = l214-ext\nrole_session_name = l214-sess\nregion = ap-southeast-2\n")
+        open(creds_file, "w").write("[base]\naws_access_key_id = %s\naws_secret_access_key = l214-base-secret\n" % L214_BASE_AK)
+        aws = {"AWS_CONFIG_FILE": config_file, "AWS_SHARED_CREDENTIALS_FILE": creds_file, "AWS_EC2_METADATA_DISABLED": "true", "AWS_ENDPOINT_URL_STS": base + "/sts"}
+        gw = start({**aws, "AWS_PROFILE": "app"}, "role")
+        s, _, b = bedrock_chat()
+        sts = [x for x in got if x["path"] == "/sts/"]
+        form = sts[-1].get("form", {}) if sts else {}
+        check("aws profile: role_arn with source_profile is assumed at STS AssumeRole with the profile's external_id and session name",
+              form.get("RoleArn") == "arn:aws:iam::123456789012:role/l214-app" and form.get("ExternalId") == "l214-ext" and form.get("RoleSessionName") == "l214-sess" and form.get("DurationSeconds") == "900", sts[-1:])
+        check("aws profile: AssumeRole is signed with the source profile's keys, in the key's region",
+              sts and f"Credential={L214_BASE_AK}/" in sts[-1]["auth"] and "/us-west-2/sts/aws4_request" in sts[-1]["auth"], sts[-1:])
+        check("aws profile: Bedrock signs with the assumed role's credentials", s == 200 and f"Credential={L214_ROLE_AK}/" in converse_auth(), (s, b[:200], converse_auth()))
+        n = len([x for x in got if x["path"] == "/sts/"])
+        s, _, _ = bedrock_chat()
+        check("aws profile: the assumed role's credentials are cached until they expire", s == 200 and len([x for x in got if x["path"] == "/sts/"]) == n, n)
+        stop(gw)
+        gw = None
+
+        # ---- credential_process in the default profile, and the profile's region for Vertex's federation ----
+        script = os.path.join(work, "creds.sh")
+        open(script, "w").write("#!/bin/sh\necho \"$1\" >> %s\nprintf '{\"Version\": 1, \"AccessKeyId\": \"%s\", \"SecretAccessKey\": \"l214-proc-secret\", \"SessionToken\": \"l214-proc-session\", \"Expiration\": \"2099-01-01T00:00:00Z\"}'\n" % (os.path.join(work, "proc.calls"), L214_PROC_AK))
+        os.chmod(script, 0o755)
+        open(config_file, "w").write("[default]\nregion = eu-north-1\ncredential_process = %s from-l214\n" % script)
+        open(creds_file, "w").write("")
+        gw = start(aws, "process")
+        s, _, b = bedrock_chat()
+        check("aws profile: a credential_process in the default profile gives Bedrock its credentials", s == 200 and f"Credential={L214_PROC_AK}/" in converse_auth(), (s, b[:200], converse_auth()))
+        calls = open(os.path.join(work, "proc.calls")).read().split() if os.path.exists(os.path.join(work, "proc.calls")) else []
+        check("aws profile: the credential_process ran through the shell with its arguments", calls[:1] == ["from-l214"], calls)
+        s, _, b = call("POST", "/v1/chat/completions", {"model": "vertex/gemini-2.5-flash", "messages": [{"role": "user", "content": "hi"}]}, {}, base=GW_L214, auth=False)
+        wif = [x for x in got if x["path"] == "/wif/sts"]
+        sub = urllib.parse.unquote(urllib.parse.unquote(urllib.parse.parse_qs(wif[-1]["body"]).get("subject_token", [""])[0])) if wif else ""
+        check("aws profile: with no region set, Vertex's AWS federation signs in the default profile's region with its credentials",
+              s == 200 and f"Credential={L214_PROC_AK}/" in sub and "/eu-north-1/sts/aws4_request" in sub, (s, b[:200], sub[:300]))
+        stop(gw)
+        gw = None
+        # a failing process is the request's error, with its status
+        open(script, "w").write("#!/bin/sh\necho 'no credentials today' >&2\nexit 3\n")
+        gw = start(aws, "process-fail")
+        s, _, b = bedrock_chat()
+        check("aws profile: a credential_process that exits non-zero fails the request with its status", s >= 400 and "status 3" in b, (s, b[:300]))
+        stop(gw)
+        gw = None
+
+        # ---- SSO: an sso-session profile; the expired token is refreshed through SSO OIDC and written back ----
+        home = os.path.join(work, "home")
+        cache_dir = os.path.join(home, ".aws", "sso", "cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_file = os.path.join(cache_dir, hashlib.sha1(b"corp").hexdigest() + ".json")
+        json.dump({"startUrl": "https://corp.awsapps.com/start", "region": "us-east-1", "accessToken": "sso-l214-stale", "expiresAt": "2020-01-01T00:00:00Z",
+                   "clientId": "l214-client", "clientSecret": "l214-client-secret", "refreshToken": "sso-l214-refresh", "registrationExpiresAt": "2099-01-01T00:00:00Z"}, open(cache_file, "w"))
+        open(config_file, "w").write("[profile ssodev]\nsso_session = corp\nsso_account_id = 111122223333\nsso_role_name = Dev\n\n[sso-session corp]\nsso_start_url = https://corp.awsapps.com/start\nsso_region = us-east-1\n")
+        gw = start({**aws, "AWS_PROFILE": "ssodev", "HOME": home, "AWS_ENDPOINT_URL_SSO": base + "/sso", "AWS_ENDPOINT_URL_SSO_OIDC": base + "/oidc"}, "sso")
+        s, _, b = bedrock_chat()
+        oidc = [x for x in got if x["path"] == "/oidc/token"]
+        portal = [x for x in got if x["path"] == "/sso/federation/credentials"]
+        check("aws profile (SSO): the expired cached token is refreshed through SSO OIDC CreateToken with the cached client", len(oidc) == 1, oidc)
+        check("aws profile (SSO): GetRoleCredentials gets the account, the role and the fresh token",
+              portal and portal[-1]["query"] == {"account_id": "111122223333", "role_name": "Dev"} and portal[-1]["bearer"] == "sso-l214-fresh", portal[-1:])
+        check("aws profile (SSO): Bedrock signs with the SSO role's credentials", s == 200 and f"Credential={L214_SSO_AK}/" in converse_auth(), (s, b[:200], converse_auth()))
+        cached = json.load(open(cache_file))
+        check("aws profile (SSO): the refreshed token goes back to the cache file, the rest of it kept",
+              cached.get("accessToken") == "sso-l214-fresh" and cached.get("refreshToken") == "sso-l214-refresh-2" and cached.get("clientId") == "l214-client" and cached.get("expiresAt", "") > "2026", cached)
+        stop(gw)
+        gw = None
+
+        # ---- the Maxim sink's attachments, and a Bedrock rerank fallback through the plugins' pre hooks ----
+        wasm = os.path.join(ROOT, "tests", "wasm", "plugin.wasm")
+        cfg_b = {
+            "client": {"enable_logging": True, "enforce_auth_on_inference": False},
+            "alerts": {"enabled": False},
+            "pricing_sync": {"url": base + "/nodatasheet", "enabled": False},
+            "logs_store": {"enabled": True, "dir": os.path.join(work, "logs"), "content_logging": True},
+            "providers": {
+                "openai": {"keys": [{"name": "oa", "value": "sk-l214", "models": [], "weight": 1.0}], "network_config": {"base_url": base, "max_retries": 0}},
+                "bedrock": {"keys": [{"name": "bk", "value": "", "models": [], "weight": 1.0, "bedrock_key_config": {"access_key": "AKIDEXAMPLE", "secret_key": "l214-static", "region": "us-east-1"}}], "network_config": {"base_url": base, "max_retries": 0}},
+            },
+            "exporters": [{"id": "mx", "kind": "maxim", "api_key": "mk-l214", "log_repo_id": "repo-l214", "base_url": base, "interval_seconds": 1, "include_content": True}],
+            # the plugin rewrites the first "l214-fb" of the request it gets: the query's on the primary attempt, the
+            # model's on the fallback attempt (whose pre hooks run again on the request as it came, with its model)
+            "plugins": [{"name": "fbp", "enabled": True, "path": wasm, "config": whole_wasm_config({"mode": "rewrite", "from": "l214-fb", "to": "l214-zz"})}],
+        }
+        cfg_b_path = os.path.join(BUILD, "e2e.l214b.json")
+        json.dump(cfg_b, open(cfg_b_path, "w"))
+        gw2 = start({}, "maxim", port=18385, path=cfg_b_path)
+        png = b"\x89PNG\r\n\x1a\n" + b"l214-pixels"
+        content = [{"type": "text", "text": "what is in these?"},
+                   {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(png).decode()}},
+                   {"type": "image_url", "image_url": {"url": "https://cdn.example/l214/cat.jpg"}},
+                   {"type": "file", "file": {"file_data": base64.b64encode(b"%PDF-1.4 l214").decode(), "filename": "l214.pdf", "file_type": "application/pdf"}}]
+        s, h, b = call("POST", "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": content}]}, {}, base=GW_L214B, auth=False)
+        rid = {k.lower(): v for k, v in h.items()}.get("x-bifrost-request-id", "")
+        logs = []
+        for _ in range(60):
+            logs = [x for x in got if x["path"] == "/api/sdk/v3/log" and rid and rid in x["body"]]
+            if logs and "add-attachment" in logs[-1]["body"]:
+                break
+            time.sleep(0.5)
+        body = logs[-1]["body"] if logs else ""
+        asks = [x for x in got if x["path"] == "/api/sdk/v1/log-repositories/attachments/upload-url"]
+        puts = [x for x in got if x["method"] == "PUT" and x["path"].startswith("/bucket/")]
+        adds = [json.loads(l[l.index("data=") + 5:-1]) for l in body.split("\n") if ",action=add-attachment," in l]
+        check("maxim attachments: file data asks GetUploadUrl for each (key, MIME type and size, with the API key)",
+              s == 200 and len(asks) == 2 and {a["query"].get("mimeType") for a in asks} == {"image/png", "application/pdf"} and all(a["key"] == "mk-l214" and a["query"].get("key", "").startswith("repo-l214/generation/") for a in asks)
+              and str(len(png)) in [a["query"].get("size") for a in asks], (s, asks))
+        check("maxim attachments: the bytes are PUT to the signed URLs with their type", len(puts) == 2 and any(p["bytes"] == png and p["ctype"] == "image/png" for p in puts), [(p["path"], p["ctype"], len(p["bytes"])) for p in puts])
+        check("maxim attachments: each attachment is announced after the trace (two file data, one URL with its url in metadata)",
+              len(adds) == 3 and sorted(a["type"] for a in adds) == ["fileData", "fileData", "url"] and any(a.get("metadata", {}).get("url") == "https://cdn.example/l214/cat.jpg" and a.get("mimeType") == "image/jpeg" for a in adds)
+              and any(a.get("name") == "l214.pdf" and a.get("size") == len(b"%PDF-1.4 l214") for a in adds) and body.index("add-attachment") > body.index("action=add-generation"), (adds, body[:400]))
+        check("maxim attachments: the uploaded keys are the ones the add-attachment lines name", len(asks) == 2 and sorted(a["query"]["key"] for a in asks) == sorted(a["key"] for a in adds if a["type"] == "fileData"), (asks, adds))
+        # a Bedrock rerank whose primary fails: the fallback sends what its own pre hooks made of the request
+        s, _, b = call("POST", "/v1/rerank", {"model": "bedrock/cohere.rerank-l214-fail", "query": "capital l214-fb", "documents": ["Oslo", "Paris"], "top_n": 1, "fallbacks": ["bedrock/cohere.rerank-l214-fb"]}, {}, base=GW_L214B, auth=False)
+        rr = [x for x in got if x["path"] == "/rerank"]
+        bodies = [json.loads(x["body"]) for x in rr[-2:]]
+        queries = [x["queries"][0]["textQuery"]["text"] for x in bodies]
+        check("bedrock rerank: a fallback sends the request its own pre hooks made (the per-attempt pre hooks, as on the other rerank providers)",
+              s == 200 and queries == ["capital l214-zz", "capital l214-fb"] and "cohere.rerank-l214-fb" in rr[-1]["body"], (s, b[:200], queries))
+    finally:
+        stop(gw)
+        stop(gw2)
+        srv.shutdown()
+
+
 def main():
     unique_ports()
     build()
@@ -20686,6 +21125,9 @@ def main():
         # L210: request bodies freed once read, reservations behind their pace cut under contention, small bodies out of
         # the lone-body rule and the reserve only for tenants holding bytes: its own gateway (18376)
         l210_e2e(env)
+        # L213: async jobs beside the config and across nodes, sign-in counts across nodes, empty reservations cut early, the
+        # ungrouped keys notice: its own gateways (18382, restarted, and 18383)
+        l213_e2e(env)
         # L194: Hugging Face inference providers (chat, embeddings, speech, transcription, images), the CLI's agent sign-in
         # and default key, and the A2A v0.3 REST client: its own gateway (18344) and Hugging Face double (18345)
         l194_e2e(env)
@@ -20725,6 +21167,10 @@ def main():
         # vector store, A2A gRPC through tests/peer_paths.tov) and the write-stall limit of WebSockets on Bun.serve: its
         # own gateway (18380) and a Redis stand-in (18381)
         l212_e2e(env)
+        # L214: the AWS shared config file's profiles (role_arn chains, credential_process, SSO) for Bedrock and Vertex,
+        # the Maxim sink's attachments, and a Bedrock rerank fallback through its own pre hooks: its own gateways (18384,
+        # restarted per profile, and 18385)
+        l214_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

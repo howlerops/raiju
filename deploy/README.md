@@ -32,6 +32,10 @@ Raiju is not stateless. In the folder that holds `config.json` (`/app/data` in t
   with a key derived from `encryption_key`, else from `cluster.secret` with clustering on, else a key
   each node makes at its start (then a callback that reaches another node fails; a start with other
   nodes configured warns). Set `encryption_key` or clustering when several nodes serve SSO;
+- `config.json.jobs/` (async jobs, one 0600 file per job, removed when its result TTL ends) and
+  `config.json.provision-jobs.json` (the newest 50 user provisioning jobs), so a poll after a restart, or on a
+  node that shares the folder, finds the job; a node with its own folder asks its peers. A job whose gateway
+  stopped while it ran reads as failed about 45 s later;
 - `logs/` (the request log store, when `logs_store` is on) and `logs/audit/` (the audit log, when
   `audit` is on), private (0700 folders, 0600 files). An enabled store whose folder cannot be written
   stops the start;
@@ -143,7 +147,9 @@ reserved whole when the body is admitted (503 unread when it cannot fit, never p
 pace), and a chunked body is charged as its bytes arrive. Under contention a reservation whose body fell
 behind its pace (at its rate so far more than 10 s to go, a second after admission) is cut to what it has
 received plus a look-ahead (a 48th of the cap, 64 KB to 1 MB) and charged as its bytes arrive from then on,
-so clients that declare big lengths and send slowly or nothing do not hold the cap. A body whose credential was checked from the headers (a virtual key, a direct
+so clients that declare big lengths and send slowly or nothing do not hold the cap. A reservation that has
+received nothing may be cut 200 ms after admission, and a tenant that reconnects at once (a new reservation
+while it holds one, or within a second after one ended) gets no fresh grace. A body whose credential was checked from the headers (a virtual key, a direct
 provider key that is one of the configured keys, a sign-in) must keep `server.body_min_kb_per_second`
 (default 32, 0 off) after `server.body_rate_grace_seconds` (default 10), counted over each recent
 `server.body_rate_window_seconds` (default 30), and arrive whole within `server.body_max_seconds`
@@ -155,7 +161,8 @@ growing, fills the cap only up to `server.body_reserve_mb` (default a quarter; -
 so a new body that keeps its tenant within its share is admitted while others hold the budget, and one
 tenant cannot hold the whole budget with many keys. A tenant's first body may fill the cap, and small
 bodies in flight do not stop a lone big body. Give each customer's keys a
-`customer_id` (or a team) for this to count them together. A body whose credential was not checked (inference with auth off, the plugins' HTTP hooks, routes
+`customer_id` (or a team) for this to count them together; the gateway warns at start, and the dashboard
+shows a notice, when two or more virtual keys have neither. A body whose credential was not checked (inference with auth off, the plugins' HTTP hooks, routes
 that read their credential from the body) must arrive whole within `server.body_deadline_seconds`
 (default 30, 0 off) and, beside other bodies, shares `server.unchecked_body_mb` (default an eighth of
 the cap; -1 for no separate share), so an unauthenticated client cannot turn the authenticated big
@@ -183,11 +190,17 @@ A Bedrock key with neither an API key (`value`) nor `access_key`/`secret_key`, a
 `aws_workload_identity` (or an AWS `external_account` file), take the AWS SDK's default chain, as
 Bifrost does: the environment (`AWS_ACCESS_KEY_ID`, ...), an EKS IRSA web identity
 (`AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_ROLE_ARN`, which the EKS webhook sets for a service account
-annotated with `eks.amazonaws.com/role-arn`), the shared credentials file, ECS task roles and EKS
-Pod Identity (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` or `_FULL_URI`, which ECS and the Pod
-Identity agent set) and the EC2 instance profile (IMDSv2). The region falls back to the instance
-metadata's. On ECS the module's task role is the identity; give it the Bedrock permissions the keys
-need. `AWS_EC2_METADATA_DISABLED=true` skips the instance metadata.
+annotated with `eks.amazonaws.com/role-arn`), the selected profile of the shared config and
+credentials files (`AWS_PROFILE`, else `default`; `AWS_CONFIG_FILE` and `AWS_SHARED_CREDENTIALS_FILE`
+move them), ECS task roles and EKS Pod Identity (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` or
+`_FULL_URI`, which ECS and the Pod Identity agent set) and the EC2 instance profile (IMDSv2). A
+profile may hold static keys, `role_arn` with `source_profile` or `credential_source` (assumed through
+STS), `web_identity_token_file`, SSO (`sso_session`, or the legacy `sso_start_url`; run `aws sso login`
+where the gateway's `HOME` is, and the cached token is refreshed as the CLI refreshes it) or
+`credential_process` (run with `sh -c`). `mfa_serial` is refused: a server cannot prompt for the code.
+The region falls back to the profile's `region`, then to the instance metadata's. On ECS the module's
+task role is the identity; give it the Bedrock permissions the keys need.
+`AWS_EC2_METADATA_DISABLED=true` skips the instance metadata.
 
 ## Docker
 

@@ -1,0 +1,708 @@
+// The AWS shared config file (AWS_CONFIG_FILE or ~/.aws/config) and the shared credentials file read together, as
+// the AWS SDK's config.LoadDefaultConfig reads them for the default credential chain (Bifrost uses it for a Bedrock
+// key without credentials and for Vertex's aws_workload_identity). A profile is the [profile <name>] (or [default])
+// section of the config file with the [<name>] section of the credentials file over it. Its credentials are resolved
+// in the SDK's order (aws-sdk-go-v2 config/resolve_credentials.go resolveCredsFromProfile):
+//   source_profile (resolved first, then this profile's role assumed with what it gives; a profile naming itself
+//   gives its own static keys), static keys, credential_source (Environment, Ec2InstanceMetadata, EcsContainer),
+//   web_identity_token_file (with role_arn, assumed by AssumeRoleWithWebIdentity and not assumed again), SSO
+//   (sso_session with its [sso-session <name>] section, or the legacy sso_start_url and sso_region; with
+//   sso_account_id and sso_role_name), credential_process, then the container and the instance profile;
+//   and when the profile has role_arn, it is assumed (STS AssumeRole, signed with the credentials so far;
+//   external_id, role_session_name, duration_seconds, 900 s by default).
+// The profile's region is the region when nothing else names one. This module plans; awschain.tov runs the plan.
+import { readFileSync, writeFileSync } from "node:fs"
+import { getEnv } from "./config"
+import { sha1 } from "./ws"
+import { toHex, utf8 } from "./crypto"
+import { parseIsoUtcMs } from "./cloud_auth"
+import { amzDate } from "./providers/bedrock"
+import { deadline } from "./deadline"
+import { fields, rawStr, rawNum, quote, find } from "./json"
+
+export type Ini = Map<string, Map<string, string>>
+
+// What gives a profile its first credentials.
+export type BaseStep = {
+  kind: "static" | "env" | "imds" | "container" | "webid" | "sso" | "process"
+  accessKey: string
+  secretKey: string
+  sessionToken: string
+  // webid: the token file, the role and the session; process: the command
+  file: string
+  roleArn: string
+  session: string
+  command: string
+  // sso: the token cache key (the session name, or the start URL for the legacy form), the region, the account
+  // and role, and whether the token can be refreshed (a session's can)
+  ssoKey: string
+  ssoRegion: string
+  ssoAccount: string
+  ssoRole: string
+  ssoSession: bool
+  // the profile this step was read from
+  profile: string
+}
+
+// A role assumed on top of the credentials so far.
+export type RoleStep = { roleArn: string, externalId: string, session: string, durationSeconds: int, mfaSerial: string, profile: string }
+
+export type ProfilePlan = { base: BaseStep, roles: RoleStep[], region: string, error: string, found: bool }
+
+const DEFAULT_ROLE_SECONDS = 900
+
+// Sections of an INI file by name, with lower-cased keys. Comment lines (# or ;) and indented sub-keys are skipped.
+export function parseIni(text: string): Ini {
+  const out: Ini = new Map()
+  let cur = ""
+  let has = false
+  for (const raw of text.split("\n")) {
+    const line0 = raw.endsWith("\r") ? raw.slice(0, raw.byteLength - 1) : raw
+    const line = line0.trim()
+    if (line === "" || line.startsWith("#") || line.startsWith(";")) continue
+    if (line.startsWith("[") && line.endsWith("]")) {
+      cur = line.slice(1, line.byteLength - 1).trim()
+      has = true
+      if (!out.has(cur)) out.set(cur, new Map())
+      continue
+    }
+    // a nested value (an indented line under "s3 =") belongs to its parent key, which no credential reads
+    if (line0.startsWith(" ") || line0.startsWith("\t")) continue
+    if (!has) continue
+    const eq = line.indexOf("=")
+    if (eq < 0) continue
+    const k = line.slice(0, eq).trim().toLowerCase()
+    let v = line.slice(eq + 1).trim()
+    // an inline comment after whitespace
+    for (const mark of [" #", " ;", "\t#", "\t;"]) {
+      const at = v.indexOf(mark)
+      if (at >= 0) v = v.slice(0, at).trim()
+    }
+    const sec = out.get(cur)!
+    sec.set(k, v)
+    out.set(cur, sec)
+  }
+  return out
+}
+
+// A profile's values: the config file's [profile name] (or [default], or [profile default]) with the credentials
+// file's [name] over it. undefined when neither file has it.
+export function profileValues(config: Ini, creds: Ini, name: string): Map<string, string> | undefined {
+  let found = false
+  const out: Map<string, string> = new Map()
+  const names = name === "default" ? ["default", "profile default"] : ["profile " + name]
+  for (const n of names) {
+    const s = config.get(n)
+    if (s === undefined) continue
+    found = true
+    for (const k of s.keys()) out.set(k, s.get(k)!)
+  }
+  const c = creds.get(name)
+  if (c !== undefined) {
+    found = true
+    for (const k of c.keys()) out.set(k, c.get(k)!)
+  }
+  return found ? out : undefined
+}
+
+function val(p: Map<string, string>, k: string): string {
+  return p.get(k) ?? ""
+}
+
+function step(kind: "static" | "env" | "imds" | "container" | "webid" | "sso" | "process", profile: string): BaseStep {
+  return { kind: kind, accessKey: "", secretKey: "", sessionToken: "", file: "", roleArn: "", session: "", command: "", ssoKey: "", ssoRegion: "", ssoAccount: "", ssoRole: "", ssoSession: false, profile: profile }
+}
+
+function failed(msg: string): ProfilePlan {
+  return { base: step("imds", ""), roles: [], region: "", error: msg, found: true }
+}
+
+// The plan for a profile. found is false when neither file has the profile (the caller decides whether that is an
+// error); the container and the instance profile are the base of a profile that names no credentials, as in the SDK.
+export function planProfile(config: Ini, creds: Ini, name: string, env: (n: string) => string): ProfilePlan {
+  const p = profileValues(config, creds, name)
+  if (p === undefined) return { base: step("imds", ""), roles: [], region: "", error: `profile ${name} does not exist`, found: false }
+  const region = val(p, "region")
+  const visited: string[] = []
+  const r = planOf(config, creds, name, p, env, visited)
+  return { base: r.base, roles: r.roles, region: region, error: r.error, found: true }
+}
+
+function hasKeys(p: Map<string, string>): bool {
+  return val(p, "aws_access_key_id") !== "" && val(p, "aws_secret_access_key") !== ""
+}
+
+function staticOf(p: Map<string, string>, name: string): BaseStep {
+  let s = step("static", name)
+  s.accessKey = val(p, "aws_access_key_id")
+  s.secretKey = val(p, "aws_secret_access_key")
+  s.sessionToken = val(p, "aws_session_token")
+  return s
+}
+
+function roleOf(p: Map<string, string>, name: string): RoleStep | string {
+  const d = val(p, "duration_seconds")
+  let secs = DEFAULT_ROLE_SECONDS
+  if (d !== "") {
+    const n = parseInt(d)
+    if (n === undefined || n < 1) return `profile ${name}: duration_seconds must be a whole number of seconds, got ${d}`
+    secs = n
+  }
+  return { roleArn: val(p, "role_arn"), externalId: val(p, "external_id"), session: val(p, "role_session_name"), durationSeconds: secs, mfaSerial: val(p, "mfa_serial"), profile: name }
+}
+
+function planOf(config: Ini, creds: Ini, name: string, p: Map<string, string>, env: (n: string) => string, visited: string[]): { base: BaseStep, roles: RoleStep[], error: string } {
+  const none = step("imds", name)
+  if (visited.includes(name)) return { base: none, roles: [], error: `profile ${name}: source_profile forms a loop (${visited.join(" -> ")} -> ${name})` }
+  const seen = visited.concat([name])
+  const roleArn = val(p, "role_arn")
+  const source = val(p, "source_profile")
+  const credSource = val(p, "credential_source")
+  const webFile = val(p, "web_identity_token_file")
+  const sso = val(p, "sso_session") !== "" || val(p, "sso_start_url") !== "" || val(p, "sso_account_id") !== "" || val(p, "sso_role_name") !== ""
+  const process = val(p, "credential_process")
+  // a source profile with static keys gives them and is not followed further (its own role_arn is still assumed), as
+  // the SDK's setFromIniSections stops there
+  if (visited.length > 0 && hasKeys(p)) {
+    if (roleArn === "") return { base: staticOf(p, name), roles: [], error: "" }
+    const r0 = roleOf(p, name)
+    if (typeof r0 === "string") return { base: none, roles: [], error: r0 }
+    return { base: staticOf(p, name), roles: [r0], error: "" }
+  }
+  // the SDK takes one credential type per profile (validateCredentialType), and credential_source and a web identity
+  // need a role (validateCredentialsConfig)
+  let kinds = 0
+  for (const k of [source, credSource, process, webFile]) {
+    if (k !== "") kinds++
+  }
+  if (kinds > 1) return { base: none, roles: [], error: `profile ${name}: only one credential type may be specified per profile: source_profile, credential_source, credential_process or web_identity_token_file` }
+  if (credSource !== "" && roleArn === "") return { base: none, roles: [], error: `profile ${name}: credential_source needs role_arn` }
+  let base = none
+  let roles: RoleStep[] = []
+  if (source !== "") {
+    if (source === name) {
+      // a profile that is its own source gives its own static keys
+      if (!hasKeys(p)) return { base: none, roles: [], error: `profile ${name}: source_profile names itself but the profile has no static keys` }
+      base = staticOf(p, name)
+    } else {
+      const sp = profileValues(config, creds, source)
+      if (sp === undefined) return { base: none, roles: [], error: `profile ${name}: source_profile ${source} does not exist` }
+      const r = planOf(config, creds, source, sp, env, seen)
+      if (r.error !== "") return r
+      base = r.base
+      roles = r.roles
+    }
+  } else if (hasKeys(p)) {
+    base = staticOf(p, name)
+  } else if (credSource !== "") {
+    if (credSource === "Environment") base = step("env", name)
+    else if (credSource === "Ec2InstanceMetadata") base = step("imds", name)
+    else if (credSource === "EcsContainer") base = step("container", name)
+    else return { base: none, roles: [], error: `profile ${name}: credential_source ${credSource} is not Environment, Ec2InstanceMetadata or EcsContainer` }
+  } else if (webFile !== "") {
+    if (roleArn === "") return { base: none, roles: [], error: `profile ${name}: web_identity_token_file needs role_arn` }
+    let s = step("webid", name)
+    s.file = webFile
+    s.roleArn = roleArn
+    s.session = val(p, "role_session_name")
+    // the role is assumed by the web identity exchange itself
+    return { base: s, roles: [], error: "" }
+  } else if (sso) {
+    let s = step("sso", name)
+    const sessName = val(p, "sso_session")
+    s.ssoAccount = val(p, "sso_account_id")
+    s.ssoRole = val(p, "sso_role_name")
+    if (sessName !== "") {
+      const sec = config.get("sso-session " + sessName)
+      if (sec === undefined) return { base: none, roles: [], error: `profile ${name}: sso-session ${sessName} does not exist` }
+      const url = sec.get("sso_start_url") ?? ""
+      const reg = sec.get("sso_region") ?? ""
+      if (url === "" || reg === "") return { base: none, roles: [], error: `profile ${name}: sso-session ${sessName} needs sso_start_url and sso_region` }
+      // the profile's own legacy values must agree with the session's, as the SDK checks
+      if (val(p, "sso_region") !== "" && val(p, "sso_region") !== reg) return { base: none, roles: [], error: `profile ${name}: sso_region differs from sso-session ${sessName}` }
+      if (val(p, "sso_start_url") !== "" && val(p, "sso_start_url") !== url) return { base: none, roles: [], error: `profile ${name}: sso_start_url differs from sso-session ${sessName}` }
+      s.ssoKey = sessName
+      s.ssoRegion = reg
+      s.ssoSession = true
+    } else {
+      s.ssoKey = val(p, "sso_start_url")
+      s.ssoRegion = val(p, "sso_region")
+      if (s.ssoKey === "" || s.ssoRegion === "") return { base: none, roles: [], error: `profile ${name}: SSO needs sso_start_url and sso_region (or sso_session)` }
+    }
+    if (s.ssoAccount === "" || s.ssoRole === "") return { base: none, roles: [], error: `profile ${name}: SSO needs sso_account_id and sso_role_name` }
+    base = s
+  } else if (process !== "") {
+    let s = step("process", name)
+    s.command = process
+    base = s
+  } else if (env("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") !== "" || env("AWS_CONTAINER_CREDENTIALS_FULL_URI") !== "") {
+    base = step("container", name)
+  } else {
+    base = step("imds", name)
+  }
+  // a role_arn with nothing else is assumed with the container's or the instance profile's credentials, as in the SDK
+  if (roleArn !== "") {
+    const r = roleOf(p, name)
+    if (typeof r === "string") return { base: none, roles: [], error: r }
+    roles.push(r)
+  }
+  return { base: base, roles: roles, error: "" }
+}
+
+// Whether a plan names credentials of its own (not only the container or instance profile it falls back to): the
+// default profile's plan is used only then, so the chain's own container and instance metadata steps stay as they are.
+export function namesCredentials(p: ProfilePlan): bool {
+  return p.found && p.error === "" && (p.roles.length > 0 || (p.base.kind !== "imds" && p.base.kind !== "container"))
+}
+
+// ---- reading the files ----
+
+function readOr(path: string): string {
+  if (path === "") return ""
+  try {
+    return readFileSync(path, "utf8")
+  } catch (e) {
+    return ""
+  }
+}
+
+export function configPath(env: (n: string) => string): string {
+  const f = env("AWS_CONFIG_FILE")
+  if (f !== "") return f
+  const home = env("HOME")
+  return home === "" ? "" : home + "/.aws/config"
+}
+
+export function credentialsPath(env: (n: string) => string): string {
+  const f = env("AWS_SHARED_CREDENTIALS_FILE")
+  if (f !== "") return f
+  const home = env("HOME")
+  return home === "" ? "" : home + "/.aws/credentials"
+}
+
+function envOf(n: string): string {
+  return (getEnv(n) ?? "").trim()
+}
+
+// The plan of a profile from the files on disk.
+export function loadPlan(name: string): ProfilePlan {
+  const config = parseIni(readOr(configPath(envOf)))
+  const creds = parseIni(readOr(credentialsPath(envOf)))
+  return planProfile(config, creds, name, envOf)
+}
+
+// The selected profile's name: AWS_PROFILE, else "default".
+export function profileName(): string {
+  const p = envOf("AWS_PROFILE")
+  return p === "" ? "default" : p
+}
+
+// The selected profile's region from the config file ("" when it names none).
+export function profileRegion(): string {
+  const config = parseIni(readOr(configPath(envOf)))
+  const creds = parseIni(readOr(credentialsPath(envOf)))
+  const p = profileValues(config, creds, profileName())
+  if (p === undefined) return ""
+  return val(p, "region")
+}
+
+// ---- SSO ----
+
+export type SsoToken = { accessToken: string, expiresAtMs: f64, refreshToken: string, clientId: string, clientSecret: string, region: string }
+
+// The token cache file of an SSO session or start URL: ~/.aws/sso/cache/<sha1 hex of the key>.json.
+export function ssoCachePath(home: string, key: string): string {
+  return `${home}/.aws/sso/cache/${toHex(sha1(utf8(key)))}.json`
+}
+
+// A cached SSO token; throws when the file has no accessToken or expiresAt.
+export function parseSsoToken(text: string): SsoToken throws SyntaxError {
+  const fs = try fields(text)
+  const at = rawStr(fs, "accessToken") ?? ""
+  const exp = parseIsoUtcMs(rawStr(fs, "expiresAt") ?? "")
+  if (at === "" || exp === undefined) throw new SyntaxError("the cached SSO token has no accessToken or expiresAt")
+  return { accessToken: at, expiresAtMs: exp, refreshToken: rawStr(fs, "refreshToken") ?? "", clientId: rawStr(fs, "clientId") ?? "", clientSecret: rawStr(fs, "clientSecret") ?? "", region: rawStr(fs, "region") ?? "" }
+}
+
+// An RFC 3339 UTC time for the token cache (whole seconds).
+export function isoSeconds(ms: f64): string {
+  const d = amzDate(ms)
+  return `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}T${d.slice(9, 11)}:${d.slice(11, 13)}:${d.slice(13, 15)}Z`
+}
+
+// The token cache file after a refresh: the earlier file with the new access token, expiry and refresh token.
+export function refreshedCache(old: string, accessToken: string, expiresAtMs: f64, refreshToken: string): string {
+  let fs: { key: string, raw: string }[] = []
+  try {
+    fs = fields(old)
+  } catch (e) {
+    fs = []
+  }
+  const out: string[] = []
+  const set = (k: string, raw: string): void => {
+    for (let i = 0; i < fs.length; i++) {
+      if (fs[i]!.key === k) {
+        fs[i] = { key: k, raw: raw }
+        return
+      }
+    }
+    fs.push({ key: k, raw: raw })
+  }
+  set("accessToken", quote(accessToken))
+  set("expiresAt", quote(isoSeconds(expiresAtMs)))
+  if (refreshToken !== "") set("refreshToken", quote(refreshToken))
+  for (const f of fs) out.push(`${quote(f.key)}:${f.raw}`)
+  return "{" + out.join(",") + "}"
+}
+
+// The SSO portal's GetRoleCredentials URL: AWS_ENDPOINT_URL_SSO, AWS_ENDPOINT_URL, else portal.sso.<region>.
+export function ssoPortalUrl(region: string, account: string, role: string, env: (n: string) => string): string {
+  let base = env("AWS_ENDPOINT_URL_SSO")
+  if (base === "") base = env("AWS_ENDPOINT_URL")
+  if (base === "") base = region.startsWith("cn-") ? `https://portal.sso.${region}.amazonaws.com.cn` : `https://portal.sso.${region}.amazonaws.com`
+  if (base.endsWith("/")) base = base.slice(0, base.byteLength - 1)
+  return `${base}/federation/credentials?account_id=${account}&role_name=${role}`
+}
+
+// The SSO OIDC token endpoint (CreateToken): AWS_ENDPOINT_URL_SSO_OIDC, AWS_ENDPOINT_URL, else oidc.<region>.
+export function ssoOidcUrl(region: string, env: (n: string) => string): string {
+  let base = env("AWS_ENDPOINT_URL_SSO_OIDC")
+  if (base === "") base = env("AWS_ENDPOINT_URL")
+  if (base === "") base = region.startsWith("cn-") ? `https://oidc.${region}.amazonaws.com.cn` : `https://oidc.${region}.amazonaws.com`
+  if (base.endsWith("/")) base = base.slice(0, base.byteLength - 1)
+  return base + "/token"
+}
+
+export type RawCreds = { accessKey: string, secretKey: string, sessionToken: string, expiresAtMs: f64 }
+
+// The credentials of a GetRoleCredentials answer ({roleCredentials: {accessKeyId, secretAccessKey, sessionToken,
+// expiration (epoch ms)}}).
+export function parseRoleCredentials(text: string): RawCreds throws SyntaxError {
+  const fs = try fields(text)
+  const rc = find(fs, "roleCredentials")
+  if (rc === undefined || !rc.startsWith("{")) throw new SyntaxError(`sso: GetRoleCredentials answered without roleCredentials: ${rawStr(fs, "message") ?? text.slice(0, 200)}`)
+  const r = try fields(rc)
+  const ak = rawStr(r, "accessKeyId") ?? ""
+  const sk = rawStr(r, "secretAccessKey") ?? ""
+  if (ak === "" || sk === "") throw new SyntaxError("sso: the role credentials have no accessKeyId and secretAccessKey")
+  return { accessKey: ak, secretKey: sk, sessionToken: rawStr(r, "sessionToken") ?? "", expiresAtMs: rawNum(r, "expiration") ?? 9.0e15 }
+}
+
+async function http(method: string, url: string, hs: Record<string, string>, body: string): Promise<{ status: int, text: string }> throws Error {
+  const dl = deadline(10000)
+  try {
+    const res = method === "GET" ? try await fetch(url, { method: method, headers: hs, signal: dl.controller.signal }) : try await fetch(url, { method: method, headers: hs, body: body, signal: dl.controller.signal })
+    const text = try await res.text()
+    dl.finish()
+    return { status: res.status, text: text }
+  } catch (e) {
+    dl.finish()
+    throw e
+  }
+}
+
+const REFRESH_WINDOW_MS = 300000.0
+
+// The SSO access token for a step: the cached one, refreshed through SSO OIDC when it is within five minutes of its
+// expiry and the cache holds a refresh token (an sso-session's does), as the SDK's SSOTokenProvider does; the refreshed
+// token is written back to the cache file. A legacy token that has expired is an error ("run aws sso login").
+async function ssoToken(s: BaseStep, nowMs: f64): Promise<string> throws Error {
+  const home = envOf("HOME")
+  const path = ssoCachePath(home, s.ssoKey)
+  let text = ""
+  try {
+    text = try readFileSync(path, "utf8")
+  } catch (e) {
+    throw new Error(`sso: profile ${s.profile}: no cached SSO token at ${path} (run aws sso login)`)
+  }
+  const t = try parseSsoToken(text)
+  if (t.expiresAtMs - nowMs > REFRESH_WINDOW_MS) return t.accessToken
+  if (s.ssoSession && t.refreshToken !== "" && t.clientId !== "" && t.clientSecret !== "") {
+    const body = `{"clientId":${quote(t.clientId)},"clientSecret":${quote(t.clientSecret)},"grantType":"refresh_token","refreshToken":${quote(t.refreshToken)}}`
+    const r = try await http("POST", ssoOidcUrl(s.ssoRegion, envOf), { "content-type": "application/json", "accept": "application/json" }, body)
+    if (r.status === 200) {
+      const fs = try fields(r.text)
+      const at = rawStr(fs, "accessToken") ?? ""
+      const secs = rawNum(fs, "expiresIn") ?? 0.0
+      if (at !== "" && secs > 0.0) {
+        const exp = nowMs + secs * 1000.0
+        try {
+          writeFileSync(path, refreshedCache(text, at, exp, rawStr(fs, "refreshToken") ?? ""))
+        } catch (e) {
+          // the refreshed token still serves this call
+        }
+        return at
+      }
+    }
+    if (t.expiresAtMs > nowMs) return t.accessToken
+    throw new Error(`sso: profile ${s.profile}: the SSO token could not be refreshed (OIDC answered ${r.status}); run aws sso login`)
+  }
+  if (t.expiresAtMs > nowMs) return t.accessToken
+  throw new Error(`sso: profile ${s.profile}: the cached SSO token has expired; run aws sso login`)
+}
+
+// The role credentials of an SSO step (GetRoleCredentials with the cached access token).
+export async function ssoCreds(s: BaseStep): Promise<RawCreds> throws Error {
+  const token = try await ssoToken(s, Date.now())
+  const r = try await http("GET", ssoPortalUrl(s.ssoRegion, s.ssoAccount, s.ssoRole, envOf), { "x-amz-sso_bearer_token": token, "accept": "application/json" }, "")
+  if (r.status !== 200) throw new Error(`sso: GetRoleCredentials answered ${r.status}: ${r.text.slice(0, 200)}`)
+  return try parseRoleCredentials(r.text)
+}
+
+// ---- credential_process ----
+
+const EXIT_MARK = "\n__raiju_credential_process_exit="
+const PROCESS_TIMEOUT_MS = 60000
+
+// The command's output and exit status from what the wrapper printed (its output, then the mark and the status).
+export function splitExit(out: string): { output: string, status: int } {
+  let at = -1
+  let from = 0
+  while (true) {
+    const i = out.slice(from).indexOf(EXIT_MARK)
+    if (i < 0) break
+    at = from + i
+    from = at + 1
+  }
+  if (at < 0) return { output: out, status: -1 }
+  const n = parseInt(out.slice(at + EXIT_MARK.byteLength).trim())
+  return { output: out.slice(0, at), status: n ?? -1 }
+}
+
+// The credentials a credential_process printed ({Version: 1, AccessKeyId, SecretAccessKey, SessionToken,
+// Expiration}), checked as the SDK's processcreds checks them.
+export function parseProcessCreds(text: string): RawCreds throws SyntaxError {
+  const fs = try fields(text.trim())
+  const v = rawNum(fs, "Version")
+  if (v === undefined || v !== 1.0) throw new SyntaxError(`credential_process: the output's Version must be 1, got ${find(fs, "Version") ?? "none"}`)
+  const ak = rawStr(fs, "AccessKeyId") ?? ""
+  const sk = rawStr(fs, "SecretAccessKey") ?? ""
+  if (ak === "") throw new SyntaxError("credential_process: the output has no AccessKeyId")
+  if (sk === "") throw new SyntaxError("credential_process: the output has no SecretAccessKey")
+  const expText = rawStr(fs, "Expiration") ?? ""
+  let exp = 9.0e15
+  if (expText !== "") {
+    const e = parseIsoUtcMs(expText)
+    if (e === undefined) throw new SyntaxError(`credential_process: the Expiration ${expText} is not an RFC 3339 UTC time`)
+    exp = e
+  }
+  return { accessKey: ak, secretKey: sk, sessionToken: rawStr(fs, "SessionToken") ?? "", expiresAtMs: exp }
+}
+
+class ProcessRun {
+  out: u8[] = []
+  done = false
+  resolve: ((s: string) => void) | undefined = undefined
+
+  finish(): void {
+    if (this.done) return
+    this.done = true
+    let text = ""
+    try {
+      text = new TextDecoder().decode(this.out)
+    } catch (e) {
+      text = ""
+    }
+    const r = this.resolve
+    if (r !== undefined) r(text)
+  }
+}
+
+// Runs a credential_process through the shell, as the SDK runs it (sh -c), with its one-minute limit; the wrapper
+// prints the command's exit status after its output, since a non-zero status is an error.
+export async function processCreds(command: string): Promise<RawCreds> throws Error {
+  const run = new ProcessRun()
+  const wait = new Promise<string, Error>((resolve, reject) => {
+    run.resolve = resolve
+  })
+  const wrapper = "/bin/sh -c \"$1\"; printf '" + EXIT_MARK.replaceAll("\n", "\\n") + "%d\\n' \"$?\""
+  let sock: Socket<undefined> | undefined = undefined
+  try {
+    sock = try await Bun.spawnSocket({
+      cmd: ["/bin/sh", "-c", wrapper, "sh", command],
+      socket: {
+        data(s, bytes) {
+          for (const b of bytes) run.out.push(b)
+        },
+        close(s) {
+          run.finish()
+        },
+      },
+    })
+  } catch (e) {
+    throw new Error(`credential_process: could not start the shell: ${e.message}`)
+  }
+  // nothing is written to the command's input; its end is not shut either, as that closes the socket the output
+  // comes back on
+  const sk = sock
+  const timer = setTimeout(() => {
+    if (!run.done && sk !== undefined) sk.terminate()
+    run.finish()
+  }, PROCESS_TIMEOUT_MS)
+  const text = try await wait
+  clearTimeout(timer)
+  const r = splitExit(text)
+  if (r.status < 0) throw new Error(`credential_process: the command did not finish within ${PROCESS_TIMEOUT_MS / 1000} s`)
+  if (r.status !== 0) throw new Error(`credential_process: the command exited with status ${r.status}: ${r.output.trim().slice(0, 200)}`)
+  return try parseProcessCreds(r.output)
+}
+
+// ---- tests ----
+
+function envFrom(m: Map<string, string>): (n: string) => string {
+  return (n: string): string => m.get(n) ?? ""
+}
+
+const NOENV: Map<string, string> = new Map()
+
+test("an INI file reads into sections with lower-cased keys, skipping comments and nested values", () => {
+  const ini = parseIni("# top\n[default]\nRegion = us-west-2 # trailing\naws_access_key_id=AKIAIOSFODNN7EXAMPLE\ns3 =\n  max_concurrent_requests = 10\n\n[profile dev]\r\nrole_arn = arn:aws:iam::123456789012:role/dev\r\n; comment\n")
+  expect(ini.get("default")!.get("region")).toBe("us-west-2")
+  expect(ini.get("default")!.get("aws_access_key_id")).toBe("AKIAIOSFODNN7EXAMPLE")
+  expect(ini.get("default")!.has("max_concurrent_requests")).toBe(false)
+  expect(ini.get("profile dev")!.get("role_arn")).toBe("arn:aws:iam::123456789012:role/dev")
+})
+
+test("a profile is the config file's section with the credentials file's over it", () => {
+  const config = parseIni("[profile a]\nregion = eu-west-1\naws_access_key_id = FROMCONFIG\n[a]\nignored = yes\n")
+  const creds = parseIni("[a]\naws_access_key_id = FROMCREDS\naws_secret_access_key = s\n")
+  const p = profileValues(config, creds, "a")!
+  expect(p.get("aws_access_key_id")).toBe("FROMCREDS")
+  expect(p.get("region")).toBe("eu-west-1")
+  // a non-default section without "profile " in the config file is not the profile
+  expect(p.has("ignored")).toBe(false)
+  expect(profileValues(config, creds, "b")).toBe(undefined)
+  const d = profileValues(parseIni("[profile default]\nregion = ap-south-1\n"), parseIni(""), "default")!
+  expect(d.get("region")).toBe("ap-south-1")
+})
+
+test("role_arn with source_profile assumes the role on the source's credentials, in chain order", () => {
+  const config = parseIni("[profile base]\nregion = us-east-2\n[profile mid]\nrole_arn = arn:aws:iam::1:role/mid\nsource_profile = base\n[profile top]\nrole_arn = arn:aws:iam::1:role/top\nsource_profile = mid\nexternal_id = ext-1\nrole_session_name = sess\nduration_seconds = 1800\nregion = eu-central-1\n")
+  const creds = parseIni("[base]\naws_access_key_id = AKIAIOSFODNN7EXAMPLE\naws_secret_access_key = wJalrXUtnFEMI\n")
+  const p = planProfile(config, creds, "top", envFrom(NOENV))
+  expect(p.error).toBe("")
+  expect(p.region).toBe("eu-central-1")
+  expect(p.base.kind).toBe("static")
+  expect(p.base.accessKey).toBe("AKIAIOSFODNN7EXAMPLE")
+  expect(p.roles.length).toBe(2)
+  expect(p.roles[0]!.roleArn).toBe("arn:aws:iam::1:role/mid")
+  expect(p.roles[0]!.durationSeconds).toBe(900)
+  expect(p.roles[1]!.roleArn).toBe("arn:aws:iam::1:role/top")
+  expect(p.roles[1]!.externalId).toBe("ext-1")
+  expect(p.roles[1]!.session).toBe("sess")
+  expect(p.roles[1]!.durationSeconds).toBe(1800)
+  expect(namesCredentials(p)).toBe(true)
+})
+
+test("a profile that is its own source gives its own keys; loops and missing sources are errors", () => {
+  const self = planProfile(parseIni("[profile s]\nrole_arn = arn:aws:iam::1:role/s\nsource_profile = s\naws_access_key_id = A\naws_secret_access_key = B\n"), parseIni(""), "s", envFrom(NOENV))
+  expect(self.error).toBe("")
+  expect(self.base.kind).toBe("static")
+  expect(self.roles.length).toBe(1)
+  const loop = planProfile(parseIni("[profile x]\nrole_arn = r\nsource_profile = y\n[profile y]\nrole_arn = r\nsource_profile = x\n"), parseIni(""), "x", envFrom(NOENV))
+  expect(loop.error.includes("loop")).toBe(true)
+  const missing = planProfile(parseIni("[profile x]\nrole_arn = r\nsource_profile = nope\n"), parseIni(""), "x", envFrom(NOENV))
+  expect(missing.error).toBe("profile x: source_profile nope does not exist")
+  expect(planProfile(parseIni(""), parseIni(""), "ghost", envFrom(NOENV)).found).toBe(false)
+  // a bare role_arn is assumed with the instance profile's credentials
+  const bare = planProfile(parseIni("[profile r]\nrole_arn = arn:aws:iam::1:role/r\n"), parseIni(""), "r", envFrom(NOENV))
+  expect(bare.error).toBe("")
+  expect(bare.base.kind).toBe("imds")
+  expect(bare.roles.length).toBe(1)
+  const both = planProfile(parseIni("[profile r]\nrole_arn = x\nsource_profile = a\ncredential_source = Environment\n"), parseIni(""), "r", envFrom(NOENV))
+  expect(both.error.includes("only one")).toBe(true)
+  expect(planProfile(parseIni("[profile c]\ncredential_source = Environment\n"), parseIni(""), "c", envFrom(NOENV)).error).toBe("profile c: credential_source needs role_arn")
+  // a source with static keys stops the chain there, its own role still assumed; source_profile alone lends its keys
+  const stop = planProfile(parseIni("[profile top]\nrole_arn = r-top\nsource_profile = mid\n[profile mid]\nrole_arn = r-mid\nsource_profile = deep\naws_access_key_id = A\naws_secret_access_key = B\n"), parseIni(""), "top", envFrom(NOENV))
+  expect(stop.base.kind).toBe("static")
+  expect(stop.roles.map((r) => r.roleArn).join(",")).toBe("r-mid,r-top")
+  const lend = planProfile(parseIni("[profile l]\nsource_profile = k\n[profile k]\naws_access_key_id = A\naws_secret_access_key = B\n"), parseIni(""), "l", envFrom(NOENV))
+  expect(lend.base.kind).toBe("static")
+  expect(lend.roles.length).toBe(0)
+})
+
+test("credential_source, web identity, credential_process and the fallbacks", () => {
+  const cs = planProfile(parseIni("[profile c]\nrole_arn = arn:aws:iam::1:role/c\ncredential_source = Ec2InstanceMetadata\n"), parseIni(""), "c", envFrom(NOENV))
+  expect(cs.base.kind).toBe("imds")
+  expect(cs.roles.length).toBe(1)
+  expect(namesCredentials(cs)).toBe(true)
+  expect(planProfile(parseIni("[profile c]\ncredential_source = EcsContainer\nrole_arn = r\n"), parseIni(""), "c", envFrom(NOENV)).base.kind).toBe("container")
+  expect(planProfile(parseIni("[profile c]\ncredential_source = Environment\nrole_arn = r\n"), parseIni(""), "c", envFrom(NOENV)).base.kind).toBe("env")
+  expect(planProfile(parseIni("[profile c]\ncredential_source = Nope\nrole_arn = r\n"), parseIni(""), "c", envFrom(NOENV)).error.includes("not Environment")).toBe(true)
+  const w = planProfile(parseIni("[profile w]\nweb_identity_token_file = /t\nrole_arn = arn:aws:iam::1:role/w\nrole_session_name = ws\n"), parseIni(""), "w", envFrom(NOENV))
+  expect(w.base.kind).toBe("webid")
+  expect(w.base.file).toBe("/t")
+  expect(w.base.session).toBe("ws")
+  expect(w.roles.length).toBe(0)
+  const pr = planProfile(parseIni("[profile p]\ncredential_process = /usr/bin/creds --json\n"), parseIni(""), "p", envFrom(NOENV))
+  expect(pr.base.kind).toBe("process")
+  expect(pr.base.command).toBe("/usr/bin/creds --json")
+  // a profile with only a region names no credentials: the chain's own steps stay
+  const r = planProfile(parseIni("[default]\nregion = us-west-1\n"), parseIni(""), "default", envFrom(NOENV))
+  expect(r.base.kind).toBe("imds")
+  expect(namesCredentials(r)).toBe(false)
+  const m: Map<string, string> = new Map()
+  m.set("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/v2/creds")
+  expect(planProfile(parseIni("[default]\nregion = us-west-1\n"), parseIni(""), "default", envFrom(m)).base.kind).toBe("container")
+})
+
+test("SSO profiles: an sso-session section or the legacy keys", () => {
+  const config = parseIni("[profile s]\nsso_session = corp\nsso_account_id = 111122223333\nsso_role_name = Dev\n[sso-session corp]\nsso_start_url = https://corp.awsapps.com/start\nsso_region = us-east-1\n[profile legacy]\nsso_start_url = https://corp.awsapps.com/start\nsso_region = eu-west-1\nsso_account_id = 1\nsso_role_name = R\n[profile bad]\nsso_session = nope\nsso_account_id = 1\nsso_role_name = R\n")
+  const s = planProfile(config, parseIni(""), "s", envFrom(NOENV))
+  expect(s.error).toBe("")
+  expect(s.base.kind).toBe("sso")
+  expect(s.base.ssoKey).toBe("corp")
+  expect(s.base.ssoRegion).toBe("us-east-1")
+  expect(s.base.ssoSession).toBe(true)
+  const l = planProfile(config, parseIni(""), "legacy", envFrom(NOENV))
+  expect(l.base.ssoKey).toBe("https://corp.awsapps.com/start")
+  expect(l.base.ssoSession).toBe(false)
+  expect(planProfile(config, parseIni(""), "bad", envFrom(NOENV)).error).toBe("profile bad: sso-session nope does not exist")
+  // the cache file is named by the SHA-1 of the session name (the AWS CLI's naming)
+  expect(ssoCachePath("/h", "corp")).toBe("/h/.aws/sso/cache/" + toHex(sha1(utf8("corp"))) + ".json")
+  const m: Map<string, string> = new Map()
+  expect(ssoPortalUrl("us-east-1", "1", "R", envFrom(m))).toBe("https://portal.sso.us-east-1.amazonaws.com/federation/credentials?account_id=1&role_name=R")
+  m.set("AWS_ENDPOINT_URL_SSO", "http://127.0.0.1:9/sso/")
+  expect(ssoPortalUrl("us-east-1", "1", "R", envFrom(m))).toBe("http://127.0.0.1:9/sso/federation/credentials?account_id=1&role_name=R")
+  expect(ssoOidcUrl("eu-west-1", envFrom(NOENV))).toBe("https://oidc.eu-west-1.amazonaws.com/token")
+})
+
+test("SSO tokens and role credentials read; a refreshed token keeps the cache's other fields", () => {
+  const t = try parseSsoToken(`{"startUrl":"https://x","region":"us-east-1","accessToken":"tok","expiresAt":"2026-01-01T00:00:00Z","refreshToken":"rt","clientId":"cid","clientSecret":"cs"}`)
+  expect(t.accessToken).toBe("tok")
+  expect(t.refreshToken).toBe("rt")
+  let threw = false
+  try {
+    parseSsoToken(`{"accessToken":"x"}`)
+  } catch (e) {
+    threw = true
+  }
+  expect(threw).toBe(true)
+  const c = try parseRoleCredentials(`{"roleCredentials":{"accessKeyId":"AK","secretAccessKey":"SK","sessionToken":"ST","expiration":1767225600000}}`)
+  expect(c.accessKey).toBe("AK")
+  expect(c.expiresAtMs).toBe(1767225600000.0)
+  const r = refreshedCache(`{"startUrl":"https://x","accessToken":"old","expiresAt":"2020-01-01T00:00:00Z","clientId":"cid"}`, "new", 1767225600000.0, "rt2")
+  expect(r).toBe(`{"startUrl":"https://x","accessToken":"new","expiresAt":"2026-01-01T00:00:00Z","clientId":"cid","refreshToken":"rt2"}`)
+})
+
+test("credential_process output is checked as the SDK checks it, and the exit status is read after it", () => {
+  const c = try parseProcessCreds(`{"Version": 1, "AccessKeyId": "AK", "SecretAccessKey": "SK", "SessionToken": "ST", "Expiration": "2099-01-01T00:00:00Z"}`)
+  expect(c.sessionToken).toBe("ST")
+  expect(c.expiresAtMs < 9.0e15).toBe(true)
+  expect((try parseProcessCreds(`{"Version":1,"AccessKeyId":"AK","SecretAccessKey":"SK"}`)).expiresAtMs).toBe(9.0e15)
+  const bad = [`{"Version":2,"AccessKeyId":"AK","SecretAccessKey":"SK"}`, `{"Version":1,"SecretAccessKey":"SK"}`, `{"Version":1,"AccessKeyId":"AK","SecretAccessKey":"SK","Expiration":"soon"}`]
+  for (const b of bad) {
+    let threw = false
+    try {
+      parseProcessCreds(b)
+    } catch (e) {
+      threw = true
+    }
+    expect(threw).toBe(true)
+  }
+  const s = splitExit("{\"a\":1}\n__raiju_credential_process_exit=0\n")
+  expect(s.status).toBe(0)
+  expect(s.output).toBe("{\"a\":1}")
+  expect(splitExit("oops\n__raiju_credential_process_exit=3\n").status).toBe(3)
+  expect(splitExit("cut short").status).toBe(-1)
+})
