@@ -1,5 +1,5 @@
 #!/bin/sh
-# Checks patches 0001-0010, 0012, 0013, 0015, 0016, 0017, 0019, 0020, 0021 and 0022 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
+# Checks patches 0001-0010, 0012, 0013, 0015, 0016, 0017, 0019, 0020, 0021, 0022 and 0023 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
 # (or `make tov-test`). Each program prints "ok" lines and "FAIL" lines; a run passes when no line
 # fails and the expected number of "ok" lines appears.
 set -eu
@@ -201,5 +201,14 @@ fi
 TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/random_seed.tov" -o "$OUT/random_seed" >/dev/null
 python3 "$DIR/random_seed_client.py" "$OUT/random_seed" > "$OUT/random_seed.out" || true
 expect "$OUT/random_seed.out" 5 "Math.random seeded per process and per worker"
+
+# continue releases the loop body's locals: no reference kept per continue, kept values intact (patch 0023; Linux /proc)
+if [ -r /proc/self/status ]; then
+  TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/continue_release.tov" -o "$OUT/continue_release" >/dev/null
+  "$OUT/continue_release" > "$OUT/continue_release.out"
+  expect "$OUT/continue_release.out" 6 "continue releases the loop body's locals"
+else
+  echo "skipped: continue release (needs /proc)"
+fi
 
 echo "tov-patches tests passed"

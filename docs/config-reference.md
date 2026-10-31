@@ -9,7 +9,7 @@ for each element of a list. Descriptions are the comments in the source; default
 has one. The command-line flags (`-app-dir`, `-config`, `-host`, `-port`, `-workers`, `-server`, `-mode`,
 `-healthcheck`) are in the README.
 
-1379 keys (578 with a description), and 38 Bifrost keys read through config_compat.
+1381 keys (581 with a description), and 38 Bifrost keys read through config_compat.
 
 ## Sections
 
@@ -1194,7 +1194,9 @@ Raiju's own MCP server at /mcp, which serves the gateway's tools to MCP clients.
 | Key | Type | Description |
 |---|---|---|
 | `mcp_server` | object | Raiju's own MCP server at /mcp, which serves the gateway's tools to MCP clients. |
-| `mcp_server.enabled` | bool |  |
+| `mcp_server.enabled` | bool | false turns /mcp and /mcp/{name} off (404) |
+| `mcp_server.max_sessions` | int | sessions a process keeps in all (default 10000; below 1 the default) |
+| `mcp_server.max_sessions_per_caller` | int | sessions one caller keeps: a virtual key, the user of a user-mode token, else the client address (IPv6 by /64) (default 1000; below 1 the default) |
 
 ## virtual_mcps
 

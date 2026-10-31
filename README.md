@@ -311,7 +311,9 @@ caches and `/metrics` (summed) through a private share folder, `$TMPDIR/raiju-<p
 Request-log queries are shared only when the log store is shared; otherwise each worker answers from its own log. Usage
 reaches the other workers within about 200 ms, so a burst spread over several
 workers can pass a limit by a few requests, as across cluster nodes. Each
-worker starts its own stdio MCP servers.
+worker starts its own stdio MCP servers. The MCP server's sessions (`Mcp-Session-Id`, 30 minutes idle) are kept in each
+process, at most `mcp_server.max_sessions_per_caller` (1000) per virtual key, MCP user or client address and
+`mcp_server.max_sessions` (10000) in all; a new session past either drops the oldest idle one.
 
 A config change saved by one worker (through the API, say) is applied by every worker before the request is answered,
 so a deleted virtual key stops working on all of them at once; saves made at the same time on several workers are
@@ -375,7 +377,10 @@ bodies to a broker for 20 s, and fails when either grows past 40 MB (before L210
 from 20 to 836 MB in 100 s). `make soak-websockets` (`tests/soak/websockets.py`) opens and closes realtime sessions
 with a key, Responses sockets (with a response and bare) and live sessions in a loop on both servers and fails past
 256 bytes per session on the RSS slope (before L217 a closed session left 2 to 6 KB, and live sessions were refused
-for good after 10,000). CI runs all three in the memory soak job. Measured on a 4-core VM (one worker, about 600 requests a second plus 100 slow streams):
+for good after 10,000). `make soak-slope` (`tests/soak/slope.py`) drives small chats with a virtual key, the request
+log and the log store on, as fast as one worker answers (about 250k to 300k per server), and fails when RSS grows by
+more than 10 bytes a request after warm-up, on Bun and http1 (before L216 about 100 bytes a request stayed resident:
+Tov's `continue` did not release the loop body's locals, tov-patches/0023). CI runs all four in the memory soak job. Measured on a 4-core VM (one worker, about 600 requests a second plus 100 slow streams):
 
 | | Before L182 | After |
 |---|---|---|
@@ -405,6 +410,7 @@ make e2e     # gateway against a mock upstream, on both servers
 make soak    # memory soak of one worker; fails when RSS grows (ports 18320-18321)
 make soak-bodies  # big request bodies to one worker and a broker; fails when RSS grows (ports 18320, 18321, 18377)
 make soak-websockets  # WebSocket sessions opened and closed on both servers; fails on the RSS slope (ports 18320-18321)
+make soak-slope   # small chats on both servers; fails on a per-request RSS slope (ports 18388-18389)
 make smoke   # opt-in: real providers, for each one with credentials in the environment (below)
 make openapi-check # docs/openapi/management.yaml against a probe gateway
 make parity-count  # recount docs/parity.md and refresh its Summary table
@@ -421,7 +427,7 @@ make bench
 `.github/workflows/ci.yml` runs on pull requests and pushes to `main`: it builds the patched
 compiler once (cached by Tov's revision and a hash of `tov-patches/` and `scripts/build-tov.sh`),
 then check, unit, openapi-check, web-check and the parity count in one job, e2e on Bun and on
-http1, `make ui` in Chromium, and the memory soaks (`make soak`, `make soak-bodies`, `make soak-websockets`); logs are uploaded when a job fails. The Docker image is built
+http1, `make ui` in Chromium, and the memory soaks (`make soak`, `make soak-bodies`, `make soak-websockets`, `make soak-slope`); logs are uploaded when a job fails. The Docker image is built
 (no push) on pull requests and on `main`, booted the way the Helm chart runs it (`tests/image_smoke.py`: read-only
 root filesystem, non-root, /health, /ready, a chat through a mock upstream) and scanned with trivy (a fixable
 critical or high CVE fails it; the vulnerability database comes from ghcr.io or public.ecr.aws and is cached). `scripts/ci.sh` runs the same stages locally: `scripts/ci.sh` for all

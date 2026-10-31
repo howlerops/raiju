@@ -11,11 +11,21 @@ session. It sets up the machine, explains the lead/worker loop and points at the
 Worker briefs start from [handoff/worker-prompt-template.md](handoff/worker-prompt-template.md);
 the rules all workers follow are in [handoff/worker-brief.md](handoff/worker-brief.md).
 
-Branch: `claude/affectionate-shannon-pjwi5z`. Waves 1 to 29 are on `main` (PR howlerops/raiju#11).
-The branch carries wave 30 (L210 and L211).
+Branch: `claude/affectionate-shannon-pjwi5z`. Waves 1 to 32 are on `main` (PRs howlerops/raiju#11 and
+howlerops/raiju#13).
 
 ## Where things stand
 
+- Waves 31 and 32 (L212 to L219): L212 to L214 closed the gaps listed after wave 30 (connect-time address checks on
+  raw sockets and a write-stall limit on Bun.serve WebSockets through Tov patch 0022; async and provisioning jobs that
+  survive restarts and cross nodes, cluster-wide sign-in throttling; the AWS default chain and ~/.aws/config
+  profiles and the parity tail). L215 runs the Docker image job on pull requests: build, a boot smoke as the chart
+  runs it (tests/image_smoke.py) and a trivy scan, green. The seventh re-audit
+  (docs/audits/production-reaudit-7-2026-10-31.md) found two leaks and four P1s, all fixed: about 50 bytes per
+  keyed inference request (a Tov compiler bug, `continue` not releasing loop locals, fixed by patch 0023; L216),
+  2 to 16 KB per closed WebSocket session (L217), reservation cuts (L218) and uncapped MCP sessions (L219). CI's
+  memory soak job now runs four soaks (`soak`, `soak-bodies`, `soak-websockets`, `soak-slope`). Behaviour changes
+  are in docs/behaviour-changes-wave-31.md.
 - Wave 30 (L210, L211): the sixth re-audit (docs/audits/production-reaudit-6-2026-10-26.md) found a memory leak since
   wave 26 (every body over 64 KB stayed resident); it is fixed and `make soak-bodies` in the CI soak job fails on RSS
   growth. Declared-length reservations are cut when behind pace, and small requests no longer block a lone big body.
@@ -95,21 +105,23 @@ The branch carries wave 30 (L210 and L211).
   priors and classifier training, the gateway wiring, outcomes with credibility learning, budget
   pacing and escalation, and the Crews tab with metrics. The price table was regenerated from the
   current Bifrost datasheet.
-- docs/parity.md counts 567 parity rows: done 531, partial 12, missing 0, out of scope 15,
+- docs/parity.md counts 567 parity rows: done 532, partial 11, missing 0, out of scope 15,
   n/a 9, plus 42 Raiju-only extras.
-- Tests at handoff (compiler from tov-patches 0001 to 0010, 0012, 0013, 0015 to 0017, 0019 to 0021): `make unit` 2,499 passed,
+- Tests at handoff (compiler from tov-patches 0001 to 0010, 0012, 0013, 0015 to 0017, 0019 to 0023): `make unit` 2,535 passed,
   0 failed, plus the Python tests (gen_pricing, the h2/gRPC interop suite, crew_priors,
   test_deploy, test_gen_config_doc); e2e "all passed" on Bun and http1; `make ui` all passed;
-  `make openapi-check` ok; `make web-check` and `make config-doc-check` up to date. Helm lint and
-  terraform validate pass; the Docker image was not built here (no daemon).
+  `make openapi-check` ok; `make web-check` and `make config-doc-check` up to date; the four memory soaks pass
+  (slope 5 B/request on Bun, 4 on http1). Helm lint and terraform validate pass; the Docker image is built, boot-tested
+  and scanned in CI (no Docker daemon here).
 - Test tools now needed: `pip install grpcio protobuf h2 numpy scipy`, and Go with GOTOOLCHAIN=go1.26.9 for
   the A2A gRPC e2e client (tests/a2a_grpc_client; e2e skips it if go is missing).
-- The Tov runtime carries fourteen patches (`tov-patches/`): 0001 to 0004, 0005 WAMR (WASM
+- The Tov runtime carries sixteen patches (`tov-patches/`): 0001 to 0004, 0005 WAMR (WASM
   plugins), 0006 libdatachannel (WebRTC), 0007 fetch pool and upstream HTTP/2 (nghttp2), 0008
   streamed request bodies, 0009 node:fs rename and fsync, 0010 a WASM wall-clock limit, 0012
   server lifecycle (graceful stop, timeouts, connection cap), 0013 the fetch peer address policy,
   0015 TLS client certificates, Request.signal and gunzip, 0016 a small fetch input buffer, 0017
-  server.requestIP, 0019 worker respawn after SIGKILL and Bun.plainAlloc, 0020 flockSync, 0021 random seeding. 0011, 0014 and 0018 are
+  server.requestIP, 0019 worker respawn after SIGKILL and Bun.plainAlloc, 0020 flockSync, 0021 random seeding, 0022 the raw-socket address policy and the WebSocket write-stall
+  limit, 0023 `continue` releasing loop locals (a compiler fix). 0011, 0014 and 0018 are
   unused. They apply in order only; `make tov` rebuilds the compiler.
 - Admin UI: SolidJS 2.0 RC in `web/`, embedded through the committed `src/ui_assets.tov`;
   charts with zoom and series toggles, MCP access and virtual MCP screens, role-aware actions
@@ -126,18 +138,16 @@ The branch carries wave 30 (L210 and L211).
 
 ## What's next
 
-Run the staging validation kit (docs/staging-validation.md) on real infrastructure: it needs an AWS sandbox
-account, provider API keys and an Okta or Entra developer tenant. Then re-audit against what it finds.
+Real tests on real infrastructure, from another machine: run the staging validation kit (docs/staging-validation.md,
+tests/staging, the manual staging workflow, deploy/terraform/examples/staging). It needs an AWS sandbox account,
+provider API keys and an Okta or Entra developer tenant, and covers what no test here can: flock on EFS/NFS, real
+rolling upgrades, memory under real traffic, real identity providers, multi-node networking and the ECS module
+applied on AWS. Then re-audit against what it finds.
 
-- Raw-socket connections (A2A gRPC, Redis/Valkey vector stores, realtime WebSockets to providers)
-  have no connect-time address check; Bun.serve has no write-stall limit on upgraded sockets.
-- Provisioning jobs and async jobs do not cross nodes or survive restarts; sign-in throttle counts
-  are per node.
 - Real providers: `make smoke` has never run against real keys (none in this environment).
-- Deployment: build and scan the image, install the chart on a real cluster and apply the ECS
-  module on AWS (both are checked only by lint, terraform validate and mock-provider tests).
 - Crew routing: fit real priors and a classifier from your own evaluation data.
-- Upstream: offer tov-patches/upstream to Tov (0013, 0015, 0016, 0017, 0019, 0020 and 0021 have no write-up yet).
+- Upstream: offer tov-patches/upstream to Tov (0013, 0015, 0016, 0017, 0019 to 0022 have no write-up yet; 0023 is
+  compiler-bugs C10).
 
 ## Owner decisions after wave 22 (2026-10-24)
 

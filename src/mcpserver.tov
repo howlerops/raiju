@@ -265,7 +265,7 @@ function failPlan(status: int, id: string, code: int, message: string): Plan {
 
 // Decides every reply to one POST without running tools. Tool calls come back as
 // pending items for handleMcp to run, in order.
-export function planMcp(body: string, sessionId: string | undefined, tools: ExposedTool[], store: SessionStore, nowMs: f64, instructions?: string): Plan {
+export function planMcp(body: string, sessionId: string | undefined, tools: ExposedTool[], store: SessionStore, nowMs: f64, instructions?: string, owner?: string): Plan {
   const t = body.trim()
   const batch = t.startsWith("[")
   let texts: string[] = [t]
@@ -315,7 +315,7 @@ export function planMcp(body: string, sessionId: string | undefined, tools: Expo
     }
     if (m.method === "initialize") {
       const init = buildInitialize(m.params, instructions)
-      const s = store.create(init.version, nowMs)
+      const s = store.create(init.version, nowMs, owner)
       if (s === undefined) {
         items.push({ kind: "reply", text: rpcError(m.id, -32603, "could not create a session") })
         status = 500
@@ -356,9 +356,10 @@ async function runCall(id: string, name: string, argumentsJson: string, run: Too
 }
 
 // Handles one HTTP POST to the MCP endpoint. tools must be the list already filtered
-// for the caller's virtual key; run is only called with names from that list.
-export async function handleMcp(body: string, sessionId: string | undefined, tools: ExposedTool[], run: ToolRunner, store: SessionStore, nowMs: f64, instructions?: string): Promise<McpReply> {
-  const plan = planMcp(body, sessionId, tools, store, nowMs, instructions)
+// for the caller's virtual key; run is only called with names from that list. owner names the caller a new
+// session counts against (SessionStore caps).
+export async function handleMcp(body: string, sessionId: string | undefined, tools: ExposedTool[], run: ToolRunner, store: SessionStore, nowMs: f64, instructions?: string, owner?: string): Promise<McpReply> {
+  const plan = planMcp(body, sessionId, tools, store, nowMs, instructions, owner)
   const parts: string[] = []
   for (const it of plan.items) {
     if (it.kind === "reply") parts.push(it.text)
@@ -391,26 +392,70 @@ function matchesAny(patterns: string[], name: string): bool {
   return false
 }
 
-type Entry = { session: Session, seenMs: f64 }
+type Entry = { session: Session, seenMs: f64, owner: string }
+
+// The session caps of a process when the config names none (mcp_server.max_sessions and
+// max_sessions_per_caller). Bifrost's MCP server keeps no sessions, so these are Raiju's own.
+export const DEFAULT_MAX_SESSIONS: int = 10000
+export const DEFAULT_MAX_SESSIONS_PER_CALLER: int = 1000
+
+// One caller's session ids (a class, so the map holds it by reference).
+class OwnedIds {
+  ids: string[] = []
+}
 
 // Sessions of this process, in memory. A session expires when it has been idle longer
-// than the ttl; get() counts as activity.
+// than the ttl; get() counts as activity. A caller (owner: its key, user or address) holds at
+// most maxPerOwner sessions and the process maxTotal; a new session past either drops the
+// oldest idle one. Every use appends the session to a log in the order of use, so expiry and
+// eviction read from its front instead of scanning every session (re-audit 7 P1-3); a line a
+// later use left behind no longer matches its entry and is skipped.
 export class SessionStore {
   private entries: Map<string, Entry> = new Map()
+  private owners: Map<string, OwnedIds> = new Map()
+  private logIds: string[] = []
+  private logSeen: f64[] = []
+  private head: int = 0
+  private maxTotal: int = DEFAULT_MAX_SESSIONS
+  private maxPerOwner: int = DEFAULT_MAX_SESSIONS_PER_CALLER
 
   constructor(readonly ttlMs: f64) {}
 
-  // A new session under a random id. Undefined when the random source fails.
-  create(protocolVersion: string, nowMs: f64): Session | undefined {
+  // Sets the caps; a value below 1 keeps the default. Lower caps apply from the next session.
+  limit(maxTotal: int, maxPerOwner: int): void {
+    this.maxTotal = maxTotal >= 1 ? maxTotal : DEFAULT_MAX_SESSIONS
+    this.maxPerOwner = maxPerOwner >= 1 ? maxPerOwner : DEFAULT_MAX_SESSIONS_PER_CALLER
+  }
+
+  // A new session under a random id for owner. Undefined when the random source fails.
+  create(protocolVersion: string, nowMs: f64, owner?: string): Session | undefined {
     this.expire(nowMs)
+    const who = owner ?? ""
     let id = ""
     try {
       id = secureHex(32)
     } catch (e) {
       return undefined
     }
+    // make room under the caller's cap, then under the process's
+    const mine = this.owners.get(who)
+    if (mine !== undefined) {
+      while (mine.ids.length >= this.maxPerOwner) {
+        if (!this.dropOldestOf(mine)) break
+      }
+    }
+    while (this.entries.size >= this.maxTotal) {
+      if (!this.dropOldest()) break
+    }
     const s: Session = { id: id, protocolVersion: protocolVersion, initialized: false, createdMs: nowMs }
-    this.entries.set(id, { session: s, seenMs: nowMs })
+    this.entries.set(id, { session: s, seenMs: nowMs, owner: who })
+    let held = this.owners.get(who)
+    if (held === undefined) {
+      held = new OwnedIds()
+      this.owners.set(who, held)
+    }
+    held.ids.push(id)
+    this.logUse(id, nowMs)
     return s
   }
 
@@ -419,10 +464,13 @@ export class SessionStore {
     const e = this.entries.get(id)
     if (e === undefined) return undefined
     if (nowMs - e.seenMs > this.ttlMs) {
-      this.entries.delete(id)
+      this.drop(id)
       return undefined
     }
-    this.entries.set(id, { session: e.session, seenMs: nowMs })
+    if (e.seenMs !== nowMs) {
+      this.entries.set(id, { session: e.session, seenMs: nowMs, owner: e.owner })
+      this.logUse(id, nowMs)
+    }
     return e.session
   }
 
@@ -430,29 +478,127 @@ export class SessionStore {
   markInitialized(id: string, nowMs: f64): void {
     const s = this.get(id, nowMs)
     if (s === undefined) return
+    const e = this.entries.get(id)
+    if (e === undefined) return
     const done: Session = { id: s.id, protocolVersion: s.protocolVersion, initialized: true, createdMs: s.createdMs }
-    this.entries.set(id, { session: done, seenMs: nowMs })
+    this.entries.set(id, { session: done, seenMs: e.seenMs, owner: e.owner })
   }
 
   delete(id: string): void {
-    this.entries.delete(id)
+    this.drop(id)
   }
 
-  // Drops the sessions idle past the ttl. Returns how many were dropped.
+  // Drops the sessions idle past the ttl, from the front of the use log. Returns how many were dropped.
   expire(nowMs: f64): int {
     let n = 0
-    for (const id of this.entries.keys()) {
+    while (this.head < this.logIds.length) {
+      const id = this.logIds[this.head]!
+      const seen = this.logSeen[this.head]!
       const e = this.entries.get(id)
-      if (e !== undefined && nowMs - e.seenMs > this.ttlMs) {
-        this.entries.delete(id)
+      if (e !== undefined && e.seenMs === seen) {
+        if (nowMs - seen <= this.ttlMs) break
+        this.drop(id)
         n += 1
       }
+      this.head += 1
     }
+    this.compact()
     return n
   }
 
   count(): int {
-    return this.entries.keys().length
+    return this.entries.size
+  }
+
+  // Sessions owner holds.
+  countOf(owner: string): int {
+    const o = this.owners.get(owner)
+    return o === undefined ? 0 : o.ids.length
+  }
+
+  // Lines in the use log (it stays within twice the sessions plus 64).
+  logLength(): int {
+    return this.logIds.length - this.head
+  }
+
+  private logUse(id: string, nowMs: f64): void {
+    this.logIds.push(id)
+    this.logSeen.push(nowMs)
+    this.compact()
+  }
+
+  private drop(id: string): void {
+    const e = this.entries.get(id)
+    if (e === undefined) return
+    this.entries.delete(id)
+    const o = this.owners.get(e.owner)
+    if (o === undefined) return
+    const i = o.ids.indexOf(id)
+    if (i >= 0) {
+      // order does not matter here: the last id takes the dropped one's place
+      const last = o.ids.pop()!
+      if (i < o.ids.length) o.ids[i] = last
+    }
+    if (o.ids.length === 0) this.owners.delete(e.owner)
+  }
+
+  // Drops the session idle longest. False when there is none.
+  private dropOldest(): bool {
+    while (this.head < this.logIds.length) {
+      const id = this.logIds[this.head]!
+      const seen = this.logSeen[this.head]!
+      this.head += 1
+      const e = this.entries.get(id)
+      if (e !== undefined && e.seenMs === seen) {
+        this.drop(id)
+        return true
+      }
+    }
+    return false
+  }
+
+  // Drops the session of o idle longest (a scan of one caller's sessions, at most its cap).
+  private dropOldestOf(o: OwnedIds): bool {
+    let best = ""
+    let bestSeen = 0.0
+    for (const id of o.ids) {
+      const e = this.entries.get(id)
+      if (e === undefined) continue
+      if (best === "" || e.seenMs < bestSeen) {
+        best = id
+        bestSeen = e.seenMs
+      }
+    }
+    if (best === "") return false
+    this.drop(best)
+    return true
+  }
+
+  // Keeps the log near the live sessions: the read front is cut off once it is half the log, and
+  // lines left behind by later uses are dropped once they outnumber the sessions.
+  private compact(): void {
+    const len = this.logIds.length
+    if (this.head > 64 && this.head * 2 > len) {
+      this.logIds = this.logIds.slice(this.head)
+      this.logSeen = this.logSeen.slice(this.head)
+      this.head = 0
+      return
+    }
+    if (len - this.head <= 2 * this.entries.size + 64) return
+    const ids: string[] = []
+    const seen: f64[] = []
+    for (let i = this.head; i < len; i++) {
+      const id = this.logIds[i]!
+      const t = this.logSeen[i]!
+      const e = this.entries.get(id)
+      if (e !== undefined && e.seenMs === t) {
+        ids.push(id)
+        seen.push(t)
+      }
+    }
+    this.logIds = ids
+    this.logSeen = seen
+    this.head = 0
   }
 }
 
@@ -519,6 +665,69 @@ test("sessions expire after idle ttl", () => {
   expect(u === undefined).toBe(false)
   expect(store.expire(5000.0)).toBe(1)
   expect(store.count()).toBe(0)
+})
+
+test("a caller looping initialize stays at its cap; the oldest idle session goes first", () => {
+  const store = new SessionStore(60000.0)
+  store.limit(100, 3)
+  const a = store.create("2025-06-18", 0.0, "vk:a")!
+  const b = store.create("2025-06-18", 1.0, "vk:a")!
+  const c = store.create("2025-06-18", 2.0, "vk:a")!
+  const other = store.create("2025-06-18", 2.0, "vk:b")!
+  // a was used last, so b is the oldest idle one
+  expect(store.get(a.id, 3.0) === undefined).toBe(false)
+  store.create("2025-06-18", 4.0, "vk:a")
+  expect(store.countOf("vk:a")).toBe(3)
+  expect(store.get(b.id, 5.0) === undefined).toBe(true)
+  expect(store.get(a.id, 5.0) === undefined).toBe(false)
+  expect(store.get(c.id, 5.0) === undefined).toBe(false)
+  for (let i = 0; i < 5000; i++) store.create("2025-06-18", 10.0 + i, "vk:a")
+  expect(store.countOf("vk:a")).toBe(3)
+  expect(store.count()).toBe(4)
+  // another caller's session is untouched
+  expect(store.get(other.id, 6000.0) === undefined).toBe(false)
+  expect(store.logLength() <= 2 * store.count() + 64).toBe(true)
+})
+
+test("the process cap drops the session idle longest, whoever holds it", () => {
+  const store = new SessionStore(60000.0)
+  store.limit(3, 10)
+  const a = store.create("2025-06-18", 0.0, "u:1")!
+  const b = store.create("2025-06-18", 1.0, "u:2")!
+  const c = store.create("2025-06-18", 2.0, "u:3")!
+  expect(store.get(a.id, 3.0) === undefined).toBe(false)
+  const d = store.create("2025-06-18", 4.0, "u:4")!
+  expect(store.count()).toBe(3)
+  expect(store.get(b.id, 5.0) === undefined).toBe(true)
+  expect(store.countOf("u:2")).toBe(0)
+  for (const s of [a, c, d]) expect(store.get(s.id, 5.0) === undefined).toBe(false)
+  for (let i = 0; i < 1000; i++) store.create("2025-06-18", 10.0 + i, `u:${i % 7}`)
+  expect(store.count()).toBe(3)
+  // a cap below 1 keeps the default
+  store.limit(0, -1)
+  for (let i = 0; i < 20; i++) store.create("2025-06-18", 2000.0, "u:x")
+  expect(store.countOf("u:x")).toBe(20)
+})
+
+test("expiry reads the use log from the front and keeps it near the live sessions", () => {
+  const store = new SessionStore(1000.0)
+  const keep = store.create("2025-06-18", 0.0, "k")!
+  for (let i = 0; i < 500; i++) store.create("2025-06-18", 1.0 * i, `k${i}`)
+  // keep is used often: one line per use, the stale ones skipped and compacted away
+  for (let t = 1; t <= 3000; t++) expect(store.get(keep.id, 1.0 * t + 0.5) === undefined).toBe(false)
+  expect(store.logLength() <= 2 * store.count() + 64).toBe(true)
+  // the 500 created by t=500 are idle past the ttl by now; keep is not
+  expect(store.expire(3000.5)).toBe(500)
+  expect(store.count()).toBe(1)
+  expect(store.countOf("k0")).toBe(0)
+  expect(store.expire(3000.5)).toBe(0)
+  store.markInitialized(keep.id, 3001.0)
+  const k = store.get(keep.id, 3002.0)
+  expect(k !== undefined && k.initialized).toBe(true)
+  store.delete(keep.id)
+  expect(store.count()).toBe(0)
+  expect(store.countOf("k")).toBe(0)
+  expect(store.expire(1.0e9)).toBe(0)
 })
 
 test("tools/list pages by 100 with a cursor", () => {

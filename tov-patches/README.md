@@ -20,6 +20,7 @@ Patch 0019 (worker respawn) changes the worker supervisor in `runtime/tov.c` and
 Patch 0020 (`node:fs` `flockSync`) adds one native to the shared lists in `builtins.rs` and `tov.h` next to 0009's, and is written on top of 0001-0019.
 Patch 0021 (`Math.random` seeding) changes the generator and the worker fork in `runtime/tov.c` (next to 0019's supervisor), and is written on top of 0001-0020.
 Patch 0022 (address policy on `Bun.connect` and `WebSocket`, write-stall limit on upgraded sockets) reuses 0013's address classes in `runtime/tov.c`, changes the sockets in `runtime/net.c` and `runtime/ws.c` and the server sweep 0012 adds, and is written on top of 0001-0021.
+Patch 0023 (`continue` releases the loop body's locals) changes one line of `codegen/body.rs`, which no other patch touches; it applies on its own or on top of 0001-0022.
 
 ## Submitting upstream
 
@@ -890,3 +891,23 @@ allowed with `loopback`, refused on the metadata address) needs `PEER_NAME` as 0
 WebSockets, the one whose client reads nothing is closed (1006) within a few sweeps and its connection ends, while one
 whose client reads 32 KB every 100 ms stays open (before the patch neither was ever closed). Written on top of
 0001-0021.
+
+## 0023 — `continue` releases the loop body's locals
+
+**Problem.** A `continue` jumped past the releases of the loop body's own locals: the body's scope is closed (its
+strings, arrays, maps and records released) before the continue label, but `continue` unwound only the scopes nested
+inside the body. Every `continue` taken after such a local was declared kept one reference to it for good. In Raiju,
+`forwardedHeaders` (`const v = h.get(key)!` then `continue` for every `x-bf-*` header) kept the virtual key header
+string of every request: about 32 bytes, ~50 bytes of RSS, per inference request with no plateau (re-audit 7
+P0-1: 23 to 92 MB over 1.47M small chats). `break` was right (it already unwound the body's scope).
+
+**Change.** `loop_body` records the continue target at the depth outside the body's scope, as it does for `break`,
+so `continue` releases the body's locals before its `goto` (for, for-of, while and do-while, sync and async).
+
+**Files.** `crates/tov/src/codegen/body.rs`.
+
+**Tested.** `tests/continue_release.tov` (6 checks): each loop kind, and a loop in an async function, takes
+`continue` 64 times holding a fresh 1 MB string and the process RSS must grow less than 16 MB (before the patch it
+grew 64 MB in each); values kept before a `continue` (pushed to an array) are intact afterwards. Valgrind reports no
+leak and no invalid access on it. Raiju's slope soak (`tests/soak/slope.py`, `make soak-slope`) drives small chats
+with a virtual key and fails on a per-request RSS slope. Written against the pinned commit; applies on top of 0001-0022.

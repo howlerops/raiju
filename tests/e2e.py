@@ -18892,6 +18892,113 @@ def l214_e2e(env):
         srv.shutdown()
 
 
+GW_L219 = "http://127.0.0.1:18390"  # L219: MCP server sessions capped per caller and per process, ordered expiry
+
+def l219_e2e(env):
+    """L219 (production re-audit 7, P1-3). MCP server sessions had no cap and every POST /mcp scanned them all: one key
+    looping initialize made 49k sessions in 150 s and another tenant's chat p50 went from 2 to 202 ms. A caller now
+    keeps at most mcp_server.max_sessions_per_caller sessions and a process mcp_server.max_sessions, the oldest idle one
+    dropped for a new one, and expiry reads only the idle end of a use log. Its own gateway (18390)."""
+    import threading
+    d = os.path.join(BUILD, "e2e-l219")
+    os.makedirs(d, exist_ok=True)
+    cp = os.path.join(d, "config.json")
+    log = os.path.join(d, "gw.log")
+    keys = [{"id": "vk-l219-%s" % n, "name": "vk-l219-%s" % n, "value": "sk-bf-l219-%s" % n} for n in ["a", "b", "c", "d"]]
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": True},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "governance": {"virtual_keys": keys},
+        "providers": {"openai": {"keys": [{"name": "o-l219", "value": "sk-l219", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+        "mcp": {"client_configs": [{"name": "weather", "connection_type": "http", "connection_string": MOCK + "/mcp"}]},
+        "mcp_server": {"max_sessions": 6, "max_sessions_per_caller": 3},
+    }
+    json.dump(cfg, open(cp, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18390", "-host", "127.0.0.1", "-config", cp, "-workers", "1", "-server", os.environ.get("RAIJU_SERVER", "bun")],
+                          env=env, stderr=open(log, "w"))
+    k = lambda n: {"content-type": "application/json", "x-bf-vk": "sk-bf-l219-%s" % n}
+    init = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "e2e-l219", "version": "1"}}}
+
+    def new(n):
+        s, h, _ = raw("POST", GW_L219 + "/mcp", init, k(n))
+        return (hdr(h, "mcp-session-id") or "") if s == 200 else ""
+
+    def ping(n, sid):
+        s, _, _ = raw("POST", GW_L219 + "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "ping"}, {**k(n), "mcp-session-id": sid})
+        return s
+
+    def sessions():
+        _, _, m = call("GET", "/metrics", base=GW_L219, auth=False)
+        for line in m.splitlines():
+            if line.startswith("raiju_mcp_sessions "):
+                return int(float(line.split()[1]))
+        return -1
+
+    try:
+        wait(GW_L219 + "/health")
+        a1, a2, a3 = new("a"), new("a"), new("a")
+        b1 = new("b")
+        check("l219: initialize opens sessions under the caps", all([a1, a2, a3, b1]) and sessions() == 4, (a1, a2, a3, b1, sessions()))
+        time.sleep(0.01)
+        ping("a", a1)
+        time.sleep(0.01)
+        a4 = new("a")
+        got = [ping("a", a1), ping("a", a2), ping("a", a3), ping("a", a4), ping("b", b1)]
+        check("l219: a key's fourth session drops its oldest idle one (a2; a1 was used since) and leaves the other key's session",
+              got == [200, 400, 200, 200, 200] and sessions() == 4, (got, sessions()))
+        for _ in range(200):
+            new("a")
+        check("l219: a key looping initialize stays at its cap (3) and the other key's session lives", sessions() == 4 and ping("b", b1) == 200, (sessions(), ping("b", b1)))
+        c1, c2 = new("c"), new("c")
+        ping("b", b1)
+        d1 = new("d")
+        got = [ping("b", b1), ping("c", c1), ping("c", c2), ping("d", d1)]
+        check("l219: past the process cap (6) a new session drops the one idle longest, whoever holds it", got == [200, 200, 200, 200] and sessions() == 6, (got, sessions()))
+
+        # one key floods initialize from 8 threads while another key's small chats are timed
+        body = {"model": "openai/gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
+
+        def probe(secs):
+            lat = []
+            end = time.time() + secs
+            while time.time() < end:
+                t0 = time.time()
+                call("POST", "/v1/chat/completions", body, k("b"), base=GW_L219, auth=False)
+                lat.append(time.time() - t0)
+            lat.sort()
+            return lat[len(lat) // 2] * 1000 if lat else 0.0
+
+        base_p50 = probe(2.0)
+        stop = time.time() + 6.0
+        made = [0]
+
+        def flood():
+            import http.client
+            c = http.client.HTTPConnection("127.0.0.1", 18390, timeout=10)
+            payload = json.dumps(init)
+            while time.time() < stop:
+                try:
+                    c.request("POST", "/mcp", body=payload, headers=k("a"))
+                    c.getresponse().read()
+                    made[0] += 1
+                except Exception:
+                    c = http.client.HTTPConnection("127.0.0.1", 18390, timeout=10)
+        ts = [threading.Thread(target=flood, daemon=True) for _ in range(8)]
+        for t in ts:
+            t.start()
+        time.sleep(2.0)
+        flood_p50 = probe(3.5)
+        for t in ts:
+            t.join()
+        check("l219: while one key loops initialize (%d sessions opened) the sessions stay at the cap and another key's chat p50 stays flat (%.1f ms, %.1f ms before)" % (made[0], flood_p50, base_p50),
+              sessions() == 6 and made[0] > 1000 and flood_p50 < base_p50 * 3 + 12, (sessions(), made[0], base_p50, flood_p50))
+        check("l219: config_compat knows the mcp_server caps (no unknown-key warning)", "mcp_server.max_session" not in open(log).read(), "")
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
 def main():
     unique_ports()
     build()
@@ -21404,6 +21511,9 @@ def main():
         # L218: body reservations (empty ones cut at any age, abandoners reserve the look-ahead, cuts only when they let the
         # newcomer fit, behind judged against the minimum rate, the lone-body allowance per body): its own gateway (18394)
         l218_e2e(env)
+        # L219: MCP server sessions capped per caller and per process (oldest idle dropped), another key's chats flat
+        # while one key loops initialize: its own gateway (18390)
+        l219_e2e(env)
         # L194: Hugging Face inference providers (chat, embeddings, speech, transcription, images), the CLI's agent sign-in
         # and default key, and the A2A v0.3 REST client: its own gateway (18344) and Hugging Face double (18345)
         l194_e2e(env)

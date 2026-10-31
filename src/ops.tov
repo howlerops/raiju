@@ -71,7 +71,7 @@ import { pushShare, cardShare, cardOf, adoptCard, takePeriod, CardWire, CARD_NS 
 import { FileLease } from "./filelease"
 import { upstreamHeaders, tlsOf, withAcceptedCredential } from "./agentauth"
 import { clientSignal, CLIENT_WATCH_HEADER } from "./clientgone"
-import { tempTokenAllows, USER_HEADER, markUser, flowIdOfPath, userFlowById } from "./mcpuser"
+import { tempTokenAllows, USER_HEADER, markUser, userOfMark, flowIdOfPath, userFlowById } from "./mcpuser"
 import * as vmcp from "./vmcp"
 import { handleProfiles } from "./profiles"
 import { ExportQueue, SinkSender } from "./exporters"
@@ -107,7 +107,7 @@ import { planWindow, maxObjectBytes, archiveIntervalMs, archiveGraceMs, closedWi
 import { jobRequest, hiddenDeletes, MAX_ATTEMPTS, RetainQueue } from "./retained"
 import { payloadKeys, decodePayload, hydrate } from "./hybrid"
 import { OidcConfig, Discovery, OidcFlows, Session, UiSessions, DueSession, Sealer, parseDiscovery, discoveryUrl, tokenRequestBody, refreshRequestBody, verifyIdToken, accessTokenClaims, stateCookie, clearStateCookie, stateBound } from "./oidc"
-import { issuerOf, challengeOf, callerOf, keyById, keyUsable, serverAuthMode, ConsentContext, vkIdentityCut } from "./mcpissuer"
+import { issuerOf, challengeOf, callerOf, keyById, keyUsable, serverAuthMode, ConsentContext, vkIdentityCut, addressHash } from "./mcpissuer"
 
 export type Gate = { kind: "ok", actor: string } | { kind: "deny", res: Response }
 
@@ -608,6 +608,16 @@ function throttled(seconds: int): Response {
 // The client's address the server put on the request (clientip.tov), or "".
 function clientIp(req: Request): string {
   return req.headers.get(CLIENT_IP_HEADER) ?? ""
+}
+
+// The caller a new MCP server session counts against: its virtual key, else the user a checked user-mode token
+// names, else its address (an IPv6 one by its /64). A session-mode token carries no verified identity, so it
+// counts by address too.
+export function mcpOwner(h: Hdrs, vk: VirtualKeyConfig | undefined, ip: string): string {
+  if (vk !== undefined) return "vk:" + vk.id
+  const user = userOfMark(h.get(USER_HEADER))
+  if (user !== "") return "user:" + user
+  return "addr:" + addressHash(ip)
 }
 
 function denied(status: int, message: string, challenge?: string): Response {
@@ -7307,6 +7317,7 @@ export class Ops {
     if (req.method === "DELETE") {
       const sid = h.get("mcp-session-id")
       if (sid !== undefined) this.mcpSessions.delete(sid)
+      metrics.setGauge("raiju_mcp_sessions", "", 1.0 * this.mcpSessions.count())
       return new Response(undefined, { status: 204 })
     }
     // GET is the server-to-client stream (Bifrost's SSE handler): a connection event, then heartbeats that
@@ -7322,7 +7333,11 @@ export class Ops {
     if (req.method !== "POST") return json(405, errorJson("use POST for MCP requests", "invalid_request_error", undefined))
     const body = await req.text()
     const now = Date.now()
+    // sessions are capped per caller and per process (re-audit 7 P1-3); expiry reads only the idle end of the use log
+    const ms = this.engine.cfg.mcp_server
+    this.mcpSessions.limit(ms?.max_sessions ?? 0, ms?.max_sessions_per_caller ?? 0)
     this.mcpSessions.expire(now)
+    const owner = mcpOwner(h, vk, clientIp(req))
     // each call passes the key's MCP rules and budgets, forwards the allowed request headers, and
     // is charged its tool_pricing cost; a virtual MCP's call is judged by the tool it runs
     const run = async (name: string, args: string): Promise<{ text: string, isError: bool }, Error> => {
@@ -7360,7 +7375,8 @@ export class Ops {
     }
     const iparts = m.instructionParts(allowedTools, this.engine.keyMcp(h, virtualName), this.engine.projectMcp(h, virtualName)).filter((p) => seen.some((n) => n.startsWith(p.name + "-")))
     const instructions = m.renderInstructions(iparts)
-    const r = await handleMcp(body, h.get("mcp-session-id"), tools, run, this.mcpSessions, now, instructions)
+    const r = await handleMcp(body, h.get("mcp-session-id"), tools, run, this.mcpSessions, now, instructions, owner)
+    metrics.setGauge("raiju_mcp_sessions", "", 1.0 * this.mcpSessions.count())
     const out: Record<string, string> = new Map()
     out.set("content-type", r.contentType)
     const sid = r.sessionId
@@ -7930,4 +7946,19 @@ test("redivisionSig follows an equal split's roster and the caps it divides, and
   expect(redivisionSig(g2, pj) !== sig).toBe(true)
   const none: ProjectConfig = { id: "p1", name: "p", split_policy: "none", budget_id: "b1", members: [{ id: "m1", user_id: "alice" }] }
   expect(redivisionSig(g, none)).toBe("")
+})
+
+test("an MCP server session counts against the key, else the checked user, else the address by its /64", () => {
+  const vk: VirtualKeyConfig = { id: "vk1", name: "k", value: "sk-bf-x" }
+  const none: Hdrs = new Map()
+  expect(mcpOwner(none, vk, "10.0.0.1")).toBe("vk:vk1")
+  const marked: Hdrs = new Map()
+  marked.set(USER_HEADER, markUser("alice"))
+  expect(mcpOwner(marked, undefined, "10.0.0.1")).toBe("user:alice")
+  // a user header the caller wrote itself names nobody
+  const forged: Hdrs = new Map()
+  forged.set(USER_HEADER, "alice")
+  expect(mcpOwner(forged, undefined, "10.0.0.1")).toBe(mcpOwner(none, undefined, "10.0.0.1"))
+  expect(mcpOwner(none, undefined, "2001:db8::1")).toBe(mcpOwner(none, undefined, "2001:db8::2"))
+  expect(mcpOwner(none, undefined, "10.0.0.1") !== mcpOwner(none, undefined, "10.0.0.2")).toBe(true)
 })
