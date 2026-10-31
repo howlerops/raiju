@@ -1,0 +1,130 @@
+// Bun.connect's and the WebSocket client's address policy (patch 0022): the `peer` option checks every address a
+// host resolves to right before the connection is made, as fetch's (patch 0013). Run by tov-patches/tests/run.sh
+// (prints "ok" and "FAIL" lines). The listeners are on 127.0.0.1; PEER_NAME is a name in /etc/hosts that resolves to
+// it, so the check runs after a real lookup.
+import { rmSync } from "node:fs"
+
+type Peer = { private?: bool, loopback?: bool, allow?: string[] }
+
+const name = process.env.PEER_NAME ?? "vm"
+const unixPath = (process.env.TMPDIR ?? "/tmp") + `/socket_peer_${process.pid}.sock`
+
+const tcp = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { open(s) { s.write("hi") } } })
+try {
+  rmSync(unixPath)
+} catch (e) {
+  // not there
+}
+const unix = Bun.listen({ unix: unixPath, socket: { open(s) { s.write("hi") } } })
+const server = Bun.serve({
+  port: 0,
+  hostname: "127.0.0.1",
+  fetch(req, srv) {
+    if (srv.upgrade(req)) return
+    return new Response("no")
+  },
+  websocket: {
+    message(ws, m) {
+      ws.send(m)
+    },
+  },
+})
+
+function check(label: string, ok: bool, detail: string): void {
+  console.log(ok ? `ok ${label}` : `FAIL ${label}: ${detail}`)
+}
+
+// "" when the socket opened, else the error's code and message
+async function dial(host: string, peer: Peer | undefined): Promise<string> {
+  try {
+    const s = peer === undefined
+      ? try await Bun.connect({ hostname: host, port: tcp.port, socket: {} })
+      : try await Bun.connect({ hostname: host, port: tcp.port, peer: peer, socket: {} })
+    s.terminate()
+    return ""
+  } catch (e) {
+    if (e instanceof SocketError) return `${e.code}: ${e.message}`
+    return e.message
+  }
+}
+
+function refused(r: string): bool {
+  return r.startsWith("AddressNotAllowed: ")
+}
+
+// "" when the WebSocket opened and echoed, else what its error (or close) said
+function wsDial(host: string, peer: Peer | undefined): Promise<string> {
+  return new Promise<string>((resolve) => {
+    let ws: WebSocket | undefined = undefined
+    try {
+      const url = `ws://${host}:${server.port}/`
+      ws = peer === undefined ? try new WebSocket(url, { headers: {} }) : try new WebSocket(url, { peer: peer })
+    } catch (e) {
+      resolve(`throws ${e.message}`)
+      return
+    }
+    const w = ws!
+    let err = ""
+    w.onopen = () => {
+      w.send("ping")
+    }
+    w.onmessage = (ev) => {
+      w.close()
+      resolve(ev.data === "ping" ? "" : "wrong echo")
+    }
+    w.onerror = (ev) => {
+      err = ev.message
+    }
+    w.onclose = (ev) => {
+      resolve(`${err} (close ${ev.code})`)
+    }
+  })
+}
+
+async function main(): Promise<int> {
+  // Bun.connect
+  check("Bun.connect without the option reaches a loopback address", await dial("127.0.0.1", undefined) === "", "")
+  const strict = await dial("127.0.0.1", {})
+  check("Bun.connect refuses a loopback address by default", refused(strict) && strict.includes("a private address 127.0.0.1"), strict)
+  check("loopback: true lets it through", await dial("127.0.0.1", { loopback: true }) === "", "")
+  check("private: true lets it through", await dial("127.0.0.1", { private: true }) === "", "")
+  check("an allowed CIDR range lets it through", await dial("127.0.0.1", { allow: ["10.0.0.0/8", "127.0.0.0/8"] }) === "", "")
+  const byName = await dial(name, {})
+  check("a name that resolves to a private address is refused at connect", refused(byName) && byName.includes(`(host ${name})`), byName)
+  check("the name itself in the allow list lets it through", await dial(name, { allow: [name] }) === "", "")
+  check("a name is reached without the option", await dial(name, undefined) === "", "")
+  const mapped = await dial("::ffff:127.0.0.1", {})
+  check("an IPv4-mapped loopback address is judged by its IPv4 address", refused(mapped) && mapped.includes("127.0.0.1"), mapped)
+  const meta = await dial("169.254.169.254", { private: true, loopback: true, allow: ["169.254.0.0/16"] })
+  check("the metadata address is refused whatever the policy says", refused(meta) && meta.includes("unspecified or metadata"), meta)
+  const zero = await dial("0.0.0.0", { private: true })
+  check("0.0.0.0 is refused", refused(zero), zero)
+  let viaUnix = ""
+  try {
+    const s = try await Bun.connect({ unix: unixPath, peer: {}, socket: {} })
+    s.terminate()
+  } catch (e) {
+    viaUnix = e.message
+  }
+  check("a Unix socket is not checked", viaUnix === "", viaUnix)
+
+  // the WebSocket client
+  check("a WebSocket without the option reaches a loopback address", await wsDial(name, undefined) === "", "")
+  const wsName = await wsDial(name, {})
+  check("a WebSocket to a name that resolves to a private address is refused", wsName.startsWith("AddressNotAllowed: ") && wsName.includes("(close 1006)"), wsName)
+  check("a WebSocket with loopback: true opens", await wsDial(name, { loopback: true }) === "", "")
+  const wsMeta = await wsDial("169.254.169.254", { private: true })
+  check("a WebSocket to the metadata address is refused", wsMeta.startsWith("AddressNotAllowed: "), wsMeta)
+
+  tcp.stop(true)
+  unix.stop(true)
+  server.stop(true)
+  try {
+    rmSync(unixPath)
+  } catch (e) {
+    // gone
+  }
+  return 0
+}
+
+await main()

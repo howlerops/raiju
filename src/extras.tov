@@ -4,7 +4,7 @@ import { Engine, Build, Translate, errorResponse, noHeaders } from "./gateway"
 import { ChatRequest, snapshot, errorJson } from "./schemas"
 import { parseModel, kindOf, isKnownKind } from "./router"
 import { providerOf, Config } from "./config"
-import { JobStore, jobJson, resultTtlMs, asyncOp, estimateChatTokens, anthropicCountRequest, geminiCountRequest, countResponse, countTokensJson, parseRerank, rerankJson, lexicalRerank } from "./jobs"
+import { JobStore, Slot, jobJson, resultTtlMs, asyncOp, estimateChatTokens, anthropicCountRequest, geminiCountRequest, countResponse, countTokensJson, parseRerank, rerankJson, lexicalRerank } from "./jobs"
 import * as cohere from "./providers/cohere"
 import * as openai from "./providers/openai"
 import * as anthropic from "./providers/anthropic"
@@ -107,11 +107,16 @@ async function rerankText(engine: Engine, req: Request, text: string, wire: bool
   }
   if (k.kind === "bedrock") {
     const ret = !wire && (rawBool(body, "return_documents") ?? true)
-    const b: Build = (t) => try bedrock.rerankUpstream(t, query, docs, topN)
+    // each attempt sends what its pre hooks made of the request (a fallback's run again, as on the other rerank providers)
+    const b: Build = (t) => {
+      const cur = try parseRerank(build(engine.attemptFields(req, body)))
+      return try bedrock.rerankUpstream(t, cur.query, cur.documents, cur.topN)
+    }
     const tr: Translate = (t, out, requested) => {
       const scored = try bedrock.rerankResults(out)
-      const units = Math.ceil(docs.length / 100)
-      return try rerankShape({ body: rerankJson(scored, docs, ret, requested, units), promptTokens: 0, completionTokens: 0 }, wire)
+      const cur = try parseRerank(build(engine.attemptFields(req, body)))
+      const units = Math.ceil(cur.documents.length / 100)
+      return try rerankShape({ body: rerankJson(scored, cur.documents, ret, requested, units), promptTokens: 0, completionTokens: 0 }, wire)
     }
     return await engine.serve(req, "rerank", undefined, body, text, b, tr, false)
   }
@@ -521,9 +526,11 @@ export async function asyncSubmit(jobs: JobStore, req: Request, path: string, di
 }
 
 // GET /v1/async/<op>/{id} (Bifrost's poll path; the job must be of that op) and
-// GET /v1/async/jobs/{id} (any op). caller is the poller (jobOwner): another caller's job reads as missing.
-export function asyncGet(jobs: JobStore, op: string, id: string, caller: string): Response {
-  const j = jobs.getFor(id, caller, Math.floor(Date.now()))
+// GET /v1/async/jobs/{id} (any op). caller is the poller (jobOwner): another caller's job reads as missing. peer is
+// the job as another node holds it, when this one does not (server.tov peerSlot).
+export function asyncGet(jobs: JobStore, op: string, id: string, caller: string, peer?: Slot): Response {
+  const now = Math.floor(Date.now())
+  const j = peer !== undefined ? jobs.peerJobFor(peer, caller, now) : jobs.getFor(id, caller, now)
   if (j === undefined || (op !== "jobs" && j.op !== op)) return errorResponse(404, `no job ${id} (it may have expired)`, "invalid_request_error", noHeaders())
   return json(200, jobJson(j, jobs.ttlMs))
 }
@@ -547,8 +554,9 @@ export async function sdkAsyncSubmit(jobs: JobStore, req: Request, dispatch: Dis
 
 // GET on an SDK route with x-bf-async-id: the job while it runs (202), then the route's own answer
 // or error once it is done. undefined when the id is not a job of that route.
-export function sdkAsyncPoll(jobs: JobStore, op: string, id: string, caller: string): Response {
-  const j = jobs.getFor(id, caller, Math.floor(Date.now()))
+export function sdkAsyncPoll(jobs: JobStore, op: string, id: string, caller: string, peer?: Slot): Response {
+  const now = Math.floor(Date.now())
+  const j = peer !== undefined ? jobs.peerJobFor(peer, caller, now) : jobs.getFor(id, caller, now)
   if (j === undefined || j.op !== op) return errorResponse(404, `job not found or expired`, "invalid_request_error", noHeaders())
   if (j.status === "pending" || j.status === "processing") return json(202, jobJson(j, jobs.ttlMs))
   const st = j.http_status ?? (j.status === "failed" ? 500 : 200)

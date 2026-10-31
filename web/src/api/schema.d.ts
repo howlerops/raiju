@@ -50,7 +50,7 @@ export interface paths {
         };
         /**
          * Prometheus text metrics
-         * @description Families follow Bifrost's telemetry plugin; the raiju_* families are Raiju's own. The crew routing families (raiju_crew_assignments_total, raiju_crew_calls_total, raiju_crew_attempts_total, raiju_crew_escalations_total, raiju_crew_accepts_total, raiju_crew_outcomes_total, raiju_crew_outcome_quality, raiju_crew_task_cost_usd, raiju_crew_lambda, raiju_crew_subscription_phi) are described in docs/crew-routing.md. Counters and histograms add up over the workers of a node; the lambda and quota gauges take the largest.
+         * @description Families follow Bifrost's telemetry plugin; the raiju_* families are Raiju's own. The crew routing families (raiju_crew_assignments_total, raiju_crew_calls_total, raiju_crew_attempts_total, raiju_crew_escalations_total, raiju_crew_accepts_total, raiju_crew_outcomes_total, raiju_crew_outcome_quality, raiju_crew_task_cost_usd, raiju_crew_lambda, raiju_crew_subscription_phi) are described in docs/crew-routing.md. Counters and histograms add up over the workers of a node; the lambda and quota gauges take the largest. raiju_mcp_sessions is the MCP server sessions the workers hold (summed).
          */
         get: operations["getMetrics"];
         put?: never;
@@ -147,6 +147,26 @@ export interface paths {
          * @description Used by nodes with cluster.config_sync "pull" when another node saved a configuration their own config file does not hold. The answer is the config file text as its writer saved it (secrets sealed when encryption_key is set), whose sha256 is the generation asked for. See docs/operations.md.
          */
         post: operations["postApiClusterConfig"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/cluster/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * This node's copy of an async or provisioning job for a peer polling it (cluster peers only, Raiju extra)
+         * @description Async jobs and provisioning jobs are kept beside each node's config (<config>.jobs and <config>.provision-jobs.json), so nodes that share that folder find each other's jobs there. A node that does not hold a polled job (GET /v1/async/jobs/{id}, GET /v1/async/<op>/{id}, an SDK route with x-bf-async-id, GET /api/scim/provision/jobs/{id}) asks each peer for it and answers with the first copy found. An async job's copy carries its owner, which the asking node checks against its caller.
+         */
+        post: operations["postApiClusterJobs"];
         delete?: never;
         options?: never;
         head?: never;
@@ -8118,6 +8138,86 @@ export interface operations {
                 };
             };
             /** @description Clustering is off, this node does not hold that generation, or the request reached the main listener while cluster.listen_port is set. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description The body is over cluster.max_body_mb (16 MB by default). */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+        };
+    };
+    postApiClusterJobs: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Hex HMAC-SHA256 of the body, keyed with the cluster secret. */
+                "x-raiju-cluster-sig": string;
+                /** @description The time of the request in epoch milliseconds; more than a minute away from the node's clock is refused, so a captured head does not replay. */
+                "x-raiju-cluster-ts": string;
+                /** @description Hex HMAC-SHA256, keyed with the cluster secret, of "POST /api/cluster/jobs <x-raiju-cluster-ts> <Content-Length>", checked before the body is read. */
+                "x-raiju-cluster-head": string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /**
+                     * @description An async job (job_...) or a provisioning job (op_...).
+                     * @enum {string}
+                     */
+                    kind: "async" | "provision";
+                    /** @description The job's id. */
+                    id: string;
+                    /** @description The time of the request in epoch milliseconds; more than a minute away from the node's clock is refused. */
+                    ts: number;
+                };
+            };
+        };
+        responses: {
+            /** @description Whether this node holds the job, and its copy (an async job's state with its version, owner and beat, or a provisioning job's answer) as JSON text. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        found: boolean;
+                        job?: string;
+                    };
+                };
+            };
+            /** @description The body or a parameter is invalid. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Authentication required, or the session or token is not valid. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagementErrorResponse"];
+                };
+            };
+            /** @description Clustering is off, or the request reached the main listener while cluster.listen_port is set. */
             404: {
                 headers: {
                     [name: string]: unknown;

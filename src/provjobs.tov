@@ -1,0 +1,235 @@
+// The user provisioning jobs (directory sync, bulk import, reconcile; provision.tov) by operation id: the newest
+// PROV_JOBS_MAX, kept in memory and, with a file (<config>.provision-jobs.json beside the config), in that private
+// file with a state version (statever.tov). Every change takes the file's lock, reads it again and writes it whole, so
+// every worker of the node, a node that shares the folder and the next start see the same jobs; a node that does not
+// share it asks its peers for an id it does not hold (ops.tov jobFromPeers). A running job carries its runner's beat,
+// refreshed every PROV_BEAT_MS (beat); one whose beat is older than PROV_STALE_MS (its gateway stopped or restarted
+// while it ran) reads as failed, and is written so.
+import { readFileSync, existsSync, rmSync } from "node:fs"
+import { writeFileAtomic, PRIVATE_FILE } from "./atomicfile"
+import { lockFile, unlockFile } from "./filelock"
+import { readState, withVersion } from "./statever"
+import { fields, rawStr, setField, build, quote } from "./json"
+import { isoMs } from "./exports"
+
+export const PROV_JOBS_VERSION = 1
+export const PROV_JOBS_MAX = 50
+export const PROV_BEAT_MS = 10000.0
+export const PROV_STALE_MS = 45000.0
+export const PROV_INTERRUPTED = "the gateway running this job stopped before it finished (a restart or a crash); run it again"
+
+// A job: its id, its answer (the JSON object the routes show), whether it runs, and its runner's last beat (epoch ms).
+export type ProvJob = { id: string, body: string, running: bool, beat: f64 }
+type ProvFile = { jobs?: ProvJob[] }
+
+// The status a job's answer names ("" when it names none).
+function statusOf(body: string): string {
+  try {
+    return rawStr(try fields(body), "status") ?? ""
+  } catch (e) {
+    return ""
+  }
+}
+
+// The answer of a job whose runner stopped: failed, with the reason and the time it was found.
+export function interruptedBody(body: string, nowMs: f64): string {
+  try {
+    let fs = try fields(body)
+    setField(&fs, "status", quote("failed"))
+    setField(&fs, "finished_at", quote(isoMs(nowMs)))
+    setField(&fs, "error", quote(PROV_INTERRUPTED))
+    return build(fs)
+  } catch (e) {
+    return body
+  }
+}
+
+export class ProvisionJobs {
+  // oldest first
+  private jobs: ProvJob[] = []
+  // the jobs this process runs: alive whatever their beat
+  private mine: Map<string, bool> = new Map()
+  file = ""
+  // why the file was not read ("" when it was): a file from a newer Raiju is neither read nor written over
+  problem = ""
+
+  // Keeps the jobs in file (made at the first change), read now.
+  useFile(file: string): void {
+    this.file = file
+    this.load()
+  }
+
+  // Reads the file (when there is one) into memory.
+  private load(): void {
+    if (this.file === "" || !existsSync(this.file)) return
+    try {
+      const st = readState(this.file, try readFileSync(this.file, "utf8"), PROV_JOBS_VERSION, [])
+      if (!st.ok) {
+        if (st.problem !== this.problem) console.error(`raiju: provisioning jobs: ${st.problem}`)
+        this.problem = st.problem
+        return
+      }
+      this.problem = ""
+      const f = try JSON.parse(st.text) as ProvFile
+      this.jobs = f.jobs ?? []
+    } catch (e) {
+      console.error(`raiju: provisioning jobs: ${this.file}: ${e.message}`)
+    }
+  }
+
+  // Applies change to the jobs as the file holds them now, under its lock, and writes them back.
+  private change(fn: (jobs: ProvJob[]) => ProvJob[]): void {
+    if (this.file === "") {
+      this.jobs = fn(this.jobs)
+      return
+    }
+    const l = lockFile(this.file)
+    if (!l.ok) {
+      // the change stays in this process; the next one that gets the lock writes it
+      console.error(`raiju: provisioning jobs: another process kept ${this.file}'s lock`)
+      this.jobs = fn(this.jobs)
+      return
+    }
+    this.load()
+    this.jobs = fn(this.jobs)
+    if (this.problem === "") {
+      try {
+        try writeFileAtomic(this.file, withVersion(JSON.stringify({ jobs: this.jobs }), PROV_JOBS_VERSION) + "\n", { mode: PRIVATE_FILE, exact: true })
+      } catch (e) {
+        console.error(`raiju: provisioning jobs: could not write ${this.file}: ${e.message}`)
+      }
+    }
+    unlockFile(l)
+  }
+
+  // Records a job's answer (the newest PROV_JOBS_MAX are kept); a running one is this process's until it ends.
+  set(id: string, body: string, nowMs: f64): void {
+    const running = statusOf(body) === "running"
+    if (running) this.mine.set(id, true)
+    else this.mine.delete(id)
+    const job: ProvJob = { id: id, body: body, running: running, beat: nowMs }
+    this.change((jobs: ProvJob[]): ProvJob[] => {
+      // a job keeps its place: the order is the order of their first record
+      const out: ProvJob[] = jobs.map((j) => j.id === id ? job : j)
+      if (!jobs.some((j) => j.id === id)) out.push(job)
+      return out.length > PROV_JOBS_MAX ? out.slice(out.length - PROV_JOBS_MAX) : out
+    })
+  }
+
+  // Refreshes the beat of the jobs this process runs (every PROV_BEAT_MS).
+  beat(nowMs: f64): void {
+    if (this.mine.size === 0) return
+    const mine = this.mine
+    this.change((jobs: ProvJob[]): ProvJob[] => jobs.map((j) => mine.has(j.id) && j.running ? { id: j.id, body: j.body, running: true, beat: nowMs } : j))
+  }
+
+  // Whether a job read from the file is running on a gateway that stopped.
+  private stale(j: ProvJob, nowMs: f64): bool {
+    return j.running && !this.mine.has(j.id) && nowMs - j.beat >= PROV_STALE_MS
+  }
+
+  // Fails (in the file too) the running jobs whose runner stopped.
+  private settle(nowMs: f64): void {
+    if (!this.jobs.some((j) => this.stale(j, nowMs))) return
+    const mine = this.mine
+    this.change((jobs: ProvJob[]): ProvJob[] => jobs.map((j) => j.running && !mine.has(j.id) && nowMs - j.beat >= PROV_STALE_MS ? { id: j.id, body: interruptedBody(j.body, nowMs), running: false, beat: j.beat } : j))
+  }
+
+  // A job's answer, or undefined.
+  get(id: string, nowMs: f64): string | undefined {
+    this.load()
+    this.settle(nowMs)
+    for (const j of this.jobs) {
+      if (j.id === id) return j.body
+    }
+    return undefined
+  }
+
+  // The answers, newest first.
+  list(nowMs: f64): string[] {
+    this.load()
+    this.settle(nowMs)
+    const out: string[] = []
+    for (let i = this.jobs.length - 1; i >= 0; i--) out.push(this.jobs[i]!.body)
+    return out
+  }
+}
+
+// ---- tests ----
+
+let provSeq = 0
+
+function provFile(): string {
+  provSeq += 1
+  return "/tmp/raiju-provjobs-test-" + process.pid + "-" + Math.floor(Date.now()) + "-" + provSeq + ".json"
+}
+
+function body(id: string, status: string): string {
+  return `{"operation_id":${quote(id)},"operation":"sync","status":${quote(status)},"started_at":"2026-10-31T00:00:00Z"}`
+}
+
+test("provisioning jobs are shared through the file, kept across a restart, and bounded", () => {
+  const f = provFile()
+  const a = new ProvisionJobs()
+  a.useFile(f)
+  const b = new ProvisionJobs()
+  b.useFile(f)
+  const now = 1.0e12
+  a.set("op_1", body("op_1", "running"), now)
+  // another worker (or node on the same folder) sees it at once
+  expect(b.get("op_1", now) ?? "").toBe(body("op_1", "running"))
+  a.set("op_1", body("op_1", "completed"), now + 5.0)
+  expect(statusOf(b.get("op_1", now + 5.0) ?? "")).toBe("completed")
+  // a new process (a restart) reads them back; the file is private and versioned
+  const c = new ProvisionJobs()
+  c.useFile(f)
+  expect(c.list(now + 6.0).length).toBe(1)
+  const text = try readFileSync(f, "utf8")
+  expect(text.startsWith(`{"version":1,`)).toBe(true)
+  // the newest PROV_JOBS_MAX are kept, newest first
+  for (let i = 2; i <= PROV_JOBS_MAX + 5; i++) b.set(`op_${i}`, body(`op_${i}`, "completed"), now + 10.0)
+  const all = a.list(now + 11.0)
+  expect(all.length).toBe(PROV_JOBS_MAX)
+  expect(all[0]!.includes(`"op_${PROV_JOBS_MAX + 5}"`)).toBe(true)
+  expect(a.get("op_1", now + 11.0)).toBeUndefined()
+  // a file from a newer Raiju is neither read nor written over
+  try writeFileAtomic(f, `{"version":9,"jobs":[]}`, { durable: false })
+  const n = new ProvisionJobs()
+  n.useFile(f)
+  expect(n.problem.includes("newer Raiju")).toBe(true)
+  n.set("op_x", body("op_x", "completed"), now)
+  expect(try readFileSync(f, "utf8")).toBe(`{"version":9,"jobs":[]}`)
+  try rmSync(f, { force: true })
+  try rmSync(f + ".flock", { force: true })
+})
+
+test("a running provisioning job whose gateway stopped reads as failed; its own runner keeps it running", () => {
+  const f = provFile()
+  const runner = new ProvisionJobs()
+  runner.useFile(f)
+  const now = 2.0e12
+  runner.set("op_r", body("op_r", "running"), now)
+  // the runner beats while it runs: the others see it running
+  runner.beat(now + PROV_STALE_MS - 1000.0)
+  const other = new ProvisionJobs()
+  other.useFile(f)
+  expect(statusOf(other.get("op_r", now + PROV_STALE_MS + 1000.0) ?? "")).toBe("running")
+  expect(statusOf(runner.get("op_r", now + 10.0 * PROV_STALE_MS) ?? "")).toBe("running")
+  // the runner stopped (a restart: a new process on the same file): failed once the beat is stale, and written so
+  const after = new ProvisionJobs()
+  after.useFile(f)
+  const late = now + 3.0 * PROV_STALE_MS
+  const got = after.get("op_r", late) ?? ""
+  expect(statusOf(got)).toBe("failed")
+  expect(got.includes("stopped before it finished")).toBe(true)
+  expect(got.includes(`"finished_at"`)).toBe(true)
+  const again = new ProvisionJobs()
+  again.useFile(f)
+  expect(statusOf(again.list(late)[0]!)).toBe("failed")
+  // without a file the jobs live in memory
+  const mem = new ProvisionJobs()
+  mem.set("op_m", body("op_m", "completed"), now)
+  expect(mem.list(now).length).toBe(1)
+  try rmSync(f, { force: true })
+  try rmSync(f + ".flock", { force: true })
+})

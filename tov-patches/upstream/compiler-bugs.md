@@ -25,6 +25,7 @@ Sources: `docs/tov-notes.md`, `docs/agent-brief.md`, the workaround comments in 
 | C7 | An inner closure capturing a class-typed parameter of the outer closure: generated C does not compile | compiler | reproduces |
 | C8 | `tov check --json` positions are in code points; the unit is not documented | tooling | reproduces (behaviour) |
 | C9 | `new ns.Class()` through a namespace import: misleading diagnostic | diagnostics | reproduces |
+| C10 | `continue` does not release the loop body's locals (a leak per `continue`) | compiler (codegen/refcounts) | reproduces; fixed by tov-patches/0023 |
 | R1 | The async slab allocator crashes with ~250 `fetch` calls in flight | runtime | reproduces |
 | R2 | `timerUnref` scans every live timer; `AbortSignal.timeout` timers outlive their request | runtime (performance) | not re-measured |
 | R3 | `Headers` lookups are linear case-insensitive scans | runtime (performance) | not re-measured |
@@ -427,6 +428,67 @@ error[N0001] main.tov:2:15: unknown class `lib`
 
 **Workaround in Raiju**: named imports of classes, distinct class names across modules, and
 factory functions for importers that only have the namespace (`src/cloud_auth.tov`).
+
+---
+
+## C10. `continue` does not release the loop body's locals
+
+**Repro** (found 2026-10-31 on Raiju's patched compiler, c2048582 + 0001-0021; the code is the pinned commit's):
+
+```ts
+import { readFileSync } from "node:fs"
+
+function rssMb(): int {
+  const s = try readFileSync("/proc/self/status", "utf8")
+  const line = s.slice(s.indexOf("VmRSS:") + 6)
+  const kb = line.slice(0, line.indexOf("\n")).trim()
+  return Math.floor((parseInt(kb.slice(0, kb.indexOf(" "))) ?? 0) / 1024)
+}
+
+const MB = "x".repeat(1048576)
+function f(n: int): int {
+  let fell = 0
+  for (let i = 0; i < n; i++) {
+    const v = MB + i
+    if (v.byteLength > 0) continue
+    fell += 1
+  }
+  return fell
+}
+
+const before = try rssMb()
+f(64)
+console.log(`RSS +${(try rssMb()) - before} MB`)
+```
+
+**Expected**: `RSS +0 MB` (or about that): each 1 MB string is released when its iteration ends.
+
+**Actual**: `RSS +64 MB`. Every `continue` keeps one reference to each local the loop body declared before it,
+so none of those strings is ever freed. Valgrind reports them as definitely lost. The same holds for `for`,
+`for-of`, `while` and `do-while`, in sync and async functions, and for any refcounted local (strings, arrays,
+maps, records). `break` is fine.
+
+**Cause**: `loop_body` (`crates/tov/src/codegen/body.rs`) records the continue target at the depth *inside* the
+body's scope, but the continue label is emitted after that scope is closed, so the `goto` skips the body's
+releases:
+
+```c
+tv_str v_v_25 = t32;            /* retained */
+if (c33) { goto cont20; }       /* skips the release below */
+...
+tv_str_release(v_v_25);
+cont20:;
+```
+
+**Fix**: record the continue target one scope out, as `break` already is (`tov-patches/0023`, one line).
+
+**Seen in Raiju as**: re-audit 7 P0-1, every inference request with a virtual key left ~50 bytes of RSS behind with
+no plateau (23 to 92 MB over 1.47M small chats): `forwardedHeaders` reads each header value, then `continue`s past
+the `x-bf-*` ones, so the virtual key header string of every request stayed allocated. Found with valgrind (one
+32-byte block definitely lost per request, allocated by `Headers.forEach`) and a hardware watchpoint on that
+string's refcount (the extra reference was taken in `forwardedHeaders` and never dropped).
+
+**Workaround without the patch**: no `continue` after a refcounted local in a loop body; use `if`/`else`.
 
 ---
 

@@ -3,9 +3,14 @@
 // Async: POST /v1/async/<op> answers 202 with a job id; the gateway runs the
 // request in the background and GET /v1/async/jobs/{id} reports the result.
 // Finished jobs are kept for a TTL; unfinished ones also expire, so a request
-// that never completes cannot fill the store. With several workers the worker
-// that runs a job writes its state to the node's share folder (useDir), one file
-// per job, so a poll that lands on any worker finds it.
+// that never completes cannot fill the store. The worker that runs a job writes
+// its state to a folder (useDir: <config>.jobs beside the config, else the node's
+// share folder), one private file per job with a state version, so a poll that
+// lands on any worker, on a node that shares the folder, or on this node after a
+// restart finds it. A node that does not share the folder asks its peers (ops.tov
+// jobFromPeers, POST /api/cluster/jobs). The runner refreshes each unfinished job's
+// beat (beatAll); one whose beat is older than JOB_STALE_MS (its gateway stopped or
+// restarted while it ran) reads as failed.
 //
 // Token counting: exact counts come from the provider's count endpoint when it
 // has one; the estimates here cover the rest.
@@ -21,6 +26,7 @@ import { secureHex, sha256, toHex, utf8 } from "./crypto"
 import { isoMs } from "./exports"
 import { existsSync, readdirSync, readFileSync, rmSync } from "node:fs"
 import { writeFileAtomic, mkdirPrivate } from "./atomicfile"
+import { readState, withVersion } from "./statever"
 
 export type Job = {
   id: string,
@@ -40,8 +46,45 @@ export type Job = {
 }
 
 // The store's own bookkeeping: `at` is the ms the expiry clock started
-// (creation, then completion), which the job's seconds can't express exactly.
-type Slot = { job: Job, at: int }
+// (creation, then completion), which the job's seconds can't express exactly;
+// `beat` the last ms (epoch) its runner showed it was still working on it.
+export type Slot = { job: Job, at: int, beat?: int }
+
+// The job files' version (statever.tov): a file written by a newer Raiju is not read.
+export const JOB_FILE_VERSION = 1
+// how often a runner refreshes the beat of its unfinished jobs, and how old a beat may be before the job reads as
+// interrupted (its gateway stopped or restarted while it ran)
+export const JOB_BEAT_MS = 10000
+export const JOB_STALE_MS = 45000
+export const INTERRUPTED = "the gateway running this job stopped before it finished (a restart or a crash); submit it again"
+
+// A job file's text: the slot with its state version first.
+export function slotText(slot: Slot): string {
+  return withVersion(JSON.stringify(slot), JOB_FILE_VERSION)
+}
+
+// Whether id has the shape of the ids create makes ("job_" and 32 lowercase hex digits): only those are asked of the
+// peers, so a poll of anything else costs no peer request.
+export function isJobId(id: string): bool {
+  if (id.byteLength !== 36 || !id.startsWith("job_")) return false
+  for (let i = 4; i < 36; i++) {
+    if (!"0123456789abcdef".includes(id.slice(i, i + 1))) return false
+  }
+  return true
+}
+
+// The slot of a job file's (or a peer's) text, when it is one of this version or older and names job id.
+export function slotOf(text: string, id: string): Slot | undefined {
+  const st = readState("async job file", text, JOB_FILE_VERSION, [])
+  if (!st.ok) return undefined
+  try {
+    const slot = try JSON.parse(st.text) as Slot
+    if (slot.job.id !== id) return undefined
+    return slot
+  } catch (e) {
+    return undefined
+  }
+}
 
 function isFinished(j: Job): bool {
   return j.status === "completed" || j.status === "failed"
@@ -111,16 +154,38 @@ export class JobStore {
   // the node's share folder for jobs ("" for one process), and when it was last swept
   private dir = ""
   private dirSweptAt = 0
+  // the jobs this process runs (created and not finished): alive whatever their beat
+  private running: Map<string, bool> = new Map()
+  // whether the folder was made, and whether making it failed (reported once)
+  private dirMade = false
+  private dirFailed = false
 
   constructor(readonly ttlMs: int, readonly maxJobs: int) {}
 
-  // Shares the jobs with the other workers of the node through dir (the share folder, private to the node).
+  // The folder the jobs are kept in ("" none).
+  dirOf(): string {
+    return this.dir
+  }
+
+  // Keeps the jobs in dir (made private if missing): beside the config they outlive a restart and reach every worker
+  // and every node that shares the folder; the node's share folder reaches its workers only.
+  // The folder is made (0700) with the first job, so a gateway that never takes one leaves none.
   useDir(dir: string): void {
+    this.dir = dir
+    this.dirMade = false
+  }
+
+  // Makes the folder once; false (logged once) when it cannot be made.
+  private ensureDir(): bool {
+    if (this.dirMade) return true
     try {
-      mkdirPrivate(dir)
-      this.dir = dir
+      mkdirPrivate(this.dir)
+      this.dirMade = true
+      return true
     } catch (e) {
-      console.error(`raiju: async jobs stay with the worker that took them: ${e.message}`)
+      if (!this.dirFailed) console.error(`raiju: async jobs stay with the worker that took them: ${e.message}`)
+      this.dirFailed = true
+      return false
     }
   }
 
@@ -130,9 +195,10 @@ export class JobStore {
   }
 
   private publish(slot: Slot): void {
-    if (this.dir === "") return
+    if (this.dir === "" || !this.ensureDir()) return
     try {
-      try writeFileAtomic(this.fileOf(slot.job.id), JSON.stringify(slot), { durable: false })
+      // created and finished jobs are flushed to disk (they must outlive a restart); a start or a beat need not be
+      try writeFileAtomic(this.fileOf(slot.job.id), slotText(slot), { durable: isFinished(slot.job) || slot.job.status === "pending" })
     } catch (e) {
       console.error(`raiju: async job ${slot.job.id}: ${e.message}`)
     }
@@ -153,10 +219,8 @@ export class JobStore {
     const f = this.fileOf(id)
     if (!existsSync(f)) return undefined
     try {
-      const slot = try JSON.parse(try readFileSync(f, "utf8")) as Slot
-      // the file must be the job asked for
-      if (slot.job.id !== id) return undefined
-      return slot
+      // the file must be the job asked for, at a version this build reads
+      return slotOf(try readFileSync(f, "utf8"), id)
     } catch (e) {
       return undefined
     }
@@ -171,7 +235,11 @@ export class JobStore {
         if (!name.endsWith(".json")) continue
         const f = this.dir + "/" + name
         try {
-          const slot = try JSON.parse(try readFileSync(f, "utf8")) as Slot
+          const text = try readFileSync(f, "utf8")
+          const st = readState("async job file", text, JOB_FILE_VERSION, [])
+          // a newer Raiju's file is left to it
+          if (!st.ok) continue
+          const slot = try JSON.parse(st.text) as Slot
           if (this.expired(slot, nowMs)) rmSync(f, { force: true })
         } catch (e) {
           continue
@@ -217,8 +285,9 @@ export class JobStore {
     }
     const who: string | undefined = owner === undefined || owner === "" ? undefined : owner
     const job: Job = { id: id, op: op, status: "pending", created_at: Math.floor(nowMs / 1000), ttl_ms: ttlMs, owner: who }
-    this.jobs.set(job.id, { job: job, at: nowMs })
-    this.publish({ job: job, at: nowMs })
+    this.jobs.set(job.id, { job: job, at: nowMs, beat: nowMs })
+    this.running.set(job.id, true)
+    this.publish({ job: job, at: nowMs, beat: nowMs })
     this.sweepDir(nowMs)
     return job
   }
@@ -227,9 +296,43 @@ export class JobStore {
     const slot = this.jobs.get(id)
     if (slot === undefined || slot.job.status !== "pending") return false
     const job: Job = { id: slot.job.id, op: slot.job.op, status: "processing", created_at: slot.job.created_at, ttl_ms: slot.job.ttl_ms, owner: slot.job.owner }
-    this.jobs.set(id, { job: job, at: slot.at })
-    this.publish({ job: job, at: slot.at })
+    this.jobs.set(id, { job: job, at: slot.at, beat: slot.beat })
+    this.publish({ job: job, at: slot.at, beat: slot.beat })
     return true
+  }
+
+  // Refreshes the beat of every job this process runs (every JOB_BEAT_MS, ops.tov startJobBeat), so the other
+  // processes that read its file know it is still being worked on.
+  beatAll(nowMs: int): void {
+    for (const id of this.running.keys()) {
+      const slot = this.jobs.get(id)
+      if (slot === undefined || isFinished(slot.job)) {
+        this.running.delete(id)
+        continue
+      }
+      const next: Slot = { job: slot.job, at: slot.at, beat: nowMs }
+      this.jobs.set(id, next)
+      this.publish(next)
+    }
+  }
+
+  // The jobs this process is running now.
+  runningCount(): int {
+    return this.running.size
+  }
+
+  // A job read from a folder that is unfinished and whose runner has not shown a sign of life for JOB_STALE_MS: its
+  // gateway stopped while it ran, so it is failed (and written so) rather than left pending forever.
+  private interrupted(slot: Slot, nowMs: int): Slot | undefined {
+    if (isFinished(slot.job) || this.running.has(slot.job.id)) return undefined
+    const beat = slot.beat ?? slot.at
+    if (nowMs - beat < JOB_STALE_MS) return undefined
+    const j = slot.job
+    const job: Job = { id: j.id, op: j.op, status: "failed", created_at: j.created_at, completed_at: Math.floor(nowMs / 1000), http_status: 500, error: INTERRUPTED, ttl_ms: j.ttl_ms, raw: `{"error":{"message":${quote(INTERRUPTED)},"type":"api_error"}}`, owner: j.owner }
+    const next: Slot = { job: job, at: nowMs, beat: slot.beat }
+    if (this.jobs.has(j.id)) this.jobs.set(j.id, next)
+    this.publish(next)
+    return next
   }
 
   // Records the upstream answer. A 2xx body is the result; anything else fails
@@ -248,6 +351,7 @@ export class JobStore {
       job = { id: cur.id, op: cur.op, status: "failed", created_at: cur.created_at, completed_at: completed, http_status: httpStatus, error: msg, ttl_ms: cur.ttl_ms, raw: body, owner: cur.owner }
     }
     this.jobs.set(id, { job: job, at: nowMs })
+    this.running.delete(id)
     this.publish({ job: job, at: nowMs })
     return true
   }
@@ -262,15 +366,30 @@ export class JobStore {
     return j
   }
 
-  // A job this worker runs, else one another worker of the node runs (its file in the share folder).
+  // A job this worker runs, else one another process runs or ran (its file in the folder).
   get(id: string, nowMs: int): Job | undefined {
+    const slot = this.slotFor(id, nowMs)
+    return slot === undefined ? undefined : slot.job
+  }
+
+  // The job's slot as get sees it (for a peer's poll, POST /api/cluster/jobs), or undefined.
+  slotFor(id: string, nowMs: int): Slot | undefined {
     const slot = this.jobs.get(id) ?? this.shared(id)
     if (slot === undefined) return undefined
     if (this.expired(slot, nowMs)) {
       this.jobs.delete(id)
+      this.running.delete(id)
       this.unpublish(id)
       return undefined
     }
+    return this.interrupted(slot, nowMs) ?? slot
+  }
+
+  // A job a peer holds (its answer to POST /api/cluster/jobs), checked like a poll here: the caller must own it.
+  peerJobFor(slot: Slot, caller: string, nowMs: int): Job | undefined {
+    if (this.expired(slot, nowMs)) return undefined
+    const owner = slot.job.owner ?? ""
+    if (owner !== "" && !sameOwner(owner, caller)) return undefined
     return slot.job
   }
 
@@ -281,6 +400,7 @@ export class JobStore {
       const slot = this.jobs.get(id)
       if (slot !== undefined && this.expired(slot, nowMs)) {
         this.jobs.delete(id)
+        this.running.delete(id)
         this.unpublish(id)
         removed += 1
       }
@@ -828,4 +948,67 @@ test("a job run by one worker is polled on another through the share folder, and
   expect(a.get(j.id, now + 10)).toBeDefined()
   expect((try readdirSync(dir)).length).toBe(0)
   try rmSync(dir, { recursive: true, force: true })
+})
+
+test("a job kept beside the config outlives a restart; one its stopped runner left unfinished reads as failed", () => {
+  const dir = "/tmp/raiju-jobs-restart-" + process.pid + "-" + Math.floor(Date.now())
+  const now = Math.floor(Date.now())
+  const a = new JobStore(600000, 100)
+  a.useDir(dir)
+  const done = a.create("chat/completions", now, undefined, "vk:one")!
+  a.start(done.id)
+  a.finish(done.id, 200, `{"ok":1}`, now + 5)
+  const open = a.create("embeddings", now, undefined, "vk:one")!
+  a.start(open.id)
+  // the files are private and carry the state version
+  const names = try readdirSync(dir)
+  expect(names.length).toBe(2)
+  const text = try readFileSync(dir + "/" + names[0]!, "utf8")
+  expect(text.startsWith(`{"version":1,`)).toBe(true)
+  // a new process on the same folder (a restart, or another node sharing it) finds both
+  const b = new JobStore(600000, 100)
+  b.useDir(dir)
+  expect(b.getFor(done.id, "vk:one", now + 10)?.result ?? "").toBe(`{"ok":1}`)
+  expect(b.getFor(done.id, "vk:two", now + 10)).toBeUndefined()
+  // the unfinished one stays processing while its runner beats
+  expect(b.get(open.id, now + JOB_STALE_MS - 1)?.status ?? "").toBe("processing")
+  a.beatAll(now + JOB_STALE_MS)
+  expect(b.get(open.id, now + JOB_STALE_MS + 10)?.status ?? "").toBe("processing")
+  // its runner stopped (no beat for JOB_STALE_MS): failed, with an answer, on every reader, and kept so
+  const late = now + 2 * JOB_STALE_MS + 1
+  const f = b.get(open.id, late)!
+  expect(f.status).toBe("failed")
+  expect(f.http_status ?? 0).toBe(500)
+  expect((f.error ?? "").includes("stopped before it finished")).toBe(true)
+  expect(jobJson(f, 600000).includes(`"status":"failed"`)).toBe(true)
+  const c = new JobStore(600000, 100)
+  c.useDir(dir)
+  expect(c.get(open.id, late + 1)?.status ?? "").toBe("failed")
+  // the runner itself never reads its own running job as interrupted
+  const d = new JobStore(600000, 100)
+  d.useDir(dir)
+  const mine = d.create("chat/completions", now, undefined, "")!
+  expect(d.get(mine.id, now + 10 * JOB_STALE_MS)?.status ?? "").toBe("pending")
+  expect(d.runningCount()).toBe(1)
+  try rmSync(dir, { recursive: true, force: true })
+})
+
+test("a job file written by a newer Raiju is not read, and a peer's slot is checked like a poll", () => {
+  const slot: Slot = { job: { id: "job_x", op: "chat/completions", status: "completed", created_at: 1, result: "1", owner: "vk:a" }, at: 1000 }
+  const text = slotText(slot)
+  expect(slotOf(text, "job_x")!.job.status).toBe("completed")
+  expect(slotOf(text, "job_y")).toBeUndefined()
+  expect(slotOf(text.replace(`"version":1`, `"version":2`), "job_x")).toBeUndefined()
+  // a file from before versions reads as version 0
+  expect(slotOf(JSON.stringify(slot), "job_x")!.job.id).toBe("job_x")
+  const s = new JobStore(60000, 10)
+  expect(s.peerJobFor(slot, "vk:a", 2000)?.id ?? "").toBe("job_x")
+  expect(s.peerJobFor(slot, "vk:b", 2000)).toBeUndefined()
+  expect(s.peerJobFor(slot, "vk:a", 1000 + 60000)).toBeUndefined()
+  // only ids of the shape create makes are asked of the peers
+  const made = s.create("chat/completions", 0)!
+  expect(isJobId(made.id)).toBe(true)
+  expect(isJobId("job_x")).toBe(false)
+  expect(isJobId("job_" + "G".repeat(32))).toBe(false)
+  expect(isJobId("op_" + "a".repeat(33))).toBe(false)
 })

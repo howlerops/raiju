@@ -56,7 +56,7 @@ import { Ops, Reply, UiSocket, lockBusyReply } from "./ops"
 import { parseCursor } from "./feed"
 import { cookieValue, SETUP_COOKIE, setupPublic } from "./setupsession"
 import { rerank, bedrockRerank, countTokens, responsesInputTokens, asyncSubmit, asyncGet, sdkAsyncSubmit, sdkAsyncPoll, decisionRoute, openaiDecisionPath, Dispatch } from "./extras"
-import { asyncPoll, jobOwner } from "./jobs"
+import { asyncPoll, jobOwner, Slot, slotOf, isJobId } from "./jobs"
 import { serveUi, uiPath, UI_CSP } from "./uiserve"
 import { TransportRun, transportStart, transportEnd, transportDone, transportSink, llmHooked, storageHooked, StorageCall, storageOp, storageIdKey, pathWithId, ownedRequest, passthroughOwned, recordUpload, httpHooked } from "./pluginroute"
 import { kindOfPath, isInferencePath } from "./plughttp"
@@ -64,7 +64,7 @@ import { EXTRA_PARAMS_HEADER, EXTRA_PARAMS_CARRY, mergeExtraParams, extraParamsC
 import { lifecycle, readyInput, readyReport, ServerLimits } from "./lifecycle"
 import { CLIENT_WATCH_HEADER, watchStart, watchGone, watchEnd, watched } from "./clientgone"
 import { usesChain, withChainCreds } from "./awschain"
-import { bodyBudget, peerBudget, bufferedCap, uncheckedShare, credentialShare, bodyReserve, bodyDeadlineMs, bodyRate, readCharged, ReadPlan, BodyClass, BodyHold, UNREAD_ABOVE } from "./bodybudget"
+import { bodyBudget, peerBudget, bufferedCap, uncheckedShare, credentialShare, bodyReserve, bodyDeadlineMs, bodyRate, readCharged, reserveLookahead, ReadPlan, BodyClass, BodyHold, UNREAD_ABOVE, DEFAULT_BODY_MIN_KB_PER_SECOND } from "./bodybudget"
 import { clusterBodyCap, wellFormedSig, headRefusal, peerHeaders, HEAD_SIG_HEADER, TS_HEADER } from "./cluster"
 
 type ModelEntry = { id: string, object: string, created: int, owned_by: string }
@@ -1330,6 +1330,9 @@ export async function heldBody(engine: Engine, req: Request, limit: int, kind: B
   const cls: BodyClass = kind === "unchecked" ? "unchecked" : "checked"
   const w = peer || cls === "unchecked" ? "" : (who ?? "")
   hold.peer = peer
+  const rate = bodyRate(engine.cfg.server)
+  // reservations are judged behind against the minimum rate (the default when it is off)
+  b.minRate = rate.bytesPerSecond > 0 ? rate.bytesPerSecond : DEFAULT_BODY_MIN_KB_PER_SECOND * 1024.0
   const declared = req.headers.get("content-length")
   let max = limit
   if (declared !== undefined) {
@@ -1346,19 +1349,22 @@ export async function heldBody(engine: Engine, req: Request, limit: int, kind: B
     }
     // reserved whole before it is read, so a body that cannot fit is refused before its client sends it, and an
     // admitted one that keeps its pace is never refused part way (re-audit 5 P2-A); one that falls behind may have its
-    // reservation cut under contention (re-audit 6 P1-A, BodyBudget.track)
-    if (!b.take(n, 0, cap, cls, share, w, whoShare, reserve)) return { res: busyResponse(), req: req, hold: hold }
-    hold.held = n
+    // reservation cut under contention (re-audit 6 P1-A, BodyBudget.track). A tenant that abandoned a declared body
+    // lately is reserved only the look-ahead, and charged as its bytes arrive (re-audit 7 P1-1)
+    const first = cap > 0 && b.abandonedLately(w) ? Math.min(n, reserveLookahead(cap)) : n
+    if (!b.take(first, 0, cap, cls, share, w, whoShare, reserve, hold)) return { res: busyResponse(), req: req, hold: hold }
+    hold.held = first
     hold.cls = cls
     hold.who = w
-    b.track(hold, n)
+    if (first < n) b.ahead(hold, n)
+    else b.track(hold, n)
     max = n
   }
   const st = req.body
   if (st === undefined) return { res: undefined, req: req, hold: hold }
   hold.cls = cls
   hold.who = w
-  const plan: ReadPlan = { max: max, cap: cap, cls: cls, share: share, who: w, whoShare: whoShare, reserve: reserve, deadlineMs: bodyDeadlineMs(engine.cfg.server), rate: bodyRate(engine.cfg.server) }
+  const plan: ReadPlan = { max: max, cap: cap, cls: cls, share: share, who: w, whoShare: whoShare, reserve: reserve, deadlineMs: bodyDeadlineMs(engine.cfg.server), rate: rate }
   const got = await readCharged(st, b, hold, plan)
   if (got.stop === "large") return { res: errorResponse(413, "request body too large", "invalid_request_error", noHeaders()), req: req, hold: hold }
   if (got.stop === "busy") return { res: busyResponse(), req: req, hold: hold }
@@ -1442,7 +1448,17 @@ async function clusterRoute(ops: Ops, req: Request, p: string, m: string): Promi
   if (p === "/api/cluster/leader" && m === "GET") return ops.clusterLeader(req)
   if (p === "/api/cluster/config" && m === "POST") return await ops.clusterConfig(req)
   if (p === "/api/cluster/logs" && m === "POST") return await ops.clusterLogs(req)
+  if (p === "/api/cluster/jobs" && m === "POST") return await ops.clusterJobs(req)
   return undefined
+}
+
+// An async job this node does not hold (not in this process, not in its jobs folder), as the peer that holds it has
+// it (ops.jobFromPeers: a node that does not share the folder), for a poll of id. undefined when this node holds it,
+// when no peer has it, and for an id this gateway never makes.
+async function peerSlot(engine: Engine, ops: Ops, id: string): Promise<Slot | undefined> {
+  if (!isJobId(id) || engine.jobs.get(id, Math.floor(Date.now())) !== undefined) return undefined
+  const text = await ops.jobFromPeers("async", id)
+  return text === undefined ? undefined : slotOf(text, id)
 }
 
 // Everything the cluster listener (cluster.listen_port) answers: the peer routes, /health, and /metrics when
@@ -1741,7 +1757,7 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
   if (m === "GET" || m === "HEAD") {
     // x-bf-async-id on an inference route: poll the job that route created
     const aid = req.headers.get("x-bf-async-id") ?? ""
-    if (aid !== "" && !p.startsWith("/api/")) return sdkAsyncPoll(engine.jobs, p.slice(1, p.byteLength), aid, requestOwner(engine, req))
+    if (aid !== "" && !p.startsWith("/api/")) return sdkAsyncPoll(engine.jobs, p.slice(1, p.byteLength), aid, requestOwner(engine, req), await peerSlot(engine, ops, aid))
     if (p === "/health") return Response.json({ status: "ok" })
     if (p === "/ready") return readyResponse(engine, ops)
     if (uiPath(p)) {
@@ -1755,7 +1771,7 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
     if (p === "/genai/v1beta/models") return await cors(engine, req, await outOfLine(genaiModels(engine, "")))
     if (p.startsWith(GENAI)) return await cors(engine, req, await outOfLine(genaiModels(engine, p.slice(GENAI.byteLength))))
     const poll = asyncPoll(p)
-    if (poll !== undefined) return asyncGet(engine.jobs, poll.op, poll.id, requestOwner(engine, req))
+    if (poll !== undefined) return asyncGet(engine.jobs, poll.op, poll.id, requestOwner(engine, req), await peerSlot(engine, ops, poll.id))
     if (p === "/api/cache") return ops.check(req, p) ?? cacheView(engine)
     if (p === "/api/logs" || p === "/api/logs/stats") {
       const cs = ops.checkScope(req, p)
@@ -2128,8 +2144,18 @@ export function wsUpgrade(engine: Engine, ops: Ops, req: Request): WsUpgrade {
   const att = attachId(p)
   if (p !== "/v1/responses" && p !== "/v1/live/sessions" && p !== "/ws" && att === "") return { kind: "none" }
   const h = snapshot(req.headers)
-  if (p === "/v1/responses") return { kind: "session", session: wsSession(req, gated(new ResponsesSocket(engine, h), engine.wsResponses)) }
-  if (p === "/v1/live/sessions") return { kind: "session", session: wsSession(req, gated(new LiveSocket(engine, ops.liveSessions, h, ownerOf(engine, h), "", new Map()), engine.wsLive)) }
+  if (p === "/v1/responses") {
+    // the credential is checked from the headers before the upgrade, as the HTTP route checks it (an inactive or
+    // expired key, or none while client.enforce_auth_on_inference is on): 401 or 403, no socket
+    const d = engine.gov.credentialDenial(h)
+    if (d !== undefined) return { kind: "refused", status: d.status, message: d.message }
+    return { kind: "session", session: wsSession(req, gated(new ResponsesSocket(engine, h), engine.wsResponses)) }
+  }
+  if (p === "/v1/live/sessions") {
+    // an anonymous caller is refused before anything opens, as Bifrost's prepareRequest refuses it
+    if (!credentialOk(engine, h)) return { kind: "refused", status: 401, message: "authentication is required for live sessions" }
+    return { kind: "session", session: wsSession(req, gated(new LiveSocket(engine, ops.liveSessions, h, ownerOf(engine, h), "", new Map()), engine.wsLive)) }
+  }
   if (att !== "") {
     if (!validId(att)) return { kind: "refused", status: 400, message: "a session id is required" }
     if (!credentialOk(engine, h)) return { kind: "refused", status: 401, message: "authentication is required for live sessions" }
@@ -2549,4 +2575,35 @@ test("with auth not enforced an inference call passes, and the stream threshold 
   expect(headerRefusal(ops.engine, ops, bigPost("/v1/chat/completions", []), 100 * 1048576)).toBeUndefined()
   expect(bodyLimits(ops.engine).threshold).toBe(65536)
   expect(bodyLimits(ops.engine).limit).toBe(100 * 1048576)
+})
+
+function upgradeReq(path: string, hs: string[][]): Request {
+  const h: Record<string, string> = new Map()
+  h.set("upgrade", "websocket")
+  h.set("connection", "Upgrade")
+  for (const kv of hs) h.set(kv[0]!, kv[1]!)
+  return new Request("http://localhost" + path, { method: "GET", headers: h })
+}
+
+function upgradeStatus(engine: Engine, ops: Ops, r: Request): int {
+  const wu = wsUpgrade(engine, ops, r)
+  if (wu.kind === "refused") return wu.status
+  return wu.kind === "session" ? 101 : 0
+}
+
+test("the Responses and live sockets check credentials before the upgrade (re-audit 7 P0-2)", () => {
+  const cfg: Config = { client: { enforce_auth_on_inference: true }, governance: { virtual_keys: [{ id: "k", value: "sk-bf-k" }, { id: "off", value: "sk-bf-off", is_active: false }] } }
+  const ops = new Ops(new Engine(cfg), new ConfigStore("/tmp/raiju-server-wsauth.json", cfg))
+  const eng = ops.engine
+  expect(upgradeStatus(eng, ops, upgradeReq("/v1/responses", []))).toBe(401)
+  expect(upgradeStatus(eng, ops, upgradeReq("/openai/v1/responses", []))).toBe(401)
+  expect(upgradeStatus(eng, ops, upgradeReq("/v1/responses", [["x-bf-vk", "sk-bf-off"]]))).toBe(403)
+  expect(upgradeStatus(eng, ops, upgradeReq("/v1/responses", [["x-bf-vk", "sk-bf-k"]]))).toBe(101)
+  expect(upgradeStatus(eng, ops, upgradeReq("/v1/live/sessions", []))).toBe(401)
+  expect(upgradeStatus(eng, ops, upgradeReq("/v1/live/sessions", [["authorization", "Bearer sk-bf-k"]]))).toBe(101)
+  // with auth not enforced, both open without a credential
+  const open: Config = {}
+  const ops2 = new Ops(new Engine(open), new ConfigStore("/tmp/raiju-server-wsauth-open.json", open))
+  expect(upgradeStatus(ops2.engine, ops2, upgradeReq("/v1/responses", []))).toBe(101)
+  expect(upgradeStatus(ops2.engine, ops2, upgradeReq("/v1/live/sessions", []))).toBe(101)
 })

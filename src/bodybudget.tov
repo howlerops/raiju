@@ -215,14 +215,26 @@ export class BodyPace {
   }
 }
 
-// A declared length is reserved whole while its body is on pace to arrive soon. Under contention a body that does not
-// fit cuts the reservations of other tenants furthest behind their pace (re-audit 6 P1-A: tenants that declared big
-// lengths and sent slowly or nothing held the whole cap, and other tenants' 1-4 MB bodies got 503 for minutes): such a
-// body keeps what it has received plus a look-ahead (reserveLookahead) and is charged as its bytes arrive from then on, like a
-// chunked body. A body is cut only RESERVE_GRACE_MS after it was admitted, and only when at its rate so far the rest
-// would take longer than RESERVE_HORIZON_MS, so bodies that arrive briskly are never refused part way (re-audit 5 P2-A).
+// A declared length is reserved whole while its body keeps pace. Under contention a body that does not fit cuts the
+// reservations of other tenants that fell behind (re-audit 6 P1-A: tenants that declared big lengths and sent slowly or
+// nothing held the whole cap, and other tenants' 1-4 MB bodies got 503 for minutes): such a body keeps what it has
+// received plus a look-ahead (reserveLookahead) and is charged as its bytes arrive from then on, like a chunked body.
+// Re-audit 7 (P1-1, P1-2):
+// - a reservation that has received nothing may be cut at any age (tenants that reconnected just under a grace kept a
+//   fresh, uncuttable reservation), and a tenant that abandoned a declared body lately (its request ended with nothing
+//   received, ABANDONED_MS) is reserved only the look-ahead until it sends (abandonedLately);
+// - a body that is sending is behind when, RESERVE_GRACE_MS into its tenant's run of reservations (L213: a reservation
+//   made while the tenant holds another, or within RESERVE_GRACE_MS after one ended, counts from the first of the run),
+//   its rate so far is under BEHIND_RATE_MULTIPLE times server.body_min_kb_per_second (a fixed 10 s horizon cut a 30 MB
+//   upload at 1 MB/s);
+// - only a new body that keeps its tenant within its share cuts, and only when cutting every reservation that is behind
+//   would let it fit (cuts were made and the newcomer refused anyway); the furthest behind go first, no more than needed;
+// - a cut body that keeps pace may grow up to the cap, not only cap - reserve, so it is not refused part way while
+//   there is room.
+// Bodies that arrive briskly keep their reservations and are never refused part way (re-audit 5 P2-A).
 export const RESERVE_GRACE_MS = 1000.0
-export const RESERVE_HORIZON_MS = 10000.0
+export const BEHIND_RATE_MULTIPLE = 8.0
+export const ABANDONED_MS = 60000.0
 export const RESERVE_LOOKAHEAD = 1048576
 
 // The look-ahead a cut reservation keeps beyond the bytes received: a 48th of the cap, between 64 KB and
@@ -247,16 +259,25 @@ export class BodyHold {
   got = 0
   start = 0.0
   id = 0
+  // a declared body charged as its bytes arrive: its reservation was cut, or only the look-ahead was reserved
+  cut = false
+  // its id among the big bodies in hand (0: none)
+  bid = 0
 
   release(): void {
     const b = this.peer ? peerBudget() : bodyBudget()
     b.untrack(this)
+    b.forget(this)
     const n = this.held
     this.held = 0
     if (n <= 0) return
     b.give(n, this.cls, this.who)
   }
 }
+
+// A tenant's run of reservations (BodyBudget.runs): its grace counts from `since` while it holds one (`live`) or
+// ended one less than RESERVE_GRACE_MS ago (`ended`).
+type TenantRun = { since: f64, live: int, ended: f64 }
 
 export class BodyBudget {
   // every byte charged, the small bodies' part of it, and the unchecked bodies' part
@@ -268,6 +289,8 @@ export class BodyBudget {
   cuts = 0
   // the clock (ms); a test sets it
   clock = -1.0
+  // server.body_min_kb_per_second in bytes per second, against which a reservation is judged behind (heldBody sets it)
+  minRate = DEFAULT_BODY_MIN_KB_PER_SECOND * 1024.0
   // the bytes each tenant's bodies hold (BodyHold.who), for server.credential_body_mb
   private byWho: Map<string, int> = new Map()
   // the declared lengths reserved whole, by id
@@ -275,6 +298,14 @@ export class BodyBudget {
   private nextId = 0
   // the tenants refused a body lately, and until when they count as waiting
   private waiting: Map<string, f64> = new Map()
+  // per tenant with reservations lately: when its run of reservations began (the grace counts from it), how many it
+  // holds, and when its last one ended
+  private runs: Map<string, TenantRun> = new Map()
+  // the big bodies in hand charged with their hold (take's h), by BodyHold.bid
+  private bodies: Map<int, BodyHold> = new Map()
+  private nextBody = 0
+  // the tenants that abandoned a declared body lately, and until when (abandonedLately)
+  private abandoned: Map<string, f64> = new Map()
 
   now(): f64 {
     return this.clock >= 0 ? this.clock : performance.now()
@@ -286,14 +317,56 @@ export class BodyBudget {
     return this.held - (this.unchecked - share)
   }
 
-  // The most bytes one tenant other than who holds.
-  private biggest(who: string): int {
+  // The bytes of the biggest single body a tenant other than who holds (of the bodies charged with their hold). Re-audit
+  // 7 P2-1: the tenant's sum let one tenant's several bodies claim the allowance beside a lone body over the cap.
+  private biggestBody(who: string): int {
     let n = 0
-    for (const k of this.byWho.keys()) {
-      if (k === who) continue
-      n = Math.max(n, this.byWho.get(k) ?? 0)
+    for (const h of this.bodies.values()) {
+      if (h.who === who) continue
+      n = Math.max(n, h.held)
     }
     return n
+  }
+
+  // h's request is done: its body is no longer in hand. A declared body of which nothing arrived marks its tenant as
+  // having abandoned it for ABANDONED_MS (its next declared bodies are reserved only the look-ahead until they send);
+  // one that arrived whole clears the mark.
+  forget(h: BodyHold): void {
+    if (h.bid > 0) this.bodies.delete(h.bid)
+    h.bid = 0
+    if (h.who === "" || h.declared <= 0) return
+    const t = this.now()
+    if (h.got <= 0) {
+      for (const k of this.abandoned.keys()) {
+        if ((this.abandoned.get(k) ?? 0.0) <= t) this.abandoned.delete(k)
+      }
+      this.abandoned.set(h.who, t + ABANDONED_MS)
+    } else if (h.got >= h.declared) {
+      this.abandoned.delete(h.who)
+    }
+  }
+
+  // Whether tenant who abandoned a declared body lately (re-audit 7 P1-1: tenants that declared 12 MB, sent nothing and
+  // reconnected kept the cap reserved).
+  abandonedLately(who: string): bool {
+    if (who === "") return false
+    const u = this.abandoned.get(who)
+    if (u === undefined) return false
+    if (u <= this.now()) {
+      this.abandoned.delete(who)
+      return false
+    }
+    return true
+  }
+
+  // Records h, a declared body of n bytes of which only the look-ahead was charged (its tenant abandoned one lately): it
+  // is charged as its bytes arrive, like a cut reservation.
+  ahead(h: BodyHold, n: int): void {
+    h.id = 0
+    h.declared = n
+    h.got = 0
+    h.start = this.now()
+    h.cut = true
   }
 
   // The bytes tenant who holds now.
@@ -309,12 +382,46 @@ export class BodyBudget {
     h.got = 0
     h.start = this.now()
     this.reserved.set(h.id, h)
+    if (h.who !== "") this.runStart(h.who, h.start)
   }
 
   // h no longer holds a reservation (its body is read, refused or cut).
   untrack(h: BodyHold): void {
-    if (h.id > 0) this.reserved.delete(h.id)
+    if (h.id > 0) {
+      this.reserved.delete(h.id)
+      if (h.who !== "") this.runEnd(h.who, this.now())
+    }
     h.id = 0
+  }
+
+  // A reservation of tenant who begins at t: it joins the tenant's run when one holds a reservation or ended one less
+  // than RESERVE_GRACE_MS ago, else starts a new run. Runs that ended long ago are forgotten here, so the map stays as
+  // small as the tenants reserving lately.
+  private runStart(who: string, t: f64): void {
+    for (const k of this.runs.keys()) {
+      const r = this.runs.get(k)
+      if (r !== undefined && r.live <= 0 && t - r.ended >= RESERVE_GRACE_MS) this.runs.delete(k)
+    }
+    const r = this.runs.get(who)
+    if (r === undefined) {
+      this.runs.set(who, { since: t, live: 1, ended: 0.0 })
+      return
+    }
+    this.runs.set(who, { since: r.since, live: r.live + 1, ended: r.ended })
+  }
+
+  private runEnd(who: string, t: f64): void {
+    const r = this.runs.get(who)
+    if (r === undefined) return
+    this.runs.set(who, { since: r.since, live: Math.max(0, r.live - 1), ended: t })
+  }
+
+  // When the grace of h's reservation began: its own start, or its tenant's run's when that began earlier.
+  private graceFrom(h: BodyHold): f64 {
+    if (h.who === "") return h.start
+    const r = this.runs.get(h.who)
+    if (r === undefined) return h.start
+    return Math.min(h.start, r.since)
   }
 
   // The reservations held now.
@@ -322,16 +429,74 @@ export class BodyBudget {
     return this.reserved.size
   }
 
-  // How long (ms) the rest of a reserved body would take at its rate so far when that is past RESERVE_HORIZON_MS, else
-  // -1 (it keeps its reservation): a body that has sent nothing after the grace is as late as can be.
+  // The rate a body must keep (bytes per second) not to count as behind.
+  private keepRate(): f64 {
+    return BEHIND_RATE_MULTIPLE * (this.minRate > 0 ? this.minRate : DEFAULT_BODY_MIN_KB_PER_SECOND * 1024.0)
+  }
+
+  // How long (ms) the rest of a reserved body would take at its rate so far when it is behind, else -1 (it keeps its
+  // reservation): a body that has received nothing is as late as can be, at any age.
   private behind(h: BodyHold, t: f64): f64 {
-    const age = t - h.start
-    if (age < RESERVE_GRACE_MS) return -1.0
     const rest = h.declared - h.got
     if (rest <= 0) return -1.0
     if (h.got <= 0) return 1.0e15 + rest * 1.0
-    const need = (rest * 1.0) * age / (h.got * 1.0)
-    return need > RESERVE_HORIZON_MS ? need : -1.0
+    if (t - this.graceFrom(h) < RESERVE_GRACE_MS) return -1.0
+    const age = t - h.start
+    if (age <= 0.0) return -1.0
+    const rate = (h.got * 1000.0) / age
+    if (rate >= this.keepRate()) return -1.0
+    return (rest * 1000.0) / rate
+  }
+
+  // Whether a cut body keeps pace (its first RESERVE_GRACE_MS, or its rate so far at least keepRate): it may grow up to
+  // the cap.
+  private paced(h: BodyHold, t: f64): bool {
+    const age = t - h.start
+    if (age < RESERVE_GRACE_MS) return true
+    return (h.got * 1000.0) / age >= this.keepRate()
+  }
+
+  // The bytes cutting reservation h would give back.
+  private freed(h: BodyHold, cap: int): int {
+    return h.held - Math.min(h.held, h.got + reserveLookahead(cap))
+  }
+
+  // Cuts other tenants' reservations (any, for who "") that are behind, furthest first, until a new body of n bytes
+  // fits; nothing is cut unless cutting all of them would let it fit (re-audit 7 P1-2). true when it fits now.
+  private cutFor(n: int, own: int, cap: int, cls: BodyClass, share: int, who: string, ws: int, rs: int, nh?: BodyHold): bool {
+    const t = this.now()
+    const hs: BodyHold[] = []
+    const ds: int[] = []
+    for (const h of this.reserved.values()) {
+      if (who !== "" && h.who === who) continue
+      if (this.behind(h, t) < 0.0) continue
+      const d = this.freed(h, cap)
+      if (d <= 0) continue
+      hs.push(h)
+      ds.push(d)
+    }
+    if (hs.length === 0) return false
+    // as if every one of them were cut: does the new body fit then?
+    for (let i = 0; i < hs.length; i++) this.shift(hs[i]!, -ds[i]!)
+    const fit = this.admits(n, own, cap, cls, share, who, ws, rs, nh)
+    for (let i = 0; i < hs.length; i++) this.shift(hs[i]!, ds[i]!)
+    if (!fit) return false
+    while (!this.admits(n, own, cap, cls, share, who, ws, rs, nh)) {
+      if (!this.cutOne(who, cap)) return false
+    }
+    return true
+  }
+
+  // Moves d bytes of h's charge (negative: gives them back), as a cut would; cutFor undoes it after its look.
+  private shift(h: BodyHold, d: int): void {
+    h.held += d
+    this.held += d
+    if (h.cls === "unchecked") this.unchecked += d
+    if (h.who !== "") {
+      const left = (this.byWho.get(h.who) ?? 0) + d
+      if (left > 0) this.byWho.set(h.who, left)
+      else this.byWho.delete(h.who)
+    }
   }
 
   // Cuts the reservation furthest behind its pace among other tenants' (any, for who ""): it keeps what it received
@@ -352,6 +517,7 @@ export class BodyBudget {
     const h = this.reserved.get(id)
     if (h === undefined) return false
     this.untrack(h)
+    h.cut = true
     const keep = Math.min(h.held, h.got + reserveLookahead(cap))
     if (h.held > keep) {
       this.give(h.held - keep, h.cls, h.who)
@@ -390,14 +556,17 @@ export class BodyBudget {
 
   // Charges n more bytes to a request of kind cls that already holds `own` of them (a declared length is charged
   // whole when its body is admitted). true when they fit under cap (0: no cap), or when no other request holds a big
-  // body. A checked body that does not fit first cuts other tenants' reservations that fell behind their pace.
-  take(n: int, own: int, cap: int, cls: BodyClass, share: int, who?: string, whoShare?: int, reserve?: int): bool {
+  // body. A new checked body that keeps its tenant within its share and does not fit may cut other tenants'
+  // reservations that fell behind their pace (cutFor). h is the request's hold, when it has one: its body counts among
+  // the big bodies in hand (biggestBody), and a cut body's pace is looked at as it grows.
+  take(n: int, own: int, cap: int, cls: BodyClass, share: int, who?: string, whoShare?: int, reserve?: int, h?: BodyHold): bool {
     if (n <= 0) return true
     const w = who ?? ""
     const ws = whoShare ?? 0
     const rs = reserve ?? 0
-    while (!this.admits(n, own, cap, cls, share, w, ws, rs)) {
-      if (cls !== "checked" || !this.cutOne(w, cap)) {
+    if (!this.admits(n, own, cap, cls, share, w, ws, rs, h)) {
+      const mayCut = cls === "checked" && own <= 0 && (w === "" || ws <= 0 || this.heldBy(w) + n <= ws)
+      if (!mayCut || !this.cutFor(n, own, cap, cls, share, w, ws, rs, h)) {
         this.refuse(own, w)
         return false
       }
@@ -406,10 +575,15 @@ export class BodyBudget {
     if (cls === "unchecked") this.unchecked += n
     if (cls === "small") this.small += n
     if (w !== "") this.byWho.set(w, (this.byWho.get(w) ?? 0) + n)
+    if (h !== undefined && cls !== "small" && h.bid === 0) {
+      this.nextBody += 1
+      h.bid = this.nextBody
+      this.bodies.set(h.bid, h)
+    }
     return true
   }
 
-  private admits(n: int, own: int, cap: int, cls: BodyClass, share: int, who: string, whoShare: int, reserve: int): bool {
+  private admits(n: int, own: int, cap: int, cls: BodyClass, share: int, who: string, whoShare: int, reserve: int, h?: BodyHold): bool {
     if (n <= 0 || cap <= 0) return true
     if (cls === "unchecked" && share > 0) {
       // alone among the big bodies it may pass the share (the request limit decides its size); beside others it
@@ -427,13 +601,18 @@ export class BodyBudget {
     if (own <= 0) {
       const mine = this.heldBy(who)
       // a new body (a declared length, or a chunked body's first bytes) that keeps its tenant within its share may use
-      // the reserve: up to the cap, or beside a lone body bigger than the cap up to the reserve past it
-      if (mine + n <= whoShare) return seen + n <= Math.max(cap, this.biggest(who) + reserve)
+      // the reserve: up to the cap, or beside a single body bigger than the cap up to the reserve past it
+      if (mine + n <= whoShare) {
+        const big = this.biggestBody(who)
+        return seen + n <= (big > cap ? big + reserve : cap)
+      }
       // the reserve is kept from tenants that hold bytes already (re-audit 6 P1-B): a tenant's first body may fill the
       // cap, and so may a new body of a tenant that holds every big body while no other tenant waits
       if (mine <= 0) return seen + n <= cap
       if (seen - this.small - mine <= 0 && !this.contested(who)) return seen + n <= cap
     }
+    // a cut body that keeps pace grows up to the cap (re-audit 7 P1-2: it was refused part way at cap - reserve)
+    if (own > 0 && h !== undefined && h.cut && this.paced(h, this.now())) return seen + n <= cap
     // a tenant holding bytes beside others (or with another waiting), or a chunked body growing, leaves the reserve to
     // the others: under contention it is the one refused
     return seen + n <= cap - reserve
@@ -574,7 +753,7 @@ export async function readCharged(st: ReadableStream, b: BodyBudget, hold: BodyH
     }
     const more = body.length + v.length - hold.held
     if (more > 0) {
-      if (!b.take(more, hold.held, plan.cap, plan.cls, plan.share, plan.who, plan.whoShare, plan.reserve)) {
+      if (!b.take(more, hold.held, plan.cap, plan.cls, plan.share, plan.who, plan.whoShare, plan.reserve, hold)) {
         stop = "busy"
         break
       }
@@ -588,6 +767,8 @@ export async function readCharged(st: ReadableStream, b: BodyBudget, hold: BodyH
   clock.timer = -1
   b.untrack(hold)
   if (stop !== "") {
+    // a body refused here was not abandoned by its client (BodyBudget.forget)
+    if (stop === "busy" || stop === "large") hold.declared = 0
     try {
       await st.cancel()
     } catch (e) {
@@ -864,10 +1045,12 @@ test("the cap is a hard bound: a tenant's share no longer lets the bodies in han
   expect(b.take(24, 0, cap, "checked", 0, "vk:b", ws, rs)).toBe(false)
   expect(b.take(24, 0, cap, "checked", 0, "vk:c", ws, rs)).toBe(false)
   expect(b.held).toBe(46)
-  // a body within its share still fits beside the lone one, up to the reserve past it
-  expect(b.take(12, 0, cap, "checked", 0, "vk:c", ws, rs)).toBe(true)
+  // a body within its share fits beside it up to the cap; the reserve past the cap is only beside a single body over
+  // the cap (re-audit 7 P2-1; 46 + 12 was admitted before)
+  expect(b.take(12, 0, cap, "checked", 0, "vk:c", ws, rs)).toBe(false)
+  expect(b.take(2, 0, cap, "checked", 0, "vk:c", ws, rs)).toBe(true)
   expect(b.take(1, 0, cap, "checked", 0, "vk:d", ws, rs)).toBe(false)
-  expect(b.held).toBe(58)
+  expect(b.held).toBe(48)
   // with no reserve the cap alone decides
   const n = new BodyBudget()
   expect(n.take(40, 0, cap, "checked", 0, "vk:a", ws, 0)).toBe(true)
@@ -922,13 +1105,18 @@ test("under contention the tenant past its share is the one refused, and a lone 
   const ws = 12
   const rs = 12
   // a lone chunked body grows past the cap (the request limit bounds it)
-  expect(b.take(46, 0, cap, "checked", 0, "vk:a", ws, rs)).toBe(true)
-  expect(b.take(2, 46, cap, "checked", 0, "vk:a", ws, rs)).toBe(true)
+  const lone = new BodyHold()
+  lone.who = "vk:a"
+  expect(b.take(46, 0, cap, "checked", 0, "vk:a", ws, rs, lone)).toBe(true)
+  lone.held = 46
+  expect(b.take(4, 46, cap, "checked", 0, "vk:a", ws, rs, lone)).toBe(true)
+  lone.held = 50
   // another tenant's first body fits within the reserve past it
   expect(b.take(4, 0, cap, "checked", 0, "vk:b", ws, rs)).toBe(true)
   // and the tenant past its share is refused its next bytes
-  expect(b.take(1, 48, cap, "checked", 0, "vk:a", ws, rs)).toBe(false)
-  b.give(48, "checked", "vk:a")
+  expect(b.take(1, 50, cap, "checked", 0, "vk:a", ws, rs, lone)).toBe(false)
+  b.give(50, "checked", "vk:a")
+  b.forget(lone)
   expect(b.held).toBe(4)
   // a single tenant on its own may fill the cap with its bodies while no other tenant waits (re-audit 6 P1-B; L208 kept
   // it to cap - reserve)
@@ -1080,12 +1268,9 @@ test("reservations that fell behind their pace are cut for other tenants' bodies
   for (const k of ["vk:1", "vk:2", "vk:3", "vk:4"]) hs.push(declared(b, 12 * M, cap, k))
   expect(b.held).toBe(cap)
   expect(b.reservations()).toBe(4)
-  // an outsider's 4 MB body half a second later: the reservations are young, nothing is cut, it is refused
-  b.clock = 500.0
-  expect(b.take(4 * M, 0, cap, "checked", 0, "vk:o", 12 * M, 12 * M)).toBe(false)
-  expect(b.cuts).toBe(0)
-  // two seconds in, with nothing sent: one reservation is cut to its look-ahead and the outsider is served
-  b.clock = 2000.0
+  // an outsider's 4 MB body a millisecond later: a reservation that has received nothing is cut at any age (re-audit 7
+  // P1-1; L213 waited 200 ms, wave 30 a second), to its look-ahead, and the outsider is served
+  b.clock = 1.0
   expect(b.take(4 * M, 0, cap, "checked", 0, "vk:o", 12 * M, 12 * M)).toBe(true)
   expect(b.cuts).toBe(1)
   expect(b.reservations()).toBe(3)
@@ -1142,6 +1327,244 @@ test("a body on pace keeps its reservation; the one furthest behind is cut first
   u.clock = 5000.0
   expect(u.take(5 * M, 0, cap, "unchecked", 3 * M)).toBe(false)
   expect(u.cuts).toBe(0)
+})
+
+// Lets go of a test budget's reservation (BodyHold.release works on the process's budget).
+function letGo(b: BodyBudget, h: BodyHold): void {
+  b.untrack(h)
+  b.give(h.held, h.cls, h.who)
+  h.held = 0
+}
+
+test("an empty reservation is cut at any age, and a reconnecting tenant's grace counts once (L213, re-audit 7 P1-1)", () => {
+  const M = 1048576
+  const cap = 4 * M
+  const b = new BodyBudget()
+  b.clock = 0.0
+  // four tenants declare 1 MB each and send nothing
+  const hs: BodyHold[] = []
+  for (const k of ["vk:1", "vk:2", "vk:3", "vk:4"]) hs.push(declared(b, M, cap, k))
+  expect(b.held).toBe(cap)
+  // at once (L213 kept them for 200 ms) they are cut (two: each keeps its look-ahead) and the outsider served
+  b.clock = 1.0
+  expect(b.take(M, 0, cap, "checked", 0, "vk:o", M, M)).toBe(true)
+  expect(b.cuts).toBe(2)
+  // a body that has started sending keeps the full grace
+  const g = new BodyBudget()
+  g.clock = 0.0
+  const sending = declared(g, 3 * M, cap, "vk:s")
+  sending.got = 1000
+  g.clock = 500.0
+  expect(g.take(2 * M, 0, cap, "checked", 0, "vk:o", 2 * M, M)).toBe(false)
+  g.clock = RESERVE_GRACE_MS + 1.0
+  expect(g.take(2 * M, 0, cap, "checked", 0, "vk:o", 2 * M, M)).toBe(true)
+  // a tenant that reconnects at once (its request ended, a new one sent): the new reservation's grace counts from the
+  // first of the run, so it is cut as soon as it is needed, however young
+  const r = new BodyBudget()
+  r.clock = 0.0
+  const first = declared(r, 3 * M, cap, "vk:r")
+  first.got = 1000
+  r.clock = 900.0
+  letGo(r, first)
+  const again = declared(r, 3 * M, cap, "vk:r")
+  again.got = 1000
+  r.clock = RESERVE_GRACE_MS + 50.0
+  expect(r.take(2 * M, 0, cap, "checked", 0, "vk:o", 2 * M, M)).toBe(true)
+  expect(again.id).toBe(0)
+  // after a quiet second its next reservation has a grace of its own again
+  const q = new BodyBudget()
+  q.clock = 0.0
+  const one = declared(q, 3 * M, cap, "vk:q")
+  q.clock = 500.0
+  letGo(q, one)
+  q.clock = 500.0 + RESERVE_GRACE_MS
+  const two = declared(q, 3 * M, cap, "vk:q")
+  two.got = 1000
+  q.clock = 500.0 + RESERVE_GRACE_MS + 500.0
+  expect(q.take(2 * M, 0, cap, "checked", 0, "vk:o", 2 * M, M)).toBe(false)
+  expect(two.id > 0).toBe(true)
+})
+
+test("a newcomer past its share cuts nothing, and an upload well above the minimum rate keeps its reservation (re-audit 7 P1-2)", () => {
+  const M = 1048576
+  const cap = 48 * M
+  const q = 12 * M
+  // C2: a 30 MB upload at 1 MB/s, three seconds in (wave 30 judged it behind: 27 s to go, more than 10 s)
+  const b = new BodyBudget()
+  b.clock = 0.0
+  const up = declared(b, 30 * M, cap, "vk:1")
+  b.clock = 3000.0
+  up.got = 3 * M
+  // another tenant's 24 MB body, past its share, does not fit: refused, and nothing is cut (it cut the upload, which
+  // was then refused part way)
+  expect(b.take(24 * M, 0, cap, "checked", 0, "vk:2", q, q)).toBe(false)
+  expect(b.cuts).toBe(0)
+  expect(up.id > 0).toBe(true)
+  expect(up.held).toBe(30 * M)
+  // a 40 MB upload: a body within its share that does not fit beside it does not cut it either, at 1 MB/s
+  const f = new BodyBudget()
+  f.clock = 0.0
+  const fast = declared(f, 40 * M, cap, "vk:1")
+  f.clock = 3000.0
+  fast.got = 3 * M
+  expect(f.take(12 * M, 0, cap, "checked", 0, "vk:2", q, q)).toBe(false)
+  expect(f.cuts).toBe(0)
+  // the same upload at 100 KB/s is behind (under 8 x 32 KB/s): cut for the body within its share
+  const s = new BodyBudget()
+  s.clock = 0.0
+  const slow = declared(s, 40 * M, cap, "vk:1")
+  s.clock = 3000.0
+  slow.got = 300 * 1024
+  expect(s.take(24 * M, 0, cap, "checked", 0, "vk:2", q, q)).toBe(false)
+  expect(s.cuts).toBe(0)
+  expect(s.take(12 * M, 0, cap, "checked", 0, "vk:2", q, q)).toBe(true)
+  expect(s.cuts).toBe(1)
+  expect(slow.held).toBe(300 * 1024 + reserveLookahead(cap))
+  // judged against server.body_min_kb_per_second: with a floor of 8 KB/s, 100 KB/s keeps pace
+  const low = new BodyBudget()
+  low.clock = 0.0
+  low.minRate = 8192.0
+  const kept = declared(low, 40 * M, cap, "vk:1")
+  low.clock = 3000.0
+  kept.got = 300 * 1024
+  expect(low.take(12 * M, 0, cap, "checked", 0, "vk:2", q, q)).toBe(false)
+  expect(low.cuts).toBe(0)
+})
+
+test("nothing is cut unless cutting every reservation behind would let the newcomer fit (re-audit 7 P1-2)", () => {
+  const M = 1048576
+  const cap = 48 * M
+  const q = 12 * M
+  const b = new BodyBudget()
+  b.clock = 0.0
+  // an empty 4 MB reservation (behind) and a 40 MB one at 4 MB/s
+  const empty = declared(b, 4 * M, cap, "vk:e")
+  const fast = declared(b, 40 * M, cap, "vk:f")
+  b.clock = 2000.0
+  fast.got = 8 * M
+  // a 12 MB body: cutting the empty one frees 3 MB, not enough: refused and nothing cut (wave 30 cut it anyway)
+  expect(b.take(12 * M, 0, cap, "checked", 0, "vk:o", q, q)).toBe(false)
+  expect(b.cuts).toBe(0)
+  expect(empty.id > 0).toBe(true)
+  expect(empty.held).toBe(4 * M)
+  // a 6 MB body fits once it is cut
+  expect(b.take(6 * M, 0, cap, "checked", 0, "vk:o", q, q)).toBe(true)
+  expect(b.cuts).toBe(1)
+  expect(empty.id).toBe(0)
+  expect(b.held).toBe(40 * M + reserveLookahead(cap) + 6 * M)
+  // a chunked body's growth never cuts
+  const g = new BodyBudget()
+  g.clock = 0.0
+  declared(g, 40 * M, cap, "vk:e")
+  expect(g.take(4 * M, 0, cap, "checked", 0, "vk:o", q, q)).toBe(true)
+  expect(g.take(8 * M, 4 * M, cap, "checked", 0, "vk:o", q, q)).toBe(false)
+  expect(g.cuts).toBe(0)
+})
+
+test("a cut body that keeps pace may grow up to the cap; a slow one only to cap - reserve (re-audit 7 P1-2)", () => {
+  const M = 1048576
+  const cap = 48 * M
+  const q = 12 * M
+  for (const rate of ["fast", "slow"]) {
+    const b = new BodyBudget()
+    b.clock = 0.0
+    const a = declared(b, 30 * M, cap, "vk:a")
+    // another tenant's 16 MB in hand, then an outsider's 12 MB: the empty reservation is cut to its look-ahead
+    expect(b.take(16 * M, 0, cap, "checked", 0, "vk:b", q, q)).toBe(true)
+    b.clock = 1.0
+    expect(b.take(12 * M, 0, cap, "checked", 0, "vk:o", q, q)).toBe(true)
+    expect(a.cut).toBe(true)
+    expect(a.held).toBe(M)
+    // two seconds in it has sent 8 MB (4 MB/s) or 100 KB
+    b.clock = 2000.0
+    a.got = rate === "fast" ? 8 * M : 100 * 1024
+    const more = rate === "fast" ? 7 * M : 5 * M
+    expect(b.take(more, a.held, cap, "checked", 0, "vk:a", q, q, a)).toBe(true)
+    a.held += more
+    // past cap - reserve (36 MB in hand): the body that keeps pace grows on, the slow one is refused
+    expect(b.take(6 * M, a.held, cap, "checked", 0, "vk:a", q, q, a)).toBe(rate === "fast")
+  }
+})
+
+// Charges n more bytes of tenant who to body h of test budget b (as readCharged does), shares of a quarter.
+function bodyOf(b: BodyBudget, h: BodyHold, n: int, cap: int, who: string): bool {
+  const q = Math.max(1, Math.floor(cap / 4))
+  h.who = who
+  h.cls = "checked"
+  if (!b.take(n, h.held, cap, "checked", 0, who, q, q, h)) return false
+  h.held += n
+  return true
+}
+
+test("the reserve past the cap applies only beside a single body over the cap, not one tenant's several (re-audit 7 P2-1)", () => {
+  const cap = 48
+  // one tenant's two 24-byte bodies fill the cap
+  const b = new BodyBudget()
+  const h1 = new BodyHold()
+  const h2 = new BodyHold()
+  expect(bodyOf(b, h1, 24, cap, "vk:a")).toBe(true)
+  expect(bodyOf(b, h2, 24, cap, "vk:a")).toBe(true)
+  // another tenant's body within its share is refused (it was admitted: 60 in hand with a cap of 48)
+  const o = new BodyHold()
+  expect(bodyOf(b, o, 12, cap, "vk:o")).toBe(false)
+  expect(b.held).toBe(48)
+  // beside a single 50-byte body it may use the reserve past it
+  const c = new BodyBudget()
+  const big = new BodyHold()
+  expect(bodyOf(c, big, 50, cap, "vk:a")).toBe(true)
+  expect(bodyOf(c, o, 12, cap, "vk:o")).toBe(true)
+  expect(c.held).toBe(62)
+  // and once that body is done the allowance goes with it
+  c.give(big.held, "checked", "vk:a")
+  c.forget(big)
+  big.held = 0
+  const h3 = new BodyHold()
+  expect(bodyOf(c, h3, 36, cap, "vk:b")).toBe(true)
+  const p = new BodyHold()
+  expect(bodyOf(c, p, 12, cap, "vk:p")).toBe(false)
+})
+
+test("a tenant that abandoned a declared body is marked for a while; a body that arrives whole clears it (re-audit 7 P1-1)", () => {
+  const M = 1048576
+  const cap = 48 * M
+  const b = new BodyBudget()
+  b.clock = 0.0
+  const h = declared(b, 12 * M, cap, "vk:a")
+  expect(b.abandonedLately("vk:a")).toBe(false)
+  // its request ends with nothing received
+  letGo(b, h)
+  b.forget(h)
+  expect(b.abandonedLately("vk:a")).toBe(true)
+  expect(b.abandonedLately("vk:b")).toBe(false)
+  expect(b.abandonedLately("")).toBe(false)
+  // its next declared body is reserved only the look-ahead (heldBody): not a reservation, charged as it arrives
+  const next = new BodyHold()
+  expect(bodyOf(b, next, reserveLookahead(cap), cap, "vk:a")).toBe(true)
+  b.ahead(next, 12 * M)
+  expect(next.cut).toBe(true)
+  expect(b.reservations()).toBe(0)
+  // it arrives whole: the mark is cleared
+  next.got = 12 * M
+  b.forget(next)
+  expect(b.abandonedLately("vk:a")).toBe(false)
+  // the mark lasts ABANDONED_MS
+  const again = declared(b, 12 * M, cap, "vk:a")
+  letGo(b, again)
+  b.forget(again)
+  b.clock = ABANDONED_MS - 1.0
+  expect(b.abandonedLately("vk:a")).toBe(true)
+  b.clock = ABANDONED_MS + 1.0
+  expect(b.abandonedLately("vk:a")).toBe(false)
+  // a body the budget refused (declared 0) or one that sent bytes marks nothing
+  const part = declared(b, 12 * M, cap, "vk:c")
+  part.got = 1000
+  letGo(b, part)
+  b.forget(part)
+  expect(b.abandonedLately("vk:c")).toBe(false)
+  const refused = new BodyHold()
+  refused.who = "vk:d"
+  b.forget(refused)
+  expect(b.abandonedLately("vk:d")).toBe(false)
 })
 
 test("a reservation is let go when its request is done", () => {

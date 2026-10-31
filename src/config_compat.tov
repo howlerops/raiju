@@ -1841,6 +1841,76 @@ function rateLimitOf(rf: Field[], inout rates: string[]): string | undefined thr
 // provider config keeps the provider's models, weight and first budget or rate limit. Deny-by-default
 // (allow_all_providers false) is written as a deny of every model, since Raiju allows every model of a
 // profile's provider when no list says otherwise. What Raiju cannot express is noted.
+// An access profile's mcp_configs as Raiju's ([{mcp_client_name, tools_to_execute}]), with the deprecated aliases folded
+// in as Bifrost's schema describes them: each mcp_servers entry is a ["*"] allowlist for its client unless mcp_configs
+// lists that client (whose explicit list is kept); an mcp_tool_overrides include adds its tool to the client's list
+// (making one when the client has none), an exclude takes it off an explicit list (a ["*"] list cannot enumerate it,
+// so it stays). undefined when one client is named two ways across mcp_configs and mcp_servers (an id in one, its name
+// in the other), which Bifrost refuses.
+function foldMcpConfigs(pf: Field[], names: Map<string, string>, profile: string, inout notes: string[]): string | undefined throws SyntaxError {
+  let spell: string[] = []
+  let tools: (string | undefined)[] = []
+  const resolve = (c: string): string => names.get(c) ?? c
+  for (const mel of try items(find(pf, "mcp_configs"))) {
+    const mf = try members(mel)
+    spell.push(rawStr(mf, "mcp_client_id") ?? "")
+    const t = find(mf, "tools_to_execute")
+    tools.push(t === undefined || isNull(t) ? undefined : t)
+  }
+  const fromConfigs = spell.length
+  for (const sel of try items(find(pf, "mcp_servers"))) {
+    const sid = rawStr(try members(sel), "mcp_server_id") ?? ""
+    if (sid === "") continue
+    let same = -1
+    let other = -1
+    for (let i = 0; i < spell.length; i++) {
+      if (spell[i] === sid) same = i
+      else if (resolve(spell[i]!) === resolve(sid)) other = i
+    }
+    if (same >= 0) continue
+    if (other >= 0 && other < fromConfigs) {
+      notes.push(`config: access profile "${profile}" names MCP client "${resolve(sid)}" as "${spell[other]!}" in mcp_configs and as "${sid}" in mcp_servers, which is ambiguous`)
+      return undefined
+    }
+    if (other >= 0) continue
+    spell.push(sid)
+    tools.push(`["*"]`)
+  }
+  for (const oel of try items(find(pf, "mcp_tool_overrides"))) {
+    const of = try members(oel)
+    const cid = rawStr(of, "mcp_client_id") ?? ""
+    const tool = rawStr(of, "tool_name") ?? ""
+    const action = rawStr(of, "action") ?? ""
+    if (cid === "" || tool === "") continue
+    let at = -1
+    for (let i = 0; i < spell.length; i++) {
+      if (resolve(spell[i]!) === resolve(cid)) at = i
+    }
+    const list: string[] = at < 0 ? [] : try strings(tools[at])
+    if (action === "include") {
+      if (at < 0) {
+        spell.push(cid)
+        tools.push(quotedArray([tool]))
+      } else if (!list.includes("*") && !list.includes(tool)) {
+        tools[at] = quotedArray(list.concat([tool]))
+      }
+    } else if (action === "exclude") {
+      if (at >= 0 && !list.includes("*")) {
+        tools[at] = quotedArray(list.filter((t) => t !== tool))
+      } else {
+        notes.push(`config: access profile "${profile}" mcp_tool_overrides exclude of "${tool}" on "${cid}" narrows nothing: the client's tools are not an explicit list`)
+      }
+    }
+  }
+  let out: string[] = []
+  for (let i = 0; i < spell.length; i++) {
+    let mfs: Field[] = [{ key: "mcp_client_name", raw: quote(resolve(spell[i]!)) }]
+    add(&mfs, "tools_to_execute", tools[i])
+    out.push(build(mfs))
+  }
+  return "[" + out.join(",") + "]"
+}
+
 function mapAccessProfiles(inout top: Field[], vmIds: Map<string, string>, inout notes: string[]): void throws SyntaxError {
   const raw = find(top, "access_profiles")
   if (raw === undefined) return
@@ -1865,6 +1935,13 @@ function mapAccessProfiles(inout top: Field[], vmIds: Map<string, string>, inout
     }
     if (ids.includes(id)) {
       notes.push(`config: access profile "${name}" repeats the id "${id}" and is not loaded`)
+      continue
+    }
+    // the MCP tools it grants, with the deprecated mcp_servers and mcp_tool_overrides folded in; a client named two
+    // ways (its id here, its name there) is refused, as Bifrost refuses it
+    const folded = try foldMcpConfigs(pf, names, name, &notes)
+    if (folded === undefined) {
+      notes.push(`config: access profile "${name}" is not loaded`)
       continue
     }
     ids.push(id)
@@ -1934,24 +2011,23 @@ function mapAccessProfiles(inout top: Field[], vmIds: Map<string, string>, inout
       const vn = rawStr(vf, "virtual_mcp_name")
       if (vn !== undefined && !vms.includes(vn)) vms.push(vn)
     }
-    if (find(pf, "virtual_mcps") !== undefined) add(&out, "virtual_mcps", quotedArray(vms))
+    if (find(pf, "virtual_mcps") !== undefined) {
+      add(&out, "virtual_mcps", quotedArray(vms))
+      if (find(pf, "mcp_tool_groups") !== undefined) notes.push(`config: access profile "${name}" mcp_tool_groups is ignored: virtual_mcps is set`)
+    } else if (find(pf, "mcp_tool_groups") !== undefined) {
+      // the deprecated alias: each tool_group_id is a virtual MCP's id, folded into virtual_mcps
+      for (const gel of try items(find(pf, "mcp_tool_groups"))) {
+        const gid = find(try members(gel), "tool_group_id")
+        if (gid === undefined || isNull(gid)) continue
+        const byId = vmIds.get(gid.trim())
+        if (byId === undefined) notes.push(`config: access profile "${name}" mcp_tool_groups tool_group_id ${gid.trim()} names no virtual MCP in mcp.virtual_mcps; it is not granted`)
+        else if (!vms.includes(byId)) vms.push(byId)
+      }
+      add(&out, "virtual_mcps", quotedArray(vms))
+    }
     // the agents the profile grants (Bifrost Enterprise's agent_grants, [{agent_name}]), as they are
     add(&out, "agent_grants", find(pf, "agent_grants"))
-    const mcs = try items(find(pf, "mcp_configs"))
-    if (find(pf, "mcp_configs") !== undefined) {
-      let mc: string[] = []
-      for (const mel of mcs) {
-        const mf = try members(mel)
-        const cid = rawStr(mf, "mcp_client_id") ?? ""
-        let mfs: Field[] = [{ key: "mcp_client_name", raw: quote(names.get(cid) ?? cid) }]
-        add(&mfs, "tools_to_execute", find(mf, "tools_to_execute"))
-        mc.push(build(mfs))
-      }
-      add(&out, "mcp_configs", "[" + mc.join(",") + "]")
-    }
-    for (const k of ["mcp_tool_groups", "mcp_servers", "mcp_tool_overrides"]) {
-      if (find(pf, k) !== undefined) notes.push(`config: access profile "${name}" ${k} is not applied: use virtual_mcps and mcp_configs`)
-    }
+    if (find(pf, "mcp_configs") !== undefined || find(pf, "mcp_servers") !== undefined || find(pf, "mcp_tool_overrides") !== undefined) add(&out, "mcp_configs", folded)
     profiles.push(build(out))
   }
   if (profiles.length > 0) {
@@ -2020,6 +2096,7 @@ export function unknownKeys(configText: string): string[] throws SyntaxError {
       const fe = find(try members(f.raw), "feed")
       if (fe !== undefined) try checkChildren("cluster.feed", fe, clusterFeedKeys(), &out)
     }
+    if (f.key === "mcp_server") try checkChildren("mcp_server", f.raw, ["enabled", "max_sessions", "max_sessions_per_caller"], &out)
     if (f.key === "websocket") try checkChildren("websocket", f.raw, ["max_connections_per_user", "transcript_buffer_size", "pool"], &out)
     if (f.key === "server") {
       try checkChildren("server", f.raw, serverKeys(), &out)
@@ -2123,6 +2200,11 @@ test("the MCP authorization server's keys and Raiju's registration limits are kn
   expect(try unknownKeys(text)).toEqual([])
   const typo = try unknownKeys(`{ "client": { "oauth2_server_config": { "max_unused_client": 5 } } }`)
   expect(typo).toEqual(["client.oauth2_server_config.max_unused_client"])
+})
+
+test("the MCP server's session caps are known; a typo among its keys is reported", () => {
+  expect(try unknownKeys(`{ "mcp_server": { "enabled": true, "max_sessions": 5000, "max_sessions_per_caller": 50 } }`)).toEqual([])
+  expect(try unknownKeys(`{ "mcp_server": { "max_session": 5 } }`)).toEqual(["mcp_server.max_session"])
 })
 
 test("the cluster and its live feed keys are known; a typo in either is reported", () => {
@@ -3118,6 +3200,45 @@ test("top-level access_profiles map onto governance.access_profiles", () => {
   expect(find(try fields(r.text), "access_profiles")).toBeUndefined()
   const parsed = try JSON.parse(profiles[0]!) as AccessProfile
   expect(validateProfile(parsed)).toBe("")
+})
+
+test("an access profile's deprecated mcp_tool_groups, mcp_servers and mcp_tool_overrides fold into virtual_mcps and mcp_configs", () => {
+  const text = `{
+    "mcp": { "client_configs": [ { "client_id": "c1", "name": "docs" }, { "client_id": "c2", "name": "jira" }, { "client_id": "c3", "name": "git" } ],
+             "virtual_mcps": [ { "id": 7, "name": "dev-tools" } ] },
+    "access_profiles": [
+      {
+        "name": "old",
+        "mcp_tool_groups": [ { "tool_group_id": 7 }, { "tool_group_id": 99 } ],
+        "mcp_configs": [ { "mcp_client_id": "c1", "tools_to_execute": ["search", "read"] } ],
+        "mcp_servers": [ { "mcp_server_id": "c1" }, { "mcp_server_id": "c2" } ],
+        "mcp_tool_overrides": [
+          { "mcp_client_id": "c1", "tool_name": "write", "action": "include" },
+          { "mcp_client_id": "c1", "tool_name": "read", "action": "exclude" },
+          { "mcp_client_id": "c2", "tool_name": "delete", "action": "exclude" },
+          { "mcp_client_id": "c3", "tool_name": "log", "action": "include" }
+        ]
+      },
+      { "name": "new", "virtual_mcps": [ { "virtual_mcp_name": "dev-tools" } ], "mcp_tool_groups": [ { "tool_group_id": 7 } ] },
+      { "name": "clash", "mcp_configs": [ { "mcp_client_id": "docs", "tools_to_execute": ["*"] } ], "mcp_servers": [ { "mcp_server_id": "c1" } ] }
+    ]
+  }`
+  const r = try normalize(text)
+  const gov = try members(find(try fields(r.text), "governance")!)
+  const profiles = try elements(find(gov, "access_profiles")!)
+  expect(profiles.length).toBe(2)
+  const p = try fields(profiles[0]!)
+  expect(find(p, "virtual_mcps")).toBe(`["dev-tools"]`)
+  // c1 keeps its explicit list (plus the include, minus the exclude); c2 gets everything; c3 only the included tool
+  expect(find(p, "mcp_configs")).toBe(`[{"mcp_client_name":"docs","tools_to_execute":["search","write"]},{"mcp_client_name":"jira","tools_to_execute":["*"]},{"mcp_client_name":"git","tools_to_execute":["log"]}]`)
+  expect(r.notes.some((x) => x.includes(`tool_group_id 99 names no virtual MCP`))).toBe(true)
+  expect(r.notes.some((x) => x.includes(`exclude of "delete" on "c2" narrows nothing`))).toBe(true)
+  // virtual_mcps wins over the alias
+  expect(find(try fields(profiles[1]!), "virtual_mcps")).toBe(`["dev-tools"]`)
+  expect(r.notes.some((x) => x.includes(`"new" mcp_tool_groups is ignored: virtual_mcps is set`))).toBe(true)
+  // one client named by its name in mcp_configs and by its id in mcp_servers is refused
+  expect(r.notes.some((x) => x.includes(`"clash" names MCP client "docs" as "docs" in mcp_configs and as "c1" in mcp_servers`))).toBe(true)
+  expect(r.notes.some((x) => x.includes(`access profile "clash" is not loaded`))).toBe(true)
 })
 
 test("websocket: the session cap is read, and the pool and transcript buffer are noted", () => {

@@ -1,0 +1,108 @@
+// The raw-socket client paths and the address policy the runtime checks when they connect (tov-patches/0022), each
+// called directly, past the URL guards that run before them in the gateway, so only the connect-time check can
+// refuse: the A2A gRPC client (a2agrpcup.tov grpcSend on h2.tov), the Redis/Valkey vector store (vectorstore.tov
+// RespClient) and the realtime and live WebSockets to providers (realtime.tov openUpstream). The hosts are names the
+// resolver maps to an address (inet_aton forms: "0x7f000001" is 127.0.0.1, "0" is 0.0.0.0, "0x0a000001" is
+// 10.0.0.1), so each check runs on what the lookup returned. Prints "ok" and "FAIL" lines; run by tests/e2e.py
+// (l212_e2e). The listeners are on 127.0.0.1, on ports the system picks.
+import { grpcSend } from "../src/a2agrpcup"
+import { grpcClose } from "../src/grpc"
+import { Call, CallCancel } from "../src/a2a"
+import { openVectorStore } from "../src/vectorstore"
+import { openUpstream } from "../src/realtime"
+import { providerPeer } from "../src/netguard"
+
+function check(label: string, ok: bool, detail: string): void {
+  console.log(ok ? `ok ${label}` : `FAIL ${label}: ${detail}`)
+}
+
+// a TCP listener that closes each connection at once (a gRPC agent that is reached but answers nothing)
+const closer = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { open(s) { s.terminate() } } })
+// a RESP server that answers +OK to every command (enough for the store's FT.CREATE)
+const resp = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data(s, b) { s.write("+OK\r\n") } } })
+// a WebSocket server (a provider's realtime endpoint)
+const ws = Bun.serve({
+  port: 0,
+  hostname: "127.0.0.1",
+  fetch(req, srv) {
+    if (srv.upgrade(req)) return
+    return new Response("no")
+  },
+  websocket: { message(w, m) { w.send(m) } },
+})
+
+async function grpcError(host: string, port: int, allowPrivate: bool): Promise<string> {
+  const call: Call = { op: "GetTask", v03: false, params: `{"id":"t1"}`, stream: false, taskId: "t1", configId: "" }
+  const cancel: CallCancel | undefined = undefined
+  const g = await grpcSend(`http://${host}:${port}`, { ca: "", verify: true }, call, `{"id":"t1"}`, "1", new Map(), cancel, allowPrivate)
+  grpcClose()
+  return g.error
+}
+
+async function storeError(addr: string): Promise<string> {
+  try {
+    const s = try openVectorStore({ type: "redis", config: { addr: addr } })
+    if (s === undefined) return "no store"
+    try await s.ensure("peer-paths", 3, ["scope"])
+    return ""
+  } catch (e) {
+    return e.message
+  }
+}
+
+// "" when the socket opened, else the error event's message (or the close code)
+function wsError(url: string, allowPrivate: bool): Promise<string> {
+  return new Promise<string>((resolve) => {
+    const up = openUpstream(url, {}, providerPeer(allowPrivate))
+    if (up === undefined) {
+      resolve("no socket")
+      return
+    }
+    let err = ""
+    up.onopen = () => {
+      up.close()
+      resolve("")
+    }
+    up.onerror = (ev) => {
+      err = ev.message
+    }
+    up.onclose = (ev) => {
+      resolve(err === "" ? `closed ${ev.code}` : err)
+    }
+  })
+}
+
+function refused(r: string): bool {
+  return r.includes("is not allowed")
+}
+
+async function main(): Promise<int> {
+  // A2A gRPC: the agent's allow_private_network decides, as its URL guard does
+  const g1 = await grpcError("0x7f000001", closer.port, false)
+  check("gRPC: a name that resolves to a loopback address is refused at connect without allow_private_network", refused(g1) && g1.includes("127.0.0.1"), g1)
+  const g2 = await grpcError("0x7f000001", closer.port, true)
+  check("gRPC: with allow_private_network the connection is made", g2 !== "" && !refused(g2), g2)
+  const g3 = await grpcError("0", closer.port, true)
+  check("gRPC: a name that resolves to 0.0.0.0 is refused even with allow_private_network", refused(g3) && g3.includes("0.0.0.0"), g3)
+
+  // Redis/Valkey vector store: private networks allowed, blocked addresses refused
+  const r1 = await storeError(`0x7f000001:${resp.port}`)
+  check("redis: a store on a private address is reached", r1 === "", r1)
+  const r2 = await storeError(`0:${resp.port}`)
+  check("redis: a store whose name resolves to 0.0.0.0 is refused at connect", refused(r2) && r2.includes("0.0.0.0"), r2)
+
+  // realtime and live WebSockets to providers: loopback allowed, private only with allow_private_network
+  const w1 = await wsError(`ws://0x7f000001:${ws.port}/v1/realtime`, false)
+  check("websocket: a provider on a loopback address is reached", w1 === "", w1)
+  const w2 = await wsError(`ws://0x0a000001:1/v1/realtime`, false)
+  check("websocket: a provider whose name resolves to a private address is refused without allow_private_network", refused(w2) && w2.includes("10.0.0.1"), w2)
+  const w3 = await wsError(`ws://0:${ws.port}/v1/realtime`, true)
+  check("websocket: a provider whose name resolves to 0.0.0.0 is refused even with allow_private_network", refused(w3) && w3.includes("0.0.0.0"), w3)
+
+  closer.stop(true)
+  resp.stop(true)
+  ws.stop(true)
+  return 0
+}
+
+await main()

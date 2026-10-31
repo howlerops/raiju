@@ -21,6 +21,9 @@ import { LogEntry, kindOf, bifrostRequestType } from "./logstore"
 import { isoMs } from "./exports"
 import { trimSlash } from "./providers/types"
 import { Field, fields, elements, find, rawStr, quote, build } from "./json"
+import { sha256, toHex, utf8 } from "./crypto"
+import { decode } from "./base64"
+import { pctEncode } from "./cloud_auth"
 
 export const MAXIM_BASE = "https://app.getmaxim.ai"
 
@@ -265,6 +268,290 @@ export function maximRequest(base: string, apiKey: string, repoId: string, rows:
   return { url: `${root}/api/sdk/v3/log?id=${repoId}`, method: "POST", headers: headers, body: body }
 }
 
+// ---- attachments ----
+
+// One attachment of a generation, as the plugin's ExtractAttachmentsFromRequest makes it from the request: a URL
+// (sent as an add-attachment line) or file data (uploaded to the signed URL maxim-go asks for, then announced by an
+// add-attachment line).
+export type MaximAttachment = { generationId: string, id: string, name: string, mimeType: string, kind: "url" | "fileData", url: string, data: u8[] }
+
+// A JSON string as Go's encoding/json writes it (it escapes <, > and & too).
+function goQuote(s: string): string {
+  return quote(s).replaceAll("<", "\\u003c").replaceAll(">", "\\u003e").replaceAll("&", "\\u0026")
+}
+
+// The attachment's id: a UUID made from the generation and the attachment's place in the request, so a batch that is
+// sent again names (and uploads) the same attachments. The plugin draws random ones.
+export function attachmentId(generationId: string, index: int): string {
+  const h = toHex(sha256(utf8(generationId + "/attachment/" + index)))
+  const n = "0123456789abcdef".indexOf(h.slice(16, 17)) % 4
+  const v = "89ab".slice(n, n + 1)
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-${v}${h.slice(17, 20)}-${h.slice(20, 32)}`
+}
+
+// The file extension the plugin names a file after (extFromMime).
+function extOf(mime: string): string {
+  if (mime === "image/png") return "png"
+  if (mime === "image/jpeg" || mime === "image/jpg") return "jpg"
+  if (mime === "image/gif") return "gif"
+  if (mime === "image/webp") return "webp"
+  if (mime === "audio/wav") return "wav"
+  if (mime === "audio/mpeg") return "mp3"
+  if (mime === "application/pdf") return "pdf"
+  return "bin"
+}
+
+// The image type of raw bytes, as http.DetectContentType names the image formats; "" for anything else.
+export function sniffImage(b: u8[]): string {
+  const at = (i: int): int => i < b.length ? int(b[i]!) : -1
+  if (at(0) === 0x89 && at(1) === 0x50 && at(2) === 0x4e && at(3) === 0x47) return "image/png"
+  if (at(0) === 0xff && at(1) === 0xd8 && at(2) === 0xff) return "image/jpeg"
+  if (at(0) === 0x47 && at(1) === 0x49 && at(2) === 0x46 && at(3) === 0x38) return "image/gif"
+  if (at(0) === 0x52 && at(1) === 0x49 && at(2) === 0x46 && at(3) === 0x46 && at(8) === 0x57 && at(9) === 0x45 && at(10) === 0x42 && at(11) === 0x50) return "image/webp"
+  if (at(0) === 0x42 && at(1) === 0x4d) return "image/bmp"
+  if (at(0) === 0 && at(1) === 0 && at(2) === 1 && at(3) === 0) return "image/x-icon"
+  return ""
+}
+
+// The MIME type maxim-go gives a URL attachment that names none (mimeFromPath on the URL's path).
+function mimeFromPath(path: string): string {
+  const slash = path.split("/")
+  const last = slash[slash.length - 1] ?? ""
+  const parts = last.split(".")
+  if (parts.length < 2) return "application/octet-stream"
+  const ext = parts[parts.length - 1]!.toLowerCase()
+  if (ext === "png") return "image/png"
+  if (ext === "jpg" || ext === "jpeg") return "image/jpeg"
+  if (ext === "gif") return "image/gif"
+  if (ext === "webp") return "image/webp"
+  if (ext === "pdf") return "application/pdf"
+  if (ext === "zip") return "application/zip"
+  if (ext === "json") return "application/json"
+  if (ext === "html" || ext === "htm") return "text/html"
+  if (ext === "txt") return "text/plain"
+  return "application/octet-stream"
+}
+
+// The last segment of a URL's path, or "" (path.Base: "." and "/" count as none).
+function baseName(path: string): string {
+  const segs = path.split("/").filter((s) => s !== "")
+  if (segs.length === 0) return ""
+  return segs[segs.length - 1]!
+}
+
+function imageMimeOfFormat(f: string): string {
+  const x = f.trim().toLowerCase()
+  if (x === "png") return "image/png"
+  if (x === "jpeg" || x === "jpg") return "image/jpeg"
+  if (x === "webp") return "image/webp"
+  if (x === "gif") return "image/gif"
+  return ""
+}
+
+function b64(s: string): u8[] | undefined {
+  try {
+    return decode(s)
+  } catch (e) {
+    return undefined
+  }
+}
+
+// A data URL as file data (dataURLToAttachment), or undefined when it is not base64.
+function dataUrlAttachment(gen: string, idx: int, s: string, kind: string): MaximAttachment | undefined {
+  const at = s.indexOf(";base64,")
+  if (at < 0) return undefined
+  let mime = s.slice(5, at).split(";")[0] ?? ""
+  if (mime === "") mime = "application/octet-stream"
+  const data = b64(s.slice(at + 8))
+  if (data === undefined) return undefined
+  return { generationId: gen, id: attachmentId(gen, idx), name: kind + "." + extOf(mime), mimeType: mime, kind: "fileData", url: "", data: data }
+}
+
+// An image URL (urlToAttachment): a data URL is file data; an http(s) URL is a URL attachment named after its path,
+// typed by its extension, else its rsct query parameter (Azure), else image/png.
+function imageUrlAttachment(gen: string, idx: int, s: string): MaximAttachment | undefined {
+  if (s.startsWith("data:")) return dataUrlAttachment(gen, idx, s, "image")
+  let name = "attachment"
+  let mime = ""
+  const u = URL.parse(s)
+  if (u !== undefined) {
+    const b = baseName(u.pathname)
+    if (b !== "") name = b
+    const dot = b.split(".")
+    if (dot.length > 1) mime = imageMimeOfFormat(dot[dot.length - 1]!)
+    if (mime === "") mime = u.searchParams.get("rsct") ?? ""
+  }
+  if (mime === "") mime = "image/png"
+  return { generationId: gen, id: attachmentId(gen, idx), name: name, mimeType: mime, kind: "url", url: s, data: [] }
+}
+
+// A file part (chatFileToAttachment, responsesFileToAttachment): its file_url as a URL attachment, else its
+// file_data as file data.
+function fileAttachment(gen: string, idx: int, f: Field[]): MaximAttachment | undefined {
+  const name0 = rawStr(f, "filename") ?? ""
+  const name = name0 === "" ? "attachment" : name0
+  const type = rawStr(f, "file_type") ?? ""
+  const url = rawStr(f, "file_url") ?? ""
+  if (url !== "") return { generationId: gen, id: attachmentId(gen, idx), name: name, mimeType: type, kind: "url", url: url, data: [] }
+  const fd = rawStr(f, "file_data") ?? ""
+  if (fd === "") return undefined
+  const data = b64(fd)
+  if (data === undefined) return undefined
+  return { generationId: gen, id: attachmentId(gen, idx), name: name, mimeType: type === "" ? "application/octet-stream" : type, kind: "fileData", url: "", data: data }
+}
+
+// Audio data (audioDataToAttachment): base64 or a data URL; the format names the type (wav, mp3, else audio/<format>).
+function audioAttachment(gen: string, idx: int, data: string, format: string | undefined): MaximAttachment | undefined {
+  let enc = data
+  if (data.startsWith("data:")) {
+    const at = data.indexOf(";base64,")
+    if (at < 0) return undefined
+    enc = data.slice(at + 8)
+  }
+  const bytes = b64(enc)
+  if (bytes === undefined) return undefined
+  let mime = "audio/mpeg"
+  if (format !== undefined) {
+    const f = format.toLowerCase()
+    mime = f === "wav" ? "audio/wav" : f === "mp3" ? "audio/mpeg" : "audio/" + format
+  }
+  return { generationId: gen, id: attachmentId(gen, idx), name: "audio." + extOf(mime), mimeType: mime, kind: "fileData", url: "", data: bytes }
+}
+
+// An input image of an image generation (inputImageStringToAttachment): a URL or data URL, else raw base64 typed by
+// its bytes (image/png when they are not an image).
+function inputImageAttachment(gen: string, idx: int, s: string): MaximAttachment | undefined {
+  if (s === "") return undefined
+  if (s.startsWith("data:") || s.startsWith("http://") || s.startsWith("https://")) return imageUrlAttachment(gen, idx, s)
+  const bytes = b64(s)
+  if (bytes === undefined) return imageUrlAttachment(gen, idx, s)
+  let mime = sniffImage(bytes)
+  if (mime === "") mime = "image/png"
+  return { generationId: gen, id: attachmentId(gen, idx), name: "input_image." + extOf(mime), mimeType: mime, kind: "fileData", url: "", data: bytes }
+}
+
+// The attachments of a row, from its request body, in the order of the request: chat image_url, file and input_audio
+// parts; Responses input_image, input_file and input_audio parts; an image generation's input_images. A row that
+// names its generation (x-bf-maxim-generation-id) has none, as the plugin returns before it reads them.
+export function attachmentsOf(e: LogEntry): MaximAttachment[] {
+  const out: MaximAttachment[] = []
+  if (!traced(e) || attr(e, "generation-id") !== undefined) return out
+  const body = bodyFields(e.input)
+  if (body.length === 0) return out
+  const gen = e.id
+  const reqType = bifrostRequestType(e.op, e.streamed === true)
+  const base = reqType.endsWith("_stream") ? reqType.slice(0, reqType.byteLength - 7) : reqType
+  const push = (a: MaximAttachment | undefined): void => {
+    if (a !== undefined) out.push(a)
+  }
+  try {
+    if (base === "chat_completion" || base === "responses") {
+      const items = elements(find(body, base === "responses" ? "input" : "messages") ?? "[]")
+      for (const m of items) {
+        if (!m.startsWith("{")) continue
+        const content = find(fields(m), "content")
+        if (content === undefined || !content.startsWith("[")) continue
+        for (const part of elements(content)) {
+          if (!part.startsWith("{")) continue
+          const pf = fields(part)
+          const t = rawStr(pf, "type") ?? ""
+          const idx = out.length
+          if (base === "chat_completion" && t === "image_url") {
+            const iu = find(pf, "image_url")
+            const url = iu === undefined ? "" : iu.startsWith("{") ? rawStr(fields(iu), "url") ?? "" : rawStr(pf, "image_url") ?? ""
+            if (url !== "") push(imageUrlAttachment(gen, idx, url))
+          } else if (base === "responses" && t === "input_image") {
+            const url = rawStr(pf, "image_url") ?? ""
+            if (url !== "") push(imageUrlAttachment(gen, idx, url))
+          } else if (base === "chat_completion" && t === "file") {
+            const f = find(pf, "file")
+            if (f !== undefined && f.startsWith("{")) push(fileAttachment(gen, idx, fields(f)))
+          } else if (base === "responses" && t === "input_file") {
+            push(fileAttachment(gen, idx, pf))
+          } else if (t === "input_audio") {
+            const a = find(pf, "input_audio")
+            if (a !== undefined && a.startsWith("{")) {
+              const af = fields(a)
+              const data = rawStr(af, "data") ?? ""
+              let format = rawStr(af, "format")
+              // a Responses part's format defaults to mp3
+              if (base === "responses" && (format === undefined || format === "")) format = "mp3"
+              if (data !== "") push(audioAttachment(gen, idx, data, format))
+            }
+          }
+        }
+      }
+    } else if (base === "image_generation") {
+      const imgs = find(body, "input_images")
+      if (imgs !== undefined && imgs.startsWith("[")) {
+        for (const raw of elements(imgs)) {
+          const s = rawStr([{ key: "s", raw: raw }], "s") ?? ""
+          push(inputImageAttachment(gen, out.length, s))
+        }
+      }
+    }
+  } catch (x) {
+    return out
+  }
+  return out
+}
+
+// The storage key maxim-go uploads an attachment under: {repoId}/{entity}/{entityId}/files/original/{fileId}.
+export function attachmentKey(repoId: string, a: MaximAttachment): string {
+  return `${repoId}/generation/${a.generationId}/files/original/${a.id}`
+}
+
+// The add-attachment commit line of an attachment (maxim-go's populated fields without the data, keys sorted as Go
+// writes a map): a URL attachment's metadata carries its url, and a URL that names no type is typed by its path.
+export function attachmentLine(repoId: string, a: MaximAttachment): string {
+  const fs: string[] = [`"id":${goQuote(a.id)}`, `"key":${goQuote(attachmentKey(repoId, a))}`]
+  if (a.kind === "url") {
+    let mime = a.mimeType
+    if (mime === "") {
+      const u = URL.parse(a.url)
+      if (u !== undefined) mime = mimeFromPath(u.pathname)
+    }
+    fs.push(`"metadata":{"url":${goQuote(a.url)}}`)
+    if (mime !== "") fs.push(`"mimeType":${goQuote(mime)}`)
+    fs.push(`"name":${goQuote(a.name)}`)
+    fs.push(`"type":"url"`)
+    fs.push(`"url":${goQuote(a.url)}`)
+  } else {
+    fs.push(`"mimeType":${goQuote(a.mimeType === "" ? "application/octet-stream" : a.mimeType)}`)
+    if (a.name !== "") fs.push(`"name":${goQuote(a.name)}`)
+    if (a.data.length > 0) fs.push(`"size":${a.data.length}`)
+    fs.push(`"type":"fileData"`)
+  }
+  return commitLine("generation", a.generationId, "add-attachment", "{" + fs.join(",") + "}")
+}
+
+// Query encoding as Go's url.Values.Encode writes it (a space is +).
+function qs(s: string): string {
+  return pctEncode(s).replaceAll("%20", "+")
+}
+
+// The GetUploadUrl call: GET {base}/api/sdk/v1/log-repositories/attachments/upload-url?key=&mimeType=&size= with the
+// API key.
+export function uploadUrlRequest(base: string, apiKey: string, key: string, mimeType: string, size: int): { url: string, headers: Map<string, string> } {
+  const root = trimSlash(base === "" ? MAXIM_BASE : base)
+  const hs: Map<string, string> = new Map()
+  hs.set("content-type", "application/json")
+  hs.set("accept", "application/json")
+  hs.set("x-maxim-api-key", apiKey)
+  return { url: `${root}/api/sdk/v1/log-repositories/attachments/upload-url?key=${qs(key)}&mimeType=${qs(mimeType)}&size=${size}`, headers: hs }
+}
+
+// The signed URL of a GetUploadUrl answer ({data: {url}}); an {error: {message}} or no URL throws.
+export function parseUploadUrl(text: string): string throws SyntaxError {
+  const fs = try fields(text)
+  const er = find(fs, "error")
+  if (er !== undefined && er.startsWith("{")) throw new SyntaxError(`API error: ${rawStr(try fields(er), "message") ?? ""}`)
+  const d = find(fs, "data")
+  const url = d !== undefined && d.startsWith("{") ? rawStr(try fields(d), "url") ?? rawStr(try fields(d), "URL") ?? "" : ""
+  if (url === "") throw new SyntaxError("no upload URL in response")
+  return url
+}
+
 // ---- tests ----
 
 function sample(id: string): LogEntry {
@@ -403,4 +690,73 @@ test("maxim: the messages of text completions, Responses and image prompts", () 
   expect(messagesOf("responses", try fields(`{"input":"just this"}`)).latest).toBe("just this")
   expect(messagesOf("image_generation", try fields(`{"prompt":"a cat"}`)).messages.join(",")).toBe(`{"role":"user","content":"a cat"}`)
   expect(messagesOf("embedding", try fields(`{"input":"x"}`)).messages.length).toBe(0)
+})
+
+test("maxim: chat image, file and audio parts are the generation's attachments, as the plugin extracts them", () => {
+  let e = sample("att")
+  // "iVBORw0KGgo=" is a PNG signature; "AAEC" is three bytes
+  e.input = `{"model":"gpt-4o","messages":[{"role":"user","content":[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"https://cdn.example/pics/cat.jpg?x=1&y=2"}},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}},{"type":"file","file":{"file_data":"AAEC","filename":"r.pdf","file_type":"application/pdf"}},{"type":"file","file":{"file_url":"https://files.example/doc"}},{"type":"input_audio","input_audio":{"data":"AAEC","format":"wav"}}]}]}`
+  const as = attachmentsOf(e)
+  expect(as.length).toBe(5)
+  expect(as[0]!.kind).toBe("url")
+  expect(as[0]!.name).toBe("cat.jpg")
+  expect(as[0]!.mimeType).toBe("image/jpeg")
+  expect(as[1]!.kind).toBe("fileData")
+  expect(as[1]!.name).toBe("image.png")
+  expect(as[1]!.data.length).toBe(8)
+  expect(as[2]!.name).toBe("r.pdf")
+  expect(as[2]!.mimeType).toBe("application/pdf")
+  expect(as[3]!.name).toBe("attachment")
+  expect(as[3]!.mimeType).toBe("")
+  expect(as[4]!.name).toBe("audio.wav")
+  expect(as[4]!.mimeType).toBe("audio/wav")
+  // the ids are UUIDs that stay the same for the same row
+  expect(as[0]!.id).toBe(attachmentsOf(e)[0]!.id)
+  expect(as[0]!.id.byteLength).toBe(36)
+  expect(as[0]!.id.slice(14, 15)).toBe("4")
+  expect(as[0]!.id === as[1]!.id).toBe(false)
+  // the add-attachment lines: Go's sorted keys and HTML escapes, the url in metadata, a typeless URL typed by its path
+  expect(attachmentLine("repo1", as[0]!)).toBe(`generation{id=att,action=add-attachment,data={"id":"${as[0]!.id}","key":"repo1/generation/att/files/original/${as[0]!.id}","metadata":{"url":"https://cdn.example/pics/cat.jpg?x=1\\u0026y=2"},"mimeType":"image/jpeg","name":"cat.jpg","type":"url","url":"https://cdn.example/pics/cat.jpg?x=1\\u0026y=2"}}`)
+  expect(attachmentLine("repo1", as[3]!).includes(`"mimeType":"application/octet-stream","name":"attachment","type":"url"`)).toBe(true)
+  expect(attachmentLine("repo1", as[2]!)).toBe(`generation{id=att,action=add-attachment,data={"id":"${as[2]!.id}","key":"repo1/generation/att/files/original/${as[2]!.id}","mimeType":"application/pdf","name":"r.pdf","size":3,"type":"fileData"}}`)
+  // a row that names its generation, and a row without its body, have none
+  let named = e
+  const ids: Record<string, string> = new Map()
+  ids.set("generation-id", "g-1")
+  named.maxim = ids
+  expect(attachmentsOf(named).length).toBe(0)
+  expect(attachmentsOf(sample("plain")).length).toBe(0)
+})
+
+test("maxim: Responses parts and image-generation input images; the upload URL call", () => {
+  let r = sample("rs")
+  r.op = "responses"
+  r.input = `{"model":"gpt-4o","input":[{"role":"user","content":[{"type":"input_image","image_url":"https://x.example/a?rsct=image/webp"},{"type":"input_file","file_url":"https://x.example/f.pdf","filename":"f.pdf"},{"type":"input_audio","input_audio":{"data":"AAEC"}}]}]}`
+  const ra = attachmentsOf(r)
+  expect(ra.length).toBe(3)
+  expect(ra[0]!.mimeType).toBe("image/webp")
+  expect(ra[0]!.name).toBe("a")
+  expect(ra[1]!.name).toBe("f.pdf")
+  expect(ra[2]!.mimeType).toBe("audio/mpeg")
+  let g = sample("ig")
+  g.op = "image_generation"
+  g.input = `{"model":"gpt-image-1","prompt":"x","input_images":["iVBORw0KGgo=","https://x.example/in.png","AAEC"]}`
+  const ga = attachmentsOf(g)
+  expect(ga.length).toBe(3)
+  expect(ga[0]!.name).toBe("input_image.png")
+  expect(ga[1]!.kind).toBe("url")
+  // bytes that are not an image are named and typed as a PNG, as the plugin does
+  expect(ga[2]!.mimeType).toBe("image/png")
+  const u = uploadUrlRequest("https://maxim.example/", "mk", "repo1/generation/ig/files/original/abc", "image/png", 8)
+  expect(u.url).toBe("https://maxim.example/api/sdk/v1/log-repositories/attachments/upload-url?key=repo1%2Fgeneration%2Fig%2Ffiles%2Foriginal%2Fabc&mimeType=image%2Fpng&size=8")
+  expect(u.headers.get("x-maxim-api-key")).toBe("mk")
+  expect(try parseUploadUrl(`{"data":{"url":"https://bucket.example/put?sig=1"}}`)).toBe("https://bucket.example/put?sig=1")
+  let msg = ""
+  try {
+    parseUploadUrl(`{"error":{"message":"no repo"}}`)
+  } catch (x) {
+    msg = x.message
+  }
+  expect(msg).toBe("API error: no repo")
+  expect(sniffImage([0xff, 0xd8, 0xff, 0xe0])).toBe("image/jpeg")
 })

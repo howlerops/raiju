@@ -50,7 +50,10 @@ RUN scripts/build-tov.sh \
 FROM ${DEBIAN}
 
 ENV DEBIAN_FRONTEND=noninteractive
+# the upgrade takes the Debian security fixes released since the pinned base (openssl, perl-base, ...), so the image
+# scan stays clean between base bumps
 RUN apt-get update \
+ && apt-get upgrade -y --no-install-recommends \
  && apt-get install -y --no-install-recommends ca-certificates libjavascriptcoregtk-4.1-0 \
  && rm -rf /var/lib/apt/lists/*
 

@@ -1,6 +1,8 @@
 // The soak upstream (tests/soak/soak.py): OpenAI-shaped answers that keep nothing in memory (tests/mock_upstream.tov
 // records every request, which would read as growth), on MOCK_PORT with MOCK_WORKERS workers. The model "slow-stream"
-// streams 20 chunks 100 ms apart; any other model answers at once, streamed or not.
+// streams 20 chunks 100 ms apart; any other model answers at once, streamed or not. The realtime and live WebSockets
+// (tests/soak/websockets.py) answer test.rt.start, test.rt.turn and session.start; a streamed /v1/responses answers
+// two events.
 const port = parseInt(process.env.MOCK_PORT ?? "18320") ?? 18320
 const workers = parseInt(process.env.MOCK_WORKERS ?? "2") ?? 2
 
@@ -9,6 +11,19 @@ type Model = { model?: string, stream?: bool }
 function chunk(model: string, delta: string, finish: string): string {
   return `data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"${model}","choices":[{"index":0,"delta":${delta},"finish_reason":${finish}}]}\n\n`
 }
+
+// The value of a string field in a flat-enough event ("" when it has none).
+function strField(text: string, key: string): string {
+  const k = `"${key}":"`
+  const i = text.indexOf(k)
+  if (i < 0) return ""
+  const rest = text.slice(i + k.byteLength)
+  const j = rest.indexOf(`"`)
+  return j < 0 ? "" : rest.slice(0, j)
+}
+
+const RESPONSES_SSE = `event: response.created\ndata: {"type":"response.created","response":{"id":"resp_soak","object":"response","status":"in_progress","model":"gpt-4o-mini"}}\n\n` +
+  `event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_soak","object":"response","status":"completed","model":"gpt-4o-mini","output":[],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}\n\n`
 
 async function pause(ms: int): Promise<void, Error> {
   const p = new Promise<void, Error>((resolve, reject) => { setTimeout(() => resolve(), ms) })
@@ -49,12 +64,46 @@ Bun.serve<string>({
         return Response.json({ id: "c1", object: "chat.completion", created: 1, model: model, choices: [{ index: 0, message: { role: "assistant", content: "Hello from " + model }, finish_reason: "stop" }], usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 } })
       },
     },
+    "/v1/responses": {
+      POST: async (req) => {
+        await req.text()
+        return new Response(RESPONSES_SSE, { headers: { "content-type": "text/event-stream" } })
+      },
+    },
     "/v1/models": {
       GET: (req) => Response.json({ object: "list", data: [{ id: "gpt-4o-mini", object: "model", created: 1, owned_by: "mock" }] }),
     },
   },
-  fetch(req) {
+  fetch(req, server) {
+    if (req.url.includes("/v1/realtime") || req.url.includes("/v1/live/sessions")) {
+      if (server.upgrade(req, { data: "" })) return
+    }
     return new Response("not found", { status: 404 })
+  },
+  websocket: {
+    message(ws, m) {
+      const text = typeof m === "string" ? m : ""
+      if (text.includes(`"session.start"`)) {
+        const id = strField(text, "mock_id")
+        ws.send(`{"type":"session.started","session":{"id":"${id === "" ? "sess_soak" : id}"}}`)
+        return
+      }
+      if (text.includes(`"session.close"`)) {
+        ws.send(`{"type":"session.closed","reason":"close_requested","usage":{"seconds":1}}`)
+        ws.close(1000, "closed")
+        return
+      }
+      if (text.includes(`"test.rt.start"`)) {
+        ws.send(`{"type":"session.created","session":{"id":"${strField(text, "id")}","object":"realtime.session"}}`)
+        return
+      }
+      if (text.includes(`"test.rt.turn"`)) {
+        const id = strField(text, "id")
+        ws.send(`{"type":"response.created","response":{"id":"${id}","status":"in_progress"}}`)
+        ws.send(`{"type":"response.done","response":{"id":"${id}","status":"completed","usage":{"total_tokens":15,"input_tokens":10,"output_tokens":5,"input_token_details":{"audio_tokens":0,"cached_tokens":0},"output_token_details":{"audio_tokens":0}}}}`)
+        return
+      }
+    },
   },
 })
 console.log(`mini mock on ${port}`)

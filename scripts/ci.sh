@@ -14,8 +14,10 @@
 #   e2e-http1  tests/e2e.py on the HTTP/1.1 server
 #   ui         make ui (headless Chromium through Playwright)
 #   soak       optional, not in the default list: tests/soak/soak.py, a memory soak of one worker that fails
-#              when RSS grows, then tests/soak/bodies.py, big request bodies to a worker and a broker (about
-#              four minutes in all; make soak, make soak-bodies)
+#              when RSS grows, then tests/soak/bodies.py, big request bodies to a worker and a broker, then
+#              tests/soak/websockets.py, WebSocket sessions opened and closed on both servers, failing on the RSS
+#              slope; tests/soak/slope.py, small chats on both servers failing on a per-request RSS slope
+#              (about ten minutes in all; make soak, make soak-bodies, make soak-websockets, make soak-slope)
 # scripts/ci.sh tov-key prints the compiler's cache key (Tov's revision, a hash of tov-patches/
 # and scripts/build-tov.sh).
 #
@@ -51,7 +53,7 @@ stage_cmd() {
     e2e-bun)   echo 'env -u RAIJU_SERVER python3 tests/e2e.py' ;;
     e2e-http1) echo 'RAIJU_SERVER=http1 python3 tests/e2e.py' ;;
     ui)        echo 'make ui TOV="$TOV"' ;;
-    soak)      echo 'make soak TOV="$TOV" && make soak-bodies TOV="$TOV"' ;;
+    soak)      echo 'make soak TOV="$TOV" && make soak-bodies TOV="$TOV" && make soak-websockets TOV="$TOV" && make soak-slope TOV="$TOV"' ;;
     *) return 1 ;;
   esac
 }

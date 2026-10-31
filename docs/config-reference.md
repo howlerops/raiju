@@ -9,7 +9,7 @@ for each element of a list. Descriptions are the comments in the source; default
 has one. The command-line flags (`-app-dir`, `-config`, `-host`, `-port`, `-workers`, `-server`, `-mode`,
 `-healthcheck`) are in the README.
 
-1379 keys (578 with a description), and 38 Bifrost keys read through config_compat.
+1381 keys (581 with a description), and 38 Bifrost keys read through config_compat.
 
 ## Sections
 
@@ -1194,7 +1194,9 @@ Raiju's own MCP server at /mcp, which serves the gateway's tools to MCP clients.
 | Key | Type | Description |
 |---|---|---|
 | `mcp_server` | object | Raiju's own MCP server at /mcp, which serves the gateway's tools to MCP clients. |
-| `mcp_server.enabled` | bool |  |
+| `mcp_server.enabled` | bool | false turns /mcp and /mcp/{name} off (404) |
+| `mcp_server.max_sessions` | int | sessions a process keeps in all (default 10000; below 1 the default) |
+| `mcp_server.max_sessions_per_caller` | int | sessions one caller keeps: a virtual key, the user of a user-mode token, else the client address (IPv6 by /64) (default 1000; below 1 the default) |
 
 ## virtual_mcps
 
@@ -1627,7 +1629,7 @@ Bifrost's server section; Raiju reads a2a_allow_private_push_callbacks (push cal
 | `server.max_buffered_body_mb` | int | request-body megabytes each process reads at once across requests (default 48; -1 no cap; bodybudget.tov) |
 | `server.body_deadline_seconds` | number | a body over 64 KB whose credential was not checked from the headers must arrive whole within this, or it is answered 408 (default 30; 0 off; bodybudget.tov) |
 | `server.unchecked_body_mb` | int | the megabytes of max_buffered_body_mb that bodies whose credential was not checked may hold together (default an eighth; -1 no separate share; bodybudget.tov) |
-| `server.body_min_kb_per_second` | number | a body over 64 KB whose credential was checked must arrive at this rate after body_rate_grace_seconds, counted over each recent body_rate_window_seconds, or it is answered 408 (default 32; 0 off; bodybudget.tov) |
+| `server.body_min_kb_per_second` | number | a body over 64 KB whose credential was checked must arrive at this rate after body_rate_grace_seconds, counted over each recent body_rate_window_seconds, or it is answered 408 (default 32; 0 off; bodybudget.tov). Under contention a declared body's reservation sending under eight times this (32 KB/s when off) may be cut |
 | `server.body_rate_grace_seconds` | number | the start of a checked body that body_min_kb_per_second does not count (default 10) |
 | `server.body_rate_window_seconds` | number | the sliding window body_min_kb_per_second is counted over once a checked body is past its grace (default 30; 0 an average from the start) |
 | `server.body_max_seconds` | number | a body over 64 KB whose credential was checked (or a signed peer body) must arrive whole within this, or it is answered 408 (default 600; 0 off; bodybudget.tov) |
