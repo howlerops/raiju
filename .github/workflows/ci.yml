@@ -149,6 +149,9 @@ jobs:
 
   # The Dockerfile and the Helm chart against trivy's misconfiguration rules, on every change (under a minute).
   # deploy/terraform is left out until its ECS module defaults to HTTPS and a narrowed ingress (audit P0-1).
+  # A config scan needs no vulnerability database, only trivy's checks bundle. Its default home is mirror.gcr.io; when
+  # that download fails trivy falls back to the checks built into its binary, so the job does not go red with the
+  # mirror but may scan with older checks. The bundle comes from ghcr.io instead (the action caches it per day).
   config-scan:
     name: Scan Dockerfile and chart (trivy)
     runs-on: ubuntu-24.04
@@ -156,6 +159,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        env:
+          TRIVY_CHECKS_BUNDLE_REPOSITORY: ghcr.io/aquasecurity/trivy-checks:2
         with:
           scan-type: config
           scan-ref: .
@@ -163,15 +168,24 @@ jobs:
           severity: CRITICAL,HIGH
           exit-code: "1"
 
+  # The image as it ships (built, not pushed), on pull requests and on main: a boot smoke run the way the Helm chart
+  # runs it (tests/image_smoke.py), then trivy against known CVEs in its OS packages and the binary.
   image:
     name: Docker image
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    env:
+      TRIVY_CACHE_DIR: ${{ github.workspace }}/.cache/trivy-image
+      # Trivy tries these in order but moves on only after a temporary error. Its default first choice, mirror.gcr.io,
+      # answered 404 for the database, which stopped the download (every main build failed so). ghcr.io comes first,
+      # then AWS's public mirror: ghcr.io's rate limit is a temporary error, so it falls through.
+      TRIVY_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-db:2,public.ecr.aws/aquasecurity/trivy-db:2,mirror.gcr.io/aquasec/trivy-db:2
+      TRIVY_JAVA_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-java-db:1,public.ecr.aws/aquasecurity/trivy-java-db:1,mirror.gcr.io/aquasec/trivy-java-db:1
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
       - name: Build (no push)
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -179,13 +193,59 @@ jobs:
           load: true
           tags: raiju:ci
           cache-from: type=gha
-          cache-to: type=gha,mode=max
-      # the image's OS packages and the binary against known CVEs: a fixable critical or high one fails the job
-      # (a minute or two, most of it the vulnerability database download)
-      - name: Scan the image (trivy)
-        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+          # only main writes the layer cache, so pull requests do not evict it
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max' || '' }}
+      # read-only root filesystem, /tmp a tmpfs, user 65532, no capabilities, the chart's arguments, a setup token:
+      # /health, /ready, raiju -healthcheck, Docker's HEALTHCHECK, the setup lock, a chat through a mock upstream,
+      # a clean stop on SIGTERM
+      - name: Boot smoke
+        run: python3 tests/image_smoke.py raiju:ci
+      # the scan runs even when the smoke failed, so one failure does not hide the other
+      - name: Install trivy
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        uses: aquasecurity/setup-trivy@e6c2c5e321ed9123bda567646e2f96565e34abe1 # v0.2.4
         with:
-          image-ref: raiju:ci
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
-          exit-code: "1"
+          version: v0.69.3
+          cache: true
+      - name: Date
+        id: date
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: echo "day=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+      # the database is cached per day, so an outage of every repository falls back to the last one saved
+      - name: Restore the vulnerability database
+        id: db-cache
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.TRIVY_CACHE_DIR }}
+          key: trivy-db-${{ runner.os }}-${{ steps.date.outputs.day }}
+          restore-keys: trivy-db-${{ runner.os }}-
+      - name: Update the vulnerability database
+        id: db
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          # trivy skips the download while the cached database is current
+          for attempt in 1 2 3; do
+            if trivy image --download-db-only; then
+              echo "fresh=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::warning::trivy database download failed (attempt $attempt)"
+            sleep $((attempt * 20))
+          done
+          if [ -f "$TRIVY_CACHE_DIR/db/trivy.db" ]; then
+            echo "::warning::every trivy database repository failed; scanning with the cached database"
+          else
+            echo "::error::no trivy database could be downloaded and none is cached"
+            exit 1
+          fi
+      - name: Save the vulnerability database
+        if: ${{ !cancelled() && steps.db.outputs.fresh == 'true' && steps.db-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.TRIVY_CACHE_DIR }}
+          key: trivy-db-${{ runner.os }}-${{ steps.date.outputs.day }}
+      # a fixable critical or high CVE fails the job
+      - name: Scan the image (trivy)
+        if: ${{ !cancelled() && steps.db.outcome == 'success' }}
+        run: trivy image --skip-db-update --pkg-types os,library --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 raiju:ci

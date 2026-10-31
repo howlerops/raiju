@@ -8,6 +8,7 @@ and are skipped without it, unless REQUIRE_HELM is set (CI). DEPLOY_ROOT points 
 
 Usage: python3 -m unittest tests/test_deploy.py
 """
+import importlib.util
 import json
 import os
 import re
@@ -60,6 +61,118 @@ class DockerfileTest(unittest.TestCase):
 
     def test_app_data_is_the_working_directory(self):
         self.assertIsNotNone(re.search(r"^WORKDIR /app/data$", self.text, re.M), "the runtime's WORKDIR is not /app/data")
+
+
+def image_smoke():
+    """tests/image_smoke.py as a module."""
+    spec = importlib.util.spec_from_file_location("image_smoke", os.path.join(ROOT, "tests", "image_smoke.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class CiWorkflowTest(unittest.TestCase):
+    """.github/workflows/ci.yml's image and config-scan jobs: trivy's databases come from repositories that answer and
+    are cached, the image is built, smoke-tested and scanned on pull requests too, and fixable CVEs still fail."""
+
+    def setUp(self):
+        self.doc = yaml.safe_load(open(os.path.join(ROOT, ".github", "workflows", "ci.yml")))
+        self.jobs = self.doc["jobs"]
+        self.image = self.jobs["image"]
+
+    def step(self, job, pred, what):
+        found = [s for s in job["steps"] if pred(s)]
+        self.assertTrue(found, f"no step that {what}")
+        return found[0]
+
+    def index(self, job, step):
+        return job["steps"].index(step)
+
+    def test_image_runs_on_pull_requests(self):
+        on = self.doc.get("on", self.doc.get(True))  # YAML 1.1 reads a bare `on` as true
+        self.assertIn("pull_request", on)
+        self.assertNotIn("if", self.image, "the image job is limited to some events")
+
+    def test_image_is_built_with_the_cache_and_not_pushed(self):
+        build = self.step(self.image, lambda s: str(s.get("uses", "")).startswith("docker/build-push-action"), "builds the image")
+        w = build["with"]
+        self.assertIs(w["push"], False)
+        self.assertIs(w["load"], True)
+        self.assertEqual(w["tags"], "raiju:ci")
+        self.assertEqual(w["cache-from"], "type=gha")
+        # only pushes to main write the layer cache
+        self.assertIn("github.event_name == 'push'", w["cache-to"])
+
+    def test_db_repositories_answer(self):
+        env = self.image["env"]
+        for var, name in (("TRIVY_DB_REPOSITORY", "trivy-db"), ("TRIVY_JAVA_DB_REPOSITORY", "trivy-java-db")):
+            repos = env[var].split(",")
+            # trivy does not move past a 404, so mirror.gcr.io may only be the last resort
+            self.assertTrue(repos[0].startswith(f"ghcr.io/aquasecurity/{name}:"), repos)
+            self.assertTrue(any(r.startswith(f"public.ecr.aws/aquasecurity/{name}:") for r in repos), repos)
+            self.assertFalse(any(r.startswith("mirror.gcr.io") for r in repos[:-1]), repos)
+        self.assertNotIn("--db-repository", json.dumps(self.image["steps"]), "a step overrides the repositories")
+
+    def test_db_is_cached(self):
+        cache_dir = self.image["env"]["TRIVY_CACHE_DIR"]
+        restore = self.step(self.image, lambda s: str(s.get("uses", "")).startswith("actions/cache/restore@"), "restores the database")
+        save = self.step(self.image, lambda s: str(s.get("uses", "")).startswith("actions/cache/save@"), "saves the database")
+        update = self.step(self.image, lambda s: "--download-db-only" in s.get("run", ""), "downloads the database")
+        scan = self.step(self.image, lambda s: re.search(r"\btrivy image\b(?!.*--download-db-only)", s.get("run", "")), "scans the image")
+        for s in (restore, save):
+            self.assertEqual(s["with"]["path"], "${{ env.TRIVY_CACHE_DIR }}")
+        self.assertIn("trivy", cache_dir)
+        self.assertEqual(save["with"]["key"], restore["with"]["key"])
+        self.assertTrue(restore["with"]["restore-keys"], "no fallback to an older database")
+        self.assertLess(self.index(self.image, restore), self.index(self.image, update))
+        self.assertLess(self.index(self.image, update), self.index(self.image, save))
+        self.assertLess(self.index(self.image, update), self.index(self.image, scan))
+        # a failed download falls back to the cached database; with none the job fails
+        self.assertIn("db/trivy.db", update["run"])
+        self.assertIn("exit 1", update["run"])
+        self.assertIn("--skip-db-update", scan["run"])
+
+    def test_fixable_critical_and_high_cves_fail(self):
+        scan = self.step(self.image, lambda s: re.search(r"\btrivy image\b(?!.*--download-db-only)", s.get("run", "")), "scans the image")
+        run = scan["run"]
+        self.assertIn("--severity CRITICAL,HIGH", run)
+        self.assertIn("--ignore-unfixed", run)
+        self.assertIn("--exit-code 1", run)
+        self.assertTrue(run.rstrip().endswith("raiju:ci"))
+        self.assertNotIn("continue-on-error", scan)
+
+    def test_boot_smoke(self):
+        build = self.step(self.image, lambda s: s.get("id") == "build", "has the id build")
+        smoke = self.step(self.image, lambda s: "tests/image_smoke.py" in s.get("run", ""), "runs the boot smoke")
+        self.assertIn("raiju:ci", smoke["run"])
+        self.assertLess(self.index(self.image, build), self.index(self.image, smoke))
+        self.assertTrue(os.path.exists(os.path.join(ROOT, "tests", "image_smoke.py")))
+
+    def test_image_smoke_runs_hardened(self):
+        values = yaml.safe_load(open(os.path.join(CHART, "values.yaml")))
+        run = image_smoke().docker_run_args("n", "img", "/d", "tok", 1)
+        self.assertTrue(values["securityContext"]["readOnlyRootFilesystem"])
+        self.assertIn("--read-only", run)
+        self.assertEqual(run[run.index("--user") + 1], f"{values['podSecurityContext']['runAsUser']}:{values['podSecurityContext']['runAsGroup']}")
+        self.assertNotEqual(values["podSecurityContext"]["runAsUser"], 0)
+        self.assertEqual(run[run.index("--cap-drop") + 1], "ALL")
+        self.assertIn("BIFROST_SETUP_TOKEN=tok", run)
+        self.assertEqual(run[run.index("img"):], ["img", "-app-dir", "/app/data", "-host", "0.0.0.0", "-port", "8080", "-workers", "1"])
+
+    def test_config_scan_checks_bundle(self):
+        scan = self.step(self.jobs["config-scan"], lambda s: str(s.get("uses", "")).startswith("aquasecurity/trivy-action@"), "runs trivy")
+        self.assertTrue(scan["env"]["TRIVY_CHECKS_BUNDLE_REPOSITORY"].startswith("ghcr.io/aquasecurity/trivy-checks:"))
+        self.assertEqual(scan["with"]["scan-type"], "config")
+        self.assertEqual(scan["with"]["exit-code"], "1")
+
+    def test_run_steps_are_valid_shell(self):
+        for name, job in self.jobs.items():
+            for s in job["steps"]:
+                if "run" not in s:
+                    continue
+                script = re.sub(r"\$\{\{.*?\}\}", "x", s["run"])
+                p = subprocess.run(["bash", "-n"], input=script, capture_output=True, text=True)
+                self.assertEqual(p.returncode, 0, f"{name}: {s.get('name', s['run'][:40])}: {p.stderr}")
 
 
 class ComposeTest(unittest.TestCase):
@@ -297,6 +410,26 @@ class HelmTest(unittest.TestCase):
     def test_binds_every_address(self):
         args = self.pod(self.render())["containers"][0]["args"]
         self.assertEqual(args[args.index("-host") + 1], "0.0.0.0")
+
+    def test_image_smoke_runs_the_container_as_the_chart_does(self):
+        # tests/image_smoke.py (CI's boot smoke of the image) passes the rendered container's arguments and security
+        smoke = image_smoke()
+        pod = self.pod(self.render("workers=3"))
+        c = pod["containers"][0]
+        self.assertEqual(c["args"], smoke.chart_args(8080, 3))
+        run = smoke.docker_run_args("n", "img", "/d", "tok", 3)
+        self.assertTrue(c["securityContext"]["readOnlyRootFilesystem"])
+        self.assertIn("--read-only", run)
+        self.assertEqual(c["securityContext"]["capabilities"]["drop"], ["ALL"])
+        self.assertEqual(run[run.index("--cap-drop") + 1], "ALL")
+        self.assertFalse(c["securityContext"]["allowPrivilegeEscalation"])
+        self.assertEqual(run[run.index("--security-opt") + 1], "no-new-privileges")
+        sc = pod["securityContext"]
+        self.assertEqual(run[run.index("--user") + 1], f"{sc['runAsUser']}:{sc['runAsGroup']}")
+        mounts = {m["mountPath"] for m in c["volumeMounts"]}
+        self.assertEqual(mounts, {"/app/data", "/tmp"})
+        self.assertTrue(run[run.index("--tmpfs") + 1].startswith("/tmp:"))
+        self.assertEqual(run[run.index("-v") + 1], "/d:/app/data")
 
     def test_setup_token_from_a_secret(self):
         env = self.pod(self.render())["containers"][0]["env"]

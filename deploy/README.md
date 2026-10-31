@@ -437,7 +437,9 @@ over a real network, memory at 512Mi under real traffic) is checked by the stagi
   The binary is dynamically linked against glibc, libstdc++ and WebKitGTK's JavaScriptCore (Tov
   links it for `node:*` modules), so the runtime is `debian:bookworm-slim` with
   `libjavascriptcoregtk-4.1-0`, not distroless, and carries JavaScriptCore's GLib and ICU
-  libraries. CI scans it with trivy on every push to main.
+  libraries. CI builds it on every pull request and push to main, boots it as the chart runs it
+  (`tests/image_smoke.py`) and scans it with trivy.
 - The chart's pod security settings (read-only root filesystem, no capabilities, fsGroup on the
-  data volume) are checked with `helm template` (`make deploy-check`) and trivy's config rules, but
-  have not been exercised on a cluster.
+  data volume) are checked with `helm template` (`make deploy-check`) and trivy's config rules, and the
+  image's boot smoke in CI runs it with the same settings under Docker, but they have not been exercised
+  on a cluster.

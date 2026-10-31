@@ -409,8 +409,10 @@ make bench
 `.github/workflows/ci.yml` runs on pull requests and pushes to `main`: it builds the patched
 compiler once (cached by Tov's revision and a hash of `tov-patches/` and `scripts/build-tov.sh`),
 then check, unit, openapi-check, web-check and the parity count in one job, e2e on Bun and on
-http1, `make ui` in Chromium, and the memory soaks (`make soak`, `make soak-bodies`); logs are uploaded when a job fails. Pushes to `main` also build
-the Docker image (no push). `scripts/ci.sh` runs the same stages locally: `scripts/ci.sh` for all
+http1, `make ui` in Chromium, and the memory soaks (`make soak`, `make soak-bodies`); logs are uploaded when a job fails. The Docker image is built
+(no push) on pull requests and on `main`, booted the way the Helm chart runs it (`tests/image_smoke.py`: read-only
+root filesystem, non-root, /health, /ready, a chat through a mock upstream) and scanned with trivy (a fixable
+critical or high CVE fails it; the vulnerability database comes from ghcr.io or public.ecr.aws and is cached). `scripts/ci.sh` runs the same stages locally: `scripts/ci.sh` for all
 of them, or name some (`scripts/ci.sh check unit`; `--help` lists them; `soak` runs only when named). It uses `TOV` and `BUN`
 when set; with `CI_LOCK=/tmp/raiju-e2e.lock` the stages that bind fixed ports take that lock.
 
