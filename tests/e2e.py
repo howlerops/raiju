@@ -14125,17 +14125,21 @@ def l208_e2e(env):
         socks = []
         time.sleep(1.0)
 
-        # ---- P2-A: eight keys declare 1 MB at once and send nothing yet ----
-        conns = [l196_open(18372, "/v1/chat/completions", 1048576, k(i), 0) for i in range(1, 9)]
+        # ---- P2-A: eight keys declare 1 MB at once; the first four have started sending ----
+        # (L218, re-audit 7 P1-1: a reservation that has received nothing is cut at any age for another tenant's body, so
+        # the burst's bodies start sending here; eight that sent nothing at all were all admitted, cut to their look-ahead)
+        conns = [l196_open(18372, "/v1/chat/completions", 1048576, k(i), 1024) for i in range(1, 5)]
+        time.sleep(0.2)
+        conns += [l196_open(18372, "/v1/chat/completions", 1048576, k(i), 0) for i in range(5, 9)]
         socks = conns
         time.sleep(0.5)
         early = [l208_status(s, 0.5) for s in conns]
-        check("l208: of eight 1 MB bodies declared at once, the four past the 4 MB cap are 503 before any byte is sent", early.count(503) == 4 and early.count(0) == 4, early)
+        check("l208: of eight 1 MB bodies declared at once, the four past the 4 MB cap are 503 before any byte is sent", early == [0, 0, 0, 0, 503, 503, 503, 503], early)
         done = []
         for s, e in zip(conns, early):
             if e != 0:
                 continue
-            s.sendall(l196_chat(1048576))
+            s.sendall(l196_chat(1048576)[1024:])
         for s, e in zip(conns, early):
             if e != 0:
                 continue
@@ -14620,6 +14624,206 @@ def l213_e2e(env):
         for g in [ga, gb]:
             g.terminate()
             g.wait()
+
+
+GW_L218 = "http://127.0.0.1:18394"  # L218: body reservations (empty ones cut at any age, abandoners reserve the look-ahead, cuts only when they let the newcomer fit, behind judged against the minimum rate, the lone-body allowance per body)
+
+
+def l218_upload(total: int, headers: dict, rate: float, out: dict):
+    """A chat POST to the L218 gateway declaring total bytes and sending them at rate bytes per second; out gets the
+    status, the bytes sent when it was answered and how long it took."""
+    body = l196_chat(total)
+    t0 = time.time()
+    s = l196_open(18394, "/v1/chat/completions", total, headers, 0)
+    s.settimeout(0.001)
+    sent, data = 0, b""
+    while sent < total:
+        try:
+            c = s.recv(65536)
+            if not c:
+                break
+            data += c
+            if b"\r\n\r\n" in data:
+                break
+        except socket.timeout:
+            pass
+        except OSError:
+            break
+        want = min(total, int((time.time() - t0 + 0.05) * rate))
+        if want > sent:
+            try:
+                s.sendall(body[sent:want])
+                sent = want
+            except OSError:
+                break
+        time.sleep(0.05)
+    s.settimeout(20)
+    try:
+        while b"\r\n\r\n" not in data:
+            c = s.recv(65536)
+            if not c:
+                break
+            data += c
+    except OSError:
+        pass
+    s.close()
+    try:
+        out["status"] = int(data.split(b" ", 2)[1])
+    except Exception:
+        out["status"] = 0
+    out["sent"] = sent
+    out["after"] = round(time.time() - t0, 1)
+    out["head"] = data.decode("latin-1")[:200]
+
+
+def l218_post(total: int, headers: dict) -> int:
+    """The status of a whole chat POST of total bytes to the L218 gateway (0 when the connection broke: a refusal before
+    the body was sent)."""
+    try:
+        return call("POST", "/v1/chat/completions", l196_chat(total).decode(), headers, base=GW_L218, auth=False)[0]
+    except Exception:
+        return 0
+
+
+def l218_e2e(env):
+    """L218 (production re-audit 7, P1-1, P1-2, P2-1), on a 3 MB body cap with a 4 KB/s minimum rate. P1-2: a newcomer
+    past its share cuts nothing, a reservation is behind only when its rate is under 8 x server.body_min_kb_per_second
+    (a fixed 10 s horizon cut an upload at 1 MB/s, which was then refused part way), and only a body within its share
+    cuts, when that lets it fit. P1-1: a tenant that abandoned a declared body (nothing arrived) is reserved only the
+    look-ahead for its next ones, and a flood of empty reservations reconnecting every 0.9 s turns no outsider away.
+    P2-1: the reserve past the cap is kept for a single body over the cap, not one tenant's several. Its own gateway
+    (18394)."""
+    import threading
+    d = os.path.join(BUILD, "e2e-l218")
+    os.makedirs(d, exist_ok=True)
+    cp = os.path.join(d, "config.json")
+    log = os.path.join(d, "gw.log")
+    keys = [{"id": "vk-l218-%s" % n, "name": "vk-l218-%s" % n, "value": "sk-bf-l218-%s" % n} for n in ["v", "w", "o", "p", "k", "x", "a1", "a2", "a3", "a4"]]
+    cfg = {
+        "client": {"enable_logging": False, "enforce_auth_on_inference": True},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        # 3 MB of bodies in hand, a quarter (768 KB) per tenant and a quarter kept from tenants holding bytes; checked
+        # bodies at 4 KB/s after 4 s, so a reservation is behind under 32 KB/s
+        "server": {"max_buffered_body_mb": 3, "body_min_kb_per_second": 4, "body_rate_grace_seconds": 4},
+        "governance": {"virtual_keys": keys},
+        "providers": {"openai": {"keys": [{"name": "o-l218", "value": "sk-l218", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+    }
+    json.dump(cfg, open(cp, "w"))
+    gw = subprocess.Popen(cwd=ROOT, args=[os.path.join(BUILD, "raiju"), "-port", "18394", "-host", "127.0.0.1", "-config", cp, "-server", os.environ.get("RAIJU_SERVER", "bun")],
+                          env=env, stderr=open(log, "w"))
+    k = lambda n: {"x-bf-vk": "sk-bf-l218-%s" % n}
+    M = 1048576
+    socks = []
+    stop = [0.0]
+    floods = []
+    try:
+        wait(GW_L218 + "/health")
+
+        # ---- P1-2: a 2.5 MB upload at 192 KB/s keeps its reservation ----
+        up = {}
+        t = threading.Thread(target=l218_upload, args=(2621440, k("v"), 196608.0, up))
+        t.start()
+        time.sleep(1.5)
+        # 1.5 s in, 2.2 MB to go: more than the old 10 s horizon at its rate, but well above 8 x 4 KB/s
+        past = declared_status(18394, "/v1/chat/completions", 2 * M, k("o"))
+        within = l218_post(716800, k("p"))
+        t.join(30)
+        check("l218: beside a 2.5 MB upload at 192 KB/s, another tenant's 2 MB body (past its share) and 700 KB body (within it) are 503 and cut nothing",
+              past == 503 and within in (503, 0), (past, within))
+        check("l218: the upload is served whole (it was cut and refused part way)", up.get("status") == 200 and up.get("sent") == 2621440, up)
+        # the same upload at 16 KB/s is behind: the body within its share cuts it and is served
+        slow = l196_open(18394, "/v1/chat/completions", 2621440, k("w"), 0)
+        socks.append(slow)
+        for _ in range(12):
+            slow.sendall(b"x" * 2048)
+            time.sleep(0.125)
+        cut = l218_post(716800, k("p"))
+        early = l208_status(slow, 0.2)
+        check("l218: an upload at 16 KB/s (under 8 x 4 KB/s) is cut for another tenant's body within its share, which is served; the cut body is not refused",
+              cut == 200 and early == 0, (cut, early))
+        slow.close()
+        socks = []
+        time.sleep(0.5)
+
+        # ---- P2-1: one tenant's two bodies in hand earn no reserve past the cap ----
+        two = [l196_open(18394, "/v1/chat/completions", 1572864, k("k"), 1572864 - 1024) for _ in range(2)]
+        socks = list(two)
+        time.sleep(0.5)
+        beside = declared_status(18394, "/v1/chat/completions", 716800, k("x"))
+        for s in two:
+            s.sendall(l196_chat(1572864)[1572864 - 1024:])
+        done = [l196_read(s)[0] for s in two]
+        check("l218: beside one tenant's two 1.5 MB bodies (the cap), another tenant's 700 KB body is 503 (it was admitted past the cap)", beside == 503 and done == [200, 200], (beside, done))
+        for s in two:
+            s.close()
+        socks = []
+        lone = l196_open(18394, "/v1/chat/completions", 3670016, k("k"), 3670016 - 1024)
+        socks = [lone]
+        time.sleep(0.5)
+        by_lone = l218_post(716800, k("x"))
+        lone.sendall(l196_chat(3670016)[3670016 - 1024:])
+        code, _ = l196_read(lone)
+        check("l218: beside a single 3.5 MB body (over the cap) a 700 KB body within its share is still served, and so is the big one", by_lone == 200 and code == 200, (by_lone, code))
+        lone.close()
+        socks = []
+        time.sleep(0.5)
+
+        # ---- P1-1: a tenant that abandoned a declared body reserves only the look-ahead ----
+        gone = l196_open(18394, "/v1/chat/completions", 2621440, k("a1"), 0)
+        time.sleep(0.3)
+        gone.close()
+        time.sleep(0.5)
+        again = l196_open(18394, "/v1/chat/completions", 2621440, k("a1"), 0)
+        socks = [again]
+        # at once: a body past its share may not cut, so it fits only if the 2.5 MB was not reserved whole (and before,
+        # the young reservation of a reconnecting tenant was not cut within its run's first second)
+        other = l196_open(18394, "/v1/chat/completions", 2 * M, k("o"), 0)
+        socks.append(other)
+        first = [l208_status(again, 0.3), l208_status(other, 0.3)]
+        check("l218: after a tenant abandoned a declared 2.5 MB body, its next one holds only the look-ahead: another tenant's 2 MB body (past its share) is admitted beside it (it was 503)",
+              first == [0, 0], first)
+        for s in socks:
+            s.close()
+        socks = []
+        time.sleep(0.5)
+        # four tenants declaring 750 KB, sending nothing and reconnecting every 0.9 s (re-audit 7's churn)
+        stop[0] = time.time() + 7.0
+
+        def flood(n):
+            while time.time() < stop[0]:
+                try:
+                    s = l196_open(18394, "/v1/chat/completions", 768000, k(n), 0)
+                    time.sleep(0.9)
+                    s.close()
+                except OSError:
+                    time.sleep(0.05)
+
+        floods = [threading.Thread(target=flood, args=(n,)) for n in ["a1", "a2", "a3", "a4"]]
+        for th in floods:
+            th.start()
+            time.sleep(0.2)
+        time.sleep(0.5)
+        out = []
+        while time.time() < stop[0] - 0.5:
+            out.append(l218_post(716800, k("p")))
+            time.sleep(0.1)
+        stop[0] = 0.0
+        for th in floods:
+            th.join(10)
+        check("l218: while four tenants reconnect every 0.9 s declaring 750 KB and sending nothing, an outsider's 700 KB chats are all served",
+              len(out) >= 5 and all(c == 200 for c in out), (len(out), sorted(set(out)), out.count(200)))
+    finally:
+        stop[0] = 0.0
+        for th in floods:
+            th.join(10)
+        for s in socks:
+            try:
+                s.close()
+            except OSError:
+                pass
+        gw.terminate()
+        gw.wait()
 
 
 GW_L189 = "http://127.0.0.1:18334"  # L189: WebSocket and realtime drain at shutdown, the write-stall timeout and broker mode's graceful stop (its broker takes the port after the gateways); 18335 is the UI setup gateway (tests/ui_e2e.mjs)
@@ -21128,6 +21332,9 @@ def main():
         # L213: async jobs beside the config and across nodes, sign-in counts across nodes, empty reservations cut early, the
         # ungrouped keys notice: its own gateways (18382, restarted, and 18383)
         l213_e2e(env)
+        # L218: body reservations (empty ones cut at any age, abandoners reserve the look-ahead, cuts only when they let the
+        # newcomer fit, behind judged against the minimum rate, the lone-body allowance per body): its own gateway (18394)
+        l218_e2e(env)
         # L194: Hugging Face inference providers (chat, embeddings, speech, transcription, images), the CLI's agent sign-in
         # and default key, and the A2A v0.3 REST client: its own gateway (18344) and Hugging Face double (18345)
         l194_e2e(env)

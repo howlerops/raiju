@@ -144,12 +144,19 @@ unread. `server.max_buffered_body_mb` (default 48; -1 for no cap; read per reque
 request-body megabytes each process reads at once: a body that does not fit is answered 503 with
 `retry-after: 1`, and is retried by well-behaved clients. The cap is a hard bound: a declared length is
 reserved whole when the body is admitted (503 unread when it cannot fit, never part way while it keeps
-pace), and a chunked body is charged as its bytes arrive. Under contention a reservation whose body fell
-behind its pace (at its rate so far more than 10 s to go, a second after admission) is cut to what it has
-received plus a look-ahead (a 48th of the cap, 64 KB to 1 MB) and charged as its bytes arrive from then on,
-so clients that declare big lengths and send slowly or nothing do not hold the cap. A reservation that has
-received nothing may be cut 200 ms after admission, and a tenant that reconnects at once (a new reservation
-while it holds one, or within a second after one ended) gets no fresh grace. A body whose credential was checked from the headers (a virtual key, a direct
+pace), and a chunked body is charged as its bytes arrive. Under contention a new body that keeps its
+tenant within its share may cut other tenants' reservations that fell behind to what they have received
+plus a look-ahead (a 48th of the cap, 64 KB to 1 MB), charged as their bytes arrive from then on, so
+clients that declare big lengths and send slowly or nothing do not hold the cap. A reservation that has
+received nothing is behind at any age; one that is sending is behind when, a second after admission, its
+rate so far is under eight times `server.body_min_kb_per_second` (256 KB/s at the default; a tenant that
+reconnects at once, a new reservation while it holds one or within a second after one ended, gets no
+fresh second). Nothing is cut unless cutting every reservation behind lets the new body fit, a body past
+its tenant's share cuts nothing, and a cut body that keeps that pace may grow to the cap (a slower one
+to the reserve). A tenant that abandoned a declared body (its request ended with nothing received) is
+reserved only the look-ahead for its next declared bodies for a minute, or until one arrives whole.
+Beside a single body bigger than the cap, a new body within its tenant's share may use the reserve past
+it (not beside one tenant's several bodies). A body whose credential was checked from the headers (a virtual key, a direct
 provider key that is one of the configured keys, a sign-in) must keep `server.body_min_kb_per_second`
 (default 32, 0 off) after `server.body_rate_grace_seconds` (default 10), counted over each recent
 `server.body_rate_window_seconds` (default 30), and arrive whole within `server.body_max_seconds`

@@ -64,7 +64,7 @@ import { EXTRA_PARAMS_HEADER, EXTRA_PARAMS_CARRY, mergeExtraParams, extraParamsC
 import { lifecycle, readyInput, readyReport, ServerLimits } from "./lifecycle"
 import { CLIENT_WATCH_HEADER, watchStart, watchGone, watchEnd, watched } from "./clientgone"
 import { usesChain, withChainCreds } from "./awschain"
-import { bodyBudget, peerBudget, bufferedCap, uncheckedShare, credentialShare, bodyReserve, bodyDeadlineMs, bodyRate, readCharged, ReadPlan, BodyClass, BodyHold, UNREAD_ABOVE } from "./bodybudget"
+import { bodyBudget, peerBudget, bufferedCap, uncheckedShare, credentialShare, bodyReserve, bodyDeadlineMs, bodyRate, readCharged, reserveLookahead, ReadPlan, BodyClass, BodyHold, UNREAD_ABOVE, DEFAULT_BODY_MIN_KB_PER_SECOND } from "./bodybudget"
 import { clusterBodyCap, wellFormedSig, headRefusal, peerHeaders, HEAD_SIG_HEADER, TS_HEADER } from "./cluster"
 
 type ModelEntry = { id: string, object: string, created: int, owned_by: string }
@@ -1330,6 +1330,9 @@ export async function heldBody(engine: Engine, req: Request, limit: int, kind: B
   const cls: BodyClass = kind === "unchecked" ? "unchecked" : "checked"
   const w = peer || cls === "unchecked" ? "" : (who ?? "")
   hold.peer = peer
+  const rate = bodyRate(engine.cfg.server)
+  // reservations are judged behind against the minimum rate (the default when it is off)
+  b.minRate = rate.bytesPerSecond > 0 ? rate.bytesPerSecond : DEFAULT_BODY_MIN_KB_PER_SECOND * 1024.0
   const declared = req.headers.get("content-length")
   let max = limit
   if (declared !== undefined) {
@@ -1346,19 +1349,22 @@ export async function heldBody(engine: Engine, req: Request, limit: int, kind: B
     }
     // reserved whole before it is read, so a body that cannot fit is refused before its client sends it, and an
     // admitted one that keeps its pace is never refused part way (re-audit 5 P2-A); one that falls behind may have its
-    // reservation cut under contention (re-audit 6 P1-A, BodyBudget.track)
-    if (!b.take(n, 0, cap, cls, share, w, whoShare, reserve)) return { res: busyResponse(), req: req, hold: hold }
-    hold.held = n
+    // reservation cut under contention (re-audit 6 P1-A, BodyBudget.track). A tenant that abandoned a declared body
+    // lately is reserved only the look-ahead, and charged as its bytes arrive (re-audit 7 P1-1)
+    const first = cap > 0 && b.abandonedLately(w) ? Math.min(n, reserveLookahead(cap)) : n
+    if (!b.take(first, 0, cap, cls, share, w, whoShare, reserve, hold)) return { res: busyResponse(), req: req, hold: hold }
+    hold.held = first
     hold.cls = cls
     hold.who = w
-    b.track(hold, n)
+    if (first < n) b.ahead(hold, n)
+    else b.track(hold, n)
     max = n
   }
   const st = req.body
   if (st === undefined) return { res: undefined, req: req, hold: hold }
   hold.cls = cls
   hold.who = w
-  const plan: ReadPlan = { max: max, cap: cap, cls: cls, share: share, who: w, whoShare: whoShare, reserve: reserve, deadlineMs: bodyDeadlineMs(engine.cfg.server), rate: bodyRate(engine.cfg.server) }
+  const plan: ReadPlan = { max: max, cap: cap, cls: cls, share: share, who: w, whoShare: whoShare, reserve: reserve, deadlineMs: bodyDeadlineMs(engine.cfg.server), rate: rate }
   const got = await readCharged(st, b, hold, plan)
   if (got.stop === "large") return { res: errorResponse(413, "request body too large", "invalid_request_error", noHeaders()), req: req, hold: hold }
   if (got.stop === "busy") return { res: busyResponse(), req: req, hold: hold }

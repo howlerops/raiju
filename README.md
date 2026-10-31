@@ -279,10 +279,14 @@ also caps the request-body bytes it reads at once across requests, `server.max_b
 (default 48, sized for a 512Mi pod: parsing a chat body costs several times its size) as a hard bound;
 a declared length is reserved whole when the body is admitted, so a body that does not fit is answered
 503 with `retry-after` before its client sends it, and a chunked body is charged as its bytes arrive.
-Under contention a reservation whose body fell behind its pace (at its rate so far, more than 10 s to go,
-a second after it was admitted, 200 ms when it has received nothing, with one grace for a tenant that
-reconnects at once) is cut to what it has received plus a small look-ahead, so a client that
-declares a big length and sends slowly or nothing does not hold the cap. A body whose credential was checked from the headers (a virtual key, a
+Under contention a new body that keeps its tenant within its share cuts other tenants' reservations
+that fell behind (one that has received nothing, at any age; one sending under eight times
+`server.body_min_kb_per_second`, a second after admission, with one grace for a tenant that reconnects at
+once) to what they have received plus a small look-ahead, and only when cutting them lets it fit, so a
+client that declares a big length and sends slowly or nothing does not hold the cap, and an upload
+well above the minimum rate is never cut; a cut body that keeps that pace may still grow to the cap. A
+tenant that abandoned a declared body (nothing arrived) is reserved only the look-ahead for its next
+ones, for a minute, until one arrives whole. A body whose credential was checked from the headers (a virtual key, a
 direct provider key that is one of the configured keys, a management sign-in) must keep
 `server.body_min_kb_per_second` (default 32) after `server.body_rate_grace_seconds` (10), counted over
 each recent `server.body_rate_window_seconds` (30), and arrive whole within `server.body_max_seconds`
