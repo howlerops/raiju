@@ -12104,7 +12104,9 @@ def l158_e2e(env):
         check("a temporary config file older than ten minutes is removed at startup", not os.path.exists(stale), os.listdir(d))
         check("a recent temporary config file is kept (a save in progress)", os.path.exists(fresh), os.listdir(d))
         os.unlink(fresh)
-        inode = os.stat(cfg_path).st_ino
+        # the original file is held open so its inode cannot be freed and reused by the replacement
+        held = open(cfg_path, "rb")
+        inode = os.fstat(held.fileno()).st_ino
         s, b = 0, ""
         for i in range(5):
             s, _, b = call("POST", "/api/governance/virtual-keys", {"name": f"l158-{i}"}, admin, base=GW_L158, auth=False)
@@ -12122,6 +12124,7 @@ def l158_e2e(env):
         vks = [v.get("name") for v in saved.get("governance", {}).get("virtual_keys", [])]
         check("config.json is complete and holds every saved key", all(f"l158-{i}" in vks for i in range(5)), vks)
         check("config.json was replaced by a rename (a new inode)", os.stat(cfg_path).st_ino != inode, inode)
+        held.close()
         check("config.json keeps its permissions across saves", stat.S_IMODE(os.stat(cfg_path).st_mode) == 0o640, oct(os.stat(cfg_path).st_mode))
     finally:
         gw.terminate()
