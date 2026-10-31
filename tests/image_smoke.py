@@ -25,13 +25,15 @@ UPSTREAM_KEY = "smoke-" + "upstream-key"
 
 
 def smoke_config(mock_base_url):
+    # the mock upstream is reached through the Docker bridge (host.docker.internal is a private address), which the
+    # gateway refuses at connect time unless the provider allows private networks (L188)
     """The gateway's config.json: one OpenAI provider at the mock, logging on (so /ready covers the log store)."""
     return {
         "client": {"enable_logging": True, "drop_excess_requests": False, "allowed_origins": []},
         "providers": {
             "openai": {
                 "keys": [{"name": "smoke", "value": UPSTREAM_KEY, "models": [], "weight": 1.0}],
-                "network_config": {"base_url": mock_base_url, "max_retries": 0},
+                "network_config": {"base_url": mock_base_url, "max_retries": 0, "allow_private_network": True},
             }
         },
     }
