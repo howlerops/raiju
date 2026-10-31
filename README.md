@@ -372,7 +372,10 @@ measure. Raiju's internal overhead (`x-bf-overhead-us`) was ~40 µs mean at
 the log store on, and fails when its RSS keeps growing or an open stream costs too much. `make soak-bodies`
 (`tests/soak/bodies.py`) sends 1 MB, 4 MB and 200 KB request bodies to one worker for 60 s and signed 4 MB peer
 bodies to a broker for 20 s, and fails when either grows past 40 MB (before L210 a 1 MB + 4 MB loop grew a worker
-from 20 to 836 MB in 100 s). CI runs both in the memory soak job. Measured on a 4-core VM (one worker, about 600 requests a second plus 100 slow streams):
+from 20 to 836 MB in 100 s). `make soak-websockets` (`tests/soak/websockets.py`) opens and closes realtime sessions
+with a key, Responses sockets (with a response and bare) and live sessions in a loop on both servers and fails past
+256 bytes per session on the RSS slope (before L217 a closed session left 2 to 6 KB, and live sessions were refused
+for good after 10,000). CI runs all three in the memory soak job. Measured on a 4-core VM (one worker, about 600 requests a second plus 100 slow streams):
 
 | | Before L182 | After |
 |---|---|---|
@@ -401,6 +404,7 @@ make unit    # tov test, plus the Python tests (pricing, HTTP/2 and gRPC interop
 make e2e     # gateway against a mock upstream, on both servers
 make soak    # memory soak of one worker; fails when RSS grows (ports 18320-18321)
 make soak-bodies  # big request bodies to one worker and a broker; fails when RSS grows (ports 18320, 18321, 18377)
+make soak-websockets  # WebSocket sessions opened and closed on both servers; fails on the RSS slope (ports 18320-18321)
 make smoke   # opt-in: real providers, for each one with credentials in the environment (below)
 make openapi-check # docs/openapi/management.yaml against a probe gateway
 make parity-count  # recount docs/parity.md and refresh its Summary table
@@ -417,7 +421,7 @@ make bench
 `.github/workflows/ci.yml` runs on pull requests and pushes to `main`: it builds the patched
 compiler once (cached by Tov's revision and a hash of `tov-patches/` and `scripts/build-tov.sh`),
 then check, unit, openapi-check, web-check and the parity count in one job, e2e on Bun and on
-http1, `make ui` in Chromium, and the memory soaks (`make soak`, `make soak-bodies`); logs are uploaded when a job fails. The Docker image is built
+http1, `make ui` in Chromium, and the memory soaks (`make soak`, `make soak-bodies`, `make soak-websockets`); logs are uploaded when a job fails. The Docker image is built
 (no push) on pull requests and on `main`, booted the way the Helm chart runs it (`tests/image_smoke.py`: read-only
 root filesystem, non-root, /health, /ready, a chat through a mock upstream) and scanned with trivy (a fixable
 critical or high CVE fails it; the vulnerability database comes from ghcr.io or public.ecr.aws and is cached). `scripts/ci.sh` runs the same stages locally: `scripts/ci.sh` for all

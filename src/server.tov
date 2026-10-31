@@ -2144,8 +2144,18 @@ export function wsUpgrade(engine: Engine, ops: Ops, req: Request): WsUpgrade {
   const att = attachId(p)
   if (p !== "/v1/responses" && p !== "/v1/live/sessions" && p !== "/ws" && att === "") return { kind: "none" }
   const h = snapshot(req.headers)
-  if (p === "/v1/responses") return { kind: "session", session: wsSession(req, gated(new ResponsesSocket(engine, h), engine.wsResponses)) }
-  if (p === "/v1/live/sessions") return { kind: "session", session: wsSession(req, gated(new LiveSocket(engine, ops.liveSessions, h, ownerOf(engine, h), "", new Map()), engine.wsLive)) }
+  if (p === "/v1/responses") {
+    // the credential is checked from the headers before the upgrade, as the HTTP route checks it (an inactive or
+    // expired key, or none while client.enforce_auth_on_inference is on): 401 or 403, no socket
+    const d = engine.gov.credentialDenial(h)
+    if (d !== undefined) return { kind: "refused", status: d.status, message: d.message }
+    return { kind: "session", session: wsSession(req, gated(new ResponsesSocket(engine, h), engine.wsResponses)) }
+  }
+  if (p === "/v1/live/sessions") {
+    // an anonymous caller is refused before anything opens, as Bifrost's prepareRequest refuses it
+    if (!credentialOk(engine, h)) return { kind: "refused", status: 401, message: "authentication is required for live sessions" }
+    return { kind: "session", session: wsSession(req, gated(new LiveSocket(engine, ops.liveSessions, h, ownerOf(engine, h), "", new Map()), engine.wsLive)) }
+  }
   if (att !== "") {
     if (!validId(att)) return { kind: "refused", status: 400, message: "a session id is required" }
     if (!credentialOk(engine, h)) return { kind: "refused", status: 401, message: "authentication is required for live sessions" }
@@ -2565,4 +2575,35 @@ test("with auth not enforced an inference call passes, and the stream threshold 
   expect(headerRefusal(ops.engine, ops, bigPost("/v1/chat/completions", []), 100 * 1048576)).toBeUndefined()
   expect(bodyLimits(ops.engine).threshold).toBe(65536)
   expect(bodyLimits(ops.engine).limit).toBe(100 * 1048576)
+})
+
+function upgradeReq(path: string, hs: string[][]): Request {
+  const h: Record<string, string> = new Map()
+  h.set("upgrade", "websocket")
+  h.set("connection", "Upgrade")
+  for (const kv of hs) h.set(kv[0]!, kv[1]!)
+  return new Request("http://localhost" + path, { method: "GET", headers: h })
+}
+
+function upgradeStatus(engine: Engine, ops: Ops, r: Request): int {
+  const wu = wsUpgrade(engine, ops, r)
+  if (wu.kind === "refused") return wu.status
+  return wu.kind === "session" ? 101 : 0
+}
+
+test("the Responses and live sockets check credentials before the upgrade (re-audit 7 P0-2)", () => {
+  const cfg: Config = { client: { enforce_auth_on_inference: true }, governance: { virtual_keys: [{ id: "k", value: "sk-bf-k" }, { id: "off", value: "sk-bf-off", is_active: false }] } }
+  const ops = new Ops(new Engine(cfg), new ConfigStore("/tmp/raiju-server-wsauth.json", cfg))
+  const eng = ops.engine
+  expect(upgradeStatus(eng, ops, upgradeReq("/v1/responses", []))).toBe(401)
+  expect(upgradeStatus(eng, ops, upgradeReq("/openai/v1/responses", []))).toBe(401)
+  expect(upgradeStatus(eng, ops, upgradeReq("/v1/responses", [["x-bf-vk", "sk-bf-off"]]))).toBe(403)
+  expect(upgradeStatus(eng, ops, upgradeReq("/v1/responses", [["x-bf-vk", "sk-bf-k"]]))).toBe(101)
+  expect(upgradeStatus(eng, ops, upgradeReq("/v1/live/sessions", []))).toBe(401)
+  expect(upgradeStatus(eng, ops, upgradeReq("/v1/live/sessions", [["authorization", "Bearer sk-bf-k"]]))).toBe(101)
+  // with auth not enforced, both open without a credential
+  const open: Config = {}
+  const ops2 = new Ops(new Engine(open), new ConfigStore("/tmp/raiju-server-wsauth-open.json", open))
+  expect(upgradeStatus(ops2.engine, ops2, upgradeReq("/v1/responses", []))).toBe(101)
+  expect(upgradeStatus(ops2.engine, ops2, upgradeReq("/v1/live/sessions", []))).toBe(101)
 })

@@ -14336,6 +14336,75 @@ def l212_e2e(env):
         gw.wait()
 
 
+def l217_e2e(env):
+    """L217 (re-audit 7 P0-2, P1-4): WebSocket sessions leave nothing behind once closed, on both servers (a realtime
+    session with a key left ~5 KB, a /v1/responses open and close ~2.2 KB: the socket's pipe held the connection whose
+    data held the socket, and an upstream socket's onopen held the socket itself); /v1/responses and /v1/live/sessions
+    check the credential from the headers before upgrading (the Responses socket upgraded with none while auth was
+    enforced). Its own gateway (18392), one worker."""
+    server = os.environ.get("RAIJU_SERVER", "bun")
+    key = "sk-bf-l217-" + "0123456789abcdef"
+    off = "sk-bf-l217-" + "inactive-0123456"
+    cfg = {
+        "client": {"enforce_auth_on_inference": True, "enable_logging": False},
+        "alerts": {"enabled": False},
+        "pricing_sync": {"url": MOCK + "/nodatasheet", "enabled": False},
+        "governance": {"virtual_keys": [{"id": "vk-l217", "name": "vk-l217", "value": key}, {"id": "vk-l217-off", "name": "vk-l217-off", "value": off, "is_active": False}]},
+        "providers": {"openai": {"keys": [{"name": "l217", "value": "sk-l217", "models": [], "weight": 1.0}], "network_config": {"base_url": MOCK, "max_retries": 0}}},
+    }
+    gw = l183_start(env, "l217", 18392, cfg)
+    vk = {"x-bf-vk": key}
+    try:
+        # credentials before the upgrade: no 101 for a caller the route would refuse
+        for path in ["/v1/responses", "/openai/v1/responses", "/openai/responses"]:
+            c = WsClient(path, {}, port=18392)
+            c.close()
+            check(f"L217 {server}: {path} without a credential is refused 401 before the upgrade (auth enforced)", c.status == 401, c.status)
+        c = WsClient("/v1/responses", {"x-bf-vk": off}, port=18392)
+        c.close()
+        check(f"L217 {server}: /v1/responses with an inactive key is refused 403 before the upgrade", c.status == 403, c.status)
+        c = WsClient("/v1/live/sessions", {}, port=18392)
+        c.close()
+        check(f"L217 {server}: /v1/live/sessions without a credential is refused 401 before the upgrade", c.status == 401, c.status)
+        rs = WsClient("/v1/responses", vk, port=18392)
+        rs.send(json.dumps({"type": "response.create", "model": "openai/gpt-4o-mini", "input": "hi"}))
+        evs = rs.until("response.completed")
+        rs.close()
+        check(f"L217 {server}: /v1/responses with the key upgrades and answers", rs.status == 101 and evs and evs[-1].get("type") == "response.completed", (rs.status, evs[-3:]))
+        lc = WsClient("/v1/live/sessions", vk, port=18392)
+        lc.send(json.dumps({"type": "session.start", "session": {"model": "openai/gpt-live", "mock_id": "sess_l217_" + server}}))
+        evs = lc.until("session.started")
+        lc.close()
+        check(f"L217 {server}: /v1/live/sessions with the key upgrades and starts", lc.status == 101 and evs and evs[-1].get("type") == "session.started", (lc.status, evs))
+
+        # closed sessions leave nothing behind: realtime sessions with a key (one provider event each, then a drop)
+        # and Responses sockets opened and closed at once
+        def realtime(i):
+            c = WsClient("/v1/realtime?model=openai/gpt-realtime", vk, port=18392)
+            c.send(json.dumps({"type": "test.rt.start", "id": "sess_l217_%d" % i}))
+            ok = bool(c.until("session.created"))
+            c.close()
+            return c.status == 101 and ok
+
+        def bare(i):
+            c = WsClient("/v1/responses", vk, port=18392)
+            c.close()
+            return c.status == 101
+        for label, one, n in [("realtime sessions with a key", realtime, 1500), ("Responses sockets opened and closed", bare, 3000)]:
+            for i in range(200):
+                one(i)
+            time.sleep(1)
+            rss0 = l124_vm(gw.pid, "VmRSS")
+            ok = sum(1 for i in range(n) if one(i))
+            time.sleep(1)
+            rss1 = l124_vm(gw.pid, "VmRSS")
+            check(f"L217 {server}: {n} {label} leave the worker's memory flat (grew {rss1 - rss0} MiB; ~5 KB and ~2.2 KB a session stayed before)",
+                  ok == n and rss1 - rss0 < 4, (ok, rss0, rss1))
+    finally:
+        gw.terminate()
+        gw.wait()
+
+
 def l210_e2e(env):
     """L210 (production re-audit 6, P0-A, P1-A, P1-B). P0-A: a body over 64 KB is freed once its request is done (each
     read raced a promise that never settled, which kept every chunk alive: 1 MB chats grew a worker by their size).
@@ -21378,6 +21447,9 @@ def main():
         # the Maxim sink's attachments, and a Bedrock rerank fallback through its own pre hooks: its own gateways (18384,
         # restarted per profile, and 18385)
         l214_e2e(env)
+        # L217: WebSocket sessions leave no memory once closed, and the Responses and live sockets check credentials
+        # before upgrading: its own gateway (18392)
+        l217_e2e(env)
     finally:
         gw.terminate(); gw_b.terminate(); gw_d.terminate(); mock.terminate(); qdrant.terminate(); gw_w.terminate(); gw_bf.terminate(); gw_g.terminate(); grpc_coll.terminate(); gw_gt.terminate(); grpc_tls_coll.terminate(); idp.shutdown(); proxy.shutdown(); tls_up.shutdown()
         gw_vw.terminate(); gw_vp.terminate(); gw_vc.terminate(); weav.terminate(); pine.terminate()

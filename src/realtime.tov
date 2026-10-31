@@ -90,6 +90,8 @@ export class SocketExt {
     this.closed = true
     this.onClose()
     this.leave()
+    // the pipe's closures hold the connection, whose data holds this socket: a cycle reference counting never frees
+    this.pipe = undefined
   }
   // Counts the socket among the sessions a graceful stop closes with a going-away frame (drain.tov).
   track(): void {
@@ -197,6 +199,8 @@ export function extClose(ws: ServerWebSocket<Session>): bool {
   const e = s.ext
   if (e === undefined) return false
   e.gone()
+  // the connection is done with its session (whose pipe held the connection until gone)
+  ws.data = undefined
   return true
 }
 
@@ -353,6 +357,23 @@ export function openUpstream(url: string, hs: Record<string, string>, peer: Peer
   }
 }
 
+// A weak link to an upstream socket, for its own handlers: a handler that held its socket would be a cycle reference
+// counting never frees.
+export class UpCell {
+  weak up: WebSocket | undefined = undefined
+}
+
+// Lets go of an upstream socket's handlers once it has closed: they hold the relay or the route's socket, which hold
+// the upstream socket back.
+export function unhook(cell: UpCell): void {
+  const up = cell.up
+  if (up === undefined) return
+  up.onopen = undefined
+  up.onmessage = undefined
+  up.onclose = undefined
+  up.onerror = undefined
+}
+
 // Closes an upstream socket that is open. One still connecting is left to its onopen, which closes it:
 // closing a socket mid-connect crashed the process on the http1 server.
 function closeUp(up: WebSocket): void {
@@ -496,10 +517,14 @@ export class RealtimeSocket extends SocketExt {
     }, (p) => false, () => 0, (code, why) => {
       closeUp(up)
     })
+    const cell = new UpCell()
+    cell.up = up
     up.onopen = () => {
       // a caller that left while the dial was connecting: the relay is over, so the socket is closed
-      if (relay.closed) up.close()
-      else relay.channelOpened(false)
+      const u = cell.up
+      if (relay.closed) {
+        if (u !== undefined) u.close()
+      } else relay.channelOpened(false)
     }
     up.onmessage = (ev) => {
       const d = ev.data
@@ -508,6 +533,7 @@ export class RealtimeSocket extends SocketExt {
     up.onclose = (ev) => {
       if (ev.code === 1000 || ev.code === 1001 || ev.code === 1005) relay.providerGone()
       else relay.providerBroke()
+      unhook(cell)
     }
     up.onerror = (ev) => {
       relay.providerBroke()
@@ -630,4 +656,78 @@ test("a socket past the cap gets Bifrost's 429 event for its route", () => {
   rt.refuseFull()
   expect(sent).toBe(`{"type":"error","error":{"type":"rate_limit_exceeded","code":"rate_limit_exceeded","message":"websocket connection limit reached"}}`)
   expect(FULL_EVENT_RESPONSES).toBe(`{"type":"error","status":429,"error":{"code":"websocket_connection_limit_reached","message":"websocket connection limit reached"}}`)
+})
+
+// A server connection as Bun.serve has one: it holds its session in data, and the session's pipe holds it back.
+class FakeConn {
+  data: Session | undefined = undefined
+  sent = 0
+}
+
+// Weak links to what one WebSocket session allocates: they read undefined once it is freed.
+class SocketProbe {
+  weak ext: SocketExt | undefined = undefined
+  weak session: Session | undefined = undefined
+  weak payload: FakeConn | undefined = undefined
+}
+
+function socketOnce(p: SocketProbe, close: bool): void {
+  const conn = new FakeConn()
+  const s = new Session("ws://localhost/v1/responses", new Map(), "", "")
+  const e = new SocketExt()
+  s.ext = e
+  conn.data = s
+  e.pipe = new Pipe((t: string) => {
+    conn.sent += 1
+  }, (c: int, r: string) => {
+    conn.sent += 1
+  }, () => {}, () => {})
+  e.track()
+  e.onOpen()
+  e.send("x")
+  p.ext = e
+  p.session = s
+  if (close) e.gone()
+}
+
+test("a WebSocket session is freed once its client has gone (re-audit 7 P0-2)", () => {
+  const p = new SocketProbe()
+  socketOnce(p, true)
+  expect(p.ext === undefined).toBe(true)
+  expect(p.session === undefined).toBe(true)
+  expect(openSessions().count(false)).toBe(0)
+})
+
+// The upstream socket's handlers hold the relay; a closed socket lets go of them.
+function upstreamOnce(p: SocketProbe, release: bool): void {
+  const held = new FakeConn()
+  let made: WebSocket | undefined = undefined
+  try {
+    made = new WebSocket("ws://127.0.0.1:9/never")
+  } catch (e) {
+    return
+  }
+  const up = made
+  if (up === undefined) return
+  const cell = new UpCell()
+  cell.up = up
+  up.onopen = () => {
+    const u = cell.up
+    if (u !== undefined) held.sent += 1
+  }
+  up.onmessage = (ev) => {
+    held.sent += 1
+  }
+  p.payload = held
+  if (release) unhook(cell)
+}
+
+test("a closed upstream socket lets go of its handlers and what they hold", () => {
+  const p = new SocketProbe()
+  upstreamOnce(p, true)
+  expect(p.payload === undefined).toBe(true)
+  // (without it, the socket the runtime still holds keeps them)
+  const q = new SocketProbe()
+  upstreamOnce(q, false)
+  expect(q.payload === undefined).toBe(false)
 })

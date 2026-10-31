@@ -28,7 +28,7 @@ import { trimSlash } from "./providers/types"
 import { Field, fields, find, rawStr, setField, build, quote } from "./json"
 import { Hdrs, snapshot } from "./schemas"
 import { Config, KeyConfig, AliasTarget } from "./config"
-import { SocketExt, upstreamFor, wsBase, openUpstream } from "./realtime"
+import { SocketExt, upstreamFor, wsBase, openUpstream, UpCell, unhook } from "./realtime"
 import { Grant } from "./governance"
 import { SessionSpec, sessionHooks, sessionGuard } from "./livehooks"
 import { deadline } from "./deadline"
@@ -38,8 +38,18 @@ const LIVE_CONTROL_MS = 30000
 const LIVE_CONTENT_MS = 120000
 import { Relay, Leg, Exchange, Refusal, UpdateCheck, establish, prepareServerEvents, startClock, withOffer, strAt, withJsonAt, eventType } from "./webrtc"
 
-// How many sessions the registry holds. Past that a new session is refused, not left unrecorded.
+// How many sessions the registry holds. Past that the record of an ended session nearest its expiry makes room;
+// with every record a running session, a new one is refused, not left unrecorded.
 const MAX_RECORDS = 10000
+// How long a session's record stays once the session has ended, so its recording (/content) and a late attach stay
+// its owner's; then it goes, with its share-dir folder (re-audit 7 P1-4: records were never removed, and past
+// MAX_RECORDS every new live session was refused until a restart).
+export const LIVE_ENDED_KEEP_MS = 3600000.0
+// A record whose end this worker never sees (a session the worker did not run, or one whose relay never reported)
+// goes this long after it was made.
+export const LIVE_RECORD_TTL_MS = 86400000.0
+// how often expired records are looked for
+const SWEEP_MS = 60000.0
 
 // The hash a session's owner is recorded by: the owner's virtual key is not kept on disk.
 function ownerHash(owner: string): string {
@@ -49,9 +59,17 @@ function ownerHash(owner: string): string {
 // The virtual key that opened each live session, by the provider's session id.
 export class LiveRegistry {
   owners: Map<string, string> = new Map()
+  // when each record goes (ms since the epoch): LIVE_RECORD_TTL_MS after it was made, LIVE_ENDED_KEEP_MS after its
+  // session ended
+  expires: Map<string, f64> = new Map()
+  // the records whose session has ended
+  ended: Set<string> = new Set()
+  // the records whose share-dir folder this worker made (and removes when the record goes)
+  private claimed: Set<string> = new Set()
+  private nextSweep: f64 = 0.0
   // With several workers, a directory of the node's: each session is a folder named by its id's hash,
   // holding its owner's hash. mkdir claims the folder atomically, so the first worker to open a
-  // session records it for all of them. The folders stay until the directory is removed.
+  // session records it for all of them. The worker that made a folder removes it with its record.
   shareDir = ""
 
   share(dir: string): void {
@@ -76,14 +94,24 @@ export class LiveRegistry {
     }
   }
 
-  // Records the owner of a session. False when the registry is full, or the session belongs to
-  // another owner. A session opened with no virtual key is not recorded, and anyone may reach it.
+  private keep(id: string, owner: string, nowMs: f64): void {
+    this.owners.set(id, owner)
+    this.expires.set(id, nowMs + LIVE_RECORD_TTL_MS)
+  }
+
+  // Records the owner of a session. False when the registry is full of running sessions, or the session belongs
+  // to another owner. A session opened with no virtual key is not recorded, and anyone may reach it.
   bind(id: string, owner: string): bool {
+    return this.bindAt(id, owner, Date.now())
+  }
+
+  bindAt(id: string, owner: string, nowMs: f64): bool {
     if (owner === "" || id === "") return true
+    this.sweep(nowMs, false)
     if (this.owners.has(id)) return this.owners.get(id) === owner
-    if (this.owners.size >= MAX_RECORDS) return false
+    if (!this.roomAt(nowMs)) return false
     if (this.shareDir === "") {
-      this.owners.set(id, owner)
+      this.keep(id, owner, nowMs)
       return true
     }
     const dir = this.folder(id)
@@ -93,7 +121,7 @@ export class LiveRegistry {
     } catch (e) {
       // another worker claimed the session: its owner is the record
       if (!this.sharedOwnerIs(id, hash)) return false
-      this.owners.set(id, owner)
+      this.keep(id, owner, nowMs)
       return true
     }
     try {
@@ -107,8 +135,69 @@ export class LiveRegistry {
       }
       return false
     }
-    this.owners.set(id, owner)
+    this.keep(id, owner, nowMs)
+    this.claimed.add(id)
     return true
+  }
+
+  // The session ended: its record (when it is this owner's) stays LIVE_ENDED_KEEP_MS more, then goes.
+  release(id: string, owner: string): void {
+    this.releaseAt(id, owner, Date.now())
+  }
+
+  releaseAt(id: string, owner: string, nowMs: f64): void {
+    if (id === "" || owner === "" || this.owners.get(id) !== owner) return
+    this.ended.add(id)
+    this.expires.set(id, nowMs + LIVE_ENDED_KEEP_MS)
+  }
+
+  // Whether a new record fits: when full, the ended session's record nearest its expiry makes room.
+  room(): bool {
+    return this.roomAt(Date.now())
+  }
+
+  roomAt(nowMs: f64): bool {
+    if (this.owners.size < MAX_RECORDS) return true
+    this.sweep(nowMs, true)
+    if (this.owners.size < MAX_RECORDS) return true
+    let victim = ""
+    let soonest = 0.0
+    for (const id of this.ended.values()) {
+      const at = this.expires.get(id) ?? 0.0
+      if (victim === "" || at < soonest) {
+        victim = id
+        soonest = at
+      }
+    }
+    if (victim === "") return false
+    this.remove(victim)
+    return true
+  }
+
+  // Removes the records past their time (at most once every SWEEP_MS unless forced).
+  sweep(nowMs: f64, force: bool): void {
+    if (!force && nowMs < this.nextSweep) return
+    this.nextSweep = nowMs + SWEEP_MS
+    const gone: string[] = []
+    for (const id of this.expires.keys()) {
+      if ((this.expires.get(id) ?? 0.0) <= nowMs) gone.push(id)
+    }
+    for (const id of gone) this.remove(id)
+  }
+
+  // Forgets a record, and removes its share-dir folder when this worker made it.
+  private remove(id: string): void {
+    this.owners.delete(id)
+    this.expires.delete(id)
+    this.ended.delete(id)
+    if (!this.claimed.has(id)) return
+    this.claimed.delete(id)
+    if (this.shareDir === "") return
+    try {
+      rmSync(this.folder(id), { recursive: true, force: true })
+    } catch (e) {
+      // left for the directory's removal
+    }
   }
 
   // Whether a caller with this virtual key ("" for none) may use the session.
@@ -250,7 +339,7 @@ export async function liveCreate(engine: Engine, reg: LiveRegistry, req: Request
   const admitted = engine.gov.admit(h, ref.provider, ref.model)
   if (admitted.kind === "denial") return errorResponse(admitted.status, admitted.message, admitted.type, noHeaders())
   const grant: Grant = admitted
-  if (reg.owners.size >= MAX_RECORDS) return errorResponse(503, "the live session registry is full", "server_error", noHeaders())
+  if (!reg.room()) return errorResponse(503, "the live session registry is full", "server_error", noHeaders())
   const sel = target(engine.cfg, ref, new Set<int>(), h.get("x-bf-api-key") ?? undefined)
   if (sel === undefined || sel.t.kind !== "openai") return errorResponse(404, "no OpenAI key is configured for live sessions", "invalid_request_error", noHeaders())
   const t = sel.t
@@ -301,7 +390,9 @@ export async function liveCreate(engine: Engine, reg: LiveRegistry, req: Request
 
   // each window of voice time is admitted again, as Bifrost's meter does for its next billing unit
   const spec: SessionSpec = { op: "live", transport: "webrtc", provider: provider, model: modelName }
-  const hooks = sessionHooks(engine, h, grant, spec, (id) => reg.bind(id, owner))
+  const hooks = sessionHooks(engine, h, grant, spec, (id) => reg.bind(id, owner), (id) => {
+    reg.release(id, owner)
+  })
   const est = await establish({
     offer: offer,
     exchange: exchange,
@@ -599,9 +690,12 @@ export class LiveSocket extends SocketExt {
       return
     }
     this.upstream = up
+    const cell = new UpCell()
+    cell.up = up
     // a client that left while the dial was connecting: the upstream is closed once it opens
     up.onopen = () => {
-      if (this.closed || this.ended) up.close()
+      const u = cell.up
+      if ((this.closed || this.ended) && u !== undefined) u.close()
     }
     up.onmessage = (ev) => {
       const d = ev.data
@@ -610,6 +704,8 @@ export class LiveSocket extends SocketExt {
     }
     up.onclose = (ev) => {
       this.endWith(ev.code === 1005 || ev.code === 1006 ? 1011 : ev.code, ev.reason)
+      // (the handlers hold this socket, which holds the upstream)
+      unhook(cell)
     }
     up.onerror = (ev) => {
       this.endWith(1011, "upstream live connection failed")
@@ -623,7 +719,9 @@ export class LiveSocket extends SocketExt {
     const spec: SessionSpec = { op: "live", transport: "websocket", provider: provider, model: model }
     const reg = this.reg
     const owner = this.owner
-    const relay = new Relay(sessionHooks(this.engine, this.headers, grant, spec, (id) => reg.bind(id, owner)), sessionGuard(this.engine), Date.now())
+    const relay = new Relay(sessionHooks(this.engine, this.headers, grant, spec, (id) => reg.bind(id, owner), (id) => {
+      reg.release(id, owner)
+    }), sessionGuard(this.engine), Date.now())
     // only a created WebRTC session bills a minimum
     relay.core.minimum = 0.0
     relay.core.model = model
@@ -655,10 +753,14 @@ export class LiveSocket extends SocketExt {
     }, (p) => false, () => 0, (code, why) => {
       closeUpstream(up)
     })
+    const cell = new UpCell()
+    cell.up = up
     up.onopen = () => {
       // a client that left while the dial was connecting: the relay is over, so the socket is closed
-      if (relay.closed) up.close()
-      else relay.channelOpened(false)
+      const u = cell.up
+      if (relay.closed) {
+        if (u !== undefined) u.close()
+      } else relay.channelOpened(false)
     }
     up.onmessage = (ev) => {
       const d = ev.data
@@ -667,6 +769,7 @@ export class LiveSocket extends SocketExt {
     up.onclose = (ev) => {
       if (ev.code === 1000 || ev.code === 1001 || ev.code === 1005) relay.providerGone()
       else relay.providerBroke()
+      unhook(cell)
     }
     up.onerror = (ev) => {
       relay.providerBroke()
@@ -814,4 +917,65 @@ test("WebRTC calls are refused unless server.webrtc_enabled is set", () => {
   expect(off?.status).toBe(403)
   expect(webrtcRefusal({ server: { webrtc_enabled: false } })?.status).toBe(403)
   expect(webrtcRefusal({ server: { webrtc_enabled: true } })).toBeUndefined()
+})
+
+test("a live session's record goes after its session ends, and a full registry makes room from ended ones (re-audit 7 P1-4)", () => {
+  const reg = new LiveRegistry()
+  const t0 = 1000000.0
+  expect(reg.bindAt("sess_a", "vk1", t0)).toBe(true)
+  // only its owner's end counts
+  reg.releaseAt("sess_a", "vk2", t0)
+  expect(reg.ended.has("sess_a")).toBe(false)
+  reg.releaseAt("sess_a", "vk1", t0)
+  // kept for the recording and late attaches, then gone
+  reg.sweep(t0 + LIVE_ENDED_KEEP_MS - 1.0, true)
+  expect(reg.allowed("sess_a", "vk2")).toBe(false)
+  reg.sweep(t0 + LIVE_ENDED_KEEP_MS, true)
+  expect(reg.owners.has("sess_a")).toBe(false)
+  expect(reg.expires.size).toBe(0)
+  expect(reg.ended.size).toBe(0)
+  // a record whose end is never seen goes after the TTL
+  expect(reg.bindAt("sess_b", "vk1", t0)).toBe(true)
+  reg.sweep(t0 + LIVE_RECORD_TTL_MS, true)
+  expect(reg.owners.has("sess_b")).toBe(false)
+  // full of running sessions: a new one is refused; once one has ended, its record makes room at once
+  for (let i = 0; i < 10000; i++) expect(reg.bindAt(`sess_${i}`, "vk1", t0)).toBe(true)
+  expect(reg.bindAt("sess_new", "vk1", t0)).toBe(false)
+  expect(reg.roomAt(t0)).toBe(false)
+  reg.releaseAt("sess_7", "vk1", t0)
+  expect(reg.bindAt("sess_new", "vk1", t0)).toBe(true)
+  expect(reg.owners.has("sess_7")).toBe(false)
+  expect(reg.owners.size).toBe(10000)
+  // more sessions that each end, past the cap: never refused
+  reg.releaseAt("sess_new", "vk1", t0)
+  for (let i = 0; i < 500; i++) {
+    const id = `sess_more_${i}`
+    expect(reg.bindAt(id, "vk2", t0 + 1.0)).toBe(true)
+    reg.releaseAt(id, "vk2", t0 + 1.0)
+  }
+  expect(reg.owners.size).toBe(10000)
+})
+
+test("a shared live record's folder goes with its record", () => {
+  const dir = "/tmp/raiju-live-share-test"
+  try {
+    rmSync(dir, { recursive: true, force: true })
+  } catch (e) {}
+  const reg = new LiveRegistry()
+  reg.share(dir)
+  const other = new LiveRegistry()
+  other.share(dir)
+  const t0 = 5000000.0
+  expect(reg.bindAt("sess_s", "vk1", t0)).toBe(true)
+  // another worker sees the owner through the folder
+  expect(other.allowed("sess_s", "vk2")).toBe(false)
+  expect(other.allowed("sess_s", "vk1")).toBe(true)
+  reg.releaseAt("sess_s", "vk1", t0)
+  reg.sweep(t0 + LIVE_ENDED_KEEP_MS, true)
+  expect(reg.owners.has("sess_s")).toBe(false)
+  // the folder is gone with it
+  expect(other.allowed("sess_s", "vk2")).toBe(true)
+  try {
+    rmSync(dir, { recursive: true, force: true })
+  } catch (e) {}
 })

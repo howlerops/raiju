@@ -1,4 +1,4 @@
-.PHONY: build test unit e2e soak soak-bodies smoke ui web web-check check openapi-check parity-count run bench tov tov-test wasm-fixture config-doc config-doc-check deploy-check
+.PHONY: build test unit e2e soak soak-bodies soak-websockets smoke ui web web-check check openapi-check parity-count run bench tov tov-test wasm-fixture config-doc config-doc-check deploy-check
 
 # Tov's async slab allocator corrupts its free lists once ~30 fetches are in
 # flight (see docs/tov-notes.md); plain malloc avoids it at the same speed.
@@ -71,6 +71,12 @@ soak:
 # when RSS grows (tests/soak/bodies.py --help; fixed ports 18320, 18321 and 18377: run it under the e2e lock)
 soak-bodies:
 	python3 tests/soak/bodies.py
+
+# memory soak of WebSocket sessions: realtime with a key, the Responses socket (with a response and bare) and live
+# sessions opened and closed in a loop on both servers; fails on the RSS slope per session (tests/soak/websockets.py
+# --help; fixed ports 18320 and 18321: run it under the e2e lock)
+soak-websockets:
+	python3 tests/soak/websockets.py
 
 e2e:
 	python3 tests/e2e.py
