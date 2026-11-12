@@ -270,7 +270,7 @@ func main() {
 	stubCall("domain-only", *domain, *key, getTask(taskID))
 	stubCall("unknown-agent", "nosuch."+*domain, *key, getTask(taskID))
 	stubCall("no-key", authority, "", getTask(taskID))
-	stubCall("bad-key", authority, "sk-bf-not-a-key", getTask(taskID))
+	stubCall("bad-key", authority, "sk-raiju-not-a-key", getTask(taskID))
 	stubCall("no-grant", authority, *nogrant, getTask(taskID))
 	stubCall("task-missing", authority, *key, getTask("missing-task"))
 	stubCall("agent-error", authority, *key, func(cx context.Context, s a2apb.A2AServiceClient) error {

@@ -11,7 +11,7 @@ Everything below the line is the brief.
 
 ---
 
-You are a worker on Raiju, a Bifrost-compatible LLM gateway written in Tov (TypeScript syntax compiled to native code). A lead integrates your work; you finish ONE ledger task in your own git worktree.
+You are a worker on Raiju, an LLM gateway written in Tov (TypeScript syntax compiled to native code). A lead integrates your work; you finish ONE ledger task in your own git worktree.
 
 Read these first, fully:
 - /home/user/raiju/handoff/worker-brief.md (shared rules; they all apply)
@@ -21,14 +21,13 @@ Read these first, fully:
 
 Environment (already set up; do not rebuild or modify it):
 - export TOV=/home/user/raiju/build/tov/target/release/tov   (patched compiler; never use plain `tov`, never run scripts/build-tov.sh in /home/user/raiju)
-- Bifrost reference source (read-only): /tmp/claude-0/bifrost-src at commit 6c84d7a
 - Baseline at HEAD: HEAD is green (make unit and e2e on both servers). If your failures also happen on a clean checkout of HEAD, report them as pre-existing instead of fixing them.
 
 Your worktree: you were started in an isolated git worktree of the repo. Run `pwd` and `git log --oneline -1` first; work ONLY inside that worktree. Never edit /home/user/raiju itself (read from it only). Do not commit, push, branch, or stash-drop; leave your changes in the working tree.
 
 YOUR TASK: ledger <ID> (<gap numbers>; follow-up to <earlier rows>).
 <What is built already, with file names to grep. What to build, as numbered pieces in priority order.
-Name the Bifrost files to compare against. Say "stop on a piece if it grows too big and report it
+Name the reference files to compare against. Say "stop on a piece if it grows too big and report it
 under LIMITS".>
 Update the matching docs/parity.md rows (status and notes), docs/openapi/management.yaml for any
 route change, and config_compat keys for any config you add.
@@ -36,7 +35,7 @@ Your e2e ports: <two free ports from HANDOFF.md's port registry> only.
 
 How to finish:
 1. Build from HEAD (your worktree starts there).
-2. Read the code your task touches first and follow its idiom. Compare behaviour with the Bifrost source where the task names it. Keep scope to the task.
+2. Read the code your task touches first and follow its idiom. Compare behaviour with the reference source where the task names it. Keep scope to the task.
 3. Typecheck: `TOV=$TOV python3 scripts/check.py --no-fix <changed .tov files>` then `TOV=$TOV python3 scripts/check.py --no-fix src/main.tov`. Never let it auto-fix.
 3b. If you add or change any /api, /mcp, /health or /metrics route, update docs/openapi/management.yaml and run `make openapi-check TOV=$TOV` (it must print `openapi-check: ok`).
 4. Unit: `$TOV test src/<module>.tov` for each new/changed module, then `make unit TOV=$TOV` (full suite; it takes several minutes — use a foreground Bash call with timeout 600000, or run it in the background and wait for it).

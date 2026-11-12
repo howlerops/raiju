@@ -1,30 +1,28 @@
-// The MCP authorization server (Bifrost's discovery documents, /oauth2/register, /oauth2/authorize,
-// /oauth2/token and the consent page), on when client.mcp_server_auth_mode is "both" or "oauth". An MCP
-// client registers (RFC 7591), sends its user to the consent page, and the user approves the request with a
-// virtual key. The client then trades the one-time code (PKCE S256) for an access token and a refresh token.
-// The access token is an RS256 JWT whose sub is the virtual key's id and whose bf_mode is "vk", so a /mcp call
-// that carries it runs as that key (Bifrost's vk mode). A session-mode grant (a dashboard user consents, no key)
-// signs a token with bf_mode "session": the request runs anonymously, as Bifrost's session mode does. A user-mode
-// grant (an identity-provider user signed in through the gateway's OIDC sign-in, oidc.tov) signs bf_mode "user"
-// with the user's subject: the request runs as that user (Bifrost's user mode, on Raiju's own identity provider).
+// The MCP authorization server provides discovery documents, /oauth2/register, /oauth2/authorize,
+// /oauth2/token and a consent page when client.mcp_server_auth_mode is "both" or "oauth". An MCP client
+// registers (RFC 7591) and sends its user to consent. With virtual-key approval, the client exchanges a
+// one-time code using PKCE S256 for access and refresh tokens. The access token is an RS256 JWT whose
+// sub is the virtual key's id and whose raiju_mode is "vk"; /mcp requests carrying it run as that key.
+// A session-mode grant from a dashboard user carries raiju_mode "session" and runs anonymously.
+// A user-mode grant from an identity-provider user signed in through the gateway's OIDC sign-in (oidc.tov)
+// carries raiju_mode "user" and the user's subject; requests run as that user.
 //
-// The signing key is the operator's PEM (client.oauth2_server_config.signing_key). Without one, a key is generated
-// at the first start and kept in the state file beside config.json (openIssuerState), so a restart and every worker
-// of the node sign with the same key. The grants (refresh tokens and the clients they belong to) and the consented
-// requests (their codes as hashes) are kept there too, and read back when one is not held in memory, so a restart and
-// a second worker see them. Only a consent, a token request, a refresh or a revoke writes that file.
+// The signing key is the operator's PEM (client.oauth2_server_config.signing_key). Without one, a key is
+// generated on first start and kept in the state file beside config.json. Loading or creating it holds the shared
+// file's lock, so simultaneous starts on different nodes and all their workers use the same key. Grants
+// (refresh tokens and their clients) and consented requests (with hashed codes) are also persisted and loaded
+// when absent from memory. Only startup, consent, token, refresh or revoke operations write this file.
 //
-// The two routes anyone may call store no client. /oauth2/authorize stores nothing: the pending request is sealed into
-// the consent link's token (AES-256-GCM under a key derived from the signing key), so any worker, and any node with the
-// same signing key, opens it. /oauth2/register stores no client either: the client_id is the client's metadata sealed
-// the same way (under another key derived from the signing key), and the client is written to the state file only
-// when it gets its first grant (the consent). So no registration, however many, can push out another user's client.
-// Registration is bounded per address (Raiju's limits; Bifrost has none, only an hourly sweep of clients with no
-// grant): a number of registrations a minute and of unused clients (clients with no grant yet), counted in a small
-// log (<state>-registrations.jsonl: an address hash, a time and a hash of the client_id per registration, appended under
-// its own lock). An unused client lives an hour (Bifrost's sweep grace): past it its client_id is refused, as is a
-// client whose grants have all aged out. Clients an earlier release registered (<state>-clients.jsonl) keep working
-// until the same lifetime ends.
+// The public /oauth2/authorize and /oauth2/register routes store no client. Authorization seals the pending
+// request into the consent link's token using AES-256-GCM with a key derived from the signing key, allowing
+// any worker or node with that signing key to open it. Registration seals client metadata into client_id
+// using a different derived key. The client is persisted only on its first grant, so registrations cannot
+// displace another user's client.
+// Registrations per minute and unused clients are limited per address. An unused client has no grant yet.
+// A small log, <state>-registrations.jsonl, records an address hash, time and client_id hash for each
+// registration, appended under its own lock. Unused clients expire after one hour; their client_id is then
+// refused, as is a client whose grants have all expired. Clients registered by an earlier release in
+// <state>-clients.jsonl remain usable until the same lifetime ends.
 import { Config, OAuth2ServerConfig, VirtualKeyConfig } from "./config"
 import { pkceChallenge } from "./mcpauth"
 import { secureHex, sha256, utf8, toHex, hmacSha256 } from "./crypto"
@@ -37,14 +35,14 @@ import { rfc3339Ms } from "./vkexpiry"
 import { rfc3339 } from "./anthropic_batch"
 import { connectPageHtml, consentPageHtml } from "./mcpconsent"
 import { ConfigCipher, sealStored, openStored } from "./store"
-import { existsSync, readFileSync, unlinkSync, writeFileSync, rmSync, statSync } from "node:fs"
+import { existsSync, readFileSync, unlinkSync, writeFileSync, rmSync, statSync, closeSync } from "node:fs"
 import { writeFileAtomic, appendPrivate } from "./atomicfile"
 import { readState, stateVersion } from "./statever"
-import { FileLock, lockFile, lockFileAsync, unlockFile } from "./filelock"
+import { FileLock, lockFile, lockFileAsync, unlockFile, LOCK_WAIT_MS, holdAsAnother } from "./filelock"
 import { parseIP, formatIP } from "./netguard"
 import { CLIENT_IP_HEADER } from "./clientip"
 
-// The lifetimes and limits of Bifrost's defaults (mcpoauth2issuance.go and the table constants).
+// Default lifetimes and limits.
 const DEFAULT_CODE_TTL_S: f64 = 300.0
 const MAX_CODE_TTL_S: f64 = 900.0
 const DEFAULT_ACCESS_TTL_S: f64 = 600.0
@@ -56,18 +54,18 @@ const MAX_REDIRECTS = 32
 const MAX_REDIRECT = 2048
 // Revoked refresh rows are kept this long (so a replayed token still revokes its family), then dropped from the file.
 const REVOKED_KEEP_MS = 30 * 86400000.0
-// The signing key the generated one is sized to (Bifrost's size).
+// Key size used when generating a signing key.
 const GENERATED_KEY_BITS = 2048
-// Session list paging (Bifrost's oauth2SessionsDefaultLimit and oauth2SessionsMaxLimit).
+// Default and maximum page sizes for session lists.
 const SESSIONS_DEFAULT_LIMIT = 50
 const SESSIONS_MAX_LIMIT = 500
-// The registration limits' defaults (client.oauth2_server_config; Raiju's own, Bifrost has none). An unused client is
-// one with no grant yet: no refresh token and no consented request.
+// Registration limit defaults for client.oauth2_server_config. An unused client has no grant yet:
+// no refresh token and no consented request.
 const DEFAULT_MAX_UNUSED_CLIENTS = 1000
 const DEFAULT_MAX_UNUSED_PER_ADDRESS = 20
 const DEFAULT_REGISTRATIONS_PER_MINUTE = 10
-// How long a client with no grant lives (Bifrost's orphanClientGrace, one hour). It must outlive a code (MAX_CODE_TTL_S),
-// so a client mid-handshake is not dropped before its first token.
+// A client with no grant lives for one hour. This must exceed MAX_CODE_TTL_S so a client mid-handshake
+// is not dropped before receiving its first token.
 const DEFAULT_UNUSED_CLIENT_TTL_S = 3600
 const MIN_UNUSED_CLIENT_TTL_S = 1200
 // The unused clients held in memory and in the registry stay under this many bytes too (a client may be 70 KB).
@@ -144,11 +142,11 @@ type RegistryHead = { version?: int, gen?: string }
 // The state file's version (statever.tov): a file from a newer Raiju is neither read nor written over.
 const ISSUER_STATE_VERSION = 1
 
-// Who is consenting, as the request's credentials show it (Bifrost's identity resolver and consent checks).
-// signedIn: a dashboard sign-in (a session token or admin credentials) or an identity-provider user is on the
-// request. enforce: inference auth is enforced. userAvailable: the gateway's OIDC sign-in is on, so user mode can
-// be offered. disableVk: oauth2_server_config.disable_vk_identity. user and userName: the signed-in identity-provider
-// user ("" when none). userActive tells whether a user may still use a user-mode grant.
+// Consent identity derived from the request's credentials.
+// signedIn: the request has a dashboard sign-in (session token or admin credentials) or an identity-provider user.
+// enforce: inference authentication is enforced. userAvailable: the gateway's OIDC sign-in is enabled, so user
+// mode can be offered. disableVk: oauth2_server_config.disable_vk_identity. user and userName: the signed-in
+// identity-provider user ("" when absent). userActive: whether the user may still use a user-mode grant.
 export type ConsentContext = { signedIn: bool, enforce: bool, userAvailable: bool, disableVk: bool, user: string, userName: string, userActive: (sub: string) => bool }
 
 const CLIENTS: Map<string, OAuthClientRow> = new Map()
@@ -233,7 +231,7 @@ export function countsOf(file: string): string {
 
 // Opens the state file beside config.json and takes the signing key from it. When the authorization server is on
 // and the config names no signing_key, the key is generated at the first start and saved there, so every later
-// start (and every worker, which all start after this) signs with it. A configured key always wins. The client
+// start (and every worker and node sharing it) signs with it. A configured key always wins. The client
 // registry beside it is read too; with the server on, both are written back once, so a file of an earlier version
 // (every registered client and the pending requests in the state file) is split, and the clients past their limits
 // dropped. Returns a note to print, or "" when all is well.
@@ -256,6 +254,21 @@ export function openIssuerState(c: Config, file: string, cipher: ConfigCipher | 
   countsReadAt = -1.0e15
   generatedPem = ""
   sealedKey = ""
+  // Startup runs before workers serve requests. Use the existing bounded native flock wait, not a retry loop:
+  // a concurrent first start must finish saving its key before this process reads or generates one.
+  const lock: FileLock = file === "" ? { path: "", ok: true } : lockFile(file, LOCK_WAIT_MS)
+  if (!lock.ok || (file !== "" && lock.path === "")) {
+    return `the state file ${file} cannot be locked; the MCP authorization server is off until it can be opened safely`
+  }
+  try {
+    return loadIssuerState(c, file, cipher)
+  } finally {
+    unlockFile(lock)
+  }
+}
+
+// Called only while the state lock is held (or with no state file for memory-only tests).
+function loadIssuerState(c: Config, file: string, cipher: ConfigCipher | undefined): string {
   let st: StateFile = {}
   if (existsSync(file)) {
     try {
@@ -293,9 +306,17 @@ export function openIssuerState(c: Config, file: string, cipher: ConfigCipher | 
       return `could not generate the MCP signing key: ${e.message}`
     }
     try {
-      sealedKey = try sealStored(cipher, pem)
+      const stored = try sealStored(cipher, pem)
+      if (file !== "") {
+        // Do not publish a node-local key if its durable shared write fails. Keep every existing row, including
+        // those an earlier release will migrate below, and make signing state private even if it was opened up.
+        st.version = ISSUER_STATE_VERSION
+        st.signing_key = stored
+        try writeFileAtomic(file, JSON.stringify(st) + "\n", { mode: 384, exact: true })
+      }
+      sealedKey = stored
     } catch (e) {
-      return `could not seal the MCP signing key: ${e.message}`
+      return `could not save the MCP signing key in ${file}; the MCP authorization server is off until the state file is writable`
     }
     generatedPem = pem
     tidyFiles(limitsOf(oc))
@@ -449,7 +470,7 @@ function writeGrants(): void {
       console.error(`raiju: mcp oauth: ${stateFile} was written by a newer Raiju; it is not written over`)
       return
     }
-    writeFileAtomic(stateFile, JSON.stringify(st) + "\n", { mode: 384 })
+    writeFileAtomic(stateFile, JSON.stringify(st) + "\n", { mode: 384, exact: true })
     // what was just written is what memory holds: it is not read back
     stateStamp = stampOf(stateFile)
     stateReadAt = now
@@ -934,11 +955,11 @@ function verifyBearer(tok: string, iss: Issuer, nowMs: f64): Caller {
   if (nbf !== undefined && nowMs / 1000.0 < nbf) return bad("invalid token: not valid yet")
   const sub = rawStr(claims, "sub") ?? ""
   if (sub === "") return bad("invalid token: missing sub")
-  const mode = rawStr(claims, "bf_mode") ?? ""
+  const mode = rawStr(claims, "raiju_mode") ?? ""
   if (mode === "vk") return { kind: "vk", vk: sub }
   if (mode === "session") return { kind: "session", sub: sub }
   if (mode === "user") return { kind: "user", sub: sub }
-  return bad(`invalid token: bf_mode ${mode} is not accepted`)
+  return bad(`invalid token: raiju_mode ${mode} is not accepted`)
 }
 
 // Whether an aud claim (a string, or an array of strings) names the resource.
@@ -1164,10 +1185,10 @@ function clientOf(id: string, nowMs: f64, iss: Issuer): OAuthClientRow | undefin
   return openClient(iss.clientKey, id)
 }
 
-// The identity modes a consent page offers (Bifrost's availableModes). "vk" is offered unless disable_vk_identity is
-// set while user mode is available (so a flow always keeps a usable mode). "session" is offered to a signed-in
-// dashboard user while auth is not enforced for inference: that grant carries no key. "user" is offered while the
-// gateway's OIDC sign-in is on: the grant names the signed-in identity-provider user.
+// Identity modes offered by the consent page. "vk" is offered unless disable_vk_identity is set while user
+// mode is available, ensuring a usable mode remains. "session" is offered to a signed-in dashboard user when
+// inference authentication is not enforced; its grant carries no key. "user" is offered when the gateway's
+// OIDC sign-in is enabled; its grant names the signed-in identity-provider user.
 export function consentModes(signedIn: bool, enforce: bool, userAvailable?: bool, disableVk?: bool): string[] {
   const users = userAvailable ?? false
   const modes: string[] = []
@@ -1194,11 +1215,10 @@ export function consentDetail(id: string, token: string, iss: Issuer, nowMs: f64
   return okJson(JSON.stringify({ redirect_uri: r.redirect_uri, client_name: name, available_modes: modes, expires_at: rfc3339(r.expires_at / 1000.0) }))
 }
 
-// PUT /api/oauth2/consent/flows/{id}: approves the request, mints the one-time code and answers the redirect URL
-// with it. In mode "vk" the key is the one the token will name; in mode "session" (a signed-in dashboard user) the
-// token names a new random session id instead; in mode "user" it names the signed-in identity-provider user (user).
-// A key that belongs to a user (its user_id) grants user mode for that user while user mode is available, and then
-// only to that user signed in (Bifrost's VK user upgrade).
+// PUT /api/oauth2/consent/flows/{id}: approves the request, mints a one-time code and returns a redirect URL
+// containing it. In "vk" mode the token names the selected key; in "session" mode it names a new random session
+// id; in "user" mode it names the signed-in identity-provider user. A key with a user_id grants user mode
+// for that user when user mode is available, and only when that user is signed in.
 export function consentSubmit(id: string, token: string, body: string, iss: Issuer, nowMs: f64, lookup: (value: string) => VirtualKeyConfig | undefined, modes: string[], signedIn: bool, user?: string, userAvailable?: bool): Answer {
   // read through: a consent another worker recorded a moment ago is seen
   const r = consentRequest(id, token, iss, nowMs, true)
@@ -1261,8 +1281,8 @@ export function consentSubmit(id: string, token: string, body: string, iss: Issu
   return { status: 200, body: JSON.stringify({ redirect_url: url }), contentType: "application/json" }
 }
 
-// The identity checks of a refresh (Bifrost's bf_sub liveness): vkCut refuses vk-mode grants (disable_vk_identity
-// while user mode is available), and userActive tells whether a user-mode grant's user may still refresh.
+// Refresh identity checks: vkCut refuses vk-mode grants when disable_vk_identity is set and user mode is
+// available. userActive indicates whether a user-mode grant's user may still refresh.
 export type RefreshChecks = { vkCut: bool, userActive: (sub: string) => bool }
 
 function noChecks(): RefreshChecks {
@@ -1363,12 +1383,12 @@ function issuePair(iss: Issuer, family: string, clientId: string, mode: string, 
   return { status: 200, body: JSON.stringify({ access_token: access, token_type: "Bearer", expires_in: iss.accessTtl, refresh_token: refresh, scope: scope }), contentType: "application/json" }
 }
 
-// An RS256 JWT: iss, aud (the resource), sub (the virtual key's id, the session id or the user), bf_mode (vk, session or user),
+// An RS256 JWT: iss, aud (the resource), sub (the virtual key's id, the session id or the user), raiju_mode (vk, session or user),
 // scope, iat, nbf, exp.
 function accessToken(iss: Issuer, mode: string, sub: string, scope: string, resource: string, nowMs: f64): string throws SyntaxError {
   const now = Math.floor(nowMs / 1000.0)
   const header = encodeUrl(utf8(JSON.stringify({ alg: "RS256", typ: "JWT", kid: iss.kid })))
-  const claims = JSON.stringify({ iss: iss.issuer, aud: resource, sub: sub, bf_mode: mode, scope: scope, iat: now, nbf: now, exp: now + iss.accessTtl })
+  const claims = JSON.stringify({ iss: iss.issuer, aud: resource, sub: sub, raiju_mode: mode, scope: scope, iat: now, nbf: now, exp: now + iss.accessTtl })
   const input = header + "." + encodeUrl(utf8(claims))
   const sig = try signRs256(iss.pem, input)
   return input + "." + sig
@@ -1392,16 +1412,16 @@ function consentRequest(id: string, token: string, iss: Issuer, nowMs: f64, forc
   const f = openFlow(iss.flowKey, token)
   if (f === undefined || f.i !== id || nowMs >= f.e) return undefined
   if (force || !REQUESTS.has(id)) syncGrants(force)
-  // the link ends with the pending state (Bifrost deletes its token at consent): a used link is refused as unknown
+  // The link expires with the pending state; a used link is refused as unknown.
   if (REQUESTS.has(id)) return undefined
   return { id: f.i, client_id: f.c, redirect_uri: f.r, state: f.s, scope: f.sc, resource: f.rs, challenge: f.ch, expires_at: f.e, status: "pending", mode: "", sub: "", code_hash: "" }
 }
 
 // ---- the grants: GET and DELETE /api/oauth2/sessions ----
 
-// A live grant as the sessions list shows it (Bifrost's OAuth2SessionRow). Its id is the SHA-256 of the grant's
-// current refresh token, which the list never shows.
-type GrantRow = { id: string, client_id: string, client_name: string, bf_mode: string, bf_sub: string, bf_sub_display: string, scope: string, created_at: string, last_used_at?: string }
+// A live grant in the sessions list. Its id is the SHA-256 hash of its current refresh token;
+// the list never exposes the token.
+type GrantRow = { id: string, client_id: string, client_name: string, raiju_mode: string, raiju_sub: string, raiju_sub_display: string, scope: string, created_at: string, last_used_at?: string }
 
 const GRANT_MODES = ["user", "vk", "session"]
 
@@ -1416,13 +1436,13 @@ function listOf(raw: string): string[] {
 }
 
 // GET /api/oauth2/sessions: the live grants (refresh rows not revoked), newest first. q matches the client's name or
-// id and the bound identity, bf_mode, virtual_key_id and user_id are comma lists, and limit (default 50, at most
+// id and the bound identity, raiju_mode, virtual_key_id and user_id are comma lists, and limit (default 50, at most
 // 500) and offset page the result. nameOf gives a virtual key's name, the display of a vk grant.
 export function grantsList(query: URLSearchParams, nameOf: (vkId: string) => string): Answer {
   const search = (query.get("q") ?? "").trim().toLowerCase()
-  const modes = listOf(query.get("bf_mode") ?? "")
+  const modes = listOf(query.get("raiju_mode") ?? "")
   for (const m of modes) {
-    if (!GRANT_MODES.includes(m)) return apiErr(400, "Invalid bf_mode parameter: must be one or more of user, vk, session")
+    if (!GRANT_MODES.includes(m)) return apiErr(400, "Invalid raiju_mode parameter: must be one or more of user, vk, session")
   }
   const vkIds = listOf(query.get("virtual_key_id") ?? "")
   const userIds = listOf(query.get("user_id") ?? "")
@@ -1456,7 +1476,7 @@ export function grantsList(query: URLSearchParams, nameOf: (vkId: string) => str
     if (vkIds.length > 0 && !(r.mode === "vk" && vkIds.includes(r.sub))) continue
     if (userIds.length > 0 && !(r.mode === "user" && userIds.includes(r.sub))) continue
     if (search !== "" && !(name.toLowerCase().includes(search) || r.client_id.includes(search) || r.sub.toLowerCase().includes(search))) continue
-    let row: GrantRow = { id: r.hash, client_id: r.client_id, client_name: name, bf_mode: r.mode, bf_sub: r.sub, bf_sub_display: r.mode === "vk" ? nameOf(r.sub) : "", scope: r.scope, created_at: rfc3339(r.created_at / 1000.0) }
+    let row: GrantRow = { id: r.hash, client_id: r.client_id, client_name: name, raiju_mode: r.mode, raiju_sub: r.sub, raiju_sub_display: r.mode === "vk" ? nameOf(r.sub) : "", scope: r.scope, created_at: rfc3339(r.created_at / 1000.0) }
     if (r.used_at > 0) row.last_used_at = rfc3339(r.used_at / 1000.0)
     rows.push(row)
   }
@@ -1464,8 +1484,8 @@ export function grantsList(query: URLSearchParams, nameOf: (vkId: string) => str
   return okJson(JSON.stringify({ sessions: page, count: page.length, total_count: rows.length, limit: limit, offset: offset }))
 }
 
-// DELETE /api/oauth2/sessions/{id}: revokes the grant of a live refresh row, so its client can no longer refresh it.
-// Access tokens already issued last until they expire, as in Bifrost.
+// DELETE /api/oauth2/sessions/{id}: revokes a live refresh grant, preventing further refreshes.
+// Already-issued access tokens remain valid until they expire.
 export function grantRevoke(id: string): Answer {
   syncGrants(true)
   const r = REFRESH.get(id)
@@ -1481,10 +1501,10 @@ function rotatedSince(vk: VirtualKeyConfig | undefined, sinceMs: f64): bool {
   return at !== undefined && at > sinceMs
 }
 
-// Revokes everything minted for one identity (Bifrost's RevokeOAuth2GrantsBySubject): its live refresh tokens, and
-// the consented requests whose codes are not exchanged yet, so none of them can mint a token later. A virtual key's
-// rotation calls this for the key (mode "vk"), since a grant is bound to the key's id, not to its value. Access
-// tokens already issued last until they expire, as in Bifrost. Returns how many grants and codes were revoked.
+// Revokes an identity's live refresh tokens and consented requests with unexchanged codes, preventing them
+// from minting tokens. Virtual-key rotation revokes grants for the key in "vk" mode because grants bind to
+// the key's id, not its value. Already-issued access tokens remain valid until expiry.
+// Returns the number of grants and codes revoked.
 export function revokeSubject(mode: string, sub: string): int {
   syncGrants(true)
   let n = 0
@@ -1506,10 +1526,9 @@ export function revokeSubject(mode: string, sub: string): int {
 
 // ---- helpers ----
 
-// Whether a redirect URI may be used at all (Bifrost's oauth2RedirectAllowed). The scheme must be on the allowlist
-// first: https; http for a loopback host; or a private-use scheme with an authority (cursor://...). Then the URI
-// is accepted when it is a loopback callback, the cursor client's callback, an exact entry of
-// allowed_redirect_uris, or any https callback when "*" is among them.
+// Checks whether a redirect URI is permitted. Its scheme must first be allowed: https, http for a loopback
+// host, or a private-use scheme with an authority (cursor://...). It must then be a loopback callback,
+// the Cursor client's callback, an exact allowed_redirect_uris entry, or any https callback when "*" is listed.
 export function redirectAllowed(uri: string, allowed: string[]): bool {
   if (uri === "" || uri.byteLength > MAX_REDIRECT) return false
   const u = URL.parse(uri)
@@ -1542,7 +1561,7 @@ function registeredRedirect(c: OAuthClientRow, uri: string): bool {
   return false
 }
 
-// localhost, the IPv6 loopback, or an IPv4 address in 127.0.0.0/8 (Bifrost's isLoopbackRedirectHost).
+// localhost, IPv6 loopback, or an IPv4 address in 127.0.0.0/8.
 function loopbackHost(host: string): bool {
   if (host === "localhost" || host === "[::1]" || host === "::1") return true
   const parts = host.split(".")
@@ -1659,9 +1678,9 @@ export async function issuerRoute(c: Config, req: Request, path: string, lookup:
     const id = path.slice(consentPrefix.byteLength)
     const iss = issuerOf(c)
     if (id === "" || id.includes("/")) return undefined
-    // the route is always registered, as in Bifrost: it answers 404 while the authorization server is off
+    // The route is always registered and returns 404 while the authorization server is disabled.
     if (iss === undefined) return respond(apiErr(404, "the MCP authorization server is off: set client.mcp_server_auth_mode to both or oauth"))
-    const token = req.headers.get("x-bifrost-temp-token") ?? ""
+    const token = req.headers.get("x-raiju-temp-token") ?? ""
     const modes = consentModes(cc.signedIn, cc.enforce, cc.userAvailable, cc.disableVk)
     if (m === "GET") return respond(consentDetail(id, token, iss, nowMs, modes, cc.user, cc.userName))
     const body = await req.text()
@@ -1777,16 +1796,16 @@ test("an authorization request is checked, and approved with a key into a code t
   const vkOnly: string[] = ["vk"]
   expect(consentDetail(flow, "wrong", iss, 2500.0, vkOnly).status).toBe(401)
   expect(consentDetail(flow, tok, iss, 2500.0, vkOnly).status).toBe(200)
-  const key: VirtualKeyConfig = { id: "vk-x", value: "sk-bf-test-x" }
-  const lookup = (v: string): VirtualKeyConfig | undefined => v === "sk-bf-test-x" ? key : undefined
+  const key: VirtualKeyConfig = { id: "vk-x", value: "sk-raiju-test-x" }
+  const lookup = (v: string): VirtualKeyConfig | undefined => v === "sk-raiju-test-x" ? key : undefined
   // no dashboard sign-in on this request, so session mode is refused
   const bad = consentSubmit(flow, tok, "{\"mode\":\"session\",\"value\":\"\"}", iss, 2500.0, lookup, vkOnly, false)
   expect(bad.status).toBe(401)
-  const done = consentSubmit(flow, tok, "{\"mode\":\"vk\",\"value\":\"sk-bf-test-x\"}", iss, 2500.0, lookup, vkOnly, false)
+  const done = consentSubmit(flow, tok, "{\"mode\":\"vk\",\"value\":\"sk-raiju-test-x\"}", iss, 2500.0, lookup, vkOnly, false)
   expect(done.status).toBe(200)
   const url = try JSON.parse(done.body) as { redirect_url: string }
   const code = url.redirect_url.slice(url.redirect_url.indexOf("code=") + 5, url.redirect_url.indexOf("&state="))
-  expect(consentSubmit(flow, tok, "{\"mode\":\"vk\",\"value\":\"sk-bf-test-x\"}", iss, 2500.0, lookup, vkOnly, false).status).toBe(401)
+  expect(consentSubmit(flow, tok, "{\"mode\":\"vk\",\"value\":\"sk-raiju-test-x\"}", iss, 2500.0, lookup, vkOnly, false).status).toBe(401)
   const byId = (id: string): VirtualKeyConfig | undefined => id === "vk-x" ? key : undefined
   const badVerifier = tokenEndpoint(new URLSearchParams(`grant_type=authorization_code&code=${code}&code_verifier=${"w".repeat(50)}&client_id=${cid}&redirect_uri=http%3A%2F%2F127.0.0.1%3A8080%2Fcb`), iss, 3000.0, byId)
   expect(badVerifier.body.includes("PKCE verification failed")).toBe(true)
@@ -1809,7 +1828,7 @@ test("a key that is inactive or past its expiry is not usable", () => {
 test("a token with another audience, another key or a bad signature is refused", () => {
   const iss = testIssuer()
   expect(callerOf(iss, undefined, 0.0).kind).toBe("none")
-  expect(callerOf(iss, "Bearer sk-bf-plain", 0.0).kind).toBe("none")
+  expect(callerOf(iss, "Bearer sk-raiju-plain", 0.0).kind).toBe("none")
   expect(callerOf(undefined, "Bearer eyJhbGciOiJSUzI1NiJ9.a.b", 0.0).kind).toBe("none")
   expect(callerOf(iss, "Bearer eyJhbGciOiJSUzI1NiJ9.a.b", 0.0).kind).toBe("error")
 })
@@ -1868,7 +1887,7 @@ function vkGrant(iss: Issuer, name: string, port: string, nowMs: f64): string[] 
   const loc = authorize(sp, iss, nowMs).location!
   const flow = loc.slice(loc.indexOf("flow=") + 5, loc.indexOf("#t="))
   const tok = loc.slice(loc.indexOf("#t=") + 3)
-  const keyValue = "sk-bf-" + name
+  const keyValue = "sk-raiju-" + name
   const key: VirtualKeyConfig = { id: "vk-" + name, value: keyValue }
   const lookup = (v: string): VirtualKeyConfig | undefined => v === keyValue ? key : undefined
   const done = consentSubmit(flow, tok, `{"mode":"vk","value":"${keyValue}"}`, iss, nowMs, lookup, ["vk"], false)
@@ -1919,27 +1938,27 @@ test("the grants list shows a live grant, and a revoke ends it", () => {
   const names = (id: string): string => id === "vk-grant-list-client" ? "the key" : ""
   const listed = grantsList(q, names)
   expect(listed.status).toBe(200)
-  const body = try JSON.parse(listed.body) as { total_count: int, sessions: { id: string, bf_mode: string, bf_sub_display: string, client_name: string }[] }
+  const body = try JSON.parse(listed.body) as { total_count: int, sessions: { id: string, raiju_mode: string, raiju_sub_display: string, client_name: string }[] }
   expect(body.total_count).toBe(1)
-  expect(body.sessions[0]!.bf_mode).toBe("vk")
-  expect(body.sessions[0]!.bf_sub_display).toBe("the key")
+  expect(body.sessions[0]!.raiju_mode).toBe("vk")
+  expect(body.sessions[0]!.raiju_sub_display).toBe("the key")
   expect(body.sessions[0]!.client_name).toBe("grant-list-client")
   expect(grantRevoke(body.sessions[0]!.id).status).toBe(204)
   expect(grantRevoke(body.sessions[0]!.id).status).toBe(404)
   expect(grantsList(q, names).body.includes("\"total_count\":0")).toBe(true)
   // a revoked grant does not refresh
   const form = `grant_type=refresh_token&refresh_token=${g[1]}&client_id=${g[0]}`
-  const byId = (id: string): VirtualKeyConfig | undefined => id === "vk-grant-list-client" ? { id: id, value: "sk-bf-grant-list-client" } : undefined
+  const byId = (id: string): VirtualKeyConfig | undefined => id === "vk-grant-list-client" ? { id: id, value: "sk-raiju-grant-list-client" } : undefined
   expect(tokenEndpoint(new URLSearchParams(form), iss, 6000.0, byId).status).toBe(400)
 })
 
 test("the grants list checks its parameters", () => {
   const names = (id: string): string => ""
-  expect(grantsList(new URLSearchParams("bf_mode=user,nope"), names).status).toBe(400)
+  expect(grantsList(new URLSearchParams("raiju_mode=user,nope"), names).status).toBe(400)
   expect(grantsList(new URLSearchParams("limit=0"), names).status).toBe(400)
   expect(grantsList(new URLSearchParams("limit=x"), names).status).toBe(400)
   expect(grantsList(new URLSearchParams("offset=-1"), names).status).toBe(400)
-  expect(grantsList(new URLSearchParams("bf_mode=vk&limit=5&offset=0"), names).status).toBe(200)
+  expect(grantsList(new URLSearchParams("raiju_mode=vk&limit=5&offset=0"), names).status).toBe(200)
   expect(grantRevoke("no-such-row").status).toBe(404)
 })
 
@@ -1972,7 +1991,7 @@ test("the state file keeps the generated key and the grants across a restart", (
   expect(openIssuerState(cfg, file, undefined)).toBe("")
   expect(issuerOf(cfg)!.kid).toBe(first.kid)
   const form = `grant_type=refresh_token&refresh_token=${g[1]}&client_id=${g[0]}`
-  const byId = (id: string): VirtualKeyConfig | undefined => id === "vk-persist-client" ? { id: id, value: "sk-bf-persist-client" } : undefined
+  const byId = (id: string): VirtualKeyConfig | undefined => id === "vk-persist-client" ? { id: id, value: "sk-raiju-persist-client" } : undefined
   expect(tokenEndpoint(new URLSearchParams(form), first, 8000.0, byId).status).toBe(200)
   // a configured key wins over the generated one
   const configured: Config = { client: { mcp_server_auth_mode: "both", oauth2_server_config: { issuer_url: "https://gw.example", signing_key: TEST_KEY } } }
@@ -1986,6 +2005,59 @@ test("the state file keeps the generated key and the grants across a restart", (
   try rmSync(countsOf(file) + ".flock", { force: true })
 })
 
+test("a first start cannot publish a private signing key while another process holds the state lock", () => {
+  const file = "/tmp/raiju-mcp-initial-lock-" + process.pid + ".json"
+  const cfg: Config = { client: { mcp_server_auth_mode: "both", oauth2_server_config: { issuer_url: "https://gw.example" } } }
+  restartMemory()
+  try rmSync(file, { force: true })
+  // A separate descriptor conflicts exactly like another process, without scheduler-dependent timing.
+  const other = try holdAsAnother(file)
+  try {
+    openIssuerState(cfg, file, undefined)
+    expect(issuerOf(cfg)).toBe(undefined)
+    expect(existsSync(file)).toBe(false)
+  } finally {
+    try closeSync(other)
+    openIssuerState(off(), "", undefined)
+    restartMemory()
+    try rmSync(file, { force: true })
+    try rmSync(file + ".flock", { force: true })
+  }
+})
+
+test("generated signing state is sealed and private, and another fresh start opens the registered client", () => {
+  const file = "/tmp/raiju-mcp-initial-shared-" + process.pid + ".json"
+  const cfg: Config = { client: { mcp_server_auth_mode: "both", oauth2_server_config: { issuer_url: "https://gw.example" } } }
+  const cipher: ConfigCipher = { key: sha256(utf8("isolated-signing-state-regression")) }
+  restartMemory()
+  try rmSync(file, { force: true })
+  try {
+    expect(openIssuerState(cfg, file, cipher)).toBe("")
+    const first = issuerOf(cfg)!
+    const now = Date.now()
+    const cb = "http://127.0.0.1:9/cb"
+    const cid = try clientIdOf(register(`{"redirect_uris":["${cb}"]}`, first, now).body)
+    const text = try readFileSync(file, "utf8")
+    expect(text.includes("enc:v1:")).toBe(true)
+    expect(text.includes("PRIVATE KEY")).toBe(false)
+    expect((try statSync(file)).mode & 511).toBe(384)
+    restartMemory()
+    expect(openIssuerState(cfg, file, cipher)).toBe("")
+    const second = issuerOf(cfg)!
+    expect(second.kid).toBe(first.kid)
+    expect(authorizeStatus(second, cid, cb, now + 1000.0)).toBe(302)
+    expect((try readFileSync(file, "utf8")).includes(first.pem)).toBe(false)
+  } finally {
+    openIssuerState(off(), "", undefined)
+    restartMemory()
+    try rmSync(file, { force: true })
+    try rmSync(file + ".flock", { force: true })
+    try rmSync(registryOf(file), { force: true })
+    try rmSync(countsOf(file), { force: true })
+    try rmSync(countsOf(file) + ".flock", { force: true })
+  }
+})
+
 function off(): Config {
   return { client: { mcp_server_auth_mode: "headers" } }
 }
@@ -1995,8 +2067,7 @@ test("a state file from a newer Raiju is neither read nor written over, and one 
   const cfg: Config = { client: { mcp_server_auth_mode: "both", oauth2_server_config: { issuer_url: "https://gw.example" } } }
   const newer = `{"version":99,"signing_key":"from-the-future","clients":[]}\n`
   try writeFileSync(file, newer)
-  const note = openIssuerState(cfg, file, undefined)
-  expect(note.includes("newer Raiju")).toBe(true)
+  openIssuerState(cfg, file, undefined)
   expect(issuerOf(cfg)).toBe(undefined)
   persistGrants()
   expect(try readFileSync(file, "utf8")).toBe(newer)
@@ -2083,9 +2154,9 @@ test("user mode grants a token that names the signed-in user, and the user's key
 
   // a key that belongs to bob: refused to alice, and granted to bob as user mode
   const o2 = try openRequest(iss, "owned-key-client", "8092", now)
-  const bobKey: VirtualKeyConfig = { id: "vk-bob", value: "sk-bf-bob-key", user_id: "bob" }
-  const lookup = (v: string): VirtualKeyConfig | undefined => v === "sk-bf-bob-key" ? bobKey : undefined
-  const vkBody = "{\"mode\":\"vk\",\"value\":\"sk-bf-bob-key\"}"
+  const bobKey: VirtualKeyConfig = { id: "vk-bob", value: "sk-raiju-bob-key", user_id: "bob" }
+  const lookup = (v: string): VirtualKeyConfig | undefined => v === "sk-raiju-bob-key" ? bobKey : undefined
+  const vkBody = "{\"mode\":\"vk\",\"value\":\"sk-raiju-bob-key\"}"
   expect(consentSubmit(o2[1]!, o2[2]!, vkBody, iss, now, lookup, modes, false, "", true).body.includes("please sign in")).toBe(true)
   expect(consentSubmit(o2[1]!, o2[2]!, vkBody, iss, now, lookup, modes, true, "alice", true).body.includes("different user")).toBe(true)
   const asBob = consentSubmit(o2[1]!, o2[2]!, vkBody, iss, now, lookup, modes, true, "bob", true)
@@ -2100,7 +2171,7 @@ test("disable_vk_identity stops a vk grant from refreshing", () => {
   const iss = testIssuer()
   const g = try vkGrant(iss, "vk-cut-client", "8093", Date.now())
   const form = `grant_type=refresh_token&refresh_token=${g[1]}&client_id=${g[0]}`
-  const byId = (id: string): VirtualKeyConfig | undefined => id === "vk-vk-cut-client" ? { id: id, value: "sk-bf-vk-cut-client" } : undefined
+  const byId = (id: string): VirtualKeyConfig | undefined => id === "vk-vk-cut-client" ? { id: id, value: "sk-raiju-vk-cut-client" } : undefined
   const cut: RefreshChecks = { vkCut: true, userActive: (sub: string): bool => true }
   const r = tokenEndpoint(new URLSearchParams(form), iss, Date.now(), byId, cut)
   expect(r.status).toBe(400)
@@ -2133,16 +2204,16 @@ test("a pending request and a consented code survive a restart through the state
   const otherKey: Issuer = { issuer: iss.issuer, resource: iss.resource, pem: iss.pem, kid: iss.kid, codeTtl: iss.codeTtl, accessTtl: iss.accessTtl, allowed: [], flowKey: flowKeyOf("another key"), clientKey: iss.clientKey, limits: iss.limits }
   expect(consentDetail(o[1]!, o[2]!, otherKey, now, ["vk"]).status).toBe(401)
   expect(consentDetail(o[1]!, o[2]!, iss, now + 301000.0, ["vk"]).status).toBe(401)
-  const key: VirtualKeyConfig = { id: "vk-r", value: "sk-bf-restart" }
-  const lookup = (v: string): VirtualKeyConfig | undefined => v === "sk-bf-restart" ? key : undefined
-  const done = consentSubmit(o[1]!, o[2]!, "{\"mode\":\"vk\",\"value\":\"sk-bf-restart\"}", iss, now, lookup, ["vk"], false)
+  const key: VirtualKeyConfig = { id: "vk-r", value: "sk-raiju-restart" }
+  const lookup = (v: string): VirtualKeyConfig | undefined => v === "sk-raiju-restart" ? key : undefined
+  const done = consentSubmit(o[1]!, o[2]!, "{\"mode\":\"vk\",\"value\":\"sk-raiju-restart\"}", iss, now, lookup, ["vk"], false)
   expect(done.status).toBe(200)
   // the consented client now holds a grant: it is kept in the state file
   expect((try readFileSync(file, "utf8")).includes(o[0]!)).toBe(true)
   // and a restart between consent and the token request: the link is spent, the code still exchanges, once
   restartMemory()
   expect(consentDetail(o[1]!, o[2]!, iss, now, ["vk"]).status).toBe(401)
-  expect(consentSubmit(o[1]!, o[2]!, "{\"mode\":\"vk\",\"value\":\"sk-bf-restart\"}", iss, now, lookup, ["vk"], false).status).toBe(401)
+  expect(consentSubmit(o[1]!, o[2]!, "{\"mode\":\"vk\",\"value\":\"sk-raiju-restart\"}", iss, now, lookup, ["vk"], false).status).toBe(401)
   const form = `grant_type=authorization_code&code=${try codeOf(done.body)}&code_verifier=${o[3]!}&client_id=${o[0]!}&redirect_uri=http%3A%2F%2F127.0.0.1%3A8094%2Fcb`
   const byId = (id: string): VirtualKeyConfig | undefined => id === "vk-r" ? key : undefined
   expect(tokenEndpoint(new URLSearchParams(form), iss, now, byId).status).toBe(200)
@@ -2313,9 +2384,9 @@ test("a flood of registrations from many addresses does not end another user's s
   const loc = go.location!
   const flow = loc.slice(loc.indexOf("flow=") + 5, loc.indexOf("#t="))
   const tok = loc.slice(loc.indexOf("#t=") + 3)
-  const key: VirtualKeyConfig = { id: "vk-flood", value: "sk-bf-flood" }
+  const key: VirtualKeyConfig = { id: "vk-flood", value: "sk-raiju-flood" }
   const lookup = (v: string): VirtualKeyConfig | undefined => v === key.value ? key : undefined
-  const done = consentSubmit(flow, tok, `{"mode":"vk","value":"sk-bf-flood"}`, iss, now + 6000.0, lookup, ["vk"], false)
+  const done = consentSubmit(flow, tok, `{"mode":"vk","value":"sk-raiju-flood"}`, iss, now + 6000.0, lookup, ["vk"], false)
   expect(done.status).toBe(200)
   // the consent stored the client in the state file, so it outlives the unused lifetime
   expect((try readFileSync(file, "utf8")).includes(cid)).toBe(true)
@@ -2489,9 +2560,9 @@ test("revoking a key's grants ends its refresh tokens and its consented codes", 
   const loc = authorize(sp, iss, 7000.0).location!
   const flow = loc.slice(loc.indexOf("flow=") + 5, loc.indexOf("#t="))
   const tok = loc.slice(loc.indexOf("#t=") + 3)
-  const key: VirtualKeyConfig = { id: "vk-rot-client", value: "sk-bf-rot-client" }
+  const key: VirtualKeyConfig = { id: "vk-rot-client", value: "sk-raiju-rot-client" }
   const lookup = (v: string): VirtualKeyConfig | undefined => v === key.value ? key : undefined
-  const done = consentSubmit(flow, tok, `{"mode":"vk","value":"sk-bf-rot-client"}`, iss, 7000.0, lookup, ["vk"], false)
+  const done = consentSubmit(flow, tok, `{"mode":"vk","value":"sk-raiju-rot-client"}`, iss, 7000.0, lookup, ["vk"], false)
   const url = try JSON.parse(done.body) as { redirect_url: string }
   const code = url.redirect_url.slice(url.redirect_url.indexOf("code=") + 5, url.redirect_url.indexOf("&state="))
   expect(revokeSubject("vk", "vk-rot-client")).toBe(2)
@@ -2502,7 +2573,7 @@ test("revoking a key's grants ends its refresh tokens and its consented codes", 
   expect(tokenEndpoint(new URLSearchParams(form), iss, 7100.0, byId).status).toBe(400)
   // another key's grant is untouched, and a second revoke finds nothing
   const keep = new URLSearchParams(`grant_type=refresh_token&refresh_token=${other[1]!}&client_id=${other[0]!}`)
-  const otherKey: VirtualKeyConfig = { id: "vk-rot-other", value: "sk-bf-rot-other" }
+  const otherKey: VirtualKeyConfig = { id: "vk-rot-other", value: "sk-raiju-rot-other" }
   expect(tokenEndpoint(keep, iss, 7100.0, (id: string): VirtualKeyConfig | undefined => otherKey).status).toBe(200)
   expect(revokeSubject("vk", "vk-rot-client")).toBe(0)
 })
@@ -2510,12 +2581,12 @@ test("revoking a key's grants ends its refresh tokens and its consented codes", 
 test("a grant from before the key's rotation does not refresh, even where the revoke was not seen", () => {
   const iss = testIssuer()
   const g = try vkGrant(iss, "rot-late-client", "8094", 8000.0)
-  const rotated: VirtualKeyConfig = { id: "vk-rot-late-client", value: "sk-bf-new", rotated_at: "1970-01-01T00:00:09Z" }
+  const rotated: VirtualKeyConfig = { id: "vk-rot-late-client", value: "sk-raiju-new", rotated_at: "1970-01-01T00:00:09Z" }
   const refresh = new URLSearchParams(`grant_type=refresh_token&refresh_token=${g[1]!}&client_id=${g[0]!}`)
   expect(tokenEndpoint(refresh, iss, 9500.0, (id: string): VirtualKeyConfig | undefined => rotated).status).toBe(400)
   // a key rotated before the grant was made does not void it
   const g2 = try vkGrant(iss, "rot-early-client", "8095", 12000.0)
-  const early: VirtualKeyConfig = { id: "vk-rot-early-client", value: "sk-bf-rot-early-client", rotated_at: "1970-01-01T00:00:09Z" }
+  const early: VirtualKeyConfig = { id: "vk-rot-early-client", value: "sk-raiju-rot-early-client", rotated_at: "1970-01-01T00:00:09Z" }
   const r2 = new URLSearchParams(`grant_type=refresh_token&refresh_token=${g2[1]!}&client_id=${g2[0]!}`)
   expect(tokenEndpoint(r2, iss, 12500.0, (id: string): VirtualKeyConfig | undefined => early).status).toBe(200)
 })

@@ -1,44 +1,37 @@
-// The request-body bytes one process holds at once, across requests (server.max_buffered_body_mb). A body is read
-// whole before it is parsed, and parsing a big one costs several times its size, so a few large bodies sent at once
-// could take a worker past its memory limit. A body that has not been read yet (over UNREAD_ABOVE, or chunked) is
-// charged here (a declared length when the body is admitted, a chunked body as its bytes arrive) and given back when
-// its request is done; a declared length that cannot fit beside what is held is refused with 503 unread, and a chunked
-// body whose next bytes do not fit is refused with 503 there. A small body the server has read already is charged
-// too, but never refused: turning it away would save no memory.
+// Per-process request-body memory budget across requests (server.max_buffered_body_mb). Bodies are read whole
+// before parsing, which can require several times their size. Concurrent large bodies can exceed worker memory.
+// Unread bodies (over UNREAD_ABOVE, or chunked) are charged at admission by declared length, or as chunks arrive,
+// and released when the request finishes. A declared length that cannot fit is refused unread with 503; a chunked
+// body is refused with 503 when its next bytes cannot fit. Small bodies already read are charged but never refused,
+// since refusing them would save no memory.
 //
-// Bodies come in two kinds (production re-audit 3, P1-D). A checked body is one whose credential the gateway verified
-// from the headers before reading it (a virtual key, a direct provider key that matches a configured one, a management
-// sign-in, the SCIM token, a signed peer request). An unchecked body is one nobody vouched for: inference with auth off
-// or behind the plugins' HTTP hooks (they may add the credential), and the routes that read their credential from the
-// body. Unchecked bodies share a small part of the cap (server.unchecked_body_mb, an eighth by default), and the bytes
-// one of them holds past that share do not count against the checked bodies: an unauthenticated client cannot turn the
-// authenticated big POSTs away. An unchecked body must arrive whole within server.body_deadline_seconds (30).
+// A checked body has a credential verified from headers before reading: a virtual key, a direct provider key
+// matching a configured key, a management sign-in, the SCIM token or a signed peer request. Unchecked bodies include
+// inference with auth off or behind plugin HTTP hooks that may add credentials, and routes reading credentials from
+// the body. They share server.unchecked_body_mb (an eighth of the cap by default). Their bytes beyond that share do
+// not count against checked bodies, preventing unauthenticated clients from excluding authenticated large POSTs.
+// An unchecked body must arrive whole within server.body_deadline_seconds (30).
 //
-// A checked body must keep server.body_min_kb_per_second (32) after server.body_rate_grace_seconds (10), counted over
-// each recent server.body_rate_window_seconds (30), and arrive whole within server.body_max_seconds (600): a slow but
-// steady authenticated upload is served (P2-B), and one that sends a lot at once and then trickles is cut a window
-// later (re-audit 4 P1-E: an average from the start let the early bytes buy about 26 minutes).
+// A checked body must sustain server.body_min_kb_per_second (32) after server.body_rate_grace_seconds (10), measured
+// over each recent server.body_rate_window_seconds (30), and finish within server.body_max_seconds (600). This
+// permits steady uploads while cutting off clients that send an initial burst and then trickle bytes.
 //
-// The cap is a hard bound on the bytes in hand (re-audit 5 P1-A: a per-credential discount let them reach twice the
-// cap, and three ordinary uploads took the chart's 512Mi pod past its limit). Under contention the tenant decides who
-// is refused first (re-audit 5 P1-B): bodies count per tenant (a virtual key's customer, else its team, else the key;
-// else the credential's name), and a new body that keeps its tenant within server.credential_body_mb (a quarter of
-// the cap) may use the last server.body_reserve_mb (a quarter) of the cap. The reserve is kept from tenants that hold
-// bytes already (re-audit 6 P1-B): a tenant's first body may fill the cap, and so may the next bodies of a tenant that
-// holds every big body while no other tenant waits (one was refused within WAITING_MS); a tenant holding bytes beside
-// others, or a chunked body that keeps growing, fills the cap only up to the reserve, so an idle tenant's body within
-// its share is admitted while others hold the budget, and the tenant past its share is the one refused.
+// The cap bounds bytes held under contention. Bodies are accounted per tenant: a virtual key's customer, team or
+// key, in that order, otherwise the credential's name. A new body keeping its tenant within
+// server.credential_body_mb (a quarter of the cap) may use server.body_reserve_mb (a quarter) at the end of the cap.
+// A tenant's first body may fill the cap, as may subsequent bodies when that tenant holds every big body and no
+// other tenant waits (WAITING_MS). A tenant holding bytes alongside others, or a growing chunked body, is limited
+// by the reserve so an idle tenant within its share can be admitted while a tenant beyond its share is refused.
 //
-// A declared length is reserved whole when the body is admitted (re-audit 5 P2-A), so a body that cannot fit is 503
-// before its client sends anything and an admitted one that arrives briskly is never refused part way; a chunked body
-// is charged as its bytes arrive. Under contention a reservation whose body fell behind its pace is cut to what it has
-// received plus a look-ahead (re-audit 6 P1-A), so tenants that declare big lengths and send slowly or nothing do not
-// hold the cap.
+// Declared lengths are reserved whole at admission, so a body that cannot fit receives 503 before sending data,
+// and an admitted body arriving briskly is not refused partway. Chunked bodies are charged as bytes arrive.
+// Under contention, a reservation falling behind its required pace is reduced to received bytes plus look-ahead,
+// preventing large declarations with slow or absent uploads from holding the cap.
 //
-// A body is always admitted when the process holds no other big body (small ones, read already, do not count), so a
-// single request up to client.max_request_body_size_mb is still served (Bifrost's limit keeps its meaning); the cap
-// decides how many big bodies are read at once. Beside such a lone body bigger than the cap, tenants within their
-// share may still use the reserve past it. The peer routes and the broker have a budget of their own (peerBudget).
+// A body is always admitted when no other big body is held (small, already-read bodies do not count), allowing a
+// single request up to client.max_request_body_size_mb. The cap controls concurrent big-body reads. Beside a lone
+// body larger than the cap, tenants within their share may still use the reserve beyond it. Peer routes and the
+// broker use a separate budget (peerBudget).
 import { ServerSectionConfig } from "./config"
 
 // Sized for the chart's 512Mi pod: a chat body costs about eight times its size while it is parsed and sent on
@@ -101,9 +94,9 @@ export function bodyReserve(s: ServerSectionConfig | undefined, cap: int): int {
   return Math.min(cap, mb * 1048576)
 }
 
-// server.body_deadline_seconds: an unchecked body that reaches the gateway unread must arrive whole within this
-// (Raiju's own; Bifrost's server has no read deadline). The body timeout limits only the gap between bytes, so without
-// it a client could hold a charged body for as long as it sends a byte a minute.
+// server.body_deadline_seconds: an unchecked body arriving unread must arrive whole within this deadline.
+// The body timeout alone limits only the gap between bytes, allowing a client to retain a charged body by
+// sending a byte periodically.
 export const DEFAULT_BODY_DEADLINE_SECONDS = 30.0
 
 // server.body_deadline_seconds in ms: unset is the default, 0 or less is none (0 returned).

@@ -31,7 +31,7 @@ BUILD = soak.BUILD
 MOCK_PORT = soak.MOCK_PORT
 PORT = soak.PORT
 BROKER_PORT = int(os.environ.get("SOAK_BROKER_PORT", "18377"))
-KEY = "sk-bf-soak-" + "bodies-0123456789"
+KEY = "sk-raiju-soak-" + "bodies-0123456789"
 SECRET = "soak-bodies-" + "cluster-secret-0123456789abcdef"
 
 
@@ -164,7 +164,7 @@ def main():
         time.sleep(0.5)
         print("bodies: gateway start %.1f MB" % (soak.rss_kb(gw.pid) / 1024), flush=True)
         st = Stats()
-        key = {"x-bf-vk": KEY}
+        key = {"x-raiju-vk": KEY}
         big = [chat(1048576), chat(4 * 1048576)]
         mid = [chat(200000)]
         jobs = [

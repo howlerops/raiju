@@ -30,7 +30,7 @@ import { Vault, tokenizeChatRequest, restoreCompletion, tokenize, tokenizeText }
 import { Target, Upstream, Translated, proxyOf, tlsOf, poolOf, peerOf, RS } from "./providers/types"
 import { anthropicRoute } from "./providers/anthropic_route"
 import * as vertexWif from "./vertexwif"
-import { mantleSurface } from "./providers/bedrock_mantle"
+import * as bedrockMantle from "./providers/bedrock_mantle"
 import { CompatPlan, Shaped, settingsOf, withHeader, responseToChat, chatToText, textFrame, chatSseToText, textToChatFields } from "./compat"
 import { ResponsesToChatStream, ChatToResponses, toResponse, toResponseStream } from "./responses"
 import { ModelRef, parseModel, parseModelVia, target, kindOf, classify, backoffMs, maxRetries, timeoutMs, healthId, resolveAlias, matchedAlias, directRefs, directionOpts } from "./router"
@@ -94,7 +94,7 @@ type ChatSender = (t: Target, b: Field[], tc: LazyChat) => Upstream throws Synta
 type AnswerStep = (s: string) => string throws SyntaxError
 export type Translate = (t: Target, text: string, requestedModel: string) => Translated throws SyntaxError
 
-// shortCircuit: the answer (or error) is a plugin's, not the provider's (x-bf-plugin-short-circuit)
+// shortCircuit: the answer (or error) is a plugin's, not the provider's (x-raiju-plugin-short-circuit)
 type Outcome = { ok: bool, status: int, body: string, contentType: string, provider: string, model: string, promptTokens: int, completionTokens: int, attempts: int, upstreamMs: f64, direct?: bool, raw?: bool, key?: string, alias?: string, aliasName?: string, aliasFamily?: string, retryMs?: f64, served?: string, billed?: f64, pass?: Response, finish?: () => void, noBilled?: bool, shortCircuit?: bool, idle?: IdleWatch, run?: StreamRun }
 
 // A converted stream whose answer has started: what pumping it needs. The attempt hands this back instead of pumping
@@ -254,16 +254,16 @@ export function eventSink(real: StreamSink, onEvent: (block: string) => EventSte
   return s
 }
 
-// The sink of a streamed answer with the plugins' post hooks on each chunk (Bifrost runs the LLM post hooks per
-// chunk of a stream): the JSON of every event goes through the chain, in reverse; a chunk a plugin turns into
-// an error ends the stream with that error as the last event. The [DONE] marker and error events are not hooked.
+// Streamed response sink with plugin post hooks on each chunk. Each event's JSON passes through the chain
+// in reverse order. If a plugin turns a chunk into an error, that error is sent as the final event.
+// The [DONE] marker and error events bypass chunk hooks.
 export function llmStreamSink(chain: PluginChain, run: PluginRun, real: StreamSink): StreamSink {
   return eventSink(real, (block) => {
     const data = sseData(block)
     if (data === undefined || !data.startsWith("{")) return { kind: "send", block: block }
     if (data.startsWith("{\"error\"")) {
-      // the stream's error reaches the post hooks as an error (Bifrost's PostLLMHook with the stream's BifrostError): a
-      // plugin may change it, drop it, or recover with a chunk that is sent in its place
+      // The stream's error reaches post hooks as an error. A plugin may change it, drop it,
+      // or recover with a replacement chunk.
       const oe = chain.runPostChunkError(&run.ctx, 500, data)
       if (oe.skip === true) return { kind: "drop" }
       if (oe.body === data) return { kind: "send", block: block }
@@ -635,12 +635,12 @@ function replaceFirstContent(completion: string, text: string): string {
 // The compat headers of a request's plan: the params and tools it dropped, and the request type it converted to.
 function compatHeaders(inout out: Hdrs, cp: CompatPlan | undefined): void {
   if (cp === undefined || !cp.enabled) return
-  if (cp.dropped.length > 0) out.set("x-bifrost-dropped-compat-params", cp.dropped.join(","))
-  if (cp.toolDrops.length > 0) out.set("x-bifrost-dropped-unsupported-tools", cp.toolDrops.join(","))
-  if (cp.converted !== "") out.set("x-bifrost-converted-request-type", cp.converted)
+  if (cp.dropped.length > 0) out.set("x-raiju-dropped-compat-params", cp.dropped.join(","))
+  if (cp.toolDrops.length > 0) out.set("x-raiju-dropped-unsupported-tools", cp.toolDrops.join(","))
+  if (cp.converted !== "") out.set("x-raiju-converted-request-type", cp.converted)
 }
 
-// The entries of an x-bf-mcp-include-tools value: "<client>-<tool>" or "<client>-*", comma-separated.
+// The entries of an x-raiju-mcp-include-tools value: "<client>-<tool>" or "<client>-*", comma-separated.
 export function includeToolNames(value: string): string[] {
   const out: string[] = []
   for (const part of value.split(",")) {
@@ -672,9 +672,9 @@ class LastHeaders {
   h: Map<string, string> = new Map()
 }
 
-// Bifrost's request type names (core/schemas/bifrost.go), for x-bifrost-request-type.
-// bifrost_mcp_client_operation_duration_seconds for one tool call. The client is the server the
-// namespaced tool name belongs to; a name that does not split keeps an empty client.
+// Request type names for x-raiju-request-type.
+// raiju_mcp_client_operation_duration_seconds measures one tool call. The client is the server identified by
+// the namespaced tool name; a name that cannot be split leaves the client empty.
 function timedMcp(m: McpManager, name: string, t0: f64, isError: bool): void {
   const parts = splitToolName(name, m.status().map((s) => s.name))
   metrics.observeMcp(parts?.server ?? "", parts?.tool ?? name, isError ? "tool_error" : "", (performance.now() - t0) / 1000.0)
@@ -695,6 +695,9 @@ function routeOf(op: string): string {
 function takesBodyAsIs(route: string, kind: string): bool {
   if (route === "responses") return kind === "openai"
   if (route === "messages") return kind === "anthropic"
+  // Hugging Face's mapped provider may take inputs/feature-extraction instead;
+  // its embedding builder needs the body, even though its chat streams natively.
+  if (route === "embeddings" && kind === "huggingface") return false
   // (Cloudflare and Databricks take the OpenAI embeddings body under their own URLs)
   if (route === "embeddings") return providers.streamsNatively(kind) || kind === "cloudflare" || kind === "databricks"
   return providers.streamsNatively(kind)
@@ -724,28 +727,27 @@ function requestType(op: string, streamed: bool): string {
   return streamed && (t === "chat_completion" || t === "text_completion" || t === "responses") ? t + "_stream" : t
 }
 
-// The routed identity, as Bifrost reports it (lib/responseheaders.go): who answered, what was
-// asked for, and whether it took a fallback. key is the key's name, alias the upstream name
-// the key's aliases mapped the request to ("" when none did).
-// name and family are the alias config's canonical name and family ("" when unset).
+// Routed identity: who answered, what was requested, and whether a fallback was used.
+// key is the key's name; alias is the upstream name selected by its aliases, or "" when none matched.
+// name and family are the alias config's canonical name and family, or "" when unset.
 function routedHeaders(inout out: Hdrs, primary: ModelRef, provider: string, model: string, idx: int, requested: string, upstreamMs: f64, key: string, alias: string, name: string, family: string): void {
-  out.set("x-bifrost-provider", provider)
-  out.set("x-bifrost-original-model", requested)
-  out.set("x-bifrost-resolved-model", model)
-  out.set("x-bifrost-fallback-index", "" + Math.max(0, idx))
-  out.set("x-bifrost-upstream-latency-ms", "" + Math.round(upstreamMs))
-  out.set("x-bifrost-routing-info-provider", provider)
-  out.set("x-bifrost-routing-info-model", model)
-  if (key !== "") out.set("x-bifrost-routing-info-key", key)
-  if (alias !== "") out.set("x-bifrost-routing-info-alias-model-id", alias)
-  if (name !== "") out.set("x-bifrost-routing-info-alias-model-name", name)
-  if (family !== "") out.set("x-bifrost-routing-info-alias-model-family", family)
-  out.set("x-bifrost-routing-info-is-fallback", idx > 0 ? "true" : "false")
-  out.set("x-bifrost-routing-info-primary-provider", primary.provider)
-  out.set("x-bifrost-routing-info-primary-model", primary.model)
+  out.set("x-raiju-provider", provider)
+  out.set("x-raiju-original-model", requested)
+  out.set("x-raiju-resolved-model", model)
+  out.set("x-raiju-fallback-index", "" + Math.max(0, idx))
+  out.set("x-raiju-upstream-latency-ms", "" + Math.round(upstreamMs))
+  out.set("x-raiju-routing-info-provider", provider)
+  out.set("x-raiju-routing-info-model", model)
+  if (key !== "") out.set("x-raiju-routing-info-key", key)
+  if (alias !== "") out.set("x-raiju-routing-info-alias-model-id", alias)
+  if (name !== "") out.set("x-raiju-routing-info-alias-model-name", name)
+  if (family !== "") out.set("x-raiju-routing-info-alias-model-family", family)
+  out.set("x-raiju-routing-info-is-fallback", idx > 0 ? "true" : "false")
+  out.set("x-raiju-routing-info-primary-provider", primary.provider)
+  out.set("x-raiju-routing-info-primary-model", primary.model)
   const slash = requested.indexOf("/")
-  out.set("x-bifrost-routing-info-requested-provider", slash > 0 ? requested.slice(0, slash) : primary.provider)
-  out.set("x-bifrost-routing-info-requested-model", slash > 0 ? requested.slice(slash + 1) : requested)
+  out.set("x-raiju-routing-info-requested-provider", slash > 0 ? requested.slice(0, slash) : primary.provider)
+  out.set("x-raiju-routing-info-requested-model", slash > 0 ? requested.slice(slash + 1) : requested)
 }
 
 // The upstream name a key's aliases map the request model to, or "" when they do not change it.
@@ -775,7 +777,7 @@ function fallbackIndex(allowed: ModelRef[], provider: string, model: string): in
   return 0
 }
 
-// The cache id Bifrost reports for a direct entry: a hash of its cache key.
+// The cache id for a direct entry is a hash of its cache key.
 function cacheId(key: string): string {
   return toHex(sha256(utf8(key)))
 }
@@ -783,28 +785,27 @@ function cacheId(key: string): string {
 // On a hit, the provider, model and prompt tokens of the answer as it was first served.
 function originHeaders(inout out: Hdrs, o: CacheOrigin | undefined): void {
   if (o === undefined) return
-  out.set("x-bifrost-cache-provider-used", o.provider)
-  out.set("x-bifrost-cache-model-used", o.model)
-  out.set("x-bifrost-cache-input-tokens", "" + o.inputTokens)
+  out.set("x-raiju-cache-provider-used", o.provider)
+  out.set("x-raiju-cache-model-used", o.model)
+  out.set("x-raiju-cache-input-tokens", "" + o.inputTokens)
 }
 
-// x-bifrost-cache-* for a lookup that ran. id is "" when the entry has none; latencyMs is the
-// time spent serving a hit (a miss has none).
+// x-raiju-cache-* headers for a completed lookup. id is "" when the entry has none; latencyMs is the time
+// spent serving a hit and is absent for a miss.
 function cacheHeaders(inout out: Hdrs, kind: string, primary: ModelRef, similarity: f64 | undefined, threshold: f64 | undefined, id: string, latencyMs: f64 | undefined): void {
-  out.set("x-bifrost-cache-hit", "true")
-  out.set("x-bifrost-cache-hit-type", kind)
-  if (id !== "") out.set("x-bifrost-cache-id", id)
-  if (latencyMs !== undefined) out.set("x-bifrost-cache-hit-latency-ms", "" + Math.round(latencyMs))
-  out.set("x-bifrost-cache-requested-provider", primary.provider)
-  out.set("x-bifrost-cache-requested-model", primary.model)
-  if (similarity !== undefined) out.set("x-bifrost-cache-similarity", similarity.toFixed(4))
-  if (threshold !== undefined) out.set("x-bifrost-cache-threshold", "" + threshold)
+  out.set("x-raiju-cache-hit", "true")
+  out.set("x-raiju-cache-hit-type", kind)
+  if (id !== "") out.set("x-raiju-cache-id", id)
+  if (latencyMs !== undefined) out.set("x-raiju-cache-hit-latency-ms", "" + Math.round(latencyMs))
+  out.set("x-raiju-cache-requested-provider", primary.provider)
+  out.set("x-raiju-cache-requested-model", primary.model)
+  if (similarity !== undefined) out.set("x-raiju-cache-similarity", similarity.toFixed(4))
+  if (threshold !== undefined) out.set("x-raiju-cache-threshold", "" + threshold)
 }
 
-// The retry hint of a failed upstream call, in milliseconds, as Bifrost reads it
-// (core/providers/utils/retryafter.go): retry-after-ms, else Retry-After in seconds or as an
-// seconds (an HTTP date is not read: Tov has no Date parsing). Clamped to 1s..5m. undefined when
-// the response gives no usable hint.
+// Retry hint from a failed upstream call, in milliseconds: retry-after-ms takes precedence over Retry-After
+// in seconds. HTTP dates are not parsed because Tov has no date parsing. Clamped to 1s..5m.
+// Returns undefined when the response has no usable hint.
 export function retryHintMs(ms: string | undefined, after: string | undefined): f64 | undefined {
   const a = (ms ?? "").trim()
   if (a !== "") {
@@ -833,7 +834,7 @@ test("retry hint: retry-after-ms first, then Retry-After seconds, clamped to 1s.
   expect(retryHintMs(undefined, "Thu, 01 Jan 1970 00:00:10 GMT")).toBe(undefined)
 })
 
-// The error's type field, for x-bifrost-error-type.
+// The error's type field for x-raiju-error-type.
 function errorType(body: string): string {
   try {
     const e = find(fields(body), "error")
@@ -846,14 +847,61 @@ function errorType(body: string): string {
 
 // Whether a kind's streams can be converted as they arrive, and which converter does it.
 export function streamable(t: Target): bool {
-  return providers.streamsNatively(t.kind) || t.kind === "anthropic" || t.kind === "gemini" || t.kind === "bedrock" || t.kind === "cohere" || t.kind === "vertex"
+  return providers.streamsNatively(t.kind) || t.kind === "anthropic" || t.kind === "gemini" || t.kind === "bedrock" || t.kind === "cohere" || t.kind === "vertex" || t.kind === "bedrock_mantle"
 }
 
 export function converterKind(t: Target): string {
+  if (t.kind === "bedrock_mantle") return bedrockMantle.isAnthropicFamily(bedrockMantle.splitRegion(t.model).model) ? "anthropic" : "openai"
   // Vertex streams Anthropic events for Claude models and Gemini chunks for the rest
   const kind = t.kind === "vertex" ? (isClaude(t.model) ? "anthropic" : "gemini") : t.kind
   return providers.streamsNatively(kind) ? "openai" : kind
 }
+
+test("Mantle native chat converters emit text and tool fragments before completion and account for hidden usage", () => {
+  const t: Target = { provider: "bedrock_mantle", kind: "bedrock_mantle", model: "qwen.qwen3-235b-a22b-2507", key: { value: "test-only" }, cfg: {} }
+  expect(providers.supportsEmbeddings(t.kind)).toBe(false)
+  const enc = new TextEncoder()
+  const conv = new StreamConverter(converterKind(t), "bedrock_mantle/qwen.qwen3-235b-a22b-2507", false)
+  const first = conv.push(enc.encode(`data: {"model":"qwen.qwen3-235b-a22b-2507","choices":[{"index":0,"delta":{"content":"first"},"finish_reason":null}]}\n\n`))
+  expect(first.includes(`"content":"first"`)).toBe(true)
+  expect(first.includes(`"model":"bedrock_mantle/qwen.qwen3-235b-a22b-2507"`)).toBe(true)
+  expect(first.includes("[DONE]")).toBe(false)
+  const second = conv.push(enc.encode(`data: {"model":"qwen.qwen3-235b-a22b-2507","choices":[{"index":0,"delta":{"content":"second"},"finish_reason":null}]}\n\n`))
+  expect(second.includes(`"content":"second"`)).toBe(true)
+  const toolStart = `{"index":0,"id":"call-1","type":"function","function":{"name":"proof_add","arguments":"{\\"a\\":17,"}}`
+  const toolEnd = `{"index":0,"function":{"arguments":"\\"b\\":25}"}}`
+  const start = conv.push(enc.encode(`data: {"model":"qwen.qwen3-235b-a22b-2507","choices":[{"index":0,"delta":{"tool_calls":[${toolStart}]},"finish_reason":null}]}\n\n`))
+  const end = conv.push(enc.encode(`data: {"model":"qwen.qwen3-235b-a22b-2507","choices":[{"index":0,"delta":{"tool_calls":[${toolEnd}]},"finish_reason":null}]}\n\n`))
+  expect(start.includes(toolStart)).toBe(true)
+  expect(end.includes(toolEnd)).toBe(true)
+  const finish = conv.push(enc.encode(`data: {"model":"qwen.qwen3-235b-a22b-2507","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n`))
+  expect(finish.includes(`"finish_reason":"tool_calls"`)).toBe(true)
+  const usage = conv.push(enc.encode(`data: {"model":"qwen.qwen3-235b-a22b-2507","choices":[],"usage":{"prompt_tokens":191,"completion_tokens":16,"total_tokens":207}}\n\n`))
+  expect(usage).toBe("")
+  expect(conv.promptTokens()).toBe(191)
+  expect(conv.completionTokens()).toBe(16)
+  expect(conv.push(enc.encode("data: [DONE]\n\n")) + conv.end()).toBe("data: [DONE]\n\n")
+})
+
+test("Mantle converters preserve usage and error events and select Claude's native surface", () => {
+  const t: Target = { provider: "custom-mantle", kind: "bedrock_mantle", model: "eu-west-1/anthropic.claude-haiku-4-5", key: { value: "test-only" }, cfg: {} }
+  const enc = new TextEncoder()
+  const claude = new StreamConverter(converterKind(t), "custom-mantle/claude", true)
+  const first = claude.push(enc.encode(`event: message_start\ndata: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":5,"output_tokens":0}}}\n\nevent: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}\n\n`))
+  expect(first.includes(`"content":"hello"`)).toBe(true)
+  expect(first.includes("[DONE]")).toBe(false)
+  const failed = claude.push(enc.encode(`event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"synthetic overload"}}\n\n`))
+  expect(failed.includes(`"type":"overloaded_error"`)).toBe(true)
+  expect(failed.includes("data: [DONE]")).toBe(true)
+  t.model = "qwen.qwen3-235b-a22b-2507"
+  const qwen = new StreamConverter(converterKind(t), "custom-mantle/qwen", true)
+  const usage = qwen.push(enc.encode(`data: {"model":"qwen","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}\n\n`))
+  expect(usage.includes(`"total_tokens":8`)).toBe(true)
+  expect(qwen.promptTokens()).toBe(5)
+  expect(qwen.completionTokens()).toBe(3)
+  const error = qwen.push(enc.encode(`data: {"error":{"message":"synthetic failure","type":"api_error"}}\n\n`))
+  expect(error.includes(`"message":"synthetic failure"`)).toBe(true)
+})
 
 export type ConverterFactory = (t: Target, requestedModel: string) => StreamConverter | undefined
 
@@ -875,7 +923,7 @@ async function sleep(ms: int): Promise<void> {
   })
 }
 
-// A retry's backoff, cut short when the caller goes away (Bifrost's backoff waits on the request's context too).
+// Retry backoff ends early when the caller disconnects.
 async function backoffSleep(ms: int, client: AbortSignal | undefined): Promise<void> {
   if (client === undefined) {
     await sleep(ms)
@@ -891,12 +939,12 @@ async function backoffSleep(ms: int, client: AbortSignal | undefined): Promise<v
   })
 }
 
-// The outcome of a request whose caller went away: Bifrost's request_cancelled, logged as 499 (cancelled).
+// A request whose caller disconnected has outcome request_cancelled and is logged as 499 (cancelled).
 function cancelledOutcome(provider: string, model: string, attempts: int, upstreamMs: f64): Outcome {
   return { ok: false, status: CANCELLED_STATUS, body: errorJson(CANCELLED_MESSAGE, CANCELLED_TYPE, undefined), contentType: "application/json", provider: provider, model: model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
 }
 
-// A request's plugin logs as its log row keeps them (grouped by plugin, Bifrost's plugin_logs), or undefined.
+// Request plugin_logs grouped by plugin as stored in the log row, or undefined.
 function pluginLogsOf(c: ReqCtx): string | undefined {
   const tr = c.pluginTrace
   const all = tr === undefined ? c.pluginLogs : tr.logs.concat(c.pluginLogs)
@@ -922,8 +970,8 @@ export function pluginPaths(cfg: Config): PluginSource[] {
   return out
 }
 
-// The name of the user a virtual key is assigned to (telemetry's user_name, as Bifrost reads it from governance):
-// a configured user whose name is the id, as users are named by their id here; "" for none.
+// Telemetry user_name for the user assigned to a virtual key: the configured user's id, which also serves
+// as the user's name here, or "" when no user is assigned.
 export function userNameOf(cfg: Config, userId: string): string {
   if (userId === "") return ""
   for (const u of cfg.governance?.users ?? []) {
@@ -948,10 +996,10 @@ function respond(status: int, body: string, h: Hdrs): Response {
   return new Response(body, { status: status, headers: r })
 }
 
-// Bifrost's send_back_raw_request / send_back_raw_response: the provider's setting, which the
-// x-bf-send-back-raw-request / -response header overrides when client.allow_per_request_raw_override is on.
+// Provider send_back_raw_request / send_back_raw_response settings. The x-raiju-send-back-raw-request /
+// x-raiju-send-back-raw-response headers override them when client.allow_per_request_raw_override is on.
 function sendBackRaw(h: Hdrs, cfg: Config, p: ProviderConfig, which: string): bool {
-  const hv = (h.get("x-bf-send-back-raw-" + which) ?? "").trim().toLowerCase()
+  const hv = (h.get("x-raiju-send-back-raw-" + which) ?? "").trim().toLowerCase()
   if (cfg.client?.allow_per_request_raw_override === true) {
     if (hv === "true" || hv === "1" || hv === "t") return true
     if (hv === "false" || hv === "0" || hv === "f") return false
@@ -959,10 +1007,10 @@ function sendBackRaw(h: Hdrs, cfg: Config, p: ProviderConfig, which: string): bo
   return which === "request" ? p.send_back_raw_request === true : p.send_back_raw_response === true
 }
 
-// Bifrost's store_raw_request_response: the provider's setting, which x-bf-store-raw-request-response
-// overrides when client.allow_per_request_content_storage_override is on.
+// Provider store_raw_request_response setting. x-raiju-store-raw-request-response overrides it when
+// client.allow_per_request_content_storage_override is on.
 function storeRawOn(h: Hdrs, cfg: Config, p: ProviderConfig): bool {
-  const hv = (h.get("x-bf-store-raw-request-response") ?? "").trim().toLowerCase()
+  const hv = (h.get("x-raiju-store-raw-request-response") ?? "").trim().toLowerCase()
   if (cfg.client?.allow_per_request_content_storage_override === true) {
     if (hv === "true" || hv === "1" || hv === "t") return true
     if (hv === "false" || hv === "0" || hv === "f") return false
@@ -989,7 +1037,7 @@ function tailText(bytes: u8[]): string {
   return rawText(i === 0 ? bytes : bytes.slice(i))
 }
 
-// Bifrost's custom_provider_config.allowed_requests: once the map is set, only the request types marked true are served.
+// custom_provider_config.allowed_requests: when the map is set, only request types marked true are served.
 function allowedRequest(p: ProviderConfig, rtype: string): bool {
   const allowed = p.custom_provider_config?.allowed_requests
   if (allowed === undefined) return true
@@ -1016,14 +1064,13 @@ function finishes(data: string): bool {
   }
 }
 
-// Bifrost's default queue (core/schemas/provider.go), for a provider with no concurrency_and_buffer_size.
+// Default queue for a provider without concurrency_and_buffer_size.
 const DEFAULT_CONCURRENCY: int = 1000
 const DEFAULT_BUFFER: int = 5000
 
-// One limiter per provider (Bifrost's per-provider queue). A provider that sets
-// concurrency_and_buffer_size gets that queue. With client.drop_excess_requests on, a provider
-// without one gets Bifrost's default queue, so a full queue sheds requests there too; with it
-// off, such a provider has no queue and its requests are never held or shed.
+// One limiter per provider. concurrency_and_buffer_size configures the provider's queue.
+// With client.drop_excess_requests on, providers without an explicit queue use the default queue and shed
+// requests when it is full. With it off, those providers have no queue and do not hold or shed requests.
 function limitersFor(cfg: Config): Map<string, Limiter> {
   const out: Map<string, Limiter> = new Map()
   const ps = cfg.providers
@@ -1096,7 +1143,7 @@ function injectedDef(all: string[], it: InjectedTool): string | undefined throws
   return undefined
 }
 
-// A captured body as a JSON value, the way Bifrost embeds raw bytes: the body itself when it is JSON, else a JSON string.
+// A captured body as a JSON value: the body itself when valid JSON, otherwise a JSON string.
 function rawJson(s: string): string {
   return jsonOk(s) ? s.trim() : quote(s)
 }
@@ -1116,7 +1163,7 @@ function jsonOk(s: string): bool {
   }
 }
 
-// Adds Bifrost's extra_fields { raw_request, raw_response } to a JSON object body; other bodies pass unchanged.
+// Adds extra_fields { raw_request, raw_response } to a JSON object body; other bodies pass unchanged.
 function withRawFields(body: string, rawReq: string | undefined, rawResp: string | undefined): string {
   if (rawReq === undefined && rawResp === undefined) return body
   const t = body.trim()
@@ -1129,7 +1176,7 @@ function withRawFields(body: string, rawReq: string | undefined, rawResp: string
   return `${inner}${sep}"extra_fields":{${parts.join(",")}}}`
 }
 
-// The caller's own key (x-bf-direct-key) as the target of the primary provider: no pool, no health, no rotation.
+// The caller's own key (x-raiju-direct-key) as the target of the primary provider: no pool, no health, no rotation.
 function directTarget(cfg: Config, ref: ModelRef, key: string): { t: Target, keyIndex: int } {
   const p: ProviderConfig = providerOf(cfg, ref.provider) ?? {}
   const k: KeyConfig = { id: "header-provided", name: "header-provided", value: key, weight: 1.0 }
@@ -1209,7 +1256,7 @@ class ReqCtx {
   outputCost = 0.0
   additionalCost = 0.0
   canonicalModel = ""
-  // Bifrost's metric labels for this request, filled once it is routed and admitted
+  // Metric labels for this request, filled once it is routed and admitted.
   labels: metrics.RequestLabels = metrics.newLabels("", "", "")
   // aborted when the caller goes away before its answer (clientgone.tov): the upstream call, the retries and the
   // fallbacks stop
@@ -1245,8 +1292,7 @@ class ReqCtx {
   passAbove = -1
   // a chat request's plugin hooks across its attempts and around the cache (AttemptPlugins)
   attemptHook: AttemptPlugins | undefined = undefined
-  // the request's plugin spans and plugin logs (its plugin run's trace), and the plugin logs of the gateway's own
-  // steps that are plugins in Bifrost (compat's warnings)
+  // The request's plugin spans and logs, plus plugin logs for gateway steps such as compat warnings.
   pluginTrace: PluginTrace | undefined = undefined
   pluginLogs: PluginLogEntry[] = []
   constructor(readonly rid: string, readonly op: string, readonly started: f64) {}
@@ -1271,12 +1317,11 @@ function withModel(text: string, provider: string, model: string): string {
   }
 }
 
-// A chat request's LLM hooks as Bifrost runs them in each attempt (core/bifrost.go tryRequest): the primary's pre hooks
-// ran before routing (chatOnce); before each fallback the post hooks see the failed attempt's error (a plugin may recover
-// it into the answer), and the pre hooks run again on the request as it came, with the fallback's provider and model,
-// so the fallback sends what they make of it (or their short circuit answers). The cache sits among the plugins as
-// Bifrost's builtin cache plugin does: an answer is cached as the post_builtin plugins left it, and a cache hit goes
-// through the post hooks of the pre_builtin and builtin plugins only (PluginChain.runPostSplit, runPostCached).
+// LLM hooks for each chat attempt. The primary's pre hooks run before routing (chatOnce). Before each fallback,
+// post hooks receive the failed attempt's error and may recover it into an answer. Pre hooks then run again on
+// the original request with the fallback's provider and model; the fallback sends their result or returns their
+// short-circuit answer. The cache sits among the plugins: answers are cached after post_builtin processing,
+// and cache hits run only the pre_builtin and builtin post hooks (PluginChain.runPostSplit, runPostCached).
 export class AttemptPlugins {
   // the request the current attempt sends (build reads it)
   body: Field[]
@@ -1347,8 +1392,8 @@ export class AttemptPlugins {
     return { kind: "go" }
   }
 
-  // The post_builtin plugins' pre hooks at the start of the primary attempt, once the cache missed (Bifrost runs them
-  // after its builtin plugins, the cache among them, so a cache hit never reaches them and they do not change its key).
+  // Run post_builtin pre hooks at the start of the primary attempt after a cache miss.
+  // Cache hits bypass these hooks, and the hooks do not change the cache key.
   private afterCache(): RefStep {
     this.late = false
     const pre = this.chain.runPreAfterCache(&this.run.ctx, this.text)
@@ -1424,9 +1469,9 @@ function textAsChat(t: Target, sh: Shaped, stream: bool, canPipe: bool): Upstrea
   return try providers.chatUpstream(t, req, sh.body, false)
 }
 
-// A Replicate prediction that has not settled is read again at its get URL every 2 seconds (Bifrost's interval),
-// within the provider's timeout (the request's deadline signal ends the wait), as Bifrost polls running chat
-// predictions. An answer that has settled, or has no get URL, is returned as it came.
+// Poll an unsettled Replicate prediction at its get URL every 2 seconds, within the provider's timeout.
+// The request's deadline signal ends the wait. Return settled predictions and predictions without a get URL
+// unchanged.
 async function replicatePoll(t: Target, first: string, signal: AbortSignal): Promise<{ status: int, text: string }> {
   let cur = first
   try {
@@ -1446,8 +1491,8 @@ async function replicatePoll(t: Target, first: string, signal: AbortSignal): Pro
   return { status: 200, text: cur }
 }
 
-// Replicate's text completion: the prompt as the one user message of its chat prediction (Bifrost sends the
-// prompt as the prediction's input, and the answer comes back as a text completion).
+// Replicate text completion represents the prompt as a single user message for a chat prediction,
+// sends it as the prediction input, and returns the answer as a text completion.
 function replicateText(t: Target, body: Field[]): Upstream throws SyntaxError {
   const cf = try textToChatFields(body)
   return try providers.chatUpstream(t, try new LazyChat(build(cf)).get(), cf, false)
@@ -1498,8 +1543,8 @@ function splitLogsOnly(providers: GuardrailProvider[], inout live: Map<string, C
   return out
 }
 
-// One stored text with the logs_only redaction: the built-in guard's findings and the moved local rules'
-// findings become numbered placeholders from the request's vault ([EMAIL-1]), as Bifrost's logs_only stores them.
+// Stored text with logs_only redaction: findings from the built-in guard and moved local rules become
+// numbered placeholders from the request's vault, such as [EMAIL-1].
 export function logsOnlyText(text: string, g: GuardConfig | undefined, rules: CompiledRule[][], vault: Vault): string {
   if (text === "") return text
   let out = text
@@ -1587,8 +1632,8 @@ function originOf(h: Hdrs): string {
   return (h.get("x-forwarded-proto") ?? "http") + "://" + host
 }
 
-// The idle guard of an upstream stream (network_config.stream_idle_timeout_in_seconds, Bifrost's 120 when unset):
-// a read that waits that long aborts the call.
+// Upstream stream idle guard: a read waiting network_config.stream_idle_timeout_in_seconds aborts the call.
+// The default timeout is 120 seconds.
 function idleGuard(dl: Deadline, p: ProviderConfig): IdleWatch {
   const sec = streamIdleSeconds(p.network_config?.stream_idle_timeout_in_seconds)
   return idleWatch(sec, () => {
@@ -1620,7 +1665,7 @@ export class Engine {
   // The hooks main.tov sets: adminOwns (whether this node owns a client's renewal; every node when unset),
   // adminStored (the credential the config file holds for a client, read for the workers and nodes that renewed it
   // elsewhere) and adminPublish (sends a renewed credential to the other nodes, sealed; see clusterstate.tov).
-  adminSaved: ((r: McpUserToken) => void) | undefined = undefined
+  adminSaved: ((r: McpUserToken) => Promise<void>) | undefined = undefined
   adminLease: FileLease = new FileLease("", FILE_LEASE_MS)
   adminOwns: ((client: string) => bool) | undefined = undefined
   adminStored: ((client: string) => McpUserToken | undefined) | undefined = undefined
@@ -1638,21 +1683,21 @@ export class Engine {
   mcp: McpManager | undefined = undefined
   jobs: JobStore
   plugins: PluginChain | undefined = undefined
-  // the plugin runs of the requests in flight, by the id the transport hooks put in x-bf-plugin-run: the LLM hooks
+  // the plugin runs of the requests in flight, by the id the transport hooks put in x-raiju-plugin-run: the LLM hooks
   // of a request use the context its transport hooks used (pluginroute.tov)
   pluginRuns: Map<string, PluginRun> = new Map()
-  // the plugin spans and logs of the requests a non-chat route hooked, found by x-bf-plugin-trace (pluginroute.tov)
+  // the plugin spans and logs of the requests a non-chat route hooked, found by x-raiju-plugin-trace (pluginroute.tov)
   pluginTraces: Map<string, PluginTrace> = new Map()
-  // the plugins across the attempts of the requests with fallbacks a non-chat route hooked, found by x-bf-plugin-attempt
+  // the plugins across the attempts of the requests with fallbacks a non-chat route hooked, found by x-raiju-plugin-attempt
   // (pluginroute.tov hookedRun): serve runs the pre hooks again on each fallback with them, as on chat
   attemptRuns: Map<string, AttemptPlugins> = new Map()
   // jsonparser with usage all_requests: the JSON of each stream is completed (plugins.tov JsonStreamFixer)
   jsonStreamOn = false
   semantic: SemanticCache | undefined = undefined
   semanticCfg: SemanticCacheConfig = defaultSemanticConfig()
-  // an external vector store for the semantic cache (Bifrost's vector_store), shared by all workers
+  // External vector_store for the semantic cache, shared by all workers.
   vstore: VectorStore | undefined = undefined
-  vsNs = "BifrostSemanticCachePlugin"
+  vsNs = "RaijuSemanticCachePlugin"
   vsReady = false
   guardInput = false
   guardOutput = false
@@ -1743,7 +1788,7 @@ export class Engine {
         disable_identity_scoping: sc.disable_identity_scoping ?? d.disable_identity_scoping,
       }
       this.semantic = new SemanticCache(this.semanticCfg)
-      this.vsNs = sc.vector_store_namespace ?? "BifrostSemanticCachePlugin"
+      this.vsNs = sc.vector_store_namespace ?? "RaijuSemanticCachePlugin"
       try {
         this.vstore = openVectorStore(cfg.vector_store)
       } catch (e) {
@@ -1762,7 +1807,7 @@ export class Engine {
       halfOpenProbes: d.halfOpenProbes,
     }
     this.health = new Health(bc)
-    // the circuit policies of the config (Bifrost's circuit_breaker_config.policies, kept as circuit_breaker_policies)
+    // Configured circuit_breaker_config.policies, stored as circuit_breaker_policies.
     for (const pc of cfg.circuit_breaker_policies ?? []) {
       const pr = parsePolicy(JSON.stringify(pc), "")
       if (!pr.ok) console.error(`raiju: circuit_breaker_policies ${pc.name}: ${pr.err}`)
@@ -1784,8 +1829,8 @@ export class Engine {
         console.error(`raiju: request log store disabled: ${e.message}`)
       }
     }
-    // Bifrost's hybrid store: with logs_store.object_storage set, each row's payload fields go to the bucket (hybrid.tov),
-    // unless object_storage_offload is false
+    // Hybrid store: when logs_store.object_storage is set, row payload fields go to the bucket (hybrid.tov),
+    // unless object_storage_offload is false.
     const hob = ls?.object_storage
     const hstore = this.logStore
     if (ls !== undefined && ls.enabled === true && hob !== undefined && ls.object_storage_offload !== false && hstore !== undefined) {
@@ -1793,7 +1838,7 @@ export class Engine {
         const pol = hybridPolicy(hob.format, hob.compression, hob.compress === true, ls.object_storage_exclude_fields ?? [], ls.object_storage_exclude_request_types ?? [])
         for (const w of pol.warnings) console.error(`raiju: ${w}`)
         const dst: LogExportsConfig = { enabled: true, kind: hob.type, bucket: hob.bucket, region: hob.region, endpoint: hob.endpoint, access_key_id: hob.access_key_id, secret_access_key: hob.secret_access_key, session_token: hob.session_token, path_style: hob.path_style }
-        const q = new RetainQueue(dst, hob.prefix ?? "bifrost", pol.gz, MAX_JOBS, MAX_BYTES)
+        const q = new RetainQueue(dst, hob.prefix ?? "raiju", pol.gz, MAX_JOBS, MAX_BYTES)
         q.policy = pol
         this.hybridQueue = q
         hstore.onPrepare = (e: LogEntry): LogEntry => {
@@ -1805,12 +1850,12 @@ export class Engine {
         }
       }
     }
-    // Bifrost's retain_content_in_object_storage: content-off bodies go to logs_store.object_storage, with the store on
+    // retain_content_in_object_storage sends content-off bodies to logs_store.object_storage when enabled.
     const ob = ls?.object_storage
     if (ls !== undefined && ls.enabled === true && cfg.client?.retain_content_in_object_storage === true && this.logStore !== undefined) {
       if (ob !== undefined && ob.bucket !== "" && (ob.type === "s3" || ob.type === "gcs")) {
         const dst: LogExportsConfig = { enabled: true, kind: ob.type, bucket: ob.bucket, region: ob.region, endpoint: ob.endpoint, access_key_id: ob.access_key_id, secret_access_key: ob.secret_access_key, session_token: ob.session_token, path_style: ob.path_style }
-        this.hiddenQueue = new RetainQueue(dst, ob.prefix ?? "bifrost", ob.compress === true, MAX_JOBS, MAX_BYTES)
+        this.hiddenQueue = new RetainQueue(dst, ob.prefix ?? "raiju", ob.compress === true, MAX_JOBS, MAX_BYTES)
       } else {
         console.error("raiju: retain_content_in_object_storage is on but logs_store.object_storage is not set (type s3 or gcs, and a bucket); content-off requests keep no content")
       }
@@ -1974,8 +2019,8 @@ export class Engine {
     sink.close()
   }
 
-  // The output guard of one streamed answer in a format (guard_stream.tov), or undefined when none applies.
-  // live: the stream goes to a client as it arrives, so a block-capable guard holds it (Bifrost's hold-and-replay).
+  // Output guard for a streamed answer in a format (guard_stream.tov), or undefined when none applies.
+  // live means the stream is sent as it arrives, so a block-capable guard holds it for replay.
   streamGuard(format: StreamFormat, guardOn: bool, live?: bool): OutputStreamGuard | undefined {
     const gs = this.streamGuards(guardOn)
     const b = this.streamBuiltin(guardOn)
@@ -2138,8 +2183,7 @@ export class Engine {
     sentNames.end()
     if (this.logStore !== undefined) {
       ctx.toolNames = sentNames.names
-      // the stop reason of the streamed answer, from the events the client was sent (Bifrost's FinishReason
-      // of the last chunk)
+      // Stop reason of the streamed answer, taken from the last chunk sent to the client.
       ctx.stopReason = sentNames.stop
     }
     const fe = conv.takeFrames()
@@ -2185,8 +2229,8 @@ export class Engine {
   async tierFor(req: Request, text: string, cx: ComplexitySettings): Promise<{ tier: Tier, mechanism: string, score: f64 | undefined }> {
     const mode = cplx.classifierMode(cx.classifier)
     if (mode === "heuristic") return this.heuristicTier(text, cx)
-    // a classifier's own calls are charged to the caller's budgets only with count_toward_budgets (the decision
-    // model's always are, as in Bifrost)
+    // Classifier calls count toward the caller's budgets only with count_toward_budgets;
+    // decision model calls always count.
     const llmCharged = cx.llm?.count_toward_budgets === true
     const decisionCall = async (b: string, ph: string): Promise<string | undefined> => await this.classifierCall(req, "/v1/decisions", b, ph, true)
     const llmCall = async (b: string, ph: string): Promise<string | undefined> => await this.classifierCall(req, "/v1/chat/completions", b, ph, llmCharged)
@@ -2211,16 +2255,15 @@ export class Engine {
     return this.heuristicTier(text, cx)
   }
 
-  // The tier routed for a chat request under complexity_router.session (Bifrost's session tier retention): the
-  // request's session (x-bf-session-id and the like, scoped to its virtual key and user) never steps down a tier
-  // within a day of its last request. A held COMPLEX, and a tool continuation, take the session's tier without being
-  // classified; otherwise the classified tier is raised to the held one, and the mechanism reads "session" when the
-  // session decided it.
+  // Tier routing under complexity_router.session. The session (x-raiju-session-id and similar identifiers,
+  // scoped to its virtual key and user) never steps down a tier within a day of its last request.
+  // A held COMPLEX tier or tool continuation uses the session tier without classification. Otherwise, the
+  // classified tier is raised to the held tier. The mechanism is "session" when the session determines it.
   async sessionTier(req: Request, h: Hdrs, text: string, cx: ComplexitySettings): Promise<{ tier: Tier, mechanism: string, score: f64 | undefined }> {
     const sid = cx.session?.enabled === true ? sessionId(h) : undefined
     if (sid === undefined) return await this.tierFor(req, text, cx)
     // the key names the caller by a digest, so no credential is held
-    const key = toHex(sha256(utf8((h.get("x-bf-vk") ?? h.get("authorization") ?? h.get("x-api-key") ?? "") + "\n" + (h.get("x-bf-user-id") ?? "") + "\n" + sid)))
+    const key = toHex(sha256(utf8((h.get("x-raiju-vk") ?? h.get("authorization") ?? h.get("x-api-key") ?? "") + "\n" + (h.get("x-raiju-user-id") ?? "") + "\n" + sid)))
     const now = Date.now()
     const held = this.sessionTiers.get(key, now, false)
     if (held !== undefined && (held === "COMPLEX" || cplx.isContinuation(text))) {
@@ -2239,7 +2282,7 @@ export class Engine {
   async classifierCall(req: Request, route: string, body: string, phase: string, charged: bool): Promise<string | undefined> {
     try {
       const hs: Record<string, string> = snapshot(req.headers)
-      hs.set("x-bf-complexity-tier", "MEDIUM")
+      hs.set("x-raiju-complexity-tier", "MEDIUM")
       if (charged) hs.delete(NO_CHARGE_HEADER)
       else if (this.classifierToken !== "") hs.set(NO_CHARGE_HEADER, this.classifierToken)
       const inner = new Request("http://raiju.internal" + route, { method: "POST", headers: hs, body: body })
@@ -2263,7 +2306,7 @@ export class Engine {
     }
   }
 
-  // bifrost_routing_embedding_* and bifrost_routing_llm_*: the classifier's own call and its cost.
+  // raiju_routing_embedding_* and raiju_routing_llm_* measure the classifier's call and its cost.
   recordClassifier(route: string, body: string, out: string, phase: string): void {
     try {
       const sent = try JSON.parse(body) as { model?: string }
@@ -2334,9 +2377,9 @@ export class Engine {
   // Tries each model in order; within one, retries transient failures with
   // backoff and moves to another key on credential errors.
   async attempt(refs: ModelRef[], h: Hdrs, build: Build, translate: Translate, streamed: bool, ctx: ReqCtx): Promise<Outcome> {
-    const pinned = h.get("x-bf-api-key") ?? h.get("x-bf-api-key-id") ?? undefined
+    const pinned = h.get("x-raiju-api-key") ?? h.get("x-raiju-api-key-id") ?? undefined
     const direct = directKeyFrom(h, this.cfg.client?.allow_direct_keys === true)
-    // x-bf-eh-* headers and allowlisted headers go upstream, as client.header_filter_config allows (headerfilter.tov)
+    // x-raiju-eh-* headers and allowlisted headers go upstream, as client.header_filter_config allows (headerfilter.tov)
     const extra = forwardedHeaders(h, headerFilterOf(this.cfg.client?.header_filter_config))
     let last: Outcome = { ok: false, status: 404, body: errorJson("no provider is configured for this model", "invalid_request_error", "model_not_found"), contentType: "application/json", provider: "", model: "", promptTokens: 0, completionTokens: 0, attempts: 0, upstreamMs: 0.0 }
     let attempts = 0
@@ -2350,7 +2393,7 @@ export class Engine {
       if (client !== undefined && client.aborted) return cancelledOutcome(ref.provider, ref.model, attempts, upstreamMs)
       const tried: Set<int> = new Set()
       const p: ProviderConfig = this.providerConf(ref.provider) ?? {}
-      // Bifrost's allowed_requests: a request type the provider does not allow is not sent; the next fallback may take it
+      // allowed_requests prevents sending disallowed request types to a provider; the next fallback may serve them.
       const rtype = requestType(ctx.op, streamed)
       if (!allowedRequest(p, rtype)) {
         last = { ok: false, status: 400, body: errorJson(`${rtype} is not supported by ${ref.provider} provider`, "invalid_request_error", "unsupported_operation"), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
@@ -2481,17 +2524,17 @@ export class Engine {
             break
           }
         }
-        // another wire for this attempt, as Bifrost picks it per request: Claude on Azure and use_anthropic_endpoints
-        // go as Anthropic Messages, and a Bedrock key's OpenAI-family models go to its Mantle surface
+        // Select the wire format for this attempt: Claude on Azure and use_anthropic_endpoints use Anthropic
+        // Messages; a Bedrock key's OpenAI-family models use its Mantle surface.
         const ra = matchedAlias(t.key, ref.model)
         const viaAnthropic = anthropicRoute(t, ra, ref.model)
         if (viaAnthropic !== undefined) t = viaAnthropic
-        else if (t.kind === "bedrock" && mantleSurface(t, ra, ref.model)) t.kind = "bedrock_mantle"
+        else if (t.kind === "bedrock" && bedrockMantle.mantleSurface(t, ra, ref.model)) t.kind = "bedrock_mantle"
         let up: Upstream = { url: "", headers: new Map(), body: "" }
         try {
           up = build(t)
-          // x-bf-passthrough-extra-params: the extras go into the provider's own body, as Bifrost merges them (a body
-          // signed with SigV4 is signed again)
+          // x-raiju-passthrough-extra-params merges extras into the provider's body.
+          // A SigV4-signed body is signed again after merging.
           const carry = h.get(EXTRA_PARAMS_CARRY)
           if (carry !== undefined && h.get(EXTRA_PARAMS_HEADER) === "true" && up.body !== "") {
             const merged = mergeIntoUpstream(up.body, carry)
@@ -2500,8 +2543,8 @@ export class Engine {
         } catch (e) {
           return { ok: false, status: 400, body: errorJson(e.message, "invalid_request_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
         }
-        // anthropic-beta: the provider's flags and the caller's, filtered for Claude as Bifrost does (anthropic_beta.tov).
-        // The Messages route forwards the caller's own anthropic-beta, as Bifrost's Anthropic integration does.
+        // Merge provider and caller anthropic-beta flags, filtered for Claude (anthropic_beta.tov).
+        // The Messages route forwards the caller's anthropic-beta header.
         const providerBeta: string = up.headers.get("anthropic-beta") ?? ""
         for (const k of extra.keys()) up.headers.set(k, extra.get(k)!)
         // a chat request's plugin headers as its pre hooks left them for this attempt (those of a post_builtin plugin or a
@@ -2534,7 +2577,7 @@ export class Engine {
           if (cs.sampled) up.headers.set("traceparent", traceparentFor(cs.traceId, cs.spanId, true))
           child = cs
         }
-        // Bifrost's per-provider queue: a dropped request is answered with a 503 and no upstream call
+        // A request dropped by the per-provider queue returns 503 without an upstream call.
         const lim = this.limiters.get(ref.provider)
         let slot = false
         if (lim !== undefined) {
@@ -2610,7 +2653,7 @@ export class Engine {
             // Past this point the client has bytes, so there's no retry or fallback.
             ctx.outHeaders.set("content-type", conv.framed() ? "application/vnd.amazon.eventstream" : "text/event-stream")
             ctx.outHeaders.set("cache-control", "no-cache")
-            ctx.outHeaders.set("x-bf-attempts", "" + attempts)
+            ctx.outHeaders.set("x-raiju-attempts", "" + attempts)
             routedHeaders(&ctx.outHeaders, refs[0]!, ref.provider, ref.model, refIndex, ctx.requested, upstreamMs, t.key.name ?? t.key.id ?? "", aliasTo(t.key, ref.model, this.cfg.client?.routing_chain_max_depth), aliasNameOf(t.key, ref.model), aliasFamilyOf(t.key, ref.model))
             // the compat drops and conversions of this target are decided by now (build shaped it): they go out with the stream's headers
             compatHeaders(&ctx.outHeaders, ctx.compat)
@@ -2846,14 +2889,14 @@ export class Engine {
     return try parseEmbedding(body)
   }
 
-  // Adds the connected MCP servers' tools to a chat request. x-bf-mcp-include-clients
-  // (comma-separated server names) narrows them; "none" leaves the request alone.
-  // Bifrost's injected_tools: the provider's MCP tools join each chat request it serves, under their configured names.
-  // A client tool with an injected name is replaced. Unchanged when nothing can be injected.
-  // Whether a target's request gets the prompt cache breakpoints: the gateway's prompt_cache.auto_inject, the
-  // request's x-bf-prompt-cache-auto-inject, or the provider's own prompt_cache.auto_inject.
+  // Add connected MCP servers' tools to a chat request. x-raiju-mcp-include-clients narrows the selection
+  // to comma-separated server names; "none" leaves the request unchanged.
+  // The provider's injected_tools join each chat request under their configured names, replacing client tools
+  // with matching names. The request is unchanged when nothing can be injected.
+  // Prompt cache breakpoints are controlled by the gateway's prompt_cache.auto_inject, the request's
+  // x-raiju-prompt-cache-auto-inject, or the provider's prompt_cache.auto_inject.
   cacheAutoFor(req: Request): (t: Target) => bool {
-    const on = this.autoPromptCache || req.headers.get("x-bf-prompt-cache-auto-inject") === "true"
+    const on = this.autoPromptCache || req.headers.get("x-raiju-prompt-cache-auto-inject") === "true"
     return (t: Target): bool => on || (t.cfg.prompt_cache?.auto_inject ?? false)
   }
 
@@ -2892,8 +2935,8 @@ export class Engine {
     return try this.withMcpInstructions(withTools, m, h, tools)
   }
 
-  // A Responses request with the MCP tools in the Responses shape (a tool the request already names stays as it
-  // is) and the servers' instructions appended to its own instructions, as Bifrost's ParseAndAddToolsToRequest.
+  // Add MCP tools in Responses format, preserving tools already named in the request,
+  // and append the servers' instructions to the request's instructions.
   withMcpResponses(text: string, h: Hdrs): string throws SyntaxError {
     const m = this.mcp
     if (m === undefined) return text
@@ -2936,24 +2979,24 @@ export class Engine {
     return build(fs)
   }
 
-  // The MCP tools a request is offered (chat tool definitions): the key's rules, then x-bf-mcp-include-clients and
-  // x-bf-mcp-include-tools; the code mode meta-tools stand in for the code mode clients' tools.
+  // The MCP tools a request is offered (chat tool definitions): the key's rules, then x-raiju-mcp-include-clients and
+  // x-raiju-mcp-include-tools; the code mode meta-tools stand in for the code mode clients' tools.
   mcpToolsFor(m: McpManager, h: Hdrs): string[] throws SyntaxError {
-    // Bifrost's client.mcp_disable_auto_tool_inject: tools are added only when the request names its clients or tools
-    const named = h.get("x-bf-mcp-include-clients") !== undefined || h.get("x-bf-mcp-include-tools") !== undefined
+    // With client.mcp_disable_auto_tool_inject, tools are added only when the request names their clients or tools.
+    const named = h.get("x-raiju-mcp-include-clients") !== undefined || h.get("x-raiju-mcp-include-tools") !== undefined
     if (this.cfg.client?.mcp_disable_auto_tool_inject === true && !named) return []
     // a key's access profile may limit the MCP tools it gets; clients it doesn't name
     // count only with allow_by_default
     let tools = m.allToolsFor(this.gov.policyFor(h)?.mcpTools, this.keyMcp(h), this.projectMcp(h))
-    const only = h.get("x-bf-mcp-include-clients")
+    const only = h.get("x-raiju-mcp-include-clients")
     if (only !== undefined) {
       if (only.trim() === "none") return []
       const names = only.split(",").map((n) => n.trim() + "-")
       tools = tools.filter((t) => names.some((n) => t.includes(`"name":"${n}`)))
     }
-    // x-bf-mcp-include-tools: "<client>-<tool>" or "<client>-*" entries; the request's tool list
-    // is narrowed to them (Bifrost's MCPContextKeyIncludeTools; an empty list includes no tool)
-    const onlyTools = h.get("x-bf-mcp-include-tools")
+    // x-raiju-mcp-include-tools accepts "<client>-<tool>" or "<client>-*" entries and narrows the request's
+    // tool list to them. An empty list includes no tools.
+    const onlyTools = h.get("x-raiju-mcp-include-tools")
     if (onlyTools !== undefined) {
       const want = includeToolNames(onlyTools)
       const kept: string[] = []
@@ -3016,7 +3059,7 @@ export class Engine {
     const entries = this.codeEntriesFor(m, h)
     const level = bindingLevelOf(this.cfg.mcp?.code_mode_binding_level)
     const lim = limitsOf(this.cfg.mcp?.code_mode_limits)
-    // tool_execution_timeout bounds the whole program, as Bifrost's per-execution timeout does
+    // tool_execution_timeout bounds the whole program.
     const deadline = Date.now() + 1000.0 * (this.cfg.mcp?.tool_execution_timeout_seconds ?? 30)
     const host = async (server: string, tool: string, args: string): Promise<ToolText, Error> => {
       return try await this.mcpCall(m, h, chatToolName(server, tool), args, auto)
@@ -3033,10 +3076,10 @@ export class Engine {
     }
     const client = this.perUserClient(name)
     if (client !== undefined && this.userHeaders(name, h) === undefined) {
-      // the caller is sent the submission page of a flow opened for its identity (Bifrost's inline 401 with the link)
+      // The caller receives the submission page of a flow opened for its identity.
       const id = this.headersIdentity(h)
       if (id.vk === "" && id.session === "" && id.user === "") {
-        return { kind: "denial", status: 401, type: "authentication_error", message: `per-user headers for ${client} requires an identity: send a Virtual Key (x-bf-vk), authenticate as a user, or set x-bf-mcp-session-id to any opaque string you'll re-send on subsequent calls` }
+        return { kind: "denial", status: 401, type: "authentication_error", message: `per-user headers for ${client} requires an identity: send a Virtual Key (x-raiju-vk), authenticate as a user, or set x-raiju-mcp-session-id to any opaque string you'll re-send on subsequent calls` }
       }
       const open = this.headersAuth
       const link = open === undefined ? "" : open(client, id.vk, id.session, id.user, originOf(h))
@@ -3046,10 +3089,10 @@ export class Engine {
     return this.gov.admitTool(h)
   }
 
-  // The MCP tool rules of the request's virtual key, as mcp.tov judges them (undefined: not limited). A key with no
-  // mcp_configs gets no tools but those of allow_by_default clients, as in Bifrost (an empty grant), unless its access
-  // profiles name tools (they decide then) or the call comes through a virtual MCP the key was given (via: the
-  // virtual MCP's own allowed keys decide). A request without a virtual key is not limited here.
+  // The request's virtual-key MCP tool rules, evaluated by mcp.tov (undefined: unrestricted). A key with no
+  // mcp_configs gets only tools from allow_by_default clients, unless its access profiles name tools
+  // (those grants decide) or the call uses a virtual MCP granted to the key (the virtual MCP's allowed
+  // keys decide). A request without a virtual key is unrestricted here.
   keyMcp(h: Hdrs, via?: string): McpKeyConfig[] | undefined {
     const vk = this.gov.findKey(h)
     if (vk === undefined) return undefined
@@ -3084,9 +3127,9 @@ export class Engine {
   }
 
   // The identity per-user headers are kept under, as per-user OAuth tokens are (identityOf): the user of a user-mode
-  // MCP token, else the virtual key, else the x-bf-mcp-session-id header.
+  // MCP token, else the virtual key, else the x-raiju-mcp-session-id header.
   headersIdentity(h: Hdrs): { vk: string, session: string, user: string } {
-    return identityOf(h.get("x-bf-mcp-session-id"), this.gov.findKey(h)?.id ?? "", userOfMark(h.get(USER_HEADER)))
+    return identityOf(h.get("x-raiju-mcp-session-id"), this.gov.findKey(h)?.id ?? "", userOfMark(h.get(USER_HEADER)))
   }
 
   // The caller's token for a tool of a per_user_oauth client. "none" for other tools; "bearer" with the token to
@@ -3100,8 +3143,8 @@ export class Engine {
     const client = hit.server
     const vk = this.gov.findKey(h)?.id ?? ""
     // a user-mode MCP token names its user (ops.tov mcp); the key and then the session header come after it (identityOf)
-    const ident = identityOf(h.get("x-bf-mcp-session-id"), vk, userOfMark(h.get(USER_HEADER)))
-    if (ident.vk === "" && ident.session === "" && ident.user === "") return userAuthOf("denial", "", 401, "authentication_error", `per-user OAuth for MCP client ${client} needs a virtual key (x-bf-vk) or an x-bf-mcp-session-id header`)
+    const ident = identityOf(h.get("x-raiju-mcp-session-id"), vk, userOfMark(h.get(USER_HEADER)))
+    if (ident.vk === "" && ident.session === "" && ident.user === "") return userAuthOf("denial", "", 401, "authentication_error", `per-user OAuth for MCP client ${client} needs a virtual key (x-raiju-vk) or an x-raiju-mcp-session-id header`)
     const now = Date.now()
     const row = userTokenOf(this.cfg.mcp?.user_tokens, client, ident.vk, ident.session, ident.user)
     const act = force && row !== undefined && row.refresh_token !== "" ? "refresh" : tokenAction(row, now)
@@ -3150,7 +3193,7 @@ export class Engine {
     }
     if (te === undefined) return userAuthOf("denial", "", 401, "authentication_error", `MCP client ${client} has no token_exchange settings`)
     const subject = this.subjectOf(h)
-    if (subject === "") return userAuthOf("denial", "", 401, "authentication_error", `MCP client ${client} exchanges the caller's identity-provider token: send it as the Authorization bearer, with the virtual key in x-bf-vk`)
+    if (subject === "") return userAuthOf("denial", "", 401, "authentication_error", `MCP client ${client} exchanges the caller's identity-provider token: send it as the Authorization bearer, with the virtual key in x-raiju-vk`)
     const vk = this.gov.findKey(h)?.id ?? ""
     const now = Date.now()
     const key = exchangeKey(client, vk, subject)
@@ -3209,9 +3252,9 @@ export class Engine {
 
   // Puts a credential in place of the one held for its client, in the config in memory and in the running session,
   // and saves it (adminSaved). publish sends it to the other nodes (a renewal does; a credential from them does not).
-  private setAdminRow(row: McpUserToken, publish: boolean): void {
+  private setAdminRow(row: McpUserToken, publish: boolean): Promise<void> | undefined {
     let c = this.cfg
-    if (!tokenExchangeNames(c.mcp?.client_configs).includes(row.mcp_client_name)) return
+    if (!tokenExchangeNames(c.mcp?.client_configs).includes(row.mcp_client_name)) return undefined
     let m = c.mcp ?? {}
     let next: McpUserToken[] = []
     let found = false
@@ -3230,12 +3273,13 @@ export class Engine {
     const live = this.mcp
     if (live !== undefined) live.setAdmin(row)
     const f = this.adminSaved
-    if (f !== undefined) f(row)
+    const saved = f === undefined ? undefined : f(row)
     if (publish) {
       const p = this.adminPublish
       if (p !== undefined) p(row)
     }
     this.scheduleAdminRenewal()
+    return saved
   }
 
   // A credential another node renewed or verified arrives through the cluster state (clusterstate.tov, last writer
@@ -3329,7 +3373,9 @@ export class Engine {
     if (needsReverify(out.row) && latest !== undefined && latest.refresh_token !== row.refresh_token) return needsReverify(latest) ? "" : latest.access_token
     this.adminRetry.delete(client)
     if (needsReverify(out.row)) console.error(`raiju: mcp ${client}: ${out.row.status_reason ?? ""}; verify the client again`)
-    this.setAdminRow(out.row, true)
+    const saved = this.setAdminRow(out.row, true)
+    // Other workers must read the saved rotation before this renewal gives its lease back.
+    if (saved !== undefined) await saved
     return needsReverify(out.row) ? "" : out.row.access_token
   }
 
@@ -3557,7 +3603,7 @@ export class Engine {
   // Temporary credentials for a Bedrock key's role_arn (STS AssumeRole), cached until they near expiry.
   async assumeRole(bk: BedrockKeyConfig): Promise<{ creds?: cloudAuth.AssumedCreds, error: string }> {
     const role = bk.role_arn ?? ""
-    const session = bk.session_name ?? "bifrost-session"
+    const session = bk.session_name ?? "raiju-session"
     const key = role + "|" + (bk.external_id ?? "") + "|" + session
     const now = Date.now()
     const cached = this.stsCreds.get(key, now)
@@ -3618,7 +3664,7 @@ export class Engine {
       virtual_key: vk?.id,
       team: vk?.team_id,
       customer: vk?.customer_id,
-      // percentages, as Bifrost
+      // Percentages.
       budget_used: this.gov.budgetFraction(vk) * 100.0,
       tokens_used: this.gov.rateFraction(vk, "token") * 100.0,
       request_used: this.gov.rateFraction(vk, "request") * 100.0,
@@ -3629,9 +3675,9 @@ export class Engine {
       headers: h,
       params: params,
     }
-    // chain_rule: a matched rule with chain_rule sends its target back through the rules as the new
-    // context. The chain ends on a terminal rule, at the depth limit, when nothing matches, or when a step
-    // changes neither provider nor model. The last matched rule decides (Bifrost's accumulation).
+    // chain_rule sends a matched rule's target back through the rules as the new context.
+    // The chain ends on a terminal rule, at the depth limit, when nothing matches, or when a step
+    // changes neither provider nor model. The last matched rule decides.
     const maxDepth = this.cfg.client?.routing_chain_max_depth ?? 10
     let cur: ModelRef = first
     let decided: ModelRef[] | undefined = undefined
@@ -3648,8 +3694,8 @@ export class Engine {
       const out: ModelRef[] = [next]
       for (const f of m.fallbacks) out.push(parseModel(this.cfg, f))
       decided = out
-      if (tg.key_id !== undefined) h.set("x-bf-api-key", tg.key_id)
-      h.set("x-bf-routing-rule", m.rule)
+      if (tg.key_id !== undefined) h.set("x-raiju-api-key", tg.key_id)
+      h.set("x-raiju-routing-rule", m.rule)
       if (!m.chain || steps >= maxDepth) break
       steps += 1
       if (next.provider === cur.provider && next.model === cur.model) break
@@ -3718,7 +3764,7 @@ export class Engine {
     if (pick !== undefined) ctx.crew = pick
     if (pick !== undefined && compat !== undefined) compat.crewEffort = pick.effort
     const callModel = pick === undefined ? modelName : pick.model
-    // bifrost_active_requests: in flight from here until the answer (or the throw) is out
+    // raiju_active_requests: in flight from here until the answer or error is sent.
     const method = requestType(op, streamed)
     metrics.activeRequests(method, 1.0)
     let res: Response = new Response(undefined, { status: 500 })
@@ -3754,10 +3800,10 @@ export class Engine {
     h.delete(NO_CHARGE_HEADER)
     const rid = ctx.rid
     let out: Hdrs = new Map()
-    out.set("x-bifrost-request-id", rid)
-    // Bifrost's tracing middleware echoes the request id as x-request-id too
+    out.set("x-raiju-request-id", rid)
+    // Tracing middleware also echoes the request ID as x-request-id.
     out.set("x-request-id", rid)
-    out.set("x-bifrost-request-type", requestType(op, streamed))
+    out.set("x-raiju-request-type", requestType(op, streamed))
     // a crew/<pool> call says which candidate, class and attempt it was routed by (crew.tov)
     const crew = ctx.crew
     if (crew !== undefined) {
@@ -3766,11 +3812,11 @@ export class Engine {
       out.set("x-raiju-crew-attempt", "" + crew.attempt)
     }
     const span = ctx.span
-    if (span !== undefined) out.set("x-bifrost-trace-id", span.traceId)
+    if (span !== undefined) out.set("x-raiju-trace-id", span.traceId)
     const model = modelName ?? rawStr(body, "model")
     ctx.model = model ?? ""
     if (model === undefined) return errorResponse(400, "the request needs a model, e.g. \"openai/gpt-4o-mini\"", "invalid_request_error", out)
-    // overhead components (bifrost_overhead_component_microseconds): routing starts here
+    // Overhead components (raiju_overhead_component_microseconds): routing starts here.
     const tRoute = performance.now()
     // complexity tier: for routing rules (complexity_tier) and the tier map behind model "auto"
     let tier: Tier | undefined = undefined
@@ -3788,7 +3834,7 @@ export class Engine {
         mechanism = d.mechanism
         ctx.complexityScore = d.score
       }
-      out.set("x-bf-complexity-tier", tier ?? "MEDIUM")
+      out.set("x-raiju-complexity-tier", tier ?? "MEDIUM")
     }
     // a bare model name resolves through keys, then the catalog, preferring the SDK route's provider
     let refs = [this.refVia(model, routeOf(op))].concat(this.fallbacksOf(body))
@@ -3817,12 +3863,12 @@ export class Engine {
       if (routed !== undefined) {
         refs = routed
         pinnedDir = true
-        out.set("x-bf-routing-rule", h.get("x-bf-routing-rule") ?? "")
+        out.set("x-raiju-routing-rule", h.get("x-raiju-routing-rule") ?? "")
       }
     }
     // adaptive load balancing's provider level (load_balancer_config): healthy directions first, broken
     // fallbacks pruned, healthy providers appended (router.tov directRefs); a pinned key keeps its provider
-    if (h.get("x-bf-api-key") === undefined && h.get("x-bf-api-key-id") === undefined) refs = this.directPlan(refs, pinnedDir)
+    if (h.get("x-raiju-api-key") === undefined && h.get("x-raiju-api-key-id") === undefined) refs = this.directPlan(refs, pinnedDir)
     const routeUs = (performance.now() - tRoute) * 1000.0
     const primary = refs[0]!
     const tGov = performance.now()
@@ -3857,7 +3903,7 @@ export class Engine {
     rl.businessUnitName = at.businessUnitName
     rl.projectId = at.projectId
     rl.projectName = at.projectName
-    const ruleName = out.get("x-bf-routing-rule")
+    const ruleName = out.get("x-raiju-routing-rule")
     if (ruleName !== undefined && ruleName !== "") {
       rl.routingRuleName = ruleName
       rl.routingRuleId = ruleName
@@ -3871,9 +3917,9 @@ export class Engine {
       metrics.observeRouting(ruleName !== undefined && ruleName !== "" ? "routing_rule" : "complexity", tier ?? "", ruleName ?? "")
     }
     if (model !== primary.provider + "/" + primary.model && model !== primary.model) rl.alias = model
-    // the app: the caller's x-bf-app, else the one its User-Agent names (the operator's
-    // user_agent_mappings first, then Bifrost's built-in identifiers)
-    const xApp = h.get("x-bf-app") ?? ""
+    // The app is the caller's x-raiju-app, otherwise the one identified by its User-Agent:
+    // operator user_agent_mappings take precedence over built-in identifiers.
+    const xApp = h.get("x-raiju-app") ?? ""
     rl.app = xApp !== "" ? xApp : appOf(h.get("user-agent") ?? "", this.cfg.user_agent_mappings ?? [])
     ctx.app = rl.app
     rl.userId = ctx.userId
@@ -3902,14 +3948,14 @@ export class Engine {
     // a request streamed to the provider has no text to key a cache on
     const cache = ctx.large === undefined ? this.cache : undefined
     let key = ""
-    const noStore = h.get("x-bf-cache-no-store") === "true"
+    const noStore = h.get("x-raiju-cache-no-store") === "true"
     if (cache !== undefined) {
-      const scope = keyScope(op + (h.get("x-bf-cache-key") ?? ""), grant.vk?.id ?? "", this.cfg.cache?.scope_by_virtual_key !== false)
+      const scope = keyScope(op + (h.get("x-raiju-cache-key") ?? ""), grant.vk?.id ?? "", this.cfg.cache?.scope_by_virtual_key !== false)
       key = cacheKey(scope, model, text)
       const hit = cache.get(key)
       if (hit !== undefined) {
         metrics.observeCacheHit(ctx.labels, "direct")
-        out.set("x-bf-cache", "hit")
+        out.set("x-raiju-cache", "hit")
         cacheHeaders(&out, "direct", primary, undefined, undefined, cacheId(key), performance.now() - started)
         originHeaders(&out, hit.origin)
         out.set("content-type", hit.contentType)
@@ -3941,21 +3987,21 @@ export class Engine {
     let semScope = ""
     let semVec: f64[] = []
     const sem = ctx.large === undefined ? this.semantic : undefined
-    const semKey = h.get("x-bf-cache-key") ?? this.cfg.semantic_cache?.default_cache_key
-    if (sem !== undefined && semKey !== undefined && op === "chat" && h.get("x-bf-cache-type") !== "direct") {
+    const semKey = h.get("x-raiju-cache-key") ?? this.cfg.semantic_cache?.default_cache_key
+    if (sem !== undefined && semKey !== undefined && op === "chat" && h.get("x-raiju-cache-type") !== "direct") {
       try {
         const pt = promptText(text, this.semanticCfg)
         if (pt !== undefined) {
           semVec = await this.embed(pt)
           // entries stay with the virtual key that wrote them unless disable_identity_scoping
           semScope = identityScope(scopeKey(primary.provider, primary.model, semKey, this.semanticCfg), grant.vk?.id ?? "", this.semanticCfg)
-          const th = h.get("x-bf-cache-threshold")
+          const th = h.get("x-raiju-cache-threshold")
           const thr = th === undefined ? this.semanticCfg.threshold : (parseFloat(th) ?? this.semanticCfg.threshold)
           const hit = this.vstore !== undefined ? await this.vectorLookup(semScope, semVec, thr) : sem.lookup(semScope, semVec, Date.now(), th === undefined ? undefined : parseFloat(th))
           if (hit !== undefined) {
             metrics.observeCacheHit(ctx.labels, "semantic")
-            out.set("x-bf-cache", "semantic-hit")
-            out.set("x-bf-cache-similarity", hit.score.toFixed(4))
+            out.set("x-raiju-cache", "semantic-hit")
+            out.set("x-raiju-cache-similarity", hit.score.toFixed(4))
             cacheHeaders(&out, "semantic", primary, hit.score, th === undefined ? this.semanticCfg.threshold : (parseFloat(th) ?? this.semanticCfg.threshold), hit.id, performance.now() - started)
             originHeaders(&out, hit.origin)
             out.set("content-type", hit.contentType)
@@ -3974,7 +4020,7 @@ export class Engine {
 
     // the cache plugin's time (lookups and the semantic embedding), for the overhead components
     const cacheUs = (performance.now() - tCache) * 1000.0
-    if (cache !== undefined || semVec.length > 0) out.set("x-bifrost-cache-hit", "false")
+    if (cache !== undefined || semVec.length > 0) out.set("x-raiju-cache-hit", "false")
     ctx.outHeaders = out
     ctx.requested = model
     if (compat !== undefined && compat.enabled) await this.compatLoad(compat, allowed)
@@ -3985,10 +4031,10 @@ export class Engine {
     if (run !== undefined) r = await separately(this.pumpStream(run))
     // translation and retries: the attempt's time less the upstream calls
     const convertUs = Math.max(0.0, (performance.now() - tAtt) * 1000.0 - r.upstreamMs * 1000.0)
-    out.set("x-bf-attempts", "" + r.attempts)
-    if (r.shortCircuit === true) out.set("x-bf-plugin-short-circuit", "true")
+    out.set("x-raiju-attempts", "" + r.attempts)
+    if (r.shortCircuit === true) out.set("x-raiju-plugin-short-circuit", "true")
     if (compat !== undefined && compat.enabled) {
-      // Bifrost logs these as warnings: the fitted values and a dropped service tier (the compat plugin's logs)
+      // Compatibility warnings report fitted values and a dropped service tier.
       for (const w of compat.warnings) {
         console.error(`raiju: compat: ${w}`)
         ctx.pluginLogs.push({ plugin_name: "compat", level: "warn", message: w, timestamp: Date.now() })
@@ -3999,13 +4045,13 @@ export class Engine {
       ctx.error = r.body.byteLength > 2000 ? r.body.slice(0, 2000) : r.body
       out.set("content-type", "application/json")
       const et = errorType(r.body)
-      if (et !== "") out.set("x-bifrost-error-type", et)
-      if (r.retryMs !== undefined) out.set("x-bifrost-retry-after-ms", "" + Math.round(r.retryMs))
+      if (et !== "") out.set("x-raiju-error-type", et)
+      if (r.retryMs !== undefined) out.set("x-raiju-retry-after-ms", "" + Math.round(r.retryMs))
       if (r.provider !== "") routedHeaders(&out, primary, r.provider, r.model, fallbackIndex(allowed, r.provider, r.model), model, r.upstreamMs, r.key ?? "", r.alias ?? "", r.aliasName ?? "", r.aliasFamily ?? "")
       return respond(r.status, r.body, out)
     }
-    // a provider's billed cost (OpenRouter's usage.cost) replaces the datasheet estimate
-    // an alias's model_name (Bifrost's canonical name) is the model priced when it is set
+    // A provider's billed cost (OpenRouter's usage.cost) replaces the datasheet estimate.
+    // An alias's model_name is the model priced when it is set.
     const priced = r.aliasName !== undefined && r.aliasName !== "" ? r.aliasName : r.model
     ctx.canonicalModel = r.aliasName !== undefined ? r.aliasName : ""
     if (grant.budgets.length > 0 && this.pricing.priceFor(r.provider, priced, ctx.decision) === undefined && !this.unpriced.has(r.provider + "/" + priced)) {
@@ -4018,7 +4064,7 @@ export class Engine {
     const rModel = r.model
     const settle = (pt: int, ct: int, billed: f64 | undefined): f64 => {
       const c = billed !== undefined && billed > 0 ? billed : ctx.decision ? this.pricing.decisionCost(rProvider, priced, pt, ct) : this.pricing.cost(rProvider, priced, pt, ct)
-      // the price table's input and output parts (Bifrost's input_cost and output_cost); a billed difference is the additional cost
+      // The price table's input_cost and output_cost; a billed difference is the additional cost.
       const parts = this.pricing.costParts(rProvider, priced, pt, ct)
       ctx.inputCost = parts.input
       ctx.outputCost = parts.output
@@ -4051,30 +4097,30 @@ export class Engine {
     const plugNoStore = ahc !== undefined && ahc.noStore
     const cachedBody = ahc !== undefined && ahc.cachedBody !== undefined ? ahc.cachedBody! : r.body
     if (sem !== undefined && semVec.length > 0 && !noStore && !plugNoStore && r.raw !== true && (this.semanticCfg.cache_tool_call_responses || !hasToolCalls(cachedBody))) {
-      const ttlHeader = h.get("x-bf-cache-ttl")
+      const ttlHeader = h.get("x-raiju-cache-ttl")
       const ttl = ttlHeader === undefined ? undefined : parseTtl(ttlHeader)
       const origin: CacheOrigin = { provider: r.provider, model: r.model, inputTokens: r.promptTokens }
       if (this.vstore !== undefined) await this.vectorStore(semScope, semVec, cachedBody, r.contentType, ttl ?? this.semanticCfg.ttl_ms, origin, semKey ?? "")
       else sem.store(semScope, semVec, cachedBody, r.contentType, Date.now(), ttl, origin, semKey)
     }
     if (cache !== undefined && !noStore && !plugNoStore && r.raw !== true) {
-      const ttlHeader = h.get("x-bf-cache-ttl")
+      const ttlHeader = h.get("x-raiju-cache-ttl")
       const ttl = ttlHeader === undefined ? this.cacheTtlMs : parseTtl(ttlHeader) ?? this.cacheTtlMs
-      cache.set(key, cachedBody, r.contentType, ttl, { provider: r.provider, model: r.model, inputTokens: r.promptTokens }, h.get("x-bf-cache-key") ?? "")
+      cache.set(key, cachedBody, r.contentType, ttl, { provider: r.provider, model: r.model, inputTokens: r.promptTokens }, h.get("x-raiju-cache-key") ?? "")
     }
-    if (r.provider !== primary.provider || r.model !== primary.model) out.set("x-bf-fallback-used", r.provider + "/" + r.model)
+    if (r.provider !== primary.provider || r.model !== primary.model) out.set("x-raiju-fallback-used", r.provider + "/" + r.model)
     const idx = fallbackIndex(allowed, r.provider, r.model)
     routedHeaders(&out, primary, r.provider, r.model, idx, model, r.upstreamMs, r.key ?? "", r.alias ?? "", r.aliasName ?? "", r.aliasFamily ?? "")
     // the model a provider's server-side fallback answered with (Anthropic usage iterations)
     const served = r.served ?? ""
-    if (served !== "") out.set("x-bifrost-routing-info-server-side-fallback-model", served)
+    if (served !== "") out.set("x-raiju-routing-info-server-side-fallback-model", served)
     // a semantic lookup that missed still says which upstream answered and what it counted
     if (sem !== undefined && semVec.length > 0) {
-      out.set("x-bifrost-cache-provider-used", r.provider)
-      out.set("x-bifrost-cache-model-used", r.model)
-      out.set("x-bifrost-cache-input-tokens", "" + r.promptTokens)
+      out.set("x-raiju-cache-provider-used", r.provider)
+      out.set("x-raiju-cache-model-used", r.model)
+      out.set("x-raiju-cache-input-tokens", "" + r.promptTokens)
     }
-    out.set("x-bifrost-latency-ms", "" + Math.round(performance.now() - started))
+    out.set("x-raiju-latency-ms", "" + Math.round(performance.now() - started))
     out.set("content-type", r.contentType)
     if (r.contentType === "text/event-stream") out.set("cache-control", "no-cache")
     if (r.pass !== undefined) {
@@ -4085,16 +4131,15 @@ export class Engine {
       }
       return this.passThrough(ctx, r, out)
     }
-    // Time spent in the gateway itself, upstream calls excluded (Bifrost's "overhead").
+    // Time spent in the gateway itself, excluding upstream calls.
     const overheadUs = (performance.now() - started - r.upstreamMs) * 1000.0
     metrics.observeOverheadFor(ul, overheadUs)
-    // Bifrost's components: governance and the cache are plugins there; the rest of the overhead is
-    // miscellaneous, so the components sum to the overhead
+    // Overhead is split into governance, cache and miscellaneous components, which sum to total overhead.
     metrics.observeOverheadComponent(ul, "plugins", govUs + cacheUs)
     metrics.observeOverheadComponent(ul, "routing", routeUs)
     metrics.observeOverheadComponent(ul, "conversion", convertUs)
     metrics.observeOverheadComponent(ul, "miscellaneous", Math.max(0.0, overheadUs - (govUs + cacheUs + routeUs + convertUs)))
-    out.set("x-bf-overhead-us", "" + Math.round(overheadUs))
+    out.set("x-raiju-overhead-us", "" + Math.round(overheadUs))
     // the same measurements as spans for the otel plugin: the request span's overhead, and each stage
     const epochAt = (p: f64): f64 => Date.now() - (performance.now() - p)
     ctx.overheadUs = overheadUs
@@ -4160,7 +4205,7 @@ export class Engine {
     if (vs === undefined || !this.vsReady) return
     const payload: Map<string, string> = new Map()
     payload.set("scope", scopeTag(scope))
-    // the x-bf-cache-key, so DELETE /api/cache/clear-by-key can find the entries (Bifrost's cache_key field)
+    // Store x-raiju-cache-key so DELETE /api/cache/clear-by-key can find the entries.
     if (cacheKey !== undefined && cacheKey !== "") payload.set("cache_key", cacheKey)
     payload.set("body", body)
     payload.set("contentType", contentType)
@@ -4176,10 +4221,10 @@ export class Engine {
     }
   }
 
-  // Clears semantic cache entries from the vector store: the entry with id (the x-bifrost-cache-id of a hit),
-  // or every entry stored under cacheKey. Returns how many went. When no request has used the namespace yet it is
-  // opened as it stands (attach: no dimension is needed, and a namespace that does not exist holds nothing); the
-  // next lookup still ensures it. Throws what the store reports.
+  // Clears semantic cache entries from the vector store: the entry with id (the x-raiju-cache-id of a hit),
+  // or every entry stored under cacheKey. Returns the number removed. If no request has used the namespace,
+  // attaches to it without requiring a dimension; a nonexistent namespace contains no entries. The next lookup
+  // still ensures the namespace. Propagates store errors.
   async vectorClear(id: string, cacheKey: string): Promise<int, Error> {
     const vs = this.vstore
     if (vs === undefined) return 0
@@ -4225,19 +4270,18 @@ export class Engine {
   }
 
   // Whether a request's bodies stay out of the log store and exporters: the
-  // x-bf-disable-content-logging header (when allowed), then the key's setting, then the client's.
+  // x-raiju-disable-content-logging header (when allowed), then the key's setting, then the client's.
   contentOff(h: Hdrs): bool {
     const cl = this.cfg.client
-    const hv = h.get("x-bf-disable-content-logging")
+    const hv = h.get("x-raiju-disable-content-logging")
     if (hv !== undefined && cl?.allow_per_request_content_storage_override === true) return hv === "true" || hv === "1"
     const vk = this.gov.findKey(h)
     if (vk !== undefined && vk.disable_content_logging !== undefined) return vk.disable_content_logging
     return cl?.disable_content_logging === true
   }
 
-  // The raw upstream bodies that logs and log exports keep get the guardrail redaction too, as the
-  // content fields do (Bifrost: stored log fields and exports carry the redacted payload). A response
-  // also gets the local output rules that redact, the same rules that rewrite a streamed answer.
+  // Guardrail redaction applies to raw upstream bodies retained in logs and exports as well as content
+  // fields. Responses also receive local output redaction rules, including those used for streamed answers.
   redactRaw(raw: string, response: bool): string {
     let body = raw
     const g = this.guard
@@ -4252,10 +4296,10 @@ export class Engine {
   }
 
   record(c: ReqCtx): void {
-    // logs_only: the answer is out; what is stored from here on carries placeholders instead of the findings
-    // the placeholders' originals stay with the stored row for a caller holding Logs:Reveal (Bifrost's reveal), unless
-    // content logging is off for the request (there is then nothing to reveal)
-    // a row whose answer a logs_only HTTP provider still checks waits for it (chatOnce releaseRecord)
+    // logs_only: the answer has been sent; stored content uses placeholders for findings.
+    // Originals remain with the stored row for callers holding Logs:Reveal, unless content logging is off
+    // for the request, in which case there is nothing to reveal.
+    // A row awaiting a logs_only HTTP provider's answer check waits for it (chatOnce releaseRecord).
     if (this.heldRecords.has(c.rid) && this.heldRecords.get(c.rid) === undefined) {
       this.heldRecords.set(c.rid, c)
       return
@@ -4358,7 +4402,7 @@ export class Engine {
       span.setInt("http.response.status_code", c.status)
       span.setBool("raiju.cache_hit", c.cached)
       const ov = c.overheadUs
-      if (ov !== undefined) span.setNum("bifrost.overhead.duration_ms", ov / 1000.0)
+      if (ov !== undefined) span.setNum("raiju.overhead.duration_ms", ov / 1000.0)
       if (!ok) span.fail(c.error === "" ? `HTTP ${c.status}` : c.error)
       span.end(Date.now())
       // a hooked route whose post hooks are still to run exports the trace once they have (PluginTrace.done), with
@@ -4416,14 +4460,14 @@ export class Engine {
     return { action: action, text: cur, reason: "" }
   }
 
-  // One billing unit of a live or realtime session (over WebRTC or a WebSocket) in the request log, the
-  // exporters, the spans and the governance usage, as one request (op "live" or "realtime"): a window of
-  // voice time, a delegated response or a realtime turn, as Bifrost logs them. It carries the model, its
-  // duration as the latency, its tokens, what it cost, and its voice seconds in the row's metadata; its
-  // cost and tokens are charged to the budgets and token limits now. requestId is the row's own, parentId
-  // the session's (the caller's x-bf-parent-request-id wins).
-  // trace is the plugin run of a realtime turn whose LLM hooks ran (livehooks.tov TurnPlugins): its plugin logs and spans
-  // go with the row.
+  // Records one billing unit of a live or realtime session over WebRTC or WebSocket as one request
+  // (op "live" or "realtime") in logs, exporters, spans and governance usage: a window of voice time,
+  // a delegated response or a realtime turn. The row carries the model, duration as latency, tokens,
+  // cost and voice seconds in metadata. Cost and tokens are charged to budgets and token limits now.
+  // requestId belongs to the row; parentId belongs to the session, with the caller's
+  // x-raiju-parent-request-id taking precedence.
+  // trace is the plugin run for a realtime turn whose LLM hooks ran (livehooks.tov TurnPlugins);
+  // its plugin logs and spans accompany the row.
   recordLive(op: string, h: Hdrs, grant: Grant, provider: string, model: string, status: int, durationMs: f64, promptTokens: int, completionTokens: int, input: string, output: string, error: string, extra: Record<string, string>, cost: LiveCost, requestId: string, parentId: string, trace?: PluginTrace): void {
     const c = new ReqCtx(requestId, op, performance.now() - durationMs)
     c.pluginTrace = trace
@@ -4451,7 +4495,7 @@ export class Engine {
     c.projectId = at.projectId
     c.userAgent = h.get("user-agent") ?? ""
     c.sessionId = sessionId(h) ?? ""
-    const xApp = h.get("x-bf-app") ?? ""
+    const xApp = h.get("x-raiju-app") ?? ""
     c.app = xApp !== "" ? xApp : appOf(h.get("user-agent") ?? "", this.cfg.user_agent_mappings ?? [])
     const meta: Record<string, string> = {}
     const base = logMetadata(h, this.cfg.client?.logging_headers ?? [])
@@ -4485,12 +4529,12 @@ export class Engine {
     return bill
   }
 
-  // Charges an audio answer as a chat answer is (settle): a log row, the budgets and token limits, and the metrics.
-  // Speech is billed by its input characters, a transcription or translation by the usage its answer reports
-  // (media.tov transcriptionUsage); a streamed transcription goes to the caller as it arrives and is charged when it
-  // ends, from the usage of its events. Only a 200 answer of an admitted request is charged. A request refused by
-  // governance or failed at the provider is logged with its status and error, and charged nothing; one that named no
-  // model or provider the gateway serves never reached one, and is not logged (as Bifrost answers it before its core).
+  // Settles an audio answer through a log row, budgets, token limits and metrics.
+  // Speech is billed by input characters; transcription and translation use reported usage
+  // (media.tov transcriptionUsage). Streamed transcription is forwarded as it arrives and charged
+  // at completion using event usage. Only a 200 answer for an admitted request is charged.
+  // Governance refusals and provider failures are logged with status and error without a charge.
+  // Requests naming no model or provider served by the gateway are not sent upstream or logged.
   async mediaAnswer(route: MediaRoute, bill: MediaBill, res: Response, h: Hdrs, started: f64, rid: string): Promise<Response> {
     const grant = bill.grant
     if (bill.provider === "") return res
@@ -4587,8 +4631,8 @@ export class Engine {
     metrics.observeUsage(rl, { input: usage.prompt, output: usage.completion, cost: c, cacheRead: 0.0, cacheWrite: 0.0, cacheWrite5m: 0.0, cacheWrite1h: 0.0 })
   }
 
-  // A refused or failed audio request (Bifrost logs these as errors): a row with the status and the error, charged nothing.
-  // The answer is returned as it came.
+  // A refused or failed audio request gets a log row with its status and error and no charge.
+  // The answer is returned unchanged.
   async mediaFailed(route: MediaRoute, bill: MediaBill, res: Response, h: Hdrs, started: f64, rid: string): Promise<Response> {
     let bytes: u8[] = []
     try {
@@ -4652,11 +4696,11 @@ export class Engine {
 
   // Chat completions. With MCP agent mode on (client.mcp_auto_execute), tool calls to
   // the listed MCP tools run here and the model is called again, up to mcp_agent_depth
-  // rounds; streamed requests and x-bf-mcp-agent: off skip it.
+  // rounds; streamed requests and x-raiju-mcp-agent: off skip it.
   async chat(req: Request, sink?: StreamSink): Promise<Response> {
     const ag = this.agent
     const m = this.mcp
-    if (ag === undefined || m === undefined || req.method !== "POST" || req.headers.get("x-bf-mcp-agent") === "off") return try await this.chatOnce(req, sink)
+    if (ag === undefined || m === undefined || req.method !== "POST" || req.headers.get("x-raiju-mcp-agent") === "off") return try await this.chatOnce(req, sink)
     const text = await req.text()
     const hs: Record<string, string> = snapshot(req.headers)
     let streamed = false
@@ -4687,8 +4731,8 @@ export class Engine {
       // the last model call's headers (request id, cache, attempts), plus the agent's counts
       const out: Record<string, string> = last.h
       if (!out.has("content-type")) out.set("content-type", "application/json")
-      out.set("x-bf-agent-steps", "" + r.steps)
-      out.set("x-bf-agent-tool-calls", "" + r.toolCalls)
+      out.set("x-raiju-agent-steps", "" + r.steps)
+      out.set("x-raiju-agent-tool-calls", "" + r.toolCalls)
       return new Response(r.body, { status: r.status, headers: out })
     } catch (e) {
       return errorResponse(502, `agent mode failed: ${e.message}`, "api_error", noHeaders())
@@ -4714,14 +4758,14 @@ export class Engine {
     return names
   }
 
-  // Agent mode on a Responses request, as Bifrost's CheckAndExecuteAgentForResponsesRequest: the answer's
-  // auto-executable MCP calls (code mode's meta-tools included) run and the model is asked again, each call
-  // served by `once` (the whole Responses route: log, fallbacks, caches). undefined when agent mode does not
-  // apply (no auto-execute list, no MCP, a stream, x-bf-mcp-agent: off): the caller serves the request itself.
+  // Agent mode for a Responses request runs auto-executable MCP calls, including code-mode meta-tools,
+  // then asks the model again. Each model call uses `once`, including logging, fallbacks and caches.
+  // Returns undefined when agent mode does not apply (no auto-execute list, no MCP, a stream, or
+  // x-raiju-mcp-agent: off); the caller then handles the request itself.
   async responsesAgent(req: Request, text: string, stream: bool, once: (r: Request, body: string) => Promise<Response>): Promise<Response | undefined> {
     const ag = this.agent
     const m = this.mcp
-    if (ag === undefined || m === undefined || stream || req.method !== "POST" || req.headers.get("x-bf-mcp-agent") === "off") return undefined
+    if (ag === undefined || m === undefined || stream || req.method !== "POST" || req.headers.get("x-raiju-mcp-agent") === "off") return undefined
     const hs: Record<string, string> = new Map()
     req.headers.forEach((v, k) => {
       if (k !== "content-length" && k !== "transfer-encoding") hs.set(k, v)
@@ -4744,8 +4788,8 @@ export class Engine {
       const r = await runResponsesAgent(text, call, this.agentExec(m, hdr, ag), ag, this.agentNames(m, entries), codeOk)
       const out: Record<string, string> = last.h
       if (!out.has("content-type")) out.set("content-type", "application/json")
-      out.set("x-bf-agent-steps", "" + r.steps)
-      out.set("x-bf-agent-tool-calls", "" + r.toolCalls)
+      out.set("x-raiju-agent-steps", "" + r.steps)
+      out.set("x-raiju-agent-tool-calls", "" + r.toolCalls)
       return new Response(r.body, { status: r.status, headers: out })
     } catch (e) {
       return errorResponse(502, `agent mode failed: ${e.message}`, "api_error", noHeaders())
@@ -4815,7 +4859,7 @@ export class Engine {
     // the body has streamed past them, CompatPlan.shapeParams)
     let cpl: CompatPlan | undefined = undefined
     if (route === "completions" && p !== undefined) {
-      const cp = new CompatPlan(withHeader(settingsOf(this.cfg.client?.compat), hs.get("x-bf-compat") ?? undefined), "completions", stream)
+      const cp = new CompatPlan(withHeader(settingsOf(this.cfg.client?.compat), hs.get("x-raiju-compat") ?? undefined), "completions", stream)
       if (cp.enabled) {
         await this.compatLoad(cp, [first])
         textChat = cp.routeFor(first.provider, kind, first.model) === "chat"
@@ -4860,8 +4904,8 @@ export class Engine {
       return new Request(req.url, { method: "POST", headers: hs, body: all })
     }
     const lg = new LargeBody(lp, head, meta, ended ? undefined : src, declared)
-    // a chat or text stream that goes as it is asks for its usage chunk, as Bifrost asks every OpenAI-format stream
-    // (the budgets and the log read it from the answer's tail)
+    // A passthrough chat or text stream requests a usage chunk for budgets and logging
+    // to read from the answer's tail.
     lg.askUsage = family === "" && stream && (route === "chat" || route === "completions")
     const tiny: Field[] = [{ key: "model", raw: quote(meta.model) }]
     // A chat stream to a converted provider is called as a stream and its events are converted as they arrive (Bedrock's
@@ -4876,7 +4920,7 @@ export class Engine {
     const live = family !== "" && stream && (route === "chat" || msgLive || textLive || respLive)
     const wire = live || (route === "messages" && stream)
     const holder = new ConvRef()
-    const autoCache = this.autoPromptCache || hs.get("x-bf-prompt-cache-auto-inject") === "true" || (p?.prompt_cache?.auto_inject ?? false)
+    const autoCache = this.autoPromptCache || hs.get("x-raiju-prompt-cache-auto-inject") === "true" || (p?.prompt_cache?.auto_inject ?? false)
     if (family !== "") {
       // the answer is converted back (a chat or embeddings answer), or passes as the provider's own Messages answer
       // (Bedrock and Vertex Claude)
@@ -4884,7 +4928,7 @@ export class Engine {
       if (needsHash(family)) {
         if (this.gov.enforce && this.gov.findKey(hs) === undefined) {
           if (!ended) await src.cancel()
-          return errorResponse(401, "a virtual key is required (x-bf-vk or Authorization: Bearer sk-bf-...)", "authentication_error", noHeaders())
+          return errorResponse(401, "a virtual key is required (x-raiju-vk or Authorization: Bearer sk-raiju-...)", "authentication_error", noHeaders())
         }
         // converted into a spool on disk and hashed, so the request can be signed before its first byte goes out
         const c = newConv(family, convModel, p!, autoCache, wire, limit, 4096)
@@ -4952,7 +4996,10 @@ export class Engine {
         const tr = try providers.chatTranslate(t.kind, t.model, text, requested, false)
         return { body: try toMessage(tr.body, meta.model), promptTokens: tr.promptTokens, completionTokens: tr.completionTokens }
       }
-      if (route === "embeddings") return try providers.embeddingsTranslate(t.kind, t.model, text, requested)
+      if (route === "embeddings") {
+        const hc = holder.conv
+        return try providers.embeddingsTranslate(t.kind, t.model, text, requested, hc?.emb?.encodingFormat)
+      }
       if (route === "completions" && family !== "" && family !== "text-shaped") {
         // a text completion sent as chat: the chat answer as a text completion, as the whole-body route converts it
         // (a stream is converted as it arrives, in largeLive)
@@ -5105,7 +5152,7 @@ export class Engine {
     hs.set("content-type", r.contentType)
     if (r.contentType.startsWith("text/event-stream")) hs.set("cache-control", "no-cache")
     // (the request type as the answer showed it: a stream whose flag lay past a large body's prefix)
-    if (ctx.streamed) hs.set("x-bifrost-request-type", requestType(ctx.op, true))
+    if (ctx.streamed) hs.set("x-raiju-request-type", requestType(ctx.op, true))
     return new Response(body, { status: r.status, headers: hs })
   }
 
@@ -5153,9 +5200,9 @@ export class Engine {
       }
       text = try this.withMcpTools(text, snapshot(req.headers))
       body = fields(text)
-      // the prompt named by x-bf-prompt-id goes before the messages (prompts.tov)
+      // the prompt named by x-raiju-prompt-id goes before the messages (prompts.tov)
       const ph = snapshot(req.headers)
-      if (ph.get("x-bf-prompt-id") !== undefined) {
+      if (ph.get("x-raiju-prompt-id") !== undefined) {
         const vk = this.gov.findKey(ph)
         const applied = try applyPrompt(this.cfg.prompt_repo, ph, text, { budgetPercent: this.gov.budgetFraction(vk) * 100.0, tokensPercent: this.gov.rateFraction(vk, "token") * 100.0, requestsPercent: this.gov.rateFraction(vk, "request") * 100.0 })
         if (applied.prompt_id !== undefined) {
@@ -5180,9 +5227,9 @@ export class Engine {
         }
         if (changed) text = build(body)
       }
-      // x-bf-passthrough-extra-params: true merges the body's extra_params object into the request, so
-      // provider fields that are not in the chat schema reach the provider (Bifrost's SDK gate)
-      if (req.headers.get("x-bf-passthrough-extra-params") === "true") {
+      // x-raiju-passthrough-extra-params: true merges the body's extra_params object into the request,
+      // allowing provider fields outside the chat schema to reach the provider.
+      if (req.headers.get("x-raiju-passthrough-extra-params") === "true") {
         const ep = find(body, "extra_params")
         if (ep !== undefined && ep.startsWith("{")) {
           for (const f of try fields(ep)) setField(&body, f.key, f.raw)
@@ -5202,7 +5249,7 @@ export class Engine {
       const r = shared ?? new PluginRun({ requestId: req.headers.get("x-request-id") ?? newId("req_"), op: "chat", model: "", provider: "", headers: new Map(), values: new Map(), trace: new PluginTrace() })
       r.ctx.op = "chat"
       r.ctx.model = rawStr(body, "model") ?? ""
-      // the provider the model resolves to (a bare model's default one), as Bifrost's request carries it
+      // The provider resolved for the model, using the default provider for a bare model name.
       r.ctx.provider = this.refOf(r.ctx.model).provider
       // the request as it came, for the pre hooks of each fallback
       const original = text
@@ -5212,15 +5259,15 @@ export class Engine {
       if (pre.kind === "short_circuit") {
         const delay = parseInt(r.ctx.values.get("mock_latency_ms") ?? "0") ?? 0
         if (delay > 0) await sleep(delay)
-        // an error that lets the fallbacks be tried (Bifrost's AllowFallbacks unset or true) is the primary attempt's: the
-        // fallbacks run, each with the pre hooks again (AttemptPlugins)
+        // When the primary attempt's error permits fallbacks, each fallback runs the pre hooks again
+        // (AttemptPlugins).
         if (pre.status >= 400 && pre.allowFallbacks !== false && this.fallbacksOf(body).length > 0) {
           primaryFail = { status: pre.status, body: pre.body }
         } else {
           const post = chain.runPost(&r.ctx, pre.status, pre.body)
           const hs: Record<string, string> = new Map()
           hs.set("content-type", post.status === pre.status ? pre.contentType : "application/json")
-          hs.set("x-bf-plugin-short-circuit", "true")
+          hs.set("x-raiju-plugin-short-circuit", "true")
           return new Response(post.body, { status: post.status, headers: hs })
         }
       }
@@ -5250,14 +5297,14 @@ export class Engine {
         wantUsage = false
       }
     }
-    const autoCache = this.autoPromptCache || req.headers.get("x-bf-prompt-cache-auto-inject") === "true"
+    const autoCache = this.autoPromptCache || req.headers.get("x-raiju-prompt-cache-auto-inject") === "true"
     // a streamed answer goes through the plugins' post hooks chunk by chunk
     const pipeSink = stream && sink !== undefined && chain !== undefined && run !== undefined ? llmStreamSink(chain, run, sink) : sink
     const canPipe = stream && pipeSink !== undefined
     // a provider's own prompt_cache.auto_inject turns the breakpoints on for its requests
     const autoFor = (t: Target): bool => autoCache || (t.cfg.prompt_cache?.auto_inject ?? false)
     // compat: the request for each target, shaped in build (drops and fits, and Responses when the model needs it)
-    const cp = new CompatPlan(withHeader(settingsOf(this.cfg.client?.compat), req.headers.get("x-bf-compat") ?? undefined), "chat", stream)
+    const cp = new CompatPlan(withHeader(settingsOf(this.cfg.client?.compat), req.headers.get("x-raiju-compat") ?? undefined), "chat", stream)
     const sendChat: ChatSender = (t, b, tc) => {
       // Usage is always requested from streaming upstreams, for budgets and metrics.
       let streamBody = b.slice()
@@ -5447,7 +5494,7 @@ export class Engine {
       // the body this attempt's pre hooks left (a fallback's run again), else the request's
       return try providers.embeddingsUpstream(t, this.attemptFields(req, body))
     }
-    const translate: Translate = (t, text, requested) => try providers.embeddingsTranslate(t.kind, t.model, text, requested)
+    const translate: Translate = (t, text, requested) => try providers.embeddingsTranslate(t.kind, t.model, text, requested, rawStr(this.attemptFields(req, body), "encoding_format"))
     return try await this.serve(req, "embeddings", undefined, body, text, build, translate, false)
   }
 
@@ -5462,22 +5509,22 @@ export class Engine {
     const stream = rawBool(body, "stream") ?? false
     const wantUsage = streamUsage(body)
     const canPipe = stream && sink !== undefined
-    const cp = new CompatPlan(withHeader(settingsOf(this.cfg.client?.compat), req.headers.get("x-bf-compat") ?? undefined), "completions", stream)
+    const cp = new CompatPlan(withHeader(settingsOf(this.cfg.client?.compat), req.headers.get("x-raiju-compat") ?? undefined), "completions", stream)
     const build: Build = (t) => {
       // the body this attempt's pre hooks left (a fallback's run again), else the request's
       const cur = this.attemptFields(req, body)
       const sh = try cp.shape(t.provider, t.kind, t.model, cur)
       if (sh.route === "chat") return try textAsChat(t, sh, stream, canPipe)
       if (t.kind === "replicate") return try replicateText(t, cur)
-      // Anthropic's legacy complete API answers whole, as in Bifrost (which has no Anthropic text stream). Bedrock's
-      // InvokeModel text models stream on InvokeModelWithResponseStream, as Bifrost's TextCompletionStream; a stream
-      // that cannot be piped is asked whole and sent as one frame.
+      // Anthropic's legacy complete API returns a whole answer. Bedrock InvokeModel text models stream
+      // through InvokeModelWithResponseStream. A stream that cannot be piped is requested as a whole
+      // answer and sent as one frame.
       if (t.kind === "anthropic") {
         if (stream) throw new SyntaxError(`text_completion_stream is not supported by ${t.provider} provider`)
         return try anthropicNative.textRequest(t, sh.body)
       }
       if (t.kind === "bedrock") return canPipe ? try bedrockNative.textStreamRequest(t, sh.body) : try bedrockNative.textRequest(t, sh.body)
-      // Sarvam's OpenAI-compatible API has chat only (Bifrost refuses its text completions)
+      // Sarvam's OpenAI-compatible API supports chat only.
       if (!providers.streamsNatively(t.kind) || t.kind === "sarvam") throw new SyntaxError(`${t.provider} does not serve text completions`)
       return openai.completionsRequest(t, sh.body)
     }
@@ -5580,11 +5627,11 @@ test("send-back-raw: the provider setting, overridden per request only when allo
   const off: Config = { client: { allow_per_request_raw_override: false } }
   expect(sendBackRaw(hdrs([]), off, p, "response")).toBe(true)
   expect(sendBackRaw(hdrs([]), off, p, "request")).toBe(false)
-  expect(sendBackRaw(hdrs([["x-bf-send-back-raw-response", "false"]]), cfg, p, "response")).toBe(false)
-  expect(sendBackRaw(hdrs([["x-bf-send-back-raw-request", "true"]]), cfg, p, "request")).toBe(true)
+  expect(sendBackRaw(hdrs([["x-raiju-send-back-raw-response", "false"]]), cfg, p, "response")).toBe(false)
+  expect(sendBackRaw(hdrs([["x-raiju-send-back-raw-request", "true"]]), cfg, p, "request")).toBe(true)
   // the override is ignored unless allowed
-  expect(sendBackRaw(hdrs([["x-bf-send-back-raw-response", "false"]]), off, p, "response")).toBe(true)
-  expect(sendBackRaw(hdrs([["x-bf-send-back-raw-response", "garbage"]]), cfg, p, "response")).toBe(true)
+  expect(sendBackRaw(hdrs([["x-raiju-send-back-raw-response", "false"]]), off, p, "response")).toBe(true)
+  expect(sendBackRaw(hdrs([["x-raiju-send-back-raw-response", "garbage"]]), cfg, p, "response")).toBe(true)
 })
 
 test("direct key target: the caller's key replaces the pool", () => {
@@ -5602,11 +5649,11 @@ test("store_raw_request_response: the header overrides the provider setting only
   const allow: Config = { client: { allow_per_request_content_storage_override: true } }
   const deny: Config = { client: {} }
   expect(storeRawOn(hdrs([]), deny, p)).toBe(true)
-  expect(storeRawOn(hdrs([["x-bf-store-raw-request-response", "false"]]), deny, p)).toBe(true)
-  expect(storeRawOn(hdrs([["x-bf-store-raw-request-response", "false"]]), allow, p)).toBe(false)
-  expect(storeRawOn(hdrs([["x-bf-store-raw-request-response", "TRUE"]]), allow, off)).toBe(true)
+  expect(storeRawOn(hdrs([["x-raiju-store-raw-request-response", "false"]]), deny, p)).toBe(true)
+  expect(storeRawOn(hdrs([["x-raiju-store-raw-request-response", "false"]]), allow, p)).toBe(false)
+  expect(storeRawOn(hdrs([["x-raiju-store-raw-request-response", "TRUE"]]), allow, off)).toBe(true)
   expect(storeRawOn(hdrs([]), allow, off)).toBe(false)
-  expect(storeRawOn(hdrs([["x-bf-store-raw-request-response", "maybe"]]), allow, p)).toBe(true)
+  expect(storeRawOn(hdrs([["x-raiju-store-raw-request-response", "maybe"]]), allow, p)).toBe(true)
 })
 
 test("allowed_requests admits only the request types set to true", () => {
@@ -5668,7 +5715,7 @@ test("per-provider limiters follow concurrency_and_buffer_size and carry over un
   ps.set("plain", {})
   const cfg: Config = { providers: ps, client: { drop_excess_requests: true } }
   const made = limitersFor(cfg)
-  // with drop on, the provider without a queue gets Bifrost's default one
+  // With drop enabled, a provider without a queue receives the default queue.
   expect(made.size).toBe(2)
   expect(made.get("plain")!.limit).toBe(1000)
   expect(made.get("plain")!.buffer).toBe(5000)
@@ -5701,7 +5748,7 @@ test("injected tools are named as configured and point at their MCP tool", () =>
   expect(injectedChatName({ providers: ps }, "other") === undefined).toBe(true)
 })
 
-test("x-bf-mcp-include-tools: a list of client-tool names, client-* wildcards, and an empty list", () => {
+test("x-raiju-mcp-include-tools: a list of client-tool names, client-* wildcards, and an empty list", () => {
   const search = `{"type":"function","function":{"name":"search-find","parameters":{"type":"object"}}}`
   const fetchTool = `{"type":"function","function":{"name":"search-fetch","parameters":{"type":"object"}}}`
   const weather = `{"type":"function","function":{"name":"weather-get","parameters":{"type":"object"}}}`
@@ -5936,13 +5983,13 @@ test("an audio request's bill is freed after the request (its gate reaches it th
   expect(p.bill === undefined).toBe(true)
 })
 
-test("a virtual key with no mcp_configs gets no MCP tools but allow_by_default ones, as in Bifrost", () => {
+test("a virtual key with no mcp_configs gets no MCP tools but allow_by_default ones, as in Raiju", () => {
   const e = new Engine({ governance: { virtual_keys: [
-    { id: "vk-none", value: "sk-bf-none" },
-    { id: "vk-some", value: "sk-bf-some", mcp_configs: [{ mcp_client_name: "fs", tools_to_execute: ["read"] }] },
+    { id: "vk-none", value: "sk-raiju-none" },
+    { id: "vk-some", value: "sk-raiju-some", mcp_configs: [{ mcp_client_name: "fs", tools_to_execute: ["read"] }] },
   ] } })
   const h: Hdrs = new Map()
-  h.set("x-bf-vk", "sk-bf-none")
+  h.set("x-raiju-vk", "sk-raiju-none")
   // an empty grant (before, a key without the list was not limited at all)
   const none = e.keyMcp(h)
   expect(none?.length).toBe(0)
@@ -5951,7 +5998,7 @@ test("a virtual key with no mcp_configs gets no MCP tools but allow_by_default o
   // a virtual MCP the key was given decides by its own allowed keys
   expect(e.keyMcp(h, "my-vmcp")).toBeUndefined()
   const some: Hdrs = new Map()
-  some.set("x-bf-vk", "sk-bf-some")
+  some.set("x-raiju-vk", "sk-raiju-some")
   expect(e.keyMcp(some)?.length).toBe(1)
   // a request without a virtual key is not limited by key rules
   expect(e.keyMcp(new Map())).toBeUndefined()

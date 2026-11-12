@@ -1,7 +1,7 @@
 # Deploying Raiju
 
 Raiju is one binary. The image runs it as non-root on a slim Debian base (bookworm-slim with
-JavaScriptCore, which the binary links). It takes a Bifrost-format `config.json` from `/app/data`
+JavaScriptCore, which the binary links). It takes a Raiju-format `config.json` from `/app/data`
 (its `-app-dir`), and provider keys come from environment variables that the config refers to as
 `env.NAME`. Terraform modules (Helm release, AWS ECS Fargate) are in
 [terraform/](terraform/README.md). Every config key is listed in
@@ -9,8 +9,8 @@ JavaScriptCore, which the binary links). It takes a Bifrost-format `config.json`
 
 Endpoints for probes and scraping: `GET /health` (liveness: 200, `{"status":"ok"}`),
 `GET /ready` (readiness: 200 `{"status":"ready",...}`, or 503 while the process drains for a stop
-or when a store that is on could not open) and `GET /metrics` (Prometheus text, Bifrost metric
-names). `/metrics` is open, as in Bifrost, and its labels name virtual keys, teams and customers: set
+or when a store that is on could not open) and `GET /metrics` (Prometheus text, Raiju metric
+names). `/metrics` is open, and its labels name virtual keys, teams and customers: set
 `server.metrics_token` (a bearer token, `env.NAME` allowed) to keep tenants on the inference port from
 reading it, or move it to the cluster listener with `cluster.serve_metrics` (a start with neither logs a warning). The image has no curl; its `HEALTHCHECK` runs `raiju -healthcheck`, which GETs `/health`
 on 127.0.0.1 at `-port`, `PORT` or 8080 and exits 0 on a 2xx (`raiju -healthcheck /ready` probes
@@ -194,8 +194,8 @@ has its own cap.
 ## AWS credentials from the workload
 
 A Bedrock key with neither an API key (`value`) nor `access_key`/`secret_key`, and Vertex's
-`aws_workload_identity` (or an AWS `external_account` file), take the AWS SDK's default chain, as
-Bifrost does: the environment (`AWS_ACCESS_KEY_ID`, ...), an EKS IRSA web identity
+`aws_workload_identity` (or an AWS `external_account` file), take the AWS SDK's default chain:
+the environment (`AWS_ACCESS_KEY_ID`, ...), an EKS IRSA web identity
 (`AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_ROLE_ARN`, which the EKS webhook sets for a service account
 annotated with `eks.amazonaws.com/role-arn`), the selected profile of the shared config and
 credentials files (`AWS_PROFILE`, else `default`; `AWS_CONFIG_FILE` and `AWS_SHARED_CREDENTIALS_FILE`
@@ -237,9 +237,9 @@ pass all of them (including `-host 0.0.0.0`), because they replace the default c
 more processes per container. Do not bind-mount `config.json` read-only into `/app/data` for a gateway you
 manage through the API or UI: saves would fail.
 
-The management API (`/api` and the dashboard) is locked until an admin exists, as in Bifrost: pass a setup
-token (`-e BIFROST_SETUP_TOKEN=...`, or `setup_token` in the config), create the first admin with it
-(the dashboard's setup screen, or `POST /api/users` with the token in `X-Bifrost-Setup-Token`), and sign
+The management API (`/api` and the dashboard) is locked until an admin exists: pass a setup
+token (`-e RAIJU_SETUP_TOKEN=...`, or `setup_token` in the config), create the first admin with it
+(the dashboard's setup screen, or `POST /api/users` with the token in `X-Raiju-Setup-Token`), and sign
 in from then on. With no admin and
 no setup token, `/api` answers 403. Inference is unaffected.
 
@@ -252,7 +252,7 @@ docker compose --profile metrics up --build   # adds Prometheus on :9090
 ```
 
 `.env` is optional and is never copied into the image (`.dockerignore`). Put
-`BIFROST_SETUP_TOKEN=...` in it to create the first admin with (see Docker above). The compose file passes
+`RAIJU_SETUP_TOKEN=...` in it to create the first admin with (see Docker above). The compose file passes
 `-host 0.0.0.0` explicitly. `/app/data` is the named volume `raiju-data`. A one-shot `raiju-config`
 service copies `deploy/config.example.json` into it when it has no `config.json` yet; after that, the file
 in the volume is the one Raiju reads and the API and UI edit (the first admin included), and it survives
@@ -314,13 +314,13 @@ Pods roll automatically when the ConfigMap or the chart's Secret changes. Change
 `existingSecret` are not detected, so restart the deployment (`kubectl rollout restart deploy/raiju`).
 
 The container passes `-host 0.0.0.0` (the binary's own default is 127.0.0.1). `/api` is locked until an
-admin exists: set `setupToken.existingSecret` (a Secret with a `BIFROST_SETUP_TOKEN` key, or the key named
-by `setupToken.key`), or put `BIFROST_SETUP_TOKEN` in `existingSecret`, then create the first admin with
-`POST /api/users` and the token in `X-Bifrost-Setup-Token`. With a PVC the admin is kept in
+admin exists: set `setupToken.existingSecret` (a Secret with a `RAIJU_SETUP_TOKEN` key, or the key named
+by `setupToken.key`), or put `RAIJU_SETUP_TOKEN` in `existingSecret`, then create the first admin with
+`POST /api/users` and the token in `X-Raiju-Setup-Token`. With a PVC the admin is kept in
 `/app/data/config.json`; with `configMode: always` it is lost at the next start unless `config` holds it.
 
 ```sh
-kubectl create secret generic raiju-setup --from-literal=BIFROST_SETUP_TOKEN=$(openssl rand -hex 16)
+kubectl create secret generic raiju-setup --from-literal=RAIJU_SETUP_TOKEN=$(openssl rand -hex 16)
 helm upgrade --install raiju deploy/helm/raiju --reuse-values --set setupToken.existingSecret=raiju-setup
 ```
 
@@ -417,7 +417,7 @@ capacity and availability.
 
 ## Config and secrets
 
-- `config.json` uses Bifrost's format ([docs/config-reference.md](../docs/config-reference.md)).
+- `config.json` follows the [configuration reference](../docs/config-reference.md).
   Any value written `env.NAME` is replaced with the environment variable `NAME` when the config
   loads (the process reads `/proc/self/environ`). Keep keys in the environment, not in the file.
 - The file is read at start. Changes made through the management API or the web UI are saved to it
@@ -440,7 +440,7 @@ capacity and availability.
   cap) also caps the folder: the oldest segments are deleted first. Set it below the volume's size; at 1,500
   requests a second a day of rows is on the order of 100 GB.
 - With `logs_store.object_storage` set (S3, or GCS through its S3 interop API), the rows keep their metadata and a
-  prompt preview and each row's bodies, raw payloads and plugin logs go to the bucket (Bifrost's hybrid store), which
+  prompt preview and each row's bodies, raw payloads and plugin logs go to the bucket (hybrid store), which
   keeps the folder small; the log detail reads them back. `object_storage.format` is `json` (default) or `parquet`,
   `compression` `none` or `gzip` (Parquet's snappy and zstd are written as GZIP pages); set
   `logs_store.object_storage_offload: false` to keep rows whole. Rows beyond `max_memory_entries` are read from the

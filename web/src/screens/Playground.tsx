@@ -23,7 +23,7 @@ export function Playground() {
   const val = (n: string) => ((form?.elements.namedItem(n) as HTMLInputElement | HTMLTextAreaElement | null)?.value ?? "").trim()
   const headers = (): Record<string, string> => {
     const vk = val("vk")
-    return vk ? { "x-bf-vk": vk } : {}
+    return vk ? { "x-raiju-vk": vk } : {}
   }
 
   const loadModels = async () => {
@@ -84,7 +84,7 @@ export function Playground() {
           </datalist>
           <label>
             Virtual key (optional)
-            <input name="vk" type="password" autocomplete="off" spellcheck={false} placeholder="sk-bf-..." />
+            <input name="vk" type="password" autocomplete="off" spellcheck={false} placeholder="sk-raiju-..." />
           </label>
           <div class="actions">
             <button type="button" id="pg-load" class="ghost" onClick={loadModels}>

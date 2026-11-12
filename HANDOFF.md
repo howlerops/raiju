@@ -1,20 +1,174 @@
 # Handoff
 
-Raiju is a Bifrost-compatible LLM gateway written in Tov (TypeScript syntax compiled to
+Raiju is an LLM gateway written in Tov (TypeScript syntax compiled to
 native code). Work runs as a ledger with a lead and workers: the lead keeps
 [LEDGER.md](LEDGER.md), hands self-contained tasks to worker agents in their own git
 worktrees, then merges, tests and commits. Bifrost parity is tracked row by row in
 [docs/parity.md](docs/parity.md); scope is in [SCOPE.md](SCOPE.md).
+
+Current owned names use `RAIJU_*`, `x-raiju-*`, `sk-raiju-*`, `ck-raiju-*`,
+`rt-raiju-*` and `raiju_*` metrics, with no old-name aliases. Historical parity
+evidence refers to the actual reference gateway, not current wire compatibility.
+
+**Constrained Linux qualification (2026-11-12): PASS for the bounded mock workload, not production cutover.**
+Measured ARM64 Linux image (before later PR-review validation fixes) `sha256:cc1132cf23094d2fe495cff1a0ca740593e488728dcc84409b640688a605656a`;
+binary SHA256 `bb59e0743a0cf21bb863aa2c262b680c956df2243cb42e7b42a84ddc1b060860`.
+Two workers, authentication and stdout request logging enabled, content logging off; cgroup limits 2 CPU,
+2 GiB, no swap. Client, mock and gateway communicated only inside Linux on an internal Docker network,
+with synthetic credentials and no external egress. No paid inference or cloud resource changes.
+
+- **Demand basis:** read-only seven-day production-account CloudWatch data: eu-west-1 had 1,003,290
+  accepted Bedrock Runtime requests plus 180,386 throttled attempts; client/server errors are already
+  included in accepted requests, not additive. Highest observed minute averaged 43.95 requests/s,
+  including throttles. Titan accounted for 530,122 accepted requests and Haiku 5.5 for 472,042.
+  us-east-1 had 531 accepted requests. This is account-wide demand, not a gateway routing inventory.
+- **Sustained proof:** dispatched 90 short delayed requests/s plus 10 streams/s for 600 seconds, then
+  drained: 60,000/60,000 valid gateway responses, zero errors or client shedding; 236 peak upstream streams.
+  Each stream had 360 content frames, 23,040 content bytes and about 21 s duration. All measured requests
+  reached the mock; missing auth was rejected before upstream dispatch. 60,502 request logs cover measured
+  traffic plus warmup/preflight/auth rejection. Direct controls before/after completed 12,000/12,000.
+- **Observed cost:** mean 0.191 CPU cores; sampled cgroup memory peak 100.67 MiB; zero OOM kills or container
+  restarts; normal shutdown. Anonymous-memory half-run means rose from 38.22 to 45.01 MiB: this is bounded
+  ten-minute evidence, not proof of no leak. CPU throttled time was 0.794 s across the sustained interval.
+- **Latency:** stream median TTFT 2702.90 ms versus direct 2701.67–2702.07 ms (aggregate difference
+  0.83–1.23 ms). Gateway TTFT p99 2779.71 ms versus direct 2710.17–2740.30 ms; stream-completion scheduled
+  p99 23.38 s versus direct 21.59–21.68 s. Different run lengths and shared VM scheduling preclude a strict
+  per-request overhead or production tail-SLO claim.
+- **Scope:** 100 requests/s is 2.28 times the highest observed minute-average Runtime demand; it is not
+  sub-minute burst coverage, an actual AWS instance measurement, or a native Bedrock/embeddings CPU test.
+  The AWS role expired before separate Mantle metrics could be read; those failed queries are not zero load.
+- **Failed attempts remain:** `linux-capacity-results/` records denied Docker host-address routing;
+  `linux-bridge-capacity-results/` and `linux-sustained-results/` record resets/timeouts or counter-isolation
+  failures on host-to-Docker traffic, including overload-stage client shedding. These are not erased by the
+  isolated success and do not establish a gateway capacity ceiling. Production code/security policy unchanged.
+
+Evidence and reproducible drivers: local ignored `build/performance/linux-network-results/{results,summary}.json`,
+`cgroup-samples.jsonl`, `gateway.log`, `linux-network-capacity.cjs`, `gateway-performance.cjs`,
+`summarize-linux.cjs`; production queries and coverage notes are in `build/performance/production-demand/`.
+
+**Local performance qualification (2026-11-12):** current-source native ARM64 build completed 120 synthetic
+cases with 915,100 valid responses and zero response errors; fixed-rate overload also shed 10,908 requests
+at the load generator, so this is not an all-offered-traffic pass. No provider credentials or cloud resources used.
+At 32 concurrent streams, minimal Raiju added 1.04 ms median first-token delay versus direct; authenticated
+request logging added 16.67 ms. At 128 streams the logged profile added 31.99 ms and completed 485 streams/s.
+The logged fixed-rate profile shed 2,874/4,500 offered requests at 1,500 requests/s; production capacity is
+not qualified. Short windows and host/generator variability prevent treating these numbers as stable limits.
+Evidence: `build/performance/current-native-results/{results,summary}.json` and
+`build/performance/current-native-environment.json` (local ignored artifacts).
+Binary SHA256: `684a9f99c55e9422fd460e3a25212021feb0b5a0026d8899826fcf059539f2de`.
+Native Langfuse integration remains optional, not a product gate;
+the [Langfuse implementation handoff](docs/langfuse-handoff.md) remains available for that separate decision.
+
+**Performance diagnosis update:** a separate 30-case isolation run split authentication and stdout logging
+into independent profiles. All 517,289 measured responses were valid and every measured request reached
+the mock provider. At 32 concurrent streams, added median first-token delay was 0.87 ms for minimal Raiju,
+1.07 ms for auth only, 0.85 ms for logging only, and 1.03 ms for both. The earlier 16.67 ms result is
+preserved but was not reproduced; it does not establish logging as the bottleneck. The combined profile
+emitted 83,904 valid success log records, covering its 80,313 measured responses plus warmup.
+Evidence: `build/performance/isolation/{results,summary}.json`. Do not patch out authentication/logging
+or claim a product performance fix from this comparison. Local host variability remains unresolved.
+A reversed-order run then placed authenticated/logged Raiju first: at 3,000 offered requests/s it completed
+the short fixed-rate window with zero errors, zero client shedding and 3.51 ms scheduled p99 latency.
+At 32 concurrent streams it added 0.82 ms median first-token delay versus direct. Evidence:
+`build/performance/reversed-overload/{results,summary}.json`. The earlier overload was not reproduced.
+These conflicting short local runs establish neither a stable capacity ceiling nor an AWS production SLO.
+The owner's Langfuse UI screenshot reports **4.77.0 OSS**; the infrastructure repository's 4.3.1 pin is
+checked-in intent, not the observed running version. Neither is evidence that the cluster runs 4.79.0.
+The owner identified roughly $800 potential exposure for a successful paid soak; that is not a verified invoice.
+Future live checks require an explicit aggregate spend/request cap, not merely remaining provider credits.
 
 **To pick this up:** paste [handoff/leader-prompt.md](handoff/leader-prompt.md) into a new
 session. It sets up the machine, explains the lead/worker loop and points at the queued wave.
 Worker briefs start from [handoff/worker-prompt-template.md](handoff/worker-prompt-template.md);
 the rules all workers follow are in [handoff/worker-brief.md](handoff/worker-brief.md).
 
-Branch: `claude/affectionate-shannon-pjwi5z`. Waves 1 to 32 are on `main` (PRs howlerops/raiju#11 and
-howlerops/raiju#13).
+Qualification PR branch: `codex/raiju-production-qualification`, based on `a930011`. Waves 1 to 32 are on
+`main` (PRs howlerops/raiju#11 and howlerops/raiju#13). This batch adds the documented clean name cutover,
+qualification fixes and evidence; it does not authorize production deployment.
 
 ## Where things stand
+
+- **Disposable dev qualification is complete, with a failed sustained-traffic gate; production cutover is not approved.**
+  The owner approved the full dev stack, a full 24-hour soak and teardown in account `537124952465`, `eu-west-1`,
+  prefix `raiju-proof-20261110`. Fresh cryptographic state and exact external source/history names are approved.
+  Baseline: `a93001198b52189a6e1f1eb9f24a1c3f2fde1faa`; current immutable ARM64 image:
+  `sha256:841d6666a762061920744092c51f5d03f635f90c4e86d4307762a8f385d67ca5`.
+  Builder/runtime executable SHA256: `bb59e0743a0cf21bb863aa2c262b680c956df2243cb42e7b42a84ddc1b060860`.
+
+  | Exercised gate on the current image | Result |
+  |---|---|
+  | Linux units / typecheck | 2,544 passed, zero failed / passed |
+  | Complete E2E / independent embedding wire oracle | Bun and http1 passed |
+  | Hardened image boot / CI-policy vulnerability scan | 20 checks passed / passed |
+  | Real dev IRSA models / Mantle installed SDKs | 22/22 / 17/17 |
+  | Real STS lifetime, two unchanged processes | Passed after 3,600 + 30 s; zero restarts; default SDK/native Titan vectors identical at 1,024 dimensions |
+  | Baseline-to-current rolling, unencrypted config and OAuth off | 1,160 creates and 1,160 updates including mixed-version bridge; zero loss; 447 good readiness samples |
+  | Node-pinned OAuth stop-first / enabled-backend DCR and trickle | Passed; grant, refresh and pending consent survive |
+  | Three-node preflight | 20 passed, zero failed, one explicit MCP-off skip |
+  | EFS concurrent writes / legacy-lock bridge | 120 creates and updates, zero loss; ages 0, 6 and -8 s passed |
+  | Live config flock holder killed with SIGKILL | 40 queued writes acknowledged/persisted, zero early completions or loss |
+  | Actual NFS isolation and lease expiry | Eight writes recover after 62.71 s while holder is alive; zero loss, read on all three nodes |
+  | Partition/rejoin and primed cluster counter | Passed; all nodes remain 429 within the same window; listener, sync and nine log rows pass |
+  | Actual ALB audit attribution | Independent caller IP matched; forged X-Forwarded-For rejected |
+
+  **The installed consumer SDK matrix is not all green:** 13 passes, one strict counterexample:
+  `finish_reason:stop` accompanies valid forced `tool_calls`. A fresh direct `api.openai.com` matched
+  request reproduces it; no gateway normalization was added. Explicit tool-call parsing and LangChain
+  tool/result continuation pass. Whole customer graphs, independent billing and provider-side billing cessation
+  are not proved. Current evidence and original failures: ignored `build/proof/2026-11-10/final-artifact.json`,
+  `renewal-infrastructure-final.json`, `consumer-sdk-cloud/`, `eks-irsa-renewal/`, and `eks-mantle-renewal/`.
+  Superseded images and their failures remain separate; do not attribute their results to the current image.
+
+  **The full 24-hour run completed and failed.** Run `20261110-attempt5` started
+  `2026-11-11T06:10:16.856Z`, with 172,800 completed requests and 1,412/1,412 valid samples spanning 86,401 s.
+  There were 60,220 accepted inferences, 60,198 intentional discard-body responses, 165 recognized refusals
+  and 52,217 errors (30.22%, above the 1% gate). Every counted error was HTTP 429; the retained terminal
+  provider message says **“You have no credits remaining.”** Accepted inference stopped increasing at about
+  12.86 h. Individual earlier 429 bodies are not retained, so do not attribute every historical response
+  independently. No extra provider spend or rerun is approved.
+
+  Memory met its numeric bounds: 168 MiB peak, 8.23 MiB growth over the second half, 140 MiB at the end,
+  zero memory-inferred restarts; the exact same sole gateway task was healthy at completion. Source:
+  ECS/ContainerInsights service `MemoryUtilized`, **not process RSS**. This does not pass the full real-traffic
+  gate: successful upstream inference did not continue for 24 h. The original failed verdict is preserved.
+  Runner `ee068f4dbed64e728865e7fdc37d249e`; gateway task `3a76fc30913a40be8164e036dafadde6`.
+  Evidence: `completed-soak-disposition.json`, `completed-soak-evidence-index.json`, and
+  `cloud-evidence/ee068f4dbed64e728865e7fdc37d249e/` under the ignored proof directory.
+  Operator MFA expiries interrupted only local collection; normal refresh resumed the same run, without
+  restarting the gateway or shortening the measurement. Candidate smoke before the run passed OpenAI 8/8
+  and Anthropic 7/7, with one unsupported-embedding skip.
+
+  Real Okta/Entra is explicitly unproven and accepted: no disposable tenants are available. The owner excluded
+  `/mcp` from Totango cutover: process-local transport sessions return HTTP 400 across nodes. Node-pinned
+  OAuth continuity is not transparent multi-node MCP support. Native macOS is not qualified: the prior adapter
+  run had 713 passes/36 failures, including Linux `/proc` dependence. Earlier contextual HTTP timeouts did not
+  recur in complete current-image runs; their root cause remains unproven.
+
+  The current build also fixes awaited MCP credential persistence before releasing its renewal lease; its
+  existing two-worker expiry/401 regression passes nine checks. Earlier fixes cover SDK float32LE/base64
+  embeddings, shared signing-state initialization and compiler patch 0025's real Linux JSC GC initialization.
+  Future OAuth state fails startup. Obsolete key-length, directory-snapshot and buffered-output wording tests
+  were deleted rather than repinned. No crash-atomic provider/disk transaction is claimed.
+
+  **Approved teardown is complete:** `teardown-result.json` reports PASS; Terraform state is empty.
+  ECS/ALB/EFS/CloudMap, owned roles/security groups, manual DNS and ECR are removed; provider-secret
+  deletion was requested without a recovery window. AWS may retain asynchronously deleting secret records
+  and task-definition tombstones. EKS leaves/namespace/network policy and dedicated IRSA role/policy were
+  already removed; the source Mantle credential/version and existing releases stayed unchanged.
+  Existing VPC, NATs, certificate, cluster/node roles and source AWS credentials were not teardown targets.
+  Sensitive local plan/state-backup/credential copies and the generated proof overlay were removed after destroy;
+  the empty current Terraform state, source `.env`, local image and safe evidence are retained.
+  The private EFS state and cores were not exported; their filesystem was destroyed.
+
+  UI at `http://127.0.0.1:18480` was visually verified as `proof-ui-viewer · viewer`, then its owned
+  forward stopped for teardown. It is no longer running; do not reuse its removed credential copy.
+  Setup help uses `RAIJU_SETUP_TOKEN` / `X-Raiju-Setup-Token`.
+  [Gateway comparison](docs/gateway-evaluation.md): Langfuse 4.78.0 is not a drop-in for required IRSA/SigV4,
+  Mantle and cross-format contracts. Existing OSS Langfuse is 4.3.1; no shared upgrade or live benchmark was done.
+  Next: restore provider credit/quota with owner approval, then explicitly authorize any replacement
+  sustained successful-traffic run and associated spend. Keep the failed run unchanged. Before production
+  promotion, exercise the actual application graphs and cutover/privacy/policy/tracing plan; retain accepted
+  identity/MCP limitations and the upstream terminal-reason compatibility risk. No rerun or production change is authorized.
 
 - Waves 31 and 32 (L212 to L219): L212 to L214 closed the gaps listed after wave 30 (connect-time address checks on
   raw sockets and a write-stall limit on Bun.serve WebSockets through Tov patch 0022; async and provisioning jobs that

@@ -62,6 +62,26 @@ run "one_task_with_writable_ephemeral_data_and_tmp" {
     condition     = contains([for e in jsondecode(aws_ecs_task_definition.this.container_definitions)[0].environment : "${e.name}=${e.value}"], "RAIJU_TRUSTED_PROXIES=10.20.0.0/16")
     error_message = "the ALB's forwarding headers are believed from the VPC's range by default"
   }
+  assert {
+    condition     = alltrue([for rule in aws_security_group.service.ingress : rule.self != true || rule.from_port != var.port])
+    error_message = "the main HTTP port is ALB-only unless task-peer access is explicitly enabled"
+  }
+}
+
+run "staging_probes_can_reach_node_http" {
+  command = plan
+
+  variables {
+    allow_task_http_peers = true
+  }
+
+  assert {
+    condition = anytrue([
+      for rule in aws_security_group.service.ingress :
+      rule.self == true && rule.from_port == var.port && rule.to_port == var.port && rule.protocol == "tcp" && length(coalesce(rule.cidr_blocks, [])) == 0 && length(coalesce(rule.ipv6_cidr_blocks, [])) == 0
+    ])
+    error_message = "node HTTP is reachable only from the service security group, not a VPC or public CIDR"
+  }
 }
 
 run "trusted_proxies_can_be_named_or_turned_off" {

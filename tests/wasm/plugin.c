@@ -1,4 +1,4 @@
-/* A small plugin for Raiju's WebAssembly plugin tests (Bifrost's JSON ABI: malloc, free, get_name,
+/* A small plugin for Raiju's WebAssembly plugin tests (the JSON ABI: malloc, free, get_name,
  * init, pre_hook, post_hook, cleanup). It is plain C with no libc, compiled to tests/wasm/plugin.wasm
  * by `make wasm-fixture`; the .wasm is committed so the tests need no WebAssembly toolchain.
  *
@@ -29,7 +29,7 @@
  *   post   what post_hook adds: error (turns a response into a 429 error), recover (turns an error into
  *          a chat response), chunk (rewrites each stream chunk: "chunk_from" to "chunk_to"), text (the
  *          same, in a whole response as well as in each chunk), skip (drops a stream chunk that contains
- *          "chunk_skip", answering an error with Bifrost's stream_control skip_stream)
+ *          "chunk_skip", answering an error with stream_control skip_stream)
  *   count  "on": post_hook also adds "x_post_n", how many whole answers this instance's post_hook has seen
  *   chunk_from, chunk_to, chunk_skip, chunk_stop   http_stream_chunk_hook: replaces chunk_from with
  *          chunk_to in each chunk, drops a chunk that contains chunk_skip, ends the stream on a chunk
@@ -382,7 +382,7 @@ EXPORT("post_hook") u64 plugin_post_hook(u32 ptr, u32 len) {
     if (is_post("error") && !input_error) {
         puts_(&b, "{\"context\":");
         if (have_ctx) put(&b, in + cs, ce - cs); else puts_(&b, "{}");
-        puts_(&b, ",\"response\":null,\"error\":{\"error\":{\"message\":\"turned into an error by the plugin\",\"type\":\"plugin_error\",\"code\":\"plugin_post\"},\"status_code\":429,\"is_bifrost_error\":false},\"has_error\":true,\"hook_error\":\"\"}");
+        puts_(&b, ",\"response\":null,\"error\":{\"error\":{\"message\":\"turned into an error by the plugin\",\"type\":\"plugin_error\",\"code\":\"plugin_post\"},\"status_code\":429,\"is_raiju_error\":false},\"has_error\":true,\"hook_error\":\"\"}");
         return pack(&b);
     }
     /* post=recover: an error that came in becomes a chat response */
@@ -407,7 +407,7 @@ EXPORT("post_hook") u64 plugin_post_hook(u32 ptr, u32 len) {
     }
     if (value_of(in, len, "response", &rs, &re)) {
         int is_chunk = find(in + rs, re - rs, CHAT_CHUNK) >= 0;
-        /* post=skip: a stream chunk that contains chunk_skip is dropped (an error with Bifrost's stream_control) */
+        /* post=skip: a stream chunk that contains chunk_skip is dropped (an error with stream_control) */
         if (is_post("skip") && is_chunk && chunk_skip[0] && find(in + rs, re - rs, chunk_skip) >= 0) {
             b.n = 0;
             puts_(&b, "{\"context\":");

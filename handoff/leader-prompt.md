@@ -6,7 +6,7 @@ switch the session with `/model` before pasting.
 
 ---
 
-You are the lead on Raiju, a Bifrost-compatible LLM gateway written in Tov (TypeScript syntax
+You are the lead on Raiju, an LLM gateway written in Tov (TypeScript syntax
 compiled to native code). Work runs as a ledger with a lead and workers. You keep the ledger,
 write task briefs, start workers, merge and verify their work, and commit. Workers build one
 task each in their own git worktree and never commit. Keep driving until every `todo` row in
@@ -27,9 +27,6 @@ Then tell the user what is left and how you will approach it, and start.
 - Compiler: `make tov` (runs `scripts/build-tov.sh`, applies `tov-patches/0001`–`0004`). Then
   `export TOV=$PWD/build/tov/target/release/tov`. Never use plain `tov`.
 - Unit tests need JavaScriptCore: `apt-get install -y libjavascriptcoregtk-4.1-dev`.
-- Bifrost reference: `git clone https://github.com/maximhq/bifrost /tmp/claude-0/bifrost-src`
-  and `git -C /tmp/claude-0/bifrost-src checkout 6c84d7a`. Read-only. The worker brief
-  points at that path.
 - Check the baseline before starting workers: typecheck, `make unit TOV=$TOV`,
   `make openapi-check TOV=$TOV`, and e2e on both servers (commands below). Record the counts.
 
@@ -50,7 +47,7 @@ Then tell the user what is left and how you will approach it, and start.
 1. Add or update the ledger row (`assigned`). Commit the ledger first so the worktree starts
    from it.
 2. Copy `handoff/worker-prompt-template.md` to the scratchpad, fill in YOUR TASK: what exists
-   (file names to grep), numbered pieces in priority order, the Bifrost files to compare,
+   (file names to search), numbered pieces in priority order, the relevant reference files,
    and two free e2e ports from the HANDOFF port registry. Never give two workers the same port.
 3. Start it with the Agent tool: `model: haiku`, `isolation: worktree`,
    `run_in_background: true`, and the short launch line from the template's header.

@@ -11,9 +11,9 @@ interface Grant {
   id: string
   client_id: string
   client_name: string
-  bf_mode: string
-  bf_sub: string
-  bf_sub_display: string
+  raiju_mode: string
+  raiju_sub: string
+  raiju_sub_display: string
   scope: string
   created_at: string
   last_used_at?: string
@@ -106,10 +106,10 @@ function Grants(props: Ctl) {
                     <tr>
                       <td>{g().client_name || <Mono>{g().client_id}</Mono>}</td>
                       <td>
-                        <Pill>{g().bf_mode}</Pill>
+                        <Pill>{g().raiju_mode}</Pill>
                       </td>
                       <td>
-                        <Mono>{g().bf_sub_display || g().bf_sub || "—"}</Mono>
+                        <Mono>{g().raiju_sub_display || g().raiju_sub || "—"}</Mono>
                       </td>
                       <td>{g().scope || "—"}</td>
                       <td class="nowrap">{fmtTime(Date.parse(g().created_at))}</td>

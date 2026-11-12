@@ -50,7 +50,7 @@ export interface paths {
         };
         /**
          * Prometheus text metrics
-         * @description Families follow Bifrost's telemetry plugin; the raiju_* families are Raiju's own. The crew routing families (raiju_crew_assignments_total, raiju_crew_calls_total, raiju_crew_attempts_total, raiju_crew_escalations_total, raiju_crew_accepts_total, raiju_crew_outcomes_total, raiju_crew_outcome_quality, raiju_crew_task_cost_usd, raiju_crew_lambda, raiju_crew_subscription_phi) are described in docs/crew-routing.md. Counters and histograms add up over the workers of a node; the lambda and quota gauges take the largest. raiju_mcp_sessions is the MCP server sessions the workers hold (summed).
+         * @description Gateway metric families use raiju_*; previous metric names have no aliases. The crew routing families (raiju_crew_assignments_total, raiju_crew_calls_total, raiju_crew_attempts_total, raiju_crew_escalations_total, raiju_crew_accepts_total, raiju_crew_outcomes_total, raiju_crew_outcome_quality, raiju_crew_task_cost_usd, raiju_crew_lambda, raiju_crew_subscription_phi) are described in docs/crew-routing.md. Counters and histograms add up over the workers of a node; the lambda and quota gauges take the largest. raiju_mcp_sessions is the MCP server sessions the workers hold (summed).
          */
         get: operations["getMetrics"];
         put?: never;
@@ -164,7 +164,7 @@ export interface paths {
         put?: never;
         /**
          * This node's copy of an async or provisioning job for a peer polling it (cluster peers only, Raiju extra)
-         * @description Async jobs and provisioning jobs are kept beside each node's config (<config>.jobs and <config>.provision-jobs.json), so nodes that share that folder find each other's jobs there. A node that does not hold a polled job (GET /v1/async/jobs/{id}, GET /v1/async/<op>/{id}, an SDK route with x-bf-async-id, GET /api/scim/provision/jobs/{id}) asks each peer for it and answers with the first copy found. An async job's copy carries its owner, which the asking node checks against its caller.
+         * @description Async jobs and provisioning jobs are kept beside each node's config (<config>.jobs and <config>.provision-jobs.json), so nodes that share that folder find each other's jobs there. A node that does not hold a polled job (GET /v1/async/jobs/{id}, GET /v1/async/<op>/{id}, an SDK route with x-raiju-async-id, GET /api/scim/provision/jobs/{id}) asks each peer for it and answers with the first copy found. An async job's copy carries its owner, which the asking node checks against its caller.
          */
         post: operations["postApiClusterJobs"];
         delete?: never;
@@ -3995,12 +3995,12 @@ export interface paths {
         };
         /**
          * Read an MCP authorization request on the consent page (the client, its redirect URI and expiry)
-         * @description The request is the one the MCP authorization server's /oauth2/authorize sealed into the consent link (nothing is stored until the consent). Its consent temp token (the fragment after the hash, t=, of the consent link; the request sealed with AES-256-GCM under a key derived from the signing key, so any worker, restart or node with the same signing key opens it) is sent in the X-Bifrost-Temp-Token header. The modes offered are listed in the available_modes field. "vk" (unless oauth2_server_config.disable_vk_identity is set while user mode is available), "session" for a dashboard user signed in on this request while inference auth is not enforced, and "user" while the gateway's OIDC sign-in is on. logged_in_user (id, name) names the identity-provider user whose single sign-on session token is sent as the Authorization bearer, so the page can offer to continue as that user; the consent page sends its user to /api/oidc/login?return_to=... to sign in.
+         * @description The request is the one the MCP authorization server's /oauth2/authorize sealed into the consent link (nothing is stored until the consent). Its consent temp token (the fragment after the hash, t=, of the consent link; the request sealed with AES-256-GCM under a key derived from the signing key, so any worker, restart or node with the same signing key opens it) is sent in the X-Raiju-Temp-Token header. The modes offered are listed in the available_modes field. "vk" (unless oauth2_server_config.disable_vk_identity is set while user mode is available), "session" for a dashboard user signed in on this request while inference auth is not enforced, and "user" while the gateway's OIDC sign-in is on. logged_in_user (id, name) names the identity-provider user whose single sign-on session token is sent as the Authorization bearer, so the page can offer to continue as that user; the consent page sends its user to /api/oidc/login?return_to=... to sign in.
          */
         get: operations["getApiOauth2ConsentFlowsId"];
         /**
          * Approve an MCP authorization request with a virtual key, as the signed-in dashboard user or as the signed-in identity-provider user, and answer the client's redirect URL with a one-time code
-         * @description Body {"mode": "vk", "value": "<virtual key>"}. The key must be active and unexpired, and its current value (not a rotated one). A key that belongs to a user (its user_id) grants user mode for that user while user mode is available, and only to that user signed in (400 otherwise). Body {"mode": "session"} approves as the dashboard user signed in on this request: the token then names a new session id and runs without a key (refused with 401 without that sign-in, and with 400 while inference auth is enforced). Body {"mode": "user"} approves as the identity-provider user whose single sign-on session token is the Authorization bearer (400 without one): the token's sub is that user and bf_mode is user. The redirect URL carries code, state and iss (RFC 9207); the client exchanges the code at /oauth2/token.
+         * @description Body {"mode": "vk", "value": "<virtual key>"}. The key must be active and unexpired, and its current value (not a rotated one). A key that belongs to a user (its user_id) grants user mode for that user while user mode is available, and only to that user signed in (400 otherwise). Body {"mode": "session"} approves as the dashboard user signed in on this request: the token then names a new session id and runs without a key (refused with 401 without that sign-in, and with 400 while inference auth is enforced). Body {"mode": "user"} approves as the identity-provider user whose single sign-on session token is the Authorization bearer (400 without one): the token's sub is that user and raiju_mode is user. The redirect URL carries code, state and iss (RFC 9207); the client exchanges the code at /oauth2/token.
          */
         put: operations["putApiOauth2ConsentFlowsId"];
         post?: never;
@@ -4019,7 +4019,7 @@ export interface paths {
         };
         /**
          * List the live MCP OAuth grants of the authorization server (the refresh tokens not revoked)
-         * @description Each row has id (the SHA-256 of the grant's current refresh token), client_id, client_name, bf_mode (vk or session), bf_sub (the virtual key's id, or the session id), bf_sub_display (the key's name for vk), scope, created_at and last_used_at (RFC 3339). Newest first. q matches the client's name or id and the bound identity; bf_mode, virtual_key_id and user_id are comma-separated lists. Paged by limit (default 50, at most 500) and offset.
+         * @description Each row has id (the SHA-256 of the grant's current refresh token), client_id, client_name, raiju_mode (vk or session), raiju_sub (the virtual key's id, or the session id), raiju_sub_display (the key's name for vk), scope, created_at and last_used_at (RFC 3339). Newest first. q matches the client's name or id and the bound identity; raiju_mode, virtual_key_id and user_id are comma-separated lists. Paged by limit (default 50, at most 500) and offset.
          */
         get: operations["getApiOauth2Sessions"];
         put?: never;
@@ -4059,7 +4059,7 @@ export interface paths {
         };
         /**
          * Read a per-user OAuth consent flow (its client, the caller it is for and its expiry)
-         * @description The flow is the consent link a caller was given. Its temp token (client.mcp_enable_temp_token_auth) is sent in the X-Bifrost-Temp-Token header in place of a dashboard session; it opens the flow until the flow ends. The answer has id, flow_mode (vk, session or user), status, mcp_client, user_id, virtual_key_id, session_id, expires_at, created_at and has_active_token. A user-mode flow (opened by a user-mode MCP token) has no temp token and opens only for its own user signed in through the gateway's OIDC sign-in, whatever that user's role (403 for anyone else). 404 when the flow is unknown or expired. Flows are kept in mcp-flow-state.json beside config.json, so a restart keeps them.
+         * @description The flow is the consent link a caller was given. Its temp token (client.mcp_enable_temp_token_auth) is sent in the X-Raiju-Temp-Token header in place of a dashboard session; it opens the flow until the flow ends. The answer has id, flow_mode (vk, session or user), status, mcp_client, user_id, virtual_key_id, session_id, expires_at, created_at and has_active_token. A user-mode flow (opened by a user-mode MCP token) has no temp token and opens only for its own user signed in through the gateway's OIDC sign-in, whatever that user's role (403 for anyone else). 404 when the flow is unknown or expired. Flows are kept in mcp-flow-state.json beside config.json, so a restart keeps them.
          */
         get: operations["getApiOauthPerUserFlowsId"];
         put?: never;
@@ -4829,7 +4829,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Fetch an agent card without registering the agent (Raiju-only; Bifrost's inspect) */
+        /** Fetch an agent card without registering the agent */
         post: operations["postApiAgentsInspect"];
         delete?: never;
         options?: never;
@@ -5166,7 +5166,7 @@ export interface paths {
         };
         /**
          * The agent's card as the gateway serves it (its interfaces are the gateway's JSON-RPC and REST routes)
-         * @description Bifrost serves the same card at this path. Its JSON-RPC and REST interfaces are the gateway's own routes; push notifications are advertised only when the agent can push; the agent's signatures are dropped. The caller's virtual key is checked (x-bf-vk or Authorization Bearer sk-bf-...). Cacheable with revalidation (Cache-Control private, no-cache, ETag, 304).
+         * @description Bifrost serves the same card at this path. Its JSON-RPC and REST interfaces are the gateway's own routes; push notifications are advertised only when the agent can push; the agent's signatures are dropped. The caller's virtual key is checked (x-raiju-vk or Authorization Bearer sk-raiju-...). Cacheable with revalidation (Cache-Control private, no-cache, ETag, 304).
          */
         get: operations["getAgentsA2aNameAgentCard"];
         put?: never;
@@ -5598,7 +5598,7 @@ export interface components {
             enabled: boolean;
             /** @description Allow any identified virtual key to call the agent without a grant. */
             allow_by_default?: boolean;
-            /** @description Send the caller's accepted gateway credential to the agent, on the header it came in on (x-bf-vk, Authorization, ...), so the agent can use it on its own LLM and MCP calls through the gateway. Off by default. */
+            /** @description Send the caller's accepted gateway credential to the agent, on the header it came in on (x-raiju-vk, Authorization, ...), so the agent can use it on its own LLM and MCP calls through the gateway. Off by default. */
             forward_accepted_credential?: boolean;
             /** @description With forward_accepted_credential, let the forwarded credential replace a header the registration's own auth sets on the same name (otherwise the configured one wins). */
             forward_accepted_credential_overrides_auth?: boolean;
@@ -5713,7 +5713,7 @@ export interface components {
             customer_id?: string;
             /** @description The business unit of the caller's team. */
             business_unit_id?: string;
-            /** @description The project the request named (x-bf-project-id or -name), when it admitted the caller. */
+            /** @description The project the request named (x-raiju-project-id or -name), when it admitted the caller. */
             project_id?: string;
             task_id?: string;
             /** @description The caller's binding (JSONRPC, HTTP+JSON, GRPC). */
@@ -6196,7 +6196,7 @@ export interface components {
             prometheus_labels?: string[];
             mcp_auto_execute?: string[];
             /**
-             * @description A request with an identity token and x-bf-vk. error cannot be set while an MCP client uses auth_type token_exchange (400), as Bifrost refuses it.
+             * @description A request with an identity token and x-raiju-vk. error cannot be set while an MCP client uses auth_type token_exchange (400), as Bifrost refuses it.
              * @enum {string}
              */
             dual_credential_conflict_behavior?: "error" | "prefer_vk" | "prefer_idp";
@@ -6942,9 +6942,9 @@ export interface components {
         McpTopTools: {
             [key: string]: unknown;
         };
-        /** @description The Bifrost CLI's TokenResponse (cli/internal/browserauth). */
+        /** @description Agent sign-in token response. */
         AgentTokenResponse: {
-            /** @description Starts with ck-bf-agent- */
+            /** @description Starts with ck-raiju-agent- */
             agent_access_token: string;
             refresh_token: string;
             token_type?: string;
@@ -6963,7 +6963,7 @@ export interface components {
             error_description?: string;
             message?: string;
         };
-        /** @description The Bifrost CLI's VirtualKeyListResponse (cli/internal/agentapi). */
+        /** @description The virtual keys available to the agent client. */
         AgentVirtualKeyList: {
             virtual_keys: {
                 id?: string;
@@ -6981,7 +6981,7 @@ export interface components {
             selected_virtual_key_id?: string;
             forced_virtual_key_id?: string;
         };
-        /** @description The Bifrost CLI's UsageSummaryResponse (cli/internal/agentapi). */
+        /** @description Usage summary for the agent client. */
         AgentUsageSummary: {
             budgets?: {
                 [key: string]: unknown;
@@ -7424,7 +7424,7 @@ export interface components {
         VirtualKey: {
             id: string;
             name: string;
-            /** @description sk-bf-... ; generated when empty on write; full on create, masked on read */
+            /** @description sk-raiju-... ; generated when empty on write; full on create, masked on read */
             value: string;
             description?: string;
             is_active: boolean;
@@ -13615,7 +13615,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description The generation's namespace (BifrostComplexityRouter_ then a fingerprint) */
+                /** @description The generation's namespace (RaijuComplexityRouter_ then a fingerprint) */
                 namespace: string;
             };
             cookie?: never;
@@ -17849,9 +17849,9 @@ export interface operations {
                 min_complexity_score?: number;
                 /** @description Highest heuristic complexity score (rows with no score do not match) */
                 max_complexity_score?: number;
-                /** @description Comma-separated prompt ids the request named with x-bf-prompt-id */
+                /** @description Comma-separated prompt ids the request named with x-raiju-prompt-id */
                 selected_prompt_ids?: string;
-                /** @description Comma-separated prompt names the request named with x-bf-prompt-id */
+                /** @description Comma-separated prompt names the request named with x-raiju-prompt-id */
                 prompt_names?: string;
             };
             header?: never;
@@ -19531,7 +19531,7 @@ export interface operations {
             };
             header?: never;
             path: {
-                /** @description Session id (x-bf-session-id, or a coding harness session header) */
+                /** @description Session id (x-raiju-session-id, or a coding harness session header) */
                 session_id: string;
             };
             cookie?: never;
@@ -20198,7 +20198,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description The x-bf-cache-key value (percent-encoded) */
+                /** @description The x-raiju-cache-key value (percent-encoded) */
                 cacheKey: string;
             };
             cookie?: never;
@@ -20568,7 +20568,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description A setup session: an HttpOnly, SameSite=Strict cookie (bifrost_setup_session) that stands in for the token for 12 hours: on POST /api/users and, under the setup lock (no admin yet), on every /api route. The body gives expires_at. */
+            /** @description A setup session: an HttpOnly, SameSite=Strict cookie (raiju_setup_session) that stands in for the token for 12 hours: on POST /api/users and, under the setup lock (no admin yet), on every /api route. The body gives expires_at. */
             200: {
                 headers: {
                     /** @description The setup session cookie. */
@@ -20800,14 +20800,14 @@ export interface operations {
             query?: never;
             header?: {
                 /** @description The operator's setup_token (config or env). Needed while no admin account exists. */
-                "X-Bifrost-Setup-Token"?: string;
+                "X-Raiju-Setup-Token"?: string;
             };
             path?: never;
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description A setup session: an HttpOnly, SameSite=Strict cookie (bifrost_setup_session) that stands in for the token on POST /api/users for 12 hours. The body gives expires_at. */
+            /** @description A setup session: an HttpOnly, SameSite=Strict cookie (raiju_setup_session) that stands in for the token on POST /api/users for 12 hours. The body gives expires_at. */
             200: {
                 headers: {
                     /** @description The setup session cookie. */
@@ -25730,7 +25730,7 @@ export interface operations {
             query?: never;
             header: {
                 /** @description The consent temp token of this request */
-                "X-Bifrost-Temp-Token": string;
+                "X-Raiju-Temp-Token": string;
             };
             path: {
                 /** @description The authorization request's id */
@@ -25774,7 +25774,7 @@ export interface operations {
             query?: never;
             header: {
                 /** @description The consent temp token of this request */
-                "X-Bifrost-Temp-Token": string;
+                "X-Raiju-Temp-Token": string;
             };
             path: {
                 /** @description The authorization request's id */
@@ -25844,7 +25844,7 @@ export interface operations {
         parameters: {
             query?: {
                 q?: string;
-                bf_mode?: string;
+                raiju_mode?: string;
                 virtual_key_id?: string;
                 user_id?: string;
                 limit?: number;
@@ -25865,7 +25865,7 @@ export interface operations {
                     "application/json": components["schemas"]["ManagementErrorResponse"];
                 };
             };
-            /** @description A bf_mode, limit or offset is not valid. */
+            /** @description A raiju_mode, limit or offset is not valid. */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -25929,7 +25929,7 @@ export interface operations {
             query?: never;
             header?: {
                 /** @description The flow's temp token, when client.mcp_enable_temp_token_auth is on */
-                "X-Bifrost-Temp-Token"?: string;
+                "X-Raiju-Temp-Token"?: string;
             };
             path: {
                 /** @description The consent flow's id */
@@ -25973,7 +25973,7 @@ export interface operations {
             query?: never;
             header?: {
                 /** @description The flow's temp token, when client.mcp_enable_temp_token_auth is on */
-                "X-Bifrost-Temp-Token"?: string;
+                "X-Raiju-Temp-Token"?: string;
             };
             path: {
                 /** @description The consent flow's id */
@@ -27001,7 +27001,7 @@ export interface operations {
             query?: never;
             header?: {
                 /** @description The submission's temp token (the fragment of the link a tool call answered), when client.mcp_enable_temp_token_auth is on */
-                "X-Bifrost-Temp-Token"?: string;
+                "X-Raiju-Temp-Token"?: string;
             };
             path: {
                 /** @description The submission flow's id */
@@ -27081,7 +27081,7 @@ export interface operations {
             query?: never;
             header?: {
                 /** @description The submission's temp token (the fragment of the link a tool call answered), when client.mcp_enable_temp_token_auth is on */
-                "X-Bifrost-Temp-Token"?: string;
+                "X-Raiju-Temp-Token"?: string;
             };
             path: {
                 /** @description The submission flow's id */

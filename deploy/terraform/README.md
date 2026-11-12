@@ -27,7 +27,7 @@ module "raiju" {
   replicas         = 2
   workers          = 2
 
-  config_json          = file("config.json")   # Bifrost format, refers to env.NAME
+  config_json          = file("config.json")   # Raiju format, refers to env.NAME
   existing_secret_name = "raiju-keys"          # preferred
   # provider_secrets = { OPENAI_API_KEY = var.openai_api_key }   # state holds the value
 
@@ -56,7 +56,7 @@ module "raiju" {
 
   secret_arns = {
     OPENAI_API_KEY      = "arn:aws:secretsmanager:us-east-1:123456789012:secret:raiju/openai"
-    BIFROST_SETUP_TOKEN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:raiju/setup"
+    RAIJU_SETUP_TOKEN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:raiju/setup"
   }
 }
 ```
@@ -64,11 +64,16 @@ module "raiju" {
 `ingress_cidr_blocks` has no default, and the module serves HTTPS only: set
 `certificate_arn`, or `allow_plain_http = true` to serve plain HTTP on purpose.
 The management API is locked until an admin exists: give the tasks a
-`BIFROST_SETUP_TOKEN` (or `setup_token` in a mounted config), create the first
+`RAIJU_SETUP_TOKEN` (or `setup_token` in a mounted config), create the first
 admin with it, then remove it if you like.
 
 Outputs: `alb_dns_name`, `service_name`, `cluster_arn`, `task_definition_arn`,
 `log_group_name`, `target_group_arn`, `service_security_group_id`, `cluster_dns_name`.
+
+`allow_task_http_peers` is off by default: only the ALB reaches the main HTTP port. The staging example explicitly
+enables service-security-group peer access so its probe tasks can run direct-node checks; this does not open the
+port to arbitrary VPC clients. The staging example also requires `aws_account_id`, enforced by the AWS provider,
+and accepts `cpu_architecture` to match the candidate image.
 
 The root filesystem is read-only (`readonly_root_filesystem`), and two volumes are
 writable: `/app/data` (the EFS file system when `efs_file_system_id` is set, else the
@@ -129,6 +134,7 @@ each keeps its own config. A cluster needs:
 {
   "cluster": {
     "enabled": true,
+    "peers": [],
     "secret": "env.RAIJU_CLUSTER_SECRET",
     "config_sync": "file",
     "listen_port": 7946,

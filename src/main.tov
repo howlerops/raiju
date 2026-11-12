@@ -1,7 +1,7 @@
-// raiju: an LLM gateway. Flags follow Bifrost's: -port, -host, -app-dir
-// (which holds config.json), plus -config <file> and -workers <n>. -mode broker runs the
+// raiju: an LLM gateway. Flags include -port, -host, -app-dir
+// (which holds config.json), -config <file> and -workers <n>. -mode broker runs the
 // cluster broker instead of a gateway (cluster_config.type "broker"). -healthcheck [path] probes a
-// gateway running on this host (the -host and -port given) and exits 0 when it answers 2xx.
+// gateway on this host using -host and -port and exits 0 when it answers 2xx.
 import { aliasProblems } from "./router"
 import { configureCrews } from "./crew"
 import { startBroker } from "./broker"
@@ -23,21 +23,21 @@ import { start, startCluster, bodyLimits, NO_BODY_LIMIT, startLiveModelRefresher
 import { serverLimits, stopSettings, beginStop, ServerLimits } from "./lifecycle"
 import { secretProblem } from "./cluster"
 import { Ops, withSecrets, makeShareDir } from "./ops"
-import { fromBifrost, merge } from "./guardrails_compat"
+import { fromRaiju, merge } from "./guardrails_compat"
 import { warnings } from "./config_compat"
 import { existsSync, readFileSync } from "node:fs"
 import { startFront, startClusterFront } from "./front"
-import { openIssuerState } from "./mcpissuer"
+import { openIssuerState, serverAuthMode } from "./mcpissuer"
 import { setA2aGrpc, listenA2aGrpc, claimA2aGrpc } from "./a2agrpc"
 import { healthcheckUrl, runHealthcheck } from "./healthcheck"
 import { allocCheck, upgradeNotice, NOTICE_FILE } from "./startup"
 
-// healthcheck: the path -healthcheck probes ("" when the flag is not given); hostGiven: -host or BIFROST_HOST set the bind
+// healthcheck: the path -healthcheck probes ("" when omitted); hostGiven: -host or RAIJU_HOST set the bind address.
 type Args = { port: int, host: string, config: string, workers: int, server: string, mode: string, healthcheck: string, hostGiven: bool }
 
 function parseArgs(argv: string[]): Args {
-  // the bind address defaults to the loopback, as Bifrost's (localhost, BIFROST_HOST overrides); containers pass -host 0.0.0.0
-  const a: Args = { port: 8080, host: process.env.BIFROST_HOST ?? "127.0.0.1", config: "", workers: 1, server: process.env.RAIJU_SERVER ?? "", mode: process.env.RAIJU_MODE ?? "", healthcheck: "", hostGiven: process.env.BIFROST_HOST !== undefined }
+  // The bind address defaults to localhost; RAIJU_HOST overrides it. Containers pass -host 0.0.0.0.
+  const a: Args = { port: 8080, host: process.env.RAIJU_HOST ?? "127.0.0.1", config: "", workers: 1, server: process.env.RAIJU_SERVER ?? "", mode: process.env.RAIJU_MODE ?? "", healthcheck: "", hostGiven: process.env.RAIJU_HOST !== undefined }
   const envPort = process.env.PORT
   if (envPort !== undefined) a.port = parseInt(envPort) ?? 8080
   const envConfig = process.env.RAIJU_CONFIG
@@ -79,14 +79,14 @@ function loadConfigOrExit(file: string): Config | undefined {
   }
 }
 
-// Bifrost's guardrails_config, translated and merged into the served config (never saved:
-// the store keeps the section as written).
-function withBifrostGuardrails(c: Config, store: ConfigStore, report: bool): Config {
+// guardrails_config is translated and merged into the served config, but never saved:
+// the store keeps the section as written.
+function withRaijuGuardrails(c: Config, store: ConfigStore, report: bool): Config {
   const raw = store.rawSection("guardrails_config")
   if (raw === undefined) return c
   let g = c.guardrails
   try {
-    const t = fromBifrost(raw)
+    const t = fromRaiju(raw)
     if (report) for (const w of t.warnings) console.error(`raiju: guardrails: ${w}`)
     g = merge(c.guardrails, t.config)
   } catch (e) {
@@ -97,7 +97,7 @@ function withBifrostGuardrails(c: Config, store: ConfigStore, report: bool): Con
   return n
 }
 
-// What Raiju makes of the config file: Bifrost names it reads differently, keys it ignores.
+// Config file field handling: recognized names and ignored keys.
 function reportConfig(file: string): void {
   try {
     if (!existsSync(file)) return
@@ -125,7 +125,7 @@ async function lockedSave(store: ConfigStore, what: string, save: () => void): P
 async function applyChange(engine: Engine, ops: Ops, store: ConfigStore, c: Config, appDir: string): Promise<void> {
   let resolved = c
   resolveConfig(&resolved)
-  const next = withBifrostGuardrails(withAppDirs(await withSecrets(resolved), appDir), store, false)
+  const next = withRaijuGuardrails(withAppDirs(await withSecrets(resolved), appDir), store, false)
   engine.reload(next)
   // the other workers learn that this one runs the generation (a management API answer waits for them, ops.settleConfig)
   ops.ackConfig()
@@ -230,8 +230,8 @@ async function main(): Promise<int> {
   setPluginCacheBase(appDir)
   const loaded = loadConfigOrExit(args.config)
   if (loaded === undefined) return 1
-  // Encryption at rest: the sealed secrets in the file are opened with the cipher from encryption_key
-  // (or BIFROST_ENCRYPTION_KEY). A value that cannot be opened stops the start, as it is never guessed at.
+  // Encryption at rest: sealed secrets in the file are opened with the cipher from encryption_key
+  // (or RAIJU_ENCRYPTION_KEY). A value that cannot be opened prevents startup; its value is never guessed.
   let cipher: ConfigCipher | undefined = undefined
   let raw = loaded
   try {
@@ -258,7 +258,7 @@ async function main(): Promise<int> {
   }
   if (args.mode === "broker") return runBroker(first, args.host)
   reportConfig(args.config)
-  const cfg = withBifrostGuardrails(withAppDirs(await withSecrets(first), appDir), store, true)
+  const cfg = withRaijuGuardrails(withAppDirs(await withSecrets(first), appDir), store, true)
   for (const p of aliasProblems(cfg)) console.error(`raiju: config: ${p}`)
   // crew routing (crew.tov): the pools, priors and classifier are checked and loaded here, relative to the config file's folder
   const crewProblems = configureCrews(cfg, path.dirname(args.config))
@@ -267,13 +267,17 @@ async function main(): Promise<int> {
   // the MCP authorization server's state beside config.json: its signing key (generated when none is configured)
   // and its grants. It is opened before the workers start, so every worker signs with the same key.
   const stateNote = openIssuerState(cfg, path.join(path.dirname(args.config), "mcp-oauth-state.json"), cipher)
-  if (stateNote !== "") console.error(`raiju: mcp oauth: ${stateNote}`)
+  if (stateNote !== "") {
+    console.error(`raiju: mcp oauth: ${stateNote}`)
+    // An enabled issuer must not serve from a node that failed to load its durable shared identity.
+    if (serverAuthMode(cfg) !== "headers") return 1
+  }
   // plugins whose path is a URL are downloaded before the chain is built (plugindl.tov)
   const pdl = await fetchPluginUrls(pluginPaths(cfg), cfg.server?.plugin_download_private_allowlist ?? [], false)
   for (const e of pdl.errors) console.error(`raiju: plugin: ${e}`)
   const engine = new Engine(cfg)
   const ops = new Ops(engine, store)
-  // a required log store or audit log that cannot open stops the start, as Bifrost's does (required: false keeps going)
+  // Failure to open a required log store or audit log prevents startup; required: false allows startup to continue.
   const storage = ops.storageProblems()
   for (const p of storage) console.error(`raiju: ${p} (set required: false to start without it)`)
   if (storage.length > 0) return 1
@@ -284,9 +288,7 @@ async function main(): Promise<int> {
   // a tool call of a per_user_headers client whose key has submitted nothing opens a submission and names its page
   engine.headersAuth = (client: string, vk: string, session: string, user: string, base: string): string => headersAuthMessage(store, client, vk, session, user, base)
   // token_exchange admin credentials: renewed before they expire and after a 401, and saved to the config file
-  engine.adminSaved = (r) => {
-    lockedSave(store, "an MCP admin credential", () => saveExchangeAdmin(store, r))
-  }
+  engine.adminSaved = (r) => lockedSave(store, "an MCP admin credential", () => saveExchangeAdmin(store, r))
   // token_exchange admin credentials. Each is renewed by one node of the cluster (Ops.ownsAdmin) and by one worker of
   // that node at a time (the lease in the supervisor's share folder, shared by its workers). The renewed credential is
   // read back from the config file by the other workers, and sent to the other nodes through the cluster state with

@@ -1,17 +1,17 @@
-// GPT Live over WebRTC, terminated here as Bifrost's webrtclive.go and webrtcrelay.go do: the browser's
-// SDP offer is answered by this gateway's own peer connection, a second peer connection offers to the
-// provider, and the two are relayed: audio as RTP packets (never decoded) and the "oai-events" data
-// channel as text. Every data-channel event passes through LiveCore, which meters, guards and reports
-// it. The peer connections are libdatachannel's (tov-patches/0006, std/rtc).
+// GPT Live over WebRTC terminates at the gateway: one peer connection answers
+// the browser's SDP offer, a second offers to the provider, and the two relay
+// audio as RTP packets (without decoding) and the "oai-events" data channel as
+// text. Every data-channel event passes through LiveCore for metering, guards
+// and reporting. Peer connections use libdatachannel (tov-patches/0006, std/rtc).
 //
 // Layout of this file, top to bottom:
-//   - SDP and RTP helpers (pure): the Opus-only offer, a2=max-message-size, RTP header cleanup
-//   - LiveEventFilter: the server-event permissions of the create body (liveeventfilter.go)
-//   - LiveCore: the session's policy and metering (livesession.go and livemeter.go): usage seconds in
-//     billing windows, the 15 s minimum, token usage of delegated responses, the transcript, the
-//     guard hooks, draining until session.closed
-//   - Relay: the two legs wired to a core, with the queues and the clock
-//   - establish: the create handshake with real peer connections
+//   - SDP and RTP helpers (pure): Opus-only offer, a2=max-message-size, RTP header cleanup
+//   - LiveEventFilter: server-event permissions from the create body
+//   - LiveCore: session policy and metering, including voice billing windows,
+//     the 15 s minimum, delegated-response token usage, transcript, guard hooks,
+//     and draining until session.closed
+//   - Relay: the two legs wired to a core, with queues and clock
+//   - establish: create handshake with real peer connections
 import { RTCPeerConnection, RTCDataChannel, RTCTrack, RTCConfig } from "std/rtc"
 import { Field, fields, find, rawStr, setField, build, quote, elements } from "./json"
 import { openSessions } from "./drain"
@@ -28,7 +28,7 @@ const STALE_AFTER_MS = 2.0 * LIVE_WINDOW_SECONDS * 1000.0
 // Bounds: the transcript kept per session, and the messages waiting for a channel to open.
 const TRANSCRIPT_MAX = 1048576
 const PENDING_MAX = 1000
-// Bifrost's handshake timeouts
+// Handshake timeouts.
 const HANDSHAKE_MS = 10000
 const GATHER_MS = 3000
 const BROWSER_DRAIN_MS = 10000
@@ -354,20 +354,21 @@ export type Refusal = { status: int, type: string, message: string }
 // refusal), record the finished session, bind the provider's session id to the virtual key that
 // opened it (false when it can't be recorded), and the metrics of an event.
 export class LiveHooks {
-  // The plugins' LLM hooks on each realtime turn (livehooks.tov TurnPlugins, Bifrost's RunRealtimeTurnPreHooks), when
-  // a plugin takes part: turnPre gets the turn's Responses-shaped request ({input, instructions, tools}, without the
-  // model) as the turn starts, and a refusal ends the session as a re-admission's does; turnPost gets the turn's
-  // response ({object, model, status, output, usage}) or its error with the HTTP status when the turn ends, and a
-  // refusal (a post hook's error) ends the session after the turn's row.
+  // Participating plugins' LLM hooks on each realtime turn (livehooks.tov TurnPlugins).
+  // At turn start, turnPre gets the Responses-shaped request ({input, instructions, tools},
+  // without model); a refusal ends the session, as does a re-admission refusal. At turn end,
+  // turnPost gets the response ({object, model, status, output, usage}) or its error with
+  // HTTP status. A post-hook error ends the session after the turn's row.
   turnPre: ((body: string) => Refusal | undefined) | undefined = undefined
   turnPost: ((status: int, body: string) => Refusal | undefined) | undefined = undefined
 
   constructor(readonly readmit: () => Refusal | undefined, readonly report: (r: LiveReport) => void, readonly bind: (id: string) => bool, readonly count: (direction: string, type: string) => void, readonly turn: (t: TurnReport) => void) {}
 }
 
-// What a realtime turn's request is made of, as Bifrost's buildRealtimeTurnPreRequest makes it: the caller's messages and
-// tool outputs since the last turn (as Responses input items with their text), then the input items of the
-// response.create that starts the turn, its instructions, and its tools (else the session's).
+// A realtime turn request contains the caller's messages and tool outputs since the
+// last turn as Responses input items with their text, followed by input items from
+// the response.create that starts the turn, its instructions, and its tools
+// (falling back to the session's tools).
 export function turnRequestJson(inputs: string[], create: string, sessionTools: string): string {
   const items = inputs.slice()
   let instructions: string | undefined = undefined
@@ -426,8 +427,8 @@ export function turnInputOf(type: string, m: string): string {
   return s === "" ? "" : `{"type":"message","role":"user","content":${quote(s)}}`
 }
 
-// A realtime turn's response in the Responses shape, as Bifrost's buildRealtimeTurnPostResponse makes it: the model's
-// text as an assistant message, the function calls the response.done lists, and its usage.
+// A realtime turn response in Responses shape: model text as an assistant message,
+// function calls listed by response.done, and usage.
 export function turnResponseJson(model: string, done: string, text: string): string {
   const out: string[] = []
   if (text !== "") out.push(`{"type":"message","role":"assistant","content":[{"type":"output_text","text":${quote(text)}}]}`)
@@ -458,10 +459,10 @@ export function turnErrorJson(status: int, message: string): string {
 // the cached part of the prompt, and the audio tokens among each side's.
 export type ModelTokens = { model: string, prompt: int, completion: int, cached: int, inputAudio: int, outputAudio: int }
 
-// One billing unit that closed, for its log row, as Bifrost's meter closes them: a window of voice time, a
-// delegated response, or the voice unit that ends a live session ("window", "delegation", "end"); a realtime
-// response ("turn"), or what a turn left behind when the session ended ("end"). The units of a session are
-// linked by its id.
+// A closed billing unit for its log row: a voice-time window ("window"), delegated
+// response ("delegation"), or final voice unit ("end"); a realtime response ("turn"),
+// or the remainder of a turn when the session ends ("end"). Units are linked by
+// the session id.
 export type TurnReport = {
   kind: string,
   // 1-based, in the order the units closed
@@ -493,9 +494,9 @@ export type TurnReport = {
 // and its error.
 export type DoneOutcome = { state: string, reason: string, status: int, error: string }
 
-// The status Bifrost gives a realtime error (newBifrostErrorFromRealtimeError): 500, or 400 when its type, code or
-// message names an invalid request, or 429 when one names a rate limit, a quota, a budget or billing (the last of
-// them that matches wins, as Bifrost reads them in that order).
+// Realtime errors default to status 500. A type, code or message indicating an
+// invalid request sets 400; one indicating a rate limit, quota, budget or billing
+// sets 429. Checks run in that order, and the last match wins.
 export function realtimeErrorStatus(values: string[]): int {
   let status = 500
   for (const v of values) {
@@ -507,11 +508,11 @@ export function realtimeErrorStatus(values: string[]): int {
   return status
 }
 
-// What a response.done says about the end of its response. completed (or no status) is 200. failed is the realtime
-// error its status_details carry, with Bifrost's status for it (realtimeErrorStatus) and its message. cancelled (the
-// caller's response.cancel, or a turn the caller's speech cut off) is 499, the status Bifrost logs a cancelled
-// request with. incomplete (max_output_tokens, a content filter) delivered what it had, so it is 200 as Bifrost logs
-// it, with the reason beside it.
+// response.done status mapping: completed or absent status is 200. failed uses
+// the realtime error's mapped status and message from status_details. cancelled
+// (response.cancel or a turn interrupted by caller speech) is logged as 499.
+// incomplete (max_output_tokens or a content filter) is logged as 200 with its
+// reason, since it delivered the output available.
 export function doneOutcome(m: string): DoneOutcome {
   const state = strAt(m, ["response", "status"])
   const reason = strAt(m, ["response", "status_details", "reason"])
@@ -644,7 +645,7 @@ function isRealtimeOutputDelta(type: string): bool {
 }
 
 const INPUT_TRANSCRIPT = "conversation.item.input_audio_transcription.completed"
-// What Bifrost answers a response.create made while a response is running.
+// The reply to response.create while a response is already running.
 const ACTIVE_RESPONSE = "Conversation already has an active response in progress."
 
 // The check of a live session.update before it reaches the provider (live.tov checkDelegation): the frame to send (its
@@ -684,7 +685,7 @@ export class LiveCore {
   // model of a live session's delegated responses when they name none
   model = ""
   backendModel = ""
-  // a live session's check of each session.update (Bifrost's liveUpdatePolicy), when it has one
+  // A live session's policy check of each session.update, when configured.
   checkUpdate: ((m: string) => UpdateCheck) | undefined = undefined
   // a turn (a response, from its start to its response.done) is running
   turnActive = false
@@ -768,8 +769,8 @@ export class LiveCore {
       if (inp !== "" && this.turnInputs.length < 256) this.turnInputs.push(inp)
       if (type === "session.update") this.noteTools(out)
     }
-    // a realtime turn the caller starts is admitted first; a refusal ends the session and the event goes nowhere. A
-    // response.create while a turn is running is refused and goes nowhere either, as Bifrost does (the session goes on)
+    // A caller-started realtime turn is admitted first; refusal ends the session and blocks
+    // the event. response.create during a running turn is also blocked, but the session continues.
     if (this.realtime && type === "response.create") {
       if (this.turnActive) {
         this.io.toClient(errorEvent("invalid_request_error", ACTIVE_RESPONSE))
@@ -896,8 +897,8 @@ export class LiveCore {
       this.endForRefusal(why.type, why.message, why.status)
       return
     }
-    // the plugins' pre hooks on the turn's request (Bifrost's RunRealtimeTurnPreHooks): a refusal (a short-circuit error,
-    // or a short-circuit answer, which a turn cannot take) closes the session with its error, as Bifrost closes it
+    // Turn-request pre hooks: a refusal (a short-circuit error or a short-circuit answer,
+    // which a turn cannot accept) closes the session with its error.
     const pre = this.hooks.turnPre
     const create = this.pendingCreate
     this.pendingCreate = ""
@@ -977,8 +978,8 @@ export class LiveCore {
     const began = this.turnStartMs > 0.0 ? this.turnStartMs : this.now
     this.turnStartMs = 0.0
     let outcome = doneOutcome(m)
-    // the turn's post hooks (its response, or the error a failed or cancelled response is); a post hook's error is the
-    // turn's error, and the session ends after its row, as Bifrost closes it with the error
+    // Turn post hooks receive the response or the failed/cancelled response's error.
+    // A post-hook error becomes the turn's error and ends the session after its row.
     const refused = this.turnDone(outcome.status, outcome.status === 200 ? turnResponseJson(this.model, m, text.output) : turnErrorJson(outcome.status, outcome.error))
     if (refused !== undefined) outcome = { state: outcome.state, reason: outcome.reason, status: refused.status, error: refused.message }
     this.emit("turn", 0.0, 0.0, [used], text.input, text.output, began, this.now, false, outcome)
@@ -1777,9 +1778,9 @@ function makePeer(cfg: RTCConfig): RTCPeerConnection | undefined {
   }
 }
 
-// Counts a WebRTC session among those a graceful stop ends (drain.tov): once the drain has run out it is closed
-// (what it used is reported, the browser gets what is queued, both peers go), as Bifrost's shutdown closes its
-// relays. The registry forgets it when it closes.
+// Registers a WebRTC session for graceful shutdown (drain.tov). When draining times
+// out, usage is reported, queued data is sent to the browser, and both peers close.
+// The registry removes the session when it closes.
 function track(relay: Relay): void {
   const id = openSessions().add({ feed: false, goAway: () => {
     relay.close()
@@ -2451,7 +2452,7 @@ test("a realtime turn is admitted when it starts, once, whoever starts it", () =
   // the provider's own events for the same turn do not admit it again
   t.core.fromProvider(`{"type":"response.created","response":{"id":"resp_1"}}`, undefined, 1150.0)
   expect(t.cap.readmits).toBe(1)
-  // another response.create while it runs is refused, as Bifrost does: the caller is told, the provider never sees it
+  // Another response.create while a response runs is refused: the caller is notified; the provider never sees it.
   const sentBefore = t.cap.client.length
   t.core.fromClient(`{"type":"response.create"}`, [], 1160.0)
   expect(t.cap.readmits).toBe(1)
@@ -2742,7 +2743,7 @@ test("a realtime turn the caller cut off, or text no turn took, is a closing row
   expect(v.cap.turns.length).toBe(0)
 })
 
-test("a failed or cancelled response.done is a row with the status Bifrost gives it; an incomplete one is 200", () => {
+test("a failed or cancelled response.done is a row with the status Raiju gives it; an incomplete one is 200", () => {
   const t = realtimeFixture()
   t.core.fromClient(`{"type":"response.create"}`, [], 1100.0)
   t.core.fromProvider(`{"type":"response.done","response":{"id":"r_f","status":"failed","status_details":{"type":"failed","error":{"type":"server_error","code":"upstream_error","message":"the model crashed"}},"usage":{"input_tokens":30,"output_tokens":2}}}`, undefined, 1200.0)

@@ -3,7 +3,7 @@
 virtual key, a chat whole and streamed on RAIJU_MODEL, /metrics, and (with --providers) the real-provider matrix of
 tests/smoke.py run through BASE_URL instead of a local gateway.
 
-Usage: tests/staging/smoke_check.py [--base-url URL] [--providers openai/gpt-4.1-nano,anthropic/claude-haiku-4-5]
+Usage: tests/staging/smoke_check.py [--base-url URL] [--providers openai/gpt-4o-mini,anthropic/claude-haiku-4-5]
 Settings come from the environment (tests/staging/kit.py): RAIJU_BASE_URL, RAIJU_ADMIN_TOKEN, RAIJU_VKS,
 RAIJU_MODEL, RAIJU_METRICS_TOKEN, RAIJU_SETUP_TOKEN (checked to open nothing once an admin exists).
 Each check prints PASS, FAIL or SKIP with its numbers; the exit status is 1 when one failed.
@@ -65,7 +65,7 @@ def check_management(rep, s, gw):
     rep.add("smoke.api_locked_without_credentials", st in (401, 403), {"status": st})
     setup = os.environ.get("RAIJU_SETUP_TOKEN", "")
     if setup and (s.admin_token or s.admin_user):
-        st, _, _ = kit.request("GET", gw.base + "/api/governance/virtual-keys", headers={"x-bifrost-setup-token": setup}, timeout=15, ca_file=s.ca_file)
+        st, _, _ = kit.request("GET", gw.base + "/api/governance/virtual-keys", headers={"x-raiju-setup-token": setup}, timeout=15, ca_file=s.ca_file)
         rep.add("smoke.setup_token_closed_after_first_admin", st in (401, 403), {"status": st})
     if not (s.admin_token or s.admin_user):
         rep.add("smoke.admin_api", None, {}, "no RAIJU_ADMIN_TOKEN")
@@ -80,10 +80,10 @@ def check_inference(rep, s, gw):
     if not s.vks:
         rep.add("smoke.inference", None, {}, "no RAIJU_VKS")
         return
-    st, _, _ = gw.infer("/v1/chat/completions", {"model": s.model, "max_tokens": 4, "messages": [{"role": "user", "content": "hi"}]}, vk="sk-bf-" + "not-a-real-key")
+    st, _, _ = gw.infer("/v1/chat/completions", {"model": s.model, "max_tokens": 4, "messages": [{"role": "user", "content": "hi"}]}, vk="sk-raiju-" + "not-a-real-key")
     rep.add("smoke.unknown_virtual_key_refused", st in (401, 403), {"status": st})
     t0 = time.time()
-    st, _, b = gw.get("/v1/models", {"x-bf-vk": s.vks[0]})
+    st, _, b = gw.get("/v1/models", {"x-raiju-vk": s.vks[0]})
     n = len((kit.jload(b) or {}).get("data", [])) if st == 200 else 0
     rep.add("smoke.models", st == 200 and n > 0, {"status": st, "models": n, "ms": round((time.time() - t0) * 1000)})
     ask = [{"role": "user", "content": "Reply with the single word: ok"}]
@@ -110,7 +110,7 @@ def check_metrics(rep, s, gw):
     if st == 401 and not s.metrics_token:
         rep.add("smoke.metrics", None, {"status": st}, "server.metrics_token is set: give RAIJU_METRICS_TOKEN")
         return
-    reqs = kit.metric_sum(b.decode("utf8", "replace"), "bifrost_upstream_requests_total") if st == 200 else None
+    reqs = kit.metric_sum(b.decode("utf8", "replace"), "raiju_upstream_requests_total") if st == 200 else None
     rep.add("smoke.metrics", st == 200, {"status": st, "bytes": len(b), "upstream_requests": reqs if reqs is not None else 0})
 
 
@@ -120,7 +120,7 @@ def run_matrix(rep, s, models):
     import smoke  # tests/smoke.py
     smoke.GW = s.base_url
     gw = kit.Gateway(s.base_url, s)
-    extra = {"x-bf-vk": s.vks[0]} if s.vks else {}
+    extra = {"x-raiju-vk": s.vks[0]} if s.vks else {}
     extra.update(gw.admin_headers())
     orig = smoke.call
 

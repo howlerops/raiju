@@ -12,8 +12,7 @@ Issues in a vendored library below are fixed by updating the library in the Tov 
 
 ## Outbound requests
 
-Every outbound URL a user or caller controls goes through one address guard (`src/netguard.tov`), which matches
-Bifrost's `core/network/ssrf.go`:
+Every outbound URL a user or caller controls goes through one address guard (`src/netguard.tov`):
 
 - Hosts are read the way the resolver reads them, so another spelling of an address is the same address: IPv4 in
   any `inet_aton` form (`2130706433`, `0x7f000001`, `0177.0.0.1` and `127.1` are all 127.0.0.1), IPv6 with an
@@ -31,7 +30,7 @@ Bifrost's `core/network/ssrf.go`:
 
 | Target | Private addresses | Switch or allowlist |
 |---|---|---|
-| Every provider connection (`base_url` from the config file or the API, key-level URLs, model listings, token endpoints configured on a key, realtime and live WebSockets) | refused (loopback allowed) | the provider's `network_config.allow_private_network` (as Bifrost's `ConfigureDialer`) |
+| Every provider connection (`base_url` from the config file or the API, key-level URLs, model listings, token endpoints configured on a key, realtime and live WebSockets) | refused (loopback allowed) | the provider's `network_config.allow_private_network` |
 | A2A push callbacks (set by callers with a virtual key) | refused | `server.a2a_allow_private_push_callbacks` |
 | A2A agents (card, OAuth endpoints, every call, gRPC included) | refused | the agent's `allow_private_network` |
 | Webhook endpoints | refused | the endpoint's `allow_private_network` |
@@ -42,22 +41,22 @@ Bifrost's `core/network/ssrf.go`:
 
 Redirects: webhooks, A2A push callbacks, agent cards and their OAuth endpoints, exporters, and OAuth and token
 exchange POSTs follow none. Plugin downloads check each hop. A2A calls follow a redirect only on the origin they
-were sent to (Bifrost's rule), and an MCP OpenAPI tool call that carries credentials (a query, or a header besides
+were sent to, and an MCP OpenAPI tool call that carries credentials (a query, or a header besides
 `Accept` and `Content-Type`) gets a redirect to another host, or from https to http, back as the 3xx result.
 
 Raw-socket connections are checked by the runtime the same way (`tov-patches/0022`, the `peer` option of
 `Bun.connect` and of the WebSocket client): A2A agents called over gRPC (under the agent's `allow_private_network`),
 Redis or Valkey vector stores (as the HTTP stores), and realtime and live WebSocket connections to providers (as every
-provider connection; Bifrost dials those unchecked).
+provider connection).
 
 Limits: through a proxy (a provider's `proxy_config`, the global proxy, `HTTP_PROXY`) the proxy resolves the host,
-so only an address written in the URL is checked, as Bifrost does. WebRTC media goes to the ICE candidates the
+so only an address written in the URL is checked. WebRTC media goes to the ICE candidates the
 provider's SDP answer names, which are not checked (the SDP exchange is). The OTLP gRPC exporter and Kafka brokers
 (operator-configured raw sockets) are not checked.
 
 ## Sign-in
 
-- **Passwords** are stored as bcrypt hashes (cost 10, Bifrost's form: `governance.users[].password_hash`, and
+- **Passwords** are stored as bcrypt hashes (cost 10, `governance.users[].password_hash`, and
   `auth_config.admin_password` is hashed in memory unless it is already a bcrypt hash). A user still holding the
   old salted SHA-256 form (`salt` + `password_sha256`) signs in with it once and gets a bcrypt hash saved in its
   place. A password checked once is remembered in the process for ten minutes (by an HMAC with a per-process key),

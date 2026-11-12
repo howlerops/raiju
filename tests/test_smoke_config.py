@@ -61,6 +61,7 @@ class BuildConfig(unittest.TestCase):
         self.assertNotIn("pem-fixture", text)
         ps = cfg["providers"]
         self.assertEqual(ps["openai"]["keys"][0]["value"], "env.OPENAI_API_KEY")
+        self.assertEqual(plan["openai"]["model"], "openai/gpt-4o-mini")
         self.assertEqual(ps["bedrock"]["keys"][0]["bedrock_key_config"], {"access_key": "env.AWS_ACCESS_KEY_ID", "secret_key": "env.AWS_SECRET_ACCESS_KEY", "region": "us-east-1"})
         self.assertEqual(ps["azure"]["keys"][0]["azure_key_config"]["endpoint"], "env.AZURE_OPENAI_ENDPOINT")
         self.assertEqual(ps["vertex"]["keys"][0]["vertex_key_config"], {"project_id": "sa-proj", "region": "us-central1", "auth_credentials": "env." + smoke.VERTEX_CREDS_VAR})

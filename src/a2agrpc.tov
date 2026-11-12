@@ -1,16 +1,15 @@
-// The A2A gRPC binding (Bifrost's handlers/agentgatewaygrpc.go): the lf.a2a.v1 service on a listener of its own, with
-// each agent under <name>.<server.a2a_grpc_base_domain>. The agent is the first label of the request's :authority under
-// that domain; a foreign host, no agent or more labels is NOT_FOUND. The caller's virtual key is read from the metadata
-// in the order Bifrost reads it, and the call passes the gate of the HTTP bindings (Ops.a2aGrpcGate). A method decodes
-// its request (a2apb), runs the operation the JSON-RPC binding would run (Ops.a2aCall, binding "grpc") and encodes the
-// answer; an agent's error is a gRPC status as a2a-go maps it.
+// The A2A gRPC binding exposes lf.a2a.v1 on a separate listener, with each agent under
+// <name>.<server.a2a_grpc_base_domain>. The agent is the first label of the request's :authority under that domain;
+// a foreign host, missing agent or extra labels returns NOT_FOUND. The caller's virtual key is read from metadata,
+// and the call passes the HTTP bindings' gate (Ops.a2aGrpcGate). Each method decodes its request (a2apb), runs the
+// operation used by the JSON-RPC binding (Ops.a2aCall, binding "grpc"), and encodes the answer. Agent errors are
+// mapped to gRPC statuses.
 //
-// An error the agent answered (a JSON-RPC error, whatever binding it came in) carries the details a2a-go attaches
-// to its status: a google.rpc.ErrorInfo with the A2A reason in grpc-status-details-bin (grpcstatus.tov). The
-// gateway's own refusals (no agent, no key, no grant, limits) are plain statuses, as Bifrost's are.
+// An agent's JSON-RPC error, regardless of binding, carries a google.rpc.ErrorInfo with the A2A reason in
+// grpc-status-details-bin (grpcstatus.tov). Gateway refusals (no agent, no key, no grant, limits) are plain statuses.
 //
-// A client that cancels a call (RST_STREAM, or its connection lost) cancels the call upstream: the agent's request is
-// aborted or its gRPC stream reset (ops.tov CallCancel). Not built: TLS (h2c only, as Bifrost's listener).
+// Client cancellation (RST_STREAM or a lost connection) cancels the upstream call by aborting the agent request or
+// resetting its gRPC stream (ops.tov CallCancel). The listener supports h2c only, not TLS.
 import { listen, H2Header } from "./h2"
 import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs"
 import { writeFileAtomic } from "./atomicfile"
@@ -27,7 +26,7 @@ const SERVICE = "/lf.a2a.v1.A2AService/"
 // grpc-go's default largest request message
 const MAX_RECV: int = 4194304
 // the prefix of a virtual key (governance.tov's VK_PREFIX)
-const VK_PREFIX = "sk-bf-"
+const VK_PREFIX = "sk-raiju-"
 
 function trimDots(s: string): string {
   let a: int = 0
@@ -37,8 +36,8 @@ function trimDots(s: string): string {
   return s.slice(a, b)
 }
 
-// The agent an :authority names under the domain: its first label, lower-cased, with the port dropped. "" when the
-// authority is not under the domain, names no agent, or has more labels (Bifrost's agentNameFromAuthority).
+// The agent named by :authority under the domain: its lower-cased first label, with the port removed. Returns ""
+// when the authority is outside the domain, names no agent, or has extra labels.
 export function agentOfAuthority(authority: string, domain: string): string {
   const parts = authority.split(":")
   // an IPv6 literal or a stray colon is no DNS name
@@ -51,8 +50,8 @@ export function agentOfAuthority(authority: string, domain: string): string {
   return name
 }
 
-// The virtual key a call sent and the metadata it came in on (Bifrost's resolveVirtualKeyFromGRPCMetadata): x-bf-vk
-// first, then a Bearer token, then x-api-key, x-goog-api-key or api-key. The last three count only with the sk-bf- prefix.
+// The virtual key and its metadata field: x-raiju-vk first, then a Bearer token, then x-api-key, x-goog-api-key or
+// api-key. The last three are accepted only with the sk-raiju- prefix.
 export function keyOf(md: H2Header[]): { value: string, header: string } {
   const get = (name: string): string => {
     for (const h of md) {
@@ -60,8 +59,8 @@ export function keyOf(md: H2Header[]): { value: string, header: string } {
     }
     return ""
   }
-  const vk = get("x-bf-vk")
-  if (vk !== "") return { value: vk, header: "x-bf-vk" }
+  const vk = get("x-raiju-vk")
+  if (vk !== "") return { value: vk, header: "x-raiju-vk" }
   const auth = get("authorization")
   if (auth.toLowerCase().startsWith("bearer ")) {
     const token = auth.slice(7, auth.byteLength).trim()
@@ -74,9 +73,9 @@ export function keyOf(md: H2Header[]): { value: string, header: string } {
   return { value: "", header: "" }
 }
 
-// The call's metadata as the gateway's headers: lower-cased names, the first value of each, without the transport's own
-// fields (:pseudo, grpc-*) and a2a-version (Bifrost's sanitizeGRPCMetadata). The key stays: the gateway takes the key it
-// was sent with out of what goes to the agent, and forward_accepted_credential sends it on where the agent asks.
+// Call metadata as gateway headers: lower-cased names and the first value of each, excluding transport fields
+// (:pseudo, grpc-*) and a2a-version. The key is retained here; it is removed before forwarding to the agent unless
+// forward_accepted_credential sends it where the agent requests.
 export function headersOf(md: H2Header[]): Hdrs {
   const h: Hdrs = new Map()
   for (const x of md) {
@@ -177,8 +176,7 @@ function admit(ops: Ops, domain: string, call: GrpcCall, op: string): Admitted t
   const g: GrpcGate = ops.a2aGrpcGate(name, h, keyOf(call.metadata).value !== "")
   const agent = g.agent
   if (g.status !== 0 && g.grant) {
-    // a refused grant is a2a-go's ErrUnauthorized: PERMISSION_DENIED with the UNAUTHORIZED ErrorInfo, as Bifrost's
-    // governance refusal reaches a gRPC caller
+    // A refused grant returns a2a-go's ErrUnauthorized: PERMISSION_DENIED with an UNAUTHORIZED ErrorInfo.
     const ge = new GrpcError(GRPC_PERMISSION_DENIED, g.message)
     try {
       ge.details = try a2aStatusOf(GRPC_PERMISSION_DENIED, g.message, -31403, "[" + ops.grantInfo(name, op, h, "") + "]")
@@ -319,9 +317,9 @@ export function grpcMethods(ops: Ops, domain: string): Map<string, GrpcRun> {
   return m
 }
 
-// The gRPC settings: when server.a2a_grpc_base_domain and server.a2a_grpc_port are both set (Bifrost starts the listener
-// under the same two), the cards of every worker advertise the interface (ops.a2aGrpc). Returns the reason the settings
-// are refused, "" otherwise. RAIJU_A2A_GRPC_LISTEN_PORT, when set, is the port the listener binds (see listenA2aGrpc).
+// When server.a2a_grpc_base_domain and server.a2a_grpc_port are both set, every worker's cards advertise the gRPC
+// interface (ops.a2aGrpc). Returns the reason the settings are refused, or "" when valid. RAIJU_A2A_GRPC_LISTEN_PORT,
+// when set, selects the listener's bind port (see listenA2aGrpc).
 export function setA2aGrpc(ops: Ops, server: ServerSectionConfig | undefined): string {
   const domain = trimDots((server?.a2a_grpc_base_domain ?? "").toLowerCase())
   const port: int = server?.a2a_grpc_port ?? 0
@@ -412,10 +410,10 @@ test("the agent is the first label of the authority under the domain", () => {
   expect(agentOfAuthority("[::1]:18246", "gw.test")).toBe("")
 })
 
-test("the virtual key is read in Bifrost's order, and an unprefixed credential is not a key", () => {
+test("the virtual key is read in Raiju's order, and an unprefixed credential is not a key", () => {
   const md = (pairs: string[][]): H2Header[] => pairs.map((p) => ({ name: p[0]!, value: p[1]! }))
-  const vk = "sk-bf-" + "unit-1"
-  expect(keyOf(md([["x-bf-vk", vk], ["authorization", "Bearer sk-bf-other"]])).header).toBe("x-bf-vk")
+  const vk = "sk-raiju-" + "unit-1"
+  expect(keyOf(md([["x-raiju-vk", vk], ["authorization", "Bearer sk-raiju-other"]])).header).toBe("x-raiju-vk")
   expect(keyOf(md([["authorization", "bearer  " + vk]])).value).toBe(vk)
   expect(keyOf(md([["authorization", "Bearer " + vk]])).header).toBe("authorization")
   expect(keyOf(md([["authorization", "Bearer agent-token"]])).value).toBe("")

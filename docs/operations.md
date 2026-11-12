@@ -100,11 +100,13 @@ catalog) are flock(2) on `<file>.flock`. What that means where the file lives:
   period expires: the other nodes' changes wait for it and answer 503 after 15 seconds until then. Mounts
   with `nolock` or `local_lock=flock`/`all` keep the lock on the client only: nodes do not see each other's
   lock, so do not share the config file across nodes on such a mount.
-- Amazon EFS: NFSv4.1 with server-held advisory locks, so the same as NFS: a task that dies holding the
-  lock (it holds it for milliseconds per save) blocks the other tasks' changes until its lease expires (on
-  the order of a minute; changes answer 503 meanwhile and can be retried). The ECS module mounts EFS with
-  the defaults, which keep locks on the server. Only real infrastructure can confirm these timings: they
-  were checked here on local disk only.
+- Amazon EFS: NFSv4.1 with server-held advisory locks. A process killed while its NFS client remains connected
+  can release promptly; a disconnected client can retain its lock until the server lease expires, with other
+  gateway writes answering 503 after 15 seconds meanwhile. In an isolated leviosa-dev Fargate/EFS proof,
+  separate-task waiters stayed blocked behind live holders; SIGKILL released a synthetic lock in 0.054 s.
+  A dedicated-subnet NACL then cut only the holder's NFS traffic while its process stayed alive: the waiter
+  acquired 67.389 s after the cut began. These are measured cases, not an EFS timing guarantee. The module's
+  default mount keeps locks on the server. Evidence: `build/proof/2026-11-10/efs-faults/`.
 - A file system without flock (some FUSE mounts): the lock guards nothing, and Raiju logs once that writes
   to that file are not guarded against other processes. Run one writer there.
 
@@ -231,7 +233,7 @@ can read the usage data and, with `config_sync: "pull"`, the configuration text.
 the file and on the wire.
 
 - Run cluster traffic on a private network, or through a service mesh that adds mTLS between pods.
-- Set `encryption_key` (or `BIFROST_ENCRYPTION_KEY`) to the same value on every node.
+- Set `encryption_key` (or `RAIJU_ENCRYPTION_KEY`) to the same value on every node.
 - Use a long random `cluster.secret` from a secret store (`"secret": "env.RAIJU_CLUSTER_SECRET"`), and set
   `cluster.listen_port` so `/api/cluster/*` is not on the public port at all.
 

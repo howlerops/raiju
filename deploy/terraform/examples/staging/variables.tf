@@ -3,6 +3,16 @@ variable "region" {
   default = "us-east-1"
 }
 
+variable "aws_account_id" {
+  description = "Approved sandbox AWS account. The provider refuses all other accounts before creating resources."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[0-9]{12}$", var.aws_account_id))
+    error_message = "aws_account_id must be the approved 12-digit sandbox account ID."
+  }
+}
+
 variable "name" {
   description = "Prefix for every resource. Keep it short (ALB names allow 32 characters)."
   type        = string
@@ -42,6 +52,12 @@ variable "task_subnet_ids" {
 variable "image" {
   description = "The Raiju image under test, in ECR (the release candidate)."
   type        = string
+}
+
+variable "cpu_architecture" {
+  description = "Image architecture passed to Fargate: X86_64 or ARM64. Match the image being validated."
+  type        = string
+  default     = "X86_64"
 }
 
 variable "certificate_arn" {

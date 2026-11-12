@@ -1,9 +1,9 @@
 # Staging validation
 
-The six production audits (docs/audits/) end with the same list: what only real infrastructure can confirm. This
-runbook is how an operator confirms it before a release goes to production. Nothing in it has been run yet: the
-development container has no cloud account, provider keys or IdP tenant. Record the results (the
-`staging-results/` folder each run writes) with the release.
+The production audits (docs/audits/) end with the same list: what only real infrastructure can confirm. This
+runbook defines the release gates, not evidence that they passed. Record the results (the `staging-results/`
+folder each run writes), release/image identity, environment and every skipped or blocked gate with the release.
+A successful runner exit permits skips; it does not establish complete staging acceptance.
 
 The steps run in order. Each one needs the ones before it. Budget about three working days, most of it the 24-hour
 soak and waiting on the IdP tenants.
@@ -30,7 +30,7 @@ The scripts:
 
 | Script | Check |
 |---|---|
-| `smoke_check.py` | /health, /ready, the certificate and the HTTP-to-HTTPS redirect, `/api` locked without credentials (and the setup token closed once an admin exists), an unknown virtual key refused, /v1/models, a chat whole and streamed, /metrics. `--providers openai/gpt-4.1-nano,...` also runs `tests/smoke.py`'s per-provider matrix (tool call, embeddings, native routes, the large request, log rows with cost) through the URL. |
+| `smoke_check.py` | /health, /ready, the certificate and the HTTP-to-HTTPS redirect, `/api` locked without credentials (and the setup token closed once an admin exists), an unknown virtual key refused, /v1/models, a chat whole and streamed, /metrics. `--providers openai/gpt-4o-mini,...` also runs `tests/smoke.py`'s per-provider matrix (tool call, embeddings, native routes, the large request, log rows with cost) through the URL. |
 | `creates.py` | 40 concurrent virtual key creates and 40 concurrent updates, spread over one or more URLs; every acknowledged write must be readable on every URL afterwards. |
 | `bridge.py` | `creates.py` across an old and a new release on one volume, in rounds. |
 | `body_soak.py` | Mixed traffic for a duration (chats, streams, long-context chats, bodies from 64 KB to 50 MB) while the RSS is sampled; a chart (`rss.svg`), `samples.csv` and a verdict. |
@@ -68,8 +68,9 @@ Every script creates what it needs under names starting `stg-<run>-` and deletes
   you are validating).
 - A DNS name you control (`raiju-staging.example.com`) and an ACM certificate for it in the same region.
 - Provider keys for the providers you ship with, each in Secrets Manager (`aws secretsmanager create-secret --name
-  raiju-stg/openai --secret-string ...`). Budget: the smoke matrix costs cents; the soak's chat traffic at the
-  default rate is about $10 to $30 a day on a small model (the big bodies cost nothing, see above).
+  raiju-stg/openai --secret-string ...`). No general dollar estimate is a spending authorization: long-context
+  traffic, upstream attempts and model pricing can make this run expensive. Require explicit aggregate money
+  and upstream-request ceilings before any paid run; shared remaining credits are not a budget control.
 - Terraform 1.7 or later, the AWS CLI with the Session Manager plugin (for ECS Exec), Python 3.10 or later, `curl`
   and `jq` on the operator host.
 - For (d) and (f): a host inside the VPC (the probe task, a bastion, or a self-hosted GitHub runner), since the
@@ -81,10 +82,12 @@ Every script creates what it needs under names starting `stg-<run>-` and deletes
 cd deploy/terraform/examples/staging
 cat > staging.tfvars <<'EOF'
 owner               = "you@example.com"
+aws_account_id      = "123456789012"        # REQUIRED: provider refuses every other account
 vpc_id              = "vpc-..."
 public_subnet_ids   = ["subnet-...", "subnet-..."]
 task_subnet_ids     = ["subnet-...", "subnet-..."]
 image               = "123456789012.dkr.ecr.us-east-1.amazonaws.com/raiju:<candidate>"
+cpu_architecture    = "X86_64"              # ARM64 for an ARM64 image (for example, a native Apple Silicon build)
 certificate_arn     = "arn:aws:acm:us-east-1:123456789012:certificate/..."
 public_url          = "https://raiju-staging.example.com"
 ingress_cidr_blocks = ["203.0.113.10/32"]   # your address, the runner's
@@ -101,6 +104,12 @@ terraform output alb_dns_name                                # point raiju-stagi
 `terraform output -raw seeded_config` shows the config the seed task wrote (no secret values: `env.NAME`
 references). To change it, edit the variables, apply, and run the seed task again with `SEED_FORCE=1`
 (`aws ecs run-task ... --overrides '{"containerOverrides":[{"name":"seed","environment":[{"name":"SEED_FORCE","value":"1"}]}]}'`).
+
+With DNS discovery, the generated cluster still needs `"peers": []`: discovery supplies the dynamic addresses,
+but `ClusterConfig.peers` is a required runtime field. An actual first deployment caught this omission even though
+the mocked Terraform checks passed. Before startup, validate the generated config against the release image,
+not only `terraform validate`. Provider default tags must also stay plan-known; the fixed creation-time expiry
+belongs on resource tags, not in provider defaults, to avoid AWS provider 5.x's inconsistent EFS final plan.
 
 ### Teardown
 
@@ -128,16 +137,26 @@ export OPENAI_API_KEY=... ANTHROPIC_API_KEY=...        # the providers you ship 
 make build TOV=$TOV && SMOKE_NO_BUILD=1 make smoke
 ```
 
+`make smoke` reads the process environment, not `.env` automatically. For a trusted local `.env`, use
+`set -a; . ./.env; set +a` before running it. Keep the file private (`chmod 600 .env`); it is excluded from Git and
+the Docker context. Smoke log lookups authenticate with the setup-token header, so the usage/cost checks exercise
+the locked management API too.
+
 **Real providers, deployed.** The same matrix through the ALB:
 
 ```sh
-export RAIJU_BASE_URL=https://raiju-staging.example.com RAIJU_ADMIN_TOKEN=... RAIJU_VKS=sk-bf-...,sk-bf-...
-python3 tests/staging/smoke_check.py --providers openai/gpt-4.1-nano,anthropic/claude-haiku-4-5
+export RAIJU_BASE_URL=https://raiju-staging.example.com RAIJU_ADMIN_TOKEN=... RAIJU_VKS=sk-raiju-...,sk-raiju-...
+python3 tests/staging/smoke_check.py --providers openai/gpt-4o-mini,anthropic/claude-haiku-4-5
 ```
 
 *Pass:* every line `PASS` (or `SKIP` for what is not configured), exit 0. `smoke.matrix.<provider>` passes when that
 provider's matrix had no failure. *Fail:* any `FAIL`; a `cost 0` failure means the model is missing from the price
 table.
+
+**Cost gate:** the commands below describe the historical real-provider procedure, not authorization to repeat it.
+Use mock providers for sustained load by default and label that evidence accordingly. Do not start a paid
+24-hour run without owner-approved limits and pre-dispatch worst-case cost reservations. See the
+[Langfuse handoff's spending controls](langfuse-handoff.md#validation-and-spending-controls).
 
 **The soak.** One task with the chart's limit (the module's `memory = 512`), 24 hours of mixed traffic. Memory comes
 from ECS: Container Insights, or the task's metadata. The simplest source is CloudWatch's `MemoryUtilized` for the
@@ -149,8 +168,8 @@ SERVICE=$(terraform -chdir=deploy/terraform/examples/staging output -raw service
 aws ecs update-cluster-settings --cluster "$CLUSTER" --settings name=containerInsights,value=enabled
 export RAIJU_RSS_CMD="aws cloudwatch get-metric-statistics --namespace ECS/ContainerInsights \
   --metric-name MemoryUtilized --dimensions Name=ClusterName,Value=${CLUSTER##*/} Name=ServiceName,Value=$SERVICE \
-  --start-time \$(date -u -d '-2 min' +%FT%TZ) --end-time \$(date -u +%FT%TZ) --period 60 --statistics Maximum \
-  --query 'Datapoints[-1].Maximum' --output text | sed 's/\$/ MiB/'"
+  --start-time \$(python3 -c 'from datetime import datetime,timedelta,timezone; print((datetime.now(timezone.utc)-timedelta(minutes=2)).isoformat())') --end-time \$(python3 -c 'from datetime import datetime,timezone; print(datetime.now(timezone.utc).isoformat())') --period 60 --statistics Maximum \
+  --query 'max(Datapoints[].Maximum)' --output text | xargs printf '%s MiB\n'"
 python3 tests/staging/body_soak.py --duration 24h --rate 2 --sample-every 60 --limit-mb 512 \
   --out staging-results/soak
 ```
@@ -166,10 +185,13 @@ exporter beside the gateway, `--rss-metric process_resident_memory_bytes --metri
 stopped task; the task's `StoppedReason` (`OutOfMemoryError` is an OOM kill); the log group for a worker started again (a worker the OOM killer kills inside a running task is
 respawned, tov-patches 0019: RSS samples then drop without the task stopping).
 
-*Pass:* `PASS soak`: growth over the second half under 32 MB (`--max-growth-mb`), peak under 90% of 512 MB, no
-restart in the samples, errors (connection failures and 5xx other than the body budget's) under 1%; no task stopped
-in the service events; `rss.svg` flat after the warm-up. *Fail:* any of those; attach `rss.svg`, `samples.csv`,
-`summary.json` and the log group's last hour to the report.
+*Pass:* `PASS soak`: completed traffic and at least one valid completion for every enabled real-model kind;
+growth over the second half under 32 MB (`--max-growth-mb`), peak under 90% of 512 MB, no restart in the samples;
+errors under 1%; no task stopped in the service events; `rss.svg` flat after warm-up. Inference 4xx and malformed
+or incomplete HTTP-200 responses count as errors. Intentional discard-model routing 400 and recognized body-budget
+or size refusals are tracked separately; body-only discard runs do not require upstream inference.
+Inspect `accepted_by_kind`, `discarded`, `refused`, `statuses` and `reasons` in `summary.json`. *Fail:* any gate;
+attach `rss.svg`, `samples.csv`, `summary.json` and the log group's last hour to the report.
 
 **Teardown:** nothing to undo; turn Container Insights off if the account does not normally use it.
 
@@ -184,12 +206,12 @@ curl -si "http://${BASE#https://}/health" | head -3            # 301 to https
 curl -s "$BASE/health"; curl -s -o /dev/null -w '%{http_code}\n' "$BASE/ready"          # {"status":"ok"} 200
 curl -s -o /dev/null -w '%{http_code}\n' "$BASE/api/governance/virtual-keys"            # 401: /api is locked
 SETUP=$(eval "$(terraform output -raw setup_token_command)")
-curl -s -X POST "$BASE/api/users" -H "X-Bifrost-Setup-Token: $SETUP" -H 'content-type: application/json' \
+curl -s -X POST "$BASE/api/users" -H "X-Raiju-Setup-Token: $SETUP" -H 'content-type: application/json' \
   -d '{"name":"ops-admin","role":"admin"}' | jq -r .token > admin-token && chmod 600 admin-token
 export RAIJU_BASE_URL=$BASE RAIJU_ADMIN_TOKEN=$(cat admin-token) RAIJU_SETUP_TOKEN=$SETUP
 curl -s -X POST "$BASE/api/governance/virtual-keys" -H "Authorization: Bearer $RAIJU_ADMIN_TOKEN" \
   -H 'content-type: application/json' -d '{"name":"staging-a"}' | jq -r .value      # repeat for staging-b
-export RAIJU_VKS=sk-bf-...,sk-bf-...
+export RAIJU_VKS=sk-raiju-...,sk-raiju-...
 python3 tests/staging/run.py --checks smoke,creates,trickle,declared,dcr --out staging-results/b
 ```
 
@@ -279,6 +301,11 @@ aws ecs execute-command --cluster <cluster> --task <probe-A-id> --container prob
 
 The data directory is `/data` in a probe (the access point's root, `/raiju` on the file system) and `/app/data` in
 the gateway tasks; the gateway's lock file is `config.json.flock`.
+
+The staging stack enables `allow_task_http_peers`: its seed/probe tasks share the gateway service security group
+and can reach node HTTP ports directly. Arbitrary VPC hosts cannot. Run direct-node checks from a probe, or attach
+that group to a dedicated, approved test runner. The general ECS module keeps this access disabled by default;
+its main port remains ALB-only unless explicitly enabled.
 
 1. **40 concurrent creates over the tasks.** From a host in the VPC, with each task's address
    (`aws ecs describe-tasks`, or resolve `terraform output -raw cluster_dns_name`):
@@ -415,6 +442,7 @@ gate runs) with:
   `RAIJU_NEW_URL`, `RAIJU_RSS_CMD`, `RAIJU_RSS_METRIC`.
 
 Then Actions, Staging validation, Run workflow. GitHub-hosted runners reach only the ALB (add their address range
-to `ingress_cidr_blocks`, or use a self-hosted runner) and stop after six hours: run the 24-hour soak, the cluster
-checks and the bridge from a self-hosted runner inside the VPC (`runner` input) or from an operator host. Results
+to `ingress_cidr_blocks`, or use a self-hosted runner) and this workflow has a six-hour timeout on **every** runner.
+Run the 24-hour soak directly from a durable operator host; changing the runner label does not extend the job.
+Cluster checks and the bridge need an approved runner/probe with the private-node access described above. Results
 are uploaded as the `staging-results` artifact and summarised on the run page.

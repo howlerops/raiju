@@ -484,7 +484,7 @@ cont20:;
 
 **Seen in Raiju as**: re-audit 7 P0-1, every inference request with a virtual key left ~50 bytes of RSS behind with
 no plateau (23 to 92 MB over 1.47M small chats): `forwardedHeaders` reads each header value, then `continue`s past
-the `x-bf-*` ones, so the virtual key header string of every request stayed allocated. Found with valgrind (one
+the `x-raiju-*` ones, so the virtual key header string of every request stayed allocated. Found with valgrind (one
 32-byte block definitely lost per request, allocated by `Headers.forEach`) and a hardware watchpoint on that
 string's refcount (the extra reference was taken in `forwardedHeaders` and never dropped).
 

@@ -25,7 +25,7 @@ def attacker(url, vk, declared, rate_bps, stop, ends, held, lock, ca_file):
     while time.time() < stop:
         try:
             s, host = kit.open_socket(url, timeout=30, ca_file=ca_file)
-            s.sendall(kit.raw_head("POST", "/v1/chat/completions", host, {"content-type": "application/json", "content-length": str(declared), "x-bf-vk": vk}))
+            s.sendall(kit.raw_head("POST", "/v1/chat/completions", host, {"content-type": "application/json", "content-length": str(declared), "x-raiju-vk": vk}))
             t0, sent, code, step = time.time(), 0, None, 0.25
             while time.time() < stop:
                 pending = getattr(s, "pending", lambda: 0)()

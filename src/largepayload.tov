@@ -1,16 +1,17 @@
-// Bifrost's large_payload_optimization: a request body over request_threshold_bytes is not read whole.
-// The first prefetch_size_bytes are read to find the routing fields (scanPrefix), and the whole body then
-// goes to the provider as a stream (LargeBody.stream) while the request log keeps a truncated copy
-// (BodyTap). Bodies over max_payload_bytes are refused. The Tov patch 0008 gives fetch a stream body and
-// Bun.serve (and src/http1.tov) a request body that arrives as a stream.
-// Routes: the OpenAI-format JSON routes, the Responses route and the Anthropic Messages route (JSON bodies
-// with the model in the first bytes), and multipart uploads (the model among the form fields before the file).
-// An answer that is passed through is read for its usage as it flows (UsageTap), so budgets, rate limits and
-// the request log count what a streamed request used.
+// large_payload_optimization avoids reading an entire request body when it exceeds
+// request_threshold_bytes. The first prefetch_size_bytes are read for routing
+// fields (scanPrefix), then LargeBody.stream forwards the body while BodyTap
+// retains a truncated copy for logging. Bodies over max_payload_bytes are refused.
+// Tov patch 0008 supports fetch stream bodies and streaming request bodies in
+// Bun.serve and src/http1.tov.
+// Supported routes include OpenAI-format JSON, Responses and Anthropic Messages
+// (with the model in the initial bytes), plus multipart uploads with the model
+// field before the file. UsageTap reads usage from passthrough responses as they
+// flow, so budgets, rate limits and logs account for streamed requests.
 import { Config } from "./config"
 import { decodeString, quote } from "./json"
 
-// The settings with Bifrost's defaults (config.schema.json): 10 MiB, 10 MiB, 64 KiB, 500 MiB, 1 MiB.
+// Default settings: 10 MiB, 10 MiB, 64 KiB, 500 MiB, 1 MiB.
 export type LargeSettings = { requestThreshold: int, responseThreshold: int, prefetch: int, maxPayload: int, truncatedLog: int }
 
 export const DEFAULT_REQUEST_THRESHOLD = 10485760
@@ -24,7 +25,7 @@ function orDefault(v: int | undefined, d: int): int {
   return v
 }
 
-// undefined while the feature is off (enabled false or absent, as in Bifrost).
+// Undefined when enabled is false or absent.
 export function largeSettings(cfg: Config): LargeSettings | undefined {
   const c = cfg.large_payload_optimization
   if (c === undefined || c.enabled !== true) return undefined
@@ -39,9 +40,10 @@ export function largeSettings(cfg: Config): LargeSettings | undefined {
 
 // ---- reading the routing fields from the first bytes ----
 
-// What Bifrost keeps as LargePayloadMetadata: the model (and where its string literal is, for the rewrite to
-// the provider's model name), whether the body asks for a stream, generationConfig.responseModalities and
-// whether it has a speechConfig (Gemini), and thread.type (Anthropic). A field the prefix does not reach is absent.
+// Routing metadata includes the model and its string-literal position for provider
+// model rewriting, the streaming flag, generationConfig.responseModalities,
+// presence of speechConfig (Gemini), and thread.type (Anthropic). Fields outside
+// the scanned prefix are absent.
 export type Prefix = {
   model: string,
   hasModel: bool,
@@ -167,9 +169,9 @@ function eachMember(b: u8[], start: int, on: (kf: int, kt: int, vf: int, vt: int
   }
 }
 
-// Reads the routing fields from the start of a JSON request body. Nested objects are entered only for the
-// two Bifrost reads (generationConfig and thread); every other value is skipped, so a big message array
-// costs one pass and a field after it is simply not found.
+// Reads routing fields from a JSON request body's prefix. Only generationConfig
+// and thread are entered as nested objects; other values are skipped. A large
+// message array takes one pass, and fields beyond the prefix are not found.
 export function scanPrefix(b: u8[]): Prefix {
   const p: Prefix = { model: "", hasModel: false, modelFrom: 0, modelTo: 0, hasStream: false, stream: false, streamOptions: false, modalities: [], speech: false, threadType: "" }
   let model = ""
@@ -312,11 +314,11 @@ export class LargeBody {
   passAnswer = true
   // why the conversion refused the body, when it did
   convError = ""
-  // An OpenAI-format chat or text stream asks for its usage chunk, as Bifrost asks every such stream: the prefix gets
-  // stream_options.include_usage first in the object (a stream_options the caller wrote later in the body still wins)
+  // OpenAI-format chat and text streams request usage by placing
+  // stream_options.include_usage first; a later caller-supplied stream_options wins.
   askUsage = false
-  // openai_config.disable_store: "store":false goes last in the object, so it wins over a store the caller wrote anywhere
-  // in the body (the last of two equal keys is the one a JSON reader keeps), as Bifrost forces store=false
+  // openai_config.disable_store appends "store":false last, overriding any earlier
+  // store value because the JSON reader retains the last duplicate key.
   noStore = false
   // set by the spool to remove its files when the request is over
   release: (() => void) | undefined = undefined
@@ -895,7 +897,7 @@ test("scanPrefix reads escapes in the model and ignores look-alike keys inside v
   expect(scanPrefix(bytes(`{"model":5}`)).hasModel).toBe(false)
 })
 
-test("scanPrefix reads Bifrost's other metadata", () => {
+test("scanPrefix reads Raiju's other metadata", () => {
   const g = scanPrefix(bytes(`{"model":"gemini-2.0","generationConfig":{"temperature":0.2,"responseModalities":["AUDIO","TEXT"],"speechConfig":{"voiceConfig":{}}},"thread":{"id":"t","type":"create"}}`))
   expect(g.modalities.join(",")).toBe("AUDIO,TEXT")
   expect(g.speech).toBe(true)

@@ -65,10 +65,12 @@ EXPOSE 8080
 USER 65532:65532
 # /app/data holds config.json and the state Raiju writes beside it (config.json.bak, mcp-oauth-state.json,
 # mcp-flow-state.json, logs/ and logs/audit/): mount a writable volume there to keep it. Without one, Docker gives
-# the container an anonymous volume (as Bifrost's image declares its app dir). It is also the working directory: the
+# the container an anonymous volume. It is also the working directory: the
 # gateway reads its log and audit folders from -app-dir, but a relative path given by hand lands somewhere writable.
 WORKDIR /app/data
-VOLUME ["/app/data"]
+# Fargate copies directory metadata only for declared volumes. Without /tmp here its task bind mount is
+# root-owned 0755, so user 65532 cannot create the worker-share or request-log directories. Preserve /tmp's 1777 mode.
+VOLUME ["/app/data", "/tmp"]
 
 # The image has no curl: the binary probes itself. `raiju -healthcheck` GETs /health on 127.0.0.1 at -port, or
 # PORT, or 8080; set PORT when the command below listens elsewhere.

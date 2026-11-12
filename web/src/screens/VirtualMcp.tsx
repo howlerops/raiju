@@ -1,5 +1,5 @@
 // Virtual MCPs and tool groups. A virtual MCP is a named set of tools picked from the MCP clients,
-// served at /mcp/{name}; a tool group is Bifrost's name for the same record (/api/mcp/tool-groups),
+// served at /mcp/{name}; a tool group is the same record at /api/mcp/tool-groups,
 // with its tools given as client plus tool names and its keys reached through teams, customers and
 // providers as well as directly. Both lists are the same records; the two editors write them.
 import { createMemo, createSignal, createStore, For, refresh, Show, snapshot, untrack } from "solid-js"
@@ -494,7 +494,7 @@ export function VirtualMcp() {
       <p class="hint">
         {mode() === "mcp"
           ? "A virtual MCP serves a chosen set of tools at /mcp/name. A key that is not attached cannot use it."
-          : "Tool groups are the same records in Bifrost's shape: tools by client, and keys reached through teams, customers and providers."}
+          : "Tool groups are the same records: tools by client, and keys reached through teams, customers and providers."}
       </p>
       <Guard>
         <Show when={editor()} keyed>

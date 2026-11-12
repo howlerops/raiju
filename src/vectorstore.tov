@@ -1,11 +1,9 @@
-// External vector stores for the semantic cache (Bifrost's top-level vector_store):
-// Qdrant and Weaviate over their REST APIs, Pinecone over its index REST API, Redis or
-// Valkey over RESP with RediSearch, and chromem, an in-process store that can write
-// each namespace to a file. Each
-// entry is a vector, a payload of text fields, and an expiry (ms since the epoch).
-// Searches skip expired entries, so a stale answer is never returned even when the
-// server's own cleanup lags. The request builders and reply parsers are pure
-// functions and are tested here without a server.
+// Vector stores for the semantic cache (top-level vector_store): Qdrant and Weaviate
+// over their REST APIs, Pinecone over its index REST API, Redis or Valkey over RESP
+// with RediSearch, and chromem, an in-process store that can write each namespace
+// to a file. Each entry is a vector, a payload of text fields, and an expiry
+// (ms since the epoch). Searches skip expired entries even when server cleanup lags.
+// Request builders and reply parsers are pure functions tested without a server.
 //
 // Reserved payload keys, written by the store: entry_id (the caller's id) and
 // expires_ms. Callers must not use them as field names.
@@ -19,10 +17,9 @@ import { writeFileAtomic, appendPrivate, mkdirPrivate } from "./atomicfile"
 import { Peer, peerOf, policyOf } from "./netguard"
 
 const ID_KEY = "entry_id"
-// The address policy of the stores (Qdrant, Weaviate and Pinecone over fetch, Redis and Valkey over Bun.connect), as
-// the log exporters have it: a store on a private network is fine, link-local, unspecified and cloud metadata
-// addresses are refused when the runtime connects (Bifrost checks none; a store's address comes from the config or
-// the admin API).
+// Store addresses come from config or the admin API. Qdrant, Weaviate and Pinecone
+// connect over fetch; Redis and Valkey use Bun.connect. Private networks are allowed;
+// link-local, unspecified and cloud metadata addresses are refused at connection time.
 const STORE_PEER: Peer = peerOf(policyOf(true))
 const EXP_KEY = "expires_ms"
 
@@ -98,8 +95,8 @@ export abstract class VectorStore {
   // payload matches every condition, or undefined.
   abstract search(ns: string, vector: f64[], threshold: f64, filter: Cond[]): Promise<Hit | undefined, Error>
   abstract delete(ns: string, id: string): Promise<void, Error>
-  // Deletes every entry whose payload matches each condition and returns how many went (Bifrost's DeleteAll,
-  // used to clear a cache key). A backend without it throws.
+  // Deletes every entry whose payload matches all conditions and returns the count,
+  // for example to clear a cache key. A backend without this operation throws.
   async deleteWhere(ns: string, filter: Cond[]): Promise<int, Error> {
     throw new Error("this vector store cannot delete entries by field")
   }
@@ -153,12 +150,21 @@ function vectorJson(v: f64[]): string {
   return "[" + parts.join(",") + "]"
 }
 
-// The IEEE 754 single-precision bytes of x, little-endian: what RediSearch reads as
-// FLOAT32. Rounds to nearest; values past the float range become infinities.
-export function f32Bytes(x: f64): u8[] {
+// IEEE 754 round-to-nearest, ties-to-even (Math.round rounds ties away).
+function nearestEven(x: f64): int {
+  const lower = Math.floor(x)
+  const fraction = x - lower
+  return fraction > 0.5 || (fraction === 0.5 && lower % 2 !== 0) ? lower + 1 : lower
+}
+
+// Append IEEE 754 single-precision little-endian bytes without allocating a
+// four-byte array for every vector component. Shared by Redis and embeddings.
+export function appendF32Bytes(inout out: u8[], x: f64): void {
   let a = Math.abs(x)
   let e = 0
-  if (a > 0.0) {
+  // Infinity also takes this branch rather than entering the normalization loop.
+  const overflow = a >= 3.402823669209385e38
+  if (a > 0.0 && !overflow) {
     while (a >= 2.0) {
       a = a / 2.0
       e += 1
@@ -170,30 +176,28 @@ export function f32Bytes(x: f64): u8[] {
   }
   let biased = 0
   let mant = 0
-  if (a > 0.0) {
+  if (a > 0.0 && !overflow) {
     if (e >= -126) {
-      mant = Math.round((a - 1.0) * 8388608.0)
+      mant = nearestEven((a - 1.0) * 8388608.0)
       biased = e + 127
     } else {
       // subnormal: the value is a * 2^e, and the mantissa counts units of 2^-149
-      mant = Math.round(a * Math.pow(2.0, e + 149))
+      mant = nearestEven(a * Math.pow(2.0, e + 149))
     }
   }
-  if (biased >= 255) {
+  if (overflow || biased >= 255) {
     biased = 255
     mant = 0
   }
   // a mantissa that rounds up to 2^23 carries into the exponent by itself
   let bits = biased * 8388608 + mant
-  if (x < 0.0) bits += 2147483648
-  return [u8(bits & 255), u8((bits >> 8) & 255), u8((bits >> 16) & 255), u8((bits >> 24) & 255)]
+  if (x < 0.0 || (x === 0.0 && 1.0 / x < 0.0)) bits += 2147483648
+  out.push(u8(bits & 255), u8((bits >> 8) & 255), u8((bits >> 16) & 255), u8((bits >> 24) & 255))
 }
 
 function vectorBytes(v: f64[]): u8[] {
-  const out: u8[] = []
-  for (const x of v) {
-    for (const b of f32Bytes(x)) out.push(b)
-  }
+  let out: u8[] = []
+  for (const x of v) appendF32Bytes(&out, x)
   return out
 }
 
@@ -754,8 +758,8 @@ export function weaviateWhere(filter: Cond[], nowMs: int): string {
   return `{operator:And,operands:[${ops.join(",")}]}`
 }
 
-// The batch delete of every object of a class whose fields equal the conditions (Bifrost's DeleteAll through the
-// ObjectsBatchDeleter), with the REST where-filter: one condition alone, several under And.
+// Batch-deletes every object of a class whose fields match the conditions, using a
+// REST where-filter: one condition alone, or several under And.
 export function weaviateBatchDeleteBody(cls: string, filter: Cond[]): string {
   const ops: string[] = []
   for (const c of filter) ops.push(`{"path":[${quote(c.key)}],"operator":"Equal","valueText":${quote(c.eq)}}`)
@@ -899,8 +903,8 @@ export class WeaviateStore extends VectorStore {
 
 // ---- Pinecone (REST) ----
 
-// The base URL of an index host. Pinecone Local and loopback hosts get plain http, the
-// others https, as Bifrost does.
+// The base URL of an index host. Pinecone Local and loopback hosts use plain http;
+// other hosts use https.
 export function pineconeOrigin(host: string): string {
   if (host.startsWith("http://") || host.startsWith("https://")) return host
   const local = host.startsWith("localhost") || host.startsWith("127.") || host.startsWith("[::1]")
@@ -928,7 +932,7 @@ export function pineconeDeleteBody(ns: string, id: string): string {
   return `{"ids":[${quote(id)}],"namespace":${quote(ns)}}`
 }
 
-// A delete by metadata filter: each condition as $eq (Bifrost's DeleteVectorsByFilter).
+// Deletes by metadata filter, expressing each condition as $eq.
 export function pineconeDeleteWhereBody(ns: string, filter: Cond[]): string {
   const parts: string[] = []
   for (const c of filter) parts.push(`${quote(c.key)}:{"$eq":${quote(c.eq)}}`)
@@ -1011,7 +1015,7 @@ export class PineconeStore extends VectorStore {
     if (r.status < 200 || r.status >= 300) throw new Error(`pinecone: delete: HTTP ${r.status}: ${r.text}`)
   }
 
-  // Deletes by metadata filter. Pinecone does not say how many went, as in Bifrost, so the count is 0.
+  // Deletes by metadata filter. Pinecone does not report a deletion count, so the count is 0.
   async deleteWhere(ns: string, filter: Cond[]): Promise<int, Error> {
     try this.need(ns)
     const r = try await this.call("POST", "/vectors/delete", pineconeDeleteWhereBody(ns, filter))
@@ -1022,7 +1026,7 @@ export class PineconeStore extends VectorStore {
 
 // ---- chromem (in process, with an optional file per namespace) ----
 
-// Reads f32 values from little-endian IEEE single bytes, the inverse of f32Bytes.
+// Reads f32 values from little-endian IEEE single bytes, the inverse of vectorBytes.
 export function f32Values(b: u8[]): f64[] {
   const out: f64[] = []
   for (let i = 0; i + 3 < b.length; i += 4) {
@@ -1310,10 +1314,10 @@ export class ChromemStore extends VectorStore {
 // ---- tests (no network) ----
 
 test("scope tags are fixed-length hex, whatever the scope holds", () => {
-  const t = scopeTag("openai\u0000gpt\u0000key\u0001vk=sk-bf-a")
+  const t = scopeTag("openai\u0000gpt\u0000key\u0001vk=sk-raiju-a")
   expect(t.byteLength).toBe(64)
-  expect(t).toBe(scopeTag("openai\u0000gpt\u0000key\u0001vk=sk-bf-a"))
-  expect(t !== scopeTag("openai\u0000gpt\u0000key\u0001vk=sk-bf-b")).toBe(true)
+  expect(t).toBe(scopeTag("openai\u0000gpt\u0000key\u0001vk=sk-raiju-a"))
+  expect(t !== scopeTag("openai\u0000gpt\u0000key\u0001vk=sk-raiju-b")).toBe(true)
 })
 
 test("the same entry id always gets the same point id, shaped as a UUID", () => {
@@ -1326,12 +1330,15 @@ test("the same entry id always gets the same point id, shaped as a UUID", () => 
 })
 
 test("f32 bytes match the IEEE single encoding", () => {
-  expect(f32Bytes(1.0).join(",")).toBe("0,0,128,63")
-  expect(f32Bytes(-2.0).join(",")).toBe("0,0,0,192")
-  expect(f32Bytes(0.5).join(",")).toBe("0,0,0,63")
-  expect(f32Bytes(0.1).join(",")).toBe("205,204,204,61")
-  expect(f32Bytes(0.0).join(",")).toBe("0,0,0,0")
-  expect(f32Bytes(1e-40).join(",")).toBe("194,22,1,0")
+  expect(vectorBytes([1.0]).join(",")).toBe("0,0,128,63")
+  expect(vectorBytes([-2.0]).join(",")).toBe("0,0,0,192")
+  expect(vectorBytes([0.5]).join(",")).toBe("0,0,0,63")
+  expect(vectorBytes([0.1]).join(",")).toBe("205,204,204,61")
+  expect(vectorBytes([0.0]).join(",")).toBe("0,0,0,0")
+  expect(vectorBytes([1e-40]).join(",")).toBe("194,22,1,0")
+  expect(vectorBytes([-0.0]).join(",")).toBe("0,0,0,128")
+  expect(vectorBytes([1.000000059604644775390625]).join(",")).toBe("0,0,128,63")
+  expect(vectorBytes([1.000000178813934326171875]).join(",")).toBe("2,0,128,63")
 })
 
 test("tag values are escaped for RediSearch", () => {
@@ -1489,7 +1496,7 @@ test("openVectorStore picks the configured backend", () => {
 })
 
 test("weaviate class names must start with an uppercase letter", () => {
-  expect(try weaviateClass("BifrostSemanticCachePlugin")).toBe("BifrostSemanticCachePlugin")
+  expect(try weaviateClass("RaijuSemanticCachePlugin")).toBe("RaijuSemanticCachePlugin")
   let low = false
   try {
     try weaviateClass("mycache")
@@ -1507,15 +1514,15 @@ test("weaviate class names must start with an uppercase letter", () => {
 })
 
 test("weaviate schema, object and query bodies", () => {
-  const s = weaviateSchemaBody("BifrostX", ["scope"])
+  const s = weaviateSchemaBody("RaijuX", ["scope"])
   expect(s.includes(`"distance":"cosine"`)).toBe(true)
   expect(s.includes(`{"name":"scope","dataType":["text"],"tokenization":"field"}`)).toBe(true)
   const pm: Map<string, string> = new Map()
   pm.set("scope", "s1")
-  const o = weaviateObjectBody("BifrostX", "e1", [1.0, 0.0], pm, 77, ["scope"])
-  expect(o.startsWith(`{"class":"BifrostX","id":"${pointId("e1")}","vector":[1,0],"properties":{"p":`)).toBe(true)
+  const o = weaviateObjectBody("RaijuX", "e1", [1.0, 0.0], pm, 77, ["scope"])
+  expect(o.startsWith(`{"class":"RaijuX","id":"${pointId("e1")}","vector":[1,0],"properties":{"p":`)).toBe(true)
   expect(o.endsWith(`,"expires_ms":77,"scope":"s1"}}`)).toBe(true)
-  const q = weaviateSearchQuery("BifrostX", [1.0], 0.8, [{ key: "scope", eq: "a" }], 500)
+  const q = weaviateSearchQuery("RaijuX", [1.0], 0.8, [{ key: "scope", eq: "a" }], 500)
   expect(q.includes("distance: 0.19999")).toBe(true)
   expect(q.includes("GreaterThan,valueNumber:500")).toBe(true)
   expect(q.includes("Equal,valueText:")).toBe(true)
@@ -1523,14 +1530,14 @@ test("weaviate schema, object and query bodies", () => {
 
 test("a weaviate reply gives the best hit with its payload and similarity", () => {
   const pj = payloadJson("e5", new Map(), 9)
-  const reply = `{"data":{"Get":{"BifrostX":[{"p":${quote(pj)},"_additional":{"id":"u","distance":0.25}}]}}}`
-  const h = try parseWeaviateHit(reply, "BifrostX")
+  const reply = `{"data":{"Get":{"RaijuX":[{"p":${quote(pj)},"_additional":{"id":"u","distance":0.25}}]}}}`
+  const h = try parseWeaviateHit(reply, "RaijuX")
   expect(h!.id).toBe("e5")
   expect(h!.score).toBeCloseTo(0.75)
-  expect(try parseWeaviateHit(`{"data":{"Get":{"BifrostX":[]}}}`, "BifrostX")).toBeUndefined()
+  expect(try parseWeaviateHit(`{"data":{"Get":{"RaijuX":[]}}}`, "RaijuX")).toBeUndefined()
   let threw = false
   try {
-    try parseWeaviateHit(`{"errors":[{"message":"no"}]}`, "BifrostX")
+    try parseWeaviateHit(`{"errors":[{"message":"no"}]}`, "RaijuX")
   } catch (e) {
     threw = true
   }
@@ -1554,10 +1561,11 @@ test("pinecone origin, filter, query and reply", () => {
   expect(try parsePineconeHit(`{"matches":[]}`)).toBeUndefined()
 })
 
-test("f32 values read back what f32Bytes wrote", () => {
-  expect(f32Values(f32Bytes(-2.0))[0]!).toBe(-2.0)
-  expect(f32Values(f32Bytes(0.1))[0]!).toBeCloseTo(0.1)
-  expect(f32Values(f32Bytes(1e-40))[0]!).toBeCloseTo(1e-40)
+test("f32 values read back the packed vector", () => {
+  const values = f32Values(vectorBytes([-2.0, 0.1, 1e-40]))
+  expect(values[0]!).toBe(-2.0)
+  expect(values[1]!).toBeCloseTo(0.1)
+  expect(values[2]!).toBeCloseTo(1e-40)
 })
 
 test("chromem keeps entries by tag, filters, and drops expired ones", () => {

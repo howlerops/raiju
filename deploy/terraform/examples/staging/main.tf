@@ -11,10 +11,11 @@
 # The secrets have no recovery window and the EFS file system is deleted with its data: nothing outlives a destroy.
 
 provider "aws" {
-  region = var.region
+  region              = var.region
+  allowed_account_ids = [var.aws_account_id]
 
   default_tags {
-    tags = local.tags
+    tags = local.static_tags
   }
 }
 
@@ -26,12 +27,17 @@ data "aws_vpc" "this" {
 resource "time_static" "created" {}
 
 locals {
-  tags = {
-    purpose    = "raiju-staging"
-    owner      = var.owner
-    ttl_hours  = tostring(var.ttl_hours)
-    expires_at = timeadd(time_static.created.rfc3339, "${var.ttl_hours}h")
+  # Provider defaults must be known during the first plan. Putting time_static's initially unknown expiry
+  # there makes AWS provider 5.x produce an inconsistent EFS final plan; resource tags can hold that value.
+  static_tags = {
+    purpose   = "raiju-staging"
+    owner     = var.owner
+    ttl_hours = tostring(var.ttl_hours)
+    dr-tier   = "none"
   }
+  tags = merge(local.static_tags, {
+    expires_at = timeadd(time_static.created.rfc3339, "${var.ttl_hours}h")
+  })
   task_count = var.cluster ? 3 : 1
 
   providers = {
@@ -43,6 +49,7 @@ locals {
   cluster_block = jsondecode(var.cluster ? jsonencode({
     cluster = {
       enabled     = true
+      peers       = []
       secret      = "env.RAIJU_CLUSTER_SECRET"
       config_sync = "file"
       listen_port = 7946
@@ -57,7 +64,7 @@ locals {
   # config.json as the seed task writes it: keys and secrets only as env.NAME references
   config = merge(
     {
-      setup_token = "env.BIFROST_SETUP_TOKEN"
+      setup_token = "env.RAIJU_SETUP_TOKEN"
       client = merge({
         enable_logging            = true
         enforce_auth_on_inference = true
@@ -89,6 +96,7 @@ resource "random_password" "cluster_secret" {
 resource "aws_secretsmanager_secret" "setup_token" {
   name                    = "${var.name}/setup-token"
   recovery_window_in_days = 0
+  tags                    = local.tags
 }
 
 resource "aws_secretsmanager_secret_version" "setup_token" {
@@ -99,6 +107,7 @@ resource "aws_secretsmanager_secret_version" "setup_token" {
 resource "aws_secretsmanager_secret" "cluster_secret" {
   name                    = "${var.name}/cluster-secret"
   recovery_window_in_days = 0
+  tags                    = local.tags
 }
 
 resource "aws_secretsmanager_secret_version" "cluster_secret" {
@@ -112,13 +121,14 @@ resource "aws_efs_file_system" "data" {
   encrypted        = true
   performance_mode = "generalPurpose"
   throughput_mode  = "elastic"
-  tags             = { Name = "${var.name}-data" }
+  tags             = merge(local.tags, { Name = "${var.name}-data" })
 }
 
 resource "aws_security_group" "efs" {
   name        = "${var.name}-efs"
   description = "NFS from the staging VPC"
   vpc_id      = var.vpc_id
+  tags        = local.tags
 
   ingress {
     description = "NFS"
@@ -139,6 +149,7 @@ resource "aws_efs_mount_target" "data" {
 
 resource "aws_efs_access_point" "data" {
   file_system_id = aws_efs_file_system.data.id
+  tags           = local.tags
 
   # the image's user; config.json is written 0600 by it
   posix_user {
@@ -167,8 +178,11 @@ module "raiju" {
   public_subnet_ids   = var.public_subnet_ids
   task_subnet_ids     = var.task_subnet_ids
   image               = var.image
+  cpu_architecture    = var.cpu_architecture
   certificate_arn     = var.certificate_arn
   ingress_cidr_blocks = var.ingress_cidr_blocks
+  # Seed/probe tasks share the service group; only these peers may bypass the ALB for node checks.
+  allow_task_http_peers = true
 
   cpu           = var.cpu
   memory        = var.memory
@@ -186,7 +200,7 @@ module "raiju" {
   cluster_secret_arn = var.cluster ? aws_secretsmanager_secret.cluster_secret.arn : null
 
   secret_arns = merge(var.provider_secret_arns, {
-    BIFROST_SETUP_TOKEN = aws_secretsmanager_secret.setup_token.arn
+    RAIJU_SETUP_TOKEN = aws_secretsmanager_secret.setup_token.arn
   })
 
   depends_on = [aws_efs_mount_target.data, aws_secretsmanager_secret_version.setup_token, aws_secretsmanager_secret_version.cluster_secret]
@@ -198,6 +212,7 @@ module "raiju" {
 resource "aws_cloudwatch_log_group" "tools" {
   name              = "/ecs/${var.name}-tools"
   retention_in_days = 7
+  tags              = local.tags
 }
 
 data "aws_iam_policy_document" "assume_ecs_tasks" {
@@ -213,6 +228,7 @@ data "aws_iam_policy_document" "assume_ecs_tasks" {
 resource "aws_iam_role" "tools_execution" {
   name               = "${var.name}-tools-execution"
   assume_role_policy = data.aws_iam_policy_document.assume_ecs_tasks.json
+  tags               = local.tags
 }
 
 resource "aws_iam_role_policy_attachment" "tools_execution" {
@@ -235,6 +251,7 @@ data "aws_iam_policy_document" "tools_task" {
 resource "aws_iam_role" "tools_task" {
   name               = "${var.name}-tools-task"
   assume_role_policy = data.aws_iam_policy_document.assume_ecs_tasks.json
+  tags               = local.tags
 }
 
 resource "aws_iam_role_policy" "tools_task" {
@@ -275,6 +292,7 @@ resource "aws_ecs_task_definition" "tool" {
   memory                   = "512"
   execution_role_arn       = aws_iam_role.tools_execution.arn
   task_role_arn            = aws_iam_role.tools_task.arn
+  tags                     = local.tags
 
   volume {
     name = local.tools_volume.name

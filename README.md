@@ -1,9 +1,9 @@
 # Raiju
 
-An LLM gateway written in [Tov](https://tov.sh), aiming to be a drop-in
-replacement for [Bifrost](https://github.com/maximhq/bifrost): the same
-`config.json`, the same `provider/model` names, the same `x-bf-*` headers and
-`bifrost_*` metrics, compiled to one small native binary.
+An LLM gateway written in [Tov](https://tov.sh), compiled to one small native binary.
+Raiju uses `RAIJU_*` environment variables, `x-raiju-*` gateway headers and `raiju_*`
+metrics. This is a breaking naming cutover, not a drop-in wire replacement:
+the previous gateway-owned names have no aliases.
 
 Scope and priorities: [SCOPE.md](SCOPE.md) (from the
 [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6SjdriReWQr)).
@@ -14,12 +14,12 @@ Scope and priorities: [SCOPE.md](SCOPE.md) (from the
 make tov                         # Tov with the patches in tov-patches/ (needs git and cargo)
 make build                       # build/raiju (about 21 MB; links glibc, libstdc++ and JavaScriptCore)
 OPENAI_API_KEY=sk-... build/raiju            # no config: providers from env vars
-build/raiju -app-dir ~/.config/bifrost       # or an existing Bifrost config.json
+build/raiju -app-dir ~/.config/raiju         # load config.json from this directory
 build/raiju -config config.json -port 8080 -workers 4
-BIFROST_SETUP_TOKEN=$(openssl rand -hex 16) build/raiju   # /api opens to this token until an admin exists
+RAIJU_SETUP_TOKEN=$(openssl rand -hex 16) build/raiju   # /api opens to this token until an admin exists
 ```
 
-The gateway listens on 127.0.0.1 unless `-host` (or `BIFROST_HOST`) says otherwise; the image and the
+The gateway listens on 127.0.0.1 unless `-host` (or `RAIJU_HOST`) says otherwise; the image and the
 deploy files pass `-host 0.0.0.0`. The management API is locked until an admin exists (see
 [Secure defaults](#secure-defaults)). The first start after an upgrade lists, once, the defaults that changed
 in recent releases and that your config relies on (recorded in `.raiju-notices.json` beside `config.json`).
@@ -60,9 +60,9 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
   provider; `/bedrock/model/{id}/{converse|invoke}` and their streaming forms (AWS
   event-stream) to any provider; `/cohere/v2/{chat|embed|rerank}`; `/litellm`, `/langchain`,
   `/pydanticai`; provider passthroughs (`/openai_passthrough/*` and the rest).
-- **Bifrost compatibility:** reads Bifrost's `config.json` (section names, plugins,
-  guardrails, alerting, vector store, otel) and reports what it ignores; sends the
-  `x-bifrost-*` response headers and Bifrost's Prometheus families and labels.
+- **Configuration:** reads `config.json` sections for providers, plugins,
+  guardrails, alerting, vector stores and OTel, and reports what it ignores.
+  Gateway response headers use `x-raiju-*`; gateway metric families use `raiju_*`.
 - **Count tokens** are exact for Anthropic, Gemini and Vertex (their APIs) and for the Bedrock
   models Bedrock can count; everyone else gets an estimate, marked `"exact": false`. The
   management API spec (`docs/openapi/management.yaml`) does not cover `/v1/count_tokens`.
@@ -74,22 +74,22 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
   and `make openapi-check` checks the routes against it. `clients/` holds a native client spike
   (gpui and Slint) that reads the same API; see [clients/README.md](clients/README.md).
 - **WebAssembly plugins:** a `plugins[]` entry with `"path": "/path/to/plugin.wasm"` loads a plugin in
-  Bifrost's JSON ABI (exports `malloc`, `free`, `get_name`, `init`, `pre_hook`, `post_hook`, `cleanup`) and
+  the gateway's JSON ABI (exports `malloc`, `free`, `get_name`, `init`, `pre_hook`, `post_hook`, `cleanup`) and
   runs it on an embedded interpreter (WAMR, added to the Tov runtime by `tov-patches/0005-wamr.patch`).
   `wasm_limits` on the entry caps its memory pages, stack and instructions per hook call. A plugin sees only
   its own memory; a hook that traps, loops or answers with an error is logged and skipped. Go shared-object
-  plugins (`.so`) are not supported. `tests/wasm/plugin.c` is a small example. The chain runs Bifrost's LLM hooks
+  plugins (`.so`) are not supported. `tests/wasm/plugin.c` is a small example. The chain runs LLM hooks
   (`pre_hook`, `post_hook`) on every request type (chat, completions, embeddings, Responses, rerank, speech,
   transcription, images, OCR) and on each chunk of a stream, and a `post_hook` answer with `has_error` turns a
   response into an error. A module that exports `http_pre_hook`, `http_post_hook` or `http_stream_chunk_hook`
-  also gets Bifrost's HTTP transport hooks: before routing it can rewrite the request or answer it, after the
+  also gets HTTP transport hooks: before routing it can rewrite the request or answer it, after the
   response it can rewrite that, and for each event of a stream it can rewrite, drop or end (see `docs/parity.md`,
   section Plugins). A `path` may be a URL: it must be https unless the entry pins the file with `"sha256"`
   (checked on download and on every load), and the copy is kept in a private `plugin-cache` folder beside the
   config file (`RAIJU_PLUGIN_DIR` overrides).
 - **Outbound safety:** every URL a user or caller sets (A2A agents and push callbacks, webhooks, MCP servers with
   `require_public_target`, MCP OAuth and token exchange endpoints, the MCP library, plugin downloads, exporters,
-  vector stores) and every provider connection (as Bifrost's dialer: loopback allowed, other private addresses only
+  vector stores) and every provider connection (loopback allowed, other private addresses only
   with `network_config.allow_private_network`) is checked against private and metadata addresses in every spelling,
   on the addresses the host resolves to when the connection is made (tov-patches/0013), so DNS rebinding is refused
   too; see [SECURITY.md](SECURITY.md), which also lists the vendored native libraries and how to report a
@@ -99,7 +99,7 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
   Zitadel and Google Workspace (`scim_config`: claim mapping, inbound SCIM 2.0, directory sync and bulk import on
   `bulkSyncInterval`, reconcile with preview, silent session refresh; `/api/scim/provision/*`), a hash-chained
   HMAC-signed audit log (`/api/audit-logs`, `/export`, `/verify`), alerting
-  to webhooks, Slack, Teams and PagerDuty (`alerts`, Bifrost's CEL alert rules), secrets from HashiCorp Vault and AWS Secrets
+  to webhooks, Slack, Teams and PagerDuty (`alerts`, CEL alert rules), secrets from HashiCorp Vault and AWS Secrets
   Manager (`vault.<path>#<field>`, `aws-sm.<id>`), log exports to S3, MinIO or GCS
   (`log_exports`), and clustering that shares budget and rate-limit usage
   between nodes (`cluster`).
@@ -114,7 +114,7 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
   Patronus, any webhook) alongside the built-in PII and secret redaction.
 - **Log exporters:** Datadog, Splunk HEC, Elasticsearch and any HTTP endpoint
   (`exporters`), next to the S3/GCS object exports.
-- **Routing:** session affinity (`x-bf-session-id`, `session_affinity`) and a
+- **Routing:** session affinity (`x-raiju-session-id`, `session_affinity`) and a
   complexity router (`complexity_tier` in routing rules, tiers behind model `auto`).
 - **Crew routing** (Raiju-only; [docs/crew-routing.md](docs/crew-routing.md)): task-level routing of
   agent crews after S. K. Radha's *Pareto Crewing*. Model `crew/<pool>` with `x-raiju-task-id` and
@@ -135,60 +135,60 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
   Groq, Mistral, xAI, DeepSeek, Cerebras, Fireworks, Together, Nebius, Parasail,
   OpenRouter, Perplexity, Ollama, vLLM, SGLang, LM Studio, and custom
   OpenAI-compatible providers (`custom_provider_config`). Hugging Face models are named
-  `huggingface/<inference provider>/<hub id>` (`huggingface/fal-ai/fal-ai/flux/dev`) and routed as Bifrost
-  routes them: chat through the router, embeddings, speech, transcription and images on the provider's own route
+  `huggingface/<inference provider>/<hub id>` (`huggingface/fal-ai/fal-ai/flux/dev`):
+  chat goes through the router; embeddings, speech, transcription and images use the provider's own route
   with the hub's model mapping (`RAIJU_HF_HUB_URL` points the mapping and listing reads at a hub mirror).
 - **Compat routes and proxies:** `/litellm/*` and `/langchain/*` prefixes, OCR
   pass-through (`/v1/ocr`), per-provider HTTP proxies (`proxy_config`, with credentials).
 - **Reliability:** fallback chains, retries with jittered exponential backoff
   and `Retry-After`, key rotation on 401/403, weighted key selection with
-  per-key model lists, key pinning (`x-bf-api-key`), timeouts, `x-bf-eh-*`
+  per-key model lists, key pinning (`x-raiju-api-key`), timeouts, `x-raiju-eh-*`
   header forwarding.
-- **Governance:** virtual keys (`x-bf-vk`, Bearer, `x-api-key`, `x-goog-api-key`,
+- **Governance:** virtual keys (`x-raiju-vk`, Bearer, `x-api-key`, `x-goog-api-key`,
   `api-key`), provider/model allowlists, budgets and rate limits across the
   customer → team → key hierarchy, cost tracking with a price table and overrides (the built-in
   table is generated from the Bifrost datasheet by `scripts/gen_pricing.py`; audio is billed by
-  tokens, seconds or characters as Bifrost bills it).
-- **Caching:** exact-match response cache (`x-bf-cache-key`, `x-bf-cache-ttl`,
-  `x-bf-cache-no-store`); auto prompt caching for Anthropic and Bedrock
-  (`prompt_cache.auto_inject`, `x-bf-prompt-cache-auto-inject`).
-- **Observability:** Prometheus `/metrics` with Bifrost's metric names,
-  `x-bifrost-request-id`, JSON request logs, `x-bf-overhead-us`.
+  tokens, seconds or characters according to that source).
+- **Caching:** exact-match response cache (`x-raiju-cache-key`, `x-raiju-cache-ttl`,
+  `x-raiju-cache-no-store`); auto prompt caching for Anthropic and Bedrock
+  (`prompt_cache.auto_inject`, `x-raiju-prompt-cache-auto-inject`).
+- **Observability:** Prometheus `/metrics` with `raiju_*` gateway metric names,
+  `x-raiju-request-id`, JSON request logs, `x-raiju-overhead-us`.
 
 ## Inference auth
 
-As in Bifrost, `client.enforce_auth_on_inference` makes inference require a virtual key, or
+`client.enforce_auth_on_inference` makes inference require a virtual key, or
 admin credentials. When it is omitted, Raiju turns it on if the config has credentials to
 use (virtual keys, admin users or `auth_config`), and leaves it off otherwise. Set it to
-`false` to serve anonymous inference with keys configured. `auth_config` takes Bifrost's
+`false` to serve anonymous inference with keys configured. `auth_config` takes
 `admin_username`, `admin_password` and `is_enabled`, at the top level or under `governance`.
 While inference is not authenticated the gateway says so at start-up.
 
-The Bifrost CLI signs in with `bifrost auth login` against `/api/agent/auth/*`: a browser page takes a user's
-password (or a dashboard single sign-on session), the CLI trades the one-time code for a `ck-bf-agent-` token
+Agent clients sign in against `/api/agent/auth/*`: a browser page takes a user's
+password (or a dashboard single sign-on session), and the client trades the one-time code for a `ck-raiju-agent-` token
 (one hour, rotated with a 30-day refresh token), and inference with that token runs as the user's chosen assigned
-key (`x-bf-agent-vk-id`) or, when it picks none, the user's first active assigned key. Tokens live in the
+key (`x-raiju-agent-vk-id`) or, when it picks none, the user's first active assigned key. Tokens live in the
 gateway process's memory, as dashboard sessions do.
 
 ## Secure defaults
 
-- **The management API is locked until an admin exists**, as Bifrost's setup lock. With no admin
+- **The management API is locked until an admin exists.** With no admin
   account (no admin users, API keys or `auth_config`), every `/api` route but the public ones
   (`/api/session/is-auth-enabled`, login, setup, `/api/version`, OAuth callbacks) needs the
-  operator's setup token in `X-Bifrost-Setup-Token`, or the setup session cookie that
+  operator's setup token in `X-Raiju-Setup-Token`, or the setup session cookie that
   `POST /api/session/setup` trades it for: 401 without it, 403 with a wrong one. The token is
-  `setup_token` in the config (`env.NAME` allowed), else the `BIFROST_SETUP_TOKEN` environment
+  `setup_token` in the config (`env.NAME` allowed), else the `RAIJU_SETUP_TOKEN` environment
   variable. With neither set, `/api` answers 403 to everything, and the start-up log says how to
   set one. Create the first admin with the token: the dashboard opens on a setup screen that asks for
-  it and an admin name, or send `POST /api/users` with `X-Bifrost-Setup-Token`; from then on normal
+  it and an admin name, or send `POST /api/users` with `X-Raiju-Setup-Token`; from then on normal
   sign-in applies and the token opens nothing. `client.whitelisted_routes` stay open.
-  In the deployments: `BIFROST_SETUP_TOKEN` in compose's `.env`, the chart's `setupToken.existingSecret`,
+  In the deployments: `RAIJU_SETUP_TOKEN` in compose's `.env`, the chart's `setupToken.existingSecret`,
   or a `secret_arns` entry on ECS ([deploy/README.md](deploy/README.md)).
-- **Sign-in:** passwords are bcrypt hashes (Bifrost's form; old salted SHA-256 ones are replaced at the
+- **Sign-in:** passwords are bcrypt hashes (old salted SHA-256 ones are replaced at the
   next sign-in), unknown users cost the same time as real ones, and failed sign-ins are throttled per
   account and per client address (429 with Retry-After; `server.sign_in_throttle`). Forwarding headers
   are believed only from `server.trusted_proxies`. See [SECURITY.md](SECURITY.md#sign-in).
-- **Bind address:** 127.0.0.1 by default (Bifrost's `localhost`); `-host` or `BIFROST_HOST` change it.
+- **Bind address:** 127.0.0.1 by default; `-host` or `RAIJU_HOST` change it.
   The image, compose, the chart and the Terraform modules pass `-host 0.0.0.0`.
 - **Metrics:** label values a caller chooses are bounded. A path no route serves (404, 405, 501), and
   a management path the gate refused, is labelled `other`; ids in paths become `{id}` (past the third
@@ -198,7 +198,7 @@ gateway process's memory, as dashboard sessions do.
   reported as `other`. `bench/metrics_cardinality.py` measures it (10,000 junk requests).
 - **Async jobs:** ids are 128 random bits (`job_` and 32 hex digits). A job submitted with a virtual
   key is shown only to that key, and one submitted with another credential only to that
-  credential; an anonymous job is open to any poll, as in Bifrost. Another caller's job reads as
+  credential; an anonymous job is open to any poll. Another caller's job reads as
   404. Jobs are kept beside the config (`<config>.jobs/`), so a poll after a restart or on another
   node finds them (a node with its own folder asks its peers); a job whose gateway stopped while it
   ran reads as failed.
@@ -211,18 +211,18 @@ gateway process's memory, as dashboard sessions do.
   `$TMPDIR/raiju-<pid>-<16 random hex digits>` (default `/tmp`), made by the supervisor with a fresh
   `mkdir` (a planted folder or symlink makes it fail rather than be used) and set to 0700.
 - **MCP:** a virtual key with no `mcp_configs` gets no MCP tools but those of `allow_by_default`
-  clients, as in Bifrost. Grant a key its tools with `mcp_configs` (`tools_to_execute: ["*"]` for
+  clients. Grant a key its tools with `mcp_configs` (`tools_to_execute: ["*"]` for
   all of a client's tools), an access profile, or a virtual MCP. A request without a virtual key is
   not limited by key rules.
 - **WebRTC:** the WebRTC calls the gateway terminates on its own peer (`POST /v1/realtime/calls`,
   `POST /v1/realtime`, `POST /v1/live/sessions`) are off unless `server.webrtc_enabled` is `true`
-  (403 otherwise). Bifrost has no such switch; Raiju adds it because the peer's DTLS and SCTP stack
-  (libdatachannel, usrsctp) is C code any caller with a virtual key reaches. WebSocket realtime and
+  (403 otherwise). Explicit opt-in limits exposure of the peer's DTLS and SCTP stack
+  (libdatachannel, usrsctp), whose C code any caller with a virtual key reaches. WebSocket realtime and
   live sessions are not affected.
 
 ## Owner switches
 
-Two Raiju-only switches, both off by default (Bifrost's behaviour):
+Two policy switches:
 
 - `client.refuse_unpriced_models`: a request subject to a budget (virtual key, team,
   customer, provider or model budget) is refused with 403 when its model, or a fallback the
@@ -303,7 +303,7 @@ eighth of the cap) beside other bodies and must arrive whole within `server.body
 sign-in, OAuth, OIDC) read at most 64 KB, and the cluster peer routes at most `cluster.max_body_mb`
 (16) with a budget of their own, after checking the head signature (method, route, time and
 Content-Length, HMAC with `cluster.secret`). A lone body up to `client.max_request_body_size_mb` is
-always read (small bodies in flight do not count against it), so that limit keeps Bifrost's meaning.
+always read (small bodies in flight do not count against it).
 `bench/body_memory.py` measures both, and `make soak-bodies` checks that big bodies leave no memory behind.
 
 The workers of one node share budgets, rate limits, the response and semantic
@@ -365,7 +365,7 @@ Caveats: Raiju passes request and response bodies through mostly untouched,
 while Bifrost parses and re-serializes them and runs more plugins (model
 catalog, telemetry, compat). Bifrost's published
 11 µs is internal overhead on a dedicated t3.xlarge, not this end-to-end
-measure. Raiju's internal overhead (`x-bf-overhead-us`) was ~40 µs mean at
+measure. Raiju's internal overhead (`x-raiju-overhead-us`) was ~40 µs mean at
 5,000 RPS on a busier setup.
 
 ### Memory
@@ -445,10 +445,12 @@ chat), a request just over `large_payload_optimization`'s threshold (set to 8 Ki
 the streamed path), and the usage and cost of the log rows. Each check prints `ok`, `FAIL` or `skip`;
 the exit status is 1 only when a check fails, so with no credentials everything skips and it exits 0.
 Prompts are a few words and `max_tokens` is 16 to 64 (the large request is about 2,000 input tokens).
+OpenAI embeddings have input-only usage (`prompt_tokens` and `total_tokens`):
+Raiju records zero completion tokens without requiring a chat-style usage block.
 
 | Provider | Reads | Default model (embeddings) |
 |---|---|---|
-| openai | `OPENAI_API_KEY` | gpt-4.1-nano (text-embedding-3-small) |
+| openai | `OPENAI_API_KEY` | gpt-4o-mini (text-embedding-3-small) |
 | anthropic | `ANTHROPIC_API_KEY` | claude-haiku-4-5 |
 | gemini | `GEMINI_API_KEY` | gemini-2.5-flash-lite (gemini-embedding-001) |
 | mistral | `MISTRAL_API_KEY` | mistral-small-latest (mistral-embed) |

@@ -34,7 +34,7 @@ import soak  # noqa: E402  (build, rss_kb, wait_up)
 BUILD = soak.BUILD
 MOCK_PORT = soak.MOCK_PORT
 PORT = soak.PORT
-KEY = "sk-bf-soak-" + "websockets-0123456789"
+KEY = "sk-raiju-soak-" + "websockets-0123456789"
 CLIENTS = 8
 
 
@@ -131,7 +131,7 @@ class Stats:
 
 def session(kind, idx, stats):
     """One session of a phase."""
-    hdr = {"x-bf-vk": KEY}
+    hdr = {"x-raiju-vk": KEY}
     with stats.lock:
         stats.n += 1
         n = stats.n

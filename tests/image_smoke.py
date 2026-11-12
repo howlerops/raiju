@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """Boot smoke of the Docker image, run the way the Helm chart runs it: a read-only root filesystem with /tmp as
 a tmpfs and /app/data as a writable volume, the image's non-root user (65532), every capability dropped and no
-privilege escalation, the chart's arguments and a setup token from BIFROST_SETUP_TOKEN. It checks that /health
+privilege escalation, the chart's arguments and a setup token from RAIJU_SETUP_TOKEN. It checks that /health
 and /ready answer, that `raiju -healthcheck` passes inside the container, that the management API is locked to
 the setup token, that a chat completion reaches a mock upstream (a small HTTP server here, reached from the
 container through host.docker.internal) and comes back, that the process runs as 65532 and cannot write the
 root filesystem while /app/data and /tmp take writes, and that SIGTERM stops it cleanly (exit 0).
+An enabled OAuth issuer with unusable durable state must fail startup (exit 1), not advertise readiness.
 
 Usage: tests/image_smoke.py [IMAGE]           (default raiju:ci; CI runs it after building the image)
        tests/image_smoke.py --binary build/raiju
+       tests/image_smoke.py IMAGE --docker-host-address <reachable-host-LAN-IP>
 The second form runs the same HTTP checks against a local binary (ports 18386 and 18387) without Docker, to try
 the script and its config where Docker is missing; the container-only checks are skipped. Exits 1 when a check
 fails and prints the gateway's log.
+For Docker runtimes whose host-gateway is a synthetic reserved address (for example OrbStack's 0/8 mapping),
+use the third form. It changes only the mock's host mapping, not the gateway's address policy.
 """
 import argparse, http.server, json, os, shutil, signal, subprocess, sys, tempfile, threading, time, urllib.error, urllib.request, uuid
 
@@ -44,7 +48,7 @@ def chart_args(port, workers):
     return ["-app-dir", "/app/data", "-host", "0.0.0.0", "-port", str(port), "-workers", str(workers)]
 
 
-def docker_run_args(name, image, data_dir, setup_token, workers):
+def docker_run_args(name, image, data_dir, setup_token, workers, host_address):
     """`docker run` with the chart's pod and container security context and volumes."""
     return [
         "docker", "run", "-d", "--name", name,
@@ -54,8 +58,8 @@ def docker_run_args(name, image, data_dir, setup_token, workers):
         "--user", f"{UID}:{UID}",                        # runAsUser, runAsGroup
         "--cap-drop", "ALL",                             # capabilities.drop
         "--security-opt", "no-new-privileges",           # allowPrivilegeEscalation: false
-        "--add-host", "host.docker.internal:host-gateway",
-        "-e", f"BIFROST_SETUP_TOKEN={setup_token}",
+        "--add-host", f"host.docker.internal:{host_address}",
+        "-e", f"RAIJU_SETUP_TOKEN={setup_token}",
         "-p", "127.0.0.1::8080",
         image, *chart_args(8080, workers),
     ]
@@ -140,10 +144,10 @@ class Smoke:
         self.wait_for("/ready answers 200", base + "/ready", 30)
         s, b = call("GET", base + "/api/session/is-auth-enabled")
         info = json.loads(b) if s == 200 else {}
-        self.check("the setup token from BIFROST_SETUP_TOKEN is seen", info.get("setup_token_configured") is True and info.get("setup_required") is True, (s, b[:200]))
+        self.check("the setup token from RAIJU_SETUP_TOKEN is seen", info.get("setup_token_configured") is True and info.get("setup_required") is True, (s, b[:200]))
         s, b = call("GET", base + "/api/providers")
         self.check("/api is locked without the setup token", s in (401, 403), (s, b[:200]))
-        s, b = call("GET", base + "/api/providers", headers={"X-Bifrost-Setup-Token": setup_token})
+        s, b = call("GET", base + "/api/providers", headers={"X-Raiju-Setup-Token": setup_token})
         self.check("/api opens to the setup token", s == 200 and "openai" in b, (s, b[:200]))
         before = len(mock.seen)
         s, b = call("POST", base + "/v1/chat/completions", {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "ping"}]}, timeout=30)
@@ -162,7 +166,7 @@ def docker(*args, check=False, timeout=60):
     return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout, check=check)
 
 
-def run_image(image, workers):
+def run_image(image, workers, host_address):
     smoke = Smoke()
     setup_token = "smoke-setup-" + uuid.uuid4().hex[:16]
     name = "raiju-smoke-" + uuid.uuid4().hex[:8]
@@ -178,7 +182,7 @@ def run_image(image, workers):
         if r.returncode != 0:
             os.chmod(data, 0o777)
             os.chmod(os.path.join(data, "config.json"), 0o666)
-        r = subprocess.run(docker_run_args(name, image, data, setup_token, workers), capture_output=True, text=True, timeout=120)
+        r = subprocess.run(docker_run_args(name, image, data, setup_token, workers, host_address), capture_output=True, text=True, timeout=120)
         if not smoke.check("the container starts", r.returncode == 0, r.stderr.strip()):
             return 1
         started = True
@@ -187,8 +191,10 @@ def run_image(image, workers):
 
         inspect = json.loads(docker("inspect", name).stdout)[0]
         smoke.check("the root filesystem is read-only", inspect["HostConfig"]["ReadonlyRootfs"] is True, inspect["HostConfig"].get("ReadonlyRootfs"))
-        image_user = json.loads(docker("image", "inspect", image).stdout)[0]["Config"].get("User", "")
+        image_config = json.loads(docker("image", "inspect", image).stdout)[0]["Config"]
+        image_user = image_config.get("User", "")
         smoke.check("the image's USER is the numeric non-root user", image_user == f"{UID}:{UID}", image_user)
+        smoke.check("the image exports /tmp metadata for non-root Fargate bind mounts", "/tmp" in (image_config.get("Volumes") or {}))
 
         if smoke.http_checks(base, mock, setup_token):
             r = docker("exec", name, "/usr/local/bin/raiju", "-healthcheck")
@@ -214,6 +220,25 @@ def run_image(image, workers):
         r = docker("stop", "-t", "40", name, timeout=90)
         code = docker("inspect", "-f", "{{.State.ExitCode}}", name).stdout.strip()
         smoke.check("SIGTERM stops the gateway cleanly (exit 0)", r.returncode == 0 and code == "0", (r.returncode, code))
+        if r.returncode == 0 and code == "0":
+            # A configured OAuth issuer must fail closed before readiness when its durable state cannot be used.
+            # The same-volume fixture is written as the gateway user, not by relaxing host/container permissions.
+            cfg = smoke_config(f"http://host.docker.internal:{mock.port}")
+            cfg["client"].update(mcp_server_auth_mode="both", oauth2_server_config={"issuer_url": "https://smoke.invalid"})
+            fixture = subprocess.run(
+                ["docker", "run", "--rm", "-i", "--network", "none", "--read-only",
+                 "--user", f"{UID}:{UID}", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+                 "-v", f"{data}:/app/data", "--entrypoint", "/bin/sh", image, "-c",
+                 "cat > /app/data/config.json && printf '{\"version\":99}\\n' > /app/data/mcp-oauth-state.json"],
+                input=json.dumps(cfg), capture_output=True, text=True, timeout=30)
+            if smoke.check("the unusable OAuth state fixture is installed as the gateway user", fixture.returncode == 0, fixture.stderr):
+                restarted = docker("start", name)
+                try:
+                    stopped = docker("wait", name, timeout=20)
+                    oauth_exit = stopped.stdout.strip()
+                except subprocess.TimeoutExpired:
+                    oauth_exit = "still running"
+                smoke.check("unusable enabled OAuth state fails startup (exit 1)", restarted.returncode == 0 and oauth_exit == "1", oauth_exit)
     finally:
         if started and smoke.failed:
             print("---- container log ----")
@@ -233,8 +258,8 @@ def run_binary(binary, workers):
     data = tempfile.mkdtemp(prefix="raiju-smoke-")
     mock = Mock("127.0.0.1", LOCAL_MOCK_PORT)
     log = open(os.path.join(data, "gateway.log"), "w+")
-    env = {k: v for k, v in os.environ.items() if k not in ("BIFROST_HOST", "RAIJU_CONFIG", "APP_DIR", "PORT")}
-    env["BIFROST_SETUP_TOKEN"] = setup_token
+    env = {k: v for k, v in os.environ.items() if k not in ("RAIJU_HOST", "RAIJU_CONFIG", "APP_DIR", "PORT")}
+    env["RAIJU_SETUP_TOKEN"] = setup_token
     proc = None
     try:
         with open(os.path.join(data, "config.json"), "w") as f:
@@ -280,6 +305,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("image", nargs="?", default="raiju:ci")
     p.add_argument("--binary", help="run against this local binary instead of the image (no Docker)")
+    p.add_argument("--docker-host-address", default="host-gateway", help="reachable host IP for the mock; use a LAN IP when the runtime's host-gateway is reserved")
     # two workers, so the workers' share folder in /tmp is made on the tmpfs
     p.add_argument("--workers", type=int, default=2)
     a = p.parse_args()
@@ -288,7 +314,7 @@ def main():
     if shutil.which("docker") is None:
         print("image smoke: docker is not installed")
         return 1
-    return run_image(a.image, a.workers)
+    return run_image(a.image, a.workers, a.docker_host_address)
 
 
 if __name__ == "__main__":

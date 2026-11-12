@@ -1,25 +1,26 @@
-// Realtime client secrets and transcription sessions, as Bifrost serves them (handlers/realtime_client_secrets.go,
-// webrtcrealtime.go and wsrealtime.go).
+// Realtime client secrets and transcription sessions.
 //
-// Client secrets. POST /v1/realtime/client_secrets (and OpenAI's older /v1/realtime/sessions and
-// /v1/realtime/transcription_sessions) mint a short-lived token at the provider with a pool key, under the caller's
-// virtual key (realtimecalls.tov realtimeMint). The provider's token never reaches the caller: it is replaced by one of
-// this gateway's own ("ek_bf_" and 32 hex digits), and the mapping from it to the provider's token, the virtual key,
-// the pool key and the model is kept until the provider's token expires. A browser that connects with it (a WebSocket
-// on /v1/realtime, or a WebRTC call) is admitted, governed, logged and billed as that virtual key, and the provider is
-// sent its own token (realtimeCredential). An ek_ token this gateway did not mint goes to the provider as it is, which
-// decides whether it is valid, as Bifrost does.
+// POST /v1/realtime/client_secrets and OpenAI's older /v1/realtime/sessions and
+// /v1/realtime/transcription_sessions mint a short-lived provider token with a pool key under
+// the caller's virtual key (realtimecalls.tov realtimeMint). The provider token is replaced
+// with a gateway token ("ek_raiju_" plus 32 hex digits). Its mapping to the provider token,
+// virtual key, pool key and model lasts until the provider token expires. Browser WebSocket
+// connections on /v1/realtime and WebRTC calls using it are admitted, governed, logged and
+// billed as that virtual key. realtimeCredential sends the provider its own token. External
+// ek_ tokens pass through unchanged for the provider to validate.
 //
-// The mappings live on the cluster state (clusterstate.tov) under "realtime.ek", so a token minted through one worker
-// or node is honoured by every other: keyed by the SHA-256 of the token (the token itself never travels), the provider's
-// token sealed under the encryption key the nodes share (store.tov sealStored; main sets it with setEkSeal). An expired
-// mapping is refused and deleted when it is read, and the expired ones are swept at each mint.
+// Mappings live in cluster state (clusterstate.tov) under "realtime.ek" so all workers and
+// nodes can use them. They are keyed by the token's SHA-256 hash, so the gateway token itself
+// is not transmitted through cluster state. The provider token is sealed with the nodes'
+// shared encryption key (store.tov sealStored; main sets it with setEkSeal). Expired mappings
+// are rejected and deleted on read, and swept at each mint.
 //
-// Transcription sessions. A realtime session can be a transcription-only one: a WebSocket with ?intent=transcription,
-// whose model arrives in its first session.update (session.audio.input.transcription.model, or the beta
-// transcription_session.update's session.input_audio_transcription.model), or a call whose session is of type
-// transcription. transcriptionModelOf reads that model and pinTranscriptionModel keeps the event bound to the routed
-// one; their units are billed at the transcription rates (livehooks.tov transcriptionUnitCost).
+// Transcription-only sessions include WebSockets with ?intent=transcription, whose model
+// arrives in the first session.update at session.audio.input.transcription.model, or in a beta
+// transcription_session.update at session.input_audio_transcription.model, and calls whose
+// session type is transcription. transcriptionModelOf reads the model; pinTranscriptionModel
+// binds events to the routed model. Usage is billed at transcription rates
+// (livehooks.tov transcriptionUnitCost).
 import { clusterState } from "./clusterstate"
 import { sha256, toHex, utf8, secureHex } from "./crypto"
 import { Field, fields, find, rawStr, rawNum, setField, build, quote, without, isNull } from "./json"
@@ -164,8 +165,8 @@ export function bearerOf(v: string | undefined): string {
   return t.slice(7).trim()
 }
 
-// The credential a browser WebSocket names in its subprotocols (OpenAI's openai-insecure-api-key.<key>, xAI's
-// xai-client-secret.<key>), as Bifrost reads it; "" for none or for two that disagree.
+// Reads browser WebSocket credentials from OpenAI's openai-insecure-api-key.<key> or xAI's
+// xai-client-secret.<key> subprotocol. Returns "" if absent or if two credentials disagree.
 export function subprotocolCredential(v: string | undefined): string {
   if (v === undefined) return ""
   let cred = ""
@@ -189,7 +190,7 @@ export function subprotocolCredential(v: string | undefined): string {
 // may).
 export type RealtimeCred = { headers: Hdrs, mapping: EkMapping | undefined, providerToken: string, pin: string | undefined, refused: string }
 
-const CREDENTIAL_HEADERS = ["authorization", "x-api-key", "api-key", "x-goog-api-key", "x-bf-vk"]
+const CREDENTIAL_HEADERS = ["authorization", "x-api-key", "api-key", "x-goog-api-key", "x-raiju-vk"]
 
 export const REVOKED = "the provided credential does not exist, has expired, or has been revoked"
 
@@ -197,7 +198,7 @@ export function realtimeCredential(cfg: Config, h: Hdrs, nowMs: f64): RealtimeCr
   let token = bearerOf(h.get("authorization"))
   const sub = subprotocolCredential(h.get("sec-websocket-protocol"))
   if (token === "") token = sub
-  const pinned = h.get("x-bf-api-key")
+  const pinned = h.get("x-raiju-api-key")
   if (!isEphemeral(token)) {
     if (sub === "" || h.has("authorization")) return { headers: h, mapping: undefined, providerToken: "", pin: pinned, refused: "" }
     // a browser's credential in the subprotocol stands for an Authorization header
@@ -220,7 +221,7 @@ export function realtimeCredential(cfg: Config, h: Hdrs, nowMs: f64): RealtimeCr
     }
     // the key it was minted under is gone: the token goes with it
     if (value === "") return { headers: out, mapping: m, providerToken: "", pin: undefined, refused: REVOKED }
-    out.set("x-bf-vk", value)
+    out.set("x-raiju-vk", value)
   }
   return { headers: out, mapping: m, providerToken: m.token, pin: m.key === "" ? undefined : m.key, refused: "" }
 }
@@ -246,8 +247,8 @@ function gaTranscription(session: Field[]): Field[] | undefined {
   return objAt(input, "transcription")
 }
 
-// Whether a session object is a transcription-only one (Bifrost's IsGATranscriptionSessionBody): its type says so, or it
-// names no model of its own (nor does the body around it, rootModel) and has an input transcription.
+// Reports whether a session is transcription-only: its type says so, or it has input
+// transcription but neither the session nor the enclosing body's rootModel names a model.
 export function isTranscriptionSession(session: Field[], rootModel: bool): bool {
   const type = find(session, "type")
   if (type !== undefined) return rawStr(session, "type") === "transcription"
@@ -268,8 +269,8 @@ function withGaModel(session: Field[], model: string): Field[] {
   return s
 }
 
-// A nested object's model with its provider prefix removed ("openai/whisper-1" goes up as "whisper-1"), as Bifrost's
-// StripNestedModelPrefixes; the object is returned as it was when it names no model.
+// Removes a provider prefix from a nested object's model ("openai/whisper-1" becomes
+// "whisper-1"). Returns the object unchanged if it names no model.
 function bareModelIn(cfg: Config, obj: string): string {
   try {
     let fs = fields(obj)
@@ -307,10 +308,10 @@ export function bareNestedModels(cfg: Config, session: Field[]): Field[] {
   return fs
 }
 
-// The model a mint names (as the caller wrote it, provider prefix and all) and whether it mints a transcription
-// session, in Bifrost's order (ExtractRealtimeClientSecretModel): session.model, the top-level model, then a
-// transcription session's session.audio.input.transcription.model; on /v1/realtime/transcription_sessions the beta
-// input_audio_transcription.model. error is set when none names one.
+// Extracts the mint's model as supplied, including its provider prefix, and whether the session
+// is transcription-only. Checks session.model, then the top-level model, then a transcription
+// session's session.audio.input.transcription.model. On /v1/realtime/transcription_sessions,
+// checks the beta input_audio_transcription.model. Sets error if no model is named.
 export type MintModel = { model: string, transcription: bool, error: string }
 
 export function mintModel(body: string, route: string): MintModel {
@@ -346,12 +347,12 @@ export function mintModel(body: string, route: string): MintModel {
   return { model: "", transcription: false, error: "session.model or model is required" }
 }
 
-// The body the provider is sent to mint: the model as the provider knows it (bare), as Bifrost normalizes it. For
-// OpenAI and Azure client secrets the session carries the model (a transcription session in
-// session.audio.input.transcription.model) and a type, and the top-level model goes; /v1/realtime/sessions keeps its
-// top-level model and /v1/realtime/transcription_sessions its input_audio_transcription.model. xAI mints connection
-// credentials only: its body loses the model and a session that configures anything else is refused (Bifrost's
-// xaiRealtimeMintBody). Throws a SyntaxError with the message for the caller.
+// Builds the provider mint body using the bare model name. OpenAI and Azure client-secret
+// requests put the model and type in session, using session.audio.input.transcription.model
+// for transcription, and remove the top-level model. /v1/realtime/sessions keeps its top-level
+// model; /v1/realtime/transcription_sessions keeps input_audio_transcription.model. xAI mints
+// connection credentials only: the model is removed and sessions configuring anything else
+// are rejected. Throws a SyntaxError with the caller-facing message.
 export function mintBody(cfg: Config, kind: string, route: string, body: string, model: string): string throws SyntaxError {
   let root = try fields(body)
   const sraw = find(root, "session")
@@ -423,8 +424,8 @@ export function transcriptionModelOf(m: string): string {
   return ""
 }
 
-// The event with the transcription model it names replaced by the routed model, so a session stays on the model it
-// was admitted for (Bifrost's pinRealtimeTranscriptionModel). Any other event is returned as it is.
+// Replaces an event's transcription model with the routed model so the session stays on
+// its admitted model. Returns other events unchanged.
 export function pinTranscriptionModel(m: string, model: string): string {
   if (transcriptionModelOf(m) === "") return m
   try {
@@ -445,8 +446,7 @@ export function pinTranscriptionModel(m: string, model: string): string {
   }
 }
 
-// How long, how many frames and how many bytes a transcription WebSocket may take to name its model (Bifrost's
-// bootstrap limits).
+// Time, frame-count and byte limits for a transcription WebSocket to name its model.
 export const BOOTSTRAP_MS = 15000
 export const BOOTSTRAP_FRAMES = 16
 export const BOOTSTRAP_BYTES = 1048576
@@ -486,7 +486,7 @@ test("a minted token maps to its virtual key until it expires, sealed on the clu
   expect(m.vk).toBe("vk1")
   expect(m.token).toBe("ek_up_9")
   expect(lookupMapping("ek_bf_other", 1500000.0)).toBe(undefined)
-  expect(lookupMapping("sk-bf-x", 1500000.0)).toBe(undefined)
+  expect(lookupMapping("sk-raiju-x", 1500000.0)).toBe(undefined)
   // past its expiry it is gone, and its entry deleted
   expect(lookupMapping(tok, 2000000.0)).toBe(undefined)
   expect(clusterState().get(EK_NS, ekKey(tok))).toBe(undefined)
@@ -501,7 +501,7 @@ test("a minted token maps to its virtual key until it expires, sealed on the clu
 
 test("a realtime connection with a minted token is the virtual key it was minted under", () => {
   setEkSeal((v) => v, (v) => v)
-  const cfg: Config = { governance: { virtual_keys: [{ id: "vk-a", value: "sk-bf-a" }] } }
+  const cfg: Config = { governance: { virtual_keys: [{ id: "vk-a", value: "sk-raiju-a" }] } }
   const tok = "ek_bf_" + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   putMapping(tok, { vk: "vk-a", key: "pool", token: "ek_up_a", provider: "openai", model: "gpt-realtime", transcription: false, expires_at: 9999999999 }, 1000.0)
   const h: Hdrs = new Map()
@@ -509,7 +509,7 @@ test("a realtime connection with a minted token is the virtual key it was minted
   h.set("user-agent", "ua")
   const c = realtimeCredential(cfg, h, 2000.0)
   expect(c.refused).toBe("")
-  expect(c.headers.get("x-bf-vk")).toBe("sk-bf-a")
+  expect(c.headers.get("x-raiju-vk")).toBe("sk-raiju-a")
   expect(c.headers.has("authorization")).toBe(false)
   expect(c.headers.get("user-agent")).toBe("ua")
   expect(c.providerToken).toBe("ek_up_a")
@@ -517,7 +517,7 @@ test("a realtime connection with a minted token is the virtual key it was minted
   // a browser names it in the subprotocol
   const b: Hdrs = new Map()
   b.set("sec-websocket-protocol", "realtime, openai-insecure-api-key." + tok)
-  expect(realtimeCredential(cfg, b, 2000.0).headers.get("x-bf-vk")).toBe("sk-bf-a")
+  expect(realtimeCredential(cfg, b, 2000.0).headers.get("x-raiju-vk")).toBe("sk-raiju-a")
   // the virtual key is gone: refused
   const gone: Config = { governance: { virtual_keys: [] } }
   expect(realtimeCredential(gone, h, 2000.0).refused).toBe(REVOKED)
@@ -530,13 +530,13 @@ test("a realtime connection with a minted token is the virtual key it was minted
   expect(uc.headers.has("authorization")).toBe(false)
   // any other credential is the caller's own; a subprotocol one stands for Authorization
   const v: Hdrs = new Map()
-  v.set("sec-websocket-protocol", "realtime, openai-insecure-api-key.sk-bf-a")
-  expect(realtimeCredential(cfg, v, 2000.0).headers.get("authorization")).toBe("Bearer sk-bf-a")
+  v.set("sec-websocket-protocol", "realtime, openai-insecure-api-key.sk-raiju-a")
+  expect(realtimeCredential(cfg, v, 2000.0).headers.get("authorization")).toBe("Bearer sk-raiju-a")
   expect(subprotocolCredential("openai-insecure-api-key.a, xai-client-secret.b")).toBe("")
   expect(bearerOf("bearer  x ")).toBe("x")
 })
 
-test("the model of a mint, in Bifrost's order, and the body the provider is sent", () => {
+test("the model of a mint, in Raiju's order, and the body the provider is sent", () => {
   const cfg: Config = {}
   const a = mintModel(`{"session":{"type":"realtime","model":"openai/gpt-realtime"}}`, "/v1/realtime/client_secrets")
   expect(a.model).toBe("openai/gpt-realtime")

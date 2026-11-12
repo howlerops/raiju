@@ -16,7 +16,7 @@ fills), then:
 
 1. warm-up (--warmup seconds, 15 by default): the full mix, so allocator pools, caches and the log ring settle;
 2. soak (--seconds, 75 by default): --clients keep-alive connections (12 by default, from 3 processes) loop small
-   chats: plain and streamed, the key in x-bf-vk or in Authorization, some with an x-bf-eh- header to forward.
+   chats: plain and streamed, the key in x-raiju-vk or in Authorization, some with an x-raiju-eh- header to forward.
 
 The RSS and the number of answered requests are sampled every 2 s; the least-squares slope of RSS against requests
 over the soak, in bytes per request, fails above --max-slope (10 by default; a settled heap measures about 0 to 2,
@@ -35,7 +35,7 @@ import soak  # noqa: E402  (build, rss_kb, wait_up)
 BUILD = soak.BUILD
 PORT = int(os.environ.get("SOAK_SLOPE_PORT", "18388"))
 MOCK_PORT = int(os.environ.get("SOAK_SLOPE_MOCK_PORT", "18389"))
-KEY = "sk-bf-soak-" + "slope-0123456789"
+KEY = "sk-raiju-soak-" + "slope-0123456789"
 
 PLAIN = json.dumps({"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "hello there"}]}).encode()
 STREAM = json.dumps({"model": "openai/gpt-4o-mini", "stream": True, "messages": [{"role": "user", "content": "hi"}]}).encode()
@@ -53,9 +53,9 @@ def client(idx, until, count, errors):
         if (n + idx) % 3 == 0:
             h["authorization"] = "Bearer " + KEY
         else:
-            h["x-bf-vk"] = KEY
+            h["x-raiju-vk"] = KEY
         if n % 5 == 0:
-            h["x-bf-eh-x-soak-trace"] = "t" + str(n)
+            h["x-raiju-eh-x-soak-trace"] = "t" + str(n)
         body = STREAM if n % 4 == 0 else PLAIN
         try:
             if c is None:

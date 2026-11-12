@@ -10,8 +10,8 @@
 #   parity     the docs/parity.md summary is up to date
 #   configdoc  docs/config-reference.md is up to date (scripts/gen_config_doc.py --check)
 #   deploy     the Dockerfile, compose file and Helm chart (tests/test_deploy.py; helm template needs helm)
-#   e2e-bun    tests/e2e.py on the Bun.serve server
-#   e2e-http1  tests/e2e.py on the HTTP/1.1 server
+#   e2e-bun    tests/e2e.py and the embedding wire regression on the Bun.serve server
+#   e2e-http1  the same checks on the HTTP/1.1 server
 #   ui         make ui (headless Chromium through Playwright)
 #   soak       optional, not in the default list: tests/soak/soak.py, a memory soak of one worker that fails
 #              when RSS grows, then tests/soak/bodies.py, big request bodies to a worker and a broker, then
@@ -50,8 +50,8 @@ stage_cmd() {
     configdoc) echo 'python3 scripts/gen_config_doc.py --check' ;;
     deploy)    echo 'python3 -m unittest -v tests/test_deploy.py' ;;
     # unset, not "bun": tests/e2e.py reads an unset RAIJU_SERVER as the default server in places
-    e2e-bun)   echo 'env -u RAIJU_SERVER python3 tests/e2e.py' ;;
-    e2e-http1) echo 'RAIJU_SERVER=http1 python3 tests/e2e.py' ;;
+    e2e-bun)   echo 'env -u RAIJU_SERVER python3 tests/e2e.py && env -u RAIJU_SERVER python3 tests/embeddings_encoding.py' ;;
+    e2e-http1) echo 'RAIJU_SERVER=http1 python3 tests/e2e.py && RAIJU_SERVER=http1 python3 tests/embeddings_encoding.py' ;;
     ui)        echo 'make ui TOV="$TOV"' ;;
     soak)      echo 'make soak TOV="$TOV" && make soak-bodies TOV="$TOV" && make soak-websockets TOV="$TOV" && make soak-slope TOV="$TOV"' ;;
     *) return 1 ;;
