@@ -501,7 +501,8 @@ export type RoleConfig = { id?: int, name: string, description?: string, dac?: s
 
 // Credentials for the management API and UI (governance.auth_config or deprecated top-level
 // auth_config): admin_username/admin_password/is_enabled, or username/password/token.
-export type AdminAuthConfig = { username?: string, password?: string, token?: string, admin_username?: string, admin_password?: string, is_enabled?: bool, disable_auth_on_inference?: bool }
+// Loginless administration is explicit: both is_enabled:false and allow_unauthenticated_access:true.
+export type AdminAuthConfig = { username?: string, password?: string, token?: string, admin_username?: string, admin_password?: string, is_enabled?: bool, allow_unauthenticated_access?: bool, disable_auth_on_inference?: bool }
 
 // scim_config: enabled switches the identity provider on. config.provisioningToken is the bearer token
 // its SCIM connector sends to /scim/v2 (env.NAME allowed; SCIM provisioning is on while a token is set).
@@ -1206,6 +1207,25 @@ export function resolveEnv(v: string): string {
   return getEnv(v.slice(4)) ?? ""
 }
 
+// Resolve role-map keys, not values: a missing or colliding identity must refuse sign-in.
+export function resolveOidcRoleMap(oc: OidcConfig): OidcConfig {
+  const source = oc.role_map
+  if (source === undefined) return oc
+  const mapped: Record<string, string> = new Map()
+  for (const key of source.keys()) {
+    let identity = resolveEnv(key)
+    if (oc.role_claim === "email") identity = identity.toLowerCase()
+    if (identity.trim() === "" || mapped.get(identity) !== undefined) {
+      mapped.set("", "")
+    } else {
+      mapped.set(identity, source.get(key) ?? "")
+    }
+  }
+  let out = oc
+  out.role_map = mapped
+  return out
+}
+
 function opt(v: string | undefined): string | undefined {
   return v === undefined ? undefined : resolveEnv(v)
 }
@@ -1370,6 +1390,7 @@ export function resolveConfig(inout c: Config): void {
   const declared = c.agents
   if (declared !== undefined) c.agents = servedAgents(declared)
   if (c.setup_token !== undefined) c.setup_token = resolveEnv(c.setup_token)
+  if (c.oidc !== undefined) c.oidc = resolveOidcRoleMap(c.oidc)
   const ps = c.providers
   if (ps !== undefined) {
     const resolved: Map<string, ProviderConfig> = new Map()
@@ -1399,7 +1420,9 @@ export function resolveConfig(inout c: Config): void {
   if (auth !== undefined) {
     const u = auth.username ?? auth.admin_username
     const pw = auth.password ?? auth.admin_password
-    const eff: AdminAuthConfig = auth.is_enabled === false ? {} : { username: opt(u), password: opt(pw), token: opt(auth.token) }
+    let eff: AdminAuthConfig = auth.is_enabled === false ? {} : { username: opt(u), password: opt(pw), token: opt(auth.token) }
+    eff.is_enabled = auth.is_enabled
+    eff.allow_unauthenticated_access = auth.allow_unauthenticated_access
     // disable_auth_on_inference: admin auth guards only the management API unless the client section says otherwise.
     if (auth.disable_auth_on_inference === true && c.client?.enforce_auth_on_inference === undefined) {
       let cl: ClientConfig = c.client ?? {}
@@ -1891,3 +1914,39 @@ function hdrMap(k: string, v: string): Map<string, string> {
   m.set(k, v)
   return m
 }
+
+test("loginless admin flags survive effective config without changing inference policy", () => {
+  const c = try parseConfig(`{"governance":{"auth_config":{"is_enabled":false,"allow_unauthenticated_access":true,"token":"disabled"}},"client":{"enforce_auth_on_inference":true}}`)
+  expect(c.governance!.auth_config!.is_enabled).toBe(false)
+  expect(c.governance!.auth_config!.allow_unauthenticated_access).toBe(true)
+  expect(c.governance!.auth_config!.token).toBeUndefined()
+  expect(c.client!.enforce_auth_on_inference).toBe(true)
+})
+
+test("OIDC role map env keys resolve and missing or colliding identities fail closed", () => {
+  const cfg: OidcConfig = {
+    enabled: true, issuer: "https://idp.example.com", client_id: "test",
+    role_claim: "email", role_map: { "env.HOME": "admin" },
+  }
+  const resolved = resolveOidcRoleMap(cfg)
+  expect(resolved.role_map!.get((process.env.HOME ?? "").toLowerCase())).toBe("admin")
+  const missing = try parseConfig(`{"oidc":{"enabled":true,"issuer":"https://idp.example.com","client_id":"test","role_map":{"env.RAIJU_TEST_UNSET_IDENTITY_7B58":"admin"}}}`)
+  expect(missing.oidc!.role_map!.get("")).toBe("")
+  const collision = try parseConfig(`{"oidc":{"enabled":true,"issuer":"https://idp.example.com","client_id":"test","role_claim":"email","role_map":{"Alice@Example.com":"admin","alice@example.com":"viewer"}}}`)
+  expect(collision.oidc!.role_map!.get("")).toBe("")
+  const groups = resolveOidcRoleMap({ enabled: true, issuer: "", client_id: "", role_map: { "Admins": "admin" } })
+  expect(groups.role_map!.get("Admins")).toBe("admin")
+  expect(groups.role_map!.get("admins")).toBeUndefined()
+})
+
+test("OIDC domain admission policies survive raw and resolved config without defaults", () => {
+  const text = `{"oidc":{"enabled":true,"issuer":"https://idp.example.com","client_id":"test","allowed_email_domains":["example.com"],"allowed_hosted_domains":["EXAMPLE.com","other.example"]}}`
+  const raw = try rawConfigOf(text)
+  const resolved = try parseConfig(text)
+  for (const cfg of [raw, resolved]) {
+    expect(cfg.oidc!.allowed_email_domains!.join(",")).toBe("example.com")
+    expect(cfg.oidc!.allowed_hosted_domains!.join(",")).toBe("EXAMPLE.com,other.example")
+  }
+  const omitted = try rawConfigOf(`{"oidc":{"enabled":true,"issuer":"https://idp.example.com","client_id":"test"}}`)
+  expect(omitted.oidc!.allowed_hosted_domains).toBeUndefined()
+})

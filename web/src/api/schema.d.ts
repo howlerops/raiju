@@ -6323,6 +6323,15 @@ export interface components {
         };
         /** @description Bifrost GetConfigResponse. The whole config as stored, with secret values replaced by <redacted>. Keys follow config.tov. */
         GetConfigResponse: {
+            oidc?: {
+                /** @description When present, require a verified email at an exact case-insensitive allowed domain. Independent of allowed_hosted_domains. */
+                allowed_email_domains?: string[];
+                /** @description When present, require the signed ID token's nonempty string hd claim to match an exact case-insensitive allowed domain before role or session issuance. Missing or malformed claims and invalid allowlists refuse sign-in. Independent of allowed_email_domains; no default. */
+                allowed_hosted_domains?: string[];
+            } & {
+                [key: string]: unknown;
+            };
+        } & {
             [key: string]: unknown;
         };
         /** @description The global outbound proxy (Raiju). Bifrost's proxy_config. */
@@ -6409,15 +6418,20 @@ export interface components {
             /** Format: int64 */
             bucket_size_seconds: number;
         };
-        /** @description Bifrost IsAuthEnabledResponse, as Raiju answers it. */
+        /** @description Raiju native authentication status and explicit management access mode. */
         IsAuthEnabledResponse: {
             is_auth_enabled: boolean;
             has_valid_token: boolean;
-            /** @description basic or none */
+            /** @description basic, oidc or none */
             auth_type: string;
             inference_auth_enforced?: boolean;
             setup_required?: boolean;
             setup_token_configured?: boolean;
+            /**
+             * @description Explicit management access policy; missing on older servers means native.
+             * @enum {string}
+             */
+            administration_mode?: "native" | "loginless";
         };
         /** @description Bifrost Key (the provider-specific *_key_config objects are passed through). */
         Key: {

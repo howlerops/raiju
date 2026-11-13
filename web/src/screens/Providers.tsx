@@ -1,4 +1,5 @@
 import { createMemo, createSignal, Errored, For, Loading, refresh, Show, untrack } from "solid-js"
+import { LoadingSkeleton } from "../LoadingSkeleton"
 import { api } from "../api/client"
 import type { Key, Provider } from "../api/types"
 import { splitList } from "../fmt"
@@ -44,25 +45,25 @@ function KeyEditForm(props: { provider: string; k: Key; onClose: () => void; onS
     <form class="inline-form" aria-label={"Edit key " + (key.name || keyRef(key))} onSubmit={submit}>
       <label>
         Key name
-        <input name="name" required autocomplete="off" ref={(el) => { initValue(key.name ?? "")(el); queueMicrotask(() => el.focus()) }} />
+        <input class="input input-sm" name="name" required autocomplete="off" ref={(el) => { initValue(key.name ?? "")(el); queueMicrotask(() => el.focus()) }} />
       </label>
       <label>
         New API key
-        <input name="value" type="password" autocomplete="new-password" spellcheck={false} placeholder="leave blank to keep it" />
+        <input class="input input-sm" name="value" type="password" autocomplete="new-password" spellcheck={false} placeholder="leave blank to keep it" />
       </label>
       <label>
         Models
-        <input name="models" ref={initValue((key.models ?? []).join(", "))} placeholder="blank = all models" autocomplete="off" />
+        <input class="input input-sm" name="models" ref={initValue((key.models ?? []).join(", "))} placeholder="blank = all models" autocomplete="off" />
       </label>
       <label>
         Weight
-        <input name="weight" type="number" min="0" step="0.1" ref={initValue(key.weight === undefined ? "1" : String(key.weight))} />
+        <input class="input input-sm" name="weight" type="number" min="0" step="0.1" ref={initValue(key.weight === undefined ? "1" : String(key.weight))} />
       </label>
       <div class="actions">
-        <button type="button" class="ghost" onClick={props.onClose}>
+        <button type="button" class="btn btn-sm btn-ghost" onClick={props.onClose}>
           Cancel
         </button>
-        <button type="submit" class="primary" disabled={busy()}>
+        <button type="submit" class="btn btn-sm btn-primary" disabled={busy()}>
           Save key
         </button>
       </div>
@@ -98,22 +99,22 @@ function AddKeyForm(props: { provider: string; onSaved: () => void }) {
       <form class="inline-form" onSubmit={submit}>
         <label>
           Key name
-          <input name="name" required placeholder="e.g. primary" autocomplete="off" />
+          <input class="input input-sm" name="name" required placeholder="e.g. primary" autocomplete="off" />
         </label>
         <label>
           API key
-          <input name="value" type="password" required autocomplete="new-password" spellcheck={false} />
+          <input class="input input-sm" name="value" type="password" required autocomplete="new-password" spellcheck={false} />
         </label>
         <label>
           Models
-          <input name="models" placeholder="blank = all models" autocomplete="off" />
+          <input class="input input-sm" name="models" placeholder="blank = all models" autocomplete="off" />
         </label>
         <label>
           Weight
-          <input name="weight" type="number" min="0" step="0.1" value="1" />
+          <input class="input input-sm" name="weight" type="number" min="0" step="0.1" value="1" />
         </label>
         <div class="actions">
-          <button type="submit" class="primary" disabled={busy()}>
+          <button type="submit" class="btn btn-sm btn-primary" disabled={busy()}>
             Add key
           </button>
         </div>
@@ -157,7 +158,7 @@ function ProviderEditForm(props: { p: Provider; onClose: () => void; onSaved: ()
     <form class="form-grid" aria-label={"Edit provider " + prov.name} onSubmit={submit}>
       <label>
         Base URL (optional)
-        <input
+        <input class="input input-sm"
           name="base_url"
           type="url"
           placeholder="https://..."
@@ -171,14 +172,14 @@ function ProviderEditForm(props: { p: Provider; onClose: () => void; onSaved: ()
       <Show when={custom()}>
         <label>
           Base provider type
-          <input name="base_provider_type" ref={initValue(String(prov.custom_provider_config?.base_provider_type ?? ""))} autocomplete="off" />
+          <input class="input input-sm" name="base_provider_type" ref={initValue(String(prov.custom_provider_config?.base_provider_type ?? ""))} autocomplete="off" />
         </label>
       </Show>
       <div class="actions wide">
-        <button type="button" class="ghost" onClick={props.onClose}>
+        <button type="button" class="btn btn-sm btn-ghost" onClick={props.onClose}>
           Cancel
         </button>
-        <button type="submit" class="primary" disabled={busy()}>
+        <button type="submit" class="btn btn-sm btn-primary" disabled={busy()}>
           Save provider
         </button>
       </div>
@@ -192,14 +193,14 @@ function ProviderCard(props: { p: Provider; onChange: () => void }) {
   const [editKey, setEditKey] = createSignal<Key | undefined>(undefined)
   const keys = () => props.p.keys ?? []
   return (
-    <article class="card" aria-label={"Provider " + props.p.name}>
+    <article class="card panel bg-base-100 border border-base-300" aria-label={"Provider " + props.p.name}>
       <header class="toolbar" style="margin-bottom:8px">
         <h3>{props.p.name}</h3>
         <Pill>{props.p.kind || "unknown"}</Pill>
         <span class="hint mono grow">{baseUrlOf(props.p) || "default endpoint"}</span>
         <span class="row-actions">
           <Can resource="ModelProvider" op="Update">
-            <button type="button" class="ghost" aria-expanded={tf(editing())} onClick={() => setEditing(!editing())}>
+            <button type="button" class="btn btn-sm btn-ghost" aria-expanded={tf(editing())} onClick={() => setEditing(!editing())}>
               Edit
             </button>
           </Can>
@@ -238,7 +239,7 @@ function ProviderCard(props: { p: Provider; onChange: () => void }) {
                 <td>
                   <span class="row-actions">
                     <Can resource="ModelProvider" op="Update">
-                      <button type="button" class="ghost" onClick={() => setEditKey(k())}>
+                      <button type="button" class="btn btn-sm btn-ghost" onClick={() => setEditKey(k())}>
                         Edit
                       </button>
                     </Can>
@@ -310,16 +311,16 @@ function AddProvider(props: { names: () => string[]; onSaved: () => void }) {
     })
   }
   return (
-    <section class="card" aria-labelledby="pv-add-h">
+    <section class="card panel bg-base-100 border border-base-300" aria-labelledby="pv-add-h">
       <h2 id="pv-add-h">Add provider</h2>
       <form id="pv-add" class="form-grid" onSubmit={submit}>
         <label>
           Name
-          <input name="name" placeholder="e.g. openai-eu" autocomplete="off" />
+          <input class="input input-sm" name="name" placeholder="e.g. openai-eu" autocomplete="off" />
         </label>
         <label>
           Kind
-          <select name="kind" id="pv-kind" value={kind()} onChange={(e) => setKind(e.currentTarget.value)}>
+          <select class="select select-sm" name="kind" id="pv-kind" value={kind()} onChange={(e) => setKind(e.currentTarget.value)}>
             <option value="openai">openai</option>
             <option value="anthropic">anthropic</option>
             <option value="gemini">gemini</option>
@@ -331,16 +332,16 @@ function AddProvider(props: { names: () => string[]; onSaved: () => void }) {
         </label>
         <label hidden={kind() !== "custom"}>
           Base provider type
-          <input name="base_provider_type" placeholder="openai, anthropic, ..." autocomplete="off" />
+          <input class="input input-sm" name="base_provider_type" placeholder="openai, anthropic, ..." autocomplete="off" />
         </label>
         <label>
           Base URL (optional)
-          <input name="base_url" type="url" placeholder="https://..." autocomplete="off" />
+          <input class="input input-sm" name="base_url" type="url" placeholder="https://..." autocomplete="off" />
         </label>
         <FormError text={error()} />
         <div class="actions wide">
           <span class="hint grow">Built-in kinds use the kind as the name when the name is blank.</span>
-          <button type="submit" class="primary" disabled={busy()}>
+          <button type="submit" class="btn btn-sm btn-primary" disabled={busy()}>
             Save provider
           </button>
         </div>
@@ -355,14 +356,14 @@ export function Providers() {
   return (
     <section aria-labelledby="pv-title">
       <Toolbar title="Providers" id="pv-title">
-        <button type="button" class="ghost" onClick={reload}>
+        <button type="button" class="btn btn-sm btn-ghost" onClick={reload}>
           Refresh
         </button>
       </Toolbar>
       <div id="pv-list">
         <Errored fallback={(err) => <ErrP error={err()} />}>
-          <Loading fallback={<p class="muted">Loading...</p>}>
-            <Show when={providers().providers.length} fallback={<p class="card muted">No providers configured yet. Add one below.</p>}>
+          <Loading fallback={<LoadingSkeleton variant="content" />}>
+            <Show when={providers().providers.length} fallback={<p class="card panel bg-base-100 border border-base-300 muted">No providers configured yet. Add one below.</p>}>
               <For each={providers().providers} keyed={(p) => p.name}>
                 {(p) => <ProviderCard p={p()} onChange={reload} />}
               </For>

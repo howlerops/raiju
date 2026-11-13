@@ -1,60 +1,53 @@
-// What the signed-in caller may do, so the pages hide or disable actions the role cannot take.
-// The gateway still checks every request; this only keeps buttons honest. The source is
-// GET /api/users/me/permissions: a custom role or a management API key lists (resource, operation)
-// pairs; a built-in role (admin, editor, viewer, auditor) is reported by name and mirrors the fixed
-// rules in src/rbac.tov.
+// Frontend permissions mirror the native server's expanded permission pairs.
 import { createSignal } from "solid-js"
-import { send } from "./api/client"
+import { send, ApiError } from "./api/client"
+import { adminToken, administrationMode, verified, revokeSession } from "./auth"
 
 export type Op = "View" | "Create" | "Update" | "Delete"
-
+// Shared with the role editor: built-in admin expands to every catalogue pair.
+export const RESOURCES = ["Logs", "MCPLogs", "AuditLogs", "ModelProvider", "Observability", "VirtualKeys", "Users", "MCPGateway", "Teams", "Customers", "BusinessUnits", "Projects", "RBAC", "AccessProfiles", "RoutingRules", "Governance", "Settings", "Cluster", "APIKeys", "Crews"]
+export const OPERATIONS = ["View", "Create", "Update", "Delete", "Download", "Reveal", "RunInference"]
 export interface Me {
   user: string
   role: string
   builtIn: boolean
   pairs: { resource: string; operation: string }[]
 }
-
-// undefined until the first answer; can() allows everything then, and the server decides
 const [me, setMe] = createSignal<Me | undefined>(undefined)
 export { me }
 
-// the resources an editor writes (rbac.tov editorWrites: providers and governance records)
-const EDITOR_WRITES = ["ModelProvider", "VirtualKeys", "Governance", "Teams", "Customers", "AccessProfiles"]
-// the resources only an admin reads
-const ADMIN_ONLY = ["Users", "APIKeys", "AuditLogs", "Metrics"]
-
 export function allows(m: Me | undefined, resource: string, op: Op): boolean {
-  if (!m) return true
-  if (m.builtIn) {
-    if (m.role === "admin") return true
-    if (m.role === "auditor") return op === "View" && (resource === "Logs" || resource === "AuditLogs")
-    if (op === "View") return !ADMIN_ONLY.includes(resource)
-    return m.role === "editor" && EDITOR_WRITES.includes(resource)
-  }
-  return m.pairs.some((p) => p.resource === resource && p.operation === op)
+  // Metrics is a scrape endpoint, not a native management permission resource.
+  if (resource === "Metrics") return !!m && m.builtIn && m.role === "admin" && op === "View"
+  return !!m && m.pairs.some((p) => p.resource === resource && p.operation === op)
 }
-
 export function can(resource: string, op: Op = "View"): boolean {
-  return allows(me(), resource, op)
+  return verified() && allows(me(), resource, op)
 }
-
+export async function verifyToken(token: string): Promise<Me> {
+  const r = await send("GET", "/api/users/me/permissions", {
+    auth: false, quiet: true, headers: administrationMode() === "native" && token ? { authorization: "Bearer " + token } : {},
+  })
+  const d = r.data as { user?: unknown; role?: unknown; built_in?: unknown; permissions?: unknown } | undefined
+  if (r.status !== 200 || !d || typeof d.user !== "string" || !d.user || typeof d.role !== "string" || !d.role || typeof d.built_in !== "boolean" || !Array.isArray(d.permissions) || !d.permissions.every((p) => p && typeof p.resource === "string" && p.resource && typeof p.operation === "string" && p.operation)) {
+    throw new Error("The gateway returned invalid permissions. Access remains locked.")
+  }
+  if (administrationMode() === "loginless") {
+    const pairs = new Set(d.permissions.map((p) => p.resource + ":" + p.operation))
+    if (d.user !== "loginless" || d.role !== "admin" || d.built_in !== true || !RESOURCES.every((resource) => OPERATIONS.every((operation) => pairs.has(resource + ":" + operation)))) {
+      throw new Error("The gateway did not return the loginless administrator permissions. Access remains locked.")
+    }
+  }
+  return { user: d.user, role: d.role, builtIn: d.built_in, pairs: d.permissions }
+}
 export async function refreshMe(): Promise<void> {
-  try {
-    const r = await send("GET", "/api/users/me/permissions", { quiet: true })
-    const d = (r.data ?? {}) as { user?: string; role?: string; built_in?: boolean; permissions?: { resource?: string; operation?: string }[] }
-    setMe({
-      user: d.user ?? "",
-      role: d.role ?? "admin",
-      builtIn: d.built_in !== false,
-      pairs: (d.permissions ?? []).map((p) => ({ resource: p.resource ?? "", operation: p.operation ?? "" })),
-    })
-  } catch {
-    // not signed in, or a gateway without the route: keep the last answer, the server still decides
+  setMe(undefined)
+  try { setMe(await verifyToken(adminToken())) }
+  catch (e) {
+    if (e instanceof ApiError && e.status === 401) revokeSession()
+    throw e
   }
 }
-
 export function roleLabel(m: Me | undefined): string {
-  if (!m) return ""
-  return (m.user ? m.user + " · " : "") + m.role.replace("_", " ")
+  return m ? (m.user ? m.user + " · " : "") + m.role.replace("_", " ") : ""
 }

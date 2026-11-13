@@ -21,6 +21,135 @@ Worker replacement retains the same listeners and identities. SIGTERM/SIGINT
 still use the normal graceful drain; crash-loop replacement retains its backoff.
 The `http1` server remains single-process.
 
+## Native administration sign-in
+
+Raiju serves its own first-admin setup and sign-in screens; an external identity
+proxy is optional, not a prerequisite. Native sign-in is the default. Until the
+selected gateway confirms its configured access mode and permissions, the console
+does not mount navigation, dashboard components, configuration forms or live
+sockets (including Fleet). An unavailable or malformed response fails closed.
+Disabling credentials alone does not enable anonymous administration.
+
+Without configured native OIDC, initial setup requires the operator's setup token
+and creates an administrator, not a viewer/editor. The generated bearer is shown
+once and verified before the console opens; creating this account does not create
+a password. Keep the bearer securely for future token sign-ins, or configure an
+appropriate password user. Enabled native OIDC can instead provide the initial
+identity and role without a separate local account.
+
+### Set an initial password login
+
+There is no universal default username/password. An operator can preconfigure
+the first administrator before starting Raiju:
+
+```json
+{
+  "governance": {
+    "auth_config": {
+      "is_enabled": true,
+      "username": "env.RAIJU_ADMIN_USERNAME",
+      "password": "env.RAIJU_ADMIN_PASSWORD"
+    }
+  }
+}
+```
+
+Provide those environment variables through your secret manager or container
+environment; do not commit their values. This skips first-admin setup and allows
+native password sign-in. The local preview separately generates synthetic
+`preview` credentials at startup and writes them to
+`build/console-preview-access.json`; they are not product defaults.
+
+### Native single sign-on
+
+Configure `oidc.enabled`, the issuer and client credentials, and the exact
+`/api/oidc/callback` URI on each regional UI origin. Register those callbacks
+with the identity provider before enabling the deployment. A configured OIDC-only
+gateway shows sign-in, not first-admin setup; anonymous management calls remain
+locked until the provider has verified the identity.
+
+For providers carrying verified email claims, set `oidc.allowed_email_domains`
+to the explicit company domains. This requires `email_verified:true`, a valid
+email and an exact, case-insensitive domain match. Missing/unverified email,
+suffix tricks and accounts outside the allowlist are refused. Omitting the
+allowlist preserves existing provider policies; it is not a company restriction.
+
+For Google Workspace membership, also set `oidc.allowed_hosted_domains` to the
+explicit organization domains. A verified email alone does not prove managed
+Workspace membership. This independent policy requires a nonempty string `hd`
+claim in the signed ID token, matched case-insensitively to an exact allowed
+domain before role assignment or session issuance (including refreshed ID
+tokens). Subdomains, suffix matches, malformed domains and missing claims are
+refused. Both allowlists must be nonempty lists of valid DNS domains when set;
+neither has a default, and omitting either leaves that policy disabled.
+Set both lists when both managed membership and verified company email are
+required; a match in one list never bypasses the other. The authorization
+request's `hd` hint, email suffix and access-token claims are not membership proof.
+
+Use `role_claim:"email"` and exact `role_map` entries when the provider does not
+send groups. Role-map keys may use `env.NAME` references for operator-managed
+addresses; unresolved references fail closed. Select a deliberate `default_role`
+(for example, viewer), never make every company user an administrator by default.
+Native provisioned users retain their current local roles/scopes.
+
+Successful native SSO writes a regional bearer into the callback origin's
+tab-scoped storage. It does not add a second cookie-based authentication scheme.
+When the selected gateway is the current UI origin, SSO continues in the same tab.
+For a remote target the link opens that gateway's own console; no regional session
+or credential is forwarded across origins. Native logout revokes the bearer
+session and removes the tab credential, without logging the user out of the
+shared identity provider.
+
+### Explicit loginless administration
+
+For self-managed access behind your own login gate, opt in before starting:
+
+```json
+{
+  "governance": {
+    "auth_config": {
+      "is_enabled": false,
+      "allow_unauthenticated_access": true
+    }
+  }
+}
+```
+
+Both settings are required. This opens the management API and console as an
+administrator to anyone who can reach the gateway; it is not merely a UI
+preference. Restrict the listener/network and require your external gate on
+**every** management path, including WebSocket upgrades. Do not expose a direct
+origin that bypasses it. Raiju does not learn individual user identity or roles
+from an external gate in this mode; actions share the loginless principal.
+Use the existing signed `auth_proxy` integration instead when native per-user
+identity, RBAC and attribution are required. A consolidated cross-origin console
+must also be able to reach your externally protected regional APIs; it does not
+forward browser cookies or invent an upstream SSO session.
+
+The server declares loginless mode explicitly and supplies its permission set.
+The console still verifies that response before opening and clears only the
+selected origin's stored native credential. Inference authorization and the
+separate metrics scrape policy are unchanged: explicitly configure
+`client.enforce_auth_on_inference` and `server.metrics_token` as appropriate.
+
+### Session and API enforcement
+
+Native password sessions use the user's current role and data scope. Unknown
+identities have no implicit administrator role. A protected management API 401
+removes the authenticated UI; a permission-level 403 remains a denied operation.
+Signing out revokes a native session and clears the tab's selected-origin
+credential. Long-lived user/API tokens are not globally revoked by signing out
+of a tab. Shared-file session caches may take up to one second to observe a
+revocation on another worker.
+
+These UI gates supplement, never replace, native API authorization. Public
+health/auth/bootstrap and protocol-specific authorization routes remain
+deliberate exceptions. Operators can still explicitly opt out through
+`client.whitelisted_routes` or disable inference enforcement; do neither for
+private administration/tenant traffic. Set `metrics_token` to protect scrapes:
+the separately protected `/metrics` endpoint uses its own credential policy,
+and a scrape-token refusal does not invalidate a native admin identity.
+
 
 ## Configuration changes
 
@@ -201,6 +330,13 @@ Shared between the workers of one node only:
   the encryption key). They outlive a restart; nodes share them only when they share the config folder, so
   put several nodes behind sticky sessions or a shared volume for dashboard and CLI sign-ins. A write that
   cannot get its file's lock within half a second fails its request (503) and writes nothing.
+- UI WebSocket tickets live for 30 seconds in `<config>.ws-tickets/` (0700, files
+  0600 named by the ticket hash). A ticket issued on one worker can be redeemed on
+  any worker or replica sharing that directory. A successful atomic unlink claims
+  it once; an unreadable/unwritable store never falls back to a local grant.
+  Independent data volumes need session affinity for ticket issuance and socket
+  upgrade, just as for dashboard sessions. Do not share this state across
+  independently administered regions.
 - Single sign-on logins in flight are kept nowhere: `/api/oidc/login` seals the PKCE verifier, the nonce,
   the return path and a 10-minute expiry into the `state` value (AES-256-GCM), and the callback opens it on
   whichever worker takes it. The key is derived from the encryption key, so with `encryption_key` set every

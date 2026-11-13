@@ -30,7 +30,7 @@ const PERIODS: [string, string][] = [
 ]
 
 function Panel(props: { children?: import("@solidjs/web").JSX.Element }) {
-  return <div class="card chart-card">{props.children}</div>
+  return <div class="card panel bg-base-100 border border-base-300 chart-card">{props.children}</div>
 }
 
 // ---- overview ----
@@ -62,7 +62,7 @@ export function OverviewCharts(props: { tick: () => number }) {
         <span class="grow"></span>
         <label class="inline">
           Period
-          <select id="ov-period" onChange={(ev) => {
+          <select class="select select-sm" id="ov-period" onChange={(ev) => {
                 setZoom(undefined)
                 setPeriod(ev.currentTarget.value)
               }}>
@@ -85,7 +85,7 @@ export function OverviewCharts(props: { tick: () => number }) {
           const provCost = bucketsOf(obj(d.provider_usage).cost)
           const rankings = obj(obj(d.model_rankings).rankings)
           return (
-            <div class="grid charts">
+            <div class="content-grid charts">
               <Panel>
                 <TimeChart
                   id="ch-requests"
@@ -203,12 +203,12 @@ export function LogCharts(props: { query: Query; zoom?: ZoomProps }) {
   const metricLabel = () => METRICS.find((d) => d[0] === metric())![1]
 
   return (
-    <details class="card" id="lg-charts" open>
+    <details class="card panel bg-base-100 border border-base-300" id="lg-charts" open>
       <summary>Charts for these filters</summary>
       <div class="filters" style="margin-top:10px">
         <label>
           Break down by
-          <select id="lg-dim" onChange={(ev) => setDimension(ev.currentTarget.value)}>
+          <select class="select select-sm" id="lg-dim" onChange={(ev) => setDimension(ev.currentTarget.value)}>
             {DIMENSIONS.map(([v, l]) => (
               <option value={v} ref={(el) => (el.selected = v === "provider")}>
                 {l}
@@ -218,7 +218,7 @@ export function LogCharts(props: { query: Query; zoom?: ZoomProps }) {
         </label>
         <label>
           Measure
-          <select id="lg-metric" onChange={(ev) => setMetric(ev.currentTarget.value)}>
+          <select class="select select-sm" id="lg-metric" onChange={(ev) => setMetric(ev.currentTarget.value)}>
             {METRICS.map(([v, l]) => (
               <option value={v} ref={(el) => (el.selected = v === "cost")}>
                 {l}
@@ -227,7 +227,7 @@ export function LogCharts(props: { query: Query; zoom?: ZoomProps }) {
           </select>
         </label>
       </div>
-      <div class="grid charts">
+      <div class="content-grid charts">
         <Panel>
           <Guard>
             {(() => {

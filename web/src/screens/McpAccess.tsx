@@ -6,6 +6,7 @@ import { ApiError, send } from "../api/client"
 import { fmtTime } from "../fmt"
 import { can } from "../perm"
 import { Card, copyText, DangerButton, FormError, Guard, Mono, notify, Pill, Table, Toolbar, useFormRun, useRun, type Tone } from "../ui"
+import { regionalLink } from "../gateway"
 
 interface Grant {
   id: string
@@ -87,10 +88,10 @@ function Grants(props: Ctl) {
       >
         <label>
           Client or identity
-          <input id="mca-grant-q" ref={(el) => (input = el)} autocomplete="off" />
+          <input class="input input-sm" id="mca-grant-q" ref={(el) => (input = el)} autocomplete="off" />
         </label>
         <div class="actions">
-          <button type="submit">Filter</button>
+          <button class="btn btn-sm" type="submit">Filter</button>
         </div>
       </form>
       <div id="mca-grants">
@@ -152,8 +153,9 @@ function Sessions(props: Ctl) {
   const reauth = (r: SessionRow) =>
     run(async () => {
       const res = await send("POST", "/api/mcp/sessions/" + encodeURIComponent(r.id) + "/reauth")
-      const url = String((res.data as { url?: string } | undefined)?.url ?? "")
-      setLink({ client: r.mcp_client.name, url })
+      const value = String((res.data as { url?: string } | undefined)?.url ?? "")
+      if (!value) throw new Error("The gateway did not return a consent link.")
+      setLink({ client: r.mcp_client.name, url: regionalLink(value) })
       props.bump()
     })
   let linkField: HTMLInputElement | undefined
@@ -166,7 +168,7 @@ function Sessions(props: Ctl) {
       <div class="filters">
         <label>
           Show
-          <select id="mca-kind" onChange={(ev) => setKind(ev.currentTarget.value)}>
+          <select class="select select-sm" id="mca-kind" onChange={(ev) => setKind(ev.currentTarget.value)}>
             <option value="" ref={(el) => (el.selected = true)}>
               All sessions
             </option>
@@ -183,14 +185,14 @@ function Sessions(props: Ctl) {
               <strong>{"Consent link for " + l.client}</strong> Send it to the caller; it is the page they approve on.
             </p>
             <div class="secret-row">
-              <input readonly aria-label="Consent link" ref={(el) => (linkField = el)} value={location.origin + l.url} />
-              <button type="button" onClick={async () => notify((await copyText(location.origin + l.url, linkField)) ? "Link copied" : "Copy failed", "ok")}>
+              <input class="input input-sm" readonly aria-label="Consent link" ref={(el) => (linkField = el)} value={l.url} />
+              <button class="btn btn-sm" type="button" onClick={async () => notify((await copyText(l.url, linkField)) ? "Link copied" : "Copy failed", "ok")}>
                 Copy
               </button>
-              <a class="button" href={l.url} target="_blank" rel="noopener">
+              <a class="btn btn-sm" href={l.url} target="_blank" rel="noopener noreferrer">
                 Open
               </a>
-              <button type="button" class="ghost" onClick={() => setLink(undefined)}>
+              <button type="button" class="btn btn-sm btn-ghost" onClick={() => setLink(undefined)}>
                 Close
               </button>
             </div>
@@ -220,7 +222,7 @@ function Sessions(props: Ctl) {
                       <Show when={can("MCPGateway", "Update") || can("MCPGateway", "Delete")}>
                         <span class="row-actions">
                           <Show when={r().can_reauth && can("MCPGateway", "Update")}>
-                            <button type="button" class="ghost" disabled={busy()} onClick={() => reauth(r())}>
+                            <button type="button" class="btn btn-sm btn-ghost" disabled={busy()} onClick={() => reauth(r())}>
                               Re-authorize
                             </button>
                           </Show>
@@ -324,7 +326,7 @@ function Headers(props: Ctl) {
               <form class="inline-form" id="mca-hdr-open" aria-label="Open a headers submission" onSubmit={openFlow}>
                 <label>
                   MCP client
-                  <select name="client">
+                  <select class="select select-sm" name="client">
                     <For each={data().clients} keyed={(c) => c.name}>
                       {(c) => <option value={c().name}>{c().name}</option>}
                     </For>
@@ -332,14 +334,14 @@ function Headers(props: Ctl) {
                 </label>
                 <label>
                   Virtual key
-                  <select name="vk" required>
+                  <select class="select select-sm" name="vk" required>
                     <For each={data().keys} keyed={(k) => k.id}>
                       {(k) => <option value={k().id}>{k().name ? k().name + " (" + k().id + ")" : k().id}</option>}
                     </For>
                   </select>
                 </label>
                 <div class="actions">
-                  <button type="submit" class="primary" disabled={open.busy()}>
+                  <button type="submit" class="btn btn-sm btn-primary" disabled={open.busy()}>
                     Open submission
                   </button>
                 </div>
@@ -349,7 +351,7 @@ function Headers(props: Ctl) {
           </Show>
           <Show when={flow()} keyed>
             {(f) => (
-              <form class="card" id="mca-hdr-flow" aria-label="Header values" onSubmit={sendValues}>
+              <form class="card panel bg-base-100 border border-base-300" id="mca-hdr-flow" aria-label="Header values" onSubmit={sendValues}>
                 <h3>{"Header values for " + f.virtual_key.id + " on " + f.mcp_client.name}</h3>
                 <p class="hint">
                   {"Expires " + fmtTime(f.expires_at) + (f.has_active_credential ? ". Stored values: " + f.submitted_keys.join(", ") + " (leave a field empty to keep it)." : ".")}
@@ -359,17 +361,17 @@ function Headers(props: Ctl) {
                     {(k) => (
                       <label>
                         {k}
-                        <input name={"h:" + k} type="password" autocomplete="off" spellcheck={false} />
+                        <input class="input input-sm" name={"h:" + k} type="password" autocomplete="off" spellcheck={false} />
                       </label>
                     )}
                   </For>
                   <FormError text={submit.error()} />
                 </div>
                 <div class="actions">
-                  <button type="button" class="ghost" onClick={() => setFlow(undefined)}>
+                  <button type="button" class="btn btn-sm btn-ghost" onClick={() => setFlow(undefined)}>
                     Cancel
                   </button>
-                  <button type="submit" class="primary" disabled={submit.busy()}>
+                  <button type="submit" class="btn btn-sm btn-primary" disabled={submit.busy()}>
                     Verify and save
                   </button>
                 </div>
@@ -389,7 +391,7 @@ export function McpAccess() {
   return (
     <section aria-labelledby="mca-title">
       <Toolbar title="MCP access" id="mca-title">
-        <button type="button" id="mca-refresh" class="ghost" onClick={bump}>
+        <button type="button" id="mca-refresh" class="btn btn-sm btn-ghost" onClick={bump}>
           Refresh
         </button>
       </Toolbar>

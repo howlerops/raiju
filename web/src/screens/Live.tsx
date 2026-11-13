@@ -82,7 +82,7 @@ export function Live() {
   return (
     <section aria-labelledby="lv-title">
       <Toolbar title="Live requests" id="lv-title">
-        <span class={["pill", feed.paused() ? "warn" : pillTone()]} id="lv-state" role="status">
+        <span class={["badge badge-soft", feed.paused() || pillTone() === "warn" ? "badge-warning" : "badge-success"]} id="lv-state" role="status">
           {feed.paused() ? "Paused" : stateText()}
         </span>
         <span class="hint" id="lv-count">
@@ -92,7 +92,7 @@ export function Live() {
         <Show when={feed.nodes().length > 1}>
           <label class="inline-label">
             Node
-            <select id="lv-node" value={nodeFilter()} onChange={(e) => setNodeFilter(e.currentTarget.value)}>
+            <select class="select select-sm" id="lv-node" value={nodeFilter()} onChange={(e) => setNodeFilter(e.currentTarget.value)}>
               <option value="">All nodes</option>
               <For each={feed.nodes()}>{(n) => <option value={n} selected={n === nodeFilter()}>{n}</option>}</For>
             </select>
@@ -101,7 +101,7 @@ export function Live() {
         <button
           type="button"
           id="lv-pause"
-          class="ghost"
+          class="btn btn-sm btn-ghost"
           aria-pressed={tf(feed.paused())}
           onClick={() => (feed.paused() ? feed.resume() : feed.pause())}
         >
@@ -110,7 +110,7 @@ export function Live() {
         <button
           type="button"
           id="lv-clear"
-          class="ghost"
+          class="btn btn-sm btn-ghost"
           onClick={() => {
             feed.clear()
             setSelected(undefined)
@@ -130,7 +130,7 @@ export function Live() {
           Some events were missed while the connection was down and could not be replayed.
         </p>
       </Show>
-      <div class="card" style="padding:0">
+      <div class="card panel bg-base-100 border border-base-300" style="padding:0">
         <div
           class="vlist"
           id="lv-list"
@@ -189,11 +189,11 @@ export function Live() {
       </div>
       <Show when={selected()} keyed>
         {(e) => (
-          <section class="card" id="lv-detail" aria-label="Request detail" style="margin-top:14px">
+          <section class="card panel bg-base-100 border border-base-300" id="lv-detail" aria-label="Request detail" style="margin-top:14px">
             <div class="toolbar">
               <h2 style="margin:0">Request detail</h2>
               <span class="grow"></span>
-              <button type="button" class="ghost" onClick={() => setSelected(undefined)}>
+              <button type="button" class="btn btn-sm btn-ghost" onClick={() => setSelected(undefined)}>
                 Close
               </button>
             </div>

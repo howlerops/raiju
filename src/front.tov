@@ -6,7 +6,7 @@ import { serve, Http1Request, Http1Response, BodyQueue } from "./http1"
 import { WsConnection } from "./ws"
 import { Engine, StreamSink, errorResponse, noHeaders } from "./gateway"
 import { Ops } from "./ops"
-import { clientIpFor, dispatch, clusterDispatch, compatPath, streamKind, streamsRequest, routeStream, httpPathLabel, http1Upgrade, largeFront, limitedBody, credentialCheck, heldBody, routeBodyLimit, Served } from "./server"
+import { clientIpFor, dispatch, clusterDispatch, compatPath, streamKind, streamsRequest, routeStream, httpPathLabel, http1Upgrade, largeFront, limitedBody, credentialCheck, heldBody, routeBodyLimit, corsHeaders, Served } from "./server"
 import { UNREAD_ABOVE, BodyHold } from "./bodybudget"
 import { ServerLimits } from "./lifecycle"
 import { snapshot } from "./schemas"
@@ -71,12 +71,10 @@ function toRequest(req: Http1Request, host: string, watch: string, clientIp: str
   return new Request(url, { method: req.method, headers: h, body: req.bytes })
 }
 
-async function write(res: Http1Response, r: Response): Promise<int> {
-  const h: Map<string, string> = new Map()
-  r.headers.forEach((value, key) => {
-    h.set(key, value)
-  })
+async function write(res: Http1Response, r: Response, engine?: Engine, req?: Request): Promise<int> {
+  let h = snapshot(r.headers)
   // a streamed body (a large answer) goes out as it comes
+  if (engine !== undefined && req !== undefined) corsHeaders(engine, req, &h)
   const st = r.body
   if (st !== undefined && st.pushed) {
     res.writeHead(r.status, h)
@@ -133,14 +131,14 @@ async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request,
     const checked = await credentialCheck(engine, ops, request, limit)
     const refused = checked.res
     if (refused !== undefined) {
-      const n = await write(res, refused)
+      const n = await write(res, refused, engine, request)
       metrics.observeHttp(httpPathLabel(path, refused.status), req.method, refused.status, (performance.now() - t0) / 1000.0, inBytes, n * 1.0, metrics.httpCustomValues(request.headers))
       return
     }
     // large_payload_optimization: a big body is refused, streamed on, or read after all
     const lf = await largeFront(engine, request)
     if (lf instanceof Response) {
-      const n = await write(res, lf)
+      const n = await write(res, lf, engine, request)
       metrics.observeHttp(httpPathLabel(path, lf.status), req.method, lf.status, (performance.now() - t0) / 1000.0, inBytes, n * 1.0, metrics.httpCustomValues(request.headers))
       return
     }
@@ -150,7 +148,7 @@ async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request,
       if (limit < NO_LIMIT) {
         const within = await limitedBody(request, limit)
         if (within === undefined) {
-          const n = await write(res, errorResponse(413, "request body too large", "invalid_request_error", noHeaders()))
+          const n = await write(res, errorResponse(413, "request body too large", "invalid_request_error", noHeaders()), engine, request)
           metrics.observeHttp(httpPathLabel(path, 413), req.method, 413, (performance.now() - t0) / 1000.0, inBytes, n * 1.0, metrics.httpCustomValues(request.headers))
           return
         }
@@ -161,7 +159,7 @@ async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request,
       const hb = await heldBody(engine, request, limit, checked.kind, checked.who)
       const no = hb.res
       if (no !== undefined) {
-        const n = await write(res, no)
+        const n = await write(res, no, engine, request)
         metrics.observeHttp(httpPathLabel(path, no.status), req.method, no.status, (performance.now() - t0) / 1000.0, inBytes, n * 1.0, metrics.httpCustomValues(request.headers))
         return
       }
@@ -178,7 +176,7 @@ async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request,
     const th = await transportStart(engine, request)
     tr = th.tr
     if (th.response !== undefined) {
-      const n = await write(res, th.response)
+      const n = await write(res, th.response, engine, request)
       metrics.observeHttp(httpPathLabel(path, th.response.status), req.method, th.response.status, (performance.now() - t0) / 1000.0, inBytes, n * 1.0, metrics.httpCustomValues(request.headers))
       return
     }
@@ -186,7 +184,11 @@ async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request,
     const kind = streamingKind(req, tr === undefined ? bodyText : th.body)
     if (kind !== "") {
       const sink = new StreamSink(
-        (status, headers) => res.writeHead(status, headers),
+        (status, headers) => {
+          let head = headers
+          corsHeaders(engine, request, &head)
+          res.writeHead(status, head)
+        },
         (chunk) => res.write(chunk),
         () => res.end(),
       )
@@ -198,18 +200,19 @@ async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request,
       if (!sink.started) {
         const hooked = await transportEnd(engine, tr, r)
         status = hooked.status
-        n = await write(res, hooked)
+        n = await write(res, hooked, engine, request)
       }
       metrics.observeHttp(httpPathLabel(path, status), req.method, status, (performance.now() - t0) / 1000.0, inBytes, n * 1.0, metrics.httpCustomValues(request.headers))
       return
     }
     const r = await transportEnd(engine, tr, await dispatch(engine, ops, request))
-    const n = await write(res, r)
+    const n = await write(res, r, engine, request)
     metrics.observeHttp(httpPathLabel(path, r.status), req.method, r.status, (performance.now() - t0) / 1000.0, inBytes, n * 1.0, metrics.httpCustomValues(request.headers))
   } catch (e) {
     if (!res.finished) {
-      const h: Map<string, string> = new Map()
+      let h: Map<string, string> = new Map()
       h.set("content-type", "application/json")
+      corsHeaders(engine, request, &h)
       res.writeHead(500, h)
       res.end(`{"error":{"message":"internal error","type":"api_error"}}`)
     }

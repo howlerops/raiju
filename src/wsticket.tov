@@ -2,7 +2,9 @@
 // header on a WebSocket, so the dashboard exchanges credentials for a ticket via
 // POST /api/session/ws-ticket, then opens /ws?ticket=... The ticket identifies
 // the actor that obtained it.
-import { secureHex } from "./crypto"
+import { secureHex, sha256, utf8, toHex } from "./crypto"
+import { readFileSync, readdirSync, unlinkSync, rmSync, statSync } from "node:fs"
+import { mkdirPrivate, writeFileAtomic, syncDir, PRIVATE_FILE } from "./atomicfile"
 
 // Ticket lifetime.
 export const WS_TICKET_TTL_MS = 30000.0
@@ -11,24 +13,77 @@ type Ticket = { actor: string, expires: f64 }
 
 export class WsTickets {
   private tickets: Map<string, Ticket> = new Map()
+  private dir = ""
+  private ready = false
+  private sweptAt: f64 = -1.0e15
+
+  // Regional replicas that share configuration must redeem tickets through the same
+  // directory. Never put these in the per-pod share folder or replicate them across regions.
+  useDir(dir: string): void {
+    this.dir = dir
+    this.ready = false
+  }
+
+  private path(ticket: string): string {
+    return this.dir + "/" + toHex(sha256(utf8(ticket))) + ".json"
+  }
 
   // A new ticket for an actor (the name the gate returned for the caller).
   issue(actor: string, nowMs: f64): string throws Error {
-    this.sweep(nowMs)
     const t = "wst_" + (try secureHex(24))
-    this.tickets.set(t, { actor: actor, expires: nowMs + WS_TICKET_TTL_MS })
+    const row: Ticket = { actor: actor, expires: nowMs + WS_TICKET_TTL_MS }
+    if (this.dir !== "") {
+      if (!this.ready) {
+        try mkdirPrivate(this.dir)
+        this.ready = true
+      }
+      this.sweepFiles(nowMs)
+      try writeFileAtomic(this.path(t), JSON.stringify(row), { mode: PRIVATE_FILE, exact: true })
+    } else {
+      this.sweep(nowMs)
+      this.tickets.set(t, row)
+    }
     return t
   }
 
   // The actor the ticket was issued to. A ticket works once: it is gone after this call, whatever
   // the answer. undefined for an unknown, used or expired ticket.
   consume(ticket: string, nowMs: f64): string | undefined {
+    if (this.dir !== "") {
+      // Read then unlink, returning the actor ONLY after a successful unlink. The
+      // atomic directory operation has one winner even if several workers read the
+      // same row. Permission/storage failures deny rather than falling back to memory.
+      const path = this.path(ticket)
+      try {
+        const row = try JSON.parse(try readFileSync(path, "utf8")) as Ticket
+        try unlinkSync(path)
+        syncDir(this.dir)
+        return row.expires <= nowMs ? undefined : row.actor
+      } catch (e) {
+        return undefined
+      }
+    }
     const t = this.tickets.get(ticket)
     this.tickets.delete(ticket)
     if (t === undefined || t.expires <= nowMs) return undefined
     return t.actor
   }
 
+
+  private sweepFiles(nowMs: f64): void {
+    if (nowMs - this.sweptAt < 1000.0) return
+    this.sweptAt = nowMs
+    try {
+      for (const name of try readdirSync(this.dir)) {
+        if (name.byteLength !== 69 || !name.endsWith(".json")) continue
+        const path = this.dir + "/" + name
+        try {
+          const row = try JSON.parse(try readFileSync(path, "utf8")) as Ticket
+          if (row.expires <= nowMs) try unlinkSync(path)
+        } catch (e) {}
+      }
+    } catch (e) {}
+  }
   // Drops the expired tickets.
   private sweep(nowMs: f64): void {
     const dead: string[] = []
@@ -56,4 +111,42 @@ test("an expired or unknown ticket is refused", () => {
   expect(w.consume("wst_nope", 0.0)).toBeUndefined()
   const u = try w.issue("carol", 0.0)
   expect(u === t).toBe(false)
+})
+
+test("shared regional ticket stores redeem once across independent workers and replicas", () => {
+  const dir = "/tmp/raiju-ws-tickets-" + process.pid + "-" + (try secureHex(8))
+  const a = new WsTickets()
+  const b = new WsTickets()
+  a.useDir(dir)
+  b.useDir(dir)
+  try {
+    const ticket = try a.issue("alice", 1000.0)
+    const names = try readdirSync(dir)
+    const file = dir + "/" + names[0]!
+    expect((try statSync(file)).mode & 511).toBe(PRIVATE_FILE)
+    expect((try readFileSync(file, "utf8")).includes(ticket)).toBe(false)
+    expect(b.consume(ticket, 2000.0)).toBe("alice")
+    expect(a.consume(ticket, 2000.0)).toBeUndefined()
+    const next = try b.issue("bob", 3000.0)
+    expect(a.consume(next, 3000.0 + WS_TICKET_TTL_MS)).toBeUndefined()
+    expect(b.consume(next, 3001.0)).toBeUndefined()
+  } finally {
+    try rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("shared ticket storage errors never fall back to a process-local grant", () => {
+  const file = "/tmp/raiju-ws-tickets-blocked-" + process.pid + "-" + (try secureHex(8))
+  try writeFileAtomic(file, "not a directory")
+  const w = new WsTickets()
+  w.useDir(file)
+  let failed = false
+  try {
+    w.issue("alice", 1000.0)
+  } catch (e) {
+    failed = true
+  }
+  expect(failed).toBe(true)
+  expect(w.consume("unknown", 1000.0)).toBeUndefined()
+  try rmSync(file, { force: true })
 })

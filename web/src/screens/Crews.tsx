@@ -203,13 +203,13 @@ function LearnedCells(props: { pool: CrewPool }) {
       <h3 id={"cr-cells-" + slug(props.pool.name)}>Learned role effects</h3>
       <Show when={rows().length > 0} fallback={<p class="muted">No outcome has been credited to this pool yet. Each cell shows the prior and the blend once one is.</p>}>
         <div class="table-wrap">
-          <table class="cr-cells">
+          <table class="table table-sm cr-cells">
             <thead>
               <tr>
                 <For each={CELL_COLS}>
                   {(c) => (
                     <th scope="col" aria-sort={dir(c.key)}>
-                      <button type="button" class="ghost sort" onClick={() => pick(c.key)}>
+                      <button type="button" class="btn btn-sm btn-ghost sort" onClick={() => pick(c.key)}>
                         {c.label}
                         {key() === c.key ? (desc() ? " ↓" : " ↑") : ""}
                       </button>
@@ -247,7 +247,7 @@ function PoolCard(props: { pool: CrewPool }) {
   const sid = () => "cr-pool-" + slug(p().name)
   const subOf = (name: string | undefined) => (p().subscriptions ?? []).find((s) => s.name === name)
   return (
-    <section class="card" id={sid()} aria-labelledby={sid() + "-h"}>
+    <section class="card panel bg-base-100 border border-base-300" id={sid()} aria-labelledby={sid() + "-h"}>
       <h2 id={sid() + "-h"}>Pool {p().name}</h2>
       <dl class="kv">
         <dt>Roles</dt>
@@ -467,21 +467,21 @@ function TaskPanel(props: { pools: () => CrewPool[] }) {
     })
 
   return (
-    <section class="card" id="cr-tasks" aria-labelledby="cr-tasks-h">
+    <section class="card panel bg-base-100 border border-base-300" id="cr-tasks" aria-labelledby="cr-tasks-h">
       <h2 id="cr-tasks-h">Tasks</h2>
       <form class="form-grid" id="cr-task-form" onSubmit={onLookup}>
         <label>
           Pool
-          <select id="cr-task-pool" onChange={(e) => setPool(e.currentTarget.value)}>
+          <select class="select select-sm" id="cr-task-pool" onChange={(e) => setPool(e.currentTarget.value)}>
             <For each={props.pools()}>{(p) => <option value={p.name} selected={p.name === pool()}>{p.name}</option>}</For>
           </select>
         </label>
         <label>
           Task id
-          <input id="cr-task-id" value={taskId()} onInput={(e) => setTaskId(e.currentTarget.value)} autocomplete="off" spellcheck={false} />
+          <input class="input input-sm" id="cr-task-id" value={taskId()} onInput={(e) => setTaskId(e.currentTarget.value)} autocomplete="off" spellcheck={false} />
         </label>
         <div class="actions">
-          <button type="submit" class="primary" disabled={look.busy()}>
+          <button type="submit" class="btn btn-sm btn-primary" disabled={look.busy()}>
             Look up
           </button>
         </div>
@@ -493,31 +493,31 @@ function TaskPanel(props: { pools: () => CrewPool[] }) {
         <form class="form-grid" id="cr-assign-form" onSubmit={onAssign}>
           <label>
             Pool
-            <select id="cr-assign-pool" onChange={(e) => setAPool(e.currentTarget.value)}>
+            <select class="select select-sm" id="cr-assign-pool" onChange={(e) => setAPool(e.currentTarget.value)}>
               <For each={props.pools()}>{(p) => <option value={p.name} selected={p.name === aPool()}>{p.name}</option>}</For>
             </select>
           </label>
           <label>
             Task id
-            <input id="cr-assign-task" value={aTask()} onInput={(e) => setATask(e.currentTarget.value)} required autocomplete="off" />
+            <input class="input input-sm" id="cr-assign-task" value={aTask()} onInput={(e) => setATask(e.currentTarget.value)} required autocomplete="off" />
           </label>
           <label>
             Class
-            <select id="cr-assign-class" onChange={(e) => setAClass(e.currentTarget.value)}>
+            <select class="select select-sm" id="cr-assign-class" onChange={(e) => setAClass(e.currentTarget.value)}>
               <option value="" selected={aClass() === ""}>Classify from the text</option>
               <For each={poolObj(aPool())?.classes ?? []}>{(k) => <option value={k} selected={k === aClass()}>{k}</option>}</For>
             </select>
           </label>
           <label>
             Task text (for the classifier)
-            <input id="cr-assign-text" value={aText()} onInput={(e) => setAText(e.currentTarget.value)} autocomplete="off" />
+            <input class="input input-sm" id="cr-assign-text" value={aText()} onInput={(e) => setAText(e.currentTarget.value)} autocomplete="off" />
           </label>
           <label>
             Labels
-            <input id="cr-assign-labels" value={aLabels()} onInput={(e) => setALabels(e.currentTarget.value)} placeholder="comma separated" autocomplete="off" />
+            <input class="input input-sm" id="cr-assign-labels" value={aLabels()} onInput={(e) => setALabels(e.currentTarget.value)} placeholder="comma separated" autocomplete="off" />
           </label>
           <div class="actions wide">
-            <button type="submit" class="primary" disabled={assign.busy()}>
+            <button type="submit" class="btn btn-sm btn-primary" disabled={assign.busy()}>
               Assign
             </button>
           </div>
@@ -527,11 +527,11 @@ function TaskPanel(props: { pools: () => CrewPool[] }) {
         <form class="form-grid" id="cr-outcome-form" onSubmit={onOutcome}>
           <label>
             Quality (0 to 1)
-            <input id="cr-outcome-quality" type="number" step="any" min="0" max="1" value={quality()} onInput={(e) => setQuality(e.currentTarget.value)} required />
+            <input class="input input-sm" id="cr-outcome-quality" type="number" step="any" min="0" max="1" value={quality()} onInput={(e) => setQuality(e.currentTarget.value)} required />
           </label>
           <label>
             Verifier
-            <select id="cr-outcome-verifier" onChange={(e) => setVerifier(e.currentTarget.value)}>
+            <select class="select select-sm" id="cr-outcome-verifier" onChange={(e) => setVerifier(e.currentTarget.value)}>
               <option value="" selected={verifier() === ""}>None</option>
               <option value="pass" selected={verifier() === "pass"}>Pass</option>
               <option value="fail" selected={verifier() === "fail"}>Fail</option>
@@ -539,21 +539,21 @@ function TaskPanel(props: { pools: () => CrewPool[] }) {
           </label>
           <label>
             Verifier accuracy (0.5 to 1)
-            <input id="cr-outcome-accuracy" type="number" step="any" min="0.5" max="1" value={accuracy()} onInput={(e) => setAccuracy(e.currentTarget.value)} />
+            <input class="input input-sm" id="cr-outcome-accuracy" type="number" step="any" min="0.5" max="1" value={accuracy()} onInput={(e) => setAccuracy(e.currentTarget.value)} />
           </label>
           <label>
             Attempt (default: the one in force)
-            <input id="cr-outcome-attempt" type="number" step="1" min="1" value={attempt()} onInput={(e) => setAttempt(e.currentTarget.value)} />
+            <input class="input input-sm" id="cr-outcome-attempt" type="number" step="1" min="1" value={attempt()} onInput={(e) => setAttempt(e.currentTarget.value)} />
           </label>
           <div class="actions wide">
-            <button type="submit" class="primary" disabled={outcome.busy()}>
+            <button type="submit" class="btn btn-sm btn-primary" disabled={outcome.busy()}>
               Record outcome
             </button>
           </div>
           <FormError text={outcome.error()} />
         </form>
         <div class="actions">
-          <button type="button" id="cr-next" onClick={askNext} disabled={next.busy()}>
+          <button class="btn btn-sm" type="button" id="cr-next" onClick={askNext} disabled={next.busy()}>
             Ask for the next step
           </button>
         </div>
@@ -566,7 +566,7 @@ function TaskPanel(props: { pools: () => CrewPool[] }) {
 function Body(props: { pools: () => CrewPool[] }) {
   return (
     <>
-      <Show when={props.pools().length > 0} fallback={<section class="card"><p class="muted">No crew pool is configured. Pools are set under crews in config.json (docs/crew-routing.md).</p></section>}>
+      <Show when={props.pools().length > 0} fallback={<section class="card panel bg-base-100 border border-base-300"><p class="muted">No crew pool is configured. Pools are set under crews in config.json (docs/crew-routing.md).</p></section>}>
         <For each={props.pools()}>{(p) => <PoolCard pool={p} />}</For>
       </Show>
       <TaskPanel pools={props.pools} />
@@ -583,7 +583,7 @@ export function Crews() {
   return (
     <section aria-labelledby="cr-title">
       <Toolbar title="Crews" id="cr-title">
-        <button type="button" id="cr-refresh" class="ghost" onClick={() => setVersion((v) => v + 1)}>
+        <button type="button" id="cr-refresh" class="btn btn-sm btn-ghost" onClick={() => setVersion((v) => v + 1)}>
           Refresh
         </button>
       </Toolbar>

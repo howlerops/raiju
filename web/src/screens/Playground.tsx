@@ -1,7 +1,9 @@
 import { createSignal, For, Show } from "solid-js"
+import { LoadingSkeleton } from "../LoadingSkeleton"
 import { message, send } from "../api/client"
 import { contentText, fmtInt, listOf, pretty } from "../fmt"
 import { notify, Toolbar, useRun } from "../ui"
+import { target, targetLabel } from "../gateway"
 
 interface Result {
   ms: number
@@ -73,21 +75,22 @@ export function Playground() {
   return (
     <section aria-labelledby="pg-title">
       <Toolbar title="Playground" id="pg-title" />
-      <form id="pg-form" class="card" ref={(el) => (form = el)} onSubmit={submit}>
+      <p class="hint" id="pg-target">Inference target: <strong>{targetLabel()}</strong> · <span class="mono">{target().url}</span>. The virtual key and message go directly to this gateway only; no regional fallback.</p>
+      <form id="pg-form" class="card panel bg-base-100 border border-base-300" ref={(el) => (form = el)} onSubmit={submit}>
         <div class="form-grid">
           <label>
             Model
-            <input name="model" list="pg-models" required placeholder="openai/gpt-4o-mini" autocomplete="off" />
+            <input class="input input-sm" name="model" list="pg-models" required placeholder="openai/gpt-4o-mini" autocomplete="off" />
           </label>
           <datalist id="pg-models">
             <For each={models()}>{(id) => <option value={id} />}</For>
           </datalist>
           <label>
             Virtual key (optional)
-            <input name="vk" type="password" autocomplete="off" spellcheck={false} placeholder="sk-raiju-..." />
+            <input class="input input-sm" name="vk" type="password" autocomplete="off" spellcheck={false} placeholder="sk-raiju-..." />
           </label>
           <div class="actions">
-            <button type="button" id="pg-load" class="ghost" onClick={loadModels}>
+            <button type="button" id="pg-load" class="btn btn-sm btn-ghost" onClick={loadModels}>
               Load models
             </button>
           </div>
@@ -96,7 +99,7 @@ export function Playground() {
           </p>
           <label class="wide">
             Message
-            <textarea
+            <textarea class="textarea textarea-sm"
               name="message"
               rows="4"
               required
@@ -111,17 +114,15 @@ export function Playground() {
           </label>
           <div class="actions wide">
             <span class="hint grow">Ctrl+Enter sends.</span>
-            <button type="submit" class="primary" disabled={busy()}>
-              Send
+            <button type="submit" class="btn btn-sm btn-primary" disabled={busy()}>
+              Send to {targetLabel()}
             </button>
           </div>
         </div>
       </form>
-      <div id="pg-result" class="card" aria-live="polite">
+      <div id="pg-result" class="card panel bg-base-100 border border-base-300" aria-live="polite">
         <Show when={pending()}>
-          <p class="muted" role="status">
-            Sending...
-          </p>
+          <LoadingSkeleton variant="content" label="Waiting for response" />
         </Show>
         <Show when={failure()}>
           <p class="error" role="alert">

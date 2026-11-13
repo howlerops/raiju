@@ -23,6 +23,10 @@ export type OidcConfig = {
   role_claim?: string,
   role_map?: Record<string, string>,
   default_role?: string,
+  // When present, require a verified email at one of these exact domains.
+  allowed_email_domains?: string[],
+  // When present, require the signed ID token's hd claim to match one of these exact domains.
+  allowed_hosted_domains?: string[],
   session_ttl_seconds?: int,
   // the audiences an ID token may carry (absent: the client id). scim_config's audience and Entra's appIdUri.
   audiences?: string[],
@@ -410,13 +414,72 @@ function isRole(r: string): bool {
   return ROLES.includes(r)
 }
 
+function validDomain(domain: string): bool {
+  if (domain === "" || domain.byteLength > 253 || domain !== domain.trim() || !domain.includes(".")) return false
+  for (const label of domain.toLowerCase().split(".")) {
+    if (label === "" || label.byteLength > 63 || label.startsWith("-") || label.endsWith("-")) return false
+    for (let i = 0; i < label.byteLength; i++) {
+      const c = label.slice(i, i + 1)
+      if (!(c >= "a" && c <= "z") && !(c >= "0" && c <= "9") && c !== "-") return false
+    }
+  }
+  return true
+}
+
+function validEmailLocal(local: string): bool {
+  if (local === "" || local.byteLength > 64 || local.startsWith(".") || local.endsWith(".") || local.includes("..")) return false
+  const normalized = local.toLowerCase()
+  for (let i = 0; i < normalized.byteLength; i++) {
+    const c = normalized.slice(i, i + 1)
+    if (!(c >= "a" && c <= "z") && !(c >= "0" && c <= "9") && !"!#$%&'*+-/=?^_`{|}~.".includes(c)) return false
+  }
+  return true
+}
+
+function admitEmail(cfg: OidcConfig, pfs: Field[]): void throws Error {
+  const domains = cfg.allowed_email_domains
+  if (domains === undefined) return
+  if (domains.length === 0 || domains.some((d) => !validDomain(d))) throw new Error("oidc: invalid allowed_email_domains")
+  const email = rawStr(pfs, "email") ?? ""
+  const parts = email.split("@")
+  if (find(pfs, "email_verified") !== "true" || parts.length !== 2 || !validEmailLocal(parts[0] ?? "") ||
+      !validDomain(parts[1] ?? "") || !domains.some((d) => d.toLowerCase() === (parts[1] ?? "").toLowerCase())) {
+    throw new Error("oidc: a verified email at an allowed domain is required")
+  }
+}
+
+function admitHostedDomain(cfg: OidcConfig, pfs: Field[]): void throws Error {
+  const domains = cfg.allowed_hosted_domains
+  if (domains === undefined) return
+  if (domains.length === 0 || domains.some((d) => !validDomain(d))) throw new Error("oidc: invalid allowed_hosted_domains")
+  const domain = rawStr(pfs, "hd") ?? ""
+  if (!validDomain(domain) || !domains.some((d) => d.toLowerCase() === domain.toLowerCase())) {
+    throw new Error("oidc: a signed hosted-domain claim at an allowed domain is required")
+  }
+}
+
 // First group (in claim order) with a role_map entry wins; else default_role.
 function roleOf(cfg: OidcConfig, pfs: Field[]): string throws Error {
-  const groups = try stringsOf(find(pfs, cfg.role_claim ?? "groups"))
+  let groups: string[] = []
+  if (cfg.role_claim === "email") {
+    const email = rawStr(pfs, "email")
+    if (email !== undefined) groups.push(email)
+  } else {
+    groups = try stringsOf(find(pfs, cfg.role_claim ?? "groups"))
+  }
   const map = cfg.role_map
   if (map !== undefined) {
+    for (const key of map.keys()) {
+      if (key.trim() === "" || key.startsWith("env.") || !isRole(map.get(key) ?? "")) throw new Error("oidc: invalid or unresolved role_map")
+    }
     for (const g of groups) {
-      const r = map.get(g)
+      let r = map.get(g)
+      if (cfg.role_claim === "email") {
+        r = undefined
+        for (const key of map.keys()) {
+          if (key.toLowerCase() === g.toLowerCase()) r = map.get(key)
+        }
+      }
       if (r !== undefined) {
         if (!isRole(r)) throw new Error(`oidc: role_map maps to unknown role ${r}`)
         return r
@@ -482,6 +545,8 @@ function checkToken(idToken: string, jwksJson: string, cfg: OidcConfig, issuer: 
   const sub = rawStr(pfs, "sub")
   if (sub === undefined || sub === "") throw new Error("oidc: ID token has no sub")
   const email = rawStr(pfs, "email")
+  try admitEmail(cfg, pfs)
+  try admitHostedDomain(cfg, pfs)
   const role = try roleOf(cfg, pfs)
   return { kind: "ok", sub: sub, email: email, role: role, claims: payload }
 }
@@ -1237,4 +1302,86 @@ test("the state cookie binds a sign-in to its browser: HttpOnly, SameSite=Lax, S
   const changed = value.slice(0, 63) + (value.endsWith("0") ? "1" : "0")
   expect(stateBound(`${STATE_COOKIE}=${changed}`, r.state)).toBe(false)
   expect(clearStateCookie(true).includes("Max-Age=0")).toBe(true)
+})
+
+test("email admission requires verified exact domains and rejects malformed allowlists", () => {
+  let cfg = testCfg({})
+  cfg.allowed_email_domains = ["EXAMPLE.com", "other.example"]
+  for (const email of ["alice@example.com", "Alice@EXAMPLE.COM", "bob@other.example"]) {
+    const token = try signedToken(claimsJson(`,"email_verified":true`).replace("alice@example.com", email))
+    expect(verifyIdToken(token, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("ok")
+  }
+  for (const email of ["alice@example.com.evil", "alice@evil-example.com", "alice@sub.example.com", "alice@@example.com", "@example.com", "alice @example.com", ".alice@example.com", "alice@example.com."]) {
+    const token = try signedToken(claimsJson(`,"email_verified":true`).replace("alice@example.com", email))
+    expect(verifyIdToken(token, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("error")
+  }
+  for (const extra of ["", `,"email_verified":false`, `,"email_verified":"true"`]) {
+    const token = try signedToken(claimsJson(extra))
+    expect(verifyIdToken(token, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("error")
+  }
+  const missing = try signedToken(claimsJson(`,"email_verified":true`).replace(`,"email":"alice@example.com"`, ""))
+  expect(verifyIdToken(missing, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("error")
+  const valid = try signedToken(claimsJson(`,"email_verified":true`))
+  const invalidDomains: string[][] = [[], [""], [" "], ["*.example.com"], ["@example.com"], ["example.com", "bad domain"]]
+  for (const domains of invalidDomains) {
+    cfg.allowed_email_domains = domains
+    expect(verifyIdToken(valid, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("error")
+  }
+})
+
+test("hosted-domain admission requires an exact signed string claim before assigning roles", () => {
+  let cfg = testCfg({ "alice@example.com": "admin" }, "viewer", "email")
+  cfg.allowed_hosted_domains = ["EXAMPLE.com", "other.example"]
+  for (const domain of ["example.com", "EXAMPLE.COM", "other.example"]) {
+    const token = try signedToken(claimsJson(`,"hd":"${domain}"`))
+    expect(resultRole(verifyIdToken(token, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS))).toBe("admin")
+  }
+  for (const extra of ["", `,"hd":true`, `,"hd":42`, `,"hd":null`, `,"hd":["example.com"]`, `,"hd":{}`]) {
+    const token = try signedToken(claimsJson(extra))
+    expect(verifyIdToken(token, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("error")
+  }
+  for (const domain of ["", " ", "example.com.evil", "evil-example.com", "sub.example.com", "example.com.", ".example.com", " example.com", "example.com ", "*.example.com", "@example.com", "example..com", "-example.com", "example-.com", "example_com"]) {
+    const token = try signedToken(claimsJson(`,"hd":"${domain}"`))
+    expect(verifyIdToken(token, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("error")
+  }
+  const token = try signedToken(claimsJson(`,"hd":"example.com"`))
+  const invalidDomains: string[][] = [[], [""], [" "], ["*.example.com"], ["@example.com"], ["example.com."], ["example..com"], ["-example.com"], ["example"], ["example.com", "bad domain"]]
+  for (const domains of invalidDomains) {
+    cfg.allowed_hosted_domains = domains
+    expect(verifyIdToken(token, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("error")
+  }
+})
+
+test("hosted-domain and verified-email admission are independent and omitted policies stay unchanged", () => {
+  let cfg = testCfg({})
+  const plain = try signedToken(claimsJson(""))
+  const wrongHosted = try signedToken(claimsJson(`,"hd":"outside.example","email_verified":true`))
+  expect(verifyIdToken(plain, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("ok")
+  expect(verifyIdToken(wrongHosted, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("ok")
+  cfg.allowed_email_domains = ["example.com"]
+  expect(verifyIdToken(wrongHosted, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("ok")
+  cfg.allowed_hosted_domains = ["example.com"]
+  expect(verifyIdToken(wrongHosted, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("error")
+  const hostedOnly = try signedToken(claimsJson(`,"hd":"example.com"`))
+  expect(verifyIdToken(hostedOnly, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("error")
+  const both = try signedToken(claimsJson(`,"hd":"example.com","email_verified":true`))
+  expect(verifyIdToken(both, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("ok")
+  expect(verifyIdToken(both, TEST_JWKS, cfg, TEST_ISS, undefined, TEST_NOW_MS).kind).toBe("ok")
+  const wrongEmail = try signedToken(claimsJson(`,"hd":"example.com","email_verified":true`).replace("alice@example.com", "alice@outside.example"))
+  expect(verifyIdToken(wrongEmail, TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("error")
+  const unsignedHosted = both.split(".")
+  unsignedHosted[1] = b64(claimsJson(`,"hd":"EXAMPLE.COM","email_verified":true`))
+  expect(verifyIdToken(unsignedHosted.join("."), TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("error")
+  const missingHosted = try signedToken(claimsJson(`,"email_verified":true`))
+  expect(verifyIdToken(missingHosted, TEST_JWKS, cfg, TEST_ISS, undefined, TEST_NOW_MS).kind).toBe("error")
+})
+
+test("email role keys ignore case but group roles retain case and unresolved maps refuse sign-in", () => {
+  const token = try signedToken(claimsJson(`,"groups":["Admins"]`))
+  expect(resultRole(verifyIdToken(token, TEST_JWKS, testCfg({ "ALICE@EXAMPLE.COM": "admin" }, "viewer", "email"), TEST_ISS, "n-1", TEST_NOW_MS))).toBe("admin")
+  expect(resultRole(verifyIdToken(token, TEST_JWKS, testCfg({ "admins": "admin" }), TEST_ISS, "n-1", TEST_NOW_MS))).toBe("viewer")
+  const invalidMaps: Record<string, string>[] = [{ "env.MISSING": "admin" }, { "": "" }]
+  for (const map of invalidMaps) {
+    expect(verifyIdToken(token, TEST_JWKS, testCfg(map), TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("error")
+  }
 })

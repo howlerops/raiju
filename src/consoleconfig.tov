@@ -1,0 +1,294 @@
+// Public console metadata only. The file is read once per process: changes require a restart.
+// Rebuild the response from validated fields, never serve an operator file verbatim.
+import { readFileSync } from "node:fs"
+import { Field, fields, find, elements, rawStr } from "./json"
+import { parseIPv6 } from "./netguard"
+
+export type ConsoleGateway = { id: string, name: string, url: string }
+export type ConsoleManifest = { gateways: ConsoleGateway[], defaultGateway?: string }
+export type ConsoleConfig = { status: int, body: string, origins: string[] }
+
+// An origin, not a URL prefix. Refuse characters that URL parsers can repair or that CSP
+// interprets as syntax. A single trailing slash is harmless and is removed in the output.
+export function httpOrigin(value: string): string | undefined {
+  const end = value.endsWith("/") ? value.slice(0, value.byteLength - 1) : value
+  const prefix = end.startsWith("https://") ? "https://" : end.startsWith("http://") ? "http://" : ""
+  if (prefix === "") return undefined
+  const authority = end.slice(prefix.byteLength)
+  if (authority === "") return undefined
+  const safe = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-:[]"
+  for (const c of authority.split("")) if (!safe.includes(c)) return undefined
+  let host = authority
+  let port = ""
+  if (authority.startsWith("[")) {
+    const close = authority.indexOf("]")
+    if (close < 0) return undefined
+    host = authority.slice(0, close + 1)
+    const suffix = authority.slice(close + 1)
+    if (suffix !== "") {
+      if (!suffix.startsWith(":")) return undefined
+      port = suffix.slice(1)
+      if (port === "") return undefined
+    }
+  } else {
+    const bits = authority.split(":")
+    if (bits.length > 2) return undefined
+    host = bits[0]!
+    if (bits.length === 2) {
+      port = bits[1]!
+      if (port === "") return undefined
+    }
+  }
+  if (port !== "") {
+    if (!characters(port, "0123456789") || port.startsWith("0") || port.byteLength > 5) return undefined
+    const n = parseInt(port) ?? 0
+    if (n < 1 || n > 65535) return undefined
+  }
+  const canonical = canonicalConsoleHost(host)
+  if (canonical === undefined) return undefined
+  if (prefix === "https://" && port === "443" || prefix === "http://" && port === "80") port = ""
+  return prefix + canonical + (port === "" ? "" : ":" + port)
+}
+
+function characters(value: string, allowed: string): bool {
+  if (value === "") return false
+  for (const c of value.split("")) if (!allowed.includes(c)) return false
+  return true
+}
+
+function strictIpv4(host: string): bool {
+  const parts = host.split(".")
+  if (parts.length !== 4) return false
+  for (const p of parts) {
+    if (!characters(p, "0123456789") || p.byteLength > 3 || p.byteLength > 1 && p.startsWith("0")) return false
+    const n = parseInt(p) ?? -1
+    if (n < 0 || n > 255) return false
+  }
+  return true
+}
+
+function hexGroup(value: int): string {
+  if (value === 0) return "0"
+  let n = value
+  let out = ""
+  const digits = "0123456789abcdef"
+  while (n > 0) {
+    const digit = n % 16
+    out = digits.slice(digit, digit + 1) + out
+    n = Math.trunc(n / 16)
+  }
+  return out
+}
+
+// Tov's URL parser does not validate hosts or perform WHATWG IPv6 canonicalization.
+// Use the existing pure IP parser, then compress the first longest zero run (RFC 5952).
+function canonicalConsoleHost(raw: string): string | undefined {
+  const host = raw.toLowerCase()
+  if (host.startsWith("[")) {
+    if (!host.endsWith("]")) return undefined
+    const inner = host.slice(1, host.byteLength - 1)
+    if (!characters(inner, "0123456789abcdef:.")) return undefined
+    if (inner.includes(".")) {
+      const tail = inner.split(":")
+      if (!strictIpv4(tail[tail.length - 1]!)) return undefined
+    }
+    const bytes = parseIPv6(inner)
+    if (bytes === undefined) return undefined
+    const values: int[] = []
+    const groups: string[] = []
+    for (let i = 0; i < 16; i += 2) {
+      const n = bytes[i]! * 256 + bytes[i + 1]!
+      values.push(n)
+      groups.push(hexGroup(n))
+    }
+    let start = -1
+    let longest = 1
+    let i = 0
+    while (i < 8) {
+      if (values[i]! !== 0) {
+        i += 1
+        continue
+      }
+      let end = i
+      while (end < 8 && values[end]! === 0) end += 1
+      if (end - i > longest) {
+        start = i
+        longest = end - i
+      }
+      i = end
+    }
+    if (start < 0) return "[" + groups.join(":") + "]"
+    return "[" + groups.slice(0, start).join(":") + "::" + groups.slice(start + longest).join(":") + "]"
+  }
+  if (strictIpv4(host)) return host
+  const name = host.endsWith(".") ? host.slice(0, host.byteLength - 1) : host
+  if (name === "" || name.byteLength > 253) return undefined
+  const labels = name.split(".")
+  const last = labels[labels.length - 1]!
+  if (characters(last, "0123456789") || last.startsWith("0x") && characters(last.slice(2), "0123456789abcdef")) return undefined
+  const alnum = "abcdefghijklmnopqrstuvwxyz0123456789"
+  for (const part of labels) {
+    if (part.byteLength < 1 || part.byteLength > 63 || !characters(part, alnum + "-")) return undefined
+    if (!alnum.includes(part.slice(0, 1)) || !alnum.includes(part.slice(part.byteLength - 1))) return undefined
+  }
+  return host
+}
+
+export function consoleOrigin(value: string): string | undefined {
+  const origin = httpOrigin(value)
+  if (origin === undefined) return undefined
+  const u = URL.parse(origin)
+  if (u === undefined) return undefined
+  if (u.protocol === "http:") {
+    const host = u.hostname.toLowerCase()
+    if (host !== "localhost" && host !== "127.0.0.1" && host !== "[::1]" && host !== "::1") return undefined
+  }
+  return origin
+}
+
+function onlyFields(fs: Field[], allowed: string[]): bool {
+  const seen: string[] = []
+  for (const f of fs) {
+    if (!allowed.includes(f.key) || seen.includes(f.key)) return false
+    seen.push(f.key)
+  }
+  return true
+}
+
+function label(fs: Field[], key: string): string | undefined {
+  const s = rawStr(fs, key)
+  if (s === undefined || s === "" || s.trim() !== s) return undefined
+  const bytes = new TextEncoder().encode(s)
+  let count = 0
+  for (let i = 0; i < bytes.length; i++) {
+    const c = int(bytes[i]!)
+    if (c < 32 || c === 127 || c === 194 && i + 1 < bytes.length && int(bytes[i + 1]!) >= 128 && int(bytes[i + 1]!) <= 159) return undefined
+    if ((c & 192) !== 128) count += 1
+  }
+  if (count > 100) return undefined
+  return s
+}
+
+function gatewayId(id: string): bool {
+  const start = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+  const rest = start + "_-"
+  if (id.byteLength < 1 || id.byteLength > 64) return false
+  for (const c of id.split("")) if (!rest.includes(c)) return false
+  return start.includes(id.slice(0, 1))
+}
+
+function invalid(): ConsoleConfig {
+  return { status: 503, body: `{"error":"invalid RAIJU_CONSOLE_CONFIG; expected public gateways with unique ids and HTTPS or loopback HTTP origins"}`, origins: [] }
+}
+
+// Decode the complete document first (including JSON syntax and field types), then check
+// unknown/duplicate members and semantic constraints before publishing any of it.
+export function parseConsoleConfig(text: string): ConsoleConfig {
+  try {
+    const decoded = JSON.parse(text) as ConsoleManifest
+    const fs = fields(text)
+    if (!onlyFields(fs, ["gateways", "defaultGateway"])) return invalid()
+    const raw = find(fs, "gateways")
+    if (raw === undefined || !raw.startsWith("[")) return invalid()
+    const rows = elements(raw)
+    if (rows.length === 0 || rows.length > 32 || decoded.gateways.length !== rows.length) return invalid()
+    const gateways: ConsoleGateway[] = []
+    const origins: string[] = []
+    const ids: string[] = []
+    for (const row of rows) {
+      const rf = fields(row)
+      if (!onlyFields(rf, ["id", "name", "url"])) return invalid()
+      const id = label(rf, "id")
+      const name = label(rf, "name")
+      const url = rawStr(rf, "url")
+      if (id === undefined || name === undefined || url === undefined) return invalid()
+      if (!gatewayId(id)) return invalid()
+      const origin = consoleOrigin(url)
+      if (origin === undefined || ids.includes(id) || origins.includes(origin)) return invalid()
+      ids.push(id)
+      origins.push(origin)
+      gateways.push({ id: id, name: name, url: origin })
+    }
+    const d = find(fs, "defaultGateway")
+    if (d !== undefined) {
+      const id = label(fs, "defaultGateway")
+      if (id === undefined || !ids.includes(id)) return invalid()
+      return { status: 200, body: JSON.stringify({ gateways: gateways, defaultGateway: id }), origins: origins }
+    }
+    return { status: 200, body: JSON.stringify({ gateways: gateways }), origins: origins }
+  } catch (e) {
+    return invalid()
+  }
+}
+
+export function loadConsoleConfig(path: string): ConsoleConfig {
+  if (path === "") return { status: 404, body: `{"error":"console configuration is not enabled"}`, origins: [] }
+  try {
+    return parseConsoleConfig(readFileSync(path, "utf8"))
+  } catch (e) {
+    return invalid()
+  }
+}
+
+let configured: ConsoleConfig | undefined = undefined
+export function consoleConfig(): ConsoleConfig {
+  const hit = configured
+  if (hit !== undefined) return hit
+  const result = loadConsoleConfig(process.env.RAIJU_CONSOLE_CONFIG ?? "")
+  configured = result
+  return result
+}
+
+test("console endpoints are origins, with HTTP restricted to loopback", () => {
+  expect(consoleOrigin("https://gateway.example/")).toBe("https://gateway.example")
+  expect(consoleOrigin("http://localhost:8400")).toBe("http://localhost:8400")
+  expect(consoleOrigin("http://127.0.0.1:8401")).toBe("http://127.0.0.1:8401")
+  expect(consoleOrigin("http://[::1]:8402")).toBe("http://[::1]:8402")
+  expect(consoleOrigin("http://127.0.0.2:8401")).toBeUndefined()
+  for (const url of ["http://gateway.example", "http://localhost.evil", "http://0.0.0.0:8400", "http://192.168.1.2", "https://user@gateway.example", "https://gateway.example/api", "https://gateway.example/?x=1", "https://gateway.example#x", "https://gateway.example?", "https://gateway.example#", "https://gateway.example\\evil", "https://*.example", "https://gateway.example;", "https://gateway.example\n", "//gateway.example"]) {
+    expect(consoleOrigin(url)).toBeUndefined()
+  }
+})
+
+test("console manifest fails closed on invalid schema, secrets and ambiguous endpoints", () => {
+  const row = `{"id":"europe","name":"Europe","url":"https://europe.example"}`
+  const ok = parseConsoleConfig(`{"gateways":[${row}],"defaultGateway":"europe"}`)
+  expect(ok.status).toBe(200)
+  expect(ok.origins).toEqual(["https://europe.example"])
+  for (const text of ["not json", "null", "[]", "{}", `{"gateways":[]}`, `{"gateways":null}`, `{"gateways":[${row}],"token":"secret"}`, `{"gateways":[${row}],"gateways":[${row}]}`, `{"gateways":[${row}],"defaultGateway":"missing"}`, `{"gateways":[${row},${row}]}`, `{"gateways":[${row},{"id":"america","name":"America","url":"https://europe.example/"}]}`, `{"gateways":[{"id":"x","name":"X","url":"https://x.example","token":"secret"}]}`, `{"gateways":[{"id":2,"name":"X","url":"https://x.example"}]}`, `{"gateways":[{"id":"x","name":"X","url":"http://x.example"}]}`, `{"gateways":[${row}]} trailing`]) {
+    const r = parseConsoleConfig(text)
+    expect(r.status).toBe(503)
+    expect(r.origins.length).toBe(0)
+    expect(r.body.includes("secret")).toBe(false)
+  }
+  expect(loadConsoleConfig("").status).toBe(404)
+  expect(loadConsoleConfig("/raiju-console-regression-no-such-file/config.json").status).toBe(503)
+})
+
+test("console metadata bounds names, identifiers and fleet size before publishing", () => {
+  for (const id of ["-bad", "_bad", "two words", "slash/id", "é"]) {
+    expect(parseConsoleConfig(`{"gateways":[{"id":${JSON.stringify(id)},"name":"Example","url":"https://gateway.example"}]}`).status).toBe(503)
+  }
+  let tooLong = ""
+  for (let i = 0; i < 101; i++) tooLong += "x"
+  expect(parseConsoleConfig(`{"gateways":[{"id":"id","name":${JSON.stringify(tooLong)},"url":"https://gateway.example"}]}`).status).toBe(503)
+  expect(parseConsoleConfig(`{"gateways":[{"id":${JSON.stringify(tooLong)},"name":"Example","url":"https://gateway.example"}]}`).status).toBe(503)
+  expect(parseConsoleConfig(`{"gateways":[{"id":"id","name":"bad\\u0085name","url":"https://gateway.example"}]}`).status).toBe(503)
+  const rows: ConsoleGateway[] = []
+  for (let i = 0; i < 33; i++) rows.push({ id: `g${i}`, name: `Gateway ${i}`, url: `https://g${i}.example` })
+  expect(parseConsoleConfig(JSON.stringify({ gateways: rows })).status).toBe(503)
+})
+
+test("console authorities use the browser's exact origin without permissive native URL repairs", () => {
+  expect(consoleOrigin("https://GATEWAY.example:443/")).toBe("https://gateway.example")
+  expect(consoleOrigin("https://gateway.example.:8443")).toBe("https://gateway.example.:8443")
+  expect(consoleOrigin("https://[2001:0DB8:0000:0000:0000:0000:0000:0001]:443")).toBe("https://[2001:db8::1]")
+  expect(consoleOrigin("https://[::ffff:127.0.0.1]")).toBe("https://[::ffff:7f00:1]")
+  expect(consoleOrigin("http://[0:0:0:0:0:0:0:1]:80/")).toBe("http://[::1]")
+  for (const url of ["https://[bad]", "https://[::1", "https://[::1]junk", "https://[1:2:3]", "https://[1::2::3]", "https://[::ffff:127.1]", "https://[::ffff:127.000.0.1]", "https://-bad.example", "https://bad-.example", "https://bad..example", "https://bad_example", "https://2130706433", "https://127.1", "https://127.0.0.1.", "https://0177.0.0.1", "https://0x7f000001", "https://example.123", "https://example.0xff", "https://%65xample.com", "https://gateway.example:0", "https://gateway.example:0443", "https://gateway.example:65536", "https://gateway.example:", "https://é.example"]) {
+    expect(consoleOrigin(url)).toBeUndefined()
+  }
+  const r = parseConsoleConfig(`{"gateways":[{"id":"a","name":"A","url":"https://[2001:db8::1]"},{"id":"b","name":"B","url":"https://[2001:0DB8:0:0:0:0:0:1]:443/"}]}`)
+  expect(r.status).toBe(503)
+  expect(r.origins.length).toBe(0)
+})
