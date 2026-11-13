@@ -1,9 +1,11 @@
 // Small shared pieces: toasts, pills, tables, the two-step delete button,
 // busy wrappers and the error line.
 import { createSignal, Errored, For, Loading, Show } from "solid-js"
+import { LoadingSkeleton } from "./LoadingSkeleton"
 import type { JSX } from "@solidjs/web"
 import { message } from "./api/client"
 import { can, type Op } from "./perm"
+import { targetLabel } from "./gateway"
 
 // ---- initial values for uncontrolled fields ----
 
@@ -44,7 +46,7 @@ export function Toasts() {
     <div class="toasts" aria-live="polite">
       <For each={toasts()}>
         {(t) => (
-          <div class={["toast", t.tone]} role={t.tone === "error" ? "alert" : "status"}>
+          <div class={["notification alert", t.tone === "ok" ? "alert-success" : t.tone === "error" ? "alert-error" : "alert-info"]} role={t.tone === "error" ? "alert" : "status"}>
             {t.text}
           </div>
         )}
@@ -58,7 +60,7 @@ export function Toasts() {
 export type Tone = "" | "ok" | "warn" | "bad"
 
 export function Pill(props: { tone?: Tone; children?: JSX.Element }) {
-  return <span class={["pill", props.tone ?? ""]}>{props.children}</span>
+  return <span class={["badge", props.tone ? "badge-soft" : "", props.tone === "ok" ? "badge-success" : props.tone === "warn" ? "badge-warning" : props.tone === "bad" ? "badge-error" : "badge-neutral"]}>{props.children}</span>
 }
 
 export function stateTone(s: unknown): Tone {
@@ -70,11 +72,11 @@ export function stateTone(s: unknown): Tone {
 
 export function Stat(props: { label: string; value: string; sub?: string }) {
   return (
-    <div class="stat">
-      <div class="label">{props.label}</div>
-      <div class="value">{props.value}</div>
+    <div class="bg-base-100 border border-base-300 rounded-box stat">
+      <div class="stat-title">{props.label}</div>
+      <div class="stat-value">{props.value}</div>
       <Show when={props.sub}>
-        <div class="sub">{props.sub}</div>
+        <div class="stat-desc">{props.sub}</div>
       </Show>
     </div>
   )
@@ -93,7 +95,7 @@ export function ErrP(props: { error: unknown }) {
 export function Table(props: { cols: string[]; children?: JSX.Element }) {
   return (
     <div class="table-wrap">
-      <table>
+      <table class="table table-sm">
         <thead>
           <tr>
             <For each={props.cols}>{(c) => <th scope="col">{c}</th>}</For>
@@ -105,11 +107,11 @@ export function Table(props: { cols: string[]; children?: JSX.Element }) {
   )
 }
 
-// Loading text and an error line around async content.
+// A loading skeleton and an error line around async content.
 export function Guard(props: { children?: JSX.Element }) {
   return (
     <Errored fallback={(err) => <ErrP error={err()} />}>
-      <Loading fallback={<p class="muted">Loading...</p>}>{props.children}</Loading>
+      <Loading fallback={<LoadingSkeleton variant="content" />}>{props.children}</Loading>
     </Errored>
   )
 }
@@ -182,16 +184,16 @@ export function DangerButton(props: { label: string; action: () => Promise<void>
       <Show
         when={confirming()}
         fallback={
-          <button type="button" class="danger-outline" disabled={props.disabled} onClick={() => setConfirming(true)}>
+          <button type="button" class="btn btn-sm btn-outline btn-error" disabled={props.disabled} onClick={() => setConfirming(true)}>
             {props.label}
           </button>
         }
       >
-        <span class="muted">Are you sure?</span>
-        <button type="button" class="danger" disabled={busy()} onClick={go}>
+        <span class="muted">Confirm on {targetLabel()}?</span>
+        <button type="button" class="btn btn-sm btn-error" disabled={busy()} onClick={go}>
           {"Confirm " + props.label.toLowerCase()}
         </button>
-        <button type="button" class="ghost" disabled={busy()} onClick={() => setConfirming(false)}>
+        <button type="button" class="btn btn-sm btn-ghost" disabled={busy()} onClick={() => setConfirming(false)}>
           Cancel
         </button>
       </Show>
@@ -202,7 +204,7 @@ export function DangerButton(props: { label: string; action: () => Promise<void>
 // A section with a heading, used by the overview and the governance lists.
 export function Card(props: { title: string; id: string; children?: JSX.Element }) {
   return (
-    <section class="card" aria-labelledby={props.id}>
+    <section class="card panel bg-base-100 border border-base-300" aria-labelledby={props.id}>
       <h2 id={props.id}>{props.title}</h2>
       {props.children}
     </section>

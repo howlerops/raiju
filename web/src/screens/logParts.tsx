@@ -1,5 +1,6 @@
 // Pieces shared by the logs table and the live feed.
 import { createMemo, Errored, For, Loading, Show } from "solid-js"
+import { LoadingSkeleton } from "../LoadingSkeleton"
 import { api, message } from "../api/client"
 import type { LogEntry } from "../api/types"
 import { fmtInt, fmtMoney, fmtMs, fmtTime, num, pretty } from "../fmt"
@@ -41,7 +42,7 @@ export function LogDetail(props: { entry: LogEntry }) {
   })
   return (
     <Errored fallback={(err) => <ErrP error={err()} />}>
-      <Loading fallback={<p class="muted">Loading...</p>}>
+      <Loading fallback={<LoadingSkeleton variant="content" />}>
         {(() => {
           const { rec, err } = full()
           const pairs: [string, unknown][] = [

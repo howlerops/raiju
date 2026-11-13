@@ -1,10 +1,8 @@
-// The setup screen: shown while the gateway has no admin account, when every /api route is locked behind the
-// operator's setup token. The token is checked with POST /api/session/setup (which also sets
-// the HttpOnly setup session cookie), then the first admin is created with
-// POST /api/users and X-Raiju-Setup-Token. The new admin's token is shown once and becomes this tab's sign-in.
-// The setup token itself is never stored.
+// First-admin setup uses the explicit setup header on both requests, never a
+// cross-origin cookie. The setup secret itself is never stored.
 import { createSignal, Show } from "solid-js"
 import { send, ApiError } from "../api/client"
+import { target, targetLabel } from "../gateway"
 
 const SETUP_HEADER = "X-Raiju-Setup-Token"
 
@@ -24,7 +22,7 @@ function Instructions() {
   )
 }
 
-export function Setup(props: { configured: boolean; done: (token: string) => void }) {
+export function Setup(props: { configured: boolean; done: (token: string) => Promise<void> }) {
   const [error, setError] = createSignal("")
   const [busy, setBusy] = createSignal(false)
   const [created, setCreated] = createSignal<{ name: string; token: string } | undefined>(undefined)
@@ -44,7 +42,7 @@ export function Setup(props: { configured: boolean; done: (token: string) => voi
     setError("")
     setBusy(true)
     try {
-      // the token is checked first (a wrong one is a 403), and the setup session cookie is set
+      // Check the setup secret before creating the account on this same target.
       try {
         await send("POST", "/api/session/setup", { auth: false, quiet: true, headers: { [SETUP_HEADER]: token } })
       } catch (e) {
@@ -68,15 +66,16 @@ export function Setup(props: { configured: boolean; done: (token: string) => voi
 
   return (
     <main>
-      <section class="card setup" id="setup">
+      <section class="card panel bg-base-100 border border-base-300 setup" id="setup">
         <h1>Finish setting up Raiju</h1>
+        <p class="hint">Creating the first admin only on <strong>{targetLabel()}</strong> · <span class="mono">{target().url}</span></p>
         <Show
           when={created()}
           fallback={
             <>
               <p class="muted">
                 No admin account exists yet, so the management API is locked. Enter the setup token and create the first
-                admin account.
+                admin account. Setup issues a bearer token; it does not create a password.
               </p>
               <Show
                 when={props.configured}
@@ -92,15 +91,15 @@ export function Setup(props: { configured: boolean; done: (token: string) => voi
                 <form id="setup-form" class="setup-form" onSubmit={(ev) => void submit(ev)}>
                   <label>
                     Setup token
-                    <input id="setup-token" type="password" autocomplete="off" spellcheck={false} ref={(el) => (tokenIn = el)} />
+                    <input class="input input-sm" id="setup-token" type="password" autocomplete="off" spellcheck={false} ref={(el) => (tokenIn = el)} />
                   </label>
                   <label>
                     Admin name
-                    <input id="setup-name" autocomplete="username" spellcheck={false} placeholder="admin" ref={(el) => (nameIn = el)} />
+                    <input class="input input-sm" id="setup-name" autocomplete="username" spellcheck={false} placeholder="admin" ref={(el) => (nameIn = el)} />
                   </label>
                   <label>
                     Email (optional)
-                    <input id="setup-email" type="email" autocomplete="email" ref={(el) => (emailIn = el)} />
+                    <input class="input input-sm" id="setup-email" type="email" autocomplete="email" ref={(el) => (emailIn = el)} />
                   </label>
                   <Show when={error()}>
                     <p class="error" role="alert" id="setup-error">
@@ -108,7 +107,7 @@ export function Setup(props: { configured: boolean; done: (token: string) => voi
                     </p>
                   </Show>
                   <div class="actions">
-                    <button type="submit" class="primary" id="setup-submit" disabled={busy()}>
+                    <button type="submit" class="btn btn-sm btn-primary" id="setup-submit" disabled={busy()}>
                       {busy() ? "Creating…" : "Create admin"}
                     </button>
                   </div>
@@ -124,12 +123,17 @@ export function Setup(props: { configured: boolean; done: (token: string) => voi
           {(c) => (
             <div id="setup-done">
               <p>
-                The admin account <strong>{c().name}</strong> was created. Its token is shown this once: keep it somewhere safe.
-                This tab is signed in with it.
+                The admin account <strong>{c().name}</strong> was created on {targetLabel()}. Its token is shown this once: keep it somewhere safe.
+                Continue verifies this bearer token before signing this tab in. No password was created; save the token for future regional sign-ins.
               </p>
-              <input id="setup-new-token" class="mono" readonly value={c().token} onFocus={(ev) => ev.currentTarget.select()} />
+              <input id="setup-new-token" class="input input-sm mono" readonly value={c().token} onFocus={(ev) => ev.currentTarget.select()} />
+              <Show when={error()}><p class="error" role="alert">{error()}</p></Show>
               <div class="actions">
-                <button type="button" class="primary" id="setup-continue" onClick={() => props.done(c().token)}>
+                <button type="button" class="btn btn-sm btn-primary" id="setup-continue" disabled={busy()} onClick={async () => {
+                  setBusy(true)
+                  try { await props.done(c().token) } catch (e) { setError(e instanceof Error ? e.message : String(e)) }
+                  finally { setBusy(false) }
+                }}>
                   Continue to the dashboard
                 </button>
               </div>

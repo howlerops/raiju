@@ -1,4 +1,5 @@
 import { createMemo, createSignal, For, onSettled, refresh, Show } from "solid-js"
+import { LoadingSkeleton } from "../LoadingSkeleton"
 import { api, send } from "../api/client"
 import { fmtInt, fmtMoney, fmtMs, fmtPct, num } from "../fmt"
 import { can } from "../perm"
@@ -35,6 +36,7 @@ export function Overview() {
   const health = createMemo(() => api.get("/api/health"))
   const mcp = createMemo(() => api.get("/api/mcp"))
   const [metrics, setMetrics] = createSignal("Opening this loads /metrics.")
+  const [metricsPending, setMetricsPending] = createSignal(false)
 
   const reload = () => {
     refresh(stats)
@@ -54,11 +56,14 @@ export function Overview() {
 
   const loadMetrics = async (ev: Event) => {
     if (!(ev.currentTarget as HTMLDetailsElement).open) return
+    setMetricsPending(true)
     try {
       const r = await send("GET", "/metrics")
       setMetrics(r.text || "(no metrics)")
     } catch (e) {
       setMetrics(e instanceof Error ? e.message : String(e))
+    } finally {
+      setMetricsPending(false)
     }
   }
 
@@ -68,7 +73,7 @@ export function Overview() {
         <span class="hint" id="ov-updated" role="status">
           {updated()}
         </span>
-        <button type="button" class="ghost" id="ov-refresh" onClick={reload}>
+        <button type="button" class="btn btn-sm btn-ghost" id="ov-refresh" onClick={reload}>
           Refresh
         </button>
       </Toolbar>
@@ -97,7 +102,7 @@ export function Overview() {
         <OverviewCharts tick={tick} />
       </Show>
 
-      <div class="grid" style="margin-top:14px">
+      <div class="content-grid" style="margin-top:14px">
         <Show when={can("Logs")}>
         <Card title="Models, last hour" id="ov-models-h">
           <div id="ov-models">
@@ -214,11 +219,13 @@ export function Overview() {
       </div>
 
       <Show when={can("Metrics")}>
-      <details class="card" id="ov-metrics-box" style="margin-top:14px" onToggle={loadMetrics}>
+      <details class="card panel bg-base-100 border border-base-300" id="ov-metrics-box" style="margin-top:14px" onToggle={loadMetrics}>
         <summary>Prometheus metrics</summary>
-        <pre class="code" id="ov-metrics">
-          {metrics()}
-        </pre>
+        <Show when={!metricsPending()} fallback={<LoadingSkeleton variant="content" label="Loading metrics" />}>
+          <pre class="code" id="ov-metrics">
+            {metrics()}
+          </pre>
+        </Show>
       </details>
       </Show>
     </section>

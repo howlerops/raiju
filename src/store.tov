@@ -875,6 +875,11 @@ function redactConfig(c: Config): Config {
     if (auth !== undefined) {
       g.auth_config = {
         username: auth.username,
+        admin_username: auth.admin_username,
+        admin_password: auth.admin_password === undefined ? undefined : maskSecret(auth.admin_password),
+        is_enabled: auth.is_enabled,
+        allow_unauthenticated_access: auth.allow_unauthenticated_access,
+        disable_auth_on_inference: auth.disable_auth_on_inference,
         password: auth.password === undefined ? undefined : maskSecret(auth.password),
         token: auth.token === undefined ? undefined : maskSecret(auth.token),
       }
@@ -4263,7 +4268,7 @@ function frameworkPlan(raw: string, cur: PricingSyncConfig | undefined): Framewo
 
 // In auth_config, admin_username and admin_password replace the stored credential;
 // "<redacted>" preserves the stored password. is_enabled false clears the credential,
-// and disable_auth_on_inference sets client.enforce_auth_on_inference. The token is kept.
+// and disable_auth_on_inference sets client.enforce_auth_on_inference. Loginless access requires both flags.
 type AuthPlan = { kind: "ok", auth: AdminAuthConfig, disable: bool | undefined } | { kind: "error", message: string }
 
 function authPlan(raw: string, cur: AdminAuthConfig | undefined): AuthPlan {
@@ -4275,10 +4280,15 @@ function authPlan(raw: string, cur: AdminAuthConfig | undefined): AuthPlan {
   }
   const enabledRaw = find(fs, "is_enabled")
   if (enabledRaw !== undefined && rawBool(fs, "is_enabled") === undefined) return { kind: "error", message: "is_enabled must be true or false" }
+  const openRaw = find(fs, "allow_unauthenticated_access")
+  if (openRaw !== undefined && rawBool(fs, "allow_unauthenticated_access") === undefined) return { kind: "error", message: "allow_unauthenticated_access must be true or false" }
+  const open = rawBool(fs, "allow_unauthenticated_access") ?? cur?.allow_unauthenticated_access
+  const enabled = rawBool(fs, "is_enabled") ?? cur?.is_enabled
+  if (open === true && enabled !== false) return { kind: "error", message: "allow_unauthenticated_access requires is_enabled false" }
   const disableRaw = find(fs, "disable_auth_on_inference")
   if (disableRaw !== undefined && rawBool(fs, "disable_auth_on_inference") === undefined) return { kind: "error", message: "disable_auth_on_inference must be true or false" }
   const disable = rawBool(fs, "disable_auth_on_inference")
-  if (rawBool(fs, "is_enabled") === false) return { kind: "ok", auth: { token: cur?.token }, disable: disable }
+  if (enabled === false) return { kind: "ok", auth: { token: cur?.token, is_enabled: false, allow_unauthenticated_access: open }, disable: disable }
   let user: string | undefined = cur?.username
   const u = rawStr(fs, "admin_username")
   if (u !== undefined) user = u
@@ -4288,7 +4298,7 @@ function authPlan(raw: string, cur: AdminAuthConfig | undefined): AuthPlan {
   if (user === undefined || user === "" || pw === undefined || pw === "") {
     return { kind: "error", message: "admin_username and admin_password are required to turn admin auth on" }
   }
-  return { kind: "ok", auth: { username: user, password: pw, token: cur?.token }, disable: disable }
+  return { kind: "ok", auth: { username: user, password: pw, token: cur?.token, is_enabled: enabled, allow_unauthenticated_access: open }, disable: disable }
 }
 
 // PUT /api/config replaces each supplied section and keeps omitted sections:
@@ -4361,7 +4371,7 @@ function putConfig(store: ConfigStore, body: string): ApiReply {
     message: "config updated successfully",
     client: store.cfg.client ?? {},
     framework_config: { pricing_url: pf?.url ?? "", pricing_sync_interval: pf?.interval_seconds ?? 0, model_parameters_url: pf?.model_parameters_url ?? "", live_models_sync_interval: pf?.live_models_sync_interval ?? 3600 },
-    auth_config: { admin_username: au?.username ?? "", is_enabled: au?.username !== undefined, disable_auth_on_inference: store.cfg.client?.enforce_auth_on_inference === false },
+    auth_config: { admin_username: au?.username ?? "", is_enabled: au?.is_enabled ?? (au?.username !== undefined), allow_unauthenticated_access: au?.allow_unauthenticated_access === true, disable_auth_on_inference: store.cfg.client?.enforce_auth_on_inference === false },
   })
   return reply(200, view)
 }
@@ -4772,6 +4782,7 @@ test("PUT /api/config: framework_config and auth_config are checked, then saved,
     expect(store.cfg.governance?.auth_config?.username).toBe("ops")
     expect(handleApi(store, "PUT", "/api/config", `{"auth_config":{"is_enabled":false}}`).status).toBe(200)
     expect(store.cfg.governance?.auth_config?.username).toBeUndefined()
+    expect(store.cfg.governance?.auth_config?.is_enabled).toBe(false)
   } finally {
     cleanup(path)
   }
@@ -6471,6 +6482,33 @@ test("every per-key block survives the key routes, and masked secrets inside a b
     expect(k3.oauth_key_config!.client_secret).toBe("csecret-1234567890")
     expect(k3.github_copilot_key_config!.private_key).toBe(pem)
     expect(k3.cloudflare_key_config!.account_id).toBe("acct")
+  } finally {
+    cleanup(path)
+  }
+})
+
+test("loginless administration saves and redacts both flags, rejecting invalid or contradictory opt-ins", () => {
+  const path = tmpPath()
+  try {
+    const store = try new ConfigStore(path, { governance: { auth_config: { username: "root", password: "pw" } }, client: { enforce_auth_on_inference: true } })
+    for (const body of [`{"allow_unauthenticated_access":"true","is_enabled":false}`, `{"allow_unauthenticated_access":true}`, `{"allow_unauthenticated_access":true,"is_enabled":true}`]) {
+      expect(handleApi(store, "PUT", "/api/config", `{"auth_config":${body}}`).status).toBe(400)
+    }
+    expect(store.cfg.governance!.auth_config!.username).toBe("root")
+    const opened = handleApi(store, "PUT", "/api/config", `{"auth_config":{"is_enabled":false,"allow_unauthenticated_access":true}}`)
+    expect(opened.status).toBe(200)
+    expect(opened.body.includes(`"allow_unauthenticated_access":true`)).toBe(true)
+    expect(store.cfg.governance!.auth_config!.is_enabled).toBe(false)
+    expect(store.cfg.governance!.auth_config!.allow_unauthenticated_access).toBe(true)
+    expect(store.cfg.client!.enforce_auth_on_inference).toBe(true)
+    expect(handleApi(store, "PUT", "/api/config", `{"client_config":{"max_request_body_size_mb":5}}`).status).toBe(200)
+    const saved = try JSON.parse(readFileSync(path, "utf8")) as Config
+    expect(saved.governance!.auth_config!.allow_unauthenticated_access).toBe(true)
+    const redacted = try JSON.parse(store.redacted()) as Config
+    expect(redacted.governance!.auth_config!.is_enabled).toBe(false)
+    expect(redacted.governance!.auth_config!.allow_unauthenticated_access).toBe(true)
+    expect(handleApi(store, "PUT", "/api/config", `{"auth_config":{"allow_unauthenticated_access":false}}`).status).toBe(200)
+    expect(store.cfg.governance!.auth_config!.allow_unauthenticated_access).toBe(false)
   } finally {
     cleanup(path)
   }

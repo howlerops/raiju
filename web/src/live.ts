@@ -7,6 +7,7 @@
 import { createSignal, type Accessor } from "solid-js"
 import { api } from "./api/client"
 import type { LogEntry } from "./api/types"
+import { isActive, onGatewayLeave, targetURL } from "./gateway"
 
 export const LIVE_MAX = 5000
 
@@ -122,6 +123,8 @@ export function createFeed(): Feed {
   let flushTimer: ReturnType<typeof setTimeout> | undefined
   let prepend: (n: number) => void = () => {}
   const seen = new Set<string>()
+  let generation = 0
+  let unregister: (() => void) | undefined
 
   const flush = () => {
     flushTimer = undefined
@@ -176,7 +179,7 @@ export function createFeed(): Feed {
   }
 
   const scheduleRetry = () => {
-    if (!want) return
+    if (!want || !isActive()) return
     const delay = Math.min(30000, 1000 * Math.pow(2, retry))
     retry += 1
     setState("waiting")
@@ -189,7 +192,8 @@ export function createFeed(): Feed {
   }
 
   const connect = async (): Promise<void> => {
-    if (!want) return
+    if (!want || !isActive()) return
+    const connecting = generation
     setState("connecting")
     setWaitText("Connecting")
     let ticket = ""
@@ -197,29 +201,33 @@ export function createFeed(): Feed {
       const r = await api.post("/api/session/ws-ticket")
       ticket = r && r.ticket ? String(r.ticket) : ""
     } catch (e) {
+      if (!want || connecting !== generation || !isActive()) return
       setNote("Live feed: " + (e instanceof Error ? e.message : String(e)))
       return scheduleRetry()
     }
-    if (!want) return
+    if (!want || connecting !== generation || !isActive()) return
     if (!ticket) return scheduleRetry()
-    const proto = location.protocol === "https:" ? "wss:" : "ws:"
-    let url = proto + "//" + location.host + "/ws?batch=1&ticket=" + encodeURIComponent(ticket)
-    if (cursors.size) url += "&since=" + [...cursors].map(([k, s]) => k + ":" + s).join(",")
+    const endpoint = new URL(targetURL("/ws"))
+    endpoint.protocol = endpoint.protocol === "https:" ? "wss:" : "ws:"
+    endpoint.searchParams.set("batch", "1")
+    endpoint.searchParams.set("ticket", ticket)
+    if (cursors.size) endpoint.searchParams.set("since", [...cursors].map(([k, s]) => k + ":" + s).join(","))
     let sock: WebSocket
     try {
-      sock = new WebSocket(url)
+      sock = new WebSocket(endpoint.href)
     } catch (e) {
       setNote("Live feed: " + (e instanceof Error ? e.message : String(e)))
       return scheduleRetry()
     }
     ws = sock
     sock.onopen = () => {
+      if (!want || connecting !== generation || !isActive()) { sock.close(); return }
       retry = 0
       setWaitText("")
       setNote("")
       setState("live")
     }
-    sock.onmessage = (ev) => onMessage(String(ev.data))
+    sock.onmessage = (ev) => { if (want && connecting === generation && isActive()) onMessage(String(ev.data)) }
     sock.onclose = () => {
       if (ws === sock) ws = undefined
       scheduleRetry()
@@ -227,7 +235,7 @@ export function createFeed(): Feed {
     sock.onerror = () => {}
   }
 
-  return {
+  const feed: Feed = {
     rows,
     state,
     waitText,
@@ -240,11 +248,18 @@ export function createFeed(): Feed {
     start() {
       if (want) return
       want = true
+      generation += 1
+      unregister = onGatewayLeave(() => feed.stop())
+      window.addEventListener("raiju-session-expired", feed.stop)
       retry = 0
       void connect()
     },
     stop() {
       want = false
+      generation += 1
+      window.removeEventListener("raiju-session-expired", feed.stop)
+      unregister?.()
+      unregister = undefined
       setState("stopped")
       clearTimeout(timer)
       timer = undefined
@@ -283,4 +298,5 @@ export function createFeed(): Feed {
       prepend = fn
     },
   }
+  return feed
 }
