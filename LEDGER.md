@@ -6,6 +6,11 @@ integrates and commits. Priorities come from [SCOPE.md](SCOPE.md).
 
 Status: `todo` → `assigned` → `review` → `done` (or `blocked`, `rework`).
 
+Historical entries below retain names and test results as recorded at the time;
+they are not proof of the current naming cutover. Current commands and wire names
+are documented in README.md and docs/behaviour-changes-wave-31.md. Old owned names
+in historical entries are evidence only, not supported aliases.
+
 ## Waves 1–3 (all done)
 
 | ID | Work | Pri | Files | Status | Verified by |

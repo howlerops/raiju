@@ -120,7 +120,7 @@ SETUP_TOKEN = "openapi-check-setup"
 def probe(port, method, path):
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
     body = None if method == "GET" else ""
-    c.request(method, path, body=body, headers={"content-type": "application/json", "x-bifrost-setup-token": SETUP_TOKEN})
+    c.request(method, path, body=body, headers={"content-type": "application/json", "x-raiju-setup-token": SETUP_TOKEN})
     r = c.getresponse()
     data = r.read(4096).decode("utf8", "replace")
     c.close()
@@ -159,7 +159,7 @@ def main():
     workdir = tempfile.mkdtemp(prefix="raiju-openapi-")
     cfg = os.path.join(workdir, "config.json")
     with open(cfg, "w", encoding="utf8") as f:
-        # /api is locked without an admin (Bifrost's setup lock): the probes send this setup token
+        # /api is locked without an admin (the setup lock): the probes send this setup token
         json.dump({"setup_token": SETUP_TOKEN, "providers": {}, "pricing_sync": {"url": "http://127.0.0.1:9"}}, f)
     log = open(os.path.join(workdir, "gateway.log"), "w")
     proc = subprocess.Popen([BIN, "-port", str(port), "-host", "127.0.0.1", "-config", cfg], stderr=log, stdout=log)

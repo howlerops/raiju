@@ -1,18 +1,18 @@
 // The setup screen: shown while the gateway has no admin account, when every /api route is locked behind the
-// operator's setup token (Bifrost's setup lock). The token is checked with POST /api/session/setup (which also sets
-// the HttpOnly setup session cookie, as Bifrost's dashboard does), then the first admin is created with
-// POST /api/users and X-Bifrost-Setup-Token. The new admin's token is shown once and becomes this tab's sign-in.
+// operator's setup token. The token is checked with POST /api/session/setup (which also sets
+// the HttpOnly setup session cookie), then the first admin is created with
+// POST /api/users and X-Raiju-Setup-Token. The new admin's token is shown once and becomes this tab's sign-in.
 // The setup token itself is never stored.
 import { createSignal, Show } from "solid-js"
 import { send, ApiError } from "../api/client"
 
-const SETUP_HEADER = "X-Bifrost-Setup-Token"
+const SETUP_HEADER = "X-Raiju-Setup-Token"
 
 function Instructions() {
   return (
     <div id="setup-help" class="hint">
       <p>
-        The setup token is a secret the operator sets on the server: the <code>BIFROST_SETUP_TOKEN</code> environment
+        The setup token is a secret the operator sets on the server: the <code>RAIJU_SETUP_TOKEN</code> environment
         variable, or <code>setup_token</code> at the top level of <code>config.json</code> (a value or an{" "}
         <code>env.NAME</code> reference). Restart the gateway after setting it.
       </p>

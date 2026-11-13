@@ -40,6 +40,12 @@ variable "ingress_cidr_blocks" {
   }
 }
 
+variable "allow_task_http_peers" {
+  description = "Allow tasks sharing the service security group to reach the main HTTP port directly. Off by default to preserve the ALB-only boundary. The staging kit enables this for its in-VPC probe tasks; it does not permit arbitrary VPC clients."
+  type        = bool
+  default     = false
+}
+
 variable "trusted_proxies" {
   description = "Addresses or CIDR ranges whose X-Forwarded-For / X-Real-IP Raiju believes (server.trusted_proxies), passed as RAIJU_TRUSTED_PROXIES; a trusted_proxies list in config.json still wins. Null (the default) is the VPC's CIDR block, where the ALB's addresses are: without it every request seems to come from the ALB, so the audit log names the ALB and the per-address limits (sign-in throttle, MCP client registration) count all clients as one. [] trusts no proxy."
   type        = list(string)

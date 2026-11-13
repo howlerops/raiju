@@ -2,7 +2,7 @@
 """Writes docs/config-reference.md: every config.json key Raiju reads, from the types in src/.
 
 It walks the Config type in src/config.tov and every type it names (in any src/*.tov file), and lists each key
-with its type and the comment written above it (or after it on the same line). It then adds the Bifrost keys that
+with its type and the comment written above it (or after it on the same line). It then adds the compatibility keys that
 src/config_compat.tov knows (the *Keys() lists: names Raiju maps on load) and its notes table (keys that are read
 and not applied), so a key the loader accepts is never missing from the reference.
 
@@ -21,7 +21,7 @@ OUT = os.path.join(ROOT, "docs", "config-reference.md")
 
 # A short description for the top-level sections whose field in Config has no comment of its own.
 SECTION_NOTES = {
-    "client": "Gateway-wide request handling: logging, auth on inference, CORS, body limits, header handling and MCP defaults (Bifrost's client section).",
+    "client": "Gateway-wide request handling: logging, auth on inference, CORS, body limits, header handling and MCP defaults.",
     "providers": "Providers by name (openai, anthropic, a custom name, ...): their keys, network settings and quirks.",
     "governance": "Virtual keys, budgets, rate limits, teams, customers, users, roles, routing rules and admin auth.",
     "cache": "The exact-match response cache.",
@@ -32,7 +32,7 @@ SECTION_NOTES = {
     "logs_store": "The request log store (files under the app dir; /api/logs reads it).",
     "otel": "OpenTelemetry traces and metrics export (OTLP over HTTP or gRPC).",
     "mcp": "The MCP gateway: client connections, tool execution, tool groups and code mode.",
-    "plugins": "Plugins in Bifrost's format: built-in names, WebAssembly files or URLs, with their config.",
+    "plugins": "Plugins: built-in names, WebAssembly files or URLs, with their config.",
     "semantic_cache": "The semantic cache: embedding model, threshold and where entries are kept.",
     "pricing_sync": "Periodic download of the pricing datasheet.",
     "secrets": "Secret references resolved when the config loads (env, files, cloud secret managers).",
@@ -72,15 +72,15 @@ COMPAT_LISTS = {
 # providerChildKeys(section) returns the keys of providers.<name>.<section>
 COMPAT_SECTIONED = {"providerChildKeys": "providers.<name>.{section}"}
 
-# What config_compat does with the Bifrost keys that have no rename note and no entry in its notes table.
+# What config_compat does with compatibility keys that have no rename note and no entry in its notes table.
 COMPAT_NOTES = {
-    "version": "Accepted (Bifrost's file version); no effect.",
-    "source_of_truth": "Accepted (Bifrost's config-store setting); no effect: Raiju's source of truth is the file.",
-    "env_label": "Accepted (Bifrost's environment label); no effect.",
-    "guardrails_config": "Bifrost's guardrails, translated into `guardrails` when the config loads and merged with it (never saved back).",
+    "version": "Accepted file version; no effect.",
+    "source_of_truth": "Accepted config-store setting; no effect: Raiju's source of truth is the file.",
+    "env_label": "Accepted environment label; no effect.",
+    "guardrails_config": "Translated into `guardrails` when the config loads and merged with it (never saved back).",
     "server.read_buffer_size": "Accepted; no Raiju counterpart (the command line takes -host and -port).",
-    "governance.complexity_analyzer_config": "Bifrost's complexity analyzer, read into `complexity_router`.",
-    "mcp.tool_manager_config": "Bifrost's MCP runtime settings: each one is moved to the Raiju key named in its row when that key is unset (the Raiju key wins).",
+    "governance.complexity_analyzer_config": "Read into `complexity_router`.",
+    "mcp.tool_manager_config": "MCP runtime settings: each one is moved to the Raiju key named in its row when that key is unset (the Raiju key wins).",
     "mcp.tool_manager_config.code_mode_binding_level": "Read as `mcp.code_mode_binding_level`.",
     "mcp.tool_manager_config.code_mode_limits": "Read as `mcp.code_mode_limits`.",
     "mcp.tool_manager_config.max_instructions_per_client": "Read as `mcp.max_instructions_per_client`.",
@@ -453,7 +453,7 @@ class Walker:
 
 
 def compat_note(path, notes, renames):
-    """What happens to a Bifrost key on load: its note, its rename, or an entry of COMPAT_NOTES."""
+    """What happens to a compatibility key on load: its note, its rename, or an entry of COMPAT_NOTES."""
     if path in notes:
         n = notes[path]
         return n[0].upper() + n[1:] + "."
@@ -511,7 +511,7 @@ def generate():
     lists, notes, renames = compat_lists()
     typed = {r[0] for r in w.rows}
 
-    # the Bifrost names config_compat reads that are not keys of the typed config
+    # the compatibility names config_compat reads that are not keys of the typed config
     compat_rows = []
     for prefix, keys in lists.items():
         for k in keys:
@@ -528,8 +528,8 @@ def generate():
     lines.append("")
     lines.append("<!-- Generated by scripts/gen_config_doc.py from the types in src/ and src/config_compat.tov. Do not edit by hand: run `make config-doc`. -->")
     lines.append("")
-    lines.append("Every key of `config.json` that Raiju reads. The file format is Bifrost's, so a Bifrost config loads as it is;")
-    lines.append("Bifrost names that Raiju maps on load are listed at the end. Values written `env.NAME` are read from the")
+    lines.append("Every key of `config.json` that Raiju reads. Supported compatibility keys and their mappings are listed")
+    lines.append("at the end; this does not imply wire-protocol compatibility. Values written `env.NAME` are read from the")
     lines.append("environment when the config loads. `<name>` stands for a key you choose (a provider's name, a map key), and `[]`")
     lines.append("for each element of a list. Descriptions are the comments in the source; defaults are given there when a key")
     lines.append("has one. The command-line flags (`-app-dir`, `-config`, `-host`, `-port`, `-workers`, `-server`, `-mode`,")
@@ -537,7 +537,7 @@ def generate():
     lines.append("")
     keyed = len(w.rows)
     described = sum(1 for r in w.rows if r[2])
-    lines.append(f"{keyed} keys ({described} with a description), and {len(compat_rows)} Bifrost keys read through config_compat.")
+    lines.append(f"{keyed} keys ({described} with a description), and {len(compat_rows)} compatibility keys read through config_compat.")
     lines.append("")
     lines.append("## Sections")
     lines.append("")
@@ -563,11 +563,11 @@ def generate():
                 d = (d + " " if d else "") + f"Not applied: {path.split('.')[-1]} {note}."
             lines.append(f"| `{esc(path)}` | {esc(typ)} | {esc(d)} |")
         lines.append("")
-    lines.append("## Bifrost keys read through config_compat")
+    lines.append("## Compatibility keys read through config_compat")
     lines.append("")
-    lines.append("These are Bifrost names that `src/config_compat.tov` reads: most are rewritten on load to the Raiju key")
-    lines.append("that holds the same setting (for example `cluster_config` to `cluster`, `alerting` to `alerts`), and the")
-    lines.append("ones with a note are read and not applied. The startup log says what each file's keys became.")
+    lines.append("These are additional names that `src/config_compat.tov` reads: most are rewritten on load to the Raiju key")
+    lines.append("that holds the same setting (for example `cluster_config` to `cluster`, `alerting` to `alerts`). Each row")
+    lines.append("describes its mapping or why it is not applied. The startup log says what each file's keys became.")
     lines.append("")
     lines.append("| Key | Note |")
     lines.append("|---|---|")

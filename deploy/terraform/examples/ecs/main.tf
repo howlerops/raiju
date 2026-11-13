@@ -75,7 +75,7 @@ module "raiju" {
   # Providers come from environment variables, which Raiju reads without a
   # config file. With no EFS volume /app/data is the task's ephemeral storage:
   # API changes and the first admin last until the task stops. Add a
-  # BIFROST_SETUP_TOKEN secret to open /api until the first admin is created:
+  # RAIJU_SETUP_TOKEN secret to open /api until the first admin is created:
   # without an admin or a setup token the management API answers 403.
   secret_arns = var.provider_secret_arns
 }

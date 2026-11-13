@@ -1,36 +1,39 @@
-// WebAssembly plugins in Bifrost's JSON ABI, run by the interpreter behind std/wasm (WAMR, added
-// to the Tov runtime by tov-patches/0005-wamr.patch). A plugin is a .wasm file that exports
+// WebAssembly plugins use a JSON ABI and run in the interpreter behind std/wasm
+// (WAMR, added to the Tov runtime by tov-patches/0005-wamr.patch).
+// A plugin is a .wasm file that exports
 //
 //   malloc(size) -> ptr           free(ptr) or free(ptr, size)
 //   get_name() -> packed          init(config_ptr, config_len) -> 0 on success
 //   pre_hook(ptr, len) -> packed  post_hook(ptr, len) -> packed
 //   cleanup() -> 0
 //
-// The HTTP transport hooks are optional exports in the same format: http_pre_hook (http_intercept,
-// its older name, when that is all the module has), http_post_hook and http_stream_chunk_hook.
-// Their inputs and answers are described at wasmHttpPre, wasmHttpPost and wasmHttpChunk below.
+// HTTP transport hooks are optional exports in the same format: http_pre_hook
+// (or its older name, http_intercept, when that is all the module has),
+// http_post_hook and http_stream_chunk_hook. Their inputs and answers are
+// described at wasmHttpPre, wasmHttpPost and wasmHttpChunk below.
 //
-// where "packed" is a u64: the pointer to a JSON text in the plugin's memory in the upper 32
-// bits and its length in the lower 32. The host writes each input into memory it got from
-// malloc, calls the hook, reads the answer, and frees both. All data is JSON.
+// "packed" is a u64: the pointer to JSON text in plugin memory occupies the upper
+// 32 bits and its length the lower 32. The host writes each input into memory
+// obtained from malloc, calls the hook, reads the answer, and frees both.
+// All data is JSON.
 //
 // pre_hook gets {"context", "request"} and answers {"context", "request", "short_circuit",
 // "has_short_circuit", "error"}; post_hook gets {"context", "response", "error", "has_error"}
-// and answers {"context", "response", "error", "has_error", "hook_error"}. A non-empty "error"
-// or "hook_error", a trap, or an answer that is not JSON is a failed hook: the chain logs it and
-// goes on without that plugin's change, as Bifrost's plugin pipeline does.
+// and answers {"context", "response", "error", "has_error", "hook_error"}. A non-empty
+// "error" or "hook_error", a trap, or a non-JSON answer fails the hook: the chain
+// logs it and continues without that plugin's change.
 //
-// The request is Bifrost's chat request: provider, model, input (the messages), params (every
-// other field of the OpenAI body) and fallbacks, both at the top of the object (as Bifrost's
-// docs show it) and under "chat_request" (as its Rust and TypeScript examples read it). The
-// response is {"chat_response": <the chat completion>}. Whichever of the two request forms a
-// plugin changes is applied. The same shapes serve every request type the hooks run on (embeddings,
-// speech, transcription, images, Responses, rerank...): the request key and the response key are
-// named after the type (plughttp.tov LlmKind), and a type with no chat messages has its own input
-// field as "input".
+// A chat request contains provider, model, input (messages), params (all other
+// OpenAI body fields), and fallbacks, both at the top level and under
+// "chat_request". Changes to either request form are applied. The response is
+// {"chat_response": <the chat completion>}. The same shapes serve other request
+// types handled by the hooks (embeddings, speech, transcription, images, Responses,
+// rerank): request and response keys are named after the type (plughttp.tov LlmKind),
+// and types without chat messages use their own input field as "input".
 //
-// Each instance runs with limits (memory pages, operand stack, instructions per call), so a
-// plugin that loops or grows without end fails its hook instead of hanging the gateway.
+// Each instance has memory-page, operand-stack and per-call instruction limits.
+// A plugin that loops or grows without bound fails its hook rather than hanging
+// the gateway.
 
 import { instantiate, WasmInstance, WasmLimits } from "std/wasm"
 import { readFileBytesSync, statSync } from "node:fs"
@@ -63,9 +66,9 @@ export type WasmPre =
   | { kind: "continue", body: string, context: string }
   | { kind: "short_circuit", status: int, body: string, context: string }
 
-// A post_hook's answer: the body (and the status it now has, when the plugin changed it: an error made
-// of a response, or a response made of an error), and the shared context.
-// skip: on a stream, the plugin dropped the chunk (an error with Bifrost's stream_control skip_stream).
+// A post_hook answer contains the body, its status after any conversion between
+// response and error, and the shared context.
+// skip: on a stream, the plugin dropped the chunk via an error with stream_control skip_stream.
 export type WasmPost =
   | { kind: "same", context: string }
   | { kind: "body", body: string, context: string }
@@ -93,7 +96,7 @@ export type WasmHttpChunk =
   | { kind: "skip", context: string }
   | { kind: "stop", message: string, context: string }
 
-// ---- the request and response in Bifrost's shapes ----
+// ---- plugin request and response shapes ----
 
 const REQUEST_KEYS: string[] = ["provider", "model", "input", "params", "fallbacks"]
 
@@ -269,7 +272,7 @@ export function applyResponse(body: string, out: string): string throws SyntaxEr
   return try applyResponseFor(CHAT_KIND, body, out, false)
 }
 
-// The error body of a Bifrost error a plugin returned, and its status (500 unless it names a 4xx or 5xx).
+// The body and status of a plugin-returned error; status defaults to 500 unless it specifies a 4xx or 5xx.
 function errorReply(ef: Field[]): { status: int, body: string } {
   let status = Math.trunc(rawNum(ef, "status_code") ?? 500.0)
   if (status < 400 || status > 599) status = 500
@@ -278,7 +281,7 @@ function errorReply(ef: Field[]): { status: int, body: string } {
   return { status: status, body: errorJson("the plugin refused the request", "api_error", undefined) }
 }
 
-// The message of a Bifrost error ({"error": {"message"}}), or "".
+// The message of a plugin error ({"error": {"message"}}), or "".
 function errorMessageOf(ef: Field[]): string {
   const inner = find(ef, "error")
   if (inner === undefined || !inner.startsWith("{")) return ""
@@ -289,7 +292,7 @@ function errorMessageOf(ef: Field[]): string {
   }
 }
 
-// Whether a Bifrost error carries nothing: Bifrost's pipeline reads such an error as a recovery.
+// Whether a plugin error is empty; the pipeline treats an empty error as recovery.
 function emptyError(ef: Field[]): bool {
   for (const key of ["status_code", "type", "code"]) {
     const v = find(ef, key)
@@ -311,7 +314,7 @@ function emptyError(ef: Field[]): bool {
   return true
 }
 
-// The reply of a short circuit: a response of the kind (200) or a Bifrost error with its status.
+// A short-circuit reply: a response of the requested kind (200), or a plugin error with its status.
 export function shortCircuitReplyFor(k: LlmKind, sc: string): { status: int, body: string } throws SyntaxError {
   const f = try fields(sc)
   const resp = find(f, "response")
@@ -331,8 +334,8 @@ export function shortCircuitReply(sc: string): { status: int, body: string } thr
   return try shortCircuitReplyFor(CHAT_KIND, sc)
 }
 
-// A gateway error body ({"error":{...}}) as the Bifrost error a post hook gets.
-export function bifrostErrorJson(status: int, body: string): string {
+// Converts a gateway error body ({"error":{...}}) to the error shape a post hook receives.
+export function raijuErrorJson(status: int, body: string): string {
   let inner = `{"message":"the request failed"}`
   try {
     const e = find(fields(body), "error")
@@ -340,7 +343,7 @@ export function bifrostErrorJson(status: int, body: string): string {
   } catch (x) {
     inner = `{"message":${quote(body.slice(0, 500))}}`
   }
-  return `{"is_bifrost_error":false,"status_code":${status},"error":${inner}}`
+  return `{"is_raiju_error":false,"status_code":${status},"error":${inner}}`
 }
 
 // ---- one loaded plugin ----
@@ -490,7 +493,7 @@ export class WasmPluginInst {
     if (!this.ex.post) return { kind: "same", context: context }
     const failed = status >= 400
     const input = failed
-      ? `{"context":${context},"response":null,"error":${bifrostErrorJson(status, body)},"has_error":true}`
+      ? `{"context":${context},"response":null,"error":${raijuErrorJson(status, body)},"has_error":true}`
       : `{"context":${context},"response":${responseJsonFor(k, body, stream)},"error":{},"has_error":false}`
     const text = try this.callJson("post_hook", input)
     try {
@@ -503,8 +506,8 @@ export class WasmPluginInst {
         const ev = find(f, "error")
         if (ev !== undefined && ev.startsWith("{")) {
           const ef = fields(ev)
-          // Bifrost's StreamControl on a chunk's error: skip_stream drops the chunk (log_error logs the message), and
-          // the stream goes on
+          // On a chunk's error, stream_control skip_stream drops the chunk and log_error logs
+          // the message; the stream continues.
           const scRaw = find(ef, "stream_control")
           if (stream && scRaw !== undefined && scRaw.startsWith("{")) {
             const scf = fields(scRaw)
@@ -572,10 +575,10 @@ export class WasmPluginInst {
     return { response: r !== undefined && r.startsWith("{") ? r : undefined, error: err === "" ? "" : `${this.pluginName}: ${err}`, context: this.contextOf(f, context) }
   }
 
-  // http_stream_chunk_hook, for each chunk of a streamed answer before it is written. Input {"context",
-  // "request", "chunk"} (the chunk is the event's JSON, with no SSE framing); the answer is {"context",
-  // "chunk", "has_chunk", "skip", "error"}: skip drops the chunk, a chunk (has_chunk) is sent on, and an
-  // error with no chunk ends the stream (with a chunk it is only logged, as Bifrost does).
+  // http_stream_chunk_hook runs on each streamed chunk before writing it. Input is {"context",
+  // "request", "chunk"}, where chunk is the event's JSON without SSE framing. The answer is
+  // {"context", "chunk", "has_chunk", "skip", "error"}: skip drops the chunk; has_chunk sends
+  // the chunk onward. An error without a chunk ends the stream; with a chunk it is only logged.
   httpChunk(context: string, reqJson: string, chunk: string): WasmHttpChunk throws Error {
     if (!this.ex.httpChunk) return { kind: "chunk", chunk: chunk, warning: "", context: context }
     const text = try this.callJson("http_stream_chunk_hook", `{"context":${context},"request":${reqJson},"chunk":${chunk}}`)
@@ -761,7 +764,7 @@ function fixture(config: string, limits: WasmPluginLimits | undefined): WasmPlug
 const CHAT = `{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"ping"}],"temperature":0.2,"stream":false}`
 const COMPLETION = `{"id":"c1","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`
 
-test("requestJson gives Bifrost's chat request in both forms", () => {
+test("requestJson gives Raiju's chat request in both forms", () => {
   const r = try requestJson(CHAT)
   const f = try fields(r)
   expect(rawStr(f, "provider")).toBe("openai")
@@ -1198,8 +1201,8 @@ test("post_hook may turn a response into an error, recover from an error, and re
   ch.close()
 })
 
-test("the error a post hook gets is Bifrost's error shape, and the module's http export is found", () => {
-  expect(bifrostErrorJson(502, `{"error":{"message":"m","type":"t"}}`)).toBe(`{"is_bifrost_error":false,"status_code":502,"error":{"message":"m","type":"t"}}`)
+test("the error a post hook gets is Raiju's error shape, and the module's http export is found", () => {
+  expect(raijuErrorJson(502, `{"error":{"message":"m","type":"t"}}`)).toBe(`{"is_raiju_error":false,"status_code":502,"error":{"message":"m","type":"t"}}`)
   const p = try fixture(`{}`, undefined)
   expect(p.ex.httpPre).toBe("http_pre_hook")
   p.close()

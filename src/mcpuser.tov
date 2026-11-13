@@ -1,14 +1,13 @@
-// Per-user OAuth for MCP clients of auth_type per_user_oauth (Bifrost's per-user consent). Each caller
-// (a virtual key, an x-bf-mcp-session-id in session mode, or an identity-provider user through a user-mode MCP
-// token) holds its own token row per client. A caller without a usable token is sent a consent link; the flow it
-// opens is held here until the callback returns, and the callback saves the row. The admin's own verification of
-// an oauth client (initiate-verification, reauthorize) is a flow of mode "admin" in the same table. Temp tokens
-// (client.mcp_enable_temp_token_auth) let the link's owner open the flow's routes without a dashboard session,
-// until the flow ends.
+// Per-user OAuth for MCP clients with auth_type per_user_oauth. Each caller (a virtual key, an
+// x-raiju-mcp-session-id in session mode, or an identity-provider user with a user-mode MCP token) has a
+// separate token row per client. Callers without usable tokens receive consent links. Flows remain here
+// until the callback saves the token row. Admin verification of an oauth client (initiate-verification,
+// reauthorize) uses mode "admin" in the same table. Temp tokens (client.mcp_enable_temp_token_auth) allow
+// a link's owner to access flow routes without a dashboard session until the flow ends.
 //
-// The flows and temp tokens are kept in a state file beside config.json (openFlowState), with each flow's PKCE
-// verifier sealed like the config's secrets and the temp tokens kept only as their SHA-256, so a restart between
-// the consent link and the callback keeps the flow, and every worker of the node sees the flows the others opened.
+// Flows and temp tokens persist in a state file beside config.json (openFlowState). PKCE verifiers are
+// sealed like config secrets, and temp tokens are stored only as SHA-256 hashes. Flows therefore survive
+// restarts between consent and callback and are visible to every worker on the node.
 import { McpAuthConfig, authorizeUrl, pkceVerifier, pkceChallenge, codeTokenRequest, tokenRequest, tokenFields } from "./mcpauth"
 import { secureHex, sha256, utf8, toHex } from "./crypto"
 import { deadline } from "./deadline"
@@ -19,7 +18,7 @@ import { lockFile, unlockFile } from "./filelock"
 import { resolvedTargetProblem, peerOf, strictPolicy } from "./netguard"
 
 // One caller's tokens for one per_user_oauth client. At most one of virtual_key_id, session_id and user_id is set:
-// user_id for a user-mode token, else virtual_key_id, else session_id in session mode (the x-bf-mcp-session-id header
+// user_id for a user-mode token, else virtual_key_id, else session_id in session mode (the x-raiju-mcp-session-id header
 // of a request without a key; identityOf). The tokens are sealed
 // in the saved file.
 export type McpUserToken = {
@@ -42,8 +41,8 @@ export type McpUserToken = {
   user_id?: string,
 }
 
-// A consent flow a caller opened: its state is the authorize request's state, and the link it was given
-// names its id. It lives FLOW_TTL_MS, as Bifrost's does.
+// A caller's consent flow. Its state is the authorization request's state, and the supplied link names
+// its id. Its lifetime is FLOW_TTL_MS.
 export type UserFlow = {
   id: string,
   state: string,
@@ -228,7 +227,7 @@ export function mintTempToken(scope: string, flowId: string, expiresAt: f64): st
   return plain
 }
 
-// Ends the temp tokens of a flow (a per-user headers submission that completed), as Bifrost deletes them by resource.
+// Invalidates a flow's temp tokens after a per-user headers submission completes.
 export function endTempTokens(flowId: string): void {
   syncFlows()
   const now = Date.now()
@@ -281,9 +280,9 @@ export function userTokenOf(list: McpUserToken[] | undefined, client: string, vk
   return i < 0 ? undefined : all[i]
 }
 
-// The identity a request is keyed by, in Bifrost's order (BifrostContext.MCPAuthMode): the user of a user-mode token,
-// else the virtual key, else the x-bf-mcp-session-id header. A request with a key and a session header is the key's.
-// A session id over 255 characters is ignored, as Bifrost's NormalizeSessionID ignores it.
+// Request identity precedence: the user of a user-mode token, then the virtual key, then the
+// x-raiju-mcp-session-id header. A request with both a key and a session header belongs to the key.
+// Session ids longer than 255 characters are ignored.
 export function identityOf(sessionHeader: string | undefined, vk: string, user?: string): { vk: string, session: string, user: string } {
   const u = user ?? ""
   if (u !== "") return { vk: "", session: "", user: u }
@@ -293,7 +292,7 @@ export function identityOf(sessionHeader: string | undefined, vk: string, user?:
   return { vk: "", session: "", user: "" }
 }
 
-// Bifrost's MaxSessionIDLength (runes).
+// Maximum session id length in Unicode code points.
 const MAX_SESSION_ID = 255
 
 // A request header that carries the user of a user-mode MCP token from the /mcp handler to the tool calls it makes.
@@ -329,15 +328,15 @@ export function consentMessage(client: string, link: string, tempToken: bool): s
   return m
 }
 
-// The consent link of a per-user flow: Bifrost's auth page for the flow (src/mcpconsent.tov), which reads the
-// flow and opens its start route. The temp token rides in the fragment, which the page reads.
+// A per-user flow's consent link opens the auth page (src/mcpconsent.tov), which reads the flow and opens
+// its start route. The page reads the temp token from the URL fragment.
 export function consentLink(base: string, flowId: string, tempToken: string): string {
   const u = `${base}/workspace/mcp-sessions/auth?flow=${flowId}`
   return tempToken === "" ? u : `${u}#t=${tempToken}`
 }
 
-// The link of a per-user headers submission: the same auth page with kind=headers, which reads the flow and
-// submits the values (Bifrost's frontend URL). The temp token rides in the fragment.
+// A per-user headers submission link opens the auth page with kind=headers to read the flow and submit
+// values. The temp token is carried in the URL fragment.
 export function headersLink(base: string, flowId: string, tempToken: string): string {
   const u = `${base}/workspace/mcp-sessions/auth?flow=${flowId}&kind=headers`
   return tempToken === "" ? u : `${u}#t=${tempToken}`
@@ -355,10 +354,9 @@ function prune(nowMs: f64): void {
   }
 }
 
-// Opens a consent flow for a caller of a per_user_oauth client. a is the client's registration (its
-// authorize endpoint and client_id, set by the admin's verification). The flow's temp token is minted when
-// tempOn is set, except for a user-mode flow, which the user's own dashboard sign-in opens (as Bifrost). error
-// says why no flow was opened.
+// Opens a consent flow for a per_user_oauth caller. a is the client's registration, including its
+// authorization endpoint and client_id from admin verification. A temp token is minted when tempOn is set,
+// except for user-mode flows, which use the user's dashboard sign-in. error explains why no flow was opened.
 export function startUserFlow(a: McpAuthConfig, client: string, vk: string, sessionId: string, base: string, tempOn: bool, nowMs: f64, userId?: string): { flow: UserFlow | undefined, error: string } {
   if ((a.client_id ?? "") === "" || (a.authorize_url ?? "") === "") return { flow: undefined, error: `MCP client ${client} is not verified yet: an admin runs initiate-verification first` }
   syncFlows()
@@ -421,8 +419,8 @@ export function adminFlowsOf(client: string): UserFlow[] {
   return out
 }
 
-// The flow of a callback's state without taking it (a callback that carries an error: a per-user flow stays
-// pending so its link can be retried, as in Bifrost). undefined when unknown.
+// Looks up a callback's state without consuming the flow. On an error callback, a per-user flow stays
+// pending so its link can be retried. Returns undefined for an unknown state.
 export function peekFlow(state: string): UserFlow | undefined {
   let f = USER_FLOWS.get(state)
   if (f === undefined) {
@@ -480,7 +478,7 @@ export function takeUserFlow(state: string, nowMs: f64): UserFlow | undefined {
   return f
 }
 
-// Ends an admin flow whose callback completed: the client is authorized now, so its row goes (as Bifrost removes it).
+// Removes an admin flow after its callback completes and the client is authorized.
 export function endAdminFlow(id: string, nowMs: f64): void {
   endFlow(id, nowMs)
   saveFlows(nowMs)
@@ -514,8 +512,8 @@ export function forgetUserFlows(client: string, vk: string, sessionId: string, u
   if (ids.length > 0) saveFlows(now)
 }
 
-// Whether a dashboard caller may open a flow (Bifrost's canAccessUserFlow): a user-mode flow only by its own user;
-// any other flow by anyone who passed the gate.
+// A user-mode flow is accessible only to its own user. Other flows are accessible to any dashboard
+// caller who passed the access gate.
 export function mayOpenFlow(f: UserFlow, callerUser: string): bool {
   const u = f.user_id ?? ""
   if (u === "") return true
@@ -586,10 +584,10 @@ export async function refreshUserRow(a: McpAuthConfig, row: McpUserToken, nowMs:
   return try rowFromTokens(text, nowMs, row.mcp_client_name, row.virtual_key_id, row.session_id, row.id, row.refresh_token, row.user_id)
 }
 
-// One form POST to an authorization server under a deadline: the body of a 2xx answer, else an error. The token
-// endpoint must be a public address, or one oauth_private_allowlist names (allow), checked on the addresses its host
-// resolves to before the request and again by the runtime when it connects; a redirect is not followed, as Bifrost's
-// OAuth client does not replay a credential-bearing POST elsewhere.
+// Sends a form POST to an authorization server under a deadline, returning the body of a 2xx response
+// or an error. The token endpoint must be public or permitted by oauth_private_allowlist (allow).
+// Resolved addresses are checked before the request and by the runtime when connecting. Redirects are
+// not followed, preventing credential-bearing POSTs from being replayed to another destination.
 async function postForm(url: string, headers: Map<string, string>, body: string, allow: string[]): Promise<string> throws Error {
   const pr = await resolvedTargetProblem(url, allow)
   if (pr !== "") throw new Error(`${url}: ${pr} (add the host to oauth_private_allowlist to allow it)`)
@@ -651,7 +649,7 @@ test("rows are keyed by virtual key, or by session id in session mode", () => {
   expect(userTokenIndex(list, "m", "", "s-x")).toBe(-1)
 })
 
-test("the virtual key takes precedence over the session header (Bifrost's order), and blank headers are ignored", () => {
+test("the virtual key takes precedence over the session header (Raiju's order), and blank headers are ignored", () => {
   expect(identityOf("abc", "vk1")).toEqual({ vk: "vk1", session: "", user: "" })
   expect(identityOf("abc", "")).toEqual({ vk: "", session: "abc", user: "" })
   expect(identityOf("  ", "vk1").vk).toBe("vk1")

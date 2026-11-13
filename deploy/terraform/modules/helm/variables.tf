@@ -91,7 +91,7 @@ variable "service_type" {
 
 variable "config_json" {
   description = <<-EOT
-    Contents of config.json in Bifrost format, for example file("config.json").
+    Contents of config.json in Raiju format, for example file("config.json").
     Null uses the chart's default config. Providers absent from this config are
     removed from the chart defaults, so only the providers you list are built.
     Keep keys out of the file: refer to them as "env.NAME" and set NAME in
@@ -166,7 +166,7 @@ variable "timeout" {
 }
 
 variable "setup_token_secret_name" {
-  description = "Name of a Secret in the namespace with a BIFROST_SETUP_TOKEN key (chart setupToken.existingSecret). The management API is locked until an admin exists; create the first one with POST /api/users and this token in X-Bifrost-Setup-Token."
+  description = "Name of a Secret in the namespace with a RAIJU_SETUP_TOKEN key (chart setupToken.existingSecret). The management API is locked until an admin exists; create the first one with POST /api/users and this token in X-Raiju-Setup-Token."
   type        = string
   default     = null
 }

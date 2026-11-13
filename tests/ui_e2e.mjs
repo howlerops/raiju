@@ -29,8 +29,8 @@ writeFileSync(config, JSON.stringify({
     auth_config: { token: "admin-secret" },
     budgets: [{ id: "monthly", max_limit: 50, reset_duration: "1M" }],
     virtual_keys: [
-      { id: "vk-ui-oauth", value: "sk-bf-ui-oauth", mcp_configs: [{ mcp_client_name: "local", tools_to_execute: ["*"] }] },
-      { id: "vk-po-a", value: "sk-bf-po-a", mcp_configs: [{ mcp_client_name: "po", tools_to_execute: ["*"] }] },
+      { id: "vk-ui-oauth", value: "sk-raiju-ui-oauth", mcp_configs: [{ mcp_client_name: "local", tools_to_execute: ["*"] }] },
+      { id: "vk-po-a", value: "sk-raiju-po-a", mcp_configs: [{ mcp_client_name: "po", tools_to_execute: ["*"] }] },
     ],
   },
   mcp: {
@@ -63,7 +63,7 @@ writeFileSync(config, JSON.stringify({
   }] },
 }))
 
-// a gateway with no admin account and a setup token: the setup screen (Bifrost's setup lock)
+// a gateway with no admin account and a setup token: the setup screen (the setup lock)
 const SETUP_PORT = Number(process.env.UI_E2E_SETUP_PORT ?? 18335)
 const SETUP_GW = `http://127.0.0.1:${SETUP_PORT}`
 const SETUP_TOKEN = "ui-setup-" + "token-l189"
@@ -74,7 +74,7 @@ writeFileSync(setupConfig, JSON.stringify({
   providers: { openai: { keys: [{ name: "main", value: "sk-ui-setup", models: [], weight: 1 }], network_config: { base_url: MOCK } } },
 }))
 const setupEnv = { ...process.env }
-delete setupEnv.BIFROST_SETUP_TOKEN
+delete setupEnv.RAIJU_SETUP_TOKEN
 
 const procs = [
   spawn(join(root, "build/mock_upstream"), [], { env: { ...process.env, MOCK_PORT: String(PORT + 1) }, stdio: "ignore" }),
@@ -423,8 +423,8 @@ try {
   await page.click("#vk-save")
   await page.waitForSelector("#vk-secret-value", { state: "visible", timeout: 5000 })
   const secret = await page.inputValue("#vk-secret-value")
-  check("creating a virtual key shows its value once", secret.startsWith("sk-bf-"), secret)
-  const res = await fetch(GW + "/v1/chat/completions", { method: "POST", headers: { "content-type": "application/json", "x-bf-vk": secret }, body: JSON.stringify({ model: "openai/gpt-4o-mini", messages: [{ role: "user", content: "with the new key" }] }) })
+  check("creating a virtual key shows its value once", secret.startsWith("sk-raiju-"), secret)
+  const res = await fetch(GW + "/v1/chat/completions", { method: "POST", headers: { "content-type": "application/json", "x-raiju-vk": secret }, body: JSON.stringify({ model: "openai/gpt-4o-mini", messages: [{ role: "user", content: "with the new key" }] }) })
   check("the key created in the UI works", res.status === 200, res.status)
   const saved = JSON.parse(readFileSync(config, "utf8"))
   check("the key was saved to config.json", (saved.governance.virtual_keys ?? []).some((v) => v.name === "from-ui"))
@@ -462,9 +462,9 @@ try {
   await page.locator('#vk-list tbody tr', { hasText: "from-ui" }).locator('button.toggle').click()
   check("and enables it again", await poll(async () => (await api("GET", "/api/governance/virtual-keys")).data.virtual_keys.find((v) => v.id === vkId)?.is_active === true))
   await page.locator('#vk-list tbody tr', { hasText: "from-ui" }).locator('button:has-text("Rotate")').click()
-  check("rotating shows the new value once", await until(page, (old) => (document.querySelector("#vk-secret-value")?.value ?? "").startsWith("sk-bf-") && document.querySelector("#vk-secret-value").value !== old, secret), await page.inputValue("#vk-secret-value").catch(() => ""))
+  check("rotating shows the new value once", await until(page, (old) => (document.querySelector("#vk-secret-value")?.value ?? "").startsWith("sk-raiju-") && document.querySelector("#vk-secret-value").value !== old, secret), await page.inputValue("#vk-secret-value").catch(() => ""))
   const rotated = await page.inputValue("#vk-secret-value")
-  check("the rotated value is different and works", rotated !== secret && (await chat("after rotation", "openai/gpt-4o-mini", { "x-bf-vk": rotated })).status === 200, rotated)
+  check("the rotated value is different and works", rotated !== secret && (await chat("after rotation", "openai/gpt-4o-mini", { "x-raiju-vk": rotated })).status === 200, rotated)
   await page.click("#vk-new")
   await page.fill("#vk-form input[name=name]", "bad")
   await page.route("**/api/governance/virtual-keys", (r) => r.request().method() === "POST" ? r.fulfill({ status: 400, contentType: "application/json", body: '{"error":{"message":"refused for the test"}}' }) : r.fallback())
@@ -703,10 +703,10 @@ try {
     await cp.fill("#vk", "   ")
     await cp.click("#go")
     check("a blank key is refused on the page, as an alert", await until(cp, () => document.querySelector("#msg")?.getAttribute("role") === "alert" && /Enter the virtual key/.test(document.querySelector("#msg").textContent)), await text(cp, "#msg"))
-    await cp.fill("#vk", "sk-bf-not-a-key")
+    await cp.fill("#vk", "sk-raiju-not-a-key")
     await cp.click("#go")
     check("a key the gateway does not know is refused with the reason", await until(cp, () => /HTTP 4\d\d/.test(document.querySelector("#msg")?.textContent ?? "")), await text(cp, "#msg"))
-    await cp.fill("#vk", "sk-bf-ui-oauth")
+    await cp.fill("#vk", "sk-raiju-ui-oauth")
     await cp.click("#go")
     check("approving with a virtual key returns to the client with a code", await cp.waitForURL(/8080\/cb\?code=/, { timeout: 8000 }).then(() => true, () => false), cp.url())
     const code = new URL(cp.url()).searchParams.get("code") ?? ""
@@ -746,7 +746,7 @@ try {
     check("the per-user OAuth client connects with the admin's token", poReady)
     const call = await fetch(GW + "/v1/mcp/tool/execute", {
       method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer sk-bf-po-a" },
+      headers: { "content-type": "application/json", authorization: "Bearer sk-raiju-po-a" },
       body: JSON.stringify({ id: "c1", type: "function", function: { name: "po-get_weather", arguments: '{"city":"Oslo"}' } }),
     })
     const denial = await call.text()
@@ -1245,7 +1245,7 @@ try {
     const newToken = await sp.inputValue("#setup-new-token")
     const users = await fetch(SETUP_GW + "/api/users", { headers: { authorization: "Bearer " + newToken } })
     const ujson = await users.json().catch(() => ({}))
-    check("the admin exists on the gateway (POST /api/users with X-Bifrost-Setup-Token) and its token opens the API", users.status === 200 && (ujson.users ?? []).some((u) => u.name === "root" && u.role === "admin"), JSON.stringify(ujson).slice(0, 200))
+    check("the admin exists on the gateway (POST /api/users with X-Raiju-Setup-Token) and its token opens the API", users.status === 200 && (ujson.users ?? []).some((u) => u.name === "root" && u.role === "admin"), JSON.stringify(ujson).slice(0, 200))
     check("the setup lock is lifted", (await (await fetch(SETUP_GW + "/api/session/is-auth-enabled")).json()).setup_required === false)
     await sp.click("#setup-continue")
     check("Continue opens the dashboard signed in as the new admin", await until(sp, () => !document.querySelector("#setup") && document.querySelector("#token-btn")?.textContent === "Admin token: set" && /admin/.test(document.querySelector("#role-pill")?.textContent ?? "")), await text(sp, "header"))
@@ -1259,7 +1259,7 @@ try {
     const np = await nctx.newPage()
     await np.route("**/api/session/is-auth-enabled", (r) => r.fulfill({ status: 200, contentType: "application/json", body: '{"is_auth_enabled":false,"setup_required":true,"setup_token_configured":false}' }))
     await np.goto(SETUP_GW + "/#overview")
-    check("with no setup token configured the screen explains how to set one", await until(np, () => !!document.querySelector("#setup-unconfigured")) && (await np.locator("#setup-form").count()) === 0 && (await text(np, "#setup-help")).includes("BIFROST_SETUP_TOKEN"), await text(np, "main"))
+    check("with no setup token configured the screen explains how to set one", await until(np, () => !!document.querySelector("#setup-unconfigured")) && (await np.locator("#setup-form").count()) === 0 && (await text(np, "#setup-help")).includes("RAIJU_SETUP_TOKEN"), await text(np, "main"))
     await nctx.close()
   }
 

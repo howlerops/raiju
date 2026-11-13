@@ -2,8 +2,7 @@
 //
 // find(provider, model) tries, in order:
 //   1. config.pricing: "provider/model" or "model", per token
-//   2. Bifrost pricing overrides (governance.pricing_overrides), patched over
-//      the datasheet price for the same model
+//   2. governance.pricing_overrides, patched over the datasheet price for the same model
 //   3. the datasheet: exact "provider/model" key, "model" key, provider + base
 //      model; then the same with a trailing "-YYYYMMDD" removed; then the
 //      longest key the model starts with, or contains as ".key" (regions).
@@ -14,15 +13,14 @@
 import { Config, PricingEntry } from "./config"
 import { PRICING_DATA } from "./pricing_data"
 
-// USD per token. A missing cache rate bills cached tokens at the input rate. The decision rates
-// bill a decision request's tokens; a missing one is the normal rate (computeDecisionCost in Bifrost).
-// inputAudio and outputAudio are the rates of audio tokens (realtime and audio models report them in
-// their usage details; a missing one bills audio tokens at the text rate), perSecond is the voice rate
-// (USD per second, input_cost_per_second). A live session bills its seconds at it (liveCost in livehooks.tov,
-// as Bifrost's computeLiveCost); a transcription whose answer has no tokens bills its seconds at it
-// (transcriptionCost). inputCharacter is the rate per character of speech's input (input_cost_per_character).
-// perAudioSecond is the rate per second of audio input (input_cost_per_audio_per_second), which a transcription billed
-// by its seconds takes before perSecond, as Bifrost's tieredAudioInputPerSecondRate does.
+// USD per token. Missing cache rates bill cached tokens at the input rate. Decision rates bill
+// decision requests' tokens, falling back to normal rates when absent. inputAudio and outputAudio
+// bill audio tokens reported in usage details, falling back to text rates when absent.
+// perSecond is the voice rate in USD per second (input_cost_per_second). Live sessions bill their
+// seconds at this rate (liveCost in livehooks.tov); transcriptions with no tokens also bill seconds
+// (transcriptionCost). inputCharacter is the speech input rate per character (input_cost_per_character).
+// perAudioSecond is the audio input rate per second (input_cost_per_audio_per_second), which takes
+// precedence over perSecond for transcriptions billed by duration.
 export type Price = { input: f64, output: f64, cacheRead?: f64, cacheWrite?: f64, inputDecisions?: f64, outputDecisions?: f64, inputAudio?: f64, outputAudio?: f64, perSecond?: f64, inputCharacter?: f64, perAudioSecond?: f64 }
 
 // The tokens a realtime or live response used, as the provider reports them: prompt and completion are
@@ -30,9 +28,8 @@ export type Price = { input: f64, output: f64, cacheRead?: f64, cacheWrite?: f64
 // tokens among them.
 export type TokenUsage = { prompt: int, completion: int, cached: int, inputAudio: int, outputAudio: int }
 
-// A transcription's usage as Bifrost's extractTranscriptionUsage reads it: the prompt and completion tokens,
-// the audio and text tokens of the prompt when the answer splits them (0 otherwise), and the seconds of
-// audio (undefined when the answer gives none).
+// Transcription usage: prompt and completion tokens, prompt audio and text tokens when separately
+// reported (0 otherwise), and audio duration in seconds (undefined when not reported).
 export type SttUsage = { prompt: int, completion: int, inputAudio: int, inputText: int, seconds: f64 | undefined }
 
 // One datasheet row with the provider and base model it was filed under.
@@ -41,11 +38,10 @@ export type PriceRow = { provider: string, baseModel: string, price: Price }
 // A request's price split into its input and output parts (USD).
 export type CostParts = { input: f64, output: f64 }
 
-// A pricing override as Bifrost stores it. Only scope_kind "global" and
-// "provider" apply; virtual-key scopes need request context and are skipped
-// (setOverrides returns how many it skipped). request_types decide which billing
-// an override patches: "decisions" for a decision request, any other type for the
-// rest. An override with no request_types patches both, as before.
+// A pricing override. Only scope_kind "global" and "provider" apply; virtual-key scopes require
+// request context and are skipped. setOverrides returns the number skipped. request_types selects
+// billing: "decisions" patches decision requests, and any other type patches the rest.
+// An override without request_types patches both.
 export type PricingOverride = {
   scope_kind: string,
   provider_id?: string,
@@ -55,8 +51,7 @@ export type PricingOverride = {
   pricing_patch: string,
 }
 
-// Rates an override sets. pricing_patch is JSON in Bifrost's field names;
-// only the fields present replace the datasheet's.
+// Rates set by an override. pricing_patch is JSON; only present fields replace datasheet values.
 type PricePatch = {
   input_cost_per_token?: f64,
   output_cost_per_token?: f64,
@@ -126,7 +121,7 @@ function parseTable(text: string): Map<string, PriceRow> {
   return rows
 }
 
-// Parses a Bifrost datasheet (https://getbifrost.ai/datasheet). Entries with no input, output, voice or
+// Parses the pricing datasheet (https://getbifrost.ai/datasheet). Entries with no input, output, voice or
 // character rate are dropped; a missing input or output rate is 0.
 export function parseDatasheet(json: string): Map<string, PriceRow> throws SyntaxError {
   const sheet = try JSON.parse(json) as Record<string, DatasheetEntry>
@@ -420,10 +415,10 @@ export class Pricing {
     return promptTokens * ri + completionTokens * ro
   }
 
-  // The input and output parts of a realtime or live response's price, as Bifrost's computeTextCost
-  // splits them: cached prompt tokens at the cache rate, audio tokens at the audio rates (taken out of
-  // the text cost; a missing audio rate leaves them at the text rate), the rest at the text rates. Both
-  // are 0 when the model's price is unknown.
+  // The input and output portions of a realtime or live response's price. Cached prompt tokens use
+  // cache rates, audio tokens use audio rates and are excluded from text cost, and remaining tokens
+  // use text rates. Missing audio rates leave audio tokens at text rates. Both portions are 0 when
+  // the model's price is unknown.
   usageParts(provider: string, model: string, u: TokenUsage): CostParts {
     const p = this.find(provider, model)
     if (p === undefined) return { input: 0.0, output: 0.0 }
@@ -461,10 +456,10 @@ export class Pricing {
     return seconds * (p.perSecond ?? 0.0)
   }
 
-  // The input and output parts of a transcription (Bifrost's computeTranscriptionCost). The input is audio:
-  // its audio and text tokens when the answer splits its prompt, else the prompt tokens, else its seconds at the
-  // audio rate per second (input_cost_per_audio_per_second, else input_cost_per_second). The output is the text tokens.
-  // Both are 0 when the model's price is unknown.
+  // The input and output portions of a transcription's price. Input uses separate audio and text
+  // prompt tokens when reported, otherwise prompt tokens, otherwise seconds at the audio rate per second
+  // (input_cost_per_audio_per_second, falling back to input_cost_per_second). Output uses text tokens.
+  // Both portions are 0 when the model's price is unknown.
   transcriptionCost(provider: string, model: string, u: SttUsage): CostParts {
     const p = this.find(provider, model)
     if (p === undefined) return { input: 0.0, output: 0.0 }
@@ -480,10 +475,10 @@ export class Pricing {
     return { input: input, output: Math.max(0, u.completion) * p.output }
   }
 
-  // The input and output parts of speech (Bifrost's computeSpeechCost). The input is its characters at the
-  // per-character rate, which Bifrost takes at the text rate when the model has none; without characters, its
-  // prompt tokens at the text rate. The output is the audio tokens at the audio rate (the text rate when none).
-  // Speech answers carry no seconds here, so no per-second output is billed. Both are 0 when the price is unknown.
+  // The input and output portions of speech pricing. Input characters use the per-character rate,
+  // falling back to the text rate; without characters, prompt tokens use the text rate. Output audio
+  // tokens use the audio rate, falling back to the text rate. Speech answers carry no seconds here,
+  // so no per-second output is billed. Both portions are 0 when the price is unknown.
   speechCost(provider: string, model: string, chars: int, promptTokens: int, completionTokens: int): CostParts {
     const p = this.find(provider, model)
     if (p === undefined) return { input: 0.0, output: 0.0 }
@@ -494,8 +489,8 @@ export class Pricing {
     return { input: input, output: output }
   }
 
-  // The input and output parts of a request's price without cache tokens (Bifrost's input_cost and
-  // output_cost); both are 0 when the model's price is unknown.
+  // The input and output portions of a request's price, excluding cache tokens.
+  // Both are 0 when the model's price is unknown.
   costParts(provider: string, model: string, promptTokens: int, completionTokens: int): CostParts {
     const p = this.find(provider, model)
     if (p === undefined) return { input: 0.0, output: 0.0 }
@@ -556,7 +551,7 @@ test("cache read and write tokens are billed at their own rates", () => {
   expect(p.cost("openai", "gpt-4", 1000, 0, 500)).toBeCloseTo(0.03)
 })
 
-test("overrides: config beats Bifrost, provider scope beats global", () => {
+test("overrides: config beats Raiju, provider scope beats global", () => {
   const cfg: Config = { pricing: new Map() }
   cfg.pricing!.set("openai/gpt-4o", { input_cost_per_token: 0.000001, output_cost_per_token: 0.000002 })
   const p = new Pricing(cfg)
@@ -697,7 +692,7 @@ test("realtime usage: audio tokens at the audio rates, cached tokens at the cach
   // output: 100 text at 16e-6, 400 audio at 64e-6
   expect(parts.output).toBeCloseTo(0.0016 + 0.0256)
   expect(p.usageCost("acme", "rt", u)).toBeCloseTo(parts.input + parts.output)
-  // audio tokens beyond the uncached prompt are clamped, as Bifrost does
+  // Audio tokens are clamped to the uncached prompt token count.
   const c = p.usageParts("acme", "rt", { prompt: 100, completion: 0, cached: 80, inputAudio: 100, outputAudio: 0 })
   expect(c.input).toBeCloseTo(20.0 * 0.000032 + 80.0 * 0.0000004)
   // negative counts are no counts
@@ -829,7 +824,7 @@ test("speech bills its characters at the character rate, else at the text rate, 
   const c = p.speechCost("acme", "tts-1", 100, 0, 0)
   expect(c.input).toBeCloseTo(100 * 0.00001)
   expect(c.output).toBe(0.0)
-  // no character rate: the characters are billed at the text rate, as Bifrost does
+  // Without a character rate, characters are billed at the text rate.
   expect(p.speechCost("acme", "tts-2", 100, 0, 0).input).toBeCloseTo(100 * 0.000001)
   // no characters: the prompt tokens at the text rate
   expect(p.speechCost("acme", "tts-1", 0, 50, 0).input).toBeCloseTo(50 * 0.000001)

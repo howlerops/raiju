@@ -2,7 +2,7 @@
 """Memory soak against a deployed gateway (re-audit 6 P0-A: "a soak test asserting flat RSS over many big bodies"):
 mixed traffic for --duration (short chats, streams, long-context chats, and request bodies from 64 KB to 50 MB)
 while the gateway's RSS is sampled. Passes when the RSS stays flat over the second half, never comes near the
-memory limit, and no restart (an OOM kill) shows up.
+memory limit, no restart (an OOM kill) shows up, and every configured inference kind completes real traffic.
 
 Usage: tests/staging/body_soak.py --duration 24h [--rate 2] [--concurrency 16]
          [--kinds chat:30,stream:25,long:10,body:35] [--mix default|l210|64K:40,1M:20,...]
@@ -23,6 +23,9 @@ no provider, so the gateway reads the whole body (the budget, the rate rule, the
 400 without calling anyone: memory is exercised at no provider cost. Give a real model to send them upstream
 (large_payload_optimization's streamed path); bodies past the budget answer 503 and are counted as refused.
 Kinds chat, stream and long use RAIJU_MODEL with max_tokens 16 (long: --long-kb of prompt, about 250 tokens a KB).
+Each enabled real-model kind must complete at least one valid chat response (streams must reach [DONE]).
+Unexpected responses, including 4xx, count as errors; only the discard model's routing 400 and body-budget/size
+refusals are expected. Body-only discard runs need completed stress requests, not upstream inference.
 
 Output (--out, default staging-soak-<run>): samples.csv, rss.svg (the RSS over time against the limit) and
 summary.json. One PASS/FAIL line ends the run.
@@ -75,13 +78,21 @@ def restarts(series, drop=0.5, floor_mb=8.0):
     return out
 
 
-def soak_verdict(samples, limit_mb, max_growth_mb, warmup=0.1, headroom=0.9, max_error_ratio=0.01, requests=0, errors=0):
+def soak_verdict(samples, limit_mb, max_growth_mb, warmup=0.1, headroom=0.9, max_error_ratio=0.01, requests=0, errors=0,
+                 accepted=None, required_kinds=("chat", "stream", "long")):
     """samples: [(t_seconds, rss_mb)]. Growth is the least-squares slope over the second half (after warmup) times
-    that half's length, so noise does not count but a steady leak does. (ok, numbers, reasons)."""
+    that half's length, so noise does not count but a steady leak does. Require traffic and a valid completion for
+    each enabled real-model kind. (ok, numbers, reasons)."""
     pts = [(t, v) for t, v in samples if v is not None]
     reasons = []
+    accepted = accepted or {}
+    if not requests:
+        reasons.append("no completed requests")
+    for kind in required_kinds:
+        if not accepted.get(kind, 0):
+            reasons.append(f"no accepted {kind} inference")
     if len(pts) < 4:
-        return False, {"samples": len(pts)}, ["fewer than 4 RSS samples"]
+        return False, {"samples": len(pts)}, reasons + ["fewer than 4 RSS samples"]
     t0, t1 = pts[0][0], pts[-1][0]
     start = t0 + (t1 - t0) * warmup
     body = [p for p in pts if p[0] >= start]
@@ -93,7 +104,8 @@ def soak_verdict(samples, limit_mb, max_growth_mb, warmup=0.1, headroom=0.9, max
     ratio = errors / requests if requests else 0.0
     nums = {"samples": len(pts), "rss_start_mb": round(body[0][1], 1), "rss_end_mb": round(pts[-1][1], 1), "peak_mb": round(peak, 1),
             "growth_2nd_half_mb": round(growth, 2), "limit_mb": limit_mb, "restarts": len(rs), "requests": requests,
-            "error_ratio": round(ratio, 4)}
+            "error_ratio": round(ratio, 4), "accepted": sum(accepted.values()), "accepted_by_kind": dict(accepted),
+            "required_kinds": list(required_kinds)}
     if growth > max_growth_mb:
         reasons.append(f"RSS grew {growth:.1f} MB over the second half (limit {max_growth_mb})")
     if peak > limit_mb * headroom:
@@ -154,11 +166,41 @@ def pick(weights, rng):
 
 # ---------------------------------------------------------------- traffic
 
+def completed_inference(kind, body):
+    """A successful chat payload, or a completed SSE stream without an error event."""
+    if kind != "stream":
+        data = kit.jload(body)
+        choices = data.get("choices") if isinstance(data, dict) and not data.get("error") else None
+        return (isinstance(choices, list) and bool(choices)
+                and all(isinstance(choice, dict) and isinstance(choice.get("message"), dict)
+                        and (isinstance(choice["message"].get("content"), str)
+                             or isinstance(choice["message"].get("refusal"), str)
+                             or isinstance(choice["message"].get("tool_calls"), list) and bool(choice["message"]["tool_calls"]))
+                        for choice in choices))
+    text = body.decode("utf8", "replace")
+    events = [line[5:].strip() for line in text.splitlines() if line.startswith("data:")]
+    if not events or events[-1] != "[DONE]":
+        return False
+    chunks = [kit.jload(event) for event in events[:-1]]
+    def valid_chunk(chunk):
+        if not isinstance(chunk, dict) or chunk.get("error"):
+            return False
+        choices = chunk.get("choices")
+        return (isinstance(choices, list)
+                and all(isinstance(choice, dict) and isinstance(choice.get("delta"), dict)
+                        for choice in choices))
+
+    return (all(valid_chunk(chunk) for chunk in chunks)
+            and any(chunk["choices"] for chunk in chunks))
+
+
 class Counters:
-    def __init__(self):
+    def __init__(self, body_model=DISCARD_MODEL):
         self.lock = threading.Lock()
         self.by = {}
-        self.requests = self.errors = self.refused = 0
+        self.requests = self.errors = self.refused = self.discarded = 0
+        self.accepted = {}
+        self.body_model = body_model
         self.bytes_sent = 0
         self.last_error = ""
 
@@ -168,9 +210,15 @@ class Counters:
             self.bytes_sent += sent
             key = f"{kind}:{status}"
             self.by[key] = self.by.get(key, 0) + 1
-            if kit.is_busy(status, body) or status == 413:
+            if kit.is_busy(status, body) or (status == 413 and kind == "body"):
                 self.refused += 1
-            elif status == 0 or status >= 500 or (status == 408 and kind != "body"):
+            elif (kind == "body" and self.body_model == DISCARD_MODEL and status == 400
+                  and b"could not auto resolve a provider for the request, please specify a provider explicitly" in body):
+                self.discarded += 1
+            elif (status == 200 and not (kind == "body" and self.body_model == DISCARD_MODEL)
+                  and completed_inference(kind, body)):
+                self.accepted[kind] = self.accepted.get(kind, 0) + 1
+            else:
                 self.errors += 1
                 self.last_error = f"{kind} {status} {body[:160]!r}"
 
@@ -239,7 +287,9 @@ def main(argv=None):
     os.makedirs(out, exist_ok=True)
     rng = random.Random(a.seed or None)
     gw = kit.Gateway(s.base_url, s)
-    c = Counters()
+    c = Counters(a.body_model)
+    required_kinds = [kind for kind, weight in kinds.items()
+                      if weight > 0 and (kind != "body" or a.body_model != DISCARD_MODEL)]
     stop = time.time() + duration
     slots = threading.Semaphore(a.concurrency)
     samples = []
@@ -256,13 +306,14 @@ def main(argv=None):
     def sampler():
         f = open(os.path.join(out, "samples.csv"), "w", newline="")
         w = csv.writer(f)
-        w.writerow(["t_s", "rss_mb", "requests", "errors", "refused"])
+        w.writerow(["t_s", "rss_mb", "requests", "errors", "refused", "discarded", "accepted"])
         while True:
             v = sample_rss(a, s)
             t = time.time() - t_start
             samples.append((t, v))
             with c.lock:
-                w.writerow([round(t, 1), "" if v is None else round(v, 2), c.requests, c.errors, c.refused])
+                w.writerow([round(t, 1), "" if v is None else round(v, 2), c.requests, c.errors, c.refused,
+                            c.discarded, sum(c.accepted.values())])
             f.flush()
             if time.time() >= stop:
                 break
@@ -286,7 +337,7 @@ def main(argv=None):
         if now - last_note > 600:
             last_note = now
             rss = next((v for _, v in reversed(samples) if v is not None), None)
-            rep.note(f"  t={int(now - t_start)}s requests={c.requests} errors={c.errors} refused={c.refused} rss={'n/a' if rss is None else f'{rss:.0f} MB'}")
+            rep.note(f"  t={int(now - t_start)}s requests={c.requests} accepted={sum(c.accepted.values())} errors={c.errors} refused={c.refused} discarded={c.discarded} rss={'n/a' if rss is None else f'{rss:.0f} MB'}")
     for _ in range(a.concurrency):
         slots.acquire(timeout=320)
     smp.join(120)
@@ -294,10 +345,12 @@ def main(argv=None):
     with open(os.path.join(out, "rss.svg"), "w") as f:
         f.write(svg_chart(samples, a.limit_mb, f"Raiju RSS, {a.duration} soak against {s.base_url}"))
     have_rss = any(v is not None for _, v in samples)
-    summary = {"duration_s": duration, "requests": c.requests, "errors": c.errors, "refused": c.refused, "statuses": c.by,
-               "bytes_sent": c.bytes_sent, "last_error": c.last_error[:300]}
+    summary = {"duration_s": duration, "requests": c.requests, "errors": c.errors, "refused": c.refused,
+               "discarded": c.discarded, "accepted": sum(c.accepted.values()), "accepted_by_kind": c.accepted,
+               "required_kinds": required_kinds, "statuses": c.by, "bytes_sent": c.bytes_sent, "last_error": c.last_error[:300]}
     if have_rss:
-        ok, nums, reasons = soak_verdict(samples, a.limit_mb, a.max_growth_mb, max_error_ratio=a.max_error_ratio, requests=c.requests, errors=c.errors)
+        ok, nums, reasons = soak_verdict(samples, a.limit_mb, a.max_growth_mb, max_error_ratio=a.max_error_ratio,
+                                       requests=c.requests, errors=c.errors, accepted=c.accepted, required_kinds=required_kinds)
         summary.update(nums)
         summary["reasons"] = reasons
         rep.add("soak", ok, nums, "; ".join(reasons) or f"flat; statuses {c.by}")

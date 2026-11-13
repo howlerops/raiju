@@ -66,7 +66,7 @@ def main():
                                         "network_config": {"base_url": "http://127.0.0.1:9", "max_retries": 0}},
                              "gemini": {"keys": [{"name": "g", "value": "g-cardinality", "models": [], "weight": 1.0}],
                                         "network_config": {"base_url": "http://127.0.0.1:9", "max_retries": 0}}}}, open(cfg, "w"))
-    env = {k: v for k, v in os.environ.items() if k != "BIFROST_SETUP_TOKEN"}
+    env = {k: v for k, v in os.environ.items() if k != "RAIJU_SETUP_TOKEN"}
     gw = subprocess.Popen([BIN, "-port", str(PORT), "-host", "127.0.0.1", "-config", cfg], env=env, stderr=subprocess.DEVNULL)
     try:
         for _ in range(100):

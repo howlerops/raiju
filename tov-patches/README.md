@@ -20,7 +20,9 @@ Patch 0019 (worker respawn) changes the worker supervisor in `runtime/tov.c` and
 Patch 0020 (`node:fs` `flockSync`) adds one native to the shared lists in `builtins.rs` and `tov.h` next to 0009's, and is written on top of 0001-0019.
 Patch 0021 (`Math.random` seeding) changes the generator and the worker fork in `runtime/tov.c` (next to 0019's supervisor), and is written on top of 0001-0020.
 Patch 0022 (address policy on `Bun.connect` and `WebSocket`, write-stall limit on upgraded sockets) reuses 0013's address classes in `runtime/tov.c`, changes the sockets in `runtime/net.c` and `runtime/ws.c` and the server sweep 0012 adds, and is written on top of 0001-0021.
-Patch 0023 (`continue` releases the loop body's locals) changes one line of `codegen/body.rs`, which no other patch touches; it applies on its own or on top of 0001-0022.
+Patch 0023 (`continue` releases the loop body's locals) changes one line of `codegen/body.rs`, which no earlier patch touches; it applies on its own or on top of 0001-0022.
+Patch 0024 (dynamic `process.env[name]` reads) changes index checking, code generation and the existing `tv_process_env` runtime's embedded-NUL rejection; it applies on top of 0023.
+Patch 0025 (WebKitGTK main-thread/run-loop initialization) changes only `runtime/js.c` and applies on top of 0024.
 
 ## Submitting upstream
 
@@ -105,6 +107,10 @@ sock.write("request\n")       // to the child's stdin
   existing socket table as an already-open socket. Reads, writes, backpressure,
   `end()` and close events then come from the code that serves TCP and Unix
   sockets.
+- Linux creates both descriptors close-on-exec atomically with `SOCK_CLOEXEC`.
+  On macOS (which lacks that socket flag), `F_GETFD`/`F_SETFD` set `FD_CLOEXEC`
+  on both ends before `fork`; a failure closes both ends and rejects the spawn
+  instead of leaking an inheritable descriptor or starting the child.
 - The child gets `PR_SET_PDEATHSIG(SIGTERM)` on Linux, so it dies with its
   parent (a `Bun.serve` worker, say). Exited children are reaped with
   `waitpid(pid, WNOHANG)` for the spawned pids only, so other code that waits for its
@@ -203,8 +209,8 @@ through `tov-patches/tests/udp_dgram.tov`.
 
 ## 0005 — WebAssembly modules (`std/wasm`, on WAMR)
 
-**Problem.** Tov could not run WebAssembly. Bifrost's dynamic plugins are WebAssembly modules
-(its Go shared-object plugins are out of reach for a native Tov binary), and the only route to a
+**Problem.** Tov could not run WebAssembly. The gateway's dynamic plugins are WebAssembly modules.
+Go shared-object plugins cannot load in a native Tov binary, and the only route to a
 WebAssembly engine was linking JavaScriptCore into the gateway (about 34 MB). This adds a small
 interpreter, [WAMR](https://github.com/bytecodealliance/wasm-micro-runtime), to the runtime
 build, behind a Tov module.
@@ -278,7 +284,7 @@ no multi-memory, and one memory read or written by offset, not mapped into Tov. 
 
 **Problem.** Tov had no WebRTC, so a program could not be a peer: it could not answer a browser's SDP offer,
 open a data channel, or carry audio. An LLM gateway that terminates a browser's WebRTC session (to meter, guard
-and log its events, as Bifrost does with Pion) needs all three.
+and log its events) needs all three.
 
 **API (`import { RTCPeerConnection } from "std/rtc"`; callbacks, like the browser's, on Tov's event loop).**
 
@@ -349,7 +355,7 @@ the string twice, and a closure that captures a class-typed parameter of the clo
 **Problem.** `fetch` pooled keep-alive connections with no way to tune them: idle connections
 lived until the server closed them, any number of requests opened that many connections to a
 host, and every request was HTTP/1.1. An LLM gateway needs a per-provider idle timeout and
-connection cap (Bifrost's `keep_alive_timeout_in_seconds` and `max_conns_per_host`), and
+connection cap (`keep_alive_timeout_in_seconds` and `max_conns_per_host`), and
 HTTP/2 to providers that serve it (`enforce_http2`, `http2_ping_interval_in_seconds`).
 
 **API (Tov; not in Bun).**
@@ -416,7 +422,7 @@ if it cannot.
 
 **Problem.** Neither end of an HTTP request could stream its body. `fetch` took a string or bytes, and
 `Bun.serve` held a request whole (up to 64 MiB) before calling the handler, so a gateway could not pass
-a large body to a provider without holding it. Bifrost's `large_payload_optimization` reads the routing
+a large body to a provider without holding it. `large_payload_optimization` reads the routing
 fields from the first bytes of a big request and streams the rest through.
 
 **API (Bun's, plus two options and `Socket.pause()` / `resume()`).**
@@ -660,7 +666,7 @@ const res = await fetch(url, {
 - Unspecified (0.0.0.0/8, ::), link-local (169.254.0.0/16, fe80::/10), Teredo (2001::/32) and the metadata addresses
   100.100.100.200 and fd00:ec2::254 are always refused, whatever `private`, `loopback` and `allow` say. IPv6 forms
   that carry an IPv4 address (IPv4-mapped, IPv4-compatible, 6to4, NAT64) are judged by that address, and so are
-  `allow` ranges. The classes are those of Bifrost's `core/network/ssrf.go`.
+  `allow` ranges. The classes are those of the network SSRF policy.
 - The policy is part of the pool key (`|peer:<bits>:<hash of allow>`), so a connection made without a policy, or
   under another one, is never reused by a request that has one.
 - Through a proxy the proxy resolves the host, so nothing is checked (as Go's dialers do behind a proxy); a program
@@ -685,7 +691,7 @@ that `/etc/hosts` maps to 127.0.0.1 (`PEER_NAME` names one) and is skipped witho
 of 0001-0010, 0012 and 0013: its `identity` argument follows 0013's `peer` and `peerAllow` in `fetchStart`.)
 
 **Problem.** Three things a gateway needs were missing. `fetch` and `Bun.connect` could not present a client
-certificate, so a server that requires mutual TLS (an A2A agent, in Bifrost's `agents[].*.tls`) could not be
+certificate, so a server that requires mutual TLS (an A2A agent, in `agents[].*.tls`) could not be
 reached. A request on `Bun.serve` had no signal: an async handler never learned that its client went away, so
 the work it started (an upstream call, retries) ran on to the end. And there was no way to decompress gzip or
 DEFLATE data in a program (only `fetch` bodies were decoded), which gRPC's `grpc-encoding: gzip` needs.
@@ -897,7 +903,7 @@ whose client reads 32 KB every 100 ms stays open (before the patch neither was e
 **Problem.** A `continue` jumped past the releases of the loop body's own locals: the body's scope is closed (its
 strings, arrays, maps and records released) before the continue label, but `continue` unwound only the scopes nested
 inside the body. Every `continue` taken after such a local was declared kept one reference to it for good. In Raiju,
-`forwardedHeaders` (`const v = h.get(key)!` then `continue` for every `x-bf-*` header) kept the virtual key header
+`forwardedHeaders` (`const v = h.get(key)!` then `continue` for every `x-raiju-*` header) kept the virtual key header
 string of every request: about 32 bytes, ~50 bytes of RSS, per inference request with no plateau (re-audit 7
 P0-1: 23 to 92 MB over 1.47M small chats). `break` was right (it already unwound the body's scope).
 
@@ -911,3 +917,66 @@ so `continue` releases the body's locals before its `goto` (for, for-of, while a
 grew 64 MB in each); values kept before a `continue` (pushed to an array) are intact afterwards. Valgrind reports no
 leak and no invalid access on it. Raiju's slope soak (`tests/soak/slope.py`, `make soak-slope`) drives small chats
 with a virtual key and fails on a per-request RSS slope. Written against the pinned commit; applies on top of 0001-0022.
+
+## 0024 — dynamic environment reads (`process.env[name]`)
+
+**Problem.** Only literal `process.env.NAME` reads compiled. Raiju therefore read
+`/proc/self/environ` for config-supplied `env.NAME` references, silently resolving
+all such secrets to empty strings on macOS, where `/proc` is absent.
+
+**Design.** A string index on the environment namespace has type
+`string | undefined` and lowers to the same `tv_process_env` runtime call as a
+literal member. The key expression is evaluated once; an unset variable is
+`undefined`, while a present empty variable is `""`. No environment copy,
+platform-specific filesystem access, or new runtime API is required. The runtime
+rejects names containing embedded NUL bytes before calling `getenv`, rather than
+resolving a different, truncated name. Assignment remains unsupported.
+
+**Checks.** `tests/process_env.tov` covers inherited, empty and missing values,
+literal-access parity and embedded/trailing/prefix NUL rejection; it is included
+in `tests/run.sh`. Raiju's consumer regression `tests/config_env.tov` runs under
+`make unit`, including JSON-decoded NUL names. It can also be built and run with an
+arbitrary environment name and expected fixture value (set `<name>_EMPTY=""` and
+leave `<name>_UNSET` absent). Assertions never print environment values.
+Environment-backed config rotation still requires a process restart.
+
+## 0025 — initialize WebKitGTK's main thread and run loop before the first VM
+
+**Problem.** Real ARM64 Fargate gateway processes exited with SIGSEGV (139). An in-task
+inspection of the core with the deployed image's exact executable found
+`JSC::FullGCActivityCallback::doCollection` → `WTF::MemoryPressureHandler::singleton`.
+Its constructor called `WTF::RunLoop::mainSingleton`, returned null, then faulted at
+`ldr x22, [x0, #8]` (address `0x8`). Creating a C API JavaScript context initializes
+JSC, but does not initialize WTF's main-thread/run-loop singleton.
+
+**Change.** On the system WebKitGTK path only, call its exported
+`WTF::initializeMainThread()` after pushing Tov's thread-default GLib context and
+before creating the first JavaScript VM. This registers the thread that actually
+runs Tov's event loop (a large-stack pthread on Linux) and binds WTF's main run loop
+to the context Tov already pumps. The initializer is once-only inside WTF. Its
+symbol is a required link dependency, not an optional fallback. macOS's framework
+and Tov's own-engine `TVInitialize()` paths are unchanged. GC, memory-pressure
+handling, and timer dispatch remain enabled.
+
+The upstream initialization contract is in
+[MainThread.cpp](https://github.com/WebKit/WebKit/blob/webkitgtk-2.50.6/Source/WTF/wtf/MainThread.cpp);
+the GLib run loop selects the calling thread's default context in
+[RunLoopGLib.cpp](https://github.com/WebKit/WebKit/blob/webkitgtk-2.50.6/Source/WTF/wtf/glib/RunLoopGLib.cpp).
+
+**Regression.** `TOV=build/tov/target/release/tov sh tov-patches/tests/jsc_gc.sh`
+builds a small real npm/JavaScriptCore program. On Linux, a test-only interposer
+constructs the actual memory-pressure singleton (the original crash path), checks
+main/current run-loop and thread identity, then invokes JSC's real synchronous full
+collector from a GLib timer on Tov's context. The JavaScript fixture requires real
+`FinalizationRegistry` callbacks to return through the host event loop. There are
+two `ok` lines on Linux; the same fixture without interposition checks macOS's
+existing collection/event-loop path with one. The focused runner is included in
+`tests/run.sh`. Rebuild the patched compiler before running it; a rebuilt Linux
+gateway image and the approved soak are still required to qualify the deployment.
+
+The focused Linux regression passed with the rebuilt canonical ARM64 compiler:
+both real full GC/memory-pressure and finalization callbacks ran on the initialized
+program loop. The unchanged macOS path also passed with the retained native compiler;
+this is not a claim that a new macOS compiler was rebuilt. The canonical runtime
+image passed hardened boot, including unusable enabled OAuth state exiting 1, and
+the CI-policy vulnerability scan. Deployed qualification and the 24-hour soak remain pending.

@@ -186,6 +186,17 @@ resource "aws_security_group" "service" {
   }
 
   dynamic "ingress" {
+    for_each = var.allow_task_http_peers ? [1] : []
+    content {
+      description = "HTTP from staging probes sharing the task security group"
+      from_port   = var.port
+      to_port     = var.port
+      protocol    = "tcp"
+      self        = true
+    }
+  }
+
+  dynamic "ingress" {
     for_each = var.cluster_enabled ? [1] : []
     content {
       description = "Raiju cluster peers (cluster.listen_port)"

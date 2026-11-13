@@ -17,7 +17,7 @@ Build the gateway with TOV_CFLAGS=-DTV_PLAIN_ALLOC (make build does).
 import argparse, http.client, http.server, json, os, socket, subprocess, sys, tempfile, threading, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-KEY = "sk-bf-" + "bench-body-memory"
+KEY = "sk-raiju-" + "bench-body-memory"
 
 
 def vm(pid, key):
@@ -138,7 +138,7 @@ def main():
             ok = False
         del big
         body = chat_body(a.auth_size_mb * 1048576)
-        codes = burst(a.port, a.auth_conns, body, {"x-bf-vk": KEY})
+        codes = burst(a.port, a.auth_conns, body, {"x-raiju-vk": KEY})
         peak2 = vm(gw.pid, "VmHWM")
         print(f"{a.server}: authenticated {a.auth_conns} x {a.auth_size_mb} MB: codes {sorted(codes)}, peak {peak2} MB (limit {a.max_auth_rss_mb})")
         served, busy = codes.count(200), codes.count(503)

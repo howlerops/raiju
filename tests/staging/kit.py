@@ -381,7 +381,7 @@ class Gateway:
         return request(method, self.base + path, body, self.admin_headers(), timeout, self.s.ca_file)
 
     def infer(self, path, body, vk=None, headers=None, timeout=120):
-        h = {"x-bf-vk": vk if vk is not None else (self.s.vks[0] if self.s.vks else "")}
+        h = {"x-raiju-vk": vk if vk is not None else (self.s.vks[0] if self.s.vks else "")}
         h.update(headers or {})
         return request("POST", self.base + path, body, h, timeout, self.s.ca_file)
 

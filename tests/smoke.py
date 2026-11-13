@@ -21,7 +21,7 @@ LARGE_THRESHOLD = 8192
 
 # name, the environment variables that must be set, chat model, embeddings model ("" = none offered), native route
 PROVIDERS = [
-    ("openai", ["OPENAI_API_KEY"], "gpt-4.1-nano", "text-embedding-3-small", "responses"),
+    ("openai", ["OPENAI_API_KEY"], "gpt-4o-mini", "text-embedding-3-small", "responses"),
     ("anthropic", ["ANTHROPIC_API_KEY"], "claude-haiku-4-5", "", "messages"),
     ("gemini", ["GEMINI_API_KEY"], "gemini-2.5-flash-lite", "gemini-embedding-001", "genai"),
     ("mistral", ["MISTRAL_API_KEY"], "mistral-small-latest", "mistral-embed", ""),
@@ -109,7 +109,7 @@ def build_config(env, logs_dir, read_file=_read):
         providers[name] = {"keys": [key], "network_config": {"max_retries": 1, "default_request_timeout_in_seconds": 60}}
         plan[name] = {"model": f"{name}/{model}", "embed": f"{name}/{emb}" if emb else "", "native": native}
     cfg = {
-        # /api is locked without an admin (Bifrost's setup lock): the log reads send this throwaway setup token
+        # /api is locked without an admin (the setup lock): the log reads send this throwaway setup token
         "setup_token": SETUP_TOKEN,
         "client": {"enable_logging": True, "enforce_auth_on_inference": False},
         "logs_store": {"enabled": True, "dir": logs_dir, "content_logging": False},
@@ -173,7 +173,7 @@ def sse_events(text):
 def log_row(rid, want_tokens=True):
     """The request's log row (logging is asynchronous, so it is polled for a few seconds)."""
     for _ in range(30):
-        s, _, b = call("GET", "/api/logs/" + urllib.parse.quote(rid, safe=""), {"x-bifrost-setup-token": SETUP_TOKEN}, timeout=5)
+        s, _, b = call("GET", "/api/logs/" + urllib.parse.quote(rid, safe=""), headers={"x-raiju-setup-token": SETUP_TOKEN}, timeout=5)
         if s == 200:
             row = jget(b) or {}
             if not want_tokens or row.get("prompt_tokens"):

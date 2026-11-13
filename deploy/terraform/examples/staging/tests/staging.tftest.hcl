@@ -53,6 +53,7 @@ mock_provider "time" {
 
 variables {
   owner               = "platform-team@example.com"
+  aws_account_id      = "123456789012"
   vpc_id              = "vpc-0example"
   public_subnet_ids   = ["subnet-0a", "subnet-0b"]
   task_subnet_ids     = ["subnet-0c", "subnet-0d"]
@@ -74,6 +75,10 @@ run "first_apply_starts_no_task" {
     error_message = "expires_at is the creation time plus ttl_hours (48)"
   }
   assert {
+    condition     = aws_efs_file_system.data.tags.expires_at == output.expires_at && aws_efs_file_system.data.tags.purpose == "raiju-staging" && aws_efs_file_system.data.tags.dr-tier == "none"
+    error_message = "the EFS datastore carries its fixed expiry, proof ownership and non-production DR tier"
+  }
+  assert {
     condition     = aws_secretsmanager_secret.setup_token.recovery_window_in_days == 0 && aws_secretsmanager_secret.cluster_secret.recovery_window_in_days == 0
     error_message = "the secrets are deleted at once on destroy"
   }
@@ -82,7 +87,7 @@ run "first_apply_starts_no_task" {
     error_message = "one task: no cluster block"
   }
   assert {
-    condition     = jsondecode(output.seeded_config).setup_token == "env.BIFROST_SETUP_TOKEN" && jsondecode(output.seeded_config).providers.openai.keys[0].value == "env.OPENAI_API_KEY"
+    condition     = jsondecode(output.seeded_config).setup_token == "env.RAIJU_SETUP_TOKEN" && jsondecode(output.seeded_config).providers.openai.keys[0].value == "env.OPENAI_API_KEY"
     error_message = "the seeded config holds env.NAME references only"
   }
 }

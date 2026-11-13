@@ -96,7 +96,7 @@ def main(argv=None):
     t = threading.Thread(target=outsider_loop, args=(gw, s.vks[1], a.body_model, a.outsider_kb * 1024, stop, outsider), daemon=True)
     t.start()
     cut, status, sent = trickle(s.base_url, "/v1/chat/completions", int(a.declared_mb * 1048576), int(a.fast_mb * 1048576),
-                                a.max_hold + 10, {"x-bf-vk": s.vks[0]}, s.ca_file)
+                                a.max_hold + 10, {"x-raiju-vk": s.vks[0]}, s.ca_file)
     t.join(a.max_hold + 30)
     ok, nums = verdict(cut, status, a.max_hold, outsider)
     nums["sent_mb"] = round(sent / 1048576, 2)

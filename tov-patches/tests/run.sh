@@ -1,5 +1,5 @@
 #!/bin/sh
-# Checks patches 0001-0010, 0012, 0013, 0015, 0016, 0017, 0019, 0020, 0021, 0022 and 0023 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
+# Checks patches 0001-0010, 0012, 0013, 0015, 0016, 0017, 0019, 0020, 0021, 0022, 0023, 0024 and 0025 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
 # (or `make tov-test`). Each program prints "ok" lines and "FAIL" lines; a run passes when no line
 # fails and the expected number of "ok" lines appears.
 set -eu
@@ -26,6 +26,14 @@ expect() {
 TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/spawn_socket.tov" -o "$OUT/spawn" >/dev/null
 "$OUT/spawn" > "$OUT/spawn.out"
 expect "$OUT/spawn.out" 1 "Bun.spawnSocket"
+
+# Dynamic environment lookup (patch 0024); values never appear in diagnostics.
+TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/process_env.tov" -o "$OUT/process-env" >/dev/null
+RAIJU_PATCH_ENV=fixture RAIJU_PATCH_ENV_EMPTY= "$OUT/process-env" RAIJU_PATCH_ENV > "$OUT/process-env.out"
+expect "$OUT/process-env.out" 1 "dynamic process.env"
+
+# WebKitGTK's main loop must exist before the VM's full-collection/memory-pressure callbacks.
+TOV="$TOV" sh "$DIR/jsc_gc.sh"
 
 TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/stream_body.tov" -o "$OUT/stream" >/dev/null
 "$OUT/stream" > "$OUT/stream.out" & SRV=$!

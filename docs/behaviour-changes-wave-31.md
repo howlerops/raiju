@@ -2,6 +2,83 @@
 
 Waves 31 and 32 (L212 to L219) closed the known gaps listed after wave 30, fixed the seventh production re-audit (docs/audits/production-reaudit-7-2026-10-31.md) and made the CI image job run on pull requests. Read this before upgrading a deployment.
 
+- **Breaking owned-name cutover**: configure `RAIJU_*` environment variables
+  (including `RAIJU_SETUP_TOKEN` and `RAIJU_HOST`); bootstrap management with
+  `X-Raiju-Setup-Token`. Request and response gateway headers now use `x-raiju-*`,
+  generated virtual keys use `sk-raiju-`, agent access tokens use `ck-raiju-agent-`
+  and agent refresh tokens use `rt-raiju-agent-`. Gateway metrics use `raiju_*`,
+  plugin-owned names use Raiju, and owned error flags use `is_raiju_error`.
+  MCP OAuth JWTs use the `raiju_mode` private claim. Grant responses use
+  `raiju_mode`, `raiju_sub` and `raiju_sub_display`; the grant-list filter is `raiju_mode`.
+  No previous owned env/header/token/metric/plugin/claim names are accepted as aliases.
+  Update clients, secrets, dashboards and scrape queries together; existing
+  old-prefix credentials must be replaced. This change is not a new successful
+  infrastructure proof or a completed 24-hour soak.
+  Cryptographic domain labels changed too: old encrypted values and sealed OAuth/OIDC
+  clients, consent links and sign-in states are not portable across this boundary.
+  Stop first; use a fresh config/state directory with securely recreated credentials
+  and registrations. Retain the old directory for rollback. Do not run mixed versions
+  over encrypted or OAuth state. The default unencrypted configuration can retain its
+  ordinary settings, but credentials and clients still need the name cutover above.
+  Exact third-party URLs, upstream source identifiers and benchmark product
+  identities remain unchanged where needed for accurate sourcing/comparison;
+  historical ledger and audit observations retain their recorded evidence.
+
+- **Mantle streaming correction**: `bedrock_mantle` chat requests with `stream:true`
+  now use the upstream incremental stream instead of replaying a completed answer.
+  OpenAI-compatible models use the existing OpenAI SSE converter; Claude-family
+  models use the native Messages converter. Usage remains accounted for when the
+  caller hides usage events. Regional endpoints, bearer/SigV4 auth, project headers,
+  prompt-cache controls and non-streaming calls keep their existing behavior.
+  This does not add Mantle embeddings. Real dev Qwen exposed the buffering bug;
+  final-image installed OpenAI/LangChain qualification passed 17 checks.
+
+- **Shared MCP signing-state initialization**: nodes sharing a state directory
+  serialize signing-key load/create/save under its bounded startup flock. A
+  generated key is not activated until its private state file is durably written.
+  With OAuth enabled, failure to open that state now fails startup before workers
+  or readiness rather than leaving a healthy-looking node with OAuth disabled.
+  The previous race issued client IDs that other live nodes rejected. Corrected
+  real three-node startup produced one JWKS key and nine valid same/cross-node authorizations.
+
+- **Shared MCP credential rotation**: a worker now awaits its pending config save
+  before releasing the retained admin credential's renewal lease. Previously the
+  save callback discarded that promise, so another worker could send the old
+  rotating refresh token again before the saved replacement became visible.
+  This does not share MCP transport sessions or make provider rotation and disk
+  persistence one crash-atomic transaction. Corrected-image qualification is required.
+
+- **Native environment references**: compiler patch 0024 supports computed
+  `process.env[name]`, so `env.NAME` config references no longer depend on
+  `/proc/self/environ` and work on macOS as well as Linux. Unset names remain
+  unset and present empty values remain empty. Names containing NUL bytes are
+  rejected rather than resolving a different, truncated name. This does not load
+  `.env` files automatically; environment-backed rotation still requires restart.
+
+- **Soak completion credit**: HTTP 200 alone is insufficient. Chat choices must
+  contain typed message payloads; stream choices must contain typed deltas and
+  end with `[DONE]`. Malformed nonempty choices no longer count as successful
+  inference; usage-only chunks with empty choices remain valid within a stream.
+
+- **Linux WebKitGTK GC crash**: compiler patch 0025 initializes WTF's main thread
+  and run loop before creating the JavaScript VM. The observed Fargate full-GC
+  crash dereferenced its missing main loop through the memory-pressure handler.
+  The focused Linux proof now runs the real handler and full collector, including
+  finalization callbacks. GC and memory-pressure handling remain enabled; macOS
+  and the own-engine path are unchanged. The deployed 24-hour stability gate is
+  still required.
+
+- **Embedding SDK fidelity**: translated OpenAI embedding responses now honor
+  `encoding_format:"base64"` as IEEE754 float32 little-endian bytes. This fixes
+  silent vector corruption in the OpenAI SDK, which requests base64 by default.
+  Numeric default/`"float"` responses and native AWS InvokeModel remain unchanged;
+  already-encoded upstream strings are not encoded twice. Ordinary/large requests,
+  both embedding API paths, batch order, dimensions, usage and metadata are covered
+  by the independent `struct`/base64 wire regression on Bun and http1. Hugging Face
+  large embeddings use the existing bounded buffered converter, not invalid
+  OpenAI-wire passthrough. Shared float packing preserves signed zero and rounds
+  ties to even. The new regression runs in CI and local E2E commands.
+
 - **L215**: the CI image job runs on pull requests too: it builds the image, boots it as the chart runs it (read-only root, uid 65532, caps dropped) and scans it with trivy (database from ghcr.io, then public.ecr.aws, then mirror.gcr.io, cached); the runtime image now runs `apt-get upgrade` to take Debian security fixes released since the pinned base.
 - **L212**: realtime and live WebSockets to a provider whose base_url resolves to a private non-loopback address need `network_config.allow_private_network`, as every other provider connection does (link-local, unspecified and metadata addresses are refused); a Redis/Valkey vector store on a link-local, unspecified or metadata address is refused; A2A gRPC connections are checked at connect under the agent's allow_private_network (tov-patches 0022); on Bun.serve a WebSocket client that stops reading is dropped after `server.idle_timeout_seconds`, as on http1.
 - **L214**: the AWS default chain follows the SDK's order (environment keys before AWS_PROFILE; an AWS_PROFILE naming a missing profile is an error) and reads ~/.aws/config profiles (role_arn chains, credential_process, SSO, region) for Bedrock keys without credentials and Vertex workload identity; the Maxim exporter uploads attachments when include_content is on; an access profile naming one MCP client two ways across mcp_configs and the deprecated mcp_servers is not loaded; a Bedrock rerank fallback sends what its attempt's pre hooks made of the request.

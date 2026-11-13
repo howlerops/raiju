@@ -26,8 +26,7 @@ function isRegion(s: string): bool {
   return true
 }
 
-// Splits Bifrost's per-request "region/model" form. The region is undefined when the
-// model has no such prefix.
+// Splits the per-request "region/model" form. The region is undefined when the model has no such prefix.
 export function splitRegion(model: string): { region: string | undefined, model: string } {
   const slash = model.indexOf("/")
   if (slash > 0 && isRegion(model.slice(0, slash))) {
@@ -36,8 +35,7 @@ export function splitRegion(model: string): { region: string | undefined, model:
   return { region: undefined, model: model }
 }
 
-// The OpenAI-compatible base path. gpt-5/6, Gemma 4 and Grok are served under
-// /openai/v1, the rest under /v1 (as Bifrost's fallback routing does).
+// The OpenAI-compatible base path: /openai/v1 for gpt-5/6, Gemma 4 and Grok; /v1 for other models.
 export function basePath(model: string): string {
   const m = model.toLowerCase()
   if (m.includes("gpt-5") || m.includes("gpt-6") || m.includes("gemma-4") || m.includes("grok")) return "openai/v1"
@@ -62,33 +60,50 @@ function origin(t: Target, region: string): { sch: string, host: string } {
 
 // The OpenAI body with gateway-only fields dropped and the model set to the name
 // Mantle knows (sent verbatim, with no regional prefix).
-function withModel(body: Field[], model: string): string {
+function withModel(body: Field[], model: string, stream?: bool): string {
   let fs = without(body, openai.GATEWAY_FIELDS)
   setField(&fs, "model", quote(model))
+  if (stream === true) {
+    setField(&fs, "stream", "true")
+    setField(&fs, "stream_options", `{"include_usage":true}`)
+  }
   return build(fs)
 }
 
 // The OpenAI body as an Anthropic Messages body for an Anthropic-family model. The provider's prompt_cache injection
 // points mark messages, and auto_inject places the breakpoints, as on Anthropic.
-function messagesText(body: Field[], model: string, cache?: ProviderPromptCacheConfig, autoCache?: bool): string throws SyntaxError {
+function messagesText(body: Field[], model: string, cache?: ProviderPromptCacheConfig, autoCache?: bool, stream?: bool): string throws SyntaxError {
   const req = try JSON.parse(build(body)) as ChatRequest
-  return try anthropic.messagesBody(req, body, model, false, autoCache === true, cache)
+  return try anthropic.messagesBody(req, body, model, stream === true, autoCache === true, cache)
 }
 
 // The chat POST at a given time. Bearer auth when the key has a value; otherwise SigV4
 // with the key's access keys, signed for service "bedrock-mantle".
-export function chatRequestAt(t: Target, body: Field[], nowMs: f64, autoCache?: bool): Upstream throws SyntaxError {
+function chatAt(t: Target, body: Field[], nowMs: f64, autoCache: bool | undefined, stream: bool): Upstream throws SyntaxError {
   const sel = splitRegion(t.model)
   const anth = isAnthropicFamily(sel.model)
   const path = anth ? "/anthropic/v1/messages" : `/${basePath(sel.model)}/chat/completions`
   let text = ""
-  if (anth) text = try messagesText(body, sel.model, t.cfg.prompt_cache, autoCache)
-  else text = withModel(body, sel.model)
+  if (anth) text = try messagesText(body, sel.model, t.cfg.prompt_cache, autoCache, stream)
+  else text = withModel(body, sel.model, stream)
   return try postAt(t, sel.region, path, text, anth, nowMs)
 }
 
-// The geographic and global inference-profile prefixes (Bifrost's bedrockCrossRegionPrefixes): such ids exist only on
-// bedrock-runtime.
+export function chatRequestAt(t: Target, body: Field[], nowMs: f64, autoCache?: bool): Upstream throws SyntaxError {
+  return try chatAt(t, body, nowMs, autoCache, false)
+}
+
+// Both Mantle surfaces stream incrementally through the existing OpenAI / Anthropic converters.
+// Request upstream usage even when the client hides it, so budgets and metrics still account for it.
+export function streamRequestAt(t: Target, body: Field[], nowMs: f64, autoCache?: bool): Upstream throws SyntaxError {
+  return try chatAt(t, body, nowMs, autoCache, true)
+}
+
+export function streamRequest(t: Target, body: Field[], autoCache?: bool): Upstream throws SyntaxError {
+  return try streamRequestAt(t, body, Date.now(), autoCache)
+}
+
+// Geographic and global inference-profile prefixes; these ids exist only on bedrock-runtime.
 const CROSS_REGION_PREFIXES = ["us-gov", "us", "eu", "apac", "au", "jp", "in", "global"]
 
 function alnum(s: string): bool {
@@ -113,11 +128,9 @@ function arnResourceType(arn: string): string {
   return res.slice(0, end)
 }
 
-// Whether a request to a Bedrock key is served on the Mantle surface (Bifrost's resolveBedrockSurface): never for an
-// application inference profile (the key's or the alias's arn) whose model is a profile resource id, nor for a
-// cross-region id; otherwise the OpenAI family (by the alias's family, else the names), Gemma 4 and Grok
-// (isMantleModel). Bifrost consults its datasheet's bedrock_apis between those rules; Raiju's price table has none, so
-// the family decides.
+// Determines whether a Bedrock key uses the Mantle surface. Application inference profiles whose model is a profile
+// resource id (using the key's or alias's arn) and cross-region ids never use Mantle. Otherwise, OpenAI-family models,
+// Gemma 4 and Grok use Mantle. Family resolution uses the alias's family when set, then model names.
 export function mantleSurface(t: Target, alias: AliasTarget | undefined, aliasName: string): bool {
   const bare = splitRegion(t.model).model
   const arn = t.key.bedrock_key_config?.arn ?? ""
@@ -128,9 +141,8 @@ export function mantleSurface(t: Target, alias: AliasTarget | undefined, aliasNa
   return resolveFamily(t.model, alias, aliasName) === "openai" || t.model.includes("gemma-4") || t.model.includes("grok")
 }
 
-// Whether a Responses request goes to Mantle's own Responses endpoint: the OpenAI-compatible models (gpt-*, Gemma,
-// Grok) are served there, as Bifrost's Responses sends them (its datasheet check falls back to yes); Claude models
-// are answered through the Messages surface (the chat bridge).
+// Responses requests for OpenAI-compatible models (gpt-*, Gemma and Grok) use Mantle's Responses endpoint.
+// Claude models use the Messages surface through the chat bridge.
 export function servesResponses(model: string): bool {
   return !isAnthropicFamily(splitRegion(model).model)
 }
@@ -151,9 +163,8 @@ function projectOf(t: Target): string {
   return t.key.bedrock_key_config?.project_id ?? ""
 }
 
-// The project header: OpenAI-Project on the OpenAI-compatible surface, anthropic-workspace-id on the Messages
-// surface (Bifrost's MantleOpenAIProjectHeader and MantleAnthropicProjectHeader). It is a plain header, outside the
-// signature.
+// The project header is OpenAI-Project on the OpenAI-compatible surface and anthropic-workspace-id on the Messages
+// surface. It is a plain header, outside the signature.
 function setProject(inout h: Map<string, string>, t: Target, anth: bool): void {
   const p = projectOf(t)
   if (p !== "") h.set(anth ? "anthropic-workspace-id" : "OpenAI-Project", p)
@@ -195,8 +206,8 @@ function postAt(t: Target, modelRegion: string | undefined, path: string, text: 
   return { url: at.sch + at.host + path, headers: h, body: text }
 }
 
-// The model listing: GET /v1/models on the key's regional host (OpenAI's list shape), as Bifrost's
-// listModelsByKey sends it: a bearer token for an API key, else the GET signed for bedrock-mantle.
+// Lists models with GET /v1/models on the key's regional host, using OpenAI's list shape. API keys use a bearer
+// token; otherwise the GET is signed for bedrock-mantle.
 export function modelsRequestAt(t: Target, nowMs: f64): Upstream {
   const bk = t.key.bedrock_key_config
   const region = bk?.region ?? DEFAULT_REGION
@@ -206,7 +217,7 @@ export function modelsRequestAt(t: Target, nowMs: f64): Upstream {
   let h: Map<string, string> = new Map()
   if (bearer !== "" || (bk?.access_key ?? "") === "") h = headers([["authorization", "Bearer " + bearer]])
   else h = signRequest("GET", { accessKey: bk?.access_key ?? "", secretKey: bk?.secret_key ?? "", sessionToken: bk?.session_token, region: region }, SIGNING_SERVICE, at.host, path, "", "", nowMs)
-  // the catalog is scoped to the key's project, as Bifrost's listing sends it
+  // The catalog is scoped to the key's project.
   setProject(&h, t, false)
   addExtraHeaders(&h, t.cfg)
   return { url: at.sch + at.host + path, headers: h, body: "" }
@@ -216,8 +227,8 @@ export function modelsRequest(t: Target): Upstream {
   return modelsRequestAt(t, Date.now())
 }
 
-// Bifrost counts tokens on Mantle for Anthropic-family models only, through the native count_tokens path on the same
-// host (bedrockmantle/counttokens.go); the OpenAI-compatible surface has no count path.
+// Token counting on Mantle is supported only for Anthropic-family models, through the native count_tokens path
+// on the same host. The OpenAI-compatible surface has no count path.
 export function countsTokens(model: string): bool {
   return isAnthropicFamily(splitRegion(model).model)
 }
@@ -426,4 +437,51 @@ test("the Mantle surface of a Bedrock key: OpenAI family, Gemma 4 and Grok, unle
   const t: Target = { provider: "bedrock", kind: "bedrock", model: "my-dep", key: { value: "" }, cfg: {} }
   expect(mantleSurface(t, { model_id: "my-dep", model_family: "openai" }, "x")).toBe(true)
   expect(mantleSurface(t, { model_id: "my-dep", model_name: "claude-opus-4-8" }, "x")).toBe(false)
+})
+
+test("Mantle Qwen streams preserve the endpoint, bearer, tool turns and output cap while requesting usage", () => {
+  const body = try fields(`{"model":"bedrock_mantle/qwen.qwen3-235b-a22b-2507","messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"proof_add","arguments":"{\\"a\\":17,\\"b\\":25}"}}]},{"role":"tool","tool_call_id":"call-1","content":"42"}],"max_tokens":4096,"fallbacks":["other"],"stream_options":{"include_usage":false}}`)
+  const t = mantleTarget("qwen.qwen3-235b-a22b-2507", "mantle-test", "eu-west-1")
+  t.key.bedrock_key_config!.project_id = "project-test"
+  const up = try streamRequestAt(t, body, 0.0)
+  expect(up.url).toBe("https://bedrock-mantle.eu-west-1.api.aws/v1/chat/completions")
+  expect(up.headers.get("authorization")).toBe("Bearer mantle-test")
+  expect(up.headers.get("OpenAI-Project")).toBe("project-test")
+  expect(up.body.includes(`"model":"qwen.qwen3-235b-a22b-2507"`)).toBe(true)
+  expect(up.body.includes(`"stream":true`)).toBe(true)
+  expect(up.body.includes(`"stream_options":{"include_usage":true}`)).toBe(true)
+  expect(up.body.includes(`"max_tokens":4096`)).toBe(true)
+  expect(up.body.includes(`"tool_call_id":"call-1"`)).toBe(true)
+  expect(up.body.includes(`"fallbacks"`)).toBe(false)
+  const plain = try chatRequestAt(t, body, 0.0)
+  expect(plain.body.includes(`"stream":true`)).toBe(false)
+  expect(plain.body.includes(`"include_usage":false`)).toBe(true)
+})
+
+test("Mantle streams keep omitted output caps omitted on the model's regional endpoint", () => {
+  const body = try fields(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
+  const t = mantleTarget("eu-west-1/openai.gpt-5.5", "", "us-west-2")
+  const up = try streamRequestAt(t, body, 1440938160000.0)
+  expect(up.url).toBe("https://bedrock-mantle.eu-west-1.api.aws/openai/v1/chat/completions")
+  expect(up.body.includes("max_tokens")).toBe(false)
+  expect(up.body.includes("max_completion_tokens")).toBe(false)
+  expect(up.body.includes(`"stream":true`)).toBe(true)
+})
+
+test("Mantle Claude streams keep native Messages and configured cache points", () => {
+  const body = try fields(`{"model":"m","messages":[{"role":"user","content":"synthetic rules"}],"max_tokens":4096}`)
+  const t = mantleTarget("eu-west-1/anthropic.claude-haiku-4-5", "mantle-test", undefined)
+  t.cfg = { prompt_cache: { cache_control_injection_points: [{ location: "message", index: -1 }] } }
+  const up = try streamRequestAt(t, body, 0.0)
+  expect(up.url).toBe("https://bedrock-mantle.eu-west-1.api.aws/anthropic/v1/messages")
+  expect(up.headers.get("anthropic-version")).toBe("2023-06-01")
+  expect(up.body.includes(`"model":"anthropic.claude-haiku-4-5"`)).toBe(true)
+  expect(up.body.includes(`"stream":true`)).toBe(true)
+  expect(up.body.includes("stream_options")).toBe(false)
+  expect(up.body.includes(`"cache_control":{"type":"ephemeral"}`)).toBe(true)
+  const plain = try chatRequestAt(t, body, 0.0)
+  expect(plain.body.includes(`"stream":true`)).toBe(false)
+  expect(plain.body.includes(`"cache_control":{"type":"ephemeral"}`)).toBe(true)
+  const auto = try streamRequestAt(mantleTarget("anthropic.claude-haiku-4-5", "mantle-test", undefined), body, 0.0, true)
+  expect(auto.body.includes(`"cache_control":{"type":"ephemeral"}`)).toBe(true)
 })

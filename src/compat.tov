@@ -1,11 +1,11 @@
-// Bifrost's compat plugin for the chat, text completion and Responses endpoints. Per request and per target,
-// it drops the parameters the model's datasheet row does not list, fits the output caps and the reasoning
-// budget to the model's limits, and sends the request to the endpoint the model serves: text to chat, or chat
-// to Responses (for models that serve only Responses, and for reasoning with tools on models whose row refuses
-// it). Streams are converted as they arrive (the stream converters are in gateway.tov). The row is the one
-// GET /api/models/parameters serves (the gateway reads it through Engine.paramsLookup).
-// Settings: client.compat, read with Bifrost's defaults when the section is there, and x-bf-compat per
-// request, which adds features to the configured ones. Decision emulation is in decision_emulate.tov.
+// Compatibility handling for the chat, text completion, and Responses endpoints. Per request and target,
+// it drops parameters absent from the model's datasheet row, fits output caps and the reasoning
+// budget to the model's limits, and routes to the endpoint the model serves: text to chat, or chat
+// to Responses (for Responses-only models and for reasoning with tools when the row disallows
+// that combination). Streams are converted as they arrive (gateway.tov). The row is the one
+// GET /api/models/parameters serves, read through Engine.paramsLookup.
+// Settings: client.compat uses defaults when the section is present; x-raiju-compat adds features
+// per request. Decision emulation is in decision_emulate.tov.
 import { Field, fields, elements, find, rawStr, rawNum, quote, setField, without, build, decodeString, isNull } from "./json"
 import { CompatConfig } from "./config"
 import { Translated } from "./providers/types"
@@ -20,8 +20,8 @@ export type CompatSettings = {
   decisions: bool,
 }
 
-// What a model's datasheet row says it takes and serves. known is false when the row lists no
-// model_parameters: then nothing is dropped, which is Bifrost's behaviour without a parameter list.
+// The parameters and endpoints a model's datasheet row supports. known is false when the row lists no
+// model_parameters; in that case, nothing is dropped.
 // budget is the reasoning budget range [min, max] (max 0: none), or [] when the row names none.
 export type Support = { known: bool, params: string[], types: string[], maxOutput: f64, minOutput: f64, budget: f64[] }
 
@@ -56,8 +56,8 @@ function setFeature(inout s: CompatSettings, name: string): void {
   if (name === "convert_decision_to_responses") s.decisions = true
 }
 
-// x-bf-compat: "true", ["*"], or a JSON list of feature names. It only adds features (Bifrost's
-// header overrides are enables), and a value it cannot read changes nothing.
+// x-raiju-compat: "true", ["*"], or a JSON list of feature names. It only adds features;
+// an unreadable value changes nothing.
 export function withHeader(s: CompatSettings, value: string | undefined): CompatSettings {
   const v = (value ?? "").trim()
   if (v === "") return s
@@ -104,8 +104,8 @@ function typeOfEndpoint(ep: string): string {
   return ""
 }
 
-// A datasheet row (as GET /api/models/parameters serves it) read as Bifrost reads it: the parameter
-// names its model_parameters list, the flags that add to them, and the endpoints it serves.
+// A datasheet row served by GET /api/models/parameters: parameter names from
+// model_parameters, flags that add to them, and supported endpoints.
 export function supportOf(record: string): Support {
   let s = unknownSupport()
   let types: string[] = []
@@ -262,8 +262,8 @@ function dropChat(body: Field[], sup: Support, converted: bool): Dropped {
   dropUnlisted(&fs, L, "frequency_penalty", ["frequency_penalty"], &dropped)
   dropUnlisted(&fs, L, "logit_bias", ["logit_bias"], &dropped)
   dropUnlisted(&fs, L, "logprobs", ["logprobs"], &dropped)
-  // the cap goes by any of its spellings: max_tokens is folded into max_completion_tokens by Bifrost, and a
-  // Responses row lists max_output_tokens (the cap a chat request becomes when it is sent to Responses)
+  // The cap accepts any of its spellings: max_tokens is folded into max_completion_tokens, and a
+  // Responses row lists max_output_tokens (the cap used when a chat request is sent to Responses).
   const capListed = L.includes("max_completion_tokens") || L.includes("max_tokens") || L.includes("max_output_tokens")
   if (!capListed) dropUnlisted(&fs, [], "max_completion_tokens", ["max_completion_tokens", "max_tokens", "max_output_tokens"], &dropped)
   dropUnlisted(&fs, L, "metadata", ["metadata"], &dropped)
@@ -351,8 +351,8 @@ function dropText(body: Field[], sup: Support): Dropped {
   return { body: fs, dropped: dropped, toolDrops: [] }
 }
 
-// The reasoning budget range a model takes: the row's, else the built-in one for Claude and Gemini 2.5
-// (Bifrost's knownReasoningBudget), else none ([]).
+// The reasoning budget range a model accepts: the row's range, otherwise the built-in range for Claude
+// and Gemini 2.5, otherwise none ([]).
 function budgetRange(sup: Support, model: string): f64[] {
   if (sup.budget.length > 0) return sup.budget
   if (model.includes("claude")) return [1024.0, 0.0]
@@ -363,9 +363,9 @@ function budgetRange(sup: Support, model: string): f64[] {
   return []
 }
 
-// Bifrost's FitOutputTokens on the output caps and the reasoning budget. A cap above the row's limit is
-// lowered to it, and a cap under the row's floor is raised to it. A budget that was sent with a lowered cap
-// keeps its share of the new cap; then the budget stays in the model's range and under the cap. Only fields
+// Fit output caps and the reasoning budget to the model's limits. A cap above the row's limit is
+// lowered to it, and a cap below the row's floor is raised to it. A budget sent with a lowered cap
+// keeps its share of the new cap, then is constrained to the model's range and the cap. Only fields
 // present are changed; each change is a "field: from -> to" entry.
 function fitCaps(body: Field[], sup: Support, model: string, inout changes: string[]): Field[] throws SyntaxError {
   let fs = body.slice()
@@ -419,9 +419,9 @@ function fitCaps(body: Field[], sup: Support, model: string, inout changes: stri
   return fs
 }
 
-// The Responses parameters a model does not list (Bifrost's Responses branch of dropUnsupportedParams).
-// reasoning goes when the row does not list it, or when reasoningOff says the deployment refuses it (Azure
-// DeepSeek, unless the request is served as chat); otherwise its summary is fitted like a chat request's.
+// Drop unsupported Responses parameters. reasoning is removed when the row does not list it
+// or reasoningOff indicates the deployment refuses it (Azure DeepSeek, unless served as chat).
+// Otherwise, its summary is fitted as for a chat request.
 function dropResponses(body: Field[], sup: Support, reasoningOff: bool): Dropped throws SyntaxError {
   let fs = body.slice()
   let dropped: string[] = []
@@ -452,12 +452,12 @@ function dropResponses(body: Field[], sup: Support, reasoningOff: bool): Dropped
   return { body: fs, dropped: dropped, toolDrops: toolDrops }
 }
 
-// Whether a model is a DeepSeek model (Bifrost's IsDeepSeekModel).
+// Whether a model is a DeepSeek model.
 export function isDeepSeekModel(model: string): bool {
   return model.toLowerCase().includes("deepseek")
 }
 
-// The coding harnesses Bifrost names by their User-Agent: Claude Code and Desktop, Codex, Cursor, OpenCode.
+// Coding harnesses identified by User-Agent: Claude Code and Desktop, Codex, Cursor, OpenCode.
 const HARNESS_AGENTS: string[] = ["claude-cli", "claude-code", "claude-vscode", "claude-desktop", "claude/", "codex-cli", "codex-tui", "codex desktop/", "codex/", "cursor", "opencode"]
 
 // Whether a User-Agent names a coding harness (matched anywhere in it, case-insensitively).
@@ -754,7 +754,7 @@ export class CompatPlan {
   converted = ""
   // the fits made by the last shape: "field: from -> to"
   changes: string[] = []
-  // what the caller logs for the last shape: the fits, and a dropped service_tier (Bifrost's warnings)
+  // What the caller logs for the final shape: parameter adjustments and a dropped service_tier.
   warnings: string[] = []
   // set for an Azure DeepSeek Responses request that is not served as chat: its reasoning goes
   reasoningOff = false

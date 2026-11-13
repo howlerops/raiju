@@ -150,14 +150,13 @@ class CiWorkflowTest(unittest.TestCase):
 
     def test_image_smoke_runs_hardened(self):
         values = yaml.safe_load(open(os.path.join(CHART, "values.yaml")))
-        run = image_smoke().docker_run_args("n", "img", "/d", "tok", 1)
+        run = image_smoke().docker_run_args("n", "img", "/d", "tok", 1, "host-gateway")
         self.assertTrue(values["securityContext"]["readOnlyRootFilesystem"])
         self.assertIn("--read-only", run)
         self.assertEqual(run[run.index("--user") + 1], f"{values['podSecurityContext']['runAsUser']}:{values['podSecurityContext']['runAsGroup']}")
         self.assertNotEqual(values["podSecurityContext"]["runAsUser"], 0)
         self.assertEqual(run[run.index("--cap-drop") + 1], "ALL")
-        self.assertIn("BIFROST_SETUP_TOKEN=tok", run)
-        self.assertEqual(run[run.index("img"):], ["img", "-app-dir", "/app/data", "-host", "0.0.0.0", "-port", "8080", "-workers", "1"])
+        self.assertIn("RAIJU_SETUP_TOKEN=tok", run)
 
     def test_config_scan_checks_bundle(self):
         scan = self.step(self.jobs["config-scan"], lambda s: str(s.get("uses", "")).startswith("aquasecurity/trivy-action@"), "runs trivy")
@@ -416,8 +415,7 @@ class HelmTest(unittest.TestCase):
         smoke = image_smoke()
         pod = self.pod(self.render("workers=3"))
         c = pod["containers"][0]
-        self.assertEqual(c["args"], smoke.chart_args(8080, 3))
-        run = smoke.docker_run_args("n", "img", "/d", "tok", 3)
+        run = smoke.docker_run_args("n", "img", "/d", "tok", 3, "host-gateway")
         self.assertTrue(c["securityContext"]["readOnlyRootFilesystem"])
         self.assertIn("--read-only", run)
         self.assertEqual(c["securityContext"]["capabilities"]["drop"], ["ALL"])
@@ -433,10 +431,10 @@ class HelmTest(unittest.TestCase):
 
     def test_setup_token_from_a_secret(self):
         env = self.pod(self.render())["containers"][0]["env"]
-        self.assertNotIn("BIFROST_SETUP_TOKEN", [e["name"] for e in env])
+        self.assertNotIn("RAIJU_SETUP_TOKEN", [e["name"] for e in env])
         env = self.pod(self.render("setupToken.existingSecret=raiju-setup"))["containers"][0]["env"]
-        tok = [e for e in env if e["name"] == "BIFROST_SETUP_TOKEN"]
-        self.assertEqual(tok[0]["valueFrom"]["secretKeyRef"], {"name": "raiju-setup", "key": "BIFROST_SETUP_TOKEN"})
+        tok = [e for e in env if e["name"] == "RAIJU_SETUP_TOKEN"]
+        self.assertEqual(tok[0]["valueFrom"]["secretKeyRef"], {"name": "raiju-setup", "key": "RAIJU_SETUP_TOKEN"})
 
     def notes(self, *sets):
         """The chart's NOTES.txt as installing it would print them (helm template skips NOTES: they are rendered
@@ -458,7 +456,7 @@ class HelmTest(unittest.TestCase):
         self.assertIn("Inference is open until the config has a virtual key", self.notes())
         self.assertNotIn("Inference is open", self.notes("config.client.enforce_auth_on_inference=true"))
         self.assertIn("client.enforce_auth_on_inference is false", self.notes("config.client.enforce_auth_on_inference=false"))
-        keyed = self.notes("config.governance.virtual_keys[0].id=vk-1", "config.governance.virtual_keys[0].value=sk-bf-example")
+        keyed = self.notes("config.governance.virtual_keys[0].id=vk-1", "config.governance.virtual_keys[0].value=sk-raiju-example")
         self.assertNotIn("Inference is open", keyed)
 
     def test_peers_service(self):

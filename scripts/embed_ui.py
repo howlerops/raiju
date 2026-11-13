@@ -107,6 +107,9 @@ def rows(dist):
             gz = ""
             if len(raw) > 1024:
                 packed = gzip.compress(raw, 9, mtime=0)
+                # Python 3.11 delegates mtime=0 to zlib, leaking the host OS
+                # into byte 9. Match Python 3.13's portable "unknown OS" header.
+                packed = packed[:9] + b"\xff" + packed[10:]
                 if len(packed) < len(raw) * 0.9:
                     gz = base64.b64encode(packed).decode("ascii")
         elif ext in BINARY_TYPES:

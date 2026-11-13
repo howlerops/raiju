@@ -29,7 +29,18 @@ nobody rediscovers them. Each one is worth a report upstream
 
 ## Library gaps
 
-`String.fromCharCode`, `lastIndexOf`, `number.toString(radix)`, `decodeURIComponent`
-and dynamic `process.env[name]` don't exist. `parseFloat("5m")` is `undefined`
-(strict). Replacements live next to their use (`schemas.hex`, `config.getEnv`
-via `/proc/self/environ`, `URLSearchParams` for percent-decoding).
+`String.fromCharCode`, `lastIndexOf`, `number.toString(radix)` and `decodeURIComponent`
+don't exist. `parseFloat("5m")` is `undefined` (strict). Replacements live next to
+their use (`schemas.hex`, `URLSearchParams` for percent-decoding).
+
+Dynamic `process.env[name]` reads are supplied by patch 0024, using the same native
+environment API as `process.env.NAME`. `config.getEnv` no longer reads Linux's
+`/proc/self/environ`: config-supplied `env.NAME` secrets resolve on macOS too,
+including the distinction between an unset variable and a present empty value.
+Config reloads do not change the inherited environment; rotate environment-backed
+secrets by restarting the process with the new value.
+
+The native macOS provider matrix is not a full platform qualification. Management key creation and dependent
+random/session tests still hit Linux's `/proc/sys/kernel/random/uuid`; an observed native adapter/transitive run
+had 713 passes and 36 failures. Use the Linux container for infrastructure and management acceptance until that
+entropy path is ported; do not weaken secure identifier generation to make native tests pass.

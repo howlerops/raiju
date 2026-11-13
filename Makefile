@@ -49,6 +49,8 @@ parity-count:
 
 unit: build/h2_echo
 	$(TOV) test src/main.tov
+	$(TOV) build tests/config_env.tov -o build/config_env
+	RAIJU_PATCH_ENV=fixture RAIJU_PATCH_ENV_EMPTY= build/config_env RAIJU_PATCH_ENV fixture
 	python3 -m unittest tests/test_gen_pricing.py
 	python3 -m unittest tests/h2_test.py
 	python3 -m unittest tests/test_crew_priors.py
@@ -85,7 +87,9 @@ soak-slope:
 
 e2e:
 	python3 tests/e2e.py
+	python3 tests/embeddings_encoding.py
 	RAIJU_SERVER=http1 python3 tests/e2e.py
+	RAIJU_SERVER=http1 python3 tests/embeddings_encoding.py
 
 # opt-in: real providers, for each one with credentials in the environment (README, Real-provider smoke tests)
 smoke:

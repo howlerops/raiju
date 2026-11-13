@@ -1,14 +1,16 @@
-// The hybrid log store (Bifrost's logs_store.object_storage, framework/logstore/hybrid.go): with object storage
-// configured, a request log row keeps its metadata and a short preview of its prompt, and its payload fields (the
-// request and answer bodies, the raw provider payloads, the plugin logs) go to the bucket as one object under
-// <prefix>/logs/YYYY/MM/DD/HH/<id>.json (.json.gz gzipped, .parquet as a one-row Parquet file). The log detail
-// (GET /api/logs/{id}) reads the object back and merges it into the row; the list, stats and histograms never need it.
-// object_storage_exclude_fields keeps fields in the row, object_storage_exclude_request_types keeps whole rows, and
-// error_details (Raiju's error) always stays in the row, as Bifrost keeps it for the error breakdowns. A row whose
-// content is hidden (retain_content_in_object_storage, retained.tov) is not offloaded here.
-// This module is pure: the gateway splits rows (LogStore.onPrepare) and queues the uploads, ops.tov sends them and
-// hydrates the detail.
-import { LogEntry, bifrostRequestType, kindOf } from "./logstore"
+// Hybrid log storage (logs_store.object_storage): when object storage is configured,
+// request log rows retain metadata and a short prompt preview. Payload fields
+// (request and response bodies, raw provider payloads and plugin logs) are stored
+// as one object under <prefix>/logs/YYYY/MM/DD/HH/<id>.json, .json.gz for gzipped
+// JSON, or .parquet for a one-row Parquet file. GET /api/logs/{id} retrieves and
+// merges the object; lists, stats and histograms do not need it.
+// object_storage_exclude_fields keeps fields in the row;
+// object_storage_exclude_request_types keeps whole rows. error_details always
+// stays in the row for error breakdowns. Rows with hidden content
+// (retain_content_in_object_storage, retained.tov) are not offloaded here.
+// This module is pure: LogStore.onPrepare splits rows and queues uploads;
+// ops.tov sends uploads and hydrates log details.
+import { LogEntry, raijuRequestType, kindOf } from "./logstore"
 import { parquetFileWith, parquetRow, PqColumn, PqCell } from "./sink_parquet"
 import { gzipBytes, gunzip, isGzip } from "./gzip"
 import { isoMs } from "./exports"
@@ -17,11 +19,11 @@ import { fields, elements, rawStr, find, quote } from "./json"
 // The row fields that are payload, in the order objects hold them.
 export const PAYLOAD_FIELDS: string[] = ["input", "output", "raw_request", "raw_response", "plugin_logs"]
 
-// The longest prompt preview a row keeps (Bifrost bounds its content summary the same way).
+// Maximum prompt preview length retained in a row.
 const PREVIEW_MAX = 2048
 
-// A field name of Bifrost's payload columns (or Raiju's own) as the row field it is here, or "" for one with no
-// counterpart (error_details always stays in the row).
+// Maps a payload column name to its row field, or "" if no counterpart exists.
+// error_details always stays in the row.
 export function payloadFieldOf(name: string): string {
   const n = name.trim()
   if (PAYLOAD_FIELDS.includes(n)) return n
@@ -35,9 +37,10 @@ export function payloadFieldOf(name: string): string {
 // done here (logged at start).
 export type HybridPolicy = { format: string, gz: bool, keep: string[], skipTypes: string[], warnings: string[] }
 
-// The policy for logs_store.object_storage's format, compression (and the legacy compress flag) and the exclude lists.
-// Bifrost's rules: json takes none or gzip; parquet takes none, gzip, snappy or zstd (default snappy). Raiju writes
-// Parquet pages uncompressed or GZIP: snappy and zstd are written as GZIP, with a warning.
+// Policy for logs_store.object_storage format, compression, legacy compress flag
+// and exclude lists. JSON accepts none or gzip; Parquet accepts none, gzip,
+// snappy or zstd (default snappy). Parquet pages are written uncompressed or
+// with GZIP; snappy and zstd are written as GZIP with a warning.
 export function hybridPolicy(format: string | undefined, compression: string | undefined, compress: bool, excludeFields: string[], excludeTypes: string[]): HybridPolicy {
   const warnings: string[] = []
   let f = (format ?? "").trim().toLowerCase()
@@ -86,11 +89,12 @@ function fieldOf(e: LogEntry, name: string): string | undefined {
   return undefined
 }
 
-// Whether a row is offloaded: an LLM row whose content is not hidden, whose request type is not excluded (by Bifrost's
-// name or Raiju's op), and that holds a payload field the policy moves.
+// Offloads an LLM row only if its content is not hidden, its request type is not
+// excluded by request-type name or gateway op, and it contains a payload field
+// selected for offloading.
 export function offloads(p: HybridPolicy, e: LogEntry): bool {
   if (e.content_hidden === true || kindOf(e) !== "llm") return false
-  if (p.skipTypes.includes(e.op) || p.skipTypes.includes(bifrostRequestType(e.op, e.streamed === true))) return false
+  if (p.skipTypes.includes(e.op) || p.skipTypes.includes(raijuRequestType(e.op, e.streamed === true))) return false
   for (const f of PAYLOAD_FIELDS) {
     const v = fieldOf(e, f)
     if (v !== undefined && v !== "" && !p.keep.includes(f)) return true
@@ -115,9 +119,10 @@ function contentTextOf(raw: string): string {
   }
 }
 
-// The row's preview of a request body (Bifrost keeps the last user message and a content summary): the last user
-// message's text of a chat or Messages body, a Responses input, or a prompt, as {"messages":[{"role":"user",
-// "content":"..."}]} cut to PREVIEW_MAX bytes. undefined when the body holds none.
+// Request-body preview: the last user message text from a chat or Messages body,
+// a Responses input, or a prompt, represented as {"messages":[{"role":"user",
+// "content":"..."}]} and truncated to PREVIEW_MAX bytes. Returns undefined
+// when the body contains none of these.
 export function previewInput(body: string): string | undefined {
   let text = ""
   try {
@@ -183,8 +188,8 @@ export function splitEntry(p: HybridPolicy, e: LogEntry): { row: LogEntry, paylo
   return { row: row, payload: "{" + parts.join(",") + "}" }
 }
 
-// The object key of a row: <prefix>/logs/YYYY/MM/DD/HH/<id> with the format's extension (Bifrost's objectKey). Empty
-// prefix segments are dropped.
+// Object key: <prefix>/logs/YYYY/MM/DD/HH/<id> with the format's extension.
+// Empty prefix segments are dropped.
 export function payloadKey(prefix: string, ts: f64, id: string, format: string, gz: bool): string {
   const iso = isoMs(ts)
   const segs = prefix.split("/").filter((s) => s !== "")
@@ -232,7 +237,7 @@ export function decodePayload(bytes: u8[]): Map<string, string> throws Error {
   return out
 }
 
-// The row with its object's fields merged back (the log detail), as Bifrost's hydrateLog does.
+// The log-detail row with its object's fields merged back in.
 export function hydrate(e: LogEntry, m: Map<string, string>): LogEntry {
   let out = e
   const i = m.get("input")
@@ -259,7 +264,7 @@ function sampleRow(): LogEntry {
   }
 }
 
-test("the policy: formats, compression and the exclude lists in Bifrost's names", () => {
+test("the policy: formats, compression and the exclude lists in Raiju's names", () => {
   const j = hybridPolicy(undefined, undefined, false, [], [])
   expect(j.format).toBe("json")
   expect(j.gz).toBe(false)
@@ -318,12 +323,12 @@ test("excluded fields stay in the row, excluded types and hidden rows are not of
   expect(offloads(keepIn, bare)).toBe(false)
 })
 
-test("object keys follow Bifrost's layout, and every format's key is tried on a read", () => {
+test("object keys follow Raiju's layout, and every format's key is tried on a read", () => {
   const p = hybridPolicy("parquet", "none", false, [], [])
-  expect(payloadKey("bifrost", 1791979200000.0, "r1", "json", false)).toBe("bifrost/logs/2026/10/14/12/r1.json")
+  expect(payloadKey("raiju", 1791979200000.0, "r1", "json", false)).toBe("raiju/logs/2026/10/14/12/r1.json")
   expect(payloadKey("/a//b/", 1791979200000.0, "r1", "json", true)).toBe("a/b/logs/2026/10/14/12/r1.json.gz")
-  const ks = payloadKeys(p, "bifrost", 1791979200000.0, "r1")
-  expect(ks[0]).toBe("bifrost/logs/2026/10/14/12/r1.parquet")
+  const ks = payloadKeys(p, "raiju", 1791979200000.0, "r1")
+  expect(ks[0]).toBe("raiju/logs/2026/10/14/12/r1.parquet")
   expect(ks.length).toBe(3)
   expect(previewInput(`{"input":"plain prompt"}`)).toBe(`{"messages":[{"role":"user","content":"plain prompt"}]}`)
   expect(previewInput(`{"model":"m"}`)).toBe(undefined)

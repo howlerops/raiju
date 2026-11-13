@@ -47,11 +47,11 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(kit.norm_url(" "), "")
 
     def test_from_environment_and_flags(self):
-        env = {"RAIJU_BASE_URL": "https://gw.example.com/", "RAIJU_VKS": "sk-bf-a,sk-bf-b", "RAIJU_NODE_URLS": "10.0.1.5:8080 10.0.2.6:8080",
+        env = {"RAIJU_BASE_URL": "https://gw.example.com/", "RAIJU_VKS": "sk-raiju-a,sk-raiju-b", "RAIJU_NODE_URLS": "10.0.1.5:8080 10.0.2.6:8080",
                "RAIJU_CLUSTER_URLS": "10.0.1.5:7000,10.0.2.6:7001", "RAIJU_ADMIN_TOKEN": "tok-example"}
         s = kit.Settings(env)
         self.assertEqual(s.base_url, "https://gw.example.com")
-        self.assertEqual(s.vks, ["sk-bf-a", "sk-bf-b"])
+        self.assertEqual(s.vks, ["sk-raiju-a", "sk-raiju-b"])
         self.assertEqual(s.model, kit.DEFAULT_MODEL)
         self.assertEqual(s.node_urls, ["http://10.0.1.5:8080", "http://10.0.2.6:8080"])
         self.assertEqual(s.cluster_port, 7946)
@@ -99,14 +99,14 @@ class ParsingTest(unittest.TestCase):
 
     def test_metrics(self):
         text = "\n".join([
-            "# HELP bifrost_upstream_requests_total x",
-            'bifrost_upstream_requests_total{provider="openai",model="a"} 3',
-            'bifrost_upstream_requests_total{provider="anthropic",model="b"} 4',
+            "# HELP raiju_upstream_requests_total x",
+            'raiju_upstream_requests_total{provider="openai",model="a"} 3',
+            'raiju_upstream_requests_total{provider="anthropic",model="b"} 4',
             "process_resident_memory_bytes 1.048576e+08",
-            "bifrost_upstream_requests_total_other 9",
+            "raiju_upstream_requests_total_other 9",
         ])
-        self.assertEqual(kit.metric_sum(text, "bifrost_upstream_requests_total"), 7)
-        self.assertEqual(kit.metric_sum(text, "bifrost_upstream_requests_total", {"provider": "openai"}), 3)
+        self.assertEqual(kit.metric_sum(text, "raiju_upstream_requests_total"), 7)
+        self.assertEqual(kit.metric_sum(text, "raiju_upstream_requests_total", {"provider": "openai"}), 3)
         self.assertEqual(kit.metric_sum(text, "process_resident_memory_bytes"), 104857600)
         self.assertIsNone(kit.metric_sum(text, "missing"))
 
@@ -210,21 +210,22 @@ class VerdictTest(unittest.TestCase):
 
     def test_soak(self):
         flat = [(t * 60.0, 60 + (t % 3)) for t in range(100)]
-        ok, n, why = body_soak.soak_verdict(flat, 512, 32)
+        traffic = {"requests": 100, "accepted": {"chat": 30, "stream": 25, "long": 10}}
+        ok, n, why = body_soak.soak_verdict(flat, 512, 32, **traffic)
         self.assertTrue(ok, why)
         self.assertLess(abs(n["growth_2nd_half_mb"]), 2)
         leak = [(t * 60.0, 60 + t * 1.5) for t in range(100)]
-        ok, n, why = body_soak.soak_verdict(leak, 512, 32)
+        ok, n, why = body_soak.soak_verdict(leak, 512, 32, **traffic)
         self.assertFalse(ok)
         self.assertGreater(n["growth_2nd_half_mb"], 32)
         high = [(t * 60.0, 480.0) for t in range(10)]
-        self.assertFalse(body_soak.soak_verdict(high, 512, 32)[0])  # flat but past 90% of the limit
+        self.assertFalse(body_soak.soak_verdict(high, 512, 32, **traffic)[0])  # flat but past 90% of the limit
         oom = [(t * 60.0, 300.0 if t != 50 else 25.0) for t in range(100)]
-        ok, n, why = body_soak.soak_verdict(oom, 512, 32)
+        ok, n, why = body_soak.soak_verdict(oom, 512, 32, **traffic)
         self.assertFalse(ok)
         self.assertEqual(n["restarts"], 1)
-        self.assertFalse(body_soak.soak_verdict([(0, 50), (60, None), (120, 50)], 512, 32)[0])  # too few samples
-        self.assertFalse(body_soak.soak_verdict(flat, 512, 32, requests=100, errors=5)[0])  # 5% errors
+        self.assertFalse(body_soak.soak_verdict([(0, 50), (60, None), (120, 50)], 512, 32, **traffic)[0])  # too few samples
+        self.assertFalse(body_soak.soak_verdict(flat, 512, 32, errors=5, **traffic)[0])  # 5% errors
 
     def test_restarts(self):
         self.assertEqual(body_soak.restarts([50, 60, 70, 20, 30, 80, 25]), [3, 6])
@@ -293,6 +294,107 @@ class VerdictTest(unittest.TestCase):
         self.assertAlmostEqual(smoke_check.cert_days_left("Nov  5 00:00:00 2026 GMT", now), 10.0)
         evs = smoke_check.sse_events('data: {"a":1}\n\ndata: [DONE]\n\n')
         self.assertEqual(evs, [{"a": 1}])
+
+
+class SoakTrafficTest(unittest.TestCase):
+    flat = [(t * 60.0, 60.0) for t in range(10)]
+    chat = b'{"choices":[{"message":{"content":"ok"}}]}'
+    stream = b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'
+    discard = b'{"error":{"message":"could not auto resolve a provider for the request, please specify a provider explicitly"}}'
+    busy = b'{"error":{"message":"the gateway is reading too many request bodies at once (server.max_buffered_body_mb); retry shortly"}}'
+
+    def verdict(self, counters, required_kinds=("chat", "stream", "long")):
+        return body_soak.soak_verdict(self.flat, 512, 32, requests=counters.requests, errors=counters.errors,
+                                     accepted=counters.accepted, required_kinds=required_kinds)
+
+    def test_no_traffic_fails_even_with_flat_rss(self):
+        for required in (("chat", "stream", "long"), ()):
+            with self.subTest(required=required):
+                ok, _, reasons = self.verdict(body_soak.Counters(), required)
+                self.assertFalse(ok)
+                self.assertIn("no completed requests", reasons)
+
+    def test_rejected_inference_cannot_hide_behind_body_stress(self):
+        for status in (400, 401, 403, 404, 408, 413, 429, 500, 503, 0):
+            for kind in ("chat", "stream", "long"):
+                with self.subTest(status=status, kind=kind):
+                    counters = body_soak.Counters()
+                    for _ in range(200):
+                        counters.add("body", 400, self.discard, 65536)
+                    counters.add(kind, status, b'{"error":{"message":"rejected"}}', 128)
+                    self.assertEqual(counters.errors, 1)
+                    self.assertEqual(counters.refused, 0)
+                    ok, numbers, reasons = self.verdict(counters, (kind,))
+                    self.assertFalse(ok, reasons)
+                    self.assertLess(numbers["error_ratio"], 0.01)
+                    self.assertIn(f"no accepted {kind} inference", reasons)
+
+    def test_every_enabled_inference_kind_must_complete(self):
+        counters = body_soak.Counters()
+        counters.add("chat", 200, self.chat, 128)
+        counters.add("long", 200, self.chat, 65536)
+        counters.add("stream", 503, self.busy, 128)
+        ok, _, reasons = self.verdict(counters)
+        self.assertFalse(ok)
+        self.assertIn("no accepted stream inference", reasons)
+        self.assertEqual((counters.errors, counters.refused), (0, 1))
+        counters.add("stream", 200, self.stream, 128)
+        ok, numbers, reasons = self.verdict(counters)
+        self.assertTrue(ok, reasons)
+        self.assertEqual(numbers["accepted"], 3)
+        self.assertEqual(numbers["accepted_by_kind"], {"chat": 1, "long": 1, "stream": 1})
+
+    def test_http_200_without_valid_completion_is_an_error(self):
+        cases = [("chat", b""),
+                 ("chat", b'{"error":{"message":"upstream failed"}}'),
+                 ("chat", b'{"choices":[null]}'),
+                 ("chat", b'{"choices":["error"]}'),
+                 ("chat", b'{"choices":{"message":{"content":"not a list"}}}'),
+                 ("chat", b'{"choices":[{"message":null}]}'),
+                 ("chat", b'{"choices":[{"message":{}}]}'),
+                 ("chat", b'{"choices":[{"message":{"content":123}}]}'),
+                 ("stream", b'data: {"choices":[null]}\n\ndata: [DONE]\n\n'),
+                 ("stream", b'data: {"choices":["error"]}\n\ndata: [DONE]\n\n'),
+                 ("stream", b'data: {"choices":[{"delta":null}]}\n\ndata: [DONE]\n\n'),
+                 ("stream", self.stream.split(b"data: [DONE]")[0]),
+                 ("stream", b"data: [DONE]\n\n"),
+                 ("stream", b'data: {"error":{"message":"upstream failed"}}\n\n' + self.stream)]
+        for kind, response in cases:
+            with self.subTest(kind=kind, response=response):
+                counters = body_soak.Counters()
+                counters.add(kind, 200, response, 128)
+                self.assertEqual(counters.errors, 1)
+                self.assertFalse(self.verdict(counters, (kind,))[0])
+
+    def test_body_only_discard_and_budget_rejections_are_expected(self):
+        counters = body_soak.Counters()
+        counters.add("body", 400, self.discard, 65536)
+        counters.add("body", 503, self.busy, 50 * 1048576)
+        counters.add("body", 413, b"request body too large", 50 * 1048576)
+        self.assertEqual((counters.requests, counters.discarded, counters.refused, counters.errors), (3, 1, 2, 0))
+        ok, numbers, reasons = self.verdict(counters, ())
+        self.assertTrue(ok, reasons)
+        self.assertEqual(numbers["accepted"], 0)
+        self.assertFalse(self.verdict(counters)[0])  # not evidence for a mixed real-provider soak
+
+    def test_body_errors_are_not_discarded_or_refused(self):
+        for status, response in ((400, b'{"error":{"message":"malformed request"}}'),
+                                 (400, b"[]"), (401, b"unauthorized"), (408, b"body deadline"),
+                                 (429, b"rate limited"), (503, b"upstream unavailable")):
+            with self.subTest(status=status, response=response):
+                counters = body_soak.Counters()
+                counters.add("body", status, response, 65536)
+                self.assertEqual((counters.errors, counters.discarded, counters.refused), (1, 0, 0))
+                self.assertFalse(self.verdict(counters, ())[0])
+
+    def test_real_body_model_requires_real_completion(self):
+        counters = body_soak.Counters("openai/test-model")
+        counters.add("body", 400, self.discard, 65536)
+        self.assertEqual((counters.errors, counters.discarded), (1, 0))
+        self.assertFalse(self.verdict(counters, ("body",))[0])
+        counters = body_soak.Counters("openai/test-model")
+        counters.add("body", 200, self.chat, 65536)
+        self.assertTrue(self.verdict(counters, ("body",))[0])
 
 
 class PlanTest(unittest.TestCase):
@@ -379,7 +481,7 @@ class TerraformStagingTest(unittest.TestCase):
         self.assertIn("efs_enabled         = true", self.main)
 
     def test_no_secret_values_in_the_config(self):
-        self.assertIn('setup_token = "env.BIFROST_SETUP_TOKEN"', self.main)
+        self.assertIn('setup_token = "env.RAIJU_SETUP_TOKEN"', self.main)
         self.assertIn('secret      = "env.RAIJU_CLUSTER_SECRET"', self.main)
 
     @unittest.skipUnless(os.environ.get("TERRAFORM"), "set TERRAFORM to a terraform binary to run the example's terraform test")

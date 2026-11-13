@@ -22,7 +22,7 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | Cost tracking | done (models outside the built-in datasheet cost 0 and skip budgets, as in Bifrost; `client.refuse_unpriced_models` refuses budgeted requests to them, off by default) |
 | Virtual keys | done |
 | Request IDs | done |
-| Prometheus metrics | partial: Bifrost's families and enrichment labels, http_* with custom labels, active requests, key rotation, MCP and the push gateway; the overhead components are Raiju's own four stages |
+| Prometheus metrics | partial: `raiju_*` gateway families and enrichment labels, http_* with custom labels, active requests, key rotation, MCP and the push gateway; the overhead components are Raiju's own four stages |
 | config.json compatibility | partial: sections and keys mapped; keys Raiju does not apply are reported at startup (`websocket`, top-level `access_profiles`, `network_config` transport knobs, Vertex workload identity; docs/parity.md section c) |
 | Multi-core workers | partial: budgets, rate limits and caches shared between workers; `/metrics` is summed; request logs are per worker unless the log store is shared |
 | Anthropic | partial: no legacy text completions |
@@ -67,7 +67,7 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | Custom providers | done |
 | Vertex AI | done: chat, streaming, embeddings, responses, images and image edits, batches and files over GCS, exact count tokens; the AWS workload identity is not built (needs a cloud account) |
 | Model aliases | partial: chained key aliases and object-form aliases with model name and family; bare names resolved through the model catalog; provider override fields (api_version, region and similar) are not applied |
-| Header/param forwarding | x-bf-eh-* done |
+| Header/param forwarding | x-raiju-eh-* done |
 | Key pinning | done |
 | Routing rules (CEL) | done (Bifrost variables, RE2 regex) |
 
@@ -99,7 +99,7 @@ Priorities chosen in the [scoping form](https://claude.ai/artifact/E4vNoYy3CKL6S
 | Outbound proxies | done (HTTP, with credentials; SOCKS5 isn't in Tov's fetch) |
 | MCP code mode | partial (moved in from Out by the owner, 2026-10-17; L117): the four meta-tools (listToolFiles, readToolFile, getToolDocs, executeToolCode), Python stubs, `mcp.code_mode_binding_level` and `mcp.code_mode_limits`, and the gates on the tool calls a program makes. The runner is a Starlark subset (no while, classes, exceptions or imports); see docs/parity.md (g) |
 | Provider passthrough routes | done (OpenAI, Anthropic, Azure, Bedrock agent/guardrail, GenAI, ChatGPT Codex) |
-| Direct keys, raw request/response echo | partial: direct keys and send-back of raw requests and responses are done; `x-bf-store-raw-request-response` is not built |
+| Direct keys, raw request/response echo | partial: direct keys and send-back of raw requests and responses are done; `x-raiju-store-raw-request-response` is not built |
 | Reasoning parameters | done (Anthropic, Gemini, Bedrock Claude and Nova) |
 | A2A agents (registered agents, agent cards, JSON-RPC tasks) | partial: registrations at /api/agents with cached cards (fetched again on a timer), grants, runtime headers or OAuth, forwarded caller credentials, inspect and push-config management; the gateway at /agents/a2a/{name} serves the card and proxies the JSON-RPC methods (v0.3 and v1 names, tasks/resubscribe) and the REST binding, bridging between them, with push notification configs relayed through the gateway, logged under the agent's name; /agents/a2a lists the agents a key may call; the agent_names log filter works; the gRPC binding (lf.a2a.v1 over Raiju's own HTTP/2 cleartext server, `server.a2a_grpc_port`), push configs and cards shared across workers and nodes; extension URIs, client certificates for the agent's TLS and calls to GRPC-only agents are not built |
 | Crew routing (Raiju-only, not in Bifrost) | done: task-level multi-model routing of agent crews (`crew/<pool>`, docs/crew-routing.md), offline priors and classifier training, outcomes, credibility learning, budget pacing, escalation, the Crews tab and metrics |

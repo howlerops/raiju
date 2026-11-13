@@ -1,14 +1,15 @@
-// Plugin hooks around a request on the servers. Bifrost runs the plugins' HTTP transport hooks on the
-// inference routes: before routing (a plugin can rewrite the request's headers, query and body, or answer at
-// once), after the response (rewrite its status, headers and body), and for each chunk of a streamed answer
-// (rewrite, drop, or end the stream). Its LLM hooks (preRequest and postResponse) run on every request type.
-// The built-in chat route runs them in gateway.tov chatOnce; the other routes run them here (llmHooked), so
-// a plugin sees embeddings, speech, transcription, images, Responses and the other types as chat requests,
-// in the shapes of plughttp.tov and wasmplugin.tov.
+// Plugin hooks around server requests. HTTP transport hooks run on inference routes:
+// before routing (rewrite headers, query and body, or answer immediately), after the
+// response (rewrite status, headers and body), and per streamed chunk (rewrite, drop
+// or end the stream). LLM hooks (preRequest and postResponse) run on every request type.
+// The built-in chat route runs them in gateway.tov chatOnce; other routes use
+// llmHooked here. Plugins see embeddings, speech, transcription, images, Responses
+// and other types as chat requests in the shapes defined by plughttp.tov and wasmplugin.tov.
 //
-// The two phases share one PluginRun per request: transportStart makes it and puts its id in the request's
-// x-bf-plugin-run header, and the LLM hooks find it in Engine.pluginRuns by that id, so a WebAssembly
-// plugin's context travels from http_pre_hook to pre_hook, post_hook and http_post_hook.
+// Both phases share one PluginRun per request. transportStart creates it and puts
+// its id in x-raiju-plugin-run. LLM hooks find it in Engine.pluginRuns by that id,
+// carrying WebAssembly plugin context from http_pre_hook through pre_hook,
+// post_hook and http_post_hook.
 
 import { Engine, StreamSink, EventStep, eventSink, llmStreamSink, errorResponse, noHeaders, AttemptPlugins } from "./gateway"
 import { PluginChain, PluginRun, PluginContext, PluginTrace, BasePlugin, PostResult, PreResult, HttpChunkResult, RUN_HEADER, TRACE_HEADER, ATTEMPT_HEADER, errorPost } from "./plugins"
@@ -74,20 +75,20 @@ function responseOf(r: HttpResp): Response {
 // Runs the plugins' HTTP pre hooks on a request, before it is routed. A request that no hook looks at (no
 // plugin with a transport hook, a route that is not an inference route) comes back as it was; a body over
 // HOOK_BODY_LIMIT is handed to the hooks empty. The handlers that run later find the hooks' run through the
-// x-bf-plugin-run header.
+// x-raiju-plugin-run header.
 export async function transportStart(engine: Engine, req: Request): Promise<TransportStart> {
   const chain = chainOf(engine)
   const u = URL.parse(req.url)
   const path = u === undefined ? "" : u.pathname
-  // (a CORS preflight is answered before the plugins, as Bifrost's CORS middleware does)
+  // CORS preflight requests are answered before plugins run.
   if (chain === undefined || u === undefined || req.method === "OPTIONS" || !chain.hasHttp() || !isInferencePath(path)) return { response: undefined, request: req, tr: undefined, body: "" }
   const hs = snapshot(req.headers)
   hs.delete(RUN_HEADER)
   // the server's client watch (clientgone.tov) is not the plugins' to see or set; it rides on past them
   const watch = hs.get(CLIENT_WATCH_HEADER)
   hs.delete(CLIENT_WATCH_HEADER)
-  // a body declared bigger than hooks take is not read here (a large upload goes on as it streams in); the hooks still
-  // run, with an empty body, as Bifrost runs them on a large payload
+  // A body declared larger than the hook limit is not read here; the upload streams
+  // onward, and hooks still run with an empty body.
   const declaredLarge = (parseFloat(hs.get("content-length") ?? "0") ?? 0.0) > HOOK_BODY_LIMIT
   let bytes: u8[] = []
   if (!declaredLarge && req.method !== "GET" && req.method !== "HEAD") {
@@ -110,10 +111,10 @@ export async function transportStart(engine: Engine, req: Request): Promise<Tran
   const method0 = hr.method
   const path0 = hr.path
   const pre = chain.runHttpPre(&run.ctx, &hr)
-  // a failed pre hook answers with its message as bare text, as Bifrost's middleware does (SetBodyString)
+  // A failed pre hook returns its message as bare text.
   if (pre.kind === "error") return { response: bareError(500, pre.message), request: req, tr: undefined, body: "" }
   if (pre.kind === "respond") return { response: responseOf(pre.resp), request: req, tr: undefined, body: "" }
-  // Bifrost refuses a plugin that moves the request to another route
+  // Refuse plugin changes that move the request to another route.
   if (hr.method !== method0 || hr.path !== path0) return { response: errorResponse(409, "request method/path was modified by a plugin, this is not allowed", "api_error", noHeaders()), request: req, tr: undefined, body: "" }
   run.req = hr
   // the id is the only way to reach the run, so it is not guessable
@@ -202,8 +203,8 @@ export async function transportEnd(engine: Engine, tr: TransportRun | undefined,
   if (ct.startsWith("application/vnd.amazon.eventstream") && res.status < 400) {
     return new Response(framesWhole(tr, bytes), { status: res.status, headers: snapshotRecord(res.headers) })
   }
-  // a large answer goes to the hooks with an empty body (as Bifrost skips a large response's body): their status and
-  // headers apply, and a body they set replaces it
+  // Large responses reach hooks with an empty body. Hook status and headers apply,
+  // and any body the hooks set replaces the response body.
   const large = bytes.length > HOOK_BODY_LIMIT
   let hr: HttpResp = { status: res.status, headers: snapshot(res.headers), body: large ? [] : bytes }
   tr.chain.runHttpPost(&tr.run.ctx, req, &hr)
@@ -383,7 +384,7 @@ function formWith(fd: FormData, body: string): FormData throws SyntaxError {
 // The answer a short-circuiting plugin gave for a request of a kind.
 function shortResponse(k: LlmKind, status: int, body: string, contentType: string): Response {
   const hs: Record<string, string> = new Map()
-  hs.set("x-bf-plugin-short-circuit", "true")
+  hs.set("x-raiju-plugin-short-circuit", "true")
   if (k.binary && status < 400) {
     try {
       const f = fields(body)
@@ -574,18 +575,18 @@ async function postProcess(chain: PluginChain, run: PluginRun, k: LlmKind, res: 
 
 // ---- the batch and file calls ----
 
-// A batch or file call as Bifrost's request types name it (op: batch_list, batch_retrieve, batch_cancel, batch_results,
-// batch_delete, batch_create, file_upload, file_list, file_retrieve, file_delete, file_content), the provider it is for,
-// the member its id goes in ("batch_id", "file_id", or "" for a call with no id), the id, and the path the call takes
-// for an id (where it is sent when a plugin changes the id).
+// A batch or file call: its operation (batch_list, batch_retrieve, batch_cancel,
+// batch_results, batch_delete, batch_create, file_upload, file_list, file_retrieve,
+// file_delete or file_content), provider, id member ("batch_id", "file_id" or ""
+// for calls without an id), id, and path used when a plugin changes the id.
 export type StorageCall = { op: string, provider: string, idKey: string, id: string, pathFor: (id: string) => string }
 
-// The request of a batch or file call as the plugins get it: the provider (as "provider/" in model, so it reaches them as
-// the request's provider with no model), the id, the query's fields, a JSON body's fields, and an upload's text fields
-// with the file's filename and content_type (the bytes are not passed, as Bifrost does not serialise them). Which
-// fields came from the query and which from the body is kept, so a plugin's change goes back where the field came from.
-// A JSON body that names its model (a cached content's creation) shows it as "provider/model"; bodyModel marks it, and
-// the model a plugin leaves there goes back into the body.
+// A batch or file request as plugins see it: provider (encoded as "provider/" in
+// model, yielding a provider without a model), id, query fields, JSON body fields,
+// and upload text fields with filename and content_type. File bytes are not serialized.
+// Field origins are preserved so plugin changes return to the query or body as appropriate.
+// A JSON body naming its model, such as cached content creation, exposes it as
+// "provider/model". bodyModel marks this, and the model left by the plugin returns to the body.
 export type StorageRequest = { json: string, fromQuery: string[], fromBody: string[], jsonBody: bool, bodyModel: bool }
 
 // A JSON body's model, "" when it names none.
@@ -674,13 +675,13 @@ export function storageChange(call: StorageCall, sr: StorageRequest, changed: st
   return { id: id, query: query, body: body }
 }
 
-// Runs a batch or file call with the plugins' LLM hooks around it, as Bifrost runs them on every batch and file request:
-// pre_hook on the call's request (storageRequest; a change to its id, query or body fields is the call that is made, a
-// short circuit answers it), post_hook on the answer or its error. A file's content goes to post_hook as
-// {file_id, content_type}: the plugin may turn it into an error, and the bytes go back as they came. Without plugins
-// that handle the call's type the handler just runs.
-// A batch or file call, with its objects bound to the virtual key that created them (objowner.tov), then through
-// the plugins' LLM hooks (storageRun).
+// Run a batch or file call through LLM hooks. pre_hook receives storageRequest;
+// changes to its id, query or body affect the call, and a short circuit answers it.
+// post_hook receives the response or error. File content reaches post_hook as
+// {file_id, content_type}; a plugin may return an error, otherwise bytes pass unchanged.
+// Without plugins handling the request type, the handler runs directly.
+// Objects are bound to their creating virtual key (objowner.tov) before the call
+// runs through the LLM hooks (storageRun).
 export async function storageHooked(engine: Engine, req: Request, call: StorageCall, handler: Handler): Promise<Response> throws TypeError {
   const vk = engine.gov.findKey(snapshot(req.headers))
   const kind = ownerKind(call.op)
@@ -770,9 +771,9 @@ function foreignRef(refs: ObjectRef[], vkId: string, provider: string, same: (a:
   return undefined
 }
 
-// Whether two provider names reach the same upstream, so an object made through one is the same object through the
-// other (Bifrost's equivalentProviders): the same name, or a custom provider and its base, or two custom providers on
-// one base, with the same base URL (an unset one is the base's default).
+// Whether provider names reach the same upstream and therefore refer to the same
+// objects: identical names, a custom provider and its base, or custom providers on
+// one base, with matching base URLs. An unset URL uses the base provider's default.
 export function sameUpstream(cfg: Config, a: string, b: string): bool {
   if (a === b) return true
   const ps = cfg.providers
@@ -791,11 +792,12 @@ function trimSlash(u: string): string {
   return u.endsWith("/") ? u.slice(0, u.byteLength - 1) : u
 }
 
-// An inference request (chat, Responses, Messages, GenAI, a passthrough body) that names another key's object: a
-// file by id or Gemini file URI, a cached content it runs on, a batch's input file (objowner.tov objectRefs). Refused
-// as Bifrost refuses it, with a 404 access_blocked that does not confirm the object exists. Otherwise the request goes
-// on (rebuilt with its body when the body was read). Only a request with a virtual key is checked, only while
-// client.enforce_vk_object_ownership is on and some object is recorded, and only a JSON body.
+// Check inference requests (chat, Responses, Messages, GenAI and passthrough bodies)
+// for references to another key's objects: file ids, Gemini file URIs, cached content
+// or batch input files (objowner.tov objectRefs). Refuse with 404 access_blocked
+// without confirming the object exists. Otherwise continue, rebuilding the request
+// with its body if read. Checks apply only to JSON bodies with a virtual key while
+// client.enforce_vk_object_ownership is on and at least one object is recorded.
 export async function ownedRequest(engine: Engine, req: Request, provider: string): Promise<Request | Response> {
   const m = req.method
   if (m === "GET" || m === "HEAD" || m === "DELETE") return req
@@ -829,9 +831,9 @@ function modelProvider(engine: Engine, body: string): string {
   }
 }
 
-// A passthrough call (a provider's own path, raw): the objects its path addresses and its body names are checked like
-// a direct reference, and a GET of a collection (files, batches, cachedContents) is narrowed to what the key may see
-// (Bifrost's passthroughObjectRefs). rest is the provider path the call is sent to.
+// Check objects addressed by a raw passthrough path or named in its body as direct
+// references. Collection GETs (files, batches, cachedContents) are narrowed to objects
+// the key may see. rest is the provider path the call is sent to.
 export async function passthroughOwned(engine: Engine, req: Request, provider: string, gemini: bool, rest: string, handler: Handler): Promise<Response> throws TypeError {
   const vk = engine.gov.findKey(snapshot(req.headers))
   if (vk === undefined || vk.id === "" || engine.cfg.client?.enforce_vk_object_ownership === false) return try await handler(req, undefined)
@@ -908,8 +910,8 @@ async function storageRun(engine: Engine, req: Request, call: StorageCall, handl
   return await postProcess(chain, run, CHAT_LIKE, res)
 }
 
-// Bifrost's request type of a batch or file operation as the routes name it (media.tov, anthropic_batch.tov, genai_in.tov),
-// or "".
+// The request type for a batch or file operation named by the routes
+// (media.tov, anthropic_batch.tov, genai_in.tov), or "".
 export function storageOp(op: string): string {
   if (op === "files.create" || op === "files.upload") return "file_upload"
   if (op === "files.list") return "file_list"
@@ -935,7 +937,7 @@ export function storageOp(op: string): string {
   return ""
 }
 
-// The member a storage call's id goes in: Bifrost's request field for the type.
+// The request field that holds a storage call's id for its type.
 export function storageIdKey(op: string): string {
   if (op.startsWith("file_")) return "file_id"
   if (op.startsWith("responses_")) return "response_id"
@@ -990,8 +992,8 @@ export function pathWithId(path: string, oldId: string, newId: string): string {
 // The kind whose answers are JSON (shortResponse and postProcess read no audio from it).
 const CHAT_LIKE: LlmKind = { op: "storage", reqType: "", reqKey: "", respKey: "", streamKey: "", inputKey: "", form: false, binary: false }
 
-// A file's content through the post hooks, as Bifrost's FileContentResponse ({file_id, content_type}; the bytes are not
-// serialised): an error a plugin makes of it is the answer, otherwise the content goes back as it came.
+// File content reaches post hooks as {file_id, content_type}, without serialized
+// bytes. A plugin error becomes the response; otherwise content passes unchanged.
 async function contentPost(chain: PluginChain, run: PluginRun, id: string, res: Response): Promise<Response> {
   let bytes: u8[] = []
   try {
@@ -1221,7 +1223,7 @@ test("a short circuit of speech is audio, and others are the plugin's body", () 
   const speech = kindOfOp("speech")!
   const a = shortResponse(speech, 200, `{"audio":"${encode(utf8("abc"))}","content_type":"audio/mpeg"}`, "application/json")
   expect(a.headers.get("content-type")).toBe("audio/mpeg")
-  expect(a.headers.get("x-bf-plugin-short-circuit")).toBe("true")
+  expect(a.headers.get("x-raiju-plugin-short-circuit")).toBe("true")
   const j = shortResponse(kindOfOp("embeddings")!, 200, `{"object":"list"}`, "application/json")
   expect(j.status).toBe(200)
   expect(j.headers.get("content-type")).toBe("application/json")
