@@ -6409,7 +6409,7 @@ export interface components {
             /** Format: int64 */
             bucket_size_seconds: number;
         };
-        /** @description Bifrost IsAuthEnabledResponse, as Raiju answers it. */
+        /** @description Raiju native authentication status and explicit management access mode. */
         IsAuthEnabledResponse: {
             is_auth_enabled: boolean;
             has_valid_token: boolean;
@@ -6418,6 +6418,11 @@ export interface components {
             inference_auth_enforced?: boolean;
             setup_required?: boolean;
             setup_token_configured?: boolean;
+            /**
+             * @description Explicit management access policy; missing on older servers means native.
+             * @enum {string}
+             */
+            administration_mode?: "native" | "loginless";
         };
         /** @description Bifrost Key (the provider-specific *_key_config objects are passed through). */
         Key: {

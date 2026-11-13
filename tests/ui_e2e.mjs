@@ -149,7 +149,7 @@ try {
   }
   // some traffic so logs and stats have something to show
   for (let i = 0; i < 3; i++) await chat("hi " + i)
-  browser = await chromium.launch()
+  browser = await chromium.launch(process.env.PLAYWRIGHT_CHANNEL ? {channel:process.env.PLAYWRIGHT_CHANNEL} : {})
   const page = await browser.newPage({ viewport: { width: 400, height: 900 } })
   const errors = []
   page.on("pageerror", (e) => errors.push(String(e)))
@@ -216,8 +216,7 @@ try {
   check("top providers are ranked", await until(page, () => (document.querySelector("#ch-providers")?.textContent ?? "").includes("openai")), await text(page, "#ch-providers"))
   const chartW = await page.evaluate(() => Number(document.querySelector("#ch-requests svg").getAttribute("width")))
   check("a chart fits a 400px screen", chartW > 200 && chartW <= 400, chartW)
-  const box = await page.locator("#ch-requests svg").boundingBox()
-  await page.mouse.move(box.x + box.width - 30, box.y + box.height / 2)
+  await page.locator("#ch-requests svg").hover()
   check("hovering a chart shows a readout of that bucket", await until(page, () => (document.querySelector("#ch-requests .chart-tip")?.textContent ?? "").includes("Success")), await text(page, "#ch-requests"))
   await page.mouse.move(2, 2)
   await page.focus("#ch-requests svg")
@@ -369,7 +368,8 @@ try {
     check("a dropped socket shows the wait", await until(lp, () => /Reconnecting in 1 s/.test(document.querySelector("#lv-state")?.textContent ?? ""), null, 4000), await text(lp, "#lv-state"))
     check("a dropped socket reconnects", await until(lp, () => document.querySelector("#lv-state")?.textContent === "Live", null, 10000) && sockets === 2, `${sockets} ${await text(lp, "#lv-state")}`)
     check("the first connection asks for batches and no resume", urls[0].includes("batch=1") && !urls[0].includes("since="), urls[0])
-    check("a reconnect resumes from the highest seq of each producer", urls[1].includes("since=") && urls[1].includes("n1:6") && urls[1].includes("n2:9"), urls[1])
+    const resumed = new URL(urls[1]).searchParams.get("since")?.split(",").sort()
+    check("a reconnect resumes from the highest seq of each producer", JSON.stringify(resumed) === JSON.stringify(["n1:6", "n2:9"]), urls[1])
     check("the rows survive a reconnect", /^5000 shown/.test(await text(lp, "#lv-count")))
     await ctx.close()
   }
@@ -459,9 +459,9 @@ try {
   await until(page, () => !document.querySelector("#vk-form"))
   vk = (await api("GET", "/api/governance/virtual-keys")).data.virtual_keys.find((v) => v.id === vkId)
   check("saving without changes keeps the MCP tools and the budget", vk?.budget_id === "monthly" && (vk?.mcp_configs ?? []).length === 1, JSON.stringify(vk))
-  await page.locator('#vk-list tbody tr', { hasText: "from-ui" }).locator('button.toggle').click()
+  await page.locator('#vk-list tbody tr', { hasText: "from-ui" }).getByRole('button', {name:"Active", exact:true}).click()
   check("the status button disables a key", await poll(async () => (await api("GET", "/api/governance/virtual-keys")).data.virtual_keys.find((v) => v.id === vkId)?.is_active === false))
-  await page.locator('#vk-list tbody tr', { hasText: "from-ui" }).locator('button.toggle').click()
+  await page.locator('#vk-list tbody tr', { hasText: "from-ui" }).getByRole('button', {name:"Disabled", exact:true}).click()
   check("and enables it again", await poll(async () => (await api("GET", "/api/governance/virtual-keys")).data.virtual_keys.find((v) => v.id === vkId)?.is_active === true))
   await page.locator('#vk-list tbody tr', { hasText: "from-ui" }).locator('button:has-text("Rotate")').click()
   check("rotating shows the new value once", await until(page, (old) => (document.querySelector("#vk-secret-value")?.value ?? "").startsWith("sk-raiju-") && document.querySelector("#vk-secret-value").value !== old, secret), await page.inputValue("#vk-secret-value").catch(() => ""))
