@@ -281,6 +281,8 @@ value (rendered into a ConfigMap) to `/app/data/config.json`: with `configMode: 
 default) only when the file is not there yet, so changes made through the API or UI persist and a
 later change to `config` reaches only a fresh volume; with `configMode: always` at every start
 (config as code: `config` is the source of truth and API changes last until the pod restarts).
+First-write seeding uses a unique temporary file and an atomic no-clobber link: simultaneous
+replica starts cannot overwrite a config another replica or administrator has already saved.
 Liveness probes `GET /health`, readiness `GET /ready`.
 
 Useful values (see `values.yaml`):

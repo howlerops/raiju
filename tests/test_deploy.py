@@ -449,6 +449,31 @@ class HelmTest(unittest.TestCase):
         self.assertEqual(always["env"][0]["value"], "always")
         self.assertIn("configMode", self.render("configMode=sometimes", ok=False))
 
+    def test_shared_seed_does_not_overwrite_a_concurrent_admin_save(self):
+        import shlex
+        from pathlib import Path
+
+        script = self.pod(self.render())["initContainers"][0]["command"][2]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data, seed, commands = [root / name for name in ("data", "seed", "bin")]
+            for path in (data, seed, commands):
+                path.mkdir()
+            (seed / "config.json").write_text("initial-config")
+            # Pause at copy time logically: another writer publishes after the
+            # initial absence check, but before this init publishes its seed.
+            copier = commands / "cp"
+            copier.write_text('#!/bin/sh\n/bin/cp "$@"\nprintf admin-save > ' +
+                              shlex.quote(str(data / "config.json")) + '\n')
+            copier.chmod(0o755)
+            result = subprocess.run(
+                ["sh", "-c", script.replace("/app/data", str(data)).replace("/app/seed", str(seed))],
+                env={**os.environ, "PATH": str(commands) + ":" + os.environ["PATH"], "CONFIG_MODE": "ifAbsent"},
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((data / "config.json").read_text(), "admin-save")
+            self.assertEqual(list(data.glob("*.seed.*")), [])
+
     def test_replicas_need_shareable_storage(self):
         err = self.render("replicaCount=3", ok=False)
         self.assertIn("ReadWriteOnce", err)
