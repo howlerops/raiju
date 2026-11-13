@@ -1,5 +1,5 @@
 #!/bin/sh
-# Checks patches 0001-0010, 0012, 0013, 0015, 0016, 0017, 0019, 0020, 0021, 0022, 0023, 0024 and 0025 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
+# Checks patches 0001-0010, 0012, 0013, 0015, 0016, 0017, 0019, 0020, 0021, 0022, 0023, 0024, 0025 and 0026 with the patched compiler: TOV=build/tov/target/release/tov tov-patches/tests/run.sh
 # (or `make tov-test`). Each program prints "ok" lines and "FAIL" lines; a run passes when no line
 # fails and the expected number of "ok" lines appears.
 set -eu
@@ -34,6 +34,11 @@ expect "$OUT/process-env.out" 1 "dynamic process.env"
 
 # WebKitGTK's main loop must exist before the VM's full-collection/memory-pressure callbacks.
 TOV="$TOV" sh "$DIR/jsc_gc.sh"
+
+# A pre-start node:dns VM must not lose its collector when native workers start (patch 0026).
+if [ "$(uname -s)" = Linux ]; then
+  TOV="$TOV" sh "$DIR/clean_workers.sh"
+fi
 
 TOV_CFLAGS=-DTV_PLAIN_ALLOC "$TOV" build "$DIR/stream_body.tov" -o "$OUT/stream" >/dev/null
 "$OUT/stream" > "$OUT/stream.out" & SRV=$!

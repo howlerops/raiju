@@ -68,6 +68,15 @@ Waves 31 and 32 (L212 to L219) closed the known gaps listed after wave 30, fixed
   and the own-engine path are unchanged. The deployed 24-hour stability gate is
   still required.
 
+- **Native multi-worker startup**: workers now re-execute the gateway with fresh
+  JavaScriptCore/native state while adopting the supervisor's listeners and
+  retaining its node identity, shared-state directory and sign-in state key.
+  Previously, DNS or another JavaScript-backed startup operation could initialize
+  a VM before the worker fork; garbage collection then waited indefinitely for a
+  collector thread that did not survive the fork. This is separate from the
+  WebKitGTK main-loop crash fixed by patch 0025. Worker respawn/backoff and graceful
+  shutdown remain enabled; `http1` remains single-process.
+
 - **Embedding SDK fidelity**: translated OpenAI embedding responses now honor
   `encoding_format:"base64"` as IEEE754 float32 little-endian bytes. This fixes
   silent vector corruption in the OpenAI SDK, which requests base64 by default.

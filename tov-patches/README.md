@@ -23,6 +23,7 @@ Patch 0022 (address policy on `Bun.connect` and `WebSocket`, write-stall limit o
 Patch 0023 (`continue` releases the loop body's locals) changes one line of `codegen/body.rs`, which no earlier patch touches; it applies on its own or on top of 0001-0022.
 Patch 0024 (dynamic `process.env[name]` reads) changes index checking, code generation and the existing `tv_process_env` runtime's embedded-NUL rejection; it applies on top of 0023.
 Patch 0025 (WebKitGTK main-thread/run-loop initialization) changes only `runtime/js.c` and applies on top of 0024.
+Patch 0026 (opt-in clean worker re-execution) changes native HTTP startup/supervision, Bun's worker helpers and their builtin declarations; it applies on top of 0025.
 
 ## Submitting upstream
 
@@ -980,3 +981,47 @@ program loop. The unchanged macOS path also passed with the retained native comp
 this is not a claim that a new macOS compiler was rebuilt. The canonical runtime
 image passed hardened boot, including unusable enabled OAuth state exiting 1, and
 the CI-policy vulnerability scan. Deployed qualification and the 24-hour soak remain pending.
+
+## 0026 — clean worker processes after JavaScript-backed startup
+
+**Problem.** A Linux multi-worker gateway could stop answering even `/health` after
+DNS discovery initialized JavaScriptCore before the native worker fork. Frozen
+workers had one thread and waited in `JSC::Heap::collectNow` for a collector thread
+that existed only in the supervisor. Initializing the main loop (0025) does not
+make a live, multithreaded VM safe to inherit across fork.
+
+**Contract.** `Bun.cleanWorkers()` opts a program into fresh executable workers.
+Call it before asynchronous startup, then call `Bun.workersReady()` after opening
+all startup listeners and installing shutdown handlers. Until that checkpoint,
+startup may pump asynchronous I/O but no HTTP requests are accepted and no workers
+are spawned. Each worker adopts every inherited listener in order, validating its
+host and port (including the supervisor's actual port for a port-0 listener).
+Missing, extra or mismatched listeners fail startup.
+
+Startup runs again in each worker. `Bun.workerSupervisor()` returns the original
+supervisor PID; `Bun.workerState(name, value)` registers a nonempty shared startup
+string in the supervisor, or looks it up when the value is empty. Workers import
+an immutable snapshot. Raiju uses this for its share directory, node identity and
+ephemeral sign-in state key. The single-process and generic non-opted-in worker
+paths retain their existing semantics.
+
+**Implementation.** The supervisor uses `posix_spawn` rather than continuing
+application/VM code in a forked child. Each spawn gets a private, immediately
+unlinked bootstrap file; only its descriptor number travels in the environment.
+The shared connection-load map also uses an unlinked file. Spawn file actions
+preserve the required descriptors without clearing close-on-exec in the parent.
+Imports restore close-on-exec before application startup, and close the parsed
+manifest. Existing worker replacement, crash-loop backoff and stop handling remain.
+
+**Regression.** On Linux, run
+`TOV=build/tov/target/release/tov sh tov-patches/tests/clean_workers.sh`.
+It exercises DNS/real VM initialization and actual full/idle garbage collection,
+two shared port-0 listeners, retained supervisor identity, descriptor isolation,
+SIGKILL replacement and supervisor SIGTERM. A second startup order awaits DNS
+before opening listeners. This local native regression does not prove EFS mounts,
+real provider calls, regional capacity or deployed stability.
+
+Clean workers also retain patch 0021's per-slot `TOV_SEED` behavior: worker slots
+have distinct deterministic `Math.random` streams, and replacing a slot starts
+that slot's stream again. The regression checks this with a fixed seed; the
+ordinary system-random path remains enabled when no seed is supplied.
