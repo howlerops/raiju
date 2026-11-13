@@ -126,6 +126,12 @@ function SignIn(props: { account?: boolean }) {
   let password: HTMLInputElement | undefined
   const [error, setError] = createSignal("")
   const [busy, setBusy] = createSignal(false)
+  const remote = target().url !== location.origin
+  const PasswordForm = () => <form onSubmit={(ev) => { ev.preventDefault(); void submit(false) }}>
+    <label>Username<input class="input w-full" id="auth-username" autocomplete="username" ref={(el) => { username = el }} /></label>
+    <label>Password<input class="input w-full" id="auth-password" type="password" autocomplete="current-password" ref={(el) => { password = el }} /></label>
+    <button class="btn btn-primary" type="submit" id="auth-submit" disabled={busy()}>{busy() ? "Signing in…" : "Sign in to " + targetLabel()}</button>
+  </form>
   const save = async (token: string) => {
     if (!token) throw new Error("Enter a regional token.")
     await verifyToken(token)
@@ -166,11 +172,10 @@ function SignIn(props: { account?: boolean }) {
     <h1>{props.account ? "Regional account" : "Sign in to " + targetLabel()}</h1>
     <p class="muted">Sign in before accessing gateway administration or Fleet health.</p>
     <p class="hint">Credentials are isolated to this gateway origin and this tab. Changing identity or region reloads the console.</p>
-    <form onSubmit={(ev) => { ev.preventDefault(); void submit(false) }}>
-      <label>Username<input class="input w-full" id="auth-username" autocomplete="username" ref={(el) => { username = el }} /></label>
-      <label>Password<input class="input w-full" id="auth-password" type="password" autocomplete="current-password" ref={(el) => { password = el }} /></label>
-      <button class="btn btn-primary" type="submit" id="auth-submit" disabled={busy()}>{busy() ? "Signing in…" : "Sign in to " + targetLabel()}</button>
-    </form>
+    <Show when={sso()}><p id="auth-sso"><a class="btn btn-primary w-full" href={targetURL("/api/oidc/login")} target={remote ? "_blank" : undefined} rel="noopener noreferrer">{remote ? "Open regional UI for SSO" : "Continue with SSO"}</a></p></Show>
+    <Show when={sso()} fallback={<PasswordForm />}>
+      <details id="auth-password-details"><summary>Use a local account instead</summary><PasswordForm /></details>
+    </Show>
     <details id="auth-token-details"><summary>Use a regional token instead</summary>
       <p class="hint">First-admin setup creates a token, not a password. Use that token here; password sign-in requires an operator-configured password account.</p>
       <form onSubmit={(ev) => { ev.preventDefault(); void submit(true) }}>
@@ -178,8 +183,7 @@ function SignIn(props: { account?: boolean }) {
         <button class="btn btn-primary" type="submit" disabled={busy()}>Use token</button>
       </form>
     </details>
-    <Show when={sso()}><p id="auth-sso"><a class="btn btn-outline" href={targetURL("/api/oidc/login")} target={consoleConfig() ? "_blank" : undefined} rel="noopener noreferrer">{consoleConfig() ? "Open regional UI for SSO" : "Sign in with SSO"}</a></p></Show>
-    <Show when={consoleConfig()}><p class="hint">Regional SSO cookies do not sign in to a consolidated console. Use native credentials or a regional bearer token here.</p></Show>
+    <Show when={remote && sso()}><p class="hint">SSO opens the selected gateway's own console. Regional sessions remain isolated; this console does not forward cookies or credentials across regions.</p></Show>
     <Show when={error()}><p class="error" role="alert">{error()}</p></Show>
     <Show when={props.account}><button type="button" class="btn" onClick={dismissSignIn}>Close account</button><button type="button" id="signout-btn" class="btn" disabled={busy()} onClick={() => void logout()}>Sign out</button></Show>
   </section>

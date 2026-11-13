@@ -30,10 +30,12 @@ does not mount navigation, dashboard components, configuration forms or live
 sockets (including Fleet). An unavailable or malformed response fails closed.
 Disabling credentials alone does not enable anonymous administration.
 
-Initial setup requires the operator's setup token and creates an administrator,
-not a viewer/editor. The generated bearer is shown once and verified before the
-console opens; creating this account does not create a password. Keep the bearer
-securely for future token sign-ins, or configure an appropriate password/SSO user.
+Without configured native OIDC, initial setup requires the operator's setup token
+and creates an administrator, not a viewer/editor. The generated bearer is shown
+once and verified before the console opens; creating this account does not create
+a password. Keep the bearer securely for future token sign-ins, or configure an
+appropriate password user. Enabled native OIDC can instead provide the initial
+identity and role without a separate local account.
 
 ### Set an initial password login
 
@@ -57,6 +59,34 @@ environment; do not commit their values. This skips first-admin setup and allows
 native password sign-in. The local preview separately generates synthetic
 `preview` credentials at startup and writes them to
 `build/console-preview-access.json`; they are not product defaults.
+
+### Native single sign-on
+
+Configure `oidc.enabled`, the issuer and client credentials, and the exact
+`/api/oidc/callback` URI on each regional UI origin. Register those callbacks
+with the identity provider before enabling the deployment. A configured OIDC-only
+gateway shows sign-in, not first-admin setup; anonymous management calls remain
+locked until the provider has verified the identity.
+
+For providers carrying verified email claims, set `oidc.allowed_email_domains`
+to the explicit company domains. This requires `email_verified:true`, a valid
+email and an exact, case-insensitive domain match. Missing/unverified email,
+suffix tricks and accounts outside the allowlist are refused. Omitting the
+allowlist preserves existing provider policies; it is not a company restriction.
+
+Use `role_claim:"email"` and exact `role_map` entries when the provider does not
+send groups. Role-map keys may use `env.NAME` references for operator-managed
+addresses; unresolved references fail closed. Select a deliberate `default_role`
+(for example, viewer), never make every company user an administrator by default.
+Native provisioned users retain their current local roles/scopes.
+
+Successful native SSO writes a regional bearer into the callback origin's
+tab-scoped storage. It does not add a second cookie-based authentication scheme.
+When the selected gateway is the current UI origin, SSO continues in the same tab.
+For a remote target the link opens that gateway's own console; no regional session
+or credential is forwarded across origins. Native logout revokes the bearer
+session and removes the tab credential, without logging the user out of the
+shared identity provider.
 
 ### Explicit loginless administration
 

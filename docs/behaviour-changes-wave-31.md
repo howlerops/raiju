@@ -22,6 +22,16 @@ Waves 31 and 32 (L212 to L219) closed the known gaps listed after wave 30, fixed
   Explicit API/inference auth opt-outs and the separate metrics-token policy
   remain operator-controlled; see `docs/operations.md`.
 
+- **Native OIDC-only administration**: a configured identity provider can supply
+  the first identity without creating a local password/token account. Management
+  stays closed until sign-in; setup tokens cannot bypass configured SSO.
+  `oidc.allowed_email_domains` adds exact verified-email admission, and email
+  role-map keys can resolve operator-managed environment references. SSO returns
+  an origin-scoped native bearer; it does not create cookie-based administration.
+  Same-origin SSO uses the current tab; remote SSO opens that region's own console
+  without forwarding regional sessions. Local-account sign-in stays available as
+  an explicit alternative when configured.
+
 - **Dashboard presentation**: desktop navigation is now a persistent sidebar,
   with a compact header, roomier cards/tables and a responsive horizontal
   navigation strip on smaller screens. Fleet summary counts come only from

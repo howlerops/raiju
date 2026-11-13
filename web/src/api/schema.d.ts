@@ -6413,7 +6413,7 @@ export interface components {
         IsAuthEnabledResponse: {
             is_auth_enabled: boolean;
             has_valid_token: boolean;
-            /** @description basic or none */
+            /** @description basic, oidc or none */
             auth_type: string;
             inference_auth_enforced?: boolean;
             setup_required?: boolean;

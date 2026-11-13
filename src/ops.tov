@@ -1,7 +1,7 @@
 // Management-side state shared by both servers: who may use /api (RBAC), the
 // audit log of changes, the alerting loop, the gateway's own MCP server and
 // cluster counters. One instance per process; rebuilt parts follow config changes.
-import { Config, AlertsConfig, LogExportsConfig, LogExporterConfig, PricingSyncConfig, providerNames, getEnv, resolveEnv, parseConfig, PluginSpec, WasmLimitsSpec, AdminUserConfig, TeamConfig } from "./config"
+import { Config, AlertsConfig, LogExportsConfig, LogExporterConfig, PricingSyncConfig, providerNames, getEnv, resolveEnv, resolveOidcRoleMap, parseConfig, PluginSpec, WasmLimitsSpec, AdminUserConfig, TeamConfig } from "./config"
 import { listJson, sessionJson, sessionSummaryJson, detailJson, withMapping, phaseMapping, uaRoute, listFilter, unsupportedFilter, pageOfQuery, pctDecode, Page, timeOf } from "./logapi"
 import { Incident } from "./holds"
 import { WsTickets } from "./wsticket"
@@ -1297,6 +1297,7 @@ export class Ops {
   sweeping = false
   sending = false
   oidcCfg: OidcConfig | undefined = undefined
+  oidcConfigured = false
   // the oidc section as configured (before env. references are read), to tell a changed one
   oidcKey: string = ""
   discovery: Discovery | undefined = undefined
@@ -1462,16 +1463,18 @@ export class Ops {
     this.configureRetained()
     this.configureExporters(cfg.exporters ?? [])
     const oc = cfg.oidc
+    // Missing/invalid enabled fields must not reopen first-admin setup.
+    this.oidcConfigured = oc !== undefined && oc.enabled !== false
     const key = oc === undefined ? "" : JSON.stringify(oc)
     const same = oc !== undefined && this.oidcCfg !== undefined && key === this.oidcKey
     if (!same) {
       this.discovery = undefined
       this.oidcKey = key
       // the issuer, client and secret may be env. references (scim_config's settings allow them)
-      let ro = oc
+      let ro = oc === undefined ? undefined : resolveOidcRoleMap(oc)
       if (ro !== undefined) {
-        ro.issuer = resolveEnv(ro.issuer)
-        ro.client_id = resolveEnv(ro.client_id)
+        ro.issuer = resolveEnv(ro.issuer ?? "")
+        ro.client_id = resolveEnv(ro.client_id ?? "")
         const sec = ro.client_secret
         if (sec !== undefined) ro.client_secret = resolveEnv(sec)
         const auds = ro.audiences
@@ -5740,8 +5743,8 @@ export class Ops {
     } catch (e) {
       return html(503, "<p>Could not create a session; try again.</p>", clear)
     }
-    // the UI keeps its admin token in sessionStorage; the session token takes its place
-    return html(200, `<!doctype html><meta charset="utf-8"><title>Signed in</title><script>sessionStorage.setItem("raiju.adminToken", ${JSON.stringify(token)}); location.replace(${JSON.stringify(backTo)});</script><p>Signed in as ${(v.email ?? v.sub).replace("<", "&lt;")}.</p>`, clear)
+    // The token is scoped to this regional origin, just as the native UI's bearer-token storage is.
+    return html(200, `<!doctype html><meta charset="utf-8"><title>Signed in</title><script>sessionStorage.removeItem("raiju.adminToken"); sessionStorage.setItem("raiju.adminToken:"+location.origin, ${JSON.stringify(token)}); location.replace(${JSON.stringify(backTo)});</script><p>Signed in as ${(v.email ?? v.sub).replace("<", "&lt;")}.</p>`, clear)
   }
 
   // ---- session refresh and sweep ----
@@ -6328,7 +6331,12 @@ export class Ops {
     const s = this.sessions.get(token, Date.now())
     if (s === undefined) return undefined
     if (disabledNamed(this.rbac, ssoNames(s.sub, s.email))) return undefined
-    return s
+    const name = this.ssoUser(s.sub, s.email)
+    if (disabledNamed(this.rbac, [name])) return undefined
+    const user = provisioned(this.rbac, name)
+    const role = user === undefined ? s.role : user.role
+    if (!isBuiltinRole(role) && customRole(this.rbac.roles ?? [], role) === undefined) return undefined
+    return { sub: s.sub, email: s.email, role: role }
   }
 
   // Whether the caller may use this /api route; the actor names them in the audit log.
@@ -6341,13 +6349,8 @@ export class Ops {
     const auth = req.headers.get("authorization") ?? ""
     if (auth.startsWith("Bearer sk-sess-")) {
       const s = this.liveSession(auth.slice(7))
-      // Password sessions use the stored user's current role, including custom roles.
-      // An unprovisioned OIDC identity retains the role verified at sign-in.
-      let role = s?.role
-      if (s !== undefined) {
-        const u = provisioned(this.rbac, this.ssoUser(s.sub, s.email))
-        if (u !== undefined) role = u.role
-      }
+      // liveSession applies the current provisioned user's role; unprovisioned identities retain their verified role.
+      const role = s?.role
       if (s === undefined || role === undefined || (!isBuiltinRole(role) && customRole(this.rbac.roles ?? [], role) === undefined)) return { kind: "deny", res: denied(401, "the session expired; sign in again") }
       // a user-mode per-user flow is opened by its own user, whatever the user's role (the route checks the user again)
       if (req.method === "GET" && ownUserFlow(path, s.sub)) return { kind: "ok", actor: "sso:" + s.sub, role: role }
@@ -6356,7 +6359,7 @@ export class Ops {
         this.recordChange("sso:" + s.sub, req, path, 403, "")
         return { kind: "deny", res: denied(403, `role ${role} may not ${perm} this route`) }
       }
-      return { kind: "ok", actor: "sso:" + s.sub, role: role }
+      return { kind: "ok", actor: "sso:" + this.ssoUser(s.sub, s.email), role: role }
     }
     if (!this.authOn) return this.setupLock(req, path)
     // a temp token (client.mcp_enable_temp_token_auth) opens the per-user consent flow it was minted for
@@ -6424,14 +6427,14 @@ export class Ops {
     const cfg = this.store.cfg
     const gov = cfg.governance
     const auth = gov?.auth_config ?? cfg.auth_config
-    return auth?.is_enabled !== false && (gov?.users ?? []).length === 0 && (gov?.api_keys ?? []).length === 0 &&
+    return !this.oidcConfigured && auth?.is_enabled !== false && (gov?.users ?? []).length === 0 && (gov?.api_keys ?? []).length === 0 &&
       (auth?.username ?? auth?.admin_username ?? "") === "" &&
       (auth?.password ?? auth?.admin_password ?? "") === "" && (auth?.token ?? "") === ""
   }
 
   sessionStatus(bearer: string): { is_auth_enabled: bool, has_valid_token: bool, auth_type: string, administration_mode: string, inference_auth_enforced: bool, setup_required: bool, setup_token_configured: bool } {
-    return { is_auth_enabled: !this.loginlessAdministration() && this.authOn, has_valid_token: bearer !== "" && this.liveSession(bearer) !== undefined,
-      auth_type: !this.loginlessAdministration() && this.authOn ? "basic" : "none", inference_auth_enforced: this.engine.gov.enforce,
+    return { is_auth_enabled: !this.loginlessAdministration() && (this.authOn || this.oidcConfigured), has_valid_token: bearer !== "" && this.liveSession(bearer) !== undefined,
+      auth_type: !this.loginlessAdministration() ? (this.authOn ? "basic" : (this.oidcConfigured ? "oidc" : "none")) : "none", inference_auth_enforced: this.engine.gov.enforce,
       administration_mode: this.loginlessAdministration() ? "loginless" : "native",
       setup_required: this.setupRequired(), setup_token_configured: this.setupToken() !== "" }
   }
@@ -6442,7 +6445,7 @@ export class Ops {
     const out: string[] = []
     if (this.loginlessAdministration()) {
       out.push("loginless administration is enabled: /api/admin and the management /api routes are open to anyone who reaches this port; protect access with your external login or network boundary; inference authentication is unchanged")
-    } else if (!this.authOn) {
+    } else if (!this.authOn && !this.oidcConfigured) {
       if (!this.setupRequired()) out.push("dashboard credentials are disabled: management /api is locked; setup tokens cannot unlock a configured installation; configure native credentials or explicitly opt into loginless administration")
       else if (this.setupToken() !== "") out.push("no admin account is configured: /api is locked until one is created; send the setup token in the X-Raiju-Setup-Token header (POST /api/users creates the first admin)")
       else out.push("no admin account and no setup token are configured: /api is locked (403); set setup_token in config.json (or the RAIJU_SETUP_TOKEN env var) and restart to finish setup")
@@ -6484,7 +6487,7 @@ export class Ops {
   // configured, all non-public API routes return 403.
   setupLock(req: Request, path: string): Gate {
     if (setupPublic(path)) return { kind: "ok", actor: "anonymous" }
-    if (!this.setupRequired()) return { kind: "deny", res: denied(403, "dashboard credentials are disabled; configure native credentials or explicitly enable loginless administration in config.json") }
+    if (!this.setupRequired()) return { kind: "deny", res: denied(this.oidcConfigured ? 401 : 403, "management authentication is required; setup tokens cannot unlock a configured installation") }
     const want = this.setupToken()
     if (want === "") return { kind: "deny", res: denied(403, LOCKED_MESSAGE) }
     const given = req.headers.get("x-raiju-setup-token") ?? ""
@@ -6506,9 +6509,9 @@ export class Ops {
   // Checks whether the request carries a dashboard sign-in through a session token or admin credentials,
   // providing the identity for session-mode consent. With dashboard auth off, there is no such identity.
   consentSignedIn(req: Request): bool {
-    if (!this.authOn) return false
     const auth = req.headers.get("authorization") ?? ""
     if (auth.startsWith("Bearer sk-sess-")) return this.liveSession(auth.slice(7)) !== undefined
+    if (!this.authOn) return false
     return authorize(this.rbac, snapshot(req.headers), "GET", "/api/users/me/permissions").kind === "ok"
   }
 
@@ -8167,4 +8170,72 @@ test("the default administration mode remains native setup, never loginless", ()
   expect(ops.sessionStatus("").administration_mode).toBe("native")
   expect(ops.sessionStatus("").setup_required).toBe(true)
   expect(ops.mePermissions("loginless").status).toBe(401)
+})
+
+test("OIDC-only installations advertise auth, refuse setup bypass and accept only signed-in roles", () => {
+  const cfg: Config = { setup_token: "synthetic-setup", oidc: {
+    enabled: true, issuer: "https://idp.example.com", client_id: "test-client",
+    role_claim: "email", default_role: "viewer",
+  } }
+  const ops = try lockFor(cfg)
+  expect(ops.authOn).toBe(false)
+  const state = ops.sessionStatus("")
+  expect(state.is_auth_enabled).toBe(true)
+  expect(state.auth_type).toBe("oidc")
+  expect(state.setup_required).toBe(false)
+  expect(state.has_valid_token).toBe(false)
+  const hs: Record<string, string> = new Map()
+  expect(gateStatus(ops, "/api/users/me/permissions", hs)).toBe(401)
+  hs.set("x-raiju-setup-token", "synthetic-setup")
+  expect(gateStatus(ops, "/api/providers", hs)).toBe(401)
+  const token = try ops.sessions.create("external-sub", "viewer", Date.now(), "reader@example.com")
+  hs.set("authorization", "Bearer " + token)
+  expect(ops.sessionStatus(token).has_valid_token).toBe(true)
+  expect(gateStatus(ops, "/api/providers", hs)).toBe(200)
+  expect(ops.consentSignedIn(new Request("https://gw/api/providers", { headers: hs }))).toBe(true)
+  hs.delete("authorization")
+  hs.set("cookie", "raiju_session=" + token)
+  expect(gateStatus(ops, "/api/providers", hs)).toBe(401)
+})
+
+test("disabled OIDC keeps fresh native setup while malformed enabled OIDC stays locked", () => {
+  const disabled = try lockFor({ oidc: { enabled: false, issuer: "", client_id: "" } })
+  expect(disabled.setupRequired()).toBe(true)
+  expect(disabled.sessionStatus("").is_auth_enabled).toBe(false)
+  for (const raw of [
+    `{"setup_token":"synthetic-setup","oidc":{"enabled":true}}`,
+    `{"setup_token":"synthetic-setup","oidc":{"issuer":"","client_id":""}}`,
+  ]) {
+    let rejected = false
+    try {
+      try parseConfig(raw)
+    } catch (e) {
+      rejected = true
+    }
+    expect(rejected).toBe(true)
+  }
+  const ops = try lockFor({ setup_token: "synthetic-setup", oidc: { enabled: true, issuer: "", client_id: "" } })
+  expect(ops.setupRequired()).toBe(false)
+  expect(ops.sessionStatus("").is_auth_enabled).toBe(true)
+  const hs: Record<string, string> = new Map()
+  hs.set("x-raiju-setup-token", "synthetic-setup")
+  expect(gateStatus(ops, "/api/users", hs)).toBe(401)
+})
+
+test("provisioned OIDC sessions use current native role and scope and revoke on disable", () => {
+  const ops = try lockFor({ governance: {
+    users: [{ name: "reader", email: "reader@example.com", role: "regional-reader", projects: ["p-eu"] }],
+    roles: [{ name: "regional-reader", dac: "own-data", permissions: [{ resource: "Logs", operation: "View" }] }],
+  } })
+  const token = try ops.sessions.create("external-sub", "admin", Date.now(), "READER@example.com")
+  expect(ops.liveSession(token)?.role).toBe("regional-reader")
+  const hs: Record<string, string> = new Map()
+  hs.set("authorization", "Bearer " + token)
+  expect(gateStatus(ops, "/api/logs", hs)).toBe(200)
+  expect(gateStatus(ops, "/api/providers", hs)).toBe(403)
+  const gate = ops.gate(new Request("http://gw/api/logs", { headers: hs }), "/api/logs")
+  expect(gate.kind).toBe("ok")
+  if (gate.kind === "ok") expect(ops.scopeOfActor(gate.actor).projects).toEqual(["p-eu"])
+  ops.rbac.users[0]!.disabled = true
+  expect(ops.liveSession(token)).toBeUndefined()
 })

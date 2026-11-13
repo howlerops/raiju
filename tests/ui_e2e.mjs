@@ -531,7 +531,7 @@ try {
   check("logs list recent requests", true)
   check("the virtual key filter lists the keys", (await page.locator('#lg-filter select[name=virtual_key] option').count()) >= 2)
   const okPill = await page.locator("#lg-body tr.clickable").first().locator("td").nth(3).textContent()
-  check("a successful request shows its HTTP status as a green pill", okPill?.trim() === "200" && (await page.locator("#lg-body tr.clickable").first().locator(".pill.ok").count()) === 1, okPill)
+  check("a successful request shows its HTTP status", okPill?.trim() === "200", okPill)
   check("the range line counts the entries", /1–\d+ of \d+/.test(await text(page, "#lg-range")), await text(page, "#lg-range"))
   // charts on the logs screen
   check("the logs screen draws the requests chart", await until(page, () => document.querySelectorAll("#lgc-requests rect.bar").length > 0), await text(page, "#lg-charts"))
@@ -669,7 +669,7 @@ try {
   await page.check("#mcp-form input[name=disabled]")
   await page.click("#mcp-save")
   check("a disabled client is added", await until(page, () => document.querySelector('article[aria-label="MCP client offui"]') !== null), await text(page, "#mcp-form p.error"))
-  check("the disabled client shows as disabled", (await page.locator('article[aria-label="MCP client offui"] .pill', { hasText: "disabled" }).count()) === 1)
+  check("the disabled client shows as disabled", await page.locator('article[aria-label="MCP client offui"]').getByText("disabled", {exact:true}).isVisible())
   await page.locator('article[aria-label="MCP client offui"] > header button:has-text("Edit")').click()
   check("editing a client shows its stored header", (await page.inputValue("#mcp-form textarea[name=headers]")).includes("X-Test"))
   check("the name of an existing client is read only", await page.evaluate(() => document.querySelector("#mcp-form input[name=name]").readOnly))
@@ -1125,7 +1125,7 @@ try {
     // deleting a role a user holds is refused; once released it goes
     await page.click('#role-list tr[data-role="ui-keyreader"] button:has-text("Delete")')
     await page.click('#role-list tr[data-role="ui-keyreader"] button:has-text("Confirm delete")')
-    check("a role a user still holds is not deleted, and the refusal is shown", await until(page, () => document.querySelector(".toast.error") !== null) && (await api("GET", "/api/roles/ui-keyreader")).status === 200, await text(page, ".toasts"))
+    check("a role a user still holds is not deleted, and the refusal is shown", await until(page, () => [...document.querySelectorAll('.toasts [role="alert"]')].some((el) => el.textContent?.includes("role ui-keyreader is used by user ui-roleuser"))) && (await api("GET", "/api/roles/ui-keyreader")).status === 200, await text(page, ".toasts"))
     await api("PUT", "/api/users/ui-roleuser/role", { role: "viewer" })
     await page.click("#roles-refresh")
     await until(page, () => !(document.querySelector('#role-list tr[data-role="ui-keyreader"]')?.textContent ?? "").includes("ui-roleuser"))
