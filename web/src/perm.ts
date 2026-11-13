@@ -1,9 +1,12 @@
 // Frontend permissions mirror the native server's expanded permission pairs.
 import { createSignal } from "solid-js"
 import { send, ApiError } from "./api/client"
-import { adminToken, verified, revokeSession } from "./auth"
+import { adminToken, administrationMode, verified, revokeSession } from "./auth"
 
 export type Op = "View" | "Create" | "Update" | "Delete"
+// Shared with the role editor: built-in admin expands to every catalogue pair.
+export const RESOURCES = ["Logs", "MCPLogs", "AuditLogs", "ModelProvider", "Observability", "VirtualKeys", "Users", "MCPGateway", "Teams", "Customers", "BusinessUnits", "Projects", "RBAC", "AccessProfiles", "RoutingRules", "Governance", "Settings", "Cluster", "APIKeys", "Crews"]
+export const OPERATIONS = ["View", "Create", "Update", "Delete", "Download", "Reveal", "RunInference"]
 export interface Me {
   user: string
   role: string
@@ -23,11 +26,17 @@ export function can(resource: string, op: Op = "View"): boolean {
 }
 export async function verifyToken(token: string): Promise<Me> {
   const r = await send("GET", "/api/users/me/permissions", {
-    auth: false, quiet: true, headers: token ? { authorization: "Bearer " + token } : {},
+    auth: false, quiet: true, headers: administrationMode() === "native" && token ? { authorization: "Bearer " + token } : {},
   })
   const d = r.data as { user?: unknown; role?: unknown; built_in?: unknown; permissions?: unknown } | undefined
   if (r.status !== 200 || !d || typeof d.user !== "string" || !d.user || typeof d.role !== "string" || !d.role || typeof d.built_in !== "boolean" || !Array.isArray(d.permissions) || !d.permissions.every((p) => p && typeof p.resource === "string" && p.resource && typeof p.operation === "string" && p.operation)) {
     throw new Error("The gateway returned invalid permissions. Access remains locked.")
+  }
+  if (administrationMode() === "loginless") {
+    const pairs = new Set(d.permissions.map((p) => p.resource + ":" + p.operation))
+    if (d.user !== "loginless" || d.role !== "admin" || d.built_in !== true || !RESOURCES.every((resource) => OPERATIONS.every((operation) => pairs.has(resource + ":" + operation)))) {
+      throw new Error("The gateway did not return the loginless administrator permissions. Access remains locked.")
+    }
   }
   return { user: d.user, role: d.role, builtIn: d.built_in, pairs: d.permissions }
 }

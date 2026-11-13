@@ -1,6 +1,6 @@
 import { createSignal, For, lazy, Loading, Match, onSettled, Show, Switch, Errored } from "solid-js"
 import { send, ApiError } from "./api/client"
-import { dialog, dismissSignIn, openSignIn, setToken, tokenSet, verified, setVerified, revokeSession } from "./auth"
+import { administrationMode, configureAdministrationMode, dialog, dismissSignIn, openSignIn, setToken, tokenSet, verified, setVerified, revokeSession } from "./auth"
 import { can, me, refreshMe, roleLabel, verifyToken } from "./perm"
 import { notify, Toasts, type Tone } from "./ui"
 import { consoleConfig, switchGateway, target, targetLabel, targetURL } from "./gateway"
@@ -64,14 +64,18 @@ async function bootstrap(): Promise<void> {
   setVerified(false)
   try {
     const r = await send("GET", "/api/session/is-auth-enabled", { auth: false, quiet: true })
-    const d = r.data as { setup_required?: unknown; setup_token_configured?: unknown; is_auth_enabled?: unknown } | undefined
+    const d = r.data as { setup_required?: unknown; setup_token_configured?: unknown; is_auth_enabled?: unknown; administration_mode?: unknown } | undefined
     if (r.status !== 200 || !d || typeof d.setup_required !== "boolean" || (d.setup_required && typeof d.setup_token_configured !== "boolean")) throw new Error("Invalid setup status. Access remains locked.")
+    const mode = d.administration_mode === undefined ? "native" : d.administration_mode
+    if (mode !== "native" && mode !== "loginless") throw new Error("Invalid administration mode. Access remains locked.")
+    if (mode === "loginless" && (d.is_auth_enabled !== false || d.setup_required !== false)) throw new Error("Invalid loginless administration status. Access remains locked.")
+    configureAdministrationMode(mode)
     setSetup(d.setup_required ? { configured: d.setup_token_configured === true } : undefined)
     if (!d.setup_required) {
-      if (d.is_auth_enabled !== true) throw new Error("Native authentication is disabled on this gateway. Ask an operator to enable it; access remains locked.")
+      if (mode === "native" && d.is_auth_enabled !== true) throw new Error("Native authentication is disabled on this gateway without explicit loginless administration. Ask an operator to configure access; access remains locked.")
       try { await refreshMe(); setVerified(true) }
-      catch (e) { if (!(e instanceof ApiError && e.status === 401)) throw e }
-      checkSso()
+      catch (e) { if (mode === "loginless" || !(e instanceof ApiError && e.status === 401)) throw e }
+      if (mode === "native") checkSso()
     }
   } catch (e) { setBootstrapError(e instanceof Error ? e.message : String(e)) }
   finally { setChecked(true) }
@@ -214,8 +218,17 @@ export function App() {
     <Show when={checked() && !bootstrapError() && !setup() && verified()} fallback={
       <div class="auth-page">
         <Show when={checked()} fallback={<LoadingSkeleton variant="page" label="Checking gateway identity" />}>
-          <Show when={!bootstrapError()} fallback={<section class="card panel"><p class="error" role="alert">{bootstrapError()}</p><button class="btn" id="auth-retry" onClick={() => void bootstrap()}>Retry connection</button></section>}>
-            <Show when={setup()} fallback={<SignIn />}>{(st) => <Setup configured={st().configured} done={setupDone} />}</Show>
+          <Show when={!bootstrapError()} fallback={<section class="card panel"><p class="error" role="alert">{bootstrapError()}</p><Show when={administrationMode() === "loginless"}><p class="hint">Loginless administration requires upstream access controls. Access remains locked until this gateway's administrator permissions can be verified.</p></Show><button class="btn" id="auth-retry" onClick={() => void bootstrap()}>Retry connection</button></section>}>
+            <Show when={setup()} fallback={
+              <Show when={administrationMode() === "native"} fallback={
+                <section class="card panel auth-card">
+                  <h1>Loginless administration</h1>
+                  <p class="error" role="alert">Gateway access could not be verified. Access remains locked.</p>
+                  <p class="hint">This gateway requires upstream access controls. Check those controls or ask an operator to restore access.</p>
+                  <button class="btn" id="auth-retry" onClick={() => void bootstrap()}>Retry connection</button>
+                </section>
+              }><SignIn /></Show>
+            }>{(st) => <Setup configured={st().configured} done={setupDone} />}</Show>
           </Show>
         </Show>
       </div>
@@ -258,13 +271,22 @@ export function App() {
         </nav>
         <footer class="sidebar-footer">
           <ThemeControls />
-          <Show when={me()}>
-            {(m) => <span id="role-pill" class="badge badge-neutral" title="The role of the signed-in caller">{roleLabel(m())}</span>}
+          <Show when={administrationMode() === "loginless"} fallback={
+            <>
+              <Show when={me()}>
+                {(m) => <span id="role-pill" class="badge badge-neutral" title="The role of the signed-in caller">{roleLabel(m())}</span>}
+              </Show>
+              <button type="button" id="token-btn" class="btn btn-sm btn-outline w-full"
+                onClick={() => openSignIn("Enter credentials for " + targetLabel() + " only.")}>
+                {tokenSet() ? "Regional token: set" : "Sign in"}
+              </button>
+            </>
+          }>
+            <div id="loginless-administration" class="loginless-warning" role="note">
+              <strong>Loginless administration</strong>
+              <p>No native sign-in. Anyone who can reach this gateway has administrator access. Upstream access controls are required.</p>
+            </div>
           </Show>
-          <button type="button" id="token-btn" class="btn btn-sm btn-outline w-full"
-            onClick={() => openSignIn("Enter credentials for " + targetLabel() + " only. Submit a blank token to clear it.")}>
-            {tokenSet() ? "Regional token: set" : "Sign in"}
-          </button>
         </footer>
       </aside>
       <header class="console-heading top">
@@ -336,7 +358,7 @@ export function App() {
         }</Show>
       </main>
 
-      <Show when={dialog()}><div class="overlay"><SignIn account /></div></Show>
+      <Show when={administrationMode() === "native" && dialog()}><div class="overlay"><SignIn account /></div></Show>
     </div>
     </Show>
     <Toasts />

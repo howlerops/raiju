@@ -2,7 +2,7 @@
 // docs/openapi/management.yaml). The path and method pick the parameter,
 // body and response types.
 import type { paths } from "./schema"
-import { adminToken, revokeSession } from "../auth"
+import { adminToken, administrationMode, revokeSession } from "../auth"
 import { apiCredentials, discarded, gatewaySignal, isActive, targetLabel, targetURL } from "../gateway"
 
 export class ApiError extends Error {
@@ -51,7 +51,7 @@ function errorText(status: number, data: unknown, text: string, path: string): s
     else if (e && typeof e === "object") msg = String((e as { message?: unknown }).message ?? "")
   }
   if (msg) return msg
-  if (status === 401) return "Session expired. Sign in to continue."
+  if (status === 401) return administrationMode() === "loginless" ? "Loginless gateway access was rejected. Check upstream access controls." : "Session expired. Sign in to continue."
   if (text.trim()) return text.trim().slice(0, 300)
   return "Request failed with HTTP " + status
 }

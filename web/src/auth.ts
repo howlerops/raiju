@@ -1,5 +1,5 @@
-// Admin sign-in state: the bearer token (kept for this tab only) and the
-// sign-in dialog, which the HTTP client opens when a call returns 401.
+// Admin identity for this tab: native bearer credentials or explicitly configured loginless mode.
+// The HTTP client revokes verified access on management 401s; loginless never offers credential dialogs.
 import { createSignal } from "solid-js"
 import { consoleConfig, isActive, reloadTarget, target } from "./gateway"
 
@@ -35,8 +35,11 @@ let current = ""
 const [tokenSet, setTokenSet] = createSignal(current !== "")
 const [dialog, setDialog] = createSignal<{ message: string } | undefined>(undefined)
 
+export type AdministrationMode = "native" | "loginless"
+const [administrationMode, setAdministrationMode] = createSignal<AdministrationMode>("native")
+
 const [verified, setVerified] = createSignal(false)
-export { tokenSet, dialog, verified, setVerified }
+export { tokenSet, dialog, verified, setVerified, administrationMode }
 
 export function revokeSession(): void {
   setVerified(false)
@@ -50,13 +53,26 @@ export function initializeAuth(): void {
   setTokenSet(current !== "")
 }
 
+// This mode comes only from the public session status, never from a failed login.
+// Keep other regions' tab credentials intact, but never expose a native bearer in loginless mode.
+export function configureAdministrationMode(mode: AdministrationMode): void {
+  setVerified(false)
+  setDialog(undefined)
+  setAdministrationMode(mode)
+  if (mode === "loginless") {
+    writeToken("")
+    current = ""
+    setTokenSet(false)
+  }
+}
+
 export function adminToken(): string {
-  return current
+  return administrationMode() === "native" ? current : ""
 }
 
 
 export function setToken(t: string): void {
-  if (!isActive()) return
+  if (!isActive() || administrationMode() !== "native") return
   const changed = t !== current
   writeToken(t)
   current = t
@@ -66,6 +82,6 @@ export function setToken(t: string): void {
 }
 
 export function openSignIn(message: string): void {
-  if (isActive()) setDialog({ message })
+  if (isActive() && administrationMode() === "native") setDialog({ message })
 }
 export function dismissSignIn(): void { setDialog(undefined) }

@@ -24,17 +24,73 @@ The `http1` server remains single-process.
 ## Native administration sign-in
 
 Raiju serves its own first-admin setup and sign-in screens; an external identity
-proxy is optional, not a prerequisite. Until the selected gateway confirms a
-valid native identity and permission set, the console does not mount navigation,
-dashboard components, configuration forms or live sockets (including Fleet).
-An unavailable or malformed identity response fails closed. Deliberately disabled
-native authentication is an operator configuration error for this console, not
-an invitation to bootstrap a second administrator.
+proxy is optional, not a prerequisite. Native sign-in is the default. Until the
+selected gateway confirms its configured access mode and permissions, the console
+does not mount navigation, dashboard components, configuration forms or live
+sockets (including Fleet). An unavailable or malformed response fails closed.
+Disabling credentials alone does not enable anonymous administration.
 
 Initial setup requires the operator's setup token and creates an administrator,
 not a viewer/editor. The generated bearer is shown once and verified before the
 console opens; creating this account does not create a password. Keep the bearer
 securely for future token sign-ins, or configure an appropriate password/SSO user.
+
+### Set an initial password login
+
+There is no universal default username/password. An operator can preconfigure
+the first administrator before starting Raiju:
+
+```json
+{
+  "governance": {
+    "auth_config": {
+      "is_enabled": true,
+      "username": "env.RAIJU_ADMIN_USERNAME",
+      "password": "env.RAIJU_ADMIN_PASSWORD"
+    }
+  }
+}
+```
+
+Provide those environment variables through your secret manager or container
+environment; do not commit their values. This skips first-admin setup and allows
+native password sign-in. The local preview separately generates synthetic
+`preview` credentials at startup and writes them to
+`build/console-preview-access.json`; they are not product defaults.
+
+### Explicit loginless administration
+
+For self-managed access behind your own login gate, opt in before starting:
+
+```json
+{
+  "governance": {
+    "auth_config": {
+      "is_enabled": false,
+      "allow_unauthenticated_access": true
+    }
+  }
+}
+```
+
+Both settings are required. This opens the management API and console as an
+administrator to anyone who can reach the gateway; it is not merely a UI
+preference. Restrict the listener/network and require your external gate on
+**every** management path, including WebSocket upgrades. Do not expose a direct
+origin that bypasses it. Raiju does not learn individual user identity or roles
+from an external gate in this mode; actions share the loginless principal.
+Use the existing signed `auth_proxy` integration instead when native per-user
+identity, RBAC and attribution are required. A consolidated cross-origin console
+must also be able to reach your externally protected regional APIs; it does not
+forward browser cookies or invent an upstream SSO session.
+
+The server declares loginless mode explicitly and supplies its permission set.
+The console still verifies that response before opening and clears only the
+selected origin's stored native credential. Inference authorization and the
+separate metrics scrape policy are unchanged: explicitly configure
+`client.enforce_auth_on_inference` and `server.metrics_token` as appropriate.
+
+### Session and API enforcement
 
 Native password sessions use the user's current role and data scope. Unknown
 identities have no implicit administrator role. A protected management API 401

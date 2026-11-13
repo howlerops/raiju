@@ -48,7 +48,7 @@ type QuotaRateUsage = { kind: string, used: f64, limit: f64 }
 type QuotaRate = { id: string, token_max_limit?: int, token_reset_duration?: string, request_max_limit?: int, request_reset_duration?: string, usage: QuotaRateUsage[], source_type?: string, source_id?: string, source_name?: string }
 // One per-model limit of a key in the quota view; no provider means every provider.
 type QuotaModel = { model_name: string, provider?: string, budgets: QuotaBudget[], rate_limit?: QuotaRate }
-import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, takeUpgrades, THROTTLED, required, roleAllows, selfRoute, isBuiltinRole, customRole, provisioned, disabledNamed, anyRoleId, userByEmail, systemRole, customRoles } from "./rbac"
+import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, takeUpgrades, THROTTLED, required, roleAllows, selfRoute, isBuiltinRole, customRole, provisioned, disabledNamed, anyRoleId, builtinPairs, userByEmail, systemRole, customRoles } from "./rbac"
 import { DataScope, allScope, noScope, scopeOf, inScope } from "./scope"
 import { AuditEvent, AuditLog, actionFor, auditListJson, auditQueryOf, maskDetail, profileAuditJson } from "./audit"
 import { isCacheId } from "./cache"
@@ -1410,7 +1410,7 @@ export class Ops {
     if (owners.dir === "" && lsw !== undefined && lsw.enabled === true) owners.useDir(join(lsw.dir ?? "logs", "provider-objects"))
     const gov = cfg.governance
     const users: UserConfig[] = gov?.users ?? []
-    const auth = gov?.auth_config
+    const auth = gov?.auth_config ?? cfg.auth_config
     let legacy: UserConfig[] = []
     try {
       legacy = fromLegacy(auth).users
@@ -1430,7 +1430,7 @@ export class Ops {
       return who.kind === "user" ? who.name : undefined
     }
     // auth_config with only part of a credential still locks the API, as before
-    this.authOn = this.rbac.users.length > 0 || (gov?.api_keys ?? []).length > 0 || !checkAdmin(auth, new Map())
+    this.authOn = this.rbac.users.length > 0 || (gov?.api_keys ?? []).length > 0 || (auth?.is_enabled !== false && !checkAdmin(auth, new Map()))
     const ac = cfg.audit
     if (this.audit === undefined && ac !== undefined && ac.enabled === true) {
       try {
@@ -6283,6 +6283,7 @@ export class Ops {
 
   // For one resource, the role's entity_dac entry overrides the role's dac.
   scopeOfActorFor(actor: string, resource: string): DataScope {
+    if (actor === "loginless" && this.loginlessAdministration()) return allScope()
     const name = actor.startsWith("proxy:") ? actor.slice(6) : actor.startsWith("sso:") ? this.ssoUser(actor.slice(4), undefined) : actor
     const gov = this.store.cfg.governance
     for (const u of gov?.users ?? []) {
@@ -6332,8 +6333,9 @@ export class Ops {
 
   // Whether the caller may use this /api route; the actor names them in the audit log.
   gate(req: Request, path: string): Gate {
+    if (this.loginlessAdministration()) return { kind: "ok", actor: "loginless", role: "admin" }
     // client.whitelisted_routes: these exact paths skip authentication.
-    if ((this.store.cfg.client?.whitelisted_routes ?? []).includes(path)) return { kind: "ok", actor: "anonymous" }
+    if ((this.store.cfg.client?.whitelisted_routes ?? []).includes(path) && !(req.method === "PUT" && path.split("/").filter((s) => s !== "").join("/") === "api/config")) return { kind: "ok", actor: "anonymous" }
     const pg = this.proxyGate(req, path)
     if (pg !== undefined) return pg
     const auth = req.headers.get("authorization") ?? ""
@@ -6410,6 +6412,12 @@ export class Ops {
     return (process.env.RAIJU_SETUP_TOKEN ?? "").trim()
   }
 
+  // Only a saved, deliberate opt-in opens management. Disabled credentials alone remain locked.
+  loginlessAdministration(): bool {
+    const auth = this.store.cfg.governance?.auth_config ?? this.store.cfg.auth_config
+    return auth?.is_enabled === false && auth?.allow_unauthenticated_access === true
+  }
+
   // A disabled existing credential is not a new installation. Read the saved configuration:
   // resolution intentionally removes disabled legacy credentials from the effective auth state.
   setupRequired(): bool {
@@ -6421,9 +6429,10 @@ export class Ops {
       (auth?.password ?? auth?.admin_password ?? "") === "" && (auth?.token ?? "") === ""
   }
 
-  sessionStatus(bearer: string): { is_auth_enabled: bool, has_valid_token: bool, auth_type: string, inference_auth_enforced: bool, setup_required: bool, setup_token_configured: bool } {
-    return { is_auth_enabled: this.authOn, has_valid_token: bearer !== "" && this.liveSession(bearer) !== undefined,
-      auth_type: this.authOn ? "basic" : "none", inference_auth_enforced: this.engine.gov.enforce,
+  sessionStatus(bearer: string): { is_auth_enabled: bool, has_valid_token: bool, auth_type: string, administration_mode: string, inference_auth_enforced: bool, setup_required: bool, setup_token_configured: bool } {
+    return { is_auth_enabled: !this.loginlessAdministration() && this.authOn, has_valid_token: bearer !== "" && this.liveSession(bearer) !== undefined,
+      auth_type: !this.loginlessAdministration() && this.authOn ? "basic" : "none", inference_auth_enforced: this.engine.gov.enforce,
+      administration_mode: this.loginlessAdministration() ? "loginless" : "native",
       setup_required: this.setupRequired(), setup_token_configured: this.setupToken() !== "" }
   }
 
@@ -6431,8 +6440,11 @@ export class Ops {
   // anyone who can reach the port while inference authentication is not enforced.
   startupWarnings(): string[] {
     const out: string[] = []
-    if (!this.authOn) {
-      if (this.setupToken() !== "") out.push("no admin account is configured: /api is locked until one is created; send the setup token in the X-Raiju-Setup-Token header (POST /api/users creates the first admin)")
+    if (this.loginlessAdministration()) {
+      out.push("loginless administration is enabled: /api/admin and the management /api routes are open to anyone who reaches this port; protect access with your external login or network boundary; inference authentication is unchanged")
+    } else if (!this.authOn) {
+      if (!this.setupRequired()) out.push("dashboard credentials are disabled: management /api is locked; setup tokens cannot unlock a configured installation; configure native credentials or explicitly opt into loginless administration")
+      else if (this.setupToken() !== "") out.push("no admin account is configured: /api is locked until one is created; send the setup token in the X-Raiju-Setup-Token header (POST /api/users creates the first admin)")
       else out.push("no admin account and no setup token are configured: /api is locked (403); set setup_token in config.json (or the RAIJU_SETUP_TOKEN env var) and restart to finish setup")
     }
     if (!this.engine.gov.enforce) out.push("inference is not authenticated (client.enforce_auth_on_inference is off): anyone who reaches this port can use the provider keys")
@@ -6472,6 +6484,7 @@ export class Ops {
   // configured, all non-public API routes return 403.
   setupLock(req: Request, path: string): Gate {
     if (setupPublic(path)) return { kind: "ok", actor: "anonymous" }
+    if (!this.setupRequired()) return { kind: "deny", res: denied(403, "dashboard credentials are disabled; configure native credentials or explicitly enable loginless administration in config.json") }
     const want = this.setupToken()
     if (want === "") return { kind: "deny", res: denied(403, LOCKED_MESSAGE) }
     const given = req.headers.get("x-raiju-setup-token") ?? ""
@@ -6866,6 +6879,7 @@ export class Ops {
   // Unknown/anonymous actors carry no permissions. Session and proxy gates supply their
   // verified role explicitly; password/token users (including legacy admins) are looked up.
   mePairs(actor: string, verifiedRole?: string): { role: string, roleId?: int, builtIn: bool, pairs: PermissionPair[] } {
+    if (actor === "loginless" && this.loginlessAdministration()) return { role: "admin", roleId: anyRoleId([], "admin"), builtIn: true, pairs: builtinPairs("admin", RESOURCES, OPERATIONS) }
     if (actor.startsWith("key:")) return { role: "api_key", builtIn: false, pairs: this.heldOf(actor).pairs }
     let role = verifiedRole ?? (actor === "setup-token" ? "admin" : "")
     if (verifiedRole === undefined) {
@@ -7031,10 +7045,10 @@ export class Ops {
     // While no admin exists, creating the first account requires the operator's setup_token in the header
     // or a setup session from POST /api/session/setup.
     const want = this.setupToken()
-    if (method === "POST" && !this.authOn && want !== "" && !sameSecret(setupToken, want) && !validSetupSession(setupSession, want, Date.now())) {
+    if (method === "POST" && this.setupRequired() && want !== "" && !sameSecret(setupToken, want) && !validSetupSession(setupSession, want, Date.now())) {
       return { status: 403, body: errorJson("the setup token is required to create the first admin account", "invalid_request_error", undefined), contentType: "application/json" }
     }
-    if (method === "POST" && path === "/api/users" && !this.authOn) {
+    if (method === "POST" && path === "/api/users" && this.setupRequired()) {
       try {
         if (rawStr(try fields(body), "role") !== "admin") return badRequest("the first account must have the admin role")
       } catch (e) {
@@ -8083,4 +8097,74 @@ test("first-account setup cannot strand the installation with a non-admin user",
   const ops = try lockFor({ setup_token: "synthetic-setup" })
   expect(ops.users("POST", "/api/users", `{"name":"viewer","role":"viewer"}`, "synthetic-setup", "").status).toBe(400)
   expect(ops.store.cfg.governance?.users?.length ?? 0).toBe(0)
+})
+
+test("disabled-only native administration cannot use setup tokens or anonymous config writes", () => {
+  const hs: Record<string, string> = new Map()
+  hs.set("x-raiju-setup-token", "synthetic-disabled-setup")
+  const ops = try lockFor({ setup_token: "synthetic-disabled-setup", governance: { auth_config: { is_enabled: false } } })
+  expect(ops.sessionStatus("").administration_mode).toBe("native")
+  expect(ops.setupRequired()).toBe(false)
+  expect(gateStatus(ops, "/api/providers", hs)).toBe(403)
+  expect(ops.mePermissions("loginless").status).toBe(401)
+  expect(ops.mayReveal("loginless")).toBe(false)
+  const native = try lockFor({ governance: { auth_config: { token: "synthetic-native-admin" } }, client: { whitelisted_routes: ["/api/config"] } })
+  const g = native.gate(new Request("http://gw/api/config", { method: "PUT" }), "/api/config")
+  expect(g.kind).toBe("deny")
+  expect(native.sessionStatus("").administration_mode).toBe("native")
+})
+
+test("explicit loginless administration grants a deliberate native admin principal, writes, reveal and all-data scope", () => {
+  const raw = `{"setup_token":"synthetic-unused-setup","governance":{"auth_config":{"is_enabled":false,"allow_unauthenticated_access":true},"users":[{"name":"loginless","role":"viewer"}],"roles":[{"name":"admin","permissions":[]}],"virtual_keys":[{"id":"k","value":"sk-raiju-loginless-inference"}]},"client":{"enforce_auth_on_inference":true},"server":{"metrics_token":"synthetic-metrics"}}`
+  const ops = new Ops(new Engine(try parseConfig(raw)), new ConfigStore("/tmp/raiju-loginless-state.json", try JSON.parse(raw) as Config))
+  const state = ops.sessionStatus("")
+  expect(state.administration_mode).toBe("loginless")
+  expect(state.is_auth_enabled).toBe(false)
+  expect(state.auth_type).toBe("none")
+  expect(state.setup_required).toBe(false)
+  expect(state.inference_auth_enforced).toBe(true)
+  expect(ops.metricsOpen()).toBe(false)
+  for (const method of ["GET", "POST", "PUT", "DELETE"]) {
+    const g = ops.gate(new Request("http://gw/api/providers", { method: method }), "/api/providers")
+    expect(g.kind).toBe("ok")
+    if (g.kind === "ok") {
+      expect(g.actor).toBe("loginless")
+      expect(g.role).toBe("admin")
+    }
+  }
+  const me = try JSON.parse(ops.mePermissions("loginless").body) as { user: string, role: string, built_in: bool, permissions: PermissionDoc[] }
+  expect(me.user).toBe("loginless")
+  expect(me.role).toBe("admin")
+  expect(me.built_in).toBe(true)
+  expect(me.permissions.length > 0).toBe(true)
+  expect(ops.mePermissionMap("loginless").status).toBe(200)
+  expect(ops.mayReveal("loginless")).toBe(true)
+  expect(ops.scopeOfActor("loginless").all).toBe(true)
+  expect(ops.mePermissions("anonymous").status).toBe(401)
+  expect(ops.startupWarnings().some((w) => w.includes("/api/admin") && w.includes("open"))).toBe(true)
+  expect(ops.engine.gov.admit(new Map(), "openai", "m").kind).toBe("denial")
+  const vk: Hdrs = new Map()
+  vk.set("x-raiju-vk", "sk-raiju-loginless-inference")
+  expect(ops.engine.gov.admit(vk, "openai", "m").kind).toBe("grant")
+})
+
+test("loginless management does not require setup to create a user", () => {
+  const path = "/tmp/raiju-loginless-users.json"
+  try {
+    const cfg: Config = { setup_token: "synthetic-not-needed", governance: { auth_config: { is_enabled: false, allow_unauthenticated_access: true } } }
+    const ops = new Ops(new Engine(cfg), new ConfigStore(path, cfg))
+    expect(ops.users("POST", "/api/users", `{"name":"viewer","role":"viewer"}`, "", "").status).toBe(201)
+    expect(ops.setupRequired()).toBe(false)
+    expect(ops.loginlessAdministration()).toBe(true)
+  } finally {
+    try rmSync(path, { force: true })
+    try rmSync(path + ".bak", { force: true })
+  }
+})
+
+test("the default administration mode remains native setup, never loginless", () => {
+  const ops = try lockFor({ setup_token: "synthetic-default-setup" })
+  expect(ops.sessionStatus("").administration_mode).toBe("native")
+  expect(ops.sessionStatus("").setup_required).toBe(true)
+  expect(ops.mePermissions("loginless").status).toBe(401)
 })

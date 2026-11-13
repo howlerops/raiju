@@ -4,7 +4,7 @@
 import { createMemo, createSignal, Errored, For, Loading, refresh, Show } from "solid-js"
 import { LoadingSkeleton } from "../LoadingSkeleton"
 import { message, send } from "../api/client"
-import { can } from "../perm"
+import { can, RESOURCES, OPERATIONS } from "../perm"
 import { Can, DangerButton, ErrP, FormError, initChecked, initSelected, initValue, Mono, notify, Table, Toolbar, useFormRun, useRun } from "../ui"
 
 interface Pair {
@@ -42,9 +42,6 @@ interface Data {
   users: User[] | undefined
 }
 
-// The catalogue a role without Settings / View cannot read; the editor falls back to these.
-const RESOURCES = ["Logs", "MCPLogs", "AuditLogs", "ModelProvider", "Observability", "VirtualKeys", "Users", "MCPGateway", "Teams", "Customers", "BusinessUnits", "Projects", "RBAC", "AccessProfiles", "RoutingRules", "Governance", "Settings", "Cluster", "APIKeys", "Crews"]
-const OPERATIONS = ["View", "Create", "Update", "Delete", "Download", "Reveal", "RunInference"]
 const DACS: [string, string][] = [
   ["", "Default"],
   ["own-data", "Own data"],

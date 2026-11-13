@@ -8,6 +8,13 @@ Waves 31 and 32 (L212 to L219) closed the known gaps listed after wave 30, fixed
   sign-out revokes native sessions and clears the regional tab credential.
   The primary login omits gateway selection, raw endpoints and appearance
   controls; these remain in the authenticated sidebar.
+  Operators may explicitly opt into loginless administration using both
+  `governance.auth_config.is_enabled:false` and
+  `governance.auth_config.allow_unauthenticated_access:true`; disabled credentials
+  alone remain locked. Loginless opens the management API as well as the UI and
+  requires operator-supplied access controls. Inference and metrics policies
+  remain independent. Initial native password credentials can be supplied using
+  environment references; there is no universal default password.
   Native authorization now preserves current session roles/data scope and
   ignores empty SSO email aliases instead of matching an unrelated account.
   Existing-but-disabled auth is not fresh setup (`setup_required:false`);
