@@ -1,24 +1,27 @@
 import { defineConfig } from "vite"
 import solid from "vite-plugin-solid"
+import tailwindcss from "@tailwindcss/vite"
 
 // The dev server proxies the gateway's routes, so `bun run dev` works against a
 // running gateway (RAIJU_GATEWAY, default http://127.0.0.1:8080).
 const gateway = process.env.RAIJU_GATEWAY ?? "http://127.0.0.1:8080"
 
 export default defineConfig({
-  plugins: [solid()],
+  plugins: [solid(), tailwindcss()],
   build: {
     target: "es2022",
     outDir: "dist",
     emptyOutDir: true,
     assetsDir: "assets",
-    // one stylesheet and one script keep the embedded table small
+    // Share one stylesheet; screens load as independent cached JS chunks.
     cssCodeSplit: false,
     sourcemap: false,
     chunkSizeWarningLimit: 600,
   },
   server: {
     proxy: {
+      // Preserve the native 404 (embedded mode), never Vite's HTML SPA fallback.
+      "/console.json": gateway,
       "/api": gateway,
       "/health": gateway,
       "/metrics": gateway,

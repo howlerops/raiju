@@ -6,6 +6,7 @@ import { createMemo, createSignal, createStore, For, refresh, Show, snapshot, un
 import { send } from "../api/client"
 import { can } from "../perm"
 import { DangerButton, FormError, Guard, initChecked, initValue, notify, Pill, Toolbar, tf, useFormRun } from "../ui"
+import { targetURL } from "../gateway"
 
 interface VTool {
   source: string
@@ -125,12 +126,12 @@ function McpForm(props: { current: VMcp | undefined; opts: Opts; onClose: () => 
     })
   }
   return (
-    <form id="vm-form" class="card" aria-labelledby="vm-form-title" onSubmit={submit}>
+    <form id="vm-form" class="card panel bg-base-100 border border-base-300" aria-labelledby="vm-form-title" onSubmit={submit}>
       <h2 id="vm-form-title">{cur ? "Edit " + cur.name : "New virtual MCP"}</h2>
       <div class="form-grid">
         <label>
           Name
-          <input
+          <input class="input input-sm"
             name="name"
             required
             autocomplete="off"
@@ -144,7 +145,7 @@ function McpForm(props: { current: VMcp | undefined; opts: Opts; onClose: () => 
         </label>
         <label class="wide">
           Description
-          <input name="description" autocomplete="off" ref={initValue(cur?.description ?? "")} />
+          <input class="input input-sm" name="description" autocomplete="off" ref={initValue(cur?.description ?? "")} />
         </label>
       </div>
       <fieldset style="margin-top:12px">
@@ -160,7 +161,7 @@ function McpForm(props: { current: VMcp | undefined; opts: Opts; onClose: () => 
           <For each={rows.tools}>
             {(row, i) => (
               <div class="rule">
-                <input
+                <input class="input input-sm"
                   aria-label="Source tool"
                   list="vm-sources"
                   placeholder="client-tool or client-*"
@@ -168,8 +169,8 @@ function McpForm(props: { current: VMcp | undefined; opts: Opts; onClose: () => 
                   value={row.source}
                   onInput={(e) => setRows((s) => void (s.tools[i()]!.source = e.currentTarget.value))}
                 />
-                <input aria-label="Renamed as" placeholder="as (optional)" autocomplete="off" value={row.as} onInput={(e) => setRows((s) => void (s.tools[i()]!.as = e.currentTarget.value))} />
-                <input
+                <input class="input input-sm" aria-label="Renamed as" placeholder="as (optional)" autocomplete="off" value={row.as} onInput={(e) => setRows((s) => void (s.tools[i()]!.as = e.currentTarget.value))} />
+                <input class="input input-sm"
                   aria-label="Tool description"
                   placeholder="description (optional)"
                   autocomplete="off"
@@ -178,30 +179,30 @@ function McpForm(props: { current: VMcp | undefined; opts: Opts; onClose: () => 
                 />
                 <input
                   aria-label="Argument defaults"
-                  class="mono"
+                  class="input input-sm mono"
                   placeholder='defaults, e.g. {"limit": 10}'
                   autocomplete="off"
                   spellcheck={false}
                   value={row.defaults}
                   onInput={(e) => setRows((s) => void (s.tools[i()]!.defaults = e.currentTarget.value))}
                 />
-                <button type="button" class="ghost" onClick={() => setRows((s) => void s.tools.splice(i(), 1))}>
+                <button type="button" class="btn btn-sm btn-ghost" onClick={() => setRows((s) => void s.tools.splice(i(), 1))}>
                   Remove
                 </button>
               </div>
             )}
           </For>
         </div>
-        <button type="button" id="vm-add-tool" class="ghost" onClick={() => setRows((s) => void s.tools.push({ source: "", as: "", description: "", defaults: "" }))}>
+        <button type="button" id="vm-add-tool" class="btn btn-sm btn-ghost" onClick={() => setRows((s) => void s.tools.push({ source: "", as: "", description: "", defaults: "" }))}>
           Add tool
         </button>
       </fieldset>
       <FormError text={error()} />
       <div class="actions">
-        <button type="button" id="vm-cancel" class="ghost" onClick={props.onClose}>
+        <button type="button" id="vm-cancel" class="btn btn-sm btn-ghost" onClick={props.onClose}>
           Cancel
         </button>
-        <button type="submit" id="vm-save" class="primary" disabled={busy()}>
+        <button type="submit" id="vm-save" class="btn btn-sm btn-primary" disabled={busy()}>
           {cur ? "Save changes" : "Create virtual MCP"}
         </button>
       </div>
@@ -243,7 +244,7 @@ function Checks(props: { legend: string; name: string; items: Named[]; chosen: s
           <For each={props.items} keyed={(i) => i.id}>
             {(it) => (
               <label class="check">
-                <input type="checkbox" name={props.name} value={it().id} ref={initChecked(props.chosen.includes(it().id))} /> {label(it())}
+                <input class="checkbox checkbox-sm" type="checkbox" name={props.name} value={it().id} ref={initChecked(props.chosen.includes(it().id))} /> {label(it())}
               </label>
             )}
           </For>
@@ -289,12 +290,12 @@ function GroupForm(props: { current: VMcp | undefined; opts: Opts; onClose: () =
     })
   }
   return (
-    <form id="tg-form" class="card" aria-labelledby="tg-form-title" onSubmit={submit}>
+    <form id="tg-form" class="card panel bg-base-100 border border-base-300" aria-labelledby="tg-form-title" onSubmit={submit}>
       <h2 id="tg-form-title">{cur ? "Edit tool group " + cur.name : "New tool group"}</h2>
       <div class="form-grid">
         <label>
           Name
-          <input
+          <input class="input input-sm"
             name="name"
             required
             autocomplete="off"
@@ -307,7 +308,7 @@ function GroupForm(props: { current: VMcp | undefined; opts: Opts; onClose: () =
         </label>
         <label class="wide">
           Description
-          <input name="description" autocomplete="off" ref={initValue(cur?.description ?? "")} />
+          <input class="input input-sm" name="description" autocomplete="off" ref={initValue(cur?.description ?? "")} />
         </label>
       </div>
       <fieldset style="margin-top:12px">
@@ -322,7 +323,7 @@ function GroupForm(props: { current: VMcp | undefined; opts: Opts; onClose: () =
           <For each={rows.tools}>
             {(row, i) => (
               <div class="rule">
-                <select aria-label="MCP client" onChange={(e) => setRows((s) => void (s.tools[i()]!.client = e.currentTarget.value))}>
+                <select class="select select-sm" aria-label="MCP client" onChange={(e) => setRows((s) => void (s.tools[i()]!.client = e.currentTarget.value))}>
                   <option value="" selected={!row.client}>
                     Choose MCP client
                   </option>
@@ -334,21 +335,21 @@ function GroupForm(props: { current: VMcp | undefined; opts: Opts; onClose: () =
                     )}
                   </For>
                 </select>
-                <input
+                <input class="input input-sm"
                   aria-label="Tool names"
                   placeholder="* for all, or a comma list"
                   autocomplete="off"
                   value={row.tools}
                   onInput={(e) => setRows((s) => void (s.tools[i()]!.tools = e.currentTarget.value))}
                 />
-                <button type="button" class="ghost" onClick={() => setRows((s) => void s.tools.splice(i(), 1))}>
+                <button type="button" class="btn btn-sm btn-ghost" onClick={() => setRows((s) => void s.tools.splice(i(), 1))}>
                   Remove
                 </button>
               </div>
             )}
           </For>
         </div>
-        <button type="button" id="tg-add-tool" class="ghost" onClick={() => setRows((s) => void s.tools.push({ client: "", tools: "*" }))}>
+        <button type="button" id="tg-add-tool" class="btn btn-sm btn-ghost" onClick={() => setRows((s) => void s.tools.push({ client: "", tools: "*" }))}>
           Add client
         </button>
       </fieldset>
@@ -359,10 +360,10 @@ function GroupForm(props: { current: VMcp | undefined; opts: Opts; onClose: () =
       <Checks legend="Providers" name="g-provider" items={props.opts.providers.map((p) => ({ id: p }))} chosen={[]} />
       <FormError text={error()} />
       <div class="actions">
-        <button type="button" id="tg-cancel" class="ghost" onClick={props.onClose}>
+        <button type="button" id="tg-cancel" class="btn btn-sm btn-ghost" onClick={props.onClose}>
           Cancel
         </button>
-        <button type="submit" id="tg-save" class="primary" disabled={busy()}>
+        <button type="submit" id="tg-save" class="btn btn-sm btn-primary" disabled={busy()}>
           {cur ? "Save changes" : "Create tool group"}
         </button>
       </div>
@@ -387,14 +388,14 @@ function McpCard(props: { m: VMcp; res: Resolved | undefined; keys: Named[]; mod
     }
   }
   return (
-    <article class="card" aria-label={(props.mode === "group" ? "Tool group " : "Virtual MCP ") + props.m.name}>
+    <article class="card panel bg-base-100 border border-base-300" aria-label={(props.mode === "group" ? "Tool group " : "Virtual MCP ") + props.m.name}>
       <header class="toolbar" style="margin-bottom:8px">
         <h3>{props.m.name}</h3>
         <Pill>{props.m.tools.length + (props.m.tools.length === 1 ? " tool" : " tools")}</Pill>
-        <span class="hint mono grow">{"/mcp/" + props.m.name}</span>
+        <span class="hint mono grow">{targetURL("/mcp/" + encodeURIComponent(props.m.name))}</span>
         <span class="row-actions">
           <Show when={writable()}>
-            <button type="button" class="ghost" onClick={props.onEdit}>
+            <button type="button" class="btn btn-sm btn-ghost" onClick={props.onEdit}>
               Edit
             </button>
           </Show>
@@ -421,7 +422,7 @@ function McpCard(props: { m: VMcp; res: Resolved | undefined; keys: Named[]; mod
       <h4>Tools served</h4>
       <Show when={props.res && props.res.tools.length} fallback={<p class="hint">{props.m.tools.length ? "None of its tools is available yet." : "No tools yet."}</p>}>
         <div class="tool-chips">
-          <For each={props.res!.tools}>{(t) => <span class="pill mono">{t}</span>}</For>
+          <For each={props.res!.tools}>{(t) => <span class="badge badge-neutral mono">{t}</span>}</For>
         </div>
       </Show>
       <h4>Virtual keys that may use it</h4>
@@ -430,7 +431,7 @@ function McpCard(props: { m: VMcp; res: Resolved | undefined; keys: Named[]; mod
           <For each={props.keys} keyed={(k) => k.id}>
             {(k) => (
               <label class="check">
-                <input
+                <input class="checkbox checkbox-sm"
                   type="checkbox"
                   aria-label={"Allow key " + k().id}
                   disabled={!can("MCPGateway", "Create") && !can("MCPGateway", "Delete")}
@@ -463,7 +464,7 @@ export function VirtualMcp() {
           <button
             type="button"
             id="vm-mode-mcp"
-            class="toggle"
+            class="btn btn-sm tool-toggle"
             aria-pressed={tf(mode() === "mcp")}
             onClick={() => {
               setMode("mcp")
@@ -475,7 +476,7 @@ export function VirtualMcp() {
           <button
             type="button"
             id="vm-mode-group"
-            class="toggle"
+            class="btn btn-sm tool-toggle"
             aria-pressed={tf(mode() === "group")}
             onClick={() => {
               setMode("group")
@@ -486,7 +487,7 @@ export function VirtualMcp() {
           </button>
         </span>
         <Show when={can("MCPGateway", "Create")}>
-          <button type="button" id="vm-new" class="primary" onClick={() => setEditor({ m: undefined })}>
+          <button type="button" id="vm-new" class="btn btn-sm btn-primary" onClick={() => setEditor({ m: undefined })}>
             {mode() === "mcp" ? "New virtual MCP" : "New tool group"}
           </button>
         </Show>
@@ -507,7 +508,7 @@ export function VirtualMcp() {
           }
         </Show>
         <div id="vm-list">
-          <Show when={data().mcps.length} fallback={<p class="card muted">{mode() === "mcp" ? "No virtual MCPs yet." : "No tool groups yet."}</p>}>
+          <Show when={data().mcps.length} fallback={<p class="card panel bg-base-100 border border-base-300 muted">{mode() === "mcp" ? "No virtual MCPs yet." : "No tool groups yet."}</p>}>
             <For each={data().mcps} keyed={(m) => m.name}>
               {(m) => <McpCard m={m()} res={data().resolved[m().name]} keys={data().opts.keys} mode={mode()} onEdit={() => setEditor({ m: m() })} onChange={reload} />}
             </For>

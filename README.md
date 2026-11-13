@@ -503,3 +503,109 @@ when they are stale. The gateway serves the page with `Cache-Control: no-cache` 
 hashed files under `/assets/` as immutable, and gzip to clients that accept it. To serve the UI from
 a directory instead of the binary (a dev build, or a CDN copy), set `RAIJU_UI_DIR=/path/to/dist`;
 files there are revalidated on every request.
+
+### One console, independent gateways
+
+Raiju's optional consolidated console manages any operator-configured gateways;
+customer names, cloud accounts, regions and endpoints belong in deployment values,
+not product defaults. It does **not** join gateways into one cluster, synchronize
+their configurations or proxy inference between them.
+
+On the instance serving the console, set `RAIJU_CONSOLE_CONFIG` to a read-only JSON
+file containing **public metadata only**:
+
+```json
+{
+  "gateways": [
+    {"id": "europe", "name": "Europe", "url": "https://gateway-europe.example.com"},
+    {"id": "america", "name": "America", "url": "https://gateway-america.example.com"}
+  ],
+  "defaultGateway": "europe"
+}
+```
+
+The host serves this as `/console.json` and permits only the configured gateway
+origins in its page's connection policy. Restart after changing the file.
+Missing configuration preserves the normal single-gateway UI; invalid configured
+metadata fails closed. Origins require HTTPS; plain HTTP is accepted only on
+loopback for local preview. URLs must not contain credentials, query strings,
+fragments or a non-root path. No provider/admin tokens belong in this file.
+
+On **each target gateway**, add the exact console origin to
+`client.allowed_origins`, for example `["https://console.example.com"]`.
+Publish `GET /health`, `GET /ready`, management `/api` including preflight,
+ticket-authenticated `/ws`, and the exact Playground models/chat routes including
+their preflights through the protected UI ingress. Keep the public inference
+ingress separate. CORS does not authenticate a request: native setup, login, RBAC
+and inference virtual-key enforcement still apply.
+
+The Fleet health page reads only public health/readiness status. Regional
+configuration, credentials, logs and inference stay behind explicit target
+selection. HTTP calls go directly from the browser to that origin, omit cookies
+in console mode and reject redirects. Sign-in tokens are scoped by canonical
+gateway origin in tab-only session storage. Switching gateway or identity reloads
+the document, discarding forms, fetched data and live sockets. Writes and
+Playground requests never fan out or fall back to another gateway.
+
+Browser WebSockets may attach ambient cookies; cross-origin live feeds require a
+one-use regional ticket and an explicitly permitted Origin rather than trusting
+those cookies. SSO links open the target's regional UI: they do not transfer an
+SSO cookie into a cross-origin console session. Use native password login or a
+regional bearer token in the console.
+
+This avoids moving data through another gateway's server; an authorized
+administrator's browser still receives the selected gateway's data. It does not
+enforce the administrator's physical location or replace deployment-specific
+residency/IAM/egress policy.
+
+Helm supports the same public manifest through `console.gateways` and
+`console.defaultGateway`. Empty defaults keep ordinary single-gateway behavior.
+The manifest has its own read-only ConfigMap mount, independent of the mutable
+inference configuration and data volume.
+
+### Local-only consolidated preview
+
+Build the UI and a native image, and have `python:3.12-slim` available locally:
+
+```sh
+make web
+docker build -t raiju:console-preview .
+python3 scripts/preview_console.py --image raiju:console-preview
+```
+
+Open **http://127.0.0.1:4173**. The runner prints distinct synthetic regional
+username/password credentials; Playground keys and tokens are in the private
+`build/console-preview-access.json` file. It starts a real native console and two
+real two-worker gateways with independent state. Provider responses come from
+local mock servers, never a paid provider. All published ports bind loopback.
+Gateways and mocks stay on separate internal Docker networks, blocking external
+and gateway-to-gateway egress. Fixture-only, fixed-upstream TCP relays expose
+those internal listeners on Docker engines that cannot publish internal-network
+ports; they do not aggregate APIs or route requests between gateways.
+The runner never reads `.env`, imports host AWS/provider credentials, pulls or
+publishes images, or accesses a cluster. Stop with Ctrl+C to remove its disposable
+containers, volumes, networks and fixture credentials. No merge is needed.
+
+For frontend iteration against a prebuilt image, start with
+`python3 scripts/preview_console.py --image raiju:console-preview --ui-dir web/dist`.
+The runner snapshots the build instead of mounting Vite's mutable output.
+After rebuilding, run `python3 scripts/publish_preview_ui.py --source web/dist`:
+it publishes assets before the new HTML and retains old hashed chunks for tabs
+already open. A rebuild alone does not change the running preview. The snapshot
+and retained assets are removed when the runner stops. Do not bind-mount a build
+directory that is deleted/replaced under an active browser.
+
+Production rolling deployments need the same immutable-asset availability
+contract: serve previous asset versions through shared/versioned static hosting
+for the supported tab lifetime. A rolling fleet of embedded binaries alone does
+not guarantee that a new replica can serve an old tab's lazy chunk.
+
+The repeatable browser regression is `scripts/check_console.sh <built-image>`
+with Playwright 1.56.1/Chromium available (`NODE_PATH=$(npm root -g)`).
+Set `RAIJU_PREVIEW_SERVER=http1` to exercise the alternate native transport; the
+default tests two-worker Bun gateways. CI runs both against the newly built image.
+The proof covers regional login, isolated edits/sessions, exact-origin CORS/CSP,
+targeted local inference/live sockets, partial outages, invalid manifests and
+explicit recovery after a configured target is removed. While an interactive
+preview is running, use `node tests/console_e2e.mjs` against that fixture instead
+of starting a second runner. `PLAYWRIGHT_CHANNEL=chrome` selects an installed Chrome.

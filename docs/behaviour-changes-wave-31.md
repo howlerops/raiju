@@ -2,6 +2,66 @@
 
 Waves 31 and 32 (L212 to L219) closed the known gaps listed after wave 30, fixed the seventh production re-audit (docs/audits/production-reaudit-7-2026-10-31.md) and made the CI image job run on pull requests. Read this before upgrading a deployment.
 
+- **Native administration gate**: first-admin setup and verified native sign-in
+  now precede the entire console, including Fleet. Unknown or malformed identity
+  responses never default to admin. Rejected sessions remove protected views;
+  sign-out revokes native sessions and clears the regional tab credential.
+  The primary login omits gateway selection, raw endpoints and appearance
+  controls; these remain in the authenticated sidebar.
+  Operators may explicitly opt into loginless administration using both
+  `governance.auth_config.is_enabled:false` and
+  `governance.auth_config.allow_unauthenticated_access:true`; disabled credentials
+  alone remain locked. Loginless opens the management API as well as the UI and
+  requires operator-supplied access controls. Inference and metrics policies
+  remain independent. Initial native password credentials can be supplied using
+  environment references; there is no universal default password.
+  Native authorization now preserves current session roles/data scope and
+  ignores empty SSO email aliases instead of matching an unrelated account.
+  Existing-but-disabled auth is not fresh setup (`setup_required:false`);
+  its setup exchange returns 409. A non-admin first account is rejected with 400.
+  Explicit API/inference auth opt-outs and the separate metrics-token policy
+  remain operator-controlled; see `docs/operations.md`.
+
+- **Native OIDC-only administration**: a configured identity provider can supply
+  the first identity without creating a local password/token account. Management
+  stays closed until sign-in; setup tokens cannot bypass configured SSO.
+  `oidc.allowed_email_domains` adds exact verified-email admission, and email
+  role-map keys can resolve operator-managed environment references. SSO returns
+  an origin-scoped native bearer; it does not create cookie-based administration.
+  Same-origin SSO uses the current tab; remote SSO opens that region's own console
+  without forwarding regional sessions. Local-account sign-in stays available as
+  an explicit alternative when configured.
+
+- **Dashboard presentation**: desktop navigation is now a persistent sidebar,
+  with a compact header, roomier cards/tables and a responsive horizontal
+  navigation strip on smaller screens. Fleet summary counts come only from
+  configured gateways and current public readiness probes; no regional
+  inference or usage data is aggregated. Targeting remains regional.
+  Same-region hash routes preserve the sidebar/header, including during regional
+  bootstrap. Screens are lazy-loaded JS chunks with a route-local loading/error
+  boundary reset on navigation; existing widget boundaries let ready data render
+  independently of slower widgets. Back/forward navigation stays client-side.
+  Region and identity changes still deliberately reload the whole document.
+  Appearance offers labeled System/Light/Dark icon buttons, persists locally and follows OS changes
+  in System mode. Tailwind 4 and daisyUI 5 provide the actual buttons, form
+  controls, badges, cards, statistics and tables. Built-in Garden supplies the
+  light palette and built-in Dark supplies dark mode; custom palette overrides
+  and the earlier Party Rock hard-shadow styling are removed.
+  Solid 2 and the embedded static build remain; no React or component JS runtime
+  is introduced. Both explicit and OS-following modes share the daisyUI tokens.
+  Gateway selection, origin, health, isolation details, appearance and account
+  controls live in a persistent sidebar; the content header shows only the page.
+  Navigation scrolls independently on shorter desktops, while narrow screens
+  keep all controls accessible in a stacked layout.
+  Local frontend overrides are now published into disposable snapshots: new
+  assets precede the new HTML, and previous hashed chunks remain available for
+  open tabs. Rebuilding Vite's output alone no longer changes the running preview.
+  Noncompact loading states use accessible daisyUI skeletons for pages, forms,
+  tables and content, including bootstrap and pending Playground responses.
+  Component-local boundaries remain independent. Buttons, compact status badges,
+  empty states and errors retain their existing behavior; reduced-motion users
+  receive static skeletons.
+
 - **Breaking owned-name cutover**: configure `RAIJU_*` environment variables
   (including `RAIJU_SETUP_TOKEN` and `RAIJU_HOST`); bootstrap management with
   `X-Raiju-Setup-Token`. Request and response gateway headers now use `x-raiju-*`,
@@ -76,6 +136,20 @@ Waves 31 and 32 (L212 to L219) closed the known gaps listed after wave 30, fixed
   collector thread that did not survive the fork. This is separate from the
   WebKitGTK main-loop crash fixed by patch 0025. Worker respawn/backoff and graceful
   shutdown remain enabled; `http1` remains single-process.
+
+- **Optional multi-gateway console**: `RAIJU_CONSOLE_CONFIG` names a read-only public
+  manifest of gateway labels and origins; absent configuration retains the
+  single-gateway UI. Fleet status aggregates only health/readiness. Regional
+  sessions are scoped by origin in tab storage; switching identity or gateway
+  reloads the page, clearing forms, data and sockets. Writes and Playground calls
+  target one explicitly selected origin, without a cross-region proxy or fallback.
+  Native CORS supports bearer/setup preflight while actual requests retain their
+  authentication gates. Remote UI sockets require an explicitly permitted Origin
+  and a one-use ticket. Those tickets now use private hashed files beside the
+  configuration (`<config>.ws-tickets/`) so a different worker or replica sharing
+  that directory can redeem them once; directory-operation failures deny access.
+  Gateways without shared session storage still require appropriate session
+  affinity. No cloud account, customer endpoint or geography is a product default.
 
 - **Embedding SDK fidelity**: translated OpenAI embedding responses now honor
   `encoding_format:"base64"` as IEEE754 float32 little-endian bytes. This fixes
