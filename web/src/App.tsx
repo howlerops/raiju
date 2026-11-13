@@ -115,17 +115,6 @@ function ThemeControls() {
   </div>
 }
 
-function PublicControls() {
-  return <section class="public-controls" aria-label="Connection and appearance">
-    <Show when={consoleConfig()}>{(config) => <label>Gateway / region
-      <select class="select select-sm w-full" id="gateway-select" value={target().id} onChange={(ev) => {
-        try { switchGateway(ev.currentTarget.value) } catch (e) { notify(String(e), "error") }
-      }}><For each={config().gateways}>{(gateway) => <option value={gateway.id}>{gateway.name}</option>}</For></select>
-    </label>}</Show>
-    <ThemeControls />
-    <p class="mono endpoint" id="target-endpoint">{target().url}</p>
-  </section>
-}
 
 function SignIn(props: { account?: boolean }) {
   let input: HTMLInputElement | undefined
@@ -223,7 +212,7 @@ export function App() {
   return (
     <>
     <Show when={checked() && !bootstrapError() && !setup() && verified()} fallback={
-      <div class="auth-page"><PublicControls />
+      <div class="auth-page">
         <Show when={checked()} fallback={<LoadingSkeleton variant="page" label="Checking gateway identity" />}>
           <Show when={!bootstrapError()} fallback={<section class="card panel"><p class="error" role="alert">{bootstrapError()}</p><button class="btn" id="auth-retry" onClick={() => void bootstrap()}>Retry connection</button></section>}>
             <Show when={setup()} fallback={<SignIn />}>{(st) => <Setup configured={st().configured} done={setupDone} />}</Show>

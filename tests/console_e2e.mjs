@@ -46,7 +46,7 @@ page.on('request', (request) => {
 })
 await context.route('**/*', (route) => allowed.has(new URL(route.request().url()).origin) ? route.continue() : route.abort())
 const targetIs = async (gateway) => {
-  await page.waitForFunction((url) => document.querySelector('#target-endpoint')?.textContent === url, gateway.url)
+  await page.waitForFunction(({url,name}) => document.querySelector('#target-endpoint')?.textContent === url || document.querySelector('#auth h1')?.textContent === 'Sign in to ' + name, gateway)
 }
 const select = async (gateway) => {
   await page.locator('#gateway-select').selectOption(gateway.id)
@@ -70,6 +70,7 @@ try {
   await targetIs(eu)
   await page.locator('#auth').waitFor()
   assert.equal(await page.locator('nav[aria-label="Sections"], .admin-shell, #fleet-title, #cfg-json').count(), 0, 'Anonymous visitors must not see the administrative shell')
+  assert.equal(await page.locator('#gateway-select, #target-endpoint, [aria-label="Appearance"]').count(), 0, 'Primary login must not expose workspace controls or infrastructure URLs')
   await Promise.all(collecting)
   const publicBeforeLogin = new Set(['/health', '/ready', '/api/session/is-auth-enabled', '/api/oidc/status', '/api/users/me/permissions'])
   assert.ok(records.filter((r) => new URL(r.url).origin !== access.console).every((r) => publicBeforeLogin.has(new URL(r.url).pathname)), 'No administrative data requests before verified login')

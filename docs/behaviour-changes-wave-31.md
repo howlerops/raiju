@@ -6,6 +6,8 @@ Waves 31 and 32 (L212 to L219) closed the known gaps listed after wave 30, fixed
   now precede the entire console, including Fleet. Unknown or malformed identity
   responses never default to admin. Rejected sessions remove protected views;
   sign-out revokes native sessions and clears the regional tab credential.
+  The primary login omits gateway selection, raw endpoints and appearance
+  controls; these remain in the authenticated sidebar.
   Native authorization now preserves current session roles/data scope and
   ignores empty SSO email aliases instead of matching an unrelated account.
   Existing-but-disabled auth is not fresh setup (`setup_required:false`);
