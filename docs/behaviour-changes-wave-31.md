@@ -19,7 +19,13 @@ Waves 31 and 32 (L212 to L219) closed the known gaps listed after wave 30, fixed
   Party Rock hard-shadow styling and conflicting component CSS are removed.
   Solid 2 and the embedded static build remain; no React or component JS runtime
   is introduced. Both explicit and OS-following modes share the daisyUI tokens.
-  Gateway context is compact; isolation details remain available in a disclosure.
+  Gateway selection, origin, health, isolation details, appearance and account
+  controls live in a persistent sidebar; the content header shows only the page.
+  Navigation scrolls independently on shorter desktops, while narrow screens
+  keep all controls accessible in a stacked layout.
+  Local frontend overrides are now published into disposable snapshots: new
+  assets precede the new HTML, and previous hashed chunks remain available for
+  open tabs. Rebuilding Vite's output alone no longer changes the running preview.
 
 - **Breaking owned-name cutover**: configure `RAIJU_*` environment variables
   (including `RAIJU_SETUP_TOKEN` and `RAIJU_HOST`); bootstrap management with

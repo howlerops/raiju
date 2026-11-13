@@ -192,80 +192,61 @@ export function App() {
 
   return (
     <div class="admin-shell">
-      <div class="console-heading">
-      <header class="top">
+      <aside class="sidebar" aria-label="Gateway workspace">
         <div class="brand">
-          <span class="logo" aria-hidden="true">
-            R
-          </span>
-          <span>
-            Raiju <span class="muted brand-caption">{consoleConfig() ? "Regional console" : "AI gateway"}</span>
-          </span>
+          <span class="logo" aria-hidden="true">R</span>
+          <span>Raiju <span class="muted brand-caption">{consoleConfig() ? "Regional console" : "AI gateway"}</span></span>
         </div>
-        <div class="top-right">
-          <label class="theme-picker"><span class="hint">Appearance</span>
+        <section class="sidebar-target" aria-label="Selected gateway">
+          <Show when={consoleConfig()}>
+            {(config) => <label>Gateway / region
+              <select class="select select-sm w-full" id="gateway-select" value={target().id} onChange={(ev) => {
+                try { switchGateway(ev.currentTarget.value) } catch (e) {
+                  ev.currentTarget.value = target().id
+                  notify(e instanceof Error ? e.message : String(e), "error")
+                }
+              }}>
+                <For each={config().gateways}>{(gateway) => <option value={gateway.id}>{gateway.name}</option>}</For>
+              </select>
+            </label>}
+          </Show>
+          <div class="target-scope"><strong>{targetLabel()}</strong><div class="mono endpoint" id="target-endpoint">{target().url}</div></div>
+          <span id="health-pill" class={["badge badge-soft", health().tone === "ok" ? "badge-success" : health().tone === "bad" ? "badge-error" : "badge-neutral"]} role="status">{health().text}</span>
+          <details class="target-help"><summary>Regional isolation</summary>
+            <p>Admin reads, changes and Playground requests apply only to this target. Fleet health uses public probes only. Switching regions reloads the page and clears forms, data and sockets. No cross-region fallback or synchronization.</p>
+          </details>
+        </section>
+        {/* Shell navigation stays mounted while regional bootstrap or a page is pending. */}
+        <nav class="side-nav" aria-label="Sections">
+          <span class="nav-caption">WORKSPACE</span>
+          <For each={VIEWS}>
+            {(v) => (
+              <Show when={(v[0] !== "fleet" || consoleConfig()) && (v[2] === "" || can(v[2]))}>
+                <a class="btn btn-sm btn-ghost" href={"#" + v[0]} data-nav={v[0]} aria-current={view() === v[0] ? "page" : undefined}>{v[1]}</a>
+              </Show>
+            )}
+          </For>
+        </nav>
+        <footer class="sidebar-footer">
+          <label class="theme-picker"><span>Appearance</span>
             <select class="select select-sm" aria-label="Appearance" value={theme()} onChange={(ev) => setTheme(ev.currentTarget.value)}>
               <option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option>
             </select>
           </label>
-          <span class="page-context">{VIEWS.find((v) => v[0] === view())?.[1]}</span>
-          <span id="health-pill" class={["badge badge-soft", health().tone === "ok" ? "badge-success" : health().tone === "bad" ? "badge-error" : "badge-neutral"]} role="status">
-            {health().text}
-          </span>
           <Show when={me()}>
-            {(m) => (
-              <span id="role-pill" class="badge badge-neutral" title="The role of the signed-in caller">
-                {roleLabel(m())}
-              </span>
-            )}
+            {(m) => <span id="role-pill" class="badge badge-neutral" title="The role of the signed-in caller">{roleLabel(m())}</span>}
           </Show>
-          <button
-            type="button"
-            id="token-btn"
-            class="btn btn-sm btn-outline"
-            onClick={() => openSignIn("Enter credentials for " + targetLabel() + " only. Submit a blank token to clear it.")}
-          >
+          <button type="button" id="token-btn" class="btn btn-sm btn-outline w-full"
+            onClick={() => openSignIn("Enter credentials for " + targetLabel() + " only. Submit a blank token to clear it.")}>
             {tokenSet() ? "Regional token: set" : "Sign in"}
           </button>
-        </div>
+        </footer>
+      </aside>
+      <header class="console-heading top">
+        <span class="page-context"><span class="muted">Workspace / </span>{VIEWS.find((v) => v[0] === view())?.[1]}</span>
       </header>
-      <section class="target-banner" aria-label="Selected gateway">
-        <Show when={consoleConfig()}>
-          {(config) => <label>Gateway / region
-            <select class="select select-sm w-full" id="gateway-select" value={target().id} onChange={(ev) => {
-              try { switchGateway(ev.currentTarget.value) } catch (e) {
-                ev.currentTarget.value = target().id
-                notify(e instanceof Error ? e.message : String(e), "error")
-              }
-            }}>
-              <For each={config().gateways}>{(gateway) => <option value={gateway.id}>{gateway.name}</option>}</For>
-            </select>
-          </label>}
-        </Show>
-        <Show when={consoleConfig()}><a class="btn btn-sm btn-ghost" href="#fleet">Fleet health</a></Show>
-        <div class="target-scope"><strong>Target: {targetLabel()}</strong><div class="mono endpoint" id="target-endpoint">{target().url}</div></div>
-        <details class="target-help"><summary>Regional isolation</summary>
-          <p>Admin reads, changes and Playground requests apply only to this target. Fleet health uses public probes only. Switching regions reloads the page and clears forms, data and sockets. No cross-region fallback or synchronization.</p>
-        </details>
-      </section>
-      </div>
       <Show when={!checked() && view() !== "fleet"}><main><p role="status">Checking selected gateway…</p></main></Show>
-
       <Show when={view() !== "fleet" ? setup() : undefined}>{(st) => <Setup configured={st().configured} done={setupDone} />}</Show>
-
-      {/* Shell navigation stays mounted while regional bootstrap or a page is pending. */}
-      <nav class="side-nav" aria-label="Sections">
-        <span class="nav-caption">WORKSPACE</span>
-        <For each={VIEWS}>
-          {(v) => (
-            <Show when={(v[0] !== "fleet" || consoleConfig()) && (v[2] === "" || can(v[2]))}>
-              <a class="btn btn-sm btn-ghost" href={"#" + v[0]} data-nav={v[0]} aria-current={view() === v[0] ? "page" : undefined}>
-                {v[1]}
-              </a>
-            </Show>
-          )}
-        </For>
-      </nav>
 
       <Show when={(checked() && !setup()) || view() === "fleet"}>
       <main>

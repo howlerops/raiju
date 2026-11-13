@@ -10,6 +10,7 @@ if [ -e build/console-preview-access.json ]; then
   echo 'An interactive preview is running; run node tests/console_e2e.mjs directly or stop it first.' >&2
   exit 2
 fi
+python3 -m unittest discover -s tests -p test_preview_publish.py
 mkdir -p build
 image=$1
 server=${RAIJU_PREVIEW_SERVER:-bun}

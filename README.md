@@ -586,6 +586,20 @@ The runner never reads `.env`, imports host AWS/provider credentials, pulls or
 publishes images, or accesses a cluster. Stop with Ctrl+C to remove its disposable
 containers, volumes, networks and fixture credentials. No merge is needed.
 
+For frontend iteration against a prebuilt image, start with
+`python3 scripts/preview_console.py --image raiju:console-preview --ui-dir web/dist`.
+The runner snapshots the build instead of mounting Vite's mutable output.
+After rebuilding, run `python3 scripts/publish_preview_ui.py --source web/dist`:
+it publishes assets before the new HTML and retains old hashed chunks for tabs
+already open. A rebuild alone does not change the running preview. The snapshot
+and retained assets are removed when the runner stops. Do not bind-mount a build
+directory that is deleted/replaced under an active browser.
+
+Production rolling deployments need the same immutable-asset availability
+contract: serve previous asset versions through shared/versioned static hosting
+for the supported tab lifetime. A rolling fleet of embedded binaries alone does
+not guarantee that a new replica can serve an old tab's lazy chunk.
+
 The repeatable browser regression is `scripts/check_console.sh <built-image>`
 with Playwright 1.56.1/Chromium available (`NODE_PATH=$(npm root -g)`).
 Set `RAIJU_PREVIEW_SERVER=http1` to exercise the alternate native transport; the

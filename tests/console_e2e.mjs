@@ -274,11 +274,22 @@ try {
   // A removed saved target requires an explicit allowed choice, never automatic fallback.
   await select(us)
   await page.route('**/console.json', (route) => route.fulfill({contentType:'application/json', body:JSON.stringify({gateways:[{id:eu.id,name:eu.name,url:eu.url}], defaultGateway:eu.id})}))
-  const start = records.length
-  await page.reload()
-  await page.getByRole('heading', {name:'Console configuration unavailable'}).waitFor()
-  await Promise.all(collecting)
-  assert.ok(!records.slice(start).some((r) => [eu.url,us.url].includes(new URL(r.url).origin)))
+  // Header promises from the previous document may settle after reload; count
+  // request starts in the new document rather than slicing their completion order.
+  let reloaded = false
+  const recoveryRequests = []
+  const recoveryNavigation = (frame) => { if (frame === page.mainFrame()) reloaded = true }
+  const recoveryRequest = (request) => { if (reloaded) recoveryRequests.push(request.url()) }
+  page.on('framenavigated', recoveryNavigation)
+  page.on('request', recoveryRequest)
+  try {
+    await page.reload()
+    await page.getByRole('heading', {name:'Console configuration unavailable'}).waitFor()
+    assert.ok(!recoveryRequests.some((url) => [eu.url,us.url].includes(new URL(url).origin)), 'Unavailable saved targets must make no regional requests')
+  } finally {
+    page.off('framenavigated', recoveryNavigation)
+    page.off('request', recoveryRequest)
+  }
   await page.getByRole('button', {name:new RegExp('Select ' + eu.name)}).click()
   await targetIs(eu)
   await page.unroute('**/console.json')

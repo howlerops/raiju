@@ -13,6 +13,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from publish_preview_ui import publish_ui
 
 ROOT = Path(__file__).resolve().parents[1]
 MOCK = r'''
@@ -123,8 +124,8 @@ def main():
             probe.bind(('127.0.0.1', port))
     docker('image', 'inspect', args.image)
     docker('image', 'inspect', args.client_image)
-    assets = args.ui_dir.resolve() if args.ui_dir else None
-    if assets and not (assets / 'index.html').is_file():
+    source_assets = args.ui_dir.resolve() if args.ui_dir else None
+    if source_assets and not (source_assets / 'index.html').is_file():
         parser.error('--ui-dir must contain a built index.html')
     build = ROOT / 'build'
     build.mkdir(exist_ok=True)
@@ -133,6 +134,9 @@ def main():
         parser.error('A preview access file already exists; stop its owner before starting another preview')
     runtime = Path(tempfile.mkdtemp(prefix='console-preview-', dir=build))
     runtime.chmod(0o755)  # Only synthetic fixture credentials exist under this disposable directory.
+    assets = runtime / 'ui' if source_assets else None
+    if assets:
+        publish_ui(source_assets, assets)
     stopped = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stopped.set())
@@ -143,6 +147,8 @@ def main():
                 dict(id='local-america', name='Local America', url=f'http://127.0.0.1:{args.america_port}')]
     access = {'console': console_url, 'gateways': [], 'owner': prefix, 'server': args.server,
               'consoleSetupToken': secrets.token_hex(32)}
+    if assets:
+        access['uiDir'] = str(assets)
     manifest = runtime / 'console.json'
     save(manifest, {'gateways': gateways, 'defaultGateway': gateways[0]['id']})
     manifest.chmod(0o644)  # Manifest has origins/labels only, never credentials.
