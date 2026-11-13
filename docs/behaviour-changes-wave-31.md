@@ -25,8 +25,10 @@ Waves 31 and 32 (L212 to L219) closed the known gaps listed after wave 30, fixed
 - **Native OIDC-only administration**: a configured identity provider can supply
   the first identity without creating a local password/token account. Management
   stays closed until sign-in; setup tokens cannot bypass configured SSO.
-  `oidc.allowed_email_domains` adds exact verified-email admission, and email
-  role-map keys can resolve operator-managed environment references. SSO returns
+  `oidc.allowed_email_domains` adds exact verified-email admission;
+  `oidc.allowed_hosted_domains` independently requires an exact signed ID-token
+  `hd` membership claim (for Google Workspace). Neither policy is enabled by
+  default. Email role-map keys can resolve operator-managed environment references. SSO returns
   an origin-scoped native bearer; it does not create cookie-based administration.
   Same-origin SSO uses the current tab; remote SSO opens that region's own console
   without forwarding regional sessions. Local-account sign-in stays available as

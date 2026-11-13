@@ -6323,6 +6323,15 @@ export interface components {
         };
         /** @description Bifrost GetConfigResponse. The whole config as stored, with secret values replaced by <redacted>. Keys follow config.tov. */
         GetConfigResponse: {
+            oidc?: {
+                /** @description When present, require a verified email at an exact case-insensitive allowed domain. Independent of allowed_hosted_domains. */
+                allowed_email_domains?: string[];
+                /** @description When present, require the signed ID token's nonempty string hd claim to match an exact case-insensitive allowed domain before role or session issuance. Missing or malformed claims and invalid allowlists refuse sign-in. Independent of allowed_email_domains; no default. */
+                allowed_hosted_domains?: string[];
+            } & {
+                [key: string]: unknown;
+            };
+        } & {
             [key: string]: unknown;
         };
         /** @description The global outbound proxy (Raiju). Bifrost's proxy_config. */

@@ -74,6 +74,18 @@ email and an exact, case-insensitive domain match. Missing/unverified email,
 suffix tricks and accounts outside the allowlist are refused. Omitting the
 allowlist preserves existing provider policies; it is not a company restriction.
 
+For Google Workspace membership, also set `oidc.allowed_hosted_domains` to the
+explicit organization domains. A verified email alone does not prove managed
+Workspace membership. This independent policy requires a nonempty string `hd`
+claim in the signed ID token, matched case-insensitively to an exact allowed
+domain before role assignment or session issuance (including refreshed ID
+tokens). Subdomains, suffix matches, malformed domains and missing claims are
+refused. Both allowlists must be nonempty lists of valid DNS domains when set;
+neither has a default, and omitting either leaves that policy disabled.
+Set both lists when both managed membership and verified company email are
+required; a match in one list never bypasses the other. The authorization
+request's `hd` hint, email suffix and access-token claims are not membership proof.
+
 Use `role_claim:"email"` and exact `role_map` entries when the provider does not
 send groups. Role-map keys may use `env.NAME` references for operator-managed
 addresses; unresolved references fail closed. Select a deliberate `default_role`

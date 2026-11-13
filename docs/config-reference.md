@@ -9,7 +9,7 @@ for each element of a list. Descriptions are the comments in the source; default
 has one. The command-line flags (`-app-dir`, `-config`, `-host`, `-port`, `-workers`, `-server`, `-mode`,
 `-healthcheck`) are in the README.
 
-1384 keys (584 with a description), and 38 compatibility keys read through config_compat.
+1385 keys (585 with a description), and 38 compatibility keys read through config_compat.
 
 ## Sections
 
@@ -1348,6 +1348,7 @@ Sign-in to the web UI and API with an OpenID Connect provider.
 | `oidc.role_map` | map of string |  |
 | `oidc.default_role` | string |  |
 | `oidc.allowed_email_domains` | string[] | When present, require a verified email at one of these exact domains. |
+| `oidc.allowed_hosted_domains` | string[] | When present, require the signed ID token's hd claim to match one of these exact domains. |
 | `oidc.session_ttl_seconds` | int |  |
 | `oidc.audiences` | string[] | the audiences an ID token may carry (absent: the client id). scim_config's audience and Entra's appIdUri. |
 | `oidc.claims_token` | string | "access_token": the claims are read from the access token (Keycloak puts its roles there), checked against the same signing keys; else the ID token's. |
