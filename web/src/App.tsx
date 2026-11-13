@@ -190,7 +190,7 @@ export function App() {
   })
 
   return (
-    <>
+    <div class="admin-shell">
       <div class="console-heading">
       <header class="top">
         <div class="brand">
@@ -198,10 +198,11 @@ export function App() {
             R
           </span>
           <span>
-            Raiju <span class="muted">{consoleConfig() ? "console" : "gateway"}</span>
+            Raiju <span class="muted brand-caption">{consoleConfig() ? "Regional console" : "AI gateway"}</span>
           </span>
         </div>
         <div class="top-right">
+          <span class="page-context">{VIEWS.find((v) => v[0] === view())?.[1]}</span>
           <span id="health-pill" class={["pill", health().tone]} role="status">
             {health().text}
           </span>
@@ -246,6 +247,7 @@ export function App() {
 
       <Show when={(checked() && !setup()) || view() === "fleet"}>
       <nav class="tabs" aria-label="Sections">
+        <span class="nav-caption">WORKSPACE</span>
         <For each={VIEWS}>
           {(v) => (
             <Show when={(v[0] !== "fleet" || consoleConfig()) && (v[2] === "" || can(v[2]))}>
@@ -320,6 +322,6 @@ export function App() {
 
       <SignIn />
       <Toasts />
-    </>
+    </div>
   )
 }

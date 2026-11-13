@@ -2,6 +2,12 @@
 
 Waves 31 and 32 (L212 to L219) closed the known gaps listed after wave 30, fixed the seventh production re-audit (docs/audits/production-reaudit-7-2026-10-31.md) and made the CI image job run on pull requests. Read this before upgrading a deployment.
 
+- **Dashboard presentation**: desktop navigation is now a persistent sidebar,
+  with a compact header, roomier cards/tables and a responsive horizontal
+  navigation strip on smaller screens. Fleet summary counts come only from
+  configured gateways and current public readiness probes; no regional
+  inference or usage data is aggregated. Authentication and targeting are unchanged.
+
 - **Breaking owned-name cutover**: configure `RAIJU_*` environment variables
   (including `RAIJU_SETUP_TOKEN` and `RAIJU_HOST`); bootstrap management with
   `X-Raiju-Setup-Token`. Request and response gateway headers now use `x-raiju-*`,
