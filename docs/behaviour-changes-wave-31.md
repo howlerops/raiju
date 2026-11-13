@@ -2,11 +2,22 @@
 
 Waves 31 and 32 (L212 to L219) closed the known gaps listed after wave 30, fixed the seventh production re-audit (docs/audits/production-reaudit-7-2026-10-31.md) and made the CI image job run on pull requests. Read this before upgrading a deployment.
 
+- **Native administration gate**: first-admin setup and verified native sign-in
+  now precede the entire console, including Fleet. Unknown or malformed identity
+  responses never default to admin. Rejected sessions remove protected views;
+  sign-out revokes native sessions and clears the regional tab credential.
+  Native authorization now preserves current session roles/data scope and
+  ignores empty SSO email aliases instead of matching an unrelated account.
+  Existing-but-disabled auth is not fresh setup (`setup_required:false`);
+  its setup exchange returns 409. A non-admin first account is rejected with 400.
+  Explicit API/inference auth opt-outs and the separate metrics-token policy
+  remain operator-controlled; see `docs/operations.md`.
+
 - **Dashboard presentation**: desktop navigation is now a persistent sidebar,
   with a compact header, roomier cards/tables and a responsive horizontal
   navigation strip on smaller screens. Fleet summary counts come only from
   configured gateways and current public readiness probes; no regional
-  inference or usage data is aggregated. Authentication and targeting are unchanged.
+  inference or usage data is aggregated. Targeting remains regional.
   Same-region hash routes preserve the sidebar/header, including during regional
   bootstrap. Screens are lazy-loaded JS chunks with a route-local loading/error
   boundary reset on navigation; existing widget boundaries let ready data render

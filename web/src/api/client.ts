@@ -2,7 +2,7 @@
 // docs/openapi/management.yaml). The path and method pick the parameter,
 // body and response types.
 import type { paths } from "./schema"
-import { adminToken, askToken } from "../auth"
+import { adminToken, revokeSession } from "../auth"
 import { apiCredentials, discarded, gatewaySignal, isActive, targetLabel, targetURL } from "../gateway"
 
 export class ApiError extends Error {
@@ -51,7 +51,7 @@ function errorText(status: number, data: unknown, text: string, path: string): s
     else if (e && typeof e === "object") msg = String((e as { message?: unknown }).message ?? "")
   }
   if (msg) return msg
-  if (status === 401) return "Unauthorized. Sign in with the admin token (top right)."
+  if (status === 401) return "Session expired. Sign in to continue."
   if (text.trim()) return text.trim().slice(0, 300)
   return "Request failed with HTTP " + status
 }
@@ -117,14 +117,9 @@ export async function send(method: string, path: string, o: RawOpts = {}): Promi
     }
     return { status: res.status, text, data }
   }
-  let r = await attempt()
-  if (r.status === 401 && authenticated && !o.quiet) {
-    const t = await askToken(
-      bearer ? "The token for " + targetLabel() + " was rejected. Enter a valid regional token." : "Sign in to " + targetLabel() + " to continue.",
-    )
-    // Identity changes reload the document. An unchanged token must not retry forever.
-    if (t && t === bearer && isActive()) r = await attempt()
-  }
+  const r = await attempt()
+  // /metrics may use a separate scrape token; its 401 does not reject the admin identity.
+  if (r.status === 401 && authenticated && path.startsWith("/api/")) revokeSession()
   if (!isActive()) return discarded()
   if (r.status < 200 || r.status >= 300) throw new ApiError(r.status, errorText(r.status, r.data, r.text, path))
   return r

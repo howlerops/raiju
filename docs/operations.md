@@ -21,6 +21,37 @@ Worker replacement retains the same listeners and identities. SIGTERM/SIGINT
 still use the normal graceful drain; crash-loop replacement retains its backoff.
 The `http1` server remains single-process.
 
+## Native administration sign-in
+
+Raiju serves its own first-admin setup and sign-in screens; an external identity
+proxy is optional, not a prerequisite. Until the selected gateway confirms a
+valid native identity and permission set, the console does not mount navigation,
+dashboard components, configuration forms or live sockets (including Fleet).
+An unavailable or malformed identity response fails closed. Deliberately disabled
+native authentication is an operator configuration error for this console, not
+an invitation to bootstrap a second administrator.
+
+Initial setup requires the operator's setup token and creates an administrator,
+not a viewer/editor. The generated bearer is shown once and verified before the
+console opens; creating this account does not create a password. Keep the bearer
+securely for future token sign-ins, or configure an appropriate password/SSO user.
+
+Native password sessions use the user's current role and data scope. Unknown
+identities have no implicit administrator role. A protected management API 401
+removes the authenticated UI; a permission-level 403 remains a denied operation.
+Signing out revokes a native session and clears the tab's selected-origin
+credential. Long-lived user/API tokens are not globally revoked by signing out
+of a tab. Shared-file session caches may take up to one second to observe a
+revocation on another worker.
+
+These UI gates supplement, never replace, native API authorization. Public
+health/auth/bootstrap and protocol-specific authorization routes remain
+deliberate exceptions. Operators can still explicitly opt out through
+`client.whitelisted_routes` or disable inference enforcement; do neither for
+private administration/tenant traffic. Set `metrics_token` to protect scrapes:
+the separately protected `/metrics` endpoint uses its own credential policy,
+and a scrape-token refusal does not invalidate a native admin identity.
+
 
 ## Configuration changes
 

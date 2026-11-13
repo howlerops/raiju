@@ -250,12 +250,14 @@ export function createFeed(): Feed {
       want = true
       generation += 1
       unregister = onGatewayLeave(() => feed.stop())
+      window.addEventListener("raiju-session-expired", feed.stop)
       retry = 0
       void connect()
     },
     stop() {
       want = false
       generation += 1
+      window.removeEventListener("raiju-session-expired", feed.stop)
       unregister?.()
       unregister = undefined
       setState("stopped")

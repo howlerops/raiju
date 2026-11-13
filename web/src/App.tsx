@@ -1,7 +1,7 @@
 import { createSignal, For, lazy, Loading, Match, onSettled, Show, Switch, Errored } from "solid-js"
 import { send, ApiError } from "./api/client"
-import { clearSignIn, closeSignIn, dialog, openSignIn, setToken, tokenSet } from "./auth"
-import { can, me, refreshMe, roleLabel } from "./perm"
+import { dialog, dismissSignIn, openSignIn, setToken, tokenSet, verified, setVerified, revokeSession } from "./auth"
+import { can, me, refreshMe, roleLabel, verifyToken } from "./perm"
 import { notify, Toasts, type Tone } from "./ui"
 import { consoleConfig, switchGateway, target, targetLabel, targetURL } from "./gateway"
 import { theme, setTheme } from "./theme"
@@ -55,23 +55,26 @@ const [sso, setSso] = createSignal(false)
 const [setup, setSetup] = createSignal<{ configured: boolean } | undefined>(undefined)
 // the setup check has answered: until then the dashboard is not rendered, so its calls cannot ask for a sign-in first
 const [checked, setChecked] = createSignal(false)
+const [bootstrapError, setBootstrapError] = createSignal("")
 
 // Asks the gateway whether it is still waiting for its first admin (a public route). True when it is.
-async function checkSetup(): Promise<boolean> {
+async function bootstrap(): Promise<void> {
+  setChecked(false)
+  setBootstrapError("")
+  setVerified(false)
   try {
     const r = await send("GET", "/api/session/is-auth-enabled", { auth: false, quiet: true })
-    const d = (r.data ?? {}) as { setup_required?: boolean; setup_token_configured?: boolean }
-    if (d.setup_required) {
-      setSetup({ configured: !!d.setup_token_configured })
-      setChecked(true)
-      return true
+    const d = r.data as { setup_required?: unknown; setup_token_configured?: unknown; is_auth_enabled?: unknown } | undefined
+    if (r.status !== 200 || !d || typeof d.setup_required !== "boolean" || (d.setup_required && typeof d.setup_token_configured !== "boolean")) throw new Error("Invalid setup status. Access remains locked.")
+    setSetup(d.setup_required ? { configured: d.setup_token_configured === true } : undefined)
+    if (!d.setup_required) {
+      if (d.is_auth_enabled !== true) throw new Error("Native authentication is disabled on this gateway. Ask an operator to enable it; access remains locked.")
+      try { await refreshMe(); setVerified(true) }
+      catch (e) { if (!(e instanceof ApiError && e.status === 401)) throw e }
+      checkSso()
     }
-  } catch {
-    // an older gateway without the route: carry on to the dashboard
-  }
-  setSetup(undefined)
-  setChecked(true)
-  return false
+  } catch (e) { setBootstrapError(e instanceof Error ? e.message : String(e)) }
+  finally { setChecked(true) }
 }
 
 // Whether the sign-in dialog offers SSO (not asked while the setup lock is on: every other /api route is locked then)
@@ -81,8 +84,10 @@ function checkSso(): void {
     .catch(() => {})
 }
 
-function setupDone(token: string): void {
+async function setupDone(token: string): Promise<void> {
+  await verifyToken(token)
   setToken(token)
+  await bootstrap()
 }
 
 async function checkHealth(): Promise<void> {
@@ -95,87 +100,110 @@ async function checkHealth(): Promise<void> {
   }
 }
 
-function SignIn() {
+function ThemeControls() {
+  return <div class="theme-controls" role="group" aria-label="Appearance">
+    <span>Appearance</span><div class="join">
+      <For each={[
+        { value: "system", label: "System", path: "M3 4h18v12H3z M8 21h8 M12 16v5" },
+        { value: "light", label: "Light", path: "M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8 M12 2v2 M12 20v2 M2 12h2 M20 12h2 M5 5l1.5 1.5 M17.5 17.5L19 19 M5 19l1.5-1.5 M17.5 6.5L19 5" },
+        { value: "dark", label: "Dark", path: "M20.5 13A9 9 0 0 1 11 3.5 9 9 0 1 0 20.5 13Z" },
+      ]}>{(option) => <button type="button" class={["btn btn-sm btn-square join-item", theme() === option.value ? "btn-primary" : "btn-ghost"]}
+        aria-label={option.label + " theme"} title={option.label + " theme"} aria-pressed={theme() === option.value ? "true" : "false"} onClick={() => setTheme(option.value)}>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={option.path} /></svg>
+      </button>}</For>
+    </div>
+  </div>
+}
+
+function PublicControls() {
+  return <section class="public-controls" aria-label="Connection and appearance">
+    <Show when={consoleConfig()}>{(config) => <label>Gateway / region
+      <select class="select select-sm w-full" id="gateway-select" value={target().id} onChange={(ev) => {
+        try { switchGateway(ev.currentTarget.value) } catch (e) { notify(String(e), "error") }
+      }}><For each={config().gateways}>{(gateway) => <option value={gateway.id}>{gateway.name}</option>}</For></select>
+    </label>}</Show>
+    <ThemeControls />
+    <p class="mono endpoint" id="target-endpoint">{target().url}</p>
+  </section>
+}
+
+function SignIn(props: { account?: boolean }) {
   let input: HTMLInputElement | undefined
   let username: HTMLInputElement | undefined
   let password: HTMLInputElement | undefined
   const [error, setError] = createSignal("")
   const [busy, setBusy] = createSignal(false)
-  const save = (token: string | undefined) => {
-    try { closeSignIn(token) } catch (e) { setError(e instanceof Error ? e.message : String(e)) }
+  const save = async (token: string) => {
+    if (!token) throw new Error("Enter a regional token.")
+    await verifyToken(token)
+    setToken(token)
+    await bootstrap()
   }
-  const login = async () => {
-    setError("")
-    setBusy(true)
-    const name = username?.value ?? ""
-    const secret = password?.value ?? ""
+  const submit = async (useToken: boolean) => {
+    setError(""); setBusy(true)
     try {
-      if (!name || !secret) throw new Error("Enter a username and password.")
-      const result = await send("POST", "/api/session/login", { auth: false, quiet: true, body: { username: name, password: secret } })
-      const token = (result.data as { token?: unknown } | undefined)?.token
-      if (typeof token !== "string" || !token) throw new Error("The gateway did not return a session token.")
-      if (password) password.value = ""
-      save(token)
+      if (useToken) await save((input?.value ?? "").trim())
+      else {
+        const name = username?.value ?? "", secret = password?.value ?? ""
+        if (!name || !secret) throw new Error("Enter a username and password.")
+        const r = await send("POST", "/api/session/login", { auth: false, quiet: true, body: { username: name, password: secret } })
+        const token = (r.data as { token?: unknown } | undefined)?.token
+        if (typeof token !== "string" || !token) throw new Error("The gateway did not return a session token.")
+        await save(token)
+      }
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)) }
+    finally { if (password) password.value = ""; setBusy(false) }
+  }
+  const logout = async () => {
+    setBusy(true); setError("")
+    try {
+      await send("POST", "/api/session/logout", { quiet: true })
+      revokeSession()
+      setToken("")
+      await bootstrap()
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      // Local sign-out is still possible, but never claim the server revoked it.
+      revokeSession()
+      notify("Local sign-out only: server logout could not be confirmed. " + String(e), "error")
+      try { sessionStorage.setItem("raiju.logout-warning", "Local session cleared; server logout could not be confirmed. " + String(e)) } catch {}
+      try { setToken("") } catch (storageError) { setError(String(storageError)) }
     } finally { setBusy(false) }
   }
-  return (
-    <Show when={dialog()}>
-      {(d) => (
-        <div class="overlay" id="auth" onKeyDown={(ev) => ev.key === "Escape" && !busy() && save(undefined)}>
-          <form class="dialog" role="dialog" aria-modal="true" aria-labelledby="auth-title" onSubmit={(ev) => { ev.preventDefault(); save((input?.value ?? "").trim()) }}>
-            <h2 id="auth-title">Sign in to {targetLabel()}</h2>
-            <p class="mono endpoint">{target().url}</p>
-            <p id="auth-msg" class="muted">{d().message}</p>
-            <p class="hint">Credentials stay in this tab, scoped to this gateway origin. Changing identity reloads the console and clears page data.</p>
-            <label>Admin or session token
-              <input class="input input-sm w-full" id="auth-input" type="password" autocomplete="off" spellcheck={false} ref={(el) => { input = el; queueMicrotask(() => el.focus()) }} />
-            </label>
-            <details>
-              <summary>Sign in with username and password</summary>
-              <label>Username<input class="input input-sm w-full" id="auth-username" autocomplete="username" ref={(el) => (username = el)} /></label>
-              <label>Password<input class="input input-sm w-full" id="auth-password" type="password" autocomplete="current-password" ref={(el) => (password = el)} /></label>
-              <button class="btn btn-sm btn-primary" type="button" disabled={busy()} onClick={() => void login()}>{busy() ? "Signing in…" : "Sign in to " + targetLabel()}</button>
-            </details>
-            <Show when={sso()}>
-              <p id="auth-sso">
-                <a class="btn btn-sm btn-outline" href={targetURL("/api/oidc/login")} target={consoleConfig() ? "_blank" : undefined} rel="noopener noreferrer">
-                  {consoleConfig() ? "Open regional UI for SSO" : "Sign in with SSO"}
-                </a>
-                <Show when={consoleConfig()}><span class="hint"> SSO cookies sign in only to the regional UI, not this consolidated console. Use a regional bearer token here.</span></Show>
-              </p>
-            </Show>
-            <Show when={error()}><p class="error" role="alert">{error()}</p></Show>
-            <div class="actions">
-              <button type="button" class="btn btn-sm btn-ghost" id="auth-clear" disabled={busy()} onClick={() => { try { clearSignIn() } catch (e) { setError(String(e)) } }}>Clear saved token</button>
-              <button type="button" class="btn btn-sm" id="auth-cancel" disabled={busy()} onClick={() => save(undefined)}>Cancel</button>
-              <button type="submit" class="btn btn-sm btn-primary" disabled={busy()}>Save token</button>
-            </div>
-          </form>
-        </div>
-      )}
-    </Show>
-  )
+  return <section id="auth" class="card panel bg-base-100 border border-base-300 auth-card">
+    <h1>{props.account ? "Regional account" : "Sign in to " + targetLabel()}</h1>
+    <p class="muted">Sign in before accessing gateway administration or Fleet health.</p>
+    <p class="hint">Credentials are isolated to this gateway origin and this tab. Changing identity or region reloads the console.</p>
+    <form onSubmit={(ev) => { ev.preventDefault(); void submit(false) }}>
+      <label>Username<input class="input w-full" id="auth-username" autocomplete="username" ref={(el) => { username = el }} /></label>
+      <label>Password<input class="input w-full" id="auth-password" type="password" autocomplete="current-password" ref={(el) => { password = el }} /></label>
+      <button class="btn btn-primary" type="submit" id="auth-submit" disabled={busy()}>{busy() ? "Signing in…" : "Sign in to " + targetLabel()}</button>
+    </form>
+    <details id="auth-token-details"><summary>Use a regional token instead</summary>
+      <p class="hint">First-admin setup creates a token, not a password. Use that token here; password sign-in requires an operator-configured password account.</p>
+      <form onSubmit={(ev) => { ev.preventDefault(); void submit(true) }}>
+        <label>Admin or session token<input class="input w-full" id="auth-input" type="password" autocomplete="off" ref={(el) => { input = el }} /></label>
+        <button class="btn btn-primary" type="submit" disabled={busy()}>Use token</button>
+      </form>
+    </details>
+    <Show when={sso()}><p id="auth-sso"><a class="btn btn-outline" href={targetURL("/api/oidc/login")} target={consoleConfig() ? "_blank" : undefined} rel="noopener noreferrer">{consoleConfig() ? "Open regional UI for SSO" : "Sign in with SSO"}</a></p></Show>
+    <Show when={consoleConfig()}><p class="hint">Regional SSO cookies do not sign in to a consolidated console. Use native credentials or a regional bearer token here.</p></Show>
+    <Show when={error()}><p class="error" role="alert">{error()}</p></Show>
+    <Show when={props.account}><button type="button" class="btn" onClick={dismissSignIn}>Close account</button><button type="button" id="signout-btn" class="btn" disabled={busy()} onClick={() => void logout()}>Sign out</button></Show>
+  </section>
 }
 
 export function App() {
   setView(viewFromHash())
   onSettled(() => {
-    let started = false
-    const loadTarget = () => {
-      if (started || view() === "fleet") return
-      started = true
-      // The fleet screen never loads regional permissions, logs or configuration.
-      void checkSetup().then((locked) => {
-        if (locked) return
-        void refreshMe()
-        checkSso()
-      })
-    }
-    const onHash = () => { setView(viewFromHash()); loadTarget() }
+    const onHash = () => setView(viewFromHash())
+    const expired = () => { setVerified(false) }
+    window.addEventListener("raiju-session-expired", expired)
     window.addEventListener("hashchange", onHash)
-    loadTarget()
+    void bootstrap()
+    try {
+      const warning = sessionStorage.getItem("raiju.logout-warning")
+      if (warning) { notify(warning, "error"); sessionStorage.removeItem("raiju.logout-warning") }
+    } catch {}
     void checkHealth()
     const timer = setInterval(() => {
       if (!document.hidden) void checkHealth()
@@ -186,12 +214,23 @@ export function App() {
     document.addEventListener("visibilitychange", onVis)
     return () => {
       window.removeEventListener("hashchange", onHash)
+      window.removeEventListener("raiju-session-expired", expired)
       document.removeEventListener("visibilitychange", onVis)
       clearInterval(timer)
     }
   })
 
   return (
+    <>
+    <Show when={checked() && !bootstrapError() && !setup() && verified()} fallback={
+      <div class="auth-page"><PublicControls />
+        <Show when={checked()} fallback={<LoadingSkeleton variant="page" label="Checking gateway identity" />}>
+          <Show when={!bootstrapError()} fallback={<section class="card panel"><p class="error" role="alert">{bootstrapError()}</p><button class="btn" id="auth-retry" onClick={() => void bootstrap()}>Retry connection</button></section>}>
+            <Show when={setup()} fallback={<SignIn />}>{(st) => <Setup configured={st().configured} done={setupDone} />}</Show>
+          </Show>
+        </Show>
+      </div>
+    }>
     <div class="admin-shell">
       <aside class="sidebar" aria-label="Gateway workspace">
         <div class="brand">
@@ -229,21 +268,7 @@ export function App() {
           </For>
         </nav>
         <footer class="sidebar-footer">
-          <div class="theme-controls" role="group" aria-label="Appearance">
-            <span>Appearance</span>
-            <div class="join">
-              <For each={[
-                { value: "system", label: "System", path: "M3 4h18v12H3z M8 21h8 M12 16v5" },
-                { value: "light", label: "Light", path: "M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8 M12 2v2 M12 20v2 M2 12h2 M20 12h2 M5 5l1.5 1.5 M17.5 17.5L19 19 M5 19l1.5-1.5 M17.5 6.5L19 5" },
-                { value: "dark", label: "Dark", path: "M20.5 13A9 9 0 0 1 11 3.5 9 9 0 1 0 20.5 13Z" },
-              ]}>{(option) => <button type="button"
-                class={["btn btn-sm btn-square join-item", theme() === option.value ? "btn-primary" : "btn-ghost"]}
-                aria-label={option.label + " theme"} title={option.label + " theme"}
-                aria-pressed={theme() === option.value ? "true" : "false"} onClick={() => setTheme(option.value)}>
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={option.path} /></svg>
-              </button>}</For>
-            </div>
-          </div>
+          <ThemeControls />
           <Show when={me()}>
             {(m) => <span id="role-pill" class="badge badge-neutral" title="The role of the signed-in caller">{roleLabel(m())}</span>}
           </Show>
@@ -256,10 +281,6 @@ export function App() {
       <header class="console-heading top">
         <span class="page-context"><span class="muted">Workspace / </span>{VIEWS.find((v) => v[0] === view())?.[1]}</span>
       </header>
-      <Show when={!checked() && view() !== "fleet"}><main><LoadingSkeleton variant="page" label="Checking selected gateway" /></main></Show>
-      <Show when={view() !== "fleet" ? setup() : undefined}>{(st) => <Setup configured={st().configured} done={setupDone} />}</Show>
-
-      <Show when={(checked() && !setup()) || view() === "fleet"}>
       <main>
         <Show when={view()} keyed>{(route) =>
         <Errored
@@ -275,6 +296,7 @@ export function App() {
           )}
         >
           <Loading fallback={<LoadingSkeleton variant="page" label={"Loading " + VIEWS.find((v) => v[0] === route)?.[1]} />}>
+          <Show when={VIEWS.find((v) => v[0] === route)?.[2] === "" || can(VIEWS.find((v) => v[0] === route)?.[2] ?? "")} fallback={<section class="card panel"><p role="alert">Your role cannot access this section.</p></section>}>
           <Switch>
             <Match when={view() === "fleet" && consoleConfig()}>
               <Fleet />
@@ -319,14 +341,16 @@ export function App() {
               <Playground />
             </Match>
           </Switch>
+          </Show>
           </Loading>
         </Errored>
         }</Show>
       </main>
-      </Show>
 
-      <SignIn />
-      <Toasts />
+      <Show when={dialog()}><div class="overlay"><SignIn account /></div></Show>
     </div>
+    </Show>
+    <Toasts />
+    </>
   )
 }

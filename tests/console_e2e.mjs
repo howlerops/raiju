@@ -54,13 +54,12 @@ const select = async (gateway) => {
 }
 const login = async (gateway) => {
   if (!(await page.locator('#auth').isVisible())) await page.locator('#token-btn').click()
-  await page.locator('#auth details summary').click()
   await page.locator('#auth-username').fill(gateway.username)
   await page.locator('#auth-password').fill(gateway.password)
   await page.getByRole('button', {name:'Sign in to ' + gateway.name, exact:true}).click()
   await page.locator('#auth').waitFor({state:'hidden'})
   await targetIs(gateway)
-  await page.waitForFunction(() => document.querySelector('#token-btn')?.textContent?.includes('set'))
+  await page.locator('#role-pill').waitFor()
 }
 let oldClient, paused = false
 try {
@@ -69,11 +68,23 @@ try {
   for (const origin of [eu.url, us.url]) assert.ok(csp.includes(origin), 'Console CSP omitted a configured origin')
   assert.ok(!/(?:^|\s)wss?:[;\s]/.test(csp), 'Console CSP allowed scheme-wide sockets')
   await targetIs(eu)
+  await page.locator('#auth').waitFor()
+  assert.equal(await page.locator('nav[aria-label="Sections"], .admin-shell, #fleet-title, #cfg-json').count(), 0, 'Anonymous visitors must not see the administrative shell')
+  await Promise.all(collecting)
+  const publicBeforeLogin = new Set(['/health', '/ready', '/api/session/is-auth-enabled', '/api/oidc/status', '/api/users/me/permissions'])
+  assert.ok(records.filter((r) => new URL(r.url).origin !== access.console).every((r) => publicBeforeLogin.has(new URL(r.url).pathname)), 'No administrative data requests before verified login')
+  await page.locator('#auth-token-details summary').click()
+  await page.locator('#auth-input').fill('wrong-preview-token')
+  const wrongTokenResponse = page.waitForResponse((r) => r.url() === eu.url + '/api/users/me/permissions' && r.request().headers().authorization === 'Bearer wrong-preview-token')
+  await page.locator('#auth-token-details button[type="submit"]').click()
+  assert.equal((await wrongTokenResponse).status(), 401)
+  await page.locator('#auth [role="alert"]').waitFor()
+  assert.equal(await page.locator('.admin-shell').count(), 0)
+  assert.equal(await page.evaluate((url) => sessionStorage.getItem('raiju.adminToken:' + url), eu.url), null, 'Rejected token must never be persisted')
+  await login(eu)
   await page.getByRole('region', {name:eu.name, exact:true}).getByText('Ready', {exact:true}).waitFor()
   await page.getByRole('region', {name:us.name, exact:true}).getByText('Ready', {exact:true}).waitFor()
-  await Promise.all(collecting)
-  assert.ok(records.filter((r) => new URL(r.url).origin !== access.console).every((r) => ['/health','/ready'].includes(new URL(r.url).pathname)))
-  check('fleet loads only public regional health/readiness, not admin or inference data')
+  check('native sign-in precedes all administration; authenticated fleet loads public health only')
 
   // The native preflight must permit bearer management without granting the actual call.
   const preflight = await fetch(eu.url + '/api/config', {method:'OPTIONS', headers:{
@@ -125,7 +136,6 @@ try {
   check('real management/setup/inference paths keep auth, readable errors and existing Vary across CORS')
 
   await page.locator('[data-nav="config"]').click()
-  await login(eu)
   await page.locator('#cfg-json').waitFor()
 
   // A slow screen module or API must never replace the shell or block navigation.
@@ -221,7 +231,7 @@ try {
   check('Playground and one-use-ticket live socket use the explicitly selected America gateway')
 
   await select(eu)
-  await page.waitForFunction(() => document.querySelector('#token-btn')?.textContent?.includes('set'))
+  await page.locator('#role-pill').waitFor()
   await page.locator('[data-nav="config"]').click()
   await page.locator('#cfg-json').waitFor()
   assert.equal(JSON.parse(await page.locator('#cfg-json').inputValue()).client_config.max_request_body_size_mb, 101)
@@ -258,6 +268,73 @@ try {
   }
   assert.deepEqual(errors, [])
   check('observed browser traffic contains no cross-region bearer leakage, credentialed probes or admin inference')
+  const metricsContext = await browser.newContext()
+  await metricsContext.addInitScript(({url,token}) => {
+    sessionStorage.setItem('raiju.console.gateway', url)
+    sessionStorage.setItem('raiju.adminToken:' + url, token)
+  }, {url:eu.url,token:eu.token})
+  const metricsPage = await metricsContext.newPage()
+  try {
+    await metricsPage.route('**/metrics', (route) => route.fulfill({status:401,contentType:'application/json',body:'{"error":"scrape token required"}'}))
+    await metricsPage.goto(access.console + '/#overview')
+    await metricsPage.locator('#ov-metrics-box summary').click()
+    await metricsPage.locator('#ov-metrics').filter({hasText:'scrape token required'}).waitFor()
+    await metricsPage.locator('#role-pill').waitFor()
+    assert.equal(await metricsPage.locator('#auth').count(), 0, 'A separate scrape-token refusal must not sign out a verified administrator')
+  } finally { await metricsContext.close() }
+  const signedOutToken = await page.evaluate((url) => sessionStorage.getItem('raiju.adminToken:' + url), eu.url)
+  await page.locator('#token-btn').click()
+  await page.locator('#signout-btn').click()
+  await page.getByRole('heading', {name:'Sign in to ' + eu.name, exact:true}).waitFor()
+  assert.equal(await page.locator('.admin-shell, nav[aria-label="Sections"]').count(), 0)
+  assert.equal(await page.evaluate((url) => sessionStorage.getItem('raiju.adminToken:' + url), eu.url), null)
+  await page.waitForFunction(async ({url, token}) => {
+    const response = await fetch(url + '/api/users/me/permissions', {credentials:'omit',headers:{authorization:'Bearer ' + token}})
+    return response.status === 401
+  }, {url:eu.url,token:signedOutToken}, {polling:100,timeout:5000})
+  await login(eu)
+  check('native sign-out revokes the session and returns to a dashboard-free login page')
+
+  // A server-revoked session must remove already rendered regional data, not
+  // merely open a dialog over the previous user's configuration.
+  const loginResponse = await fetch(eu.url + '/api/session/login', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({username:eu.username,password:eu.password})})
+  assert.equal(loginResponse.status, 200)
+  const expiringToken = (await loginResponse.json()).token
+  assert.ok(expiringToken)
+  const expiredContext = await browser.newContext()
+  await expiredContext.addInitScript(({url,token}) => {
+    sessionStorage.setItem('raiju.console.gateway', url)
+    sessionStorage.setItem('raiju.adminToken:' + url, token)
+  }, {url:eu.url,token:expiringToken})
+  const expiredPage = await expiredContext.newPage()
+  try {
+    await expiredPage.goto(access.console + '/#config')
+    await expiredPage.locator('#cfg-json').waitFor()
+    const revoked = await fetch(eu.url + '/api/session/logout', {method:'POST', headers:{authorization:'Bearer ' + expiringToken}})
+    assert.equal(revoked.status, 200)
+    await expiredPage.waitForFunction(async ({url, token}) => {
+      const response = await fetch(url + '/api/users/me/permissions', {credentials:'omit', headers:{authorization:'Bearer ' + token}})
+      return response.status === 401
+    }, {url:eu.url,token:expiringToken}, {polling:100,timeout:5000})
+    await expiredPage.locator('#cfg-refresh').click()
+    await expiredPage.locator('#auth').waitFor()
+    assert.equal(await expiredPage.locator('.admin-shell, #cfg-json, nav[aria-label="Sections"]').count(), 0, 'Session rejection must discard the protected UI')
+  } finally { await expiredContext.close() }
+  check('server-side session revocation removes previously rendered administration')
+
+  const malformedContext = await browser.newContext()
+  await malformedContext.addInitScript(({url,token}) => {
+    sessionStorage.setItem('raiju.console.gateway', url)
+    sessionStorage.setItem('raiju.adminToken:' + url, token)
+  }, {url:eu.url,token:eu.token})
+  const malformedPage = await malformedContext.newPage()
+  try {
+    await malformedPage.route('**/api/users/me/permissions', (route) => route.fulfill({status:200,contentType:'application/json',body:'{}'}))
+    await malformedPage.goto(access.console + '/#config')
+    await malformedPage.getByRole('alert').first().waitFor()
+    assert.equal(await malformedPage.locator('.admin-shell, #cfg-json, nav[aria-label="Sections"]').count(), 0)
+  } finally { await malformedContext.close() }
+  check('malformed identity responses cannot default to administrator')
 
   // Malformed operator metadata must stop bootstrap before any gateway requests.
   const invalid = await browser.newContext()

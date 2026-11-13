@@ -35,7 +35,15 @@ let current = ""
 const [tokenSet, setTokenSet] = createSignal(current !== "")
 const [dialog, setDialog] = createSignal<{ message: string } | undefined>(undefined)
 
-export { tokenSet, dialog }
+const [verified, setVerified] = createSignal(false)
+export { tokenSet, dialog, verified, setVerified }
+
+export function revokeSession(): void {
+  setVerified(false)
+  setDialog(undefined)
+  window.dispatchEvent(new Event("raiju-session-expired"))
+}
+
 
 export function initializeAuth(): void {
   current = readToken()
@@ -57,47 +65,7 @@ export function setToken(t: string): void {
   if (changed) reloadTarget()
 }
 
-let pending: Promise<string> | undefined
-let resolvePending: ((t: string) => void) | undefined
-let declined = false
-
-// Opens the dialog and resolves to the entered token ("" when the person declines).
-// Concurrent callers share one dialog.
-export function askToken(message: string): Promise<string> {
-  if (!isActive()) return new Promise<string>(() => {})
-  if (declined) return Promise.resolve("")
-  if (!pending) {
-    pending = new Promise<string>((resolve) => {
-      resolvePending = resolve
-    })
-    setDialog({ message })
-  }
-  return pending
-}
-
-// A person-initiated open (the header button) clears an earlier decline.
 export function openSignIn(message: string): void {
-  declined = false
-  void askToken(message)
+  if (isActive()) setDialog({ message })
 }
-
-export function closeSignIn(token: string | undefined): void {
-  if (!isActive()) return
-  declined = token === undefined
-  if (token !== undefined) setToken(token)
-  setDialog(undefined)
-  const r = resolvePending
-  pending = undefined
-  resolvePending = undefined
-  if (r) r(token ?? "")
-}
-
-export function clearSignIn(): void {
-  setToken("")
-  declined = true
-  setDialog(undefined)
-  const r = resolvePending
-  pending = undefined
-  resolvePending = undefined
-  if (r) r("")
-}
+export function dismissSignIn(): void { setDialog(undefined) }

@@ -22,7 +22,7 @@ function Instructions() {
   )
 }
 
-export function Setup(props: { configured: boolean; done: (token: string) => void }) {
+export function Setup(props: { configured: boolean; done: (token: string) => Promise<void> }) {
   const [error, setError] = createSignal("")
   const [busy, setBusy] = createSignal(false)
   const [created, setCreated] = createSignal<{ name: string; token: string } | undefined>(undefined)
@@ -75,7 +75,7 @@ export function Setup(props: { configured: boolean; done: (token: string) => voi
             <>
               <p class="muted">
                 No admin account exists yet, so the management API is locked. Enter the setup token and create the first
-                admin account.
+                admin account. Setup issues a bearer token; it does not create a password.
               </p>
               <Show
                 when={props.configured}
@@ -124,13 +124,15 @@ export function Setup(props: { configured: boolean; done: (token: string) => voi
             <div id="setup-done">
               <p>
                 The admin account <strong>{c().name}</strong> was created on {targetLabel()}. Its token is shown this once: keep it somewhere safe.
-                Continue to sign this tab in to that gateway.
+                Continue verifies this bearer token before signing this tab in. No password was created; save the token for future regional sign-ins.
               </p>
               <input id="setup-new-token" class="input input-sm mono" readonly value={c().token} onFocus={(ev) => ev.currentTarget.select()} />
               <Show when={error()}><p class="error" role="alert">{error()}</p></Show>
               <div class="actions">
-                <button type="button" class="btn btn-sm btn-primary" id="setup-continue" onClick={() => {
-                  try { props.done(c().token) } catch (e) { setError(e instanceof Error ? e.message : String(e)) }
+                <button type="button" class="btn btn-sm btn-primary" id="setup-continue" disabled={busy()} onClick={async () => {
+                  setBusy(true)
+                  try { await props.done(c().token) } catch (e) { setError(e instanceof Error ? e.message : String(e)) }
+                  finally { setBusy(false) }
                 }}>
                   Continue to the dashboard
                 </button>
