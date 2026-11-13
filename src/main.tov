@@ -171,8 +171,30 @@ function clusterSecretProblem(rawSecret: string, first: Config, broker: bool): s
   return secretProblem(rawSecret, cc.secret)
 }
 
+// Clean workers rebuild process-local engines after exec. Keep the node identity, share folder
+// and ephemeral session key chosen by the supervisor, rather than generating one per worker.
+function withWorkerIdentity(c: Config): Config {
+  const id = Bun.workerState("node-id", "")
+  const cc = c.cluster
+  if (id === "" || cc === undefined) return c
+  let cluster = cc
+  cluster.node_id = id
+  let next = c
+  next.cluster = cluster
+  return next
+}
+
+function workerShareDir(supervisor: int): string {
+  const inherited = Bun.workerState("share-dir", "")
+  if (inherited !== "") return inherited.slice(1)
+  const dir = makeShareDir(supervisor)
+  // The prefix also preserves an empty result: no worker tries to create a different folder.
+  Bun.workerState("share-dir", "1" + dir)
+  return dir
+}
+
 // The cluster listener (cluster.listen_port, on cluster.bind or the gateway's host): the peer routes, /health and,
-// with cluster.serve_metrics, /metrics. Opened before the workers fork, so each worker accepts on it. undefined when
+// with cluster.serve_metrics, /metrics. Each clean worker adopts the supervisor's listener. undefined when
 // it is not configured.
 function openClusterListener(engine: Engine, ops: Ops, cfg: Config, host: string, server: string, limits: ServerLimits): Served | undefined {
   const cc = cfg.cluster
@@ -223,6 +245,11 @@ async function main(): Promise<int> {
   const alloc = allocCheck(Bun.plainAlloc(), process.env.RAIJU_ALLOW_UNSAFE_ALLOC ?? "")
   if (alloc.message !== "") console.error(`raiju: ${alloc.message}`)
   if (alloc.fatal) return 1
+  // Forking an initialized JavaScriptCore VM loses its collector/compiler threads. Clean
+  // workers exec this binary and adopt the supervisor's listeners with fresh native/JS state.
+  const cleanWorkers = args.workers > 1 && args.server !== "http1" && args.mode !== "broker"
+  if (cleanWorkers) Bun.cleanWorkers()
+  const supervisor = Bun.workerSupervisor()
   // an OpenAPI MCP client's spec_file is read relative to the config file, and so are the log and audit folders
   const appDir = path.dirname(path.resolve(args.config))
   setSpecBaseDir(appDir)
@@ -258,7 +285,7 @@ async function main(): Promise<int> {
   }
   if (args.mode === "broker") return runBroker(first, args.host)
   reportConfig(args.config)
-  const cfg = withRaijuGuardrails(withAppDirs(await withSecrets(first), appDir), store, true)
+  const cfg = withWorkerIdentity(withRaijuGuardrails(withAppDirs(await withSecrets(first), appDir), store, true))
   for (const p of aliasProblems(cfg)) console.error(`raiju: config: ${p}`)
   // crew routing (crew.tov): the pools, priors and classifier are checked and loaded here, relative to the config file's folder
   const crewProblems = configureCrews(cfg, path.dirname(args.config))
@@ -277,6 +304,7 @@ async function main(): Promise<int> {
   for (const e of pdl.errors) console.error(`raiju: plugin: ${e}`)
   const engine = new Engine(cfg)
   const ops = new Ops(engine, store)
+  if (cleanWorkers) ops.nodeId = Bun.workerState("node-id", ops.nodeId)
   // Failure to open a required log store or audit log prevents startup; required: false allows startup to continue.
   const storage = ops.storageProblems()
   for (const p of storage) console.error(`raiju: ${p} (set required: false to start without it)`)
@@ -293,9 +321,8 @@ async function main(): Promise<int> {
   // that node at a time (the lease in the supervisor's share folder, shared by its workers). The renewed credential is
   // read back from the config file by the other workers, and sent to the other nodes through the cluster state with
   // its tokens sealed (every node must hold the same encryption_key for them to open it)
-  // The node's share folder is made here, in the supervisor before the workers fork, so every worker names the same
-  // private folder (ops.startLocalShare)
-  const shareDir = args.workers > 1 && args.server !== "http1" ? makeShareDir(process.pid) : ""
+  // The supervisor creates one private share folder; clean workers import its identity.
+  const shareDir = cleanWorkers ? workerShareDir(supervisor) : ""
   if (shareDir !== "") engine.adminLease = new FileLease(shareDir + "/leases", FILE_LEASE_MS)
   // the closures below take a const copy of the cipher: a mutable local captured by a closure in this async function
   // does not compile
@@ -320,7 +347,15 @@ async function main(): Promise<int> {
   const otherNodes = cl !== undefined && (cl.peers.length > 0 || cl.discovery !== undefined || (cl.broker?.address ?? "") !== "")
   const keySource = stateKeySource(sealKey !== undefined, cl !== undefined && cl.enabled, cl === undefined ? "" : cl.secret, otherNodes)
   if (cfg.oidc?.enabled === true && keySource.note !== "") console.error(`raiju: oidc: warning: ${keySource.note}`)
-  if (sealKey !== undefined) {
+  const inheritedStateKey = cleanWorkers ? Bun.workerState("session-key", "") : ""
+  if (inheritedStateKey !== "") {
+    try {
+      stateKey = try JSON.parse(inheritedStateKey) as u8[]
+    } catch (e) {
+      console.error("raiju: invalid clean worker session key")
+      return 1
+    }
+  } else if (sealKey !== undefined) {
     stateKey = stateKeyFrom(sealKey.key)
   } else if (keySource.source === "cluster" && cl !== undefined) {
     stateKey = stateKeyFromClusterSecret(cl.secret)
@@ -331,6 +366,7 @@ async function main(): Promise<int> {
       console.error(`raiju: oidc: no key for sign-in states (${e.message}); each worker makes its own`)
     }
   }
+  if (cleanWorkers && inheritedStateKey === "") Bun.workerState("session-key", JSON.stringify(stateKey))
   ops.keepAuthState(args.config, {
     seal: (v: string): string => {
       try {
@@ -422,7 +458,7 @@ async function main(): Promise<int> {
     })
   })
   const mcp = engine.mcp
-  if (mcp !== undefined) {
+  if (mcp !== undefined && (!cleanWorkers || process.pid !== supervisor)) {
     // the identity provider's token endpoint, for the token_exchange clients that name none, is discovered now
     // rather than on the first exchange
     await discoverTokenEndpoint(engine)
@@ -478,8 +514,9 @@ async function main(): Promise<int> {
       },
     })
   })
-  // Runs once the server is up: with -workers, in every worker after the fork.
-  const supervisor = process.pid
+  if (cleanWorkers) Bun.workersReady()
+  // Runs once this worker's independently initialized server is up. The supervisor does not
+  // run these jobs; re-exec workers retain its pid through the private runtime bootstrap.
   setTimeout(() => {
     if (process.pid !== supervisor) {
       ops.startLocalShare(shareDir)

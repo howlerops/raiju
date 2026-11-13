@@ -281,12 +281,18 @@ value (rendered into a ConfigMap) to `/app/data/config.json`: with `configMode: 
 default) only when the file is not there yet, so changes made through the API or UI persist and a
 later change to `config` reaches only a fresh volume; with `configMode: always` at every start
 (config as code: `config` is the source of truth and API changes last until the pod restarts).
+First-write seeding uses a unique temporary file and an atomic no-clobber link: simultaneous
+replica starts cannot overwrite a config another replica or administrator has already saved.
 Liveness probes `GET /health`, readiness `GET /ready`.
 
 Useful values (see `values.yaml`):
 
 | Value | Purpose |
 |---|---|
+| `image.repository`, `image.tag`, `image.digest` | Image for both init and runtime containers. Empty tag uses the chart app version. A nonempty digest (`sha256:...`) overrides the tag and renders `repository@digest`. |
+| `serviceAccount.create`, `serviceAccount.name`, `serviceAccount.annotations` | Opt-in dedicated account; defaults to no creation and no explicit pod account. Created accounts default to the release-scoped name. With `create: false`, set `name` to an existing account and manage its annotations externally. |
+| `serviceAccount.automountServiceAccountToken` | Kubernetes API token mount, `false` by default on the pod and any created account. Not required for EKS IRSA. |
+| `topologySpreadConstraints` | Optional native pod topology constraints, passed through unchanged; set selectors for this release. Defaults to `[]` and works alongside `affinity`. |
 | `config` | The whole `config.json` as YAML, rendered to a ConfigMap and copied to the data volume. |
 | `configMode` | `ifAbsent` (default) or `always`, as above. |
 | `persistence.enabled` | `true`: a PVC at `/app/data` (`existingClaim`, `storageClass`, `accessModes`, `size`, `keep`). `false`: an emptyDir, lost with the pod. |
@@ -331,6 +337,48 @@ entry. See [SECURITY.md](../SECURITY.md) for the outbound address rules.
 MCP tools are denied to a virtual key that declares no `mcp_configs`, and WebRTC realtime is off unless
 `server.webrtc_enabled` is true (WebRTC also needs `RAIJU_WEBRTC_BIND` and UDP reachability, which a
 plain Service does not give).
+
+### EKS workload identity
+
+Use a dedicated service account for IAM roles for service accounts (IRSA), not the namespace's
+default account. Example values (replace the role ARN with the role for this cluster and region):
+
+```yaml
+serviceAccount:
+  create: true
+  name: raiju-bedrock
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/raiju-bedrock
+  automountServiceAccountToken: false
+```
+
+Configure that role's trust policy for the cluster's OIDC provider, audience `sts.amazonaws.com`,
+and subject `system:serviceaccount:<namespace>:raiju-bedrock`, with only the required regional
+provider permissions. The EKS webhook injects the AWS role environment and a projected STS token;
+this is independent of Kubernetes API token automount, which can remain disabled. The chart does
+not create IAM roles, OIDC providers or AWS token volumes.
+
+To reuse an account, set `serviceAccount.create: false` and `serviceAccount.name` to its name.
+Annotate that existing account outside Helm; `serviceAccount.annotations` is rejected unless the
+chart creates the account, so IRSA annotations cannot silently land on an unused or default identity.
+Creating an account named `default` is also rejected. With all defaults, no ServiceAccount resource
+or `serviceAccountName` is rendered and the pod keeps Kubernetes API token automount disabled.
+
+For zone spreading, for example:
+
+```yaml
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: raiju
+        app.kubernetes.io/instance: raiju
+```
+
+Match these labels to the chart's rendered pod labels (including the actual release name and any
+`nameOverride`). Constraints do not alter storage or replica-count requirements.
 
 ### Several replicas
 

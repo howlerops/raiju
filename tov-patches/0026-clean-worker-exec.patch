@@ -1,0 +1,436 @@
+diff --git a/crates/tov/src/check/builtins.rs b/crates/tov/src/check/builtins.rs
+--- a/crates/tov/src/check/builtins.rs
++++ b/crates/tov/src/check/builtins.rs
+@@ -57,6 +57,10 @@
+             (vec![handler], VOID)
+         }
+         "httpWorkers" => (vec![INT], VOID),
++        "httpCleanWorkers" => (vec![], VOID),
++        "httpWorkersReady" => (vec![], VOID),
++        "httpWorkerSupervisor" => (vec![], INT),
++        "httpWorkerState" => (vec![STR, STR], STR),
+         "urlParse" => (vec![STR, STR], str_arr),
+         "urlDecode" => (vec![STR, BOOL], STR),
+         "urlEncode" => (vec![STR], STR),
+diff --git a/crates/tov/src/std/http.tov b/crates/tov/src/std/http.tov
+--- a/crates/tov/src/std/http.tov
++++ b/crates/tov/src/std/http.tov
+@@ -3331,6 +3331,33 @@
+     return serve(options)
+   }
+ 
++  // Tov opt-in: workers replay startup in fresh executables, adopting every startup HTTP
++  // listener (including port 0). Unlike forked VMs, these workers may initialize npm/JSC
++  // during startup. Startup side effects run again; share process-local identities explicitly.
++  // Call workersReady after configuring all startup listeners, before serving any requests.
++  static cleanWorkers(): void {
++    __native.httpCleanWorkers()
++  }
++
++  // Complete startup: verify every inherited listener was adopted before accepting requests.
++  // Async initialization may pump other I/O before this checkpoint, but neither the supervisor
++  // nor an incompletely initialized worker accepts HTTP requests.
++  static workersReady(): void {
++    __native.httpWorkersReady()
++  }
++
++  // The original supervisor's pid, or this process's pid outside a clean worker.
++  static workerSupervisor(): int {
++    return __native.httpWorkerSupervisor()
++  }
++
++  // A startup value shared by clean workers, privately inherited across exec. In the supervisor,
++  // a nonempty value registers/replaces it; "" looks it up. Workers only read the supervisor's
++  // immutable snapshot. Register before workersReady; values are never environment data.
++  static workerState(name: string, value: string): string {
++    return __native.httpWorkerState(name, value)
++  }
++
+   // gzip data (RFC 1952; members after the first are read too) decompressed, as in Bun. Throws when
+   // it is corrupt, cut short, or over `maxOutputLength` (Tov).
+   static gunzipSync(data: u8[], options?: DecompressOptions): u8[] throws Error {
+diff --git a/runtime/tov.c b/runtime/tov.c
+--- a/runtime/tov.c
++++ b/runtime/tov.c
+@@ -4050,7 +4050,12 @@
+ #include <sys/mman.h>
+ #include <sys/wait.h>
+ #include <sys/resource.h>
++#include <spawn.h>
++#include <limits.h>
+ #if defined(__APPLE__)
++#include <mach-o/dyld.h>
++#endif
++#if defined(__APPLE__)
+ #include <malloc/malloc.h>
+ #elif defined(__GLIBC__)
+ #include <malloc.h>
+@@ -4191,8 +4196,237 @@
+ static _Atomic int64_t *tv_http_loads;
+ static tv_int tv_http_nworkers = 1, tv_http_worker;
+ static pid_t tv_http_parent;   /* the supervisor, in worker processes */
++
++/* Clean workers explicitly replay startup in a fresh executable, never a copied JS VM.
++ * The unlinked, private bootstrap file carries descriptors and application-shared values;
++ * the environment carries only its descriptor number. All imports become CLOEXEC at once. */
++typedef struct tv_http_worker_state {
++    struct tv_http_worker_state *next;
++    tv_str name, value;
++} tv_http_worker_state;
++static tv_http_worker_state *tv_http_worker_values;
++static bool tv_http_clean_workers, tv_http_exec_worker, tv_http_boot_checked, tv_http_boot_complete;
++static int tv_http_load_fd = -1;
++static int tv_http_inherited[TV_HTTP_MAX_SERVERS], tv_http_ninherited;
++
++static int tv_http_private_file(void) {
++    char path[] = "/tmp/tov-worker-XXXXXX";
++#ifdef __linux__
++    int fd = mkostemp(path, O_CLOEXEC);
++#else
++    /* macOS has mkstemp, not mkostemp; secure it before any bootstrap content is written. */
++    int fd = mkstemp(path);
++#endif
++    if (fd < 0) tv_trap("can't create clean worker bootstrap", NULL);
++    if (unlink(path) || fcntl(fd, F_SETFD, FD_CLOEXEC))
++        tv_trap("can't secure clean worker bootstrap", NULL);
++    return fd;
++}
++
++static void tv_http_boot_write(int fd, const void *data, size_t n) {
++    const char *p = data;
++    while (n) {
++        ssize_t r = write(fd, p, n);
++        if (r < 0 && errno == EINTR) continue;
++        if (r <= 0) tv_trap("can't write clean worker bootstrap", NULL);
++        p += r; n -= (size_t)r;
++    }
++}
++
++static void tv_http_boot_read(int fd, void *data, size_t n) {
++    char *p = data;
++    while (n) {
++        ssize_t r = read(fd, p, n);
++        if (r < 0 && errno == EINTR) continue;
++        if (r <= 0) tv_trap("invalid clean worker bootstrap", NULL);
++        p += r; n -= (size_t)r;
++    }
++}
++
++static void tv_http_boot_import_fd(int fd) {
++    if (fd < 3 || fcntl(fd, F_SETFD, FD_CLOEXEC))
++        tv_trap("invalid clean worker descriptor", NULL);
++}
++
++static void tv_http_worker_bootstrap(void) {
++    if (tv_http_boot_checked) return;
++    tv_http_boot_checked = true;
++    const char *raw = getenv("TOV_CLEAN_WORKER_FD");
++    if (!raw) return;
++    char *end;
++    errno = 0;
++    long parsed = strtol(raw, &end, 10);
++    if (errno || *end || parsed < 3 || parsed > INT_MAX)
++        tv_trap("invalid clean worker bootstrap descriptor", NULL);
++    int fd = (int)parsed;
++    tv_http_boot_import_fd(fd);
++    unsetenv("TOV_CLEAN_WORKER_FD");
++    struct stat st;
++    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_uid != geteuid()
++        || (st.st_mode & 077) || st.st_nlink || st.st_size < 48 || st.st_size > 8 * 1024 * 1024)
++        tv_trap("invalid clean worker bootstrap file", NULL);
++    int64_t header[6];
++    tv_http_boot_read(fd, header, sizeof header);
++    if (header[0] != 0x544f56574f524b31LL || header[1] != getppid() || header[2] < 2
++        || header[2] > 1024 || header[3] < 0 || header[3] >= header[2]
++        || header[4] < 1 || header[4] > TV_HTTP_MAX_SERVERS || header[5] < 3 || header[5] > INT_MAX)
++        tv_trap("invalid clean worker bootstrap header", NULL);
++    tv_http_exec_worker = tv_http_clean_workers = true;
++    tv_http_parent = (pid_t)header[1];
++    tv_http_nworkers = header[2];
++    tv_http_worker = header[3];
++    tv_http_ninherited = (int)header[4];
++    tv_http_load_fd = (int)header[5];
++    tv_http_boot_import_fd(tv_http_load_fd);
++    tv_http_boot_read(fd, tv_http_inherited, (size_t)tv_http_ninherited * sizeof *tv_http_inherited);
++    for (int i = 0; i < tv_http_ninherited; i++) tv_http_boot_import_fd(tv_http_inherited[i]);
++    size_t bytes = (size_t)tv_http_nworkers * sizeof(int64_t);
++    if (fstat(tv_http_load_fd, &st) || st.st_size != (off_t)bytes)
++        tv_trap("invalid clean worker load mapping", NULL);
++    void *loads = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, tv_http_load_fd, 0);
++    if (loads == MAP_FAILED) tv_trap("can't import clean worker load mapping", NULL);
++    tv_http_loads = loads;
++    uint32_t count;
++    tv_http_boot_read(fd, &count, sizeof count);
++    if (count > 64) tv_trap("too many clean worker state values", NULL);
++    for (uint32_t i = 0; i < count; i++) {
++        uint32_t lengths[2];
++        tv_http_boot_read(fd, lengths, sizeof lengths);
++        if (!lengths[0] || lengths[0] > 128 || lengths[1] > 1024 * 1024)
++            tv_trap("invalid clean worker state length", NULL);
++        tv_http_worker_state *value = tv_alloc(sizeof *value);
++        value->name = (tv_str){tv_strbuf_new(lengths[0])};
++        value->value = (tv_str){tv_strbuf_new(lengths[1])};
++        tv_http_boot_read(fd, value->name.p->data, lengths[0]);
++        tv_http_boot_read(fd, value->value.p->data, lengths[1]);
++        value->next = tv_http_worker_values;
++        tv_http_worker_values = value;
++    }
++    char extra;
++    if (read(fd, &extra, 1) != 0) tv_trap("trailing clean worker bootstrap data", NULL);
++    close(fd);
++#ifdef __linux__
++    if (prctl(PR_SET_PDEATHSIG, SIGTERM) || getppid() != tv_http_parent) _exit(1);
++#endif
++    /* Keep patch 0021's reproducible per-slot streams when TOV_SEED is fixed. */
++    tv_random_after_fork(tv_http_worker);
++}
++
++void tv_native_httpCleanWorkers(void) {
++    tv_http_worker_bootstrap();
++    tv_http_clean_workers = true;
++}
++
++void tv_native_httpWorkersReady(void) {
++    tv_http_worker_bootstrap();
++    if (tv_http_exec_worker && tv_http_nservers != tv_http_ninherited)
++        tv_trap("clean worker listener count differs from supervisor", NULL);
++    tv_http_boot_complete = true;
++}
++
++tv_int tv_native_httpWorkerSupervisor(void) {
++    tv_http_worker_bootstrap();
++    return tv_http_exec_worker ? tv_http_parent : getpid();
++}
++
++tv_str tv_native_httpWorkerState(tv_str name, tv_str text) {
++    tv_http_worker_bootstrap();
++    if (!tv_http_exec_worker && text.p->len && tv_http_boot_complete)
++        tv_trap("clean worker shared state registered after workersReady", NULL);
++    if (text.p->len && (!name.p->len || name.p->len > 128 || text.p->len > 1024 * 1024))
++        tv_trap("invalid clean worker shared state", NULL);
++    for (tv_http_worker_state *v = tv_http_worker_values; v; v = v->next) {
++        if (!tv_str_eq(v->name, name)) continue;
++        if (!tv_http_exec_worker && text.p->len) {
++            tv_str_retain(text);
++            tv_str_release(v->value);
++            v->value = text;
++        }
++        tv_str_retain(v->value);
++        return v->value;
++    }
++    if (tv_http_exec_worker) {
++        if (text.p->len) tv_trap("clean worker shared state was not registered by its supervisor", NULL);
++        tv_str_retain(text);
++        return text;
++    }
++    if (!text.p->len) { tv_str_retain(text); return text; }
++    tv_http_worker_state *v = tv_alloc(sizeof *v);
++    tv_str_retain(name);
++    tv_str_retain(text);
++    v->name = name;
++    v->value = text;
++    v->next = tv_http_worker_values;
++    tv_http_worker_values = v;
++    tv_str_retain(text);
++    return text;
++}
+ 
++static pid_t tv_http_spawn_clean(tv_int w) {
++    int fd = tv_http_private_file();
++    int64_t header[6] = { 0x544f56574f524b31LL, tv_http_parent, tv_http_nworkers, w, tv_http_nservers, tv_http_load_fd };
++    tv_http_boot_write(fd, header, sizeof header);
++    for (int i = 0; i < tv_http_nservers; i++) tv_http_boot_write(fd, &tv_http_servers[i].fd, sizeof(int));
++    uint32_t count = 0;
++    for (tv_http_worker_state *v = tv_http_worker_values; v; v = v->next) count++;
++    if (count > 64) tv_trap("too many clean worker state values", NULL);
++    tv_http_boot_write(fd, &count, sizeof count);
++    for (tv_http_worker_state *v = tv_http_worker_values; v; v = v->next) {
++        uint32_t lengths[2] = { (uint32_t)v->name.p->len, (uint32_t)v->value.p->len };
++        tv_http_boot_write(fd, lengths, sizeof lengths);
++        tv_http_boot_write(fd, v->name.p->data, lengths[0]);
++        tv_http_boot_write(fd, v->value.p->data, lengths[1]);
++    }
++    if (lseek(fd, 0, SEEK_SET) < 0) tv_trap("can't rewind clean worker bootstrap", NULL);
++    extern char **environ;
++    size_t nenv = 0;
++    while (environ[nenv]) nenv++;
++    char **env = tv_alloc((nenv + 2) * sizeof *env);
++    size_t j = 0;
++    for (size_t i = 0; i < nenv; i++)
++        if (strncmp(environ[i], "TOV_CLEAN_WORKER_FD=", 20)) env[j++] = environ[i];
++    char variable[64];
++    snprintf(variable, sizeof variable, "TOV_CLEAN_WORKER_FD=%d", fd);
++    env[j++] = variable;
++    env[j] = NULL;
++    posix_spawn_file_actions_t actions;
++    posix_spawnattr_t attr;
++    if (posix_spawn_file_actions_init(&actions) || posix_spawnattr_init(&attr))
++        tv_trap("can't prepare clean worker spawn", NULL);
++    /* POSIX requires dup2 actions, including fd == newfd, to clear CLOEXEC in the child.
++     * Parent descriptors always remain CLOEXEC, including while other threads spawn clients. */
++    int error = posix_spawn_file_actions_adddup2(&actions, fd, fd);
++    if (!error) error = posix_spawn_file_actions_adddup2(&actions, tv_http_load_fd, tv_http_load_fd);
++    for (int i = 0; !error && i < tv_http_nservers; i++)
++        error = posix_spawn_file_actions_adddup2(&actions, tv_http_servers[i].fd, tv_http_servers[i].fd);
++    sigset_t defaults, mask;
++    sigemptyset(&defaults); sigaddset(&defaults, SIGTERM); sigaddset(&defaults, SIGINT);
++    sigemptyset(&mask);
++    if (!error) error = posix_spawnattr_setsigdefault(&attr, &defaults);
++    if (!error) error = posix_spawnattr_setsigmask(&attr, &mask);
++    if (!error) error = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK);
++    const char *executable = tv_argv[0];
++#ifdef __linux__
++    executable = "/proc/self/exe";
++#elif defined(__APPLE__)
++    char path[PATH_MAX];
++    uint32_t capacity = sizeof path;
++    if (_NSGetExecutablePath(path, &capacity)) tv_trap("can't locate clean worker executable", NULL);
++    executable = path;
++#endif
++    pid_t pid = -1;
++    if (!error) error = posix_spawnp(&pid, executable, &actions, &attr, tv_argv, env);
++    posix_spawnattr_destroy(&attr);
++    posix_spawn_file_actions_destroy(&actions);
++    close(fd);
++    free(env);
++    if (error) tv_trap("can't spawn clean worker executable", NULL);
++    return pid;
++}
++
+ static bool tv_http_may_accept(void) {
++    if (tv_http_clean_workers && (!tv_http_boot_complete
++        || (!tv_http_exec_worker && tv_http_want_workers > 1))) return false;
+     if (!tv_http_loads) return true;
+     int64_t mine = atomic_load_explicit(&tv_http_loads[tv_http_worker], memory_order_relaxed);
+     for (tv_int i = 0; i < tv_http_nworkers; i++)
+@@ -5548,6 +5782,10 @@
+     }
+ #endif
+     while (tv_http_alive()) {
++        /* An async startup may have entered this loop before opening any listeners. Once
++         * startup is complete, return to tv_async_run so the supervisor can spawn workers. */
++        if (tv_http_clean_workers && !tv_http_exec_worker && tv_http_boot_complete
++            && tv_http_want_workers > 1) return;
+         tv_run_microtasks();
+         /* connections whose late responses are ready */
+         while (tv_http_dirty) {
+@@ -5675,6 +5913,7 @@
+ }
+ 
+ static pid_t tv_http_spawn(tv_int w) {
++    if (tv_http_clean_workers) return tv_http_spawn_clean(w);
+     pid_t pid = fork();
+     if (pid != 0) return pid;
+     /* child */
+@@ -5825,22 +6064,34 @@
+ void tv_http_run(void) {
+     if (!tv_http_busy()) return;
+     tv_out_flush();
+-    tv_int workers = tv_http_want_workers;
++    tv_http_worker_bootstrap();
++    tv_int workers = tv_http_exec_worker || (tv_http_clean_workers && !tv_http_boot_complete)
++        ? 1 : tv_http_want_workers;
+     if (workers <= 1 || tv_http_active == 0) {
+         tv_http_refresh_date();
+         tv_http_loop();
+         return;
+     }
+-    void *m = mmap(NULL, (size_t)workers * sizeof(int64_t), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
++    size_t load_bytes = (size_t)workers * sizeof(int64_t);
++    if (tv_http_clean_workers) {
++        tv_http_load_fd = tv_http_private_file();
++        if (ftruncate(tv_http_load_fd, (off_t)load_bytes))
++            tv_trap("can't size clean worker load mapping", NULL);
++    }
++    void *m = mmap(NULL, load_bytes, PROT_READ | PROT_WRITE,
++        MAP_SHARED | (tv_http_clean_workers ? 0 : MAP_ANON), tv_http_load_fd, 0);
+     if (m != MAP_FAILED) { tv_http_loads = m; tv_http_nworkers = workers; }
++    else if (tv_http_clean_workers) tv_trap("can't create clean worker load mapping", NULL);
+     tv_http_supervise(workers);
+     /* every worker has finished: so have this process's servers */
+     for (int i = 0; i < tv_http_nservers; i++)
+         if (tv_http_servers[i].fd >= 0) { close(tv_http_servers[i].fd); tv_http_servers[i].fd = -1; }
+     tv_http_active = 0;
++    if (tv_http_clean_workers) { tv_out_flush(); _exit(0); }
+ }
+ 
+ tv_int tv_native_httpListen(tv_int port, tv_str host, tv_fn handler) {
++    tv_http_worker_bootstrap();
+     signal(SIGPIPE, SIG_IGN);
+     if (tv_http_nservers == TV_HTTP_MAX_SERVERS) { tv_sb_push_cstr(&tv_native_err, "too many servers"); return -1; }
+     const char *h = host.p->len ? host.p->data : "0.0.0.0";
+@@ -5863,21 +6114,46 @@
+         if (inet_pton(AF_INET, h, &a4->sin_addr) != 1) { tv_native_fail(EINVAL, "listen", host); return -1; }
+         slen = sizeof *a4;
+     }
+-    int lfd = socket(v6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
+-    if (lfd < 0) { tv_native_fail(errno, "socket", host); return -1; }
+-    fcntl(lfd, F_SETFD, FD_CLOEXEC);   /* (a child the program starts doesn't hold the port) */
+-    int one = 1, zero = 0;
+-    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+-    if (v6) setsockopt(lfd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof zero);
+-    if (bind(lfd, (struct sockaddr *)&ss, slen) != 0) {
+-        tv_sb_push_cstr(&tv_native_err, errno == EADDRINUSE ? "Failed to start server. Is port " : "Failed to start server on port ");
+-        tv_sb_push_int(&tv_native_err, port);
+-        tv_sb_push_cstr(&tv_native_err, errno == EADDRINUSE ? " in use?" : "");
+-        close(lfd);
+-        return -1;
++    int lfd;
++    if (tv_http_exec_worker && !tv_http_boot_complete) {
++        if (tv_http_nservers >= tv_http_ninherited)
++            tv_trap("clean worker opened an extra startup listener", NULL);
++        lfd = tv_http_inherited[tv_http_nservers];
++        struct sockaddr_storage actual;
++        socklen_t actual_len = sizeof actual;
++        if (getsockname(lfd, (struct sockaddr *)&actual, &actual_len)
++            || actual.ss_family != ss.ss_family || actual_len != slen)
++            tv_trap("invalid clean worker listener", NULL);
++        uint16_t actual_port;
++        bool same_host;
++        if (v6) {
++            struct sockaddr_in6 *a = (struct sockaddr_in6 *)&actual, *b = (struct sockaddr_in6 *)&ss;
++            actual_port = a->sin6_port;
++            same_host = !memcmp(&a->sin6_addr, &b->sin6_addr, sizeof a->sin6_addr);
++        } else {
++            struct sockaddr_in *a = (struct sockaddr_in *)&actual, *b = (struct sockaddr_in *)&ss;
++            actual_port = a->sin_port;
++            same_host = a->sin_addr.s_addr == b->sin_addr.s_addr;
++        }
++        if (!same_host || (port && ntohs(actual_port) != port))
++            tv_trap("clean worker listener host or port differs from supervisor", NULL);
++    } else {
++        lfd = socket(v6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
++        if (lfd < 0) { tv_native_fail(errno, "socket", host); return -1; }
++        fcntl(lfd, F_SETFD, FD_CLOEXEC);   /* (a child the program starts doesn't hold the port) */
++        int one = 1, zero = 0;
++        setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
++        if (v6) setsockopt(lfd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof zero);
++        if (bind(lfd, (struct sockaddr *)&ss, slen) != 0) {
++            tv_sb_push_cstr(&tv_native_err, errno == EADDRINUSE ? "Failed to start server. Is port " : "Failed to start server on port ");
++            tv_sb_push_int(&tv_native_err, port);
++            tv_sb_push_cstr(&tv_native_err, errno == EADDRINUSE ? " in use?" : "");
++            close(lfd);
++            return -1;
++        }
++        if (listen(lfd, 4096) != 0) { tv_native_fail(errno, "listen", host); close(lfd); return -1; }
++        fcntl(lfd, F_SETFL, fcntl(lfd, F_GETFL) | O_NONBLOCK);
+     }
+-    if (listen(lfd, 4096) != 0) { tv_native_fail(errno, "listen", host); close(lfd); return -1; }
+-    fcntl(lfd, F_SETFL, fcntl(lfd, F_GETFL) | O_NONBLOCK);
+     socklen_t len = sizeof ss;
+     getsockname(lfd, (struct sockaddr *)&ss, &len);
+     uint16_t bound = v6 ? ((struct sockaddr_in6 *)&ss)->sin6_port : ((struct sockaddr_in *)&ss)->sin_port;
+diff --git a/runtime/tov.h b/runtime/tov.h
+--- a/runtime/tov.h
++++ b/runtime/tov.h
+@@ -728,6 +728,10 @@
+ void tv_native_httpOnSignal(tv_fn fn);
+ void tv_native_httpOnGone(tv_fn fn);
+ void tv_native_httpWorkers(tv_int n);
++void tv_native_httpCleanWorkers(void);
++void tv_native_httpWorkersReady(void);
++tv_int tv_native_httpWorkerSupervisor(void);
++tv_str tv_native_httpWorkerState(tv_str name, tv_str value);
+ /* URLs: parse → [protocol, hostname, port, pathname, search, hash] (empty if invalid; `base`
+  * resolves a relative input, "" for none); percent-decoding (`plus`: '+' is a space) and
+  * application/x-www-form-urlencoded encoding. */

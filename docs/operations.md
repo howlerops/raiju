@@ -3,6 +3,25 @@
 This page covers what happens to configuration changes and state when Raiju runs as several
 processes: workers of one node (`-workers N`) and nodes of a cluster (`cluster` in the config).
 
+## Native worker startup
+
+The native Bun server starts multi-worker gateways in fresh processes, not by
+continuing inside a forked JavaScriptCore VM. DNS, secret resolution and MCP
+initialization can start engine threads before listeners open; an ordinary fork
+loses those threads and can deadlock later garbage collection.
+
+Workers adopt the supervisor's main and optional cluster listeners. They retain
+its node identity, private share directory and ephemeral sign-in state key, while
+initializing their own engine and MCP connections. Those bootstrap values travel
+through a private, immediately unlinked file descriptor, not environment values
+or command-line arguments. Imported descriptors are close-on-exec so MCP child
+processes do not inherit gateway listeners or bootstrap state.
+
+Worker replacement retains the same listeners and identities. SIGTERM/SIGINT
+still use the normal graceful drain; crash-loop replacement retains its backoff.
+The `http1` server remains single-process.
+
+
 ## Configuration changes
 
 Raiju keeps its configuration in one JSON file (`-config`, or `config.json` in `-app-dir`). The
