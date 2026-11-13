@@ -12,6 +12,12 @@ Waves 31 and 32 (L212 to L219) closed the known gaps listed after wave 30, fixed
   boundary reset on navigation; existing widget boundaries let ready data render
   independently of slower widgets. Back/forward navigation stays client-side.
   Region and identity changes still deliberately reload the whole document.
+  Appearance offers System/Light/Dark, persists locally and follows OS changes
+  in System mode. The Party Rock palette from
+  https://tweakcn.com/themes/cmlqxbfu8000004joajt9gs64 supplies colors, rounded
+  cards and hard shadows without a shadcn/React or external font dependency.
+  Operational status/chart and primary-text colors have readability overrides.
+  Gateway context is compact; isolation details remain available in a disclosure.
 
 - **Breaking owned-name cutover**: configure `RAIJU_*` environment variables
   (including `RAIJU_SETUP_TOKEN` and `RAIJU_HOST`); bootstrap management with

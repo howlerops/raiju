@@ -4,6 +4,7 @@ import { clearSignIn, closeSignIn, dialog, openSignIn, setToken, tokenSet } from
 import { can, me, refreshMe, roleLabel } from "./perm"
 import { notify, Toasts, type Tone } from "./ui"
 import { consoleConfig, switchGateway, target, targetLabel, targetURL } from "./gateway"
+import { theme, setTheme } from "./theme"
 const Fleet = lazy(() => import("./screens/Fleet"), { export: "Fleet" })
 const Overview = lazy(() => import("./screens/Overview"), { export: "Overview" })
 const Live = lazy(() => import("./screens/Live"), { export: "Live" })
@@ -202,6 +203,11 @@ export function App() {
           </span>
         </div>
         <div class="top-right">
+          <label class="theme-picker"><span class="hint">Appearance</span>
+            <select aria-label="Appearance" value={theme()} onChange={(ev) => setTheme(ev.currentTarget.value)}>
+              <option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option>
+            </select>
+          </label>
           <span class="page-context">{VIEWS.find((v) => v[0] === view())?.[1]}</span>
           <span id="health-pill" class={["pill", health().tone]} role="status">
             {health().text}
@@ -237,8 +243,10 @@ export function App() {
           </label>}
         </Show>
         <Show when={consoleConfig()}><a class="button" href="#fleet">Fleet health</a></Show>
-        <div><strong>Target: {targetLabel()}</strong><div class="mono endpoint" id="target-endpoint">{target().url}</div></div>
-        <p class="hint">Regional admin reads, changes and Playground requests apply only to this target. Fleet health uses public probes only. Switching reloads the page and clears forms, data and sockets. No cross-region fallback or synchronization.</p>
+        <div class="target-scope"><strong>Target: {targetLabel()}</strong><div class="mono endpoint" id="target-endpoint">{target().url}</div></div>
+        <details class="target-help"><summary>Regional isolation</summary>
+          <p>Admin reads, changes and Playground requests apply only to this target. Fleet health uses public probes only. Switching regions reloads the page and clears forms, data and sockets. No cross-region fallback or synchronization.</p>
+        </details>
       </section>
       </div>
       <Show when={!checked() && view() !== "fleet"}><main><p role="status">Checking selected gateway…</p></main></Show>

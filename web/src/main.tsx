@@ -3,6 +3,7 @@ import { createSignal, For, Show } from "solid-js"
 import { App } from "./App"
 import { bootstrapGateways, consoleConfig, switchGateway } from "./gateway"
 import { initializeAuth } from "./auth"
+import "./theme"
 import "./style.css"
 import "./live.css"
 
