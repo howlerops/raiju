@@ -1,4 +1,5 @@
 import { createMemo, createSignal, Errored, For, Loading, refresh, Show, untrack } from "solid-js"
+import { LoadingSkeleton } from "../LoadingSkeleton"
 import { api } from "../api/client"
 import type { Key, Provider } from "../api/types"
 import { splitList } from "../fmt"
@@ -361,7 +362,7 @@ export function Providers() {
       </Toolbar>
       <div id="pv-list">
         <Errored fallback={(err) => <ErrP error={err()} />}>
-          <Loading fallback={<p class="muted">Loading...</p>}>
+          <Loading fallback={<LoadingSkeleton variant="content" />}>
             <Show when={providers().providers.length} fallback={<p class="card panel bg-base-100 border border-base-300 muted">No providers configured yet. Add one below.</p>}>
               <For each={providers().providers} keyed={(p) => p.name}>
                 {(p) => <ProviderCard p={p()} onChange={reload} />}

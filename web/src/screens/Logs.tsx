@@ -1,4 +1,5 @@
 import { createMemo, createSignal, Errored, For, Loading, Show } from "solid-js"
+import { LoadingSkeleton } from "../LoadingSkeleton"
 import { api } from "../api/client"
 import type { LogEntry } from "../api/types"
 import { fmtInt } from "../fmt"
@@ -293,7 +294,7 @@ export function Logs() {
                 <Loading
                   fallback={
                     <tr class="placeholder">
-                      <td colspan={LOG_COLS.length}>Loading...</td>
+                      <td colspan={LOG_COLS.length}><LoadingSkeleton variant="table" /></td>
                     </tr>
                   }
                 >

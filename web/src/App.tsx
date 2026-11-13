@@ -5,6 +5,7 @@ import { can, me, refreshMe, roleLabel } from "./perm"
 import { notify, Toasts, type Tone } from "./ui"
 import { consoleConfig, switchGateway, target, targetLabel, targetURL } from "./gateway"
 import { theme, setTheme } from "./theme"
+import { LoadingSkeleton } from "./LoadingSkeleton"
 const Fleet = lazy(() => import("./screens/Fleet"), { export: "Fleet" })
 const Overview = lazy(() => import("./screens/Overview"), { export: "Overview" })
 const Live = lazy(() => import("./screens/Live"), { export: "Live" })
@@ -245,7 +246,7 @@ export function App() {
       <header class="console-heading top">
         <span class="page-context"><span class="muted">Workspace / </span>{VIEWS.find((v) => v[0] === view())?.[1]}</span>
       </header>
-      <Show when={!checked() && view() !== "fleet"}><main><p role="status">Checking selected gateway…</p></main></Show>
+      <Show when={!checked() && view() !== "fleet"}><main><LoadingSkeleton variant="page" label="Checking selected gateway" /></main></Show>
       <Show when={view() !== "fleet" ? setup() : undefined}>{(st) => <Setup configured={st().configured} done={setupDone} />}</Show>
 
       <Show when={(checked() && !setup()) || view() === "fleet"}>
@@ -263,7 +264,7 @@ export function App() {
             </section>
           )}
         >
-          <Loading fallback={<section class="card panel bg-base-100 border border-base-300" role="status" aria-live="polite">Loading {VIEWS.find((v) => v[0] === route)?.[1]}…</section>}>
+          <Loading fallback={<LoadingSkeleton variant="page" label={"Loading " + VIEWS.find((v) => v[0] === route)?.[1]} />}>
           <Switch>
             <Match when={view() === "fleet" && consoleConfig()}>
               <Fleet />

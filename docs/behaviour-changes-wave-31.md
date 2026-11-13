@@ -26,6 +26,11 @@ Waves 31 and 32 (L212 to L219) closed the known gaps listed after wave 30, fixed
   Local frontend overrides are now published into disposable snapshots: new
   assets precede the new HTML, and previous hashed chunks remain available for
   open tabs. Rebuilding Vite's output alone no longer changes the running preview.
+  Noncompact loading states use accessible daisyUI skeletons for pages, forms,
+  tables and content, including bootstrap and pending Playground responses.
+  Component-local boundaries remain independent. Buttons, compact status badges,
+  empty states and errors retain their existing behavior; reduced-motion users
+  receive static skeletons.
 
 - **Breaking owned-name cutover**: configure `RAIJU_*` environment variables
   (including `RAIJU_SETUP_TOKEN` and `RAIJU_HOST`); bootstrap management with

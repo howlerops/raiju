@@ -1,4 +1,5 @@
 import { createSignal, For, Show } from "solid-js"
+import { LoadingSkeleton } from "../LoadingSkeleton"
 import { message, send } from "../api/client"
 import { contentText, fmtInt, listOf, pretty } from "../fmt"
 import { notify, Toolbar, useRun } from "../ui"
@@ -121,9 +122,7 @@ export function Playground() {
       </form>
       <div id="pg-result" class="card panel bg-base-100 border border-base-300" aria-live="polite">
         <Show when={pending()}>
-          <p class="muted" role="status">
-            Sending...
-          </p>
+          <LoadingSkeleton variant="content" label="Waiting for response" />
         </Show>
         <Show when={failure()}>
           <p class="error" role="alert">

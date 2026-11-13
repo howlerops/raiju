@@ -3,18 +3,21 @@ import { createSignal, For, Show } from "solid-js"
 import { App } from "./App"
 import { bootstrapGateways, consoleConfig, switchGateway } from "./gateway"
 import { initializeAuth } from "./auth"
+import { LoadingSkeleton } from "./LoadingSkeleton"
 import "./theme"
 import "./style.css"
 import "./live.css"
 
 const root = document.getElementById("root")
 if (root) {
-  root.textContent = "Loading console configuration…"
+  const stopLoading = render(() => <main><LoadingSkeleton variant="page" label="Loading console configuration" /></main>, root)
   void bootstrapGateways().then(() => {
     initializeAuth()
+    stopLoading()
     root.textContent = ""
     render(() => <App />, root)
   }).catch((error: unknown) => {
+    stopLoading()
     root.textContent = ""
     const [recoveryError, setRecoveryError] = createSignal("")
     render(() => (

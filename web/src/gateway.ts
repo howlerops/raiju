@@ -1,4 +1,6 @@
 // Public discovery only. A target is fixed for the lifetime of this document.
+import { render } from "@solidjs/web"
+import { LoadingSkeleton } from "./LoadingSkeleton"
 export interface Gateway { id: string; name: string; url: string }
 export interface ConsoleConfig { gateways: Gateway[]; defaultGateway?: string }
 
@@ -128,7 +130,10 @@ export function reloadTarget(): void {
   shutdown.abort()
   for (const cleanup of cleanups) cleanup()
   const root = document.getElementById("root")
-  if (root) root.textContent = "Reloading gateway context…"
+  if (root) {
+    root.replaceChildren()
+    render(() => LoadingSkeleton({ variant: "page", label: "Reloading gateway context" }), root)
+  }
   location.reload()
 }
 export function switchGateway(id: string): void {

@@ -143,7 +143,7 @@ try {
   await page.route('**/api/cache', slowCache)
   try {
     await page.locator('[data-nav="overview"]').click()
-    await page.getByRole('status').filter({hasText:'Loading Overview'}).waitFor()
+    await page.getByRole('status', {name:'Loading Overview', exact:true}).waitFor()
     await page.locator('[data-nav="fleet"]').click()
     await page.locator('#fleet-title').waitFor()
     assert.ok(await shell.evaluate((node) => node === document.querySelector('nav[aria-label="Sections"]')))
@@ -151,10 +151,10 @@ try {
     await page.locator('[data-nav="overview"]').click()
     await page.locator('#ov-title').waitFor()
     await page.waitForFunction(() => {
-      const text = document.querySelector('#ov-breakers')?.textContent
-      return text && !text.includes('Loading...')
+      const widget = document.querySelector('#ov-breakers')
+      return widget && !widget.querySelector('[aria-busy="true"]')
     })
-    assert.match(await page.locator('#ov-cache').textContent(), /Loading/)
+    await page.locator('#ov-cache').getByRole('status', {name:'Loading content', exact:true}).waitFor()
     await page.locator('[data-nav="config"]').click()
     await page.locator('#cfg-json').waitFor()
     await page.goBack()

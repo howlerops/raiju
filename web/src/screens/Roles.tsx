@@ -2,6 +2,7 @@
 // permission pairs (a resource by operation grid), the access profiles attached to each role, and
 // the role each admin user holds. Every control follows the caller's own permissions.
 import { createMemo, createSignal, Errored, For, Loading, refresh, Show } from "solid-js"
+import { LoadingSkeleton } from "../LoadingSkeleton"
 import { message, send } from "../api/client"
 import { can } from "../perm"
 import { Can, DangerButton, ErrP, FormError, initChecked, initSelected, initValue, Mono, notify, Table, Toolbar, useFormRun, useRun } from "../ui"
@@ -333,7 +334,7 @@ export function Roles() {
       </section>
 
       <Errored fallback={(err) => <ErrP error={err()} />}>
-        <Loading fallback={<p class="muted">Loading...</p>}>
+        <Loading fallback={<LoadingSkeleton variant="table" />}>
           <Show when={editor()} keyed>
             {(e) => (
               <RoleForm

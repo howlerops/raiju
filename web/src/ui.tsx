@@ -1,6 +1,7 @@
 // Small shared pieces: toasts, pills, tables, the two-step delete button,
 // busy wrappers and the error line.
 import { createSignal, Errored, For, Loading, Show } from "solid-js"
+import { LoadingSkeleton } from "./LoadingSkeleton"
 import type { JSX } from "@solidjs/web"
 import { message } from "./api/client"
 import { can, type Op } from "./perm"
@@ -106,11 +107,11 @@ export function Table(props: { cols: string[]; children?: JSX.Element }) {
   )
 }
 
-// Loading text and an error line around async content.
+// A loading skeleton and an error line around async content.
 export function Guard(props: { children?: JSX.Element }) {
   return (
     <Errored fallback={(err) => <ErrP error={err()} />}>
-      <Loading fallback={<p class="muted">Loading...</p>}>{props.children}</Loading>
+      <Loading fallback={<LoadingSkeleton variant="content" />}>{props.children}</Loading>
     </Errored>
   )
 }

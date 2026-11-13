@@ -1,4 +1,5 @@
 import { createMemo, createSignal, Errored, For, Loading, refresh, Show, snapshot, untrack } from "solid-js"
+import { LoadingSkeleton } from "../LoadingSkeleton"
 import { createStore } from "solid-js"
 import { api } from "../api/client"
 import { can } from "../perm"
@@ -388,7 +389,7 @@ export function Keys() {
       <Show when={secret()}>{(s) => <Secret value={s()} onDone={() => setSecret(undefined)} />}</Show>
 
       <Errored fallback={(err) => <ErrP error={err()} />}>
-        <Loading fallback={<p class="muted">Loading...</p>}>
+        <Loading fallback={<LoadingSkeleton variant="table" />}>
           <Show when={editor()} keyed>
             {(e) => (
               <VkForm

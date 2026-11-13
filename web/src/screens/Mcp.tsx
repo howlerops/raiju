@@ -1,4 +1,5 @@
 import { createMemo, createSignal, Errored, For, Loading, refresh, Show, untrack } from "solid-js"
+import { LoadingSkeleton } from "../LoadingSkeleton"
 import { api } from "../api/client"
 import { can } from "../perm"
 import type { McpClient, McpStatus } from "../api/types"
@@ -253,7 +254,7 @@ export function Mcp() {
       </Show>
       <div id="mcp-list">
         <Errored fallback={(err) => <ErrP error={err()} />}>
-          <Loading fallback={<p class="muted">Loading...</p>}>
+          <Loading fallback={<LoadingSkeleton variant="content" />}>
             <Show when={data().clients.length} fallback={<p class="card panel bg-base-100 border border-base-300 muted">No MCP clients yet. Add one above.</p>}>
               <For each={data().clients} keyed={(c) => String(c.name)}>
                 {(c) => <ClientCard c={c()} st={data().status[String(c().name)]} onEdit={() => setEditor({ c: c() })} onChange={reload} />}

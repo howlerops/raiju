@@ -1,4 +1,5 @@
 import { createMemo, createSignal, Errored, For, Loading, refresh, Show } from "solid-js"
+import { LoadingSkeleton } from "../LoadingSkeleton"
 import type { JSX } from "@solidjs/web"
 import { api, send } from "../api/client"
 import { can } from "../perm"
@@ -202,7 +203,7 @@ function Crud(props: { spec: Spec<Row>; version: () => number }) {
       </form>
       <div>
         <Errored fallback={(err) => <ErrP error={err()} />}>
-          <Loading fallback={<p class="muted">Loading...</p>}>
+          <Loading fallback={<LoadingSkeleton variant="table" />}>
             <Show when={items().length} fallback={<p class="muted">Nothing here yet.</p>}>
               <Table cols={[...spec.columns.map((c) => c.label), ""]}>
                 <For each={items()} keyed={(r) => String(r.id)}>
