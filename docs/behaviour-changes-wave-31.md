@@ -12,7 +12,7 @@ Waves 31 and 32 (L212 to L219) closed the known gaps listed after wave 30, fixed
   boundary reset on navigation; existing widget boundaries let ready data render
   independently of slower widgets. Back/forward navigation stays client-side.
   Region and identity changes still deliberately reload the whole document.
-  Appearance offers System/Light/Dark, persists locally and follows OS changes
+  Appearance offers labeled System/Light/Dark icon buttons, persists locally and follows OS changes
   in System mode. Tailwind 4 and daisyUI 5 provide the actual buttons, form
   controls, badges, cards, statistics and tables. Built-in Garden supplies the
   light palette and built-in Dark supplies dark mode; custom palette overrides

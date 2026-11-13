@@ -229,11 +229,21 @@ export function App() {
           </For>
         </nav>
         <footer class="sidebar-footer">
-          <label class="theme-picker"><span>Appearance</span>
-            <select class="select select-sm" aria-label="Appearance" value={theme()} onChange={(ev) => setTheme(ev.currentTarget.value)}>
-              <option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option>
-            </select>
-          </label>
+          <div class="theme-controls" role="group" aria-label="Appearance">
+            <span>Appearance</span>
+            <div class="join">
+              <For each={[
+                { value: "system", label: "System", path: "M3 4h18v12H3z M8 21h8 M12 16v5" },
+                { value: "light", label: "Light", path: "M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8 M12 2v2 M12 20v2 M2 12h2 M20 12h2 M5 5l1.5 1.5 M17.5 17.5L19 19 M5 19l1.5-1.5 M17.5 6.5L19 5" },
+                { value: "dark", label: "Dark", path: "M20.5 13A9 9 0 0 1 11 3.5 9 9 0 1 0 20.5 13Z" },
+              ]}>{(option) => <button type="button"
+                class={["btn btn-sm btn-square join-item", theme() === option.value ? "btn-primary" : "btn-ghost"]}
+                aria-label={option.label + " theme"} title={option.label + " theme"}
+                aria-pressed={theme() === option.value ? "true" : "false"} onClick={() => setTheme(option.value)}>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={option.path} /></svg>
+              </button>}</For>
+            </div>
+          </div>
           <Show when={me()}>
             {(m) => <span id="role-pill" class="badge badge-neutral" title="The role of the signed-in caller">{roleLabel(m())}</span>}
           </Show>
