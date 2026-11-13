@@ -11,7 +11,7 @@ const [theme, updateTheme] = createSignal<Theme>(initial)
 export { theme }
 const apply = (value: Theme) => {
   if (value === "system") delete document.documentElement.dataset.theme
-  else document.documentElement.dataset.theme = value
+  else document.documentElement.dataset.theme = value === "light" ? "garden" : "dark"
 }
 apply(initial)
 export function setTheme(value: string): void {
