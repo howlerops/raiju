@@ -1,23 +1,23 @@
-import { createSignal, For, Match, onSettled, Show, Switch, Errored } from "solid-js"
+import { createSignal, For, lazy, Loading, Match, onSettled, Show, Switch, Errored } from "solid-js"
 import { send, ApiError } from "./api/client"
 import { clearSignIn, closeSignIn, dialog, openSignIn, setToken, tokenSet } from "./auth"
 import { can, me, refreshMe, roleLabel } from "./perm"
 import { notify, Toasts, type Tone } from "./ui"
 import { consoleConfig, switchGateway, target, targetLabel, targetURL } from "./gateway"
-import { Fleet } from "./screens/Fleet"
-import { Overview } from "./screens/Overview"
-import { Live } from "./screens/Live"
-import { Providers } from "./screens/Providers"
-import { Keys } from "./screens/Keys"
-import { Governance } from "./screens/Governance"
-import { Logs } from "./screens/Logs"
-import { Mcp } from "./screens/Mcp"
-import { McpAccess } from "./screens/McpAccess"
-import { VirtualMcp } from "./screens/VirtualMcp"
-import { Crews } from "./screens/Crews"
-import { Roles } from "./screens/Roles"
-import { Config } from "./screens/Config"
-import { Playground } from "./screens/Playground"
+const Fleet = lazy(() => import("./screens/Fleet"), { export: "Fleet" })
+const Overview = lazy(() => import("./screens/Overview"), { export: "Overview" })
+const Live = lazy(() => import("./screens/Live"), { export: "Live" })
+const Providers = lazy(() => import("./screens/Providers"), { export: "Providers" })
+const Keys = lazy(() => import("./screens/Keys"), { export: "Keys" })
+const Governance = lazy(() => import("./screens/Governance"), { export: "Governance" })
+const Logs = lazy(() => import("./screens/Logs"), { export: "Logs" })
+const Mcp = lazy(() => import("./screens/Mcp"), { export: "Mcp" })
+const McpAccess = lazy(() => import("./screens/McpAccess"), { export: "McpAccess" })
+const VirtualMcp = lazy(() => import("./screens/VirtualMcp"), { export: "VirtualMcp" })
+const Crews = lazy(() => import("./screens/Crews"), { export: "Crews" })
+const Roles = lazy(() => import("./screens/Roles"), { export: "Roles" })
+const Config = lazy(() => import("./screens/Config"), { export: "Config" })
+const Playground = lazy(() => import("./screens/Playground"), { export: "Playground" })
 import { Setup } from "./screens/Setup"
 
 // [id, label, the resource a role needs to see it (any role may open "")]
@@ -245,7 +245,7 @@ export function App() {
 
       <Show when={view() !== "fleet" ? setup() : undefined}>{(st) => <Setup configured={st().configured} done={setupDone} />}</Show>
 
-      <Show when={(checked() && !setup()) || view() === "fleet"}>
+      {/* Shell navigation stays mounted while regional bootstrap or a page is pending. */}
       <nav class="tabs" aria-label="Sections">
         <span class="nav-caption">WORKSPACE</span>
         <For each={VIEWS}>
@@ -259,7 +259,9 @@ export function App() {
         </For>
       </nav>
 
+      <Show when={(checked() && !setup()) || view() === "fleet"}>
       <main>
+        <Show when={view()} keyed>{(route) =>
         <Errored
           fallback={(err, reset) => (
             <section class="card">
@@ -272,6 +274,7 @@ export function App() {
             </section>
           )}
         >
+          <Loading fallback={<section class="card" role="status" aria-live="polite">Loading {VIEWS.find((v) => v[0] === route)?.[1]}…</section>}>
           <Switch>
             <Match when={view() === "fleet" && consoleConfig()}>
               <Fleet />
@@ -316,7 +319,9 @@ export function App() {
               <Playground />
             </Match>
           </Switch>
+          </Loading>
         </Errored>
+        }</Show>
       </main>
       </Show>
 

@@ -127,6 +127,53 @@ try {
   await page.locator('[data-nav="config"]').click()
   await login(eu)
   await page.locator('#cfg-json').waitFor()
+
+  // A slow screen module or API must never replace the shell or block navigation.
+  const shell = await page.locator('nav[aria-label="Sections"]').elementHandle()
+  const header = await page.locator('.console-heading').elementHandle()
+  let documents = 0
+  const countDocuments = (request) => { if (request.isNavigationRequest() && request.frame() === page.mainFrame()) documents++ }
+  page.on('request', countDocuments)
+  let releaseChunk, releaseCache
+  const chunkGate = new Promise((resolve) => { releaseChunk = resolve })
+  const cacheGate = new Promise((resolve) => { releaseCache = resolve })
+  const slowChunk = async (route) => { await chunkGate; await route.continue() }
+  const slowCache = async (route) => { await cacheGate; await route.continue() }
+  await page.route('**/assets/Overview-*.js', slowChunk)
+  await page.route('**/api/cache', slowCache)
+  try {
+    await page.locator('[data-nav="overview"]').click()
+    await page.getByRole('status').filter({hasText:'Loading Overview'}).waitFor()
+    await page.locator('[data-nav="fleet"]').click()
+    await page.locator('#fleet-title').waitFor()
+    assert.ok(await shell.evaluate((node) => node === document.querySelector('nav[aria-label="Sections"]')))
+    releaseChunk()
+    await page.locator('[data-nav="overview"]').click()
+    await page.locator('#ov-title').waitFor()
+    await page.waitForFunction(() => {
+      const text = document.querySelector('#ov-breakers')?.textContent
+      return text && !text.includes('Loading...')
+    })
+    assert.match(await page.locator('#ov-cache').textContent(), /Loading/)
+    await page.locator('[data-nav="config"]').click()
+    await page.locator('#cfg-json').waitFor()
+    await page.goBack()
+    await page.locator('#ov-title').waitFor()
+    await page.goForward()
+    await page.locator('#cfg-json').waitFor()
+    assert.ok(await shell.evaluate((node) => node === document.querySelector('nav[aria-label="Sections"]')))
+    assert.ok(await header.evaluate((node) => node === document.querySelector('.console-heading')))
+    assert.equal(documents, 0, 'Same-region routes must not reload the document')
+    check('lazy routes preserve shell identity, support history and isolate slow component data')
+  } finally {
+    releaseChunk()
+    releaseCache()
+    await page.unroute('**/assets/Overview-*.js', slowChunk)
+    await page.unroute('**/api/cache', slowCache)
+    page.off('request', countDocuments)
+    await shell.dispose()
+    await header.dispose()
+  }
   const beforeEU = await api(eu, 'GET', '/api/config')
   const beforeUS = await api(us, 'GET', '/api/config')
   oldClient = beforeEU.client

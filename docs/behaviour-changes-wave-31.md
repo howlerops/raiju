@@ -7,6 +7,11 @@ Waves 31 and 32 (L212 to L219) closed the known gaps listed after wave 30, fixed
   navigation strip on smaller screens. Fleet summary counts come only from
   configured gateways and current public readiness probes; no regional
   inference or usage data is aggregated. Authentication and targeting are unchanged.
+  Same-region hash routes preserve the sidebar/header, including during regional
+  bootstrap. Screens are lazy-loaded JS chunks with a route-local loading/error
+  boundary reset on navigation; existing widget boundaries let ready data render
+  independently of slower widgets. Back/forward navigation stays client-side.
+  Region and identity changes still deliberately reload the whole document.
 
 - **Breaking owned-name cutover**: configure `RAIJU_*` environment variables
   (including `RAIJU_SETUP_TOKEN` and `RAIJU_HOST`); bootstrap management with

@@ -12,7 +12,7 @@ export default defineConfig({
     outDir: "dist",
     emptyOutDir: true,
     assetsDir: "assets",
-    // one stylesheet and one script keep the embedded table small
+    // Share one stylesheet; screens load as independent cached JS chunks.
     cssCodeSplit: false,
     sourcemap: false,
     chunkSizeWarningLimit: 600,
