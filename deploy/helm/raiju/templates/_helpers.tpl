@@ -34,7 +34,20 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end }}
 
 {{- define "raiju.image" -}}
+{{- if .Values.image.digest }}
+{{- printf "%s@%s" .Values.image.repository .Values.image.digest }}
+{{- else }}
 {{- printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag) }}
+{{- end }}
+{{- end }}
+
+{{/* Empty leaves the namespace default account unchanged; created accounts use the release name. */}}
+{{- define "raiju.serviceAccountName" -}}
+{{- if .Values.serviceAccount.create }}
+{{- default (include "raiju.fullname" .) .Values.serviceAccount.name }}
+{{- else }}
+{{- .Values.serviceAccount.name }}
+{{- end }}
 {{- end }}
 
 {{- define "raiju.configMapName" -}}
@@ -127,6 +140,12 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 timeout shorter than the drain (the preStop sleep, server.shutdown_delay_seconds, server.shutdown_grace_seconds and
 about 5 s to send what is queued). */}}
 {{- define "raiju.validate" -}}
+{{- if and .Values.serviceAccount.annotations (not .Values.serviceAccount.create) }}
+{{- fail "serviceAccount.annotations requires serviceAccount.create=true; annotate an existing serviceAccount.name outside this chart" }}
+{{- end }}
+{{- if and .Values.serviceAccount.create (eq (include "raiju.serviceAccountName" .) "default") }}
+{{- fail "serviceAccount.name must not be default when serviceAccount.create=true; use a dedicated account" }}
+{{- end }}
 {{- if and (include "raiju.singleWriter" .) (or .Values.autoscaling.enabled (gt (int .Values.replicaCount) 1)) }}
 {{- fail "persistence: a ReadWriteOnce volume serves one replica. For several, use ReadWriteMany storage (persistence.accessModes) or persistence.enabled=false with configMode=always; see deploy/README.md" }}
 {{- end }}

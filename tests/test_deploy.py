@@ -307,6 +307,79 @@ class HelmTest(unittest.TestCase):
         p = subprocess.run([HELM, "lint", CHART], capture_output=True, text=True)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
 
+    def test_image_reference_is_shared_by_init_and_runtime(self):
+        version = yaml.safe_load(open(os.path.join(CHART, "Chart.yaml")))["appVersion"]
+        for sets, expected in (
+            ((), f"raiju:{version}"),
+            (("image.repository=registry.example.com/raiju", "image.tag=release-1"), "registry.example.com/raiju:release-1"),
+            (("image.repository=registry.example.com/raiju", "image.tag=ignored", "image.digest=sha256:" + "a" * 64),
+             "registry.example.com/raiju@sha256:" + "a" * 64),
+        ):
+            with self.subTest(image=expected):
+                pod = self.pod(self.render(*sets))
+                self.assertEqual([c["image"] for c in pod["initContainers"] + pod["containers"]], [expected, expected])
+
+    def test_service_account_is_opt_in(self):
+        docs = self.render()
+        self.assertFalse([d for d in docs if d["kind"] == "ServiceAccount"])
+        pod = self.pod(docs)
+        self.assertNotIn("serviceAccountName", pod)
+        self.assertIs(pod["automountServiceAccountToken"], False)
+
+    def test_created_service_account_links_irsa_without_api_token(self):
+        role = "arn:aws:iam::123456789012:role/raiju"
+        annotation = "serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn=" + role
+        for sets, name in (
+            ((), "r-raiju"),
+            (("serviceAccount.name=raiju-bedrock",), "raiju-bedrock"),
+            (("fullnameOverride=raiju-regional",), "raiju-regional"),
+        ):
+            with self.subTest(name=name):
+                docs = self.render("serviceAccount.create=true", annotation, *sets)
+                accounts = [d for d in docs if d["kind"] == "ServiceAccount"]
+                self.assertEqual(len(accounts), 1)
+                account = self.kind(docs, "ServiceAccount", name)
+                self.assertEqual(account["metadata"]["annotations"], {"eks.amazonaws.com/role-arn": role})
+                self.assertIs(account["automountServiceAccountToken"], False)
+                self.assertEqual(self.pod(docs)["serviceAccountName"], name)
+                self.assertIs(self.pod(docs)["automountServiceAccountToken"], False)
+
+    def test_existing_service_account_is_not_managed(self):
+        docs = self.render("serviceAccount.name=existing-raiju")
+        self.assertFalse([d for d in docs if d["kind"] == "ServiceAccount"])
+        self.assertEqual(self.pod(docs)["serviceAccountName"], "existing-raiju")
+        self.assertIs(self.pod(docs)["automountServiceAccountToken"], False)
+        for sets in ((), ("serviceAccount.name=existing-raiju",)):
+            err = self.render("serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn=role", *sets, ok=False)
+            self.assertIn("serviceAccount.annotations requires serviceAccount.create=true", err)
+        self.assertIn("dedicated account", self.render("serviceAccount.create=true", "serviceAccount.name=default", ok=False))
+
+    def test_service_account_api_token_can_be_enabled_explicitly(self):
+        docs = self.render("serviceAccount.create=true", "serviceAccount.automountServiceAccountToken=true")
+        self.assertIs(self.kind(docs, "ServiceAccount")["automountServiceAccountToken"], True)
+        self.assertIs(self.pod(docs)["automountServiceAccountToken"], True)
+        existing = self.render("serviceAccount.name=existing-raiju", "serviceAccount.automountServiceAccountToken=true")
+        self.assertIs(self.pod(existing)["automountServiceAccountToken"], True)
+
+    def test_topology_spread_constraints_are_optional_and_preserved(self):
+        self.assertNotIn("topologySpreadConstraints", self.pod(self.render()))
+        pod = self.pod(self.render(
+            "topologySpreadConstraints[0].maxSkew=1",
+            "topologySpreadConstraints[0].topologyKey=topology.kubernetes.io/zone",
+            "topologySpreadConstraints[0].whenUnsatisfiable=DoNotSchedule",
+            "topologySpreadConstraints[0].labelSelector.matchLabels.app\\.kubernetes\\.io/instance=r",
+            "affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key=node-type",
+            "affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].operator=Exists",
+        ))
+        self.assertEqual(pod["topologySpreadConstraints"], [{
+            "maxSkew": 1,
+            "topologyKey": "topology.kubernetes.io/zone",
+            "whenUnsatisfiable": "DoNotSchedule",
+            "labelSelector": {"matchLabels": {"app.kubernetes.io/instance": "r"}},
+        }])
+        self.assertEqual(pod["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"],
+                         [{"matchExpressions": [{"key": "node-type", "operator": "Exists"}]}])
+
     def test_data_volume_is_a_writable_claim(self):
         docs = self.render()
         pod = self.pod(docs)
