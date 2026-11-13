@@ -77,6 +77,20 @@ Waves 31 and 32 (L212 to L219) closed the known gaps listed after wave 30, fixed
   WebKitGTK main-loop crash fixed by patch 0025. Worker respawn/backoff and graceful
   shutdown remain enabled; `http1` remains single-process.
 
+- **Optional multi-gateway console**: `RAIJU_CONSOLE_CONFIG` names a read-only public
+  manifest of gateway labels and origins; absent configuration retains the
+  single-gateway UI. Fleet status aggregates only health/readiness. Regional
+  sessions are scoped by origin in tab storage; switching identity or gateway
+  reloads the page, clearing forms, data and sockets. Writes and Playground calls
+  target one explicitly selected origin, without a cross-region proxy or fallback.
+  Native CORS supports bearer/setup preflight while actual requests retain their
+  authentication gates. Remote UI sockets require an explicitly permitted Origin
+  and a one-use ticket. Those tickets now use private hashed files beside the
+  configuration (`<config>.ws-tickets/`) so a different worker or replica sharing
+  that directory can redeem them once; directory-operation failures deny access.
+  Gateways without shared session storage still require appropriate session
+  affinity. No cloud account, customer endpoint or geography is a product default.
+
 - **Embedding SDK fidelity**: translated OpenAI embedding responses now honor
   `encoding_format:"base64"` as IEEE754 float32 little-endian bytes. This fixes
   silent vector corruption in the OpenAI SDK, which requests base64 by default.

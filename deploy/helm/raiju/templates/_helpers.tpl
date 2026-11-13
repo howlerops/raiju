@@ -136,6 +136,13 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- if include "raiju.metricsOnCluster" . }}{{ include "raiju.clusterPort" . }}{{ else }}{{ .Values.port }}{{ end }}
 {{- end }}
 
+{{/* Public console metadata, mounted separately from mutable inference configuration. */}}
+{{- define "raiju.console" -}}
+{{- $manifest := dict "gateways" .Values.console.gateways }}
+{{- with .Values.console.defaultGateway }}{{- $_ := set $manifest "defaultGateway" . }}{{- end }}
+{{- toJson $manifest }}
+{{- end }}
+
 {{/* Settings the chart refuses: a single-writer claim with more than one pod, an unknown configMode, and a kill
 timeout shorter than the drain (the preStop sleep, server.shutdown_delay_seconds, server.shutdown_grace_seconds and
 about 5 s to send what is queued). */}}
@@ -146,6 +153,31 @@ about 5 s to send what is queued). */}}
 {{- if and .Values.serviceAccount.create (eq (include "raiju.serviceAccountName" .) "default") }}
 {{- fail "serviceAccount.name must not be default when serviceAccount.create=true; use a dedicated account" }}
 {{- end }}
+{{- $console := .Values.console }}
+{{- if not (kindIs "map" $console) }}{{ fail "console must be a map" }}{{ end }}
+{{- range $key, $_ := $console }}
+{{- if not (has $key (list "gateways" "defaultGateway")) }}{{ fail "console contains an unknown field; only public gateway metadata is accepted" }}{{ end }}
+{{- end }}
+{{- if not (kindIs "slice" $console.gateways) }}{{ fail "console.gateways must be a list" }}{{ end }}
+{{- if gt (len $console.gateways) 32 }}{{ fail "console supports at most 32 gateways" }}{{ end }}
+{{- $ids := dict }}{{- $origins := dict }}
+{{- range $gateway := $console.gateways }}
+{{- if not (kindIs "map" $gateway) }}{{ fail "console gateway must be a map" }}{{ end }}
+{{- range $key, $_ := $gateway }}
+{{- if not (has $key (list "id" "name" "url")) }}{{ fail "console gateway contains an unknown field; credentials are not accepted" }}{{ end }}
+{{- end }}
+{{- if or (not (kindIs "string" $gateway.id)) (not (kindIs "string" $gateway.name)) (not (kindIs "string" $gateway.url)) }}{{ fail "console gateway id, name and url must be strings" }}{{ end }}
+{{- if not (regexMatch "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$" $gateway.id) }}{{ fail "console gateway id must be a short alphanumeric identifier" }}{{ end }}
+{{- if or (eq (trim $gateway.name) "") (gt (len $gateway.name) 100) (regexMatch "[\\x00-\\x1f\\x7f]" $gateway.name) }}{{ fail "console gateway name must contain 1..100 printable characters" }}{{ end }}
+{{- if not (regexMatch "^(https://([A-Za-z0-9.-]+|\\[[0-9A-Fa-f:]+\\])|http://(localhost|127\\.0\\.0\\.1|\\[::1\\]))(:[0-9]{1,5})?/?$" $gateway.url) }}{{ fail "console gateway url must be an HTTPS origin (HTTP is allowed only for localhost previews)" }}{{ end }}
+{{- $port := trimPrefix ":" (trimSuffix "/" (regexFind ":[0-9]+/?$" $gateway.url)) }}
+{{- if and $port (or (lt (int $port) 1) (gt (int $port) 65535)) }}{{ fail "console gateway port must be in 1..65535" }}{{ end }}
+{{- $origin := lower (trimSuffix "/" $gateway.url) }}
+{{- if or (hasKey $ids $gateway.id) (hasKey $origins $origin) }}{{ fail "console gateway ids and origins must be unique" }}{{ end }}
+{{- $_ := set $ids $gateway.id true }}{{- $_ := set $origins $origin true }}
+{{- end }}
+{{- if not (kindIs "string" $console.defaultGateway) }}{{ fail "console.defaultGateway must be a string" }}{{ end }}
+{{- if and $console.defaultGateway (not (hasKey $ids $console.defaultGateway)) }}{{ fail "console.defaultGateway must name a configured gateway" }}{{ end }}
 {{- if and (include "raiju.singleWriter" .) (or .Values.autoscaling.enabled (gt (int .Values.replicaCount) 1)) }}
 {{- fail "persistence: a ReadWriteOnce volume serves one replica. For several, use ReadWriteMany storage (persistence.accessModes) or persistence.enabled=false with configMode=always; see deploy/README.md" }}
 {{- end }}

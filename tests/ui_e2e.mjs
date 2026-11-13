@@ -168,17 +168,19 @@ try {
   check("the token field is focused", await page.evaluate(() => document.activeElement?.id === "auth-input"))
   await page.press("#auth-input", "Escape")
   check("Escape closes the sign-in dialog", await until(page, () => !document.querySelector("#auth")))
-  check("the header offers the token again", (await text(page, "#token-btn")) === "Admin token")
   await page.click("#token-btn")
   await page.fill("#auth-input", "wrong-token")
+  const rejectedToken = page.waitForResponse((r) => r.url() === GW + "/api/users/me/permissions" && r.request().headers().authorization === "Bearer wrong-token")
   await page.press("#auth-input", "Enter")
-  check("the page keeps the token for this tab", await until(page, () => document.querySelector("#token-btn")?.textContent === "Admin token: set"))
-  await page.click("#token-btn")
+  check("an incorrect regional token cannot read permissions", (await rejectedToken).status() === 401)
+  await page.waitForSelector("#auth", { state: "visible" })
   await page.fill("#auth-input", "admin-secret")
   await page.press("#auth-input", "Enter")
+  const persistedSignIn = page.waitForResponse((r) => r.url() === GW + "/api/users/me/permissions" && r.request().method() === "GET")
   await page.reload()
   await page.waitForFunction(() => /\d/.test(document.querySelector("#ov-stats")?.textContent ?? ""), null, { timeout: 8000 })
-  check("a reload keeps the sign-in (sessionStorage)", (await text(page, "#token-btn")) === "Admin token: set")
+  const persistedPermissions = await persistedSignIn
+  check("a reload preserves authenticated admin permissions", persistedPermissions.status() === 200 && (await persistedPermissions.json()).role === "admin")
   check("the health pill shows the gateway is up", await until(page, () => document.querySelector("#health-pill")?.textContent === "gateway ok"))
 
   // ---- overview ----
@@ -314,7 +316,7 @@ try {
       urls.push(ws.url())
       current = ws
     })
-    await lp.addInitScript(() => sessionStorage.setItem("raiju.adminToken", "admin-secret"))
+    await lp.addInitScript(() => sessionStorage.setItem("raiju.adminToken:" + location.origin, "admin-secret"))
     await lp.goto(GW + "/#live")
     check("the played socket connects", await until(lp, () => document.querySelector("#lv-state")?.textContent === "Live"), await text(lp, "#lv-state"))
     for (let i = 0; i < 5200; i += 100) {
@@ -876,7 +878,7 @@ try {
       p.on("response", (r) => {
         if (r.status() === 403) denied.push(r.url())
       })
-      await p.addInitScript((t) => sessionStorage.setItem("raiju.adminToken", t), token)
+      await p.addInitScript((t) => sessionStorage.setItem("raiju.adminToken:" + location.origin, t), token)
       return { ctx, p, denied }
     }
     const has = (p, sel) => p.locator(sel).count().then((n) => n > 0)
@@ -1014,7 +1016,7 @@ try {
     vp.on("response", (r) => {
       if (r.status() === 403) vdenied.push(r.url())
     })
-    await vp.addInitScript((t) => sessionStorage.setItem("raiju.adminToken", t), viewerTok)
+    await vp.addInitScript((t) => sessionStorage.setItem("raiju.adminToken:" + location.origin, t), viewerTok)
     await vp.goto(GW + "/#crews")
     check("a viewer reads the pool and its frontier", await until(vp, () => document.querySelector("#cr-codeaf-bug-fix svg[role=img]") !== null && (document.querySelector("#cr-pool-codeaf")?.textContent ?? "").includes("Candidates")), await text(vp, "#cr-pool-codeaf"))
     check("a viewer has no assign, outcome or next forms", (await vp.locator("#cr-assign-form, #cr-outcome-form, #cr-next").count()) === 0)
@@ -1035,7 +1037,7 @@ try {
     const asUser = async (token) => {
       const ctx = await browser.newContext({ viewport: { width: 1200, height: 900 } })
       const p = await ctx.newPage()
-      await p.addInitScript((t) => sessionStorage.setItem("raiju.adminToken", t), token)
+      await p.addInitScript((t) => sessionStorage.setItem("raiju.adminToken:" + location.origin, t), token)
       return { ctx, p }
     }
     const callAs = async (token, method, path, body) => {
@@ -1248,7 +1250,7 @@ try {
     check("the admin exists on the gateway (POST /api/users with X-Raiju-Setup-Token) and its token opens the API", users.status === 200 && (ujson.users ?? []).some((u) => u.name === "root" && u.role === "admin"), JSON.stringify(ujson).slice(0, 200))
     check("the setup lock is lifted", (await (await fetch(SETUP_GW + "/api/session/is-auth-enabled")).json()).setup_required === false)
     await sp.click("#setup-continue")
-    check("Continue opens the dashboard signed in as the new admin", await until(sp, () => !document.querySelector("#setup") && document.querySelector("#token-btn")?.textContent === "Admin token: set" && /admin/.test(document.querySelector("#role-pill")?.textContent ?? "")), await text(sp, "header"))
+    check("Continue opens the dashboard signed in as the new admin", await until(sp, () => !document.querySelector("#setup") && /admin/.test(document.querySelector("#role-pill")?.textContent ?? "")), await text(sp, "header"))
     // (this gateway has no log store, so the request stats are not there; the response cache card reads /api/cache)
     check("the dashboard loads with the new admin's token", await until(sp, () => (document.querySelector("#ov-cache")?.textContent ?? "").includes("Hit rate") && !(document.querySelector("main")?.textContent ?? "").includes("Unauthorized")) && (await sp.locator("#auth").count()) === 0, await text(sp, "main"))
     await sp.reload()

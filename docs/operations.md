@@ -201,6 +201,13 @@ Shared between the workers of one node only:
   the encryption key). They outlive a restart; nodes share them only when they share the config folder, so
   put several nodes behind sticky sessions or a shared volume for dashboard and CLI sign-ins. A write that
   cannot get its file's lock within half a second fails its request (503) and writes nothing.
+- UI WebSocket tickets live for 30 seconds in `<config>.ws-tickets/` (0700, files
+  0600 named by the ticket hash). A ticket issued on one worker can be redeemed on
+  any worker or replica sharing that directory. A successful atomic unlink claims
+  it once; an unreadable/unwritable store never falls back to a local grant.
+  Independent data volumes need session affinity for ticket issuance and socket
+  upgrade, just as for dashboard sessions. Do not share this state across
+  independently administered regions.
 - Single sign-on logins in flight are kept nowhere: `/api/oidc/login` seals the PKCE verifier, the nonce,
   the return path and a 10-minute expiry into the `state` value (AES-256-GCM), and the callback opens it on
   whichever worker takes it. The key is derived from the encryption key, so with `encryption_key` set every

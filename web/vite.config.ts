@@ -19,6 +19,8 @@ export default defineConfig({
   },
   server: {
     proxy: {
+      // Preserve the native 404 (embedded mode), never Vite's HTML SPA fallback.
+      "/console.json": gateway,
       "/api": gateway,
       "/health": gateway,
       "/metrics": gateway,

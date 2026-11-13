@@ -57,7 +57,8 @@ import { parseCursor } from "./feed"
 import { cookieValue, SETUP_COOKIE, setupPublic } from "./setupsession"
 import { rerank, bedrockRerank, countTokens, responsesInputTokens, asyncSubmit, asyncGet, sdkAsyncSubmit, sdkAsyncPoll, decisionRoute, openaiDecisionPath, Dispatch } from "./extras"
 import { asyncPoll, jobOwner, Slot, slotOf, isJobId } from "./jobs"
-import { serveUi, uiPath, UI_CSP } from "./uiserve"
+import { serveUi, uiPath, uiCsp } from "./uiserve"
+import { consoleConfig, httpOrigin } from "./consoleconfig"
 import { TransportRun, transportStart, transportEnd, transportDone, transportSink, llmHooked, storageHooked, StorageCall, storageOp, storageIdKey, pathWithId, ownedRequest, passthroughOwned, recordUpload, httpHooked } from "./pluginroute"
 import { kindOfPath, isInferencePath } from "./plughttp"
 import { EXTRA_PARAMS_HEADER, EXTRA_PARAMS_CARRY, mergeExtraParams, extraParamsCarry } from "./extraparams"
@@ -1062,20 +1063,66 @@ function cacheView(engine: Engine): Response {
 // Gateway headers that browsers may read cross-origin.
 const EXPOSED = "x-raiju-request-id, x-raiju-trace-id, x-request-id, x-raiju-provider, x-raiju-original-model, x-raiju-resolved-model, x-raiju-fallback-index, x-raiju-request-type, x-raiju-upstream-latency-ms, x-raiju-routing-info-provider, x-raiju-routing-info-model, x-raiju-routing-info-key, x-raiju-routing-info-alias-model-id, x-raiju-routing-info-alias-model-name, x-raiju-routing-info-alias-model-family, x-raiju-routing-info-is-fallback, x-raiju-routing-info-primary-provider, x-raiju-routing-info-primary-model, x-raiju-routing-info-server-side-fallback-model, x-raiju-routing-info-requested-provider, x-raiju-routing-info-requested-model, x-raiju-cache-hit, x-raiju-cache-id, x-raiju-cache-hit-type, x-raiju-cache-hit-latency-ms, x-raiju-cache-requested-provider, x-raiju-cache-requested-model, x-raiju-cache-similarity, x-raiju-cache-threshold, x-raiju-cache-provider-used, x-raiju-cache-model-used, x-raiju-cache-input-tokens, x-raiju-latency-ms, x-raiju-pricing-request-type, x-raiju-converted-request-type, x-raiju-dropped-compat-params, x-raiju-dropped-unsupported-tools, x-raiju-passthrough-path, x-raiju-error-type, x-raiju-retry-after-ms, x-raiju-cache, x-raiju-attempts, x-raiju-fallback-used, x-raiju-overhead-us"
 
+function corsOriginAllowed(engine: Engine, origin: string): bool {
+  // "null", URL prefixes and repaired/malformed Origin values are never browser origins.
+  if (httpOrigin(origin) !== origin) return false
+  const origins = engine.cfg.client?.allowed_origins ?? []
+  return origins.includes(origin) || origins.includes("*")
+}
+
+function variesOnOrigin(value: string): bool {
+  for (const part of value.split(",")) if (part.trim().toLowerCase() === "origin" || part.trim() === "*") return true
+  return false
+}
+
+// Shared by whole responses and http1's SSE head (which does not pass through dispatch).
+// The gateway's policy, not an upstream CORS header, decides browser access. Never opt in
+// to cookies: cross-origin console callers use explicit bearer/setup credentials.
+export function corsHeaders(engine: Engine, req: Request, inout h: Map<string, string>): void {
+  const origin = req.headers.get("origin")
+  if (origin === undefined) return
+  h.delete("access-control-allow-origin")
+  h.delete("access-control-allow-credentials")
+  h.delete("access-control-expose-headers")
+  const vary = h.get("vary") ?? ""
+  if (!variesOnOrigin(vary)) h.set("vary", vary === "" ? "Origin" : vary + ", Origin")
+  if (!corsOriginAllowed(engine, origin)) return
+  h.set("access-control-allow-origin", origin)
+  h.set("access-control-expose-headers", EXPOSED)
+}
+
+// Only a real browser preflight bypasses authentication, never the actual operation.
+// Authorization is explicit: Access-Control-Allow-Headers: * alone does not cover it.
+function corsPreflight(engine: Engine, req: Request): Response | undefined {
+  if (req.method !== "OPTIONS") return undefined
+  const origin = req.headers.get("origin")
+  const method = req.headers.get("access-control-request-method")
+  if (origin === undefined || method === undefined) return undefined
+  if (!corsOriginAllowed(engine, origin) || !["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"].includes(method)) {
+    return new Response(undefined, { status: 403, headers: { "vary": "Origin, Access-Control-Request-Method, Access-Control-Request-Headers" } })
+  }
+  return new Response(undefined, { status: 204, headers: {
+    "access-control-allow-origin": origin,
+    "access-control-allow-methods": "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
+    "access-control-allow-headers": "Authorization, Content-Type, X-Raiju-Setup-Token, X-Raiju-Vk, *",
+    "access-control-max-age": "86400",
+    "vary": "Origin, Access-Control-Request-Method, Access-Control-Request-Headers",
+  } })
+}
+
 // Adds the CORS headers for an allowed origin. Response headers are a copy in Tov, so the
 // response is rebuilt: a streamed body stays a stream, any other body is carried as bytes.
 async function cors(engine: Engine, req: Request, res: Response): Promise<Response> {
-  const origins = engine.cfg.client?.allowed_origins ?? []
   const origin = req.headers.get("origin")
-  if (origin === undefined || origins.length === 0) return res
-  if (!origins.includes("*") && !origins.includes(origin)) return res
-  const h: Record<string, string> = new Map()
-  res.headers.forEach((v, k) => {
-    if (k !== "content-length") h.set(k, v)
-  })
-  h.set("access-control-allow-origin", origin)
-  h.set("access-control-expose-headers", EXPOSED)
-  h.set("vary", "origin")
+  if (origin === undefined) return res
+  const allowed = corsOriginAllowed(engine, origin)
+  if ((res.headers.get("access-control-allow-origin") ?? "") === (allowed ? origin : "") &&
+      res.headers.get("access-control-allow-credentials") === undefined &&
+      (!allowed || res.headers.get("access-control-expose-headers") === EXPOSED) &&
+      variesOnOrigin(res.headers.get("vary") ?? "")) return res
+  let h = snapshot(res.headers)
+  h.delete("content-length")
+  corsHeaders(engine, req, &h)
   const st = res.body
   if (st !== undefined && st.pushed) return new Response(st, { status: res.status, headers: h })
   let bytes: u8[] = []
@@ -1084,7 +1131,7 @@ async function cors(engine: Engine, req: Request, res: Response): Promise<Respon
   } catch (e) {
     bytes = []
   }
-  return new Response(res.status === 204 ? undefined : bytes, { status: res.status, headers: h })
+  return new Response(res.status === 204 || res.status === 304 ? undefined : bytes, { status: res.status, headers: h })
 }
 
 export type ServeOptions = { port: int, hostname: string, workers: int, maxBodyBytes?: int, limits: ServerLimits }
@@ -1222,6 +1269,8 @@ export type HeaderCheck = { res: Response | undefined, kind: BodyKind, who?: str
 // when its credentials pass or are not judged from the headers), and whether they were verified. A small body has
 // already been read by the server and goes the usual way.
 export async function credentialCheck(engine: Engine, ops: Ops, req: Request, limit: int): Promise<HeaderCheck> {
+  const preflight = corsPreflight(engine, req)
+  if (preflight !== undefined) return { res: preflight, kind: "unchecked" }
   if (!unreadBody(req, limit)) return { res: undefined, kind: "unchecked" }
   const u = URL.parse(req.url)
   const p = u === undefined ? "" : u.pathname
@@ -1230,9 +1279,8 @@ export async function credentialCheck(engine: Engine, ops: Ops, req: Request, li
   const c = headerCheck(engine, ops, req, limit)
   const res = c.res
   if (res === undefined) return c
-  // the answer the route would give: inference answers carry the CORS headers, and every answer the agent mark
-  // and the caller's request id (dispatch)
-  const shaped = isInferencePath(p) && p !== "/mcp" && !p.startsWith("/mcp/") ? await cors(engine, req, res) : res
+  // Management/setup refusals need the same browser-visible errors as inference refusals.
+  const shaped = await cors(engine, req, res)
   return { res: await echoRequestId(req, await markAgentRejection(engine, req, shaped)), kind: c.kind }
 }
 
@@ -1522,7 +1570,8 @@ function uiResponse(p: string, req: Request): Response | undefined {
   h.set("x-content-type-options", "nosniff")
   if (r.encoding !== "") h.set("content-encoding", r.encoding)
   if (r.contentType.startsWith("text/html")) {
-    h.set("content-security-policy", UI_CSP)
+    const u = URL.parse(req.url)
+    h.set("content-security-policy", uiCsp(u === undefined ? "" : u.origin, consoleConfig().origins))
     h.set("referrer-policy", "no-referrer")
     h.set("x-frame-options", "DENY")
   }
@@ -1607,8 +1656,15 @@ async function echoRequestId(req: Request, res: Response): Promise<Response> {
 }
 
 export async function dispatch(engine: Engine, ops: Ops, req: Request): Promise<Response> throws TypeError {
+  const preflight = corsPreflight(engine, req)
+  if (preflight !== undefined) return preflight
+  if (pathOfReq(req) === "/console.json") {
+    if (req.method !== "GET") return new Response(undefined, { status: 405, headers: { "allow": "GET", "cache-control": "no-store" } })
+    const config = consoleConfig()
+    return await cors(engine, req, new Response(config.body, { status: config.status, headers: { "content-type": "application/json", "cache-control": "no-store", "x-content-type-options": "nosniff" } }))
+  }
   const res = try await routes(engine, ops, req)
-  return await echoRequestId(req, await markAgentRejection(engine, req, res))
+  return await cors(engine, req, await echoRequestId(req, await markAgentRejection(engine, req, res)))
 }
 
 // The CLI that signs in with an identity credential sends it as a bearer token, with x-raiju-agent-vk-id
@@ -1880,10 +1936,6 @@ async function routes(engine: Engine, ops: Ops, req0: Request): Promise<Response
     }
     return try await engine.media(req, media)
   }
-  if (m === "OPTIONS") {
-    const res = new Response(undefined, { status: 204, headers: { "access-control-allow-methods": "GET, POST, PUT, DELETE, OPTIONS", "access-control-allow-headers": "*", "access-control-max-age": "86400" } })
-    return await cors(engine, req, res)
-  }
   return errorResponse(404, `no route for ${m} ${p}`, "invalid_request_error", noHeaders())
 }
 
@@ -2124,6 +2176,12 @@ function gated(ext: SocketExt, g: SocketGate): SocketExt {
   return ext
 }
 
+function sameBrowserOrigin(req: Request, origin: string): bool {
+  const own = URL.parse(req.url)
+  const other = URL.parse(origin)
+  return httpOrigin(origin) === origin && own !== undefined && other !== undefined && own.host === other.host && (own.protocol === other.protocol || other.protocol === "https:" && own.protocol === "http:")
+}
+
 // The WebSocket routes, for both servers: the realtime relay, the Responses API (GET /v1/responses),
 // GPT Live (/v1/live/sessions and its attach) and the UI socket (/ws). A refusal is decided before
 // the upgrade, so the client gets an HTTP status.
@@ -2131,6 +2189,17 @@ export function wsUpgrade(engine: Engine, ops: Ops, req: Request): WsUpgrade {
   const u = URL.parse(req.url)
   const p0 = u === undefined ? "" : u.pathname
   const p = wsBasePath(p0)
+  // Enforce Origin before spending a one-use UI ticket, on both native transports.
+  // Native clients without Origin still authenticate as before. A TLS terminator may
+  // deliver the same-host HTTPS browser connection to the native HTTP listener.
+  if (req.method === "GET" && (p === "/v1/realtime" || p === "/v1/responses" || p === "/v1/live/sessions" || p === "/ws" || attachId(p) !== "")) {
+    const origin = req.headers.get("origin")
+    if (origin !== undefined) {
+      if (!sameBrowserOrigin(req, origin) && (!corsOriginAllowed(engine, origin) || !(engine.cfg.client?.allowed_origins ?? []).includes(origin))) {
+        return { kind: "refused", status: 403, message: "this browser origin is not allowed" }
+      }
+    }
+  }
   if (p === "/v1/realtime" && req.method === "GET") {
     const up = prepare(engine, req)
     if (up.kind === "refused") return { kind: "refused", status: up.status, message: up.message }
@@ -2171,6 +2240,10 @@ export function wsUpgrade(engine: Engine, ops: Ops, req: Request): WsUpgrade {
     const batch = bt === "1" || bt === "true"
     // a ticket from POST /api/session/ws-ticket stands for the caller's credentials, once and briefly
     const tk = u === undefined ? "" : u.searchParams.get("ticket") ?? ""
+    const browserOrigin = req.headers.get("origin")
+    if (browserOrigin !== undefined && !sameBrowserOrigin(req, browserOrigin) && tk === "") {
+      return { kind: "refused", status: 401, message: "a one-use WebSocket ticket is required for a remote console" }
+    }
     if (tk !== "") {
       const actor = ops.wsTickets.consume(tk, Date.now())
       if (actor === undefined) return { kind: "refused", status: 401, message: "the WebSocket ticket is invalid, used or expired" }
@@ -2277,7 +2350,7 @@ async function bunHttp(engine: Engine, ops: Ops, req00: Request, limit: int): Pr
     req00.signal.addEventListener("abort", () => watchGone(id))
   }
   try {
-    return try await bunHttpWatched(engine, ops, req00, limit, wid)
+    return try await cors(engine, req00, try await bunHttpWatched(engine, ops, req00, limit, wid))
   } finally {
     if (wid !== "") watchEnd(wid)
   }
@@ -2603,3 +2676,68 @@ test("the Responses and live sockets check credentials before the upgrade (re-au
   expect(upgradeStatus(ops2.engine, ops2, upgradeReq("/v1/responses", []))).toBe(101)
   expect(upgradeStatus(ops2.engine, ops2, upgradeReq("/v1/live/sessions", []))).toBe(101)
 })
+
+test("only an allowed browser preflight passes the management and setup gates", () => {
+  const origin = "https://console.example"
+  const cfg: Config = { setup_token: "synthetic-setup", client: { allowed_origins: [origin], enforce_auth_on_inference: true } }
+  const ops = new Ops(new Engine(cfg), new ConfigStore("/tmp/raiju-console-cors.json", cfg))
+  for (const path of ["/api/providers", "/api/users", "/api/session/setup", "/api/session/ws-ticket", "/v1/chat/completions"]) {
+    const req = new Request("http://localhost" + path, { method: "OPTIONS", headers: {
+      "origin": origin, "access-control-request-method": "POST",
+      "access-control-request-headers": "authorization,content-type,x-raiju-setup-token,x-raiju-vk",
+    } })
+    const r = corsPreflight(ops.engine, req)!
+    expect(r.status).toBe(204)
+    expect(r.headers.get("access-control-allow-origin")).toBe(origin)
+    const allowed = (r.headers.get("access-control-allow-headers") ?? "").toLowerCase()
+    for (const header of ["authorization", "content-type", "x-raiju-setup-token", "x-raiju-vk"]) expect(allowed.includes(header)).toBe(true)
+    expect(r.headers.get("access-control-allow-credentials")).toBeUndefined()
+  }
+  expect(corsPreflight(ops.engine, new Request("http://localhost/api/providers", { method: "OPTIONS", headers: { "origin": origin } }))).toBeUndefined()
+  const denied = ops.gate(new Request("http://localhost/api/providers", { headers: { "origin": origin } }), "/api/providers")
+  expect(denied.kind).toBe("deny")
+  const allowed = ops.gate(new Request("http://localhost/api/providers", { headers: { "origin": origin, "x-raiju-setup-token": "synthetic-setup" } }), "/api/providers")
+  expect(allowed.kind).toBe("ok")
+  for (const bad of ["https://evil.example", "https://console.example.evil", "https://console.example/", "null"]) {
+    const r = corsPreflight(ops.engine, new Request("http://localhost/api/providers", { method: "OPTIONS", headers: { "origin": bad, "access-control-request-method": "GET" } }))!
+    expect(r.status).toBe(403)
+    expect(r.headers.get("access-control-allow-origin")).toBeUndefined()
+  }
+})
+
+test("CORS preserves existing Vary and does not trust upstream browser permissions", () => {
+  const cfg: Config = { client: { allowed_origins: ["https://console.example"] } }
+  const eng = new Engine(cfg)
+  let h: Map<string, string> = new Map()
+  h.set("vary", "Accept-Encoding")
+  h.set("access-control-allow-origin", "*")
+  h.set("access-control-allow-credentials", "true")
+  corsHeaders(eng, new Request("http://localhost/api/providers", { headers: { "origin": "https://console.example" } }), &h)
+  expect(h.get("vary")).toBe("Accept-Encoding, Origin")
+  expect(h.get("access-control-allow-origin")).toBe("https://console.example")
+  expect(h.get("access-control-allow-credentials")).toBeUndefined()
+  corsHeaders(eng, new Request("http://localhost/v1/chat/completions", { headers: { "origin": "https://evil.example" } }), &h)
+  expect(h.get("access-control-allow-origin")).toBeUndefined()
+  expect(h.get("access-control-allow-credentials")).toBeUndefined()
+  expect(h.get("vary")).toBe("Accept-Encoding, Origin")
+})
+
+test("remote UI sockets require an explicitly allowed Origin and a one-use ticket", () => {
+  const origin = "https://console.example"
+  const cfg: Config = { governance: { auth_config: { token: "synthetic-admin" } }, client: { allowed_origins: [origin] } }
+  const ops = new Ops(new Engine(cfg), new ConfigStore("/tmp/raiju-console-ws-cors.json", cfg))
+  const ticket = try ops.wsTickets.issue("admin", Date.now())
+  const path = "/ws?ticket=" + ticket
+  expect(upgradeStatus(ops.engine, ops, upgradeReq(path, [["origin", "https://evil.example"]]))).toBe(403)
+  // The denied Origin did not spend the ticket; the selected origin can still use it once.
+  expect(upgradeStatus(ops.engine, ops, upgradeReq(path, [["origin", origin]]))).toBe(101)
+  expect(upgradeStatus(ops.engine, ops, upgradeReq(path, [["origin", origin]]))).toBe(401)
+  expect(upgradeStatus(ops.engine, ops, upgradeReq("/ws", [["origin", origin], ["authorization", "Bearer synthetic-admin"], ["cookie", "raiju_session=ambient"]]))).toBe(401)
+  expect(upgradeStatus(ops.engine, ops, upgradeReq("/ws", [["origin", "http://localhost"], ["authorization", "Bearer synthetic-admin"]]))).toBe(101)
+  expect(upgradeStatus(ops.engine, ops, upgradeReq("/ws", [["authorization", "Bearer synthetic-admin"]]))).toBe(101)
+  const wildcard: Config = { client: { allowed_origins: ["*"] } }
+  const any = new Ops(new Engine(wildcard), new ConfigStore("/tmp/raiju-console-ws-wildcard.json", wildcard))
+  expect(upgradeStatus(any.engine, any, upgradeReq(path, [["origin", origin]]))).toBe(403)
+  expect(upgradeStatus(ops.engine, ops, upgradeReq("/v1/responses", [["origin", "https://evil.example"]]))).toBe(403)
+})
+

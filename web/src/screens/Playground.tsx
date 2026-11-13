@@ -2,6 +2,7 @@ import { createSignal, For, Show } from "solid-js"
 import { message, send } from "../api/client"
 import { contentText, fmtInt, listOf, pretty } from "../fmt"
 import { notify, Toolbar, useRun } from "../ui"
+import { target, targetLabel } from "../gateway"
 
 interface Result {
   ms: number
@@ -73,6 +74,7 @@ export function Playground() {
   return (
     <section aria-labelledby="pg-title">
       <Toolbar title="Playground" id="pg-title" />
+      <p class="hint" id="pg-target">Inference target: <strong>{targetLabel()}</strong> · <span class="mono">{target().url}</span>. The virtual key and message go directly to this gateway only; no regional fallback.</p>
       <form id="pg-form" class="card" ref={(el) => (form = el)} onSubmit={submit}>
         <div class="form-grid">
           <label>
@@ -112,7 +114,7 @@ export function Playground() {
           <div class="actions wide">
             <span class="hint grow">Ctrl+Enter sends.</span>
             <button type="submit" class="primary" disabled={busy()}>
-              Send
+              Send to {targetLabel()}
             </button>
           </div>
         </div>

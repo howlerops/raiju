@@ -1,8 +1,10 @@
 import { createSignal, For, Match, onSettled, Show, Switch, Errored } from "solid-js"
-import { api, send, ApiError } from "./api/client"
-import { clearSignIn, closeSignIn, dialog, onTokenChange, openSignIn, setToken, tokenSet } from "./auth"
+import { send, ApiError } from "./api/client"
+import { clearSignIn, closeSignIn, dialog, openSignIn, setToken, tokenSet } from "./auth"
 import { can, me, refreshMe, roleLabel } from "./perm"
-import { Pill, Toasts, type Tone } from "./ui"
+import { notify, Toasts, type Tone } from "./ui"
+import { consoleConfig, switchGateway, target, targetLabel, targetURL } from "./gateway"
+import { Fleet } from "./screens/Fleet"
 import { Overview } from "./screens/Overview"
 import { Live } from "./screens/Live"
 import { Providers } from "./screens/Providers"
@@ -20,6 +22,7 @@ import { Setup } from "./screens/Setup"
 
 // [id, label, the resource a role needs to see it (any role may open "")]
 const VIEWS = [
+  ["fleet", "Fleet health", ""],
   ["overview", "Overview", ""],
   ["live", "Live", "Logs"],
   ["providers", "Providers", "ModelProvider"],
@@ -40,7 +43,7 @@ type ViewId = (typeof VIEWS)[number][0]
 function viewFromHash(): ViewId {
   const h = location.hash.replace(/^#/, "")
   const hit = VIEWS.find((v) => v[0] === h)
-  return hit ? hit[0] : "overview"
+  return hit && (hit[0] !== "fleet" || consoleConfig()) ? hit[0] : consoleConfig() ? "fleet" : "overview"
 }
 
 const [view, setView] = createSignal<ViewId>(viewFromHash())
@@ -71,17 +74,13 @@ async function checkSetup(): Promise<boolean> {
 
 // Whether the sign-in dialog offers SSO (not asked while the setup lock is on: every other /api route is locked then)
 function checkSso(): void {
-  api
-    .get("/api/oidc/status")
-    .then((j) => setSso(!!j.enabled))
+  void send("GET", "/api/oidc/status", { auth: false, quiet: true })
+    .then((r) => setSso(!!(r.data as { enabled?: boolean } | undefined)?.enabled))
     .catch(() => {})
 }
 
 function setupDone(token: string): void {
-  setSetup(undefined)
   setToken(token)
-  void refreshMe()
-  checkSso()
 }
 
 async function checkHealth(): Promise<void> {
@@ -96,49 +95,60 @@ async function checkHealth(): Promise<void> {
 
 function SignIn() {
   let input: HTMLInputElement | undefined
-  const submit = (ev: SubmitEvent) => {
-    ev.preventDefault()
-    closeSignIn((input?.value ?? "").trim())
+  let username: HTMLInputElement | undefined
+  let password: HTMLInputElement | undefined
+  const [error, setError] = createSignal("")
+  const [busy, setBusy] = createSignal(false)
+  const save = (token: string | undefined) => {
+    try { closeSignIn(token) } catch (e) { setError(e instanceof Error ? e.message : String(e)) }
+  }
+  const login = async () => {
+    setError("")
+    setBusy(true)
+    const name = username?.value ?? ""
+    const secret = password?.value ?? ""
+    try {
+      if (!name || !secret) throw new Error("Enter a username and password.")
+      const result = await send("POST", "/api/session/login", { auth: false, quiet: true, body: { username: name, password: secret } })
+      const token = (result.data as { token?: unknown } | undefined)?.token
+      if (typeof token !== "string" || !token) throw new Error("The gateway did not return a session token.")
+      if (password) password.value = ""
+      save(token)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally { setBusy(false) }
   }
   return (
     <Show when={dialog()}>
       {(d) => (
-        <div class="overlay" id="auth" onKeyDown={(ev) => ev.key === "Escape" && closeSignIn(undefined)}>
-          <form class="dialog" role="dialog" aria-modal="true" aria-labelledby="auth-title" onSubmit={submit}>
-            <h2 id="auth-title">Admin token</h2>
-            <p id="auth-msg" class="muted">
-              {d().message}
-            </p>
-            <label>
-              Token
-              <input
-                id="auth-input"
-                type="password"
-                autocomplete="off"
-                spellcheck={false}
-                ref={(el) => {
-                  input = el
-                  queueMicrotask(() => el.focus())
-                }}
-              />
+        <div class="overlay" id="auth" onKeyDown={(ev) => ev.key === "Escape" && !busy() && save(undefined)}>
+          <form class="dialog" role="dialog" aria-modal="true" aria-labelledby="auth-title" onSubmit={(ev) => { ev.preventDefault(); save((input?.value ?? "").trim()) }}>
+            <h2 id="auth-title">Sign in to {targetLabel()}</h2>
+            <p class="mono endpoint">{target().url}</p>
+            <p id="auth-msg" class="muted">{d().message}</p>
+            <p class="hint">Credentials stay in this tab, scoped to this gateway origin. Changing identity reloads the console and clears page data.</p>
+            <label>Admin or session token
+              <input id="auth-input" type="password" autocomplete="off" spellcheck={false} ref={(el) => { input = el; queueMicrotask(() => el.focus()) }} />
             </label>
+            <details>
+              <summary>Sign in with username and password</summary>
+              <label>Username<input id="auth-username" autocomplete="username" ref={(el) => (username = el)} /></label>
+              <label>Password<input id="auth-password" type="password" autocomplete="current-password" ref={(el) => (password = el)} /></label>
+              <button type="button" disabled={busy()} onClick={() => void login()}>{busy() ? "Signing in…" : "Sign in to " + targetLabel()}</button>
+            </details>
             <Show when={sso()}>
               <p id="auth-sso">
-                <a class="button" href="/api/oidc/login">
-                  Sign in with SSO
+                <a class="button" href={targetURL("/api/oidc/login")} target={consoleConfig() ? "_blank" : undefined} rel="noopener noreferrer">
+                  {consoleConfig() ? "Open regional UI for SSO" : "Sign in with SSO"}
                 </a>
+                <Show when={consoleConfig()}><span class="hint"> SSO cookies sign in only to the regional UI, not this consolidated console. Use a regional bearer token here.</span></Show>
               </p>
             </Show>
+            <Show when={error()}><p class="error" role="alert">{error()}</p></Show>
             <div class="actions">
-              <button type="button" class="ghost" id="auth-clear" onClick={() => clearSignIn()}>
-                Clear saved token
-              </button>
-              <button type="button" id="auth-cancel" onClick={() => closeSignIn(undefined)}>
-                Cancel
-              </button>
-              <button type="submit" class="primary">
-                Save
-              </button>
+              <button type="button" class="ghost" id="auth-clear" disabled={busy()} onClick={() => { try { clearSignIn() } catch (e) { setError(String(e)) } }}>Clear saved token</button>
+              <button type="button" id="auth-cancel" disabled={busy()} onClick={() => save(undefined)}>Cancel</button>
+              <button type="submit" class="primary" disabled={busy()}>Save token</button>
             </div>
           </form>
         </div>
@@ -148,16 +158,22 @@ function SignIn() {
 }
 
 export function App() {
+  setView(viewFromHash())
   onSettled(() => {
-    const onHash = () => setView(viewFromHash())
+    let started = false
+    const loadTarget = () => {
+      if (started || view() === "fleet") return
+      started = true
+      // The fleet screen never loads regional permissions, logs or configuration.
+      void checkSetup().then((locked) => {
+        if (locked) return
+        void refreshMe()
+        checkSso()
+      })
+    }
+    const onHash = () => { setView(viewFromHash()); loadTarget() }
     window.addEventListener("hashchange", onHash)
-    onTokenChange(() => void refreshMe())
-    // with no admin account the API is locked: the setup screen comes first, and nothing asks for a sign-in
-    void checkSetup().then((locked) => {
-      if (locked) return
-      void refreshMe()
-      checkSso()
-    })
+    loadTarget()
     void checkHealth()
     const timer = setInterval(() => {
       if (!document.hidden) void checkHealth()
@@ -175,13 +191,14 @@ export function App() {
 
   return (
     <>
+      <div class="console-heading">
       <header class="top">
         <div class="brand">
           <span class="logo" aria-hidden="true">
             R
           </span>
           <span>
-            Raiju <span class="muted">gateway</span>
+            Raiju <span class="muted">{consoleConfig() ? "console" : "gateway"}</span>
           </span>
         </div>
         <div class="top-right">
@@ -199,20 +216,39 @@ export function App() {
             type="button"
             id="token-btn"
             class="ghost"
-            onClick={() => openSignIn("Enter the admin token. Submit it blank to clear it.")}
+            onClick={() => openSignIn("Enter credentials for " + targetLabel() + " only. Submit a blank token to clear it.")}
           >
-            {tokenSet() ? "Admin token: set" : "Admin token"}
+            {tokenSet() ? "Regional token: set" : "Sign in"}
           </button>
         </div>
       </header>
+      <section class="target-banner" aria-label="Selected gateway">
+        <Show when={consoleConfig()}>
+          {(config) => <label>Gateway / region
+            <select id="gateway-select" value={target().id} onChange={(ev) => {
+              try { switchGateway(ev.currentTarget.value) } catch (e) {
+                ev.currentTarget.value = target().id
+                notify(e instanceof Error ? e.message : String(e), "error")
+              }
+            }}>
+              <For each={config().gateways}>{(gateway) => <option value={gateway.id}>{gateway.name}</option>}</For>
+            </select>
+          </label>}
+        </Show>
+        <Show when={consoleConfig()}><a class="button" href="#fleet">Fleet health</a></Show>
+        <div><strong>Target: {targetLabel()}</strong><div class="mono endpoint" id="target-endpoint">{target().url}</div></div>
+        <p class="hint">Regional admin reads, changes and Playground requests apply only to this target. Fleet health uses public probes only. Switching reloads the page and clears forms, data and sockets. No cross-region fallback or synchronization.</p>
+      </section>
+      </div>
+      <Show when={!checked() && view() !== "fleet"}><main><p role="status">Checking selected gateway…</p></main></Show>
 
-      <Show when={setup()}>{(st) => <Setup configured={st().configured} done={setupDone} />}</Show>
+      <Show when={view() !== "fleet" ? setup() : undefined}>{(st) => <Setup configured={st().configured} done={setupDone} />}</Show>
 
-      <Show when={checked() && !setup()}>
+      <Show when={(checked() && !setup()) || view() === "fleet"}>
       <nav class="tabs" aria-label="Sections">
         <For each={VIEWS}>
           {(v) => (
-            <Show when={v[2] === "" || can(v[2])}>
+            <Show when={(v[0] !== "fleet" || consoleConfig()) && (v[2] === "" || can(v[2]))}>
               <a href={"#" + v[0]} data-nav={v[0]} aria-current={view() === v[0] ? "page" : undefined}>
                 {v[1]}
               </a>
@@ -235,6 +271,9 @@ export function App() {
           )}
         >
           <Switch>
+            <Match when={view() === "fleet" && consoleConfig()}>
+              <Fleet />
+            </Match>
             <Match when={view() === "overview"}>
               <Overview />
             </Match>

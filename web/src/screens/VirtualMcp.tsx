@@ -6,6 +6,7 @@ import { createMemo, createSignal, createStore, For, refresh, Show, snapshot, un
 import { send } from "../api/client"
 import { can } from "../perm"
 import { DangerButton, FormError, Guard, initChecked, initValue, notify, Pill, Toolbar, tf, useFormRun } from "../ui"
+import { targetURL } from "../gateway"
 
 interface VTool {
   source: string
@@ -391,7 +392,7 @@ function McpCard(props: { m: VMcp; res: Resolved | undefined; keys: Named[]; mod
       <header class="toolbar" style="margin-bottom:8px">
         <h3>{props.m.name}</h3>
         <Pill>{props.m.tools.length + (props.m.tools.length === 1 ? " tool" : " tools")}</Pill>
-        <span class="hint mono grow">{"/mcp/" + props.m.name}</span>
+        <span class="hint mono grow">{targetURL("/mcp/" + encodeURIComponent(props.m.name))}</span>
         <span class="row-actions">
           <Show when={writable()}>
             <button type="button" class="ghost" onClick={props.onEdit}>

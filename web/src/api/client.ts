@@ -3,6 +3,7 @@
 // body and response types.
 import type { paths } from "./schema"
 import { adminToken, askToken } from "../auth"
+import { apiCredentials, discarded, gatewaySignal, isActive, targetLabel, targetURL } from "../gateway"
 
 export class ApiError extends Error {
   status: number
@@ -68,24 +69,46 @@ export function queryString(q: Record<string, unknown> | undefined): string {
 
 // One call, no typing: returns status, text and parsed body, throws ApiError on a non-2xx.
 export async function send(method: string, path: string, o: RawOpts = {}): Promise<Raw> {
+  if (!isActive()) return discarded()
+  // Freeze both URL and bearer before any await, including the sign-in prompt.
+  const url = targetURL(path) + queryString(o.query)
+  const bearer = adminToken()
+  const publicProbe = path === "/health" || path === "/ready"
+  const authenticated = o.auth !== false && !publicProbe
+  const credentials = publicProbe ? "omit" : apiCredentials()
   const attempt = async (): Promise<Raw> => {
     const headers: Record<string, string> = { accept: "application/json", ...(o.headers ?? {}) }
     if (o.body !== undefined) headers["content-type"] = "application/json"
-    const t = adminToken()
-    if (o.auth !== false && t) headers.authorization = "Bearer " + t
+    if (!isActive()) return discarded()
+    if (publicProbe) {
+      for (const key of Object.keys(headers)) {
+        if (key.toLowerCase() !== "accept") delete headers[key]
+      }
+    } else if (authenticated && bearer) headers.authorization = "Bearer " + bearer
     let res: Response
     try {
-      res = await fetch(path + queryString(o.query), {
+      res = await fetch(url, {
         method: method.toUpperCase(),
         headers,
         body: o.body === undefined ? undefined : JSON.stringify(o.body),
         cache: "no-store",
-        credentials: "same-origin",
+        credentials,
+        redirect: "error",
+        referrerPolicy: "no-referrer",
+        signal: gatewaySignal(),
       })
     } catch {
-      throw new ApiError(0, "Cannot reach the gateway. Is it running?")
+      if (!isActive()) return discarded()
+      throw new ApiError(0, "Cannot reach " + targetLabel() + ". Check connectivity and regional CORS configuration.")
     }
-    const text = await res.text()
+    let text: string
+    try {
+      text = await res.text()
+    } catch {
+      if (!isActive()) return discarded()
+      throw new ApiError(0, "The gateway response could not be read.")
+    }
+    if (!isActive()) return discarded()
     let data: unknown
     try {
       data = text ? JSON.parse(text) : undefined
@@ -95,12 +118,14 @@ export async function send(method: string, path: string, o: RawOpts = {}): Promi
     return { status: res.status, text, data }
   }
   let r = await attempt()
-  if (r.status === 401 && o.auth !== false && !o.quiet) {
+  if (r.status === 401 && authenticated && !o.quiet) {
     const t = await askToken(
-      adminToken() ? "The admin token was rejected. Enter a valid token." : "This page needs the admin token to continue.",
+      bearer ? "The token for " + targetLabel() + " was rejected. Enter a valid regional token." : "Sign in to " + targetLabel() + " to continue.",
     )
-    if (t) r = await attempt()
+    // Identity changes reload the document. An unchanged token must not retry forever.
+    if (t && t === bearer && isActive()) r = await attempt()
   }
+  if (!isActive()) return discarded()
   if (r.status < 200 || r.status >= 300) throw new ApiError(r.status, errorText(r.status, r.data, r.text, path))
   return r
 }

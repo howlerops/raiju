@@ -6,6 +6,7 @@ import { ApiError, send } from "../api/client"
 import { fmtTime } from "../fmt"
 import { can } from "../perm"
 import { Card, copyText, DangerButton, FormError, Guard, Mono, notify, Pill, Table, Toolbar, useFormRun, useRun, type Tone } from "../ui"
+import { regionalLink } from "../gateway"
 
 interface Grant {
   id: string
@@ -152,8 +153,9 @@ function Sessions(props: Ctl) {
   const reauth = (r: SessionRow) =>
     run(async () => {
       const res = await send("POST", "/api/mcp/sessions/" + encodeURIComponent(r.id) + "/reauth")
-      const url = String((res.data as { url?: string } | undefined)?.url ?? "")
-      setLink({ client: r.mcp_client.name, url })
+      const value = String((res.data as { url?: string } | undefined)?.url ?? "")
+      if (!value) throw new Error("The gateway did not return a consent link.")
+      setLink({ client: r.mcp_client.name, url: regionalLink(value) })
       props.bump()
     })
   let linkField: HTMLInputElement | undefined
@@ -183,11 +185,11 @@ function Sessions(props: Ctl) {
               <strong>{"Consent link for " + l.client}</strong> Send it to the caller; it is the page they approve on.
             </p>
             <div class="secret-row">
-              <input readonly aria-label="Consent link" ref={(el) => (linkField = el)} value={location.origin + l.url} />
-              <button type="button" onClick={async () => notify((await copyText(location.origin + l.url, linkField)) ? "Link copied" : "Copy failed", "ok")}>
+              <input readonly aria-label="Consent link" ref={(el) => (linkField = el)} value={l.url} />
+              <button type="button" onClick={async () => notify((await copyText(l.url, linkField)) ? "Link copied" : "Copy failed", "ok")}>
                 Copy
               </button>
-              <a class="button" href={l.url} target="_blank" rel="noopener">
+              <a class="button" href={l.url} target="_blank" rel="noopener noreferrer">
                 Open
               </a>
               <button type="button" class="ghost" onClick={() => setLink(undefined)}>

@@ -4,6 +4,7 @@ import { createSignal, Errored, For, Loading, Show } from "solid-js"
 import type { JSX } from "@solidjs/web"
 import { message } from "./api/client"
 import { can, type Op } from "./perm"
+import { targetLabel } from "./gateway"
 
 // ---- initial values for uncontrolled fields ----
 
@@ -187,7 +188,7 @@ export function DangerButton(props: { label: string; action: () => Promise<void>
           </button>
         }
       >
-        <span class="muted">Are you sure?</span>
+        <span class="muted">Confirm on {targetLabel()}?</span>
         <button type="button" class="danger" disabled={busy()} onClick={go}>
           {"Confirm " + props.label.toLowerCase()}
         </button>
