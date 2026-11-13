@@ -67,12 +67,12 @@ function McpForm(props: { current: Cfg | undefined; onClose: () => void; onSaved
     })
   }
   return (
-    <form id="mcp-form" class="card" aria-labelledby="mcp-form-title" onSubmit={submit}>
+    <form id="mcp-form" class="card panel bg-base-100 border border-base-300" aria-labelledby="mcp-form-title" onSubmit={submit}>
       <h2 id="mcp-form-title">{c ? "Edit " + c.name : "Add MCP client"}</h2>
       <div class="form-grid">
         <label>
           Name
-          <input
+          <input class="input input-sm"
             name="name"
             required
             autocomplete="off"
@@ -86,7 +86,7 @@ function McpForm(props: { current: Cfg | undefined; onClose: () => void; onSaved
         </label>
         <label>
           Connection
-          <select name="connection_type">
+          <select class="select select-sm" name="connection_type">
             <option value="http" ref={initSelected((c?.connection_type ?? "http") === "http")}>
               HTTP
             </option>
@@ -100,30 +100,30 @@ function McpForm(props: { current: Cfg | undefined; onClose: () => void; onSaved
         </label>
         <label class="wide">
           URL (HTTP or SSE)
-          <input name="connection_string" type="url" autocomplete="off" placeholder="https://..." ref={initValue(c?.connection_string ?? "")} />
+          <input class="input input-sm" name="connection_string" type="url" autocomplete="off" placeholder="https://..." ref={initValue(c?.connection_string ?? "")} />
         </label>
         <label>
           Command (stdio)
-          <input name="command" autocomplete="off" placeholder="npx" ref={initValue(stdio.command ?? "")} />
+          <input class="input input-sm" name="command" autocomplete="off" placeholder="npx" ref={initValue(stdio.command ?? "")} />
         </label>
         <label>
           Arguments (stdio, comma separated)
-          <input name="args" autocomplete="off" ref={initValue((stdio.args ?? []).join(", "))} />
+          <input class="input input-sm" name="args" autocomplete="off" ref={initValue((stdio.args ?? []).join(", "))} />
         </label>
         <label class="wide">
           Headers, one per line as Name: value
-          <textarea name="headers" class="mono" rows="3" spellcheck={false} ref={initValue(Object.keys(hdrs).map((k) => k + ": " + hdrs[k]).join("\n"))} />
+          <textarea name="headers" class="textarea textarea-sm mono" rows="3" spellcheck={false} ref={initValue(Object.keys(hdrs).map((k) => k + ": " + hdrs[k]).join("\n"))} />
         </label>
         <label class="check">
-          <input type="checkbox" name="disabled" ref={initChecked(!!c?.disabled)} /> Disabled
+          <input class="checkbox checkbox-sm" type="checkbox" name="disabled" ref={initChecked(!!c?.disabled)} /> Disabled
         </label>
         <FormError text={error()} />
       </div>
       <div class="actions">
-        <button type="button" id="mcp-cancel" class="ghost" onClick={props.onClose}>
+        <button type="button" id="mcp-cancel" class="btn btn-sm btn-ghost" onClick={props.onClose}>
           Cancel
         </button>
-        <button type="submit" id="mcp-save" class="primary" disabled={busy()}>
+        <button type="submit" id="mcp-save" class="btn btn-sm btn-primary" disabled={busy()}>
           {c ? "Save changes" : "Add client"}
         </button>
       </div>
@@ -154,7 +154,7 @@ function ClientCard(props: { c: Cfg; st: McpStatus | undefined; onEdit: () => vo
     })
 
   return (
-    <article class="card" aria-label={"MCP client " + props.c.name}>
+    <article class="card panel bg-base-100 border border-base-300" aria-label={"MCP client " + props.c.name}>
       <header class="toolbar" style="margin-bottom:8px">
         <h3>{String(props.c.name)}</h3>
         <Pill>{props.c.connection_type || "http"}</Pill>
@@ -162,14 +162,14 @@ function ClientCard(props: { c: Cfg; st: McpStatus | undefined; onEdit: () => vo
         <span class="hint mono grow">{where()}</span>
         <span class="row-actions">
           <Can resource="MCPGateway" op="Update">
-            <button type="button" class="ghost" onClick={props.onEdit}>
+            <button type="button" class="btn btn-sm btn-ghost" onClick={props.onEdit}>
               Edit
             </button>
           </Can>
           <Can resource="MCPGateway" op="Create">
             <button
               type="button"
-              class="ghost"
+              class="btn btn-sm btn-ghost"
               disabled={busy()}
               onClick={() =>
                 run(async () => {
@@ -207,7 +207,7 @@ function ClientCard(props: { c: Cfg; st: McpStatus | undefined; onEdit: () => vo
             {(t) => (
               <button
                 type="button"
-                class="toggle mono"
+                class="btn btn-sm tool-toggle mono"
                 aria-pressed={tf(!!t().allowed)}
                 title={t().allowed ? "Enabled. Select to disable." : "Disabled. Select to enable."}
                 disabled={busy() || !can("MCPGateway", "Update")}
@@ -230,11 +230,11 @@ export function Mcp() {
   return (
     <section aria-labelledby="mcp-title">
       <Toolbar title="MCP clients" id="mcp-title">
-        <button type="button" id="mcp-refresh" class="ghost" onClick={reload}>
+        <button type="button" id="mcp-refresh" class="btn btn-sm btn-ghost" onClick={reload}>
           Refresh
         </button>
         <Can resource="MCPGateway" op="Create">
-          <button type="button" id="mcp-new" class="primary" onClick={() => setEditor({ c: undefined })}>
+          <button type="button" id="mcp-new" class="btn btn-sm btn-primary" onClick={() => setEditor({ c: undefined })}>
             Add client
           </button>
         </Can>
@@ -254,7 +254,7 @@ export function Mcp() {
       <div id="mcp-list">
         <Errored fallback={(err) => <ErrP error={err()} />}>
           <Loading fallback={<p class="muted">Loading...</p>}>
-            <Show when={data().clients.length} fallback={<p class="card muted">No MCP clients yet. Add one above.</p>}>
+            <Show when={data().clients.length} fallback={<p class="card panel bg-base-100 border border-base-300 muted">No MCP clients yet. Add one above.</p>}>
               <For each={data().clients} keyed={(c) => String(c.name)}>
                 {(c) => <ClientCard c={c()} st={data().status[String(c().name)]} onEdit={() => setEditor({ c: c() })} onChange={reload} />}
               </For>

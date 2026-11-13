@@ -49,7 +49,7 @@ function Editor(props: { cfg: Obj; onSaved: () => void }) {
       props.onSaved()
     })
   return (
-    <section class="card" id="cfg-box" aria-labelledby="cfg-edit-h">
+    <section class="card panel bg-base-100 border border-base-300" id="cfg-box" aria-labelledby="cfg-edit-h">
       <h2 id="cfg-edit-h">Settings</h2>
       <p class="hint">
         Saves three sections with PUT /api/config: client_config, framework_config (pricing sync) and auth_config (admin login). Other sections are
@@ -59,7 +59,7 @@ function Editor(props: { cfg: Obj; onSaved: () => void }) {
         Settings as JSON
         <textarea
           id="cfg-json"
-          class="mono"
+          class="textarea textarea-sm mono"
           rows="16"
           spellcheck={false}
           aria-describedby="cfg-edit-h"
@@ -78,7 +78,7 @@ function Editor(props: { cfg: Obj; onSaved: () => void }) {
         <button
           type="button"
           id="cfg-discard"
-          class="ghost"
+          class="btn btn-sm btn-ghost"
           onClick={() => {
             setError("")
             setText(initial())
@@ -86,7 +86,7 @@ function Editor(props: { cfg: Obj; onSaved: () => void }) {
         >
           Discard changes
         </button>
-        <button type="button" id="cfg-save" class="primary" disabled={busy()} onClick={save}>
+        <button type="button" id="cfg-save" class="btn btn-sm btn-primary" disabled={busy()} onClick={save}>
           Save configuration
         </button>
       </div>
@@ -100,7 +100,7 @@ export function Config() {
   return (
     <section aria-labelledby="cfg-title">
       <Toolbar title="Configuration" id="cfg-title">
-        <button type="button" id="cfg-refresh" class="ghost" onClick={reload}>
+        <button type="button" id="cfg-refresh" class="btn btn-sm btn-ghost" onClick={reload}>
           Reload
         </button>
       </Toolbar>
@@ -109,7 +109,7 @@ export function Config() {
           <Show when={cfg()} keyed>
             {(c) => <Editor cfg={c} onSaved={reload} />}
           </Show>
-          <details class="card" id="cfg-full-box">
+          <details class="card panel bg-base-100 border border-base-300" id="cfg-full-box">
             <summary>Full configuration (read only, secrets redacted)</summary>
             <pre class="code" id="cfg-full">
               {pretty(cfg())}

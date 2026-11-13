@@ -190,10 +190,10 @@ export function Logs() {
           {range()}
         </span>
       </Toolbar>
-      <form id="lg-filter" class="card filters" role="search" aria-label="Filter logs" ref={(el) => (form = el)} onSubmit={apply}>
+      <form id="lg-filter" class="card panel bg-base-100 border border-base-300 filters" role="search" aria-label="Filter logs" ref={(el) => (form = el)} onSubmit={apply}>
         <label>
           Provider
-          <input name="provider" list="lg-providers" autocomplete="off" />
+          <input class="input input-sm" name="provider" list="lg-providers" autocomplete="off" />
         </label>
         <datalist id="lg-providers">
           <Loading>
@@ -202,7 +202,7 @@ export function Logs() {
         </datalist>
         <label>
           Model
-          <input name="model" list="lg-models" autocomplete="off" />
+          <input class="input input-sm" name="model" list="lg-models" autocomplete="off" />
         </label>
         <datalist id="lg-models">
           <Loading>
@@ -211,7 +211,7 @@ export function Logs() {
         </datalist>
         <label>
           Virtual key
-          <select name="virtual_key">
+          <select class="select select-sm" name="virtual_key">
             <option value="">Any</option>
             <Loading>
               <For each={filters().virtual_keys ?? []}>
@@ -222,7 +222,7 @@ export function Logs() {
         </label>
         <label>
           Status
-          <select name="status">
+          <select class="select select-sm" name="status">
             <option value="">Any</option>
             <option value="success">Success</option>
             <option value="error">Error</option>
@@ -230,7 +230,7 @@ export function Logs() {
         </label>
         <label>
           Time range
-          <select name="period" onChange={(e) => setPeriod(e.currentTarget.value)}>
+          <select class="select select-sm" name="period" onChange={(e) => setPeriod(e.currentTarget.value)}>
             <option value="">Any time</option>
             <option value="1h">Last hour</option>
             <option value="24h">Last 24 hours</option>
@@ -240,21 +240,21 @@ export function Logs() {
         </label>
         <label id="lg-from-wrap" hidden={period() !== "custom"}>
           From
-          <input name="from" type="datetime-local" />
+          <input class="input input-sm" name="from" type="datetime-local" />
         </label>
         <label id="lg-to-wrap" hidden={period() !== "custom"}>
           To
-          <input name="to" type="datetime-local" />
+          <input class="input input-sm" name="to" type="datetime-local" />
         </label>
         <label>
           Text
-          <input name="text" autocomplete="off" placeholder="search" />
+          <input class="input input-sm" name="text" autocomplete="off" placeholder="search" />
         </label>
         <div class="actions">
           <button
             type="button"
             id="lg-clear"
-            class="ghost"
+            class="btn btn-sm btn-ghost"
             onClick={() => {
               form?.reset()
               setPeriod("")
@@ -264,7 +264,7 @@ export function Logs() {
           >
             Clear
           </button>
-          <button type="submit" class="primary">
+          <button type="submit" class="btn btn-sm btn-primary">
             Apply
           </button>
         </div>
@@ -272,9 +272,9 @@ export function Logs() {
 
       <LogCharts query={chartQuery()} zoom={{ onZoom: zoomTo, zoomed: applied().zoom !== undefined, onReset: resetZoom }} />
 
-      <div class="card" style="padding:0">
+      <div class="card panel bg-base-100 border border-base-300" style="padding:0">
         <div class="table-wrap">
-          <table>
+          <table class="table table-sm">
             <thead>
               <tr>
                 <For each={LOG_COLS}>{(c) => <th scope="col">{c}</th>}</For>
@@ -316,10 +316,10 @@ export function Logs() {
         </div>
       </div>
       <div class="pager">
-        <button type="button" id="lg-prev" class="ghost" disabled={applied().offset === 0} onClick={() => go(-PAGE_SIZE)}>
+        <button type="button" id="lg-prev" class="btn btn-sm btn-ghost" disabled={applied().offset === 0} onClick={() => go(-PAGE_SIZE)}>
           Previous
         </button>
-        <button type="button" id="lg-next" class="ghost" disabled={!hasNext()} onClick={() => go(PAGE_SIZE)}>
+        <button type="button" id="lg-next" class="btn btn-sm btn-ghost" disabled={!hasNext()} onClick={() => go(PAGE_SIZE)}>
           Next
         </button>
       </div>

@@ -1,12 +1,13 @@
 import { defineConfig } from "vite"
 import solid from "vite-plugin-solid"
+import tailwindcss from "@tailwindcss/vite"
 
 // The dev server proxies the gateway's routes, so `bun run dev` works against a
 // running gateway (RAIJU_GATEWAY, default http://127.0.0.1:8080).
 const gateway = process.env.RAIJU_GATEWAY ?? "http://127.0.0.1:8080"
 
 export default defineConfig({
-  plugins: [solid()],
+  plugins: [solid(), tailwindcss()],
   build: {
     target: "es2022",
     outDir: "dist",

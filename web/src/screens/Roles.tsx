@@ -154,16 +154,16 @@ function RoleForm(props: { role: Role | undefined; data: Data; onClose: () => vo
   }
 
   return (
-    <form id="role-form" class="card" aria-labelledby="role-form-title" ref={(el) => (form = el)} onSubmit={submit}>
+    <form id="role-form" class="card panel bg-base-100 border border-base-300" aria-labelledby="role-form-title" ref={(el) => (form = el)} onSubmit={submit}>
       <h2 id="role-form-title">{role ? "Edit role " + role.name : "New role"}</h2>
       <div class="form-grid">
         <label>
           Name
-          <input name="name" required readonly={!!role || !editable()} autocomplete="off" ref={(el) => { initValue(role?.name ?? "")(el); if (!role) queueMicrotask(() => el.focus()) }} />
+          <input class="input input-sm" name="name" required readonly={!!role || !editable()} autocomplete="off" ref={(el) => { initValue(role?.name ?? "")(el); if (!role) queueMicrotask(() => el.focus()) }} />
         </label>
         <label>
           Data access
-          <select name="dac" disabled={!editable()}>
+          <select class="select select-sm" name="dac" disabled={!editable()}>
             <For each={DACS}>
               {([v, l]) => (
                 <option value={v} ref={initSelected((role?.dac ?? "") === v)}>
@@ -175,7 +175,7 @@ function RoleForm(props: { role: Role | undefined; data: Data; onClose: () => vo
         </label>
         <label class="wide">
           Description
-          <input name="description" readonly={!editable()} autocomplete="off" ref={initValue(role?.description ?? "")} />
+          <input class="input input-sm" name="description" readonly={!editable()} autocomplete="off" ref={initValue(role?.description ?? "")} />
         </label>
       </div>
 
@@ -183,7 +183,7 @@ function RoleForm(props: { role: Role | undefined; data: Data; onClose: () => vo
         <legend>Permissions</legend>
         <p class="hint">A request needs the pair of the resource it touches and the operation its method implies. Tick what the role may do.</p>
         <div class="table-wrap">
-          <table id="role-grid">
+          <table class="table table-sm" id="role-grid">
             <thead>
               <tr>
                 <th scope="col">Resource</th>
@@ -196,14 +196,14 @@ function RoleForm(props: { role: Role | undefined; data: Data; onClose: () => vo
                   <tr>
                     <th scope="row">
                       {res}{" "}
-                      <button type="button" class="ghost" disabled={!editable()} aria-label={"Toggle every operation on " + res} onClick={() => toggleRow(res)}>
+                      <button type="button" class="btn btn-sm btn-ghost" disabled={!editable()} aria-label={"Toggle every operation on " + res} onClick={() => toggleRow(res)}>
                         All
                       </button>
                     </th>
                     <For each={props.data.operations}>
                       {(op) => (
                         <td>
-                          <input type="checkbox" name="perm" value={res + "|" + op} aria-label={res + " " + op} disabled={!editable()} ref={initChecked(held.has(res + "|" + op))} />
+                          <input class="checkbox checkbox-sm" type="checkbox" name="perm" value={res + "|" + op} aria-label={res + " " + op} disabled={!editable()} ref={initChecked(held.has(res + "|" + op))} />
                         </td>
                       )}
                     </For>
@@ -223,7 +223,7 @@ function RoleForm(props: { role: Role | undefined; data: Data; onClose: () => vo
             <For each={props.data.profiles}>
               {(p) => (
                 <label class="check">
-                  <input type="checkbox" name="profile" value={p.id} disabled={!canProfiles()} ref={initChecked(wasAttached.has(p.id))} />
+                  <input class="checkbox checkbox-sm" type="checkbox" name="profile" value={p.id} disabled={!canProfiles()} ref={initChecked(wasAttached.has(p.id))} />
                   {label(p)}
                 </label>
               )}
@@ -234,10 +234,10 @@ function RoleForm(props: { role: Role | undefined; data: Data; onClose: () => vo
 
       <FormError text={error()} />
       <div class="actions">
-        <button type="button" class="ghost" onClick={props.onClose}>
+        <button type="button" class="btn btn-sm btn-ghost" onClick={props.onClose}>
           Cancel
         </button>
-        <button type="submit" class="primary" disabled={busy() || !editable()}>
+        <button type="submit" class="btn btn-sm btn-primary" disabled={busy() || !editable()}>
           {role ? "Save role" : "Create role"}
         </button>
       </div>
@@ -249,7 +249,7 @@ function UserRoles(props: { data: Data; onChanged: () => void }) {
   const { busy, run } = useRun()
   const options = () => [...BUILT_IN.map((b) => b[0]), ...props.data.roles.map((r) => r.name)]
   return (
-    <section class="card" id="role-users" aria-labelledby="role-users-h">
+    <section class="card panel bg-base-100 border border-base-300" id="role-users" aria-labelledby="role-users-h">
       <h2 id="role-users-h">Users</h2>
       <p class="hint">The role each admin user holds. A change takes effect on that user's next request.</p>
       <Show when={props.data.users!.length} fallback={<p class="muted">There are no admin users.</p>}>
@@ -264,7 +264,7 @@ function UserRoles(props: { data: Data; onChanged: () => void }) {
                   </Show>
                 </td>
                 <td>
-                  <select
+                  <select class="select select-sm"
                     aria-label={"Role of " + u().name}
                     disabled={busy() || !can("Users", "Update")}
                     onChange={(ev) => {
@@ -305,17 +305,17 @@ export function Roles() {
   return (
     <section aria-labelledby="roles-title">
       <Toolbar title="Roles" id="roles-title">
-        <button type="button" id="roles-refresh" class="ghost" onClick={reload}>
+        <button type="button" id="roles-refresh" class="btn btn-sm btn-ghost" onClick={reload}>
           Refresh
         </button>
         <Can resource="RBAC" op="Create">
-          <button type="button" id="role-new" class="primary" onClick={() => setEditor({ role: undefined })}>
+          <button type="button" id="role-new" class="btn btn-sm btn-primary" onClick={() => setEditor({ role: undefined })}>
             New role
           </button>
         </Can>
       </Toolbar>
 
-      <section class="card" id="role-builtin" aria-labelledby="role-builtin-h">
+      <section class="card panel bg-base-100 border border-base-300" id="role-builtin" aria-labelledby="role-builtin-h">
         <h2 id="role-builtin-h">Built-in roles</h2>
         <p class="hint">These come with the gateway and cannot be changed.</p>
         <Table cols={["Role", "Access"]}>
@@ -347,7 +347,7 @@ export function Roles() {
               />
             )}
           </Show>
-          <section class="card" id="role-list" aria-labelledby="role-list-h">
+          <section class="card panel bg-base-100 border border-base-300" id="role-list" aria-labelledby="role-list-h">
             <h2 id="role-list-h">Custom roles</h2>
             <Show when={data().roles.length} fallback={<p class="muted">No custom roles yet. Create one to give a user a limited set of permissions.</p>}>
               <Table cols={["Role", "Data access", "Permissions", "Users", "Access profiles", ""]}>
@@ -366,7 +366,7 @@ export function Roles() {
                       <td>{data().profiles ? attached(data(), r()).map(label).join(", ") || "none" : "—"}</td>
                       <td>
                         <span class="row-actions">
-                          <button type="button" class="ghost" onClick={() => setEditor({ role: r() })}>
+                          <button type="button" class="btn btn-sm btn-ghost" onClick={() => setEditor({ role: r() })}>
                             {can("RBAC", "Update") ? "Edit" : "View"}
                           </button>
                           <Can resource="RBAC" op="Delete">

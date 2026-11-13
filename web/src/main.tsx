@@ -18,16 +18,16 @@ if (root) {
     root.textContent = ""
     const [recoveryError, setRecoveryError] = createSignal("")
     render(() => (
-      <main><section class="card" role="alert">
+      <main><section class="card panel bg-base-100 border border-base-300" role="alert">
         <h1>Console configuration unavailable</h1>
         <p class="error">{error instanceof Error ? error.message : String(error)}</p>
         <p>No gateway requests were made. Correct the configuration and reload.</p>
-        <button type="button" onClick={() => location.reload()}>Reload configuration</button>
+        <button class="btn btn-sm" type="button" onClick={() => location.reload()}>Reload configuration</button>
         <Show when={consoleConfig()}>
           <p>The saved target is unavailable. Explicitly choose a configured gateway to reload this tab; nothing is selected automatically.</p>
           <div class="fleet-grid">
             <For each={consoleConfig()?.gateways ?? []}>{(gateway) => (
-              <button type="button" class="card" onClick={() => {
+              <button type="button" class="btn h-auto py-4" onClick={() => {
                 try { switchGateway(gateway.id) } catch (e) { setRecoveryError(e instanceof Error ? e.message : String(e)) }
               }}>
                 Select {gateway.name}<br /><span class="mono endpoint">{gateway.url}</span>

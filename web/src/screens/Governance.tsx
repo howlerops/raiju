@@ -167,7 +167,7 @@ function Crud(props: { spec: Spec<Row>; version: () => number }) {
   }
 
   return (
-    <section class="card" aria-label={spec.title}>
+    <section class="card panel bg-base-100 border border-base-300" aria-label={spec.title}>
       <h2>{spec.title}</h2>
       <Show when={!can(resourceOf(spec.path), "Create") && !can(resourceOf(spec.path), "Update")}>
         <p class="hint">Your role can read this list but not change it.</p>
@@ -177,7 +177,7 @@ function Crud(props: { spec: Spec<Row>; version: () => number }) {
           {(f) => (
             <label>
               {f.label}
-              <input
+              <input class="input input-sm"
                 name={f.name}
                 type={f.type ?? "text"}
                 placeholder={f.placeholder}
@@ -191,10 +191,10 @@ function Crud(props: { spec: Spec<Row>; version: () => number }) {
           )}
         </For>
         <div class="actions wide">
-          <button type="button" class="ghost" hidden={!editing()} onClick={reset}>
+          <button type="button" class="btn btn-sm btn-ghost" hidden={!editing()} onClick={reset}>
             Cancel
           </button>
-          <button type="submit" class="primary" disabled={busy()}>
+          <button type="submit" class="btn btn-sm btn-primary" disabled={busy()}>
             {editing() ? "Save changes" : "Create"}
           </button>
         </div>
@@ -212,7 +212,7 @@ function Crud(props: { spec: Spec<Row>; version: () => number }) {
                       <td>
                         <span class="row-actions">
                           <Can resource={resourceOf(spec.path)} op="Update">
-                            <button type="button" class="ghost" onClick={() => startEdit(row())}>
+                            <button type="button" class="btn btn-sm btn-ghost" onClick={() => startEdit(row())}>
                               Edit
                             </button>
                           </Can>
@@ -246,7 +246,7 @@ export function Governance() {
   return (
     <section aria-labelledby="gv-title">
       <Toolbar title="Budgets & limits" id="gv-title">
-        <button type="button" id="gv-refresh" class="ghost" onClick={() => setVersion((v) => v + 1)}>
+        <button type="button" id="gv-refresh" class="btn btn-sm btn-ghost" onClick={() => setVersion((v) => v + 1)}>
           Refresh
         </button>
       </Toolbar>

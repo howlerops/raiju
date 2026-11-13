@@ -129,17 +129,17 @@ function SignIn() {
             <p id="auth-msg" class="muted">{d().message}</p>
             <p class="hint">Credentials stay in this tab, scoped to this gateway origin. Changing identity reloads the console and clears page data.</p>
             <label>Admin or session token
-              <input id="auth-input" type="password" autocomplete="off" spellcheck={false} ref={(el) => { input = el; queueMicrotask(() => el.focus()) }} />
+              <input class="input input-sm w-full" id="auth-input" type="password" autocomplete="off" spellcheck={false} ref={(el) => { input = el; queueMicrotask(() => el.focus()) }} />
             </label>
             <details>
               <summary>Sign in with username and password</summary>
-              <label>Username<input id="auth-username" autocomplete="username" ref={(el) => (username = el)} /></label>
-              <label>Password<input id="auth-password" type="password" autocomplete="current-password" ref={(el) => (password = el)} /></label>
-              <button type="button" disabled={busy()} onClick={() => void login()}>{busy() ? "Signing in…" : "Sign in to " + targetLabel()}</button>
+              <label>Username<input class="input input-sm w-full" id="auth-username" autocomplete="username" ref={(el) => (username = el)} /></label>
+              <label>Password<input class="input input-sm w-full" id="auth-password" type="password" autocomplete="current-password" ref={(el) => (password = el)} /></label>
+              <button class="btn btn-sm btn-primary" type="button" disabled={busy()} onClick={() => void login()}>{busy() ? "Signing in…" : "Sign in to " + targetLabel()}</button>
             </details>
             <Show when={sso()}>
               <p id="auth-sso">
-                <a class="button" href={targetURL("/api/oidc/login")} target={consoleConfig() ? "_blank" : undefined} rel="noopener noreferrer">
+                <a class="btn btn-sm btn-outline" href={targetURL("/api/oidc/login")} target={consoleConfig() ? "_blank" : undefined} rel="noopener noreferrer">
                   {consoleConfig() ? "Open regional UI for SSO" : "Sign in with SSO"}
                 </a>
                 <Show when={consoleConfig()}><span class="hint"> SSO cookies sign in only to the regional UI, not this consolidated console. Use a regional bearer token here.</span></Show>
@@ -147,9 +147,9 @@ function SignIn() {
             </Show>
             <Show when={error()}><p class="error" role="alert">{error()}</p></Show>
             <div class="actions">
-              <button type="button" class="ghost" id="auth-clear" disabled={busy()} onClick={() => { try { clearSignIn() } catch (e) { setError(String(e)) } }}>Clear saved token</button>
-              <button type="button" id="auth-cancel" disabled={busy()} onClick={() => save(undefined)}>Cancel</button>
-              <button type="submit" class="primary" disabled={busy()}>Save token</button>
+              <button type="button" class="btn btn-sm btn-ghost" id="auth-clear" disabled={busy()} onClick={() => { try { clearSignIn() } catch (e) { setError(String(e)) } }}>Clear saved token</button>
+              <button type="button" class="btn btn-sm" id="auth-cancel" disabled={busy()} onClick={() => save(undefined)}>Cancel</button>
+              <button type="submit" class="btn btn-sm btn-primary" disabled={busy()}>Save token</button>
             </div>
           </form>
         </div>
@@ -204,17 +204,17 @@ export function App() {
         </div>
         <div class="top-right">
           <label class="theme-picker"><span class="hint">Appearance</span>
-            <select aria-label="Appearance" value={theme()} onChange={(ev) => setTheme(ev.currentTarget.value)}>
+            <select class="select select-sm" aria-label="Appearance" value={theme()} onChange={(ev) => setTheme(ev.currentTarget.value)}>
               <option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option>
             </select>
           </label>
           <span class="page-context">{VIEWS.find((v) => v[0] === view())?.[1]}</span>
-          <span id="health-pill" class={["pill", health().tone]} role="status">
+          <span id="health-pill" class={["badge badge-soft", health().tone === "ok" ? "badge-success" : health().tone === "bad" ? "badge-error" : "badge-neutral"]} role="status">
             {health().text}
           </span>
           <Show when={me()}>
             {(m) => (
-              <span id="role-pill" class="pill" title="The role of the signed-in caller">
+              <span id="role-pill" class="badge badge-neutral" title="The role of the signed-in caller">
                 {roleLabel(m())}
               </span>
             )}
@@ -222,7 +222,7 @@ export function App() {
           <button
             type="button"
             id="token-btn"
-            class="ghost"
+            class="btn btn-sm btn-outline"
             onClick={() => openSignIn("Enter credentials for " + targetLabel() + " only. Submit a blank token to clear it.")}
           >
             {tokenSet() ? "Regional token: set" : "Sign in"}
@@ -232,7 +232,7 @@ export function App() {
       <section class="target-banner" aria-label="Selected gateway">
         <Show when={consoleConfig()}>
           {(config) => <label>Gateway / region
-            <select id="gateway-select" value={target().id} onChange={(ev) => {
+            <select class="select select-sm w-full" id="gateway-select" value={target().id} onChange={(ev) => {
               try { switchGateway(ev.currentTarget.value) } catch (e) {
                 ev.currentTarget.value = target().id
                 notify(e instanceof Error ? e.message : String(e), "error")
@@ -242,7 +242,7 @@ export function App() {
             </select>
           </label>}
         </Show>
-        <Show when={consoleConfig()}><a class="button" href="#fleet">Fleet health</a></Show>
+        <Show when={consoleConfig()}><a class="btn btn-sm btn-ghost" href="#fleet">Fleet health</a></Show>
         <div class="target-scope"><strong>Target: {targetLabel()}</strong><div class="mono endpoint" id="target-endpoint">{target().url}</div></div>
         <details class="target-help"><summary>Regional isolation</summary>
           <p>Admin reads, changes and Playground requests apply only to this target. Fleet health uses public probes only. Switching regions reloads the page and clears forms, data and sockets. No cross-region fallback or synchronization.</p>
@@ -254,12 +254,12 @@ export function App() {
       <Show when={view() !== "fleet" ? setup() : undefined}>{(st) => <Setup configured={st().configured} done={setupDone} />}</Show>
 
       {/* Shell navigation stays mounted while regional bootstrap or a page is pending. */}
-      <nav class="tabs" aria-label="Sections">
+      <nav class="side-nav" aria-label="Sections">
         <span class="nav-caption">WORKSPACE</span>
         <For each={VIEWS}>
           {(v) => (
             <Show when={(v[0] !== "fleet" || consoleConfig()) && (v[2] === "" || can(v[2]))}>
-              <a href={"#" + v[0]} data-nav={v[0]} aria-current={view() === v[0] ? "page" : undefined}>
+              <a class="btn btn-sm btn-ghost" href={"#" + v[0]} data-nav={v[0]} aria-current={view() === v[0] ? "page" : undefined}>
                 {v[1]}
               </a>
             </Show>
@@ -272,17 +272,17 @@ export function App() {
         <Show when={view()} keyed>{(route) =>
         <Errored
           fallback={(err, reset) => (
-            <section class="card">
+            <section class="card panel bg-base-100 border border-base-300">
               <p class="error" role="alert">
                 {String((err() as Error)?.message ?? err())}
               </p>
-              <button type="button" onClick={reset}>
+              <button class="btn btn-sm" type="button" onClick={reset}>
                 Retry
               </button>
             </section>
           )}
         >
-          <Loading fallback={<section class="card" role="status" aria-live="polite">Loading {VIEWS.find((v) => v[0] === route)?.[1]}…</section>}>
+          <Loading fallback={<section class="card panel bg-base-100 border border-base-300" role="status" aria-live="polite">Loading {VIEWS.find((v) => v[0] === route)?.[1]}…</section>}>
           <Switch>
             <Match when={view() === "fleet" && consoleConfig()}>
               <Fleet />

@@ -101,7 +101,7 @@ function SelectOf(props: { name: string; items: Named[]; selected: string | unde
   return (
     <label>
       {props.label}
-      <select name={props.name}>
+      <select class="select select-sm" name={props.name}>
         <option value="" ref={initSelected(!props.selected)}>
           None
         </option>
@@ -202,27 +202,27 @@ function VkForm(props: { vk: VirtualKey | undefined; opts: Options; onClose: () 
   }
 
   return (
-    <form id="vk-form" class="card" aria-labelledby="vk-form-title" onSubmit={submit}>
+    <form id="vk-form" class="card panel bg-base-100 border border-base-300" aria-labelledby="vk-form-title" onSubmit={submit}>
       <h2 id="vk-form-title">{vk ? "Edit " + (vk.name || vk.id) : "New virtual key"}</h2>
       <div class="form-grid">
         <label>
           Name
-          <input name="name" required autocomplete="off" ref={(el) => { initValue(vk?.name ?? "")(el); queueMicrotask(() => el.focus()) }} />
+          <input class="input input-sm" name="name" required autocomplete="off" ref={(el) => { initValue(vk?.name ?? "")(el); queueMicrotask(() => el.focus()) }} />
         </label>
         <label>
           ID
-          <input name="id" class="mono" ref={initValue(vk?.id ?? "")} readonly={!!vk} placeholder="blank = generated" autocomplete="off" />
+          <input name="id" class="input input-sm mono" ref={initValue(vk?.id ?? "")} readonly={!!vk} placeholder="blank = generated" autocomplete="off" />
         </label>
         <label class="wide">
           Description
-          <input name="description" ref={initValue(vk?.description ?? "")} autocomplete="off" />
+          <input class="input input-sm" name="description" ref={initValue(vk?.description ?? "")} autocomplete="off" />
         </label>
         <SelectOf name="team_id" label="Team" items={props.opts.teams} selected={vk?.team_id} />
         <SelectOf name="customer_id" label="Customer" items={props.opts.customers} selected={vk?.customer_id} />
         <SelectOf name="budget_id" label="Budget" items={props.opts.budgets} selected={vk?.budget_id} />
         <SelectOf name="rate_limit_id" label="Rate limit" items={props.opts.rate_limits} selected={vk?.rate_limit_id} />
         <label class="check">
-          <input type="checkbox" name="is_active" ref={initChecked(vk ? vk.is_active !== false : true)} /> Active
+          <input class="checkbox checkbox-sm" type="checkbox" name="is_active" ref={initChecked(vk ? vk.is_active !== false : true)} /> Active
         </label>
       </div>
 
@@ -233,7 +233,7 @@ function VkForm(props: { vk: VirtualKey | undefined; opts: Options; onClose: () 
           <For each={rows.rules}>
             {(row, i) => (
               <div class="rule">
-                <select
+                <select class="select select-sm"
                   aria-label="Provider"
                   onChange={(e) => setRows((s) => void (s.rules[i()]!.provider = e.currentTarget.value))}
                 >
@@ -248,7 +248,7 @@ function VkForm(props: { vk: VirtualKey | undefined; opts: Options; onClose: () 
                     )}
                   </For>
                 </select>
-                <input
+                <input class="input input-sm"
                   type="text"
                   aria-label="Allowed models"
                   placeholder="all models"
@@ -256,14 +256,14 @@ function VkForm(props: { vk: VirtualKey | undefined; opts: Options; onClose: () 
                   value={row.models}
                   onInput={(e) => setRows((s) => void (s.rules[i()]!.models = e.currentTarget.value))}
                 />
-                <button type="button" class="ghost" onClick={() => setRows((s) => void s.rules.splice(i(), 1))}>
+                <button type="button" class="btn btn-sm btn-ghost" onClick={() => setRows((s) => void s.rules.splice(i(), 1))}>
                   Remove
                 </button>
               </div>
             )}
           </For>
         </div>
-        <button type="button" id="vk-add-rule" class="ghost" onClick={() => setRows((s) => void s.rules.push({ provider: "", models: "" }))}>
+        <button type="button" id="vk-add-rule" class="btn btn-sm btn-ghost" onClick={() => setRows((s) => void s.rules.push({ provider: "", models: "" }))}>
           Add provider
         </button>
       </fieldset>
@@ -275,7 +275,7 @@ function VkForm(props: { vk: VirtualKey | undefined; opts: Options; onClose: () 
           <For each={rows.mcp}>
             {(row, i) => (
               <div class="rule mcp-rule">
-                <select aria-label="MCP client" onChange={(e) => setRows((s) => void (s.mcp[i()]!.client = e.currentTarget.value))}>
+                <select class="select select-sm" aria-label="MCP client" onChange={(e) => setRows((s) => void (s.mcp[i()]!.client = e.currentTarget.value))}>
                   <option value="" selected={!row.client}>
                     Choose MCP client
                   </option>
@@ -287,7 +287,7 @@ function VkForm(props: { vk: VirtualKey | undefined; opts: Options; onClose: () 
                     )}
                   </For>
                 </select>
-                <input
+                <input class="input input-sm"
                   type="text"
                   aria-label="Allowed MCP tools"
                   placeholder="* for all, blank for none, or a comma list"
@@ -295,24 +295,24 @@ function VkForm(props: { vk: VirtualKey | undefined; opts: Options; onClose: () 
                   value={row.tools}
                   onInput={(e) => setRows((s) => void (s.mcp[i()]!.tools = e.currentTarget.value))}
                 />
-                <button type="button" class="ghost" onClick={() => setRows((s) => void s.mcp.splice(i(), 1))}>
+                <button type="button" class="btn btn-sm btn-ghost" onClick={() => setRows((s) => void s.mcp.splice(i(), 1))}>
                   Remove
                 </button>
               </div>
             )}
           </For>
         </div>
-        <button type="button" id="vk-add-mcp" class="ghost" onClick={() => setRows((s) => void s.mcp.push({ client: "", tools: "*" }))}>
+        <button type="button" id="vk-add-mcp" class="btn btn-sm btn-ghost" onClick={() => setRows((s) => void s.mcp.push({ client: "", tools: "*" }))}>
           Add MCP client
         </button>
       </fieldset>
 
       <FormError text={error()} />
       <div class="actions">
-        <button type="button" id="vk-cancel" class="ghost" onClick={props.onClose}>
+        <button type="button" id="vk-cancel" class="btn btn-sm btn-ghost" onClick={props.onClose}>
           Cancel
         </button>
-        <button type="submit" id="vk-save" class="primary" disabled={busy()}>
+        <button type="submit" id="vk-save" class="btn btn-sm btn-primary" disabled={busy()}>
           {vk ? "Save changes" : "Create key"}
         </button>
       </div>
@@ -331,7 +331,7 @@ function Secret(props: { value: string; onDone: () => void }) {
       <div class="secret-row">
         <input
           id="vk-secret-value"
-          class="mono"
+          class="input input-sm mono"
           readonly
           aria-label="New virtual key value"
           value={props.value}
@@ -346,7 +346,7 @@ function Secret(props: { value: string; onDone: () => void }) {
         <button
           type="button"
           id="vk-copy"
-          class="primary"
+          class="btn btn-sm btn-primary"
           onClick={async () => {
             const ok = await copyText(props.value, input)
             setMsg(ok ? "Copied to the clipboard." : "Press Ctrl+C (Cmd+C) to copy the selected key.")
@@ -354,7 +354,7 @@ function Secret(props: { value: string; onDone: () => void }) {
         >
           Copy
         </button>
-        <button type="button" id="vk-secret-close" class="ghost" onClick={props.onDone}>
+        <button type="button" id="vk-secret-close" class="btn btn-sm btn-ghost" onClick={props.onDone}>
           Done
         </button>
       </div>
@@ -375,11 +375,11 @@ export function Keys() {
   return (
     <section aria-labelledby="vk-title">
       <Toolbar title="Virtual keys" id="vk-title">
-        <button type="button" id="vk-refresh" class="ghost" onClick={reload}>
+        <button type="button" id="vk-refresh" class="btn btn-sm btn-ghost" onClick={reload}>
           Refresh
         </button>
         <Can resource="VirtualKeys" op="Create">
-          <button type="button" id="vk-new" class="primary" onClick={() => setEditor({ vk: undefined })}>
+          <button type="button" id="vk-new" class="btn btn-sm btn-primary" onClick={() => setEditor({ vk: undefined })}>
             New virtual key
           </button>
         </Can>
@@ -403,7 +403,7 @@ export function Keys() {
               />
             )}
           </Show>
-          <div id="vk-list" class="card">
+          <div id="vk-list" class="card panel bg-base-100 border border-base-300">
             <Show when={data().keys.length} fallback={<p class="muted">No virtual keys yet. Create one to give a client scoped access.</p>}>
               <Table cols={["Name", "Status", "Providers", "MCP tools", "Team", "Customer", "Budget", "Rate limit", ""]}>
                 <For each={data().keys} keyed={(k) => k.id}>
@@ -424,7 +424,7 @@ export function Keys() {
                         <td>
                           <button
                             type="button"
-                            class="toggle"
+                            class="btn btn-sm tool-toggle"
                             aria-pressed={tf(active())}
                             disabled={busy() || !can("VirtualKeys", "Update")}
                             onClick={() =>
@@ -450,14 +450,14 @@ export function Keys() {
                         <td>
                           <span class="row-actions">
                             <Can resource="VirtualKeys" op="Update">
-                              <button type="button" class="ghost" onClick={() => setEditor({ vk: vk() })}>
+                              <button type="button" class="btn btn-sm btn-ghost" onClick={() => setEditor({ vk: vk() })}>
                                 Edit
                               </button>
                             </Can>
                             <Can resource="VirtualKeys" op="Create">
                               <button
                                 type="button"
-                                class="ghost"
+                                class="btn btn-sm btn-ghost"
                                 disabled={busy()}
                                 onClick={() =>
                                   run(async () => {

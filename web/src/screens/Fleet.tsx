@@ -45,23 +45,23 @@ export function Fleet() {
   return (
     <section aria-labelledby="fleet-title">
       <Toolbar title="Fleet health & readiness" id="fleet-title">
-        <button type="button" disabled={busy()} onClick={() => void refresh()}>Refresh health</button>
+        <button class="btn btn-sm" type="button" disabled={busy()} onClick={() => void refresh()}>Refresh health</button>
       </Toolbar>
       <p class="hint">Public health probes only. No inference, logs, provider configuration, credentials, or regional data are aggregated. An unreachable gateway never redirects traffic to another region.</p>
       <div class="cards fleet-summary" aria-label="Fleet summary">
-        <div class="stat"><div class="label">Configured gateways</div><div class="value">{gateways.length}</div><div class="sub">Independent regional targets</div></div>
-        <div class="stat"><div class="label">Ready gateways</div><div class="value">{gateways.filter((gateway) => states()[gateway.id]?.ready.tone === "ok").length}</div><div class="sub">Successful current readiness probes</div></div>
-        <div class="stat"><div class="label">Selected gateway</div><div class="value">{target().name}</div><div class="sub">All regional operations stay here</div></div>
+        <div class="bg-base-100 border border-base-300 rounded-box stat"><div class="stat-title">Configured gateways</div><div class="stat-value">{gateways.length}</div><div class="stat-desc">Independent regional targets</div></div>
+        <div class="bg-base-100 border border-base-300 rounded-box stat"><div class="stat-title">Ready gateways</div><div class="stat-value">{gateways.filter((gateway) => states()[gateway.id]?.ready.tone === "ok").length}</div><div class="stat-desc">Successful current readiness probes</div></div>
+        <div class="bg-base-100 border border-base-300 rounded-box stat"><div class="stat-title">Selected gateway</div><div class="stat-value">{target().name}</div><div class="stat-desc">All regional operations stay here</div></div>
       </div>
       <div class="fleet-grid">
         <For each={gateways}>{(gateway) => (
-          <section class="card fleet-card" aria-label={gateway.name}>
+          <section class="card panel bg-base-100 border border-base-300 fleet-card" aria-label={gateway.name}>
             <h2>{gateway.name}</h2>
             <p class="mono endpoint">{gateway.url}</p>
             <p>Health: <Pill tone={(states()[gateway.id]?.health ?? checking).tone}>{(states()[gateway.id]?.health ?? checking).text}</Pill></p>
             <p>Readiness: <Pill tone={(states()[gateway.id]?.ready ?? checking).tone}>{(states()[gateway.id]?.ready ?? checking).text}</Pill></p>
             <p class="hint" role="status">{states()[gateway.id]?.checked ? "Checked " + states()[gateway.id]!.checked : "Waiting for probes"}</p>
-            <button type="button" class="primary" onClick={() => {
+            <button type="button" class="btn btn-sm btn-primary" onClick={() => {
               try { switchGateway(gateway.id) } catch (error) { notify(error instanceof Error ? error.message : String(error), "error") }
             }}>{gateway.url === target().url ? "Open selected gateway" : "Open target"}</button>
           </section>

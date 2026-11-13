@@ -281,12 +281,12 @@ export function TimeChart(props: TimeChartProps) {
             <span class="hint" role="status">
               {selLabel()}
             </span>
-            <button type="button" class="zoom-apply" disabled={!rangeOk(bounds()!)} onClick={applySel}>
+            <button type="button" class="btn btn-sm zoom-apply" disabled={!rangeOk(bounds()!)} onClick={applySel}>
               Zoom to selection
             </button>
           </Show>
           <Show when={props.zoomed && props.onReset}>
-            <button type="button" class="ghost zoom-reset" onClick={() => props.onReset!()}>
+            <button type="button" class="btn btn-sm btn-ghost zoom-reset" onClick={() => props.onReset!()}>
               Reset zoom
             </button>
           </Show>
@@ -300,7 +300,7 @@ export function TimeChart(props: TimeChartProps) {
                 <li>
                   <button
                     type="button"
-                    class="legend-toggle"
+                    class="btn btn-sm legend-toggle"
                     aria-pressed={hidden().includes(s().name) ? "false" : "true"}
                     title={(hidden().includes(s().name) ? "Show " : "Hide ") + s().name}
                     onClick={() => toggleSeries(props.id, s().name)}
@@ -338,7 +338,7 @@ export function TimeChart(props: TimeChartProps) {
             <For each={yTicks()}>
               {(t) => (
                 <g>
-                  <line class="grid" x1={ML} x2={ML + plotW()} y1={y(t)} y2={y(t)} />
+                  <line class="chart-grid" x1={ML} x2={ML + plotW()} y1={y(t)} y2={y(t)} />
                   <text class="axis" x={ML - 6} y={y(t) + 4} text-anchor="end">
                     {props.format(t)}
                   </text>
@@ -614,7 +614,7 @@ export function FrontierChart(props: FrontierProps) {
             <For each={yTicks()}>
               {(t) => (
                 <g>
-                  <line class="grid" x1={ML} x2={ML + plotW()} y1={yOf(t)} y2={yOf(t)} />
+                  <line class="chart-grid" x1={ML} x2={ML + plotW()} y1={yOf(t)} y2={yOf(t)} />
                   <text class="axis" x={ML - 6} y={yOf(t) + 4} text-anchor="end">
                     {props.qualityFormat(t)}
                   </text>
@@ -624,7 +624,7 @@ export function FrontierChart(props: FrontierProps) {
             <For each={xTicks()}>
               {(t) => (
                 <g>
-                  <line class="grid" x1={xOf(t)} x2={xOf(t)} y1={MT} y2={MT + plotH()} />
+                  <line class="chart-grid" x1={xOf(t)} x2={xOf(t)} y1={MT} y2={MT + plotH()} />
                   <text class="axis" x={xOf(t)} y={H() - 14} text-anchor="middle">
                     {props.costFormat(t)}
                   </text>
