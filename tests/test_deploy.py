@@ -132,11 +132,14 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertIn("exit 1", update["run"])
         self.assertIn("--skip-db-update", scan["run"])
 
-    def test_fixable_critical_and_high_cves_fail(self):
+    def test_critical_and_high_cves_fail_fixed_or_not(self):
         scan = self.step(self.image, lambda s: re.search(r"\btrivy image\b(?!.*--download-db-only)", s.get("run", "")), "scans the image")
         run = scan["run"]
         self.assertIn("--severity CRITICAL,HIGH", run)
-        self.assertIn("--ignore-unfixed", run)
+        # no suppressions: an unfixed finding fails too, and nothing is ignored by file
+        self.assertNotIn("--ignore-unfixed", run)
+        self.assertNotIn("--ignorefile", run)
+        self.assertFalse(os.path.exists(os.path.join(ROOT, ".trivyignore")), ".trivyignore suppresses findings")
         self.assertIn("--exit-code 1", run)
         self.assertTrue(run.rstrip().endswith("raiju:ci"))
         self.assertNotIn("continue-on-error", scan)
