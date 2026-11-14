@@ -53,6 +53,18 @@ class DockerfileTest(unittest.TestCase):
         self.assertIsNone(re.search(r"curl[^\n]*\|\s*sh", code), "an installer is piped into a shell")
         self.assertIn("sha256sum -c", code, "the downloaded rustup-init is not checked")
 
+    def test_compiler_layer_does_not_depend_on_the_gateway_source(self):
+        # the Tov build comes before src/ is copied, so a source change reuses its layer
+        build = self.text.index("RUN scripts/build-tov.sh")
+        self.assertLess(self.text.index("COPY tov-patches/"), build)
+        self.assertLess(build, self.text.index("COPY src/"))
+        self.assertNotRegex(self.text, r"(?m)^COPY \. ")
+
+    def test_runtime_has_no_setuid_programs(self):
+        runtime = self.text[self.text.rindex("\nFROM "):]
+        self.assertIn("purge -y --allow-remove-essential mount", runtime)
+        self.assertRegex(runtime, r"find / -xdev -type f -perm /6000 -exec chmod a-s")
+
     def test_cmd_binds_every_address(self):
         m = re.search(r"^CMD\s+(\[.*\])", self.text, re.M)
         cmd = json.loads(m.group(1))
@@ -192,6 +204,18 @@ class ComposeTest(unittest.TestCase):
     def test_binds_every_address(self):
         cmd = self.raiju["command"]
         self.assertEqual(cmd[cmd.index("-host") + 1], "0.0.0.0")
+
+    def test_published_on_this_machine_only(self):
+        # /metrics is open and the example config asks for no key: nothing is published on every interface
+        for name, svc in self.doc["services"].items():
+            for port in svc.get("ports", []):
+                self.assertTrue(str(port).startswith("127.0.0.1:"), f"{name} publishes {port} beyond this machine")
+
+    def test_runs_without_privileges(self):
+        self.assertTrue(self.raiju["read_only"])
+        self.assertIn("/tmp", self.raiju["tmpfs"])
+        self.assertEqual(self.raiju["cap_drop"], ["ALL"])
+        self.assertIn("no-new-privileges:true", self.raiju["security_opt"])
 
     def test_nothing_read_only_inside_app_data(self):
         for v in self.raiju.get("volumes", []):
@@ -566,6 +590,25 @@ class HelmTest(unittest.TestCase):
         self.assertEqual(svc["spec"]["clusterIP"], "None")
         self.assertTrue(svc["spec"]["publishNotReadyAddresses"])
         self.assertEqual([p["name"] for p in svc["spec"]["ports"]], ["http"])
+
+    def test_no_literal_secret_in_the_configmap(self):
+        self.assertIn("must be a reference", self.render("config.providers.openai.keys[0].value=sk-live-abc", ok=False))
+        self.assertIn("metrics_token must be a reference", self.render("config.server.metrics_token=plain", ok=False))
+        self.render("config.providers.openai.keys[0].value=vault.kv/openai#key", "config.server.metrics_token=env.TOK")
+
+    def test_network_policy_is_opt_in(self):
+        self.assertEqual([d for d in self.render() if d["kind"] == "NetworkPolicy"], [])
+        docs = self.render("networkPolicy.enabled=true", "config.cluster.enabled=true", "cluster.secret.existingSecret=c",
+                           "networkPolicy.ingressFrom[0].namespaceSelector.matchLabels.name=ingress")
+        (np,) = [d for d in docs if d["kind"] == "NetworkPolicy"]
+        selector = self.kind(docs, "Deployment")["spec"]["selector"]["matchLabels"]
+        self.assertEqual(np["spec"]["podSelector"]["matchLabels"], selector)
+        http, cluster = np["spec"]["ingress"]
+        self.assertEqual(http["ports"][0]["port"], "http")
+        self.assertEqual(http["from"], [{"namespaceSelector": {"matchLabels": {"name": "ingress"}}}])
+        # peers only on the cluster listener
+        self.assertEqual(cluster["ports"][0]["port"], "cluster")
+        self.assertEqual(cluster["from"], [{"podSelector": {"matchLabels": selector}}])
 
     def test_cluster_secret_from_a_secret(self):
         # clustering on needs a secret, and never one written into the ConfigMap

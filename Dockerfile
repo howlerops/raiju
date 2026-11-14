@@ -40,10 +40,14 @@ RUN set -eu; \
     rm /tmp/rustup-init
 
 WORKDIR /src
-COPY . .
+# The compiler first, from its only inputs (the patches and the build script), so a change under src/ reuses this
+# layer instead of recompiling Tov.
+COPY tov-patches/ tov-patches/
+COPY scripts/build-tov.sh scripts/build-tov.sh
+RUN scripts/build-tov.sh
+COPY src/ src/
 # /out/app/data is the -app-dir: config.json is mounted (or provided) there.
-RUN scripts/build-tov.sh \
- && mkdir -p /out/app/data \
+RUN mkdir -p /out/app/data \
  && TOV_CFLAGS=-DTV_PLAIN_ALLOC build/tov/target/release/tov build src/main.tov -o /out/raiju
 
 # Runtime. The binary links glibc, libstdc++ and libatomic (for the vendored C++ libraries) and JavaScriptCore with
@@ -55,10 +59,13 @@ ENV DEBIAN_FRONTEND=noninteractive
 # The upgrade takes the Ubuntu security fixes released since the pinned base (glibc, util-linux, openssl, ...), so the
 # image scan stays clean between base bumps. The gateway never mounts anything, so the `mount` package (setuid
 # mount/umount, the restricted-mount path of CVE-2026-78410, unfixed upstream) is removed; libmount1 stays for GLib.
+# Nothing in the image needs to change user, so the setuid and setgid bits of what remains (su, passwd, ...) are cleared:
+# the gateway runs as 65532 and has no use for a path to root, also where no-new-privileges is not set.
 RUN apt-get update \
  && apt-get upgrade -y --no-install-recommends \
  && apt-get install -y --no-install-recommends ca-certificates libjavascriptcoregtk-4.1-0 \
  && apt-get purge -y --allow-remove-essential mount \
+ && find / -xdev -type f -perm /6000 -exec chmod a-s {} + \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build --chown=65532:65532 /out/app /app
