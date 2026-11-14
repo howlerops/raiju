@@ -758,7 +758,8 @@ function scimChange(ops: Ops, req: Request, path: string, body: string): Respons
         }
       }
       try {
-        ops.sessions.endUser(ended)
+        // their dashboard sessions and their CLI agent tokens
+        ops.endUsers(ended)
       } catch (e) {
         return scimReply(503, errorBody(503, "", `the users were saved but their sessions could not be ended: ${e.message}`))
       }
@@ -797,7 +798,7 @@ async function manage(ops: Ops, req: Request, path: string): Promise<Response> {
   const gate = ops.gate(req, path)
   if (gate.kind === "deny") return gate.res
   // what this caller may see and change (data access scope)
-  const sc = ops.scopeOfActorFor(gate.actor, resourceOf(req.method, path).resource)
+  const sc = ops.scopeOfActorFor(gate.actor, resourceOf(req.method, path).resource, gate.role)
   // DELETE reads its body too: DELETE /api/mcp-logs names its ids there
   const body = req.method === "GET" ? "" : await req.text()
   // a change saved by this request is answered once the node's other workers run it (ops.settleConfig)
@@ -830,7 +831,7 @@ function syncRoute(ops: Ops, req: Request, path: string, body: string, actor: st
   if (path.startsWith("/api/users/email/") || path.startsWith("/api/governance/users/email/")) return () => ops.userByEmailRoute(req.method, path)
   if (usersPath(path) === "/api/users/me/vk-creation-policy") return () => req.method === "GET" ? ops.vkCreationPolicy(actor) : NOT_GET
   if (usersPath(path).startsWith("/api/users/") && usersPath(path).split("/")[4] === "access-profiles") return () => ops.userProfiles(req.method, usersPath(path), body)
-  if (usersPath(path) === "/api/users" || usersPath(path).startsWith("/api/users/")) return () => ops.users(req.method, usersPath(path), body, req.headers.get("x-raiju-setup-token") ?? "", cookieValue(req.headers.get("cookie") ?? "", SETUP_COOKIE))
+  if (usersPath(path) === "/api/users" || usersPath(path).startsWith("/api/users/")) return () => ops.users(req.method, usersPath(path), body, req.headers.get("x-raiju-setup-token") ?? "", cookieValue(req.headers.get("cookie") ?? "", SETUP_COOKIE), ops.grantOf(actor, role))
   if (auditTarget(path) !== "") return () => ops.auditRoute(req, auditTarget(path))
   if (path === "/api/api-keys" || path.startsWith("/api/api-keys/")) return () => ops.apiKeysRoute(req.method, path, req.url, body, actor)
   if (path === "/api/mcp/virtual") return () => req.method === "GET" ? ops.virtualView() : NOT_GET
@@ -1020,7 +1021,7 @@ async function ioRoute(ops: Ops, req: Request, path: string, body: string, actor
   const bu = await providerBaseUrlProblem(req.method, path, body)
   if (bu !== "") return { status: 400, body: JSON.stringify({ error: { message: bu } }), contentType: "application/json" }
   return await ops.underLock(req.method, () => {
-    const a = handleApi(ops.store, req.method, qu === undefined ? path : path + qu.search, body, sc)
+    const a = handleApi(ops.store, req.method, qu === undefined ? path : path + qu.search, body, sc, ops.grantOf(actor, role))
     // Rotating a key revokes the MCP OAuth grants associated with its old value.
     if (a.status === 200 && isRotatePath(path)) {
       for (const id of rotatedKeyIds(a.body)) revokeSubject("vk", id)
@@ -1226,7 +1227,9 @@ function gatedPath(p: string): bool {
 // budget with them.
 export const PUBLIC_BODY_LIMIT = 65536
 
-export function publicBodyPath(p: string): bool {
+export function publicBodyPath(p0: string): bool {
+  // the SDK prefixes (/litellm/api/..., /cursor/api/...) reach the same routes
+  const p = compatPath(p0)
   for (const pre of ["/api/session/", "/api/agent/", "/api/oauth2/", "/api/oauth/", "/api/oidc/", "/api/scim/oauth/", "/oauth2/", "/oauth/", "/workspace/mcp-sessions/"]) {
     if (p.startsWith(pre)) return true
   }
@@ -1235,7 +1238,8 @@ export function publicBodyPath(p: string): bool {
 
 // The body limit of a request to path p: client.max_request_body_size_mb (limit), lowered to PUBLIC_BODY_LIMIT on the
 // public routes and to cluster.max_body_mb on the peer routes.
-export function routeBodyLimit(engine: Engine, p: string, limit: int): int {
+export function routeBodyLimit(engine: Engine, p0: string, limit: int): int {
+  const p = compatPath(p0)
   if (p.startsWith("/api/cluster/")) return Math.min(limit, clusterBodyCap(engine.cfg.cluster))
   if (publicBodyPath(p)) return Math.min(limit, PUBLIC_BODY_LIMIT)
   return limit
@@ -2242,12 +2246,12 @@ export function wsUpgrade(engine: Engine, ops: Ops, req: Request): WsUpgrade {
     if (tk !== "") {
       const actor = ops.wsTickets.consume(tk, Date.now())
       if (actor === undefined) return { kind: "refused", status: 401, message: "the WebSocket ticket is invalid, used or expired" }
-      return { kind: "session", session: wsSession(req, new UiSocket(ops.ui, ops.scopeOfActor(actor), batch, cursor)) }
+      return { kind: "session", session: wsSession(req, new UiSocket(ops.ui, ops.scopeOfActorFor(actor, "Logs"), batch, cursor)) }
     }
     // the live feed is log data: whoever may read /api/logs may open it, and sees its own data scope
     const g = ops.gate(req, "/api/logs")
     if (g.kind === "deny") return { kind: "refused", status: g.res.status, message: g.res.status === 401 ? "authentication is required" : "this role may not open the UI socket" }
-    return { kind: "session", session: wsSession(req, new UiSocket(ops.ui, ops.scopeOfActor(g.actor), batch, cursor)) }
+    return { kind: "session", session: wsSession(req, new UiSocket(ops.ui, ops.scopeOfActorFor(g.actor, "Logs", g.role), batch, cursor)) }
   }
   return { kind: "none" }
 }
@@ -2288,7 +2292,9 @@ function envProxies(): string {
 }
 
 function readsClientIp(path: string): bool {
-  return path.startsWith("/api/") || path === "/oauth2/register"
+  // by the route the request ends on: an SDK prefix is dropped before it is routed (compatPath)
+  const p = compatPath(path)
+  return p.startsWith("/api/") || p === "/oauth2/register"
 }
 
 // The request with CLIENT_IP_HEADER set from the TCP peer where the route reads it, and without the value a client
@@ -2573,6 +2579,13 @@ test("the public routes and the peer routes read small bodies", () => {
   expect(routeBodyLimit(eng, "/api/providers", limit)).toBe(limit)
   expect(routeBodyLimit(eng, "/mcp", limit)).toBe(limit)
   expect(routeBodyLimit(eng, "/api/session/login", 1000)).toBe(1000)
+  // an SDK prefix is the same route, so the same limit and the same client address
+  for (const p of ["/litellm/api/session/login", "/langchain/api/session/setup", "/pydanticai/api/agent/auth/token", "/cursor/api/session/login", "/cursor/litellm/api/session/login"]) {
+    expect(routeBodyLimit(eng, p, limit)).toBe(PUBLIC_BODY_LIMIT)
+    expect(clientIpFor(eng, p, "203.0.113.9", new Map())).toBe("203.0.113.9")
+  }
+  expect(clientIpFor(eng, "/api/session/login", "203.0.113.9", new Map())).toBe("203.0.113.9")
+  expect(clientIpFor(eng, "/litellm/v1/chat/completions", "203.0.113.9", new Map())).toBe("")
   // a 1 MB sign-in body is over the limit: refused unread with 413 (heldBody), not judged from the headers
   const ops = new Ops(eng, new ConfigStore("/tmp/raiju-server-public-limit.json", cfg))
   expect(headerRefusal(eng, ops, bigPost("/api/session/login", []), routeBodyLimit(eng, "/api/session/login", limit))).toBeUndefined()

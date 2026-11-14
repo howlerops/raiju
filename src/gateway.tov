@@ -2,7 +2,7 @@
 // rotation, fallbacks), translation, accounting.
 import { Config, KeyConfig, ProviderConfig, ComplexitySettings, BedrockKeyConfig, InjectedTool, OAuthKeyConfig, LogExportsConfig, providerOf } from "./config"
 import { applyPrompt, Applied } from "./prompts"
-import { Field, fields, find, elements, quote, rawBool, rawStr, isNull, build, setField, without } from "./json"
+import { Field, fields, find, elements, quote, rawBool, rawStr, rawNum, isNull, build, setField, without } from "./json"
 import { ChatRequest, errorJson, newId, Hdrs, hdrs, snapshot } from "./schemas"
 import { OpenAIPassthrough, ResponsesPassthrough, AnthropicToOpenAI, GeminiToOpenAI, BedrockEventStreamToOpenAI, SseSplitter } from "./streams"
 import { CohereToOpenAI } from "./streams_cohere"
@@ -74,7 +74,7 @@ import { JobStore } from "./jobs"
 import { fetchPluginUrls, missingPluginUrls, PluginSource } from "./plugindl"
 import { BasePlugin, PreResult, PostResult, PluginChain, PluginContext, PluginEntry, PluginRun, PluginTrace, PluginLogEntry, pluginLogsJson, PostOutcome, RUN_HEADER, TRACE_HEADER, ATTEMPT_HEADER, buildChain, jsonStreamEnabled, JsonStreamFixer, pluginErrorMessage, parsePluginError, errorPost } from "./plugins"
 import { SseBuffer, sseData, sseWithData } from "./plughttp"
-import { SemanticCache, SemanticCacheConfig, defaultSemanticConfig, promptText, parseEmbedding, scopeKey, identityScope, hasToolCalls } from "./semcache"
+import { SemanticCache, SemanticCacheConfig, defaultSemanticConfig, promptText, parseEmbedding, scopeKey, identityScope, requestThreshold, hasToolCalls } from "./semcache"
 import { Deadline, deadline, IdleWatch, idleWatch, streamIdleSeconds } from "./deadline"
 import { logMetadata, correlationIds, maximAttrs, stopReasonOf, stopReasonOfTail, toolNamesOfBody, ToolNameStream } from "./reqlog"
 import { VectorStore, openVectorStore, scopeTag } from "./vectorstore"
@@ -476,13 +476,13 @@ export class StreamConverter {
 
   // Whole frames only: a text completion frame is built from a complete chat frame.
   private textPost(s: string): string {
-    this.txtPending += s
+    // the whole frames are cut out in one pass; the unfinished tail stays pending
+    const parts = (this.txtPending + s).split("\n\n")
+    const last = parts.length - 1
+    this.txtPending = parts[last]!
     let res = ""
-    while (true) {
-      const i = this.txtPending.indexOf("\n\n")
-      if (i < 0) break
-      const ev = this.txtPending.slice(0, i)
-      this.txtPending = this.txtPending.slice(i + 2)
+    for (let n = 0; n < last; n++) {
+      const ev = parts[n]!
       if (ev !== "") res += textFrame(ev) + "\n\n"
     }
     return res
@@ -497,13 +497,13 @@ export class StreamConverter {
     const iv = this.iv
     const ro = this.respOut
     if (st === undefined && g === undefined && co === undefined && cv === undefined && iv === undefined && ro === undefined) return s
-    this.pending += s
+    // the whole events are cut out in one pass; the unfinished tail stays pending
+    const parts = (this.pending + s).split("\n\n")
+    const last = parts.length - 1
+    this.pending = parts[last]!
     let res = ""
-    while (true) {
-      const i = this.pending.indexOf("\n\n")
-      if (i < 0) break
-      const ev = this.pending.slice(0, i)
-      this.pending = this.pending.slice(i + 2)
+    for (let n = 0; n < last; n++) {
+      const ev = parts[n]!
       for (const line of ev.split("\n")) {
         if (!line.startsWith("data:")) continue
         const payload = line.slice(5).trim()
@@ -775,11 +775,6 @@ function fallbackIndex(allowed: ModelRef[], provider: string, model: string): in
     if (allowed[i]!.provider === provider && allowed[i]!.model === model) return i
   }
   return 0
-}
-
-// The cache id for a direct entry is a hash of its cache key.
-function cacheId(key: string): string {
-  return toHex(sha256(utf8(key)))
 }
 
 // On a hit, the provider, model and prompt tokens of the answer as it was first served.
@@ -1580,6 +1575,42 @@ export function logsOnlyFound(text: string, found: LogFinding[], vault: Vault): 
 }
 
 // A request with an x-request-id (made for a caller that sent none), its body given again as text.
+// Whether a request asks for more than one choice: n above 1, or a text completion with several prompts. The stream
+// guard (guard_stream.tov) follows one choice's text, so a guarded stream of several is refused.
+export function manyChoices(body: Field[]): bool {
+  const n = rawNum(body, "n")
+  if (n !== undefined && n > 1.0) return true
+  const p = find(body, "prompt")
+  if (p === undefined || !p.startsWith("[")) return false
+  try {
+    const els = try elements(p)
+    // an array of numbers is one prompt's tokens
+    return els.length > 1 && (els[0]!.startsWith("\"") || els[0]!.startsWith("["))
+  } catch (e) {
+    return false
+  }
+}
+
+const MANY_CHOICES_GUARDED = "a streamed answer with more than one choice cannot be checked by the output guardrails: send n = 1 (one prompt) or stream: false"
+
+// The caller's x-request-id when it can be the request's id, else "". The id becomes the log row's id and part of
+// object-storage keys, so only 1 to 128 of letters, digits, ".", "_" and "-" are taken.
+export function callerRequestId(v: string | undefined): string {
+  if (v === undefined || v.byteLength < 1 || v.byteLength > 128) return ""
+  for (const b of utf8(v)) {
+    const c = int(b)
+    const ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 46 || c === 95 || c === 45
+    if (!ok) return ""
+  }
+  return v
+}
+
+// The id a request is logged and answered under: the caller's x-request-id when acceptable, else one made here.
+export function requestIdOf(v: string | undefined): string {
+  const given = callerRequestId(v)
+  return given !== "" ? given : newId("req_")
+}
+
 function withRequestId(req: Request, rid: string, body: string): Request {
   const hs: Record<string, string> = new Map()
   req.headers.forEach((v, k) => {
@@ -2128,6 +2159,8 @@ export class Engine {
       const reader = run.stream.getReader()
       let chunkIndex = 0
       let lastAt = started
+      // the stream's two latency histograms, looked up once and not per chunk
+      const chunkTimes = metrics.streamHistograms(run.labels)
       while (true) {
         if (sink.cancelled || conv.halted) {
           await reader.cancel()
@@ -2150,7 +2183,7 @@ export class Engine {
           if (out !== "") {
             wrote = true
             const at = performance.now()
-            metrics.observeStreamChunk(run.labels, chunkIndex, (at - lastAt) / 1000.0)
+            chunkTimes.observe(chunkIndex, (at - lastAt) / 1000.0)
             chunkIndex += 1
             lastAt = at
             sink.write(out)
@@ -3710,7 +3743,7 @@ export class Engine {
   // emulated: a decision answered by a chat or Responses call (compat's convert_decision_to_responses), billed as that call
   async serve(req: Request, op: string, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool, upstreamHeaders?: Map<string, string>, sink?: StreamSink, makeConverter?: ConverterFactory, compat?: CompatPlan, prompt?: Applied, emulated?: bool, large?: LargeBody, attemptHook?: AttemptPlugins): Promise<Response> {
     const h = snapshot(req.headers)
-    const ctx = new ReqCtx(h.get("x-request-id") ?? newId("req_"), op, performance.now())
+    const ctx = new ReqCtx(requestIdOf(h.get("x-request-id")), op, performance.now())
     ctx.large = large
     // a hooked route's request with fallbacks brings its plugins across the attempts (llmHooked registered them)
     const hook = attemptHook ?? (op === "chat" ? undefined : this.attemptRuns.get(h.get(ATTEMPT_HEADER) ?? ""))
@@ -3949,14 +3982,19 @@ export class Engine {
     const cache = ctx.large === undefined ? this.cache : undefined
     let key = ""
     const noStore = h.get("x-raiju-cache-no-store") === "true"
+    // whose cache entries these are: the virtual key, or without one the caller's own identity (a hash of its direct
+    // provider key or checked credential), so two keyless callers never read each other's answers
+    let cacheWho = grant.vk?.id ?? ""
+    if (grant.vk === undefined && ctx.large === undefined && (this.cache !== undefined || this.semantic !== undefined)) cacheWho = this.gov.cacheIdentity(h)
     if (cache !== undefined) {
-      const scope = keyScope(op + (h.get("x-raiju-cache-key") ?? ""), grant.vk?.id ?? "", this.cfg.cache?.scope_by_virtual_key !== false)
+      const scope = keyScope(op + (h.get("x-raiju-cache-key") ?? ""), cacheWho, this.cfg.cache?.scope_by_virtual_key !== false)
+      // the cache id: hashed once here, then the entry's key for the lookup, the store and the hit's header
       key = cacheKey(scope, model, text)
       const hit = cache.get(key)
       if (hit !== undefined) {
         metrics.observeCacheHit(ctx.labels, "direct")
         out.set("x-raiju-cache", "hit")
-        cacheHeaders(&out, "direct", primary, undefined, undefined, cacheId(key), performance.now() - started)
+        cacheHeaders(&out, "direct", primary, undefined, undefined, key, performance.now() - started)
         originHeaders(&out, hit.origin)
         out.set("content-type", hit.contentType)
         ctx.cached = true
@@ -3994,15 +4032,16 @@ export class Engine {
         if (pt !== undefined) {
           semVec = await this.embed(pt)
           // entries stay with the virtual key that wrote them unless disable_identity_scoping
-          semScope = identityScope(scopeKey(primary.provider, primary.model, semKey, this.semanticCfg), grant.vk?.id ?? "", this.semanticCfg)
+          semScope = identityScope(scopeKey(primary.provider, primary.model, semKey, this.semanticCfg), cacheWho, this.semanticCfg)
+          // the caller's threshold can only tighten the configured one
           const th = h.get("x-raiju-cache-threshold")
-          const thr = th === undefined ? this.semanticCfg.threshold : (parseFloat(th) ?? this.semanticCfg.threshold)
-          const hit = this.vstore !== undefined ? await this.vectorLookup(semScope, semVec, thr) : sem.lookup(semScope, semVec, Date.now(), th === undefined ? undefined : parseFloat(th))
+          const thr = requestThreshold(th, this.semanticCfg.threshold)
+          const hit = this.vstore !== undefined ? await this.vectorLookup(semScope, semVec, thr) : sem.lookup(semScope, semVec, Date.now(), th === undefined ? undefined : thr)
           if (hit !== undefined) {
             metrics.observeCacheHit(ctx.labels, "semantic")
             out.set("x-raiju-cache", "semantic-hit")
             out.set("x-raiju-cache-similarity", hit.score.toFixed(4))
-            cacheHeaders(&out, "semantic", primary, hit.score, th === undefined ? this.semanticCfg.threshold : (parseFloat(th) ?? this.semanticCfg.threshold), hit.id, performance.now() - started)
+            cacheHeaders(&out, "semantic", primary, hit.score, thr, hit.id, performance.now() - started)
             originHeaders(&out, hit.origin)
             out.set("content-type", hit.contentType)
             ctx.cached = true
@@ -4535,7 +4574,9 @@ export class Engine {
   // at completion using event usage. Only a 200 answer for an admitted request is charged.
   // Governance refusals and provider failures are logged with status and error without a charge.
   // Requests naming no model or provider served by the gateway are not sent upstream or logged.
-  async mediaAnswer(route: MediaRoute, bill: MediaBill, res: Response, h: Hdrs, started: f64, rid: string): Promise<Response> {
+  async mediaAnswer(route: MediaRoute, bill: MediaBill, res: Response, h: Hdrs, started: f64, givenRid: string): Promise<Response> {
+    // the server passes the caller's x-request-id as it came
+    const rid = requestIdOf(givenRid)
     const grant = bill.grant
     if (bill.provider === "") return res
     if (grant === undefined || res.status !== 200) return await this.mediaFailed(route, bill, res, h, started, rid)
@@ -4676,7 +4717,7 @@ export class Engine {
     if (!billedMedia(route.op)) return try await handleMedia(this.cfg, req, route, undefined, mint)
     const h = snapshot(req.headers)
     const started = performance.now()
-    const rid = h.get("x-request-id") ?? newId("req_")
+    const rid = requestIdOf(h.get("x-request-id"))
     const bill = this.mediaBill(h)
     const res = try await handleMedia(this.cfg, req, route, bill, mint)
     return await this.mediaAnswer(route, bill, res, h, started, rid)
@@ -5168,7 +5209,8 @@ export class Engine {
     let promptUsed: Applied | undefined = undefined
     // logs_only on an HTTP provider: its findings reach this request's stored copy by the request id (one is made
     // when the caller sent none); "" when no such provider runs
-    const rid0 = req.headers.get("x-request-id") ?? ""
+    // an id serve() would not take counts as none, so the one made here is the one the row gets
+    const rid0 = callerRequestId(req.headers.get("x-request-id") ?? undefined)
     const lo = guardOn && this.httpLogsOnly("") ? (rid0 !== "" ? rid0 : newId("req_")) : ""
     try {
       if (guard !== undefined && this.guardInput && reversible) {
@@ -5288,6 +5330,8 @@ export class Engine {
     // The typed request is only needed to translate for non-OpenAI providers.
     const typed = new LazyChat(text)
     const stream = rawBool(body, "stream") ?? false
+    // the stream guard reads one choice: with several their texts would mix and a rule could miss
+    if (stream && manyChoices(body) && this.streamGuarded(guardOn)) return errorResponse(400, MANY_CHOICES_GUARDED, "invalid_request_error", noHeaders())
     let wantUsage = false
     const so = find(body, "stream_options")
     if (so !== undefined && so.startsWith("{")) {
@@ -5507,6 +5551,7 @@ export class Engine {
       return errorResponse(400, `invalid completions request: ${e.message}`, "invalid_request_error", noHeaders())
     }
     const stream = rawBool(body, "stream") ?? false
+    if (stream && manyChoices(body) && this.streamGuarded(true)) return errorResponse(400, MANY_CHOICES_GUARDED, "invalid_request_error", noHeaders())
     const wantUsage = streamUsage(body)
     const canPipe = stream && sink !== undefined
     const cp = new CompatPlan(withHeader(settingsOf(this.cfg.client?.compat), req.headers.get("x-raiju-compat") ?? undefined), "completions", stream)
@@ -6002,4 +6047,30 @@ test("a virtual key with no mcp_configs gets no MCP tools but allow_by_default o
   expect(e.keyMcp(some)?.length).toBe(1)
   // a request without a virtual key is not limited by key rules
   expect(e.keyMcp(new Map())).toBeUndefined()
+})
+
+test("a caller's x-request-id is taken only as a short plain token", () => {
+  expect(callerRequestId("req-1.a_B")).toBe("req-1.a_B")
+  expect(callerRequestId("a".repeat(128))).toBe("a".repeat(128))
+  expect(callerRequestId("a".repeat(129))).toBe("")
+  expect(callerRequestId("")).toBe("")
+  expect(callerRequestId(undefined)).toBe("")
+  // nothing that reads as a path, a separator or a control character
+  for (const bad of ["../x", "a/b", "a b", "a\nb", "a:b", "é", "a%2fb", "a\u0001b"]) expect(callerRequestId(bad)).toBe("")
+  expect(requestIdOf("ok-1")).toBe("ok-1")
+  const made = requestIdOf("../../etc")
+  expect(made.startsWith("req_")).toBe(true)
+  expect(callerRequestId(made)).toBe(made)
+})
+
+test("a request for several choices is recognized: n above 1 or several prompts", () => {
+  expect(manyChoices(try fields('{"n":2,"stream":true}'))).toBe(true)
+  expect(manyChoices(try fields('{"n":1}'))).toBe(false)
+  expect(manyChoices(try fields('{"model":"m"}'))).toBe(false)
+  expect(manyChoices(try fields('{"n":null}'))).toBe(false)
+  expect(manyChoices(try fields('{"prompt":["a","b"]}'))).toBe(true)
+  expect(manyChoices(try fields('{"prompt":[[1,2],[3]]}'))).toBe(true)
+  expect(manyChoices(try fields('{"prompt":["a"]}'))).toBe(false)
+  expect(manyChoices(try fields('{"prompt":[1,2,3]}'))).toBe(false)
+  expect(manyChoices(try fields('{"prompt":"a"}'))).toBe(false)
 })

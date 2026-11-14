@@ -154,29 +154,51 @@ function seriesKey(name: string, labels: string): string {
   return name + "{" + labels + "}"
 }
 
+// Whether a series changed since takeDirty was last asked: a worker writes its exposition for the others only then.
+let dirty = true
+
+// Whether anything was counted, set or observed since the last call (true the first time).
+export function takeDirty(): bool {
+  const was = dirty
+  dirty = false
+  return was
+}
+
+// Says the series must be written again (a write that failed).
+export function markDirty(): void {
+  dirty = true
+}
+
 export function inc(name: string, labels: string, by: f64): void {
   const k = seriesKey(name, labels)
   reg.counters.set(k, (reg.counters.get(k) ?? 0.0) + by)
+  dirty = true
 }
 
 export function setGauge(name: string, labels: string, v: f64): void {
   reg.gauges.set(seriesKey(name, labels), v)
+  dirty = true
 }
 
 export function addGauge(name: string, labels: string, by: f64): void {
   const k = seriesKey(name, labels)
   reg.gauges.set(k, (reg.gauges.get(k) ?? 0.0) + by)
+  dirty = true
+}
+
+// The histogram of a series, made on first use.
+function histogramOf(name: string, labels: string): Histogram {
+  const k = seriesKey(name, labels)
+  const h = reg.histograms.get(k)
+  if (h !== undefined) return h
+  const nh = new Histogram(bucketsFor(name))
+  reg.histograms.set(k, nh)
+  return nh
 }
 
 export function observe(name: string, labels: string, v: f64): void {
-  const k = seriesKey(name, labels)
-  let h = reg.histograms.get(k)
-  if (h === undefined) {
-    const nh = new Histogram(bucketsFor(name))
-    reg.histograms.set(k, nh)
-    h = nh
-  }
-  h.observe(v)
+  histogramOf(name, labels).observe(v)
+  dirty = true
 }
 
 function splitKey(k: string): { name: string, labels: string } {
@@ -326,6 +348,10 @@ class SeenValues {
 
 const seenValues: Map<string, SeenValues> = new Map()
 
+// Counts the changes to what a label set renders as (a value seen or proven, the telemetry switches, the custom
+// labels), so a series resolved earlier (StreamHistograms) is resolved again after one.
+let labelGen = 0
+
 // The labels a caller names freely on every request (any model name routes to a configured provider): a new value is
 // taken only from a request the provider served, or failed for its own reasons (a rate limit, a server error), not one
 // it refused as unknown or bad (prove), so requests with made-up models add no series; until then it is reported as
@@ -350,6 +376,7 @@ export function bounded(name: string, v: string): string {
   if (PROVEN_LABELS.includes(name)) return OTHER_LABEL
   if (seen.values.size >= MAX_LABEL_VALUES) return OTHER_LABEL
   seen.values.add(v)
+  labelGen += 1
   return v
 }
 
@@ -358,6 +385,7 @@ export function prove(name: string, v: string): void {
   const seen = seenFor(name)
   if (seen.values.has(v) || seen.values.size >= MAX_LABEL_VALUES) return
   seen.values.add(v)
+  labelGen += 1
 }
 
 // The request labels a successful request proves (see PROVEN_LABELS).
@@ -376,13 +404,14 @@ export function resetBounds(): void {
   seenValues.clear()
   labelCache.clear()
   baseCache.clear()
+  labelGen += 1
 }
 
 const labelCache: Map<string, string> = new Map()
 
 // Raiju's own labels (provider, model, status) for the raiju_* families.
 export function labels(provider: string, model: string, status: string): string {
-  const k = provider + "\u0000" + model + "\u0000" + status
+  const k = provider + "\u001f" + model + "\u001f" + status
   const hit = labelCache.get(k)
   if (hit !== undefined) return hit
   // these name guardrails, tools and live models too, so they are capped apart from the request labels
@@ -448,6 +477,7 @@ export function setTelemetry(overheadSplit: bool, users: bool): void {
   overheadBreakdown = overheadSplit
   userLabels = users
   baseCache.clear()
+  labelGen += 1
 }
 
 const baseCache: Map<string, string> = new Map()
@@ -477,6 +507,7 @@ export function setCustomLabels(names: string[]): void {
   }
   customNames = out
   baseCache.clear()
+  labelGen += 1
 }
 
 // The custom label values of a request, in the configured order ("" when the header is absent).
@@ -496,7 +527,7 @@ export function httpCustomValues(headers: Headers): string[] {
 // The rendered base label set for a request, built once per distinct combination.
 export function baseLabels(l: RequestLabels): string {
   const vals = baseValues(l)
-  const k = vals.join("\u0000")
+  const k = vals.join("\u001f")
   const hit = baseCache.get(k)
   if (hit !== undefined) return hit
   const names: string[] = (userLabels ? BASE_NAMES.concat(["user_id", "user_name"]) : BASE_NAMES).concat(customNames)
@@ -596,6 +627,40 @@ export function observeStreamChunk(l: RequestLabels, index: int, latencySeconds:
   } else {
     observe("raiju_stream_inter_token_latency_seconds", base, latencySeconds)
   }
+}
+
+// The two stream histograms of one stream's labels, resolved once per stream: observe does what observeStreamChunk
+// does without building the label text and the series key for every chunk. The series is looked up again only when
+// the rendering of labels changed in between (labelGen), so each chunk lands where observeStreamChunk would put it.
+export class StreamHistograms {
+  private first: Histogram | undefined = undefined
+  private inter: Histogram | undefined = undefined
+  private gen = -1
+
+  constructor(readonly l: RequestLabels) {}
+
+  observe(index: int, latencySeconds: f64): void {
+    if (this.gen !== labelGen) {
+      this.first = undefined
+      this.inter = undefined
+    }
+    let h = index === 0 ? this.first : this.inter
+    if (h === undefined) {
+      const nh = histogramOf(index === 0 ? "raiju_stream_first_token_latency_seconds" : "raiju_stream_inter_token_latency_seconds", baseLabels(this.l))
+      // read after the labels were rendered: rendering can itself take a new value in
+      this.gen = labelGen
+      if (index === 0) this.first = nh
+      else this.inter = nh
+      h = nh
+    }
+    h.observe(latencySeconds)
+    dirty = true
+  }
+}
+
+// The stream histograms for one stream's labels (for a module that imports this one by name).
+export function streamHistograms(l: RequestLabels): StreamHistograms {
+  return new StreamHistograms(l)
 }
 
 // Gateway overhead for a request, in microseconds (total time minus time blocked on upstream).
@@ -910,4 +975,51 @@ test("a model name becomes a label value only once a request with it succeeds", 
   observeRequest(good, { ok: false, status: 500, errorType: "provider_server_error", retries: 0.0 }, 0.01)
   expect(render().includes(`raiju_error_requests_total{provider="openai",model="gpt-real-y"`)).toBe(true)
   resetBounds()
+})
+
+test("a stream's histograms resolved once count as observeStreamChunk does, and follow a label that gets proven", () => {
+  const l = newLabels("openai", "stream-fresh-model", "chat_completion_stream")
+  const sh = new StreamHistograms(l)
+  const count = (family: string, model: string): bool => render().includes(`${family}_count{provider="openai",model="${model}",method="chat_completion_stream"`)
+  const line = (family: string, model: string, n: int): bool => {
+    for (const ln of render().split("\n")) {
+      if (ln.startsWith(`${family}_count{provider="openai",model="${model}",method="chat_completion_stream"`) && ln.endsWith(` ${n}`)) return true
+    }
+    return false
+  }
+  // an unproven model is reported as "other", by both ways
+  sh.observe(0, 0.2)
+  sh.observe(1, 0.01)
+  observeStreamChunk(l, 1, 0.01)
+  expect(line("raiju_stream_first_token_latency_seconds", OTHER_LABEL, 1)).toBe(true)
+  expect(line("raiju_stream_inter_token_latency_seconds", OTHER_LABEL, 2)).toBe(true)
+  expect(count("raiju_stream_inter_token_latency_seconds", "stream-fresh-model")).toBe(false)
+  // once proven, the next chunk of the same stream goes to the model's own series, as observeStreamChunk's does
+  prove("model", "stream-fresh-model")
+  sh.observe(2, 0.01)
+  observeStreamChunk(l, 3, 0.01)
+  sh.observe(4, 0.01)
+  expect(line("raiju_stream_inter_token_latency_seconds", "stream-fresh-model", 3)).toBe(true)
+  expect(line("raiju_stream_inter_token_latency_seconds", OTHER_LABEL, 2)).toBe(true)
+})
+
+test("the dirty flag is set by a change and cleared by asking", () => {
+  inc("raiju_dirty_test_total", "", 1.0)
+  expect(takeDirty()).toBe(true)
+  expect(takeDirty()).toBe(false)
+  render()
+  expect(takeDirty()).toBe(false)
+  inc("raiju_dirty_test_total", "", 1.0)
+  expect(takeDirty()).toBe(true)
+  setGauge("raiju_dirty_test_gauge", "", 1.0)
+  expect(takeDirty()).toBe(true)
+  addGauge("raiju_dirty_test_gauge", "", 1.0)
+  expect(takeDirty()).toBe(true)
+  observe("raiju_dirty_test_seconds", "", 0.1)
+  expect(takeDirty()).toBe(true)
+  new StreamHistograms(newLabels("p", "m", "x")).observe(0, 0.1)
+  expect(takeDirty()).toBe(true)
+  expect(takeDirty()).toBe(false)
+  markDirty()
+  expect(takeDirty()).toBe(true)
 })

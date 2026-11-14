@@ -1742,13 +1742,13 @@ class Machine {
     if (op === "*" && ((l.k === "str" && r.k === "int") || (l.k === "int" && r.k === "str"))) {
       const s = l.k === "str" ? l.s : r.s
       const n = l.k === "int" ? l.i : r.i
-      if (n <= 0) return vstr("")
+      // an empty string costs nothing, so its repeat count must not drive a loop
+      if (n <= 0 || s === "") return vstr("")
       const want: f64 = (s.byteLength + 0.0) * (n + 0.0)
       if (want > this.lim.max_memory_bytes + 0.0) throw new Error(`memory limit exceeded (max_memory_bytes ${this.lim.max_memory_bytes})`)
       try this.charge(s.byteLength * n)
-      let out = ""
-      for (let i = 0; i < n; i++) out += s
-      return vstr(out)
+      // n is at most the charged byte count here, so the work is covered by the memory limit
+      return vstr(s.repeat(n))
     }
     throw new Error(`unsupported operand types for ${op}: ${this.typeName(l)} and ${this.typeName(r)}`)
   }
@@ -2056,30 +2056,40 @@ class Machine {
     for (let i = 0; i < cs.length; i++) {
       const c = cs[i]!
       if (c !== "%") {
+        try this.charge(c.byteLength)
         out += c
         continue
       }
       i += 1
       const d = cs[i] ?? ""
       if (d === "%") {
+        try this.charge(1)
         out += "%"
         continue
       }
       if (ai >= args.length) throw new Error("not enough arguments for format string")
       const v = args[ai]!
       ai += 1
-      if (d === "s") out += this.toStr(v, false)
-      else if (d === "r") out += this.toStr(v, true)
+      // each piece is charged before it is appended, so the result never grows past the limit
+      let piece = ""
+      if (d === "s" && v.k === "str") {
+        try this.charge(v.s.byteLength)
+        out += v.s
+        continue
+      }
+      if (d === "s") piece = this.toStr(v, false)
+      else if (d === "r") piece = this.toStr(v, true)
       else if (d === "d" || d === "i") {
         if (!isNumKind(v.k)) throw new Error(`%${d} format needs a number`)
-        out += `${Math.trunc(numF(v))}`
+        piece = `${Math.trunc(numF(v))}`
       } else if (d === "f") {
         if (!isNumKind(v.k)) throw new Error("%f format needs a number")
-        out += `${numF(v)}`
+        piece = `${numF(v)}`
       } else throw new Error(`unsupported format character '${d}'`)
+      try this.charge(piece.byteLength)
+      out += piece
     }
     if (ai !== args.length) throw new Error("not all arguments converted during string formatting")
-    try this.charge(out.byteLength)
     return out
   }
 
@@ -2315,6 +2325,13 @@ class Machine {
       const from = try this.strArg(args, 0, name)
       const to = try this.strArg(args, 1, name)
       if (from === "") throw new Error("replace() needs a non-empty pattern")
+      // the result can be far larger than the receiver, so its size is charged before it is built
+      // removing the pattern (never larger than the receiver) gives the number of matches
+      const hits = Math.trunc((s.byteLength - s.replaceAll(from, "").byteLength) / from.byteLength)
+      if (hits === 0) return vstr(s)
+      const want: f64 = (s.byteLength + 0.0) + (hits + 0.0) * (to.byteLength - from.byteLength + 0.0)
+      if (want > this.lim.max_memory_bytes + 0.0) throw new Error(`memory limit exceeded (max_memory_bytes ${this.lim.max_memory_bytes})`)
+      try this.charge(s.byteLength + hits * (to.byteLength - from.byteLength))
       return vstr(s.replaceAll(from, to))
     }
     if (name === "lower") return vstr(lowerAscii(s))
@@ -2645,4 +2662,29 @@ test("runaway programs end with an error: deep expressions, big repeats", () => 
   const big = runRound(parseOk("result = 'abcdefgh' * 9007199254740991"), [], defaultCodeLimits(), [], Date.now() + 60000.0, 0, 0)
   if (big.kind === "done") expect(big.errMsg.startsWith("memory limit exceeded")).toBe(true)
   expect(resultOf("result = [1, 2] * 3")).toBe("error: unsupported operand types for *: list and int")
+})
+
+// The error of a program run with a 4 KiB memory limit ("" when it succeeds).
+function errOf(src: string): string {
+  const small = defaultCodeLimits()
+  small.max_memory_bytes = 4096
+  const r = runRound(parseOk(src), [], small, [], Date.now() + 60000.0, 0, 0)
+  return r.kind === "done" ? r.errMsg : r.kind
+}
+
+test("string builders are charged before they build: empty repeat, replace and % formatting", () => {
+  // an empty string repeated any number of times is empty at once, not a loop of that length
+  expect(resultOf("result = '' * 9007199254740991")).toBe("\"\"")
+  expect(resultOf("result = 9007199254740991 * ''")).toBe("\"\"")
+  expect(resultOf("result = 'ab' * 3")).toBe("\"ababab\"")
+  const limit = "memory limit exceeded (max_memory_bytes 4096)"
+  expect(errOf("a = 'a' * 100\nresult = a.replace('a', a)")).toBe(limit)
+  expect(errOf("a = 'a' * 1000\nresult = '%s%s%s%s%s' % (a, a, a, a, a)")).toBe(limit)
+  expect(errOf("a = 'a' * 1000\nresult = '%r%r%r%r%r' % (a, a, a, a, a)")).toBe(limit)
+  // within the limit the results are unchanged
+  expect(errOf("result = 'a-b-c'.replace('-', '++')")).toBe("")
+  expect(resultOf("result = 'a-b-c'.replace('-', '++')")).toBe("\"a++b++c\"")
+  expect(resultOf("result = 'aaa'.replace('aa', 'b')")).toBe("\"ba\"")
+  expect(resultOf("result = 'abc'.replace('x', 'y')")).toBe("\"abc\"")
+  expect(resultOf("result = '%s=%d (%r) 100%%' % ('k', 7, 'v')")).toBe("\"k=7 (\\\"v\\\") 100%\"")
 })

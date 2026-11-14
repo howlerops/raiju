@@ -213,6 +213,31 @@ function chunkSize(b: u8[], from: int, to: int): int {
   return v
 }
 
+// A header value has no control bytes other than a tab (a bare CR, LF or NUL would split or cut a line downstream).
+function isFieldValue(s: string): bool {
+  for (const c of enc.encode(s)) {
+    if ((int(c) < 32 && int(c) !== 9) || int(c) === 127) return false
+  }
+  return true
+}
+
+// A Host value is host[:port]: no path, query, fragment, userinfo, list, space, control or non-ASCII bytes.
+function isHost(s: string): bool {
+  const b = enc.encode(s)
+  if (b.length === 0) return false
+  for (const x of b) {
+    const c = int(x)
+    if (c <= 32 || c >= 127) return false
+    if (c === 47 || c === 63 || c === 35 || c === 64 || c === 92 || c === 44) return false
+  }
+  return true
+}
+
+// Whether a response header's name or value would break out of its line.
+function splitsLine(s: string): bool {
+  return s.includes("\r") || s.includes("\n")
+}
+
 function parseHead(s: string): HeadResult {
   const lines = s.split("\r\n")
   const parts = (lines[0] ?? "").split(" ")
@@ -232,7 +257,10 @@ function parseHead(s: string): HeadResult {
     const name = line.slice(0, colon)
     if (!isToken(name)) return fail(400, "malformed header name")
     const value = line.slice(colon + 1).trim()
+    if (!isFieldValue(value)) return fail(400, "malformed header value")
     const key = name.toLowerCase()
+    // the Host becomes the authority of the request's URL, so it is host[:port] and nothing else
+    if (key === "host" && (headers.has(key) || !isHost(value))) return fail(400, "malformed Host header")
     const prev = headers.get(key)
     if (prev === undefined) headers.set(key, value)
     else if (key === "content-length") {
@@ -543,7 +571,10 @@ export function serializeHead(version: string, status: int, headers: Map<string,
   for (const k of headers.keys()) {
     const lk = k.toLowerCase()
     if (lk === "content-length" || lk === "transfer-encoding" || lk === "connection" || lk === "date") continue
-    s += `${k}: ${headers.get(k) ?? ""}\r\n`
+    const v = headers.get(k) ?? ""
+    // a header that carries a line break is left out: it would add headers or a body of its own
+    if (splitsLine(k) || splitsLine(v)) continue
+    s += `${k}: ${v}\r\n`
   }
   // 1xx, 204 and 304 responses have no body, so no framing either
   const bodyless = status < 200 || status === 204 || status === 304
@@ -1361,6 +1392,32 @@ test("malformed requests are 400", () => {
   expect(failStatus("POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n")).toBe(400)
   expect(failStatus("POST / HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n")).toBe(400)
   expect(failStatus("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n")).toBe(400)
+})
+
+test("a header value with a control byte, and a Host that is not host[:port], are 400", () => {
+  expect(failStatus("GET / HTTP/1.1\r\nHost: a\r\nX-A: a\rb\r\n\r\n")).toBe(400)
+  expect(failStatus("GET / HTTP/1.1\r\nHost: a\r\nX-A: a\x00b\r\n\r\n")).toBe(400)
+  expect(failStatus("GET / HTTP/1.1\r\nHost: a\r\nX-A: a\x7fb\r\n\r\n")).toBe(400)
+  expect(failStatus("GET / HTTP/1.1\r\nHost: x/api/session/setup?\r\n\r\n")).toBe(400)
+  expect(failStatus("GET / HTTP/1.1\r\nHost: u@x\r\n\r\n")).toBe(400)
+  expect(failStatus("GET / HTTP/1.1\r\nHost: x#y\r\n\r\n")).toBe(400)
+  expect(failStatus("GET / HTTP/1.1\r\nHost: x\\y\r\n\r\n")).toBe(400)
+  expect(failStatus("GET / HTTP/1.1\r\nHost: a b\r\n\r\n")).toBe(400)
+  expect(failStatus("GET / HTTP/1.1\r\nHost:\r\n\r\n")).toBe(400)
+  expect(failStatus("GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n")).toBe(400)
+  const rs = requestsOf(feedText(new Http1Parser(), "GET / HTTP/1.1\r\nHost: [::1]:8080\r\nX-A: a\tb\r\n\r\n"))
+  expect(rs.length).toBe(1)
+  expect(rs[0]!.headers.get("host")).toBe("[::1]:8080")
+  expect(rs[0]!.headers.get("x-a")).toBe("a\tb")
+})
+
+test("a response header with a line break is left out", () => {
+  const h: Map<string, string> = new Map()
+  h.set("content-type", "text/plain")
+  h.set("location", "/x\r\nset-cookie: a=b")
+  h.set("x-a\nx-b", "1")
+  const head = serializeHead("HTTP/1.1", 200, h, { kind: "length", n: 5 }, false, "Thu, 01 Jan 1970 00:00:00 GMT")
+  expect(head).toBe("HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 5\r\ndate: Thu, 01 Jan 1970 00:00:00 GMT\r\n\r\n")
 })
 
 test("writes a head with Content-Length", () => {
