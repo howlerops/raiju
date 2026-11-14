@@ -1,5 +1,6 @@
 // Virtual keys, budgets and rate limits follow a Customer → Team → VK hierarchy.
 // State is held in memory per process.
+import { sha256, toHex, utf8 } from "./crypto"
 import { Config, AgentConfig, VirtualKeyConfig, BudgetConfig, BudgetOverride, RateLimitConfig, RateLimitShare, AccessProfile, ModelConfigGovernance, ProviderGovernance, ProjectConfig, ProviderConfigRef, GovernanceConfig, ProviderConfig, resolveEnv, getEnv } from "./config"
 import { Effective, applyProfiles, applyHeld, modelAllowed } from "./profiles"
 import { heldProfiles } from "./govapi"
@@ -580,6 +581,21 @@ export class Governance {
     return user === undefined ? "identity" : "user:" + user
   }
 
+  // Whose response-cache entries a request without a virtual key reads and writes, so two keyless callers never share
+  // a partition: a hash of the direct provider key it carries, else of the user its identity credential names, else of
+  // the accepted credential itself. "" for a request with no credential at all (auth not enforced). The leading
+  // control character keeps it apart from every virtual key id.
+  cacheIdentity(h: Hdrs): string {
+    const direct = directKeyFrom(h, this.directKeys)
+    if (direct !== undefined) return "\u0002direct=" + toHex(sha256(utf8(direct)))
+    const alt = this.altAuth
+    if (alt === undefined || !alt(h)) return ""
+    const who = this.userOf
+    const user = who === undefined ? undefined : who(h)
+    if (user !== undefined) return "\u0002user=" + toHex(sha256(utf8(user)))
+    return "\u0002cred=" + toHex(sha256(utf8(h.get("authorization") ?? "")))
+  }
+
   // The tenant whose bodies count together against server.credential_body_mb (bodybudget.tov, re-audit 5 P1-B): for a
   // virtual key its customer (directly or through its team), else its team, else the key ("customer:<id>",
   // "team:<id>", "vk:<id>"); any other checked credential is its own tenant (checkedCredential); "" for none.
@@ -1013,6 +1029,14 @@ export class Governance {
     return out
   }
 
+  // The window shared under a name (tests).
+  windowFor(name: string): Window | undefined {
+    for (const x of this.windows()) {
+      if (x.name === name) return x.w
+    }
+    return undefined
+  }
+
   // Starts every window on a multiple of its period (as clusters and sibling workers need),
   // keeping the usage counted so far.
   alignWindows(): void {
@@ -1031,6 +1055,16 @@ export class Governance {
   setRemote(name: string, window: string, remote: f64, now: f64): void {
     for (const x of this.windows()) {
       if (x.name === name && x.w.id(now) === window) x.w.remote = remote
+    }
+  }
+
+  // setRemote for every window in one pass (the share tick): total gives all the nodes' count of a window, and what
+  // is above this node's own use is the others'. One walk over the windows, where a setRemote per window walks them
+  // all each time.
+  setRemoteTotals(now: f64, total: (name: string, window: string) => f64): void {
+    for (const x of this.windows()) {
+      const id = x.w.id(now)
+      x.w.remote = Math.max(0.0, total(x.name, id) - x.w.used)
     }
   }
 
@@ -1397,6 +1431,33 @@ test("budgets debit up the hierarchy", () => {
   expect((d as Denial).status).toBe(402)
 })
 
+test("the other nodes' use of every window is set in one pass, as setRemote sets it one by one", () => {
+  const a = new Governance(govConfig())
+  const b = new Governance(govConfig())
+  const grant: Grant = { kind: "grant", vk: undefined, budgets: ["b-vk", "b-team"], rateLimits: [] }
+  a.record(grant, 100, 0.25)
+  b.record(grant, 100, 0.25)
+  const now = Date.now()
+  // every window's total across the nodes is its own use and 2 more; an unknown window has none
+  const total = (name: string, window: string): f64 => {
+    for (const u of a.sharedUsage(now)) {
+      if (u.name === name && u.window === window) return u.used + 2.0
+    }
+    return 0.0
+  }
+  for (const u of a.sharedUsage(now)) a.setRemote(u.name, u.window, Math.max(0.0, total(u.name, u.window) - u.used), now)
+  b.setRemoteTotals(now, total)
+  const names = a.sharedUsage(now).map((u) => u.name)
+  expect(names.length > 0).toBe(true)
+  expect(names.includes("budget:b-vk")).toBe(true)
+  for (const n of names) {
+    const wa = a.windowFor(n)!
+    const wb = b.windowFor(n)!
+    expect(wa.remote).toBe(2.0)
+    expect(wb.remote).toBe(wa.remote)
+  }
+})
+
 test("required headers", () => {
   const g = new Governance({ client: { required_headers: ["X-Team"] } })
   const d = g.admit(hdrs([["content-type", "application/json"]]), "openai", "gpt-4o")
@@ -1407,6 +1468,27 @@ test("required headers", () => {
   }
   expect(g.admit(hdrs([["x-team", " "]]), "openai", "gpt-4o").kind).toBe("denial")
   expect(g.admit(hdrs([["x-team", "core"]]), "openai", "gpt-4o").kind).toBe("grant")
+})
+
+test("keyless callers get their own cache identity: by direct key, by user, by credential", () => {
+  const g = new Governance({ client: { allow_direct_keys: true } })
+  const k1 = g.cacheIdentity(hdrs([["x-raiju-direct-key", "true"], ["authorization", "Bearer sk-one"]]))
+  const k2 = g.cacheIdentity(hdrs([["x-raiju-direct-key", "true"], ["authorization", "Bearer sk-two"]]))
+  expect(k1 !== "" && k2 !== "" && k1 !== k2).toBe(true)
+  expect(k1).toBe(g.cacheIdentity(hdrs([["x-raiju-direct-key", "true"], ["x-api-key", "sk-one"]])))
+  // the key itself is not in the scope
+  expect(k1.includes("sk-one")).toBe(false)
+  // no credential: the anonymous partition
+  expect(g.cacheIdentity(hdrs([["authorization", "Bearer sk-one"]]))).toBe("")
+  g.altAuth = (h) => (h.get("authorization") ?? "").startsWith("Bearer tok-")
+  const a = g.cacheIdentity(hdrs([["authorization", "Bearer tok-a"]]))
+  const b = g.cacheIdentity(hdrs([["authorization", "Bearer tok-b"]]))
+  expect(a !== "" && b !== "" && a !== b && a !== k1).toBe(true)
+  expect(g.cacheIdentity(hdrs([["authorization", "Bearer other"]]))).toBe("")
+  // two tokens of one user share that user's entries
+  g.userOf = (h) => "ana"
+  expect(g.cacheIdentity(hdrs([["authorization", "Bearer tok-a"]]))).toBe(g.cacheIdentity(hdrs([["authorization", "Bearer tok-b"]])))
+  expect(g.cacheIdentity(hdrs([["authorization", "Bearer tok-a"]])) !== a).toBe(true)
 })
 
 test("dual credentials: an identity token with x-raiju-vk is refused only under error", () => {

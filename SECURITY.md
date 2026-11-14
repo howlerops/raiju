@@ -86,6 +86,23 @@ provider's SDP answer names, which are not checked (the SDP exchange is). The OT
   of the first two when several nodes serve SSO). The state is bound to the browser that began the sign-in: the login
   sets an HttpOnly, SameSite=Lax cookie with the state's hash (Secure over https), and the callback refuses a state
   without it, so a link carrying an attacker's own state and code cannot sign a victim in as the attacker.
+  An email the identity provider marks unverified (`email_verified` false) names no local user: such a sign-in is
+  known by its subject alone and does not take the role of a user stored under that email (a disabled user it names
+  is still refused). A token without the claim is unchanged; set `oidc.allowed_email_domains` to require it.
+- **Identity-aware proxy (AWS ALB):** the load balancer's ARN (`expected_signer`) is compared with the `signer` of
+  the token's signed header, where the load balancer writes it. A `signer` among the payload's user claims, which
+  the identity provider supplies, counts for nothing.
+- **Removed users:** deleting a user (`DELETE /api/users/{name}`, a SCIM delete or deactivation, a directory
+  removal) ends its dashboard sessions and its CLI agent tokens (access and refresh tokens and pending codes).
+- **Delegated permissions:** a caller who is not a built-in admin (a custom role, or a management API key) gives a
+  user only a role whose permissions it holds in full, cannot change or delete a user whose role holds more than
+  that, and adds to a role only permissions it holds itself (403 otherwise). `auth_config` in `PUT /api/config` is
+  the admin's alone. The setup token, which makes the first admin, is not bounded.
+- **Requests:** the built-in HTTP/1 server answers 400 to a `Host` that is not `host[:port]`, to a repeated `Host`
+  and to a header value with a control byte, and decides the body limit, the client address and the route from one
+  path, the one the routes match (an SDK prefix such as `/litellm/api/...` is the same route as `/api/...`). A
+  response header carrying CR or LF is not sent. `x-raiju-eh-authorization` and `x-raiju-eh-api-key` (and
+  `authorization` / `api-key` in a header allowlist) are not forwarded: the provider credential is the gateway's.
 
 ## Plugins
 

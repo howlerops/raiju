@@ -15,7 +15,7 @@ import { OtelConfig, TlsOpts, otelTls, usesGrpc, exportMetricsGrpc } from "./ote
 import { OtelMetricsSettings, exportMetricsRequest, validateMetricsSettings, pushIntervalSeconds } from "./otel_metrics"
 import { PushGatewayConfig, pushProblem, pushUrl, pushHeaders, pushInterval } from "./pushgateway"
 import { join } from "node:path"
-import { Engine, logsOnlyText } from "./gateway"
+import { Engine, logsOnlyText, requestIdOf, callerRequestId } from "./gateway"
 import { Vault } from "./guard_reversible"
 import { CostRecalc, RecalcStatus, readShared, requestCancel, sharedInFlight } from "./costrecalc"
 import { issueSetupSession, validSetupSession, setupCookie, cookieValue, SETUP_COOKIE, sameSecret, setupPublic } from "./setupsession"
@@ -35,7 +35,7 @@ import { ProvisionJobs } from "./provjobs"
 import { JOB_BEAT_MS, slotText } from "./jobs"
 import { DirSettings, DirUser, directorySettings, listDirectory, lookupUser } from "./directory"
 import { bulkSyncInterval } from "./config_compat"
-import { Held, KeyCtx, handleApiKeys, newKeyValue } from "./apikeys"
+import { Held, KeyCtx, handleApiKeys, newKeyValue, holds } from "./apikeys"
 import { keyBudgetIds, permissionDocs, permissionIds, permissionMap, rolePairs, userObjectJson, userKeysJson, PermissionDoc, creationPolicy, heldProfiles, PROPAGATED_FIELDS, propagateProfileKeys, parseOverride } from "./govapi"
 
 // The quota view of one virtual key's budget and rate limit (GET /api/governance/virtual-keys/quota).
@@ -48,7 +48,7 @@ type QuotaRateUsage = { kind: string, used: f64, limit: f64 }
 type QuotaRate = { id: string, token_max_limit?: int, token_reset_duration?: string, request_max_limit?: int, request_reset_duration?: string, usage: QuotaRateUsage[], source_type?: string, source_id?: string, source_name?: string }
 // One per-model limit of a key in the quota view; no provider means every provider.
 type QuotaModel = { model_name: string, provider?: string, budgets: QuotaBudget[], rate_limit?: QuotaRate }
-import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, takeUpgrades, THROTTLED, required, roleAllows, selfRoute, isBuiltinRole, customRole, provisioned, disabledNamed, anyRoleId, builtinPairs, userByEmail, systemRole, customRoles } from "./rbac"
+import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, takeUpgrades, THROTTLED, required, roleAllows, selfRoute, isBuiltinRole, customRole, provisioned, disabledNamed, anyRoleId, builtinPairs, userByEmail, systemRole, customRoles, resourceOf } from "./rbac"
 import { DataScope, allScope, noScope, scopeOf, inScope } from "./scope"
 import { AuditEvent, AuditLog, actionFor, auditListJson, auditQueryOf, maskDetail, profileAuditJson } from "./audit"
 import { isCacheId } from "./cache"
@@ -79,7 +79,7 @@ import { notify, notifyOnce, noticeList } from "./notify"
 import * as exporters from "./exporters"
 import { logParquet } from "./sink_parquet"
 import { resolveAll } from "./secrets"
-import { Field, fields, find, rawStr, rawBool, rawNum, isNull, elements, setField, build } from "./json"
+import { Field, fields, find, rawStr, rawBool, rawNum, isNull, elements, setField, build, rawInt } from "./json"
 import { trimSlash } from "./providers/types"
 import { snapshot, errorJson, Hdrs, newId } from "./schemas"
 import { CLIENT_IP_HEADER, badProxyEntries, trustedProxies } from "./clientip"
@@ -87,7 +87,7 @@ import { addressKey, signInGuard } from "./signinguard"
 import { deadline } from "./deadline"
 import { secureHex, utf8, sha256, toHex } from "./crypto"
 import * as b64 from "./base64"
-import { AgentUser, Exchange, AGENT_TOKEN_PREFIX, agentSignIn, authorizeProblem, callbackUrl, signInPage, tokenResponseJson } from "./agentsignin"
+import { AgentUser, Exchange, AGENT_TOKEN_PREFIX, agentSignIn, s256, authorizeProblem, callbackUrl, signInPage, tokenResponseJson } from "./agentsignin"
 import * as metrics from "./metrics"
 import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, appendFileSync, chmodSync, statSync } from "node:fs"
 import { writeFileAtomic } from "./atomicfile"
@@ -324,6 +324,11 @@ function ownUserFlow(path: string, sub: string): bool {
 // The page a sign-in may return to: only the gateway's own MCP consent pages, as a path with its query.
 export function returnPath(raw: string): string {
   if (raw.includes("//") || raw.includes("\\") || raw.includes("#")) return ""
+  // no markup or control bytes: the path is placed in pages and Location headers
+  for (const b of new TextEncoder().encode(raw)) {
+    const c = int(b)
+    if (c < 0x20 || c === 0x7f || c === 0x3c || c === 0x3e || c === 0x22 || c === 0x27) return ""
+  }
   if (raw.startsWith("/oauth/consent?") || raw.startsWith("/workspace/mcp-sessions/auth?") || raw.startsWith("/api/agent/auth/authorize?")) return raw
   return ""
 }
@@ -401,7 +406,7 @@ function unaryOf(f: Fwd): Unary {
       const er = find(fs, "error")
       if (er !== undefined && !isNull(er)) {
         const ef = fields(er)
-        return { failed: true, result: "", code: Math.floor(rawNum(ef, "code") ?? -32603.0), message: rawStr(ef, "message") ?? "the agent failed" }
+        return { failed: true, result: "", code: (rawInt(ef, "code") ?? -32603), message: rawStr(ef, "message") ?? "the agent failed" }
       }
       const res = find(fs, "result")
       if (res !== undefined && f.status < 400) return { failed: false, result: res, code: 0, message: "" }
@@ -854,10 +859,23 @@ async function putText(url: string, headers: Map<string, string>, body: string):
   }
 }
 
+// Text placed in an HTML page: every markup character, not only the first "<" (an identity provider's claim or
+// error text is not ours).
+function htmlEsc(s: string): string {
+  return s.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll("\"", "&quot;").replaceAll("'", "&#39;")
+}
+
+// A string literal for an inline script: JSON, with "<" written as an escape so the value cannot close the script
+// element or open a comment.
+function scriptJson(s: string): string {
+  return JSON.stringify(s).replaceAll("<", "\\u003c")
+}
+
 function html(status: int, body: string, cookie?: string): Response {
   const h: Record<string, string> = new Map()
   h.set("content-type", "text/html; charset=utf-8")
   h.set("cache-control", "no-store")
+  h.set("x-content-type-options", "nosniff")
   const c = cookie ?? ""
   if (c !== "") h.set("set-cookie", c)
   return new Response(body, { status: status, headers: h })
@@ -1769,10 +1787,14 @@ export class Ops {
       const sem = this.engine.semantic
       if (sem !== undefined) sem.syncShared(Date.now())
       this.storeMetrics()
-      try {
-        writeFileAtomic(`${this.shareDir}/metrics/${process.pid}.prom`, metrics.render(), { durable: false })
-      } catch (e) {
-        // a scrape then shows this worker's last written numbers
+      // an idle worker's file already holds its numbers: it is written again only after a series changed
+      if (metrics.takeDirty()) {
+        try {
+          writeFileAtomic(`${this.shareDir}/metrics/${process.pid}.prom`, metrics.render(), { durable: false })
+        } catch (e) {
+          // a scrape then shows this worker's last written numbers; the next pass writes again
+          metrics.markDirty()
+        }
       }
     }
   }
@@ -1796,7 +1818,8 @@ export class Ops {
   applyRemote(c: Counters): void {
     const now = Date.now()
     const gov = this.engine.gov
-    for (const u of gov.sharedUsage(now)) gov.setRemote(u.name, u.window, Math.max(0.0, c.total(u.name, u.window) - u.used), now)
+    // one pass over the windows: each gets the part of its total the other workers and nodes counted
+    gov.setRemoteTotals(now, (name: string, window: string) => c.total(name, window))
     const hs = c.takeHolds()
     if (this.engine.cfg.health?.adaptive === true) this.engine.health.holds.merge(hs, now)
     clusterState().merge(c.takeState(), now)
@@ -2988,7 +3011,7 @@ export class Ops {
       const g = this.gate(new Request(req.url, { method: "GET", headers: hs }), "/api/logs")
       if (g.kind === "deny") return g.res
       try {
-        return json(200, JSON.stringify({ ticket: try this.wsTickets.issue(g.actor, now) }))
+        return json(200, JSON.stringify({ ticket: try this.wsTickets.issue(g.actor, now, g.role) }))
       } catch (e) {
         return json(500, errorJson("failed to issue WebSocket ticket", "api_error", undefined))
       }
@@ -4519,7 +4542,7 @@ export class Ops {
 
   // The ErrorInfo of a refused grant for an operation (a2a.tov unauthorizedInfo), also sent by the gRPC binding.
   grantInfo(agent: string, op: string, h: Hdrs, taskId: string): string {
-    return unauthorizedInfo(agent, requestTypeOf(op), h.get("x-request-id") ?? newId("req_"), taskId, errorStamp())
+    return unauthorizedInfo(agent, requestTypeOf(op), requestIdOf(h.get("x-request-id")), taskId, errorStamp())
   }
 
   // The agent a call names, as this worker serves it. A worker that does not hold the agent's card yet first reads the
@@ -4869,7 +4892,9 @@ export class Ops {
     const keepContent = !this.engine.contentOff(h)
     const rawOn = this.rawOn()
     // the id the call's row and its stream's event rows share, and the call's attribution
-    const reqId = (h.get("x-request-id") ?? "").trim() !== "" ? (h.get("x-request-id") ?? "").trim() : newId("a2a-req-")
+    // the caller's id only when it is a plain token (callerRequestId): it names log rows
+    const givenId = callerRequestId((h.get("x-request-id") ?? "").trim())
+    const reqId = givenId !== "" ? givenId : newId("a2a-req-")
     const at = this.engine.gov.attributionOf(h)
     let params = call.params
     let context = contextOfParams(params)
@@ -5716,16 +5741,17 @@ export class Ops {
     let v = verifyIdToken(idToken, jw.body, oc, d.issuer, flow.nonce, Date.now())
     if (v.kind === "error") {
       signInGuard().fail(ipKeys, now)
-      return html(401, `<p>Sign-in failed: ${v.message.replace("<", "&lt;")}</p>`, clear)
+      return html(401, `<p>Sign-in failed: ${htmlEsc(v.message)}</p>`, clear)
     }
     // Keycloak puts its roles in the access token: its claims are the ones the mappings read
     if (oc.claims_token === "access_token") {
       const at = accessTokenClaims(accessToken, jw.body, oc, d.issuer, Date.now())
-      if (at.kind === "error") return html(401, `<p>Sign-in failed: ${at.message.replace("<", "&lt;")}</p>`, clear)
-      v = { kind: "ok", sub: v.sub, email: v.email, role: v.role, claims: at.claims }
+      if (at.kind === "error") return html(401, `<p>Sign-in failed: ${htmlEsc(at.message)}</p>`, clear)
+      v = { kind: "ok", sub: v.sub, email: v.email, unverified_email: v.unverified_email, role: v.role, claims: at.claims }
     }
     // a user governance lists as disabled (a SCIM deactivation, say) signs in no more; users it does not list are unchanged
-    if (disabledNamed(this.rbac, ssoNames(v.sub, v.email))) {
+    // (an email the provider marked unverified names no user, but still does not get a disabled one's sign-in)
+    if (disabledNamed(this.rbac, ssoNames(v.sub, v.email ?? v.unverified_email))) {
       this.recordChange("sso:" + v.sub, req, path, 403, "")
       return html(403, "<p>This account is disabled. Ask an administrator to enable it.</p>", clear)
     }
@@ -5733,7 +5759,7 @@ export class Ops {
     const synced = await this.syncSignInLocked(v.sub, v.email, v.claims)
     if (synced.kind === "refuse") {
       this.recordChange("sso:" + v.sub, req, path, 403, "")
-      return html(403, `<p>Sign-in refused: ${synced.reason.replace("<", "&lt;")}</p>`, clear)
+      return html(403, `<p>Sign-in refused: ${htmlEsc(synced.reason)}</p>`, clear)
     }
     const role = synced.kind === "role" ? synced.role : v.role
     let token = ""
@@ -5744,7 +5770,7 @@ export class Ops {
       return html(503, "<p>Could not create a session; try again.</p>", clear)
     }
     // The token is scoped to this regional origin, just as the native UI's bearer-token storage is.
-    return html(200, `<!doctype html><meta charset="utf-8"><title>Signed in</title><script>sessionStorage.removeItem("raiju.adminToken"); sessionStorage.setItem("raiju.adminToken:"+location.origin, ${JSON.stringify(token)}); location.replace(${JSON.stringify(backTo)});</script><p>Signed in as ${(v.email ?? v.sub).replace("<", "&lt;")}.</p>`, clear)
+    return html(200, `<!doctype html><meta charset="utf-8"><title>Signed in</title><script>sessionStorage.removeItem("raiju.adminToken"); sessionStorage.setItem("raiju.adminToken:"+location.origin, ${scriptJson(token)}); location.replace(${scriptJson(backTo)});</script><p>Signed in as ${htmlEsc(v.email ?? v.sub)}.</p>`, clear)
   }
 
   // ---- session refresh and sweep ----
@@ -5877,7 +5903,7 @@ export class Ops {
         }
       }
       try {
-        this.sessions.endUser(gone)
+        this.endUsers(gone)
       } catch (e) {
         return `the removed users' sessions could not be ended: ${e.message}`
       }
@@ -6285,7 +6311,8 @@ export class Ops {
   }
 
   // For one resource, the role's entity_dac entry overrides the role's dac.
-  scopeOfActorFor(actor: string, resource: string): DataScope {
+  // role: the gate's verified role of a sign-in or proxy identity, where the caller has it.
+  scopeOfActorFor(actor: string, resource: string, role?: string): DataScope {
     if (actor === "loginless" && this.loginlessAdministration()) return allScope()
     const name = actor.startsWith("proxy:") ? actor.slice(6) : actor.startsWith("sso:") ? this.ssoUser(actor.slice(4), undefined) : actor
     const gov = this.store.cfg.governance
@@ -6306,14 +6333,25 @@ export class Ops {
       s.user = u.name
       return s
     }
+    // a sign-in or proxy identity that holds a custom role and has no user record has no memberships to scope by:
+    // short of all-data it sees nothing, not everything
+    if ((actor.startsWith("sso:") || actor.startsWith("proxy:")) && role !== undefined && !isBuiltinRole(role)) {
+      const r = customRole(gov?.roles, role)
+      let dac = r?.dac ?? "all-data"
+      for (const e of r?.entity_dac ?? []) {
+        if (e.resource === resource) dac = e.dac
+      }
+      if (r === undefined || dac !== "all-data") return noScope()
+    }
     return allScope()
   }
 
   // check() with the data scope of the caller, for the routes that read scoped data.
+  // The scope is the one of the route's resource (a role's entity_dac entry for it counts).
   checkScope(req: Request, path: string): { res: Response | undefined, scope: DataScope } {
     const g = this.gate(req, path)
     if (g.kind === "deny") return { res: g.res, scope: noScope() }
-    return { res: undefined, scope: this.scopeOfActor(g.actor) }
+    return { res: undefined, scope: this.scopeOfActorFor(g.actor, resourceOf(req.method, path).resource, g.role) }
   }
 
   // A successful management write emits a /ws event identifying the changed resource with store_update tags
@@ -6323,6 +6361,14 @@ export class Ops {
     const seg = path.split("/")[2] ?? ""
     const it: FeedItem = { node: this.feedProducer(), seq: this.ui.nextSeq(), ts: Date.now(), team: "", bu: "", customer: "", project: "", data: JSON.stringify({ id: newId("su_"), tags: [seg] }), kind: "store_update" }
     this.ui.ingest(it, "local")
+  }
+
+  // Ends everything users signed in with: their dashboard sessions and their CLI agent tokens (names: each user's
+  // name and email). For users removed or deactivated, whose credentials must not outlive the record.
+  endUsers(names: string[]): void throws Error {
+    if (names.length === 0) return
+    try this.sessions.endUser(names)
+    try agentSignIn().revokeUsers(names)
   }
 
   // The single sign-on session a token names, or undefined when there is none or its user is now disabled in
@@ -6555,6 +6601,8 @@ export class Ops {
       return { kind: "deny", res: denied(401, c.message) }
     }
     let role: Role | undefined = undefined
+    // the stored user's own name where there is one, so its data scope is found whatever case the proxy sent
+    let who = c.identity
     if ((pc.mode ?? "login_only") === "full") {
       // the SSO login's role mapping: role_claim, role_map and default_role of the provider
       const oc = this.proxyRoles
@@ -6577,6 +6625,7 @@ export class Ops {
         return { kind: "deny", res: denied(403, `${c.identity} is not provisioned`) }
       }
       role = u.role
+      who = u.name
     }
     if (role === undefined) return { kind: "deny", res: denied(403, "the mapped role is not known") }
     const perm = required(req.method, path)
@@ -6584,7 +6633,7 @@ export class Ops {
       this.recordChange("proxy:" + c.identity, req, path, 403, "")
       return { kind: "deny", res: denied(403, `role ${role} may not ${perm} this route`) }
     }
-    return { kind: "ok", actor: "proxy:" + c.identity, role: role }
+    return { kind: "ok", actor: "proxy:" + who, role: role }
   }
 
   // The gate for read-only routes: undefined when allowed.
@@ -6934,6 +6983,31 @@ export class Ops {
     return { all: true, pairs: [] }
   }
 
+  // What the actor may hand out through the users and roles routes, and whether it may change auth_config: all for
+  // a built-in admin (a stored or signed-in one, the legacy admin credential, the setup token and the open modes),
+  // else the pairs of the actor's role or key. role is the gate's verified role of a sign-in or proxy identity.
+  grantOf(actor: string, role?: string): Held {
+    if (actor.startsWith("key:") || actor === "temp-token") return this.heldOf(actor)
+    const gov = this.store.cfg.governance
+    let r: string | undefined = undefined
+    if (actor.startsWith("sso:") || actor.startsWith("proxy:")) r = role ?? ""
+    else {
+      for (const u of gov?.users ?? []) {
+        if (u.name === actor) r = u.role
+      }
+    }
+    if (r === undefined || r === "admin") return { all: true, pairs: [] }
+    return { all: false, pairs: rolePairs(gov?.roles ?? [], r, RESOURCES, OPERATIONS) }
+  }
+
+  // Whether a holder of these grants may give a user this role, or change a user who has it (rbac.tov MayAssign).
+  mayAssign(grant: Held, role: string): bool {
+    if (grant.all) return true
+    // the admin role is every permission of the catalog, whatever an edit of its entry lists
+    const pairs = role === "admin" ? builtinPairs("admin", RESOURCES, OPERATIONS) : rolePairs(this.store.cfg.governance?.roles ?? [], role, RESOURCES, OPERATIONS)
+    return pairs.every((p) => holds(grant, p))
+  }
+
   // /api/api-keys and /api/api-keys/{id} (apikeys.tov). A change is saved to the config; this worker's
   // copy of the keys is updated at once, so the next request with a new key already authenticates.
   apiKeysRoute(method: string, path: string, url: string, body: string, actor: string): Reply {
@@ -7044,7 +7118,8 @@ export class Ops {
   }
 
   // setupToken is the X-Raiju-Setup-Token header; setupSession is the cookie from POST /api/session/setup.
-  users(method: string, path: string, body: string, setupToken: string, setupSession: string): Reply {
+  // grant is what the caller may hand out (grantOf); without one nothing bounds the roles it assigns.
+  users(method: string, path: string, body: string, setupToken: string, setupSession: string, grant?: Held): Reply {
     // While no admin exists, creating the first account requires the operator's setup_token in the header
     // or a setup session from POST /api/session/setup.
     const want = this.setupToken()
@@ -7060,10 +7135,33 @@ export class Ops {
     }
     // only stored users are managed here; legacy auth_config credentials stay in the config
     const stored: UserConfig[] = this.store.cfg.governance?.users ?? []
-    const r = handleUsers({ users: stored, roles: this.store.cfg.governance?.roles ?? [] }, method, path, body)
+    const g = grant
+    const may = g === undefined || g.all ? undefined : (role: string): bool => this.mayAssign(g, role)
+    const r = handleUsers({ users: stored, roles: this.store.cfg.governance?.roles ?? [] }, method, path, body, may)
     if (method !== "GET" && r.status < 300) {
+      // a deleted user is signed out everywhere: its dashboard sessions and its CLI agent tokens end with it.
+      // They end first, so a failure leaves the user in place and the delete can be sent again.
+      const gone: string[] = []
+      if (method === "DELETE") {
+        for (const u of stored) {
+          if (r.cfg.users.some((x) => x.name === u.name)) continue
+          gone.push(u.name)
+          if (u.email !== undefined) gone.push(u.email)
+        }
+        try {
+          this.endUsers(gone)
+        } catch (e) {
+          return { status: 503, body: errorJson(`the user's sessions could not be ended, so it was not deleted: ${e.message}`, "api_error", undefined), contentType: "application/json" }
+        }
+      }
       const saved = this.store.setUsers(r.cfg.users)
       if (saved.kind === "error") return { status: saved.status, body: errorJson(saved.message, "api_error", undefined), contentType: "application/json" }
+      // once more for a sign-in that landed between the two (another worker's)
+      try {
+        this.endUsers(gone)
+      } catch (e) {
+        console.error(`raiju: a deleted user's sessions could not be re-checked: ${e.message}`)
+      }
     }
     return { status: r.status, body: r.body, contentType: "application/json" }
   }
@@ -7901,6 +7999,10 @@ test("a sign-in returns only to the gateway's own consent pages", () => {
   expect(returnPath("https://evil.example/oauth/consent?flow=abc")).toBe("")
   expect(returnPath("//evil.example/oauth/consent?x")).toBe("")
   expect(returnPath("/oauth/consent?flow=abc#t=x")).toBe("")
+  expect(returnPath("/oauth/consent?flow=</script><script>x")).toBe("")
+  expect(returnPath("/oauth/consent?flow=a\"b")).toBe("")
+  expect(returnPath("/oauth/consent?flow=a'b")).toBe("")
+  expect(returnPath("/oauth/consent?flow=a\r\nb")).toBe("")
   expect(returnPath("/api/config")).toBe("")
   expect(returnPath("")).toBe("")
 })
@@ -8238,4 +8340,77 @@ test("provisioned OIDC sessions use current native role and scope and revoke on 
   if (gate.kind === "ok") expect(ops.scopeOfActor(gate.actor).projects).toEqual(["p-eu"])
   ops.rbac.users[0]!.disabled = true
   expect(ops.liveSession(token)).toBeUndefined()
+})
+
+test("a deleted user's sessions and agent tokens end with it", () => {
+  const ops = try lockFor({ governance: { users: [
+    { name: "root", role: "admin", token_sha256: "x" },
+    { name: "bob", email: "bob@example.com", role: "viewer", token_sha256: "y" },
+  ] } })
+  const now = Date.now()
+  const local = try ops.sessions.create("bob", "viewer", now)
+  const sso = try ops.sessions.create("idp-sub-7", "viewer", now, "Bob@Example.com")
+  const other = try ops.sessions.create("root", "admin", now)
+  const si = agentSignIn()
+  const redirect = "http://127.0.0.1:5/callback"
+  const verifier = "v".repeat(50)
+  const ex = try si.exchange(try si.issueCode({ user: "bob", role: "viewer", email: "bob@example.com" }, s256(verifier), redirect, now), verifier, redirect, now)
+  if (ex.kind !== "ok") throw new Error("exchange failed")
+  const hs: Map<string, string> = new Map()
+  hs.set("authorization", "Bearer " + ex.issued.access)
+  expect(ops.agentUserOf(hs)?.user).toBe("bob")
+  expect(ops.users("DELETE", "/api/users/bob", "", "", "").status).toBe(200)
+  expect(ops.liveSession(local)).toBeUndefined()
+  expect(ops.liveSession(sso)).toBeUndefined()
+  expect(ops.liveSession(other)?.sub).toBe("root")
+  expect(ops.agentUserOf(hs)).toBeUndefined()
+  expect((try si.rotate(ex.issued.refresh, now)).kind).toBe("error")
+})
+
+test("delegated Users permissions stop at the delegate's own: no admin is made or changed", () => {
+  const ops = try lockFor({ governance: {
+    users: [
+      { name: "root", role: "admin", token_sha256: "x" },
+      { name: "del", role: "user-admin", token_sha256: "y" },
+    ],
+    roles: [
+      { name: "user-admin", permissions: [{ resource: "Users", operation: "View" }, { resource: "Users", operation: "Create" }, { resource: "Users", operation: "Update" }, { resource: "Users", operation: "Delete" }] },
+      { name: "user-reader", permissions: [{ resource: "Users", operation: "View" }] },
+    ],
+  } })
+  const del = ops.grantOf("del")
+  expect(del.all).toBe(false)
+  expect(ops.grantOf("root").all).toBe(true)
+  expect(ops.grantOf("setup-token").all).toBe(true)
+  expect(ops.grantOf("sso:someone", "admin").all).toBe(true)
+  expect(ops.grantOf("sso:someone", "viewer").all).toBe(false)
+  expect(ops.grantOf("proxy:someone").all).toBe(false)
+  expect(ops.mayAssign(del, "user-reader")).toBe(true)
+  expect(ops.mayAssign(del, "user-admin")).toBe(true)
+  expect(ops.mayAssign(del, "admin")).toBe(false)
+  expect(ops.mayAssign(del, "editor")).toBe(false)
+  expect(ops.users("POST", "/api/users", `{"name":"eve","role":"admin"}`, "", "", del).status).toBe(403)
+  expect(ops.users("PUT", "/api/users/del", `{"role":"admin"}`, "", "", del).status).toBe(403)
+  expect(ops.users("PUT", "/api/users/root", `{"email":"eve@example.com"}`, "", "", del).status).toBe(403)
+  expect(ops.users("DELETE", "/api/users/root", "", "", "", del).status).toBe(403)
+  expect(ops.users("POST", "/api/users", `{"name":"ray","role":"user-reader"}`, "", "", del).status).toBe(201)
+  expect(ops.users("POST", "/api/users", `{"name":"amy","role":"admin"}`, "", "", ops.grantOf("root")).status).toBe(201)
+})
+
+test("a sign-in or proxy identity with a scoped custom role and no user record sees no data, not all of it", () => {
+  const ops = try lockFor({ governance: {
+    users: [{ name: "root", role: "admin", token_sha256: "x" }],
+    roles: [
+      { name: "regional", dac: "own-data", permissions: [{ resource: "Logs", operation: "View" }] },
+      { name: "wide", dac: "own-data", entity_dac: [{ resource: "Logs", dac: "all-data" }], permissions: [{ resource: "Logs", operation: "View" }] },
+    ],
+  } })
+  expect(ops.scopeOfActorFor("sso:stranger", "Logs", "regional").all).toBe(false)
+  expect(ops.scopeOfActorFor("proxy:Stranger@Example.com", "Logs", "regional").all).toBe(false)
+  expect(ops.scopeOfActorFor("sso:stranger", "Logs", "gone-role").all).toBe(false)
+  // the role's own entry for the resource still counts, and built-in roles are as they were
+  expect(ops.scopeOfActorFor("sso:stranger", "Logs", "wide").all).toBe(true)
+  expect(ops.scopeOfActorFor("sso:stranger", "Teams", "wide").all).toBe(false)
+  expect(ops.scopeOfActorFor("sso:stranger", "Logs", "viewer").all).toBe(true)
+  expect(ops.scopeOfActorFor("root", "Logs").all).toBe(true)
 })

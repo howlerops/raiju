@@ -1,6 +1,6 @@
 # Deploying Raiju
 
-Raiju is one binary. The image runs it as non-root on a slim Debian base (bookworm-slim with
+Raiju is one binary. The image runs it as non-root on an Ubuntu 24.04 LTS base (noble with
 JavaScriptCore, which the binary links). It takes a Raiju-format `config.json` from `/app/data`
 (its `-app-dir`), and provider keys come from environment variables that the config refers to as
 `env.NAME`. Terraform modules (Helm release, AWS ECS Fargate) are in
@@ -211,7 +211,7 @@ task role is the identity; give it the Bedrock permissions the keys need.
 
 ## Docker
 
-The image's bases are pinned by tag and digest (`ARG DEBIAN` in the Dockerfile), and rustup-init
+The image's bases are pinned by tag and digest (`ARG BASE` in the Dockerfile), and rustup-init
 is checked against its published sha256.
 
 ```sh
@@ -309,6 +309,7 @@ Useful values (see `values.yaml`):
 | `cluster.secret.existingSecret`, `cluster.secret.key` | The Secret holding `cluster.secret` (at least 32 bytes), injected as `RAIJU_CLUSTER_SECRET`; `config.cluster.secret` defaults to `env.RAIJU_CLUSTER_SECRET`. Required with `config.cluster.enabled`, and the chart refuses a secret written into the config. |
 | `cluster.listenPort` | The cluster listener (`config.cluster.listen_port`, 7946): the peer routes are served there and refused on the main port; the peers Service targets it. `0` keeps them on the main port. |
 | `cluster.serveMetrics` | Serve `/metrics` on the cluster port only; the annotations and the ServiceMonitor follow. |
+| `networkPolicy.enabled`, `networkPolicy.ingressFrom` | Off by default. On: a NetworkPolicy for the pods. The HTTP port accepts the peers in `ingressFrom` (every source when empty) and the cluster listener accepts this release's pods only. Needs a network plugin that enforces policies; include the ingress controller and the metrics scraper in `ingressFrom`. |
 | `metricsToken.existingSecret`, `metricsToken.key` | A bearer token for `/metrics` (`config.server.metrics_token`), injected as `RAIJU_METRICS_TOKEN`; the ServiceMonitor sends it. Off: `/metrics` is open. |
 | `service.type`, `service.port` | Service. The pod port is `port`. |
 | `prometheus.annotations` | `prometheus.io/*` annotations on pod and Service (on by default). |
@@ -503,7 +504,7 @@ over a real network, memory at 512Mi under real traffic) is checked by the stagi
 
 - The image builds Tov from source (the installer needs network access and takes several minutes).
   The binary is dynamically linked against glibc, libstdc++ and WebKitGTK's JavaScriptCore (Tov
-  links it for `node:*` modules), so the runtime is `debian:bookworm-slim` with
+  links it for `node:*` modules), so the runtime is `ubuntu:noble` with
   `libjavascriptcoregtk-4.1-0`, not distroless, and carries JavaScriptCore's GLib and ICU
   libraries. CI builds it on every pull request and push to main, boots it as the chart runs it
   (`tests/image_smoke.py`) and scans it with trivy.

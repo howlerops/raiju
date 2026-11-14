@@ -194,7 +194,28 @@ about 5 s to send what is queued). */}}
 {{- fail "config.cluster.secret must be an env.NAME reference: the config is a ConfigMap; keep the value in a Secret (cluster.secret.existingSecret)" }}
 {{- end }}
 {{- end }}
+{{- /* The config is rendered into a ConfigMap and kept in the release history: a secret in it must be a reference
+     (env.NAME, vault.…, aws-sm.…), never the value. */ -}}
+{{- $provs := get .Values.config "providers" }}
+{{- if kindIs "map" $provs }}
+{{- range $pname, $prov := $provs }}
+{{- if and (kindIs "map" $prov) (kindIs "slice" (get $prov "keys")) }}
+{{- range $key := get $prov "keys" }}
+{{- if kindIs "map" $key }}
+{{- $val := toString (default "" (get $key "value")) }}
+{{- if and (ne $val "") (not (or (hasPrefix "env." $val) (hasPrefix "vault." $val) (hasPrefix "aws-sm." $val))) }}
+{{- fail (printf "config.providers.%s: a key's value must be a reference (env.NAME, vault. or aws-sm.), not the key itself: the config is a ConfigMap; put the key in providerSecrets or existingSecret" $pname) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- $server := default dict (get .Values.config "server") }}
+{{- $mtok := toString (default "" (get $server "metrics_token")) }}
+{{- if and (ne $mtok "") (not (or (hasPrefix "env." $mtok) (hasPrefix "vault." $mtok) (hasPrefix "aws-sm." $mtok))) }}
+{{- fail "config.server.metrics_token must be a reference (env.NAME): the config is a ConfigMap; keep the token in a Secret (metricsToken.existingSecret)" }}
+{{- end }}
 {{- $grace := 25.0 }}
 {{- if hasKey $server "shutdown_grace_seconds" }}{{ $grace = float64 (get $server "shutdown_grace_seconds") }}{{ end }}
 {{- $delay := 0.0 }}

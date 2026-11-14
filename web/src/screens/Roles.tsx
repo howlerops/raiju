@@ -96,7 +96,9 @@ function RoleForm(props: { role: Role | undefined; data: Data; onClose: () => vo
   const held = new Set((role?.permissions ?? []).map((p) => p.resource + "|" + p.operation))
   const wasAttached = new Set(role ? attached(props.data, role).map((p) => p.id) : [])
   const editable = () => (role ? can("RBAC", "Update") : can("RBAC", "Create"))
-  const canProfiles = () => editable() && props.data.profiles !== undefined && can("AccessProfiles", "Update")
+  // Attaching a profile is a POST (Create) and detaching a DELETE (Delete) on AccessProfiles.
+  const canAttach = () => editable() && props.data.profiles !== undefined && can("AccessProfiles", "Create")
+  const canDetach = () => editable() && props.data.profiles !== undefined && can("AccessProfiles", "Delete")
   let form: HTMLFormElement | undefined
 
   const rowBoxes = (res: string) => [...(form?.querySelectorAll<HTMLInputElement>('input[name="perm"]') ?? [])].filter((b) => b.value.startsWith(res + "|"))
@@ -130,14 +132,14 @@ function RoleForm(props: { role: Role | undefined; data: Data; onClose: () => vo
         const made = (await send("POST", "/api/roles", { body })).data as Role
         id = made.id
       }
-      if (canProfiles() && id !== undefined) {
+      if ((canAttach() || canDetach()) && id !== undefined) {
         const want = new Set([...f.querySelectorAll<HTMLInputElement>('input[name="profile"]:checked')].map((b) => b.value))
         try {
           for (const pid of want) {
-            if (!wasAttached.has(pid)) await send("POST", "/api/governance/access-profiles/" + encodeURIComponent(pid) + "/roles", { body: { role_ids: [id], is_default: true, apply_to_existing: true } })
+            if (canAttach() && !wasAttached.has(pid)) await send("POST", "/api/governance/access-profiles/" + encodeURIComponent(pid) + "/roles", { body: { role_ids: [id], is_default: true, apply_to_existing: true } })
           }
           for (const pid of wasAttached) {
-            if (!want.has(pid)) await send("DELETE", "/api/governance/access-profiles/" + encodeURIComponent(pid) + "/roles/" + id)
+            if (canDetach() && !want.has(pid)) await send("DELETE", "/api/governance/access-profiles/" + encodeURIComponent(pid) + "/roles/" + id)
           }
         } catch (e) {
           // the role itself is saved; say what the profiles did
@@ -221,7 +223,7 @@ function RoleForm(props: { role: Role | undefined; data: Data; onClose: () => vo
             <For each={props.data.profiles}>
               {(p) => (
                 <label class="check">
-                  <input class="checkbox checkbox-sm" type="checkbox" name="profile" value={p.id} disabled={!canProfiles()} ref={initChecked(wasAttached.has(p.id))} />
+                  <input class="checkbox checkbox-sm" type="checkbox" name="profile" value={p.id} disabled={!(wasAttached.has(p.id) ? canDetach() : canAttach())} ref={initChecked(wasAttached.has(p.id))} />
                   {label(p)}
                 </label>
               )}

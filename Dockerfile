@@ -1,17 +1,19 @@
 # syntax=docker/dockerfile:1
 
-# Both stages use the same Debian bookworm image, pinned by date tag and digest (the multi-arch index) so a
+# Both stages use the same Ubuntu 24.04 LTS (noble) image, pinned by date tag and digest (the multi-arch index) so a
 # rebuild gets the same base. To move to a newer one, take the tag and its digest from
-# `docker buildx imagetools inspect debian:bookworm-<date>-slim` and change both FROM lines.
-ARG DEBIAN=debian:bookworm-20261005-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
+# `docker buildx imagetools inspect ubuntu:noble-<date>` and change ARG BASE.
+# Ubuntu rather than Debian bookworm: Ubuntu ships fixes for the glibc and util-linux CVEs that bookworm leaves unfixed
+# (CVE-2026-84243, CVE-2026-53613, CVE-2026-53615), and noble is the release CI builds the compiler on.
+ARG BASE=ubuntu:noble-20261024.1@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
 
 # Build stage. Tov is built from source with the patches in tov-patches/ (applied in name order by
 # scripts/build-tov.sh: streamed bodies, child sockets, ALPN, UDP, WAMR, libdatachannel, the fetch pool with
 # nghttp2, request body streams, node:fs rename and fsync, a WASM time limit, the server lifecycle), so it needs
 # Rust and a C and C++ compiler: the vendored BoringSSL, WAMR, libdatachannel and nghttp2 compile on first use.
 # The gateway imports node:* modules, which Tov links through WebKitGTK's JavaScriptCore (pkg-config
-# javascriptcoregtk-4.1). Debian bookworm matches the glibc and libraries of the runtime image below.
-FROM ${DEBIAN} AS build
+# javascriptcoregtk-4.1). The same base as the runtime image below, so glibc and the libraries match.
+FROM ${BASE} AS build
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
@@ -38,23 +40,32 @@ RUN set -eu; \
     rm /tmp/rustup-init
 
 WORKDIR /src
-COPY . .
+# The compiler first, from its only inputs (the patches and the build script), so a change under src/ reuses this
+# layer instead of recompiling Tov.
+COPY tov-patches/ tov-patches/
+COPY scripts/build-tov.sh scripts/build-tov.sh
+RUN scripts/build-tov.sh
+COPY src/ src/
 # /out/app/data is the -app-dir: config.json is mounted (or provided) there.
-RUN scripts/build-tov.sh \
- && mkdir -p /out/app/data \
+RUN mkdir -p /out/app/data \
  && TOV_CFLAGS=-DTV_PLAIN_ALLOC build/tov/target/release/tov build src/main.tov -o /out/raiju
 
 # Runtime. The binary links glibc, libstdc++ and libatomic (for the vendored C++ libraries) and JavaScriptCore with
-# its GLib and ICU libraries; check with `ldd`. distroless/cc has no JavaScriptCore, so this is bookworm-slim with
+# its GLib and ICU libraries; check with `ldd`. distroless/cc has no JavaScriptCore, so this is Ubuntu noble with
 # that library and CA certificates for HTTPS upstreams.
-FROM ${DEBIAN}
+FROM ${BASE}
 
 ENV DEBIAN_FRONTEND=noninteractive
-# the upgrade takes the Debian security fixes released since the pinned base (openssl, perl-base, ...), so the image
-# scan stays clean between base bumps
+# The upgrade takes the Ubuntu security fixes released since the pinned base (glibc, util-linux, openssl, ...), so the
+# image scan stays clean between base bumps. The gateway never mounts anything, so the `mount` package (setuid
+# mount/umount, the restricted-mount path of CVE-2026-78410, unfixed upstream) is removed; libmount1 stays for GLib.
+# Nothing in the image needs to change user, so the setuid and setgid bits of what remains (su, passwd, ...) are cleared:
+# the gateway runs as 65532 and has no use for a path to root, also where no-new-privileges is not set.
 RUN apt-get update \
  && apt-get upgrade -y --no-install-recommends \
  && apt-get install -y --no-install-recommends ca-certificates libjavascriptcoregtk-4.1-0 \
+ && apt-get purge -y --allow-remove-essential mount \
+ && find / -xdev -type f -perm /6000 -exec chmod a-s {} + \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build --chown=65532:65532 /out/app /app

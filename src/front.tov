@@ -22,16 +22,11 @@ import { CLIENT_IP_HEADER } from "./clientip"
 // timeouts: the servers' header, idle and body timeouts and connection cap (lifecycle.tov).
 export type FrontOptions = { hostname: string, port: int, maxBodyBytes: int, streamThreshold?: int, limitBytes?: int, limits?: () => { limit: int, threshold: int }, timeouts?: ServerLimits }
 
-function pathOf(target: string): string {
-  const q = target.indexOf("?")
-  return q < 0 ? target : target.slice(0, q)
-}
-
 // The streamed route kind of a request this front end streams, or "". Bedrock's event streams
 // are binary, which this front end can't write yet, so those answer whole.
-function streamingKind(req: Http1Request, body: string): string {
-  if (req.method !== "POST") return ""
-  const kind = streamKind(compatPath(pathOf(req.path)))
+function streamingKind(method: string, path: string, body: string): string {
+  if (method !== "POST") return ""
+  const kind = streamKind(compatPath(path))
   if (kind === "bedrock") return ""
   return streamsRequest(kind, body) ? kind : ""
 }
@@ -57,13 +52,25 @@ function bodyStream(q: BodyQueue): ReadableStream {
 // watch: the id of the request's client watch (clientgone.tov), "" for none; a value the client sent is dropped.
 // clientIp: the client's address (clientip.tov) for the routes that read it, "" for none; the client's own value is
 // dropped too.
+// The URL of a request: the Host it named (http1.tov lets only host[:port] through), else the listener's.
+function urlOf(req: Http1Request, host: string): string {
+  return "http://" + (req.headers.get("host") ?? host) + req.path
+}
+
+// The path the routes will see, so every decision made before routing is made on the same one: the pathname of
+// the request's URL, or undefined when the target does not make a URL.
+function routedPath(url: string): string | undefined {
+  const u = URL.parse(url)
+  return u === undefined ? undefined : u.pathname
+}
+
 function toRequest(req: Http1Request, host: string, watch: string, clientIp: string): Request {
   let h: Record<string, string> = req.headers
   h.delete(CLIENT_WATCH_HEADER)
   if (watch !== "") h.set(CLIENT_WATCH_HEADER, watch)
   h.delete(CLIENT_IP_HEADER)
   if (clientIp !== "") h.set(CLIENT_IP_HEADER, clientIp)
-  const url = "http://" + (req.headers.get("host") ?? host) + req.path
+  const url = urlOf(req, host)
   if (req.method === "GET" || req.method === "HEAD") return new Request(url, { method: req.method, headers: h })
   const q = req.stream
   if (q !== undefined) return new Request(url, { method: req.method, headers: h, body: bodyStream(q) })
@@ -111,7 +118,16 @@ async function write(res: Http1Response, r: Response, engine?: Engine, req?: Req
 }
 
 async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request, res: Http1Response, limit0: int): Promise<void> {
-  const path = pathOf(req.path)
+  // one path for the limits, the client address, the watch and the streaming check: the one the routes match
+  const routed = routedPath(urlOf(req, host))
+  if (routed === undefined) {
+    const h: Map<string, string> = new Map()
+    h.set("content-type", "application/json")
+    res.writeHead(400, h)
+    res.end(`{"error":{"message":"malformed request target","type":"invalid_request_error"}}`)
+    return
+  }
+  const path: string = routed
   // the public routes and the peer routes read smaller bodies (server.tov routeBodyLimit)
   const limit = routeBodyLimit(engine, path, limit0 > 0 ? limit0 : NO_LIMIT)
   // an inference request's client watch: its connection closing before the answer stops the upstream call
@@ -181,7 +197,7 @@ async function handle(engine: Engine, ops: Ops, host: string, req: Http1Request,
       return
     }
     request = th.request
-    const kind = streamingKind(req, tr === undefined ? bodyText : th.body)
+    const kind = streamingKind(req.method, path, tr === undefined ? bodyText : th.body)
     if (kind !== "") {
       const sink = new StreamSink(
         (status, headers) => {

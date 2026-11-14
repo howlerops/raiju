@@ -6,7 +6,7 @@
 import { readFileSync, appendFileSync, writeFileSync, existsSync, mkdirSync, rmSync, unlinkSync } from "node:fs"
 import { writeFileAtomic, appendPrivate, mkdirPrivate } from "./atomicfile"
 import { join } from "node:path"
-import { sha256, hmacSha256, toHex, utf8, secureHex } from "./crypto"
+import { sha256, hmacSha256, toHex, utf8, secureHex, safeEq, secretFieldName, secretMapName } from "./crypto"
 import { Field, fields, elements, build, quote } from "./json"
 import { isoMs } from "./exports"
 import { timeOf } from "./logapi"
@@ -437,7 +437,7 @@ export class AuditLog {
       if (e.prev !== prev) return { ok: false, checked: checked, firstBad: want, reason: "prev does not match the previous event's hash" }
       const hash = digest(e)
       if (e.hash !== hash) return { ok: false, checked: checked, firstBad: want, reason: "hash does not match the event content" }
-      if (e.sig !== sign(this.keyBytes, hash)) return { ok: false, checked: checked, firstBad: want, reason: "signature does not verify with this key" }
+      if (!safeEq(e.sig, sign(this.keyBytes, hash))) return { ok: false, checked: checked, firstBad: want, reason: "signature does not verify with this key" }
       seq = want
       prev = hash
       checked += 1
@@ -488,7 +488,7 @@ export class AuditLog {
   // constant time. computed covers the current content, so changes to fields are detectable.
   verifyOne(e: AuditEvent): { valid: bool, computed: string, stored: string } {
     const computed = sign(this.keyBytes, digest(e))
-    return { valid: sameText(computed, e.sig), computed: computed, stored: e.sig }
+    return { valid: safeEq(computed, e.sig), computed: computed, stored: e.sig }
   }
 
   // The event with this id (its sequence number), from memory.
@@ -734,16 +734,6 @@ function addUnique(inout xs: string[], v: string): void {
   if (v !== "" && !xs.includes(v)) xs.push(v)
 }
 
-// Equal strings, compared without stopping at the first difference.
-function sameText(a: string, b: string): bool {
-  const x = utf8(a)
-  const y = utf8(b)
-  let diff = x.length === y.length ? 0 : 1
-  const n = Math.min(x.length, y.length)
-  for (let i = 0; i < n; i++) diff = diff | (int(x[i]!) ^ int(y[i]!))
-  return diff === 0
-}
-
 // The singular object name of a governance collection, or undefined.
 function singular(collection: string): string | undefined {
   if (collection === "virtual-keys") return "virtual_key"
@@ -872,17 +862,18 @@ export function maskDetail(body: string): string {
   const t = body.trim()
   if (!t.startsWith("{") && !t.startsWith("[")) return ""
   try {
-    return maskRaw(t)
+    return maskRaw(t, false)
   } catch (err) {
     return ""
   }
 }
 
-function maskRaw(raw: string): string throws SyntaxError {
+// all: inside a map whose every value is secret (headers, env).
+function maskRaw(raw: string, all: bool): string throws SyntaxError {
   if (raw.startsWith("[")) {
     const parts: string[] = []
     for (const el of try elements(raw)) {
-      const masked = try maskRaw(el)
+      const masked = try maskRaw(el, all)
       parts.push(masked)
     }
     return "[" + parts.join(",") + "]"
@@ -890,16 +881,19 @@ function maskRaw(raw: string): string throws SyntaxError {
   if (raw.startsWith("{")) {
     const out: Field[] = []
     for (const f of try fields(raw)) {
-      const isSecret = SECRET_FIELDS.includes(f.key.toLowerCase()) && f.raw !== "null"
+      // the names this log always masked whatever the value's type, and every name the config view treats as secret
+      // (client_secret, private_key, api_key, signing_key, ...) when its value is a string
+      const isSecret = f.raw !== "null" && (SECRET_FIELDS.includes(f.key.toLowerCase()) || (secretFieldName(f.key) && f.raw.startsWith("\"")))
       if (isSecret) {
         out.push({ key: f.key, raw: quote("****") })
       } else {
-        const masked = try maskRaw(f.raw)
+        const masked = try maskRaw(f.raw, all || secretMapName(f.key))
         out.push({ key: f.key, raw: masked })
       }
     }
     return build(out)
   }
+  if (all && raw.startsWith("\"")) return quote("****")
   return raw
 }
 
@@ -1116,6 +1110,13 @@ test("maskDetail masks secret fields at any depth and keeps the rest", () => {
   expect(maskDetail(body)).toBe(want)
   expect(maskDetail("{\"name\":\"gpt\"}")).toBe("{\"name\":\"gpt\"}")
   expect(maskDetail("[{\"session_token\":\"s\"}]")).toBe("[{\"session_token\":\"****\"}]")
+  // every secret the config view masks is masked here too, and whole header and env maps
+  const wide = maskDetail(`{"auth_config":{"admin_password":"pw"},"azure_key_config":{"client_secret":"cs","tenant_id":"t"},"oauth_key_config":{"private_key":"pk","token_url":"https://t/token"},"headers":{"X-Api":"hv"},"stdio_config":{"env":{"A":"ev"}},"api_key":"ak","refresh_token":"rt","signing_key":"sk","tls":{"client_key_pem":"kp"},"encryption_key":"ek","max_tokens":5,"name":"n"}`)
+  for (const secret of ["\"pw\"", "\"cs\"", "\"pk\"", "\"hv\"", "\"ev\"", "\"ak\"", "\"rt\"", "\"sk\"", "\"kp\"", "\"ek\""]) expect(wide.includes(secret)).toBe(false)
+  expect(wide.includes(`"tenant_id":"t"`)).toBe(true)
+  expect(wide.includes(`"token_url":"https://t/token"`)).toBe(true)
+  expect(wide.includes(`"max_tokens":5`)).toBe(true)
+  expect(wide.includes(`"name":"n"`)).toBe(true)
   expect(maskDetail("not json")).toBe("")
   expect(maskDetail("{\"value\":")).toBe("")
 })
@@ -1259,9 +1260,9 @@ test("one event's signature verifies; an edited field does not", () => {
     expect(log.find(1)).toBeUndefined()
     expect((try log.findAny(1))?.actor ?? "").toBe("alice")
     expect(try log.findAny(9)).toBeUndefined()
-    expect(sameText("abc", "abc")).toBe(true)
-    expect(sameText("abc", "abd")).toBe(false)
-    expect(sameText("abc", "ab")).toBe(false)
+    expect(safeEq("abc", "abc")).toBe(true)
+    expect(safeEq("abc", "abd")).toBe(false)
+    expect(safeEq("abc", "ab")).toBe(false)
   } finally {
     try rmSync(dir, { recursive: true, force: true })
   }

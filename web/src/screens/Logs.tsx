@@ -21,10 +21,9 @@ interface Applied {
   to: string
   // a zoomed range from a chart (epoch ms); it wins over from and to
   zoom?: [number, number]
-  offset: number
 }
 
-const EMPTY: Applied = { provider: "", model: "", status: "", virtual_key: "", text: "", period: "", from: "", to: "", offset: 0 }
+const EMPTY: Applied = { provider: "", model: "", status: "", virtual_key: "", text: "", period: "", from: "", to: "" }
 
 function LogRow(props: { e: LogEntry }) {
   const [open, setOpen] = createSignal(false)
@@ -58,12 +57,14 @@ function LogRow(props: { e: LogEntry }) {
 
 export function Logs() {
   const [applied, setApplied] = createSignal<Applied>(EMPTY)
+  // The page is its own signal: paging refetches the rows, not the charts for the same filters.
+  const [offset, setOffset] = createSignal(0)
   const [period, setPeriod] = createSignal("")
   let form: HTMLFormElement | undefined
 
   const page = createMemo(() => {
     const a = applied()
-    const query: Record<string, string | number> = { limit: PAGE_SIZE, offset: a.offset }
+    const query: Record<string, string | number> = { limit: PAGE_SIZE, offset: offset() }
     for (const k of ["provider", "model", "status", "virtual_key", "text"] as const) if (a[k]) query[k] = a[k]
     if (a.zoom) {
       query.since = a.zoom[0]
@@ -129,12 +130,12 @@ export function Logs() {
       period: read("period"),
       from: read("from"),
       to: read("to"),
-      offset: 0,
     })
+    setOffset(0)
   }
   // Zooming a chart narrows the screen's time range (list and charts refetch); Reset puts the
   // filters back as they were before the first zoom.
-  let before: { applied: Applied; period: string; from: string; to: string } | undefined
+  let before: { applied: Applied; offset: number; period: string; from: string; to: string } | undefined
   const local = (t: number): string => {
     const d = new Date(t)
     const p = (n: number) => (n < 10 ? "0" + n : String(n))
@@ -145,12 +146,13 @@ export function Logs() {
     if (el) el.value = v
   }
   const zoomTo = (start: number, end: number) => {
-    if (!before) before = { applied: applied(), period: read("period"), from: read("from"), to: read("to") }
+    if (!before) before = { applied: applied(), offset: offset(), period: read("period"), from: read("from"), to: read("to") }
     setField("period", "custom")
     setField("from", local(start))
     setField("to", local(end))
     setPeriod("custom")
-    setApplied((a) => ({ ...a, period: "custom", zoom: [start, end], offset: 0 }))
+    setApplied((a) => ({ ...a, period: "custom", zoom: [start, end] }))
+    setOffset(0)
   }
   const resetZoom = () => {
     const b = before
@@ -161,13 +163,14 @@ export function Logs() {
     setField("to", b.to)
     setPeriod(b.period)
     setApplied({ ...b.applied, zoom: undefined })
+    setOffset(b.offset)
   }
-  const go = (delta: number) => setApplied((a) => ({ ...a, offset: Math.max(0, a.offset + delta) }))
+  const go = (delta: number) => setOffset((o) => Math.max(0, o + delta))
 
   const range = () => {
     try {
       const p = page()
-      const off = applied().offset
+      const off = offset()
       const from = p.entries.length ? off + 1 : 0
       const to = off + p.entries.length
       return p.total ? from + "–" + to + " of " + fmtInt(p.total) : "no entries"
@@ -178,7 +181,7 @@ export function Logs() {
   const hasNext = () => {
     try {
       const p = page()
-      return applied().offset + p.entries.length < p.total
+      return offset() + p.entries.length < p.total
     } catch {
       return false
     }
@@ -261,6 +264,7 @@ export function Logs() {
               setPeriod("")
               before = undefined
               setApplied(EMPTY)
+              setOffset(0)
             }}
           >
             Clear
@@ -302,7 +306,7 @@ export function Logs() {
                     when={page().entries.length}
                     fallback={
                       <tr class="placeholder">
-                        <td colspan={LOG_COLS.length}>{applied().offset ? "No more entries." : "No matching entries."}</td>
+                        <td colspan={LOG_COLS.length}>{offset() ? "No more entries." : "No matching entries."}</td>
                       </tr>
                     }
                   >
@@ -317,7 +321,7 @@ export function Logs() {
         </div>
       </div>
       <div class="pager">
-        <button type="button" id="lg-prev" class="btn btn-sm btn-ghost" disabled={applied().offset === 0} onClick={() => go(-PAGE_SIZE)}>
+        <button type="button" id="lg-prev" class="btn btn-sm btn-ghost" disabled={offset() === 0} onClick={() => go(-PAGE_SIZE)}>
           Previous
         </button>
         <button type="button" id="lg-next" class="btn btn-sm btn-ghost" disabled={!hasNext()} onClick={() => go(PAGE_SIZE)}>

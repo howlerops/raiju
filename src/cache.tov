@@ -1,4 +1,5 @@
-// Exact-match response cache ("direct" semantic-cache mode). The key combines the routed model and request body.
+// Exact-match response cache ("direct" semantic-cache mode). The key combines the routed model and request body;
+// entries are held under its cache id (cacheKey: the SHA-256 of the key, in hex), computed once per request.
 // x-raiju-cache-key scopes entries, x-raiju-cache-ttl overrides the TTL, and x-raiju-cache-no-store skips storage.
 // With shareDir set, entries are also stored as files shared by a node's workers, so one worker's cached response
 // can be a cache hit for another.
@@ -30,8 +31,9 @@ export class ResponseCache {
     }
   }
 
-  private file(key: string): string {
-    return this.shareDir + "/" + toHex(sha256(utf8(key)))
+  // The shared file of an entry is named by its cache id.
+  private file(id: string): string {
+    return this.shareDir + "/" + id
   }
 
   // A shared entry: "<expires>\t<body bytes>\t<provider>\t<model>\t<input tokens>\t<content type>\t<key name hex>\n<body>".
@@ -83,6 +85,7 @@ export class ResponseCache {
     return n
   }
 
+  // key is the entry's cache id (cacheKey).
   get(key: string): Entry | undefined {
     let e = this.entries.get(key)
     // with several workers every entry is also a shared file, and a clear on any worker removes the file:
@@ -111,7 +114,8 @@ export class ResponseCache {
     return e
   }
 
-  // name is the request's x-raiju-cache-key ("" for none), kept so the entries can be cleared by key.
+  // key is the entry's cache id (cacheKey); name is the request's x-raiju-cache-key ("" for none), kept so the
+  // entries can be cleared by key.
   set(key: string, body: string, contentType: string, ttlMs: int, origin?: CacheOrigin, name?: string): void {
     if (this.entries.size >= this.maxEntries) this.evict()
     const expires = Date.now() + ttlMs
@@ -135,9 +139,8 @@ export class ResponseCache {
   clearId(id: string): int {
     if (!isCacheId(id)) return 0
     let n = 0
-    for (const k of this.entries.keys()) {
-      if (toHex(sha256(utf8(k))) !== id) continue
-      this.entries.delete(k)
+    if (this.entries.has(id)) {
+      this.entries.delete(id)
       n += 1
     }
     if (this.shareDir !== "") {
@@ -241,8 +244,19 @@ export function parseTtl(s: string): int | undefined {
   return Math.round(n * unit)
 }
 
+// Between the parts of a key. Not "\u0000": Tov reads that literal as an empty string, which joined the parts with
+// nothing between them, so ("ab", "c") and ("a", "bc") made one key.
+const SEP = "\u001f"
+
+// The cache id of a request: the SHA-256 (hex) of its scope, model and body. It is the entry's key in memory, the
+// name of its shared file and the x-raiju-cache-id of a hit, so the body is hashed once per request.
 export function cacheKey(scope: string, model: string, body: string): string {
-  return scope + "\u0000" + model + "\u0000" + body
+  return cacheIdOf(scope + SEP + model + SEP + body)
+}
+
+// The cache id of a whole key text.
+export function cacheIdOf(key: string): string {
+  return toHex(sha256(utf8(key)))
 }
 
 // The scope with the virtual key's id added unless scope_by_virtual_key is false, so two keys
@@ -282,26 +296,26 @@ test("a shared cache directory serves entries across instances", () => {
   const b = new ResponseCache(1000, 10)
   a.share(dir)
   b.share(dir)
-  a.set("k", "{\"x\":1}", "application/json", 60000)
-  const got = b.get("k")
+  a.set(cacheIdOf("k"), "{\"x\":1}", "application/json", 60000)
+  const got = b.get(cacheIdOf("k"))
   expect(got?.body).toBe("{\"x\":1}")
   expect(got?.contentType).toBe("application/json")
-  b.set("old", "gone", "text/plain", -1000)
+  b.set(cacheIdOf("old"), "gone", "text/plain", -1000)
   expect(a.sweepShared(Date.now())).toBe(1)
-  expect(a.get("old")).toBeUndefined()
+  expect(a.get(cacheIdOf("old"))).toBeUndefined()
   // cleared by key: the memory copy and the shared file both go
-  a.set("kk", "tagged", "text/plain", 60000, undefined, "team-a")
+  a.set(cacheIdOf("kk"), "tagged", "text/plain", 60000, undefined, "team-a")
   expect(a.clearKey("team-a")).toBe(2)
-  expect(b.get("kk")).toBeUndefined()
+  expect(b.get(cacheIdOf("kk"))).toBeUndefined()
   expect(a.clearKey("team-a")).toBe(0)
   // cleared by id: the id is the hash of the key, and the shared file has that name
-  a.set("kid", "by id", "text/plain", 60000)
-  const id = toHex(sha256(utf8("kid")))
+  a.set(cacheIdOf("kid"), "by id", "text/plain", 60000)
+  const id = cacheIdOf("kid")
   expect(isCacheId(id)).toBe(true)
   // b holds a copy in memory; the clear on a removes the shared file, so b drops its copy too
-  expect(b.get("kid")?.body).toBe("by id")
+  expect(b.get(cacheIdOf("kid"))?.body).toBe("by id")
   expect(a.clearId(id)).toBe(2)
-  expect(b.get("kid")).toBeUndefined()
+  expect(b.get(cacheIdOf("kid"))).toBeUndefined()
   // an id that is not a hash is refused: it would name a file
   expect(a.clearId("../" + id)).toBe(0)
   try {
@@ -315,17 +329,17 @@ test("a cached answer keeps its origin, in memory and in a shared directory", ()
   const b = new ResponseCache(1000, 10)
   a.share(dir)
   b.share(dir)
-  a.set("k", "{}", "application/json", 60000, { provider: "openai", model: "gpt-4o", inputTokens: 12 })
-  a.set("plain", "{}", "application/json", 60000)
-  const mem = a.get("k")!
+  a.set(cacheIdOf("k"), "{}", "application/json", 60000, { provider: "openai", model: "gpt-4o", inputTokens: 12 })
+  a.set(cacheIdOf("plain"), "{}", "application/json", 60000)
+  const mem = a.get(cacheIdOf("k"))!
   expect(mem.origin!.provider).toBe("openai")
   expect(mem.origin!.model).toBe("gpt-4o")
   expect(mem.origin!.inputTokens).toBe(12)
-  const shared = b.get("k")!
+  const shared = b.get(cacheIdOf("k"))!
   expect(shared.body).toBe("{}")
   expect(shared.origin!.provider).toBe("openai")
   expect(shared.origin!.inputTokens).toBe(12)
-  expect(b.get("plain")!.origin === undefined).toBe(true)
+  expect(b.get(cacheIdOf("plain"))!.origin === undefined).toBe(true)
   try {
     rmSync(dir, { recursive: true, force: true })
   } catch (e) {}
@@ -333,15 +347,18 @@ test("a cached answer keeps its origin, in memory and in a shared directory", ()
 
 test("clearing by id and by key in memory", () => {
   const c = new ResponseCache(60000, 10)
-  c.set("one", "1", "text/plain", 60000, undefined, "k1")
-  c.set("two", "2", "text/plain", 60000, undefined, "k1")
-  c.set("three", "3", "text/plain", 60000)
+  c.set(cacheIdOf("one"), "1", "text/plain", 60000, undefined, "k1")
+  c.set(cacheIdOf("two"), "2", "text/plain", 60000, undefined, "k1")
+  c.set(cacheIdOf("three"), "3", "text/plain", 60000)
   expect(c.clearKey("k1")).toBe(2)
-  expect(c.get("one")).toBeUndefined()
-  expect(c.get("three")?.body).toBe("3")
-  c.set("four", "4", "text/plain", 60000)
-  expect(c.clearId(toHex(sha256(utf8("four"))))).toBe(1)
-  expect(c.get("four")).toBeUndefined()
+  expect(c.get(cacheIdOf("one"))).toBeUndefined()
+  expect(c.get(cacheIdOf("three"))?.body).toBe("3")
+  c.set(cacheIdOf("four"), "4", "text/plain", 60000)
+  expect(c.clearId(cacheIdOf("four"))).toBe(1)
+  expect(c.get(cacheIdOf("four"))).toBeUndefined()
+  // the id is the hash the shared files were always named by
+  expect(cacheKey("s", "m", "{}")).toBe(toHex(sha256(utf8("s" + "\u001f" + "m" + "\u001f" + "{}"))))
+  expect(isCacheId(cacheKey("s", "m", "{}"))).toBe(true)
   expect(isCacheId("abc")).toBe(false)
   expect(isCacheId("A".repeat(64))).toBe(false)
 })

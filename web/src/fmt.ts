@@ -31,6 +31,11 @@ export function fmtTime(ts: unknown): string {
   return n > 0 ? new Date(n).toLocaleString() : "—"
 }
 
+// a value as text, or a dash when there is none
+export function dash(v: unknown): string {
+  return v === undefined || v === null || v === "" ? "—" : String(v)
+}
+
 export function splitList(s: string): string[] {
   return s
     .split(",")

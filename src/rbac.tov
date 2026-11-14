@@ -1,7 +1,7 @@
 // Role-based access to the management API (/api/*): several admin users, each
 // with a role, in place of one shared token. Credentials are kept as hashes;
 // a token is shown once, when its user is created, and never stored.
-import { sha256, toHex, utf8, secureHex } from "./crypto"
+import { sha256, toHex, utf8, secureHex, safeEq } from "./crypto"
 import { decode, encode } from "./base64"
 import { rfc3339Ms } from "./vkexpiry"
 import { AdminAuthConfig, AdminUserConfig, ApiKeyConfig, PermissionPair, RoleConfig } from "./config"
@@ -98,20 +98,6 @@ function passwordMatches(u: UserConfig | undefined, pw: string): bool {
     spendVerify(pw)
   }
   return true
-}
-
-// Compares without stopping at the first difference.
-export function safeEq(a: string, b: string): bool {
-  const x = utf8(a)
-  const y = utf8(b)
-  const n = x.length > y.length ? x.length : y.length
-  let d = x.length === y.length ? 0 : 1
-  for (let i = 0; i < n; i++) {
-    const p = i < x.length ? int(x[i]!) : 0
-    const q = i < y.length ? int(y[i]!) : 0
-    d = d | (p ^ q)
-  }
-  return d === 0
 }
 
 // The decoded "user:password" of a Basic credential, or undefined if it is not base64 text.
@@ -682,13 +668,23 @@ function uerror(status: int, message: string, cfg: RbacConfig): UsersReply {
   return ureply(status, JSON.stringify({ error: { message: message } }), cfg)
 }
 
-function createUser(cfg: RbacConfig, body: string): UsersReply {
+// What a caller may hand out through the users and roles routes: everything (a built-in admin), or its own pairs.
+export type Grant = { all: bool, pairs: PermissionPair[] }
+
+// Whether the caller may give a user a role, or change a user who holds it: a caller who is not an admin only
+// where it holds every permission of that role itself (a delegated Users permission is not the admin's).
+export type MayAssign = (role: string) => bool
+
+const NOT_YOURS = "holds permissions you do not hold; only an admin or a holder of all of them may assign or change it"
+
+function createUser(cfg: RbacConfig, body: string, may?: MayAssign): UsersReply {
   const b = parseUserBody(body)
   if (b === undefined) return uerror(400, "body must be a JSON object with name and role", cfg)
   const name = b.name ?? ""
   if (!validName(name)) return uerror(400, "name must be 1 to 64 lower-case letters, digits, _, -, @, . or +", cfg)
   const role = b.role ?? ""
   if (!knownRole(cfg.roles, role)) return uerror(400, "role must be admin, editor, viewer, auditor or a custom role", cfg)
+  if (may !== undefined && !may(role)) return uerror(403, `role ${role} ${NOT_YOURS}`, cfg)
   if (findUser(cfg.users, name) !== undefined) return uerror(409, `user ${name} already exists`, cfg)
   const email = (b.email ?? "").trim()
   if (email !== "" && !validEmail(email)) return uerror(400, "email must be an email address", cfg)
@@ -703,9 +699,11 @@ function createUser(cfg: RbacConfig, body: string): UsersReply {
   return ureply(201, JSON.stringify(out), { users: users })
 }
 
-function updateUser(cfg: RbacConfig, name: string, body: string): UsersReply {
+function updateUser(cfg: RbacConfig, name: string, body: string, may?: MayAssign): UsersReply {
   const old = findUser(cfg.users, name)
   if (old === undefined) return uerror(404, `no user ${name}`, cfg)
+  // a user above the caller is not the caller's to change (its email is a sign-in name, its disabling a lockout)
+  if (may !== undefined && !may(old.role)) return uerror(403, `user ${name}'s role ${old.role} ${NOT_YOURS}`, cfg)
   const b = parseUserBody(body)
   if (b === undefined) return uerror(400, "body must be a JSON object with role, role_id or disabled", cfg)
   let role: Role = old.role
@@ -718,6 +716,7 @@ function updateUser(cfg: RbacConfig, name: string, body: string): UsersReply {
     if (named === undefined) return uerror(400, `role_id ${b.role_id} names no role`, cfg)
     role = named
   }
+  if (may !== undefined && role !== old.role && !may(role)) return uerror(403, `role ${role} ${NOT_YOURS}`, cfg)
   const disabled = b.disabled === undefined ? old.disabled : b.disabled
   // an email of "" clears it
   let email: string | undefined = old.email
@@ -751,9 +750,10 @@ function updateUser(cfg: RbacConfig, name: string, body: string): UsersReply {
   return ureply(200, JSON.stringify(view(next)), { users: users })
 }
 
-function deleteUser(cfg: RbacConfig, name: string): UsersReply {
+function deleteUser(cfg: RbacConfig, name: string, may?: MayAssign): UsersReply {
   const old = findUser(cfg.users, name)
   if (old === undefined) return uerror(404, `no user ${name}`, cfg)
+  if (may !== undefined && !may(old.role)) return uerror(403, `user ${name}'s role ${old.role} ${NOT_YOURS}`, cfg)
   if (isActiveAdmin(old) && otherActiveAdmins(cfg.users, name) === 0) return uerror(409, LAST_ADMIN, cfg)
   const users: UserConfig[] = []
   for (const u of cfg.users) {
@@ -764,8 +764,9 @@ function deleteUser(cfg: RbacConfig, name: string): UsersReply {
 
 // GET /api/users (never with hashes), POST /api/users, PUT and DELETE
 // /api/users/{name}. Pure: the caller stores the returned cfg. Access is
-// checked by authorize() first (manage_users).
-export function handleUsers(cfg: RbacConfig, method: string, path: string, body: string): UsersReply {
+// checked by authorize() first (manage_users). may bounds what a caller who is not an admin may assign or change
+// (undefined: no bound, the admin).
+export function handleUsers(cfg: RbacConfig, method: string, path: string, body: string, may?: MayAssign): UsersReply {
   const segs = segmentsOf(path)
   if (!isApi(segs) || (segs[1] ?? "") !== "users" || segs.length > 4 || segs.length === 4 && segs[3] !== "role") return uerror(404, "no route for this path", cfg)
   const m = method.toUpperCase()
@@ -774,16 +775,16 @@ export function handleUsers(cfg: RbacConfig, method: string, path: string, body:
   if (segs.length === 4 && name !== undefined) {
     const u = findUser(cfg.users, name)
     if (m === "GET") return u === undefined ? uerror(404, `no user ${name}`, cfg) : ureply(200, JSON.stringify({ name: u.name, role: u.role }), cfg)
-    if (m === "PUT") return updateUser(cfg, name, body)
+    if (m === "PUT") return updateUser(cfg, name, body, may)
     return uerror(405, `method ${m} is not allowed on this route`, cfg)
   }
   if (name === undefined) {
     if (m === "GET") return ureply(200, JSON.stringify({ users: cfg.users.map((u) => view(u)) }), cfg)
-    if (m === "POST") return createUser(cfg, body)
+    if (m === "POST") return createUser(cfg, body, may)
     return uerror(405, `method ${m} is not allowed on this route`, cfg)
   }
-  if (m === "PUT") return updateUser(cfg, name, body)
-  if (m === "DELETE") return deleteUser(cfg, name)
+  if (m === "PUT") return updateUser(cfg, name, body, may)
+  if (m === "DELETE") return deleteUser(cfg, name, may)
   return uerror(405, `method ${m} is not allowed on this route`, cfg)
 }
 
@@ -1388,4 +1389,24 @@ test("auth_config's password becomes a bcrypt hash once per process, and a bcryp
   const given = try fromLegacy({ username: "admin", password: BC_ED })
   expect(given.users[0]!.password_hash).toBe(BC_ED)
   expect(who(authenticate(given, basic("admin", "pw")))).toBe("user admin admin")
+})
+
+test("a caller who is not an admin assigns and changes only roles it holds in full", () => {
+  const cfg: RbacConfig = { users: [
+    { name: "root", role: "admin", token_sha256: "x" },
+    { name: "vi", role: "viewer", token_sha256: "y" },
+  ] }
+  // a delegate who holds the viewer's permissions and no more
+  const may: MayAssign = (role) => role === "viewer"
+  expect(handleUsers(cfg, "POST", "/api/users", `{"name":"eve","role":"admin"}`, may).status).toBe(403)
+  expect(handleUsers(cfg, "POST", "/api/users", `{"name":"eve","role":"viewer"}`, may).status).toBe(201)
+  expect(handleUsers(cfg, "PUT", "/api/users/vi", `{"role":"admin"}`, may).status).toBe(403)
+  expect(handleUsers(cfg, "PUT", "/api/users/vi/role", `{"role_id":9001}`, may).status).toBe(403)
+  expect(handleUsers(cfg, "PUT", "/api/users/vi", `{"disabled":true}`, may).status).toBe(200)
+  // an admin's record (its email, its disabling, its removal) is not the delegate's to touch
+  expect(handleUsers(cfg, "PUT", "/api/users/root", `{"email":"eve@example.com"}`, may).status).toBe(403)
+  expect(handleUsers(cfg, "DELETE", "/api/users/root", "", may).status).toBe(403)
+  expect(handleUsers(cfg, "DELETE", "/api/users/vi", "", may).status).toBe(200)
+  // no bound: the admin, as before
+  expect(handleUsers(cfg, "POST", "/api/users", `{"name":"eve","role":"admin"}`).status).toBe(201)
 })

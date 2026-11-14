@@ -3,7 +3,7 @@
 // side that serves h2c. Tov's fetch speaks HTTP/1.1 only, so both run on Bun.connect and
 // Bun.listen. HPACK is in hpack.tov.
 
-import { HpackDecoder, HpackEncoder, HpackField, hpackEncode } from "./hpack"
+import { HpackDecoder, HpackEncoder, HpackField, HpackListTooLarge, hpackEncode } from "./hpack"
 import { Peer } from "./netguard"
 
 export type H2Header = { name: string, value: string }
@@ -36,6 +36,10 @@ const ERR_CANCEL: int = 8
 const DEFAULT_WINDOW: int = 65535
 const DEFAULT_FRAME: int = 16384
 const MAX_FRAME: int = 16777215
+// the body a unary response may have: the largest gRPC message its callers take (4 MiB), and room for its framing
+const MAX_UNARY_BODY: int = 4194304 + 16384
+// what one header block of a response may be, compressed and decoded
+const MAX_RESPONSE_BLOCK: int = 262144
 
 // ---- frames ----
 
@@ -92,7 +96,7 @@ export class H2Conn {
   private sock: Socket<undefined> | undefined = undefined
   private connecting: Promise<void, Error> | undefined = undefined
   private rbuf: u8[] = []
-  private dec: HpackDecoder = new HpackDecoder()
+  private dec: HpackDecoder = new HpackDecoder(4096, MAX_RESPONSE_BLOCK)
   private streams: Map<int, H2Stream> = new Map()
   private nextId: int = 1
   private connWindow: int = DEFAULT_WINDOW
@@ -296,6 +300,11 @@ export class H2Conn {
     for (const b of bytes) this.rbuf.push(b)
     while (this.rbuf.length >= 9) {
       const n = (int(this.rbuf[0]!) << 16) | (int(this.rbuf[1]!) << 8) | int(this.rbuf[2]!)
+      // this side leaves SETTINGS_MAX_FRAME_SIZE at its default, so a larger frame is not waited for
+      if (n > DEFAULT_FRAME) {
+        this.onClose(new Error("h2: frame too large"))
+        return
+      }
       if (this.rbuf.length < 9 + n) return
       const type = int(this.rbuf[3]!)
       const flags = int(this.rbuf[4]!)
@@ -312,8 +321,8 @@ export class H2Conn {
     }
   }
 
-  // Dispatches one frame. A connection error (throw) closes the connection.
-  private frame(type: int, flags: int, sid: int, p: u8[]): void throws Error {
+  // Dispatches one frame. A connection error (throw) closes the connection. Not private, so the tests can drive it.
+  frame(type: int, flags: int, sid: int, p: u8[]): void throws Error {
     if (this.contId !== 0 && (type !== T_CONTINUATION || sid !== this.contId)) {
       throw new Error("h2: CONTINUATION expected")
     }
@@ -344,6 +353,7 @@ export class H2Conn {
     } else if (type === T_GOAWAY) {
       throw new Error("grpc: the peer closed the connection (GOAWAY)")
     } else if (type === T_WINDOW_UPDATE) {
+      if (p.length !== 4) throw new Error("h2: WINDOW_UPDATE length")
       const inc = read32(p, 0) & 2147483647
       if (sid === 0) {
         this.connWindow = this.connWindow + inc
@@ -353,6 +363,7 @@ export class H2Conn {
       }
       this.wake()
     } else if (type === T_RST_STREAM) {
+      if (p.length !== 4) throw new Error("h2: RST_STREAM length")
       const st = this.streams.get(sid)
       if (st !== undefined) {
         this.streams.delete(sid)
@@ -393,6 +404,7 @@ export class H2Conn {
       const st = this.streams.get(sid)
       if (st === undefined) {
         for (const b of p) this.orphan.push(b)
+        if (this.orphan.length > MAX_RESPONSE_BLOCK) throw new Error("h2: header block too large")
         if ((flags & F_END_HEADERS) !== 0) {
           this.contId = 0
           const blk = this.orphan
@@ -402,6 +414,7 @@ export class H2Conn {
         return
       }
       for (const b of p) st.block.push(b)
+      if (st.block.length > MAX_RESPONSE_BLOCK) throw new Error("h2: header block too large")
       if ((flags & F_END_HEADERS) !== 0) {
         this.contId = 0
         try this.finishBlock(st)
@@ -415,11 +428,15 @@ export class H2Conn {
         end = p.length - int(p[0]!)
       }
       if (end < start) throw new Error("h2: bad padding")
-      const st = this.streams.get(sid)
+      let st = this.streams.get(sid)
       if (st !== undefined) {
         const sk = st.sink
         if (sk !== undefined) {
           if (end > start) sk.onData(p.slice(start, end))
+        } else if (st.body.length + (end - start) > MAX_UNARY_BODY) {
+          // a held body has a limit: past it the call fails and the stream is cancelled
+          this.cancel(sid, new Error("grpc: the response is larger than the limit"))
+          st = undefined
         } else {
           for (let i = start; i < end; i++) st.body.push(p[i]!)
         }
@@ -427,7 +444,7 @@ export class H2Conn {
       // the received bytes return to the windows, so the peer keeps sending
       if (p.length > 0) {
         this.write(frameBytes(T_WINDOW_UPDATE, 0, 0, be32(p.length)))
-        this.write(frameBytes(T_WINDOW_UPDATE, 0, sid, be32(p.length)))
+        if (st !== undefined) this.write(frameBytes(T_WINDOW_UPDATE, 0, sid, be32(p.length)))
       }
       if (st !== undefined && (flags & F_END_STREAM) !== 0) this.complete(st)
     } else if (type === T_PUSH_PROMISE) {
@@ -464,7 +481,7 @@ export class H2Conn {
     this.rbuf = []
     this.contId = 0
     this.orphan = []
-    this.dec = new HpackDecoder()
+    this.dec = new HpackDecoder(4096, MAX_RESPONSE_BLOCK)
     for (const id of this.streams.keys()) {
       const st = this.streams.get(id)!
       st.reject(e)
@@ -495,6 +512,18 @@ const MAX_WINDOW: int = 2147483647
 const OUT_HIGH: int = 65536
 // a header block (HEADERS with its CONTINUATIONs) larger than this is refused
 const MAX_BLOCK: int = 262144
+// what a request's header block may decode to (advertised as SETTINGS_MAX_HEADER_LIST_SIZE)
+const MAX_HEADER_LIST: int = 65536
+// the dynamic table our encoder keeps, whatever larger size the peer allows
+const MAX_ENC_TABLE: int = 4096
+// PING, SETTINGS and RST_STREAM frames a connection may send within one window
+const CTL_LIMIT: int = 2000
+const CTL_WINDOW_MS: f64 = 10000.0
+// listener defaults: connections at once, how long one may stay without a stream or a byte, and how long a
+// new one has to send its preface and SETTINGS
+const DEFAULT_MAX_CONNS: int = 1024
+const DEFAULT_IDLE_MS: int = 300000
+const HANDSHAKE_MS: f64 = 10000.0
 
 // A protocol error found while reading a frame: stream 0 is a connection error, any other
 // id a stream error.
@@ -697,11 +726,13 @@ function unpad(p: u8[], flags: int): u8[] throws H2Fault {
 cyclic class H2Session {
   sock: Socket<H2Session> | undefined = undefined
   closed: bool = false
+  // its key in the listener's table of connections
+  regId: int = 0
   private pre: u8[] = []
   private preLeft: int = 24
   private rbuf: u8[] = []
   private settingsSeen: bool = false
-  private dec: HpackDecoder = new HpackDecoder()
+  private dec: HpackDecoder = new HpackDecoder(4096, MAX_HEADER_LIST)
   private enc: HpackEncoder = new HpackEncoder()
   private streams: Map<int, SrvStream> = new Map()
   private lastId: int = 0
@@ -715,21 +746,50 @@ cyclic class H2Session {
   private contId: int = 0
   // the peer sent GOAWAY: no new streams, and the connection closes when the last one ends
   private goneAway: bool = false
+  // PING, SETTINGS and RST_STREAM frames in the current window, and when it began
+  private ctlCount: int = 0
+  private ctlSince: f64 = 0.0
+  // when the connection opened and when it last had bytes or a stream (Date.now() milliseconds)
+  private openedAt: f64 = 0.0
+  private activeAt: f64 = 0.0
 
   constructor(readonly handler: H2Handler, readonly maxStreams: int) {
     this.pre = new TextEncoder().encode(PREFACE)
+    this.openedAt = Date.now()
+    this.activeAt = this.openedAt
   }
 
-  // The server's SETTINGS: the stream limit. The rest stays at the protocol's defaults.
+  // The server's SETTINGS: the stream limit and the header list limit. The rest stays at the protocol's defaults.
   start(): void {
     const st: u8[] = [u8(0), u8(3)]
     for (const b of be32(this.maxStreams)) st.push(b)
+    st.push(u8(0))
+    st.push(u8(6))
+    for (const b of be32(MAX_HEADER_LIST)) st.push(b)
     this.write(frameBytes(T_SETTINGS, 0, 0, st))
+  }
+
+  // True when the connection should be closed at `now`: no preface and SETTINGS in time, or no stream and
+  // no byte for idleMs (0 sets no idle limit).
+  expired(now: f64, idleMs: int): bool {
+    if (this.closed) return false
+    if (!this.settingsSeen) return now - this.openedAt > HANDSHAKE_MS
+    if (this.streams.size > 0) {
+      this.activeAt = now
+      return false
+    }
+    return idleMs > 0 && now - this.activeAt > idleMs * 1.0
+  }
+
+  // Ends a connection the listener has no more use for (idle, or slow to start).
+  expire(): void {
+    this.goaway(H2_NO_ERROR, "h2: idle")
   }
 
   // Bytes from the socket: the client preface first, then frames.
   feed(bytes: u8[]): void {
     if (this.closed) return
+    this.activeAt = Date.now()
     let i: int = 0
     while (this.preLeft > 0 && i < bytes.length) {
       if (int(bytes[i]!) !== int(this.pre[this.pre.length - this.preLeft]!)) {
@@ -868,14 +928,17 @@ cyclic class H2Session {
     } else if (type === T_CONTINUATION) {
       try this.onContinuation(flags, sid, p)
     } else if (type === T_SETTINGS) {
+      try this.control()
       try this.onSettings(flags, sid, p)
     } else if (type === T_PING) {
+      try this.control()
       if (sid !== 0) throw new H2Fault(H2_PROTOCOL_ERROR, 0, "h2: PING on a stream")
       if (p.length !== 8) throw new H2Fault(H2_FRAME_SIZE_ERROR, 0, "h2: PING length")
       if ((flags & F_ACK) === 0) this.write(frameBytes(T_PING, F_ACK, 0, p))
     } else if (type === T_WINDOW_UPDATE) {
       try this.onWindowUpdate(sid, p)
     } else if (type === T_RST_STREAM) {
+      try this.control()
       if (sid === 0) throw new H2Fault(H2_PROTOCOL_ERROR, 0, "h2: RST_STREAM on stream 0")
       if (p.length !== 4) throw new H2Fault(H2_FRAME_SIZE_ERROR, 0, "h2: RST_STREAM length")
       this.dropStream(sid, `h2: the stream was reset by the client (code ${read32(p, 0)})`)
@@ -887,6 +950,18 @@ cyclic class H2Session {
       throw new H2Fault(H2_PROTOCOL_ERROR, 0, "h2: a client cannot send PUSH_PROMISE")
     }
     // PRIORITY and unknown frame types are ignored (RFC 9113 4.1)
+  }
+
+  // Counts a frame that costs the peer nothing and this side an answer or a handler run. More than
+  // CTL_LIMIT of them in one window is a flood: the connection ends.
+  private control(): void throws H2Fault {
+    const now = Date.now()
+    if (now - this.ctlSince > CTL_WINDOW_MS) {
+      this.ctlSince = now
+      this.ctlCount = 0
+    }
+    this.ctlCount = this.ctlCount + 1
+    if (this.ctlCount > CTL_LIMIT) throw new H2Fault(H2_ENHANCE_YOUR_CALM, 0, "h2: too many control frames")
   }
 
   private onData(flags: int, sid: int, p: u8[]): void throws H2Fault {
@@ -962,8 +1037,8 @@ cyclic class H2Session {
       const id = (int(p[at]!) << 8) | int(p[at + 1]!)
       const val = read32(p, at + 2)
       if (id === 1) {
-        // the table our encoder may fill is the one the peer's decoder allows
-        this.enc.setMaxSize(val)
+        // the table our encoder may fill is the one the peer's decoder allows, up to our own bound
+        this.enc.setMaxSize(val < MAX_ENC_TABLE ? val : MAX_ENC_TABLE)
       } else if (id === 4) {
         if (val > MAX_WINDOW) throw new H2Fault(H2_FLOW_CONTROL_ERROR, 0, "h2: INITIAL_WINDOW_SIZE too large")
         const delta = val - this.peerInit
@@ -1008,6 +1083,8 @@ cyclic class H2Session {
     try {
       fields = this.dec.decode(block)
     } catch (e) {
+      // decoding stopped part way, so the table is out of step: a connection error either way
+      if (e instanceof HpackListTooLarge) throw new H2Fault(H2_ENHANCE_YOUR_CALM, 0, "h2: header list too large")
       throw new H2Fault(H2_COMPRESSION_ERROR, 0, "h2: bad header block")
     }
     if (st.headersDone) {
@@ -1186,17 +1263,48 @@ cyclic class H2Session {
   }
 }
 
+// The open connections of one listener, for the connection limit and the idle sweep.
+class H2Listener {
+  conns: Map<int, H2Session> = new Map()
+  nextId: int = 0
+
+  // Closes the connections that are idle or slow to start.
+  sweep(now: f64, idleMs: int): void {
+    for (const id of this.conns.keys()) {
+      const s = this.conns.get(id)
+      if (s === undefined) continue
+      if (s.closed) this.conns.delete(id)
+      else if (s.expired(now, idleMs)) s.expire()
+    }
+  }
+}
+
 // Listens on a port and serves HTTP/2 with prior knowledge (h2c), as grpc-go does without
-// TLS. handler answers each request.
-export function listen(opts: { hostname: string, port: int, maxStreams?: int }, handler: H2Handler): TCPSocketListener<H2Session> {
+// TLS. handler answers each request. A connection over maxConnections (1024 unless given) is closed
+// at once; one with no stream and no byte for idleMs (5 minutes unless given, 0 for no limit), or with
+// no preface and SETTINGS 10 seconds after it opened, is closed with GOAWAY.
+export function listen(opts: { hostname: string, port: int, maxStreams?: int, maxConnections?: int, idleMs?: int }, handler: H2Handler): TCPSocketListener<H2Session> {
   const maxStreams = opts.maxStreams ?? 100
+  const maxConns = opts.maxConnections ?? DEFAULT_MAX_CONNS
+  const idleMs = opts.idleMs ?? DEFAULT_IDLE_MS
+  const reg = new H2Listener()
+  setInterval(() => {
+    reg.sweep(Date.now(), idleMs)
+  }, 5000)
   return Bun.listen<H2Session>({
     hostname: opts.hostname,
     port: opts.port,
     socket: {
       open(socket) {
+        if (maxConns > 0 && reg.conns.size >= maxConns) {
+          socket.terminate()
+          return
+        }
         const s = new H2Session(handler, maxStreams)
         s.sock = socket
+        s.regId = reg.nextId
+        reg.nextId = reg.nextId + 1
+        reg.conns.set(s.regId, s)
         socket.data = s
         s.start()
       },
@@ -1207,7 +1315,10 @@ export function listen(opts: { hostname: string, port: int, maxStreams?: int }, 
       },
       close(socket) {
         const s = socket.data
-        if (s !== undefined) s.detach()
+        if (s !== undefined) {
+          reg.conns.delete(s.regId)
+          s.detach()
+        }
         socket.data = undefined
       },
       error(socket) {
@@ -1229,4 +1340,105 @@ test("frame header: length, type, flags and stream id", () => {
   expect(f[4]).toBe(u8(5))
   expect(f[8]).toBe(u8(3))
   expect(f[9]).toBe(u8(1))
+})
+
+// The client preface and an empty SETTINGS, as a connection starts.
+function testHello(): u8[] {
+  const out: u8[] = []
+  for (const b of new TextEncoder().encode(PREFACE)) out.push(b)
+  for (const b of frameBytes(T_SETTINGS, 0, 0, [])) out.push(b)
+  return out
+}
+
+function testSession(): H2Session {
+  return new H2Session((req: H2Request, res: H2Reply) => {
+    res.trailersOnly([{ name: "grpc-status", value: "0" }])
+  }, 100)
+}
+
+test("server: a flood of PING frames ends the connection, a few do not", () => {
+  const ping = frameBytes(T_PING, 0, 0, [u8(0), u8(0), u8(0), u8(0), u8(0), u8(0), u8(0), u8(0)])
+  const calm = testSession()
+  calm.feed(testHello())
+  for (let i = 0; i < 100; i++) calm.feed(ping)
+  expect(calm.closed).toBe(false)
+  const flood = testSession()
+  flood.feed(testHello())
+  for (let i = 0; i < CTL_LIMIT + 1 && !flood.closed; i++) flood.feed(ping)
+  expect(flood.closed).toBe(true)
+  // RST_STREAM and SETTINGS count too
+  const mixed = testSession()
+  mixed.feed(testHello())
+  for (let i = 0; i < CTL_LIMIT + 1 && !mixed.closed; i++) {
+    mixed.feed(i % 2 === 0 ? frameBytes(T_SETTINGS, 0, 0, []) : frameBytes(T_RST_STREAM, 0, 1, be32(ERR_CANCEL)))
+  }
+  expect(mixed.closed).toBe(true)
+})
+
+test("server: a header block that decodes past the list limit ends the connection", () => {
+  const head: HpackField[] = [{ name: ":method", value: "POST" }, { name: ":path", value: "/a.B/C" }]
+  const ok = testSession()
+  ok.feed(testHello())
+  ok.feed(frameBytes(T_HEADERS, F_END_HEADERS | F_END_STREAM, 1, new HpackEncoder().encode(head)))
+  expect(ok.closed).toBe(false)
+  // one large entry enters the table, then a 1-byte index repeats it
+  const block: u8[] = []
+  for (const b of new HpackEncoder().encode([head[0]!, head[1]!, { name: "a", value: "x".repeat(4000) }])) block.push(b)
+  for (let i = 0; i < 100; i++) block.push(u8(0xbe))
+  const bad = testSession()
+  bad.feed(testHello())
+  bad.feed(frameBytes(T_HEADERS, F_END_HEADERS | F_END_STREAM, 1, block))
+  expect(bad.closed).toBe(true)
+})
+
+test("server: a huge SETTINGS_HEADER_TABLE_SIZE is accepted and the connection goes on", () => {
+  const s = testSession()
+  const hello: u8[] = []
+  for (const b of new TextEncoder().encode(PREFACE)) hello.push(b)
+  for (const b of frameBytes(T_SETTINGS, 0, 0, [u8(0), u8(1), u8(255), u8(255), u8(255), u8(255)])) hello.push(b)
+  s.feed(hello)
+  s.feed(frameBytes(T_HEADERS, F_END_HEADERS | F_END_STREAM, 1, new HpackEncoder().encode([{ name: ":method", value: "POST" }, { name: ":path", value: "/a.B/C" }])))
+  expect(s.closed).toBe(false)
+})
+
+test("server: a connection expires without its SETTINGS, or idle with no stream", () => {
+  const now = Date.now()
+  const silent = testSession()
+  expect(silent.expired(now + 1000.0, 300000)).toBe(false)
+  expect(silent.expired(now + 60000.0, 300000)).toBe(true)
+  const idle = testSession()
+  idle.feed(testHello())
+  expect(idle.expired(now + 60000.0, 300000)).toBe(false)
+  expect(idle.expired(now + 900000.0, 300000)).toBe(true)
+  expect(idle.expired(now + 900000.0, 0)).toBe(false)
+  idle.expire()
+  expect(idle.closed).toBe(true)
+})
+
+test("client: short WINDOW_UPDATE and RST_STREAM payloads and an endless CONTINUATION are connection errors", () => {
+  const c = new H2Conn("127.0.0.1", 1, undefined, undefined)
+  let wu = false
+  try {
+    c.frame(T_WINDOW_UPDATE, 0, 0, [u8(1), u8(2)])
+  } catch (e) {
+    wu = true
+  }
+  expect(wu).toBe(true)
+  let rst = false
+  try {
+    c.frame(T_RST_STREAM, 0, 1, [])
+  } catch (e) {
+    rst = true
+  }
+  expect(rst).toBe(true)
+  let cont = false
+  try {
+    c.frame(T_HEADERS, 0, 1, [])
+    const piece: u8[] = []
+    for (let i = 0; i < 16384; i++) piece.push(u8(0))
+    for (let i = 0; i < 20; i++) c.frame(T_CONTINUATION, 0, 1, piece)
+  } catch (e) {
+    cont = e.message.includes("too large")
+  }
+  expect(cont).toBe(true)
 })

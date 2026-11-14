@@ -42,6 +42,10 @@ const [verified, setVerified] = createSignal(false)
 export { tokenSet, dialog, verified, setVerified, administrationMode }
 
 export function revokeSession(): void {
+  // A rejected bearer must not be offered again; this is not an identity change, so no reload.
+  try { writeToken("") } catch { /* the in-memory copy below is still dropped */ }
+  current = ""
+  setTokenSet(false)
   setVerified(false)
   setDialog(undefined)
   window.dispatchEvent(new Event("raiju-session-expired"))

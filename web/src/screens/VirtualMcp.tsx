@@ -3,7 +3,7 @@
 // with its tools given as client plus tool names and its keys reached through teams, customers and
 // providers as well as directly. Both lists are the same records; the two editors write them.
 import { createMemo, createSignal, createStore, For, refresh, Show, snapshot, untrack } from "solid-js"
-import { send } from "../api/client"
+import { message, send } from "../api/client"
 import { can } from "../perm"
 import { DangerButton, FormError, Guard, initChecked, initValue, notify, Pill, Toolbar, tf, useFormRun } from "../ui"
 import { targetURL } from "../gateway"
@@ -384,7 +384,7 @@ function McpCard(props: { m: VMcp; res: Resolved | undefined; keys: Named[]; mod
       props.onChange()
     } catch (e) {
       box.checked = !want
-      notify(e instanceof Error ? e.message : String(e), "error")
+      notify(message(e), "error")
     }
   }
   return (

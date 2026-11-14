@@ -389,6 +389,10 @@ resource "aws_ecs_task_definition" "this" {
       # SIGTERM drains for up to server.shutdown_grace_seconds (25 by default) plus about 5 s of flushing
       stopTimeout = 35
 
+      # the image's non-root user, named here so the task does not depend on the image keeping it, and no Linux
+      # capabilities: the gateway binds a high port and needs none (the Helm chart drops them the same way)
+      user                   = "65532:65532"
+      linuxParameters        = { capabilities = { drop = ["ALL"] } }
       readonlyRootFilesystem = var.readonly_root_filesystem
       environment            = [for k, v in local.environment : { name = k, value = v }]
       secrets                = [for k, v in local.all_secrets : { name = k, valueFrom = v }]
