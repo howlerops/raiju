@@ -3,7 +3,7 @@ import { LoadingSkeleton } from "../LoadingSkeleton"
 import type { JSX } from "@solidjs/web"
 import { api, send } from "../api/client"
 import { can } from "../perm"
-import { fmtInt, fmtMoney } from "../fmt"
+import { dash, fmtInt, fmtMoney } from "../fmt"
 import { Can, DangerButton, ErrP, FormError, Mono, notify, Table, Toolbar, useFormRun } from "../ui"
 
 interface FieldSpec {
@@ -38,8 +38,6 @@ function resourceOf(path: string): string {
   const coll = path.split("/").pop() ?? ""
   return coll === "teams" ? "Teams" : coll === "customers" ? "Customers" : "Governance"
 }
-
-const dash = (v: unknown): string => (v === undefined || v === null || v === "" ? "—" : String(v))
 
 const SPECS: Spec<Row>[] = [
   {

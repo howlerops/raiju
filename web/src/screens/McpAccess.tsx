@@ -219,9 +219,10 @@ function Sessions(props: Ctl) {
                     <td class="nowrap">{r().expires_at ? fmtTime(r().expires_at) : "—"}</td>
                     <td class="nowrap">{fmtTime(r().created_at)}</td>
                     <td>
-                      <Show when={can("MCPGateway", "Update") || can("MCPGateway", "Delete")}>
+                      <Show when={can("MCPGateway", "Create") || can("MCPGateway", "Delete")}>
                         <span class="row-actions">
-                          <Show when={r().can_reauth && can("MCPGateway", "Update")}>
+                          {/* re-authorizing is a POST, which the server checks as Create */}
+                          <Show when={r().can_reauth && can("MCPGateway", "Create")}>
                             <button type="button" class="btn btn-sm btn-ghost" disabled={busy()} onClick={() => reauth(r())}>
                               Re-authorize
                             </button>
@@ -322,7 +323,8 @@ function Headers(props: Ctl) {
       <div id="mca-headers">
         <Guard>
           <Show when={data().clients.length} fallback={<p class="muted">No MCP client uses per-user headers. Add one with auth type per_user_headers.</p>}>
-            <Show when={can("MCPGateway", "Create")} fallback={<p class="muted">Your role cannot open header submissions.</p>}>
+            {/* opening a submission is a POST (Create) and saving its values a PUT (Update) */}
+            <Show when={can("MCPGateway", "Create") && can("MCPGateway", "Update")} fallback={<p class="muted">Your role cannot open header submissions.</p>}>
               <form class="inline-form" id="mca-hdr-open" aria-label="Open a headers submission" onSubmit={openFlow}>
                 <label>
                   MCP client

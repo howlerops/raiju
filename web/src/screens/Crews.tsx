@@ -7,12 +7,11 @@ import { api, ApiError } from "../api/client"
 import { FrontierChart, type FrontierMark } from "../charts"
 import { can } from "../perm"
 import type { CrewClass, CrewLearnedCell, CrewPool, CrewTaskDetail } from "../api/types"
-import { fmtInt, fmtMoney, fmtTime, splitList } from "../fmt"
+import { dash, fmtInt, fmtMoney, fmtTime, splitList } from "../fmt"
 import { FormError, Guard, Mono, notify, Table, Toolbar, useFormRun, useRun } from "../ui"
 
 type Part = { role?: string; candidate?: string }
 
-const dash = (v: unknown): string => (v === undefined || v === null || v === "" ? "—" : String(v))
 // a number, or "—" when the listing has none (null)
 const nz = (v: unknown, f: (n: number) => string): string => (typeof v === "number" && Number.isFinite(v) ? f(v) : "—")
 const usd = (n: number): string => (n === 0 ? "$0" : n >= 1 ? "$" + n.toFixed(2) : "$" + n.toFixed(4))
