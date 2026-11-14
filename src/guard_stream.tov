@@ -19,7 +19,7 @@
 
 import { CompiledRule, BlockCursor, applyRegex, compileRules } from "./guard_regex"
 import { compileLocal, localVerdict } from "./guard_local"
-import { GuardConfig, applyToText, scan } from "./guardrails"
+import { GuardConfig, FindingCursor, applyToText, scan } from "./guardrails"
 import { Field, fields, elements, find, decodeString, quote, rawStr } from "./json"
 import { errorJson } from "./schemas"
 
@@ -115,6 +115,9 @@ export class OutputStreamGuard {
   private redacting = false
   // the built-in guard, when it guards this stream (block or redact mode)
   private builtin: GuardConfig | undefined = undefined
+  // block mode: whether the answer so far has a finding, from a scan of its new end only (guardrails.tov
+  // FindingCursor gives the whole scan's answer)
+  private builtinCursor: FindingCursor | undefined = undefined
   // the providers whose verdict can be a block: only these are asked on each check of the answer
   private blockers: GuardedProvider[] = []
   // one per blocker: whether the answer so far blocks, from a scan of its new end only (guard_regex.tov
@@ -160,6 +163,7 @@ export class OutputStreamGuard {
     if (cfg.mode !== "block" && cfg.mode !== "redact") return
     this.builtin = cfg
     if (cfg.mode === "redact") this.redacting = true
+    else this.builtinCursor = new FindingCursor(cfg)
   }
 
   // Holds the stream until guards pass. maxBytes and maxMs bound the hold (0 means unbounded).
@@ -316,6 +320,9 @@ export class OutputStreamGuard {
     }
     const b = this.builtin
     if (b !== undefined && b.mode === "block") {
+      // as for the blockers: the cursor says whether the whole scan would find anything
+      const c = this.builtinCursor
+      if (!this.holding && !this.wholeChecks && c !== undefined && !c.found(this.answer)) return undefined
       const fs = scan(this.answer, b)
       if (fs.length > 0) {
         const kinds: string[] = []
@@ -821,8 +828,9 @@ test("a stream that ends without a closing blank line keeps its last piece as it
 })
 
 // The whole output of a guard fed the text as chat chunks of `step` bytes, with what blocked it.
-function streamed(p: GuardedProvider[], text: string, step: int, whole: bool): string {
+function streamed(p: GuardedProvider[], text: string, step: int, whole: bool, builtin?: GuardConfig): string {
   const g = new OutputStreamGuard(p, "chat")
+  if (builtin !== undefined) g.useBuiltin(builtin)
   g.wholeChecks = whole
   let out = ""
   let at = 0
@@ -870,4 +878,60 @@ test("the check of the answer's new end gives the stream the whole-answer check 
   expect(g.filter(chunk(base.slice(0, 4000) + "PROJ-44")).includes("guardrail_violation")).toBe(false)
   expect(g.filter(chunk("11")).includes("response blocked by guardrails: codes: found REGEX_MATCH")).toBe(true)
   expect(g.blockedBy).toBe("codes")
+})
+
+test("the built-in guard's check of the answer's new end gives the stream the whole-answer check gives, in any chunking", () => {
+  const fill = "lorem ipsum dolor sit amet, 12 of 3.5 at 10:30 "
+  const base = fill.repeat(120)
+  const cfgs: GuardConfig[] = [
+    { detect: ["private_key", "jwt", "api_key", "aws_key", "email", "credit_card", "ssn", "ipv4", "phone"], mode: "block", custom: ["Project Zeus"] },
+    { detect: ["email", "ssn"], mode: "block" },
+  ]
+  const texts: string[] = [
+    base,
+    base.slice(0, 2555) + " write to jane.doe@example.com or call +1 415 555 0199 " + base.slice(0, 700),
+    base.slice(0, 300) + " ssn 123-45-67890 " + base.slice(0, 3791) + " ssn 123-45-6789" + base.slice(0, 900),
+    base.slice(0, 2047) + " key sk-abcdefghijklmnopqrstuv " + base.slice(0, 400),
+    base.slice(0, 1200) + "-----BEGIN RSA " + base.slice(0, 1500).split("\n").join(" ") + " PRIVATE KEY-----\nMIIB\n" + base.slice(0, 300),
+    base.slice(0, 900) + " eyJhbGciOiJIUzI1NiJ9" + "a".repeat(1400) + ".eyJzdWIiOiIxIn0.c2ln " + base.slice(0, 300),
+    base.slice(0, 3100) + " the project zeus plan, card 4111 1111 1111 1111, host 10.0.0.1 " + base.slice(0, 200),
+  ]
+  const none: GuardedProvider[] = []
+  const withRule: GuardedProvider[] = [{ id: "codes", rules: try rx("PROJ-\\d{4}", "block") }]
+  let blocks = 0
+  for (const cfg of cfgs) {
+    for (const text of texts) {
+      const want = streamed(none, text, 40, true, cfg)
+      if (want.startsWith("true|builtin|")) blocks += 1
+      for (const step of [3, 40, 250, 1000]) {
+        expect(streamed(none, text, step, false, cfg) === streamed(none, text, step, true, cfg)).toBe(true)
+        expect(streamed(withRule, text, step, false, cfg) === streamed(withRule, text, step, true, cfg)).toBe(true)
+      }
+    }
+  }
+  expect(blocks).toBe(8)
+  // the block still comes with the event that completes the finding, with the whole scan's reason
+  const g = new OutputStreamGuard(none, "chat")
+  g.useBuiltin(cfgs[1]!)
+  expect(g.filter(chunk(base.slice(0, 4000) + " mail bob@example.")).includes("guardrail_violation")).toBe(false)
+  expect(g.filter(chunk("c")).includes("guardrail_violation")).toBe(false)
+  expect(g.filter(chunk("om and 123-45-6789")).includes("response blocked by guardrails: builtin: found email, ssn")).toBe(true)
+  expect(g.blockedBy).toBe("builtin")
+  // a held stream that is released at its limit goes on with the cursor, which then reads the whole answer
+  const outs: string[] = []
+  for (const whole of [false, true]) {
+    const h = new OutputStreamGuard(none, "chat")
+    h.useBuiltin(cfgs[1]!)
+    h.wholeChecks = whole
+    h.useHold(600, 0, "release")
+    h.nowMs = 1
+    let out = ""
+    for (const part of [base.slice(0, 500), " mail bob@exam", base.slice(0, 400), "ple.c", " then 123-45-", "6789 ", "tail"]) out += h.filter(chunk(part)) + "#" + h.takeReplay().join("")
+    expect(h.isHolding()).toBe(false)
+    expect(h.blockedBy).toBe("builtin")
+    expect(out.includes("builtin: found ssn")).toBe(true)
+    expect(out.includes("6789")).toBe(false)
+    outs.push(out)
+  }
+  expect(outs[0] === outs[1]).toBe(true)
 })

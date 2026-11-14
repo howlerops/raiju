@@ -36,11 +36,19 @@ const API_PREFIXES: u8[][] = [
 // Custom literals go first so an explicit user rule is never shadowed.
 const KIND_ORDER = ["custom", "private_key", "jwt", "api_key", "aws_key", "email", "credit_card", "ssn", "ipv4", "phone"]
 
+// Set when a read goes past the end of the text: a matcher that did not set it read only bytes that are the
+// same in every longer text (FindingCursor).
+let pastEnd = false
+
 // Byte at i, or -1 outside the text, so scanners can look ahead without checks.
 function at(b: u8[], i: int): int {
   if (i < 0) return -1
   const v = b[i]
-  return v === undefined ? -1 : int(v)
+  if (v === undefined) {
+    pastEnd = true
+    return -1
+  }
+  return int(v)
 }
 
 function isDigit(c: int): bool {
@@ -105,25 +113,34 @@ function runMatcher(b: u8[], kind: string, inout out: Span[], f: (b: u8[], p: in
 function findEmails(b: u8[], inout out: Span[]): void {
   for (let i = 0; i < b.length; i++) {
     if (at(b, i) !== 64) continue
-    let s = i
-    while (s > 0 && isEmailLocal(at(b, s - 1))) s--
-    while (s < i && at(b, s) === 46) s++
-    if (s === i) continue
-    let e = i + 1
-    while (e < b.length && (isAlnum(at(b, e)) || at(b, e) === 46 || at(b, e) === 45)) e++
-    while (e > i + 1 && at(b, e - 1) === 46) e--
-    // the last dot splits the labels from the TLD
-    let k = e - 1
-    while (k > i + 1 && at(b, k) !== 46) k--
-    if (k <= i + 1 || e - k - 1 < 2) continue
-    let ok = true
-    for (let j = k + 1; j < e; j++) {
-      if (!isLetter(at(b, j))) ok = false
-    }
-    if (!ok) continue
-    out.push({ kind: "email", start: s, end: e })
-    i = e - 1
+    const m = emailAt(b, i)
+    if (m === undefined) continue
+    out.push(m)
+    i = m.end - 1
   }
+}
+
+// The address around the @ at i, if it is one.
+function emailAt(b: u8[], i: int): Span | undefined {
+  let s = i
+  while (s > 0 && isEmailLocal(at(b, s - 1))) s--
+  while (s < i && at(b, s) === 46) s++
+  if (s === i) return undefined
+  let e = i + 1
+  while (e < b.length && isEmailDomain(at(b, e))) e++
+  while (e > i + 1 && at(b, e - 1) === 46) e--
+  // the last dot splits the labels from the TLD
+  let k = e - 1
+  while (k > i + 1 && at(b, k) !== 46) k--
+  if (k <= i + 1 || e - k - 1 < 2) return undefined
+  for (let j = k + 1; j < e; j++) {
+    if (!isLetter(at(b, j))) return undefined
+  }
+  return { kind: "email", start: s, end: e }
+}
+
+function isEmailDomain(c: int): bool {
+  return isAlnum(c) || c === 46 || c === 45
 }
 
 function isLetter(c: int): bool {
@@ -246,6 +263,8 @@ function ipv4End(b: u8[], p: int): int {
     let v = 0
     let n = 0
     while (isDigit(at(b, i))) {
+      // past three digits it is no octet, and a long run of digits would overflow the value (a trap)
+      if (n >= 3) return -1
       v = v * 10 + (at(b, i) - 48)
       i += 1
       n += 1
@@ -402,6 +421,129 @@ export function scan(text: string, cfg: GuardConfig): Finding[] {
     out.push({ kind: s.kind, start: s.start, end: s.end, text: text.slice(s.start, s.end) })
   }
   return out
+}
+
+function litAt(b: u8[], lit: u8[], p: int): bool {
+  for (let k = 0; k < lit.length; k++) {
+    if (lowerByte(at(b, p + k)) !== lowerByte(int(lit[k]!))) return false
+  }
+  return true
+}
+
+// scan(text, cfg).length > 0 for a text that only grows (a streamed answer), without scanning the whole text
+// each time. found(text) gives exactly that for every text that extends the one of the call before; a shorter
+// text starts over.
+//
+// Why the end of the text is enough. scan has a finding exactly when one detector matches at one start (resolve
+// keeps at least one span, and a detector's walk skips only past a match). Whether a detector matches at a
+// start is decided for good, in every longer text, once it no longer depends on where the text ends. So the
+// cursor keeps, per detector, the first start that is not decided yet and looks only from there on, over the
+// real bytes of the whole text (a detector reads back as far as it likes):
+// - a matcher that reads through at() is decided at a start when it did not read past the end (pastEnd): it
+//   then read only bytes that stay as they are. One that did (a number, a token or a JWT the text ends in)
+//   is tried again;
+// - a private key header is decided when its 11 bytes are there and are not "-----BEGIN ", or when its line
+//   has ended without "PRIVATE KEY-----";
+// - an address is decided at its @ when the run of domain characters after it has ended;
+// - a literal is decided at a start when all its bytes are there.
+// A start with a match is never passed, so the answer stays right for a caller that goes on after one.
+export class FindingCursor {
+  private b: u8[] = []
+  private matchers: ((b: u8[], p: int) => int)[] = []
+  // per matcher: the first start that is not decided
+  private front: int[] = []
+  private lits: u8[][] = []
+  private litFront: int[] = []
+  private keys = false
+  private keyFront = 0
+  private emails = false
+  private emailFront = 0
+
+  constructor(readonly cfg: GuardConfig) {
+    for (const s of cfg.custom ?? []) {
+      const lit = enc.encode(s)
+      if (lit.length === 0) continue
+      this.lits.push(lit)
+      this.litFront.push(0)
+    }
+    const on = cfg.detect
+    this.keys = on.includes("private_key")
+    this.emails = on.includes("email")
+    if (on.includes("jwt")) this.add(jwtEnd)
+    if (on.includes("api_key")) this.add(apiKeyEnd)
+    if (on.includes("aws_key")) this.add(awsEnd)
+    if (on.includes("credit_card")) this.add(cardEnd)
+    if (on.includes("ssn")) this.add(ssnEnd)
+    if (on.includes("ipv4")) this.add(ipv4End)
+    if (on.includes("phone")) this.add(phoneEnd)
+  }
+
+  private add(f: (b: u8[], p: int) => int): void {
+    this.matchers.push(f)
+    this.front.push(0)
+  }
+
+  private restart(): void {
+    this.b = []
+    for (let k = 0; k < this.front.length; k++) this.front[k] = 0
+    for (let k = 0; k < this.litFront.length; k++) this.litFront[k] = 0
+    this.keyFront = 0
+    this.emailFront = 0
+  }
+
+  found(text: string): bool {
+    if (text.byteLength < this.b.length) this.restart()
+    if (text.byteLength > this.b.length) {
+      for (const x of enc.encode(text.slice(this.b.length, text.byteLength))) this.b.push(x)
+    }
+    const n = this.b.length
+    for (let j = 0; j < this.lits.length; j++) {
+      const lit = this.lits[j]!
+      const last = n - lit.length
+      for (let p = this.litFront[j]!; p <= last; p++) {
+        if (litAt(this.b, lit, p)) return true
+      }
+      if (last + 1 > this.litFront[j]!) this.litFront[j] = last + 1
+    }
+    if (this.keys) {
+      let front = n
+      for (let p = this.keyFront; p < n; p++) {
+        if (p + BEGIN.length > n) {
+          // the header may still be arriving
+          if (front === n) front = p
+          break
+        }
+        if (!matchesAt(this.b, p, BEGIN)) continue
+        if (privateKeyEnd(this.b, p) > p) return true
+        // the header line has no "PRIVATE KEY-----" so far: it can still get one until the line ends
+        if (front === n && indexOfBytes(this.b, NL, p, n) < 0) front = p
+      }
+      this.keyFront = front
+    }
+    for (let k = 0; k < this.matchers.length; k++) {
+      const f = this.matchers[k]!
+      let front = n
+      for (let p = this.front[k]!; p < n; p++) {
+        pastEnd = false
+        if (f(this.b, p) > p) return true
+        if (pastEnd && front === n) front = p
+      }
+      this.front[k] = front
+    }
+    if (this.emails) {
+      let front = n
+      for (let i = this.emailFront; i < n; i++) {
+        if (at(this.b, i) !== 64) continue
+        if (emailAt(this.b, i) !== undefined) return true
+        if (front < n) continue
+        let e = i + 1
+        while (e < n && isEmailDomain(at(this.b, e))) e++
+        if (e === n) front = i
+      }
+      this.emailFront = front
+    }
+    return false
+  }
 }
 
 // Replaces each finding with [REDACTED:KIND]. Overlapping findings are skipped.
@@ -582,6 +724,9 @@ test("ipv4", () => {
   expect(f[0]!.text).toBe("192.168.1.10")
   expect(scan("256.1.1.1", cfg).length).toBe(0)
   expect(scan("1.2.3.4.5", cfg).length).toBe(0)
+  // a long run of digits is no address, and does not overflow the octet's value
+  expect(scan("id 123456789012345678901234567890 and 10.0.0.1.123456789012345678901234567890", cfg).length).toBe(0)
+  expect(scan("id 123456789012345678901234567890 then 10.0.0.1", cfg).length).toBe(1)
 })
 
 test("api keys and aws keys", () => {
@@ -695,4 +840,64 @@ test("applyToChatRequest rejects malformed JSON", () => {
     threw = true
   }
   expect(threw).toBe(true)
+})
+
+test("the cursor over a growing text finds what the whole scan finds, at every length and in any chunking", () => {
+  const all: GuardConfig = { detect: ["private_key", "jwt", "api_key", "aws_key", "email", "credit_card", "ssn", "ipv4", "phone"], mode: "block", custom: ["Project Zeus", "", "x9"] }
+  const fill = "lorem ipsum dolor sit amet, 12 of 3.5 at 10:30 - see #4 (a@b) v1.2.3 "
+  const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl"
+  const texts: string[] = [
+    fill.repeat(6),
+    fill + "mail jane.doe+tag@mail.example.com now",
+    fill + "a" + ".".repeat(300) + "@example.org",
+    fill + "..." + "@example.org and x@" + "sub.".repeat(80) + "example.c then .com",
+    fill + "user@localhost, a@b.c, @x.com, me@host.io1 me@host.io",
+    fill + "call +1 (415) 555-0199 today",
+    fill + "1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8",
+    fill + "v 10.20.30.40.50 and 415.555.0199 and 415.55.0199",
+    fill + "ssn 123-45-67890 then 123-45-6789 ok",
+    fill + "ssn 000-45-6789, 666-45-6789, 923-45-6789, 123-00-6789",
+    fill + "card 4111 1111 1111 1111 and 4111-1111-1111-1112",
+    fill + "card 41111111111111111 x 4111111111111111",
+    fill + "ip 192.168.1.300 or 1.2.3.4.5 or 10.0.0.1. Done",
+    fill + "ip 10.0.0.1",
+    fill + "key sk-abc and sk-abcdefghijklmnop then ghp_0123456789abcdefXYZ",
+    fill + "xsk-abcdefghijklmnopqrst pk_live_short AIza" + "b".repeat(15),
+    fill + "aws AKIAIOSFODNN7EXAMPLEX and ASIAIOSFODNN7EXAMPL then AKIAIOSFODNN7EXAMPLE.",
+    fill + "token " + jwt + " end",
+    fill + "token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0 and .eyJ and x" + jwt,
+    fill + "-----BEGIN PUBLIC KEY-----\nabc\n-----END PUBLIC KEY-----\n" + fill + "-----BEGIN RSA PRIVATE KEY-----\nMIIB\n-----END RSA PRIVATE KEY-----\n",
+    fill + "-----BEGIN " + "y".repeat(200) + " -----BEGIN OPENSSH PRIVATE KEY-----",
+    fill + "-----BEGIN CERTIFICATE\nPRIVATE KEY----- " + fill,
+    fill + "the project zeu and PROJECT ZEUS plan",
+    fill + "x" + "9",
+    "é".repeat(40) + " ünï@exämple.com 日本語 jane@example.com",
+  ]
+  const none: string[] = []
+  const cfgs: GuardConfig[] = [all, { detect: ["email", "phone"], mode: "block" }, { detect: none, mode: "block", custom: ["zeus"] }, { detect: ["private_key", "ipv4", "credit_card"], mode: "block" }]
+  let hits = 0
+  for (const text of texts) {
+    const b = enc.encode(text)
+    for (const cfg of cfgs) {
+      for (const step of [1, 2, 7, 64, 4096]) {
+        const c = new FindingCursor(cfg)
+        let end = 0
+        let early = ""
+        while (end < b.length) {
+          end = end + step < b.length ? end + step : b.length
+          // not inside a character
+          while (end < b.length && int(b[end]!) >= 128 && int(b[end]!) < 192) end += 1
+          const part = text.slice(0, end)
+          if (end * 2 <= b.length) early = part
+          const want = scan(part, cfg).length > 0
+          if (c.found(part) !== want) expect(`${text} [${step}] at ${end}`).toBe("the whole scan's answer")
+          if (want) hits += 1
+        }
+        // a shorter text starts over
+        expect(c.found(early)).toBe(scan(early, cfg).length > 0)
+        expect(c.found(text)).toBe(scan(text, cfg).length > 0)
+      }
+    }
+  }
+  expect(hits > 1000).toBe(true)
 })
