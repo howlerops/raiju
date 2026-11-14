@@ -2,10 +2,10 @@
 // (/api/oauth2/sessions), the per-user sessions (/api/mcp/sessions: OAuth tokens, pending consent
 // flows, header credentials) and the per-user headers submission (/api/mcp/per-user-headers/flows).
 import { createMemo, createSignal, For, Show } from "solid-js"
-import { ApiError, send } from "../api/client"
-import { fmtTime } from "../fmt"
-import { can } from "../perm"
-import { Card, copyText, DangerButton, FormError, Guard, Mono, notify, Pill, Table, Toolbar, useFormRun, useRun, type Tone } from "../ui"
+import { ApiError, getData, send } from "../api/client"
+import { fmtTime, idLabel } from "../fmt"
+import { canCall } from "../perm"
+import { Card, copyText, DangerButton, fieldValue, FormError, Guard, Mono, notify, Pill, Table, Toolbar, useFormRun, useRun, type Tone } from "../ui"
 import { regionalLink } from "../gateway"
 
 interface Grant {
@@ -45,6 +45,9 @@ interface Ctl {
   bump: () => void
 }
 
+const SESSIONS = "/api/mcp/sessions"
+const FLOWS = "/api/mcp/per-user-headers/flows"
+
 const KIND_LABEL: Record<string, string> = { token: "OAuth token", flow: "Pending consent", header: "Header credential" }
 
 function statusTone(s: string): Tone {
@@ -52,8 +55,7 @@ function statusTone(s: string): Tone {
 }
 
 async function getPage<T>(path: string, query: Record<string, string | number | undefined>): Promise<Page<T>> {
-  const r = await send("GET", path, { query })
-  const d = (r.data ?? {}) as Partial<Page<T>>
+  const d = ((await getData(path, query)) ?? {}) as Partial<Page<T>>
   return { sessions: d.sessions ?? [], total_count: d.total_count ?? 0 }
 }
 
@@ -116,7 +118,7 @@ function Grants(props: Ctl) {
                       <td class="nowrap">{fmtTime(Date.parse(g().created_at))}</td>
                       <td class="nowrap">{g().last_used_at ? fmtTime(Date.parse(g().last_used_at!)) : "never"}</td>
                       <td>
-                        <Show when={can("MCPGateway", "Delete")}>
+                        <Show when={canCall("DELETE", "/api/oauth2/sessions")}>
                           <DangerButton
                             label="Revoke"
                             action={async () => {
@@ -148,11 +150,11 @@ function Sessions(props: Ctl) {
   const { busy, run } = useRun()
   const rows = createMemo(() => {
     props.tick()
-    return getPage<SessionRow>("/api/mcp/sessions", { kind: kind(), limit: 100 })
+    return getPage<SessionRow>(SESSIONS, { kind: kind(), limit: 100 })
   })
   const reauth = (r: SessionRow) =>
     run(async () => {
-      const res = await send("POST", "/api/mcp/sessions/" + encodeURIComponent(r.id) + "/reauth")
+      const res = await send("POST", SESSIONS + "/" + encodeURIComponent(r.id) + "/reauth")
       const value = String((res.data as { url?: string } | undefined)?.url ?? "")
       if (!value) throw new Error("The gateway did not return a consent link.")
       setLink({ client: r.mcp_client.name, url: regionalLink(value) })
@@ -219,19 +221,18 @@ function Sessions(props: Ctl) {
                     <td class="nowrap">{r().expires_at ? fmtTime(r().expires_at) : "—"}</td>
                     <td class="nowrap">{fmtTime(r().created_at)}</td>
                     <td>
-                      <Show when={can("MCPGateway", "Create") || can("MCPGateway", "Delete")}>
+                      <Show when={canCall("POST", SESSIONS) || canCall("DELETE", SESSIONS)}>
                         <span class="row-actions">
-                          {/* re-authorizing is a POST, which the server checks as Create */}
-                          <Show when={r().can_reauth && can("MCPGateway", "Create")}>
+                          <Show when={r().can_reauth && canCall("POST", SESSIONS)}>
                             <button type="button" class="btn btn-sm btn-ghost" disabled={busy()} onClick={() => reauth(r())}>
                               Re-authorize
                             </button>
                           </Show>
-                          <Show when={can("MCPGateway", "Delete")}>
+                          <Show when={canCall("DELETE", SESSIONS)}>
                             <DangerButton
                               label="Revoke"
                               action={async () => {
-                                await send("DELETE", "/api/mcp/sessions/" + encodeURIComponent(r().id))
+                                await send("DELETE", SESSIONS + "/" + encodeURIComponent(r().id))
                                 notify("Session revoked", "ok")
                                 props.bump()
                               }}
@@ -287,12 +288,12 @@ function Headers(props: Ctl) {
   const openFlow = (ev: SubmitEvent) => {
     ev.preventDefault()
     const f = ev.currentTarget as HTMLFormElement
-    const client = (f.elements.namedItem("client") as HTMLSelectElement).value
-    const vk = (f.elements.namedItem("vk") as HTMLSelectElement).value
+    const client = fieldValue(f, "client")
+    const vk = fieldValue(f, "vk")
     void open.run(async () => {
-      const made = await send("POST", "/api/mcp/per-user-headers/flows", { body: { mcp_client_name: client, virtual_key_id: vk } })
+      const made = await send("POST", FLOWS, { body: { mcp_client_name: client, virtual_key_id: vk } })
       const id = String((made.data as { id?: string }).id)
-      const got = await send("GET", "/api/mcp/per-user-headers/flows/" + encodeURIComponent(id))
+      const got = await send("GET", FLOWS + "/" + encodeURIComponent(id))
       setFlow(got.data as Flow)
     })
   }
@@ -303,11 +304,11 @@ function Headers(props: Ctl) {
     if (!cur) return
     const headers: Record<string, string> = {}
     for (const k of cur.required_header_keys) {
-      const v = (f.elements.namedItem("h:" + k) as HTMLInputElement).value
+      const v = fieldValue(f, "h:" + k)
       if (v) headers[k] = v
     }
     void submit.run(async () => {
-      await send("PUT", "/api/mcp/per-user-headers/flows/" + encodeURIComponent(cur.id), { body: { headers } })
+      await send("PUT", FLOWS + "/" + encodeURIComponent(cur.id), { body: { headers } })
       notify("Header values saved for " + cur.virtual_key.id, "ok")
       setFlow(undefined)
       props.bump()
@@ -323,8 +324,8 @@ function Headers(props: Ctl) {
       <div id="mca-headers">
         <Guard>
           <Show when={data().clients.length} fallback={<p class="muted">No MCP client uses per-user headers. Add one with auth type per_user_headers.</p>}>
-            {/* opening a submission is a POST (Create) and saving its values a PUT (Update) */}
-            <Show when={can("MCPGateway", "Create") && can("MCPGateway", "Update")} fallback={<p class="muted">Your role cannot open header submissions.</p>}>
+            {/* opening a submission is a POST and saving its values a PUT */}
+            <Show when={canCall("POST", FLOWS) && canCall("PUT", FLOWS)} fallback={<p class="muted">Your role cannot open header submissions.</p>}>
               <form class="inline-form" id="mca-hdr-open" aria-label="Open a headers submission" onSubmit={openFlow}>
                 <label>
                   MCP client
@@ -338,7 +339,7 @@ function Headers(props: Ctl) {
                   Virtual key
                   <select class="select select-sm" name="vk" required>
                     <For each={data().keys} keyed={(k) => k.id}>
-                      {(k) => <option value={k().id}>{k().name ? k().name + " (" + k().id + ")" : k().id}</option>}
+                      {(k) => <option value={k().id}>{idLabel(k())}</option>}
                     </For>
                   </select>
                 </label>

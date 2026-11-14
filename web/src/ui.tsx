@@ -1,10 +1,10 @@
 // Small shared pieces: toasts, pills, tables, the two-step delete button,
 // busy wrappers and the error line.
-import { createSignal, Errored, For, Loading, Show } from "solid-js"
+import { createSignal, Errored, For, Loading, Show, untrack } from "solid-js"
 import { LoadingSkeleton } from "./LoadingSkeleton"
 import type { JSX } from "@solidjs/web"
 import { message } from "./api/client"
-import { can, type Op } from "./perm"
+import { canCall } from "./perm"
 import { targetLabel } from "./gateway"
 
 // ---- initial values for uncontrolled fields ----
@@ -22,6 +22,12 @@ export const initChecked = (b: boolean) => (el: HTMLInputElement) => {
 
 export const initSelected = (b: boolean) => (el: HTMLOptionElement) => {
   el.selected = b
+}
+
+// The value of a named field of a form, "" when the form has no such field.
+export function fieldValue(form: HTMLFormElement | undefined, name: string): string {
+  const el = form?.elements.namedItem(name)
+  return el instanceof HTMLInputElement || el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement ? el.value : ""
 }
 
 // ---- toasts ----
@@ -108,10 +114,10 @@ export function Table(props: { cols: string[]; children?: JSX.Element }) {
 }
 
 // A loading skeleton and an error line around async content.
-export function Guard(props: { children?: JSX.Element }) {
+export function Guard(props: { variant?: "content" | "table" | "form"; children?: JSX.Element }) {
   return (
     <Errored fallback={(err) => <ErrP error={err()} />}>
-      <Loading fallback={<LoadingSkeleton variant="content" />}>{props.children}</Loading>
+      <Loading fallback={<LoadingSkeleton variant={props.variant ?? "content"} />}>{props.children}</Loading>
     </Errored>
   )
 }
@@ -167,17 +173,10 @@ export function FormError(props: { text: string; wide?: boolean }) {
 // A delete button that asks for an in-page confirmation (no confirm() dialogs).
 export function DangerButton(props: { label: string; action: () => Promise<void>; disabled?: boolean }) {
   const [confirming, setConfirming] = createSignal(false)
-  const [busy, setBusy] = createSignal(false)
+  const { busy, run } = useRun()
   const go = async () => {
-    setBusy(true)
-    try {
-      await props.action()
-    } catch (e) {
-      notify(message(e), "error")
-    } finally {
-      setBusy(false)
-      setConfirming(false)
-    }
+    await run(() => props.action())
+    setConfirming(false)
   }
   return (
     <span class="confirm">
@@ -198,6 +197,58 @@ export function DangerButton(props: { label: string; action: () => Promise<void>
         </button>
       </Show>
     </span>
+  )
+}
+
+// ---- client and tools rows ----
+
+export interface ClientTools {
+  client: string
+  tools: string
+}
+
+// The rows of a "which tools of which MCP client" editor: a client select, a tools field and Remove.
+// rows is the form's store; update runs a change on it.
+export function ClientToolsRows(props: {
+  rows: ClientTools[]
+  clients: string[]
+  update: (change: (rows: ClientTools[]) => void) => void
+  toolsLabel: string
+  toolsPlaceholder: string
+  rowClass?: string
+}) {
+  // a stored client that is no longer configured stays selectable
+  const names = (extra: string) => (extra && !props.clients.includes(extra) ? [...props.clients, extra] : props.clients)
+  return (
+    <For each={props.rows}>
+      {(row, i) => (
+        <div class={["rule", props.rowClass]}>
+          <select class="select select-sm" aria-label="MCP client" onChange={(e) => props.update((r) => void (r[i()]!.client = e.currentTarget.value))}>
+            <option value="" selected={!row.client}>
+              Choose MCP client
+            </option>
+            <For each={untrack(() => names(row.client))}>
+              {(n) => (
+                <option value={n} selected={n === row.client}>
+                  {n}
+                </option>
+              )}
+            </For>
+          </select>
+          <input class="input input-sm"
+            type="text"
+            aria-label={props.toolsLabel}
+            placeholder={props.toolsPlaceholder}
+            autocomplete="off"
+            value={row.tools}
+            onInput={(e) => props.update((r) => void (r[i()]!.tools = e.currentTarget.value))}
+          />
+          <button type="button" class="btn btn-sm btn-ghost" onClick={() => props.update((r) => void r.splice(i(), 1))}>
+            Remove
+          </button>
+        </div>
+      )}
+    </For>
   )
 }
 
@@ -248,7 +299,8 @@ export function tf(b: boolean): "true" | "false" {
   return b ? "true" : "false"
 }
 
-// Shows its children only when the signed-in role holds the permission (the server still decides).
-export function Can(props: { resource: string; op?: Op; children?: JSX.Element }) {
-  return <Show when={can(props.resource, props.op ?? "View")}>{props.children}</Show>
+// Shows its children only when the signed-in role may make the call (the server still decides).
+// The permission pair comes from the call itself, so a control cannot name the wrong one.
+export function CanCall(props: { method: string; path: string; children?: JSX.Element }) {
+  return <Show when={canCall(props.method, props.path)}>{props.children}</Show>
 }

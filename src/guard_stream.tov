@@ -17,7 +17,7 @@
 // the hold; exceeding either blocks the stream, unless on_limit is "release", which releases held
 // events and continues on the live path.
 
-import { CompiledRule, applyRegex } from "./guard_regex"
+import { CompiledRule, BlockCursor, applyRegex, compileRules } from "./guard_regex"
 import { compileLocal, localVerdict } from "./guard_local"
 import { GuardConfig, applyToText, scan } from "./guardrails"
 import { Field, fields, elements, find, decodeString, quote, rawStr } from "./json"
@@ -117,6 +117,11 @@ export class OutputStreamGuard {
   private builtin: GuardConfig | undefined = undefined
   // the providers whose verdict can be a block: only these are asked on each check of the answer
   private blockers: GuardedProvider[] = []
+  // one per blocker: whether the answer so far blocks, from a scan of its new end only (guard_regex.tov
+  // BlockCursor gives the whole scan's answer). A held stream is checked whole, at its steps.
+  private cursors: BlockCursor[] = []
+  // true: every check scans the whole answer (the tests compare the two)
+  wholeChecks = false
   // the last text event, the template for held text that goes out in an event of its own
   private tpl: Piece | undefined = undefined
   private tplEv = ""
@@ -142,7 +147,10 @@ export class OutputStreamGuard {
         // a block rule blocks, and so does a redact rule whose match cannot be placed (guard_regex.tov applyRegex)
         if (r.action !== "detect_only") can = true
       }
-      if (can) this.blockers.push(p)
+      if (can) {
+        this.blockers.push(p)
+        this.cursors.push(new BlockCursor(p.rules))
+      }
     }
   }
 
@@ -299,7 +307,10 @@ export class OutputStreamGuard {
 
   private check(): GuardHit | undefined {
     this.checked = this.answer.byteLength
-    for (const p of this.blockers) {
+    for (let i = 0; i < this.blockers.length; i++) {
+      const p = this.blockers[i]!
+      // the cursor says whether the whole scan would block; the whole scan then gives the verdict and its reason
+      if (!this.holding && !this.wholeChecks && !this.cursors[i]!.blocked(this.answer)) continue
       const v = localVerdict(p.rules, this.answer)
       if (v.action === "block") return { id: p.id, reason: `${p.id}: ${v.reason}` }
     }
@@ -807,4 +818,56 @@ test("a stream that ends without a closing blank line keeps its last piece as it
   const rep = g.takeReplay()
   expect(rep.length).toBe(2)
   expect(rep[1]).toBe("data: [DONE]")
+})
+
+// The whole output of a guard fed the text as chat chunks of `step` bytes, with what blocked it.
+function streamed(p: GuardedProvider[], text: string, step: int, whole: bool): string {
+  const g = new OutputStreamGuard(p, "chat")
+  g.wholeChecks = whole
+  let out = ""
+  let at = 0
+  while (at < text.byteLength) {
+    const end = at + step < text.byteLength ? at + step : text.byteLength
+    out += g.filter(chunk(text.slice(at, end)))
+    at = end
+  }
+  out += g.finish("data: [DONE]\n\n")
+  return `${g.stopped}|${g.blockedBy}|${g.kinds.join(",")}|${out}`
+}
+
+test("the check of the answer's new end gives the stream the whole-answer check gives, in any chunking", () => {
+  const fill = "lorem ipsum dolor sit amet "
+  const base = fill.repeat(220)
+  const sets: GuardedProvider[][] = [
+    // a block rule; a redact rule (it can block too, so it is checked); both, with a keyword rule
+    [{ id: "codes", rules: try rx("PROJ-\\d{4}", "block") }],
+    [{ id: "pii", rules: try phone() }],
+    [
+      { id: "pii", rules: try phone() },
+      { id: "codes", rules: try rx("PROJ-\\d{4}", "block") },
+      { id: "kw", rules: try compileRules([{ pattern: "zz[0-9]", keywords: ["needle"], action: "block" }]) },
+    ],
+  ]
+  const texts: string[] = [
+    base,
+    base.slice(0, 2555) + " call 555-1234 or 555-9876 now " + base.slice(0, 2700),
+    base.slice(0, 300) + " 555-1234 " + base.slice(0, 3791) + "PROJ-4411" + base.slice(0, 900),
+    base.slice(0, 2047) + "PROJ-4411" + base.slice(0, 400),
+    base.slice(0, 700) + " zz7 555-0000 " + base.slice(0, 3300) + " the needle " + base.slice(0, 600),
+  ]
+  for (const p of sets) {
+    for (const text of texts) {
+      const want = streamed(p, text, 40, true)
+      for (const step of [3, 40, 250, 1000]) {
+        expect(streamed(p, text, step, false) === streamed(p, text, step, true)).toBe(true)
+      }
+      // the chunking of the text does not change whether and by what the stream is blocked
+      expect(streamed(p, text, 7, false).split("|").slice(0, 2).join("|")).toBe(want.split("|").slice(0, 2).join("|"))
+    }
+  }
+  // the block still comes with the event that completes the match
+  const g = new OutputStreamGuard(sets[0]!, "chat")
+  expect(g.filter(chunk(base.slice(0, 4000) + "PROJ-44")).includes("guardrail_violation")).toBe(false)
+  expect(g.filter(chunk("11")).includes("response blocked by guardrails: codes: found REGEX_MATCH")).toBe(true)
+  expect(g.blockedBy).toBe("codes")
 })

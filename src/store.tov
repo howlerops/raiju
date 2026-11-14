@@ -31,7 +31,7 @@ import { McpClientConfig, McpUserCredential } from "./mcp"
 import { McpUserToken } from "./mcpuser"
 import { decode, encode } from "./base64"
 import { gcmSeal, gcmOpen, pbkdf2Sha256 } from "./aesgcm"
-import { Field, fields, find, isNull, quote, elements, decodeString, rawStr, rawBool, rawNum, build, setField, without } from "./json"
+import { Field, fields, find, isNull, quote, elements, decodeString, rawStr, rawBool, rawNum, build, setField, without, floorInt } from "./json"
 import { secureHex, utf8, sha256, toHex, safeEq, secretFieldName, secretMapName, secureBytes } from "./crypto"
 import { Policy, Verdict, hostVerdict, urlVerdict } from "./netguard"
 import { rfc3339Ms, rfc3339Of } from "./vkexpiry"
@@ -2771,6 +2771,39 @@ export class ConfigStore {
   }
 }
 
+// The opposite of maskJson for a section sent back by a client that read it masked: a secret string that is still
+// exactly the mask of the stored one is the stored one. Without this a save of what GET /api/config returned would
+// replace a secret (the MCP authorization server's signing key, say) with its mask. Objects are matched by key and
+// arrays by position; anything that does not line up with the stored text passes as sent.
+function unmaskJson(raw: string, stored: string | undefined, all: bool): string throws SyntaxError {
+  const t = raw.trim()
+  const old = stored === undefined ? "" : stored.trim()
+  if (t.startsWith("{")) {
+    const olds = old.startsWith("{") ? try fields(old) : []
+    const out: string[] = []
+    for (const f of try fields(t)) {
+      const secret = all || secretMapName(f.key) || (secretFieldName(f.key) && f.raw.trim().startsWith("\""))
+      out.push(`${quote(f.key)}:${try unmaskJson(f.raw, find(olds, f.key), secret)}`)
+    }
+    return "{" + out.join(",") + "}"
+  }
+  if (t.startsWith("[")) {
+    const olds = old.startsWith("[") ? try elements(old) : []
+    const out: string[] = []
+    let i = 0
+    for (const e of try elements(t)) {
+      out.push(try unmaskJson(e, i < olds.length ? olds[i]! : undefined, all))
+      i += 1
+    }
+    return "[" + out.join(",") + "]"
+  }
+  if (all && t.startsWith("\"") && old.startsWith("\"")) {
+    const kept = try decodeString(old)
+    if ((try decodeString(t)) === maskSecret(kept)) return quote(kept)
+  }
+  return t
+}
+
 // Masks the secret string values of a JSON text (see secretFieldName and secretMapName in crypto.tov).
 function maskJson(raw: string, all: bool): string throws SyntaxError {
   const t = raw.trim()
@@ -2802,6 +2835,13 @@ test("the config view masks secrets in every section", () => {
   expect(m.includes(`"max_tokens":5`)).toBe(true)
   expect(m.includes(`"token_url":"https://t/token"`)).toBe(true)
   expect(m.includes(`"value":"env.FOO"`)).toBe(true)
+  // a masked section sent back restores the stored secrets and keeps everything the client changed
+  const stored = `{"oauth2_server_config":{"issuer_url":"https://a","signing_key":"-----BEGIN PRIVATE KEY-----abcdefghijklmnop"},"headers":{"x":"short"},"n":1}`
+  const sentBack = try maskJson(stored, false)
+  expect(sentBack.includes("abcdefghijklmnop")).toBe(false)
+  expect(try unmaskJson(sentBack, stored, false)).toBe(stored)
+  expect(try unmaskJson(`{"oauth2_server_config":{"issuer_url":"https://b","signing_key":"new-key"},"n":2}`, stored, false)).toBe(`{"oauth2_server_config":{"issuer_url":"https://b","signing_key":"new-key"},"n":2}`)
+  expect(try unmaskJson(`{"headers":{"x":"****","y":"****"}}`, stored, false)).toBe(`{"headers":{"x":"short","y":"****"}}`)
   // secrets whose names carry none of the usual words
   const k = try maskJson(`{"encryption_key":"eeeeeeeeeeee","client":{"oauth2_server_config":{"signing_key":"ssssssssssss"}},"exporters":[{"service_account_key":"aaaaaaaaaaaa"}],"tls":{"client_key_pem":"kkkkkkkkkkkk","client_cert_pem":"cert"},"sasl_password":"dddddddddddd","access_key":"AKIAEXAMPLE"}`, false)
   for (const secret of ["eeeeeeeeeeee", "ssssssssssss", "aaaaaaaaaaaa", "kkkkkkkkkkkk", "dddddddddddd"]) expect(k.includes(secret)).toBe(false)
@@ -3956,7 +3996,7 @@ function permissionIdsOf(body: string): { pairs: PermissionPair[], error: string
   try {
     for (const el of elements(raw)) {
       const id = parseFloat(el)
-      const pair = id === undefined ? undefined : pairOfId(RESOURCES, OPERATIONS, Math.floor(id))
+      const pair = id === undefined ? undefined : pairOfId(RESOURCES, OPERATIONS, floorInt(id) ?? -1)
       if (pair === undefined) return { pairs: pairs, error: `unknown permission id ${el}` }
       pairs.push(pair)
     }
@@ -4236,7 +4276,7 @@ function frameworkPlan(raw: string, cur: PricingSyncConfig | undefined): Framewo
   if (find(fs, "pricing_sync_interval") !== undefined && iv === undefined) return { kind: "error", message: "pricing_sync_interval must be a number of seconds" }
   if (iv !== undefined) {
     if (iv <= 0.0) return { kind: "error", message: "pricing_sync_interval must be positive" }
-    interval = Math.floor(iv)
+    interval = Math.floor(Math.min(iv, 1.0e12))
   }
   let mpu: string | undefined = cur?.model_parameters_url
   const gm = rawStr(fs, "model_parameters_url")
@@ -4249,7 +4289,7 @@ function frameworkPlan(raw: string, cur: PricingSyncConfig | undefined): Framewo
   if (lv !== undefined) {
     if (lv < 0.0) return { kind: "error", message: "live models sync interval cannot be negative" }
     if (lv > 0.0 && lv < 60.0) return { kind: "error", message: "live models sync interval must be 0 (disabled) or at least 60 seconds" }
-    live = Math.floor(lv)
+    live = Math.floor(Math.min(lv, 1.0e12))
   }
   if (url === undefined && interval === undefined && cur?.enabled === undefined && mpu === undefined && live === undefined && cur?.mcp_library_url === undefined && cur?.mcp_library_sync_interval === undefined) return { kind: "ok", ps: undefined }
   let ps: PricingSyncConfig = cur ?? {}
@@ -4325,7 +4365,8 @@ function putConfig(store: ConfigStore, body: string, grant?: Grant): ApiReply {
     const problem = clientProblem(rawClient)
     if (problem !== "") return reply(400, errorBody(problem))
     try {
-      c = JSON.parse(rawClient) as ClientConfig
+      // secrets the client read masked (GET /api/config) and sent back unchanged keep their stored values
+      c = JSON.parse(try unmaskJson(rawClient, JSON.stringify(store.cfg.client ?? {}), false)) as ClientConfig
     } catch (e) {
       return badBody()
     }
@@ -4597,8 +4638,8 @@ function modelList(c: Config, only: string, query: string, limit: f64, offset: f
       }
     }
   }
-  const from = offset >= 0 ? Math.floor(offset) : 0
-  const n = limit >= 0 ? Math.floor(limit) : 5
+  const from = offset >= 0 ? Math.floor(Math.min(offset, 1.0e9)) : 0
+  const n = limit >= 0 ? Math.floor(Math.min(limit, 1.0e9)) : 5
   return JSON.stringify({ models: all.slice(from, from + n), total: all.length })
 }
 

@@ -506,6 +506,8 @@ export function FrontierChart(props: FrontierProps) {
   const { w, ref } = useWidth(600)
   // the index of the hovered frontier vertex (in cost order), -1 for none
   const [hover, setHover] = createSignal(-1)
+  // the data table is built only while its <details> is open
+  const [tableOpen, setTableOpen] = createSignal(false)
   const H = () => props.height ?? 260
   const ML = 60
   const MR = 12
@@ -673,40 +675,42 @@ export function FrontierChart(props: FrontierProps) {
             )}
           </Show>
         </div>
-        <details class="chart-table">
+        <details class="chart-table" onToggle={(ev) => setTableOpen(ev.currentTarget.open)}>
           <summary>Data table</summary>
-          <Table cols={["Crew", "Kind", "Cost per task", "Quality"]}>
-            <For each={sorted()}>
-              {(p) => (
-                <tr>
-                  <td>{p.label}</td>
-                  <td>{p.label === props.current?.label ? "frontier, current" : "frontier"}</td>
-                  <td>{props.costFormat(p.cost)}</td>
-                  <td>{props.qualityFormat(p.quality)}</td>
-                </tr>
-              )}
-            </For>
-            <For each={props.uniform ?? []}>
-              {(p) => (
-                <tr>
-                  <td>{p.label}</td>
-                  <td>uniform</td>
-                  <td>{props.costFormat(p.cost)}</td>
-                  <td>{props.qualityFormat(p.quality)}</td>
-                </tr>
-              )}
-            </For>
-            <Show when={props.knee}>
-              {(k) => (
-                <tr>
-                  <td>{k().label}</td>
-                  <td>knee</td>
-                  <td>{props.costFormat(k().cost)}</td>
-                  <td>{props.qualityFormat(k().quality)}</td>
-                </tr>
-              )}
-            </Show>
-          </Table>
+          <Show when={tableOpen()}>
+            <Table cols={["Crew", "Kind", "Cost per task", "Quality"]}>
+              <For each={sorted()}>
+                {(p) => (
+                  <tr>
+                    <td>{p.label}</td>
+                    <td>{p.label === props.current?.label ? "frontier, current" : "frontier"}</td>
+                    <td>{props.costFormat(p.cost)}</td>
+                    <td>{props.qualityFormat(p.quality)}</td>
+                  </tr>
+                )}
+              </For>
+              <For each={props.uniform ?? []}>
+                {(p) => (
+                  <tr>
+                    <td>{p.label}</td>
+                    <td>uniform</td>
+                    <td>{props.costFormat(p.cost)}</td>
+                    <td>{props.qualityFormat(p.quality)}</td>
+                  </tr>
+                )}
+              </For>
+              <Show when={props.knee}>
+                {(k) => (
+                  <tr>
+                    <td>{k().label}</td>
+                    <td>knee</td>
+                    <td>{props.costFormat(k().cost)}</td>
+                    <td>{props.qualityFormat(k().quality)}</td>
+                  </tr>
+                )}
+              </Show>
+            </Table>
+          </Show>
         </details>
       </Show>
     </figure>

@@ -3,7 +3,7 @@ import { LoadingSkeleton } from "../LoadingSkeleton"
 import { api } from "../api/client"
 import type { LogEntry } from "../api/types"
 import { fmtInt } from "../fmt"
-import { ErrP, Toolbar, tf } from "../ui"
+import { ErrP, fieldValue, Toolbar, tf } from "../ui"
 import { LogCharts } from "./Charts"
 import { LOG_COLS, LogCells, LogDetail } from "./logParts"
 
@@ -117,7 +117,7 @@ export function Logs() {
     }
   })
 
-  const read = (n: string) => ((form?.elements.namedItem(n) as HTMLInputElement | HTMLSelectElement | null)?.value ?? "").trim()
+  const read = (n: string) => fieldValue(form, n).trim()
   const apply = (ev: SubmitEvent) => {
     ev.preventDefault()
     before = undefined

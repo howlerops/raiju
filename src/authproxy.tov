@@ -5,7 +5,7 @@
 import { Field, fields, elements, find, rawStr, rawNum, decodeString } from "./json"
 import { sha256, utf8 } from "./crypto"
 import { encodeUrl, decode, decodeText } from "./base64"
-import { modPow } from "./jwt"
+import { modPow, child, bigOf, verifyPkcs1Sha256 } from "./jwt"
 import { request } from "./discovery"
 
 export type AuthProxyConfig = {
@@ -45,49 +45,6 @@ const KEY_TIMEOUT_MS = 10000
 
 // ---- DER and PEM ----
 
-type Tlv = { tag: int, value: u8[], next: int }
-
-function tlvAt(der: u8[], pos: int): Tlv throws SyntaxError {
-  if (pos + 2 > der.length) throw new SyntaxError("der: truncated")
-  const tag = int(der[pos]!)
-  let len = int(der[pos + 1]!)
-  let p = pos + 2
-  if (len >= 0x80) {
-    const n = len - 0x80
-    if (n < 1 || n > 4) throw new SyntaxError("der: unsupported length")
-    len = 0
-    for (let i = 0; i < n; i++) {
-      if (p >= der.length) throw new SyntaxError("der: truncated")
-      len = len * 256 + int(der[p]!)
-      p++
-    }
-  }
-  if (p + len > der.length) throw new SyntaxError("der: truncated")
-  return { tag: tag, value: der.slice(p, p + len), next: p + len }
-}
-
-function childOf(der: u8[], pos: int, tag: int): Tlv throws SyntaxError {
-  const t = try tlvAt(der, pos)
-  if (t.tag !== tag) throw new SyntaxError(`der: expected tag ${tag}, found ${t.tag}`)
-  return t
-}
-
-function bigOf(b: u8[]): bigint {
-  let v = 0n
-  for (const x of b) v = v * 256n + BigInt(int(x))
-  return v
-}
-
-function byteLen(x: bigint): int {
-  let n = 0
-  let v = x
-  while (v > 0n) {
-    v = v >> 8n
-    n++
-  }
-  return n
-}
-
 function sameBytes(a: u8[], b: int[]): bool {
   if (a.length !== b.length) return false
   for (let i = 0; i < b.length; i++) {
@@ -104,9 +61,9 @@ const RSA_OID: int[] = [0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x
 
 // A SubjectPublicKeyInfo (RFC 5280): an EC P-256 point or an RSA key.
 function keyFromSpki(der: u8[]): ProxyKey throws SyntaxError {
-  const top = (try childOf(der, 0, 0x30)).value
-  const alg = try childOf(top, 0, 0x30)
-  const bits = try childOf(top, alg.next, 0x03)
+  const top = (try child(der, 0, 0x30)).value
+  const alg = try child(top, 0, 0x30)
+  const bits = try child(top, alg.next, 0x03)
   // the BIT STRING starts with the count of unused bits, always 0 here
   const pk = bits.value.slice(1)
   if (sameBytes(alg.value.slice(0, EC_OID.length), EC_OID)) {
@@ -115,9 +72,9 @@ function keyFromSpki(der: u8[]): ProxyKey throws SyntaxError {
     return try ecKey(bigOf(pk.slice(1, 33)), bigOf(pk.slice(33, 65)))
   }
   if (sameBytes(alg.value.slice(0, RSA_OID.length), RSA_OID)) {
-    const seq = (try childOf(pk, 0, 0x30)).value
-    const n = try childOf(seq, 0, 0x02)
-    const e = try childOf(seq, n.next, 0x02)
+    const seq = (try child(pk, 0, 0x30)).value
+    const n = try child(seq, 0, 0x02)
+    const e = try child(seq, n.next, 0x02)
     return { kind: "rsa", n: bigOf(n.value), e: bigOf(e.value) }
   }
   throw new SyntaxError("spki: key type is neither EC nor RSA")
@@ -281,28 +238,12 @@ function ecVerify(key: { x: bigint, y: bigint }, digest: u8[], r: bigint, s: big
 
 // ---- RSASSA-PKCS1-v1_5 with SHA-256 (RFC 8017) ----
 
-const SHA256_DIGEST_INFO: int[] = [0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20]
-
-function expectedEm(hash: u8[], k: int): bigint throws Error {
-  const tLen = SHA256_DIGEST_INFO.length + hash.length
-  if (k < tLen + 11) throw new Error("auth proxy: RSA key too small for SHA-256")
-  const em: u8[] = [u8(0), u8(1)]
-  for (let i = 0; i < k - tLen - 3; i++) em.push(u8(0xff))
-  em.push(u8(0))
-  for (const b of SHA256_DIGEST_INFO) em.push(u8(b))
-  for (const b of hash) em.push(b)
-  return bigOf(em)
-}
-
+// The shared verification with this module's wording for a refused key.
 function rsaVerify(digest: u8[], sig: u8[], n: bigint, e: bigint): bool throws Error {
-  const k = byteLen(n)
-  if (k < 256) throw new Error("auth proxy: RSA key shorter than 2048 bits")
-  if (e < 3n || (e & 1n) === 0n) throw new Error("auth proxy: invalid RSA exponent")
-  if (sig.length !== k) return false
-  const s = bigOf(sig)
-  if (s >= n) return false
-  const want = try expectedEm(digest, k)
-  return modPow(s, e, n) === want
+  const r = verifyPkcs1Sha256(digest, sig, n, e)
+  if (r === "short-key") throw new Error("auth proxy: RSA key shorter than 2048 bits")
+  if (r === "bad-exponent") throw new Error("auth proxy: invalid RSA exponent")
+  return r === "ok"
 }
 
 // ---- tokens ----

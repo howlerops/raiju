@@ -2,7 +2,8 @@
 # Runs the checks a contributor runs before a merge, as .github/workflows/ci.yml runs them.
 #
 # Usage: scripts/ci.sh [stage...]     (no stage: all of them, in this order)
-#   tov        build the patched compiler (scripts/build-tov.sh) unless $TOV is already there
+#   tov        build the patched compiler (scripts/build-tov.sh) and the JavaScriptCore the binary links
+#              (scripts/build-jsc.sh, about 15 minutes) unless both are already there
 #   check      tov check on every source file (never applies fixes)
 #   unit       make unit (tov test plus the Python tests)
 #   openapi    make openapi-check
@@ -34,6 +35,10 @@ ALL=(tov check unit openapi web parity configdoc deploy e2e-bun e2e-http1 ui)
 
 export TOV=${TOV:-$ROOT/build/tov/target/release/tov}
 export TOV_CFLAGS=${TOV_CFLAGS:--DTV_PLAIN_ALLOC}
+# the engine the image ships (scripts/build-jsc.sh), when it has been built
+if [ -z "${TOV_JSC_DIR:-}" ] && [ -e "$ROOT/build/jsc/current/lib/libtovjsc.a" ]; then
+  export TOV_JSC_DIR=$ROOT/build/jsc/current
+fi
 if [ -z "${BUN:-}" ]; then
   BUN=$(command -v bun 2>/dev/null || echo "$HOME/.bun/bin/bun")
 fi
@@ -41,7 +46,7 @@ export BUN
 
 stage_cmd() {
   case "$1" in
-    tov)       echo 'if [ -x "$TOV" ]; then echo "compiler present: $TOV"; else scripts/build-tov.sh; fi' ;;
+    tov)       echo 'if [ -x "$TOV" ] && [ -e build/jsc/current/lib/libtovjsc.a ]; then echo "compiler present: $TOV, engine: build/jsc/current"; else scripts/build-tov.sh && scripts/build-jsc.sh; fi' ;;
     check)     echo 'python3 scripts/check.py --no-fix src/*.tov src/providers/*.tov tests/*.tov && echo "check: ok"' ;;
     unit)      echo 'make unit TOV="$TOV"' ;;
     openapi)   echo 'make openapi-check TOV="$TOV"' ;;
@@ -72,10 +77,10 @@ if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
   exit 0
 fi
 
-# the compiler's cache key in CI: Tov's revision and a hash of the patches and the build script
+# the cache key of the compiler and the engine in CI: Tov's revision and a hash of the patches and the build scripts
 if [ "${1:-}" = "tov-key" ]; then
   rev=$(sed -n 's/^REV=\${TOV_REV:-\([0-9a-f]*\)}.*/\1/p' scripts/build-tov.sh)
-  hash=$({ find tov-patches -type f | LC_ALL=C sort; echo scripts/build-tov.sh; } | xargs sha256sum | sha256sum | cut -c1-16)
+  hash=$({ find tov-patches -type f | LC_ALL=C sort; echo scripts/build-tov.sh; echo scripts/build-jsc.sh; } | xargs sha256sum | sha256sum | cut -c1-16)
   echo "tov-$(uname -s)-$(uname -m)-${TOV_REV:-$rev}-$hash"
   exit 0
 fi

@@ -1,7 +1,7 @@
 # Deploying Raiju
 
-Raiju is one binary. The image runs it as non-root on an Ubuntu 24.04 LTS base (noble with
-JavaScriptCore, which the binary links). It takes a Raiju-format `config.json` from `/app/data`
+Raiju is one binary. The image runs it as non-root on an Ubuntu 24.04 LTS base (noble with ICU; the
+binary carries its own JavaScriptCore). It takes a Raiju-format `config.json` from `/app/data`
 (its `-app-dir`), and provider keys come from environment variables that the config refers to as
 `env.NAME`. Terraform modules (Helm release, AWS ECS Fargate) are in
 [terraform/](terraform/README.md). Every config key is listed in
@@ -502,11 +502,13 @@ over a real network, memory at 512Mi under real traffic) is checked by the stagi
 [docs/staging-validation.md](../docs/staging-validation.md), with the throwaway stack in
 `terraform/examples/staging`. Until it has been run, these remain unconfirmed:
 
-- The image builds Tov from source (the installer needs network access and takes several minutes).
-  The binary is dynamically linked against glibc, libstdc++ and WebKitGTK's JavaScriptCore (Tov
-  links it for `node:*` modules), so the runtime is `ubuntu:noble` with
-  `libjavascriptcoregtk-4.1-0`, not distroless, and carries JavaScriptCore's GLib and ICU
-  libraries. CI builds it on every pull request and push to main, boots it as the chart runs it
+- The image builds Tov and JavaScriptCore from source (the build needs network access; the engine
+  alone takes about 15 minutes on four cores, once per Tov revision with a layer cache).
+  JavaScriptCore (`node:*` modules run on it) is linked into the binary: WebKit's JSCOnly port at
+  the release Tov pins (`scripts/build-jsc.sh`), not the distribution's `libjavascriptcoregtk`,
+  whose package is built from the whole browser and is reported for every browser CVE. The binary
+  links glibc, libstdc++, libatomic and ICU dynamically, so the runtime is `ubuntu:noble` with
+  `libicu74`, not distroless. CI builds it on every pull request and push to main, boots it as the chart runs it
   (`tests/image_smoke.py`) and scans it with trivy.
 - The chart's pod security settings (read-only root filesystem, no capabilities, fsGroup on the
   data volume) are checked with `helm template` (`make deploy-check`) and trivy's config rules, and the

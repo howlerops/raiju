@@ -1,10 +1,10 @@
 import { createMemo, createSignal, flush, For, onSettled, Show } from "solid-js"
 import type { LogEntry } from "../api/types"
-import { fmtInt, fmtMoney, fmtMs, fmtTime } from "../fmt"
+import { fmtInt } from "../fmt"
 import { createFeed, LIVE_MAX, type LiveRow } from "../live"
-import { Pill, Toolbar, tf } from "../ui"
+import { Toolbar, tf } from "../ui"
 import { createVirtual } from "../virtual"
-import { LogDetail, StatusPill } from "./logParts"
+import { LOG_COLS, LogCells, LogDetail } from "./logParts"
 
 const ROW_H = 36
 
@@ -62,17 +62,7 @@ export function Live() {
 
   const Cells = (p: { e: LiveRow }) => (
     <>
-      <span class="vc nowrap">{fmtTime(p.e.ts)}</span>
-      <span class="vc">{p.e.provider || "—"}</span>
-      <span class="vc mono">{p.e.model || "—"}</span>
-      <span class="vc">
-        <StatusPill status={p.e.status} />
-      </span>
-      <span class="vc">{fmtMs(p.e.latency_ms)}</span>
-      <span class="vc">{fmtInt(p.e.prompt_tokens) + " / " + fmtInt(p.e.completion_tokens)}</span>
-      <span class="vc">{fmtMoney(p.e.cost)}</span>
-      <span class="vc">{p.e.cache_hit ? <Pill tone="ok">hit</Pill> : "—"}</span>
-      <span class="vc mono">{p.e.virtual_key || "—"}</span>
+      <LogCells e={p.e} as="span" />
       <Show when={feed.sawNode()}>
         <span class="vc mono">{p.e.node || "—"}</span>
       </Show>
@@ -141,15 +131,7 @@ export function Live() {
           ref={(el) => (scroller = el)}
         >
           <div class={["vhead", cols()]} role="row">
-            <span class="vc" role="columnheader">Time</span>
-            <span class="vc" role="columnheader">Provider</span>
-            <span class="vc" role="columnheader">Model</span>
-            <span class="vc" role="columnheader">Status</span>
-            <span class="vc" role="columnheader">Latency</span>
-            <span class="vc" role="columnheader">Tokens in / out</span>
-            <span class="vc" role="columnheader">Cost</span>
-            <span class="vc" role="columnheader">Cache</span>
-            <span class="vc" role="columnheader">Key</span>
+            <For each={LOG_COLS}>{(c) => <span class="vc" role="columnheader">{c}</span>}</For>
             <Show when={feed.sawNode()}>
               <span class="vc" role="columnheader">Node</span>
             </Show>

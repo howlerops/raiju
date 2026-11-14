@@ -33,7 +33,7 @@ import * as vertexWif from "./vertexwif"
 import * as bedrockMantle from "./providers/bedrock_mantle"
 import { CompatPlan, Shaped, settingsOf, withHeader, responseToChat, chatToText, textFrame, chatSseToText, textToChatFields } from "./compat"
 import { ResponsesToChatStream, ChatToResponses, toResponse, toResponseStream } from "./responses"
-import { ModelRef, parseModel, parseModelVia, target, kindOf, classify, backoffMs, maxRetries, timeoutMs, healthId, resolveAlias, matchedAlias, directRefs, directionOpts } from "./router"
+import { ModelRef, ModelIndex, modelIndex, parseModel, parseModelVia, parseModelIndexed, target, kindOf, classify, backoffMs, maxRetries, timeoutMs, healthId, resolveAlias, matchedAlias, directRefs, directionOpts } from "./router"
 import { CrewPick, crewRoute, withReasoningEffort, reasoningEffortText } from "./crew"
 import { forwardedHeaders, headerFilterOf } from "./headerfilter"
 import * as anthropicBeta from "./anthropic_beta"
@@ -63,7 +63,7 @@ import { LogStore, LogEntry, defaultLogStoreConfig } from "./logstore"
 import { dirProblem } from "./audit"
 import { isoMs } from "./exports"
 import { Tracer, Span, StageTiming, genAiAttributes, exportRequest, traceparentFor, tracesOn, TlsOpts, usesGrpc, exportSpansGrpc } from "./otel"
-import { McpManager, McpKeyConfig, keyRuleAllows, injectTools, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns, sanitizeName, perUserClientNames, perUserOAuthNames, tokenExchangeNames, userHeadersFor, ToolText, chatToolName, patternMatches, adminRowOf, ProjectMcp } from "./mcp"
+import { McpManager, McpKeyConfig, keyRuleAllows, injectToolFields, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns, sanitizeName, perUserClientNames, perUserOAuthNames, tokenExchangeNames, userHeadersFor, ToolText, chatToolName, patternMatches, adminRowOf, ProjectMcp } from "./mcp"
 import { CodeEntry, codeEntries, runMeta, metaToolDefs, isMetaTool, META_TOOLS, limitsOf, bindingLevelOf, execAutoAllowed } from "./codemode"
 import { McpTokenExchange, ExchangeCache, IdpEndpoints, exchangeKey, exchangeToken, renewAdmin, renewAt, needsReverify, RENEW_RETRY_MS, ADMIN_TAKEOVER_MS, ADMIN_WAIT_MS, ADMIN_POLL_MS } from "./tokenexchange"
 import { McpAuthConfig } from "./mcpauth"
@@ -815,7 +815,8 @@ export function retryHintMs(ms: string | undefined, after: string | undefined): 
 }
 
 function clampRetryMs(ms: f64): f64 {
-  return Math.min(Math.max(Math.floor(ms), 1000), 300000)
+  // clamped before it is floored: Math.floor traps on a float out of the int range
+  return Math.floor(Math.min(Math.max(ms, 1000.0), 300000.0))
 }
 
 test("retry hint: retry-after-ms first, then Retry-After seconds, clamped to 1s..5m", () => {
@@ -965,6 +966,9 @@ export function pluginPaths(cfg: Config): PluginSource[] {
   return out
 }
 
+// A request's MCP access (Engine.mcpAccess).
+type McpAccess = { policy: string[] | undefined, keys: McpKeyConfig[] | undefined, proj: ProjectMcp | undefined }
+
 // Telemetry user_name for the user assigned to a virtual key: the configured user's id, which also serves
 // as the user's name here, or "" when no user is assigned.
 export function userNameOf(cfg: Config, userId: string): string {
@@ -973,6 +977,13 @@ export function userNameOf(cfg: Config, userId: string): string {
     if (u.name === userId) return u.name
   }
   return ""
+}
+
+// The names of the configured governance users, for userNameOf without a scan of the list.
+function userNameSet(cfg: Config): Set<string> {
+  const out: Set<string> = new Set()
+  for (const u of cfg.governance?.users ?? []) out.add(u.name)
+  return out
 }
 
 export function errorResponse(status: int, message: string, type: string, extra: Hdrs): Response {
@@ -1178,13 +1189,16 @@ function directTarget(cfg: Config, ref: ModelRef, key: string): { t: Target, key
   return { t: { provider: ref.provider, kind: kindOf(ref.provider, p), model: ref.model, key: k, cfg: p }, keyIndex: -1 }
 }
 
-function fallbackRefs(cfg: Config, body: Field[]): ModelRef[] {
+function fallbackRefs(cfg: Config, body: Field[], idx?: ModelIndex): ModelRef[] {
   const out: ModelRef[] = []
   const raw = find(body, "fallbacks")
   if (raw === undefined || isNull(raw)) return out
   try {
     for (const el of elements(raw)) {
-      if (el.startsWith("\"")) out.push(parseModel(cfg, JSON.parse(el) as string))
+      if (el.startsWith("\"")) {
+        const name = JSON.parse(el) as string
+        out.push(idx === undefined ? parseModel(cfg, name) : parseModelIndexed(cfg, idx, name, ""))
+      }
       else if (el.startsWith("{")) {
         // { "provider": "anthropic", "model": "claude-..." }
         const f = fields(el)
@@ -1787,9 +1801,15 @@ export class Engine {
   wsLive: SocketGate
   // large_payload_optimization, when it is on (largepayload.tov)
   large: LargeSettings | undefined = undefined
+  // read from cfg's providers and governance users, at the start and at each reload: the bare model names and
+  // aliases the keys list (router.tov ModelIndex) and the user names (userNameOf)
+  modelIdx: ModelIndex
+  userNames: Set<string>
 
   constructor(public cfg: Config) {
     this.gov = new Governance(cfg)
+    this.modelIdx = modelIndex(cfg)
+    this.userNames = userNameSet(cfg)
     this.large = largeSettings(cfg)
     const wsMax = cfg.websocket?.max_connections_per_user ?? 100
     this.wsResponses = new SocketGate(wsMax)
@@ -2380,15 +2400,15 @@ export class Engine {
   }
 
   refOf(model: string): ModelRef {
-    return parseModel(this.cfg, model)
+    return parseModelIndexed(this.cfg, this.modelIdx, model, "")
   }
 
   refVia(model: string, route: string): ModelRef {
-    return parseModelVia(this.cfg, model, route)
+    return parseModelIndexed(this.cfg, this.modelIdx, model, route)
   }
 
   fallbacksOf(body: Field[]): ModelRef[] {
-    return fallbackRefs(this.cfg, body)
+    return fallbackRefs(this.cfg, body, this.modelIdx)
   }
 
   directPlan(refs: ModelRef[], pinned: bool): ModelRef[] {
@@ -2396,7 +2416,7 @@ export class Engine {
   }
 
   userName(userId: string): string {
-    return userNameOf(this.cfg, userId)
+    return userId !== "" && this.userNames.has(userId) ? userId : ""
   }
 
   injectedName(name: string): string | undefined {
@@ -2857,6 +2877,8 @@ export class Engine {
     fresh.gov.carryUsage(this.gov)
     if (this.sharedWindows) fresh.gov.alignWindows()
     this.cfg = cfg
+    this.modelIdx = fresh.modelIdx
+    this.userNames = fresh.userNames
     this.gov = fresh.gov
     this.pricing = fresh.pricing
     // a datasheet fetched at runtime carries over
@@ -2960,12 +2982,37 @@ export class Engine {
   }
 
   withMcpTools(text: string, h: Hdrs): string throws SyntaxError {
+    return (try this.mcpChat(text, h)).text
+  }
+
+  // withMcpTools in one pass over the request: the tools and the servers' instructions go into the same parsed
+  // fields. body is those fields when the request was parsed here (text is then built from them, or unchanged),
+  // so the caller need not parse it again; undefined when it was not.
+  mcpChat(text: string, h: Hdrs): { text: string, body: Field[] | undefined } throws SyntaxError {
     const m = this.mcp
-    if (m === undefined) return text
-    const tools = try this.mcpToolsFor(m, h)
-    if (tools.length === 0) return text
-    const withTools = try injectTools(text, tools)
-    return try this.withMcpInstructions(withTools, m, h, tools)
+    if (m === undefined) return { text: text, body: undefined }
+    const acc = this.mcpAccess(h)
+    const tools = try this.mcpToolsFor(m, h, acc)
+    if (tools.length === 0) return { text: text, body: undefined }
+    let fs = try fields(text)
+    const added = try injectToolFields(&fs, tools)
+    const told = try this.mcpInstructionFields(&fs, m, acc, tools)
+    return { text: added || told ? build(fs) : text, body: fs }
+  }
+
+  // The caller's MCP access, read from the request once: the access profile's tool patterns (policyFor), the
+  // key's rules (keyMcp) and the project's (projectMcp).
+  mcpAccess(h: Hdrs): McpAccess {
+    const vk = this.gov.findKey(h)
+    const pol = vk === undefined ? undefined : this.gov.policies.get(vk.id)
+    const policy = pol === undefined ? undefined : pol.mcpTools
+    let keys: McpKeyConfig[] | undefined = undefined
+    if (vk !== undefined) {
+      const own = vk.mcp_configs
+      if (own !== undefined) keys = own
+      else if (policy === undefined) keys = []
+    }
+    return { policy: policy, keys: keys, proj: this.projectMcp(h) }
   }
 
   // Add MCP tools in Responses format, preserving tools already named in the request,
@@ -2973,7 +3020,8 @@ export class Engine {
   withMcpResponses(text: string, h: Hdrs): string throws SyntaxError {
     const m = this.mcp
     if (m === undefined) return text
-    const tools = try this.mcpToolsFor(m, h)
+    const acc = this.mcpAccess(h)
+    const tools = try this.mcpToolsFor(m, h, acc)
     if (tools.length === 0) return text
     let fs = try fields(text)
     const names: string[] = []
@@ -3003,7 +3051,7 @@ export class Engine {
       out.push(build(rt))
     }
     setField(&fs, "tools", "[" + out.join(",") + "]")
-    const parts = m.instructionParts(this.gov.policyFor(h)?.mcpTools, this.keyMcp(h), this.projectMcp(h)).filter((p) => tools.some((t) => t.includes(`"name":"${p.name}-`)))
+    const parts = m.instructionParts(acc.policy, acc.keys, acc.proj).filter((p) => tools.some((t) => t.includes(`"name":"${p.name}-`)))
     const block = parts.length === 0 ? "" : m.renderInstructions(parts)
     if (block !== "") {
       const own = rawStr(fs, "instructions") ?? ""
@@ -3014,13 +3062,14 @@ export class Engine {
 
   // The MCP tools a request is offered (chat tool definitions): the key's rules, then x-raiju-mcp-include-clients and
   // x-raiju-mcp-include-tools; the code mode meta-tools stand in for the code mode clients' tools.
-  mcpToolsFor(m: McpManager, h: Hdrs): string[] throws SyntaxError {
+  mcpToolsFor(m: McpManager, h: Hdrs, access?: McpAccess): string[] throws SyntaxError {
     // With client.mcp_disable_auto_tool_inject, tools are added only when the request names their clients or tools.
     const named = h.get("x-raiju-mcp-include-clients") !== undefined || h.get("x-raiju-mcp-include-tools") !== undefined
     if (this.cfg.client?.mcp_disable_auto_tool_inject === true && !named) return []
     // a key's access profile may limit the MCP tools it gets; clients it doesn't name
     // count only with allow_by_default
-    let tools = m.allToolsFor(this.gov.policyFor(h)?.mcpTools, this.keyMcp(h), this.projectMcp(h))
+    const acc = access ?? this.mcpAccess(h)
+    let tools = m.allToolsFor(acc.policy, acc.keys, acc.proj)
     const only = h.get("x-raiju-mcp-include-clients")
     if (only !== undefined) {
       if (only.trim() === "none") return []
@@ -3040,7 +3089,7 @@ export class Engine {
       tools = kept
     }
     // code mode: the four meta-tools stand in for the code mode clients' tools (not when the request narrows them)
-    if (only === undefined && onlyTools === undefined && this.codeEntriesFor(m, h).length > 0) {
+    if (only === undefined && onlyTools === undefined && this.codeEntriesFor(m, h, acc).length > 0) {
       for (const d of metaToolDefs()) tools.push(d)
     }
     return tools
@@ -3048,23 +3097,23 @@ export class Engine {
 
   // The instructions the connected MCP servers sent (capped as mcp.max_instructions_* say) go to the model
   // as a system message ahead of the caller's own, for the servers that still offer a tool in this request.
-  withMcpInstructions(text: string, m: McpManager, h: Hdrs, tools: string[]): string throws SyntaxError {
-    const parts = m.instructionParts(this.gov.policyFor(h)?.mcpTools, this.keyMcp(h), this.projectMcp(h)).filter((p) => tools.some((t) => t.includes(`"name":"${p.name}-`)))
-    if (parts.length === 0) return text
+  mcpInstructionFields(inout fs: Field[], m: McpManager, acc: McpAccess, tools: string[]): bool throws SyntaxError {
+    const parts = m.instructionParts(acc.policy, acc.keys, acc.proj).filter((p) => tools.some((t) => t.includes(`"name":"${p.name}-`)))
+    if (parts.length === 0) return false
     const block = m.renderInstructions(parts)
-    if (block === "") return text
-    let fs = try fields(text)
+    if (block === "") return false
     const mraw = find(fs, "messages")
-    if (mraw === undefined || isNull(mraw)) return text
+    if (mraw === undefined || isNull(mraw)) return false
     const items = try elements(mraw)
     items.unshift(`{"role":"system","content":${quote(block)}}`)
     setField(&fs, "messages", "[" + items.join(",") + "]")
-    return build(fs)
+    return true
   }
 
   // The code mode servers a caller may reach, as the stubs and the runner name them.
-  codeEntriesFor(m: McpManager, h: Hdrs): CodeEntry[] {
-    return codeEntries(m.codeToolsFor(this.gov.policyFor(h)?.mcpTools, this.keyMcp(h), this.projectMcp(h)))
+  codeEntriesFor(m: McpManager, h: Hdrs, access?: McpAccess): CodeEntry[] {
+    const acc = access ?? this.mcpAccess(h)
+    return codeEntries(m.codeToolsFor(acc.policy, acc.keys, acc.proj))
   }
 
   // One MCP tool call for a request, with the gates a direct call gets: the guardrails on the call, the
@@ -3725,7 +3774,7 @@ export class Engine {
       const tg = m.targets[i]!
       const next: ModelRef = { provider: tg.provider, model: tg.model ?? cur.model }
       const out: ModelRef[] = [next]
-      for (const f of m.fallbacks) out.push(parseModel(this.cfg, f))
+      for (const f of m.fallbacks) out.push(this.refOf(f))
       decided = out
       if (tg.key_id !== undefined) h.set("x-raiju-api-key", tg.key_id)
       h.set("x-raiju-routing-rule", m.rule)
@@ -3741,8 +3790,9 @@ export class Engine {
 
   // Shared front half of every inference endpoint.
   // emulated: a decision answered by a chat or Responses call (compat's convert_decision_to_responses), billed as that call
-  async serve(req: Request, op: string, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool, upstreamHeaders?: Map<string, string>, sink?: StreamSink, makeConverter?: ConverterFactory, compat?: CompatPlan, prompt?: Applied, emulated?: bool, large?: LargeBody, attemptHook?: AttemptPlugins): Promise<Response> {
-    const h = snapshot(req.headers)
+  async serve(req: Request, op: string, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool, upstreamHeaders?: Map<string, string>, sink?: StreamSink, makeConverter?: ConverterFactory, compat?: CompatPlan, prompt?: Applied, emulated?: bool, large?: LargeBody, attemptHook?: AttemptPlugins, hdrs?: Hdrs): Promise<Response> {
+    // hdrs: the copy of req's headers the caller already made
+    const h = hdrs ?? snapshot(req.headers)
     const ctx = new ReqCtx(requestIdOf(h.get("x-request-id")), op, performance.now())
     ctx.large = large
     // a hooked route's request with fallbacks brings its plugins across the attempts (llmHooked registered them)
@@ -4668,7 +4718,7 @@ export class Engine {
       rl.virtualKeyName = gvk.name ?? ""
     }
     rl.userId = ctx.userId
-    rl.userName = userNameOf(this.cfg, ctx.userId)
+    rl.userName = this.userName(ctx.userId)
     metrics.observeUsage(rl, { input: usage.prompt, output: usage.completion, cost: c, cacheRead: 0.0, cacheWrite: 0.0, cacheWrite5m: 0.0, cacheWrite1h: 0.0 })
   }
 
@@ -4745,12 +4795,15 @@ export class Engine {
     const text = await req.text()
     const hs: Record<string, string> = snapshot(req.headers)
     let streamed = false
+    let parsed: Field[] = []
     try {
-      streamed = rawBool(fields(text), "stream") ?? false
+      parsed = fields(text)
+      streamed = rawBool(parsed, "stream") ?? false
     } catch (e) {
       streamed = false
     }
-    if (streamed) return try await this.chatOnce(new Request(req.url, { method: "POST", headers: hs, body: text }), sink)
+    // (the body read and parsed here is handed on, so chatOnce reads neither again)
+    if (streamed) return try await this.chatOnce(new Request(req.url, { method: "POST", headers: hs, body: text }), sink, undefined, { text: text, body: parsed })
     const url = req.url
     const last = new LastHeaders()
     const call = async (b: string): Promise<{ status: int, body: string }> => {
@@ -4762,7 +4815,7 @@ export class Engine {
       last.h = kept
       return { status: r.status, body: try await r.text() }
     }
-    const hdr = snapshot(req.headers)
+    const hdr: Hdrs = hs
     const entries = this.codeEntriesFor(m, hdr)
     const exec = this.agentExec(m, hdr, ag)
     const names = this.agentNames(m, entries)
@@ -4884,7 +4937,7 @@ export class Engine {
     // the provider must take the body as it is: one whose wire format for this route is the caller's (the other
     // formats are converted, and the converters need the whole body)
     const op = route === "embeddings" ? "embeddings" : route === "completions" ? "completions" : route === "responses" ? "responses" : route === "messages" ? "anthropic.messages" : "chat"
-    const first = parseModelVia(this.cfg, meta.model, routeOf(op))
+    const first = this.refVia(meta.model, routeOf(op))
     const p = first.provider === "" ? undefined : providerOf(this.cfg, first.provider)
     const kind = p === undefined ? "" : kindOf(first.provider, p)
     const stream = meta.hasStream ? meta.stream : false
@@ -5197,9 +5250,12 @@ export class Engine {
     return new Response(body, { status: r.status, headers: hs })
   }
 
-  async chatOnce(req: Request, sink?: StreamSink, skipGuards?: bool): Promise<Response> {
-    let text = await req.text()
+  // given: the request's body as its caller already read and parsed it (the text and the fields of that text).
+  async chatOnce(req: Request, sink?: StreamSink, skipGuards?: bool, given?: { text: string, body: Field[] }): Promise<Response> {
+    let text = given !== undefined ? given.text : await req.text()
     let body: Field[] = []
+    // one copy of the request's headers serves every step that reads them here, and serve
+    const ph = snapshot(req.headers)
     const guardOn = skipGuards !== true
     const guard = guardOn ? this.guard : undefined
     // reversible redaction: one vault per request, so the response restores to this request's values
@@ -5240,10 +5296,14 @@ export class Engine {
           text = one
         }
       }
-      text = try this.withMcpTools(text, snapshot(req.headers))
-      body = fields(text)
+      const mc = try this.mcpChat(text, ph)
+      text = mc.text
+      const mb = mc.body
+      // (parsed by the MCP step, or by the caller when nothing since changed the text)
+      if (mb !== undefined) body = mb
+      else if (given !== undefined && given.text === text) body = given.body
+      else body = fields(text)
       // the prompt named by x-raiju-prompt-id goes before the messages (prompts.tov)
-      const ph = snapshot(req.headers)
       if (ph.get("x-raiju-prompt-id") !== undefined) {
         const vk = this.gov.findKey(ph)
         const applied = try applyPrompt(this.cfg.prompt_repo, ph, text, { budgetPercent: this.gov.budgetFraction(vk) * 100.0, tokensPercent: this.gov.rateFraction(vk, "token") * 100.0, requestsPercent: this.gov.rateFraction(vk, "request") * 100.0 })
@@ -5254,7 +5314,7 @@ export class Engine {
         }
       }
       // a key's access profile may cap max_tokens
-      const cap = this.gov.policyFor(snapshot(req.headers))?.maxTokens
+      const cap = this.gov.policyFor(ph)?.maxTokens
       if (cap !== undefined) {
         let changed = false
         for (const k of ["max_tokens", "max_completion_tokens"]) {
@@ -5458,7 +5518,7 @@ export class Engine {
     const holdOut = lo !== "" && !stream && this.httpLogsOnly("output")
     if (holdOut) this.heldRecords.set(lo, undefined)
     const sreq = lo !== "" && rid0 === "" ? withRequestId(req, lo, text) : req
-    let res = try await this.serve(sreq, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers, stream ? pipeSink : undefined, mk, cp, promptUsed, undefined, undefined, plugHook)
+    let res = try await this.serve(sreq, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers, stream ? pipeSink : undefined, mk, cp, promptUsed, undefined, undefined, plugHook, lo !== "" && rid0 === "" ? undefined : ph)
     // post hooks on an error answer (they may recover from it or change it); a stream's hooks ran per chunk
     if (chain !== undefined && run !== undefined) {
       if (pipeSink !== undefined && pipeSink.started) chain.finish(&run.ctx)
@@ -6073,4 +6133,63 @@ test("a request for several choices is recognized: n above 1 or several prompts"
   expect(manyChoices(try fields('{"prompt":["a"]}'))).toBe(false)
   expect(manyChoices(try fields('{"prompt":[1,2,3]}'))).toBe(false)
   expect(manyChoices(try fields('{"prompt":"a"}'))).toBe(false)
+})
+
+test("the engine's model index and user names answer as the scans of the config do", () => {
+  const cfg: Config = { providers: new Map(), governance: { users: [{ name: "ada", role: "viewer" }] } }
+  cfg.providers!.set("zeta", { keys: [{ value: "k", models: ["shared"] }] })
+  cfg.providers!.set("alpha", { keys: [{ value: "k", models: ["shared", "only-a"] }] })
+  cfg.providers!.set("openai", { keys: [{ value: "k" }] })
+  const e = new Engine(cfg)
+  for (const m of ["shared", "only-a", "gpt-4o", "openai/gpt-4o", "no-such-model", ""]) {
+    expect(e.refOf(m)).toEqual(parseModel(cfg, m))
+    expect(e.refVia(m, "openai")).toEqual(parseModelVia(cfg, m, "openai"))
+  }
+  expect(e.fallbacksOf(try fields(`{"fallbacks":["shared",{"provider":"p","model":"m"},"only-a"]}`))).toEqual([parseModel(cfg, "shared"), { provider: "p", model: "m" }, parseModel(cfg, "only-a")])
+  for (const u of ["ada", "nobody", ""]) expect(e.userName(u)).toBe(userNameOf(cfg, u))
+})
+
+test("the MCP step parses a chat request once: tools and instructions go into the same fields", () => {
+  const e = new Engine({ mcp: { client_configs: [{ name: "fs", connection_type: "http", connection_string: "http://x/mcp", allow_by_default: true }] }, governance: { virtual_keys: [
+    { id: "vk-none", value: "sk-raiju-none" },
+    { id: "vk-some", value: "sk-raiju-some", mcp_configs: [{ mcp_client_name: "fs", tools_to_execute: ["read"] }] },
+  ] } })
+  const m = e.mcp!
+  const s = m.sessions[0]!
+  s.connected = true
+  s.tools = [{ name: "read", description: "r", inputSchemaRaw: "{}" }, { name: "write", description: "w", inputSchemaRaw: "{}" }]
+  s.instructions = "be careful"
+  const read = `{"type":"function","function":{"name":"fs-read","description":"r","parameters":{}}}`
+  const write = `{"type":"function","function":{"name":"fs-write","description":"w","parameters":{}}}`
+  const text = `{"model":"m","messages":[{"role":"user","content":"hi"}]}`
+  const some: Hdrs = new Map()
+  some.set("x-raiju-vk", "sk-raiju-some")
+  const mc = try e.mcpChat(text, some)
+  const block = m.renderInstructions(m.instructionParts(undefined))
+  expect(mc.text).toBe(`{"model":"m","messages":[{"role":"system","content":${quote(block)}},{"role":"user","content":"hi"}],"tools":[${read}]}`)
+  expect(mc.body!).toEqual(try fields(mc.text))
+  expect(try e.withMcpTools(text, some)).toBe(mc.text)
+  // a request without a key is offered every tool; one that names no client is left as it was
+  const open = try e.mcpChat(text, new Map())
+  expect(find(open.body!, "tools")).toBe(`[${read},${write}]`)
+  const off: Hdrs = new Map()
+  off.set("x-raiju-mcp-include-clients", "none")
+  const untouched = try e.mcpChat(text, off)
+  expect(untouched.text).toBe(text)
+  expect(untouched.body === undefined).toBe(true)
+  // nothing to add: the text is the caller's own, and its fields are still handed back
+  const full = `{"model":"m","tools":[${read}]}`
+  const same = try e.mcpChat(full, some)
+  expect(same.text).toBe(full)
+  expect(same.body!).toEqual(try fields(full))
+  // the access read once is what the separate lookups give
+  for (const h of [some, off]) {
+    const acc = e.mcpAccess(h)
+    expect(acc.keys).toEqual(e.keyMcp(h))
+    expect(acc.policy).toEqual(e.gov.policyFor(h)?.mcpTools)
+    expect(acc.proj).toEqual(e.projectMcp(h))
+  }
+  const none: Hdrs = new Map()
+  none.set("x-raiju-vk", "sk-raiju-none")
+  expect(e.mcpAccess(none).keys).toEqual(e.keyMcp(none))
 })

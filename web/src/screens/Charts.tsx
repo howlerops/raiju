@@ -1,17 +1,13 @@
 // The dashboard charts: the overview's (one /api/logs/dashboard call for a period) and the logs
 // screen's (the histogram and ranking routes for the filters in force).
 import { createMemo, createSignal } from "solid-js"
-import { send } from "../api/client"
+import { getData } from "../api/client"
 import { RankBars, TimeChart, foldSeries } from "../charts"
 import { bucketsOf, costSeries, groupSeries, latencySeries, obj, rankRows, requestSeries, tokenSeries } from "../chartData"
 import { fmtInt, fmtMoney, fmtMs, num } from "../fmt"
 import { Guard } from "../ui"
 
 type Query = Record<string, string | number | boolean | undefined>
-
-async function getJson(path: string, query: Query, timeoutMs?: number): Promise<unknown> {
-  return (await send("GET", path, { query, timeoutMs })).data
-}
 
 const compact = (n: number): string => {
   const a = Math.abs(n)
@@ -47,11 +43,11 @@ export function OverviewCharts(props: { tick: () => number; track: <T>(p: Promis
   }
   const dash = createMemo(() => {
     props.tick()
-    return props.track(getJson("/api/logs/dashboard", range(), props.timeoutMs))
+    return props.track(getData("/api/logs/dashboard", range(), props.timeoutMs))
   })
   const providers = createMemo(() => {
     props.tick()
-    return props.track(getJson("/api/logs/rankings/by-dimension", { dimension: "provider", ...range(), limit: 8 }, props.timeoutMs))
+    return props.track(getData("/api/logs/rankings/by-dimension", { dimension: "provider", ...range(), limit: 8 }, props.timeoutMs))
   })
   // Derived once per response, so a poll updates the charts below in place instead of rebuilding them.
   const overview = createMemo(() => obj(obj(dash()).overview))
@@ -200,9 +196,19 @@ export function LogCharts(props: { query: Query; zoom?: ZoomProps }) {
   const [metric, setMetric] = createSignal("cost")
 
   const base = createMemo(() => ({ ...props.query }))
-  const requests = createMemo(() => getJson("/api/logs/histogram", base()))
-  const by = createMemo(() => getJson("/api/logs/histogram/" + metric() + "/by-dimension", { ...base(), dimension: dimension() }))
-  const ranks = createMemo(() => getJson("/api/logs/rankings/by-dimension", { ...base(), dimension: dimension(), limit: 8 }))
+  const requests = createMemo(() => getData("/api/logs/histogram", base()))
+  const by = createMemo(() => getData("/api/logs/histogram/" + metric() + "/by-dimension", { ...base(), dimension: dimension() }))
+  const ranks = createMemo(() => getData("/api/logs/rankings/by-dimension", { ...base(), dimension: dimension(), limit: 8 }))
+
+  // Derived once per response and handed to charts that stay mounted, as on the overview.
+  const reqBuckets = createMemo(() => bucketsOf(requests()))
+  const reqSeries = createMemo(() => requestSeries(reqBuckets()))
+  const byBuckets = createMemo(() => bucketsOf(by()))
+  const bySeries = createMemo(() => {
+    const m = metric()
+    return foldSeries(m === "cost" ? groupSeries(byBuckets(), "by_dimension") : groupSeries(byBuckets(), "by_dimension", m === "tokens" ? "total_tokens" : "p95_latency"))
+  })
+  const rankList = createMemo(() => rankRows(ranks(), ["id"], "total_requests", (r) => fmtMoney(r.total_cost) + ", " + fmtInt(r.total_tokens) + " tokens, " + fmtMs(r.avg_latency)))
 
   const dimLabel = () => DIMENSIONS.find((d) => d[0] === dimension())![1]
   const metricLabel = () => METRICS.find((d) => d[0] === metric())![1]
@@ -235,42 +241,30 @@ export function LogCharts(props: { query: Query; zoom?: ZoomProps }) {
       <div class="content-grid charts">
         <Panel>
           <Guard>
-            {(() => {
-              const b = bucketsOf(requests())
-              return (
-                <TimeChart
-                  id="lgc-requests"
-                  title="Requests and errors"
-                  desc="Requests per time bucket for the filtered logs, success and errors stacked."
-                  times={b.times}
-                  series={requestSeries(b)}
-                  kind="bars"
-                  {...props.zoom}
-                  format={fmtInt}
-                />
-              )
-            })()}
+            <TimeChart
+              id="lgc-requests"
+              title="Requests and errors"
+              desc="Requests per time bucket for the filtered logs, success and errors stacked."
+              times={reqBuckets().times}
+              series={reqSeries()}
+              kind="bars"
+              {...props.zoom}
+              format={fmtInt}
+            />
           </Guard>
         </Panel>
         <Panel>
           <Guard>
-            {(() => {
-              const b = bucketsOf(by())
-              const m = metric()
-              const series = m === "cost" ? groupSeries(b, "by_dimension") : m === "tokens" ? groupSeries(b, "by_dimension", "total_tokens") : groupSeries(b, "by_dimension", "p95_latency")
-              return (
-                <TimeChart
-                  id="lgc-by"
-                  title={metricLabel() + " by " + dimLabel().toLowerCase()}
-                  desc={metricLabel() + " per time bucket, one series per " + dimLabel().toLowerCase() + "."}
-                  times={b.times}
-                  series={foldSeries(series)}
-                  kind={m === "latency" ? "lines" : "bars"}
-                  {...props.zoom}
-                  format={m === "cost" ? money : m === "tokens" ? compact : ms}
-                />
-              )
-            })()}
+            <TimeChart
+              id="lgc-by"
+              title={metricLabel() + " by " + dimLabel().toLowerCase()}
+              desc={metricLabel() + " per time bucket, one series per " + dimLabel().toLowerCase() + "."}
+              times={byBuckets().times}
+              series={bySeries()}
+              kind={metric() === "latency" ? "lines" : "bars"}
+              {...props.zoom}
+              format={metric() === "cost" ? money : metric() === "tokens" ? compact : ms}
+            />
           </Guard>
         </Panel>
         <Panel>
@@ -278,7 +272,7 @@ export function LogCharts(props: { query: Query; zoom?: ZoomProps }) {
             <RankBars
               id="lgc-rank"
               title={"Top " + dimLabel().toLowerCase() + "s by requests"}
-              rows={rankRows(ranks(), ["id"], "total_requests", (r) => fmtMoney(r.total_cost) + ", " + fmtInt(r.total_tokens) + " tokens, " + fmtMs(r.avg_latency))}
+              rows={rankList()}
               format={fmtInt}
             />
           </Guard>

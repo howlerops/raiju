@@ -1,10 +1,11 @@
-import { createMemo, createSignal, Errored, For, Loading, refresh, Show, untrack } from "solid-js"
-import { LoadingSkeleton } from "../LoadingSkeleton"
+import { createMemo, createSignal, For, refresh, Show, untrack } from "solid-js"
 import { api } from "../api/client"
-import { can } from "../perm"
+import { canCall } from "../perm"
 import type { McpClient, McpStatus } from "../api/types"
 import { splitList } from "../fmt"
-import { Can, DangerButton, ErrP, FormError, initChecked, initSelected, initValue, notify, Pill, Toolbar, useFormRun, useRun, tf } from "../ui"
+import { CanCall, DangerButton, fieldValue, FormError, Guard, initChecked, initSelected, initValue, notify, Pill, Toolbar, useFormRun, useRun, tf } from "../ui"
+
+const CLIENT = "/api/mcp/client"
 
 type Cfg = Record<string, unknown> & { name?: string; connection_type?: string; connection_string?: string }
 
@@ -48,7 +49,7 @@ function McpForm(props: { current: Cfg | undefined; onClose: () => void; onSaved
   const submit = (ev: SubmitEvent) => {
     ev.preventDefault()
     const form = ev.currentTarget as HTMLFormElement
-    const get = (n: string) => (form.elements.namedItem(n) as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement).value
+    const get = (n: string) => fieldValue(form, n)
     void run(async () => {
       const type = get("connection_type")
       const prevStdio = (c?.stdio_config ?? {}) as Record<string, unknown>
@@ -162,12 +163,12 @@ function ClientCard(props: { c: Cfg; st: McpStatus | undefined; onEdit: () => vo
         <Pill tone={disabled() ? "" : connected() ? "ok" : "bad"}>{status()}</Pill>
         <span class="hint mono grow">{where()}</span>
         <span class="row-actions">
-          <Can resource="MCPGateway" op="Update">
+          <CanCall method="PUT" path={CLIENT}>
             <button type="button" class="btn btn-sm btn-ghost" onClick={props.onEdit}>
               Edit
             </button>
-          </Can>
-          <Can resource="MCPGateway" op="Create">
+          </CanCall>
+          <CanCall method="POST" path={CLIENT}>
             <button
               type="button"
               class="btn btn-sm btn-ghost"
@@ -182,8 +183,8 @@ function ClientCard(props: { c: Cfg; st: McpStatus | undefined; onEdit: () => vo
             >
               Reconnect
             </button>
-          </Can>
-          <Can resource="MCPGateway" op="Delete">
+          </CanCall>
+          <CanCall method="DELETE" path={CLIENT}>
             <DangerButton
               label="Delete"
               action={async () => {
@@ -192,7 +193,7 @@ function ClientCard(props: { c: Cfg; st: McpStatus | undefined; onEdit: () => vo
                 props.onChange()
               }}
             />
-          </Can>
+          </CanCall>
         </span>
       </header>
       <Show when={props.st?.error && !connected() && !disabled()}>
@@ -211,7 +212,7 @@ function ClientCard(props: { c: Cfg; st: McpStatus | undefined; onEdit: () => vo
                 class="btn btn-sm tool-toggle mono"
                 aria-pressed={tf(!!t().allowed)}
                 title={t().allowed ? "Enabled. Select to disable." : "Disabled. Select to enable."}
-                disabled={busy() || !can("MCPGateway", "Update")}
+                disabled={busy() || !canCall("PUT", CLIENT)}
                 onClick={() => setAllowed(t().name, !t().allowed)}
               >
                 {t().name}
@@ -234,11 +235,11 @@ export function Mcp() {
         <button type="button" id="mcp-refresh" class="btn btn-sm btn-ghost" onClick={reload}>
           Refresh
         </button>
-        <Can resource="MCPGateway" op="Create">
+        <CanCall method="POST" path={CLIENT}>
           <button type="button" id="mcp-new" class="btn btn-sm btn-primary" onClick={() => setEditor({ c: undefined })}>
             Add client
           </button>
-        </Can>
+        </CanCall>
       </Toolbar>
       <Show when={editor()} keyed>
         {(e) => (
@@ -253,15 +254,13 @@ export function Mcp() {
         )}
       </Show>
       <div id="mcp-list">
-        <Errored fallback={(err) => <ErrP error={err()} />}>
-          <Loading fallback={<LoadingSkeleton variant="content" />}>
-            <Show when={data().clients.length} fallback={<p class="card panel bg-base-100 border border-base-300 muted">No MCP clients yet. Add one above.</p>}>
-              <For each={data().clients} keyed={(c) => String(c.name)}>
-                {(c) => <ClientCard c={c()} st={data().status[String(c().name)]} onEdit={() => setEditor({ c: c() })} onChange={reload} />}
-              </For>
-            </Show>
-          </Loading>
-        </Errored>
+        <Guard>
+          <Show when={data().clients.length} fallback={<p class="card panel bg-base-100 border border-base-300 muted">No MCP clients yet. Add one above.</p>}>
+            <For each={data().clients} keyed={(c) => String(c.name)}>
+              {(c) => <ClientCard c={c()} st={data().status[String(c().name)]} onEdit={() => setEditor({ c: c() })} onChange={reload} />}
+            </For>
+          </Show>
+        </Guard>
       </div>
     </section>
   )

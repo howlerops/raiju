@@ -11,15 +11,19 @@ ARG BASE=ubuntu:noble-20261024.1@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf
 # scripts/build-tov.sh: streamed bodies, child sockets, ALPN, UDP, WAMR, libdatachannel, the fetch pool with
 # nghttp2, request body streams, node:fs rename and fsync, a WASM time limit, the server lifecycle), so it needs
 # Rust and a C and C++ compiler: the vendored BoringSSL, WAMR, libdatachannel and nghttp2 compile on first use.
-# The gateway imports node:* modules, which Tov links through WebKitGTK's JavaScriptCore (pkg-config
-# javascriptcoregtk-4.1). The same base as the runtime image below, so glibc and the libraries match.
+# The gateway imports node:* modules, which run on JavaScriptCore. It is built here too (scripts/build-jsc.sh:
+# WebKit's JSCOnly port at the release Tov pins, the engine alone) and linked into the binary, so the runtime image
+# carries no WebKitGTK package: the distribution's libjavascriptcoregtk comes from the whole browser's source
+# package and is reported for every browser CVE, fixed there or not (CVE-2026-3909, in Skia, which the engine
+# does not contain). cmake, ninja, clang, lld, ruby, perl and python3 are that build's tools; libicu-dev is what
+# the engine links. The same base as the runtime image below, so glibc and the libraries match.
 FROM ${BASE} AS build
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ca-certificates curl git make gcc g++ libc6-dev \
-      pkg-config libjavascriptcoregtk-4.1-dev \
+      ca-certificates curl git make gcc g++ libc6-dev pkg-config \
+      cmake ninja-build clang lld ruby perl python3 libicu-dev \
  && rm -rf /var/lib/apt/lists/*
 
 # rustup-init at a fixed version, checked against its published sha256 (no `curl | sh`), then a fixed toolchain.
@@ -45,25 +49,29 @@ WORKDIR /src
 COPY tov-patches/ tov-patches/
 COPY scripts/build-tov.sh scripts/build-tov.sh
 RUN scripts/build-tov.sh
+# The engine next, from the Tov checkout above and its own script: the longest step, and the least often rebuilt.
+COPY scripts/build-jsc.sh scripts/build-jsc.sh
+RUN scripts/build-jsc.sh
+ENV TOV_JSC_DIR=/src/build/jsc/current
 COPY src/ src/
 # /out/app/data is the -app-dir: config.json is mounted (or provided) there.
 RUN mkdir -p /out/app/data \
  && TOV_CFLAGS=-DTV_PLAIN_ALLOC build/tov/target/release/tov build src/main.tov -o /out/raiju
 
-# Runtime. The binary links glibc, libstdc++ and libatomic (for the vendored C++ libraries) and JavaScriptCore with
-# its GLib and ICU libraries; check with `ldd`. distroless/cc has no JavaScriptCore, so this is Ubuntu noble with
-# that library and CA certificates for HTTPS upstreams.
+# Runtime. The binary carries JavaScriptCore and links glibc, libstdc++, libatomic (for the vendored C++ libraries)
+# and ICU (the engine's); check with `ldd`. So this is Ubuntu noble with those libraries and CA certificates for
+# HTTPS upstreams, and no WebKitGTK package.
 FROM ${BASE}
 
 ENV DEBIAN_FRONTEND=noninteractive
 # The upgrade takes the Ubuntu security fixes released since the pinned base (glibc, util-linux, openssl, ...), so the
 # image scan stays clean between base bumps. The gateway never mounts anything, so the `mount` package (setuid
-# mount/umount, the restricted-mount path of CVE-2026-78410, unfixed upstream) is removed; libmount1 stays for GLib.
+# mount/umount, the restricted-mount path of CVE-2026-78410, unfixed upstream) is removed.
 # Nothing in the image needs to change user, so the setuid and setgid bits of what remains (su, passwd, ...) are cleared:
 # the gateway runs as 65532 and has no use for a path to root, also where no-new-privileges is not set.
 RUN apt-get update \
  && apt-get upgrade -y --no-install-recommends \
- && apt-get install -y --no-install-recommends ca-certificates libjavascriptcoregtk-4.1-0 \
+ && apt-get install -y --no-install-recommends ca-certificates libicu74 libstdc++6 libatomic1 \
  && apt-get purge -y --allow-remove-essential mount \
  && find / -xdev -type f -perm /6000 -exec chmod a-s {} + \
  && rm -rf /var/lib/apt/lists/*

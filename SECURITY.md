@@ -88,7 +88,11 @@ provider's SDP answer names, which are not checked (the SDP exchange is). The OT
   without it, so a link carrying an attacker's own state and code cannot sign a victim in as the attacker.
   An email the identity provider marks unverified (`email_verified` false) names no local user: such a sign-in is
   known by its subject alone and does not take the role of a user stored under that email (a disabled user it names
-  is still refused). A token without the claim is unchanged; set `oidc.allowed_email_domains` to require it.
+  is still refused). A token without the claim is unchanged by default, since many providers send none; set
+  `oidc.require_verified_email` to treat a missing claim like a false one, or `oidc.allowed_email_domains` to refuse
+  the sign-in outright.
+- **Inference with a management credential** needs the `admin` role or a role holding the `RunInference`
+  permission. A viewer's or auditor's credential reads the dashboard; on the inference routes it is not a credential.
 - **Identity-aware proxy (AWS ALB):** the load balancer's ARN (`expected_signer`) is compared with the `signer` of
   the token's signed header, where the load balancer writes it. A `signer` among the payload's user claims, which
   the identity provider supplies, counts for nothing.
@@ -143,6 +147,12 @@ of each project when you deploy.
 | usrsctp | `fec583d` (pinned by libdatachannel 0.24.6; release line 0.9.5) | SCTP for data channels | WebRTC callers (off by default) | https://github.com/sctplab/usrsctp (inactive upstream) |
 | libsrtp | 2.8.0 | SRTP media | WebRTC callers (off by default) | https://github.com/cisco/libsrtp/security |
 | plog | `94899e0` (headers) | logging inside libdatachannel | none from the network | https://github.com/SergiusTheBest/plog |
+| JavaScriptCore (WebKit JSCOnly port) | WebKitGTK 2.54.1, commit `628d6ce` (`scripts/build-jsc.sh`) | the engine under `node:*` modules | the gateway's own bundled JavaScript | https://webkitgtk.org/security.html |
+
+JavaScriptCore is linked into the binary, not installed from the distribution, so the image's package scan does not
+cover it: follow the WebKitGTK advisories for JavaScriptCore issues and update it by moving Tov's pinned release
+(`TOV_REV` in `scripts/build-tov.sh`, then `WEBKIT_TAG` and `WEBKIT_COMMIT` in `scripts/build-jsc.sh`). Advisories
+for WebCore, Skia or other browser components do not apply: only the engine is built.
 
 To update one: replace its files as its `TOV.md` describes, rebuild the compiler (`make tov`) and run
 `make tov-test`, `make unit` and the e2e suite.

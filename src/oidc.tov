@@ -9,7 +9,7 @@ import { gcmSeal, gcmOpen } from "./aesgcm"
 import { SharedTable } from "./sharedtable"
 import { readFileSync, rmSync } from "node:fs"
 import { encodeUrl, decode, decodeText } from "./base64"
-import { modPow, signRs256 } from "./jwt"
+import { signRs256, bigOf, verifyPkcs1Sha256 } from "./jwt"
 import { cookieValue, sameSecret } from "./setupsession"
 
 export type OidcConfig = {
@@ -27,6 +27,8 @@ export type OidcConfig = {
   allowed_email_domains?: string[],
   // When present, require the signed ID token's hd claim to match one of these exact domains.
   allowed_hosted_domains?: string[],
+  // true: a sign-in's email names a local user (and so takes its role) only when the ID token says email_verified is true. Off by default, because many providers (Microsoft Entra among them) send no email_verified claim; an explicit false is never trusted either way.
+  require_verified_email?: bool,
   session_ttl_seconds?: int,
   // the audiences an ID token may carry (absent: the client id). scim_config's audience and Entra's appIdUri.
   audiences?: string[],
@@ -287,53 +289,17 @@ export function refreshRequestBody(cfg: OidcConfig, refreshToken: string): strin
 
 // ---- RS256 verification ----
 
-// Big-endian bytes as a non-negative bigint.
-function bigOfBytes(b: u8[]): bigint {
-  let v = 0n
-  for (const x of b) v = v * 256n + BigInt(int(x))
-  return v
-}
-
-function byteLenOf(x: bigint): int {
-  let n = 0
-  let v = x
-  while (v > 0n) {
-    v = v >> 8n
-    n++
-  }
-  return n
-}
-
-// DigestInfo prefix for SHA-256 (RFC 8017, section 9.2 note 1).
-const SHA256_DIGEST_INFO: int[] = [0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20]
-
-// The expected padded message EM = 00 01 FF..FF 00 || DigestInfo || hash, as a k-byte number.
-function expectedEm(hash: u8[], k: int): bigint throws Error {
-  const tLen = SHA256_DIGEST_INFO.length + hash.length
-  if (k < tLen + 11) throw new Error("oidc: RSA key too small for SHA-256")
-  const em: u8[] = [u8(0), u8(1)]
-  for (let i = 0; i < k - tLen - 3; i++) em.push(u8(0xff))
-  em.push(u8(0))
-  for (const b of SHA256_DIGEST_INFO) em.push(u8(b))
-  for (const b of hash) em.push(b)
-  return bigOfBytes(em)
-}
-
 // RSASSA-PKCS1-v1_5 verification: s^e mod n must equal the expected encoding.
 function rsaVerify(signingInput: string, sigB64: string, nB64: string, eB64: string): bool throws Error {
-  const n = bigOfBytes(try decode(nB64))
-  const e = bigOfBytes(try decode(eB64))
-  const k = byteLenOf(n)
-  // Refuse keys under 2048 bits, and exponents that are not odd and above 1.
-  if (k < 256) throw new Error("oidc: RSA key shorter than 2048 bits")
-  if (e < 3n || (e & 1n) === 0n) throw new Error("oidc: invalid RSA exponent")
+  const n = bigOf(try decode(nB64))
+  const e = bigOf(try decode(eB64))
+  // The key is judged before the signature is decoded, so a refused key reports itself first.
+  const empty: u8[] = []
+  const pre = verifyPkcs1Sha256(empty, empty, n, e)
+  if (pre === "short-key") throw new Error("oidc: RSA key shorter than 2048 bits")
+  if (pre === "bad-exponent") throw new Error("oidc: invalid RSA exponent")
   const sig = try decode(sigB64)
-  if (sig.length !== k) return false
-  const s = bigOfBytes(sig)
-  if (s >= n) return false
-  const m = modPow(s, e, n)
-  const want = try expectedEm(sha256(utf8(signingInput)), k)
-  return m === want
+  return verifyPkcs1Sha256(sha256(utf8(signingInput)), sig, n, e) === "ok"
 }
 
 // The JWK with the header's kid (or the only RSA signing key when there is no kid).
@@ -512,8 +478,11 @@ function checkToken(idToken: string, jwksJson: string, cfg: OidcConfig, issuer: 
   const role = try roleOf(cfg, pfs)
   // an email the provider says it has not verified (false, or the string some send) is anyone's to claim: the
   // sign-in is known by its subject alone and takes no local user's place by it. An absent claim changes nothing.
+  // With require_verified_email the claim must be there and true.
   const ev = find(pfs, "email_verified")
-  if (claimed !== undefined && (ev === "false" || ev === `"false"`)) return { kind: "ok", sub: sub, unverified_email: claimed, role: role, claims: payload }
+  const verified = ev === "true" || ev === `"true"`
+  const refused = ev === "false" || ev === `"false"` || (cfg.require_verified_email === true && !verified)
+  if (claimed !== undefined && refused) return { kind: "ok", sub: sub, unverified_email: claimed, role: role, claims: payload }
   return { kind: "ok", sub: sub, email: claimed, role: role, claims: payload }
 }
 
@@ -1289,6 +1258,16 @@ test("an email the provider marks unverified is not the sign-in's email; an abse
       expect(r.unverified_email).toBeUndefined()
     }
   }
+  // require_verified_email: a missing claim no longer passes, a true one does
+  cfg.require_verified_email = true
+  const absent = verifyIdToken(try signedToken(claimsJson("")), TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS)
+  expect(absent.kind).toBe("ok")
+  if (absent.kind === "ok") {
+    expect(absent.email).toBeUndefined()
+    expect(absent.unverified_email).toBe("alice@example.com")
+  }
+  const sure = verifyIdToken(try signedToken(claimsJson(`,"email_verified":true`)), TEST_JWKS, cfg, TEST_ISS, "n-1", TEST_NOW_MS)
+  if (sure.kind === "ok") expect(sure.email).toBe("alice@example.com")
 })
 
 test("email admission requires verified exact domains and rejects malformed allowlists", () => {

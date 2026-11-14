@@ -3,6 +3,7 @@
 // body and response types.
 import type { paths } from "./schema"
 import { adminToken, administrationMode, revokeSession } from "../auth"
+import { listOf } from "../fmt"
 import { apiCredentials, discarded, gatewaySignal, isActive, targetLabel, targetURL } from "../gateway"
 
 export class ApiError extends Error {
@@ -162,6 +163,20 @@ export const api = {
   post: <P extends keyof paths>(path: P, ...a: Args<P, "post">) => call("post", path, (a[0] ?? {}) as object),
   put: <P extends keyof paths>(path: P, ...a: Args<P, "put">) => call("put", path, (a[0] ?? {}) as object),
   del: <P extends keyof paths>(path: P, ...a: Args<P, "delete">) => call("delete", path, (a[0] ?? {}) as object),
+}
+
+// The parsed body of a GET, for routes read without the schema types.
+export async function getData(path: string, query?: RawOpts["query"], timeoutMs?: number): Promise<unknown> {
+  return (await send("GET", path, { query, timeoutMs })).data
+}
+
+// A list for a form's options or a lookup: empty when the caller may not read it or the read fails.
+export async function listOr<T>(path: string, key: string): Promise<T[]> {
+  try {
+    return listOf<T>(await getData(path), key)
+  } catch {
+    return []
+  }
 }
 
 export function message(e: unknown): string {

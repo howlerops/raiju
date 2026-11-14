@@ -1,4 +1,4 @@
-.PHONY: build test unit e2e soak soak-bodies soak-websockets soak-slope smoke ui web web-check check openapi-check parity-count run bench tov tov-test wasm-fixture config-doc config-doc-check deploy-check
+.PHONY: jsc build test unit e2e soak soak-bodies soak-websockets soak-slope smoke ui web web-check check openapi-check parity-count run bench tov tov-test wasm-fixture config-doc config-doc-check deploy-check
 
 # Tov's async slab allocator corrupts its free lists once ~30 fetches are in
 # flight (see docs/tov-notes.md); plain malloc avoids it at the same speed.
@@ -8,8 +8,18 @@ export TOV_CFLAGS ?= -DTV_PLAIN_ALLOC
 TOV_PATCHED := build/tov/target/release/tov
 export TOV ?= $(if $(wildcard $(TOV_PATCHED)),$(abspath $(TOV_PATCHED)),tov)
 
+# The JavaScriptCore linked into the binary (make jsc builds it, after make tov; about 15 minutes). Without it
+# `tov build` links the system's libjavascriptcoregtk-4.1, which the image does not ship.
+JSC_OWN := $(wildcard build/jsc/current/lib/libtovjsc.a)
+ifneq ($(JSC_OWN),)
+export TOV_JSC_DIR ?= $(abspath build/jsc/current)
+endif
+
 tov:
 	scripts/build-tov.sh
+
+jsc:
+	scripts/build-jsc.sh
 
 tov-test:
 	tov-patches/tests/run.sh

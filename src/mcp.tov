@@ -9,7 +9,7 @@ import { InstructionPart, aggregate, commentBlock } from "./mcpinstructions"
 
 // one reply of a per-user call: its status, content type, body and the session id it carries
 type UserReply = { status: int, contentType: string, body: string, sid: string }
-import { fields, elements, find, rawStr, rawBool, quote, build, setField, isNull, decodeString, rawInt, floorInt } from "./json"
+import { Field, fields, elements, find, rawStr, rawBool, quote, build, setField, isNull, decodeString, rawInt, floorInt } from "./json"
 import { deadline } from "./deadline"
 import { resolvedTargetProblem, Peer, peerOf, strictPolicy } from "./netguard"
 import { OpenApiConfig, OpenApiCred, OpenApiDoc, OpenApiOp, OpRequest, parseSpec, inputSchema, requestFor, callOperation, toolDescription, baseUrlOf, operationServersCover, specInstructions, specFilePath } from "./openapi"
@@ -533,6 +533,32 @@ function toolName(json: string): string | undefined throws SyntaxError {
 // keep their raw values.
 export function injectTools(chatBody: string, toolJsons: string[]): string throws SyntaxError {
   let fs = try fields(chatBody)
+  const added = try injectToolFields(&fs, toolJsons)
+  return added ? build(fs) : chatBody
+}
+
+// The names of tool definitions offered before, by definition text: the same definitions are offered on
+// every request, and reading a name parses the definition twice. Emptied when it grows past its cap.
+class ToolNameMemo {
+  items: Map<string, string> = new Map()
+}
+
+const toolNameMemo = new ToolNameMemo()
+
+function offeredToolName(json: string): string | undefined throws SyntaxError {
+  const hit = toolNameMemo.items.get(json)
+  if (hit !== undefined) return hit
+  const n = try toolName(json)
+  if (n !== undefined) {
+    if (toolNameMemo.items.size >= 4096) toolNameMemo.items.clear()
+    toolNameMemo.items.set(json, n)
+  }
+  return n
+}
+
+// injectTools on a request's fields: sets "tools" and returns true when a definition was added; otherwise
+// leaves the fields as they were.
+export function injectToolFields(inout fs: Field[], toolJsons: string[]): bool throws SyntaxError {
   const have: string[] = []
   const out: string[] = []
   const existing = find(fs, "tools")
@@ -545,15 +571,15 @@ export function injectTools(chatBody: string, toolJsons: string[]): string throw
   }
   let added = 0
   for (const tj of toolJsons) {
-    const n = try toolName(tj)
+    const n = try offeredToolName(tj)
     if (n === undefined || have.includes(n)) continue
     have.push(n)
     out.push(tj)
     added += 1
   }
-  if (added === 0) return chatBody
+  if (added === 0) return false
   setField(&fs, "tools", "[" + out.join(",") + "]")
-  return build(fs)
+  return true
 }
 
 // Splits "<server>-<tool>" into its parts. When several server names fit, the longest wins.
@@ -731,6 +757,9 @@ class StdioChannel {
   }
 }
 
+// One allowed tool of a session: the server's name for it, its chat name and its chat definition.
+type ToolDef = { orig: string, chat: string, json: string }
+
 // One connection to an MCP server. connect() initializes and lists every tool; a failure
 // is kept in lastError and leaves connected false.
 export class McpSession {
@@ -744,6 +773,10 @@ export class McpSession {
   private nextId = 1
   // chat tool name → the server's name for the tool, for allowed tools only
   private exposed: Map<string, string> = new Map()
+  // the allowed tools' chat definitions, in the listing's order; built on first use and dropped wherever the
+  // tool list or the tool policy changes (defsOf is the tool count they were built from)
+  private defs: ToolDef[] | undefined = undefined
+  private defsOf = -1
 
   readonly timeoutMs: int
   private tokens = new TokenCache()
@@ -1018,6 +1051,7 @@ export class McpSession {
       if (cursor === undefined) break
     }
     this.tools = all
+    this.defs = undefined
     const ex: Map<string, string> = new Map()
     for (const t of all) {
       if (toolAllowed(t.name, this.cfg)) ex.set(chatName(this.cfg.name, t.name), t.name)
@@ -1081,6 +1115,7 @@ export class McpSession {
       if (toolAllowed(op.name, this.cfg)) ex.set(chatName(this.cfg.name, op.name), op.name)
     }
     this.tools = ts
+    this.defs = undefined
     this.exposed = ex
   }
 
@@ -1214,40 +1249,62 @@ export class McpSession {
     }
   }
 
+  // Builds the allowed tools' chat definitions unless the ones kept are current.
+  private ensureDefs(): void {
+    if (this.defs !== undefined && this.defsOf === this.tools.length) return
+    const ds: ToolDef[] = []
+    for (const t of this.tools) {
+      if (!toolAllowed(t.name, this.cfg)) continue
+      const n = chatName(this.cfg.name, t.name)
+      ds.push({ orig: t.name, chat: n, json: toolJson(n, t) })
+    }
+    this.defs = ds
+    this.defsOf = this.tools.length
+  }
+
   // The chat tool definitions for this server's allowed tools.
   chatTools(): string[] {
-    return toolsForChat(this.cfg.name, this.tools, this.cfg)
+    this.ensureDefs()
+    const out: string[] = []
+    for (const d of this.defs ?? []) out.push(d.json)
+    return out
   }
 
   // The chat tool definitions of this server's allowed tools that keep accepts, given the server's
   // name for the tool and its chat name.
   toolsWhere(keep: (orig: string, chat: string) => bool): string[] {
+    this.ensureDefs()
     const out: string[] = []
-    for (const t of this.tools) {
-      if (!toolAllowed(t.name, this.cfg)) continue
-      const n = chatName(this.cfg.name, t.name)
-      if (!keep(t.name, n)) continue
-      out.push(toolJson(n, t))
+    for (const d of this.defs ?? []) {
+      if (keep(d.orig, d.chat)) out.push(d.json)
     }
     return out
   }
 
+  // Whether toolsWhere(keep) would list a tool, without listing them.
+  anyToolWhere(keep: (orig: string, chat: string) => bool): bool {
+    this.ensureDefs()
+    for (const d of this.defs ?? []) {
+      if (keep(d.orig, d.chat)) return true
+    }
+    return false
+  }
+
   // The chat tool definitions of this server's allowed tools whose chat names keep accepts.
   chatToolsWhere(keep: (name: string) => bool): string[] {
+    this.ensureDefs()
     const out: string[] = []
-    for (const t of this.tools) {
-      if (!toolAllowed(t.name, this.cfg)) continue
-      const n = chatName(this.cfg.name, t.name)
-      if (!keep(n)) continue
-      out.push(toolJson(n, t))
+    for (const d of this.defs ?? []) {
+      if (keep(d.chat)) out.push(d.json)
     }
     return out
   }
 
   // The server's name for a chat tool name, if this session exposes it.
   original(chatToolName: string): string | undefined {
-    for (const t of this.tools) {
-      if (toolAllowed(t.name, this.cfg) && chatName(this.cfg.name, t.name) === chatToolName) return t.name
+    this.ensureDefs()
+    for (const d of this.defs ?? []) {
+      if (d.chat === chatToolName) return d.orig
     }
     return undefined
   }
@@ -1262,6 +1319,7 @@ export class McpSession {
 
   // Re-applies this client's tool policy to the tools already listed, without a new listing.
   applyPolicy(): void {
+    this.defs = undefined
     const ex: Map<string, string> = new Map()
     for (const t of this.tools) {
       if (toolAllowed(t.name, this.cfg)) ex.set(chatName(this.cfg.name, t.name), t.name)
@@ -1552,7 +1610,7 @@ export class McpManager {
     const out: InstructionPart[] = []
     for (const s of this.sessions) {
       if (!s.connected || s.cfg.is_code_mode_client === true || s.instructions === "") continue
-      if (s.toolsWhere(visibleTo(s, policy, keys, proj)).length === 0) continue
+      if (!s.anyToolWhere(visibleTo(s, policy, keys, proj))) continue
       out.push({ name: s.cfg.name, text: s.instructions, max: s.cfg.max_instructions_length ?? 0 })
     }
     out.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
@@ -2141,4 +2199,41 @@ test("an error code or duration past the int range does not trap", () => {
   const neg = matchMessage(`{"jsonrpc":"2.0","id":1,"error":{"code":-1e300,"message":"x"}}`, 1)
   expect(neg).toEqual({ kind: "error", code: -32603, message: "x" })
   expect(durationMsOf("99999999999999999999999999h")).toBe(0)
+})
+
+test("a session's kept tool definitions follow its tool policy and match a fresh build", () => {
+  const m = new McpManager({ client_configs: [{ name: "fs", connection_type: "http", connection_string: "http://x/mcp", allow_by_default: true }] })
+  const s = m.sessions[0]!
+  s.connected = true
+  s.tools = [{ name: "read", description: "r", inputSchemaRaw: EMPTY_SCHEMA }, { name: "write", description: "w", inputSchemaRaw: EMPTY_SCHEMA }]
+  expect(m.allTools()).toEqual(toolsForChat("fs", s.tools, s.cfg))
+  expect(m.allToolsFor(["fs-read"])).toEqual([toolsForChat("fs", s.tools, s.cfg)[0]!])
+  expect(m.allToolsFor(["fs-read"])).toEqual(m.allToolsFor(["fs-read"]))
+  expect(s.original("fs-write")).toBe("write")
+  expect(s.anyToolWhere((orig: string, chat: string): bool => chat === "fs-write")).toBe(true)
+  expect(s.anyToolWhere((orig: string, chat: string): bool => orig === "nope")).toBe(false)
+  // a tool switched off applies at once (follow() does this for a kept stdio process)
+  let c = s.cfg
+  c.tools_to_skip = ["write"]
+  s.cfg = c
+  s.applyPolicy()
+  expect(m.allTools()).toEqual(toolsForChat("fs", s.tools, s.cfg))
+  expect(m.allTools().length).toBe(1)
+  expect(s.original("fs-write")).toBeUndefined()
+  expect(m.hasTool("fs-read")).toBe(true)
+})
+
+test("injectToolFields adds to parsed fields what injectTools adds to the text", () => {
+  const t1 = '{"type":"function","function":{"name":"s-a","description":"","parameters":{}}}'
+  const t2 = '{"type":"function","function":{"name":"s-b","description":"","parameters":{}}}'
+  const body = '{"tools":[' + t1 + '],"model":"m"}'
+  let fs = try fields(body)
+  // offered twice: the second reading of the names comes from the memo
+  for (let i = 0; i < 2; i++) {
+    let again = try fields(body)
+    expect(try injectToolFields(&again, [t1, t2, t2])).toBe(true)
+    expect(build(again)).toBe(try injectTools(body, [t1, t2, t2]))
+  }
+  expect(try injectToolFields(&fs, [t1])).toBe(false)
+  expect(build(fs)).toBe(body)
 })

@@ -3,10 +3,16 @@
 // with its tools given as client plus tool names and its keys reached through teams, customers and
 // providers as well as directly. Both lists are the same records; the two editors write them.
 import { createMemo, createSignal, createStore, For, refresh, Show, snapshot, untrack } from "solid-js"
-import { message, send } from "../api/client"
-import { can } from "../perm"
-import { DangerButton, FormError, Guard, initChecked, initValue, notify, Pill, Toolbar, tf, useFormRun } from "../ui"
+import { getData, listOr, message, send } from "../api/client"
+import { loadOptions } from "../api/options"
+import { canCall } from "../perm"
+import { idLabel, listOf } from "../fmt"
+import { ClientToolsRows, type ClientTools, DangerButton, fieldValue, FormError, Guard, initChecked, initValue, notify, Pill, Toolbar, tf, useFormRun } from "../ui"
 import { targetURL } from "../gateway"
+
+const VMCPS = "/api/mcp/virtual-mcps"
+// key boxes drawn at a time in an open card; the filter reaches the rest
+const KEY_PAGE = 50
 
 interface VTool {
   source: string
@@ -42,40 +48,24 @@ interface Opts {
   sources: string[]
 }
 
-const label = (n: Named): string => (n.name ? n.name + " (" + n.id + ")" : n.id)
+// The records themselves: the only read a key toggle repeats.
+const loadMcps = async (): Promise<VMcp[]> => listOf<VMcp>(await getData(VMCPS), "virtual_mcps")
 
-async function list<T>(path: string, key: string): Promise<T[]> {
-  try {
-    const r = await send("GET", path)
-    const v = (r.data as Record<string, unknown> | undefined)?.[key]
-    return Array.isArray(v) ? (v as T[]) : []
-  } catch {
-    return []
-  }
+// What the gateway serves for each record, by name; it changes when a record's tools do.
+async function loadResolved(): Promise<Record<string, Resolved>> {
+  const byName: Record<string, Resolved> = {}
+  for (const r of await listOr<Resolved>("/api/mcp/virtual", "")) byName[r.name] = r
+  return byName
 }
 
-async function loadAll(): Promise<{ mcps: VMcp[]; resolved: Record<string, Resolved>; opts: Opts }> {
-  const [mcps, resolved, keys, teams, customers, providers, status] = await Promise.all([
-    send("GET", "/api/mcp/virtual-mcps").then((r) => (((r.data as { virtual_mcps?: VMcp[] })?.virtual_mcps ?? []) as VMcp[])),
-    send("GET", "/api/mcp/virtual").then(
-      (r) => (Array.isArray(r.data) ? (r.data as Resolved[]) : []),
-      () => [] as Resolved[],
-    ),
-    list<Named>("/api/governance/virtual-keys", "virtual_keys"),
-    list<Named>("/api/governance/teams", "teams"),
-    list<Named>("/api/governance/customers", "customers"),
-    list<{ name: string }>("/api/providers", "providers"),
-    list<{ name: string; tools_list?: { name: string }[] }>("/api/mcp", "clients"),
+async function loadOpts(): Promise<Opts> {
+  const [o, status] = await Promise.all([
+    loadOptions("keys", "teams", "customers", "providers"),
+    listOr<{ name: string; tools_list?: { name: string }[] }>("/api/mcp", "clients"),
   ])
-  const byName: Record<string, Resolved> = {}
-  for (const r of resolved) byName[r.name] = r
   const sources: string[] = []
   for (const c of status) for (const t of c.tools_list ?? []) sources.push(c.name + "-" + t.name)
-  return {
-    mcps,
-    resolved: byName,
-    opts: { keys, teams, customers, providers: providers.map((p) => p.name), clients: status.map((c) => c.name), sources },
-  }
+  return { keys: o.keys, teams: o.teams, customers: o.customers, providers: o.providers.map((p) => p.name), clients: status.map((c) => c.name), sources }
 }
 
 // ---- the virtual MCP editor ----
@@ -96,7 +86,7 @@ function McpForm(props: { current: VMcp | undefined; opts: Opts; onClose: () => 
   const submit = (ev: SubmitEvent) => {
     ev.preventDefault()
     const form = ev.currentTarget as HTMLFormElement
-    const get = (n: string) => (form.elements.namedItem(n) as HTMLInputElement).value
+    const get = (n: string) => fieldValue(form, n)
     void run(async () => {
       const tools: VTool[] = []
       for (const r of snapshot(rows).tools) {
@@ -119,8 +109,8 @@ function McpForm(props: { current: VMcp | undefined; opts: Opts; onClose: () => 
       }
       const name = cur ? cur.name : get("name").trim()
       const body = { name, description: get("description").trim(), tools }
-      if (cur) await send("PUT", "/api/mcp/virtual-mcps/" + encodeURIComponent(cur.name), { body })
-      else await send("POST", "/api/mcp/virtual-mcps", { body })
+      if (cur) await send("PUT", VMCPS + "/" + encodeURIComponent(cur.name), { body })
+      else await send("POST", VMCPS, { body })
       notify(cur ? "Virtual MCP saved" : "Virtual MCP created", "ok")
       props.onSaved()
     })
@@ -212,10 +202,7 @@ function McpForm(props: { current: VMcp | undefined; opts: Opts; onClose: () => 
 
 // ---- the tool group editor ----
 
-interface GroupRow {
-  client: string
-  tools: string
-}
+type GroupRow = ClientTools
 
 // A stored source "client-tool" back to a client and its tool name. Clients cannot hold a dash.
 function groupRows(tools: VTool[], clients: string[]): GroupRow[] {
@@ -244,7 +231,7 @@ function Checks(props: { legend: string; name: string; items: Named[]; chosen: s
           <For each={props.items} keyed={(i) => i.id}>
             {(it) => (
               <label class="check">
-                <input class="checkbox checkbox-sm" type="checkbox" name={props.name} value={it().id} ref={initChecked(props.chosen.includes(it().id))} /> {label(it())}
+                <input class="checkbox checkbox-sm" type="checkbox" name={props.name} value={it().id} ref={initChecked(props.chosen.includes(it().id))} /> {idLabel(it())}
               </label>
             )}
           </For>
@@ -262,7 +249,7 @@ function GroupForm(props: { current: VMcp | undefined; opts: Opts; onClose: () =
   const submit = (ev: SubmitEvent) => {
     ev.preventDefault()
     const form = ev.currentTarget as HTMLFormElement
-    const get = (n: string) => (form.elements.namedItem(n) as HTMLInputElement).value
+    const get = (n: string) => fieldValue(form, n)
     const picked = (n: string) => [...form.querySelectorAll<HTMLInputElement>('input[name="' + n + '"]:checked')].map((e) => e.value)
     void run(async () => {
       const tools = snapshot(rows)
@@ -320,34 +307,13 @@ function GroupForm(props: { current: VMcp | undefined; opts: Opts; onClose: () =
           </p>
         </Show>
         <div id="tg-tools">
-          <For each={rows.tools}>
-            {(row, i) => (
-              <div class="rule">
-                <select class="select select-sm" aria-label="MCP client" onChange={(e) => setRows((s) => void (s.tools[i()]!.client = e.currentTarget.value))}>
-                  <option value="" selected={!row.client}>
-                    Choose MCP client
-                  </option>
-                  <For each={untrack(() => (row.client && !props.opts.clients.includes(row.client) ? [...props.opts.clients, row.client] : props.opts.clients))}>
-                    {(n) => (
-                      <option value={n} selected={n === row.client}>
-                        {n}
-                      </option>
-                    )}
-                  </For>
-                </select>
-                <input class="input input-sm"
-                  aria-label="Tool names"
-                  placeholder="* for all, or a comma list"
-                  autocomplete="off"
-                  value={row.tools}
-                  onInput={(e) => setRows((s) => void (s.tools[i()]!.tools = e.currentTarget.value))}
-                />
-                <button type="button" class="btn btn-sm btn-ghost" onClick={() => setRows((s) => void s.tools.splice(i(), 1))}>
-                  Remove
-                </button>
-              </div>
-            )}
-          </For>
+          <ClientToolsRows
+            rows={rows.tools}
+            clients={props.opts.clients}
+            update={(change) => setRows((s) => change(s.tools))}
+            toolsLabel="Tool names"
+            toolsPlaceholder="* for all, or a comma list"
+          />
         </div>
         <button type="button" id="tg-add-tool" class="btn btn-sm btn-ghost" onClick={() => setRows((s) => void s.tools.push({ client: "", tools: "*" }))}>
           Add client
@@ -373,13 +339,25 @@ function GroupForm(props: { current: VMcp | undefined; opts: Opts; onClose: () =
 
 // ---- the list ----
 
-function McpCard(props: { m: VMcp; res: Resolved | undefined; keys: Named[]; mode: "mcp" | "group"; onEdit: () => void; onChange: () => void }) {
-  const writable = () => can("MCPGateway", "Update")
-  const attach = async (ev: Event, vk: string) => {
+// The keys of one record: a count until the list is opened, then a filter and the first matches,
+// so a page of records does not draw a box for every key of every record.
+function KeyBoxes(props: { m: VMcp; keys: Named[]; onChange: () => void }) {
+  const [open, setOpen] = createSignal(false)
+  const [filter, setFilter] = createSignal("")
+  const path = () => VMCPS + "/" + encodeURIComponent(props.m.name) + "/virtual-keys"
+  const attached = createMemo(() => new Set(props.m.virtual_key_ids))
+  // attaching is a POST and detaching a DELETE, so a box follows the permission its next click needs
+  const locked = (id: string) => !canCall(attached().has(id) ? "DELETE" : "POST", path())
+  const count = createMemo(() => props.keys.reduce((n, k) => n + (attached().has(k.id) ? 1 : 0), 0))
+  const matching = createMemo(() => {
+    const f = filter().trim().toLowerCase()
+    return f ? props.keys.filter((k) => idLabel(k).toLowerCase().includes(f)) : props.keys
+  })
+  const toggle = async (ev: Event, vk: string) => {
     const box = ev.currentTarget as HTMLInputElement
     const want = box.checked
     try {
-      await send(want ? "POST" : "DELETE", "/api/mcp/virtual-mcps/" + encodeURIComponent(props.m.name) + "/virtual-keys/" + encodeURIComponent(vk))
+      await send(want ? "POST" : "DELETE", path() + "/" + encodeURIComponent(vk))
       notify(want ? "Key attached" : "Key detached", "ok")
       props.onChange()
     } catch (e) {
@@ -387,6 +365,42 @@ function McpCard(props: { m: VMcp; res: Resolved | undefined; keys: Named[]; mod
       notify(message(e), "error")
     }
   }
+  return (
+    <details class="vm-keys" onToggle={(ev) => setOpen(ev.currentTarget.open)}>
+      <summary>{count() + " of " + props.keys.length + (props.keys.length === 1 ? " key" : " keys")}</summary>
+      <Show when={open()}>
+        <Show when={props.keys.length > KEY_PAGE}>
+          <label class="inline-label">
+            Filter keys
+            <input class="input input-sm" type="search" autocomplete="off" aria-label={"Filter keys of " + props.m.name} onInput={(ev) => setFilter(ev.currentTarget.value)} />
+          </label>
+        </Show>
+        <div class="tool-chips" style="margin-top:6px">
+          <For each={matching().slice(0, KEY_PAGE)} keyed={(k) => k.id}>
+            {(k) => (
+              <label class="check">
+                <input class="checkbox checkbox-sm"
+                  type="checkbox"
+                  aria-label={"Allow key " + k().id}
+                  disabled={locked(k().id)}
+                  ref={initChecked(attached().has(k().id))}
+                  onChange={(ev) => toggle(ev, k().id)}
+                />{" "}
+                {idLabel(k())}
+              </label>
+            )}
+          </For>
+        </div>
+        <Show when={matching().length > KEY_PAGE} fallback={<Show when={!matching().length}><p class="hint">No key matches.</p></Show>}>
+          <p class="hint" role="status">{"Showing " + KEY_PAGE + " of " + matching().length + " keys. Filter to find the others."}</p>
+        </Show>
+      </Show>
+    </details>
+  )
+}
+
+function McpCard(props: { m: VMcp; res: Resolved | undefined; keys: Named[]; mode: "mcp" | "group"; onEdit: () => void; onChange: () => void; onKeys: () => void }) {
+  const writable = () => canCall("PUT", VMCPS)
   return (
     <article class="card panel bg-base-100 border border-base-300" aria-label={(props.mode === "group" ? "Tool group " : "Virtual MCP ") + props.m.name}>
       <header class="toolbar" style="margin-bottom:8px">
@@ -399,11 +413,11 @@ function McpCard(props: { m: VMcp; res: Resolved | undefined; keys: Named[]; mod
               Edit
             </button>
           </Show>
-          <Show when={can("MCPGateway", "Delete")}>
+          <Show when={canCall("DELETE", VMCPS)}>
             <DangerButton
               label="Delete"
               action={async () => {
-                await send("DELETE", "/api/mcp/virtual-mcps/" + encodeURIComponent(props.m.name))
+                await send("DELETE", VMCPS + "/" + encodeURIComponent(props.m.name))
                 notify("Deleted " + props.m.name, "ok")
                 props.onChange()
               }}
@@ -427,30 +441,23 @@ function McpCard(props: { m: VMcp; res: Resolved | undefined; keys: Named[]; mod
       </Show>
       <h4>Virtual keys that may use it</h4>
       <Show when={props.keys.length} fallback={<p class="hint">No virtual keys yet.</p>}>
-        <div class="tool-chips">
-          <For each={props.keys} keyed={(k) => k.id}>
-            {(k) => (
-              <label class="check">
-                <input class="checkbox checkbox-sm"
-                  type="checkbox"
-                  aria-label={"Allow key " + k().id}
-                  disabled={!can("MCPGateway", "Create") && !can("MCPGateway", "Delete")}
-                  ref={initChecked(props.m.virtual_key_ids.includes(k().id))}
-                  onChange={(ev) => attach(ev, k().id)}
-                />{" "}
-                {label(k())}
-              </label>
-            )}
-          </For>
-        </div>
+        <KeyBoxes m={props.m} keys={props.keys} onChange={props.onKeys} />
       </Show>
     </article>
   )
 }
 
 export function VirtualMcp() {
-  const data = createMemo(loadAll)
-  const reload = () => refresh(data)
+  // Three reads: a key toggle refetches the records only, an edit the records and what they serve,
+  // and the option lists load once and again on Refresh.
+  const mcps = createMemo(loadMcps)
+  const resolved = createMemo(loadResolved)
+  const opts = createMemo(loadOpts)
+  const reloadKeys = () => refresh(mcps)
+  const reload = () => {
+    refresh(mcps)
+    refresh(resolved)
+  }
   const [mode, setMode] = createSignal<"mcp" | "group">("mcp")
   const [editor, setEditor] = createSignal<{ m: VMcp | undefined } | undefined>(undefined)
   const done = () => {
@@ -486,7 +493,18 @@ export function VirtualMcp() {
             Tool groups
           </button>
         </span>
-        <Show when={can("MCPGateway", "Create")}>
+        <button
+          type="button"
+          id="vm-refresh"
+          class="btn btn-sm btn-ghost"
+          onClick={() => {
+            reload()
+            refresh(opts)
+          }}
+        >
+          Refresh
+        </button>
+        <Show when={canCall("POST", VMCPS)}>
           <button type="button" id="vm-new" class="btn btn-sm btn-primary" onClick={() => setEditor({ m: undefined })}>
             {mode() === "mcp" ? "New virtual MCP" : "New tool group"}
           </button>
@@ -501,16 +519,16 @@ export function VirtualMcp() {
         <Show when={editor()} keyed>
           {(e) =>
             mode() === "mcp" ? (
-              <McpForm current={e.m} opts={data().opts} onClose={() => setEditor(undefined)} onSaved={done} />
+              <McpForm current={e.m} opts={opts()} onClose={() => setEditor(undefined)} onSaved={done} />
             ) : (
-              <GroupForm current={e.m} opts={data().opts} onClose={() => setEditor(undefined)} onSaved={done} />
+              <GroupForm current={e.m} opts={opts()} onClose={() => setEditor(undefined)} onSaved={done} />
             )
           }
         </Show>
         <div id="vm-list">
-          <Show when={data().mcps.length} fallback={<p class="card panel bg-base-100 border border-base-300 muted">{mode() === "mcp" ? "No virtual MCPs yet." : "No tool groups yet."}</p>}>
-            <For each={data().mcps} keyed={(m) => m.name}>
-              {(m) => <McpCard m={m()} res={data().resolved[m().name]} keys={data().opts.keys} mode={mode()} onEdit={() => setEditor({ m: m() })} onChange={reload} />}
+          <Show when={mcps().length} fallback={<p class="card panel bg-base-100 border border-base-300 muted">{mode() === "mcp" ? "No virtual MCPs yet." : "No tool groups yet."}</p>}>
+            <For each={mcps()} keyed={(m) => m.name}>
+              {(m) => <McpCard m={m()} res={resolved()[m().name]} keys={opts().keys} mode={mode()} onEdit={() => setEditor({ m: m() })} onChange={reload} onKeys={reloadKeys} />}
             </For>
           </Show>
         </div>

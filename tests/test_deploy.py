@@ -65,6 +65,18 @@ class DockerfileTest(unittest.TestCase):
         self.assertIn("purge -y --allow-remove-essential mount", runtime)
         self.assertRegex(runtime, r"find / -xdev -type f -perm /6000 -exec chmod a-s")
 
+    def test_engine_is_built_in_and_no_webkit_package_ships(self):
+        # JavaScriptCore is built from source and linked in: the runtime installs no WebKitGTK package
+        self.assertLess(self.text.index("RUN scripts/build-tov.sh"), self.text.index("RUN scripts/build-jsc.sh"))
+        self.assertLess(self.text.index("RUN scripts/build-jsc.sh"), self.text.index("COPY src/"))
+        self.assertIn("ENV TOV_JSC_DIR=", self.text)
+        runtime = self.text[self.text.rindex("\nFROM "):]
+        code = "\n".join(l for l in runtime.split("\n") if not l.lstrip().startswith("#"))
+        self.assertNotIn("javascriptcoregtk", code)
+        self.assertNotIn("webkit", code.lower())
+        script = open(os.path.join(ROOT, "scripts", "build-jsc.sh")).read()
+        self.assertRegex(script, r"(?m)^WEBKIT_COMMIT=[0-9a-f]{40}$", "the engine's source is not pinned by commit")
+
     def test_cmd_binds_every_address(self):
         m = re.search(r"^CMD\s+(\[.*\])", self.text, re.M)
         cmd = json.loads(m.group(1))
