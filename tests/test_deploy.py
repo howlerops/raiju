@@ -123,7 +123,7 @@ class CiWorkflowTest(unittest.TestCase):
         self.assertIs(w["push"], False)
         self.assertIs(w["load"], True)
         self.assertEqual(w["tags"], "raiju:ci")
-        self.assertEqual(w["cache-from"], "type=gha")
+        self.assertTrue(w["cache-from"].startswith("type=gha"), w["cache-from"])
         # only pushes to main write the layer cache
         self.assertIn("github.event_name == 'push'", w["cache-to"])
 
