@@ -55,7 +55,9 @@ resource "aws_ecs_cluster" "this" {
 resource "aws_cloudwatch_log_group" "this" {
   name              = "/ecs/${var.name}"
   retention_in_days = var.log_retention_days
-  tags              = var.tags
+  # null: the service's own encryption; an ARN: this KMS key (its policy must let CloudWatch Logs use it)
+  kms_key_id = var.log_kms_key_arn
+  tags       = var.tags
 }
 
 # IAM: execution role (pulls the image, reads secrets) and task role (the app)
@@ -221,13 +223,22 @@ resource "aws_security_group" "service" {
 resource "aws_lb" "this" {
   name                       = var.name
   load_balancer_type         = "application"
-  internal                   = false
+  internal                   = var.internal
   security_groups            = [aws_security_group.alb.id]
   subnets                    = var.public_subnet_ids
   drop_invalid_header_fields = true
   # below Raiju's server.idle_timeout_seconds (60), so the ALB never reuses a connection the task is closing
   idle_timeout = var.alb_idle_timeout
   tags         = var.tags
+
+  dynamic "access_logs" {
+    for_each = var.alb_access_logs_bucket == null ? [] : [var.alb_access_logs_bucket]
+    content {
+      bucket  = access_logs.value
+      prefix  = var.name
+      enabled = true
+    }
+  }
 }
 
 resource "aws_lb_target_group" "this" {
