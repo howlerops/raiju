@@ -41,6 +41,11 @@ class FetchLint(unittest.TestCase):
         ])
         self.assertEqual(flagged(src), [])
 
+    def test_nullish_assignment_is_flagged(self):
+        self.assertEqual(flagged("let a: string | undefined = undefined\na ??= make()\n"), [2])
+        # not in a comment or a string, and `??` alone is fine
+        self.assertEqual(flagged('// a ??= b\nconst s = "x ??= y"\nconst c = a ?? b\n'), [])
+
     def test_the_sources_pass(self):
         files = sorted(glob.glob(os.path.join(ROOT, "src", "*.tov")) + glob.glob(os.path.join(ROOT, "src", "providers", "*.tov")))
         bad = []

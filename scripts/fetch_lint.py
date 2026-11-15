@@ -9,6 +9,8 @@ out says so with a `fetch-timeout: none` comment on its line.
 Comments, strings and template literals (the UI's embedded JavaScript) are skipped, and so are method
 definitions named fetch (Bun.serve's `fetch(req) {`).
 
+It also flags `??=`, which leaks with the pinned Tov revision (see _nullish_assignments).
+
 Usage: scripts/fetch_lint.py FILE...   (exit 1 when a call is flagged)
 """
 import sys
@@ -98,6 +100,21 @@ def problems(path, text):
             if not is_def and "signal" not in args and "fetch-timeout: none" not in src_line:
                 found.append((line, col, "fetch() without a timeout: pass signal: deadline(ms).controller.signal (src/deadline.tov), or mark the line `fetch-timeout: none`"))
         i = code.find("fetch", i + 5)
+    found.extend(_nullish_assignments(code))
+    return found
+
+
+def _nullish_assignments(code):
+    """[(line, col, message)] for each `??=`. With the Tov revision this repository pins, `a ??= b` evaluates b
+    and leaks its value whenever a is already set (valgrind: one lost block per assignment; fixed upstream after
+    the pin, see docs/tov-notes.md). Write `if (a === undefined) a = b` until the pin moves past that fix."""
+    found = []
+    i = code.find("??=")
+    while i >= 0:
+        line = code.count("\n", 0, i) + 1
+        col = i - (code.rfind("\n", 0, i) + 1) + 1
+        found.append((line, col, "`??=` leaks its right-hand value with the pinned Tov when the left side is set; write `if (a === undefined) a = b`"))
+        i = code.find("??=", i + 3)
     return found
 
 
