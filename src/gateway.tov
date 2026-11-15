@@ -2041,6 +2041,18 @@ export class Engine {
     return this.streamGuards(guardOn).length > 0 || this.streamBuiltin(guardOn) !== undefined
   }
 
+  // Whether an output guard can block or redact a streamed answer: the built-in guard, or a local rule that is
+  // not detect_only. A provider that only records findings leaves the stream as it is.
+  streamActs(guardOn: bool): bool {
+    if (this.streamBuiltin(guardOn) !== undefined) return true
+    for (const p of this.streamGuards(guardOn)) {
+      for (const r of p.rules) {
+        if (r.action !== "detect_only") return true
+      }
+    }
+    return false
+  }
+
   // The delay between replayed events (guardrails.stream_replay_event_interval_ms, at most 1000 ms). It applies
   // only when a block-capable output guard is on: a local rule or the built-in guard in block mode. 0 otherwise.
   replayPace(): int {
@@ -5344,13 +5356,20 @@ export class Engine {
     } catch (e) {
       return errorResponse(400, `invalid chat request: ${e.message}`, "invalid_request_error", noHeaders())
     }
+    // the stream guard reads one choice: with several their texts would mix and a rule could miss. Refused here,
+    // before the plugins' pre hooks, so no hook opens what an answer made past them would not close.
+    if ((rawBool(body, "stream") ?? false) && manyChoices(body) && this.streamActs(guardOn)) return errorResponse(400, MANY_CHOICES_GUARDED, "invalid_request_error", noHeaders())
     const chain = this.plugins
     let run: PluginRun | undefined = undefined
     let hook: AttemptPlugins | undefined = undefined
+    // One id for the request: the caller's when serve() takes it, else one made here, which the plugins' context,
+    // the log row and the answer's x-request-id all carry (ridMade: the request is rebuilt with it below).
+    let ridMade = rid0 === "" ? lo : ""
     if (chain !== undefined) {
-      // the context of the transport hooks, when they ran for this request
+      // the context of the transport hooks, when they ran for this request (its id is then the request's)
       const shared = this.pluginRuns.get(req.headers.get(RUN_HEADER) ?? "")
-      const r = shared ?? new PluginRun({ requestId: req.headers.get("x-request-id") ?? newId("req_"), op: "chat", model: "", provider: "", headers: new Map(), values: new Map(), trace: new PluginTrace() })
+      if (rid0 === "" && ridMade === "") ridMade = shared !== undefined ? shared.ctx.requestId : newId("req_")
+      const r = shared ?? new PluginRun({ requestId: rid0 !== "" ? rid0 : ridMade, op: "chat", model: "", provider: "", headers: new Map(), values: new Map(), trace: new PluginTrace() })
       r.ctx.op = "chat"
       r.ctx.model = rawStr(body, "model") ?? ""
       // The provider resolved for the model, using the default provider for a bare model name.
@@ -5392,8 +5411,6 @@ export class Engine {
     // The typed request is only needed to translate for non-OpenAI providers.
     const typed = new LazyChat(text)
     const stream = rawBool(body, "stream") ?? false
-    // the stream guard reads one choice: with several their texts would mix and a rule could miss
-    if (stream && manyChoices(body) && this.streamGuarded(guardOn)) return errorResponse(400, MANY_CHOICES_GUARDED, "invalid_request_error", noHeaders())
     let wantUsage = false
     const so = find(body, "stream_options")
     if (so !== undefined && so.startsWith("{")) {
@@ -5519,7 +5536,7 @@ export class Engine {
     // a logs_only HTTP provider on the answer: the request's row waits for its findings (record holds it until then)
     const holdOut = lo !== "" && !stream && this.httpLogsOnly("output")
     if (holdOut) this.heldRecords.set(lo, undefined)
-    const sreq = lo !== "" && rid0 === "" ? withRequestId(req, lo, text) : req
+    const sreq = ridMade !== "" ? withRequestId(req, ridMade, text) : req
     let res = try await this.serve(sreq, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers, stream ? pipeSink : undefined, mk, cp, promptUsed, undefined, undefined, plugHook, lo !== "" && rid0 === "" ? undefined : ph)
     // post hooks on an error answer (they may recover from it or change it); a stream's hooks ran per chunk
     if (chain !== undefined && run !== undefined) {
@@ -5613,7 +5630,7 @@ export class Engine {
       return errorResponse(400, `invalid completions request: ${e.message}`, "invalid_request_error", noHeaders())
     }
     const stream = rawBool(body, "stream") ?? false
-    if (stream && manyChoices(body) && this.streamGuarded(true)) return errorResponse(400, MANY_CHOICES_GUARDED, "invalid_request_error", noHeaders())
+    if (stream && manyChoices(body) && this.streamActs(true)) return errorResponse(400, MANY_CHOICES_GUARDED, "invalid_request_error", noHeaders())
     const wantUsage = streamUsage(body)
     const canPipe = stream && sink !== undefined
     const cp = new CompatPlan(withHeader(settingsOf(this.cfg.client?.compat), req.headers.get("x-raiju-compat") ?? undefined), "completions", stream)
@@ -6159,7 +6176,7 @@ test("the MCP step parses a chat request once: tools and instructions go into th
   const m = e.mcp!
   const s = m.sessions[0]!
   s.connected = true
-  s.tools = [{ name: "read", description: "r", inputSchemaRaw: "{}" }, { name: "write", description: "w", inputSchemaRaw: "{}" }]
+  s.setTools([{ name: "read", description: "r", inputSchemaRaw: "{}" }, { name: "write", description: "w", inputSchemaRaw: "{}" }])
   s.instructions = "be careful"
   const read = `{"type":"function","function":{"name":"fs-read","description":"r","parameters":{}}}`
   const write = `{"type":"function","function":{"name":"fs-write","description":"w","parameters":{}}}`

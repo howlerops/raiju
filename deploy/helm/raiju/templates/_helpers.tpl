@@ -131,6 +131,37 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- if and (include "raiju.clusterPort" .) (get $cl "serve_metrics") }}true{{ end }}
 {{- end }}
 
+{{/*
+Fails when a field of the config whose name says it holds a secret is a literal string and not a reference.
+node: the value walked; path: where it is, for the message; values: inside a provider's `keys`, whose entries
+hold the key itself in `value` (a virtual key's `value` is the gateway's own and may be set here, as before).
+Names are matched by their ending, so settings that only mention a secret (token_url,
+token_endpoint_auth_method, max_tokens) are not taken for one.
+*/}}
+{{- define "raiju.noLiteralSecrets" -}}
+{{- $node := .node -}}
+{{- $path := .path -}}
+{{- $values := .values -}}
+{{- if kindIs "map" $node -}}
+{{- range $k, $v := $node -}}
+{{- $n := lower $k -}}
+{{- $p := printf "%s.%s" $path $k -}}
+{{- if kindIs "string" $v -}}
+{{- $named := regexMatch "(secret|password|passphrase|private_key|api_key|signing_key|encryption_key|service_account_key|key_pem|secret_key|session_token|access_token|refresh_token|auth_token|bearer_token|metrics_token|setup_token|auth_credentials|admin_token)$" $n -}}
+{{- if and (or $named (and $values (eq $n "value"))) (ne $v "") (not (regexMatch "^(env|vault|aws-sm)\\." $v)) -}}
+{{- fail (printf "%s must be a reference (env.NAME, vault. or aws-sm.), not the secret itself: the config is rendered into a ConfigMap and kept in the release history; put the value in providerSecrets or existingSecret" $p) -}}
+{{- end -}}
+{{- else -}}
+{{- include "raiju.noLiteralSecrets" (dict "node" $v "path" $p "values" (eq $n "keys")) -}}
+{{- end -}}
+{{- end -}}
+{{- else if kindIs "slice" $node -}}
+{{- range $i, $v := $node -}}
+{{- include "raiju.noLiteralSecrets" (dict "node" $v "path" (printf "%s[%d]" $path $i) "values" $values) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{/* The port Prometheus scrapes /metrics on: the cluster port with serveMetrics, the main port otherwise. */}}
 {{- define "raiju.metricsPort" -}}
 {{- if include "raiju.metricsOnCluster" . }}{{ include "raiju.clusterPort" . }}{{ else }}{{ .Values.port }}{{ end }}
@@ -195,27 +226,10 @@ about 5 s to send what is queued). */}}
 {{- end }}
 {{- end }}
 {{- /* The config is rendered into a ConfigMap and kept in the release history: a secret in it must be a reference
-     (env.NAME, vault.…, aws-sm.…), never the value. */ -}}
-{{- $provs := get .Values.config "providers" }}
-{{- if kindIs "map" $provs }}
-{{- range $pname, $prov := $provs }}
-{{- if and (kindIs "map" $prov) (kindIs "slice" (get $prov "keys")) }}
-{{- range $key := get $prov "keys" }}
-{{- if kindIs "map" $key }}
-{{- $val := toString (default "" (get $key "value")) }}
-{{- if and (ne $val "") (not (or (hasPrefix "env." $val) (hasPrefix "vault." $val) (hasPrefix "aws-sm." $val))) }}
-{{- fail (printf "config.providers.%s: a key's value must be a reference (env.NAME, vault. or aws-sm.), not the key itself: the config is a ConfigMap; put the key in providerSecrets or existingSecret" $pname) }}
-{{- end }}
-{{- end }}
-{{- end }}
-{{- end }}
-{{- end }}
-{{- end }}
+     (env.NAME, vault.…, aws-sm.…), never the value. Checked for every field of the config whose name says it holds
+     a secret, at any depth (raiju.noLiteralSecrets). */ -}}
+{{- include "raiju.noLiteralSecrets" (dict "node" .Values.config "path" "config" "values" false) }}
 {{- $server := default dict (get .Values.config "server") }}
-{{- $mtok := toString (default "" (get $server "metrics_token")) }}
-{{- if and (ne $mtok "") (not (or (hasPrefix "env." $mtok) (hasPrefix "vault." $mtok) (hasPrefix "aws-sm." $mtok))) }}
-{{- fail "config.server.metrics_token must be a reference (env.NAME): the config is a ConfigMap; keep the token in a Secret (metricsToken.existingSecret)" }}
-{{- end }}
 {{- $grace := 25.0 }}
 {{- if hasKey $server "shutdown_grace_seconds" }}{{ $grace = float64 (get $server "shutdown_grace_seconds") }}{{ end }}
 {{- $delay := 0.0 }}

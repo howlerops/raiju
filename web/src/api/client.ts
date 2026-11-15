@@ -128,7 +128,7 @@ export async function send(method: string, path: string, o: RawOpts = {}): Promi
   }
   const r = await attempt()
   // /metrics may use a separate scrape token; its 401 does not reject the admin identity.
-  if (r.status === 401 && authenticated && path.startsWith("/api/")) revokeSession()
+  if (r.status === 401 && authenticated && path.startsWith("/api/")) revokeSession(bearer)
   if (!isActive()) return discarded()
   if (r.status < 200 || r.status >= 300) throw new ApiError(r.status, errorText(r.status, r.data, r.text, path))
   return r

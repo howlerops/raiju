@@ -8,12 +8,10 @@ export TOV_CFLAGS ?= -DTV_PLAIN_ALLOC
 TOV_PATCHED := build/tov/target/release/tov
 export TOV ?= $(if $(wildcard $(TOV_PATCHED)),$(abspath $(TOV_PATCHED)),tov)
 
-# The JavaScriptCore linked into the binary (make jsc builds it, after make tov; about 15 minutes). Without it
-# `tov build` links the system's libjavascriptcoregtk-4.1, which the image does not ship.
-JSC_OWN := $(wildcard build/jsc/current/lib/libtovjsc.a)
-ifneq ($(JSC_OWN),)
+# The JavaScriptCore linked into the binary (make jsc builds it, after make tov; about 15 minutes). Always named:
+# `tov build` uses the directory only when its library is there (also when `make jsc build` made it in this run),
+# and otherwise links the system's libjavascriptcoregtk-4.1, which the image does not ship.
 export TOV_JSC_DIR ?= $(abspath build/jsc/current)
-endif
 
 tov:
 	scripts/build-tov.sh

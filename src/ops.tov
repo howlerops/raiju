@@ -35,7 +35,7 @@ import { ProvisionJobs } from "./provjobs"
 import { JOB_BEAT_MS, slotText } from "./jobs"
 import { DirSettings, DirUser, directorySettings, listDirectory, lookupUser } from "./directory"
 import { bulkSyncInterval } from "./config_compat"
-import { Held, KeyCtx, handleApiKeys, newKeyValue, holds } from "./apikeys"
+import { KeyCtx, handleApiKeys, newKeyValue } from "./apikeys"
 import { keyBudgetIds, permissionDocs, permissionIds, permissionMap, rolePairs, userObjectJson, userKeysJson, PermissionDoc, creationPolicy, heldProfiles, PROPAGATED_FIELDS, propagateProfileKeys, parseOverride } from "./govapi"
 
 // The quota view of one virtual key's budget and rate limit (GET /api/governance/virtual-keys/quota).
@@ -48,7 +48,7 @@ type QuotaRateUsage = { kind: string, used: f64, limit: f64 }
 type QuotaRate = { id: string, token_max_limit?: int, token_reset_duration?: string, request_max_limit?: int, request_reset_duration?: string, usage: QuotaRateUsage[], source_type?: string, source_id?: string, source_name?: string }
 // One per-model limit of a key in the quota view; no provider means every provider.
 type QuotaModel = { model_name: string, provider?: string, budgets: QuotaBudget[], rate_limit?: QuotaRate }
-import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, takeUpgrades, THROTTLED, required, roleAllows, selfRoute, isBuiltinRole, customRole, provisioned, disabledNamed, anyRoleId, builtinPairs, userByEmail, systemRole, customRoles, resourceOf } from "./rbac"
+import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, takeUpgrades, THROTTLED, required, roleAllows, selfRoute, isBuiltinRole, customRole, provisioned, disabledNamed, anyRoleId, builtinPairs, userByEmail, systemRole, customRoles, resourceOf, Held, holds } from "./rbac"
 import { DataScope, allScope, noScope, scopeOf, inScope } from "./scope"
 import { AuditEvent, AuditLog, actionFor, auditListJson, auditQueryOf, maskDetail, profileAuditJson } from "./audit"
 import { isCacheId } from "./cache"
@@ -85,7 +85,7 @@ import { snapshot, errorJson, Hdrs, newId } from "./schemas"
 import { CLIENT_IP_HEADER, badProxyEntries, trustedProxies } from "./clientip"
 import { addressKey, signInGuard } from "./signinguard"
 import { deadline } from "./deadline"
-import { secureHex, utf8, sha256, toHex } from "./crypto"
+import { secureHex, utf8, sha256, toHex, htmlEscape } from "./crypto"
 import * as b64 from "./base64"
 import { AgentUser, Exchange, AGENT_TOKEN_PREFIX, agentSignIn, s256, authorizeProblem, callbackUrl, signInPage, tokenResponseJson } from "./agentsignin"
 import * as metrics from "./metrics"
@@ -860,12 +860,6 @@ async function putText(url: string, headers: Map<string, string>, body: string):
   }
 }
 
-// Text placed in an HTML page: every markup character, not only the first "<" (an identity provider's claim or
-// error text is not ours).
-function htmlEsc(s: string): string {
-  return s.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll("\"", "&quot;").replaceAll("'", "&#39;")
-}
-
 // A string literal for an inline script: JSON, with "<" written as an escape so the value cannot close the script
 // element or open a comment.
 function scriptJson(s: string): string {
@@ -1444,8 +1438,17 @@ export class Ops {
     // A management credential counts only when its role may run inference (the RunInference permission: the admin,
     // or a custom role given it). A viewer or auditor reads the dashboard; it does not spend the provider keys, and
     // a request without a virtual key has no key, team or customer budget to hold it.
+    // An agent token is its user's: it counts when the request runs under a key assigned to that user (the key's
+    // budgets then hold it), or when the user's own role may run inference.
     this.engine.gov.altAuth = (h) => {
-      if (this.agentUserOf(h) !== undefined) return true
+      const agent = this.agentUserOf(h)
+      if (agent !== undefined) {
+        if (this.assignedKeys(agent.user).length > 0) return true
+        for (const u of rb.users) {
+          if (u.name === agent.user) return this.mayRunInference(u.role)
+        }
+        return false
+      }
       if (rb.users.length === 0) return false
       const who = authenticate(rb, h)
       return who.kind === "user" && this.mayRunInference(who.role)
@@ -3156,7 +3159,7 @@ export class Ops {
       const params: Map<string, string> = new Map()
       for (const k of ["client_id", "redirect_uri", "state", "code_challenge", "code_challenge_method"]) params.set(k, sp.get(k) ?? "")
       const problem = authorizeProblem(params.get("client_id")!, params.get("redirect_uri")!, params.get("state")!, params.get("code_challenge")!, params.get("code_challenge_method")!)
-      if (problem !== "") return html(400, `<!doctype html><meta charset="utf-8"><title>Sign-in refused</title><p>This sign-in request cannot be used: ${problem.replaceAll("<", "&lt;")}.</p>`)
+      if (problem !== "") return html(400, `<!doctype html><meta charset="utf-8"><title>Sign-in refused</title><p>This sign-in request cannot be used: ${htmlEscape(problem)}.</p>`)
       const qs = new URLSearchParams("")
       for (const k of params.keys()) qs.set(k, params.get(k)!)
       const back = "/api/agent/auth/authorize?" + qs.toString()
@@ -5750,12 +5753,12 @@ export class Ops {
     let v = verifyIdToken(idToken, jw.body, oc, d.issuer, flow.nonce, Date.now())
     if (v.kind === "error") {
       signInGuard().fail(ipKeys, now)
-      return html(401, `<p>Sign-in failed: ${htmlEsc(v.message)}</p>`, clear)
+      return html(401, `<p>Sign-in failed: ${htmlEscape(v.message)}</p>`, clear)
     }
     // Keycloak puts its roles in the access token: its claims are the ones the mappings read
     if (oc.claims_token === "access_token") {
       const at = accessTokenClaims(accessToken, jw.body, oc, d.issuer, Date.now())
-      if (at.kind === "error") return html(401, `<p>Sign-in failed: ${htmlEsc(at.message)}</p>`, clear)
+      if (at.kind === "error") return html(401, `<p>Sign-in failed: ${htmlEscape(at.message)}</p>`, clear)
       v = { kind: "ok", sub: v.sub, email: v.email, unverified_email: v.unverified_email, role: v.role, claims: at.claims }
     }
     // a user governance lists as disabled (a SCIM deactivation, say) signs in no more; users it does not list are unchanged
@@ -5768,7 +5771,7 @@ export class Ops {
     const synced = await this.syncSignInLocked(v.sub, v.email, v.claims)
     if (synced.kind === "refuse") {
       this.recordChange("sso:" + v.sub, req, path, 403, "")
-      return html(403, `<p>Sign-in refused: ${htmlEsc(synced.reason)}</p>`, clear)
+      return html(403, `<p>Sign-in refused: ${htmlEscape(synced.reason)}</p>`, clear)
     }
     const role = synced.kind === "role" ? synced.role : v.role
     let token = ""
@@ -5779,7 +5782,7 @@ export class Ops {
       return html(503, "<p>Could not create a session; try again.</p>", clear)
     }
     // The token is scoped to this regional origin, just as the native UI's bearer-token storage is.
-    return html(200, `<!doctype html><meta charset="utf-8"><title>Signed in</title><script>sessionStorage.removeItem("raiju.adminToken"); sessionStorage.setItem("raiju.adminToken:"+location.origin, ${scriptJson(token)}); location.replace(${scriptJson(backTo)});</script><p>Signed in as ${htmlEsc(v.email ?? v.sub)}.</p>`, clear)
+    return html(200, `<!doctype html><meta charset="utf-8"><title>Signed in</title><script>sessionStorage.removeItem("raiju.adminToken"); sessionStorage.setItem("raiju.adminToken:"+location.origin, ${scriptJson(token)}); location.replace(${scriptJson(backTo)});</script><p>Signed in as ${htmlEscape(v.email ?? v.sub)}.</p>`, clear)
   }
 
   // ---- session refresh and sweep ----

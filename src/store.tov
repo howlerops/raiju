@@ -24,7 +24,7 @@ import { PromptRepoConfig } from "./prompts"
 import { FeatureFlagsConfig } from "./flags"
 import { notify } from "./notify"
 import { analyzerStatus, retryWarmup, generationsJson, deleteGeneration } from "./complexity"
-import { Grant, isBuiltinRole, customRole, customRoles, systemRole, withRoleIds, roleIdOf, roleNameById, anyRoleName, builtinRoleName, builtinRoles } from "./rbac"
+import { Held, holds, isBuiltinRole, customRole, customRoles, systemRole, withRoleIds, roleIdOf, roleNameById, anyRoleName, builtinRoleName, builtinRoles } from "./rbac"
 import { DataScope, allScope, inScope, scopeOf } from "./scope"
 import { setGlobalProxy } from "./providers/types"
 import { McpClientConfig, McpUserCredential } from "./mcp"
@@ -2782,17 +2782,22 @@ function unmaskJson(raw: string, stored: string | undefined, all: bool): string 
     const olds = old.startsWith("{") ? try fields(old) : []
     const out: string[] = []
     for (const f of try fields(t)) {
-      const secret = all || secretMapName(f.key) || (secretFieldName(f.key) && f.raw.trim().startsWith("\""))
+      const v = f.raw.trim()
+      const secret = all || (secretMapName(f.key) && v.startsWith("{")) || (secretFieldName(f.key) && v.startsWith("\""))
       out.push(`${quote(f.key)}:${try unmaskJson(f.raw, find(olds, f.key), secret)}`)
     }
     return "{" + out.join(",") + "}"
   }
   if (t.startsWith("[")) {
     const olds = old.startsWith("[") ? try elements(old) : []
+    const news = try elements(t)
+    // by position only while the list keeps its length: after an entry is added or removed the positions no
+    // longer name the same entries, and a short value's mask ("****") would match whichever one sits there
+    const aligned = olds.length === news.length
     const out: string[] = []
     let i = 0
-    for (const e of try elements(t)) {
-      out.push(try unmaskJson(e, i < olds.length ? olds[i]! : undefined, all))
+    for (const e of news) {
+      out.push(try unmaskJson(e, aligned ? olds[i]! : undefined, all))
       i += 1
     }
     return "[" + out.join(",") + "]"
@@ -2809,7 +2814,7 @@ function maskJson(raw: string, all: bool): string throws SyntaxError {
   const t = raw.trim()
   if (t.startsWith("{")) {
     const out: string[] = []
-    for (const f of try fields(t)) out.push(`${quote(f.key)}:${try maskJson(f.raw, all || secretMapName(f.key) || (secretFieldName(f.key) && f.raw.trim().startsWith("\"")))}`)
+    for (const f of try fields(t)) out.push(`${quote(f.key)}:${try maskJson(f.raw, all || (secretMapName(f.key) && f.raw.trim().startsWith("{")) || (secretFieldName(f.key) && f.raw.trim().startsWith("\"")))}`)
     return "{" + out.join(",") + "}"
   }
   if (t.startsWith("[")) {
@@ -2842,6 +2847,12 @@ test("the config view masks secrets in every section", () => {
   expect(try unmaskJson(sentBack, stored, false)).toBe(stored)
   expect(try unmaskJson(`{"oauth2_server_config":{"issuer_url":"https://b","signing_key":"new-key"},"n":2}`, stored, false)).toBe(`{"oauth2_server_config":{"issuer_url":"https://b","signing_key":"new-key"},"n":2}`)
   expect(try unmaskJson(`{"headers":{"x":"****","y":"****"}}`, stored, false)).toBe(`{"headers":{"x":"short","y":"****"}}`)
+  // a list of header names is not a map of secrets: it is shown and saved as it is
+  expect(try maskJson(`{"required_headers":["x-team","x-org"],"extra_headers":{"x-api":"secret-value"}}`, false)).toBe(`{"required_headers":["x-team","x-org"],"extra_headers":{"x-api":"****"}}`)
+  // a masked list that changed length is not matched by position
+  const lists = `{"auth":{"tokens":["aaaa","bbbb"]}}`
+  expect(try unmaskJson(`{"auth":{"tokens":["****","****"]}}`, lists, true)).toBe(lists)
+  expect(try unmaskJson(`{"auth":{"tokens":["****"]}}`, lists, true)).toBe(`{"auth":{"tokens":["****"]}}`)
   // secrets whose names carry none of the usual words
   const k = try maskJson(`{"encryption_key":"eeeeeeeeeeee","client":{"oauth2_server_config":{"signing_key":"ssssssssssss"}},"exporters":[{"service_account_key":"aaaaaaaaaaaa"}],"tls":{"client_key_pem":"kkkkkkkkkkkk","client_cert_pem":"cert"},"sasl_password":"dddddddddddd","access_key":"AKIAEXAMPLE"}`, false)
   for (const secret of ["eeeeeeeeeeee", "ssssssssssss", "aaaaaaaaaaaa", "kkkkkkkkkkkk", "dddddddddddd"]) expect(k.includes(secret)).toBe(false)
@@ -3313,7 +3324,7 @@ export function isRotatePath(path: string): bool {
   return segs.length === 4 && segs[3] === "rotate" || segs.length === 5 && segs[4] === "rotate"
 }
 
-function governanceRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, sp: URLSearchParams, scope: DataScope, grant?: Grant): ApiReply {
+function governanceRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, sp: URLSearchParams, scope: DataScope, grant?: Held): ApiReply {
   const coll = segs[2] ?? ""
   if (coll === "virtual-keys" && (segs.length === 4 && segs[3] === "rotate" || segs.length === 5 && segs[4] === "rotate")) {
     return rotateVkRoute(store, m, segs, body, path, scope)
@@ -3791,19 +3802,19 @@ function businessUnitFrom(id: string, b: BusinessUnitBody): BusinessUnitConfig {
 // The 403 for a role change that would add a permission its caller does not hold, or undefined. A caller who is
 // not an admin (grant.all false) gives a role only what it holds itself, so a delegated RBAC permission cannot mint
 // the admin's; pairs the role already has stay. No grant: no bound (the admin, and callers inside the process).
-function grantRefusal(grant: Grant | undefined, cur: PermissionPair[] | undefined, next: PermissionPair[] | undefined): ApiReply | undefined {
+function grantRefusal(grant: Held | undefined, cur: PermissionPair[] | undefined, next: PermissionPair[] | undefined): ApiReply | undefined {
   if (grant === undefined || grant.all) return undefined
-  const had = cur ?? []
+  const had: Held = { all: false, pairs: cur ?? [] }
   for (const p of next ?? []) {
-    if (had.some((x) => x.resource === p.resource && x.operation === p.operation)) continue
-    if (!grant.pairs.some((x) => x.resource === p.resource && x.operation === p.operation)) {
+    if (holds(had, p)) continue
+    if (!holds(grant, p)) {
       return reply(403, errorBody(`you do not hold ${p.resource}:${p.operation}, so you cannot add it to a role`))
     }
   }
   return undefined
 }
 
-function roleRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, scope: DataScope, system: bool, grant?: Grant): ApiReply {
+function roleRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, scope: DataScope, system: bool, grant?: Held): ApiReply {
   if (segs.length > 4 || segs.length === 4 && segs[3] !== "permissions") return notFound(path)
   if (!scope.all && m !== "GET") return scopeDenied()
   const name = segs[2]
@@ -3867,7 +3878,7 @@ function roleView(store: ConfigStore, name: string): RoleConfig | undefined {
 // /api/governance/rbac/roles/{role_id}: GET, PUT and DELETE use the {"role": ...} shape.
 // PUT is a partial update: omitted fields keep their values, and description "" clears it.
 // A role cannot be renamed because its users and access profiles are kept by its id.
-function roleByIdRoute(store: ConfigStore, m: string, id: int, segs: string[], body: string, grant?: Grant): ApiReply {
+function roleByIdRoute(store: ConfigStore, m: string, id: int, segs: string[], body: string, grant?: Held): ApiReply {
   const sys = builtinRoleName(id)
   if (sys !== undefined) return systemRoleRoute(store, m, sys, segs, body, true, grant)
   const name = roleNameById(gov(store.cfg).roles, id)
@@ -3912,7 +3923,7 @@ function roleByIdRoute(store: ConfigStore, m: string, id: int, segs: string[], b
 // or its permission pairs at .../permissions. Deletion returns 403. PUT edits description, dac,
 // entity_dac and permissions; omitted fields keep their values, and the role cannot be renamed.
 // PUT .../permissions {"permission_ids": [...]} replaces its pairs. Edited roles are judged by their pairs.
-function systemRoleRoute(store: ConfigStore, m: string, name: string, segs: string[], body: string, wrap: bool, grant?: Grant): ApiReply {
+function systemRoleRoute(store: ConfigStore, m: string, name: string, segs: string[], body: string, wrap: bool, grant?: Held): ApiReply {
   const role = systemRole(gov(store.cfg).roles, name, RESOURCES, OPERATIONS)
   if (role === undefined) return reply(404, errorBody(`no role ${name}`))
   if (segs.length === 4) {
@@ -3962,7 +3973,7 @@ function isNumeric(s: string): bool {
 
 // GET and PUT /api/roles/{name}/permissions. GET lists the role's permission pairs with their ids;
 // PUT {"permission_ids": [...]} replaces the pairs with those identified by the supplied ids.
-function rolePermissions(store: ConfigStore, m: string, name: string, body: string, grant?: Grant): ApiReply {
+function rolePermissions(store: ConfigStore, m: string, name: string, body: string, grant?: Held): ApiReply {
   const cur = customRole(gov(store.cfg).roles, name)
   if (cur === undefined) return reply(404, errorBody(`no role ${name}`))
   if (m === "GET") return permissionsReply(name, cur.permissions ?? [])
@@ -4345,7 +4356,7 @@ export function exchangeClientIn(list: McpClientConfig[] | undefined): string {
   return ""
 }
 
-function putConfig(store: ConfigStore, body: string, grant?: Grant): ApiReply {
+function putConfig(store: ConfigStore, body: string, grant?: Held): ApiReply {
   let fs: Field[] = []
   try {
     fs = fields(body)
@@ -4645,8 +4656,8 @@ function modelList(c: Config, only: string, query: string, limit: f64, offset: f
 
 // scope is what the caller may see and change (see scope.tov); all data when it is not given.
 // grant: what the caller may hand out through the roles routes and whether it may change auth_config (rbac.tov
-// Grant); undefined places no bound (the admin, and the process's own calls).
-export function handleApi(store: ConfigStore, method: string, path: string, body: string, scope?: DataScope, grant?: Grant): ApiReply {
+// Held); undefined places no bound (the admin, and the process's own calls).
+export function handleApi(store: ConfigStore, method: string, path: string, body: string, scope?: DataScope, grant?: Held): ApiReply {
   const m = method.toUpperCase()
   const q = path.indexOf("?")
   const p = q < 0 ? path : path.slice(0, q)
@@ -6562,7 +6573,7 @@ test("a caller who is not an admin adds to a role only the permissions it holds,
     const s = new ConfigStore(path, {})
     const all = allScope()
     // a delegate with RBAC and Settings writes and one Teams permission
-    const grant: Grant = { all: false, pairs: [{ resource: "RBAC", operation: "Create" }, { resource: "RBAC", operation: "Update" }, { resource: "Settings", operation: "Update" }, { resource: "Teams", operation: "View" }] }
+    const grant: Held = { all: false, pairs: [{ resource: "RBAC", operation: "Create" }, { resource: "RBAC", operation: "Update" }, { resource: "Settings", operation: "Update" }, { resource: "Teams", operation: "View" }] }
     expect(handleApi(s, "POST", "/api/roles", `{"name":"mine","permissions":[{"resource":"Teams","operation":"View"}]}`, all, grant).status).toBe(201)
     expect(handleApi(s, "POST", "/api/roles", `{"name":"big","permissions":[{"resource":"Users","operation":"Create"}]}`, all, grant).status).toBe(403)
     expect(handleApi(s, "PUT", "/api/roles/mine", `{"permissions":[{"resource":"Teams","operation":"View"},{"resource":"Users","operation":"Delete"}]}`, all, grant).status).toBe(403)

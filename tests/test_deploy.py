@@ -607,6 +607,14 @@ class HelmTest(unittest.TestCase):
         self.assertIn("must be a reference", self.render("config.providers.openai.keys[0].value=sk-live-abc", ok=False))
         self.assertIn("metrics_token must be a reference", self.render("config.server.metrics_token=plain", ok=False))
         self.render("config.providers.openai.keys[0].value=vault.kv/openai#key", "config.server.metrics_token=env.TOK")
+        # any field named as a secret, at any depth
+        for literal in ("config.providers.bedrock.keys[0].bedrock_key_config.secret_key=wJalrXUtnFEMI",
+                        "config.oidc.client_secret=s3cret",
+                        "config.governance.auth_config.admin_password=pw", "config.encryption_key=k"):
+            self.assertIn("must be a reference", self.render(literal, ok=False), literal)
+        # settings that only mention a secret are not taken for one
+        self.render("config.oidc.client_secret=env.OIDC_SECRET", "config.mcp_auth.token_url=https://idp.example/token",
+                    "config.mcp_auth.token_endpoint_auth_method=client_secret_post", "config.client.max_tokens_header=x-max")
 
     def test_network_policy_is_opt_in(self):
         self.assertEqual([d for d in self.render() if d["kind"] == "NetworkPolicy"], [])
@@ -621,6 +629,12 @@ class HelmTest(unittest.TestCase):
         # peers only on the cluster listener
         self.assertEqual(cluster["ports"][0]["port"], "cluster")
         self.assertEqual(cluster["from"], [{"podSelector": {"matchLabels": selector}}])
+        # /metrics on the cluster port: the scraper is admitted there, by its own list
+        docs = self.render("networkPolicy.enabled=true", "config.cluster.enabled=true", "cluster.secret.existingSecret=c",
+                           "cluster.serveMetrics=true", "networkPolicy.metricsFrom[0].namespaceSelector.matchLabels.name=monitoring")
+        (np,) = [d for d in docs if d["kind"] == "NetworkPolicy"]
+        self.assertEqual(np["spec"]["ingress"][1]["from"], [{"podSelector": {"matchLabels": selector}},
+                                                            {"namespaceSelector": {"matchLabels": {"name": "monitoring"}}}])
 
     def test_cluster_secret_from_a_secret(self):
         # clustering on needs a secret, and never one written into the ConfigMap
