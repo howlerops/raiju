@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Run `tov check --json` on files and apply every fix marked "safe"; then flag fetch() calls in src/ that
-have no timeout (scripts/fetch_lint.py).
+have no timeout (scripts/fetch_lint.py) and record copies that miss a field of their type (scripts/copy_lint.py).
 
 Usage: scripts/check.py [--no-fix] FILE...
 """
@@ -8,6 +8,7 @@ import re, json, os, subprocess, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fetch_lint  # noqa: E402
+import copy_lint  # noqa: E402
 
 SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src") + os.sep
 
@@ -62,6 +63,10 @@ def main():
             continue
         for line, col, msg in fetch_lint.problems(path, open(path).read()):
             print(f"{fetch_lint.CODE} {path}:{line}:{col} {msg}")
+            lint_bad += 1
+        # every copyX lists the fields of X (scripts/copy_lint.py)
+        for line, col, msg in copy_lint.problems(path, open(path).read()):
+            print(f"{copy_lint.CODE} {path}:{line}:{col} {msg}")
             lint_bad += 1
     sys.exit(1 if d["errors"] or lint_bad else 0)
 

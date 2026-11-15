@@ -1,0 +1,522 @@
+# Value-semantics audit — static list A (src/a2a.tov … src/ops.tov)
+
+472 sites from `static-a.tsv` (line numbers are those of commit 5d1461a, before any branch's edits).
+Verdicts: **DIVERGES fixed** 69, **UNSURE copied** 11, **SAME** 392 (three of the SAME ones are copied anyway, see
+below). None left unreviewed.
+
+This branch (mig-sa) has mig-sb and mig-cow merged into it; their notes are AUDIT-NOTES-sb.md and AUDIT-NOTES-cow.md.
+Where mig-cow had already fixed a listed site (the `.slice()` copies in claimsync, mcpapi, ops, gateway.withInjected,
+the batch `chatOf`s, and `detachedConfig` in main.tov) the merged code keeps one fix, and the site is still listed
+here with its verdict.
+
+How the copies are written (all valid on the pinned compiler):
+
+- arrays: `xs.slice()`.
+- maps: an empty map filled in a loop over `keys()`. `new Map(m)` is not accepted by the pinned compiler (U0017).
+- records: a literal with every field. The helpers are mig-sb's `copyX(r)` (config.tov, mcp.tov, mcpauth.tov,
+  mcpuser.tov, providers/types.tov); this branch adds five in the same form, which scripts/copy_lint.py checks:
+  `copyOidcConfig` (oidc.tov), `copyAuditEvent` (audit.tov), `copyLogEntry` (logstore.tov), `copyRequestLabels`
+  (metrics.tov), `copyUserFlow` (mcpuser.tov). They are shallow: a nested list or record is copied separately where
+  it is then changed. Records copied in one place only are written as a literal there (VirtualMcp, McpHeaderFlow,
+  DiscoveryConfig, LogsStoreConfig, AuditConfig, McpTokenExchange, OpenApiConfig, Translated, Plan).
+- the one deep copy is mig-cow's `detachedConfig` (JSON round trip, plugin specs carried over), used by main.tov
+  before `resolveConfig`. Everything inside resolveConfig is SAME only because of it. This branch adds a unit test for
+  it in config.tov; main() itself is only exercised by the e2e suite, which was not run.
+
+SAME verdicts for a store-back (`let c = this.x; c.f = v; this.x = c`) assume the record is held in that one place.
+Where the record is a whole Config that other parts were also handed (the engine's and the store's), the site is
+listed as UNSURE and copied.
+
+## Outside the list
+
+- FIXED, asked for by the coordinator: seven functions that changed their argument although no current caller reads
+  it afterwards now copy it: `withClaim`, `keycloakDetail` (directory.tov), `withRemovals` (provision.tov),
+  `withGaModel`, `bareNestedModels` (rtsession.tov), `pushedAttrs` (scim.tov), `withIp` (rbac.tov, test helper).
+- FIXED: src/ops.tov syncSignIn builds its Directory from the store's own lists; resolveGrants (claimsync.tov) pushed
+  new teams into them and syncSignIn then concatenated the same new teams again.
+- FIXED: src/mcp.tov test "a renewed admin credential…" changed `row` through `let renewed = row`; it copies now.
+- Checked, nothing to do: a parameter of array, map or record type cannot be changed in place without a local alias;
+  the pinned compiler refuses it ("to change a local copy: `let copy = xs`"), tried on a small program.
+- Not changed: src/mcpapi.tov tests write straight into `s.cfg` (`s.cfg.mcp!.user_credentials = …`,
+  `s.cfg.client = …`). They set up the store's own config on purpose and behave the same under sharing.
+- Not changed: src/front.tov toRequest (`let h = req.headers`), per the coordinator: per-request path, reviewed, SAME.
+- Not changed, worth knowing: main.tov withRaijuGuardrails / withWorkerIdentity and everything inside resolveConfig
+  still change their argument in place. That is safe only because their callers pass a config of their own
+  (main's detached copy, or a fresh parse).
+- Not changed, worth knowing: methods that return a stored record (costrecalc's status, the engine's cfg) hand out a
+  record that a later in-place store-back changes under sharing. The callers read here serialise it at once.
+
+## Sites
+
+- src/a2a.tov:263 `fs` in restCallV03 — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/a2a.tov:344 `fs` in restCall — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/a2a.tov:361 `fs` in restCall — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/a2a.tov:904 `out` in pushUpstreamParams — SAME — without() builds a new value on each call
+- src/a2a.tov:909 `inner` in pushUpstreamParams — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/a2a.tov:913 `out` in pushUpstreamParams — SAME — fs is this call's own parse, not read again
+- src/a2a.tov:958 `fs` in rewriteEmbedded — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/a2a.tov:959 `conf` in rewriteEmbedded — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/a2agrpcup.tov:225 `down` in demote — SAME — listFor gives the stored list; it is set back at once
+- src/a2agrpcup.tov:326 `out` in v1Params — SAME — without() builds a new value on each call
+- src/a2apush.tov:804 `moved` in test "a config is replaced by one with the sam…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/a2apush.tov:818 `a` in test "the management page filters, sorts and c…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/a2apush.tov:820 `b` in test "the management page filters, sorts and c…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/a2apush.tov:823 `c` in test "the management page filters, sorts and c…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/a2apush.tov:865 `late` in test "finished deliveries, unbound embedded co…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/a2apush.tov:894 `c` in test "secrets are sealed in the files and open…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/a2apush.tov:946 `moved` in test "two stores on one directory see each oth…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/a2ashare.tov:155 `b` in adoptCard — SAME — withCard now returns a record of its own
+- src/a2aver.tov:174 `mf` in partToV03 — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/a2aver.tov:265 `of` in statusUpdateTo — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/a2aver.tov:500 `out` in rpcAnswerTo — SAME — fs is this call's own parse, not read again
+- src/aesgcm.tov:225 `t` in pbkdf2Sha256 — SAME — toInts() builds a new value on each call
+- src/agent.tov:81 `fs` in nextRequest — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/agent.tov:115 `fs` in annotate — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/agent.tov:192 `fs` in responsesNext — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/agent.tov:226 `fs` in withCarried — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/agenthistory.tov:63 `agents` in agentQuery — SAME — multi() builds a new value on each call
+- src/agenthistory.tov:330 `have` in selectedCalls — SAME — map entry (or a new value) set back at once
+- src/agenthistory.tov:356 `list` in pageOf — SAME — only the sorted/reversed slices are changed in place
+- src/agenthistory.tov:647 `e3` in test "calls are selected, ordered and paged" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/agenthistory.tov:671 `f` in test "the histogram fills the asked range and …" — SAME — test: filter of a fresh agentQuery result
+- src/agenthistory.tov:681 `a` in test "filter data lists the named ids of each …" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/agenthistory.tov:684 `b` in test "filter data lists the named ids of each …" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/agenthistory.tov:686 `c` in test "filter data lists the named ids of each …" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/agenthistory.tov:701 `e` in test "one call's detail, with the bodies' cred…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/agenthistory.tov:717 `bad` in test "one call's detail, with the bodies' cred…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/agenthistory.tov:738 `a` in test "the history list: Raiju's {logs, paginat…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/agenthistory.tov:740 `b` in test "the history list: Raiju's {logs, paginat…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/agenthistory.tov:743 `d` in test "the history list: Raiju's {logs, paginat…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/agenthistory.tov:785 `req` in test "event rows: listed with their kind, matc…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/agenthistory.tov:787 `e1` in test "event rows: listed with their kind, matc…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/agenthistory.tov:793 `e2` in test "event rows: listed with their kind, matc…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/agenthistory.tov:799 `other` in test "event rows: listed with their kind, matc…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/agents.tov:237 `cf` in gatewayCard — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/agents.tov:246 `caps` in gatewayCard — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/agents.tov:274 `cf` in withGrpcInterface — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/agents.tov:311 `tags` in aggregateCard — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/agents.tov:313 `out` in aggregateCard — SAME — sf is parsed for this element and not read again
+- src/agents.tov:352 `hm` in fetchCard — SAME — upstreamHeaders builds a new map per call
+- src/agents.tov:561 `made` in withCard — DIVERGES fixed — changed the caller's registration (adoptCard reads a.updated_at after): copyAgentConfig
+- src/alertapi.tov:416 `c` in channelsRoute — SAME — copyRule() builds a new value on each call
+- src/anthropic_batch.tov:395 `hs` in passthrough — SAME — upstreamHeaders() builds a new value on each call
+- src/audit.tov:715 `shown` in auditListJson — DIVERGES fixed — wiped ip in the page's (the log's) event: copyAuditEvent
+- src/audit.tov:1012 `lines` in test "editing a line is detected at that line'…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/audit.tov:1257 `edited` in test "one event's signature verifies; an edite…" — SAME — test: e1 is not read after the edit
+- src/awschain.tov:376 `nb` in withChainCreds — DIVERGES fixed — wrote chain credentials into the configured key record: copyBedrockKeyConfig
+- src/awsprofile.tov:81 `sec` in parseIni — SAME — map entry set back at once
+- src/awsprofile.tov:136 `s` in staticOf — SAME — step() builds a new value on each call
+- src/awsprofile.tov:204 `s` in planOf — SAME — step() builds a new value on each call
+- src/awsprofile.tov:211 `s` in planOf — SAME — step() builds a new value on each call
+- src/awsprofile.tov:235 `s` in planOf — SAME — step() builds a new value on each call
+- src/bedrock_in.tov:319 `out` in end — SAME — begin() builds a new value on each call
+- src/bedrock_in.tov:362 `out` in stop — SAME — closeBlock() builds a new value on each call
+- src/cel.tov:986 `a` in onModel — SAME — sample() builds a new value on each call
+- src/cel.tov:1075 `a` in test "matches uses RE2 syntax" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/cel.tov:1170 `other` in test "a matched rule reports whether it chains…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/cel.tov:1197 `a` in orgSample — SAME — sample() builds a new value on each call
+- src/claimsync.tov:237 `teams` in resolveGrants — DIVERGES fixed — pushed new teams/units into the caller's directory (ops.syncSignIn concats newTeams to the same list): slice
+- src/claimsync.tov:248 `bus` in resolveGrants — DIVERGES fixed — pushed new teams/units into the caller's directory (ops.syncSignIn concats newTeams to the same list): slice
+- src/claimsync.tov:314 `n` in appliedUser — DIVERGES fixed — changed the caller's user (the stored one; the test reuses u): copyAdminUserConfig
+- src/claimsync.tov:348 `next` in applyClaims — SAME — appliedUser now returns a record of its own
+- src/claimsync.tov:349 `teams` in applyClaims — DIVERGES fixed — next.teams can be the existing user's own list: slice
+- src/claimsync.tov:532 `ordered` in test "roles: mappings by permissions or order,…" — SAME — test: c is not read after
+- src/clusterstate.tov:130 `ls` in onChange — SAME — map entry (or a new value) set back at once
+- src/clusterstate.tov:191 `live` in prune — SAME — entriesOf() builds a new value on each call
+- src/compat.tov:110 `s` in supportOf — SAME — unknownSupport() builds a new value on each call
+- src/compat.tov:407 `rf` in fitCaps — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/compat.tov:559 `out` in chatToText — SAME — without() builds a new value on each call
+- src/compat.tov:582 `out` in chatChunkToText — SAME — without() builds a new value on each call
+- src/config.tov:1224 `out` in resolveOidcRoleMap — SAME — callers: resolveConfig stores it back into the same config; ops copies (see ops.tov:1505); test input not read after
+- src/config.tov:1243 `n` in resolveKey — SAME — resolveConfig works in place on its inout config by design and stores each record back; the config is the caller's own (main.tov now passes detachedConfig, parseConfig/loadConfig pass a fresh parse)
+- src/config.tov:1250 `a` in resolveKey — SAME — resolveConfig works in place on its inout config by design and stores each record back; the config is the caller's own (main.tov now passes detachedConfig, parseConfig/loadConfig pass a fresh parse)
+- src/config.tov:1267 `b` in resolveKey — SAME — resolveConfig works in place on its inout config by design and stores each record back; the config is the caller's own (main.tov now passes detachedConfig, parseConfig/loadConfig pass a fresh parse)
+- src/config.tov:1284 `v` in resolveKey — SAME — resolveConfig works in place on its inout config by design and stores each record back; the config is the caller's own (main.tov now passes detachedConfig, parseConfig/loadConfig pass a fresh parse)
+- src/config.tov:1294 `c` in resolveKey — SAME — resolveConfig works in place on its inout config by design and stores each record back; the config is the caller's own (main.tov now passes detachedConfig, parseConfig/loadConfig pass a fresh parse)
+- src/config.tov:1302 `d` in resolveKey — SAME — resolveConfig works in place on its inout config by design and stores each record back; the config is the caller's own (main.tov now passes detachedConfig, parseConfig/loadConfig pass a fresh parse)
+- src/config.tov:1313 `g` in resolveKey — SAME — resolveConfig works in place on its inout config by design and stores each record back; the config is the caller's own (main.tov now passes detachedConfig, parseConfig/loadConfig pass a fresh parse)
+- src/config.tov:1326 `o` in resolveKey — SAME — resolveConfig works in place on its inout config by design and stores each record back; the config is the caller's own (main.tov now passes detachedConfig, parseConfig/loadConfig pass a fresh parse)
+- src/config.tov:1401 `np` in resolveConfig — SAME — resolveConfig works in place on its inout config by design and stores each record back; the config is the caller's own (main.tov now passes detachedConfig, parseConfig/loadConfig pass a fresh parse)
+- src/config.tov:1409 `ap` in resolveConfig — SAME — resolveConfig: read from its own inout config, changed, stored back (see config.tov:1243)
+- src/config.tov:1423 `eff` in resolveConfig — SAME — built from a literal
+- src/config.tov:1428 `cl` in resolveConfig — SAME — resolveConfig: read from its own inout config, changed, stored back (see config.tov:1243)
+- src/config.tov:1432 `g` in resolveConfig — SAME — resolveConfig: read from its own inout config, changed, stored back (see config.tov:1243)
+- src/config.tov:1439 `o` in resolveConfig — SAME — resolveConfig works in place on its inout config by design and stores each record back; the config is the caller's own (main.tov now passes detachedConfig, parseConfig/loadConfig pass a fresh parse)
+- src/config.tov:1442 `cl` in resolveConfig — SAME — resolveConfig: read from its own inout config, changed, stored back (see config.tov:1243)
+- src/config.tov:1449 `a2` in resolveConfig — SAME — resolveConfig works in place on its inout config by design and stores each record back; the config is the caller's own (main.tov now passes detachedConfig, parseConfig/loadConfig pass a fresh parse)
+- src/config.tov:1462 `q` in resolveConfig — SAME — resolveConfig works in place on its inout config by design and stores each record back; the config is the caller's own (main.tov now passes detachedConfig, parseConfig/loadConfig pass a fresh parse)
+- src/config.tov:1470 `g2` in resolveConfig — SAME — resolveConfig works in place on its inout config by design and stores each record back; the config is the caller's own (main.tov now passes detachedConfig, parseConfig/loadConfig pass a fresh parse)
+- src/config.tov:1481 `n` in resolveConfig — SAME — resolveConfig works in place on its inout config by design and stores each record back; the config is the caller's own (main.tov now passes detachedConfig, parseConfig/loadConfig pass a fresh parse)
+- src/config.tov:1489 `exs` in resolveConfig — SAME — resolveConfig: read from its own inout config, changed, stored back (see config.tov:1243)
+- src/config.tov:1491 `x` in resolveConfig — SAME — resolveConfig: read from its own inout config, changed, stored back (see config.tov:1243)
+- src/config.tov:1501 `lx` in resolveConfig — SAME — resolveConfig: read from its own inout config, changed, stored back (see config.tov:1243)
+- src/config.tov:1508 `ls` in resolveConfig — SAME — resolveConfig: read from its own inout config, changed, stored back (see config.tov:1243)
+- src/config.tov:1509 `ob` in resolveConfig — SAME — resolveConfig: read from its own inout config, changed, stored back (see config.tov:1243)
+- src/config.tov:1533 `n` in resolveClusterAndTelemetry — SAME — resolveConfig works in place on its inout config by design and stores each record back; the config is the caller's own (main.tov now passes detachedConfig, parseConfig/loadConfig pass a fresh parse)
+- src/config.tov:1538 `nd` in resolveClusterAndTelemetry — SAME — resolveConfig works in place on its inout config by design and stores each record back; the config is the caller's own (main.tov now passes detachedConfig, parseConfig/loadConfig pass a fresh parse)
+- src/config.tov:1545 `nb` in resolveClusterAndTelemetry — SAME — resolveConfig works in place on its inout config by design and stores each record back; the config is the caller's own (main.tov now passes detachedConfig, parseConfig/loadConfig pass a fresh parse)
+- src/config.tov:1553 `ns` in resolveClusterAndTelemetry — SAME — resolveConfig works in place on its inout config by design and stores each record back; the config is the caller's own (main.tov now passes detachedConfig, parseConfig/loadConfig pass a fresh parse)
+- src/config.tov:1560 `np` in resolveClusterAndTelemetry — SAME — resolveConfig works in place on its inout config by design and stores each record back; the config is the caller's own (main.tov now passes detachedConfig, parseConfig/loadConfig pass a fresh parse)
+- src/config.tov:1564 `nt` in resolveClusterAndTelemetry — SAME — resolveConfig works in place on its inout config by design and stores each record back; the config is the caller's own (main.tov now passes detachedConfig, parseConfig/loadConfig pass a fresh parse)
+- src/config.tov:1570 `no` in resolveClusterAndTelemetry — SAME — resolveConfig works in place on its inout config by design and stores each record back; the config is the caller's own (main.tov now passes detachedConfig, parseConfig/loadConfig pass a fresh parse)
+- src/config.tov:1584 `n` in resolveClusterAndTelemetry — SAME — resolveConfig works in place on its inout config by design and stores each record back; the config is the caller's own (main.tov now passes detachedConfig, parseConfig/loadConfig pass a fresh parse)
+- src/config.tov:1590 `na` in resolveClusterAndTelemetry — SAME — resolveConfig works in place on its inout config by design and stores each record back; the config is the caller's own (main.tov now passes detachedConfig, parseConfig/loadConfig pass a fresh parse)
+- src/config.tov:1637 `n` in resolveWebhooksAndFlags — SAME — resolveConfig works in place on its inout config by design and stores each record back; the config is the caller's own (main.tov now passes detachedConfig, parseConfig/loadConfig pass a fresh parse)
+- src/config.tov:1648 `n` in resolveWebhooksAndFlags — SAME — resolveConfig works in place on its inout config by design and stores each record back; the config is the caller's own (main.tov now passes detachedConfig, parseConfig/loadConfig pass a fresh parse)
+- src/config.tov:1675 `c` in parseConfig — SAME — fresh parse
+- src/config.tov:1683 `c` in loadConfig — SAME — fresh parse
+- src/config.tov:1699 `c` in rawConfigOf — SAME — fresh parse
+- src/config.tov:1708 `n` in withAppDirs — DIVERGES fixed — changed the caller's config and its logs_store/audit records (its own test says the config as written is untouched): copyConfig and record literals
+- src/config.tov:1712 `l` in withAppDirs — DIVERGES fixed — changed the caller's config and its logs_store/audit records (its own test says the config as written is untouched): copyConfig and record literals
+- src/config.tov:1719 `a` in withAppDirs — DIVERGES fixed — changed the caller's config and its logs_store/audit records (its own test says the config as written is untouched): copyConfig and record literals
+- src/config.tov:1842 `c` in test "exporter and log export secrets resolve …" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/config_compat.tov:211 `gov` in mapAuth — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/config_compat.tov:232 `mcp` in mapClient — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/config_compat.tov:274 `ls` in mapClient — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/config_compat.tov:352 `ids` in virtualMcp — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/config_compat.tov:373 `f` in clientItems — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/config_compat.tov:453 `cl` in mapToolManager — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/config_compat.tov:488 `mf` in mapMcp — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/config_compat.tov:1235 `cur` in mapSinkPlugin — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/config_compat.tov:1266 `cl` in mapLogging — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/config_compat.tov:1288 `cl` in mapTelemetry — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/config_compat.tov:1298 `tel` in mapTelemetry — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/config_compat.tov:1316 `cl` in mapGovernancePlugin — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/config_compat.tov:1498 `cl` in mapCompat — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/config_compat.tov:1649 `sf` in mapStorageRefs — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/config_compat.tov:1652 `of` in mapStorageRefs — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/config_compat.tov:1672 `ef` in mapAgents — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/config_compat.tov:1676 `af` in mapAgents — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/config_compat.tov:1679 `hf` in mapAgents — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/config_compat.tov:1690 `sf` in mapAgents — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/config_compat.tov:1710 `ef` in mapWebhooks — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/config_compat.tov:1719 `hf` in mapWebhooks — UNSURE copied — the loop walks orig while changing its alias hf: slice
+- src/config_compat.tov:1736 `gov` in mapRoleDac — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/config_compat.tov:1746 `rf` in mapRoleDac — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/config_compat.tov:1911 `gov` in mapAccessProfiles — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/config_compat.tov:1917 `budgets` in mapAccessProfiles — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/config_compat.tov:1918 `rates` in mapAccessProfiles — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/config_compat.tov:2041 `top` in normalize — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/config_compat.tov:2148 `out` in warnings — SAME — notes of this call's own normalize result
+- src/costrecalc.tov:115 `s` in begin — SAME — this.st read, changed and stored back at once
+- src/costrecalc.tov:151 `s` in advance — SAME — this.st read, changed and stored back at once
+- src/costrecalc.tov:180 `t` in advance — SAME — this.st read, changed and stored back at once
+- src/costrecalc.tov:198 `s` in cancel — SAME — this.st read, changed and stored back at once
+- src/costrecalc.tov:209 `s` in finish — SAME — this.st read, changed and stored back at once
+- src/costrecalc.tov:289 `b` in test "a log whose model has no price now keeps…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/crew.tov:316 `list` in priorsOf — SAME — map entry (or a new value) set back at once
+- src/crew.tov:623 `s` in learnProfiles — SAME — map entry (or a new value) set back at once
+- src/crew.tov:1416 `rows` in taskDetail — SAME — taskRows() builds a new value on each call
+- src/crew.tov:1427 `cur` in taskDetail — SAME — map entry (or a new value) set back at once
+- src/crew.tov:1483 `a` in outcomeRoute — SAME — storedAssignment parses the state text: a fresh record
+- src/crew.tov:1623 `a` in nextRoute — SAME — storedAssignment parses the state text: a fresh record
+- src/cursor_in.tov:164 `fs` in cursorResponsesBody — SAME — fields() builds a new value on each call
+- src/cursor_in.tov:236 `fs` in cursorChatBody — SAME — fields() builds a new value on each call
+- src/directory.tov:301 `c` in user — SAME — every caller passes a map it just built and does not read again
+- src/directory.tov:504 `cur` in addTo — SAME — map entry (or a new value) set back at once
+- src/directory.tov:608 `c` in keycloakDetail — SAME — the caller replaces the user list with the results and no caller reads u after; copied anyway (a with… function must not change its argument)
+- src/directory.tov:701 `c` in withClaim — SAME — the caller replaces the user list with the results and no caller reads u after; copied anyway (a with… function must not change its argument)
+- src/embconv.tov:337 `fs` in canon — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/embeddings_native.tov:18 `fs` in encodeResponse — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/embeddings_native.tov:24 `entry` in encodeResponse — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/embeddings_native.tov:40 `out` in encodeResponse — UNSURE copied — no caller found to read; the parameter's record is now copied
+- src/embeddings_native.tov:135 `h` in vertexRequest — SAME — headers() builds a new value on each call
+- src/exporters.tov:254 `req` in send — SAME — maximRequest() builds a new value on each call
+- src/exports.tov:100 `segs` in objectKey — SAME — exportDir() builds a new value on each call
+- src/exports.tov:605 `cfg` in test "export interval defaults to 300 seconds" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/extras.tov:130 `scored` in rerankText — SAME — lexicalRerank() builds a new value on each call
+- src/extras.tov:346 `fs` in openaiModel — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/extras.tov:542 `h` in sdkAsyncSubmit — SAME — snapshot() builds a new value on each call
+- src/front.tov:69 `h` in toRequest — SAME — req.headers is read again only for content-length and by toRequest itself, which removes and sets the same two headers
+- src/front.tov:83 `h` in write — SAME — snapshot() builds a new value on each call
+- src/front.tov:205 `head` in handle — UNSURE copied — headers is the sender's map (ctx.outHeaders in gateway): CORS headers no longer go into it
+- src/gateway.tov:598 `fs` in singleTextMessage — SAME — fields() builds a new value on each call
+- src/gateway.tov:603 `m` in singleTextMessage — SAME — fields() builds a new value on each call
+- src/gateway.tov:617 `fs` in replaceFirstContent — SAME — fields() builds a new value on each call
+- src/gateway.tov:622 `c` in replaceFirstContent — SAME — fields() builds a new value on each call
+- src/gateway.tov:625 `m` in replaceFirstContent — SAME — fields() builds a new value on each call
+- src/gateway.tov:991 `h` in errorResponse — SAME — every caller returns the response at once and does not read the map again
+- src/gateway.tov:1144 `outer` in injectedDef — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/gateway.tov:1145 `fn` in injectedDef — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/gateway.tov:1322 `fs` in withModel — SAME — fields() builds a new value on each call
+- src/gateway.tov:2164 `f` in judgeChat — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/gateway.tov:2350 `hs` in classifierCall — SAME — snapshot() builds a new value on each call
+- src/gateway.tov:2494 `t` in attempt — DIVERGES fixed — wrote minted tokens / assumed-role credentials (role_arn cleared) into the config's key record: copyTarget + copyKeyConfig (copyKeyConfig)
+- src/gateway.tov:2498 `tl` in attempt — SAME — ctx.labels read, changed and stored back; nothing else writes it during the attempt
+- src/gateway.tov:2539 `nc` in attempt — DIVERGES fixed — network_config of the config's provider record: copyNetworkConfig
+- src/gateway.tov:2541 `pc` in attempt — DIVERGES fixed — the config's provider record: copyProviderConfig
+- src/gateway.tov:2570 `nb` in attempt — DIVERGES fixed — the configured bedrock key record (role_arn cleared): copyBedrockKeyConfig
+- src/gateway.tov:2992 `fs` in withInjected — UNSURE copied — body is the request the caller builds from again for the next target: slice
+- src/gateway.tov:3010 `fs` in mcpChat — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/gateway.tov:3039 `fs` in withMcpResponses — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/gateway.tov:3085 `tools` in mcpToolsFor — SAME — allToolsFor() builds a new value on each call
+- src/gateway.tov:3120 `items` in mcpInstructionFields — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/gateway.tov:3351 `c` in setAdminRow — UNSURE copied — store-back into this.cfg, but the config record and its mcp section may be held elsewhere: copyConfig, copyMcpConfig
+- src/gateway.tov:3353 `m` in setAdminRow — UNSURE copied — store-back into this.cfg, but the config record and its mcp section may be held elsewhere: copyConfig, copyMcpConfig
+- src/gateway.tov:3578 `up` in watsonxToken — SAME — iamTokenRequest() builds a new value on each call
+- src/gateway.tov:3893 `h` in serveInner — SAME — h0's other holders (serve's h, chat's ph) are not read after serveInner
+- src/gateway.tov:3982 `rl` in serveInner — SAME — newLabels() builds a new value on each call
+- src/gateway.tov:4176 `sl` in serveInner — DIVERGES fixed — changed provider/model in ctx.labels, which is read later (record, StreamRun): metrics.copyRequestLabels
+- src/gateway.tov:4185 `ul` in serveInner — DIVERGES fixed — changed provider/model in ctx.labels, which is read later (record, StreamRun): metrics.copyRequestLabels
+- src/gateway.tov:4729 `rl` in chargeMedia — SAME — newLabels() builds a new value on each call
+- src/gateway.tov:4841 `out` in chat — SAME — last.h is not read again
+- src/gateway.tov:4898 `out` in responsesAgent — SAME — last.h is not read again
+- src/gateway.tov:5260 `hs` in passThrough — SAME — the caller returns the response at once
+- src/gateway.tov:5896 `live` in test "logs_only: moved local rules and the bui…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/gateway.tov:5942 `fs` in preRequest — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/govapi.tov:289 `nv` in propagateProfileKeys — DIVERGES fixed — changed the stored virtual keys before the save (the test reuses vks): copyVirtualKeyConfig
+- src/governance.tov:328 `mine` in constructor — SAME — map entry (or a new value) set back at once
+- src/guard_judge.tov:88 `p` in test "judge request carries the rule, the text…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/guard_judge.tov:94 `p` in test "judge request needs a rule and a model" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/guard_judge.tov:135 `p` in test "judgeFinish turns a reply or a failure i…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/guard_reversible.tov:62 `fs` in mapMessage — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/guard_reversible.tov:77 `pfs` in mapMessage — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/guard_reversible.tov:101 `fs` in mapChatTexts — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/guard_reversible.tov:124 `fs` in restoreCompletion — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/guard_reversible.tov:130 `cf` in restoreCompletion — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/guardrail_providers.tov:566 `p` in test "bedrock output source and session token" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/guardrail_providers.tov:576 `p` in test "bedrock guardrail id is percent-encoded …" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/guardrail_providers.tov:585 `p` in test "bedrock missing fields throw" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/guardrail_providers.tov:634 `p` in test "azure request shape" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/guardrail_providers.tov:648 `p` in test "azure verdicts use the threshold" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/guardrail_providers.tov:669 `p` in test "patronus request shape" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/guardrail_providers.tov:700 `p` in test "webhook request shape and headers" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/guardrail_providers.tov:722 `p` in test "non-2xx and unparsable responses follow …" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/guardrail_providers.tov:738 `p` in test "applies_to" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/guardrail_providers.tov:768 `p` in test "presidio request posts the text to /anal…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/guardrail_providers.tov:790 `p` in test "presidio thresholds, block and detect_on…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/guardrails.tov:573 `fs` in guardMessage — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/guardrails.tov:589 `pfs` in guardMessage — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/guardrails.tov:616 `fs` in applyToChatRequest — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/guardrails.tov:637 `fs` in applyToCompletion — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/guardrails.tov:644 `cf` in applyToCompletion — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/guardrails.tov:650 `mf` in applyToCompletion — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/guardrails_compat.tov:166 `ign` in parseRules — SAME — setKeys() builds a new value on each call
+- src/guardrails_compat.tov:231 `ign` in bedrock — SAME — setKeys() builds a new value on each call
+- src/guardrails_compat.tov:269 `ign` in azure — SAME — onKeys() builds a new value on each call
+- src/guardrails_compat.tov:678 `q` in merge — SAME — fromRaiju is built for this call by main and not read after; the test does not read bif after
+- src/h2.tov:1212 `body` in goaway — SAME — be32() builds a new value on each call
+- src/hpack.tov:349 `out` in strBytes — SAME — intBytes() builds a new value on each call
+- src/hpack.tov:399 `out` in strOut — SAME — intBytes() builds a new value on each call
+- src/http1.tov:669 `h` in upgradeRequired — SAME — plainHeaders() builds a new value on each call
+- src/http1.tov:750 `h` in serve — SAME — plainHeaders() builds a new value on each call
+- src/http1.tov:769 `rq` in serve — SAME — r.req is not read after the handler is called
+- src/hybrid.tov:175 `row` in splitEntry — DIVERGES fixed — stripped/filled the caller's entry (gateway onPrepare returns e whole when the queue is full; ops hydrates a stored row): copyLogEntry
+- src/hybrid.tov:242 `out` in hydrate — DIVERGES fixed — stripped/filled the caller's entry (gateway onPrepare returns e whole when the queue is full; ops hydrates a stored row): copyLogEntry
+- src/hybrid.tov:316 `hidden` in test "excluded fields stay in the row, exclude…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/hybrid.tov:319 `bare` in test "excluded fields stay in the row, exclude…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/jobs.tov:530 `fs` in anthropicCountRequest — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/json.tov:282 `fs` in test "build round trip" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/largeconv.tov:85 `out` in finish — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/largeconv.tov:287 `parts` in newConv — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/largeconv.tov:609 `up` in titanExtras — SAME — largeRequest() builds a new value on each call
+- src/largeconv.tov:623 `fs` in canon — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/largeconv.tov:650 `g` in reference — SAME — without() builds a new value on each call
+- src/largepayload.tov:680 `objs` in usage — SAME — usageObjects() builds a new value on each call
+- src/live.tov:529 `fs` in rewriteStart — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/livehooks.tov:338 `r` in test "a unit's metadata names its session, kin…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/livehooks.tov:372 `r` in test "a transcription unit costs its tokens, o…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logapi.tov:352 `m` in uaRoute — SAME — c is this request's checked body
+- src/logapi.tov:379 `m` in uaRoute — SAME — c is this request's checked body
+- src/logapi.tov:577 `e` in test "the filters Raiju records are accepted; …" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:126 `out` in publicEntry — DIVERGES fixed — cleared fields of the store's row for every reader: copyLogEntry
+- src/logstore.tov:134 `out` in liteEntry — DIVERGES fixed — cleared fields of the store's row for every reader: copyLogEntry
+- src/logstore.tov:796 `n` in recost — SAME — ring entry stored back at once
+- src/logstore.tov:827 `e` in recost — SAME — parsed from the file line
+- src/logstore.tov:1195 `out` in listOr — SAME — listParam() builds a new value on each call
+- src/logstore.tov:1591 `cur` in groupBy — SAME — map entry (or a new value) set back at once
+- src/logstore.tov:1851 `cur` in groupByPair — SAME — map entry (or a new value) set back at once
+- src/logstore.tov:2188 `cfg` in test "the ring keeps only the newest max_memor…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2215 `onCfg` in test "content is dropped when logging is off a…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2319 `cfg` in test "a day goes on in a new segment once its …" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2356 `cfg` in test "start-up reads only the newest segments …" — SAME — test: the first store is not used after cfg changes
+- src/logstore.tov:2415 `cfg` in test "rows beyond max_memory_entries: a row lo…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2440 `cfg` in test "rows beyond max_memory_entries: today's …" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2501 `call` in test "shared stores write each row at once and…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2521 `cfg` in test "max_disk_mb deletes the oldest segments …" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2530 `one` in test "max_disk_mb deletes the oldest segments …" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2538 `none` in test "max_disk_mb deletes the oldest segments …" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2694 `a1` in test "rankings are per provider and model, wit…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2700 `a2` in test "rankings are per provider and model, wit…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2734 `mcp` in test "filters: status, providers, text, bounds…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2741 `chat` in test "content_search matches prompt and answer…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2744 `resp` in test "content_search matches prompt and answer…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2746 `streamed` in test "content_search matches prompt and answer…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2772 `a` in test "routing, cache, stop and chain filters s…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2784 `b` in test "routing, cache, stop and chain filters s…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2808 `call` in test "agent_names selects the requests of the …" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2814 `other` in test "agent_names selects the requests of the …" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2819 `inside` in test "agent_names selects the requests of the …" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2822 `outside` in test "agent_names selects the requests of the …" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2828 `f` in test "agent_names selects the requests of the …" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2843 `a` in test "tool call, complexity score and prompt f…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2849 `b` in test "tool call, complexity score and prompt f…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2869 `old` in test "a cache hit without a recorded type is a…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2871 `sem` in test "a cache hit without a recorded type is a…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2885 `root` in test "roots_only hides chained rows; group_ses…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2888 `child` in test "roots_only hides chained rows; group_ses…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2892 `root2` in test "roots_only hides chained rows; group_ses…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2895 `other` in test "roots_only hides chained rows; group_ses…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2916 `m1` in test "MCP tool executions share the store but …" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2922 `m2` in test "MCP tool executions share the store but …" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2948 `a` in test "per-model usage: a key's or a user's req…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2951 `b` in test "per-model usage: a key's or a user's req…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2953 `c` in test "per-model usage: a key's or a user's req…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2956 `d` in test "per-model usage: a key's or a user's req…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2958 `e` in test "per-model usage: a key's or a user's req…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/logstore.tov:2960 `t` in test "per-model usage: a key's or a user's req…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/main.tov:96 `n` in withRaijuGuardrails — SAME — c is the fresh copy withAppDirs returned
+- src/main.tov:127 `resolved` in applyChange — DIVERGES fixed — resolved the store's config as written in place (env references, app dirs): detachedConfig (the fix is mig-cow's, merged; this branch had the same one)
+- src/main.tov:181 `cluster` in withWorkerIdentity — SAME — c is main's own detached config; first is not read after
+- src/main.tov:183 `next` in withWorkerIdentity — SAME — c is main's own detached config; first is not read after
+- src/main.tov:280 `first` in main — DIVERGES fixed — resolved the store's config as written in place (env references, app dirs): detachedConfig (the fix is mig-cow's, merged; this branch had the same one)
+- src/mcp.tov:536 `fs` in injectTools — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/mcp.tov:898 `req` in fetchToken — DIVERGES fixed — wrote token_url/refresh_token into the client's configured auth: copyMcpAuthConfig
+- src/mcp.tov:1411 `own` in callTool — SAME — forwardable builds a new map
+- src/mcp.tov:2105 `renewed` in test "a renewed admin credential is taken in p…" — SAME — test: row is not read after; copied anyway (copyMcpUserToken)
+- src/mcp.tov:2220 `c` in test "a session's kept tool definitions follow…" — SAME — test: stored back at once
+- src/mcp.tov:2234 `fs` in test "injectToolFields adds to parsed fields w…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/mcp.tov:2237 `again` in test "injectToolFields adds to parsed fields w…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/mcpapi.tov:231 `n` in withClients — DIVERGES fixed — changed store.cfg (and its mcp section) before persist, whose rollback keeps the old config: copyConfig, copyMcpConfig
+- src/mcpapi.tov:232 `m` in withClients — DIVERGES fixed — changed store.cfg (and its mcp section) before persist, whose rollback keeps the old config: copyConfig, copyMcpConfig
+- src/mcpapi.tov:239 `n` in withVirtuals — DIVERGES fixed — changed store.cfg (and its mcp section) before persist, whose rollback keeps the old config: copyConfig, copyMcpConfig
+- src/mcpapi.tov:279 `n` in keepAuth — SAME — incoming is this request's parsed body, not read after
+- src/mcpapi.tov:302 `n` in redactClient — DIVERGES fixed — masked the secrets of the stored client: copies of the client and its nested records
+- src/mcpapi.tov:306 `na` in redactClient — DIVERGES fixed — masked the secrets of the stored client: copies of the client and its nested records
+- src/mcpapi.tov:316 `ns` in redactClient — DIVERGES fixed — masked the secrets of the stored client: copies of the client and its nested records
+- src/mcpapi.tov:322 `nt` in redactClient — DIVERGES fixed — masked the secrets of the stored client: copies of the client and its nested records
+- src/mcpapi.tov:328 `no` in redactClient — DIVERGES fixed — masked the secrets of the stored client: copies of the client and its nested records
+- src/mcpapi.tov:349 `n` in keepOpenApi — SAME — the record is this request's parsed body; only the returned value is used after
+- src/mcpapi.tov:452 `n` in clientFields — SAME — the record is this request's parsed body; only the returned value is used after
+- src/mcpapi.tov:652 `next` in createClient — DIVERGES fixed — changed the stored list before the save: slice
+- src/mcpapi.tov:684 `c` in updateClient — DIVERGES fixed — changed the stored client before validation finished (early 400 returns; compared with list[at] after): copyMcpClientConfig
+- src/mcpapi.tov:752 `next` in updateClient — DIVERGES fixed — changed the stored list before the save: slice
+- src/mcpapi.tov:809 `n` in openapiChecked — SAME — the record is this request's parsed body; only the returned value is used after
+- src/mcpapi.tov:897 `out` in inlineSpecUrl — SAME — fs is this call's own parse
+- src/mcpapi.tov:1010 `n` in withHeaderState — DIVERGES fixed — changed store.cfg (and its mcp section) before persist, whose rollback keeps the old config: copyConfig, copyMcpConfig
+- src/mcpapi.tov:1011 `m` in withHeaderState — DIVERGES fixed — changed store.cfg (and its mcp section) before persist, whose rollback keeps the old config: copyConfig, copyMcpConfig
+- src/mcpapi.tov:1047 `c` in dialWith — DIVERGES fixed — set headers on the stored client: copyMcpClientConfig
+- src/mcpapi.tov:1112 `list` in openHeaderFlow — SAME — dropExpired builds a new list
+- src/mcpapi.tov:1116 `f` in openHeaderFlow — DIVERGES fixed — the element is still the stored flow: literal copy
+- src/mcpapi.tov:1242 `creds` in submitFlow — DIVERGES fixed — changed the stored credentials list before the save: slice
+- src/mcpapi.tov:1279 `c` in verifyClient — DIVERGES fixed — changed the stored client before the save: copyMcpClientConfig
+- src/mcpapi.tov:1308 `n` in withExchangeAdmin — DIVERGES fixed — changed store.cfg (and its mcp section) before persist, whose rollback keeps the old config: copyConfig, copyMcpConfig
+- src/mcpapi.tov:1309 `m` in withExchangeAdmin — DIVERGES fixed — changed store.cfg (and its mcp section) before persist, whose rollback keeps the old config: copyConfig, copyMcpConfig
+- src/mcpapi.tov:1413 `kept` in verifyExchange — SAME — exchangeAdminWithout builds a new list
+- src/mcpapi.tov:1580 `next` in createVirtual — DIVERGES fixed — virtualsOf gives the stored list: slice
+- src/mcpapi.tov:1600 `v` in updateVirtual — DIVERGES fixed — the element is the stored virtual MCP: literal copy
+- src/mcpapi.tov:1616 `next` in updateVirtual — DIVERGES fixed — changed the stored list before the save: slice
+- src/mcpapi.tov:1648 `v` in setAttached — DIVERGES fixed — the element is the stored virtual MCP: literal copy
+- src/mcpapi.tov:1649 `keys` in setAttached — DIVERGES fixed — v.allowed_keys is the stored list: slice
+- src/mcpapi.tov:1658 `next` in setAttached — DIVERGES fixed — changed the stored list before the save: slice
+- src/mcpapi.tov:1799 `next` in setVirtualKeys — DIVERGES fixed — changed the stored list before the save: slice
+- src/mcpapi.tov:1800 `v` in setVirtualKeys — DIVERGES fixed — the element is the stored virtual MCP: literal copy
+- src/mcpapi.tov:1918 `na` in oauthConfigRoute — DIVERGES fixed — the stored client's auth record: copyMcpAuthConfig
+- src/mcpapi.tov:1923 `next` in oauthConfigRoute — DIVERGES fixed — changed the stored list before the save: slice
+- src/mcpapi.tov:1955 `n` in withAuth — DIVERGES fixed — c is the stored client: copyMcpClientConfig
+- src/mcpapi.tov:2019 `a` in startFlow — DIVERGES fixed — the stored client's auth record: copyMcpAuthConfig
+- src/mcpapi.tov:2135 `next` in oauthCallback — DIVERGES fixed — the stored client's auth record: copyMcpAuthConfig
+- src/mcpapi.tov:2192 `n` in withUserTokens — DIVERGES fixed — changed store.cfg (and its mcp section) before persist, whose rollback keeps the old config: copyConfig, copyMcpConfig
+- src/mcpapi.tov:2193 `m` in withUserTokens — DIVERGES fixed — changed store.cfg (and its mcp section) before persist, whose rollback keeps the old config: copyConfig, copyMcpConfig
+- src/mcpapi.tov:2837 `failed` in test "the OAuth config status answers a flow's…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/mcpapi.tov:2840 `live` in test "the OAuth config status answers a flow's…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/mcpapi.tov:2854 `more` in test "a per-user client lists the credential i…" — SAME — test: hc is not read after
+- src/mcpauth.tov:120 `headers` in tokenRequest — SAME — formHeaders() builds a new value on each call
+- src/mcpauth.tov:134 `headers` in codeTokenRequest — SAME — formHeaders() builds a new value on each call
+- src/mcpissuer.tov:816 `a` in slowDown — SAME — oauthErr() builds a new value on each call
+- src/mcplibrary.tov:157 `e` in load — SAME — entryOf() builds a new value on each call
+- src/mcplibrary.tov:194 `e` in sync — SAME — entryOf() builds a new value on each call
+- src/mcplibrary.tov:313 `e` in createLibraryEntry — SAME — entryOf() builds a new value on each call
+- src/mcpshare.tov:79 `c` in applied — DIVERGES fixed — changed the caller's config and its mcp section: copyConfig, copyMcpConfig
+- src/mcpshare.tov:80 `m` in applied — DIVERGES fixed — changed the caller's config and its mcp section: copyConfig, copyMcpConfig
+- src/mcpuser.tov:132 `n` in adoptFlows — SAME — f comes from the file just parsed
+- src/mcpuser.tov:178 `n` in writeFlows — DIVERGES fixed — sealed the verifier and blanked the temp token of the flow in memory: copyUserFlow
+- src/mcpuser.tov:436 `n` in failAdminFlow — UNSURE copied — the caller's flow record changed status too: copyUserFlow
+- src/mcpuser.tov:580 `req` in refreshUserRow — DIVERGES fixed — wrote one user's refresh token into the client's shared auth config: copyMcpAuthConfig
+- src/mcpuser.tov:716 `u` in test "user-mode rows are keyed by user, apart …" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/media.tov:254 `hs` in deploymentRequest — SAME — snapshot() builds a new value on each call
+- src/media.tov:309 `h` in authHeaders — SAME — headers() builds a new value on each call
+- src/media.tov:321 `fs` in rewriteJsonModel — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/media.tov:499 `n` in minted — DIVERGES fixed — wrote the minted token into the config's key: copyTarget + copyKeyConfig
+- src/media.tov:576 `hs` in handleMedia — SAME — authHeaders() builds a new value on each call
+- src/media.tov:661 `h` in handleMediaLarge — SAME — authHeaders() builds a new value on each call
+- src/media.tov:842 `hs` in vertexNativeRequest — SAME — headers() builds a new value on each call
+- src/media.tov:923 `hs` in waferUpload — SAME — authHeaders() builds a new value on each call
+- src/media.tov:1764 `h` in hfImageStream — SAME — jsonHeaders() builds a new value on each call
+- src/media.tov:1841 `h` in hfMedia — SAME — jsonHeaders() builds a new value on each call
+- src/media_cloud.tov:55 `h` in vertexPublisher — SAME — headers() builds a new value on each call
+- src/media_cloud.tov:442 `h` in bearer — SAME — headers() builds a new value on each call
+- src/media_cloud.tov:540 `h` in gcsUpload — SAME — bearer() builds a new value on each call
+- src/media_cloud.tov:620 `fs` in chatOf — DIVERGES fixed — the caller reads l.body again with the line's own model: slice
+- src/media_cloud.tov:635 `fs` in vertexInstances — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/media_cloud.tov:640 `fs` in vertexInstances — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/media_cloud.tov:1042 `fs` in bedrockInputJsonl — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/media_cloud.tov:1233 `ed` in test "stability edits: the task comes from the…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/media_cloud.tov:1251 `rc` in test "stability edits: the task comes from the…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/media_cloud.tov:1263 `sx` in test "stability edits: the task comes from the…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/media_native.tov:38 `h` in anthropicHeaders — SAME — headers() builds a new value on each call
+- src/media_native.tov:50 `h` in geminiHeaders — SAME — headers() builds a new value on each call
+- src/media_native.tov:153 `fs` in chatOf — DIVERGES fixed — the caller reads l.body again with the line's own model: slice
+- src/media_native.tov:930 `mr` in geminiTranscriptionStream — SAME — geminiTranscription() builds a new value on each call
+- src/media_native.tov:932 `h` in geminiTranscriptionStream — SAME — mr is fresh; headers stored back
+- src/media_native.tov:1099 `h` in sarvamHeaders — SAME — headers() builds a new value on each call
+- src/media_native.tov:1282 `ed` in test "an Imagen edit sends reference images, t…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/metrics.tov:817 `l` in test "raiju request family carries Raiju names…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/metrics.tov:834 `l` in test "prometheus_labels add named labels fille…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/metrics.tov:840 `plain` in test "prometheus_labels add named labels fille…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/metrics.tov:902 `l` in test "telemetry switches: the overhead split a…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/msgconv.tov:648 `fs` in canon — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/native.tov:101 `fs` in chatBridge — SAME — nothing is changed after the alias is made
+- src/native.tov:712 `up` in genai — SAME — nativeRequest() builds a new value on each call
+- src/native.tov:741 `fs` in modelHooked — SAME — fields() builds a new value on each call
+- src/native.tov:955 `hs` in genaiUpload — SAME — upstreamHeaders() builds a new value on each call
+- src/native.tov:973 `hs` in genaiUpload — SAME — upstreamHeaders() builds a new value on each call
+- src/nativehook.tov:210 `fs` in chatText — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/oauth_key.tov:208 `b` in test "client credentials go as Basic auth by d…" — SAME — test: the source record is not read after
+- src/oauth_key.tov:344 `withIss` in test "a jwt_bearer key with no issuer or audie…" — SAME — test: the source record is not read after
+- src/oauth_key.tov:354 `whole` in test "a jwt_bearer key with no issuer or audie…" — SAME — test: the source record is not read after
+- src/oauth_key.tov:357 `badAlg` in test "a jwt_bearer key with no issuer or audie…" — SAME — test: the source record is not read after
+- src/objowner.tov:69 `out` in lookupForms — SAME — recordForms() builds a new value on each call
+- src/objowner.tov:279 `f` in filterList — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/oidc.tov:637 `n` in renew — SAME — record() parses the stored text: a fresh record
+- src/oidc.tov:1243 `cfg` in test "an email the provider marks unverified i…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/oidc.tov:1274 `cfg` in test "email admission requires verified exact …" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/oidc.tov:1299 `cfg` in test "hosted-domain admission requires an exac…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/oidc.tov:1322 `cfg` in test "hosted-domain and verified-email admissi…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
+- src/openapi.tov:335 `out` in mergeSiblings — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/openapi.tov:340 `merged` in mergeSiblings — SAME — obj() builds a new value on each call
+- src/openapi.tov:606 `op` in buildOpV3 — SAME — newOp() builds a new value on each call
+- src/openapi.tov:823 `op` in buildOpV2 — SAME — newOp() builds a new value on each call
+- src/openapi.tov:935 `op` in parseSwagger2 — SAME — buildOpV2() builds a new value on each call
+- src/openapi.tov:1016 `props` in normalizeNode — SAME — obj() builds a new value on each call
+- src/openapi.tov:1110 `schema` in flatten — SAME — obj() builds a new value on each call
+- src/openapi.tov:1150 `schema` in flatten — SAME — obj() builds a new value on each call
+- src/openapi.tov:1185 `prop` in flattenQuerystring — SAME — fresh value (parsed from text, or built by the call on the right)
+- src/openapi.tov:1200 `js` in flattenQuerystring — SAME — schema is this call's own parse, not read after
+- src/openapi.tov:1353 `op` in parseSpec — SAME — parsed.ops is walked once and not read after
+- src/ops.tov:344 `n` in withRedirect — DIVERGES fixed — set redirect_uri on the configured record kept for later requests: copyOidcConfig
+- src/ops.tov:707 `out` in withSecrets — SAME — fresh parse
+- src/ops.tov:1505 `ro` in configure — DIVERGES fixed — resolveOidcRoleMap returns its argument when there is no role map; the config's oidc record was resolved in place: copyOidcConfig
+- src/ops.tov:1577 `dc` in configureCluster — UNSURE copied — set bind_port on the config's discovery record: literal copy
+- src/ops.tov:2191 `fs` in withRedivision — SAME — fields() builds a new value on each call
+- src/ops.tov:3649 `f` in logList — SAME — listFilter() builds a new value on each call
+- src/ops.tov:3659 `f` in logStats — SAME — listFilter() builds a new value on each call
+- src/ops.tov:3694 `page` in sessionLogs — SAME — pg is this call's own result
+- src/ops.tov:3818 `s` in cancelRecalc — SAME — readShared parses the file
+- src/ops.tov:4602 `c` in installCard — UNSURE copied — store-back, but the config record may be held elsewhere (store rollback/base copies, the engine's users): copyConfig
+- src/ops.tov:4737 `mine` in a2aHeaders — SAME — managed is a fresh result of upstreamHeaders
+- src/ops.tov:4785 `f` in a2aSendOn — SAME — fwdFail() builds a new value on each call
+- src/ops.tov:4813 `f` in a2aSendHttp — SAME — fwdFail() builds a new value on each call
+- src/ops.tov:4821 `hm` in a2aSendHttp — SAME — hd is a fresh result of a2aHeaders
+- src/ops.tov:4862 `f` in a2aSendGrpc — SAME — fwdFail() builds a new value on each call
+- src/ops.tov:4868 `md` in a2aSendGrpc — SAME — hd is a fresh result of a2aHeaders
+- src/ops.tov:5195 `c` in adoptRemoteCard — UNSURE copied — store-back, but the config record may be held elsewhere (store rollback/base copies, the engine's users): copyConfig
+- src/ops.tov:5201 `c` in adoptRemoteCard — UNSURE copied — store-back, but the config record may be held elsewhere (store rollback/base copies, the engine's users): copyConfig
+- src/ops.tov:5621 `users` in syncSignIn — DIVERGES fixed — changed the store's user list before setClaimSync (and on the refusal returns): slice
+- src/ops.tov:6345 `a` in scopeOfActorFor — SAME — allScope() builds a new value on each call
+- src/ops.tov:6353 `s` in scopeOfActorFor — SAME — scopeOf() builds a new value on each call
+- src/ops.tov:7293 `cur` in memberUsage — SAME — map entry (or a new value) set back at once
+- src/ops.tov:7368 `shown` in auditRoute — DIVERGES fixed — wiped ip in the log's event: copyAuditEvent
+- src/ops.tov:7417 `h` in mcpCaller — SAME — snapshot() builds a new value on each call
+- src/ops.tov:7468 `tools` in mcp — SAME — exposedTools() builds a new value on each call
+- src/ops.tov:7916 `tool` in test "hidden_request_types leave entries out o…" — SAME — test local built by a helper or a parse in the test; nothing else holds it
