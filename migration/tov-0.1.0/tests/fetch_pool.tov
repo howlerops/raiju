@@ -1,0 +1,207 @@
+// fetch pool options and HTTP/2 (patch 0007): idle keep-alive timeout, connections per origin,
+// HTTP/2 over TLS with ALPN (many streams on one connection, PING, GOAWAY, fallback to HTTP/1.1).
+// Run by tov-patches/tests/run.sh, which starts h2_server.py in three modes and sets H2_PORT
+// (TLS, h2), H1TLS_PORT (TLS, http/1.1 only) and H1_PORT (plain). Prints "ok" or "FAIL" lines.
+type Pool = { keepAliveTimeout?: int, maxConnections?: int, http2?: "off" | "prefer" | "require", http2PingInterval?: int }
+
+async function pause(ms: int): Promise<void, Error> {
+  const p = new Promise<void, Error>((resolve, reject) => {
+    setTimeout(() => resolve(), ms)
+  })
+  try await p
+}
+
+async function get(url: string, pool: Pool): Promise<string, Error> {
+  const res = try await fetch(url, { tls: { rejectUnauthorized: false }, pool: pool })
+  return try await res.text()
+}
+
+// the server's counters
+async function stat(base: string, key: string): Promise<int, Error> {
+  const text = try await get(base + "/stats", {})
+  const at = text.indexOf(`"${key}": `)
+  if (at < 0) return -1
+  const rest = text.slice(at + key.byteLength + 4)
+  let n = 0
+  let i = 0
+  while (i < rest.byteLength) {
+    const d = "0123456789".indexOf(rest.slice(i, i + 1))
+    if (d < 0) break
+    n = n * 10 + d
+    i += 1
+  }
+  return n
+}
+
+async function slowOnes(base: string, pool: Pool, count: int): Promise<int, Error> {
+  const ps: Promise<string, Error>[] = []
+  const t0 = Date.now()
+  for (let i = 0; i < count; i++) ps.push(get(`${base}/slow?i=${i}`, pool))
+  const bodies = try await Promise.all(ps)
+  for (const b of bodies) {
+    if (b !== "slow") console.log(`FAIL a /slow body was ${JSON.stringify(b)}`)
+  }
+  return Math.trunc(Date.now() - t0)
+}
+
+async function main(): Promise<int> {
+  const h2 = `https://127.0.0.1:${process.env.H2_PORT ?? "0"}`
+  const h1tls = `https://127.0.0.1:${process.env.H1TLS_PORT ?? "0"}`
+  const h1 = `http://127.0.0.1:${process.env.H1_PORT ?? "0"}`
+  const prefer: Pool = { http2: "prefer" }
+  try {
+    // ---- HTTP/2: many requests, one connection
+    await stat(h2, "conns") // (opens the connection stats are read on)
+    const h2c0 = await stat(h2, "h2_conns")
+    const ms = await slowOnes(h2, prefer, 8)
+    const h2c1 = await stat(h2, "h2_conns")
+    const streams = await stat(h2, "max_streams")
+    console.log(h2c1 - h2c0 === 1 ? "ok eight concurrent requests share one HTTP/2 connection" : `FAIL ${h2c1 - h2c0} HTTP/2 connections for 8 requests`)
+    console.log(streams === 8 ? "ok the server saw eight streams open at once" : `FAIL most streams at once: ${streams}`)
+    console.log(ms < 1500 ? `ok they overlapped (${ms} ms, not 8 x 400)` : `FAIL took ${ms} ms`)
+    const again = await get(h2 + "/echo?k=1", prefer)
+    const h2c2 = await stat(h2, "h2_conns")
+    console.log(again === "hello /echo?k=1" && h2c2 === h2c1 ? "ok a later request reuses the connection" : `FAIL later request: ${again}, connections ${h2c2 - h2c1} more`)
+
+    // ---- request bodies, and response bodies larger than a window
+    let big = ""
+    for (let i = 0; i < 20000; i++) big += "0123456789abcdefghijklmnopqrstuv"
+    const res = try await fetch(h2 + "/post", { method: "POST", body: big, tls: { rejectUnauthorized: false }, pool: prefer })
+    const echoed = try await res.text()
+    console.log(res.status === 200 && echoed === big ? "ok a 640 KB request body goes out in DATA frames and comes back" : `FAIL post echoed ${echoed.byteLength} bytes, status ${res.status}`)
+    const huge = try await fetch(h2 + "/big?n=3000000", { tls: { rejectUnauthorized: false }, pool: prefer })
+    let total = 0
+    let chunks = 0
+    for await (const chunk of huge.body!) {
+      total += chunk.length
+      chunks += 1
+      if (chunks % 8 === 0) await pause(2) // a reader that is behind holds the stream, not the connection
+    }
+    console.log(total === 3000000 ? "ok a 3 MB streamed body arrives whole through a slow reader" : `FAIL streamed ${total} bytes`)
+    const whole = try await fetch(h2 + "/big", { tls: { rejectUnauthorized: false }, pool: prefer })
+    const wt = try await whole.text()
+    console.log(wt.byteLength === 300000 && whole.headers.get("content-type") === "application/octet-stream" ? "ok a body read whole, and the response headers" : `FAIL whole ${wt.byteLength}`)
+
+    // ---- content decoding, redirects and HEAD go through the same parser
+    const zipped = await get(h2 + "/gzip", prefer)
+    console.log(zipped === "gzipped over the wire" ? "ok a gzip body is decoded over HTTP/2" : `FAIL gzip: ${JSON.stringify(zipped)}`)
+    const redirected = try await fetch(h2 + "/redir", { tls: { rejectUnauthorized: false }, pool: prefer })
+    const rbody = try await redirected.text()
+    console.log(redirected.redirected && rbody === "hello /echo?redirected" ? "ok a redirect is followed over HTTP/2" : `FAIL redirect: ${redirected.redirected} ${rbody}`)
+    const head = try await fetch(h2 + "/echo?head", { method: "HEAD", tls: { rejectUnauthorized: false }, pool: prefer })
+    const hbody = try await head.text()
+    console.log(head.status === 200 && hbody === "" ? "ok HEAD has no body" : `FAIL head: ${head.status} ${hbody}`)
+
+    // ---- more requests than one connection takes streams (the server allows 50)
+    const m0 = await stat(h2, "h2_conns")
+    const many: Promise<string, Error>[] = []
+    for (let i = 0; i < 250; i++) many.push(get(`${h2}/slow?m=${i}`, prefer))
+    const manyBodies = try await Promise.all(many)
+    let manyOk = 0
+    for (let i = 0; i < 250; i++) if (manyBodies[i]! === "slow") manyOk += 1
+    const m1 = await stat(h2, "h2_conns")
+    console.log(manyOk === 250 && m1 - m0 >= 2 && m1 - m0 <= 6 ? `ok 250 concurrent requests spill over a connection that takes 50 streams (${m1 - m0} more)` : `FAIL 250 requests: ${manyOk} ok, ${m1 - m0} connections, most streams ${await stat(h2, "max_streams")}`)
+
+    // ---- an aborted request frees its stream, not the connection
+    const before = await stat(h2, "h2_conns")
+    const ac = new AbortController()
+    const doomed = fetch(h2 + "/slow", { tls: { rejectUnauthorized: false }, pool: prefer, signal: ac.signal })
+    await pause(100)
+    ac.abort()
+    let aborted = false
+    try {
+      await doomed
+    } catch (e) {
+      aborted = true
+    }
+    const after = await get(h2 + "/echo?after=abort", prefer)
+    console.log(aborted && after === "hello /echo?after=abort" && (await stat(h2, "h2_conns")) === before ? "ok an aborted stream leaves the connection usable" : `FAIL abort: ${aborted} ${after}`)
+
+    // ---- GOAWAY: the next request goes to a new connection
+    const solo: Pool = { http2: "prefer", keepAliveTimeout: 55 } // (a pool of its own: one connection)
+    const g0 = await stat(h2, "h2_conns")
+    const bye = await get(h2 + "/bye", solo)
+    await pause(150)
+    const next = await get(h2 + "/echo?after=bye", solo)
+    const h2c3 = await stat(h2, "h2_conns")
+    console.log(bye === "bye" && next === "hello /echo?after=bye" && h2c3 === g0 + 2 ? "ok after GOAWAY the next request opens a new connection" : `FAIL goaway: ${bye} ${next} ${h2c3 - g0}`)
+
+    // ---- PING
+    const ping: Pool = { http2: "prefer", http2PingInterval: 1 }
+    const p0 = await stat(h2, "pings")
+    await get(h2 + "/echo?ping", ping)
+    await pause(3500)
+    const p1 = await stat(h2, "pings")
+    console.log(p1 - p0 >= 2 ? `ok an idle HTTP/2 connection sends PINGs (${p1 - p0} in 3.5 s at a 1 s interval)` : `FAIL pings: ${p1 - p0}`)
+
+    // ---- idle keep-alive on an HTTP/2 connection
+    const ka: Pool = { http2: "prefer", keepAliveTimeout: 1 }
+    const k0 = await stat(h2, "h2_conns")
+    await get(h2 + "/echo?ka1", ka)
+    await get(h2 + "/echo?ka2", ka)
+    const k1 = await stat(h2, "h2_conns")
+    await pause(2400)
+    await get(h2 + "/echo?ka3", ka)
+    const k2 = await stat(h2, "h2_conns")
+    console.log(k1 - k0 === 1 && k2 - k1 === 1 ? "ok an HTTP/2 connection idle past the keep-alive timeout is closed" : `FAIL h2 keep-alive: ${k1 - k0}, ${k2 - k1}`)
+
+    // ---- HTTP/1.1 when the server doesn't offer h2
+    const fb = await get(h1tls + "/echo?fb", prefer)
+    console.log(fb === "hello /echo?fb" && (await stat(h1tls, "h2_conns")) === 0 ? "ok a server without h2 gets HTTP/1.1 (prefer)" : `FAIL fallback: ${fb}`)
+    let required = ""
+    try {
+      await get(h1tls + "/echo?req", { http2: "require" })
+      required = "no error"
+    } catch (e) {
+      required = e instanceof FetchError ? e.code : "other: " + e.message
+    }
+    console.log(required === "HTTP2NotNegotiated" ? "ok http2: require fails when the server doesn't choose h2" : `FAIL require: ${required}`)
+    const hBefore = await stat(h2, "h2_conns")
+    const off = await get(h2 + "/echo?off", {})
+    console.log(off === "hello /echo?off" && (await stat(h2, "h2_conns")) === hBefore ? "ok http2 off is HTTP/1.1 even where h2 is offered" : `FAIL off: ${off}`)
+
+    // ---- HTTP/1.1 pool: connections per host
+    await stat(h1, "conns")
+    const c0 = await stat(h1, "conns")
+    const free = await slowOnes(h1, { maxConnections: 100 }, 6)
+    const c1 = await stat(h1, "conns")
+    console.log(c1 - c0 === 6 && free < 1200 ? `ok without a cap, six concurrent requests use six connections (${free} ms)` : `FAIL uncapped: ${c1 - c0} connections, ${free} ms`)
+    const capped: Pool = { maxConnections: 2 }
+    const t = await slowOnes(h1, capped, 6)
+    const c2 = await stat(h1, "conns")
+    console.log(c2 - c1 === 2 && t >= 1100 ? `ok maxConnections: 2 queues the rest (2 connections, ${t} ms)` : `FAIL capped: ${c2 - c1} connections, ${t} ms`)
+
+    // ---- a queued request that is aborted leaves the queue
+    const one: Pool = { maxConnections: 1, keepAliveTimeout: 30 }
+    const first = get(h1 + "/slow?a", one)
+    const ac2 = new AbortController()
+    const queued = fetch(h1 + "/slow?b", { pool: one, signal: ac2.signal })
+    await pause(50)
+    ac2.abort()
+    let dropped = false
+    try {
+      await queued
+    } catch (e) {
+      dropped = true
+    }
+    const third = await get(h1 + "/echo?c", one)
+    console.log(dropped && (await first) === "slow" && third === "hello /echo?c" ? "ok an aborted waiting request leaves the queue" : `FAIL queue abort: ${dropped} ${third}`)
+
+    // ---- keep-alive: reuse, then expiry
+    const keep: Pool = { keepAliveTimeout: 1, maxConnections: 4 }
+    const d0 = await stat(h1, "conns")
+    await get(h1 + "/echo?1", keep)
+    await get(h1 + "/echo?2", keep)
+    const d1 = await stat(h1, "conns")
+    const open0 = await stat(h1, "open")
+    await pause(1700)
+    const open1 = await stat(h1, "open")
+    await get(h1 + "/echo?3", keep)
+    const d2 = await stat(h1, "conns")
+    console.log(d1 - d0 === 1 && d2 - d1 === 1 ? "ok a connection is reused, and not after the keep-alive timeout" : `FAIL keep-alive: ${d1 - d0} then ${d2 - d1}`)
+    console.log(open1 === open0 - 1 ? "ok the idle connection was closed by the client when the timeout passed" : `FAIL open connections ${open0} then ${open1}`)
+  } catch (e) {
+    console.log("FAIL " + e.message)
+  }
+  return 0
+}

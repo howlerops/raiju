@@ -1,0 +1,92 @@
+// fetch's address policy (patch 0013): the `peer` option checks every address a host resolves to right before
+// each connection, redirects and pooled connections included. Run by tov-patches/tests/run.sh (prints "ok" and
+// "FAIL" lines). The server listens on 127.0.0.1; "vm" or another name in /etc/hosts that resolves to it
+// (PEER_NAME) goes through the resolver rather than the numeric fast path.
+type Peer = { private?: bool, loopback?: bool, allow?: string[] }
+
+const server = Bun.serve({
+  port: 0,
+  hostname: "127.0.0.1",
+  fetch(req) {
+    const u = URL.parse(req.url)!
+    if (u.pathname === "/to") {
+      // a redirect to wherever ?u= says
+      return new Response("", { status: 302, headers: { location: u.searchParams.get("u") ?? "/" } })
+    }
+    return new Response("hello")
+  },
+})
+const port = server.port
+const base = `http://127.0.0.1:${port}`
+const name = process.env.PEER_NAME ?? "vm"
+
+function check(label: string, ok: bool, detail: string): void {
+  console.log(ok ? `ok ${label}` : `FAIL ${label}: ${detail}`)
+}
+
+// "" when the request got its answer, else the error's code and message
+async function attempt(url: string, peer: Peer | undefined): Promise<string> {
+  try {
+    const res = peer === undefined ? try await fetch(url) : try await fetch(url, { peer: peer })
+    const text = try await res.text()
+    return text === "hello" ? "" : `answered ${res.status} ${text}`
+  } catch (e) {
+    if (e instanceof FetchError) return `${e.code}: ${e.message}`
+    return e.message
+  }
+}
+
+function refused(r: string): bool {
+  return r.startsWith("AddressNotAllowed: ")
+}
+
+async function main(): Promise<int> {
+  const none = await attempt(`${base}/`, undefined)
+  check("without the option a loopback address is reached", none === "", none)
+  const strict = await attempt(`${base}/`, {})
+  check("a loopback address is refused by default", refused(strict) && strict.includes("a private address 127.0.0.1"), strict)
+  check("loopback: true lets it through", await attempt(`${base}/`, { loopback: true }) === "", "")
+  check("private: true lets it through", await attempt(`${base}/`, { private: true }) === "", "")
+  check("an allowed CIDR range lets it through", await attempt(`${base}/`, { allow: ["10.0.0.0/8", "127.0.0.0/8"] }) === "", "")
+  check("an allowed address lets it through", await attempt(`${base}/`, { allow: ["127.0.0.1"] }) === "", "")
+  check("an IPv4-mapped allow entry matches", await attempt(`${base}/`, { allow: ["::ffff:127.0.0.1"] }) === "", "")
+  const other = await attempt(`${base}/`, { allow: ["10.0.0.0/8", "127.0.0.2"] })
+  check("an allow list that does not hold the address refuses it", refused(other), other)
+
+  // a name resolved by the runtime's own resolver at connect time
+  const byName = await attempt(`http://${name}:${port}/`, {})
+  check("a name that resolves to a private address is refused at connect", refused(byName) && byName.includes(`(host ${name})`), byName)
+  check("the name itself in the allow list lets it through", await attempt(`http://${name}:${port}/`, { allow: [name.toUpperCase() + "."] }) === "", "")
+  check("a name is reached without the option", await attempt(`http://${name}:${port}/`, undefined) === "", "")
+  const local = await attempt(`http://localhost:${port}/`, {})
+  check("localhost is refused", refused(local), local)
+
+  // blocked addresses stay refused whatever the policy says
+  const zero = await attempt(`http://0.0.0.0:${port}/`, { private: true, loopback: true, allow: ["0.0.0.0/0"] })
+  check("0.0.0.0 is refused even with private, loopback and an allow list", refused(zero) && zero.includes("unspecified or metadata"), zero)
+  const meta = await attempt("http://169.254.169.254/latest/meta-data/", { private: true })
+  check("the metadata address is refused before connecting", refused(meta), meta)
+  const ali = await attempt("http://100.100.100.200/", { private: true })
+  check("100.100.100.200 is refused", refused(ali), ali)
+  const v6 = await attempt(`http://[::1]:${port}/`, {})
+  check("::1 is refused", refused(v6), v6)
+  const mapped = await attempt(`http://[::ffff:169.254.169.254]/`, { private: true })
+  check("an IPv4-mapped metadata address is refused", refused(mapped), mapped)
+
+  // each redirect hop is checked
+  const hop = await attempt(`${base}/to?u=http://0.0.0.0:${port}/`, { loopback: true })
+  check("a redirect to a refused address fails", refused(hop), hop)
+  const hopOk = await attempt(`${base}/to?u=http://${name}:${port}/`, { loopback: true })
+  check("a redirect to an allowed address is followed", hopOk === "", hopOk)
+  const hopFree = await attempt(`${base}/to?u=http://0.0.0.0:${port}/`, undefined)
+  check("without the option the same redirect is followed", hopFree === "", hopFree)
+
+  // a pooled connection made without the option is not reused by a request that has it
+  await attempt(`${base}/`, undefined)
+  const pooled = await attempt(`${base}/`, {})
+  check("a pooled connection is not reused across policies", refused(pooled), pooled)
+  server.stop()
+  return 0
+}
+
+await main()

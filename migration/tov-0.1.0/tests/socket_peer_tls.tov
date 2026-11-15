@@ -1,0 +1,75 @@
+// The address policy (patch 0022) on TLS sockets: Bun.connect with `tls` (and `alpn`), and a wss: WebSocket.
+// The check runs before the connection, so TLS never starts with a refused address. Run by
+// raiju-tests/run-s2.sh with H1TLS_PORT (h2_server.py's HTTP/1.1 TLS origin) and PEER_NAME.
+type Peer = { private?: bool, loopback?: bool, allow?: string[] }
+
+function check(label: string, ok: bool, detail: string): void {
+  console.log(ok ? `ok ${label}` : `FAIL ${label}: ${detail}`)
+}
+
+const port = Math.trunc(parseInt(process.env.H1TLS_PORT ?? "0") || 0)
+const name = process.env.PEER_NAME ?? "vm"
+
+// the ALPN protocol when the TLS socket opened ("-" for none), else the error's code and message
+async function dial(host: string, peer: Peer | undefined): Promise<string> {
+  let shook = false
+  try {
+    const s = peer === undefined
+      ? try await Bun.connect({ hostname: host, port: port, tls: { rejectUnauthorized: false, alpn: ["http/1.1"] }, socket: { handshake(s, ok) { shook = true } } })
+      : try await Bun.connect({ hostname: host, port: port, tls: { rejectUnauthorized: false, alpn: ["http/1.1"] }, peer: peer, socket: { handshake(s, ok) { shook = true } } })
+    const p = s.alpnProtocol
+    s.terminate()
+    return p === "" ? "-" : p
+  } catch (e) {
+    if (e instanceof SocketError) return `${e.code}: ${e.message}${shook ? " (after a handshake)" : ""}`
+    return e.message
+  }
+}
+
+function wss(host: string, peer: Peer): Promise<string> {
+  return new Promise<string>((resolve) => {
+    let ws: WebSocket | undefined = undefined
+    try {
+      ws = try new WebSocket(`wss://${host}:${port}/`, { peer: peer, tls: { rejectUnauthorized: false } })
+    } catch (e) {
+      resolve(`throws ${e.message}`)
+      return
+    }
+    const w = ws!
+    let err = ""
+    w.onopen = () => {
+      w.close()
+      resolve("opened")
+    }
+    w.onerror = (ev) => {
+      err = ev.message
+    }
+    w.onclose = (ev) => {
+      resolve(`${err} (close ${ev.code})`)
+    }
+  })
+}
+
+function refused(r: string): bool {
+  return r.startsWith("AddressNotAllowed: ")
+}
+
+async function main(): Promise<int> {
+  const open = await dial("127.0.0.1", undefined)
+  check("a TLS socket opens without the option", open === "http/1.1", open)
+  const strict = await dial("127.0.0.1", {})
+  check("a TLS socket to a loopback address is refused by default, before any handshake", refused(strict) && !strict.includes("handshake"), strict)
+  const byName = await dial(name, {})
+  check("a TLS socket to a name that resolves to it is refused", refused(byName) && byName.includes(`(host ${name})`), byName)
+  const ok = await dial("127.0.0.1", { loopback: true })
+  check("loopback: true lets the TLS socket through", ok === "http/1.1", ok)
+  const meta = await dial("169.254.169.254", { private: true, loopback: true })
+  check("a TLS socket to the metadata address is refused whatever the policy", refused(meta), meta)
+  const w1 = await wss("127.0.0.1", {})
+  check("a wss: WebSocket to a loopback address is refused (an error event and close 1006)", w1.startsWith("AddressNotAllowed: ") && w1.endsWith("(close 1006)"), w1)
+  const w2 = await wss(name, { allow: ["10.0.0.0/8"] })
+  check("a wss: WebSocket to a name that resolves to it is refused", w2.startsWith("AddressNotAllowed: ") && w2.endsWith("(close 1006)"), w2)
+  return 0
+}
+
+await main()

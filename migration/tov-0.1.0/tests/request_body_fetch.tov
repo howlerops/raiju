@@ -1,0 +1,157 @@
+// fetch() with a ReadableStream request body (patch 0008): chunked on HTTP/1.1 (plain and TLS) and
+// DATA frames on HTTP/2, with backpressure. Run by tov-patches/tests/run.sh, which starts
+// h2_server.py in three modes and sets H2_PORT (TLS, h2), H1TLS_PORT (TLS, http/1.1 only) and
+// H1_PORT (plain). Prints "ok" or "FAIL" lines.
+const CHUNK = 65536
+
+class Tally {
+  pulled = 0
+  cancelled = false
+}
+
+// A body of `total` bytes, the byte at position p being p % 251, produced a chunk at a time as it is pulled
+function patternStream(total: int, size: int, tally: Tally): ReadableStream {
+  let at = 0
+  return new ReadableStream({
+    async pull(c) {
+      if (at >= total) {
+        c.close()
+        return
+      }
+      const n = Math.min(size, total - at)
+      const b: u8[] = []
+      for (let i = 0; i < n; i++) b.push(u8((at + i) % 251))
+      at += n
+      tally.pulled += 1
+      c.enqueue(b)
+    },
+    cancel() {
+      tally.cancelled = true
+    },
+  })
+}
+
+function textStream(parts: string[]): ReadableStream {
+  return new ReadableStream({
+    start(c) {
+      for (const p of parts) c.enqueue(p)
+      c.close()
+    },
+  })
+}
+
+function failingStream(): ReadableStream {
+  let n = 0
+  return new ReadableStream({
+    async pull(c) {
+      n += 1
+      if (n > 3) {
+        c.error(new Error("source broke"))
+        return
+      }
+      c.enqueue("some bytes ")
+    },
+  })
+}
+
+async function pause(ms: int): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setTimeout(() => resolve(), ms)
+  })
+}
+
+async function upload(base: string, path: string, body: ReadableStream, opts: { http2?: "off" | "prefer" | "require", headers?: Record<string, string> }): Promise<string, Error> {
+  const res = try await fetch(base + path, {
+    method: "POST",
+    body: body,
+    tls: { rejectUnauthorized: false },
+    pool: { http2: opts.http2 ?? "off" },
+    headers: opts.headers,
+  })
+  return try await res.text()
+}
+
+async function suite(name: string, base: string, h2: "off" | "prefer"): Promise<int, Error> {
+  let fails = 0
+  const t1 = new Tally()
+
+  // small chunks, written before the connection exists
+  const echo = try await upload(base, "/post", textStream(["alpha", "beta", "gamma"]), { http2: h2 })
+  console.log(echo === "alphabetagamma" ? `ok ${name}: three small chunks arrive in order` : `FAIL ${name}: echo was ${JSON.stringify(echo)}`)
+
+  // an empty stream
+  const empty = try await upload(base, "/post", textStream([]), { http2: h2 })
+  console.log(empty === "" ? `ok ${name}: an empty stream sends an empty body` : `FAIL ${name}: empty echo ${JSON.stringify(empty)}`)
+
+  // a known length: no chunk framing on HTTP/1.1
+  const sized = try await upload(base, "/post", textStream(["12345", "67890"]), { http2: h2, headers: { "content-length": "10" } })
+  console.log(sized === "1234567890" ? `ok ${name}: a stream with a Content-Length is sent as it is` : `FAIL ${name}: sized echo ${JSON.stringify(sized)}`)
+
+  // a few MiB, produced as they are consumed
+  const total = 6 * 1048576 + 12345
+  const big = try await upload(base, "/upload", patternStream(total, CHUNK, t1), { http2: h2 })
+  console.log(big === `{"n": ${total}, "ok": true}` ? `ok ${name}: ${total} bytes in ${t1.pulled} chunks arrive intact` : `FAIL ${name}: upload said ${big}`)
+
+  // odd chunk sizes
+  const t2 = new Tally()
+  const odd = try await upload(base, "/upload", patternStream(200000, 777, t2), { http2: h2 })
+  console.log(odd === `{"n": 200000, "ok": true}` ? `ok ${name}: 777-byte chunks arrive intact` : `FAIL ${name}: odd upload said ${odd}`)
+
+  // backpressure: the server does not read for 0.8 s, so the source is pulled only as far as the buffers go
+  const t3 = new Tally()
+  const slow = upload(base, "/slowup", patternStream(64 * 1048576, CHUNK, t3), { http2: h2 })
+  await pause(500)
+  const early = t3.pulled
+  const slowBody = try await slow
+  console.log(early > 0 && early * CHUNK < 24 * 1048576 ? `ok ${name}: the source was pulled ${early} times (${early * CHUNK / 1048576} MiB) while the server was not reading` : `FAIL ${name}: ${early} chunks pulled while the server was not reading`)
+  console.log(slowBody === `{"n": ${64 * 1048576}, "ok": true}` ? `ok ${name}: ... and the whole body arrived once it read` : `FAIL ${name}: slow upload said ${slowBody}`)
+
+  // an answer before the body is in: the writer stops, the source is cancelled
+  const t4 = new Tally()
+  let early413 = ""
+  try {
+    const res = await fetch(base + "/early", { method: "POST", body: patternStream(256 * 1048576, CHUNK, t4), tls: { rejectUnauthorized: false }, pool: { http2: h2 } })
+    early413 = `${res.status} ${await res.text()}`
+  } catch (e) {
+    early413 = `error ${e.message}`
+  }
+  await pause(100)
+  console.log(early413 === "413 too big" ? `ok ${name}: an answer that comes before the body is returned` : `FAIL ${name}: early answer was ${early413}`)
+  console.log(t4.pulled * CHUNK < 64 * 1048576 && t4.cancelled ? `ok ${name}: the source was cancelled after ${t4.pulled} chunks` : `FAIL ${name}: ${t4.pulled} chunks pulled, cancelled ${t4.cancelled}`)
+
+  // a source that fails: the request fails
+  let failed = ""
+  try {
+    const res = await fetch(base + "/upload", { method: "POST", body: failingStream(), tls: { rejectUnauthorized: false }, pool: { http2: h2 } })
+    failed = `answered ${res.status}`
+  } catch (e) {
+    failed = "rejected"
+  }
+  console.log(failed === "rejected" ? `ok ${name}: a source that fails fails the request` : `FAIL ${name}: a failing source gave ${failed}`)
+
+  // a 307 would need the body again: it is returned, not followed
+  const t5 = new Tally()
+  const r307 = try await fetch(base + "/redir307", { method: "POST", body: patternStream(1000, 500, t5), tls: { rejectUnauthorized: false }, pool: { http2: h2 } })
+  console.log(r307.status === 307 ? `ok ${name}: a 307 to a streamed body is returned as it is` : `FAIL ${name}: 307 became ${r307.status}`)
+
+  // the connection still works afterwards
+  const again = try await upload(base, "/post", textStream(["still ", "fine"]), { http2: h2 })
+  console.log(again === "still fine" ? `ok ${name}: the origin serves the next request` : `FAIL ${name}: next request echoed ${JSON.stringify(again)}`)
+  return fails
+}
+
+async function main(): Promise<int> {
+  const h2 = `https://127.0.0.1:${process.env.H2_PORT ?? "0"}`
+  const h1tls = `https://127.0.0.1:${process.env.H1TLS_PORT ?? "0"}`
+  const h1 = `http://127.0.0.1:${process.env.H1_PORT ?? "0"}`
+  try {
+    await suite("http/1.1", h1, "off")
+    await suite("http/1.1 over TLS", h1tls, "off")
+    await suite("http/2", h2, "prefer")
+  } catch (e) {
+    console.log(`FAIL ${e.message}`)
+  }
+  return 0
+}
+
+await main()

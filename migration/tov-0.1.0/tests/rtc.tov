@@ -1,0 +1,135 @@
+// Patch 0006: std/rtc. Two peer connections in one program, on the loopback address: the offerer makes
+// a data channel and an audio track, the answerer (an echo) gets them from the SDP. Checks the
+// handshake, text and binary messages both ways, RTP packets with a rewritten SSRC and payload type,
+// and the state events. Prints "ok ..." per check and "FAIL ..." for one that doesn't hold.
+import { RTCPeerConnection, RTCDataChannel, RTCTrack, RTCConfig } from "std/rtc"
+
+let checks = 0
+let failed = false
+function ok(name: string, cond: bool): void {
+  if (cond) {
+    console.log("ok " + name)
+  } else {
+    console.log("FAIL " + name)
+    failed = true
+  }
+  checks++
+}
+
+function packet(seq: int, pt: int, ssrc: int): u8[] {
+  const p: u8[] = []
+  for (let i = 0; i < 32; i++) p.push(0)
+  p[0] = u8(0x80)
+  p[1] = u8(pt)
+  p[3] = u8(seq)
+  p[7] = u8(160)
+  p[8] = u8((ssrc >> 24) & 255)
+  p[9] = u8((ssrc >> 16) & 255)
+  p[10] = u8((ssrc >> 8) & 255)
+  p[11] = u8(ssrc & 255)
+  p[12] = u8(seq)
+  return p
+}
+
+async function main(): Promise<void, Error> {
+  const cfg: RTCConfig = { bindAddress: "127.0.0.1" }
+  const a = try new RTCPeerConnection(cfg)
+  const b = try new RTCPeerConnection(cfg)
+
+  // the answerer echoes text and counts what comes in
+  let gotChannel: RTCDataChannel | undefined = undefined
+  let gotTrack: RTCTrack | undefined = undefined
+  let packetsAtB = 0
+  let lastSsrc = 0
+  let lastPt = 0
+  b.ondatachannel = (incoming) => {
+    // (a copy: Tov 's closure capture of a class-typed parameter, inside a closure, doesn't compile)
+    const ch = incoming
+    gotChannel = ch
+    ch.onmessage = (m) => {
+      if (typeof m === "string") ch.send("echo:" + m)
+      else ch.send(m)
+    }
+  }
+  b.ontrack = (t) => {
+    gotTrack = t
+    t.onpacket = (p) => {
+      packetsAtB++
+      lastPt = int(p[1]! & 127)
+      lastSsrc = (int(p[8]!) << 24) + (int(p[9]!) << 16) + (int(p[10]!) << 8) + int(p[11]!)
+    }
+  }
+
+  const track = try a.addTrack({ mid: "0", ssrc: 4242, name: "audio", profile: "minptime=10;useinbandfec=1" })
+  const channel = a.createDataChannel("oai-events")
+  let opened = false
+  let text = ""
+  let bytes: u8[] = []
+  channel.onopen = () => {
+    opened = true
+  }
+  channel.onmessage = (m) => {
+    if (typeof m === "string") text = m
+    else bytes = m
+  }
+
+  const states: string[] = []
+  a.onstatechange = (s) => {
+    states.push(s)
+  }
+  let offer = ""
+  let answer = ""
+  const gathered = new Promise<void>((resolve) => {
+    a.ongatheringchange = (s) => {
+      if (s === "complete") resolve()
+    }
+  })
+  const gatheredB = new Promise<void>((resolve) => {
+    b.ongatheringchange = (s) => {
+      if (s === "complete") resolve()
+    }
+  })
+  ok("an offer is made", a.setLocalDescription("") === "")
+  await gathered
+  offer = a.localDescription
+  ok("the offer holds the track and the channel", offer.includes("m=audio") && offer.includes("m=application") && offer.includes("a=candidate"))
+  ok("the offer type", a.localDescriptionType === "offer")
+  ok("the remote offer is accepted", b.setRemoteDescription(offer, "offer") === "")
+  await gatheredB
+  answer = b.localDescription
+  ok("the answer", answer.includes("m=audio") && b.localDescriptionType === "answer")
+  ok("the answer is accepted", a.setRemoteDescription(answer, "answer") === "")
+
+  for (let i = 0; i < 300 && !opened; i++) await new Promise<void>((resolve) => setTimeout(resolve, 20))
+  ok("the data channel opens", opened)
+  ok("the answerer got the channel", gotChannel !== undefined)
+  ok("the connection is up", a.state === "connected" && states.includes("connected"))
+
+  ok("text goes through", channel.send("hello"))
+  const bin: u8[] = [1, 2, 3, 250]
+  ok("bytes go through", channel.send(bin))
+  for (let i = 0; i < 100 && (text === "" || bytes.length === 0); i++) await new Promise<void>((resolve) => setTimeout(resolve, 20))
+  ok("text comes back", text === "echo:hello")
+  ok("bytes come back", bytes.length === 4 && int(bytes[0]!) === 1 && int(bytes[3]!) === 250)
+
+  // RTP: the track opens with the DTLS-SRTP transport
+  for (let i = 0; i < 100 && track.readyState !== "open"; i++) await new Promise<void>((resolve) => setTimeout(resolve, 20))
+  ok("the track opens", track.readyState === "open")
+  ok("the answerer got the track", gotTrack !== undefined)
+  ok("opus is negotiated", track.payloadType === 111)
+  for (let i = 1; i <= 5; i++) {
+    track.sendRtp(packet(i, 99, 7777), 4242, 111)
+    await new Promise<void>((resolve) => setTimeout(resolve, 20))
+  }
+  for (let i = 0; i < 100 && packetsAtB < 5; i++) await new Promise<void>((resolve) => setTimeout(resolve, 20))
+  ok("RTP packets arrive", packetsAtB === 5)
+  ok("the payload type and SSRC were rewritten", lastPt === 111 && lastSsrc === 4242)
+  ok("a selected candidate pair", a.selectedCandidatePair.includes("127.0.0.1"))
+
+  a.close()
+  b.close()
+  ok("close is final", a.closed && b.closed && a.state === "closed")
+  if (failed) console.log("FAIL " + checks + " checks")
+}
+
+try await main()
