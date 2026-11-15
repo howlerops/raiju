@@ -4,9 +4,10 @@
 //
 // Text must be whole UTF-8 characters: a caller that decodes network chunks
 // must hold back an incomplete trailing sequence until the next chunk.
-import { Field, fields, elements, find, quote, rawStr, rawNum, setField, build } from "./json"
+import { Field, fields, elements, find, quote, rawStr, rawNum, setField, build, toInt } from "./json"
 import { newId, nowSeconds } from "./schemas"
 import * as b64 from "./base64"
+import { crc32 } from "./gzip"
 
 const DONE = "data: [DONE]\n\n"
 const MAX_FRAME = 16777216
@@ -18,22 +19,37 @@ export type SseEvent = { event: string, data: string }
 // line may be cut between pushes. A chunk that ends in \r may be followed by
 // the \n of the same line ending in the next chunk, so that \n is skipped.
 export class SseSplitter {
-  private rest = ""              // text after the last line end, not yet a line
+  // text after the last line end, not yet a line, in the pieces it came in (joined when its line ends, so a
+  // long line that arrives in many chunks is not copied on each of them). It holds no line end.
+  private rest: string[] = []
   private skipLF = false         // the last chunk ended in \r
   private ready: SseEvent[] = []
   private eventName = ""
   private data: string[] = []
 
   push(text: string): SseEvent[] {
-    let s = this.rest + text
-    this.rest = ""
+    // (nothing is held after a chunk that ended in \r, so the new text is all there is to look at)
+    let s = text
     if (this.skipLF && s !== "") {
       this.skipLF = false
       if (s.startsWith("\n")) s = s.slice(1)
     }
+    if (s === "") return this.take()
+    const cr = s.includes("\r")
+    // no line ends in the new text: it joins what is held
+    if (!cr && !s.includes("\n")) {
+      this.rest.push(s)
+      return this.take()
+    }
     if (s.endsWith("\r")) this.skipLF = true
-    const lines = s.split("\r\n").join("\n").split("\r").join("\n").split("\n")
-    this.rest = lines.pop() ?? ""
+    // the held text has no line end, so the line ends of the whole are those of the new text
+    const lines = (cr ? s.split("\r\n").join("\n").split("\r").join("\n") : s).split("\n")
+    if (this.rest.length > 0) {
+      lines[0] = this.rest.join("") + lines[0]!
+      this.rest = []
+    }
+    const last = lines.pop() ?? ""
+    if (last !== "") this.rest.push(last)
     for (const line of lines) this.line(line)
     return this.take()
   }
@@ -41,8 +57,8 @@ export class SseSplitter {
   // Ends the stream: a last line without a line end is read, and a pending
   // event is dispatched even without its blank line.
   flush(): SseEvent[] {
-    const tail = this.rest
-    this.rest = ""
+    const tail = this.rest.join("")
+    this.rest = []
     if (tail !== "") this.line(tail)
     this.dispatch()
     return this.take()
@@ -138,7 +154,7 @@ function objFields(raw: string | undefined): Field[] throws SyntaxError {
 // A numeric field as an int; absent reads as 0.
 function count(fs: Field[], key: string): int {
   const n = rawNum(fs, key)
-  return n === undefined ? 0 : Math.trunc(n)
+  return n === undefined ? 0 : (toInt(n) ?? 0)
 }
 
 // Finish reason of the Messages and Converse streams.
@@ -342,7 +358,7 @@ export class AnthropicToOpenAI {
       this.finish = mapStop(rawStr(d, "stop_reason"))
       const u = try objFields(find(fs, "usage"))
       const o = rawNum(u, "output_tokens")
-      if (o !== undefined) this.outTokens = Math.trunc(o)
+      if (o !== undefined) this.outTokens = toInt(o) ?? this.outTokens
       return ""
     }
     if (type === "message_stop") {
@@ -493,30 +509,6 @@ export class GeminiToOpenAI {
   }
 }
 
-// ---- AWS event stream (Bedrock ConverseStream) ----
-
-// CRC-32 (IEEE 802.3) table, built once.
-function makeCrcTable(): int[] {
-  const t: int[] = []
-  for (let n = 0; n < 256; n++) {
-    let c = n
-    for (let k = 0; k < 8; k++) {
-      if ((c & 1) === 1) c = 0xedb88320 ^ (c >> 1)
-      else c = c >> 1
-    }
-    t.push(c)
-  }
-  return t
-}
-
-const CRC_TABLE = makeCrcTable()
-
-function crc32(b: u8[]): int {
-  let crc = 0xffffffff
-  for (const x of b) crc = CRC_TABLE[(crc ^ int(x)) & 0xff]! ^ (crc >> 8)
-  return crc ^ 0xffffffff
-}
-
 function byteAt(b: u8[], i: int): int throws SyntaxError {
   if (i < 0 || i >= b.length) throw new SyntaxError("truncated event stream frame")
   return int(b[i]!)
@@ -614,17 +606,21 @@ export class BedrockEventStreamToOpenAI {
 
   push(bytes: u8[]): string {
     if (this.done) return ""
-    for (const b of bytes) this.buf.push(b)
+    // (nothing is left over between most pushes: the bytes are then taken as they are)
+    if (this.buf.length === 0) this.buf = bytes
+    else for (const b of bytes) this.buf.push(b)
     let out = ""
-    while (!this.done && this.buf.length >= 12) {
+    // the frames are read at an offset and the buffer is cut once after them (every failure empties it: fail)
+    let at = 0
+    while (!this.done && this.buf.length - at >= 12) {
       // the prelude is checked as soon as it is complete, before the rest of the frame
-      if (crc32(this.buf.slice(0, 8)) !== u32(this.buf, 8)) return out + this.fail("bad prelude CRC in event stream", "api_error")
-      const total = u32(this.buf, 0)
-      const hlen = u32(this.buf, 4)
+      if (crc32(this.buf.slice(at, at + 8)) !== u32(this.buf, at + 8)) return out + this.fail("bad prelude CRC in event stream", "api_error")
+      const total = u32(this.buf, at)
+      const hlen = u32(this.buf, at + 4)
       if (total < 16 || total > MAX_FRAME || hlen > total - 16) return out + this.fail("invalid event stream frame length", "api_error")
-      if (this.buf.length < total) break
-      const frame = this.buf.slice(0, total)
-      this.buf = this.buf.slice(total)
+      if (this.buf.length - at < total) break
+      const frame = this.buf.slice(at, at + total)
+      at += total
       if (crc32(frame.slice(0, total - 4)) !== u32(frame, total - 4)) return out + this.fail("bad message CRC in event stream", "api_error")
       let piece = ""
       try {
@@ -634,6 +630,8 @@ export class BedrockEventStreamToOpenAI {
       }
       out += piece
     }
+    // (a frame that ended the stream with an error has emptied the buffer already)
+    if (at > 0) this.buf = at >= this.buf.length ? [] : this.buf.slice(at)
     return out
   }
 
@@ -773,19 +771,23 @@ export class EventFrames {
   private buf: u8[] = []
 
   push(bytes: u8[]): EventFrame[] {
-    for (const b of bytes) this.buf.push(b)
+    if (this.buf.length === 0) this.buf = bytes
+    else for (const b of bytes) this.buf.push(b)
     const out: EventFrame[] = []
-    while (this.buf.length >= 12) {
-      const total = u32(this.buf, 0)
-      const hlen = u32(this.buf, 4)
-      if (crc32(this.buf.slice(0, 8)) !== u32(this.buf, 8) || total < 16 || total > MAX_FRAME || hlen > total - 16) {
-        out.push({ raw: this.buf, ok: false, headers: new Map(), payload: "" })
+    // the frames are read at an offset and the buffer is cut once after them
+    let at = 0
+    while (this.buf.length - at >= 12) {
+      const total = u32(this.buf, at)
+      const hlen = u32(this.buf, at + 4)
+      if (crc32(this.buf.slice(at, at + 8)) !== u32(this.buf, at + 8) || total < 16 || total > MAX_FRAME || hlen > total - 16) {
+        out.push({ raw: at > 0 ? this.buf.slice(at) : this.buf, ok: false, headers: new Map(), payload: "" })
         this.buf = []
+        at = 0
         break
       }
-      if (this.buf.length < total) break
-      const frame = this.buf.slice(0, total)
-      this.buf = this.buf.slice(total)
+      if (this.buf.length - at < total) break
+      const frame = this.buf.slice(at, at + total)
+      at += total
       try {
         if (crc32(frame.slice(0, total - 4)) !== u32(frame, total - 4)) throw new SyntaxError("bad message CRC")
         const h = try parseHeaders(frame.slice(12, 12 + hlen))
@@ -795,6 +797,7 @@ export class EventFrames {
         out.push({ raw: frame, ok: false, headers: new Map(), payload: "" })
       }
     }
+    if (at > 0) this.buf = at >= this.buf.length ? [] : this.buf.slice(at)
     return out
   }
 
@@ -1277,4 +1280,73 @@ test("event stream frames come out whole however the bytes are cut, and bytes th
   const junk = new EventFrames()
   const j = junk.push([u8(1), u8(2), u8(3), u8(4), u8(5), u8(6), u8(7), u8(8), u8(9), u8(10), u8(11), u8(12)])
   expect(j.length === 1 && !j[0]!.ok && j[0]!.raw.length === 12).toBe(true)
+})
+
+test("SSE splitter gives the same events however the text is cut, for \\n, \\r\\n and \\r line ends", () => {
+  const text = "data: a\r\n\r\ndata: b\rdata: c\r\r: note\nevent: e\ndata: d\n\ndata: long " + "x".repeat(40) + "\r\n\ndata: last\r\n\r\ndata: tail"
+  const one = new SseSplitter()
+  const whole = one.push(text).concat(one.flush())
+  expect(JSON.stringify(whole.map((e) => e.event + "=" + e.data))).toBe(JSON.stringify(["message=a", "message=b\nc", "e=d", "message=long " + "x".repeat(40), "message=last", "message=tail"]))
+  const want = JSON.stringify(whole)
+  // every cut in two, every cut in three near the line ends, and byte by byte
+  for (let i = 0; i <= text.byteLength; i++) {
+    const sp = new SseSplitter()
+    const got = sp.push(text.slice(0, i)).concat(sp.push(text.slice(i))).concat(sp.flush())
+    expect(JSON.stringify(got)).toBe(want)
+    for (let j = i; j <= i + 3 && j <= text.byteLength; j++) {
+      const s3 = new SseSplitter()
+      const g3 = s3.push(text.slice(0, i)).concat(s3.push(text.slice(i, j))).concat(s3.push("")).concat(s3.push(text.slice(j))).concat(s3.flush())
+      expect(JSON.stringify(g3)).toBe(want)
+    }
+  }
+  const each = new SseSplitter()
+  let got: SseEvent[] = []
+  for (let i = 0; i < text.byteLength; i++) got = got.concat(each.push(text.slice(i, i + 1)))
+  expect(JSON.stringify(got.concat(each.flush()))).toBe(want)
+})
+
+test("several event stream frames in one push are read in order, and what follows a bad frame is as before", () => {
+  const h: Map<string, string> = new Map()
+  h.set(":event-type", "contentBlockDelta")
+  h.set(":message-type", "event")
+  const a = encodeEventStreamFrame(h, `{"n":1}`)
+  const b = encodeEventStreamFrame(h, `{"n":2}`)
+  const c = encodeEventStreamFrame(h, `{"n":3}`)
+  // three frames and the start of a fourth: the frames come out, the start stays
+  const fr = new EventFrames()
+  const got = fr.push(a.concat(b).concat(c).concat(a.slice(0, 15)))
+  expect(got.map((f) => f.payload).join("")).toBe(`{"n":1}{"n":2}{"n":3}`)
+  expect(fr.push(a.slice(15)).length).toBe(1)
+  expect(fr.rest().length).toBe(0)
+  // bytes that do not frame after a good frame: the good frame, then all the rest as it is, nothing kept
+  const junk = [u8(1), u8(2), u8(3), u8(4), u8(5), u8(6), u8(7), u8(8), u8(9), u8(10), u8(11), u8(12), u8(13)]
+  const mixed = new EventFrames()
+  const m = mixed.push(a.concat(junk).concat(b))
+  expect(m.length).toBe(2)
+  expect(m[0]!.ok).toBe(true)
+  expect(!m[1]!.ok && m[1]!.raw.length === junk.length + b.length && int(m[1]!.raw[0]!) === 1).toBe(true)
+  expect(mixed.rest().length).toBe(0)
+  // an unfinished frame is kept whole across pushes
+  const part = new EventFrames()
+  expect(part.push(a.concat(b.slice(0, 5))).length).toBe(1)
+  expect(part.rest().length).toBe(5)
+  // the converter: frames in one push give what they give one by one, and a bad frame after a good one keeps
+  // the good one's output and ends the stream
+  const stop = encodeEventStreamFrame(headersOf([[":event-type", "messageStop"], [":message-type", "event"]]), `{"stopReason":"end_turn"}`)
+  const delta = encodeEventStreamFrame(h, `{"contentBlockIndex":0,"delta":{"text":"Hi"}}`)
+  const one = new BedrockEventStreamToOpenAI("m", false)
+  const two = new BedrockEventStreamToOpenAI("m", false)
+  const joinedOut = one.push(delta.concat(delta).concat(stop).concat(delta.slice(0, 7)))
+  const apart = two.push(delta) + two.push(delta) + two.push(stop) + two.push(delta.slice(0, 7))
+  expect(joinedOut.split("\"Hi\"").length).toBe(3)
+  expect(joinedOut.split("chatcmpl-").length).toBe(apart.split("chatcmpl-").length)
+  expect(one.end() === two.end()).toBe(true)
+  const bad = b.slice(0, b.length)
+  bad[b.length - 6] = u8(int(bad[b.length - 6]!) ^ 1)
+  const conv = new BedrockEventStreamToOpenAI("m", false)
+  const out = conv.push(delta.concat(bad).concat(delta))
+  expect(out.split("\"Hi\"").length).toBe(2)
+  expect(out.includes("bad message CRC")).toBe(true)
+  expect(conv.done).toBe(true)
+  expect(conv.push(delta)).toBe("")
 })

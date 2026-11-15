@@ -31,6 +31,16 @@ export function fmtTime(ts: unknown): string {
   return n > 0 ? new Date(n).toLocaleString() : "—"
 }
 
+// a value as text, or a dash when there is none
+export function dash(v: unknown): string {
+  return v === undefined || v === null || v === "" ? "—" : String(v)
+}
+
+// "name (id)" for a record that has a name, its id alone otherwise
+export function idLabel(it: { id: string; name?: string | null }): string {
+  return it.name ? it.name + " (" + it.id + ")" : it.id
+}
+
 export function splitList(s: string): string[] {
   return s
     .split(",")

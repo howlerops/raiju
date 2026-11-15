@@ -18,7 +18,7 @@
 // and preserved across restarts. A record is found by kind and id and carries the provider used to create it.
 // It applies to that provider and every provider name reaching the same upstream (the caller determines these;
 // see owner). Records predating provider tracking apply to every provider.
-import { readFileSync, existsSync, unlinkSync, readdirSync } from "node:fs"
+import { readFileSync, existsSync, unlinkSync, readdirSync, rmSync } from "node:fs"
 import { writeFileAtomic, mkdirPrivate } from "./atomicfile"
 import { sha256, toHex, utf8 } from "./crypto"
 import { Field, fields, elements, find, rawStr, quote, build, setField, decodeString } from "./json"
@@ -95,11 +95,18 @@ export class ObjectOwners {
   }
 
   private key(kind: string, id: string): string {
-    return kind + "\u0000" + id
+    return kind + "\u001f" + id
   }
 
   private file(kind: string, id: string): string {
     return this.dir + "/" + toHex(sha256(utf8(this.key(kind, id)))) + ".json"
+  }
+
+  // The file the same record had before the key's parts were separated: the "\u0000" literal the key was built
+  // with reads as an empty string, so ("ab", "c") and ("a", "bc") shared one. Still read on a miss (when it says
+  // it is this record), and removed by forget.
+  private legacyFile(kind: string, id: string): string {
+    return this.dir + "/" + toHex(sha256(utf8(kind + id))) + ".json"
   }
 
   // The record of one exact form, or undefined.
@@ -108,10 +115,17 @@ export class ObjectOwners {
     const m = this.mem.get(k)
     const fromMem: OwnerRecord | undefined = m === undefined ? undefined : { vk: m.split("\n")[0] ?? "", provider: m.split("\n")[1] ?? "" }
     if (this.dir === "") return fromMem
-    const p = this.file(kind, id)
-    if (!existsSync(p)) return undefined
+    let p = this.file(kind, id)
+    let legacy = false
+    if (!existsSync(p)) {
+      p = this.legacyFile(kind, id)
+      if (!existsSync(p)) return undefined
+      legacy = true
+    }
     try {
       const f = try fields(try readFileSync(p, "utf8"))
+      // a legacy name may belong to another record that shared it
+      if (legacy && (rawStr(f, "kind") !== kind || rawStr(f, "id") !== id)) return undefined
       const vk = rawStr(f, "virtual_key_id") ?? ""
       if (vk === "") return undefined
       return { vk: vk, provider: rawStr(f, "provider") ?? "" }
@@ -177,6 +191,11 @@ export class ObjectOwners {
       try {
         const p = this.file(kind, f)
         if (existsSync(p)) unlinkSync(p)
+        const old = this.legacyFile(kind, f)
+        if (existsSync(old)) {
+          const of = try fields(try readFileSync(old, "utf8"))
+          if (rawStr(of, "kind") === kind && rawStr(of, "id") === f) unlinkSync(old)
+        }
       } catch (e) {
         continue
       }
@@ -502,4 +521,36 @@ test("a list page keeps only the visible items", () => {
   const g = filterList(`{"files":[{"name":"files/x"},{"name":"files/y"}],"nextPageToken":"t"}`, "file", (id: string): bool => id === "files/x")
   expect(g).toBe(`{"files":[{"name":"files/y"}],"nextPageToken":"t"}`)
   expect(notFoundMessage("batch", "b1")).toBe("batch 'b1' not found")
+})
+
+test("owner keys keep kind and id apart; a record stored under the legacy name is still found and forgotten", () => {
+  const m = new ObjectOwners()
+  m.record("ab", "c", "vk-a", 1)
+  expect(m.owner("a", "bc")).toBe("")
+  m.record("a", "bc", "vk-b", 2)
+  expect(m.owner("ab", "c")).toBe("vk-a")
+  expect(m.owner("a", "bc")).toBe("vk-b")
+  const dir = "/tmp/raiju-objowner-test-" + toHex(sha256(utf8("sep" + Date.now())))
+  const a = new ObjectOwners()
+  a.useDir(dir)
+  a.record("ab", "c", "vk-a", 1)
+  expect(a.owner("a", "bc")).toBe("")
+  a.record("a", "bc", "vk-b", 2)
+  const b = new ObjectOwners()
+  b.useDir(dir)
+  expect(b.owner("ab", "c")).toBe("vk-a")
+  expect(b.owner("a", "bc")).toBe("vk-b")
+  // a record an earlier version wrote: named by the hash of kind and id with nothing between them
+  try writeFileAtomic(dir + "/" + toHex(sha256(utf8("file" + "file-old"))) + ".json", `{"kind":"file","id":"file-old","virtual_key_id":"vk-old","provider":"openai","created_at":1}`)
+  expect(b.owner("file", "file-old")).toBe("vk-old")
+  expect(b.owner("file", "file-old", "anthropic")).toBe("")
+  // the legacy name of ("fil", "efile-old") is the same file, which says it is another record
+  expect(b.owner("fil", "efile-old")).toBe("")
+  // the first creator is kept: no second record is written over a legacy one
+  b.record("file", "file-old", "vk-new", 2, "openai")
+  expect(a.owner("file", "file-old")).toBe("vk-old")
+  a.forget("file", "file-old")
+  expect(b.owner("file", "file-old")).toBe("")
+  expect(existsSync(dir + "/" + toHex(sha256(utf8("file" + "file-old"))) + ".json")).toBe(false)
+  try rmSync(dir, { recursive: true, force: true })
 })

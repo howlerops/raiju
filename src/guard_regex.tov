@@ -163,7 +163,8 @@ type Span = { start: int, end: int }
 type Found = { m: Span, s: Span }
 
 // The matches of one rule in the text, and whether the pattern matched a window at all.
-type Scan = { found: Found[], placed: bool }
+// from is where the search stood after the last region (findSpans carries it from region to region).
+type Scan = { found: Found[], placed: bool, from: int }
 
 const enc = new TextEncoder()
 const W = 512
@@ -361,8 +362,9 @@ function windowStarts(re: Regex, low: string | undefined, b: u8[]): Trip[] | und
 // A match of up to W - STEP bytes starting in a window's first half lies inside that window.
 // The windows are walked once, in order, so each is decoded once for the rules that need it
 // and only the hit ranges are kept. A window tries only the starts windowStarts gives it,
-// when the rule has literals.
-function scanRegions(rules: CompiledRule[], text: string, b: u8[], low: string | undefined): Span[][] {
+// when the rule has literals. s0 (a multiple of STEP) is the start of the first window walked: 0, or
+// STEP when the text is the tail of a longer one whose earlier windows are already decided (BlockCursor).
+function scanRegions(rules: CompiledRule[], text: string, b: u8[], low: string | undefined, s0: int): Span[][] {
   const n = b.length
   const plans: (Trip[] | undefined)[] = []
   const next: int[] = []
@@ -372,8 +374,8 @@ function scanRegions(rules: CompiledRule[], text: string, b: u8[], low: string |
     next.push(0)
     out.push([])
   }
-  let s = 0
-  let k = 0
+  let s = s0
+  let k = s0 >> 8
   while (s < n) {
     const st = cpAlign(b, s)
     const e = cpAlign(b, s + W < n ? s + W : n)
@@ -417,12 +419,14 @@ function scanRegions(rules: CompiledRule[], text: string, b: u8[], low: string |
 
 // Non-overlapping matches inside the regions, leftmost first. Each window is searched
 // from where the last match ended; a match that starts in the second half of a window
-// is left for the next window, which holds it in its first half.
-function findSpans(r: CompiledRule, text: string, b: u8[], regions: Span[]): Scan {
+// is left for the next window, which holds it in its first half. from0 is where an earlier
+// call over the regions before these stopped (0 for the first): the two calls together do
+// what one call over all the regions does.
+function findSpans(r: CompiledRule, text: string, b: u8[], regions: Span[], from0: int): Scan {
   const n = b.length
   const out: Found[] = []
   let placed = false
-  let from = 0
+  let from = from0
   for (const reg of regions) {
     let p = cpAlign(b, reg.start > from ? reg.start : from)
     while (p < reg.end && p < n) {
@@ -456,7 +460,7 @@ function findSpans(r: CompiledRule, text: string, b: u8[], regions: Span[]): Sca
     }
     from = p
   }
-  return { found: out, placed: placed }
+  return { found: out, placed: placed, from: from }
 }
 
 // The span of group g of a window match that starts at p (m holds offsets relative to p),
@@ -652,6 +656,17 @@ function allowedFinding(r: CompiledRule, secret: string, text: string, m: Span, 
   return false
 }
 
+// Whether a match of a rule is a finding: its secret is above the rule's entropy floor, is not an
+// allowed value, and no skip mark or allowlist covers it.
+function keeps(r: CompiledRule, text: string, f: Found, inout memo: Map<string, bool>): bool {
+  const t = text.slice(f.s.start, f.s.end)
+  if (r.entropy !== 0 && shannon(t) <= r.entropy) return false
+  if (ignored(r, t)) return false
+  if (r.skipLine.length > 0 && lineHas(text, f.m, r.skipLine)) return false
+  if (r.allow.length > 0 && allowedFinding(r, t, text, f.m, &memo)) return false
+  return true
+}
+
 // Runs the rules over text. block rules set blocked; redact rules rewrite the body
 // with [REDACTED:KIND]; detect_only rules only report. A finding is reported for the
 // secret span of a match; with an entropy floor, a finding must be above it, and an
@@ -670,12 +685,12 @@ export function applyRegex(text: string, rules: CompiledRule[]): GuardResult {
     if (r.keys.length > 0 && !r.keys.some((k: string) => low.includes(k))) continue
     run.push(r)
   }
-  const regions = scanRegions(run, text, b, ascii)
+  const regions = scanRegions(run, text, b, ascii, 0)
   for (let i = 0; i < run.length; i++) {
     const r = run[i]!
     const rg = regions[i]!
     if (rg.length === 0) continue
-    const scan = findSpans(r, text, b, rg)
+    const scan = findSpans(r, text, b, rg, 0)
     if (!scan.placed) {
       // the pattern matched but the span could not be placed
       findings.push({ kind: r.kind, start: 0, end: 0, text: "" })
@@ -683,11 +698,8 @@ export function applyRegex(text: string, rules: CompiledRule[]): GuardResult {
       continue
     }
     for (const f of scan.found) {
+      if (!keeps(r, text, f, &memo)) continue
       const t = text.slice(f.s.start, f.s.end)
-      if (r.entropy !== 0 && shannon(t) <= r.entropy) continue
-      if (ignored(r, t)) continue
-      if (r.skipLine.length > 0 && lineHas(text, f.m, r.skipLine)) continue
-      if (r.allow.length > 0 && allowedFinding(r, t, text, f.m, &memo)) continue
       const fd: Finding = { kind: r.kind, start: f.s.start, end: f.s.end, text: t }
       findings.push(fd)
       if (r.action === "block") blocked = true
@@ -697,6 +709,186 @@ export function applyRegex(text: string, rules: CompiledRule[]): GuardResult {
   if (blocked) return { body: text, findings: findings, blocked: true }
   if (redactions.length > 0) return { body: redact(text, redactions), findings: findings, blocked: false }
   return { body: text, findings: findings, blocked: false }
+}
+
+// How much of the text must lie after the first window a cursor leaves for its next scan, so that
+// everything before that window is decided: the windows before it end at most W + 3 bytes after their
+// start, a search in them starts before their end and reads at most W + 3 bytes (2 * (W + 3) - STEP = 774
+// bytes past the window in all), and each of those reads must end before the end of the text.
+const SETTLED = 1024
+
+function isAscii(s: string): bool {
+  for (const x of enc.encode(s)) {
+    if (int(x) >= 128) return false
+  }
+  return true
+}
+
+// applyRegex(text, rules).blocked for a text that only grows (a streamed answer), without scanning the
+// whole text each time. blocked(text) gives exactly that answer for every text that extends the one of
+// the call before; a shorter text starts over.
+//
+// Why a scan of the tail is enough. applyRegex walks windows that start at multiples of STEP, then
+// searches each rule's matching windows in order, carrying only where the last search stopped (from),
+// whether any search matched (placed) and the matches. A window that ends before the end of the text,
+// and a search slice that does, read the same bytes in every longer text. So once the text reaches
+// SETTLED bytes past a window start B, the windows before B give the same regions, the same matches and
+// the same carried values for good: the cursor keeps those per rule (from, placed, whether a window
+// matched) and next time scans from one window before B (so the byte before a search start is the real
+// one, for \b) with the walk starting at B. That reproduces the rest of applyRegex's walk: the windows
+// are the same slices, a literal occurrence a window uses lies in the window, and an earliest start
+// before the window is cut to the window start either way. (Like applyRegex, this takes the literal
+// filter of windowStarts to be only a filter: over a longer text it may be off, over the tail on.)
+// What is not local to the tail is handled apart:
+// - keywords are looked for in the whole text, so they are tracked as the text grows (keywords are
+//   ASCII, or the cursor scans the whole text each time), and a rule that becomes active starts the
+//   scan over;
+// - a kept match of a block rule in the decided part would have blocked when it was decided. One that
+//   was dropped stays dropped (entropy, allowed values, skip words and allowlists on the secret or the
+//   match read only the match; a line's skip mark stays on the line), except through an allowlist that
+//   reads the line while the line is not finished: the cursor does not move past such a match;
+// - the checks of a match read the whole text (the line of a match can start before the tail).
+export class BlockCursor {
+  // the tail scanned next starts here (a multiple of STEP and a code point start); the walk starts one
+  // window later, unless this is 0
+  private start = 0
+  // per rule, for the windows before the walk's start: where the search stopped, whether a search
+  // matched, whether a window matched
+  private from: int[] = []
+  private placed: bool[] = []
+  private hit: bool[] = []
+  // per rule: it has no keywords, or one of them has been seen
+  private active: bool[] = []
+  private len = 0
+  // keyword search: text lengths (code point starts) at least reach bytes apart; occurrences before
+  // keyLo were seen
+  private keyLo = 0
+  private keyMark = 0
+  private reach = 0
+  private keyed = false
+  // false: every call scans the whole text (a keyword that is not ASCII)
+  private local = true
+
+  constructor(readonly rules: CompiledRule[]) {
+    for (const r of rules) {
+      this.from.push(0)
+      this.placed.push(false)
+      this.hit.push(false)
+      this.active.push(r.keys.length === 0)
+      for (const k of r.keys) {
+        this.keyed = true
+        if (!isAscii(k)) this.local = false
+        // an ASCII keyword of n bytes in the lowercased text comes from at most n characters of the text
+        if (k.byteLength * 4 > this.reach) this.reach = k.byteLength * 4
+      }
+    }
+  }
+
+  private restart(): void {
+    this.start = 0
+    for (let i = 0; i < this.rules.length; i++) {
+      this.from[i] = 0
+      this.placed[i] = false
+      this.hit[i] = false
+    }
+  }
+
+  blocked(text: string): bool {
+    const n = text.byteLength
+    if (n < this.len) {
+      this.restart()
+      for (let i = 0; i < this.rules.length; i++) this.active[i] = this.rules[i]!.keys.length === 0
+      this.keyLo = 0
+      this.keyMark = 0
+    }
+    this.len = n
+    if (!this.local) this.restart()
+    if (this.keyed) {
+      const low = (this.local && this.keyLo > 0 ? text.slice(this.keyLo) : text).toLowerCase()
+      let woke = false
+      for (let i = 0; i < this.rules.length; i++) {
+        if (this.active[i]!) continue
+        if (this.rules[i]!.keys.some((k: string) => low.includes(k))) {
+          this.active[i] = true
+          woke = true
+        }
+      }
+      if (n - this.keyMark >= this.reach) {
+        this.keyLo = this.keyMark
+        this.keyMark = n
+      }
+      // the rule has the whole text to scan
+      if (woke) this.restart()
+    }
+    const base = this.start
+    const part = base === 0 ? text : text.slice(base)
+    const b = enc.encode(part)
+    const idx: int[] = []
+    const run: CompiledRule[] = []
+    for (let i = 0; i < this.rules.length; i++) {
+      if (!this.active[i]!) continue
+      idx.push(i)
+      run.push(this.rules[i]!)
+    }
+    const regions = scanRegions(run, part, b, asciiLower(b), base > 0 ? STEP : 0)
+    // the next walk's first window (an offset in part), or -1 to stay: the last window start with SETTLED
+    // bytes after it whose tail start, a window earlier, is a code point start
+    let cut = -1
+    if (this.local && n >= SETTLED) {
+      let c = (((n - SETTLED) >> 8) << 8) - base
+      while (c - STEP > 0 && isCont(byteAt(b, c - STEP))) c -= STEP
+      if (c - STEP > 0) cut = c
+    }
+    let memo = new Map<string, bool>()
+    const froms: int[] = []
+    const placeds: bool[] = []
+    const hits: bool[] = []
+    for (let j = 0; j < run.length; j++) {
+      const r = run[j]!
+      const i = idx[j]!
+      const rg = regions[j]!
+      const pre: Span[] = []
+      const post: Span[] = []
+      for (const reg of rg) {
+        if (reg.start < cut) pre.push(reg)
+        else post.push(reg)
+      }
+      const f0 = this.from[i]! - base
+      const a = findSpans(r, part, b, pre, f0 > 0 ? f0 : 0)
+      const z = findSpans(r, part, b, post, a.from)
+      froms.push(a.from + base)
+      placeds.push(this.placed[i]! || a.placed)
+      hits.push(this.hit[i]! || pre.length > 0)
+      if (!this.hit[i]! && rg.length === 0) continue
+      if (!this.placed[i]! && !a.placed && !z.placed) {
+        // the pattern matched but the span could not be placed
+        if (r.action !== "detect_only") return true
+        continue
+      }
+      if (r.action !== "block") continue
+      let lineAllow = false
+      for (const al of r.allow) {
+        if (al.target === "line") lineAllow = true
+      }
+      for (const f of a.found) {
+        if (keeps(r, text, { m: { start: f.m.start + base, end: f.m.end + base }, s: { start: f.s.start + base, end: f.s.end + base } }, &memo)) return true
+        // its line can still grow, and an allowlist that reads the line may then let go of it
+        if (lineAllow && !part.slice(f.m.end).includes("\n")) cut = -1
+      }
+      for (const f of z.found) {
+        if (keeps(r, text, { m: { start: f.m.start + base, end: f.m.end + base }, s: { start: f.s.start + base, end: f.s.end + base } }, &memo)) return true
+      }
+    }
+    if (cut < 0) return false
+    for (let j = 0; j < idx.length; j++) {
+      const i = idx[j]!
+      this.from[i] = froms[j]!
+      this.placed[i] = placeds[j]!
+      this.hit[i] = hits[j]!
+    }
+    this.start = base + cut - STEP
+    return false
+  }
 }
 
 // ---- tests ----
@@ -923,4 +1115,116 @@ test("stopwords of several lengths are found inside ASCII and non-ASCII secrets"
   expect(applyRegex("tok_abcdef12", rules).blocked).toBe(true)
   expect(applyRegex("tok_édemoé", rules).blocked).toBe(false)
   expect(applyRegex("tok_éabcdé", rules).blocked).toBe(true)
+})
+
+// "" when a cursor fed the text in steps of `step` bytes agrees with applyRegex on every prefix, else where not.
+function cursorDiff(rules: CompiledRule[], text: string, step: int): string {
+  const c = new BlockCursor(rules)
+  const b = enc.encode(text)
+  let n = 0
+  while (n < b.length) {
+    n = cpAlign(b, n + step < b.length ? n + step : b.length)
+    const pre = text.slice(0, n)
+    const want = applyRegex(pre, rules).blocked
+    if (c.blocked(pre) !== want) return `step ${step} at ${n}: whole scan ${want}`
+  }
+  return ""
+}
+
+// n bytes of filler with the tokens written over it at their offsets
+function laid(fill: string, n: int, at: int[], toks: string[]): string {
+  let t = fill.repeat(Math.floor(n / fill.byteLength) + 1).slice(0, n)
+  for (let i = 0; i < at.length; i++) {
+    const tok = toks[i]!
+    t = t.slice(0, at[i]!) + tok + t.slice(at[i]! + tok.byteLength)
+  }
+  return t
+}
+
+test("a block cursor agrees with the whole scan on every prefix: matches around the window seams", () => {
+  const fill = "lorem ipsum dolor sit amet "
+  const lit = try compileRules([{ pattern: "PROJ-\\d{4}", action: "block" }])
+  for (const at of [3, 250, 1020, 1279, 1281, 2047, 2560, 3071, 4095, 5000]) {
+    const text = laid(fill, 5600, [at], ["PROJ-1234"])
+    expect(applyRegex(text, lit).blocked).toBe(true)
+    for (const step of [7, 64, 257, 1500]) expect(cursorDiff(lit, text, step)).toBe("")
+  }
+  // byte by byte, across the first moves of the cursor
+  expect(cursorDiff(lit, laid(fill, 2700, [2600], ["PROJ-1234"]), 1)).toBe("")
+  // a pattern without a literal, and a text that never matches
+  const plain = try compileRules([{ pattern: "\\d{3}-\\d{4}", action: "block" }])
+  for (const at of [1279, 2815, 4000]) {
+    for (const step of [61, 256]) expect(cursorDiff(plain, laid(fill, 4600, [at], ["555-1234"]), step)).toBe("")
+  }
+  expect(cursorDiff(lit, laid(fill, 6000, [], []), 100)).toBe("")
+  expect(new BlockCursor(lit).blocked(laid(fill, 6000, [], []))).toBe(false)
+})
+
+test("a block cursor agrees with the whole scan: keywords, lines, word edges, entropy, many rules", () => {
+  const fill = "lorem ipsum dolor sit amet "
+  // the keyword comes long after the match it wakes
+  const keyed = try compileRules([{ pattern: "zz[0-9]", keywords: ["Needle"], action: "block" }])
+  const late = laid(fill, 5200, [500, 4000], ["zz7", "a nEEdle "])
+  expect(applyRegex(late, keyed).blocked).toBe(true)
+  expect(applyRegex(late.slice(0, 3900), keyed).blocked).toBe(false)
+  for (const step of [5, 97, 512]) expect(cursorDiff(keyed, late, step)).toBe("")
+  // an allowlist on the line lets go of an old match when the line, still growing, stops matching
+  const byLine = try compileRules([{ pattern: "tok_[a-z]+", action: "block", allow: [{ target: "line", regexes: ["^note:[^!]*$"] }] }])
+  // (a line too long for the allowlist's regex stops being allowed too, so the line here stays short of that)
+  const line = laid("xxxx yyy ", 5000, [300, 301, 2500], ["\n", "note: tok_abc ", "!"])
+  expect(applyRegex(line.slice(0, 2400), byLine).blocked).toBe(false)
+  expect(applyRegex(line, byLine).blocked).toBe(true)
+  for (const step of [9, 130, 700]) expect(cursorDiff(byLine, line, step)).toBe("")
+  // the same with the line finished long before: the match stays allowed
+  const done = laid("xxxx yyy ", 5000, [300, 301, 900, 2500], ["\n", "note: tok_abc ", "\n", "!"])
+  expect(applyRegex(done, byLine).blocked).toBe(false)
+  for (const step of [9, 700]) expect(cursorDiff(byLine, done, step)).toBe("")
+  // a skip mark that arrives later on the line of an old match
+  const marked = try compileRules([{ pattern: "tok_[a-z]{4}", action: "block", skip_line_containing: ["@keep"] }])
+  const mk = laid("xxxx yyy ", 4000, [200, 3000], ["tok_abcd ", " @keep "])
+  expect(applyRegex(mk.slice(0, 2900), marked).blocked).toBe(true)
+  expect(applyRegex(mk, marked).blocked).toBe(false)
+  for (const step of [11, 300]) expect(cursorDiff(marked, mk, step)).toBe("")
+  // a word edge exactly where a search starts, with a word character before it
+  const edge = try compileRules([{ pattern: "\\bkey[0-9]+", action: "block" }])
+  for (const at of [1023, 1279, 1535, 2047, 2303]) {
+    expect(applyRegex(laid(fill, 4000, [at], ["xkey12"]), edge).blocked).toBe(false)
+    for (const step of [13, 256]) expect(cursorDiff(edge, laid(fill, 4000, [at], ["xkey12"]), step)).toBe("")
+    for (const step of [13, 256]) expect(cursorDiff(edge, laid(fill, 4000, [at, 3500], ["xkey12", " key9 "]), step)).toBe("")
+  }
+  // an entropy floor, anchors, and a redact rule that matches in every window next to a block rule
+  const mixed = try compileRules([
+    { pattern: "[a-z]+ [a-z]+", action: "redact" },
+    { pattern: "^amet\\b", flags: "m", action: "redact" },
+    { pattern: "sit$", action: "redact" },
+    { pattern: "tok_[a-z0-9]{12}", entropy: 3.0, action: "block" },
+    { pattern: "acme", flags: "i", action: "detect_only" },
+  ])
+  const mx = laid(fill, 5200, [700, 2040, 4400], ["tok_aaaaaaaaaaaa", "\nACME\n", "tok_q8w3e7r5t1y9"])
+  expect(applyRegex(mx.slice(0, 4300), mixed).blocked).toBe(false)
+  expect(applyRegex(mx, mixed).blocked).toBe(true)
+  for (const step of [23, 255, 1024]) expect(cursorDiff(mixed, mx, step)).toBe("")
+  // multibyte text: window and tail starts fall inside characters
+  const wide = "héllo wörld — 日本語 "
+  const lit = try compileRules([{ pattern: "PROJ-\\d{4}", action: "block" }, { pattern: "\\bw\\S+", action: "redact" }])
+  for (const reps of [40, 77, 131]) {
+    const text = wide.repeat(reps) + "PROJ-1234" + wide.repeat(60)
+    expect(applyRegex(text, lit).blocked).toBe(true)
+    for (const step of [3, 100, 259]) expect(cursorDiff(lit, text, step)).toBe("")
+  }
+  // matches back to back through every window: where each search stops decides where the next match starts
+  const dense = try compileRules([{ pattern: "tok_[a-z0-9]{12}", entropy: 3.0, action: "block" }])
+  const dn = laid("tok_aaaaaaaaaaaa xx ", 5000, [4203], ["tok_q8w3e7r5t1y9"])
+  expect(applyRegex(dn, dense).blocked).toBe(true)
+  for (const step of [19, 256, 777]) expect(cursorDiff(dense, dn, step)).toBe("")
+  const runs = try compileRules([{ pattern: "(?:[a-z0-9]{2} ){20,60}", entropy: 3.0, action: "block" }])
+  for (const at of [1500, 2700, 3999]) {
+    const rn = laid("ab ", 5000, [at], ["q8 w3 e7 r5 t1 y9 u2 i4 o6 p0 z5 x7 c1 v3 b9 n2 m4 k6 j8 h0 g1 f3 d5 s7 "])
+    for (const step of [1, 19, 256, 777]) expect(cursorDiff(runs, rn, step)).toBe("")
+  }
+  // a shorter text starts the cursor over
+  const c = new BlockCursor(lit)
+  expect(c.blocked(wide.repeat(200))).toBe(false)
+  expect(c.blocked("PROJ-1234")).toBe(true)
+  expect(c.blocked("fine")).toBe(false)
 })

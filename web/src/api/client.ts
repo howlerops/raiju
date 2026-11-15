@@ -3,6 +3,7 @@
 // body and response types.
 import type { paths } from "./schema"
 import { adminToken, administrationMode, revokeSession } from "../auth"
+import { listOf } from "../fmt"
 import { apiCredentials, discarded, gatewaySignal, isActive, targetLabel, targetURL } from "../gateway"
 
 export class ApiError extends Error {
@@ -24,7 +25,7 @@ type QueryOf<O> = O extends { parameters: { query?: infer Q } } ? Q : never
 
 type Opts<O> = ([BodyOf<O>] extends [never] ? { body?: undefined } : { body?: BodyOf<O> | Record<string, unknown> }) &
   ([ParamsOf<O>] extends [never] ? { params?: undefined } : { params: ParamsOf<O> }) &
-  ([QueryOf<O>] extends [never] ? { query?: undefined } : { query?: QueryOf<O> })
+  ([QueryOf<O>] extends [never] ? { query?: undefined } : { query?: QueryOf<O> }) & { timeoutMs?: number }
 
 export interface RawOpts {
   body?: unknown
@@ -34,6 +35,8 @@ export interface RawOpts {
   // on 401, fail instead of opening the sign-in dialog (background reads)
   quiet?: boolean
   query?: Record<string, string | number | boolean | undefined>
+  // give up after this long (polling reads, so a stalled gateway cannot pile requests up)
+  timeoutMs?: number
 }
 
 export interface Raw {
@@ -76,6 +79,10 @@ export async function send(method: string, path: string, o: RawOpts = {}): Promi
   const publicProbe = path === "/health" || path === "/ready"
   const authenticated = o.auth !== false && !publicProbe
   const credentials = publicProbe ? "omit" : apiCredentials()
+  // One deadline for the whole call, body included.
+  const signal = o.timeoutMs ? AbortSignal.any([gatewaySignal(), AbortSignal.timeout(o.timeoutMs)]) : gatewaySignal()
+  const timedOut = () => !gatewaySignal().aborted && signal.aborted
+  const late = () => new ApiError(0, targetLabel() + " did not answer in time.")
   const attempt = async (): Promise<Raw> => {
     const headers: Record<string, string> = { accept: "application/json", ...(o.headers ?? {}) }
     if (o.body !== undefined) headers["content-type"] = "application/json"
@@ -95,10 +102,11 @@ export async function send(method: string, path: string, o: RawOpts = {}): Promi
         credentials,
         redirect: "error",
         referrerPolicy: "no-referrer",
-        signal: gatewaySignal(),
+        signal,
       })
     } catch {
       if (!isActive()) return discarded()
+      if (timedOut()) throw late()
       throw new ApiError(0, "Cannot reach " + targetLabel() + ". Check connectivity and regional CORS configuration.")
     }
     let text: string
@@ -106,6 +114,7 @@ export async function send(method: string, path: string, o: RawOpts = {}): Promi
       text = await res.text()
     } catch {
       if (!isActive()) return discarded()
+      if (timedOut()) throw late()
       throw new ApiError(0, "The gateway response could not be read.")
     }
     if (!isActive()) return discarded()
@@ -119,7 +128,7 @@ export async function send(method: string, path: string, o: RawOpts = {}): Promi
   }
   const r = await attempt()
   // /metrics may use a separate scrape token; its 401 does not reject the admin identity.
-  if (r.status === 401 && authenticated && path.startsWith("/api/")) revokeSession()
+  if (r.status === 401 && authenticated && path.startsWith("/api/")) revokeSession(bearer)
   if (!isActive()) return discarded()
   if (r.status < 200 || r.status >= 300) throw new ApiError(r.status, errorText(r.status, r.data, r.text, path))
   return r
@@ -133,11 +142,12 @@ function fill(path: string, params: Record<string, unknown> | undefined): string
 async function call<P extends keyof paths, M extends Method>(
   method: M,
   path: P,
-  opts: { params?: unknown; query?: unknown; body?: unknown },
+  opts: { params?: unknown; query?: unknown; body?: unknown; timeoutMs?: number },
 ): Promise<ResOf<OpOf<P, M>>> {
   const r = await send(method, fill(path as string, opts.params as Record<string, unknown> | undefined), {
     body: opts.body,
     query: opts.query as Record<string, string> | undefined,
+    timeoutMs: opts.timeoutMs,
   })
   return r.data as ResOf<OpOf<P, M>>
 }
@@ -153,6 +163,20 @@ export const api = {
   post: <P extends keyof paths>(path: P, ...a: Args<P, "post">) => call("post", path, (a[0] ?? {}) as object),
   put: <P extends keyof paths>(path: P, ...a: Args<P, "put">) => call("put", path, (a[0] ?? {}) as object),
   del: <P extends keyof paths>(path: P, ...a: Args<P, "delete">) => call("delete", path, (a[0] ?? {}) as object),
+}
+
+// The parsed body of a GET, for routes read without the schema types.
+export async function getData(path: string, query?: RawOpts["query"], timeoutMs?: number): Promise<unknown> {
+  return (await send("GET", path, { query, timeoutMs })).data
+}
+
+// A list for a form's options or a lookup: empty when the caller may not read it or the read fails.
+export async function listOr<T>(path: string, key: string): Promise<T[]> {
+  try {
+    return listOf<T>(await getData(path), key)
+  } catch {
+    return []
+  }
 }
 
 export function message(e: unknown): string {

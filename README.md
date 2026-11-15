@@ -12,7 +12,8 @@ Scope and priorities: [SCOPE.md](SCOPE.md) (from the
 
 ```sh
 make tov                         # Tov with the patches in tov-patches/ (needs git and cargo)
-make build                       # build/raiju (about 21 MB; links glibc, libstdc++ and JavaScriptCore)
+make jsc                         # optional: the JavaScriptCore the image links (15 min; cmake, ninja, clang, ruby, libicu-dev)
+make build                       # build/raiju (links glibc and libstdc++; JavaScriptCore from make jsc, else the system's libjavascriptcoregtk-4.1-dev)
 OPENAI_API_KEY=sk-... build/raiju            # no config: providers from env vars
 build/raiju -app-dir ~/.config/raiju         # load config.json from this directory
 build/raiju -config config.json -port 8080 -workers 4
@@ -158,7 +159,8 @@ curl localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '
 ## Inference auth
 
 `client.enforce_auth_on_inference` makes inference require a virtual key, or
-admin credentials. When it is omitted, Raiju turns it on if the config has credentials to
+admin credentials (a management user whose role is `admin` or holds the `RunInference`
+permission; a viewer's or auditor's credential reads the dashboard and is refused here). When it is omitted, Raiju turns it on if the config has credentials to
 use (virtual keys, admin users or `auth_config`), and leaves it off otherwise. Set it to
 `false` to serve anonymous inference with keys configured. `auth_config` takes
 `admin_username`, `admin_password` and `is_enabled`, at the top level or under `governance`.

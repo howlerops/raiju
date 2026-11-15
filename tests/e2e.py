@@ -612,8 +612,8 @@ def der_ints(der):
         i += 2 + ln
     return out
 
-def jwt_es256(key, kid, claims):
-    head = b64u(json.dumps({"alg": "ES256", "kid": kid, "typ": "JWT"}).encode()) + "." + b64u(json.dumps(claims).encode())
+def jwt_es256(key, kid, claims, header=None):
+    head = b64u(json.dumps({"alg": "ES256", "kid": kid, "typ": "JWT", **(header or {})}).encode()) + "." + b64u(json.dumps(claims).encode())
     der = subprocess.run(["openssl", "dgst", "-sha256", "-sign", key], input=head.encode(), check=True, capture_output=True).stdout
     r, s = der_ints(der)
     return head + "." + b64u(r.to_bytes(32, "big") + s.to_bytes(32, "big"))
@@ -773,7 +773,8 @@ def discovery_and_proxy():
         check("mdns discovery hears the peer's announcement and syncs with it", "mdns-a" in peer_nodes, sorted(set(peer_nodes)))
 
         # ALB: an ES256 token from the regional key endpoint (fetched on first use, so the first try can wait)
-        alb = jwt_es256(ec_key, "e2e-ec", {"exp": now + 600, "iat": now, "signer": ALB_ARN, "iss": "https://oidc.example", "email": "alice@example.com", "sub": "a1"})
+        # as AWS signs them: the load balancer's ARN is the header's signer; the payload is the identity provider's claims
+        alb = jwt_es256(ec_key, "e2e-ec", {"exp": now + 600, "iat": now, "iss": "https://oidc.example", "email": "alice@example.com", "sub": "a1"}, {"signer": ALB_ARN})
         hdr = {"x-amzn-oidc-data": alb}
         first = call("GET", "/api/config", headers=hdr, base=gws["alb"], auth=False)[0]
         s = first
@@ -785,10 +786,14 @@ def discovery_and_proxy():
         check("alb: the first request waits for the key, then the token opens the API", first == 401 and s == 200, (first, s))
         s = call("GET", "/api/users", headers=hdr, base=gws["alb"], auth=False)[0]
         check("alb: a provisioned editor may not manage users", s == 403, s)
-        other = jwt_es256(ec_key, "e2e-ec", {"exp": now + 600, "iat": now, "signer": ALB_ARN.replace("e2e-alb", "other-alb"), "email": "alice@example.com"})
+        other = jwt_es256(ec_key, "e2e-ec", {"exp": now + 600, "iat": now, "email": "alice@example.com"}, {"signer": ALB_ARN.replace("e2e-alb", "other-alb")})
         s = call("GET", "/api/config", headers={"x-amzn-oidc-data": other}, base=gws["alb"], auth=False)[0]
         check("alb: a token signed for another load balancer is refused", s == 401, s)
-        bob = jwt_es256(ec_key, "e2e-ec", {"exp": now + 600, "iat": now, "signer": ALB_ARN, "email": "bob@example.com"})
+        # a signer claim in the payload is the identity provider's word, not the load balancer's
+        forged = jwt_es256(ec_key, "e2e-ec", {"exp": now + 600, "iat": now, "signer": ALB_ARN, "email": "alice@example.com"}, {"signer": ALB_ARN.replace("e2e-alb", "other-alb")})
+        s = call("GET", "/api/config", headers={"x-amzn-oidc-data": forged}, base=gws["alb"], auth=False)[0]
+        check("alb: a signer named only in the payload is refused", s == 401, s)
+        bob = jwt_es256(ec_key, "e2e-ec", {"exp": now + 600, "iat": now, "email": "bob@example.com"}, {"signer": ALB_ARN})
         s, _, b = call("GET", "/api/config", headers={"x-amzn-oidc-data": bob}, base=gws["alb"], auth=False)
         check("alb login only: an identity that is not provisioned gets 403", s == 403 and "not provisioned" in b, (s, b))
         s = call("GET", "/api/config", base=gws["alb"], auth=False)[0]

@@ -438,7 +438,9 @@ gate runs) with:
 
 - secrets: `RAIJU_ADMIN_TOKEN`, `RAIJU_VKS`, and as needed `RAIJU_CLUSTER_SECRET`, `RAIJU_METRICS_TOKEN`,
   `RAIJU_SETUP_TOKEN`;
-- variables: `RAIJU_MODEL`, `RAIJU_SMOKE_MODELS`, and as needed `RAIJU_NODE_URLS`, `RAIJU_OLD_URL`,
+- variables: `RAIJU_STAGING_HOSTS` (required: the comma-separated `host[:port]` values `base_url` may name; the
+  job sends the secrets above to `base_url`, so it refuses any other host and anything but `https://`),
+  `RAIJU_MODEL`, `RAIJU_SMOKE_MODELS`, and as needed `RAIJU_NODE_URLS`, `RAIJU_OLD_URL`,
   `RAIJU_NEW_URL`, `RAIJU_RSS_CMD`, `RAIJU_RSS_METRIC`.
 
 Then Actions, Staging validation, Run workflow. GitHub-hosted runners reach only the ALB (add their address range

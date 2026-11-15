@@ -6,6 +6,8 @@
 export class Limiter {
   active: int = 0
   waiting: (() => void)[] = []
+  // the first queued request not yet let in: release() moves this on, so it does not copy the queue each time
+  head = 0
 
   constructor(readonly limit: int, readonly buffer: int, readonly drop: bool) {}
 
@@ -15,7 +17,7 @@ export class Limiter {
       this.active += 1
       return "ok"
     }
-    if (this.drop && this.waiting.length >= this.buffer) return "drop"
+    if (this.drop && this.waiting.length - this.head >= this.buffer) return "drop"
     return "wait"
   }
 
@@ -37,9 +39,17 @@ export class Limiter {
 
   // Gives the slot back. A queued request takes it over; otherwise the count goes down.
   release(): void {
-    if (this.waiting.length > 0) {
-      const next = this.waiting[0]!
-      this.waiting = this.waiting.slice(1)
+    if (this.head < this.waiting.length) {
+      const next = this.waiting[this.head]!
+      this.head += 1
+      // the taken prefix is dropped when the queue empties or once it is most of the array
+      if (this.head === this.waiting.length) {
+        this.waiting = []
+        this.head = 0
+      } else if (this.head > 1024 && this.head * 2 > this.waiting.length) {
+        this.waiting = this.waiting.slice(this.head)
+        this.head = 0
+      }
       next()
       return
     }
@@ -51,7 +61,7 @@ export class Limiter {
   }
 
   queued(): int {
-    return this.waiting.length
+    return this.waiting.length - this.head
   }
 }
 
@@ -89,6 +99,36 @@ test("release frees a slot, or hands it to the next waiter", () => {
   l.release()
   expect(l.inFlight()).toBe(0)
   // releasing an idle limiter stays at zero
+  l.release()
+  expect(l.inFlight()).toBe(0)
+})
+
+// the waiters a test let in, in order (a class, so the queued closures share it)
+class Seen {
+  order: int[] = []
+}
+
+test("waiters are let in in order, and the queue's taken prefix is dropped", () => {
+  const l = new Limiter(1, 5000, true)
+  expect(l.admit()).toBe("ok")
+  const seen = new Seen()
+  for (let i = 0; i < 3000; i++) l.waiting.push(() => seen.order.push(i))
+  const order = (): int[] => seen.order
+  expect(l.queued()).toBe(3000)
+  for (let i = 0; i < 2000; i++) l.release()
+  expect(l.queued()).toBe(1000)
+  expect(order().length).toBe(2000)
+  expect(order()[0]!).toBe(0)
+  expect(order()[1999]!).toBe(1999)
+  // compacted on the way: the array holds what is still queued, not everything ever queued
+  expect(l.waiting.length < 3000).toBe(true)
+  // the drop limit counts the queued requests only
+  expect(l.admit()).toBe("wait")
+  for (let i = 0; i < 1000; i++) l.release()
+  expect(l.queued()).toBe(0)
+  expect(l.waiting.length).toBe(0)
+  expect(order()[2999]!).toBe(2999)
+  expect(l.inFlight()).toBe(1)
   l.release()
   expect(l.inFlight()).toBe(0)
 })

@@ -13,7 +13,7 @@
 import { readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync, unlinkSync, rmSync, statSync } from "node:fs"
 import { writeFileAtomic, mkdirPrivate } from "./atomicfile"
 import { sha256, toHex, utf8, secureHex } from "./crypto"
-import { Field, fields, find, rawStr, rawNum, quote } from "./json"
+import { Field, fields, find, rawStr, rawNum, quote, floorInt } from "./json"
 import { newerProblem } from "./statever"
 import { isPrivateHost, isMetadataHost, urlVerdict, policyOf, peerOf } from "./netguard"
 import { deadline } from "./deadline"
@@ -94,7 +94,24 @@ export function pushKey(agent: string, task: string, id: string): string {
 
 // The file a config is kept in, and the file a queued push is kept in (its id is a hex digest).
 function configFile(agent: string, task: string, id: string): string {
-  return "c-" + toHex(sha256(utf8(agent + "\u0000" + task + "\u0000" + id))) + ".json"
+  return "c-" + toHex(sha256(utf8(agent + "\u001f" + task + "\u001f" + id))) + ".json"
+}
+
+// The name the same config had before its parts were separated: the "\u0000" literal the name was built with
+// reads as an empty string, so ("ab", "c") and ("a", "bc") shared a file. Still read, and removed when the
+// config is next written or dropped.
+function legacyConfigFile(agent: string, task: string, id: string): string {
+  return "c-" + toHex(sha256(utf8(agent + task + id))) + ".json"
+}
+
+// The id of a queued push: the same event pushed twice for one config is queued once.
+function deliveryId(agent: string, config: string, body: string): string {
+  return toHex(sha256(utf8(agent + "\u001f" + config + "\u001f" + body)))
+}
+
+// The id the same push had before its parts were separated (see legacyConfigFile).
+function legacyDeliveryId(agent: string, config: string, body: string): string {
+  return toHex(sha256(utf8(agent + config + body)))
 }
 
 function deliveryFile(id: string): string {
@@ -110,7 +127,7 @@ function newerItem(fs: Field[], name: string): bool {
   if (v <= f64(ITEM_VERSION)) return false
   if (!NEWER_ITEMS.has(name)) {
     NEWER_ITEMS.add(name)
-    console.error(`raiju: a2a push: ${newerProblem(name, Math.trunc(v), ITEM_VERSION)}: skipped`)
+    console.error(`raiju: a2a push: ${newerProblem(name, floorInt(v) ?? ITEM_VERSION + 1, ITEM_VERSION)}: skipped`)
   }
   return true
 }
@@ -160,7 +177,7 @@ export class PushStore {
     this.made = false
     this.lease = new FileLease(dir, this.leaseMs)
     for (const c of mem) {
-      if (!existsSync(dir + "/" + configFile(c.agent, c.task, c.id))) this.writeConfig(c)
+      if (!this.hasConfigFile(c)) this.writeConfig(c)
     }
     for (const d of memD) {
       if (!existsSync(dir + "/" + deliveryFile(d.id))) this.writeDelivery(d)
@@ -179,7 +196,7 @@ export class PushStore {
           if (t === "c") {
             const c = try JSON.parse(v) as PushConfig
             const own: PushConfig = { agent: c.agent, task: c.task, id: c.id, url: c.url, token: this.open(c.token), scheme: c.scheme, credentials: this.open(c.credentials), ingress: c.ingress, created_at: c.created_at, updated_at: c.updated_at }
-            if (!existsSync(this.dir + "/" + configFile(own.agent, own.task, own.id))) this.writeConfig(own)
+            if (!this.hasConfigFile(own)) this.writeConfig(own)
           } else if (t === "d") {
             const d = try JSON.parse(v) as PushDelivery
             if (!existsSync(this.dir + "/" + deliveryFile(d.id))) this.writeDelivery(d)
@@ -193,6 +210,26 @@ export class PushStore {
       console.error(`raiju: a2a push: could not read ${path}: ${e.message}`)
     }
     this.sync()
+  }
+
+  // Whether the legacy-named file holds this very config (it may hold another one that shared the name).
+  private legacyHolds(agent: string, task: string, id: string): bool {
+    const name = legacyConfigFile(agent, task, id)
+    if (!existsSync(this.dir + "/" + name)) return false
+    const c = this.readConfig(name)
+    return c !== undefined && c.agent === agent && c.task === task && c.id === id
+  }
+
+  // Whether a file has the config, under its name or the legacy one.
+  private hasConfigFile(c: PushConfig): bool {
+    return existsSync(this.dir + "/" + configFile(c.agent, c.task, c.id)) || this.legacyHolds(c.agent, c.task, c.id)
+  }
+
+  // Removes a config's file, and its legacy-named file when that one holds this config.
+  private dropConfig(agent: string, task: string, id: string): void {
+    if (this.dir === "") return
+    if (this.legacyHolds(agent, task, id)) this.dropFile(legacyConfigFile(agent, task, id))
+    this.dropFile(configFile(agent, task, id))
   }
 
   readConfig(name: string): PushConfig | undefined {
@@ -239,6 +276,8 @@ export class PushStore {
     const sealed: PushConfig = { agent: c.agent, task: c.task, id: c.id, url: c.url, token: this.seal(c.token), scheme: c.scheme, credentials: this.seal(c.credentials), ingress: c.ingress, created_at: c.created_at, updated_at: c.updated_at }
     try {
       try writeFileAtomic(this.dir + "/" + configFile(c.agent, c.task, c.id), `{"version":${ITEM_VERSION},"by":${process.pid},"v":${JSON.stringify(sealed)}}\n`)
+      // the copy under the legacy name is now stale
+      if (this.legacyHolds(c.agent, c.task, c.id)) this.dropFile(legacyConfigFile(c.agent, c.task, c.id))
     } catch (e) {
       this.made = false
       console.error(`raiju: a2a push: could not write in ${this.dir}: ${e.message}`)
@@ -274,20 +313,25 @@ export class PushStore {
     } catch (e) {
       return
     }
-    const oldC = new Map<string, PushConfig>()
-    for (const c of this.configs) oldC.set(configFile(c.agent, c.task, c.id), c)
+    // where each config already sits in nc: one kept under both its name and the legacy one is listed once,
+    // from the file under its name
+    const at = new Map<string, int>()
     const oldD = new Map<string, PushDelivery>()
     for (const d of this.deliveries) oldD.set(d.id, d)
     const nc: PushConfig[] = []
     const nd: PushDelivery[] = []
     for (const f of names) {
       if (f.startsWith("c-") && f.endsWith(".json")) {
-        const c = this.readConfig(f)
-        if (c !== undefined) {
+        // (a file that cannot be read just now keeps the config held for it: looked up only then)
+        const c = this.readConfig(f) ?? this.heldAs(f)
+        if (c === undefined) continue
+        const k = pushKey(c.agent, c.task, c.id)
+        const i = at.get(k)
+        if (i === undefined) {
+          at.set(k, nc.length)
           nc.push(c)
-        } else {
-          const o = oldC.get(f)
-          if (o !== undefined) nc.push(o)
+        } else if (f === configFile(c.agent, c.task, c.id)) {
+          nc[i] = c
         }
       } else if (f.startsWith("d-") && f.endsWith(".json")) {
         const o = oldD.get(f.slice(2, f.byteLength - 5))
@@ -305,6 +349,14 @@ export class PushStore {
     }
     this.configs = nc
     this.deliveries = nd
+  }
+
+  // The config in memory whose file, under its name or the legacy one, is f.
+  private heldAs(f: string): PushConfig | undefined {
+    for (const c of this.configs) {
+      if (f === configFile(c.agent, c.task, c.id) || f === legacyConfigFile(c.agent, c.task, c.id)) return c
+    }
+    return undefined
   }
 
   indexOfConfig(agent: string, task: string, id: string): int {
@@ -357,7 +409,7 @@ export class PushStore {
     if (i < 0) return false
     const old = this.configs[i]!
     this.configs = this.configs.filter((c) => !(c.agent === agent && c.task === task && c.id === id))
-    this.dropFile(configFile(agent, task, id))
+    this.dropConfig(agent, task, id)
     this.note(old, true)
     return true
   }
@@ -369,7 +421,7 @@ export class PushStore {
     if (gone.length === 0) return false
     this.configs = this.configs.filter((c) => !(c.agent === agent && c.ingress === hash && c.task === pendingTask))
     for (const c of gone) {
-      this.dropFile(configFile(c.agent, c.task, c.id))
+      this.dropConfig(c.agent, c.task, c.id)
       this.note(c, true)
     }
     return true
@@ -391,7 +443,7 @@ export class PushStore {
         const moved: PushConfig = { agent: c.agent, task: task, id: c.id, url: c.url, token: c.token, scheme: c.scheme, credentials: c.credentials, ingress: c.ingress, created_at: c.created_at, updated_at: Math.floor(Date.now()) }
         this.configs[i] = moved
         this.writeConfig(moved)
-        this.dropFile(configFile(c.agent, c.task, c.id))
+        this.dropConfig(c.agent, c.task, c.id)
         this.note(c, true)
         this.note(moved, false)
       }
@@ -501,7 +553,7 @@ export class PushStore {
     if (goneD.length > 0) this.deliveries = this.deliveries.filter((d) => d.status === "pending" || now - d.updated_at < RETENTION_MS)
     if (goneC.length > 0) this.configs = this.configs.filter((c) => agents.includes(c.agent) && !(c.task.startsWith(PENDING_PREFIX) && now - c.created_at > PENDING_TTL_MS))
     for (const d of goneD) this.dropFile(deliveryFile(d.id))
-    for (const c of goneC) this.dropFile(configFile(c.agent, c.task, c.id))
+    for (const c of goneC) this.dropConfig(c.agent, c.task, c.id)
     // the cluster state learns of the drops too, or it would send them back
     for (const c of goneC) this.note(c, true)
     if (this.dir === "") return
@@ -591,7 +643,10 @@ export function acceptPush(store: PushStore, agent: string, token: string, body:
   } else if (task !== taskId) {
     return refuse(400, "pushed event does not address the configured task")
   }
-  const id = toHex(sha256(utf8(agent + "\u0000" + cfg.id + "\u0000" + body)))
+  // A push queued before ids had separators is still the same push.
+  const legacy = store.delivery(legacyDeliveryId(agent, cfg.id, body))
+  if (legacy !== undefined && legacy.agent === agent && legacy.config === cfg.id && legacy.payload === body) return { status: 202, error: "", deliveryId: legacy.id }
+  const id = deliveryId(agent, cfg.id, body)
   store.addDelivery({ id: id, agent: agent, task: taskId, config: cfg.id, payload: body, status: "pending", attempts: 0, next_at: now, last_error: "", created_at: now, updated_at: now })
   return { status: 202, error: "", deliveryId: id }
 }
@@ -1046,4 +1101,52 @@ test("pruning removes the files of what it drops", () => {
   expect(a.configs.length).toBe(0)
   expect(a.deliveries.length).toBe(0)
   try rmSync(dir, { recursive: true, force: true })
+})
+
+test("config files and push ids keep their parts apart; ones stored under the legacy names are still found", () => {
+  expect(configFile("ab", "c", "x") === configFile("a", "bc", "x")).toBe(false)
+  expect(configFile("a", "bc", "x") === configFile("a", "b", "cx")).toBe(false)
+  expect(legacyConfigFile("ab", "c", "x")).toBe(legacyConfigFile("a", "bc", "x"))
+  expect(deliveryId("ab", "c", "{}") === deliveryId("a", "bc", "{}")).toBe(false)
+  const dir = tmpDir()
+  const a = new PushStore()
+  a.useDir(dir)
+  a.saveConfig(cfg("ab", "c", "x", "h1"))
+  a.saveConfig(cfg("a", "bc", "x", "h2"))
+  expect(a.config("ab", "c", "x")!.ingress).toBe("h1")
+  expect(a.config("a", "bc", "x")!.ingress).toBe("h2")
+  // a config kept under the legacy name by an earlier version
+  const text = try readFileSync(dir + "/" + configFile("ab", "c", "x"), "utf8")
+  try writeFileSync(dir + "/" + legacyConfigFile("echo", "t1", "c1"), text.replace(`"agent":"ab"`, `"agent":"echo"`).replace(`"task":"c"`, `"task":"t1"`).replace(`"id":"x"`, `"id":"c1"`))
+  const b = new PushStore()
+  b.useDir(dir)
+  expect(b.config("echo", "t1", "c1")!.ingress).toBe("h1")
+  expect(b.configs.length).toBe(3)
+  // written again, it moves to its own name and is listed once
+  b.saveConfig(cfg("echo", "t1", "c1", "h9"))
+  expect(existsSync(dir + "/" + legacyConfigFile("echo", "t1", "c1"))).toBe(false)
+  expect(existsSync(dir + "/" + configFile("echo", "t1", "c1"))).toBe(true)
+  expect(a.config("echo", "t1", "c1")!.ingress).toBe("h9")
+  expect(a.configs.length).toBe(3)
+  // removed while still under the legacy name, its file goes
+  try writeFileSync(dir + "/" + legacyConfigFile("echo", "t2", "c2"), text.replace(`"agent":"ab"`, `"agent":"echo"`).replace(`"task":"c"`, `"task":"t2"`).replace(`"id":"x"`, `"id":"c2"`))
+  expect(a.remove("echo", "t2", "c2")).toBe(true)
+  expect(existsSync(dir + "/" + legacyConfigFile("echo", "t2", "c2"))).toBe(false)
+  expect(b.config("echo", "t2", "c2")).toBeUndefined()
+  try rmSync(dir, { recursive: true, force: true })
+})
+
+test("a push queued under a legacy id is not queued again", () => {
+  const s = new PushStore()
+  const m = try mintToken()
+  s.saveConfig(cfg("echo", "t1", "c1", m.hash))
+  const body = `{"task":{"id":"t1"}}`
+  s.addDelivery({ id: legacyDeliveryId("echo", "c1", body), agent: "echo", task: "t1", config: "c1", payload: body, status: "pending", attempts: 0, next_at: 0, last_error: "", created_at: 0, updated_at: 0 })
+  const r = acceptPush(s, "echo", m.token, body, 5)
+  expect(r.status).toBe(202)
+  expect(r.deliveryId).toBe(legacyDeliveryId("echo", "c1", body))
+  expect(s.deliveries.length).toBe(1)
+  const other = acceptPush(s, "echo", m.token, `{"task":{"id":"t1"},"n":2}`, 6)
+  expect(other.deliveryId).toBe(deliveryId("echo", "c1", `{"task":{"id":"t1"},"n":2}`))
+  expect(s.deliveries.length).toBe(2)
 })

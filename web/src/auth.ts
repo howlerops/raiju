@@ -41,7 +41,14 @@ const [administrationMode, setAdministrationMode] = createSignal<AdministrationM
 const [verified, setVerified] = createSignal(false)
 export { tokenSet, dialog, verified, setVerified, administrationMode }
 
-export function revokeSession(): void {
+// rejected: the bearer the refused request carried. A late 401 for an older token must not erase the one a
+// sign-in has put in its place since.
+export function revokeSession(rejected?: string): void {
+  if (rejected !== undefined && rejected !== current) return
+  // A rejected bearer must not be offered again; this is not an identity change, so no reload.
+  try { writeToken("") } catch { /* the in-memory copy below is still dropped */ }
+  current = ""
+  setTokenSet(false)
   setVerified(false)
   setDialog(undefined)
   window.dispatchEvent(new Event("raiju-session-expired"))

@@ -103,6 +103,8 @@ export function TimeChart(props: TimeChartProps) {
   const [hover, setHover] = createSignal(-1)
   // the selected bucket range [a, b] (a may be above b while dragging), and the drag state
   const [sel, setSel] = createSignal<[number, number] | undefined>(undefined)
+  // the data table is built only while its <details> is open
+  const [tableOpen, setTableOpen] = createSignal(false)
   let dragFrom = -1
   let dragX0 = 0
   let dragMoved = false
@@ -211,9 +213,11 @@ export function TimeChart(props: TimeChartProps) {
       // a synthetic pointer cannot be captured; the drag still works inside the plot
     }
   }
+  // The chart outlives a refetch, so a readout or selection made on longer data is held to the data drawn now.
+  const hov = () => (hover() < n() ? hover() : -1)
   const bounds = (): [number, number] | undefined => {
     const s = sel()
-    return s ? [Math.min(s[0], s[1]), Math.max(s[0], s[1])] : undefined
+    return s && n() > 0 ? [clampIdx(Math.min(s[0], s[1])), clampIdx(Math.max(s[0], s[1]))] : undefined
   }
   // a line chart needs two points for a range; a bar chart may take one bucket
   const rangeOk = (b: [number, number]) => props.kind === "bars" || b[0] < b[1]
@@ -268,7 +272,7 @@ export function TimeChart(props: TimeChartProps) {
   }
 
   const tipLeft = () => {
-    const x = xAt(hover())
+    const x = xAt(hov())
     return x > w() / 2 ? { right: w() - x + 10 + "px" } : { left: x + 10 + "px" }
   }
 
@@ -376,36 +380,38 @@ export function TimeChart(props: TimeChartProps) {
                 />
               )}
             </Show>
-            <Show when={hover() >= 0}>
-              <line class="cross" x1={xAt(hover())} x2={xAt(hover())} y1={MT} y2={MT + plotH()} />
+            <Show when={hov() >= 0}>
+              <line class="cross" x1={xAt(hov())} x2={xAt(hov())} y1={MT} y2={MT + plotH()} />
             </Show>
           </svg>
-          <Show when={hover() >= 0}>
+          <Show when={hov() >= 0}>
             <div class="chart-tip" role="status" style={tipLeft()}>
-              <strong>{fullTime(props.times[hover()]!)}</strong>
+              <strong>{fullTime(props.times[hov()]!)}</strong>
               <For each={shown()} keyed={(s) => s.name}>
                 {(s) => (
                   <div>
                     <span class="swatch" style={{ background: colorOf(s()) }}></span>
-                    {s().name}: {props.format(s().values[hover()] ?? 0)}
+                    {s().name}: {props.format(s().values[hov()] ?? 0)}
                   </div>
                 )}
               </For>
             </div>
           </Show>
         </div>
-        <details class="chart-table">
+        <details class="chart-table" onToggle={(ev) => setTableOpen(ev.currentTarget.open)}>
           <summary>Data table</summary>
-          <Table cols={["Time", ...props.series.map((s) => s.name)]}>
-            <For each={props.times.map((t, i) => i)}>
-              {(i) => (
-                <tr>
-                  <td class="nowrap">{fullTime(props.times[i]!)}</td>
-                  <For each={props.series}>{(s) => <td>{props.format(s.values[i] ?? 0)}</td>}</For>
-                </tr>
-              )}
-            </For>
-          </Table>
+          <Show when={tableOpen()}>
+            <Table cols={["Time", ...props.series.map((s) => s.name)]}>
+              <For each={props.times.map((t, i) => i)}>
+                {(i) => (
+                  <tr>
+                    <td class="nowrap">{fullTime(props.times[i]!)}</td>
+                    <For each={props.series}>{(s) => <td>{props.format(s.values[i] ?? 0)}</td>}</For>
+                  </tr>
+                )}
+              </For>
+            </Table>
+          </Show>
         </details>
       </Show>
     </figure>
@@ -500,6 +506,8 @@ export function FrontierChart(props: FrontierProps) {
   const { w, ref } = useWidth(600)
   // the index of the hovered frontier vertex (in cost order), -1 for none
   const [hover, setHover] = createSignal(-1)
+  // the data table is built only while its <details> is open
+  const [tableOpen, setTableOpen] = createSignal(false)
   const H = () => props.height ?? 260
   const ML = 60
   const MR = 12
@@ -667,40 +675,42 @@ export function FrontierChart(props: FrontierProps) {
             )}
           </Show>
         </div>
-        <details class="chart-table">
+        <details class="chart-table" onToggle={(ev) => setTableOpen(ev.currentTarget.open)}>
           <summary>Data table</summary>
-          <Table cols={["Crew", "Kind", "Cost per task", "Quality"]}>
-            <For each={sorted()}>
-              {(p) => (
-                <tr>
-                  <td>{p.label}</td>
-                  <td>{p.label === props.current?.label ? "frontier, current" : "frontier"}</td>
-                  <td>{props.costFormat(p.cost)}</td>
-                  <td>{props.qualityFormat(p.quality)}</td>
-                </tr>
-              )}
-            </For>
-            <For each={props.uniform ?? []}>
-              {(p) => (
-                <tr>
-                  <td>{p.label}</td>
-                  <td>uniform</td>
-                  <td>{props.costFormat(p.cost)}</td>
-                  <td>{props.qualityFormat(p.quality)}</td>
-                </tr>
-              )}
-            </For>
-            <Show when={props.knee}>
-              {(k) => (
-                <tr>
-                  <td>{k().label}</td>
-                  <td>knee</td>
-                  <td>{props.costFormat(k().cost)}</td>
-                  <td>{props.qualityFormat(k().quality)}</td>
-                </tr>
-              )}
-            </Show>
-          </Table>
+          <Show when={tableOpen()}>
+            <Table cols={["Crew", "Kind", "Cost per task", "Quality"]}>
+              <For each={sorted()}>
+                {(p) => (
+                  <tr>
+                    <td>{p.label}</td>
+                    <td>{p.label === props.current?.label ? "frontier, current" : "frontier"}</td>
+                    <td>{props.costFormat(p.cost)}</td>
+                    <td>{props.qualityFormat(p.quality)}</td>
+                  </tr>
+                )}
+              </For>
+              <For each={props.uniform ?? []}>
+                {(p) => (
+                  <tr>
+                    <td>{p.label}</td>
+                    <td>uniform</td>
+                    <td>{props.costFormat(p.cost)}</td>
+                    <td>{props.qualityFormat(p.quality)}</td>
+                  </tr>
+                )}
+              </For>
+              <Show when={props.knee}>
+                {(k) => (
+                  <tr>
+                    <td>{k().label}</td>
+                    <td>knee</td>
+                    <td>{props.costFormat(k().cost)}</td>
+                    <td>{props.qualityFormat(k().quality)}</td>
+                  </tr>
+                )}
+              </Show>
+            </Table>
+          </Show>
         </details>
       </Show>
     </figure>

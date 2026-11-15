@@ -5,14 +5,13 @@
 import { createMemo, createSignal, For, Show } from "solid-js"
 import { api, ApiError } from "../api/client"
 import { FrontierChart, type FrontierMark } from "../charts"
-import { can } from "../perm"
+import { canCall } from "../perm"
 import type { CrewClass, CrewLearnedCell, CrewPool, CrewTaskDetail } from "../api/types"
-import { fmtInt, fmtMoney, fmtTime, splitList } from "../fmt"
+import { dash, fmtInt, fmtMoney, fmtTime, splitList } from "../fmt"
 import { FormError, Guard, Mono, notify, Table, Toolbar, useFormRun, useRun } from "../ui"
 
 type Part = { role?: string; candidate?: string }
 
-const dash = (v: unknown): string => (v === undefined || v === null || v === "" ? "—" : String(v))
 // a number, or "—" when the listing has none (null)
 const nz = (v: unknown, f: (n: number) => string): string => (typeof v === "number" && Number.isFinite(v) ? f(v) : "—")
 const usd = (n: number): string => (n === 0 ? "$0" : n >= 1 ? "$" + n.toFixed(2) : "$" + n.toFixed(4))
@@ -380,7 +379,7 @@ function TaskDetail(props: { d: CrewTaskDetail }) {
 
 // The task lookup, and for writers the three actions on a task: assign, record an outcome, ask for the next attempt.
 function TaskPanel(props: { pools: () => CrewPool[] }) {
-  const writer = () => can("Crews", "Create")
+  const writer = () => canCall("POST", "/api/crews")
   const [pool, setPool] = createSignal(props.pools()[0]?.name ?? "")
   const [taskId, setTaskId] = createSignal("")
   const [detail, setDetail] = createSignal<CrewTaskDetail | undefined>(undefined)

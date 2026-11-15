@@ -1,5 +1,5 @@
 import { createSignal, For, lazy, Loading, Match, onSettled, Show, Switch, Errored } from "solid-js"
-import { send, ApiError } from "./api/client"
+import { send, ApiError, message } from "./api/client"
 import { administrationMode, configureAdministrationMode, dialog, dismissSignIn, openSignIn, setToken, tokenSet, verified, setVerified, revokeSession } from "./auth"
 import { can, me, refreshMe, roleLabel, verifyToken } from "./perm"
 import { notify, Toasts, type Tone } from "./ui"
@@ -77,7 +77,7 @@ async function bootstrap(): Promise<void> {
       catch (e) { if (mode === "loginless" || !(e instanceof ApiError && e.status === 401)) throw e }
       if (mode === "native") checkSso()
     }
-  } catch (e) { setBootstrapError(e instanceof Error ? e.message : String(e)) }
+  } catch (e) { setBootstrapError(message(e)) }
   finally { setChecked(true) }
 }
 
@@ -94,13 +94,19 @@ async function setupDone(token: string): Promise<void> {
   await bootstrap()
 }
 
+let healthPending = false
 async function checkHealth(): Promise<void> {
+  // one probe at a time, and each gives up before the next tick is due
+  if (healthPending) return
+  healthPending = true
   try {
-    await send("GET", "/health", { auth: false })
+    await send("GET", "/health", { auth: false, timeoutMs: 8000 })
     setHealth({ text: "gateway ok", tone: "ok" })
   } catch (e) {
     const s = e instanceof ApiError && e.status ? "gateway error " + e.status : "gateway unreachable"
     setHealth({ text: s, tone: "bad" })
+  } finally {
+    healthPending = false
   }
 }
 
@@ -150,7 +156,7 @@ function SignIn(props: { account?: boolean }) {
         if (typeof token !== "string" || !token) throw new Error("The gateway did not return a session token.")
         await save(token)
       }
-    } catch (e) { setError(e instanceof Error ? e.message : String(e)) }
+    } catch (e) { setError(message(e)) }
     finally { if (password) password.value = ""; setBusy(false) }
   }
   const logout = async () => {
@@ -249,7 +255,7 @@ export function App() {
               <select class="select select-sm w-full" id="gateway-select" value={target().id} onChange={(ev) => {
                 try { switchGateway(ev.currentTarget.value) } catch (e) {
                   ev.currentTarget.value = target().id
-                  notify(e instanceof Error ? e.message : String(e), "error")
+                  notify(message(e), "error")
                 }
               }}>
                 <For each={config().gateways}>{(gateway) => <option value={gateway.id}>{gateway.name}</option>}</For>

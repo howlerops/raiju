@@ -2,7 +2,7 @@
 // rotation, fallbacks), translation, accounting.
 import { Config, KeyConfig, ProviderConfig, ComplexitySettings, BedrockKeyConfig, InjectedTool, OAuthKeyConfig, LogExportsConfig, providerOf } from "./config"
 import { applyPrompt, Applied } from "./prompts"
-import { Field, fields, find, elements, quote, rawBool, rawStr, isNull, build, setField, without } from "./json"
+import { Field, fields, find, elements, quote, rawBool, rawStr, rawNum, isNull, build, setField, without } from "./json"
 import { ChatRequest, errorJson, newId, Hdrs, hdrs, snapshot } from "./schemas"
 import { OpenAIPassthrough, ResponsesPassthrough, AnthropicToOpenAI, GeminiToOpenAI, BedrockEventStreamToOpenAI, SseSplitter } from "./streams"
 import { CohereToOpenAI } from "./streams_cohere"
@@ -33,7 +33,7 @@ import * as vertexWif from "./vertexwif"
 import * as bedrockMantle from "./providers/bedrock_mantle"
 import { CompatPlan, Shaped, settingsOf, withHeader, responseToChat, chatToText, textFrame, chatSseToText, textToChatFields } from "./compat"
 import { ResponsesToChatStream, ChatToResponses, toResponse, toResponseStream } from "./responses"
-import { ModelRef, parseModel, parseModelVia, target, kindOf, classify, backoffMs, maxRetries, timeoutMs, healthId, resolveAlias, matchedAlias, directRefs, directionOpts } from "./router"
+import { ModelRef, ModelIndex, modelIndex, parseModel, parseModelVia, parseModelIndexed, target, kindOf, classify, backoffMs, maxRetries, timeoutMs, healthId, resolveAlias, matchedAlias, directRefs, directionOpts } from "./router"
 import { CrewPick, crewRoute, withReasoningEffort, reasoningEffortText } from "./crew"
 import { forwardedHeaders, headerFilterOf } from "./headerfilter"
 import * as anthropicBeta from "./anthropic_beta"
@@ -63,7 +63,7 @@ import { LogStore, LogEntry, defaultLogStoreConfig } from "./logstore"
 import { dirProblem } from "./audit"
 import { isoMs } from "./exports"
 import { Tracer, Span, StageTiming, genAiAttributes, exportRequest, traceparentFor, tracesOn, TlsOpts, usesGrpc, exportSpansGrpc } from "./otel"
-import { McpManager, McpKeyConfig, keyRuleAllows, injectTools, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns, sanitizeName, perUserClientNames, perUserOAuthNames, tokenExchangeNames, userHeadersFor, ToolText, chatToolName, patternMatches, adminRowOf, ProjectMcp } from "./mcp"
+import { McpManager, McpKeyConfig, keyRuleAllows, injectToolFields, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns, sanitizeName, perUserClientNames, perUserOAuthNames, tokenExchangeNames, userHeadersFor, ToolText, chatToolName, patternMatches, adminRowOf, ProjectMcp } from "./mcp"
 import { CodeEntry, codeEntries, runMeta, metaToolDefs, isMetaTool, META_TOOLS, limitsOf, bindingLevelOf, execAutoAllowed } from "./codemode"
 import { McpTokenExchange, ExchangeCache, IdpEndpoints, exchangeKey, exchangeToken, renewAdmin, renewAt, needsReverify, RENEW_RETRY_MS, ADMIN_TAKEOVER_MS, ADMIN_WAIT_MS, ADMIN_POLL_MS } from "./tokenexchange"
 import { McpAuthConfig } from "./mcpauth"
@@ -74,9 +74,9 @@ import { JobStore } from "./jobs"
 import { fetchPluginUrls, missingPluginUrls, PluginSource } from "./plugindl"
 import { BasePlugin, PreResult, PostResult, PluginChain, PluginContext, PluginEntry, PluginRun, PluginTrace, PluginLogEntry, pluginLogsJson, PostOutcome, RUN_HEADER, TRACE_HEADER, ATTEMPT_HEADER, buildChain, jsonStreamEnabled, JsonStreamFixer, pluginErrorMessage, parsePluginError, errorPost } from "./plugins"
 import { SseBuffer, sseData, sseWithData } from "./plughttp"
-import { SemanticCache, SemanticCacheConfig, defaultSemanticConfig, promptText, parseEmbedding, scopeKey, identityScope, hasToolCalls } from "./semcache"
+import { SemanticCache, SemanticCacheConfig, defaultSemanticConfig, promptText, parseEmbedding, scopeKey, identityScope, requestThreshold, hasToolCalls } from "./semcache"
 import { Deadline, deadline, IdleWatch, idleWatch, streamIdleSeconds } from "./deadline"
-import { logMetadata, correlationIds, maximAttrs, stopReasonOf, stopReasonOfTail, toolNamesOfBody, ToolNameStream } from "./reqlog"
+import { logMetadata, correlationIds, maximAttrs, stopReasonOfTail, stopAndToolNames, ToolNameStream } from "./reqlog"
 import { VectorStore, openVectorStore, scopeTag } from "./vectorstore"
 import * as cloudAuth from "./cloud_auth"
 import * as oauthKey from "./oauth_key"
@@ -476,13 +476,13 @@ export class StreamConverter {
 
   // Whole frames only: a text completion frame is built from a complete chat frame.
   private textPost(s: string): string {
-    this.txtPending += s
+    // the whole frames are cut out in one pass; the unfinished tail stays pending
+    const parts = (this.txtPending + s).split("\n\n")
+    const last = parts.length - 1
+    this.txtPending = parts[last]!
     let res = ""
-    while (true) {
-      const i = this.txtPending.indexOf("\n\n")
-      if (i < 0) break
-      const ev = this.txtPending.slice(0, i)
-      this.txtPending = this.txtPending.slice(i + 2)
+    for (let n = 0; n < last; n++) {
+      const ev = parts[n]!
       if (ev !== "") res += textFrame(ev) + "\n\n"
     }
     return res
@@ -497,13 +497,13 @@ export class StreamConverter {
     const iv = this.iv
     const ro = this.respOut
     if (st === undefined && g === undefined && co === undefined && cv === undefined && iv === undefined && ro === undefined) return s
-    this.pending += s
+    // the whole events are cut out in one pass; the unfinished tail stays pending
+    const parts = (this.pending + s).split("\n\n")
+    const last = parts.length - 1
+    this.pending = parts[last]!
     let res = ""
-    while (true) {
-      const i = this.pending.indexOf("\n\n")
-      if (i < 0) break
-      const ev = this.pending.slice(0, i)
-      this.pending = this.pending.slice(i + 2)
+    for (let n = 0; n < last; n++) {
+      const ev = parts[n]!
       for (const line of ev.split("\n")) {
         if (!line.startsWith("data:")) continue
         const payload = line.slice(5).trim()
@@ -777,11 +777,6 @@ function fallbackIndex(allowed: ModelRef[], provider: string, model: string): in
   return 0
 }
 
-// The cache id for a direct entry is a hash of its cache key.
-function cacheId(key: string): string {
-  return toHex(sha256(utf8(key)))
-}
-
 // On a hit, the provider, model and prompt tokens of the answer as it was first served.
 function originHeaders(inout out: Hdrs, o: CacheOrigin | undefined): void {
   if (o === undefined) return
@@ -820,7 +815,8 @@ export function retryHintMs(ms: string | undefined, after: string | undefined): 
 }
 
 function clampRetryMs(ms: f64): f64 {
-  return Math.min(Math.max(Math.floor(ms), 1000), 300000)
+  // clamped before it is floored: Math.floor traps on a float out of the int range
+  return Math.floor(Math.min(Math.max(ms, 1000.0), 300000.0))
 }
 
 test("retry hint: retry-after-ms first, then Retry-After seconds, clamped to 1s..5m", () => {
@@ -970,6 +966,9 @@ export function pluginPaths(cfg: Config): PluginSource[] {
   return out
 }
 
+// A request's MCP access (Engine.mcpAccess).
+type McpAccess = { policy: string[] | undefined, keys: McpKeyConfig[] | undefined, proj: ProjectMcp | undefined }
+
 // Telemetry user_name for the user assigned to a virtual key: the configured user's id, which also serves
 // as the user's name here, or "" when no user is assigned.
 export function userNameOf(cfg: Config, userId: string): string {
@@ -978,6 +977,13 @@ export function userNameOf(cfg: Config, userId: string): string {
     if (u.name === userId) return u.name
   }
   return ""
+}
+
+// The names of the configured governance users, for userNameOf without a scan of the list.
+function userNameSet(cfg: Config): Set<string> {
+  const out: Set<string> = new Set()
+  for (const u of cfg.governance?.users ?? []) out.add(u.name)
+  return out
 }
 
 export function errorResponse(status: int, message: string, type: string, extra: Hdrs): Response {
@@ -1183,13 +1189,16 @@ function directTarget(cfg: Config, ref: ModelRef, key: string): { t: Target, key
   return { t: { provider: ref.provider, kind: kindOf(ref.provider, p), model: ref.model, key: k, cfg: p }, keyIndex: -1 }
 }
 
-function fallbackRefs(cfg: Config, body: Field[]): ModelRef[] {
+function fallbackRefs(cfg: Config, body: Field[], idx?: ModelIndex): ModelRef[] {
   const out: ModelRef[] = []
   const raw = find(body, "fallbacks")
   if (raw === undefined || isNull(raw)) return out
   try {
     for (const el of elements(raw)) {
-      if (el.startsWith("\"")) out.push(parseModel(cfg, JSON.parse(el) as string))
+      if (el.startsWith("\"")) {
+        const name = JSON.parse(el) as string
+        out.push(idx === undefined ? parseModel(cfg, name) : parseModelIndexed(cfg, idx, name, ""))
+      }
       else if (el.startsWith("{")) {
         // { "provider": "anthropic", "model": "claude-..." }
         const f = fields(el)
@@ -1580,6 +1589,42 @@ export function logsOnlyFound(text: string, found: LogFinding[], vault: Vault): 
 }
 
 // A request with an x-request-id (made for a caller that sent none), its body given again as text.
+// Whether a request asks for more than one choice: n above 1, or a text completion with several prompts. The stream
+// guard (guard_stream.tov) follows one choice's text, so a guarded stream of several is refused.
+export function manyChoices(body: Field[]): bool {
+  const n = rawNum(body, "n")
+  if (n !== undefined && n > 1.0) return true
+  const p = find(body, "prompt")
+  if (p === undefined || !p.startsWith("[")) return false
+  try {
+    const els = try elements(p)
+    // an array of numbers is one prompt's tokens
+    return els.length > 1 && (els[0]!.startsWith("\"") || els[0]!.startsWith("["))
+  } catch (e) {
+    return false
+  }
+}
+
+const MANY_CHOICES_GUARDED = "a streamed answer with more than one choice cannot be checked by the output guardrails: send n = 1 (one prompt) or stream: false"
+
+// The caller's x-request-id when it can be the request's id, else "". The id becomes the log row's id and part of
+// object-storage keys, so only 1 to 128 of letters, digits, ".", "_" and "-" are taken.
+export function callerRequestId(v: string | undefined): string {
+  if (v === undefined || v.byteLength < 1 || v.byteLength > 128) return ""
+  for (const b of utf8(v)) {
+    const c = int(b)
+    const ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 46 || c === 95 || c === 45
+    if (!ok) return ""
+  }
+  return v
+}
+
+// The id a request is logged and answered under: the caller's x-request-id when acceptable, else one made here.
+export function requestIdOf(v: string | undefined): string {
+  const given = callerRequestId(v)
+  return given !== "" ? given : newId("req_")
+}
+
 function withRequestId(req: Request, rid: string, body: string): Request {
   const hs: Record<string, string> = new Map()
   req.headers.forEach((v, k) => {
@@ -1756,9 +1801,15 @@ export class Engine {
   wsLive: SocketGate
   // large_payload_optimization, when it is on (largepayload.tov)
   large: LargeSettings | undefined = undefined
+  // read from cfg's providers and governance users, at the start and at each reload: the bare model names and
+  // aliases the keys list (router.tov ModelIndex) and the user names (userNameOf)
+  modelIdx: ModelIndex
+  userNames: Set<string>
 
   constructor(public cfg: Config) {
     this.gov = new Governance(cfg)
+    this.modelIdx = modelIndex(cfg)
+    this.userNames = userNameSet(cfg)
     this.large = largeSettings(cfg)
     const wsMax = cfg.websocket?.max_connections_per_user ?? 100
     this.wsResponses = new SocketGate(wsMax)
@@ -1990,6 +2041,18 @@ export class Engine {
     return this.streamGuards(guardOn).length > 0 || this.streamBuiltin(guardOn) !== undefined
   }
 
+  // Whether an output guard can block or redact a streamed answer: the built-in guard, or a local rule that is
+  // not detect_only. A provider that only records findings leaves the stream as it is.
+  streamActs(guardOn: bool): bool {
+    if (this.streamBuiltin(guardOn) !== undefined) return true
+    for (const p of this.streamGuards(guardOn)) {
+      for (const r of p.rules) {
+        if (r.action !== "detect_only") return true
+      }
+    }
+    return false
+  }
+
   // The delay between replayed events (guardrails.stream_replay_event_interval_ms, at most 1000 ms). It applies
   // only when a block-capable output guard is on: a local rule or the built-in guard in block mode. 0 otherwise.
   replayPace(): int {
@@ -2128,6 +2191,8 @@ export class Engine {
       const reader = run.stream.getReader()
       let chunkIndex = 0
       let lastAt = started
+      // the stream's two latency histograms, looked up once and not per chunk
+      const chunkTimes = metrics.streamHistograms(run.labels)
       while (true) {
         if (sink.cancelled || conv.halted) {
           await reader.cancel()
@@ -2150,7 +2215,7 @@ export class Engine {
           if (out !== "") {
             wrote = true
             const at = performance.now()
-            metrics.observeStreamChunk(run.labels, chunkIndex, (at - lastAt) / 1000.0)
+            chunkTimes.observe(chunkIndex, (at - lastAt) / 1000.0)
             chunkIndex += 1
             lastAt = at
             sink.write(out)
@@ -2347,15 +2412,15 @@ export class Engine {
   }
 
   refOf(model: string): ModelRef {
-    return parseModel(this.cfg, model)
+    return parseModelIndexed(this.cfg, this.modelIdx, model, "")
   }
 
   refVia(model: string, route: string): ModelRef {
-    return parseModelVia(this.cfg, model, route)
+    return parseModelIndexed(this.cfg, this.modelIdx, model, route)
   }
 
   fallbacksOf(body: Field[]): ModelRef[] {
-    return fallbackRefs(this.cfg, body)
+    return fallbackRefs(this.cfg, body, this.modelIdx)
   }
 
   directPlan(refs: ModelRef[], pinned: bool): ModelRef[] {
@@ -2363,7 +2428,7 @@ export class Engine {
   }
 
   userName(userId: string): string {
-    return userNameOf(this.cfg, userId)
+    return userId !== "" && this.userNames.has(userId) ? userId : ""
   }
 
   injectedName(name: string): string | undefined {
@@ -2824,6 +2889,8 @@ export class Engine {
     fresh.gov.carryUsage(this.gov)
     if (this.sharedWindows) fresh.gov.alignWindows()
     this.cfg = cfg
+    this.modelIdx = fresh.modelIdx
+    this.userNames = fresh.userNames
     this.gov = fresh.gov
     this.pricing = fresh.pricing
     // a datasheet fetched at runtime carries over
@@ -2927,12 +2994,37 @@ export class Engine {
   }
 
   withMcpTools(text: string, h: Hdrs): string throws SyntaxError {
+    return (try this.mcpChat(text, h)).text
+  }
+
+  // withMcpTools in one pass over the request: the tools and the servers' instructions go into the same parsed
+  // fields. body is those fields when the request was parsed here (text is then built from them, or unchanged),
+  // so the caller need not parse it again; undefined when it was not.
+  mcpChat(text: string, h: Hdrs): { text: string, body: Field[] | undefined } throws SyntaxError {
     const m = this.mcp
-    if (m === undefined) return text
-    const tools = try this.mcpToolsFor(m, h)
-    if (tools.length === 0) return text
-    const withTools = try injectTools(text, tools)
-    return try this.withMcpInstructions(withTools, m, h, tools)
+    if (m === undefined) return { text: text, body: undefined }
+    const acc = this.mcpAccess(h)
+    const tools = try this.mcpToolsFor(m, h, acc)
+    if (tools.length === 0) return { text: text, body: undefined }
+    let fs = try fields(text)
+    const added = try injectToolFields(&fs, tools)
+    const told = try this.mcpInstructionFields(&fs, m, acc, tools)
+    return { text: added || told ? build(fs) : text, body: fs }
+  }
+
+  // The caller's MCP access, read from the request once: the access profile's tool patterns (policyFor), the
+  // key's rules (keyMcp) and the project's (projectMcp).
+  mcpAccess(h: Hdrs): McpAccess {
+    const vk = this.gov.findKey(h)
+    const pol = vk === undefined ? undefined : this.gov.policies.get(vk.id)
+    const policy = pol === undefined ? undefined : pol.mcpTools
+    let keys: McpKeyConfig[] | undefined = undefined
+    if (vk !== undefined) {
+      const own = vk.mcp_configs
+      if (own !== undefined) keys = own
+      else if (policy === undefined) keys = []
+    }
+    return { policy: policy, keys: keys, proj: this.projectMcp(h) }
   }
 
   // Add MCP tools in Responses format, preserving tools already named in the request,
@@ -2940,7 +3032,8 @@ export class Engine {
   withMcpResponses(text: string, h: Hdrs): string throws SyntaxError {
     const m = this.mcp
     if (m === undefined) return text
-    const tools = try this.mcpToolsFor(m, h)
+    const acc = this.mcpAccess(h)
+    const tools = try this.mcpToolsFor(m, h, acc)
     if (tools.length === 0) return text
     let fs = try fields(text)
     const names: string[] = []
@@ -2970,7 +3063,7 @@ export class Engine {
       out.push(build(rt))
     }
     setField(&fs, "tools", "[" + out.join(",") + "]")
-    const parts = m.instructionParts(this.gov.policyFor(h)?.mcpTools, this.keyMcp(h), this.projectMcp(h)).filter((p) => tools.some((t) => t.includes(`"name":"${p.name}-`)))
+    const parts = m.instructionParts(acc.policy, acc.keys, acc.proj).filter((p) => tools.some((t) => t.includes(`"name":"${p.name}-`)))
     const block = parts.length === 0 ? "" : m.renderInstructions(parts)
     if (block !== "") {
       const own = rawStr(fs, "instructions") ?? ""
@@ -2981,13 +3074,14 @@ export class Engine {
 
   // The MCP tools a request is offered (chat tool definitions): the key's rules, then x-raiju-mcp-include-clients and
   // x-raiju-mcp-include-tools; the code mode meta-tools stand in for the code mode clients' tools.
-  mcpToolsFor(m: McpManager, h: Hdrs): string[] throws SyntaxError {
+  mcpToolsFor(m: McpManager, h: Hdrs, access?: McpAccess): string[] throws SyntaxError {
     // With client.mcp_disable_auto_tool_inject, tools are added only when the request names their clients or tools.
     const named = h.get("x-raiju-mcp-include-clients") !== undefined || h.get("x-raiju-mcp-include-tools") !== undefined
     if (this.cfg.client?.mcp_disable_auto_tool_inject === true && !named) return []
     // a key's access profile may limit the MCP tools it gets; clients it doesn't name
     // count only with allow_by_default
-    let tools = m.allToolsFor(this.gov.policyFor(h)?.mcpTools, this.keyMcp(h), this.projectMcp(h))
+    const acc = access ?? this.mcpAccess(h)
+    let tools = m.allToolsFor(acc.policy, acc.keys, acc.proj)
     const only = h.get("x-raiju-mcp-include-clients")
     if (only !== undefined) {
       if (only.trim() === "none") return []
@@ -3007,7 +3101,7 @@ export class Engine {
       tools = kept
     }
     // code mode: the four meta-tools stand in for the code mode clients' tools (not when the request narrows them)
-    if (only === undefined && onlyTools === undefined && this.codeEntriesFor(m, h).length > 0) {
+    if (only === undefined && onlyTools === undefined && this.codeEntriesFor(m, h, acc).length > 0) {
       for (const d of metaToolDefs()) tools.push(d)
     }
     return tools
@@ -3015,23 +3109,23 @@ export class Engine {
 
   // The instructions the connected MCP servers sent (capped as mcp.max_instructions_* say) go to the model
   // as a system message ahead of the caller's own, for the servers that still offer a tool in this request.
-  withMcpInstructions(text: string, m: McpManager, h: Hdrs, tools: string[]): string throws SyntaxError {
-    const parts = m.instructionParts(this.gov.policyFor(h)?.mcpTools, this.keyMcp(h), this.projectMcp(h)).filter((p) => tools.some((t) => t.includes(`"name":"${p.name}-`)))
-    if (parts.length === 0) return text
+  mcpInstructionFields(inout fs: Field[], m: McpManager, acc: McpAccess, tools: string[]): bool throws SyntaxError {
+    const parts = m.instructionParts(acc.policy, acc.keys, acc.proj).filter((p) => tools.some((t) => t.includes(`"name":"${p.name}-`)))
+    if (parts.length === 0) return false
     const block = m.renderInstructions(parts)
-    if (block === "") return text
-    let fs = try fields(text)
+    if (block === "") return false
     const mraw = find(fs, "messages")
-    if (mraw === undefined || isNull(mraw)) return text
+    if (mraw === undefined || isNull(mraw)) return false
     const items = try elements(mraw)
     items.unshift(`{"role":"system","content":${quote(block)}}`)
     setField(&fs, "messages", "[" + items.join(",") + "]")
-    return build(fs)
+    return true
   }
 
   // The code mode servers a caller may reach, as the stubs and the runner name them.
-  codeEntriesFor(m: McpManager, h: Hdrs): CodeEntry[] {
-    return codeEntries(m.codeToolsFor(this.gov.policyFor(h)?.mcpTools, this.keyMcp(h), this.projectMcp(h)))
+  codeEntriesFor(m: McpManager, h: Hdrs, access?: McpAccess): CodeEntry[] {
+    const acc = access ?? this.mcpAccess(h)
+    return codeEntries(m.codeToolsFor(acc.policy, acc.keys, acc.proj))
   }
 
   // One MCP tool call for a request, with the gates a direct call gets: the guardrails on the call, the
@@ -3692,7 +3786,7 @@ export class Engine {
       const tg = m.targets[i]!
       const next: ModelRef = { provider: tg.provider, model: tg.model ?? cur.model }
       const out: ModelRef[] = [next]
-      for (const f of m.fallbacks) out.push(parseModel(this.cfg, f))
+      for (const f of m.fallbacks) out.push(this.refOf(f))
       decided = out
       if (tg.key_id !== undefined) h.set("x-raiju-api-key", tg.key_id)
       h.set("x-raiju-routing-rule", m.rule)
@@ -3708,9 +3802,10 @@ export class Engine {
 
   // Shared front half of every inference endpoint.
   // emulated: a decision answered by a chat or Responses call (compat's convert_decision_to_responses), billed as that call
-  async serve(req: Request, op: string, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool, upstreamHeaders?: Map<string, string>, sink?: StreamSink, makeConverter?: ConverterFactory, compat?: CompatPlan, prompt?: Applied, emulated?: bool, large?: LargeBody, attemptHook?: AttemptPlugins): Promise<Response> {
-    const h = snapshot(req.headers)
-    const ctx = new ReqCtx(h.get("x-request-id") ?? newId("req_"), op, performance.now())
+  async serve(req: Request, op: string, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool, upstreamHeaders?: Map<string, string>, sink?: StreamSink, makeConverter?: ConverterFactory, compat?: CompatPlan, prompt?: Applied, emulated?: bool, large?: LargeBody, attemptHook?: AttemptPlugins, hdrs?: Hdrs): Promise<Response> {
+    // hdrs: the copy of req's headers the caller already made
+    const h = hdrs ?? snapshot(req.headers)
+    const ctx = new ReqCtx(requestIdOf(h.get("x-request-id")), op, performance.now())
     ctx.large = large
     // a hooked route's request with fallbacks brings its plugins across the attempts (llmHooked registered them)
     const hook = attemptHook ?? (op === "chat" ? undefined : this.attemptRuns.get(h.get(ATTEMPT_HEADER) ?? ""))
@@ -3949,14 +4044,19 @@ export class Engine {
     const cache = ctx.large === undefined ? this.cache : undefined
     let key = ""
     const noStore = h.get("x-raiju-cache-no-store") === "true"
+    // whose cache entries these are: the virtual key, or without one the caller's own identity (a hash of its direct
+    // provider key or checked credential), so two keyless callers never read each other's answers
+    let cacheWho = grant.vk?.id ?? ""
+    if (grant.vk === undefined && ctx.large === undefined && (this.cache !== undefined || this.semantic !== undefined)) cacheWho = this.gov.cacheIdentity(h)
     if (cache !== undefined) {
-      const scope = keyScope(op + (h.get("x-raiju-cache-key") ?? ""), grant.vk?.id ?? "", this.cfg.cache?.scope_by_virtual_key !== false)
+      const scope = keyScope(op + (h.get("x-raiju-cache-key") ?? ""), cacheWho, this.cfg.cache?.scope_by_virtual_key !== false)
+      // the cache id: hashed once here, then the entry's key for the lookup, the store and the hit's header
       key = cacheKey(scope, model, text)
       const hit = cache.get(key)
       if (hit !== undefined) {
         metrics.observeCacheHit(ctx.labels, "direct")
         out.set("x-raiju-cache", "hit")
-        cacheHeaders(&out, "direct", primary, undefined, undefined, cacheId(key), performance.now() - started)
+        cacheHeaders(&out, "direct", primary, undefined, undefined, key, performance.now() - started)
         originHeaders(&out, hit.origin)
         out.set("content-type", hit.contentType)
         ctx.cached = true
@@ -3968,8 +4068,9 @@ export class Engine {
           return respond(hitBody.status, hitBody.body, out)
         }
         if (this.logStore !== undefined) {
-          ctx.stopReason = stopReasonOf(hitBody.body)
-          ctx.toolNames = toolNamesOfBody(hitBody.body)
+          const facts = stopAndToolNames(hitBody.body)
+          ctx.stopReason = facts.stop
+          ctx.toolNames = facts.names
         }
         ctx.output = hitBody.body
         // a cached stream sent to a streamed caller is replayed event by event, paced when a block-capable guard applies
@@ -3994,15 +4095,16 @@ export class Engine {
         if (pt !== undefined) {
           semVec = await this.embed(pt)
           // entries stay with the virtual key that wrote them unless disable_identity_scoping
-          semScope = identityScope(scopeKey(primary.provider, primary.model, semKey, this.semanticCfg), grant.vk?.id ?? "", this.semanticCfg)
+          semScope = identityScope(scopeKey(primary.provider, primary.model, semKey, this.semanticCfg), cacheWho, this.semanticCfg)
+          // the caller's threshold can only tighten the configured one
           const th = h.get("x-raiju-cache-threshold")
-          const thr = th === undefined ? this.semanticCfg.threshold : (parseFloat(th) ?? this.semanticCfg.threshold)
-          const hit = this.vstore !== undefined ? await this.vectorLookup(semScope, semVec, thr) : sem.lookup(semScope, semVec, Date.now(), th === undefined ? undefined : parseFloat(th))
+          const thr = requestThreshold(th, this.semanticCfg.threshold)
+          const hit = this.vstore !== undefined ? await this.vectorLookup(semScope, semVec, thr) : sem.lookup(semScope, semVec, Date.now(), th === undefined ? undefined : thr)
           if (hit !== undefined) {
             metrics.observeCacheHit(ctx.labels, "semantic")
             out.set("x-raiju-cache", "semantic-hit")
             out.set("x-raiju-cache-similarity", hit.score.toFixed(4))
-            cacheHeaders(&out, "semantic", primary, hit.score, th === undefined ? this.semanticCfg.threshold : (parseFloat(th) ?? this.semanticCfg.threshold), hit.id, performance.now() - started)
+            cacheHeaders(&out, "semantic", primary, hit.score, thr, hit.id, performance.now() - started)
             originHeaders(&out, hit.origin)
             out.set("content-type", hit.contentType)
             ctx.cached = true
@@ -4155,8 +4257,9 @@ export class Engine {
     ctx.cost = cost
     if (this.logStore !== undefined) {
       ctx.output = r.body
-      ctx.stopReason = stopReasonOf(r.body)
-      ctx.toolNames = toolNamesOfBody(r.body)
+      const facts = stopAndToolNames(r.body)
+      ctx.stopReason = facts.stop
+      ctx.toolNames = facts.names
     }
     return respond(200, r.body, out)
   }
@@ -4535,7 +4638,9 @@ export class Engine {
   // at completion using event usage. Only a 200 answer for an admitted request is charged.
   // Governance refusals and provider failures are logged with status and error without a charge.
   // Requests naming no model or provider served by the gateway are not sent upstream or logged.
-  async mediaAnswer(route: MediaRoute, bill: MediaBill, res: Response, h: Hdrs, started: f64, rid: string): Promise<Response> {
+  async mediaAnswer(route: MediaRoute, bill: MediaBill, res: Response, h: Hdrs, started: f64, givenRid: string): Promise<Response> {
+    // the server passes the caller's x-request-id as it came
+    const rid = requestIdOf(givenRid)
     const grant = bill.grant
     if (bill.provider === "") return res
     if (grant === undefined || res.status !== 200) return await this.mediaFailed(route, bill, res, h, started, rid)
@@ -4627,7 +4732,7 @@ export class Engine {
       rl.virtualKeyName = gvk.name ?? ""
     }
     rl.userId = ctx.userId
-    rl.userName = userNameOf(this.cfg, ctx.userId)
+    rl.userName = this.userName(ctx.userId)
     metrics.observeUsage(rl, { input: usage.prompt, output: usage.completion, cost: c, cacheRead: 0.0, cacheWrite: 0.0, cacheWrite5m: 0.0, cacheWrite1h: 0.0 })
   }
 
@@ -4676,7 +4781,7 @@ export class Engine {
     if (!billedMedia(route.op)) return try await handleMedia(this.cfg, req, route, undefined, mint)
     const h = snapshot(req.headers)
     const started = performance.now()
-    const rid = h.get("x-request-id") ?? newId("req_")
+    const rid = requestIdOf(h.get("x-request-id"))
     const bill = this.mediaBill(h)
     const res = try await handleMedia(this.cfg, req, route, bill, mint)
     return await this.mediaAnswer(route, bill, res, h, started, rid)
@@ -4704,12 +4809,15 @@ export class Engine {
     const text = await req.text()
     const hs: Record<string, string> = snapshot(req.headers)
     let streamed = false
+    let parsed: Field[] = []
     try {
-      streamed = rawBool(fields(text), "stream") ?? false
+      parsed = fields(text)
+      streamed = rawBool(parsed, "stream") ?? false
     } catch (e) {
       streamed = false
     }
-    if (streamed) return try await this.chatOnce(new Request(req.url, { method: "POST", headers: hs, body: text }), sink)
+    // (the body read and parsed here is handed on, so chatOnce reads neither again)
+    if (streamed) return try await this.chatOnce(new Request(req.url, { method: "POST", headers: hs, body: text }), sink, undefined, { text: text, body: parsed })
     const url = req.url
     const last = new LastHeaders()
     const call = async (b: string): Promise<{ status: int, body: string }> => {
@@ -4721,7 +4829,7 @@ export class Engine {
       last.h = kept
       return { status: r.status, body: try await r.text() }
     }
-    const hdr = snapshot(req.headers)
+    const hdr: Hdrs = hs
     const entries = this.codeEntriesFor(m, hdr)
     const exec = this.agentExec(m, hdr, ag)
     const names = this.agentNames(m, entries)
@@ -4843,7 +4951,7 @@ export class Engine {
     // the provider must take the body as it is: one whose wire format for this route is the caller's (the other
     // formats are converted, and the converters need the whole body)
     const op = route === "embeddings" ? "embeddings" : route === "completions" ? "completions" : route === "responses" ? "responses" : route === "messages" ? "anthropic.messages" : "chat"
-    const first = parseModelVia(this.cfg, meta.model, routeOf(op))
+    const first = this.refVia(meta.model, routeOf(op))
     const p = first.provider === "" ? undefined : providerOf(this.cfg, first.provider)
     const kind = p === undefined ? "" : kindOf(first.provider, p)
     const stream = meta.hasStream ? meta.stream : false
@@ -5156,9 +5264,12 @@ export class Engine {
     return new Response(body, { status: r.status, headers: hs })
   }
 
-  async chatOnce(req: Request, sink?: StreamSink, skipGuards?: bool): Promise<Response> {
-    let text = await req.text()
+  // given: the request's body as its caller already read and parsed it (the text and the fields of that text).
+  async chatOnce(req: Request, sink?: StreamSink, skipGuards?: bool, given?: { text: string, body: Field[] }): Promise<Response> {
+    let text = given !== undefined ? given.text : await req.text()
     let body: Field[] = []
+    // one copy of the request's headers serves every step that reads them here, and serve
+    const ph = snapshot(req.headers)
     const guardOn = skipGuards !== true
     const guard = guardOn ? this.guard : undefined
     // reversible redaction: one vault per request, so the response restores to this request's values
@@ -5168,7 +5279,8 @@ export class Engine {
     let promptUsed: Applied | undefined = undefined
     // logs_only on an HTTP provider: its findings reach this request's stored copy by the request id (one is made
     // when the caller sent none); "" when no such provider runs
-    const rid0 = req.headers.get("x-request-id") ?? ""
+    // an id serve() would not take counts as none, so the one made here is the one the row gets
+    const rid0 = callerRequestId(req.headers.get("x-request-id") ?? undefined)
     const lo = guardOn && this.httpLogsOnly("") ? (rid0 !== "" ? rid0 : newId("req_")) : ""
     try {
       if (guard !== undefined && this.guardInput && reversible) {
@@ -5198,10 +5310,14 @@ export class Engine {
           text = one
         }
       }
-      text = try this.withMcpTools(text, snapshot(req.headers))
-      body = fields(text)
+      const mc = try this.mcpChat(text, ph)
+      text = mc.text
+      const mb = mc.body
+      // (parsed by the MCP step, or by the caller when nothing since changed the text)
+      if (mb !== undefined) body = mb
+      else if (given !== undefined && given.text === text) body = given.body
+      else body = fields(text)
       // the prompt named by x-raiju-prompt-id goes before the messages (prompts.tov)
-      const ph = snapshot(req.headers)
       if (ph.get("x-raiju-prompt-id") !== undefined) {
         const vk = this.gov.findKey(ph)
         const applied = try applyPrompt(this.cfg.prompt_repo, ph, text, { budgetPercent: this.gov.budgetFraction(vk) * 100.0, tokensPercent: this.gov.rateFraction(vk, "token") * 100.0, requestsPercent: this.gov.rateFraction(vk, "request") * 100.0 })
@@ -5212,7 +5328,7 @@ export class Engine {
         }
       }
       // a key's access profile may cap max_tokens
-      const cap = this.gov.policyFor(snapshot(req.headers))?.maxTokens
+      const cap = this.gov.policyFor(ph)?.maxTokens
       if (cap !== undefined) {
         let changed = false
         for (const k of ["max_tokens", "max_completion_tokens"]) {
@@ -5240,13 +5356,20 @@ export class Engine {
     } catch (e) {
       return errorResponse(400, `invalid chat request: ${e.message}`, "invalid_request_error", noHeaders())
     }
+    // the stream guard reads one choice: with several their texts would mix and a rule could miss. Refused here,
+    // before the plugins' pre hooks, so no hook opens what an answer made past them would not close.
+    if ((rawBool(body, "stream") ?? false) && manyChoices(body) && this.streamActs(guardOn)) return errorResponse(400, MANY_CHOICES_GUARDED, "invalid_request_error", noHeaders())
     const chain = this.plugins
     let run: PluginRun | undefined = undefined
     let hook: AttemptPlugins | undefined = undefined
+    // One id for the request: the caller's when serve() takes it, else one made here, which the plugins' context,
+    // the log row and the answer's x-request-id all carry (ridMade: the request is rebuilt with it below).
+    let ridMade = rid0 === "" ? lo : ""
     if (chain !== undefined) {
-      // the context of the transport hooks, when they ran for this request
+      // the context of the transport hooks, when they ran for this request (its id is then the request's)
       const shared = this.pluginRuns.get(req.headers.get(RUN_HEADER) ?? "")
-      const r = shared ?? new PluginRun({ requestId: req.headers.get("x-request-id") ?? newId("req_"), op: "chat", model: "", provider: "", headers: new Map(), values: new Map(), trace: new PluginTrace() })
+      if (rid0 === "" && ridMade === "") ridMade = shared !== undefined ? shared.ctx.requestId : newId("req_")
+      const r = shared ?? new PluginRun({ requestId: rid0 !== "" ? rid0 : ridMade, op: "chat", model: "", provider: "", headers: new Map(), values: new Map(), trace: new PluginTrace() })
       r.ctx.op = "chat"
       r.ctx.model = rawStr(body, "model") ?? ""
       // The provider resolved for the model, using the default provider for a bare model name.
@@ -5413,8 +5536,8 @@ export class Engine {
     // a logs_only HTTP provider on the answer: the request's row waits for its findings (record holds it until then)
     const holdOut = lo !== "" && !stream && this.httpLogsOnly("output")
     if (holdOut) this.heldRecords.set(lo, undefined)
-    const sreq = lo !== "" && rid0 === "" ? withRequestId(req, lo, text) : req
-    let res = try await this.serve(sreq, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers, stream ? pipeSink : undefined, mk, cp, promptUsed, undefined, undefined, plugHook)
+    const sreq = ridMade !== "" ? withRequestId(req, ridMade, text) : req
+    let res = try await this.serve(sreq, "chat", undefined, body, text, build, translate, stream, run === undefined ? undefined : run.ctx.headers, stream ? pipeSink : undefined, mk, cp, promptUsed, undefined, undefined, plugHook, lo !== "" && rid0 === "" ? undefined : ph)
     // post hooks on an error answer (they may recover from it or change it); a stream's hooks ran per chunk
     if (chain !== undefined && run !== undefined) {
       if (pipeSink !== undefined && pipeSink.started) chain.finish(&run.ctx)
@@ -5507,6 +5630,7 @@ export class Engine {
       return errorResponse(400, `invalid completions request: ${e.message}`, "invalid_request_error", noHeaders())
     }
     const stream = rawBool(body, "stream") ?? false
+    if (stream && manyChoices(body) && this.streamActs(true)) return errorResponse(400, MANY_CHOICES_GUARDED, "invalid_request_error", noHeaders())
     const wantUsage = streamUsage(body)
     const canPipe = stream && sink !== undefined
     const cp = new CompatPlan(withHeader(settingsOf(this.cfg.client?.compat), req.headers.get("x-raiju-compat") ?? undefined), "completions", stream)
@@ -6002,4 +6126,89 @@ test("a virtual key with no mcp_configs gets no MCP tools but allow_by_default o
   expect(e.keyMcp(some)?.length).toBe(1)
   // a request without a virtual key is not limited by key rules
   expect(e.keyMcp(new Map())).toBeUndefined()
+})
+
+test("a caller's x-request-id is taken only as a short plain token", () => {
+  expect(callerRequestId("req-1.a_B")).toBe("req-1.a_B")
+  expect(callerRequestId("a".repeat(128))).toBe("a".repeat(128))
+  expect(callerRequestId("a".repeat(129))).toBe("")
+  expect(callerRequestId("")).toBe("")
+  expect(callerRequestId(undefined)).toBe("")
+  // nothing that reads as a path, a separator or a control character
+  for (const bad of ["../x", "a/b", "a b", "a\nb", "a:b", "é", "a%2fb", "a\u0001b"]) expect(callerRequestId(bad)).toBe("")
+  expect(requestIdOf("ok-1")).toBe("ok-1")
+  const made = requestIdOf("../../etc")
+  expect(made.startsWith("req_")).toBe(true)
+  expect(callerRequestId(made)).toBe(made)
+})
+
+test("a request for several choices is recognized: n above 1 or several prompts", () => {
+  expect(manyChoices(try fields('{"n":2,"stream":true}'))).toBe(true)
+  expect(manyChoices(try fields('{"n":1}'))).toBe(false)
+  expect(manyChoices(try fields('{"model":"m"}'))).toBe(false)
+  expect(manyChoices(try fields('{"n":null}'))).toBe(false)
+  expect(manyChoices(try fields('{"prompt":["a","b"]}'))).toBe(true)
+  expect(manyChoices(try fields('{"prompt":[[1,2],[3]]}'))).toBe(true)
+  expect(manyChoices(try fields('{"prompt":["a"]}'))).toBe(false)
+  expect(manyChoices(try fields('{"prompt":[1,2,3]}'))).toBe(false)
+  expect(manyChoices(try fields('{"prompt":"a"}'))).toBe(false)
+})
+
+test("the engine's model index and user names answer as the scans of the config do", () => {
+  const cfg: Config = { providers: new Map(), governance: { users: [{ name: "ada", role: "viewer" }] } }
+  cfg.providers!.set("zeta", { keys: [{ value: "k", models: ["shared"] }] })
+  cfg.providers!.set("alpha", { keys: [{ value: "k", models: ["shared", "only-a"] }] })
+  cfg.providers!.set("openai", { keys: [{ value: "k" }] })
+  const e = new Engine(cfg)
+  for (const m of ["shared", "only-a", "gpt-4o", "openai/gpt-4o", "no-such-model", ""]) {
+    expect(e.refOf(m)).toEqual(parseModel(cfg, m))
+    expect(e.refVia(m, "openai")).toEqual(parseModelVia(cfg, m, "openai"))
+  }
+  expect(e.fallbacksOf(try fields(`{"fallbacks":["shared",{"provider":"p","model":"m"},"only-a"]}`))).toEqual([parseModel(cfg, "shared"), { provider: "p", model: "m" }, parseModel(cfg, "only-a")])
+  for (const u of ["ada", "nobody", ""]) expect(e.userName(u)).toBe(userNameOf(cfg, u))
+})
+
+test("the MCP step parses a chat request once: tools and instructions go into the same fields", () => {
+  const e = new Engine({ mcp: { client_configs: [{ name: "fs", connection_type: "http", connection_string: "http://x/mcp", allow_by_default: true }] }, governance: { virtual_keys: [
+    { id: "vk-none", value: "sk-raiju-none" },
+    { id: "vk-some", value: "sk-raiju-some", mcp_configs: [{ mcp_client_name: "fs", tools_to_execute: ["read"] }] },
+  ] } })
+  const m = e.mcp!
+  const s = m.sessions[0]!
+  s.connected = true
+  s.setTools([{ name: "read", description: "r", inputSchemaRaw: "{}" }, { name: "write", description: "w", inputSchemaRaw: "{}" }])
+  s.instructions = "be careful"
+  const read = `{"type":"function","function":{"name":"fs-read","description":"r","parameters":{}}}`
+  const write = `{"type":"function","function":{"name":"fs-write","description":"w","parameters":{}}}`
+  const text = `{"model":"m","messages":[{"role":"user","content":"hi"}]}`
+  const some: Hdrs = new Map()
+  some.set("x-raiju-vk", "sk-raiju-some")
+  const mc = try e.mcpChat(text, some)
+  const block = m.renderInstructions(m.instructionParts(undefined))
+  expect(mc.text).toBe(`{"model":"m","messages":[{"role":"system","content":${quote(block)}},{"role":"user","content":"hi"}],"tools":[${read}]}`)
+  expect(mc.body!).toEqual(try fields(mc.text))
+  expect(try e.withMcpTools(text, some)).toBe(mc.text)
+  // a request without a key is offered every tool; one that names no client is left as it was
+  const open = try e.mcpChat(text, new Map())
+  expect(find(open.body!, "tools")).toBe(`[${read},${write}]`)
+  const off: Hdrs = new Map()
+  off.set("x-raiju-mcp-include-clients", "none")
+  const untouched = try e.mcpChat(text, off)
+  expect(untouched.text).toBe(text)
+  expect(untouched.body === undefined).toBe(true)
+  // nothing to add: the text is the caller's own, and its fields are still handed back
+  const full = `{"model":"m","tools":[${read}]}`
+  const same = try e.mcpChat(full, some)
+  expect(same.text).toBe(full)
+  expect(same.body!).toEqual(try fields(full))
+  // the access read once is what the separate lookups give
+  for (const h of [some, off]) {
+    const acc = e.mcpAccess(h)
+    expect(acc.keys).toEqual(e.keyMcp(h))
+    expect(acc.policy).toEqual(e.gov.policyFor(h)?.mcpTools)
+    expect(acc.proj).toEqual(e.projectMcp(h))
+  }
+  const none: Hdrs = new Map()
+  none.set("x-raiju-vk", "sk-raiju-none")
+  expect(e.mcpAccess(none).keys).toEqual(e.keyMcp(none))
 })

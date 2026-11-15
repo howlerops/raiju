@@ -1,9 +1,8 @@
-import { createMemo, createSignal, Errored, Loading, refresh, Show, untrack } from "solid-js"
-import { LoadingSkeleton } from "../LoadingSkeleton"
+import { createMemo, createSignal, refresh, Show, untrack } from "solid-js"
 import { api } from "../api/client"
-import { can } from "../perm"
+import { canCall } from "../perm"
 import { pretty } from "../fmt"
-import { ErrP, FormError, notify, Toolbar, useFormRun } from "../ui"
+import { FormError, Guard, notify, Toolbar, useFormRun } from "../ui"
 
 type Obj = Record<string, any>
 
@@ -65,17 +64,17 @@ function Editor(props: { cfg: Obj; onSaved: () => void }) {
           spellcheck={false}
           aria-describedby="cfg-edit-h"
           value={text()}
-          readonly={!can("Settings", "Update")}
+          readonly={!canCall("PUT", "/api/config")}
           onInput={(e) => setText(e.currentTarget.value)}
         />
       </label>
       <FormError text={error()} wide={false} />
-      <Show when={!can("Settings", "Update")}>
+      <Show when={!canCall("PUT", "/api/config")}>
         <p class="hint" id="cfg-readonly">
           Your role can read the settings but not change them.
         </p>
       </Show>
-      <div class="actions" style="margin-top:10px" hidden={!can("Settings", "Update")}>
+      <div class="actions" style="margin-top:10px" hidden={!canCall("PUT", "/api/config")}>
         <button
           type="button"
           id="cfg-discard"
@@ -105,19 +104,17 @@ export function Config() {
           Reload
         </button>
       </Toolbar>
-      <Errored fallback={(err) => <ErrP error={err()} />}>
-        <Loading fallback={<LoadingSkeleton variant="form" />}>
-          <Show when={cfg()} keyed>
-            {(c) => <Editor cfg={c} onSaved={reload} />}
-          </Show>
-          <details class="card panel bg-base-100 border border-base-300" id="cfg-full-box">
-            <summary>Full configuration (read only, secrets redacted)</summary>
-            <pre class="code" id="cfg-full">
-              {pretty(cfg())}
-            </pre>
-          </details>
-        </Loading>
-      </Errored>
+      <Guard variant="form">
+        <Show when={cfg()} keyed>
+          {(c) => <Editor cfg={c} onSaved={reload} />}
+        </Show>
+        <details class="card panel bg-base-100 border border-base-300" id="cfg-full-box">
+          <summary>Full configuration (read only, secrets redacted)</summary>
+          <pre class="code" id="cfg-full">
+            {pretty(cfg())}
+          </pre>
+        </details>
+      </Guard>
     </section>
   )
 }

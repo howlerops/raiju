@@ -1,67 +1,35 @@
-import { createMemo, createSignal, Errored, For, Loading, refresh, Show, snapshot, untrack } from "solid-js"
-import { LoadingSkeleton } from "../LoadingSkeleton"
-import { createStore } from "solid-js"
+import { createMemo, createSignal, createStore, For, refresh, Show, snapshot, untrack } from "solid-js"
 import { api } from "../api/client"
-import { can } from "../perm"
-import type { Budget, Customer, McpClient, Provider, RateLimit, Team, VirtualKey, VkProviderConfig } from "../api/types"
-import { splitList } from "../fmt"
-import { Can, copyText, DangerButton, ErrP, FormError, initChecked, initSelected, initValue, notify, Table, Toolbar, useFormRun, useRun, tf } from "../ui"
+import { loadOptions, type Options as AllOptions } from "../api/options"
+import { canCall } from "../perm"
+import type { VirtualKey, VkProviderConfig } from "../api/types"
+import { fmtInt, idLabel, splitList } from "../fmt"
+import { CanCall, ClientToolsRows, type ClientTools, copyText, DangerButton, fieldValue, FormError, Guard, initChecked, initSelected, initValue, notify, Table, Toolbar, useFormRun, useRun, tf } from "../ui"
 
-interface Options {
-  providers: Provider[]
-  teams: Team[]
-  customers: Customer[]
-  budgets: Budget[]
-  rate_limits: RateLimit[]
-  mcp: McpClient[]
-}
+const VK = "/api/governance/virtual-keys"
+// rows of the key table shown at a time
+const PAGE_SIZE = 50
+
+type Options = Pick<AllOptions, "providers" | "teams" | "customers" | "budgets" | "rate_limits" | "clients">
 
 type McpCfg = NonNullable<VirtualKey["mcp_configs"]>[number]
 
-async function silently<T>(p: Promise<T>, pick: (t: T) => unknown[]): Promise<unknown[]> {
-  try {
-    return pick(await p)
-  } catch {
-    return []
-  }
-}
-
-async function loadAll(): Promise<{ keys: VirtualKey[]; opts: Options }> {
-  const [keys, providers, teams, customers, budgets, rate_limits, mcp] = await Promise.all([
-    api.get("/api/governance/virtual-keys"),
-    silently(api.get("/api/providers"), (b) => b.providers),
-    silently(api.get("/api/governance/teams"), (b) => b.teams),
-    silently(api.get("/api/governance/customers"), (b) => b.customers),
-    silently(api.get("/api/governance/budgets"), (b) => b.budgets),
-    silently(api.get("/api/governance/rate-limits"), (b) => b.rate_limits),
-    silently(api.get("/api/mcp/clients"), (b) => b.clients),
-  ])
-  return {
-    keys: keys.virtual_keys,
-    opts: {
-      providers: providers as Provider[],
-      teams: teams as Team[],
-      customers: customers as Customer[],
-      budgets: budgets as Budget[],
-      rate_limits: rate_limits as RateLimit[],
-      mcp: mcp as McpClient[],
-    },
-  }
-}
+const loadKeys = async (): Promise<VirtualKey[]> => (await api.get("/api/governance/virtual-keys")).virtual_keys
+const loadOpts = (): Promise<Options> => loadOptions("providers", "teams", "customers", "budgets", "rate_limits", "clients")
 
 interface Named {
   id: string
   name?: string
 }
 
-function nameOf(items: Named[], id: string | undefined): string {
-  if (!id) return "—"
-  const hit = items.find((x) => x.id === id)
-  return hit ? hit.name || hit.id : id
+// id -> shown name, built once per load so a table row does not scan the list
+function nameMap(items: Named[]): Map<string, string> {
+  return new Map(items.map((x) => [x.id, x.name || x.id]))
 }
 
-function labelOf(it: Named): string {
-  return it.name ? it.name + " (" + it.id + ")" : it.id
+function nameOf(names: Map<string, string>, id: string | undefined): string {
+  if (!id) return "—"
+  return names.get(id) ?? id
 }
 
 // What a key may run on MCP: absent means no list (not limited), an empty list means none.
@@ -109,7 +77,7 @@ function SelectOf(props: { name: string; items: Named[]; selected: string | unde
         <For each={props.items} keyed={(i) => i.id}>
           {(it) => (
             <option value={it().id} ref={initSelected(it().id === props.selected)}>
-              {labelOf(it())}
+              {idLabel(it())}
             </option>
           )}
         </For>
@@ -127,10 +95,7 @@ interface RuleRow {
   provider: string
   models: string
 }
-interface McpRow {
-  client: string
-  tools: string
-}
+type McpRow = ClientTools
 
 function VkForm(props: { vk: VirtualKey | undefined; opts: Options; onClose: () => void; onSaved: (secret: string | undefined) => void }) {
   const { busy, error, run } = useFormRun()
@@ -144,16 +109,12 @@ function VkForm(props: { vk: VirtualKey | undefined; opts: Options; onClose: () 
     if (extra && !names.includes(extra)) names.push(extra)
     return names
   }
-  const clientNames = (extra: string) => {
-    const names = props.opts.mcp.map((c) => String(c.name ?? ""))
-    if (extra && !names.includes(extra)) names.push(extra)
-    return names
-  }
+  const clientNames = untrack(() => props.opts.clients.map((c) => String(c.name ?? "")))
 
   const submit = (ev: SubmitEvent) => {
     ev.preventDefault()
     const form = ev.currentTarget as HTMLFormElement
-    const get = (n: string) => (form.elements.namedItem(n) as HTMLInputElement | HTMLSelectElement).value
+    const get = (n: string) => fieldValue(form, n)
     const opt = (n: string) => get(n) || null
     void run(async () => {
       const r = snapshot(rows)
@@ -273,35 +234,14 @@ function VkForm(props: { vk: VirtualKey | undefined; opts: Options; onClose: () 
         <legend>MCP tools</legend>
         <p class="hint">With no rows the key is not limited to MCP tools. Tools: * for all, blank for none, or a comma list.</p>
         <div id="vk-mcp">
-          <For each={rows.mcp}>
-            {(row, i) => (
-              <div class="rule mcp-rule">
-                <select class="select select-sm" aria-label="MCP client" onChange={(e) => setRows((s) => void (s.mcp[i()]!.client = e.currentTarget.value))}>
-                  <option value="" selected={!row.client}>
-                    Choose MCP client
-                  </option>
-                  <For each={untrack(() => clientNames(row.client))}>
-                    {(n) => (
-                      <option value={n} selected={n === row.client}>
-                        {n}
-                      </option>
-                    )}
-                  </For>
-                </select>
-                <input class="input input-sm"
-                  type="text"
-                  aria-label="Allowed MCP tools"
-                  placeholder="* for all, blank for none, or a comma list"
-                  autocomplete="off"
-                  value={row.tools}
-                  onInput={(e) => setRows((s) => void (s.mcp[i()]!.tools = e.currentTarget.value))}
-                />
-                <button type="button" class="btn btn-sm btn-ghost" onClick={() => setRows((s) => void s.mcp.splice(i(), 1))}>
-                  Remove
-                </button>
-              </div>
-            )}
-          </For>
+          <ClientToolsRows
+            rows={rows.mcp}
+            clients={clientNames}
+            update={(change) => setRows((s) => change(s.mcp))}
+            rowClass="mcp-rule"
+            toolsLabel="Allowed MCP tools"
+            toolsPlaceholder="* for all, blank for none, or a comma list"
+          />
         </div>
         <button type="button" id="vk-add-mcp" class="btn btn-sm btn-ghost" onClick={() => setRows((s) => void s.mcp.push({ client: "", tools: "*" }))}>
           Add MCP client
@@ -367,8 +307,23 @@ function Secret(props: { value: string; onDone: () => void }) {
 }
 
 export function Keys() {
-  const data = createMemo(loadAll)
-  const reload = () => refresh(data)
+  // The keys are their own read: a toggle, a rotation or a save refetches them, not the option lists.
+  const keys = createMemo(loadKeys)
+  const opts = createMemo(loadOpts)
+  const reload = () => refresh(keys)
+  const reloadAll = () => {
+    refresh(keys)
+    refresh(opts)
+  }
+  const teams = createMemo(() => nameMap(opts().teams))
+  const customers = createMemo(() => nameMap(opts().customers))
+  const budgets = createMemo(() => nameMap(opts().budgets))
+  const rateLimits = createMemo(() => nameMap(opts().rate_limits))
+  const [pageNo, setPageNo] = createSignal(0)
+  const lastPage = () => Math.max(0, Math.ceil(keys().length / PAGE_SIZE) - 1)
+  // a deletion can leave the page past the end
+  const start = () => Math.min(pageNo(), lastPage()) * PAGE_SIZE
+  const shown = createMemo(() => keys().slice(start(), start() + PAGE_SIZE))
   const [editor, setEditor] = createSignal<{ vk: VirtualKey | undefined } | undefined>(undefined)
   const [secret, setSecret] = createSignal<string | undefined>(undefined)
   const { busy, run } = useRun()
@@ -376,124 +331,135 @@ export function Keys() {
   return (
     <section aria-labelledby="vk-title">
       <Toolbar title="Virtual keys" id="vk-title">
-        <button type="button" id="vk-refresh" class="btn btn-sm btn-ghost" onClick={reload}>
+        <button type="button" id="vk-refresh" class="btn btn-sm btn-ghost" onClick={reloadAll}>
           Refresh
         </button>
-        <Can resource="VirtualKeys" op="Create">
+        <CanCall method="POST" path={VK}>
           <button type="button" id="vk-new" class="btn btn-sm btn-primary" onClick={() => setEditor({ vk: undefined })}>
             New virtual key
           </button>
-        </Can>
+        </CanCall>
       </Toolbar>
 
       <Show when={secret()}>{(s) => <Secret value={s()} onDone={() => setSecret(undefined)} />}</Show>
 
-      <Errored fallback={(err) => <ErrP error={err()} />}>
-        <Loading fallback={<LoadingSkeleton variant="table" />}>
-          <Show when={editor()} keyed>
-            {(e) => (
-              <VkForm
-                vk={e.vk}
-                opts={data().opts}
-                onClose={() => setEditor(undefined)}
-                onSaved={(v) => {
-                  setEditor(undefined)
-                  if (v) setSecret(v)
-                  reload()
-                }}
-              />
-            )}
-          </Show>
-          <div id="vk-list" class="card panel bg-base-100 border border-base-300">
-            <Show when={data().keys.length} fallback={<p class="muted">No virtual keys yet. Create one to give a client scoped access.</p>}>
-              <Table cols={["Name", "Status", "Providers", "MCP tools", "Team", "Customer", "Budget", "Rate limit", ""]}>
-                <For each={data().keys} keyed={(k) => k.id}>
-                  {(vk) => {
-                    const active = () => vk().is_active !== false
-                    const rules = () =>
-                      (vk().provider_configs ?? [])
-                        .map((p) => p.provider + " (" + (p.allowed_models && p.allowed_models.length ? p.allowed_models.join(", ") : "all models") + ")")
-                        .join("; ")
-                    return (
-                      <tr>
-                        <td>
-                          <div>
-                            <strong>{vk().name || vk().id}</strong>
-                            <div class="hint mono">{vk().id}</div>
-                          </div>
-                        </td>
-                        <td>
-                          <button
-                            type="button"
-                            class="btn btn-sm tool-toggle"
-                            aria-pressed={tf(active())}
-                            disabled={busy() || !can("VirtualKeys", "Update")}
-                            onClick={() =>
-                              run(async () => {
-                                await api.put("/api/governance/virtual-keys/{id}", {
-                                  params: { id: vk().id },
-                                  body: recordBody(vk(), { is_active: !active() }),
-                                })
-                                notify((vk().name || vk().id) + (active() ? " disabled" : " enabled"), "ok")
-                                reload()
+      <Guard variant="table">
+        <Show when={editor()} keyed>
+          {(e) => (
+            <VkForm
+              vk={e.vk}
+              opts={opts()}
+              onClose={() => setEditor(undefined)}
+              onSaved={(v) => {
+                setEditor(undefined)
+                if (v) setSecret(v)
+                reload()
+              }}
+            />
+          )}
+        </Show>
+        <div id="vk-list" class="card panel bg-base-100 border border-base-300">
+          <Show when={keys().length} fallback={<p class="muted">No virtual keys yet. Create one to give a client scoped access.</p>}>
+            <Table cols={["Name", "Status", "Providers", "MCP tools", "Team", "Customer", "Budget", "Rate limit", ""]}>
+              <For each={shown()} keyed={(k) => k.id}>
+                {(vk) => {
+                  const active = () => vk().is_active !== false
+                  const rules = () =>
+                    (vk().provider_configs ?? [])
+                      .map((p) => p.provider + " (" + (p.allowed_models && p.allowed_models.length ? p.allowed_models.join(", ") : "all models") + ")")
+                      .join("; ")
+                  return (
+                    <tr>
+                      <td>
+                        <div>
+                          <strong>{vk().name || vk().id}</strong>
+                          <div class="hint mono">{vk().id}</div>
+                        </div>
+                      </td>
+                      <td>
+                        <button
+                          type="button"
+                          class="btn btn-sm tool-toggle"
+                          aria-pressed={tf(active())}
+                          disabled={busy() || !canCall("PUT", VK)}
+                          onClick={() =>
+                            run(async () => {
+                              await api.put("/api/governance/virtual-keys/{id}", {
+                                params: { id: vk().id },
+                                body: recordBody(vk(), { is_active: !active() }),
                               })
-                            }
-                          >
-                            {active() ? "Active" : "Disabled"}
-                          </button>
-                        </td>
-                        <td>{rules() || "none"}</td>
-                        <td>{mcpSummary(vk().mcp_configs)}</td>
-                        <td>{nameOf(data().opts.teams, vk().team_id)}</td>
-                        <td>{nameOf(data().opts.customers, vk().customer_id)}</td>
-                        <td>{nameOf(data().opts.budgets, vk().budget_id)}</td>
-                        <td>{nameOf(data().opts.rate_limits, vk().rate_limit_id)}</td>
-                        <td>
-                          <span class="row-actions">
-                            <Can resource="VirtualKeys" op="Update">
-                              <button type="button" class="btn btn-sm btn-ghost" onClick={() => setEditor({ vk: vk() })}>
-                                Edit
-                              </button>
-                            </Can>
-                            <Can resource="VirtualKeys" op="Create">
-                              <button
-                                type="button"
-                                class="btn btn-sm btn-ghost"
-                                disabled={busy()}
-                                onClick={() =>
-                                  run(async () => {
-                                    const r = await api.post("/api/governance/virtual-keys/{id}/rotate", { params: { id: vk().id } })
-                                    reload()
-                                    const value = r.virtual_key?.value
-                                    if (value) setSecret(value)
-                                    else notify("Virtual key rotated", "ok")
-                                  })
-                                }
-                              >
-                                Rotate
-                              </button>
-                            </Can>
-                            <Can resource="VirtualKeys" op="Delete">
-                              <DangerButton
-                                label="Delete"
-                                action={async () => {
-                                  await api.del("/api/governance/virtual-keys/{id}", { params: { id: vk().id } })
-                                  notify("Virtual key deleted", "ok")
+                              notify((vk().name || vk().id) + (active() ? " disabled" : " enabled"), "ok")
+                              reload()
+                            })
+                          }
+                        >
+                          {active() ? "Active" : "Disabled"}
+                        </button>
+                      </td>
+                      <td>{rules() || "none"}</td>
+                      <td>{mcpSummary(vk().mcp_configs)}</td>
+                      <td>{nameOf(teams(), vk().team_id)}</td>
+                      <td>{nameOf(customers(), vk().customer_id)}</td>
+                      <td>{nameOf(budgets(), vk().budget_id)}</td>
+                      <td>{nameOf(rateLimits(), vk().rate_limit_id)}</td>
+                      <td>
+                        <span class="row-actions">
+                          <CanCall method="PUT" path={VK}>
+                            <button type="button" class="btn btn-sm btn-ghost" onClick={() => setEditor({ vk: vk() })}>
+                              Edit
+                            </button>
+                          </CanCall>
+                          <CanCall method="POST" path={VK + "/{id}/rotate"}>
+                            <button
+                              type="button"
+                              class="btn btn-sm btn-ghost"
+                              disabled={busy()}
+                              onClick={() =>
+                                run(async () => {
+                                  const r = await api.post("/api/governance/virtual-keys/{id}/rotate", { params: { id: vk().id } })
                                   reload()
-                                }}
-                              />
-                            </Can>
-                          </span>
-                        </td>
-                      </tr>
-                    )
-                  }}
-                </For>
-              </Table>
+                                  const value = r.virtual_key?.value
+                                  if (value) setSecret(value)
+                                  else notify("Virtual key rotated", "ok")
+                                })
+                              }
+                            >
+                              Rotate
+                            </button>
+                          </CanCall>
+                          <CanCall method="DELETE" path={VK}>
+                            <DangerButton
+                              label="Delete"
+                              action={async () => {
+                                await api.del("/api/governance/virtual-keys/{id}", { params: { id: vk().id } })
+                                notify("Virtual key deleted", "ok")
+                                reload()
+                              }}
+                            />
+                          </CanCall>
+                        </span>
+                      </td>
+                    </tr>
+                  )
+                }}
+              </For>
+            </Table>
+            <Show when={keys().length > PAGE_SIZE}>
+              <div class="pager">
+                <span class="hint" id="vk-range" role="status">
+                  {start() + 1 + "–" + (start() + shown().length) + " of " + fmtInt(keys().length)}
+                </span>
+                <button type="button" id="vk-prev" class="btn btn-sm btn-ghost" disabled={start() === 0} onClick={() => setPageNo(start() / PAGE_SIZE - 1)}>
+                  Previous
+                </button>
+                <button type="button" id="vk-next" class="btn btn-sm btn-ghost" disabled={start() + PAGE_SIZE >= keys().length} onClick={() => setPageNo(start() / PAGE_SIZE + 1)}>
+                  Next
+                </button>
+              </div>
             </Show>
-          </div>
-        </Loading>
-      </Errored>
+          </Show>
+        </div>
+      </Guard>
     </section>
   )
 }

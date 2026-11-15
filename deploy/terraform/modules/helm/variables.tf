@@ -115,6 +115,7 @@ variable "provider_secrets" {
   EOT
   type        = map(string)
   default     = {}
+  sensitive   = true
 }
 
 variable "existing_secret_name" {

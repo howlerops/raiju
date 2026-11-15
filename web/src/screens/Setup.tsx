@@ -1,7 +1,7 @@
 // First-admin setup uses the explicit setup header on both requests, never a
 // cross-origin cookie. The setup secret itself is never stored.
 import { createSignal, Show } from "solid-js"
-import { send, ApiError } from "../api/client"
+import { send, ApiError, message } from "../api/client"
 import { target, targetLabel } from "../gateway"
 
 const SETUP_HEADER = "X-Raiju-Setup-Token"
@@ -48,7 +48,7 @@ export function Setup(props: { configured: boolean; done: (token: string) => Pro
       } catch (e) {
         if (e instanceof ApiError && (e.status === 401 || e.status === 403)) setError("Invalid setup token.")
         else if (e instanceof ApiError && e.status === 409) setError("An admin account exists already. Reload the page and sign in.")
-        else setError(e instanceof Error ? e.message : String(e))
+        else setError(message(e))
         return
       }
       const body: Record<string, string> = { name, role: "admin" }
@@ -58,7 +58,7 @@ export function Setup(props: { configured: boolean; done: (token: string) => Pro
       if (tokenIn) tokenIn.value = ""
       setCreated({ name: d.name ?? name, token: d.token ?? "" })
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(message(e))
     } finally {
       setBusy(false)
     }
@@ -131,7 +131,7 @@ export function Setup(props: { configured: boolean; done: (token: string) => Pro
               <div class="actions">
                 <button type="button" class="btn btn-sm btn-primary" id="setup-continue" disabled={busy()} onClick={async () => {
                   setBusy(true)
-                  try { await props.done(c().token) } catch (e) { setError(e instanceof Error ? e.message : String(e)) }
+                  try { await props.done(c().token) } catch (e) { setError(message(e)) }
                   finally { setBusy(false) }
                 }}>
                   Continue to the dashboard

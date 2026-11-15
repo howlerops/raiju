@@ -44,6 +44,44 @@ export function parseModel(cfg: Config, s: string): ModelRef {
 // parseModel for a request on an integration route: "openai", "anthropic",
 // "genai", "bedrock", "cohere", or "" for none.
 export function parseModelVia(cfg: Config, s: string, route: string): ModelRef {
+  return resolveModel(cfg, undefined, s, route)
+}
+
+// The bare model names and alias names the configured keys list, each with the first provider that lists
+// it in the config's order (what parseModelVia's scan of every key finds). Aliases are kept lower-cased:
+// an alias name matches without regard to case.
+export class ModelIndex {
+  models: Map<string, string> = new Map()
+  aliases: Map<string, string> = new Map()
+}
+
+// Built once per config (at start and at each reload); parseModelIndexed reads it.
+export function modelIndex(cfg: Config): ModelIndex {
+  const idx = new ModelIndex()
+  const ps = cfg.providers
+  if (ps === undefined) return idx
+  for (const name of ps.keys()) {
+    for (const k of ps.get(name)!.keys ?? []) {
+      for (const m of k.models ?? []) {
+        if (!idx.models.has(m)) idx.models.set(m, name)
+      }
+      const a = k.aliases
+      if (a === undefined) continue
+      for (const an of a.keys()) {
+        const low = an.toLowerCase()
+        if (!idx.aliases.has(low)) idx.aliases.set(low, name)
+      }
+    }
+  }
+  return idx
+}
+
+// parseModelVia with the key lists read from an index of the same config.
+export function parseModelIndexed(cfg: Config, idx: ModelIndex, s: string, route: string): ModelRef {
+  return resolveModel(cfg, idx, s, route)
+}
+
+function resolveModel(cfg: Config, idx: ModelIndex | undefined, s: string, route: string): ModelRef {
   const i = s.indexOf("/")
   if (i > 0) {
     const p = s.slice(0, i)
@@ -52,15 +90,22 @@ export function parseModelVia(cfg: Config, s: string, route: string): ModelRef {
   }
   const ps = cfg.providers
   if (ps !== undefined) {
-    for (const name of ps.keys()) {
-      for (const k of ps.get(name)!.keys ?? []) {
-        if ((k.models ?? []).includes(s)) return { provider: name, model: s }
+    if (idx !== undefined) {
+      const byModel = idx.models.get(s)
+      if (byModel !== undefined) return { provider: byModel, model: s }
+      const byAlias = idx.aliases.get(s.toLowerCase())
+      if (byAlias !== undefined) return { provider: byAlias, model: s }
+    } else {
+      for (const name of ps.keys()) {
+        for (const k of ps.get(name)!.keys ?? []) {
+          if ((k.models ?? []).includes(s)) return { provider: name, model: s }
+        }
       }
-    }
-    for (const name of ps.keys()) {
-      for (const k of ps.get(name)!.keys ?? []) {
-        const a = k.aliases
-        if (a !== undefined && aliasLookup(a, s) !== undefined) return { provider: name, model: s }
+      for (const name of ps.keys()) {
+        for (const k of ps.get(name)!.keys ?? []) {
+          const a = k.aliases
+          if (a !== undefined && aliasLookup(a, s) !== undefined) return { provider: name, model: s }
+        }
       }
     }
     // the model family's own provider, when configured, before the catalog (whose bare
@@ -593,7 +638,7 @@ export function classify(status: int): Disposition {
 export function backoffMs(p: ProviderConfig, attempt: int, retryAfter: string | undefined): int {
   if (retryAfter !== undefined) {
     const secs = parseFloat(retryAfter)
-    if (secs !== undefined && secs >= 0.0) return Math.min(Math.round(secs * 1000), 60000)
+    if (secs !== undefined && secs >= 0.0) return Math.round(Math.min(secs * 1000.0, 60000.0))
   }
   const initial = p.network_config?.retry_backoff_initial ?? 500
   const max = p.network_config?.retry_backoff_max ?? 5000
@@ -928,4 +973,28 @@ test("directions: an unpinned request takes a healthy provider, and append gives
   h.holds.settle("openai#o", "gpt-x", "refused", "credential", "bad key", undefined, now, 0.5)
   const un = directRefs(cfg, pin, false, h, { select: true, append: false, reroute: false, prune: false }, now)
   expect(un.map((x) => x.provider).join(",")).toBe("groq")
+})
+
+test("the model index resolves bare names as the scan of every key does", () => {
+  const a1: Map<string, string | AliasTarget> = new Map()
+  a1.set("House", "m-1")
+  const a2: Map<string, string | AliasTarget> = new Map()
+  a2.set("house", "m-2")
+  a2.set("shared", "m-3")
+  const cfg: Config = { providers: new Map() }
+  cfg.providers!.set("zeta", { keys: [{ value: "k", models: ["shared", "only-z"] }, { value: "k2", aliases: a1 }] })
+  cfg.providers!.set("alpha", { keys: [{ value: "k", models: ["shared", "only-a"], aliases: a2 }] })
+  cfg.providers!.set("anthropic", { keys: [{ value: "k" }] })
+  cfg.providers!.set("openai", { keys: [{ value: "k" }] })
+  const idx = modelIndex(cfg)
+  for (const route of ["", "openai", "anthropic"]) {
+    for (const m of ["shared", "only-z", "only-a", "house", "HOUSE", "House", "Shared", "claude-sonnet-4", "gpt-4o", "zeta/x", "openai/gpt-4o", "nope/x", "no-such-model", "", "/x"]) {
+      expect(parseModelIndexed(cfg, idx, m, route)).toEqual(parseModelVia(cfg, m, route))
+    }
+  }
+  // a listed model wins over an alias, and the first provider in the config's order wins
+  expect(parseModelIndexed(cfg, idx, "shared", "")).toEqual({ provider: "zeta", model: "shared" })
+  expect(parseModelIndexed(cfg, idx, "HOUSE", "")).toEqual({ provider: "zeta", model: "HOUSE" })
+  const none: Config = {}
+  expect(parseModelIndexed(none, modelIndex(none), "gpt-4o", "")).toEqual(parseModel(none, "gpt-4o"))
 })

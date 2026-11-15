@@ -1,11 +1,14 @@
 // Roles and permissions: the built-in roles (read only), the custom roles with an editor for their
 // permission pairs (a resource by operation grid), the access profiles attached to each role, and
 // the role each admin user holds. Every control follows the caller's own permissions.
-import { createMemo, createSignal, Errored, For, Loading, refresh, Show } from "solid-js"
-import { LoadingSkeleton } from "../LoadingSkeleton"
+import { createMemo, createSignal, For, refresh, Show } from "solid-js"
 import { message, send } from "../api/client"
-import { can, RESOURCES, OPERATIONS } from "../perm"
-import { Can, DangerButton, ErrP, FormError, initChecked, initSelected, initValue, Mono, notify, Table, Toolbar, useFormRun, useRun } from "../ui"
+import { idLabel } from "../fmt"
+import { canCall, RESOURCES, OPERATIONS } from "../perm"
+import { CanCall, DangerButton, fieldValue, FormError, Guard, initChecked, initSelected, initValue, Mono, notify, Table, Toolbar, useFormRun, useRun } from "../ui"
+
+const ROLES = "/api/roles"
+const PROFILES = "/api/governance/access-profiles"
 
 interface Pair {
   resource: string
@@ -88,15 +91,16 @@ async function loadAll(): Promise<Data> {
 
 const holders = (d: Data, r: Role): string[] => (d.users ?? []).filter((u) => u.role === r.name).map((u) => u.name)
 const attached = (d: Data, r: Role): Profile[] => (d.profiles ?? []).filter((p) => (p.roles ?? []).some((x) => x.role_id === r.id))
-const label = (p: Profile): string => (p.name ? p.name + " (" + p.id + ")" : p.id)
 
 function RoleForm(props: { role: Role | undefined; data: Data; onClose: () => void; onSaved: () => void }) {
   const role = props.role
   const { busy, error, run } = useFormRun()
   const held = new Set((role?.permissions ?? []).map((p) => p.resource + "|" + p.operation))
   const wasAttached = new Set(role ? attached(props.data, role).map((p) => p.id) : [])
-  const editable = () => (role ? can("RBAC", "Update") : can("RBAC", "Create"))
-  const canProfiles = () => editable() && props.data.profiles !== undefined && can("AccessProfiles", "Update")
+  const editable = () => canCall(role ? "PUT" : "POST", ROLES)
+  // Attaching a profile is a POST and detaching a DELETE on the profile's roles.
+  const canAttach = () => editable() && props.data.profiles !== undefined && canCall("POST", PROFILES)
+  const canDetach = () => editable() && props.data.profiles !== undefined && canCall("DELETE", PROFILES)
   let form: HTMLFormElement | undefined
 
   const rowBoxes = (res: string) => [...(form?.querySelectorAll<HTMLInputElement>('input[name="perm"]') ?? [])].filter((b) => b.value.startsWith(res + "|"))
@@ -109,7 +113,7 @@ function RoleForm(props: { role: Role | undefined; data: Data; onClose: () => vo
   const submit = (ev: SubmitEvent) => {
     ev.preventDefault()
     const f = ev.currentTarget as HTMLFormElement
-    const get = (n: string) => ((f.elements.namedItem(n) as HTMLInputElement | HTMLSelectElement).value ?? "").trim()
+    const get = (n: string) => fieldValue(f, n).trim()
     void run(async () => {
       const permissions: Pair[] = [...f.querySelectorAll<HTMLInputElement>('input[name="perm"]:checked')].map((b) => {
         const [resource, operation] = b.value.split("|")
@@ -124,20 +128,20 @@ function RoleForm(props: { role: Role | undefined; data: Data; onClose: () => vo
       if (role) {
         // the data access overrides per resource are not edited here; they are sent back as they were
         if (role.entity_dac && Object.keys(role.entity_dac).length) body.entity_dac = role.entity_dac
-        await send("PUT", "/api/roles/" + encodeURIComponent(role.name), { body })
+        await send("PUT", ROLES + "/" + encodeURIComponent(role.name), { body })
       } else {
         body.name = get("name")
-        const made = (await send("POST", "/api/roles", { body })).data as Role
+        const made = (await send("POST", ROLES, { body })).data as Role
         id = made.id
       }
-      if (canProfiles() && id !== undefined) {
+      if ((canAttach() || canDetach()) && id !== undefined) {
         const want = new Set([...f.querySelectorAll<HTMLInputElement>('input[name="profile"]:checked')].map((b) => b.value))
         try {
           for (const pid of want) {
-            if (!wasAttached.has(pid)) await send("POST", "/api/governance/access-profiles/" + encodeURIComponent(pid) + "/roles", { body: { role_ids: [id], is_default: true, apply_to_existing: true } })
+            if (canAttach() && !wasAttached.has(pid)) await send("POST", PROFILES + "/" + encodeURIComponent(pid) + "/roles", { body: { role_ids: [id], is_default: true, apply_to_existing: true } })
           }
           for (const pid of wasAttached) {
-            if (!want.has(pid)) await send("DELETE", "/api/governance/access-profiles/" + encodeURIComponent(pid) + "/roles/" + id)
+            if (canDetach() && !want.has(pid)) await send("DELETE", PROFILES + "/" + encodeURIComponent(pid) + "/roles/" + id)
           }
         } catch (e) {
           // the role itself is saved; say what the profiles did
@@ -221,8 +225,8 @@ function RoleForm(props: { role: Role | undefined; data: Data; onClose: () => vo
             <For each={props.data.profiles}>
               {(p) => (
                 <label class="check">
-                  <input class="checkbox checkbox-sm" type="checkbox" name="profile" value={p.id} disabled={!canProfiles()} ref={initChecked(wasAttached.has(p.id))} />
-                  {label(p)}
+                  <input class="checkbox checkbox-sm" type="checkbox" name="profile" value={p.id} disabled={!(wasAttached.has(p.id) ? canDetach() : canAttach())} ref={initChecked(wasAttached.has(p.id))} />
+                  {idLabel(p)}
                 </label>
               )}
             </For>
@@ -264,7 +268,7 @@ function UserRoles(props: { data: Data; onChanged: () => void }) {
                 <td>
                   <select class="select select-sm"
                     aria-label={"Role of " + u().name}
-                    disabled={busy() || !can("Users", "Update")}
+                    disabled={busy() || !canCall("PUT", "/api/users")}
                     onChange={(ev) => {
                       const role = ev.currentTarget.value
                       void run(async () => {
@@ -306,11 +310,11 @@ export function Roles() {
         <button type="button" id="roles-refresh" class="btn btn-sm btn-ghost" onClick={reload}>
           Refresh
         </button>
-        <Can resource="RBAC" op="Create">
+        <CanCall method="POST" path={ROLES}>
           <button type="button" id="role-new" class="btn btn-sm btn-primary" onClick={() => setEditor({ role: undefined })}>
             New role
           </button>
-        </Can>
+        </CanCall>
       </Toolbar>
 
       <section class="card panel bg-base-100 border border-base-300" id="role-builtin" aria-labelledby="role-builtin-h">
@@ -330,66 +334,64 @@ export function Roles() {
         </Table>
       </section>
 
-      <Errored fallback={(err) => <ErrP error={err()} />}>
-        <Loading fallback={<LoadingSkeleton variant="table" />}>
-          <Show when={editor()} keyed>
-            {(e) => (
-              <RoleForm
-                role={e.role}
-                data={data()}
-                onClose={() => setEditor(undefined)}
-                onSaved={() => {
-                  setEditor(undefined)
-                  reload()
-                }}
-              />
-            )}
+      <Guard variant="table">
+        <Show when={editor()} keyed>
+          {(e) => (
+            <RoleForm
+              role={e.role}
+              data={data()}
+              onClose={() => setEditor(undefined)}
+              onSaved={() => {
+                setEditor(undefined)
+                reload()
+              }}
+            />
+          )}
+        </Show>
+        <section class="card panel bg-base-100 border border-base-300" id="role-list" aria-labelledby="role-list-h">
+          <h2 id="role-list-h">Custom roles</h2>
+          <Show when={data().roles.length} fallback={<p class="muted">No custom roles yet. Create one to give a user a limited set of permissions.</p>}>
+            <Table cols={["Role", "Data access", "Permissions", "Users", "Access profiles", ""]}>
+              <For each={data().roles} keyed={(r) => r.name}>
+                {(r) => (
+                  <tr data-role={r().name}>
+                    <td>
+                      <strong>{r().name}</strong>
+                      <Show when={r().description}>
+                        <div class="hint">{r().description}</div>
+                      </Show>
+                    </td>
+                    <td>{r().dac || "default"}</td>
+                    <td>{(r().permissions ?? []).length}</td>
+                    <td>{data().users ? holders(data(), r()).join(", ") || "none" : "—"}</td>
+                    <td>{data().profiles ? attached(data(), r()).map(idLabel).join(", ") || "none" : "—"}</td>
+                    <td>
+                      <span class="row-actions">
+                        <button type="button" class="btn btn-sm btn-ghost" onClick={() => setEditor({ role: r() })}>
+                          {canCall("PUT", ROLES) ? "Edit" : "View"}
+                        </button>
+                        <CanCall method="DELETE" path={ROLES}>
+                          <DangerButton
+                            label="Delete"
+                            action={async () => {
+                              await send("DELETE", ROLES + "/" + encodeURIComponent(r().name))
+                              notify("Role " + r().name + " deleted", "ok")
+                              reload()
+                            }}
+                          />
+                        </CanCall>
+                      </span>
+                    </td>
+                  </tr>
+                )}
+              </For>
+            </Table>
           </Show>
-          <section class="card panel bg-base-100 border border-base-300" id="role-list" aria-labelledby="role-list-h">
-            <h2 id="role-list-h">Custom roles</h2>
-            <Show when={data().roles.length} fallback={<p class="muted">No custom roles yet. Create one to give a user a limited set of permissions.</p>}>
-              <Table cols={["Role", "Data access", "Permissions", "Users", "Access profiles", ""]}>
-                <For each={data().roles} keyed={(r) => r.name}>
-                  {(r) => (
-                    <tr data-role={r().name}>
-                      <td>
-                        <strong>{r().name}</strong>
-                        <Show when={r().description}>
-                          <div class="hint">{r().description}</div>
-                        </Show>
-                      </td>
-                      <td>{r().dac || "default"}</td>
-                      <td>{(r().permissions ?? []).length}</td>
-                      <td>{data().users ? holders(data(), r()).join(", ") || "none" : "—"}</td>
-                      <td>{data().profiles ? attached(data(), r()).map(label).join(", ") || "none" : "—"}</td>
-                      <td>
-                        <span class="row-actions">
-                          <button type="button" class="btn btn-sm btn-ghost" onClick={() => setEditor({ role: r() })}>
-                            {can("RBAC", "Update") ? "Edit" : "View"}
-                          </button>
-                          <Can resource="RBAC" op="Delete">
-                            <DangerButton
-                              label="Delete"
-                              action={async () => {
-                                await send("DELETE", "/api/roles/" + encodeURIComponent(r().name))
-                                notify("Role " + r().name + " deleted", "ok")
-                                reload()
-                              }}
-                            />
-                          </Can>
-                        </span>
-                      </td>
-                    </tr>
-                  )}
-                </For>
-              </Table>
-            </Show>
-          </section>
-          <Show when={data().users !== undefined}>
-            <UserRoles data={data()} onChanged={reload} />
-          </Show>
-        </Loading>
-      </Errored>
+        </section>
+        <Show when={data().users !== undefined}>
+          <UserRoles data={data()} onChanged={reload} />
+        </Show>
+      </Guard>
     </section>
   )
 }

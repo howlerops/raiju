@@ -1,6 +1,6 @@
 import { createMemo, createSignal, For, onSettled, refresh, Show } from "solid-js"
 import { LoadingSkeleton } from "../LoadingSkeleton"
-import { api, send } from "../api/client"
+import { api, message, send } from "../api/client"
 import { fmtInt, fmtMoney, fmtMs, fmtPct, num } from "../fmt"
 import { can } from "../perm"
 import { OverviewCharts } from "./Charts"
@@ -28,13 +28,23 @@ function modelRows(by: unknown): ModelRow[] {
   return rows.sort((a, b) => b.requests - a.requests)
 }
 
+const POLL_MS = 10000
+// a little under the interval, so a stalled read ends before the next tick
+const POLL_TIMEOUT_MS = 8000
+
 export function Overview() {
   const [updated, setUpdated] = createSignal("")
   const [tick, setTick] = createSignal(0)
-  const stats = createMemo(() => api.get("/api/logs/stats", { query: { start_time: Date.now() - 3600000 } }))
-  const cache = createMemo(() => api.get("/api/cache"))
-  const health = createMemo(() => api.get("/api/health"))
-  const mcp = createMemo(() => api.get("/api/mcp"))
+  // Reads still in flight: a poll tick is skipped until the last reload has answered or timed out.
+  let pending = 0
+  const tracked = <T,>(p: Promise<T>): Promise<T> => {
+    pending += 1
+    return p.finally(() => { pending -= 1 })
+  }
+  const stats = createMemo(() => tracked(api.get("/api/logs/stats", { query: { start_time: Date.now() - 3600000 }, timeoutMs: POLL_TIMEOUT_MS })))
+  const cache = createMemo(() => tracked(api.get("/api/cache", { timeoutMs: POLL_TIMEOUT_MS })))
+  const health = createMemo(() => tracked(api.get("/api/health", { timeoutMs: POLL_TIMEOUT_MS })))
+  const mcp = createMemo(() => tracked(api.get("/api/mcp", { timeoutMs: POLL_TIMEOUT_MS })))
   const [metrics, setMetrics] = createSignal("Opening this loads /metrics.")
   const [metricsPending, setMetricsPending] = createSignal(false)
 
@@ -49,8 +59,8 @@ export function Overview() {
   onSettled(() => {
     setUpdated("Updated " + new Date().toLocaleTimeString())
     const timer = setInterval(() => {
-      if (!document.hidden) reload()
-    }, 10000)
+      if (!document.hidden && pending === 0) reload()
+    }, POLL_MS)
     return () => clearInterval(timer)
   })
 
@@ -61,7 +71,7 @@ export function Overview() {
       const r = await send("GET", "/metrics")
       setMetrics(r.text || "(no metrics)")
     } catch (e) {
-      setMetrics(e instanceof Error ? e.message : String(e))
+      setMetrics(message(e))
     } finally {
       setMetricsPending(false)
     }
@@ -99,7 +109,7 @@ export function Overview() {
 
       </Show>
       <Show when={can("Logs")}>
-        <OverviewCharts tick={tick} />
+        <OverviewCharts tick={tick} track={tracked} timeoutMs={POLL_TIMEOUT_MS} />
       </Show>
 
       <div class="content-grid" style="margin-top:14px">

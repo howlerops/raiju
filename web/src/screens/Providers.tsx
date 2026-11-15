@@ -1,9 +1,11 @@
-import { createMemo, createSignal, Errored, For, Loading, refresh, Show, untrack } from "solid-js"
-import { LoadingSkeleton } from "../LoadingSkeleton"
+import { createMemo, createSignal, For, refresh, Show, untrack } from "solid-js"
 import { api } from "../api/client"
 import type { Key, Provider } from "../api/types"
 import { splitList } from "../fmt"
-import { Can, DangerButton, ErrP, FormError, initValue, Pill, notify, Table, Toolbar, useFormRun, tf } from "../ui"
+import { CanCall, DangerButton, fieldValue, FormError, Guard, initValue, Pill, notify, Table, Toolbar, useFormRun, tf } from "../ui"
+
+const PROVIDERS = "/api/providers"
+const KEYS = "/api/providers/{provider}/keys"
 
 // A key is addressed by its id; older records without one fall back to the name.
 function keyRef(k: Key): string {
@@ -14,11 +16,6 @@ function baseUrlOf(p: Provider): string {
   return p.network_config?.base_url || p.base_url || ""
 }
 
-function field(form: HTMLFormElement, name: string): string {
-  const el = form.elements.namedItem(name)
-  return el instanceof HTMLInputElement || el instanceof HTMLSelectElement ? el.value : ""
-}
-
 function KeyEditForm(props: { provider: string; k: Key; onClose: () => void; onSaved: () => void }) {
   const { busy, error, run } = useFormRun()
   // the form edits the key it was opened with
@@ -27,14 +24,14 @@ function KeyEditForm(props: { provider: string; k: Key; onClose: () => void; onS
     ev.preventDefault()
     const form = ev.currentTarget as HTMLFormElement
     void run(async () => {
-      const weight = field(form, "weight")
+      const weight = fieldValue(form, "weight")
       const body: Key = {
-        name: field(form, "name").trim(),
-        models: splitList(field(form, "models")),
+        name: fieldValue(form, "name").trim(),
+        models: splitList(fieldValue(form, "models")),
         weight: weight === "" ? 1 : Number(weight),
       }
       // a blank value leaves the stored key as it is
-      const value = field(form, "value")
+      const value = fieldValue(form, "value")
       if (value !== "") body.value = value
       await api.put("/api/providers/{provider}/keys/{key_id}", { params: { provider: props.provider, key_id: keyRef(key) }, body })
       notify("Key saved", "ok")
@@ -78,13 +75,13 @@ function AddKeyForm(props: { provider: string; onSaved: () => void }) {
     ev.preventDefault()
     const form = ev.currentTarget as HTMLFormElement
     void run(async () => {
-      const weight = field(form, "weight")
+      const weight = fieldValue(form, "weight")
       await api.post("/api/providers/{provider}/keys", {
         params: { provider: props.provider },
         body: {
-          name: field(form, "name").trim(),
-          value: field(form, "value"),
-          models: splitList(field(form, "models")),
+          name: fieldValue(form, "name").trim(),
+          value: fieldValue(form, "value"),
+          models: splitList(fieldValue(form, "models")),
           weight: weight === "" ? 1 : Number(weight),
         },
       })
@@ -133,8 +130,8 @@ function ProviderEditForm(props: { p: Provider; onClose: () => void; onSaved: ()
     ev.preventDefault()
     const form = ev.currentTarget as HTMLFormElement
     void run(async () => {
-      const url = field(form, "base_url").trim()
-      const baseType = custom() ? field(form, "base_provider_type").trim() : ""
+      const url = fieldValue(form, "base_url").trim()
+      const baseType = custom() ? fieldValue(form, "base_provider_type").trim() : ""
       if (custom() && !baseType) throw new Error("Enter the base provider type for a custom provider.")
       // keys are left out, so the saved keys stay as they are (a PUT without keys keeps them)
       const network: Record<string, unknown> = { ...(prov.network_config ?? {}) }
@@ -199,12 +196,12 @@ function ProviderCard(props: { p: Provider; onChange: () => void }) {
         <Pill>{props.p.kind || "unknown"}</Pill>
         <span class="hint mono grow">{baseUrlOf(props.p) || "default endpoint"}</span>
         <span class="row-actions">
-          <Can resource="ModelProvider" op="Update">
+          <CanCall method="PUT" path={PROVIDERS}>
             <button type="button" class="btn btn-sm btn-ghost" aria-expanded={tf(editing())} onClick={() => setEditing(!editing())}>
               Edit
             </button>
-          </Can>
-          <Can resource="ModelProvider" op="Delete">
+          </CanCall>
+          <CanCall method="DELETE" path={PROVIDERS}>
             <DangerButton
               label="Delete"
               action={async () => {
@@ -213,7 +210,7 @@ function ProviderCard(props: { p: Provider; onChange: () => void }) {
                 props.onChange()
               }}
             />
-          </Can>
+          </CanCall>
         </span>
       </header>
       <Show when={editing()}>
@@ -238,12 +235,12 @@ function ProviderCard(props: { p: Provider; onChange: () => void }) {
                 <td>{k().weight === undefined ? "—" : String(k().weight)}</td>
                 <td>
                   <span class="row-actions">
-                    <Can resource="ModelProvider" op="Update">
+                    <CanCall method="PUT" path={KEYS}>
                       <button type="button" class="btn btn-sm btn-ghost" onClick={() => setEditKey(k())}>
                         Edit
                       </button>
-                    </Can>
-                    <Can resource="ModelProvider" op="Delete">
+                    </CanCall>
+                    <CanCall method="DELETE" path={KEYS}>
                       <DangerButton
                         label="Delete"
                         action={async () => {
@@ -252,7 +249,7 @@ function ProviderCard(props: { p: Provider; onChange: () => void }) {
                           props.onChange()
                         }}
                       />
-                    </Can>
+                    </CanCall>
                   </span>
                 </td>
               </tr>
@@ -275,9 +272,9 @@ function ProviderCard(props: { p: Provider; onChange: () => void }) {
           )}
         </Show>
       </div>
-      <Can resource="ModelProvider" op="Create">
+      <CanCall method="POST" path={KEYS}>
         <AddKeyForm provider={props.p.name} onSaved={props.onChange} />
-      </Can>
+      </CanCall>
     </article>
   )
 }
@@ -289,10 +286,10 @@ function AddProvider(props: { names: () => string[]; onSaved: () => void }) {
     ev.preventDefault()
     const form = ev.currentTarget as HTMLFormElement
     void run(async () => {
-      const k = field(form, "kind")
-      const name = field(form, "name").trim() || (k !== "custom" ? k : "")
-      const base = field(form, "base_url").trim()
-      const baseType = field(form, "base_provider_type").trim()
+      const k = fieldValue(form, "kind")
+      const name = fieldValue(form, "name").trim() || (k !== "custom" ? k : "")
+      const base = fieldValue(form, "base_url").trim()
+      const baseType = fieldValue(form, "base_provider_type").trim()
       if (!name) throw new Error("Enter a provider name.")
       if (k === "custom" && !baseType) throw new Error("Enter the base provider type for a custom provider.")
       if (props.names().includes(name)) throw new Error('Provider "' + name + '" already exists. Edit it or add keys below.')
@@ -361,19 +358,17 @@ export function Providers() {
         </button>
       </Toolbar>
       <div id="pv-list">
-        <Errored fallback={(err) => <ErrP error={err()} />}>
-          <Loading fallback={<LoadingSkeleton variant="content" />}>
-            <Show when={providers().providers.length} fallback={<p class="card panel bg-base-100 border border-base-300 muted">No providers configured yet. Add one below.</p>}>
-              <For each={providers().providers} keyed={(p) => p.name}>
-                {(p) => <ProviderCard p={p()} onChange={reload} />}
-              </For>
-            </Show>
-          </Loading>
-        </Errored>
+        <Guard>
+          <Show when={providers().providers.length} fallback={<p class="card panel bg-base-100 border border-base-300 muted">No providers configured yet. Add one below.</p>}>
+            <For each={providers().providers} keyed={(p) => p.name}>
+              {(p) => <ProviderCard p={p()} onChange={reload} />}
+            </For>
+          </Show>
+        </Guard>
       </div>
-      <Can resource="ModelProvider" op="Update">
+      <CanCall method="PUT" path={PROVIDERS}>
         <AddProvider names={() => safeNames(providers)} onSaved={reload} />
-      </Can>
+      </CanCall>
     </section>
   )
 }

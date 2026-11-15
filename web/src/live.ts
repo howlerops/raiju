@@ -5,7 +5,7 @@
 // batched messages (a JSON array of envelopes, or "data" holding an array),
 // an optional "node" on the envelope or the entry, and an optional event id.
 import { createSignal, type Accessor } from "solid-js"
-import { api } from "./api/client"
+import { api, message } from "./api/client"
 import type { LogEntry } from "./api/types"
 import { isActive, onGatewayLeave, targetURL } from "./gateway"
 
@@ -121,6 +121,8 @@ export function createFeed(): Feed {
   let incoming: LiveRow[] = [] // oldest first, waiting for the next flush
   let held: LiveRow[] = [] // arrived while paused
   let flushTimer: ReturnType<typeof setTimeout> | undefined
+  // paused() for the socket path, readable in the same tick as the write
+  let holding = false
   let prepend: (n: number) => void = () => {}
   const seen = new Set<string>()
   let generation = 0
@@ -128,6 +130,11 @@ export function createFeed(): Feed {
 
   const flush = () => {
     flushTimer = undefined
+    if (holding) {
+      // only the newest LIVE_MAX of the held rows will be shown
+      setQueued(Math.min(held.length, LIVE_MAX))
+      return
+    }
     if (!incoming.length) return
     const batch = incoming
     incoming = []
@@ -144,6 +151,13 @@ export function createFeed(): Feed {
     prepend(fresh.length)
   }
 
+  // Keeps the newest LIVE_MAX held rows; a dropped row may be accepted again later.
+  const trimHeld = () => {
+    const extra = held.length - LIVE_MAX
+    if (extra <= 0) return
+    for (let i = 0; i < extra; i++) seen.delete(held[i]!.id)
+    held = held.slice(extra)
+  }
   const accept = (r: LiveRow) => {
     if (seen.has(r.id)) return
     seen.add(r.id)
@@ -152,13 +166,11 @@ export function createFeed(): Feed {
       const n = r.node
       if (!nodes().includes(n)) setNodes((l) => [...l, n].sort())
     }
-    if (paused()) {
+    if (holding) {
+      // Push only: the buffer is trimmed in chunks (and again on resume), never per message.
       held.push(r)
-      if (held.length > LIVE_MAX) {
-        const dropped = held.shift()
-        if (dropped) seen.delete(dropped.id)
-      }
-      setQueued(held.length)
+      if (held.length > 2 * LIVE_MAX) trimHeld()
+      if (flushTimer === undefined) flushTimer = setTimeout(flush, 100)
       return
     }
     incoming.push(r)
@@ -202,7 +214,7 @@ export function createFeed(): Feed {
       ticket = r && r.ticket ? String(r.ticket) : ""
     } catch (e) {
       if (!want || connecting !== generation || !isActive()) return
-      setNote("Live feed: " + (e instanceof Error ? e.message : String(e)))
+      setNote("Live feed: " + message(e))
       return scheduleRetry()
     }
     if (!want || connecting !== generation || !isActive()) return
@@ -216,7 +228,7 @@ export function createFeed(): Feed {
     try {
       sock = new WebSocket(endpoint.href)
     } catch (e) {
-      setNote("Live feed: " + (e instanceof Error ? e.message : String(e)))
+      setNote("Live feed: " + message(e))
       return scheduleRetry()
     }
     ws = sock
@@ -265,6 +277,7 @@ export function createFeed(): Feed {
       timer = undefined
       clearTimeout(flushTimer)
       flushTimer = undefined
+      if (holding) setQueued(Math.min(held.length, LIVE_MAX))
       if (ws) {
         const s = ws
         ws = undefined
@@ -273,14 +286,18 @@ export function createFeed(): Feed {
       }
     },
     pause() {
+      holding = true
       setPaused(true)
       // anything already received but not shown yet waits with the rest
       held = held.concat(incoming)
       incoming = []
+      trimHeld()
       setQueued(held.length)
     },
     resume() {
+      holding = false
       setPaused(false)
+      trimHeld()
       incoming = incoming.concat(held)
       held = []
       setQueued(0)

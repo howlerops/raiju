@@ -2,7 +2,7 @@ import { createSignal, For, Show } from "solid-js"
 import { LoadingSkeleton } from "../LoadingSkeleton"
 import { message, send } from "../api/client"
 import { contentText, fmtInt, listOf, pretty } from "../fmt"
-import { notify, Toolbar, useRun } from "../ui"
+import { fieldValue, notify, Toolbar, useRun } from "../ui"
 import { target, targetLabel } from "../gateway"
 
 interface Result {
@@ -22,7 +22,7 @@ export function Playground() {
   const [failure, setFailure] = createSignal("")
   let form: HTMLFormElement | undefined
 
-  const val = (n: string) => ((form?.elements.namedItem(n) as HTMLInputElement | HTMLTextAreaElement | null)?.value ?? "").trim()
+  const val = (n: string) => fieldValue(form, n).trim()
   const headers = (): Record<string, string> => {
     const vk = val("vk")
     return vk ? { "x-raiju-vk": vk } : {}

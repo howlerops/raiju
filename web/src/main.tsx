@@ -1,6 +1,7 @@
 import { render } from "@solidjs/web"
 import { createSignal, For, Show } from "solid-js"
 import { App } from "./App"
+import { message } from "./api/client"
 import { bootstrapGateways, consoleConfig, switchGateway } from "./gateway"
 import { initializeAuth } from "./auth"
 import { LoadingSkeleton } from "./LoadingSkeleton"
@@ -23,7 +24,7 @@ if (root) {
     render(() => (
       <main><section class="card panel bg-base-100 border border-base-300" role="alert">
         <h1>Console configuration unavailable</h1>
-        <p class="error">{error instanceof Error ? error.message : String(error)}</p>
+        <p class="error">{message(error)}</p>
         <p>No gateway requests were made. Correct the configuration and reload.</p>
         <button class="btn btn-sm" type="button" onClick={() => location.reload()}>Reload configuration</button>
         <Show when={consoleConfig()}>
@@ -31,7 +32,7 @@ if (root) {
           <div class="fleet-grid">
             <For each={consoleConfig()?.gateways ?? []}>{(gateway) => (
               <button type="button" class="btn h-auto py-4" onClick={() => {
-                try { switchGateway(gateway.id) } catch (e) { setRecoveryError(e instanceof Error ? e.message : String(e)) }
+                try { switchGateway(gateway.id) } catch (e) { setRecoveryError(message(e)) }
               }}>
                 Select {gateway.name}<br /><span class="mono endpoint">{gateway.url}</span>
               </button>

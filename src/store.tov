@@ -24,15 +24,15 @@ import { PromptRepoConfig } from "./prompts"
 import { FeatureFlagsConfig } from "./flags"
 import { notify } from "./notify"
 import { analyzerStatus, retryWarmup, generationsJson, deleteGeneration } from "./complexity"
-import { isBuiltinRole, customRole, customRoles, systemRole, withRoleIds, roleIdOf, roleNameById, anyRoleName, builtinRoleName, builtinRoles } from "./rbac"
+import { Held, holds, isBuiltinRole, customRole, customRoles, systemRole, withRoleIds, roleIdOf, roleNameById, anyRoleName, builtinRoleName, builtinRoles } from "./rbac"
 import { DataScope, allScope, inScope, scopeOf } from "./scope"
 import { setGlobalProxy } from "./providers/types"
 import { McpClientConfig, McpUserCredential } from "./mcp"
 import { McpUserToken } from "./mcpuser"
 import { decode, encode } from "./base64"
 import { gcmSeal, gcmOpen, pbkdf2Sha256 } from "./aesgcm"
-import { Field, fields, find, isNull, quote, elements, decodeString, rawStr, rawBool, rawNum, build, setField, without } from "./json"
-import { secureHex, utf8, sha256, toHex } from "./crypto"
+import { Field, fields, find, isNull, quote, elements, decodeString, rawStr, rawBool, rawNum, build, setField, without, floorInt } from "./json"
+import { secureHex, utf8, sha256, toHex, safeEq, secretFieldName, secretMapName, secureBytes } from "./crypto"
 import { Policy, Verdict, hostVerdict, urlVerdict } from "./netguard"
 import { rfc3339Ms, rfc3339Of } from "./vkexpiry"
 import { durationMs, effectiveBudgetLimit, cyclesLeft } from "./governance"
@@ -101,12 +101,13 @@ export function newVkValue(): string {
   return "sk-raiju-" + randHex(32)
 }
 
-// Shows the first and last four characters. Short secrets become "****"; empty
-// values and "env.NAME" references are not secrets and pass through.
+// Shows the first and last four characters of a long secret (a provider key, say), enough to tell two apart. Anything
+// under 24 bytes becomes "****": eight shown characters of a twelve-character password would leave four to guess.
+// Empty values and "env.NAME" references are not secrets and pass through.
 export function maskSecret(v: string): string {
   if (v === "" || v.startsWith("env.")) return v
   const n = v.byteLength
-  if (n <= 8) return "****"
+  if (n < 24) return "****"
   return v.slice(0, 4) + "…" + v.slice(n - 4)
 }
 
@@ -1023,17 +1024,9 @@ function isReference(v: string): bool {
   return v.startsWith("env.") || v.startsWith("vault.") || v.startsWith("aws-sm.")
 }
 
-function hexBytes(h: string): u8[] {
-  const out: u8[] = []
-  for (let i = 0; i + 1 < h.byteLength; i += 2) {
-    out.push(u8(HEXV.indexOf(h.slice(i, i + 1)) * 16 + HEXV.indexOf(h.slice(i + 1, i + 2))))
-  }
-  return out
-}
-
 // "enc:v1:" then base64 of the 12-byte nonce, the ciphertext and the 16-byte tag.
 function sealValue(c: ConfigCipher, v: string): string throws Error {
-  const nonce = hexBytes(try secureHex(24))
+  const nonce = try secureBytes(12)
   return SEALED + encode(nonce.concat(gcmSeal(c.key, nonce, utf8(v), NO_AAD)))
 }
 
@@ -2778,29 +2771,50 @@ export class ConfigStore {
   }
 }
 
-// Field names whose string values are secrets, wherever they are in the config.
-function secretKey(k: string): bool {
-  const n = k.toLowerCase()
-  if (n.endsWith("_url") || n.endsWith("_uri") || n.endsWith("_endpoint")) return n === "webhook_url"
-  if (n === "key" || n === "value" || n === "webhook_url" || n === "dsn") return true
-  for (const w of ["secret", "password", "token", "credential", "private_key", "api_key", "routing_key", "hmac", "authorization"]) {
-    if (n.includes(w)) return true
+// The opposite of maskJson for a section sent back by a client that read it masked: a secret string that is still
+// exactly the mask of the stored one is the stored one. Without this a save of what GET /api/config returned would
+// replace a secret (the MCP authorization server's signing key, say) with its mask. Objects are matched by key and
+// arrays by position; anything that does not line up with the stored text passes as sent.
+function unmaskJson(raw: string, stored: string | undefined, all: bool): string throws SyntaxError {
+  const t = raw.trim()
+  const old = stored === undefined ? "" : stored.trim()
+  if (t.startsWith("{")) {
+    const olds = old.startsWith("{") ? try fields(old) : []
+    const out: string[] = []
+    for (const f of try fields(t)) {
+      const v = f.raw.trim()
+      const secret = all || (secretMapName(f.key) && v.startsWith("{")) || (secretFieldName(f.key) && v.startsWith("\""))
+      out.push(`${quote(f.key)}:${try unmaskJson(f.raw, find(olds, f.key), secret)}`)
+    }
+    return "{" + out.join(",") + "}"
   }
-  return false
+  if (t.startsWith("[")) {
+    const olds = old.startsWith("[") ? try elements(old) : []
+    const news = try elements(t)
+    // by position only while the list keeps its length: after an entry is added or removed the positions no
+    // longer name the same entries, and a short value's mask ("****") would match whichever one sits there
+    const aligned = olds.length === news.length
+    const out: string[] = []
+    let i = 0
+    for (const e of news) {
+      out.push(try unmaskJson(e, aligned ? olds[i]! : undefined, all))
+      i += 1
+    }
+    return "[" + out.join(",") + "]"
+  }
+  if (all && t.startsWith("\"") && old.startsWith("\"")) {
+    const kept = try decodeString(old)
+    if ((try decodeString(t)) === maskSecret(kept)) return quote(kept)
+  }
+  return t
 }
 
-// Maps whose every value is secret (headers and environment variables).
-function secretMap(k: string): bool {
-  const n = k.toLowerCase()
-  return n === "headers" || n === "env" || n.endsWith("_headers")
-}
-
-// Masks the secret string values of a JSON text (see secretKey and secretMap).
+// Masks the secret string values of a JSON text (see secretFieldName and secretMapName in crypto.tov).
 function maskJson(raw: string, all: bool): string throws SyntaxError {
   const t = raw.trim()
   if (t.startsWith("{")) {
     const out: string[] = []
-    for (const f of try fields(t)) out.push(`${quote(f.key)}:${try maskJson(f.raw, all || secretMap(f.key) || (secretKey(f.key) && f.raw.trim().startsWith("\"")))}`)
+    for (const f of try fields(t)) out.push(`${quote(f.key)}:${try maskJson(f.raw, all || (secretMapName(f.key) && f.raw.trim().startsWith("{")) || (secretFieldName(f.key) && f.raw.trim().startsWith("\"")))}`)
     return "{" + out.join(",") + "}"
   }
   if (t.startsWith("[")) {
@@ -2826,21 +2840,25 @@ test("the config view masks secrets in every section", () => {
   expect(m.includes(`"max_tokens":5`)).toBe(true)
   expect(m.includes(`"token_url":"https://t/token"`)).toBe(true)
   expect(m.includes(`"value":"env.FOO"`)).toBe(true)
+  // a masked section sent back restores the stored secrets and keeps everything the client changed
+  const stored = `{"oauth2_server_config":{"issuer_url":"https://a","signing_key":"-----BEGIN PRIVATE KEY-----abcdefghijklmnop"},"headers":{"x":"short"},"n":1}`
+  const sentBack = try maskJson(stored, false)
+  expect(sentBack.includes("abcdefghijklmnop")).toBe(false)
+  expect(try unmaskJson(sentBack, stored, false)).toBe(stored)
+  expect(try unmaskJson(`{"oauth2_server_config":{"issuer_url":"https://b","signing_key":"new-key"},"n":2}`, stored, false)).toBe(`{"oauth2_server_config":{"issuer_url":"https://b","signing_key":"new-key"},"n":2}`)
+  expect(try unmaskJson(`{"headers":{"x":"****","y":"****"}}`, stored, false)).toBe(`{"headers":{"x":"short","y":"****"}}`)
+  // a list of header names is not a map of secrets: it is shown and saved as it is
+  expect(try maskJson(`{"required_headers":["x-team","x-org"],"extra_headers":{"x-api":"secret-value"}}`, false)).toBe(`{"required_headers":["x-team","x-org"],"extra_headers":{"x-api":"****"}}`)
+  // a masked list that changed length is not matched by position
+  const lists = `{"auth":{"tokens":["aaaa","bbbb"]}}`
+  expect(try unmaskJson(`{"auth":{"tokens":["****","****"]}}`, lists, true)).toBe(lists)
+  expect(try unmaskJson(`{"auth":{"tokens":["****"]}}`, lists, true)).toBe(`{"auth":{"tokens":["****"]}}`)
+  // secrets whose names carry none of the usual words
+  const k = try maskJson(`{"encryption_key":"eeeeeeeeeeee","client":{"oauth2_server_config":{"signing_key":"ssssssssssss"}},"exporters":[{"service_account_key":"aaaaaaaaaaaa"}],"tls":{"client_key_pem":"kkkkkkkkkkkk","client_cert_pem":"cert"},"sasl_password":"dddddddddddd","access_key":"AKIAEXAMPLE"}`, false)
+  for (const secret of ["eeeeeeeeeeee", "ssssssssssss", "aaaaaaaaaaaa", "kkkkkkkkkkkk", "dddddddddddd"]) expect(k.includes(secret)).toBe(false)
+  expect(k.includes(`"client_cert_pem":"cert"`)).toBe(true)
+  expect(k.includes(`"access_key":"AKIAEXAMPLE"`)).toBe(true)
 })
-
-// Compares two strings without stopping at the first difference.
-function safeEq(a: string, b: string): bool {
-  const x = new TextEncoder().encode(a)
-  const y = new TextEncoder().encode(b)
-  const n = x.length > y.length ? x.length : y.length
-  let d = x.length === y.length ? 0 : 1
-  for (let i = 0; i < n; i++) {
-    const p = i < x.length ? int(x[i]!) : 0
-    const q = i < y.length ? int(y[i]!) : 0
-    d = d | (p ^ q)
-  }
-  return d === 0
-}
 
 // The decoded "user:password" of a Basic credential, or undefined if it is not base64 text.
 function basicCreds(v: string): string | undefined {
@@ -3306,7 +3324,7 @@ export function isRotatePath(path: string): bool {
   return segs.length === 4 && segs[3] === "rotate" || segs.length === 5 && segs[4] === "rotate"
 }
 
-function governanceRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, sp: URLSearchParams, scope: DataScope): ApiReply {
+function governanceRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, sp: URLSearchParams, scope: DataScope, grant?: Held): ApiReply {
   const coll = segs[2] ?? ""
   if (coll === "virtual-keys" && (segs.length === 4 && segs[3] === "rotate" || segs.length === 5 && segs[4] === "rotate")) {
     return rotateVkRoute(store, m, segs, body, path, scope)
@@ -3322,7 +3340,7 @@ function governanceRoute(store: ConfigStore, m: string, segs: string[], body: st
   // RBAC routes: /api/governance/rbac/roles maps to /api/roles; the rest expose the catalogue.
   if (coll === "rbac") {
     const sub = segs[3] ?? ""
-    if (sub === "roles") return roleRoute(store, m, ["api", "roles"].concat(segs.slice(4)), body, path, scope, true)
+    if (sub === "roles") return roleRoute(store, m, ["api", "roles"].concat(segs.slice(4)), body, path, scope, true, grant)
     if (sub === "resources" || sub === "operations" || sub === "permissions") return segs.length === 4 ? rbacListing(sub, m) : notFound(path)
     return notFound(path)
   }
@@ -3781,13 +3799,28 @@ function businessUnitFrom(id: string, b: BusinessUnitBody): BusinessUnitConfig {
 // using the response shape of /api/governance/rbac/roles/{role_id}; a name uses the name-based response shape.
 // /api/governance/rbac/roles lists built-in roles first, with their fixed ids and is_system_role.
 // /api/roles lists custom roles only.
-function roleRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, scope: DataScope, system: bool): ApiReply {
+// The 403 for a role change that would add a permission its caller does not hold, or undefined. A caller who is
+// not an admin (grant.all false) gives a role only what it holds itself, so a delegated RBAC permission cannot mint
+// the admin's; pairs the role already has stay. No grant: no bound (the admin, and callers inside the process).
+function grantRefusal(grant: Held | undefined, cur: PermissionPair[] | undefined, next: PermissionPair[] | undefined): ApiReply | undefined {
+  if (grant === undefined || grant.all) return undefined
+  const had: Held = { all: false, pairs: cur ?? [] }
+  for (const p of next ?? []) {
+    if (holds(had, p)) continue
+    if (!holds(grant, p)) {
+      return reply(403, errorBody(`you do not hold ${p.resource}:${p.operation}, so you cannot add it to a role`))
+    }
+  }
+  return undefined
+}
+
+function roleRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, scope: DataScope, system: bool, grant?: Held): ApiReply {
   if (segs.length > 4 || segs.length === 4 && segs[3] !== "permissions") return notFound(path)
   if (!scope.all && m !== "GET") return scopeDenied()
   const name = segs[2]
-  if (name !== undefined && isNumeric(name)) return roleByIdRoute(store, m, parseInt(name) ?? 0, segs, body)
-  if (name !== undefined && isBuiltinRole(name)) return systemRoleRoute(store, m, name, segs, body, false)
-  if (segs.length === 4 && name !== undefined) return rolePermissions(store, m, name, body)
+  if (name !== undefined && isNumeric(name)) return roleByIdRoute(store, m, parseInt(name) ?? 0, segs, body, grant)
+  if (name !== undefined && isBuiltinRole(name)) return systemRoleRoute(store, m, name, segs, body, false, grant)
+  if (segs.length === 4 && name !== undefined) return rolePermissions(store, m, name, body, grant)
   if (name === undefined) {
     if (m === "GET") {
       const parts: string[] = []
@@ -3805,6 +3838,8 @@ function roleRoute(store: ConfigStore, m: string, segs: string[], body: string, 
     if (b === undefined) return badBody()
     const ed = entityDacFrom(body)
     if (ed.error !== "") return reply(400, errorBody(ed.error))
+    const no = grantRefusal(grant, customRole(gov(store.cfg).roles, b.name ?? "")?.permissions, b.permissions)
+    if (no !== undefined) return no
     const r = store.upsertRole(roleFrom(b.name ?? "", b, ed.list))
     if (r.kind === "error") return errReply(r)
     const made = roleView(store, b.name ?? "")
@@ -3819,6 +3854,8 @@ function roleRoute(store: ConfigStore, m: string, segs: string[], body: string, 
     if (b === undefined) return badBody()
     const ed = entityDacFrom(body)
     if (ed.error !== "") return reply(400, errorBody(ed.error))
+    const no = grantRefusal(grant, cur.permissions, b.permissions)
+    if (no !== undefined) return no
     const r = store.upsertRole(roleFrom(name, b, ed.list))
     if (r.kind === "error") return errReply(r)
     const saved = roleView(store, name)
@@ -3841,12 +3878,12 @@ function roleView(store: ConfigStore, name: string): RoleConfig | undefined {
 // /api/governance/rbac/roles/{role_id}: GET, PUT and DELETE use the {"role": ...} shape.
 // PUT is a partial update: omitted fields keep their values, and description "" clears it.
 // A role cannot be renamed because its users and access profiles are kept by its id.
-function roleByIdRoute(store: ConfigStore, m: string, id: int, segs: string[], body: string): ApiReply {
+function roleByIdRoute(store: ConfigStore, m: string, id: int, segs: string[], body: string, grant?: Held): ApiReply {
   const sys = builtinRoleName(id)
-  if (sys !== undefined) return systemRoleRoute(store, m, sys, segs, body, true)
+  if (sys !== undefined) return systemRoleRoute(store, m, sys, segs, body, true, grant)
   const name = roleNameById(gov(store.cfg).roles, id)
   if (name === undefined) return reply(404, errorBody(`no role ${id}`))
-  if (segs.length === 4) return rolePermissions(store, m, name, body)
+  if (segs.length === 4) return rolePermissions(store, m, name, body, grant)
   const cur = roleView(store, name)
   if (cur === undefined) return reply(404, errorBody(`no role ${id}`))
   if (m === "GET") return reply(200, `{"role":${roleJson(cur)}}`)
@@ -3866,6 +3903,8 @@ function roleByIdRoute(store: ConfigStore, m: string, id: int, segs: string[], b
       present = false
     }
     const next: RoleConfig = { name: name, description: description, dac: b.dac ?? cur.dac, permissions: b.permissions ?? cur.permissions, entity_dac: present ? ed.list : cur.entity_dac }
+    const no = grantRefusal(grant, cur.permissions, next.permissions)
+    if (no !== undefined) return no
     const r = store.upsertRole(next)
     if (r.kind === "error") return errReply(r)
     const saved = roleView(store, name)
@@ -3884,7 +3923,7 @@ function roleByIdRoute(store: ConfigStore, m: string, id: int, segs: string[], b
 // or its permission pairs at .../permissions. Deletion returns 403. PUT edits description, dac,
 // entity_dac and permissions; omitted fields keep their values, and the role cannot be renamed.
 // PUT .../permissions {"permission_ids": [...]} replaces its pairs. Edited roles are judged by their pairs.
-function systemRoleRoute(store: ConfigStore, m: string, name: string, segs: string[], body: string, wrap: bool): ApiReply {
+function systemRoleRoute(store: ConfigStore, m: string, name: string, segs: string[], body: string, wrap: bool, grant?: Held): ApiReply {
   const role = systemRole(gov(store.cfg).roles, name, RESOURCES, OPERATIONS)
   if (role === undefined) return reply(404, errorBody(`no role ${name}`))
   if (segs.length === 4) {
@@ -3892,6 +3931,8 @@ function systemRoleRoute(store: ConfigStore, m: string, name: string, segs: stri
     if (m !== "PUT") return notAllowed(m)
     const ps = permissionIdsOf(body)
     if (ps.error !== "") return reply(400, errorBody(ps.error))
+    const no = grantRefusal(grant, role.permissions, ps.pairs)
+    if (no !== undefined) return no
     const r = store.editSystemRole({ name: name, description: role.description, dac: role.dac, permissions: ps.pairs, entity_dac: role.entity_dac })
     if (r.kind === "error") return errReply(r)
     return systemRoleRoute(store, "GET", name, segs, "", wrap)
@@ -3912,6 +3953,8 @@ function systemRoleRoute(store: ConfigStore, m: string, name: string, segs: stri
   }
   let description: string | undefined = role.description
   if (b.description !== undefined) description = b.description === "" ? undefined : b.description
+  const no = grantRefusal(grant, role.permissions, b.permissions)
+  if (no !== undefined) return no
   const r = store.editSystemRole({ name: name, description: description, dac: b.dac ?? role.dac, permissions: b.permissions ?? role.permissions, entity_dac: present ? ed.list : role.entity_dac })
   if (r.kind === "error") return errReply(r)
   return systemRoleRoute(store, "GET", name, segs, "", wrap)
@@ -3930,13 +3973,15 @@ function isNumeric(s: string): bool {
 
 // GET and PUT /api/roles/{name}/permissions. GET lists the role's permission pairs with their ids;
 // PUT {"permission_ids": [...]} replaces the pairs with those identified by the supplied ids.
-function rolePermissions(store: ConfigStore, m: string, name: string, body: string): ApiReply {
+function rolePermissions(store: ConfigStore, m: string, name: string, body: string, grant?: Held): ApiReply {
   const cur = customRole(gov(store.cfg).roles, name)
   if (cur === undefined) return reply(404, errorBody(`no role ${name}`))
   if (m === "GET") return permissionsReply(name, cur.permissions ?? [])
   if (m !== "PUT") return notAllowed(m)
   const ps = permissionIdsOf(body)
   if (ps.error !== "") return reply(400, errorBody(ps.error))
+  const no = grantRefusal(grant, cur.permissions, ps.pairs)
+  if (no !== undefined) return no
   const r = store.upsertRole({ name: name, description: cur.description, dac: cur.dac, permissions: ps.pairs, entity_dac: cur.entity_dac })
   if (r.kind === "error") return errReply(r)
   return rolePermissions(store, "GET", name, "")
@@ -3962,7 +4007,7 @@ function permissionIdsOf(body: string): { pairs: PermissionPair[], error: string
   try {
     for (const el of elements(raw)) {
       const id = parseFloat(el)
-      const pair = id === undefined ? undefined : pairOfId(RESOURCES, OPERATIONS, Math.floor(id))
+      const pair = id === undefined ? undefined : pairOfId(RESOURCES, OPERATIONS, floorInt(id) ?? -1)
       if (pair === undefined) return { pairs: pairs, error: `unknown permission id ${el}` }
       pairs.push(pair)
     }
@@ -4242,7 +4287,7 @@ function frameworkPlan(raw: string, cur: PricingSyncConfig | undefined): Framewo
   if (find(fs, "pricing_sync_interval") !== undefined && iv === undefined) return { kind: "error", message: "pricing_sync_interval must be a number of seconds" }
   if (iv !== undefined) {
     if (iv <= 0.0) return { kind: "error", message: "pricing_sync_interval must be positive" }
-    interval = Math.floor(iv)
+    interval = Math.floor(Math.min(iv, 1.0e12))
   }
   let mpu: string | undefined = cur?.model_parameters_url
   const gm = rawStr(fs, "model_parameters_url")
@@ -4255,7 +4300,7 @@ function frameworkPlan(raw: string, cur: PricingSyncConfig | undefined): Framewo
   if (lv !== undefined) {
     if (lv < 0.0) return { kind: "error", message: "live models sync interval cannot be negative" }
     if (lv > 0.0 && lv < 60.0) return { kind: "error", message: "live models sync interval must be 0 (disabled) or at least 60 seconds" }
-    live = Math.floor(lv)
+    live = Math.floor(Math.min(lv, 1.0e12))
   }
   if (url === undefined && interval === undefined && cur?.enabled === undefined && mpu === undefined && live === undefined && cur?.mcp_library_url === undefined && cur?.mcp_library_sync_interval === undefined) return { kind: "ok", ps: undefined }
   let ps: PricingSyncConfig = cur ?? {}
@@ -4311,7 +4356,7 @@ export function exchangeClientIn(list: McpClientConfig[] | undefined): string {
   return ""
 }
 
-function putConfig(store: ConfigStore, body: string): ApiReply {
+function putConfig(store: ConfigStore, body: string, grant?: Held): ApiReply {
   let fs: Field[] = []
   try {
     fs = fields(body)
@@ -4324,12 +4369,15 @@ function putConfig(store: ConfigStore, body: string): ApiReply {
   if (rawClient === undefined && rawFramework === undefined && rawAuth === undefined) {
     return reply(400, errorBody("the body needs a client_config, framework_config or auth_config object"))
   }
+  // the admin credential and whether management needs one at all are the admin's alone, not a Settings delegate's
+  if (rawAuth !== undefined && grant !== undefined && !grant.all) return reply(403, errorBody("only an admin may change auth_config"))
   let c: ClientConfig | undefined = undefined
   if (rawClient !== undefined) {
     const problem = clientProblem(rawClient)
     if (problem !== "") return reply(400, errorBody(problem))
     try {
-      c = JSON.parse(rawClient) as ClientConfig
+      // secrets the client read masked (GET /api/config) and sent back unchanged keep their stored values
+      c = JSON.parse(try unmaskJson(rawClient, JSON.stringify(store.cfg.client ?? {}), false)) as ClientConfig
     } catch (e) {
       return badBody()
     }
@@ -4601,13 +4649,15 @@ function modelList(c: Config, only: string, query: string, limit: f64, offset: f
       }
     }
   }
-  const from = offset >= 0 ? Math.floor(offset) : 0
-  const n = limit >= 0 ? Math.floor(limit) : 5
+  const from = offset >= 0 ? Math.floor(Math.min(offset, 1.0e9)) : 0
+  const n = limit >= 0 ? Math.floor(Math.min(limit, 1.0e9)) : 5
   return JSON.stringify({ models: all.slice(from, from + n), total: all.length })
 }
 
 // scope is what the caller may see and change (see scope.tov); all data when it is not given.
-export function handleApi(store: ConfigStore, method: string, path: string, body: string, scope?: DataScope): ApiReply {
+// grant: what the caller may hand out through the roles routes and whether it may change auth_config (rbac.tov
+// Held); undefined places no bound (the admin, and the process's own calls).
+export function handleApi(store: ConfigStore, method: string, path: string, body: string, scope?: DataScope, grant?: Held): ApiReply {
   const m = method.toUpperCase()
   const q = path.indexOf("?")
   const p = q < 0 ? path : path.slice(0, q)
@@ -4620,7 +4670,7 @@ export function handleApi(store: ConfigStore, method: string, path: string, body
   if (area === "routing" && (segs[2] === "complexity-analyzer-status" || segs[2] === "complexity-analyzer-generations")) return complexityStateRoute(store, m, segs, p, sc)
   if (area === "routing" && segs.length >= 3) {
     const sub = segs[2] === "rules" ? "routing-rules" : segs[2] ?? ""
-    return governanceRoute(store, m, ["api", "governance", sub].concat(segs.slice(3)), body, p, qp, sc)
+    return governanceRoute(store, m, ["api", "governance", sub].concat(segs.slice(3)), body, p, qp, sc, grant)
   }
   // Read-only RBAC catalogue: resources, operations and permission pairs.
   if (area === "resources" || area === "operations" || area === "permissions") {
@@ -4630,7 +4680,7 @@ export function handleApi(store: ConfigStore, method: string, path: string, body
   if (area === "config") {
     if (segs.length === 3 && segs[2] === "metadata") return m === "POST" ? postMetadata(store, body) : notAllowed(m)
     if (segs.length !== 2) return notFound(p)
-    if (m === "PUT") return putConfig(store, body)
+    if (m === "PUT") return putConfig(store, body, grant)
     return m === "GET" ? reply(200, store.redacted()) : notAllowed(m)
   }
   // POST /api/scim/provisioning-token: a new SCIM provisioning token, shown once; the old one stops working
@@ -4674,8 +4724,8 @@ export function handleApi(store: ConfigStore, method: string, path: string, body
     return proxyRoute(store, m, body)
   }
   if (area === "providers") return providerRoute(store, m, segs, body, p)
-  if (area === "governance" && segs.length >= 3) return governanceRoute(store, m, segs, body, p, qp, sc)
-  if (area === "roles") return roleRoute(store, m, segs, body, p, sc, false)
+  if (area === "governance" && segs.length >= 3) return governanceRoute(store, m, segs, body, p, qp, sc, grant)
+  if (area === "roles") return roleRoute(store, m, segs, body, p, sc, false, grant)
   return notFound(p)
 }
 
@@ -5007,7 +5057,7 @@ test("a masked key value sent back keeps the stored secret", () => {
   const s = new ConfigStore(path, {})
   expect(statusOf(s.addKey("anthropic", { value: "x" }))).toBe(404)
   expect(statusOf(s.upsertProvider("anthropic", { keys: [{ id: "key-a", value: "sk-ant-secret-1234" }] }))).toBe(200)
-  expect(statusOf(s.updateKey("anthropic", "key-a", { value: "sk-a…1234", name: "renamed" }))).toBe(200)
+  expect(statusOf(s.updateKey("anthropic", "key-a", { value: "****", name: "renamed" }))).toBe(200)
   expect(providerOf(s.cfg, "anthropic")!.keys![0]!.value).toBe("sk-ant-secret-1234")
   expect(providerOf(s.cfg, "anthropic")!.keys![0]!.name).toBe("renamed")
   cleanup(path)
@@ -5219,18 +5269,21 @@ test("redaction masks keys, bedrock secrets, proxy password and virtual keys; en
   expect(statusOf(s.upsertVirtualKey({ id: "vk2", name: "env", value: "env.VK_SECRET" }))).toBe(200)
   const red = s.redacted()
   expect(red.includes("sk-abcdefghijkl")).toBe(false)
-  expect(red.includes("sk-a…ijkl")).toBe(true)
+  // fifteen bytes: too short to show any of it
+  expect(red.includes("sk-a…ijkl")).toBe(false)
   expect(red.includes("\"****\"")).toBe(true)
   expect(red.includes("env.OPENAI_KEY")).toBe(true)
   expect(red.includes("proxy-pass-123")).toBe(false)
   expect(red.includes("wJalrXUtnFEMI")).toBe(false)
-  expect(red.includes("wJal…FEMI")).toBe(true)
+  expect(red.includes("wJal…FEMI")).toBe(false)
   expect(red.includes("AKIAEXAMPLE")).toBe(true)
   expect(red.includes("tok-abcdefghijk")).toBe(false)
   expect(red.includes("sk-raiju-" + "f".repeat(32))).toBe(false)
   expect(red.includes("env.VK_SECRET")).toBe(true)
   expect(maskSecret("12345678")).toBe("****")
-  expect(maskSecret("123456789")).toBe("1234…6789")
+  expect(maskSecret("123456789")).toBe("****")
+  expect(maskSecret("12345678901234567890123")).toBe("****")
+  expect(maskSecret("sk-0123456789abcdefghijklmn")).toBe("sk-0…klmn")
   expect(maskSecret("")).toBe("")
   cleanup(path)
 })
@@ -5271,7 +5324,7 @@ test("handleApi routes, methods and status codes", () => {
   const put = handleApi(s, "PUT", "/api/providers/openai", "{\"keys\":[{\"value\":\"sk-abcdefghijkl\"}]}")
   expect(put.status).toBe(200)
   expect(put.body.includes("sk-abcdefghijkl")).toBe(false)
-  expect(handleApi(s, "GET", "/api/providers", "").body.includes("sk-a…ijkl")).toBe(true)
+  expect(handleApi(s, "GET", "/api/providers", "").body.includes("\"value\":\"****\"")).toBe(true)
   expect(handleApi(s, "GET", "/api/providers/openai/keys", "").status).toBe(200)
   expect(handleApi(s, "POST", "/api/providers/openai/keys", "{\"value\":\"sk-zzzzzzzzzzzz\"}").status).toBe(201)
   expect(handleApi(s, "PUT", "/api/providers/openai/keys/nope", "{}").status).toBe(404)
@@ -6509,6 +6562,31 @@ test("loginless administration saves and redacts both flags, rejecting invalid o
     expect(redacted.governance!.auth_config!.allow_unauthenticated_access).toBe(true)
     expect(handleApi(store, "PUT", "/api/config", `{"auth_config":{"allow_unauthenticated_access":false}}`).status).toBe(200)
     expect(store.cfg.governance!.auth_config!.allow_unauthenticated_access).toBe(false)
+  } finally {
+    cleanup(path)
+  }
+})
+
+test("a caller who is not an admin adds to a role only the permissions it holds, and leaves auth_config alone", () => {
+  const path = tmpPath()
+  try {
+    const s = new ConfigStore(path, {})
+    const all = allScope()
+    // a delegate with RBAC and Settings writes and one Teams permission
+    const grant: Held = { all: false, pairs: [{ resource: "RBAC", operation: "Create" }, { resource: "RBAC", operation: "Update" }, { resource: "Settings", operation: "Update" }, { resource: "Teams", operation: "View" }] }
+    expect(handleApi(s, "POST", "/api/roles", `{"name":"mine","permissions":[{"resource":"Teams","operation":"View"}]}`, all, grant).status).toBe(201)
+    expect(handleApi(s, "POST", "/api/roles", `{"name":"big","permissions":[{"resource":"Users","operation":"Create"}]}`, all, grant).status).toBe(403)
+    expect(handleApi(s, "PUT", "/api/roles/mine", `{"permissions":[{"resource":"Teams","operation":"View"},{"resource":"Users","operation":"Delete"}]}`, all, grant).status).toBe(403)
+    expect(handleApi(s, "PUT", "/api/roles/1", `{"permissions":[{"resource":"APIKeys","operation":"Create"}]}`, all, grant).status).toBe(403)
+    expect(handleApi(s, "PUT", "/api/roles/viewer", `{"permissions":[{"resource":"Users","operation":"Update"}]}`, all, grant).status).toBe(403)
+    expect(handleApi(s, "PUT", "/api/governance/rbac/roles/9003", `{"permissions":[{"resource":"Users","operation":"Update"}]}`, all, grant).status).toBe(403)
+    // the role keeps what it had: an admin's pair stays through the delegate's edit, and taking away is allowed
+    expect(handleApi(s, "PUT", "/api/roles/mine", `{"permissions":[{"resource":"Teams","operation":"View"},{"resource":"Users","operation":"Delete"}]}`).status).toBe(200)
+    expect(handleApi(s, "PUT", "/api/roles/mine", `{"description":"d","permissions":[{"resource":"Teams","operation":"View"},{"resource":"Users","operation":"Delete"}]}`, all, grant).status).toBe(200)
+    expect(handleApi(s, "PUT", "/api/roles/mine", `{"permissions":[]}`, all, grant).status).toBe(200)
+    // auth_config is the admin's
+    expect(handleApi(s, "PUT", "/api/config", `{"auth_config":{"is_enabled":false}}`, all, grant).status).toBe(403)
+    expect(handleApi(s, "PUT", "/api/config", `{"auth_config":{"is_enabled":false}}`, all, { all: true, pairs: [] }).status === 403).toBe(false)
   } finally {
     cleanup(path)
   }

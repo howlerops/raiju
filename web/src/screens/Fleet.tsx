@@ -1,6 +1,7 @@
 import { createSignal, For, onSettled } from "solid-js"
 import { consoleConfig, gatewaySignal, switchGateway, target, type Gateway } from "../gateway"
-import { notify, Pill, Toolbar, type Tone } from "../ui"
+import { message } from "../api/client"
+import { notify, Pill, Stat, Toolbar, type Tone } from "../ui"
 
 type Probe = { text: string; tone: Tone }
 type Status = { health: Probe; ready: Probe; checked: string }
@@ -49,9 +50,9 @@ export function Fleet() {
       </Toolbar>
       <p class="hint">Public health probes only. No inference, logs, provider configuration, credentials, or regional data are aggregated. An unreachable gateway never redirects traffic to another region.</p>
       <div class="cards fleet-summary" aria-label="Fleet summary">
-        <div class="bg-base-100 border border-base-300 rounded-box stat"><div class="stat-title">Configured gateways</div><div class="stat-value">{gateways.length}</div><div class="stat-desc">Independent regional targets</div></div>
-        <div class="bg-base-100 border border-base-300 rounded-box stat"><div class="stat-title">Ready gateways</div><div class="stat-value">{gateways.filter((gateway) => states()[gateway.id]?.ready.tone === "ok").length}</div><div class="stat-desc">Successful current readiness probes</div></div>
-        <div class="bg-base-100 border border-base-300 rounded-box stat"><div class="stat-title">Selected gateway</div><div class="stat-value">{target().name}</div><div class="stat-desc">All regional operations stay here</div></div>
+        <Stat label="Configured gateways" value={String(gateways.length)} sub="Independent regional targets" />
+        <Stat label="Ready gateways" value={String(gateways.filter((gateway) => states()[gateway.id]?.ready.tone === "ok").length)} sub="Successful current readiness probes" />
+        <Stat label="Selected gateway" value={target().name} sub="All regional operations stay here" />
       </div>
       <div class="fleet-grid">
         <For each={gateways}>{(gateway) => (
@@ -62,7 +63,7 @@ export function Fleet() {
             <p>Readiness: <Pill tone={(states()[gateway.id]?.ready ?? checking).tone}>{(states()[gateway.id]?.ready ?? checking).text}</Pill></p>
             <p class="hint" role="status">{states()[gateway.id]?.checked ? "Checked " + states()[gateway.id]!.checked : "Waiting for probes"}</p>
             <button type="button" class="btn btn-sm btn-primary" onClick={() => {
-              try { switchGateway(gateway.id) } catch (error) { notify(error instanceof Error ? error.message : String(error), "error") }
+              try { switchGateway(gateway.id) } catch (error) { notify(message(error), "error") }
             }}>{gateway.url === target().url ? "Open selected gateway" : "Open target"}</button>
           </section>
         )}</For>

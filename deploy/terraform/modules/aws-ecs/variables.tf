@@ -248,3 +248,21 @@ variable "log_retention_days" {
   type        = number
   default     = 30
 }
+
+variable "log_kms_key_arn" {
+  description = "KMS key that encrypts the task's CloudWatch log group. null uses CloudWatch Logs' own encryption. The key policy must allow the logs service of the region."
+  type        = string
+  default     = null
+}
+
+variable "internal" {
+  description = "true makes the load balancer internal (reachable inside the VPC only); public_subnet_ids are then the private subnets it sits in. false: internet-facing."
+  type        = bool
+  default     = false
+}
+
+variable "alb_access_logs_bucket" {
+  description = "S3 bucket for the load balancer's access logs, under the prefix var.name. null: no access logs. The bucket policy must allow the regional load balancer log delivery."
+  type        = string
+  default     = null
+}

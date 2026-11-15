@@ -6,7 +6,7 @@
 // GET /api/models/parameters serves, read through Engine.paramsLookup.
 // Settings: client.compat uses defaults when the section is present; x-raiju-compat adds features
 // per request. Decision emulation is in decision_emulate.tov.
-import { Field, fields, elements, find, rawStr, rawNum, quote, setField, without, build, decodeString, isNull } from "./json"
+import { Field, fields, elements, find, rawStr, rawNum, quote, setField, without, build, decodeString, isNull, toInt, floorInt } from "./json"
 import { CompatConfig } from "./config"
 import { Translated } from "./providers/types"
 
@@ -367,6 +367,12 @@ function budgetRange(sup: Support, model: string): f64[] {
 // lowered to it, and a cap below the row's floor is raised to it. A budget sent with a lowered cap
 // keeps its share of the new cap, then is constrained to the model's range and the cap. Only fields
 // present are changed; each change is a "field: from -> to" entry.
+// A count as text for a change note; one too large for an int (a float-to-int conversion would trap) as it is.
+function wholeText(x: f64): string {
+  const n = toInt(x)
+  return n === undefined ? `${x}` : `${n}`
+}
+
 function fitCaps(body: Field[], sup: Support, model: string, inout changes: string[]): Field[] throws SyntaxError {
   let fs = body.slice()
   // the cap a budget must stay under; 0 when the caller's cap stands
@@ -393,7 +399,7 @@ function fitCaps(body: Field[], sup: Support, model: string, inout changes: stri
     }
     if (v !== n) {
       setField(&fs, k, "" + Math.trunc(v))
-      changes.push(`${k}: ${Math.trunc(n)} -> ${Math.trunc(v)}`)
+      changes.push(`${k}: ${wholeText(n)} -> ${Math.trunc(v)}`)
     }
   }
   const rf0 = find(fs, "reasoning")
@@ -402,7 +408,7 @@ function fitCaps(body: Field[], sup: Support, model: string, inout changes: stri
   const budget = rawNum(rf, "max_tokens")
   if (budget === undefined || !(budget > 0.0)) return fs
   let b = budget
-  if (lowered) b = Math.max(1.0, Math.floor(budget * limit / capSent))
+  if (lowered) b = Math.max(1.0, floorInt(budget * limit / capSent) ?? budget)
   const range = budgetRange(sup, model)
   const lo = range.length > 0 ? range[0]! : 0.0
   const hi = range.length > 1 ? range[1]! : 0.0
@@ -414,7 +420,7 @@ function fitCaps(body: Field[], sup: Support, model: string, inout changes: stri
   if (b !== budget) {
     setField(&rf, "max_tokens", "" + Math.trunc(b))
     setField(&fs, "reasoning", build(rf))
-    changes.push(`reasoning.max_tokens: ${Math.trunc(budget)} -> ${Math.trunc(b)}`)
+    changes.push(`reasoning.max_tokens: ${wholeText(budget)} -> ${Math.trunc(b)}`)
   }
   return fs
 }
@@ -548,7 +554,7 @@ export function chatToText(chat: string): string throws SyntaxError {
     }
     const idx = rawNum(cf, "index") ?? 0.0
     const finish = find(cf, "finish_reason") ?? "null"
-    choices.push(`{"index":${Math.trunc(idx)},"text":${quote(text)},"logprobs":null,"finish_reason":${finish}}`)
+    choices.push(`{"index":${toInt(idx) ?? 0},"text":${quote(text)},"logprobs":null,"finish_reason":${finish}}`)
   }
   let out = without(fs, ["choices", "object"])
   setField(&out, "object", quote("text_completion"))
@@ -571,7 +577,7 @@ export function chatChunkToText(chunk: string): string throws SyntaxError {
     }
     const idx = rawNum(cf, "index") ?? 0.0
     const finish = find(cf, "finish_reason") ?? "null"
-    choices.push(`{"index":${Math.trunc(idx)},"text":${quote(text)},"logprobs":null,"finish_reason":${finish}}`)
+    choices.push(`{"index":${toInt(idx) ?? 0},"text":${quote(text)},"logprobs":null,"finish_reason":${finish}}`)
   }
   let out = without(fs, ["choices", "object"])
   setField(&out, "object", quote("text_completion"))
@@ -731,18 +737,19 @@ export function responseToChat(resp: string, requested: string): Translated thro
   let msg = `{"role":"assistant","content":${hasText ? quote(text) : "null"}`
   if (calls.length > 0) msg += `,"tool_calls":[${calls.join(",")}]`
   msg += "}"
-  let pt = 0.0
-  let ct = 0.0
+  let pt = 0
+  let ct = 0
   let usage = "null"
   const u = find(fs, "usage")
   if (u !== undefined && u.startsWith("{")) {
     const uf = try fields(u)
-    pt = rawNum(uf, "input_tokens") ?? 0.0
-    ct = rawNum(uf, "output_tokens") ?? 0.0
-    usage = `{"prompt_tokens":${Math.trunc(pt)},"completion_tokens":${Math.trunc(ct)},"total_tokens":${Math.trunc(pt + ct)}}`
+    // counts too large for an int are read as 0, as a missing count is
+    pt = toInt(rawNum(uf, "input_tokens") ?? 0.0) ?? 0
+    ct = toInt(rawNum(uf, "output_tokens") ?? 0.0) ?? 0
+    usage = `{"prompt_tokens":${pt},"completion_tokens":${ct},"total_tokens":${pt + ct}}`
   }
   const body = `{"id":${quote(id)},"object":"chat.completion","created":${created},"model":${quote(requested)},"choices":[{"index":0,"message":${msg},"finish_reason":${quote(finish)}}],"usage":${usage}}`
-  return { body: body, promptTokens: Math.trunc(pt), completionTokens: Math.trunc(ct) }
+  return { body: body, promptTokens: pt, completionTokens: ct }
 }
 
 // One request's compat state: the settings, the datasheet rows of its targets (looked up before the
@@ -1184,4 +1191,14 @@ test("the drops and fits of a text completion on its parameters alone, as shape 
   const off = new CompatPlan(settingsOf(undefined), "completions", false)
   expect(off.mayShape("openai", "small")).toBe(false)
   expect(build(try off.shapeParams("openai", "openai", "small", params))).toBe(build(params))
+})
+
+test("fit: a cap or budget too large for an int is fitted like any other, not trapped on", () => {
+  const sup = supportOf(`{"mode":"chat","max_output_tokens":1000,"model_parameters":[{"id":"max_tokens"}]}`)
+  let changes: string[] = []
+  const out = try fitCaps(try fields(`{"max_tokens":1e300,"reasoning":{"max_tokens":1e300}}`), sup, "m", &changes)
+  expect(find(out, "max_tokens")).toBe("1000")
+  expect(changes[0]!.startsWith("max_tokens: 1e")).toBe(true)
+  expect(changes[0]!.endsWith(" -> 1000")).toBe(true)
+  expect(rawNum(try fields(find(out, "reasoning") ?? "{}"), "max_tokens")! < 1000.0).toBe(true)
 })

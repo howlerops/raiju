@@ -3,34 +3,15 @@
 // keeps both until shortly before they expire.
 import { fields, rawStr, rawNum, find } from "./json"
 import { Upstream, headers } from "./providers/types"
-import { utf8, sha256, hmacSha256, toHex } from "./crypto"
-import { amzDate } from "./providers/bedrock"
+import { utf8, sha256, toHex, pctEncode } from "./crypto"
+import { daysFromCivil } from "./vkexpiry"
+import { amzDate, sigv4Authorization } from "./providers/bedrock"
 
 // Tokens are reused only while more than this much of their life is left.
 const CACHE_MARGIN_MS = 60000.0
 
 const ENTRA_DEFAULT_SCOPE = "https://cognitiveservices.azure.com/.default"
 const STS_API_VERSION = "2011-06-15"
-
-const UNRESERVED = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
-const HEXU = "0123456789ABCDEF"
-
-// RFC 3986 percent-encoding of s: each character outside the unreserved set becomes
-// the %XX escapes of its UTF-8 bytes.
-export function pctEncode(s: string): string {
-  const out: string[] = []
-  for (const c of s.chars()) {
-    if (UNRESERVED.includes(c)) {
-      out.push(c)
-      continue
-    }
-    for (const b of utf8(c)) {
-      const v = int(b)
-      out.push("%" + HEXU.slice(v >> 4, (v >> 4) + 1) + HEXU.slice(v & 15, (v & 15) + 1))
-    }
-  }
-  return out.join("")
-}
 
 // ---- Entra ID (client credentials) ----
 
@@ -67,7 +48,6 @@ export type AwsCreds = { accessKey: string, secretKey: string, sessionToken?: st
 // sets it. The result carries authorization, x-amz-date and the security token.
 export function signV4(creds: AwsCreds, region: string, service: string, host: string, path: string, contentType: string, body: string, nowMs: f64, extra: string[][]): Map<string, string> {
   const date = amzDate(nowMs)
-  const day = date.slice(0, 8)
   const hs: string[][] = [["content-type", contentType], ["host", host], ["x-amz-date", date]]
   for (const e of extra) hs.push(e)
   const token = creds.sessionToken
@@ -79,18 +59,11 @@ export function signV4(creds: AwsCreds, region: string, service: string, host: s
   const signed = hs.map((h) => h[0]!).join(";")
   const payloadHash = toHex(sha256(utf8(body)))
   const canonical = `POST\n${canonicalPath}\n\n${canonicalHeaders}\n${signed}\n${payloadHash}`
-  const scope = `${day}/${region}/${service}/aws4_request`
-  const toSign = `AWS4-HMAC-SHA256\n${date}\n${scope}\n${toHex(sha256(utf8(canonical)))}`
-  const kDate = hmacSha256(utf8("AWS4" + creds.secretKey), utf8(day))
-  const kRegion = hmacSha256(kDate, utf8(region))
-  const kService = hmacSha256(kRegion, utf8(service))
-  const kSigning = hmacSha256(kService, utf8("aws4_request"))
-  const signature = toHex(hmacSha256(kSigning, utf8(toSign)))
   const out: Map<string, string> = new Map()
   for (const h of hs) {
     if (h[0] !== "host") out.set(h[0]!, h[1]!)
   }
-  out.set("authorization", `AWS4-HMAC-SHA256 Credential=${creds.accessKey}/${scope}, SignedHeaders=${signed}, Signature=${signature}`)
+  out.set("authorization", sigv4Authorization(creds.accessKey, creds.secretKey, region, service, date, canonical, signed))
   return out
 }
 
@@ -122,7 +95,6 @@ function signedHeader(key: string, value: string): string {
 export function awsSubjectToken(creds: AwsCreds, region: string, audience: string, nowMs: f64): string {
   const host = awsStsHost(region)
   const date = amzDate(nowMs)
-  const day = date.slice(0, 8)
   const hs: string[][] = [["host", host], ["x-amz-date", date], ["x-goog-cloud-target-resource", audience]]
   const token = creds.sessionToken
   if (token !== undefined && token !== "") hs.push(["x-amz-security-token", token])
@@ -130,13 +102,8 @@ export function awsSubjectToken(creds: AwsCreds, region: string, audience: strin
   const canonicalHeaders = hs.map((h) => `${h[0]!}:${h[1]!}\n`).join("")
   const signed = hs.map((h) => h[0]!).join(";")
   const canonical = `POST\n/\n${GET_CALLER_IDENTITY}\n${canonicalHeaders}\n${signed}\n${EMPTY_SHA256}`
-  const scope = `${day}/${region}/sts/aws4_request`
-  const toSign = `AWS4-HMAC-SHA256\n${date}\n${scope}\n${toHex(sha256(utf8(canonical)))}`
-  const kDate = hmacSha256(utf8("AWS4" + creds.secretKey), utf8(day))
-  const kSigning = hmacSha256(hmacSha256(hmacSha256(kDate, utf8(region)), utf8("sts")), utf8("aws4_request"))
-  const signature = toHex(hmacSha256(kSigning, utf8(toSign)))
   // Canonical Go header names, followed by host, sorted by key.
-  const out: string[][] = [["Authorization", `AWS4-HMAC-SHA256 Credential=${creds.accessKey}/${scope}, SignedHeaders=${signed}, Signature=${signature}`], ["X-Amz-Date", date], ["X-Goog-Cloud-Target-Resource", audience]]
+  const out: string[][] = [["Authorization", sigv4Authorization(creds.accessKey, creds.secretKey, region, "sts", date, canonical, signed)], ["X-Amz-Date", date], ["X-Goog-Cloud-Target-Resource", audience]]
   if (token !== undefined && token !== "") out.push(["X-Amz-Security-Token", token])
   out.push(["host", host])
   out.sort((a, b) => (a[0]! < b[0]! ? -1 : a[0]! > b[0]! ? 1 : 0))
@@ -230,17 +197,6 @@ export function xmlTag(xml: string, tag: string): string | undefined {
   const rel = xml.slice(from).indexOf(`</${tag}>`)
   if (rel < 0) return undefined
   return xml.slice(from, from + rel).replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&quot;", "\"").replaceAll("&apos;", "'").replaceAll("&amp;", "&")
-}
-
-// Days since 1970-01-01 for a proleptic Gregorian date (H. Hinnant's days_from_civil).
-function daysFromCivil(y: int, m: int, d: int): int {
-  const yy = m <= 2 ? y - 1 : y
-  const era = Math.floor(yy / 400)
-  const yoe = yy - era * 400
-  const mp = m > 2 ? m - 3 : m + 9
-  const doy = Math.floor((153 * mp + 2) / 5) + d - 1
-  const doe = yoe * 365 + Math.floor(yoe / 4) - Math.floor(yoe / 100) + doy
-  return era * 146097 + doe - 719468
 }
 
 // Epoch milliseconds for an ISO 8601 UTC timestamp such as "2015-08-30T13:36:00Z".

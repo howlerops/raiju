@@ -1,7 +1,7 @@
 # Deploying Raiju
 
-Raiju is one binary. The image runs it as non-root on a slim Debian base (bookworm-slim with
-JavaScriptCore, which the binary links). It takes a Raiju-format `config.json` from `/app/data`
+Raiju is one binary. The image runs it as non-root on an Ubuntu 24.04 LTS base (noble with ICU; the
+binary carries its own JavaScriptCore). It takes a Raiju-format `config.json` from `/app/data`
 (its `-app-dir`), and provider keys come from environment variables that the config refers to as
 `env.NAME`. Terraform modules (Helm release, AWS ECS Fargate) are in
 [terraform/](terraform/README.md). Every config key is listed in
@@ -211,7 +211,7 @@ task role is the identity; give it the Bedrock permissions the keys need.
 
 ## Docker
 
-The image's bases are pinned by tag and digest (`ARG DEBIAN` in the Dockerfile), and rustup-init
+The image's bases are pinned by tag and digest (`ARG BASE` in the Dockerfile), and rustup-init
 is checked against its published sha256.
 
 ```sh
@@ -309,6 +309,7 @@ Useful values (see `values.yaml`):
 | `cluster.secret.existingSecret`, `cluster.secret.key` | The Secret holding `cluster.secret` (at least 32 bytes), injected as `RAIJU_CLUSTER_SECRET`; `config.cluster.secret` defaults to `env.RAIJU_CLUSTER_SECRET`. Required with `config.cluster.enabled`, and the chart refuses a secret written into the config. |
 | `cluster.listenPort` | The cluster listener (`config.cluster.listen_port`, 7946): the peer routes are served there and refused on the main port; the peers Service targets it. `0` keeps them on the main port. |
 | `cluster.serveMetrics` | Serve `/metrics` on the cluster port only; the annotations and the ServiceMonitor follow. |
+| `networkPolicy.enabled`, `networkPolicy.ingressFrom`, `networkPolicy.metricsFrom` | Off by default. On: a NetworkPolicy for the pods. The HTTP port accepts the peers in `ingressFrom` (every source when empty) and the cluster listener accepts this release's pods only. Needs a network plugin that enforces policies; include the ingress controller in `ingressFrom`, and the metrics scraper in `ingressFrom`, or in `metricsFrom` when `cluster.serveMetrics` serves `/metrics` on the cluster port. |
 | `metricsToken.existingSecret`, `metricsToken.key` | A bearer token for `/metrics` (`config.server.metrics_token`), injected as `RAIJU_METRICS_TOKEN`; the ServiceMonitor sends it. Off: `/metrics` is open. |
 | `service.type`, `service.port` | Service. The pod port is `port`. |
 | `prometheus.annotations` | `prometheus.io/*` annotations on pod and Service (on by default). |
@@ -501,11 +502,13 @@ over a real network, memory at 512Mi under real traffic) is checked by the stagi
 [docs/staging-validation.md](../docs/staging-validation.md), with the throwaway stack in
 `terraform/examples/staging`. Until it has been run, these remain unconfirmed:
 
-- The image builds Tov from source (the installer needs network access and takes several minutes).
-  The binary is dynamically linked against glibc, libstdc++ and WebKitGTK's JavaScriptCore (Tov
-  links it for `node:*` modules), so the runtime is `debian:bookworm-slim` with
-  `libjavascriptcoregtk-4.1-0`, not distroless, and carries JavaScriptCore's GLib and ICU
-  libraries. CI builds it on every pull request and push to main, boots it as the chart runs it
+- The image builds Tov and JavaScriptCore from source (the build needs network access; the engine
+  alone takes about 15 minutes on four cores, once per Tov revision with a layer cache).
+  JavaScriptCore (`node:*` modules run on it) is linked into the binary: WebKit's JSCOnly port at
+  the release Tov pins (`scripts/build-jsc.sh`), not the distribution's `libjavascriptcoregtk`,
+  whose package is built from the whole browser and is reported for every browser CVE. The binary
+  links glibc, libstdc++, libatomic and ICU dynamically, so the runtime is `ubuntu:noble` with
+  `libicu74`, not distroless. CI builds it on every pull request and push to main, boots it as the chart runs it
   (`tests/image_smoke.py`) and scans it with trivy.
 - The chart's pod security settings (read-only root filesystem, no capabilities, fsGroup on the
   data volume) are checked with `helm template` (`make deploy-check`) and trivy's config rules, and the

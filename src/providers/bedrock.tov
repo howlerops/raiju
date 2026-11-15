@@ -3,17 +3,14 @@ import { Field, fields, elements, find, quote, rawStr, isNull, build, setField, 
 import { fromChat, bedrockReasoning } from "../reasoning"
 import { Target, Upstream, Translated, headers, addExtraHeaders, trimSlash } from "./types"
 import { ChatRequest, ContentPart, newId, nowSeconds } from "../schemas"
-import { sha256, hmacSha256, toHex, utf8 } from "../crypto"
+import { sha256, hmacSha256, toHex, utf8, pctEncode } from "../crypto"
+import { padInt } from "../vkexpiry"
 import * as openai from "./openai"
 import * as anthropic from "./anthropic"
 import { BedrockKeyConfig, ProviderConfig, ProviderPromptCacheConfig } from "../config"
 import { injectedIndexes, firstCacheableMessage } from "./anthropic"
 
 // ---- SigV4 ----
-
-function pad2(n: int): string {
-  return n < 10 ? "0" + n : "" + n
-}
 
 // UTC "YYYYMMDDTHHMMSSZ" for a Unix time in milliseconds.
 export function amzDate(ms: f64): string {
@@ -30,24 +27,7 @@ export function amzDate(ms: f64): string {
   const d = doy - Math.floor((153 * mp + 2) / 5) + 1
   const m = mp < 10 ? mp + 3 : mp - 9
   const y = yoe + era * 400 + (m <= 2 ? 1 : 0)
-  return `${y}${pad2(m)}${pad2(d)}T${pad2(Math.floor(rem / 3600))}${pad2(Math.floor((rem % 3600) / 60))}${pad2(rem % 60)}Z`
-}
-
-const UNRESERVED = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~"
-const HEXU = "0123456789ABCDEF"
-
-// RFC 3986 percent-encoding of one path segment.
-export function encodeSegment(s: string): string {
-  const out: string[] = []
-  const bytes = utf8(s)
-  for (let i = 0; i < bytes.length; i++) {
-    const v = int(bytes[i]!)
-    // an ASCII byte is one character of s at the same byte offset
-    const ch = v < 128 ? s.slice(i, i + 1) : ""
-    if (v < 128 && UNRESERVED.includes(ch)) out.push(ch)
-    else out.push("%" + HEXU.slice(v >> 4, (v >> 4) + 1) + HEXU.slice(v & 15, (v & 15) + 1))
-  }
-  return out.join("")
+  return `${y}${padInt(m, 2)}${padInt(d, 2)}T${padInt(Math.floor(rem / 3600), 2)}${padInt(Math.floor((rem % 3600) / 60), 2)}${padInt(rem % 60, 2)}Z`
 }
 
 export type Credentials = { accessKey: string, secretKey: string, sessionToken?: string, region: string }
@@ -68,25 +48,32 @@ export function signRequest(method: string, creds: Credentials, service: string,
 // streamed and never held in memory.
 export function signHashed(method: string, creds: Credentials, service: string, host: string, path: string, query: string, payloadHash: string, nowMs: f64): Map<string, string> {
   const date = amzDate(nowMs)
-  const day = date.slice(0, 8)
-  const canonicalPath = path.split("/").map((seg) => encodeSegment(seg)).join("/")
+  const canonicalPath = path.split("/").map((seg) => pctEncode(seg)).join("/")
   const hs: string[][] = [["content-type", "application/json"], ["host", host], ["x-amz-date", date]]
   const token = creds.sessionToken
   if (token !== undefined && token !== "") hs.push(["x-amz-security-token", token])
   const canonicalHeaders = hs.map((h) => `${h[0]!}:${h[1]!}\n`).join("")
   const signed = hs.map((h) => h[0]!).join(";")
   const canonical = `${method}\n${canonicalPath}\n${query}\n${canonicalHeaders}\n${signed}\n${payloadHash}`
-  const scope = `${day}/${creds.region}/${service}/aws4_request`
+  const out = headers(hs)
+  out.delete("host")
+  out.set("authorization", sigv4Authorization(creds.accessKey, creds.secretKey, creds.region, service, date, canonical, signed))
+  return out
+}
+
+// The part of SigV4 every caller shares once it has its canonical request: the credential scope, the string
+// to sign, the derived signing key and the Authorization header value. `date` is the x-amz-date value and
+// `signedHeaders` the semicolon-joined lower-case names the canonical request lists.
+export function sigv4Authorization(accessKey: string, secretKey: string, region: string, service: string, date: string, canonical: string, signedHeaders: string): string {
+  const day = date.slice(0, 8)
+  const scope = `${day}/${region}/${service}/aws4_request`
   const toSign = `AWS4-HMAC-SHA256\n${date}\n${scope}\n${toHex(sha256(utf8(canonical)))}`
-  const kDate = hmacSha256(utf8("AWS4" + creds.secretKey), utf8(day))
-  const kRegion = hmacSha256(kDate, utf8(creds.region))
+  const kDate = hmacSha256(utf8("AWS4" + secretKey), utf8(day))
+  const kRegion = hmacSha256(kDate, utf8(region))
   const kService = hmacSha256(kRegion, utf8(service))
   const kSigning = hmacSha256(kService, utf8("aws4_request"))
   const signature = toHex(hmacSha256(kSigning, utf8(toSign)))
-  const out = headers(hs)
-  out.delete("host")
-  out.set("authorization", `AWS4-HMAC-SHA256 Credential=${creds.accessKey}/${scope}, SignedHeaders=${signed}, Signature=${signature}`)
-  return out
+  return `AWS4-HMAC-SHA256 Credential=${accessKey}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`
 }
 
 // ---- Converse translation ----
@@ -333,7 +320,7 @@ function scheme(t: Target): string {
 // percent-encodes the result as one segment.
 function modelPath(t: Target): string {
   const arn = t.key.bedrock_key_config?.arn ?? ""
-  return encodeSegment(arn === "" ? modelId(t) : `${arn}/${modelId(t)}`)
+  return pctEncode(arn === "" ? modelId(t) : `${arn}/${modelId(t)}`)
 }
 
 // A POST to a path on an AWS host, signed with the key's credentials for service bedrock
@@ -630,8 +617,8 @@ test("sigv4 matches the AWS reference signature", () => {
 })
 
 test("segment encoding", () => {
-  expect(encodeSegment("anthropic.claude-3-haiku-20240307-v1:0")).toBe("anthropic.claude-3-haiku-20240307-v1%3A0")
-  expect(encodeSegment("a b/é")).toBe("a%20b%2F%C3%A9")
+  expect(pctEncode("anthropic.claude-3-haiku-20240307-v1:0")).toBe("anthropic.claude-3-haiku-20240307-v1%3A0")
+  expect(pctEncode("a b/é")).toBe("a%20b%2F%C3%A9")
 })
 
 test("converse translation", () => {
@@ -780,7 +767,7 @@ test("a listing page is a signed GET with its nextToken in the query", () => {
   const t: Target = { provider: "bedrock", kind: "bedrock", model: "", key: { value: "", bedrock_key_config: { access_key: "AKIAIOSFODNN7EXAMPLE", secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", region: "us-west-2" } }, cfg: {} }
   const first = listRequest(t, "/foundation-models")
   expect(first.url.endsWith("/foundation-models")).toBe(true)
-  const next = listRequest(t, "/foundation-models", "nextToken=" + encodeSegment("a+b/c="))
+  const next = listRequest(t, "/foundation-models", "nextToken=" + pctEncode("a+b/c="))
   expect(next.url.endsWith("/foundation-models?nextToken=a%2Bb%2Fc%3D")).toBe(true)
   const creds: Credentials = { accessKey: "AKIAIOSFODNN7EXAMPLE", secretKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", region: "us-west-2" }
   const post = sign(creds, "bedrock", "bedrock.us-west-2.amazonaws.com", "/foundation-models", "", 0)
