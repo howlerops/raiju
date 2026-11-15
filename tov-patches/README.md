@@ -24,6 +24,7 @@ Patch 0023 (`continue` releases the loop body's locals) changes one line of `cod
 Patch 0024 (dynamic `process.env[name]` reads) changes index checking, code generation and the existing `tv_process_env` runtime's embedded-NUL rejection; it applies on top of 0023.
 Patch 0025 (WebKitGTK main-thread/run-loop initialization) changes only `runtime/js.c` and applies on top of 0024.
 Patch 0026 (opt-in clean worker re-execution) changes native HTTP startup/supervision, Bun's worker helpers and their builtin declarations; it applies on top of 0025.
+Patch 0027 (GCC builds without scalar replacement of aggregates) changes only the C compiler flags in `crates/tov/src/build.rs`, which no earlier patch touches; it applies on its own or on top of 0026.
 
 ## Submitting upstream
 
@@ -1025,3 +1026,30 @@ Clean workers also retain patch 0021's per-slot `TOV_SEED` behavior: worker slot
 have distinct deterministic `Math.random` streams, and replacing a slot starts
 that slot's stream again. The regression checks this with a fixed seed; the
 ordinary system-random path remains enabled when no seed is supplied.
+
+## 0027 — GCC: no scalar replacement of aggregates
+
+**Problem.** A program compiled with GCC freed a string that a record still held. `parseQuery` in
+`src/logstore.tov` returns a `LogQuery` (fifteen optional fields, 312 bytes). The generated C returns it as
+`T t = v; rt_T(&t); rl_T(&v); return t;`: every string field of the copy is retained, then every one of the
+local is released. In the machine code GCC 13.3 made at `-O2` and `-O3`, the inlined retains covered only some
+of the fields (`kind`, `text`, `provider`, `model`, `scope`, `project_id`) while the out-of-line release covered
+all of them, so `virtual_key` lost a reference: it was freed when the `URLSearchParams` it came from was
+dropped, and the returned query then pointed at freed memory. The stores to the field are correct in the
+machine code; only the retain is missing.
+
+**How it was found.** One test (`parseQuery reads the HTTP query string…`) failed in the test binary of
+`src/front.tov`, on unchanged `main` too, with the query value followed by heap contents. Valgrind reports the
+read of a freed block (freed by the array of the dropped `URLSearchParams`); a hardware watchpoint on the
+string's count shows the sequence get +1, assign +1, local release -1, record release -1, with no retain for
+the returned copy. Other test binaries passed only because the freed block was not reused in time.
+
+**Cause.** GCC's scalar replacement of aggregates (`-ftree-sra`, on from `-O1`). With `-fno-tree-sra` the same
+function retains all nine string fields and the scope, and Valgrind is silent. Clang has no such pass.
+
+**Fix.** `build.rs` asks the C compiler what it is (`cc --version`) and, for GCC, adds `-fno-tree-sra` to the
+flags of every program and runtime compile. Clang refuses the option, so it is given to GCC alone. Not given on
+macOS, where the compiler is clang.
+
+**Scope.** Any function returning a large record of optional fields could be affected, so every binary built
+with GCC before this patch may hold such a fault; binaries built with clang are not affected.

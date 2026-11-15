@@ -6,7 +6,7 @@
 # TLS client certificates, Request.signal and gunzip, a small fetch input buffer, server.requestIP, workers
 # respawned after SIGKILL with a crash-loop backoff, node:fs flockSync, Math.random seeded from getrandom, the
 # address policy on Bun.connect and WebSocket and a write-stall limit on upgraded sockets, `continue` releasing the
-# loop body's locals) into
+# loop body's locals, GCC builds without scalar replacement of aggregates) into
 # build/tov/target/release/tov, applied in name order. Raiju needs this build
 # until the patches are upstream. Usage: scripts/build-tov.sh  (needs git and cargo)
 set -eu
