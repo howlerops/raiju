@@ -16,6 +16,10 @@ use the pinned compiler, and stay that way until every gate passes on the new on
   new value twice (a use-after-free; Raiju's `externalGuard` hit it). The frame now keeps what it
   was given in a slot of its own. `tests/upstream-bug/` holds the two small programs that show it on
   an unpatched compiler under AddressSanitizer; worth sending upstream.
+- A second upstream bug fixed in `0001` (also in v0.1.0 and `1959aef`): awaiting a promise whose
+  result is a record held as an object (one changed in place and shared) leaked the default object
+  made for the result, one per await. Raiju's request path leaked about 385 bytes a request.
+  `tests/upstream-bug/await_object_record_leak.tov` shows it under LeakSanitizer.
 - JavaScriptCore: v0.1.0 pins the same WebKit release (`webkitgtk-2.54.1`), but its own patch set on
   top changed, so `scripts/build-jsc.sh` has to be run again with the new compiler's
   `scripts/jsc/build.sh`.
