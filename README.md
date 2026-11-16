@@ -430,11 +430,26 @@ make bench
 compiler once (cached by Tov's revision and a hash of `tov-patches/` and `scripts/build-tov.sh`),
 then check, unit, openapi-check, web-check and the parity count in one job, e2e on Bun and on
 http1, `make ui` in Chromium, and the memory soaks (`make soak`, `make soak-bodies`, `make soak-websockets`, `make soak-slope`); logs are uploaded when a job fails. The Docker image is built
-(no push) on pull requests and on `main`, booted the way the Helm chart runs it (`tests/image_smoke.py`: read-only
-root filesystem, non-root, /health, /ready, a chat through a mock upstream) and scanned with trivy (a fixable
-critical or high CVE fails it; the vulnerability database comes from ghcr.io or public.ecr.aws and is cached). `scripts/ci.sh` runs the same stages locally: `scripts/ci.sh` for all
+on native AMD64 and ARM64 runners, booted the way the Helm chart runs it (`tests/image_smoke.py`: read-only
+root filesystem, non-root, /health, /ready, a chat through a mock upstream) and scanned with trivy (any
+critical or high CVE fails it, including unfixed findings; the vulnerability database comes from ghcr.io or public.ecr.aws and is cached). `scripts/ci.sh` runs the same stages locally: `scripts/ci.sh` for all
 of them, or name some (`scripts/ci.sh check unit`; `--help` lists them; `soak` runs only when named). It uses `TOV` and `BUN`
 when set; with `CI_LOCK=/tmp/raiju-e2e.lock` the stages that bind fixed ports take that lock.
+
+On pushes to `main`, each successful image lane publishes its exact tested image to GHCR. Only after **all**
+CI lanes pass does CI assemble those recorded architecture digests into
+`ghcr.io/howlerops/raiju:sha-<full-commit-sha>`. Pull requests never publish. There is no moving `latest` tag.
+Architecture-suffixed tags are intermediate outputs, not an all-CI-passed release. Package visibility is
+managed in GHCR; if private, authenticate with a token permitted to read the package.
+
+```sh
+docker pull ghcr.io/howlerops/raiju:sha-<full-commit-sha>
+docker buildx imagetools inspect ghcr.io/howlerops/raiju:sha-<full-commit-sha>
+```
+
+The publication job records the multi-platform digest in its Actions summary. Pin that digest
+(`ghcr.io/howlerops/raiju@sha256:...`) for deployment, rather than relying on a tag being immutable.
+Publication does not deploy or invoke a paid provider.
 
 ### Real-provider smoke tests
 
