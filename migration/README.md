@@ -35,3 +35,4 @@ right on both compilers:
 | `number` is an `int` where only integers reach it | annotations say `f64` |
 | `& \| ^ ~ << >>` on an `int` keep 32 bits | `src/bits.tov` |
 | string positions are UTF-16 units, not bytes | `strLen` and the byte/position helpers in `src/text.tov`; byte-exact work is done on `u8[]` |
+| `xs[i]` past either end traps unless the code around it expects `undefined` | `elemAt` in `src/arrays.tov` |
