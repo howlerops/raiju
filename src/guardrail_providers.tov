@@ -7,6 +7,7 @@ import { Field, fields, elements, find, rawStr, rawNum, rawBool, quote, decodeSt
 import { sign, Credentials } from "./providers/bedrock"
 import { pctEncode } from "./crypto"
 import { GuardrailProviderConfig, PatronusEvaluatorConfig } from "./config"
+import { strLen } from "./text"
 
 export type PatronusEvaluator = PatronusEvaluatorConfig
 export type GuardrailProvider = GuardrailProviderConfig
@@ -18,7 +19,6 @@ export type GuardrailRequest = { url: string, method: string, headers: Map<strin
 export type LogFinding = { kind: string, value: string }
 export type Verdict = { action: "allow" | "block" | "redact", reason: string, text?: string, found?: LogFinding[] }
 
-const enc = new TextEncoder()
 const BEDROCK_REGION = "us-east-1"
 const AZURE_API_VERSION = "2024-09-01"
 const AZURE_CATEGORIES = ["Hate", "SelfHarm", "Sexual", "Violence"]
@@ -38,7 +38,7 @@ function need(v: string | undefined, what: string): string throws Error {
 
 function trimSlashes(s: string): string {
   let out = s
-  while (out.endsWith("/")) out = out.slice(0, out.byteLength - 1)
+  while (out.endsWith("/")) out = out.slice(0, strLen(out) - 1)
   return out
 }
 
@@ -173,7 +173,7 @@ const AIDR_PATH = "/v1/guard_chat_completions"
 function aidrRequest(p: GuardrailProvider, text: string, source: string): GuardrailRequest throws Error {
   const key = try need(p.api_key, "api_key")
   let base = trimSlashes(p.base_url ?? AIDR_BASE)
-  if (base.endsWith(AIDR_PATH)) base = base.slice(0, base.byteLength - AIDR_PATH.byteLength)
+  if (base.endsWith(AIDR_PATH)) base = base.slice(0, strLen(base) - strLen(AIDR_PATH))
   const role = source === "input" ? "user" : "assistant"
   let body = `{"event_type":${quote(source)},"guard_input":{"messages":[{"role":${quote(role)},"content":${quote(text)}}]}`
   const app = p.app_id
@@ -299,17 +299,13 @@ function webhookVerdict(body: string): Verdict throws Error {
   return { action: "allow", reason: reason }
 }
 
-// Presidio returns entities with codepoint offsets. Offsets go to byte offsets
-// before the text is rewritten.
-function cpToByte(b: u8[], cp: f64): int {
-  let seen = 0.0
-  for (let i = 0; i < b.length; i++) {
-    const c = int(b[i]!)
-    if (c >= 128 && c < 192) continue
-    if (seen === cp) return i
-    seen += 1.0
-  }
-  return b.length
+// Presidio returns entities with codepoint offsets: indexes into the text's characters, which is how
+// the text is cut (never by string positions, whose unit is not codepoints). An offset that is not a
+// whole number inside the text is the end of the text.
+function cpIndex(n: int, cp: f64): int {
+  if (!(cp >= 0.0) || cp >= n + 0.0) return n
+  const i = Math.floor(cp)
+  return i + 0.0 === cp ? i : n
 }
 
 // Presidio's verdict. Entities below score_threshold are ignored. action block
@@ -331,20 +327,20 @@ function presidioVerdict(p: GuardrailProvider, text: string, body: string): Verd
   const action = p.action ?? "detect_only"
   if (action === "block") return { action: "block", reason: `presidio found ${types}` }
   if (action !== "redact") return { action: "allow", reason: `presidio found ${types}` }
-  const b = enc.encode(text)
+  const cs = text.chars()
   found.sort((x: { type: string, start: f64, end: f64 }, y: { type: string, start: f64, end: f64 }) => x.start - y.start)
   let out = ""
   let pos = 0
   const values: LogFinding[] = []
   for (const f of found) {
-    const s = cpToByte(b, f.start)
-    const e = cpToByte(b, f.end)
+    const s = cpIndex(cs.length, f.start)
+    const e = cpIndex(cs.length, f.end)
     if (s < pos || e <= s) continue
-    out += text.slice(pos, s) + `<${f.type}>`
-    values.push({ kind: f.type, value: text.slice(s, e) })
+    out += cs.slice(pos, s).join("") + `<${f.type}>`
+    values.push({ kind: f.type, value: cs.slice(s, e).join("") })
     pos = e
   }
-  return { action: "redact", reason: `presidio redacted ${types}`, text: out + text.slice(pos, text.byteLength), found: values }
+  return { action: "redact", reason: `presidio redacted ${types}`, text: out + cs.slice(pos).join(""), found: values }
 }
 
 // Azure AI Language PII: any entity counts. redact uses Azure's redactedText.
@@ -872,4 +868,19 @@ test("local kinds are not sent over HTTP", () => {
     msg = e.message
   }
   expect(msg).toBe("local guardrail kinds run in-process, not over HTTP")
+})
+
+test("presidio redacts by codepoint offsets after 2, 3 and 4-byte characters", () => {
+  const p = presidioProvider()
+  // é, 日 and 🙂 are one codepoint each (2, 3 and 4 bytes; 🙂 is two UTF-16 units)
+  const text = "é日🙂 mail a@b.co and 🙂c@d.io日"
+  const body = `[{"entity_type":"EMAIL_ADDRESS","start":21,"end":27,"score":0.95},{"entity_type":"EMAIL_ADDRESS","start":9,"end":15,"score":0.95}]`
+  const v = parseVerdictFor(p, text, 200, body)
+  expect(v.action).toBe("redact")
+  expect(v.text).toBe("é日🙂 mail <EMAIL_ADDRESS> and 🙂<EMAIL_ADDRESS>日")
+  expect(v.found).toEqual([{ kind: "EMAIL_ADDRESS", value: "a@b.co" }, { kind: "EMAIL_ADDRESS", value: "c@d.io" }])
+  // an offset past the text is its end; one that is not a whole number is too
+  const past = parseVerdictFor(p, "🙂 a@b.co", 200, `[{"entity_type":"X","start":2,"end":99,"score":0.95}]`)
+  expect(past.text).toBe("🙂 <X>")
+  expect(parseVerdictFor(p, "🙂 a@b.co", 200, `[{"entity_type":"X","start":2.5,"end":4,"score":0.95}]`).text).toBe("🙂 a@b.co")
 })

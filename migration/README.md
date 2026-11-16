@@ -16,7 +16,7 @@ use the pinned compiler, and stay that way until every gate passes on the new on
   `scripts/jsc/build.sh`.
 - `tov-0.1.0/*.tov` — the modules whose bodies differ between the compilers, to copy over `src/`
   when the build moves: `num.tov` (parseInt/parseFloat return NaN), `bits.tov` (bitwise operators on
-  an `int` keep 32 bits) and `text.tov` (string positions are UTF-16 units). Each has the same tests
+  an `int` keep 32 bits) and `text.tov` (string positions are UTF-16 units; only `strLen`, `posSpan` and `isAscii` differ). Each has the same tests
   as its `src/` twin.
 - `audit/` — the per-site verdicts of the review for shared arrays, maps and records.
 
@@ -29,4 +29,4 @@ right on both compilers:
 | `parseInt`/`parseFloat`/`Number` return `NaN`, and a float | `strToInt`/`strToFloat` in `src/num.tov` |
 | `number` is an `int` where only integers reach it | annotations say `f64` |
 | `& \| ^ ~ << >>` on an `int` keep 32 bits | `src/bits.tov` |
-| string positions are UTF-16 units, not bytes | `strLen` in `src/text.tov`; in progress |
+| string positions are UTF-16 units, not bytes | `strLen` and the byte/position helpers in `src/text.tov`; byte-exact work is done on `u8[]` |

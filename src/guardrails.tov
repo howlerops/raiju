@@ -1,9 +1,11 @@
 // Native guardrails: detect and redact PII and secrets in prompts and
 // completions. Tov has no regular expressions, so each detector is a small
-// scanner over the UTF-8 bytes. Offsets are byte offsets, which is what string
-// slicing uses, so a finding slices the original text directly.
+// scanner over the UTF-8 bytes. The detectors' offsets are byte offsets; scan
+// converts them, so a Finding's start and end are positions in the text it was
+// found in (what its slice takes), and a finding slices the original text directly.
 
 import { fields, elements, find, rawStr, decodeString, quote, build, setField } from "./json"
+import { strLen, posSpan } from "./text"
 
 export type Finding = { kind: string, start: int, end: int, text: string }
 export type GuardConfig = { detect: string[], mode: "redact" | "block" | "log", custom?: string[] }
@@ -417,8 +419,15 @@ export function scan(text: string, cfg: GuardConfig): Finding[] {
   const b = enc.encode(text)
   const spans = resolve(detectSpans(b, cfg))
   const out: Finding[] = []
+  // spans are byte offsets, in rising order and apart: walk them into positions in the text
+  let byte = 0
+  let pos = 0
   for (const s of spans) {
-    out.push({ kind: s.kind, start: s.start, end: s.end, text: text.slice(s.start, s.end) })
+    const start = pos + posSpan(b, byte, s.start)
+    const end = start + posSpan(b, s.start, s.end)
+    byte = s.end
+    pos = end
+    out.push({ kind: s.kind, start: start, end: end, text: text.slice(start, end) })
   }
   return out
 }
@@ -449,6 +458,8 @@ function litAt(b: u8[], lit: u8[], p: int): bool {
 // A start with a match is never passed, so the answer stays right for a caller that goes on after one.
 export class FindingCursor {
   private b: u8[] = []
+  // the end of the text whose bytes are in b, as a position in it
+  private end = 0
   private matchers: ((b: u8[], p: int) => int)[] = []
   // per matcher: the first start that is not decided
   private front: int[] = []
@@ -485,6 +496,7 @@ export class FindingCursor {
 
   private restart(): void {
     this.b = []
+    this.end = 0
     for (let k = 0; k < this.front.length; k++) this.front[k] = 0
     for (let k = 0; k < this.litFront.length; k++) this.litFront[k] = 0
     this.keyFront = 0
@@ -492,9 +504,11 @@ export class FindingCursor {
   }
 
   found(text: string): bool {
-    if (text.byteLength < this.b.length) this.restart()
-    if (text.byteLength > this.b.length) {
-      for (const x of enc.encode(text.slice(this.b.length, text.byteLength))) this.b.push(x)
+    const len = strLen(text)
+    if (len < this.end) this.restart()
+    if (len > this.end) {
+      for (const x of enc.encode(text.slice(this.end))) this.b.push(x)
+      this.end = len
     }
     const n = this.b.length
     for (let j = 0; j < this.lits.length; j++) {
@@ -556,7 +570,7 @@ export function redact(text: string, findings: Finding[]): string {
     out += text.slice(pos, f.start) + "[REDACTED:" + f.kind.toUpperCase() + "]"
     pos = f.end
   }
-  return out + text.slice(pos, text.byteLength)
+  return out + text.slice(pos)
 }
 
 // Scans a plain text. In redact mode the body is rewritten, in block mode
@@ -872,22 +886,29 @@ test("the cursor over a growing text finds what the whole scan finds, at every l
     fill + "the project zeu and PROJECT ZEUS plan",
     fill + "x" + "9",
     "é".repeat(40) + " ünï@exämple.com 日本語 jane@example.com",
+    "🙂日é ".repeat(9) + "call +1 (415) 555-0199 🙂 or 10.0.0.1 日 then Project Zeus é x9",
   ]
   const none: string[] = []
   const cfgs: GuardConfig[] = [all, { detect: ["email", "phone"], mode: "block" }, { detect: none, mode: "block", custom: ["zeus"] }, { detect: ["private_key", "ipv4", "credit_card"], mode: "block" }]
   let hits = 0
   for (const text of texts) {
     const b = enc.encode(text)
+    const cs = text.chars()
     for (const cfg of cfgs) {
       for (const step of [1, 2, 7, 64, 4096]) {
         const c = new FindingCursor(cfg)
         let end = 0
         let early = ""
+        let part = ""
+        let ci = 0
         while (end < b.length) {
           end = end + step < b.length ? end + step : b.length
-          // not inside a character
-          while (end < b.length && int(b[end]!) >= 128 && int(b[end]!) < 192) end += 1
-          const part = text.slice(0, end)
+          // not inside a character: the prefix grows by whole characters until it has `end` bytes
+          while (part.byteLength < end) {
+            part += cs[ci]!
+            ci += 1
+          }
+          end = part.byteLength
           if (end * 2 <= b.length) early = part
           const want = scan(part, cfg).length > 0
           if (c.found(part) !== want) expect(`${text} [${step}] at ${end}`).toBe("the whole scan's answer")
@@ -900,4 +921,29 @@ test("the cursor over a growing text finds what the whole scan finds, at every l
     }
   }
   expect(hits > 1000).toBe(true)
+})
+
+test("findings after non-ASCII text are positions in the text, and redaction cuts there", () => {
+  const cfg: GuardConfig = { detect: ["email", "phone", "ssn", "ipv4", "api_key"], mode: "redact", custom: ["Zeus é", "日本"] }
+  for (const pre of ["é", "日", "🙂", "é日🙂 ", "🙂🙂 é"]) {
+    const text = pre + " jane@example.com " + pre + " 123-45-6789 🙂 10.0.0.1" + pre + "sk-abcdefghijklmnop 日 project zeus é" + pre + "日本" + pre
+    const fs = scan(text, cfg)
+    expect(fs.map((f) => f.kind + "=" + f.text)).toEqual(["email=jane@example.com", "ssn=123-45-6789", "ipv4=10.0.0.1", "api_key=sk-abcdefghijklmnop", "custom=zeus é", "custom=日本"])
+    for (const f of fs) {
+      expect(text.slice(f.start, f.end)).toBe(f.text)
+      expect(text.indexOf(f.text)).toBe(f.start)
+      expect(f.end - f.start).toBe(strLen(f.text))
+    }
+    const want = pre + " [REDACTED:EMAIL] " + pre + " [REDACTED:SSN] 🙂 [REDACTED:IPV4]" + pre + "[REDACTED:API_KEY] 日 project [REDACTED:CUSTOM]" + pre + "[REDACTED:CUSTOM]" + pre
+    expect(redact(text, fs)).toBe(want)
+    expect(applyToText(text, cfg).body).toBe(want)
+    const body = `{"messages":[{"role":"user","content":${quote(text)}},{"role":"user","content":[{"type":"text","text":${quote(text)}}]}]}`
+    const r = try applyToChatRequest(body, cfg)
+    expect(r.body).toBe(`{"messages":[{"role":"user","content":${quote(want)}},{"role":"user","content":[{"type":"text","text":${quote(want)}}]}]}`)
+    const c = new FindingCursor({ detect: ["ssn"], mode: "block" })
+    expect(c.found(pre + " 123-45-")).toBe(false)
+    expect(c.found(pre + " 123-45-6")).toBe(false)
+    expect(c.found(pre + " 123-45-6789 " + pre)).toBe(true)
+    expect(c.found(pre)).toBe(false)
+  }
 })

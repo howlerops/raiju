@@ -1,5 +1,6 @@
 import { inc, labels, observe, render, setGauge } from "./metrics"
 import { strToFloat } from "./num"
+import { strLen, bytePositions, posOfByte } from "./text"
 
 // OpenTelemetry metrics re-encode the Prometheus registry in metrics.tov as an OTLP/HTTP JSON
 // ExportMetricsServiceRequest. The registry holds running totals, so each push is a full cumulative snapshot;
@@ -49,8 +50,8 @@ export function metricsUrl(cfg: OtelMetricsSettings): string | undefined {
   const t = cfg.traces_endpoint
   if (t === undefined || t === "") return undefined
   let base = t
-  if (base.endsWith(TRACES_PATH)) base = base.slice(0, base.byteLength - TRACES_PATH.byteLength)
-  while (base.endsWith("/")) base = base.slice(0, base.byteLength - 1)
+  if (base.endsWith(TRACES_PATH)) base = base.slice(0, strLen(base) - strLen(TRACES_PATH))
+  while (base.endsWith("/")) base = base.slice(0, strLen(base) - 1)
   return base + METRICS_PATH
 }
 
@@ -127,10 +128,12 @@ function divide(a: f64, b: f64): f64 {
 // the escapes metrics.tov writes. An optional timestamp after the value is ignored.
 function parseSample(line: string): Sample | undefined {
   const b = new TextEncoder().encode(line)
+  // the scan is over the bytes; pos gives where each byte offset lies in the line, for the cuts
+  const pos = bytePositions(line)
   const n = b.length
   let i = 0
   while (i < n && byteAt(b, i) !== SP && byteAt(b, i) !== LBRACE) i += 1
-  const name = line.slice(0, i)
+  const name = line.slice(0, posOfByte(pos, i))
   if (name === "") return undefined
   const labels: Label[] = []
   if (byteAt(b, i) === LBRACE) {
@@ -139,7 +142,7 @@ function parseSample(line: string): Sample | undefined {
       const ks = i
       while (i < n && byteAt(b, i) !== EQ) i += 1
       if (i >= n) return undefined
-      const key = line.slice(ks, i)
+      const key = line.slice(posOfByte(pos, ks), posOfByte(pos, i))
       i += 1
       if (byteAt(b, i) !== QUOTE) return undefined
       i += 1
@@ -150,15 +153,18 @@ function parseSample(line: string): Sample | undefined {
         if (c < 0) return undefined
         if (c === QUOTE) break
         if (c === BSLASH) {
-          val += line.slice(run, i)
-          val += byteAt(b, i + 1) === LOWER_N ? "\n" : line.slice(i + 1, i + 2)
-          i += 2
+          val += line.slice(posOfByte(pos, run), posOfByte(pos, i))
+          // the escaped character whole, however many bytes it has
+          const c1 = byteAt(b, i + 1)
+          const w = c1 < 0x80 ? 1 : c1 < 0xe0 ? 2 : c1 < 0xf0 ? 3 : 4
+          val += c1 === LOWER_N ? "\n" : line.slice(posOfByte(pos, i + 1), posOfByte(pos, i + 1 + w))
+          i += 1 + w
           run = i
         } else {
           i += 1
         }
       }
-      val += line.slice(run, i)
+      val += line.slice(posOfByte(pos, run), posOfByte(pos, i))
       i += 1
       labels.push({ k: key, v: val })
       if (byteAt(b, i) === COMMA) i += 1
@@ -168,7 +174,7 @@ function parseSample(line: string): Sample | undefined {
   while (byteAt(b, i) === SP) i += 1
   let end = i
   while (end < n && byteAt(b, end) !== SP) end += 1
-  const text = line.slice(i, end)
+  const text = line.slice(posOfByte(pos, i), posOfByte(pos, end))
   let value = 0.0
   if (text === "+Inf" || text === "Inf") {
     value = divide(1.0, 0.0)
@@ -198,7 +204,7 @@ function addSample(inout out: Map<string, Family>, types: Map<string, string>, s
   let part = ""
   for (const suffix of ["_bucket", "_sum", "_count"]) {
     if (s.name.endsWith(suffix)) {
-      const b = s.name.slice(0, s.name.byteLength - suffix.byteLength)
+      const b = s.name.slice(0, strLen(s.name) - strLen(suffix))
       const t = types.get(b)
       if (t === "histogram" || (t === "summary" && suffix !== "_bucket")) {
         base = b
@@ -606,6 +612,21 @@ test("label values unescape the escapes metrics.tov writes, and NaN points are d
   expect(ms[0]!.sum!.dataPoints[0]!.attributes[0]!.value.stringValue).toBe("a\"b\\c\nd")
   expect(ms[1]!.gauge!.dataPoints.length).toBe(1)
   expect(r.url).toBe("")
+})
+
+test("label keys and values are cut where they lie in the line, after 2-, 3- and 4-byte characters", () => {
+  const text = "# TYPE t counter\nt{p=\"é日🙂\",q=\"a\\\"é\\\\🙂\\nz\",r=\"\\é🙂\"} 2\n# TYPE n gauge\nn{x=\"🙂\"} 7\n"
+  const r = exportMetricsRequest({}, text, T0, T1, new Map())
+  const body = try JSON.parse(r.body) as OtlpMetricsPayload
+  const ms = body.resourceMetrics[0]!.scopeMetrics[0]!.metrics
+  expect(ms.length).toBe(2)
+  const at = ms[0]!.sum!.dataPoints[0]!.attributes
+  expect(at.map((a) => a.key).join(",")).toBe("p,q,r")
+  expect(at[0]!.value.stringValue).toBe("é日🙂")
+  expect(at[1]!.value.stringValue).toBe("a\"é\\🙂\nz")
+  expect(at[2]!.value.stringValue).toBe("é🙂")
+  expect(ms[1]!.gauge!.dataPoints[0]!.attributes[0]!.value.stringValue).toBe("🙂")
+  expect(ms[1]!.gauge!.dataPoints[0]!.asDouble).toBe(7.0)
 })
 
 test("metrics.render() output converts without loss", () => {

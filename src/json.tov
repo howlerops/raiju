@@ -2,10 +2,12 @@
 // untouched, so instead of building a tree we scan for value boundaries and
 // keep each value as its raw text. Only the fields the gateway reads are decoded.
 //
-// Offsets are byte offsets: Tov strings slice by byte, so the offsets found in
-// the encoded bytes slice the original string directly.
+// The scan runs over the encoded bytes, so its offsets are byte offsets. They are
+// not positions in the string (those are bytes on one compiler and UTF-16 units on
+// another): the text is only ever cut through Scanner.cut, which converts.
 
 import { strToFloat } from "./num"
+import { strLen, posSpan } from "./text"
 
 export type Field = { key: string, raw: string }
 
@@ -13,7 +15,28 @@ const enc = new TextEncoder()
 
 class Scanner {
   pos = 0
+  // a byte offset already converted, and the position in text it is
+  private seenByte = 0
+  private seenPos = 0
   constructor(readonly b: u8[], readonly text: string) {}
+
+  // The position in text of a byte offset (on a character boundary). Offsets mostly come in rising order,
+  // so the walk goes on from the last one.
+  private posOf(byte: int): int {
+    if (byte < this.seenByte) {
+      this.seenByte = 0
+      this.seenPos = 0
+    }
+    this.seenPos += posSpan(this.b, this.seenByte, byte)
+    this.seenByte = byte > this.b.length ? this.b.length : byte
+    return this.seenPos
+  }
+
+  // The text between two byte offsets.
+  cut(from: int, to: int): string {
+    const a = this.posOf(from)
+    return this.text.slice(a, this.posOf(to))
+  }
 
   ws(): void {
     while (this.pos < this.b.length) {
@@ -104,12 +127,12 @@ export function fields(text: string): Field[] throws SyntaxError {
     if (s.peek() !== 34) throw new SyntaxError(`expected a key at byte ${s.pos}`)
     const ks = s.pos
     try s.skipString()
-    const key = try decodeString(text.slice(ks, s.pos))
+    const key = try decodeString(s.cut(ks, s.pos))
     try s.expect(58)
     s.ws()
     const vs = s.pos
     try s.skipValue()
-    out.push({ key: key, raw: text.slice(vs, s.pos) })
+    out.push({ key: key, raw: s.cut(vs, s.pos) })
     s.ws()
     const c = s.peek()
     s.pos += 1
@@ -132,14 +155,14 @@ export function topLevelBool(text: string, key: string): bool | undefined throws
     if (s.peek() !== 34) throw new SyntaxError(`expected a key at byte ${s.pos}`)
     const ks = s.pos
     try s.skipString()
-    const k = try decodeString(text.slice(ks, s.pos))
+    const k = try decodeString(s.cut(ks, s.pos))
     try s.expect(58)
     s.ws()
     const vs = s.pos
     try s.skipValue()
     if (!seen && k === key) {
       seen = true
-      const raw = text.slice(vs, s.pos)
+      const raw = s.cut(vs, s.pos)
       if (raw === "true") out = true
       else if (raw === "false") out = false
     }
@@ -162,7 +185,7 @@ export function elements(text: string): string[] throws SyntaxError {
     s.ws()
     const vs = s.pos
     try s.skipValue()
-    out.push(text.slice(vs, s.pos))
+    out.push(s.cut(vs, s.pos))
     s.ws()
     const c = s.peek()
     s.pos += 1
@@ -180,7 +203,7 @@ export function find(fs: Field[], key: string): string | undefined {
 
 // Decodes a raw JSON string literal (quotes included).
 export function decodeString(raw: string): string throws SyntaxError {
-  if (raw.indexOf("\\") < 0) return raw.slice(1, raw.byteLength - 1)
+  if (raw.indexOf("\\") < 0) return raw.slice(1, strLen(raw) - 1)
   const s: string = try JSON.parse(raw)
   return s
 }
@@ -383,4 +406,44 @@ test("topLevelBool is rawBool over fields, also for what fields refuses", () => 
   expect(yes > 5).toBe(true)
   expect(no > 5).toBe(true)
   expect(bad > 5).toBe(true)
+})
+
+test("fields, elements and topLevelBool cut after non-ASCII text of every width", () => {
+  // 2-, 3- and 4-byte characters before a key, in keys, in values with escapes, in nested values and between members
+  const text = '{"é":"ü\\"x","日本":["語",{"k🙂":"v🙂\\\\"},"🙂🙂"],"🙂k":"a\\u00e9🙂b\\n","n":-1.5e3,"s🙂":"","t":true, "après":{"日":"é}"} ,"z":null}'
+  const fs = try fields(text)
+  expect(fs.map((f) => f.key)).toEqual(["é", "日本", "🙂k", "n", "s🙂", "t", "après", "z"])
+  expect(find(fs, "é")).toBe('"ü\\"x"')
+  expect(rawStr(fs, "é")).toBe('ü"x')
+  expect(find(fs, "日本")).toBe('["語",{"k🙂":"v🙂\\\\"},"🙂🙂"]')
+  expect(rawStr(fs, "🙂k")).toBe("aé🙂b\n")
+  expect(rawNum(fs, "n")).toBe(-1500.0)
+  expect(rawStr(fs, "s🙂")).toBe("")
+  expect(rawBool(fs, "t")).toBe(true)
+  expect(find(fs, "après")).toBe('{"日":"é}"}')
+  expect(isNull(find(fs, "z"))).toBe(true)
+  expect(build(fs)).toBe('{"é":"ü\\"x","日本":["語",{"k🙂":"v🙂\\\\"},"🙂🙂"],"🙂k":"a\\u00e9🙂b\\n","n":-1.5e3,"s🙂":"","t":true,"après":{"日":"é}"},"z":null}')
+  const els = try elements(find(fs, "日本")!)
+  expect(els).toEqual(['"語"', '{"k🙂":"v🙂\\\\"}', '"🙂🙂"'])
+  expect(try decodeString(els[0]!)).toBe("語")
+  expect(try decodeString(els[2]!)).toBe("🙂🙂")
+  const inner = try fields(els[1]!)
+  expect(inner[0]!.key).toBe("k🙂")
+  expect(rawStr(inner, "k🙂")).toBe("v🙂\\")
+  expect(rawStr(try fields(find(fs, "après")!), "日")).toBe("é}")
+  expect(try elements(' [ "é" , 1 ,"日", true,"🙂",null , ["🙂",2] ] ')).toEqual(['"é"', "1", '"日"', "true", '"🙂"', "null", '["🙂",2]'])
+  // a member after each width, alone
+  for (const ch of ["é", "日", "🙂", "é日🙂", "🙂🙂🙂"]) {
+    const t = `{"${ch}":"${ch}","k${ch}":["${ch}"],"stream":true,"last":"${ch}x"}`
+    const m = try fields(t)
+    expect(m.length).toBe(4)
+    expect(m[0]!.key).toBe(ch)
+    expect(rawStr(m, ch)).toBe(ch)
+    expect(find(m, "k" + ch)).toBe(`["${ch}"]`)
+    expect(rawBool(m, "stream")).toBe(true)
+    expect(rawStr(m, "last")).toBe(ch + "x")
+    expect(try topLevelBool(t, "stream")).toBe(true)
+    expect(try topLevelBool(`{"${ch}":false,"stream":true}`, ch)).toBe(false)
+    expect(build(m)).toBe(t)
+  }
 })
