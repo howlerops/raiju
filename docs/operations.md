@@ -312,6 +312,8 @@ Shared between the workers of a node and between nodes:
 - The replicated state (`clusterstate.tov`): configuration generations, MCP token-exchange admin
   credentials (sealed), A2A push configurations and agent cards, and realtime client-secret mappings
   (provider tokens sealed).
+  Concurrent MCP 401 responses renew the credential actually sent by each request; a late rejection of an
+  older credential does not invalidate a newer credential already saved by another worker.
 - The live log feed (`/ws`), unless `cluster.feed.cluster_wide` is false.
 - Failed sign-in counts (`signinguard.tov`): each process puts its own counts on the replicated state, keyed
   by a hash of the account or address, at most 4,096 entries, each kept an hour after its last failure; a
@@ -330,6 +332,9 @@ Shared between the workers of one node only:
   the encryption key). They outlive a restart; nodes share them only when they share the config folder, so
   put several nodes behind sticky sessions or a shared volume for dashboard and CLI sign-ins. A write that
   cannot get its file's lock within half a second fails its request (503) and writes nothing.
+  Session-file cache validation includes device and inode identity, so an atomic replacement is detected even
+  when its size and rounded modification time match. The one-second forced reload still bounds stale reads
+  if a worker misses several replacements and the filesystem reuses an inode.
 - UI WebSocket tickets live for 30 seconds in `<config>.ws-tickets/` (0700, files
   0600 named by the ticket hash). A ticket issued on one worker can be redeemed on
   any worker or replica sharing that directory. A successful atomic unlink claims
