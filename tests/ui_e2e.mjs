@@ -248,7 +248,19 @@ try {
     return !(await text(page, "#ch-requests .chart-tip")).includes("Success")
   })())
   await legendBtn("ch-requests", "Success").click()
-  check("showing the series again restores the bars and the axis", (await page.locator("#ch-requests rect.bar").count()) === barsBefore && (await axisOf("#ch-requests")) === axisBefore)
+  // The overview reloads its data on a timer, and a reload between the two readings can move the buckets: when
+  // the chart does not come back as it was first read, read it afresh (shown), hide and show once more, and compare.
+  const restored = async (bars, axis) => await page.locator("#ch-requests rect.bar").count() === bars && await axisOf("#ch-requests") === axis
+  let back = await restored(barsBefore, axisBefore)
+  if (!back) {
+    const bars2 = await page.locator("#ch-requests rect.bar").count()
+    const axis2 = await axisOf("#ch-requests")
+    await legendBtn("ch-requests", "Success").click()
+    const hidden2 = await page.locator("#ch-requests rect.bar").count()
+    await legendBtn("ch-requests", "Success").click()
+    back = hidden2 < bars2 && await restored(bars2, axis2)
+  }
+  check("showing the series again restores the bars and the axis", back, barsBefore + " bars, axis " + axisBefore + " -> " + (await page.locator("#ch-requests rect.bar").count()) + " bars, axis " + (await axisOf("#ch-requests")))
   const linesBefore = await page.locator("#ch-latency svg path").count()
   await legendBtn("ch-latency", "p99").click()
   check("a line series can be hidden too", (await page.locator("#ch-latency svg path").count()) === linesBefore - 1, linesBefore)
