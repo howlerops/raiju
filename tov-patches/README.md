@@ -1,41 +1,30 @@
 # Tov patches
 
-Raiju builds against [Tov](https://github.com/richiemcilroy/Tov) at commit
-`c2048582de4e9468267f801313144d75c12e983f` plus the patches here, applied in
-order by `scripts/build-tov.sh` (`make tov`). Each patch is written to be offered
-upstream. `tests/run.sh` checks all of them with the patched compiler:
-`TOV=build/tov/target/release/tov tov-patches/tests/run.sh` (or `make tov-test`).
-Patch 0004 is written on top of 0003 (its hunks include the ALPN signatures), so the
-patches apply in order only. Patches 0005 (WAMR) and 0006 (libdatachannel) add vendored C
-libraries (about 2.7 MB and 4.9 MB of text), which the first four do not; 0006 is applied on top of 0005.
-Patch 0008 changes the fetch and HTTP/2 code that 0007 adds, so it is applied on top of 0007.
-Patch 0009 (node:fs rename and fsync) touches the shared lists in `builtins.rs` and `tov.h` and is written on top of 0001-0008.
-Patch 0010 (WebAssembly wall-clock limit) changes `std/wasm`, `runtime/wasm.c` and the WAMR interpreter that 0005 adds, and is written on top of 0001-0009.
-Patch 0012 (server lifecycle) changes the HTTP server in `runtime/tov.c` and `std/http.tov`, and is written on top of 0001-0010.
-Patch 0013 (fetch address policy) changes the fetch code in `runtime/tov.c` and `std/http.tov` (and `fetchStart`'s signature, also called from `runtime/node.c`), and is written on top of 0001-0012.
-Patch 0015 (client certificates, `Request.signal`, gunzip) changes fetch, sockets and the server (and `fetchStart`'s and `netConnect`'s signatures), and is written on top of 0001-0013.
-Patch 0016 (fetch input buffer) changes the fetch connection reads in `runtime/tov.c` and is written on top of 0001-0013 and 0015.
-Patch 0017 (`server.requestIP`) changes the HTTP server in `runtime/tov.c` and `Request`/`Server` in `std/http.tov`, and is written on top of 0001-0016.
-Patch 0019 (worker respawn) changes the worker supervisor in `runtime/tov.c` and is written on top of 0001-0017 (its `docs/spec.md` hunk is on the line 0017 changes).
-Patch 0020 (`node:fs` `flockSync`) adds one native to the shared lists in `builtins.rs` and `tov.h` next to 0009's, and is written on top of 0001-0019.
-Patch 0021 (`Math.random` seeding) changes the generator and the worker fork in `runtime/tov.c` (next to 0019's supervisor), and is written on top of 0001-0020.
-Patch 0022 (address policy on `Bun.connect` and `WebSocket`, write-stall limit on upgraded sockets) reuses 0013's address classes in `runtime/tov.c`, changes the sockets in `runtime/net.c` and `runtime/ws.c` and the server sweep 0012 adds, and is written on top of 0001-0021.
-Patch 0023 (`continue` releases the loop body's locals) changes one line of `codegen/body.rs`, which no earlier patch touches; it applies on its own or on top of 0001-0022.
-Patch 0024 (dynamic `process.env[name]` reads) changes index checking, code generation and the existing `tv_process_env` runtime's embedded-NUL rejection; it applies on top of 0023.
-Patch 0025 (WebKitGTK main-thread/run-loop initialization) changes only `runtime/js.c` and applies on top of 0024.
-Patch 0026 (opt-in clean worker re-execution) changes native HTTP startup/supervision, Bun's worker helpers and their builtin declarations; it applies on top of 0025.
-Patch 0027 (GCC builds without scalar replacement of aggregates) changes only the C compiler flags in `crates/tov/src/build.rs`, which no earlier patch touches; it applies on its own or on top of 0026.
+Raiju builds against [Tov](https://github.com/richiemcilroy/Tov) v0.1.0
+(`ca1e3d24c44eb0d81b27cfefd1c308912c1d9f19`) plus the patches here, applied in name order by
+`scripts/build-tov.sh` (`make tov`):
 
-## Submitting upstream
+- `0001-raiju-runtime-and-compiler.patch` — every change to Tov's runtime, standard library and
+  compiler described below, as one patch against v0.1.0 (they touch the same lists and functions, so
+  they apply together). The section numbers below are the changes' original patch numbers.
+- `0002-vendor-nghttp2.patch`, `0003-vendor-wamr.patch`, `0004-vendor-libdatachannel.patch` — the
+  vendored C libraries the fetch HTTP/2 client, `std/wasm` and `std/rtc` are built on.
 
-Tov (MIT) takes outside pull requests; its rules are in its `AGENTS.md`: no mention of
-coding agents anywhere, and no attribution trailers in commits or pull requests. The
-upstream-ready versions are in [upstream/](upstream/): one `git format-patch` commit per
-pull request, in Tov's `feat: ...` style with tests in Tov's own harness (`tests/http.rs`,
-`tests/run/`) and docs in `docs/spec.md`, plus the pull request descriptions. Apply with
-`git am` on a fork at the pinned commit and open the PRs from there. Checked with
-`cargo test --release --test http` (passes) and `--test run` (passes except
-`npm_const_throws`, which fails the same way on unpatched Tov without JavaScriptCore).
+`make tov-test` checks them with the patched compiler (`tests/run.sh`: the HTTP server and worker
+supervision; `tests/run-fetch.sh`: fetch and sockets; `tests/run-misc.sh`: WebAssembly, WebRTC,
+node:fs, process.env, the GCC flag). `PORT-NOTES-*.md` record how each change was carried over from
+the Tov revision Raiju used before (`c2048582`), what was tested, and what was not (macOS paths,
+HTTP/2 against real servers).
+
+Two changes fix bugs in Tov itself, present in v0.1.0 and in upstream at `1959aef`, and should go
+upstream first (`tests/upstream-bug/` has a small program for each, failing under AddressSanitizer or
+LeakSanitizer on an unpatched compiler): an `async` function run as a task, or a generator, that
+reassigns a reference-counted parameter released the new value twice; and awaiting a promise whose
+result is a record held as an object leaked the default object made for the result. Change 0023 below
+(`continue` releases the loop body's locals) is no longer carried: upstream fixed it.
+
+Tov (MIT) takes outside pull requests; its rules are in its `AGENTS.md` (no mention of coding agents
+anywhere, and no attribution trailers in commits or pull requests).
 
 ## 0001 — streamed response bodies for `Bun.serve`
 

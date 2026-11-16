@@ -1,6 +1,6 @@
 # Tov notes
 
-Tov 0.0.1 is young. These are the problems this codebase works around, so
+Tov is young. These are the problems this codebase works around, so
 nobody rediscovers them. Each one is worth a report upstream
 (github.com/richiemcilroy/Tov) with the repro described.
 
@@ -47,33 +47,15 @@ random/session tests still hit Linux's `/proc/sys/kernel/random/uuid`; an observ
 had 713 passes and 36 failures. Use the Linux container for infrastructure and management acceptance until that
 entropy path is ported; do not weaken secure identifier generation to make native tests pass.
 
-## Upstream status (checked 2026-11-15)
+## Tov version
 
-The pinned revision is `c2048582` (2026-10-14). Upstream `main` was 580 commits ahead (`1959aef`, 2026-10-30) and had
-tagged v0.1.0. Moving the pin was assessed and not done, for these reasons:
+Raiju builds against Tov v0.1.0 (`ca1e3d2`) plus `tov-patches/`. [tov-0.1.0-migration.md](tov-0.1.0-migration.md)
+says what that version changed in the language (shared arrays and records, 32-bit bitwise operators, UTF-16
+string positions, `NaN` from `parseInt`, a trap for `xs[i]` out of bounds), which helper modules the source uses
+for each, and the two compiler bugs the port fixes.
 
-- **The patches do not carry over.** Applied in order to `1959aef`, 3 of the 24 files in `tov-patches/` apply
-  (0001, 0002, 0025); the rest fail on files upstream rewrote or removed (`runtime/tov.c` went from 7,689 to
-  14,623 lines; `runtime/h2.c` and `std/wasm.tov` are gone). Upstream now has its own ALPN, UDP, HTTP/2,
-  `requestIP`, `fsync`/`rename` and gunzip, with its own interfaces; it has no libdatachannel (WebRTC), no
-  `flockSync`, no connect-time address policy (patches 0013 and 0022, which the outbound request guard in
-  SECURITY.md depends on) and no clean worker re-execution (0026). Each patch has to be re-derived against the
-  new internals, or its callers in `src/` moved to upstream's interface.
-- **The language changed.** Upstream commit `3d5ecbf` ("Make records changed in place objects, shared as
-  JavaScript's are, unless nothing shares them") and the commits around it change when a record is copied. The
-  gateway is written for copies on assignment (docs/agent-brief.md), so every place that changes a record after
-  assigning it would have to be re-read.
-- **Upstream's memory fixes are for features added after the pin.** Its fixes for leaks and use-after-frees
-  ("Stop leaking the values of `||`, `&&` and `??=`", the splice and regex-match leaks, "Fix use-after-frees of
-  taken fields…") do not cherry-pick onto the pin: `||` on non-booleans, `splice` and regex literals do not
-  exist here, and the taken-field moves were introduced later. The one that does exist here is `??=`, which
-  leaks (see the table above); the sources do not use it and the lint refuses it.
-- **Nothing measured says the pin is hurting.** The memory soak is flat, valgrind is silent on the test binary
-  with patch 0027, and throughput rose with the last round of changes.
-
-What an upgrade would need: a branch that re-derives the patches one by one (the address policy and the worker
-supervisor first, with their tests in `tov-patches/tests`), a pass over record mutation in `src/` under the new
-sharing rule, then the same gates as any release: `make unit`, both e2e runs, the browser suite, the memory soak,
-valgrind on the test binary, and the throughput comparison against the pinned build. Upstream's "Build every
-program with gcc" should be read first: with GCC, patch 0027's `-fno-tree-sra` (or an upstream equivalent) is
-required.
+The tables above were written against the revision used before (`c2048582`). The workarounds are still in
+the source and were not re-examined one by one on v0.1.0: the build still passes `-DTV_PLAIN_ALLOC`, GCC builds
+still get `-fno-tree-sra`, and `??=` is still refused by `scripts/fetch_lint.py`. Remove one only with a test
+that shows the problem gone. Spread, default parameter values, `charCodeAt`, `lastIndexOf` and regular
+expressions exist in v0.1.0; the source predates them.

@@ -21,6 +21,8 @@ jsc:
 
 tov-test:
 	tov-patches/tests/run.sh
+	tov-patches/tests/run-fetch.sh
+	tov-patches/tests/run-misc.sh
 
 build:
 	mkdir -p build && $(TOV) build src/main.tov -o build/raiju

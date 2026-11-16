@@ -1,8 +1,8 @@
 #!/bin/sh
-# Runs workstream s3's ported patch tests inside the build container:
-#   M/tovbuild.sh M/s3 sh 'sh raiju-tests/run-s3.sh [name...]'
+# Checks the WebAssembly, WebRTC, node:fs, process.env, JavaScriptCore and GCC-flag patches:
+#   TOV=build/tov/target/release/tov tov-patches/tests/run-misc.sh [name ...]
 set -u
-TOV=${TOV:-/tov/target/release/tov}
+TOV=${TOV:-tov}
 DIR=$(cd "$(dirname "$0")" && pwd)
 OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT

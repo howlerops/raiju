@@ -2,7 +2,7 @@
 """Flags a record copy function that does not list every field of its type.
 
 `export function copyX(r: X): X { return { a: r.a, ... } }` (src/config.tov, "copies of records") builds a new
-record field by field, because the pinned Tov has no spread. A field added to X and not to copyX would be dropped
+record field by field, because Raiju's source is written without spread. A field added to X and not to copyX would be dropped
 without an error wherever the copy is used (every config save goes through copyConfig), so each copyX defined in
 the file of its type is checked against that type here.
 

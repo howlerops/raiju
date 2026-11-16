@@ -1,13 +1,13 @@
 #!/bin/sh
 # Checks the ported socket and fetch-client patches (0002, 0003, 0004, 0007, 0008 fetch half, 0013, 0015
 # client half, 0016, 0022) with the compiler built from this tree:
-#   TOV=target/release/tov raiju-tests/run-s2.sh [section ...]
+#   TOV=build/tov/target/release/tov tov-patches/tests/run-fetch.sh [section ...]
 # Sections: spawn alpn udp pool peer cert decompress buffer pause wsstall (default: all). Each program prints
 # "ok" and "FAIL" lines; a section passes when no line fails and the expected number of "ok" lines appears.
 set -eu
 # (every server here is local: fetch must not go through an environment proxy)
 unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy || true
-TOV=${TOV:-$(cd "$(dirname "$0")/.." && pwd)/target/release/tov}
+TOV=${TOV:-tov}
 DIR=$(cd "$(dirname "$0")" && pwd)
 OUT=$(mktemp -d)
 PIDS=""
