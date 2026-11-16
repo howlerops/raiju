@@ -3,11 +3,13 @@
 // (governance.teams); its members are users listing it in their teams. Handles deprovisioning
 // through DELETE or active false for users. scimHandle is pure: it returns updated state,
 // and the caller saves the returned users and teams once per request.
-import { AdminUserConfig, RoleConfig, TeamConfig } from "./config"
+import { AdminUserConfig, RoleConfig, TeamConfig, copyAdminUserConfig } from "./config"
 import { Field, fields, elements, find, rawStr, decodeString } from "./json"
 import { knownRole, validName } from "./rbac"
 import { safeEq } from "./crypto"
 import { pctDecode } from "./crypto"
+import { strToInt } from "./num"
+import { strLen } from "./text"
 
 const ERROR_SCHEMA = "urn:ietf:params:scim:api:messages:2.0:Error"
 const LIST_SCHEMA = "urn:ietf:params:scim:api:messages:2.0:ListResponse"
@@ -148,8 +150,8 @@ function patchOps(body: string): PatchOp[] | undefined {
 function eqValue(rest: string): string | undefined {
   if (!rest.toLowerCase().startsWith("eq ")) return undefined
   const q = rest.slice(3).trim()
-  if (q.byteLength < 2 || !q.startsWith("\"") || !q.endsWith("\"")) return undefined
-  const v = q.slice(1, q.byteLength - 1)
+  if (strLen(q) < 2 || !q.startsWith("\"") || !q.endsWith("\"")) return undefined
+  const v = q.slice(1, strLen(q) - 1)
   if (v.includes("\"")) return undefined
   return v
 }
@@ -170,17 +172,17 @@ function filterOf(params: URLSearchParams, attr: string): Filter {
 function memberPathValue(path: string): string | undefined {
   const pre = "members["
   if (!path.toLowerCase().startsWith(pre) || !path.endsWith("]")) return undefined
-  const inner = path.slice(pre.byteLength, path.byteLength - 1).trim()
+  const inner = path.slice(strLen(pre), strLen(path) - 1).trim()
   if (!inner.toLowerCase().startsWith("value ")) return undefined
   return eqValue(inner.slice(6).trim())
 }
 
 // startIndex (from 1) and count (default 100, at most 200) of a list request.
 function pageOf(params: URLSearchParams): { start: int, count: int } {
-  const s = parseInt(params.get("startIndex") ?? "1")
+  const s = strToInt(params.get("startIndex") ?? "1")
   const start = s === undefined || s < 1 ? 1 : s
   const c = params.get("count")
-  const n = c === undefined ? DEFAULT_COUNT : parseInt(c)
+  const n = c === undefined ? DEFAULT_COUNT : strToInt(c)
   let count = DEFAULT_COUNT
   if (n !== undefined) count = n < 0 ? 0 : n > MAX_COUNT ? MAX_COUNT : n
   return { start: start, count: count }
@@ -271,7 +273,7 @@ function withTeam(u: AdminUserConfig, team: string, on: bool): AdminUserConfig {
 // The user as a new value: its role, state and teams replaced, every other field (memberships, claims, budget
 // overrides, the attributes SCIM pushed) kept.
 function userWith(u: AdminUserConfig, role: string, disabled: bool, teams: string[] | undefined): AdminUserConfig {
-  let n = u
+  let n = copyAdminUserConfig(u)
   n.role = role
   n.disabled = disabled
   n.teams = teams
@@ -328,7 +330,9 @@ function putAttr(inout m: Map<string, string[]>, key: string, raw: string, neste
 // names, and enterprise or custom extensions (urn:... objects) by field name. Excludes
 // schemas, id, meta, groups and password.
 function pushedAttrs(fs: Field[], into: Map<string, string[]>): Map<string, string[]> {
-  let m = into
+  // a map of its own: into stays as it was
+  let m: Map<string, string[]> = new Map()
+  for (const k of into.keys()) m.set(k, into.get(k)!)
   for (const f of fs) {
     const k = f.key
     const lk = k.toLowerCase()
@@ -479,7 +483,13 @@ function replaceFromBody(st: ScimState, old: AdminUserConfig, ctx: Ctx): ScimRes
 function patchUser(st: ScimState, old: AdminUserConfig, ctx: Ctx): ScimResult {
   const ops = patchOps(ctx.body)
   if (ops === undefined) return failed(st, 400, "invalidSyntax", "the body must be a PATCH request with Operations")
-  let w: Work = { name: old.name, role: old.role, disabled: old.disabled === true, attrs: old.scim_attributes ?? new Map() }
+  // the stored user's attribute map is copied: the operations change the work record's, and old stays as it was
+  const attrs0: Map<string, string[]> = new Map()
+  const pushed = old.scim_attributes
+  if (pushed !== undefined) {
+    for (const k of pushed.keys()) attrs0.set(k, pushed.get(k)!)
+  }
+  let w: Work = { name: old.name, role: old.role, disabled: old.disabled === true, attrs: attrs0 }
   for (const o of ops) {
     if (o.op !== "add" && o.op !== "replace" && o.op !== "remove") return failed(st, 400, "invalidSyntax", `op ${o.op} is not supported`)
     let attrs = w.attrs
@@ -922,4 +932,14 @@ test("a SCIM write keeps the fields it does not hold, and group memberships are 
   expect((gu.scim_groups ?? []).join(",") + "|" + (gu.teams ?? []).join(",")).toBe("team-new|t-manual,team-new")
   const out = run(g.state, "PATCH", "/Groups/team-new", `{"Operations":[{"op":"remove","path":"members[value eq \\"ana@example.com\\"]"}]}`)
   expect((out.state.users[0]!.scim_groups ?? []).length).toBe(0)
+})
+
+test("filter values and member paths with non-ASCII text", () => {
+  expect(eqValue('eq "é日🙂"')).toBe("é日🙂")
+  expect(eqValue('eq "🙂"')).toBe("🙂")
+  expect(eqValue('eq "é')).toBe(undefined)
+  expect(eqValue('eq "')).toBe(undefined)
+  expect(memberPathValue('members[value eq "é日🙂"]')).toBe("é日🙂")
+  expect(memberPathValue('members[value eq "🙂-1"]')).toBe("🙂-1")
+  expect(memberPathValue('members[value eq "🙂"')).toBe(undefined)
 })

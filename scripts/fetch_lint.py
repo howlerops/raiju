@@ -9,7 +9,7 @@ out says so with a `fetch-timeout: none` comment on its line.
 Comments, strings and template literals (the UI's embedded JavaScript) are skipped, and so are method
 definitions named fetch (Bun.serve's `fetch(req) {`).
 
-It also flags `??=`, which leaks with the pinned Tov revision (see _nullish_assignments).
+It also flags `??=`, which leaked with the Tov revision used before v0.1.0 and has not been re-checked (see _nullish_assignments).
 
 Usage: scripts/fetch_lint.py FILE...   (exit 1 when a call is flagged)
 """
@@ -113,7 +113,7 @@ def _nullish_assignments(code):
     while i >= 0:
         line = code.count("\n", 0, i) + 1
         col = i - (code.rfind("\n", 0, i) + 1) + 1
-        found.append((line, col, "`??=` leaks its right-hand value with the pinned Tov when the left side is set; write `if (a === undefined) a = b`"))
+        found.append((line, col, "`??=` leaked its right-hand value with Tov before v0.1.0 when the left side is set (not re-checked); write `if (a === undefined) a = b`"))
         i = code.find("??=", i + 3)
     return found
 

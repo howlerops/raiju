@@ -16,6 +16,9 @@
 
 import { compileRegex, Cset, Decoded, decodeText, hasBorder, LitCand, Regex } from "./regex"
 import { Finding, GuardResult, redact } from "./guardrails"
+import { bitShl, bitShr } from "./bits"
+import { strLen, bytePositions, posOfByte } from "./text"
+import { elemAt } from "./arrays"
 
 // A Gitleaks-style allowlist. target is "" (the secret), "match" (the whole match) or
 // "line" (the line of the match). regexes and stopwords are alternatives, or, when
@@ -41,7 +44,7 @@ export type RegexRule = {
   // took part (the whole match when the pattern has none).
   secret_group?: int,
   // A finding is kept only when the Shannon entropy of its secret is above this.
-  entropy?: number,
+  entropy?: f64,
   allow?: AllowRule[],
   // A finding is dropped when its line (the line of the match) contains one of these,
   // as Gitleaks drops findings on a line with its gitleaks:allow comment.
@@ -150,7 +153,7 @@ export type CompiledRule = {
   keys: string[],
   wordB: bool,
   secretGroup: int,
-  entropy: number,
+  entropy: f64,
   skipLine: string[],
   allow: CompiledAllow[],
   gate: Regex,
@@ -171,7 +174,7 @@ const W = 512
 const STEP = 256
 
 function byteAt(b: u8[], i: int): int {
-  const v = b[i]
+  const v = elemAt(b, i)
   return v === undefined ? -1 : int(v)
 }
 
@@ -222,7 +225,7 @@ function compileAllow(a: AllowRule): CompiledAllow throws SyntaxError {
     const w = s.toLowerCase()
     stops.push(w)
     set.add(w)
-    if (!lens.includes(w.byteLength)) lens.push(w.byteLength)
+    if (!lens.includes(strLen(w))) lens.push(strLen(w))
   }
   return { target: a.target ?? "", all: a.all ?? false, regexes: res, matchers: ms, stops: stops, stopSet: set, stopLens: lens }
 }
@@ -273,8 +276,9 @@ function asciiLower(b: u8[]): string | undefined {
 }
 
 // The start offsets of every occurrence of lit in low, overlapping ones included, or
-// undefined when there are too many to list (the rule is then not filtered).
-function occurrences(low: string, lit: string, b: u8[]): int[] | undefined {
+// undefined when there are too many to list (the rule is then not filtered). The offsets are byte
+// offsets (into b); pos gives the position in low of each (bytePositions), for the cuts of low.
+function occurrences(low: string, lit: string, b: u8[], pos: int[] | undefined): int[] | undefined {
   const out: int[] = []
   if (!hasBorder(lit)) {
     // without a border no two occurrences overlap, so the pieces between them give every offset
@@ -296,8 +300,11 @@ function occurrences(low: string, lit: string, b: u8[]): int[] | undefined {
   while (out.length <= 256) {
     // chunk ends are code point starts, so the slice is valid text
     const end = cpAlign(b, from + chunk < n ? from + chunk : n)
-    const q = low.slice(from, end).indexOf(lit)
-    if (q >= 0) {
+    const sub = low.slice(posOfByte(pos, from), posOfByte(pos, end))
+    const k = sub.indexOf(lit)
+    if (k >= 0) {
+      // k is a position in sub: the bytes before it are counted, not assumed
+      const q = pos === undefined ? k : sub.slice(0, k).byteLength
       out.push(from + q)
       from = from + q + 1
       continue
@@ -313,7 +320,7 @@ function occurrences(low: string, lit: string, b: u8[]): int[] | undefined {
 function byteFits(c: int, cs: Cset): bool {
   if (cs.any) return true
   if (c >= 128) return cs.high
-  return ((cs.bits[c >> 5]! >> (c & 31)) & 1) === 1
+  return ((bitShr(cs.bits[bitShr(c, 5)]!, c & 31)) & 1) === 1
 }
 
 // The earliest byte a match can start at, when the match holds the literal at byte p. Its
@@ -337,19 +344,19 @@ type Trip = { k: int, from: int, p: int }
 // byte p (of length len) can lie in window k (start k*STEP, end at most k*STEP + W + 3, since a
 // window end moves forward to a code point start) only when k*STEP <= p and p + len <= k*STEP
 // + W + 3; the list covers every such window.
-function windowStarts(re: Regex, low: string | undefined, b: u8[]): Trip[] | undefined {
+function windowStarts(re: Regex, low: string | undefined, b: u8[], pos: int[] | undefined): Trip[] | undefined {
   const lits = re.literals()
   if (lits.length === 0 || low === undefined) return undefined
-  const nwin = ((b.length - 1) >> 8) + 1
+  const nwin = (bitShr(b.length - 1, 8)) + 1
   const out: Trip[] = []
   for (const lc of lits) {
-    const at = occurrences(low, lc.lit, b)
+    const at = occurrences(low, lc.lit, b, pos)
     if (at === undefined) return undefined
     const len = lc.lit.byteLength
     for (const p of at) {
       const x = p + len - W - 3
-      const lo = x <= 0 ? 0 : (x + STEP - 1) >> 8
-      const hi = p >> 8
+      const lo = x <= 0 ? 0 : bitShr(x + STEP - 1, 8)
+      const hi = bitShr(p, 8)
       const from = earliestStart(b, p, lc)
       for (let k = lo; k <= hi && k < nwin; k++) out.push({ k: k, from: from, p: p })
     }
@@ -364,18 +371,19 @@ function windowStarts(re: Regex, low: string | undefined, b: u8[]): Trip[] | und
 // and only the hit ranges are kept. A window tries only the starts windowStarts gives it,
 // when the rule has literals. s0 (a multiple of STEP) is the start of the first window walked: 0, or
 // STEP when the text is the tail of a longer one whose earlier windows are already decided (BlockCursor).
-function scanRegions(rules: CompiledRule[], text: string, b: u8[], low: string | undefined, s0: int): Span[][] {
+// Every offset here is a byte offset into b; pos (bytePositions(text)) gives the place to cut text at.
+function scanRegions(rules: CompiledRule[], text: string, b: u8[], pos: int[] | undefined, low: string | undefined, s0: int): Span[][] {
   const n = b.length
   const plans: (Trip[] | undefined)[] = []
   const next: int[] = []
   const out: Span[][] = []
   for (const r of rules) {
-    plans.push(windowStarts(r.gate, low, b))
+    plans.push(windowStarts(r.gate, low, b, pos))
     next.push(0)
     out.push([])
   }
   let s = s0
-  let k = s0 >> 8
+  let k = bitShr(s0, 8)
   while (s < n) {
     const st = cpAlign(b, s)
     const e = cpAlign(b, s + W < n ? s + W : n)
@@ -386,7 +394,7 @@ function scanRegions(rules: CompiledRule[], text: string, b: u8[], low: string |
       // the starts as offsets into the window; a start before the window is not in it
       const lo: int[] = []
       const hi: int[] = []
-      const plan = plans[i]
+      const plan = elemAt(plans, i)
       if (plan !== undefined) {
         // the list is sorted by window, so the entries of earlier windows are passed over
         let j = next[i]!
@@ -405,7 +413,7 @@ function scanRegions(rules: CompiledRule[], text: string, b: u8[], low: string |
         if (lo.length === 0) continue
       }
       if (!decodedNow) {
-        dec = decodeText(text.slice(st, e))
+        dec = decodeText(text.slice(posOfByte(pos, st), posOfByte(pos, e)))
         decodedNow = true
       }
       if (rules[i]!.gate.testDecoded(dec, lo, hi)) out[i]!.push({ start: st, end: e })
@@ -421,8 +429,9 @@ function scanRegions(rules: CompiledRule[], text: string, b: u8[], low: string |
 // from where the last match ended; a match that starts in the second half of a window
 // is left for the next window, which holds it in its first half. from0 is where an earlier
 // call over the regions before these stopped (0 for the first): the two calls together do
-// what one call over all the regions does.
-function findSpans(r: CompiledRule, text: string, b: u8[], regions: Span[], from0: int): Scan {
+// what one call over all the regions does. The regions, from0 and the spans found are byte offsets
+// into b (the matcher reports byte offsets into the slice it is given); pos gives the cuts of text.
+function findSpans(r: CompiledRule, text: string, b: u8[], pos: int[] | undefined, regions: Span[], from0: int): Scan {
   const n = b.length
   const out: Found[] = []
   let placed = false
@@ -431,7 +440,7 @@ function findSpans(r: CompiledRule, text: string, b: u8[], regions: Span[], from
     let p = cpAlign(b, reg.start > from ? reg.start : from)
     while (p < reg.end && p < n) {
       const hi = cpAlign(b, p + W < n ? p + W : n)
-      const m = r.gate.exec(text.slice(p, hi))
+      const m = r.gate.exec(text.slice(posOfByte(pos, p), posOfByte(pos, hi)))
       if (m === undefined) {
         if (hi >= n) break
         p = cpAlign(b, p + STEP)
@@ -466,8 +475,8 @@ function findSpans(r: CompiledRule, text: string, b: u8[], regions: Span[], from
 // The span of group g of a window match that starts at p (m holds offsets relative to p),
 // or undefined when the group did not take part or matched nothing.
 function groupSpan(m: int[], p: int, g: int): Span | undefined {
-  const s = m[2 * g]
-  const e = m[2 * g + 1]
+  const s = elemAt(m, 2 * g)
+  const e = elemAt(m, 2 * g + 1)
   if (s === undefined || e === undefined || s < 0 || e <= s) return undefined
   return { start: p + s, end: p + e }
 }
@@ -479,7 +488,7 @@ function secretSpan(r: CompiledRule, m: int[], p: int, whole: Span): Span {
     const g = groupSpan(m, p, r.secretGroup)
     return g === undefined ? whole : g
   }
-  const groups = (m.length >> 1) - 1
+  const groups = (bitShr(m.length, 1)) - 1
   for (let k = 1; k <= groups; k++) {
     const g = groupSpan(m, p, k)
     if (g !== undefined) return g
@@ -499,7 +508,7 @@ function ignored(r: CompiledRule, t: string): bool {
 
 // Shannon entropy in bits per character, as gitleaks computes it: the counts are per code
 // point, and the frequencies divide by the byte length.
-export function shannon(s: string): number {
+export function shannon(s: string): f64 {
   const n = s.byteLength
   if (n === 0) return 0
   const counts = new Map<string, int>()
@@ -514,7 +523,7 @@ export function shannon(s: string): number {
   return e
 }
 
-// The line of text that holds the byte span [s, e), without its newline. Built from
+// The line of text that holds the span [s, e) (positions in text), without its newline. Built from
 // native string operations: the text is not scanned byte by byte.
 function lineOf(text: string, s: int, e: int): string {
   const parts = text.slice(0, s).split("\n")
@@ -555,7 +564,7 @@ function regexHit(a: CompiledAllow, target: string, inout memo: Map<string, bool
       lowered = lt
       if (!lits.some((lc: LitCand): bool => lt.includes(lc.lit))) continue
     }
-    const m = a.matchers[ri]
+    const m = elemAt(a.matchers, ri)
     if (m !== undefined) {
       // an alternation of many literal branches: only the starts that reach an occurrence of a branch's literal
       if (allowStarts(re, m, target)) hit = true
@@ -656,8 +665,17 @@ function allowedFinding(r: CompiledRule, secret: string, text: string, m: Span, 
   return false
 }
 
+// A match's spans as positions in the text they were found in (pos is that text's bytePositions),
+// moved by add: what the text is cut with.
+function placedIn(f: Found, pos: int[] | undefined, add: int): Found {
+  return {
+    m: { start: posOfByte(pos, f.m.start) + add, end: posOfByte(pos, f.m.end) + add },
+    s: { start: posOfByte(pos, f.s.start) + add, end: posOfByte(pos, f.s.end) + add },
+  }
+}
+
 // Whether a match of a rule is a finding: its secret is above the rule's entropy floor, is not an
-// allowed value, and no skip mark or allowlist covers it.
+// allowed value, and no skip mark or allowlist covers it. f holds positions in text (placedIn).
 function keeps(r: CompiledRule, text: string, f: Found, inout memo: Map<string, bool>): bool {
   const t = text.slice(f.s.start, f.s.end)
   if (r.entropy !== 0 && shannon(t) <= r.entropy) return false
@@ -670,9 +688,11 @@ function keeps(r: CompiledRule, text: string, f: Found, inout memo: Map<string, 
 // Runs the rules over text. block rules set blocked; redact rules rewrite the body
 // with [REDACTED:KIND]; detect_only rules only report. A finding is reported for the
 // secret span of a match; with an entropy floor, a finding must be above it, and an
-// allowlist that covers it drops it.
+// allowlist that covers it drops it. A finding's start and end are positions in text (text.slice(start,
+// end) is its text); the scan itself works in byte offsets and converts once, here.
 export function applyRegex(text: string, rules: CompiledRule[]): GuardResult {
   const b = enc.encode(text)
+  const pos = bytePositions(text)
   const findings: Finding[] = []
   const redactions: Finding[] = []
   let blocked = false
@@ -685,19 +705,20 @@ export function applyRegex(text: string, rules: CompiledRule[]): GuardResult {
     if (r.keys.length > 0 && !r.keys.some((k: string) => low.includes(k))) continue
     run.push(r)
   }
-  const regions = scanRegions(run, text, b, ascii, 0)
+  const regions = scanRegions(run, text, b, pos, ascii, 0)
   for (let i = 0; i < run.length; i++) {
     const r = run[i]!
     const rg = regions[i]!
     if (rg.length === 0) continue
-    const scan = findSpans(r, text, b, rg, 0)
+    const scan = findSpans(r, text, b, pos, rg, 0)
     if (!scan.placed) {
       // the pattern matched but the span could not be placed
       findings.push({ kind: r.kind, start: 0, end: 0, text: "" })
       if (r.action !== "detect_only") blocked = true
       continue
     }
-    for (const f of scan.found) {
+    for (const fb of scan.found) {
+      const f = placedIn(fb, pos, 0)
       if (!keeps(r, text, f, &memo)) continue
       const t = text.slice(f.s.start, f.s.end)
       const fd: Finding = { kind: r.kind, start: f.s.start, end: f.s.end, text: t }
@@ -752,6 +773,8 @@ export class BlockCursor {
   // the tail scanned next starts here (a multiple of STEP and a code point start); the walk starts one
   // window later, unless this is 0
   private start = 0
+  // the same place as a position in the text (start is a byte offset)
+  private startAt = 0
   // per rule, for the windows before the walk's start: where the search stopped, whether a search
   // matched, whether a window matched
   private from: int[] = []
@@ -764,6 +787,9 @@ export class BlockCursor {
   // keyLo were seen
   private keyLo = 0
   private keyMark = 0
+  // keyLo and keyMark as positions in the text (they are byte lengths)
+  private keyLoAt = 0
+  private keyMarkAt = 0
   private reach = 0
   private keyed = false
   // false: every call scans the whole text (a keyword that is not ASCII)
@@ -786,6 +812,7 @@ export class BlockCursor {
 
   private restart(): void {
     this.start = 0
+    this.startAt = 0
     for (let i = 0; i < this.rules.length; i++) {
       this.from[i] = 0
       this.placed[i] = false
@@ -800,11 +827,13 @@ export class BlockCursor {
       for (let i = 0; i < this.rules.length; i++) this.active[i] = this.rules[i]!.keys.length === 0
       this.keyLo = 0
       this.keyMark = 0
+      this.keyLoAt = 0
+      this.keyMarkAt = 0
     }
     this.len = n
     if (!this.local) this.restart()
     if (this.keyed) {
-      const low = (this.local && this.keyLo > 0 ? text.slice(this.keyLo) : text).toLowerCase()
+      const low = (this.local && this.keyLo > 0 ? text.slice(this.keyLoAt) : text).toLowerCase()
       let woke = false
       for (let i = 0; i < this.rules.length; i++) {
         if (this.active[i]!) continue
@@ -815,14 +844,18 @@ export class BlockCursor {
       }
       if (n - this.keyMark >= this.reach) {
         this.keyLo = this.keyMark
+        this.keyLoAt = this.keyMarkAt
         this.keyMark = n
+        this.keyMarkAt = strLen(text)
       }
       // the rule has the whole text to scan
       if (woke) this.restart()
     }
     const base = this.start
-    const part = base === 0 ? text : text.slice(base)
+    const baseAt = this.startAt
+    const part = base === 0 ? text : text.slice(baseAt)
     const b = enc.encode(part)
+    const pos = bytePositions(part)
     const idx: int[] = []
     const run: CompiledRule[] = []
     for (let i = 0; i < this.rules.length; i++) {
@@ -830,12 +863,12 @@ export class BlockCursor {
       idx.push(i)
       run.push(this.rules[i]!)
     }
-    const regions = scanRegions(run, part, b, asciiLower(b), base > 0 ? STEP : 0)
+    const regions = scanRegions(run, part, b, pos, asciiLower(b), base > 0 ? STEP : 0)
     // the next walk's first window (an offset in part), or -1 to stay: the last window start with SETTLED
     // bytes after it whose tail start, a window earlier, is a code point start
     let cut = -1
     if (this.local && n >= SETTLED) {
-      let c = (((n - SETTLED) >> 8) << 8) - base
+      let c = (bitShl(bitShr(n - SETTLED, 8), 8)) - base
       while (c - STEP > 0 && isCont(byteAt(b, c - STEP))) c -= STEP
       if (c - STEP > 0) cut = c
     }
@@ -854,8 +887,8 @@ export class BlockCursor {
         else post.push(reg)
       }
       const f0 = this.from[i]! - base
-      const a = findSpans(r, part, b, pre, f0 > 0 ? f0 : 0)
-      const z = findSpans(r, part, b, post, a.from)
+      const a = findSpans(r, part, b, pos, pre, f0 > 0 ? f0 : 0)
+      const z = findSpans(r, part, b, pos, post, a.from)
       froms.push(a.from + base)
       placeds.push(this.placed[i]! || a.placed)
       hits.push(this.hit[i]! || pre.length > 0)
@@ -871,12 +904,12 @@ export class BlockCursor {
         if (al.target === "line") lineAllow = true
       }
       for (const f of a.found) {
-        if (keeps(r, text, { m: { start: f.m.start + base, end: f.m.end + base }, s: { start: f.s.start + base, end: f.s.end + base } }, &memo)) return true
+        if (keeps(r, text, placedIn(f, pos, baseAt), &memo)) return true
         // its line can still grow, and an allowlist that reads the line may then let go of it
-        if (lineAllow && !part.slice(f.m.end).includes("\n")) cut = -1
+        if (lineAllow && !part.slice(posOfByte(pos, f.m.end)).includes("\n")) cut = -1
       }
       for (const f of z.found) {
-        if (keeps(r, text, { m: { start: f.m.start + base, end: f.m.end + base }, s: { start: f.s.start + base, end: f.s.end + base } }, &memo)) return true
+        if (keeps(r, text, placedIn(f, pos, baseAt), &memo)) return true
       }
     }
     if (cut < 0) return false
@@ -887,6 +920,7 @@ export class BlockCursor {
       this.hit[i] = hits[j]!
     }
     this.start = base + cut - STEP
+    this.startAt = baseAt + posOfByte(pos, cut - STEP)
     return false
   }
 }
@@ -1066,7 +1100,8 @@ test("a literal rule finds matches at every offset around the window seams", () 
         while (text.byteLength + 2 <= t) text += "é"
       }
       while (text.byteLength < t) text += "-"
-      starts.push(text.byteLength)
+      // a finding's start is a position in the text; the targets are byte offsets (the seams are in bytes)
+      starts.push(strLen(text))
       text += "abcsecret."
     }
     const r = applyRegex(text, rules)
@@ -1121,10 +1156,11 @@ test("stopwords of several lengths are found inside ASCII and non-ASCII secrets"
 function cursorDiff(rules: CompiledRule[], text: string, step: int): string {
   const c = new BlockCursor(rules)
   const b = enc.encode(text)
+  const pos = bytePositions(text)
   let n = 0
   while (n < b.length) {
     n = cpAlign(b, n + step < b.length ? n + step : b.length)
-    const pre = text.slice(0, n)
+    const pre = text.slice(0, posOfByte(pos, n))
     const want = applyRegex(pre, rules).blocked
     if (c.blocked(pre) !== want) return `step ${step} at ${n}: whole scan ${want}`
   }
@@ -1133,10 +1169,10 @@ function cursorDiff(rules: CompiledRule[], text: string, step: int): string {
 
 // n bytes of filler with the tokens written over it at their offsets
 function laid(fill: string, n: int, at: int[], toks: string[]): string {
-  let t = fill.repeat(Math.floor(n / fill.byteLength) + 1).slice(0, n)
+  let t = fill.repeat(Math.floor(n / strLen(fill)) + 1).slice(0, n)
   for (let i = 0; i < at.length; i++) {
     const tok = toks[i]!
-    t = t.slice(0, at[i]!) + tok + t.slice(at[i]! + tok.byteLength)
+    t = t.slice(0, at[i]!) + tok + t.slice(at[i]! + strLen(tok))
   }
   return t
 }
@@ -1228,3 +1264,40 @@ test("a block cursor agrees with the whole scan: keywords, lines, word edges, en
   expect(c.blocked("PROJ-1234")).toBe(true)
   expect(c.blocked("fine")).toBe(false)
 })
+
+test("findings after 2-, 3- and 4-byte characters are placed in the text, whole scan and cursor", () => {
+  const rules = try compileRules([
+    { pattern: "[a-z]@[a-z]\\.[a-z]{2,3}", entity_type: "EMAIL", action: "redact" },
+    { pattern: "tok_[a-z]{4}", action: "detect_only", skip_line_containing: ["@keep"] },
+    { pattern: "a-a[0-9]", action: "detect_only" },
+  ])
+  for (const lead of ["é", "日", "🙂", "aé日🙂"]) {
+    for (const reps of [1, 90, 700]) {
+      const head = lead.repeat(reps)
+      const text = head + " a@b.co 🙂 tok_abcd\n" + head + "tok_efgh @keep\n a-a-a5 " + "x".repeat(5000) + lead + " c@d.org"
+      const r = applyRegex(text, rules)
+      expect(r.findings.map((f: Finding): string => f.kind + "=" + f.text).join(" ")).toBe("EMAIL=a@b.co EMAIL=c@d.org REGEX_MATCH=tok_abcd REGEX_MATCH=a-a5")
+      // a finding cuts the text it was found in
+      for (const f of r.findings) expect(text.slice(f.start, f.end)).toBe(f.text)
+      expect(r.findings[0]!.start).toBe(text.indexOf("a@b.co"))
+      expect(r.findings[1]!.start).toBe(text.indexOf("c@d.org"))
+      expect(r.findings[3]!.start).toBe(text.indexOf("a-a5"))
+      expect(r.body).toBe(head + " [REDACTED:EMAIL] 🙂 tok_abcd\n" + head + "tok_efgh @keep\n a-a-a5 " + "x".repeat(5000) + lead + " [REDACTED:EMAIL]")
+    }
+  }
+  // the cursor's tail and keyword cuts, with 4-byte characters before them
+  const wide = "🙂 héllo 日本 "
+  const block = try compileRules([
+    { pattern: "PROJ-\\d{4}", action: "block" },
+    { pattern: "zz[0-9]", keywords: ["Needle"], action: "block" },
+    { pattern: "tok_[a-z]+", action: "block", allow: [{ target: "line", regexes: ["^🙂 note:[^!]*$"] }] },
+  ])
+  for (const mid of ["PROJ-1234", "zz7 " + wide.repeat(150) + " a nEEdle ", "\n🙂 note: tok_abc " + wide.repeat(120) + "!"]) {
+    for (const reps of [3, 170]) {
+      const text = wide.repeat(reps) + mid + wide.repeat(140)
+      expect(applyRegex(text, block).blocked).toBe(true)
+      for (const step of [5, 259, 1100]) expect(cursorDiff(block, text, step)).toBe("")
+    }
+  }
+})
+

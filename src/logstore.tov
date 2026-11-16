@@ -8,6 +8,8 @@ import { isoMs } from "./exports"
 import { DataScope, inScope } from "./scope"
 import { fields, elements, decodeString } from "./json"
 import { daysFromCivil, civilFromDays, padInt } from "./vkexpiry"
+import { strToInt, strToFloat } from "./num"
+import { strLen, isAscii } from "./text"
 
 // kind: "mcp" for an MCP tool execution (op "tool", with tool and server set); absent for an LLM request.
 export type LogEntry = {
@@ -119,10 +121,36 @@ export type LogEntry = {
   redaction_mapping?: string,
 }
 
+// A new record with r's fields (the values the fields hold are shared); see "copies of records" in config.tov.
+export function copyLogEntry(r: LogEntry): LogEntry {
+  return {
+    id: r.id, ts: r.ts, request_id: r.request_id, op: r.op, provider: r.provider, model: r.model, status: r.status,
+    latency_ms: r.latency_ms, prompt_tokens: r.prompt_tokens, completion_tokens: r.completion_tokens, cost: r.cost, cache_hit: r.cache_hit,
+    virtual_key: r.virtual_key, team_id: r.team_id, customer_id: r.customer_id, business_unit_id: r.business_unit_id,
+    project_id: r.project_id, session_id: r.session_id, user_id: r.user_id, user_agent: r.user_agent, app: r.app, error: r.error,
+    input: r.input, output: r.output, kind: r.kind, tool: r.tool, server: r.server, raw_request: r.raw_request,
+    raw_response: r.raw_response, content_hidden: r.content_hidden, has_object: r.has_object, metadata: r.metadata,
+    parent_request_id: r.parent_request_id, agent_correlation_id: r.agent_correlation_id, maxim: r.maxim, maxim_tags: r.maxim_tags,
+    selected_key_id: r.selected_key_id, selected_key_name: r.selected_key_name, routing_rule_id: r.routing_rule_id,
+    routing_engine_used: r.routing_engine_used, alias: r.alias, complexity_tier: r.complexity_tier,
+    complexity_mechanism: r.complexity_mechanism, cache_hit_type: r.cache_hit_type, stop_reason: r.stop_reason,
+    tool_call_names: r.tool_call_names, streamed: r.streamed, complexity_score: r.complexity_score,
+    selected_prompt_id: r.selected_prompt_id, selected_prompt_name: r.selected_prompt_name,
+    selected_prompt_version: r.selected_prompt_version, overhead_ms: r.overhead_ms, input_cost: r.input_cost, output_cost: r.output_cost,
+    additional_cost: r.additional_cost, canonical_model_name: r.canonical_model_name, agent_name: r.agent_name, record_kind: r.record_kind,
+    event_sequence: r.event_sequence, event_type: r.event_type, task_state: r.task_state, message_id: r.message_id,
+    artifact_id: r.artifact_id, content_type: r.content_type, event_body: r.event_body, task_id: r.task_id, crew_pool: r.crew_pool,
+    crew_role: r.crew_role, crew_class: r.crew_class, crew_candidate: r.crew_candidate, crew_attempt: r.crew_attempt,
+    downstream_transport: r.downstream_transport, upstream_transport: r.upstream_transport, plugin_logs: r.plugin_logs,
+    redaction_mapping: r.redaction_mapping,
+  }
+}
+
 // An entry as reads and exports may show it: without its reveal mapping.
 export function publicEntry(e: LogEntry): LogEntry {
   if (e.redaction_mapping === undefined) return e
-  let out = e
+  // e is the store's row: only the copy that is shown loses its fields
+  let out = copyLogEntry(e)
   out.redaction_mapping = undefined
   return out
 }
@@ -130,7 +158,7 @@ export function publicEntry(e: LogEntry): LogEntry {
 // An entry without its bodies, raw payloads, plugin logs and reveal mapping: what another node needs of a row for
 // stats, histograms and rankings (cross-node log reads, ops.tov clusterLogs).
 export function liteEntry(e: LogEntry): LogEntry {
-  let out = e
+  let out = copyLogEntry(e)
   out.input = undefined
   out.output = undefined
   out.raw_request = undefined
@@ -258,41 +286,39 @@ type SegSpan = { size: int, min: f64, max: f64 }
 // row's own key (rows begin with their id and time; a string value that holds "ts" has no colon after it). A row
 // written by another tool may have spaces around the colon. undefined for a line without one.
 export function lineTs(line: string): f64 | undefined {
-  const n = line.byteLength
-  let from = 0
-  while (from < n) {
-    const at = line.slice(from, n).indexOf(`"ts"`)
+  // every cut is at a place indexOf or startsWith found, never one position past an unknown character
+  let rest = line
+  while (true) {
+    const at = rest.indexOf(`"ts"`)
     if (at < 0) return undefined
-    let j = from + at + 4
-    while (j < n && line.slice(j, j + 1) === " ") j += 1
-    if (j < n && line.slice(j, j + 1) === ":") {
-      j += 1
-      let k = j
-      while (k < n) {
-        const c = line.slice(k, k + 1)
-        if (c === "," || c === "}") break
-        k += 1
+    rest = rest.slice(at + 4)
+    let v = rest
+    while (v.startsWith(" ")) v = v.slice(1)
+    if (v.startsWith(":")) {
+      v = v.slice(1)
+      let end = strLen(v)
+      for (const d of [",", "}"]) {
+        const k = v.indexOf(d)
+        if (k >= 0 && k < end) end = k
       }
-      return parseFloat(line.slice(j, k).trim())
+      return strToFloat(v.slice(0, end).trim())
     }
-    from = from + at + 4
   }
-  return undefined
 }
 
 // The day and segment of a request log file, or undefined for any other name.
 function segmentOf(name: string): Segment | undefined {
-  if (name.byteLength < 25 || !name.startsWith("requests-") || !name.endsWith(".jsonl")) return undefined
+  if (strLen(name) < 25 || !isAscii(name) || !name.startsWith("requests-") || !name.endsWith(".jsonl")) return undefined
   const day = fileDay(name.slice(0, 19) + ".jsonl")
   if (day === undefined) return undefined
-  if (name.byteLength === 25) return { name: name, day: day, seg: 0 }
+  if (strLen(name) === 25) return { name: name, day: day, seg: 0 }
   // requests-YYYY-MM-DD.<n>.jsonl, n a positive number without leading zeros
-  const mid = name.slice(19, name.byteLength - 6)
-  if (mid.byteLength < 2 || !mid.startsWith(".") || mid.startsWith(".0")) return undefined
+  const mid = name.slice(19, strLen(name) - 6)
+  if (strLen(mid) < 2 || !mid.startsWith(".") || mid.startsWith(".0")) return undefined
   for (const b of new TextEncoder().encode(mid.slice(1))) {
     if (int(b) < 48 || int(b) > 57) return undefined
   }
-  const n = parseInt(mid.slice(1))
+  const n = strToInt(mid.slice(1))
   if (n === undefined || n <= 0) return undefined
   return { name: name, day: day, seg: n }
 }
@@ -325,10 +351,10 @@ function sizeOf(path: string): int {
 // The day number of a requests-YYYY-MM-DD.jsonl file, or undefined for any
 // other name (including dates that do not exist, such as 2026-02-31).
 function fileDay(name: string): int | undefined {
-  if (name.byteLength !== 25 || !name.startsWith("requests-") || !name.endsWith(".jsonl")) return undefined
-  const y = parseInt(name.slice(9, 13))
-  const m = parseInt(name.slice(14, 16))
-  const d = parseInt(name.slice(17, 19))
+  if (strLen(name) !== 25 || !isAscii(name) || !name.startsWith("requests-") || !name.endsWith(".jsonl")) return undefined
+  const y = strToInt(name.slice(9, 13))
+  const m = strToInt(name.slice(14, 16))
+  const d = strToInt(name.slice(17, 19))
   if (y === undefined || m === undefined || d === undefined) return undefined
   const days = daysFromCivil(y, m, d)
   const c = civilFromDays(days)
@@ -372,7 +398,8 @@ const TEXT_KEYS = ["content", "text", "input", "prompt", "instructions", "system
 
 function collectText(raw: string, key: string, inout out: string[], depth: int): void {
   if (depth > 32 || raw === "") return
-  const c = raw.slice(0, 1)
+  // (asked with startsWith: a raw value that begins with a multibyte character cannot be cut after one position)
+  const c = raw.startsWith("\"") ? "\"" : raw.startsWith("{") ? "{" : raw.startsWith("[") ? "[" : ""
   try {
     if (c === "\"") {
       if (TEXT_KEYS.includes(key)) out.push(decodeString(raw))
@@ -1200,7 +1227,7 @@ function listOr(sp: URLSearchParams, plural: string, single: string): string[] {
 function numParam(sp: URLSearchParams, name: string): f64 {
   const v = sp.get(name) ?? ""
   if (v === "") return -1.0
-  return parseFloat(v) ?? -1.0
+  return strToFloat(v) ?? -1.0
 }
 
 // The filter from a query string. since and until are the window (epoch ms), already resolved.
@@ -1668,7 +1695,7 @@ export function latencyView(es: LogEntry[], g: Grid): string {
 // added to an object that already has a timestamp.
 function latencyPairs(es: LogEntry[]): string {
   const t = latencyFields(es)
-  return t.slice(1, t.byteLength - 1) + "," + overheadPairs(es)
+  return t.slice(1, strLen(t) - 1) + "," + overheadPairs(es)
 }
 
 // The overhead of the entries that recorded one; 0 when none did.
@@ -1714,7 +1741,7 @@ export function throughputView(es: LogEntry[], g: Grid): string {
 
 function throughputPairs(es: LogEntry[]): string {
   const t = throughputFields(es)
-  return t.slice(1, t.byteLength - 1)
+  return t.slice(1, strLen(t) - 1)
 }
 
 // GET /api/logs/histogram/cost|tokens|latency/by-dimension for a recorded dimension.
@@ -2083,15 +2110,15 @@ export function parseQuery(params: URLSearchParams): LogQuery {
   const vk = params.get("virtual_key")
   if (vk !== undefined && vk !== "") q.virtual_key = vk
   const since = params.get("since")
-  if (since !== undefined) q.since = Number(since)
+  if (since !== undefined) q.since = strToFloat(since)
   const until = params.get("until")
-  if (until !== undefined) q.until = Number(until)
+  if (until !== undefined) q.until = strToFloat(until)
   const text = params.get("text")
   if (text !== undefined && text !== "") q.text = text
   const limit = params.get("limit")
-  if (limit !== undefined) q.limit = parseInt(limit)
+  if (limit !== undefined) q.limit = strToInt(limit)
   const offset = params.get("offset")
-  if (offset !== undefined) q.offset = parseInt(offset)
+  if (offset !== undefined) q.offset = strToInt(offset)
   return q
 }
 
@@ -2965,4 +2992,18 @@ test("per-model usage: a key's or a user's requests in a budget cycle, summed pe
   expect(mine.map((r) => r.model).join(",")).toBe("gpt-4o,claude")
   expect(mine[0]!.total_requests).toBe(1)
   expect(perModelUsage([a], "vk-1", "", 150.0, 400.0).length).toBe(0)
+})
+
+test("a row's time is read after 2-, 3- and 4-byte characters", () => {
+  expect(lineTs(`{"id":"é日🙂","ts":1500.5,"op":"chat"}`)).toBe(1500.5)
+  expect(lineTs(`{"id":"é日🙂 \\"ts\\" ","note":"🙂", "ts" : 42 }`)).toBe(42.0)
+  expect(lineTs(`{"id":"é日🙂"}`)).toBe(undefined)
+  expect(lineTs(`{"x":"ts"é, "ts"  日:1, "ts":7🙂}`)).toBe(undefined)
+  expect(lineTs(`{"x":"ts"é, "ts":7,"y":"🙂"}`)).toBe(7.0)
+})
+
+test("the text of a logged body is collected around 2-, 3- and 4-byte characters", () => {
+  expect(contentTextOf(`{"content":"é日🙂","n":1,"messages":[{"content":"🙂 hi"},{"text":"日"}]}`)).toBe(contentTextOf(`{"content":"é日🙂","messages":[{"content":"🙂 hi"},{"text":"日"}]}`))
+  expect(contentTextOf(`{"content":"é日🙂"}`).includes("é日🙂")).toBe(true)
+  expect(contentTextOf(`data: {"delta":"é"}\ndata: {"delta":"日🙂"}\n`).includes("日🙂")).toBe(true)
 })

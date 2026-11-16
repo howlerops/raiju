@@ -1,0 +1,120 @@
+// fetch's address policy (patch 0013) on every way fetch has of reaching a server after the port to Tov 0.1.0:
+// HTTPS over HTTP/1.1, HTTP/2 (a new connection and one already open under another policy), a streamed
+// request body, and a proxy. Run by raiju-tests/run-s2.sh with h2_server.py's three origins (H2_PORT: TLS
+// with h2, H1TLS_PORT: TLS with HTTP/1.1, H1_PORT: plain) and PEER_NAME, a name /etc/hosts maps to 127.0.0.1.
+type Peer = { private?: bool, loopback?: bool, allow?: string[] }
+type H2 = "off" | "prefer" | "require"
+
+function check(label: string, ok: bool, detail: string): void {
+  console.log(ok ? `ok ${label}` : `FAIL ${label}: ${detail}`)
+}
+
+// "" when the request was answered 200, else the error's code and message
+async function attempt(url: string, peer: Peer | undefined, h2: H2, proxy: string): Promise<string> {
+  try {
+    let res: Response | undefined = undefined
+    if (peer === undefined) {
+      res = try await fetch(url, { tls: { rejectUnauthorized: false }, pool: { http2: h2 }, proxy: proxy === "" ? undefined : proxy })
+    } else {
+      res = try await fetch(url, { tls: { rejectUnauthorized: false }, pool: { http2: h2 }, peer: peer, proxy: proxy === "" ? undefined : proxy })
+    }
+    try await res!.text()
+    return res!.status === 200 ? "" : `answered ${res!.status}`
+  } catch (e) {
+    if (e instanceof FetchError) return `${e.code}: ${e.message}`
+    return e.message
+  }
+}
+
+function refused(r: string): bool {
+  return r.startsWith("AddressNotAllowed: ")
+}
+
+async function main(): Promise<int> {
+  const name = process.env.PEER_NAME ?? "vm"
+  const h2p = process.env.H2_PORT ?? "0"
+  const h1tp = process.env.H1TLS_PORT ?? "0"
+  const h1p = process.env.H1_PORT ?? "0"
+
+  // HTTPS, HTTP/1.1
+  const t0 = await attempt(`https://127.0.0.1:${h1tp}/stats`, undefined, "off", "")
+  check("https (HTTP/1.1): reached without the option", t0 === "", t0)
+  const t1 = await attempt(`https://127.0.0.1:${h1tp}/stats`, {}, "off", "")
+  check("https (HTTP/1.1): a loopback address is refused, though a connection without a policy is idle in the pool", refused(t1), t1)
+  const t2 = await attempt(`https://${name}:${h1tp}/stats`, {}, "off", "")
+  check("https (HTTP/1.1): a name that resolves to it is refused", refused(t2) && t2.includes(`(host ${name})`), t2)
+  const t3 = await attempt(`https://127.0.0.1:${h1tp}/stats`, { loopback: true }, "off", "")
+  check("https (HTTP/1.1): loopback: true lets it through", t3 === "", t3)
+
+  // HTTP/2: the policy is checked before the connection that would carry the stream is made, and a
+  // connection made under another policy (or none) never carries the request
+  for (const mode of ["prefer", "require"] as H2[]) {
+    const a0 = await attempt(`https://127.0.0.1:${h2p}/stats`, undefined, mode, "")
+    check(`HTTP/2 (${mode}): reached without the option`, a0 === "", a0)
+    const a1 = await attempt(`https://127.0.0.1:${h2p}/stats`, {}, mode, "")
+    check(`HTTP/2 (${mode}): refused by default, though an HTTP/2 connection without a policy is open`, refused(a1), a1)
+    const a2 = await attempt(`https://127.0.0.1:${h2p}/stats`, { loopback: true }, mode, "")
+    check(`HTTP/2 (${mode}): loopback: true lets it through`, a2 === "", a2)
+    const a3 = await attempt(`https://127.0.0.1:${h2p}/stats`, { allow: ["10.0.0.0/8"] }, mode, "")
+    check(`HTTP/2 (${mode}): another policy does not ride the connection loopback: true opened`, refused(a3), a3)
+    const a4 = await attempt(`https://${name}:${h2p}/stats`, { private: false }, mode, "")
+    check(`HTTP/2 (${mode}): a name that resolves to a loopback address is refused`, refused(a4), a4)
+    const a5 = await attempt(`https://[::ffff:169.254.169.254]:${h2p}/stats`, { private: true, loopback: true }, mode, "")
+    check(`HTTP/2 (${mode}): the metadata address is refused whatever the policy`, refused(a5) && a5.includes("metadata"), a5)
+  }
+  // the fallback of "prefer" to HTTP/1.1 dials again: checked too
+  const f1 = await attempt(`https://127.0.0.1:${h1tp}/stats`, {}, "prefer", "")
+  check("HTTP/2 prefer against an HTTP/1.1 server: refused", refused(f1), f1)
+
+  // a streamed request body
+  let streamed = ""
+  let pulled = 0
+  try {
+    const body = new ReadableStream({
+      async pull(c) {
+        pulled += 1
+        c.enqueue("x")
+        c.close()
+      },
+    })
+    const res = try await fetch(`http://127.0.0.1:${h1p}/post`, { method: "POST", body: body, peer: {} })
+    streamed = `answered ${res.status}`
+  } catch (e) {
+    streamed = e instanceof FetchError ? `${e.code}: ${e.message}` : e.message
+  }
+  check("a request with a streamed body is refused", refused(streamed), streamed)
+
+  // a proxy: a listener that counts the connections it gets (and answers nothing useful)
+  let proxied = 0
+  const proxy = Bun.listen({
+    hostname: "127.0.0.1",
+    port: 0,
+    socket: {
+      open(s) {
+        proxied += 1
+      },
+      data(s, bytes) {
+        s.write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+        s.end()
+      },
+    },
+  })
+  const via = `http://127.0.0.1:${proxy.port}`
+  const p1 = await attempt(`http://127.0.0.1:${h1p}/stats`, {}, "off", via)
+  check("through a proxy, a loopback address in the URL is refused and the proxy is not contacted", refused(p1) && proxied === 0, `${p1} (${proxied} proxy connections)`)
+  const p2 = await attempt(`http://169.254.169.254/latest/meta-data/`, { private: true, loopback: true }, "off", via)
+  check("through a proxy, the metadata address in the URL is refused", refused(p2) && proxied === 0, `${p2} (${proxied} proxy connections)`)
+  const p3 = await attempt(`https://[::1]:${h1tp}/stats`, {}, "off", via)
+  check("through a proxy, an https URL with a loopback address is refused before CONNECT", refused(p3) && proxied === 0, `${p3} (${proxied} proxy connections)`)
+  const p4 = await attempt(`http://localhost:${h1p}/stats`, {}, "off", via)
+  check("through a proxy, localhost is refused", refused(p4) && proxied === 0, `${p4} (${proxied} proxy connections)`)
+  const p5 = await attempt(`http://127.0.0.1:${h1p}/stats`, { loopback: true }, "off", via)
+  check("through a proxy, an allowed address goes to the proxy", p5 === "" && proxied === 1, `${p5} (${proxied} proxy connections)`)
+  // (documented limit: the proxy resolves a name, so a name is not checked on this side)
+  const p6 = await attempt(`http://${name}:${h1p}/stats`, {}, "off", via)
+  check("through a proxy, a host name is left to the proxy (documented limit)", p6 === "" && proxied === 2, `${p6} (${proxied} proxy connections)`)
+  proxy.stop()
+  return 0
+}
+
+await main()

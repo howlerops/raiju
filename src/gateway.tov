@@ -1,9 +1,9 @@
 // The request engine: governance, cache, the attempt loop (retries, key
 // rotation, fallbacks), translation, accounting.
-import { Config, KeyConfig, ProviderConfig, ComplexitySettings, BedrockKeyConfig, InjectedTool, OAuthKeyConfig, LogExportsConfig, providerOf } from "./config"
+import { Config, KeyConfig, ProviderConfig, NetworkConfig, ComplexitySettings, BedrockKeyConfig, InjectedTool, OAuthKeyConfig, LogExportsConfig, providerOf, copyConfig, copyNetworkConfig, copyProviderConfig, copyBedrockKeyConfig, copyKeyConfig } from "./config"
 import { applyPrompt, Applied } from "./prompts"
 import { Field, fields, find, elements, quote, rawBool, rawStr, rawNum, isNull, build, setField, without } from "./json"
-import { ChatRequest, errorJson, newId, Hdrs, hdrs, snapshot } from "./schemas"
+import { ChatRequest, errorJson, newId, Hdrs, hdrs, snapshot, copyHdrs } from "./schemas"
 import { OpenAIPassthrough, ResponsesPassthrough, AnthropicToOpenAI, GeminiToOpenAI, BedrockEventStreamToOpenAI, SseSplitter } from "./streams"
 import { CohereToOpenAI } from "./streams_cohere"
 import { CohereStream } from "./cohere_in"
@@ -27,7 +27,7 @@ import { compileLocal, localVerdict } from "./guard_local"
 import { ToolGuard, compileToolGuards, checkToolCall } from "./guard_mcp"
 import { OutputStreamGuard, GuardedProvider, StreamFormat } from "./guard_stream"
 import { Vault, tokenizeChatRequest, restoreCompletion, tokenize, tokenizeText } from "./guard_reversible"
-import { Target, Upstream, Translated, proxyOf, tlsOf, poolOf, peerOf, RS } from "./providers/types"
+import { Target, Upstream, Translated, proxyOf, tlsOf, poolOf, peerOf, RS, copyTarget } from "./providers/types"
 import { anthropicRoute } from "./providers/anthropic_route"
 import * as vertexWif from "./vertexwif"
 import * as bedrockMantle from "./providers/bedrock_mantle"
@@ -63,7 +63,7 @@ import { LogStore, LogEntry, defaultLogStoreConfig } from "./logstore"
 import { dirProblem } from "./audit"
 import { isoMs } from "./exports"
 import { Tracer, Span, StageTiming, genAiAttributes, exportRequest, traceparentFor, tracesOn, TlsOpts, usesGrpc, exportSpansGrpc } from "./otel"
-import { McpManager, McpKeyConfig, keyRuleAllows, injectToolFields, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns, sanitizeName, perUserClientNames, perUserOAuthNames, tokenExchangeNames, userHeadersFor, ToolText, chatToolName, patternMatches, adminRowOf, ProjectMcp } from "./mcp"
+import { McpManager, McpKeyConfig, keyRuleAllows, injectToolFields, executeEndpointBody, toolMessage, splitToolName, autoExecutePatterns, sanitizeName, perUserClientNames, perUserOAuthNames, tokenExchangeNames, userHeadersFor, ToolText, chatToolName, patternMatches, adminRowOf, ProjectMcp, copyMcpConfig, McpConfig } from "./mcp"
 import { CodeEntry, codeEntries, runMeta, metaToolDefs, isMetaTool, META_TOOLS, limitsOf, bindingLevelOf, execAutoAllowed } from "./codemode"
 import { McpTokenExchange, ExchangeCache, IdpEndpoints, exchangeKey, exchangeToken, renewAdmin, renewAt, needsReverify, RENEW_RETRY_MS, ADMIN_TAKEOVER_MS, ADMIN_WAIT_MS, ADMIN_POLL_MS } from "./tokenexchange"
 import { McpAuthConfig } from "./mcpauth"
@@ -86,6 +86,9 @@ import { EMB_TITAN } from "./embconv"
 import { EXTRA_PARAMS_HEADER, EXTRA_PARAMS_CARRY, mergeIntoUpstream } from "./extraparams"
 import { clientSignal, CANCELLED_STATUS, CANCELLED_MESSAGE, CANCELLED_TYPE } from "./clientgone"
 import { usesChain, withChainCreds } from "./awschain"
+import { strToInt, strToFloat } from "./num"
+import { strLen, clipBytes } from "./text"
+import { elemAt } from "./arrays"
 
 export type Build = (t: Target) => Upstream throws SyntaxError
 // a chat request for a target, from its shaped body (tc parses the same request as a typed chat)
@@ -656,7 +659,7 @@ export function toolInList(toolJson: string, want: string[]): bool throws Syntax
   if (name === undefined) return false
   for (const w of want) {
     if (w === name) return true
-    if (w.endsWith("-*") && name.startsWith(w.slice(0, w.byteLength - 1))) return true
+    if (w.endsWith("-*") && name.startsWith(w.slice(0, strLen(w) - 1))) return true
   }
   return false
 }
@@ -664,7 +667,7 @@ export function toolInList(toolJson: string, want: string[]): bool throws Syntax
 // Whether a chat tool definition's name is `pattern` ("<server>-<tool>", or "<server>-*").
 function toolNameMatches(toolJson: string, pattern: string): bool {
   if (pattern === "*") return true
-  if (pattern.endsWith("*")) return toolJson.includes(`"name":"${pattern.slice(0, pattern.byteLength - 1)}`)
+  if (pattern.endsWith("*")) return toolJson.includes(`"name":"${pattern.slice(0, strLen(pattern) - 1)}`)
   return toolJson.includes(`"name":"${pattern}"`)
 }
 
@@ -804,12 +807,12 @@ function cacheHeaders(inout out: Hdrs, kind: string, primary: ModelRef, similari
 export function retryHintMs(ms: string | undefined, after: string | undefined): f64 | undefined {
   const a = (ms ?? "").trim()
   if (a !== "") {
-    const v = parseFloat(a)
+    const v = strToFloat(a)
     if (v !== undefined && v >= 0.0) return clampRetryMs(v)
   }
   const b = (after ?? "").trim()
   if (b === "") return undefined
-  const s = parseFloat(b)
+  const s = strToFloat(b)
   if (s !== undefined && s >= 0.0) return clampRetryMs(s * 1000.0)
   return undefined
 }
@@ -987,7 +990,8 @@ function userNameSet(cfg: Config): Set<string> {
 }
 
 export function errorResponse(status: int, message: string, type: string, extra: Hdrs): Response {
-  let h: Record<string, string> = extra
+  // a copy: the caller's map must not gain the header
+  let h: Record<string, string> = copyHdrs(extra)
   h.set("content-type", "application/json")
   return new Response(errorJson(message, type, undefined), { status: status, headers: h })
 }
@@ -1177,7 +1181,7 @@ function withRawFields(body: string, rawReq: string | undefined, rawResp: string
   const parts: string[] = []
   if (rawReq !== undefined) parts.push(`"raw_request":${rawJson(rawReq)}`)
   if (rawResp !== undefined) parts.push(`"raw_response":${rawJson(rawResp)}`)
-  const inner = t.slice(0, t.byteLength - 1).trim()
+  const inner = t.slice(0, strLen(t) - 1).trim()
   const sep = inner === "{" ? "" : ","
   return `${inner}${sep}"extra_fields":{${parts.join(",")}}}`
 }
@@ -1385,7 +1389,7 @@ export class AttemptPlugins {
     const sent = withModel(this.original, ref.provider, ref.model)
     const pre = this.chain.runPre(&this.run.ctx, sent)
     if (pre.kind === "short_circuit") {
-      this.delayMs = parseInt(this.run.ctx.values.get("mock_latency_ms") ?? "0") ?? 0
+      this.delayMs = strToInt(this.run.ctx.values.get("mock_latency_ms") ?? "0") ?? 0
       const post = this.chain.runPost(&this.run.ctx, pre.status, pre.body)
       if (post.status < 400) return { kind: "answer", status: post.status, body: post.body }
       if (pre.allowFallbacks === false) return { kind: "final", status: post.status, body: post.body }
@@ -1407,7 +1411,7 @@ export class AttemptPlugins {
     this.late = false
     const pre = this.chain.runPreAfterCache(&this.run.ctx, this.text)
     if (pre.kind === "short_circuit") {
-      this.delayMs = parseInt(this.run.ctx.values.get("mock_latency_ms") ?? "0") ?? 0
+      this.delayMs = strToInt(this.run.ctx.values.get("mock_latency_ms") ?? "0") ?? 0
       const post = this.chain.runPost(&this.run.ctx, pre.status, pre.body)
       if (post.status < 400) return { kind: "answer", status: post.status, body: post.body }
       if (pre.allowFallbacks === false) return { kind: "final", status: post.status, body: post.body }
@@ -1582,7 +1586,7 @@ export function logsOnlyFound(text: string, found: LogFinding[], vault: Vault): 
     const tok = vault.tokenFor(f.kind.toUpperCase(), f.value)
     out = out.split(f.value).join(tok)
     const q = JSON.stringify(f.value)
-    const esc = q.slice(1, q.byteLength - 1)
+    const esc = q.slice(1, strLen(q) - 1)
     if (esc !== f.value) out = out.split(esc).join(tok)
   }
   return out
@@ -2490,7 +2494,9 @@ export class Engine {
           continue
         }
         if (sel === undefined) break
-        let t = sel.t
+        // the selection's key and provider records are the config's: the tokens and credentials of this attempt go into copies
+        let t = copyTarget(sel.t)
+        t.key = copyKeyConfig(sel.t.key)
         // a request pinned to a key goes to it even while it is held; under adaptive load balancing its answer settles
         // the hold as a check does (holds.tov claimPinned)
         if (pinned !== undefined && sel.keyIndex >= 0 && this.cfg.health?.adaptive === true) this.health.holds.claimPinned(healthId(ref.provider, t.key, sel.keyIndex), ref.model, Date.now())
@@ -2535,9 +2541,11 @@ export class Engine {
             break
           }
           t.key.value = tok.token
-          let nc = t.cfg.network_config ?? {}
+          const nc0 = t.cfg.network_config
+          let nc: NetworkConfig = {}
+          if (nc0 !== undefined) nc = copyNetworkConfig(nc0)
           nc.base_url = tok.host
-          let pc = t.cfg
+          let pc = copyProviderConfig(t.cfg)
           pc.network_config = nc
           t.cfg = pc
         }
@@ -2566,7 +2574,7 @@ export class Engine {
             last = { ok: false, status: 502, body: errorJson(ar.error, "authentication_error", undefined), contentType: "application/json", provider: ref.provider, model: ref.model, promptTokens: 0, completionTokens: 0, attempts: attempts, upstreamMs: upstreamMs }
             break
           }
-          let nb = bk
+          let nb = copyBedrockKeyConfig(bk)
           nb.access_key = ar.creds!.accessKey
           nb.secret_key = ar.creds!.secretKey
           nb.session_token = ar.creds!.sessionToken
@@ -2683,7 +2691,7 @@ export class Engine {
           // (a large request that was converted for this provider has its answer converted back, so it is not passed through; nor are
           // Hugging Face embeddings, whose answers take the provider's shape)
           if ((lg !== undefined ? lg.passAnswer : (ctx.passAbove >= 0 && providers.streamsNatively(t.kind) && !(t.kind === "huggingface" && ctx.op === "embeddings"))) && status >= 200 && status < 300) {
-            const clen = parseInt(res.headers.get("content-length") ?? "") ?? -1
+            const clen = strToInt(res.headers.get("content-length") ?? "") ?? -1
             const ctype = res.headers.get("content-type") ?? ""
             const limit = lg !== undefined ? lg.settings.responseThreshold : ctx.passAbove
             if ((lg !== undefined && (ctype.startsWith("text/event-stream") || (clen < 0 && streamed))) || clen > limit) {
@@ -2988,7 +2996,8 @@ export class Engine {
       }
     }
     for (const d of defs) out.push(d)
-    let fs = body
+    // a copy: the caller builds each attempt's request from the same body
+    let fs = body.slice()
     setField(&fs, "tools", "[" + out.join(",") + "]")
     return fs
   }
@@ -3347,9 +3356,12 @@ export class Engine {
   // Puts a credential in place of the one held for its client, in the config in memory and in the running session,
   // and saves it (adminSaved). publish sends it to the other nodes (a renewal does; a credential from them does not).
   private setAdminRow(row: McpUserToken, publish: boolean): Promise<void> | undefined {
-    let c = this.cfg
+    // a config record of the engine's own: whoever else was handed the running config keeps the one it has
+    let c = copyConfig(this.cfg)
     if (!tokenExchangeNames(c.mcp?.client_configs).includes(row.mcp_client_name)) return undefined
-    let m = c.mcp ?? {}
+    const m0 = c.mcp
+    let m: McpConfig = {}
+    if (m0 !== undefined) m = copyMcpConfig(m0)
     let next: McpUserToken[] = []
     let found = false
     for (const r of m.exchange_admin ?? []) {
@@ -3766,7 +3778,8 @@ export class Engine {
       team_name: this.gov.teamName(vk),
       customer_name: this.gov.customerName(vk),
       complexity_tier: tier,
-      headers: h,
+      // a copy: a chained step matches on the headers as they came, not on what the step before set
+      headers: copyHdrs(h),
       params: params,
     }
     // chain_rule sends a matched rule's target back through the rules as the new context.
@@ -3889,7 +3902,8 @@ export class Engine {
   async serveInner(req: Request, h0: Hdrs, ctx: ReqCtx, modelName: string | undefined, body: Field[], text: string, build: Build, translate: Translate, streamed: bool, compat?: CompatPlan): Promise<Response> {
     const op = ctx.op
     const started = ctx.started
-    let h = h0
+    // a copy: the caller's headers keep the marker, and take neither the routed key nor the rule's name
+    let h: Hdrs = copyHdrs(h0)
     // a classifier's own call that is not charged (count_toward_budgets off): the marker is checked, then taken off
     const noCharge = this.classifierToken !== "" && h.get(NO_CHARGE_HEADER) === this.classifierToken
     h.delete(NO_CHARGE_HEADER)
@@ -4123,7 +4137,8 @@ export class Engine {
     // the cache plugin's time (lookups and the semantic embedding), for the overhead components
     const cacheUs = (performance.now() - tCache) * 1000.0
     if (cache !== undefined || semVec.length > 0) out.set("x-raiju-cache-hit", "false")
-    ctx.outHeaders = out
+    // a copy: what the attempt adds for a stream it opens stays off out, and what follows here off the stream's
+    ctx.outHeaders = copyHdrs(out)
     ctx.requested = model
     if (compat !== undefined && compat.enabled) await this.compatLoad(compat, allowed)
     const tAtt = performance.now()
@@ -4144,7 +4159,7 @@ export class Engine {
       compatHeaders(&out, compat)
     }
     if (!r.ok) {
-      ctx.error = r.body.byteLength > 2000 ? r.body.slice(0, 2000) : r.body
+      ctx.error = clipBytes(r.body, 2000)
       out.set("content-type", "application/json")
       const et = errorType(r.body)
       if (et !== "") out.set("x-raiju-error-type", et)
@@ -4172,7 +4187,8 @@ export class Engine {
       ctx.outputCost = parts.output
       ctx.additionalCost = Math.max(0.0, c - parts.input - parts.output)
       this.gov.record(grant, pt + ct, c)
-      let sl = ctx.labels
+      // the request's labels keep the provider and model the attempt gave them: these are for this observation
+      let sl = metrics.copyRequestLabels(ctx.labels)
       sl.provider = rProvider
       sl.model = rModel
       metrics.observeUsage(sl, { input: pt, output: ct, cost: c, cacheRead: 0.0, cacheWrite: 0.0, cacheWrite5m: 0.0, cacheWrite1h: 0.0 })
@@ -4181,7 +4197,7 @@ export class Engine {
     const passed = r.pass !== undefined
     const keepBilled = r.noBilled !== true
     const cost = passed ? 0.0 : settle(r.promptTokens, r.completionTokens, r.billed)
-    let ul = ctx.labels
+    let ul = metrics.copyRequestLabels(ctx.labels)
     ul.provider = r.provider
     ul.model = r.model
     if (r.direct === true) {
@@ -4295,7 +4311,7 @@ export class Engine {
       if (hit === undefined) return undefined
       const pl = hit.payload
       const provider = pl.get("origin_provider") ?? ""
-      const origin: CacheOrigin | undefined = provider === "" ? undefined : { provider: provider, model: pl.get("origin_model") ?? "", inputTokens: parseInt(pl.get("origin_input_tokens") ?? "") ?? 0 }
+      const origin: CacheOrigin | undefined = provider === "" ? undefined : { provider: provider, model: pl.get("origin_model") ?? "", inputTokens: strToInt(pl.get("origin_input_tokens") ?? "") ?? 0 }
       return { id: hit.id, body: pl.get("body") ?? "", contentType: pl.get("contentType") ?? "application/json", score: hit.score, origin: origin }
     } catch (e) {
       console.error(`raiju: vector_store search: ${e.message}`)
@@ -4756,7 +4772,7 @@ export class Engine {
     ctx.model = bill.model
     ctx.requested = bill.model
     ctx.status = res.status
-    ctx.error = text.byteLength > 2000 ? text.slice(0, 2000) : text
+    ctx.error = clipBytes(text, 2000)
     const grant = bill.grant
     if (grant !== undefined) {
       ctx.virtualKey = grant.vk?.id ?? ""
@@ -4916,7 +4932,7 @@ export class Engine {
     const lp = this.large
     if (lp === undefined || req.method !== "POST") return undefined
     const dtext = req.headers.get("content-length")
-    const declared = dtext === undefined ? -1 : (parseInt(dtext) ?? -1)
+    const declared = dtext === undefined ? -1 : (strToInt(dtext) ?? -1)
     if (declared >= 0 && declared <= lp.requestThreshold) return undefined
     if (declared > lp.maxPayload) return errorResponse(413, `request body of ${declared} bytes is over the maximum payload size of ${lp.maxPayload} bytes (large_payload_optimization.max_payload_bytes)`, "invalid_request_error", noHeaders())
     const src = req.body
@@ -5333,7 +5349,7 @@ export class Engine {
         let changed = false
         for (const k of ["max_tokens", "max_completion_tokens"]) {
           const raw = find(body, k)
-          const n = raw === undefined ? undefined : parseInt(raw)
+          const n = raw === undefined ? undefined : strToInt(raw)
           if (n === undefined || n > cap) {
             if (raw !== undefined || k === "max_tokens") {
               setField(&body, k, "" + cap)
@@ -5380,7 +5396,7 @@ export class Engine {
       const pre = chain.runPreBeforeCache(&r.ctx, text)
       let primaryFail: { status: int, body: string } | undefined = undefined
       if (pre.kind === "short_circuit") {
-        const delay = parseInt(r.ctx.values.get("mock_latency_ms") ?? "0") ?? 0
+        const delay = strToInt(r.ctx.values.get("mock_latency_ms") ?? "0") ?? 0
         if (delay > 0) await sleep(delay)
         // When the primary attempt's error permits fallbacks, each fallback runs the pre hooks again
         // (AttemptPlugins).
@@ -5590,7 +5606,7 @@ export class Engine {
     const prior = this.logFindings.get(rid) ?? []
     // (a request refused before it was recorded leaves its entry behind: the oldest go past a bound)
     if (prior.length === 0 && this.logFindings.size >= 1000) {
-      const first = this.logFindings.keys()[0]
+      const first = elemAt(this.logFindings.keys(), 0)
       if (first !== undefined) this.logFindings.delete(first)
     }
     this.logFindings.set(rid, prior.concat(found))

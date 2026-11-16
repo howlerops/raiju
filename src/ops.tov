@@ -1,7 +1,7 @@
 // Management-side state shared by both servers: who may use /api (RBAC), the
 // audit log of changes, the alerting loop, the gateway's own MCP server and
 // cluster counters. One instance per process; rebuilt parts follow config changes.
-import { Config, AlertsConfig, LogExportsConfig, LogExporterConfig, PricingSyncConfig, providerNames, getEnv, resolveEnv, resolveOidcRoleMap, parseConfig, PluginSpec, WasmLimitsSpec, AdminUserConfig, TeamConfig } from "./config"
+import { Config, AlertsConfig, LogExportsConfig, LogExporterConfig, PricingSyncConfig, providerNames, getEnv, resolveEnv, resolveOidcRoleMap, parseConfig, copyConfig, PluginSpec, WasmLimitsSpec, AdminUserConfig, TeamConfig } from "./config"
 import { listJson, sessionJson, sessionSummaryJson, detailJson, withMapping, phaseMapping, uaRoute, listFilter, unsupportedFilter, pageOfQuery, pctDecode, Page, timeOf } from "./logapi"
 import { Incident } from "./holds"
 import { WsTickets } from "./wsticket"
@@ -50,7 +50,7 @@ type QuotaRate = { id: string, token_max_limit?: int, token_reset_duration?: str
 type QuotaModel = { model_name: string, provider?: string, budgets: QuotaBudget[], rate_limit?: QuotaRate }
 import { RbacConfig, UserConfig, Role, authorize, authenticate, handleUsers, fromLegacy, takeUpgrades, THROTTLED, required, roleAllows, selfRoute, isBuiltinRole, customRole, provisioned, disabledNamed, anyRoleId, builtinPairs, userByEmail, systemRole, customRoles, resourceOf, Held, holds } from "./rbac"
 import { DataScope, allScope, noScope, scopeOf, inScope } from "./scope"
-import { AuditEvent, AuditLog, actionFor, auditListJson, auditQueryOf, maskDetail, profileAuditJson } from "./audit"
+import { AuditEvent, AuditLog, actionFor, auditListJson, auditQueryOf, maskDetail, profileAuditJson, copyAuditEvent } from "./audit"
 import { isCacheId } from "./cache"
 import { AlertEngine, SampleRing, CelEngine, ScopeUsage } from "./alerts"
 import * as alerts from "./alerts"
@@ -96,7 +96,7 @@ import { Counters, ClusterConfig, BrokerConfig, brokerUrl, syncInterval } from "
 import { clusterState, ownerOf } from "./clusterstate"
 import { FeedRing, FeedQueue, FeedItem, feedEnvelope, feedVisible, gapEnvelope, resumedEnvelope, parseFeed, parseItem, parseAnswer, FEED_RING_SIZE, FEED_RING_SECONDS, FEED_QUEUE_MAX, FEED_BATCH_MS, FEED_BATCH_MAX } from "./feed"
 import * as cluster from "./cluster"
-import { Discoverer } from "./discovery"
+import { Discoverer, DiscoveryConfig } from "./discovery"
 import { SocketExt } from "./realtime"
 import { LiveRegistry } from "./live"
 import { BROKER_ROUTE, BROKER_FEED_ROUTE } from "./broker"
@@ -106,8 +106,11 @@ import { ExportCursor, objectKey, putRequest, putBytesRequest, putObjectRequest,
 import { planWindow, maxObjectBytes, archiveIntervalMs, archiveGraceMs, closedWindows } from "./audit_archive"
 import { jobRequest, hiddenDeletes, MAX_ATTEMPTS, RetainQueue } from "./retained"
 import { payloadKeys, decodePayload, hydrate } from "./hybrid"
-import { OidcConfig, Discovery, OidcFlows, Session, UiSessions, DueSession, Sealer, parseDiscovery, discoveryUrl, tokenRequestBody, refreshRequestBody, verifyIdToken, accessTokenClaims, stateCookie, clearStateCookie, stateBound } from "./oidc"
+import { OidcConfig, Discovery, OidcFlows, Session, UiSessions, DueSession, Sealer, parseDiscovery, discoveryUrl, tokenRequestBody, refreshRequestBody, verifyIdToken, accessTokenClaims, stateCookie, clearStateCookie, stateBound, copyOidcConfig } from "./oidc"
 import { issuerOf, challengeOf, callerOf, keyById, keyUsable, serverAuthMode, ConsentContext, vkIdentityCut, addressHash } from "./mcpissuer"
+import { strToInt, strToFloat } from "./num"
+import { strLen } from "./text"
+import { elemAt } from "./arrays"
 
 export type Gate = { kind: "ok", actor: string, role?: string } | { kind: "deny", res: Response }
 
@@ -284,7 +287,7 @@ function recalcJson(s: RecalcStatus): string {
 // A query value as epoch milliseconds; the fallback when it is missing or not a number.
 function epochParam(raw: string | undefined, fallback: f64): f64 {
   if (raw === undefined || raw === "") return fallback
-  const v: f64 = Number(raw) ?? -1.0
+  const v: f64 = strToFloat(raw) ?? -1.0
   return v >= 0.0 && v < 1e15 ? v : fallback
 }
 
@@ -340,7 +343,8 @@ export function returnPath(raw: string): string {
 function withRedirect(oc: OidcConfig, reqUrl: string): OidcConfig {
   if ((oc.redirect_uri ?? "") !== "") return oc
   const u = URL.parse(reqUrl)
-  let n = oc
+  // oc is the configured record, kept for the next request: this request's origin goes into a copy
+  let n = copyOidcConfig(oc)
   n.redirect_uri = (u === undefined ? "" : u.origin) + "/api/oidc/callback"
   return n
 }
@@ -649,14 +653,14 @@ function mcpRefused(res: Response): McpCaller {
 function num(params: URLSearchParams, name: string): f64 | undefined {
   const v = params.get(name)
   if (v === undefined || v === "") return undefined
-  return parseFloat(v)
+  return strToFloat(v)
 }
 
 // A window bound of the adaptive history: RFC 3339, or unix seconds. dflt when absent; undefined when unreadable.
 function historyBound(raw: string | undefined, dflt: f64): f64 | undefined {
   if (raw === undefined || raw === "") return dflt
   if (raw.includes("T")) return timeOf(raw)
-  const v = parseFloat(raw)
+  const v = strToFloat(raw)
   if (v === undefined) return undefined
   return v * 1000.0
 }
@@ -668,7 +672,7 @@ function incidentStatus(inc: Incident): string {
 }
 
 // An incident as the adaptive routing routes show it.
-function incidentRow(inc: Incident, now: number) {
+function incidentRow(inc: Incident, now: f64) {
   const end = inc.resolvedAt > 0 ? inc.resolvedAt : now
   return {
     id: inc.id, target: inc.target, provider: inc.provider, key_id: inc.keyId, model: inc.model,
@@ -820,7 +824,7 @@ function rosterKey(pj: ProjectConfig | undefined): string {
 // The users routes' path: /api/governance/users[/...] is /api/users[/...] (server.tov usersPath).
 function userRoute(path: string): string {
   const g = "/api/governance/users"
-  if (path === g || path.startsWith(g + "/")) return "/api/users" + path.slice(g.byteLength)
+  if (path === g || path.startsWith(g + "/")) return "/api/users" + path.slice(strLen(g))
   return path
 }
 
@@ -877,7 +881,7 @@ function html(status: int, body: string, cookie?: string): Response {
 }
 
 function trimPeer(p: string): string {
-  return p.endsWith("/") ? p.slice(0, p.byteLength - 1) : p
+  return p.endsWith("/") ? p.slice(0, strLen(p) - 1) : p
 }
 
 // How often discovery runs, in ms: it registers this node where the mechanism needs it, then lists the others.
@@ -1129,7 +1133,7 @@ export cyclic class UiHub {
     } catch (e) {
       return
     }
-    const mine = this.shareFile().slice(this.shareDir.byteLength + 1)
+    const mine = this.shareFile().slice(strLen(this.shareDir) + 1)
     for (const f of names) {
       if (f === mine || !f.endsWith(".jsonl")) continue
       let text = ""
@@ -1140,12 +1144,12 @@ export cyclic class UiHub {
       }
       let from = this.offsets.get(f) ?? 0
       // a file rewritten shorter than it was is read again from its start
-      if (from > text.byteLength) from = 0
+      if (from > strLen(text)) from = 0
       const parts = text.slice(from).split("\n")
       let used = 0
       for (let i = 0; i < parts.length - 1; i++) {
         const line = parts[i]!
-        used += line.byteLength + 1
+        used += strLen(line) + 1
         if (line !== "") {
           for (const c of this.clients) c.emit(line)
         }
@@ -1173,12 +1177,12 @@ export cyclic class UiHub {
         continue
       }
       let from = this.feedOffsets.get(f) ?? 0
-      if (from > text.byteLength) from = 0
+      if (from > strLen(text)) from = 0
       const parts = text.slice(from).split("\n")
       let used = 0
       for (let i = 0; i < parts.length - 1; i++) {
         const line = parts[i]!
-        used += line.byteLength + 1
+        used += strLen(line) + 1
         if (line === "") continue
         let it: FeedItem | undefined = undefined
         try {
@@ -1501,7 +1505,8 @@ export class Ops {
       this.discovery = undefined
       this.oidcKey = key
       // the issuer, client and secret may be env. references (scim_config's settings allow them)
-      let ro = oc === undefined ? undefined : resolveOidcRoleMap(oc)
+      // resolveOidcRoleMap gives back oc itself when there is no role map: the resolved values go into a copy
+      let ro = oc === undefined ? undefined : copyOidcConfig(resolveOidcRoleMap(oc))
       if (ro !== undefined) {
         ro.issuer = resolveEnv(ro.issuer ?? "")
         ro.client_id = resolveEnv(ro.client_id ?? "")
@@ -1573,7 +1578,7 @@ export class Ops {
     const dc0 = cc.discovery
     if (!cluster.isBroker(cc) && dc0 !== undefined && dc0.enabled === true) {
       // the peers serve the cluster routes on cluster.listen_port when it is set, so discovered hosts get that port
-      let dc = dc0
+      let dc: DiscoveryConfig = { enabled: dc0.enabled, type: dc0.type, service_name: dc0.service_name, bind_port: dc0.bind_port, dial_timeout: dc0.dial_timeout, allowed_address_space: dc0.allowed_address_space, k8s_namespace: dc0.k8s_namespace, k8s_label_selector: dc0.k8s_label_selector, dns_names: dc0.dns_names, udp_broadcast_port: dc0.udp_broadcast_port, consul_address: dc0.consul_address, etcd_endpoints: dc0.etcd_endpoints, mdns_service: dc0.mdns_service, advertise_address: dc0.advertise_address, scheme: dc0.scheme, api_url: dc0.api_url, token_file: dc0.token_file, ca_file: dc0.ca_file }
       if (dc.bind_port === undefined && cc.listen_port !== undefined) dc.bind_port = cc.listen_port
       this.discoverer = new Discoverer(dc, this.nodeId, getEnv)
       this.discoverTimer = setInterval(() => {
@@ -2030,7 +2035,7 @@ export class Ops {
     }
     for (const f of names) {
       if (!f.endsWith(".json")) continue
-      const pid = f.slice(0, f.byteLength - 5)
+      const pid = f.slice(0, strLen(f) - 5)
       if (pid === `${process.pid}`) continue
       try {
         if (now - statSync(dir + "/" + f).mtimeMs > 1000.0) continue
@@ -2175,7 +2180,7 @@ export class Ops {
     const ids: string[] = []
     let named = ""
     const segs = path.split("/")
-    const projectRoute = segs[2] === "governance" && segs[3] === "projects" && segs.length >= 5
+    const projectRoute = elemAt(segs, 2) === "governance" && elemAt(segs, 3) === "projects" && segs.length >= 5
     for (const pj of g?.projects ?? []) {
       const was = before.get(pj.id)
       if (was === undefined || g === undefined) continue
@@ -2183,7 +2188,7 @@ export class Ops {
       if (now === "" || now === was) continue
       const id = this.queueRedivision(pj.id)
       ids.push(id)
-      if (projectRoute && segs[4] === pj.id) named = id
+      if (projectRoute && elemAt(segs, 4) === pj.id) named = id
     }
     if (ids.length === 0 || !r.body.trimStart().startsWith("{")) return r
     try {
@@ -2274,7 +2279,7 @@ export class Ops {
       return { since: f.since - 1.0, until: f.until, kind: kind, id: "", session: "", lite: path !== "/api/logs" }
     }
     if (path.startsWith("/api/mcp-logs")) {
-      const rest = path.slice("/api/mcp-logs".byteLength)
+      const rest = path.slice(strLen("/api/mcp-logs"))
       if (rest === "" ) return { since: 0.0, until: undefined, kind: "mcp", id: "", session: "", lite: false }
       if (rest === "/filterdata") return { since: 0.0, until: undefined, kind: "mcp", id: "", session: "", lite: true }
       if (rest === "/stats" || rest.startsWith("/histogram")) {
@@ -2286,10 +2291,10 @@ export class Ops {
       return undefined
     }
     if (!path.startsWith("/api/logs/")) return undefined
-    const sub = path.slice("/api/logs/".byteLength)
+    const sub = path.slice(strLen("/api/logs/"))
     if (sub.startsWith("sessions/")) {
-      const rest = sub.slice("sessions/".byteLength)
-      const raw = rest.endsWith("/summary") ? rest.slice(0, rest.byteLength - "/summary".byteLength) : rest
+      const rest = sub.slice(strLen("sessions/"))
+      const raw = rest.endsWith("/summary") ? rest.slice(0, strLen(rest) - strLen("/summary")) : rest
       const sid = pctDecode(raw) ?? ""
       if (sid === "" || sid.includes("/")) return undefined
       return { since: 0.0, until: undefined, kind: "llm", id: "", session: sid, lite: true }
@@ -2952,7 +2957,7 @@ export class Ops {
   // reach every worker through onChange; the live breakers are updated at once as well.
   circuitPoliciesRoute(method: string, path: string, body: string): Reply {
     const h = this.engine.health
-    const rest = path.slice("/api/circuit-breaker/policies".byteLength)
+    const rest = path.slice(strLen("/api/circuit-breaker/policies"))
     const one = rest.startsWith("/") ? rest.slice(1) : ""
     if (rest !== "" && one === "") return { status: 404, body: errorJson("no such route", "invalid_request_error", undefined), contentType: "application/json" }
     const cur: CircuitPolicyConfig[] = this.store.cfg.circuit_breaker_policies ?? []
@@ -3352,8 +3357,8 @@ export class Ops {
     if (req.method !== "GET") return { status: 405, body: errorJson("use GET", "invalid_request_error", undefined), contentType: "application/json" }
     const u = URL.parse(req.url)
     const sp = u === undefined ? new URLSearchParams("") : u.searchParams
-    const lim: f64 = parseFloat(sp.get("limit") ?? "20") ?? 20.0
-    const off: f64 = parseFloat(sp.get("offset") ?? "0") ?? 0.0
+    const lim: f64 = strToFloat(sp.get("limit") ?? "20") ?? 20.0
+    const off: f64 = strToFloat(sp.get("offset") ?? "0") ?? 0.0
     const limit = lim >= 0 ? Math.floor(Math.min(lim, 1.0e9)) : 20
     const offset = off >= 0 ? Math.floor(Math.min(off, 1.0e9)) : 0
     const q = (sp.get("query") ?? "").toLowerCase()
@@ -3373,7 +3378,7 @@ export class Ops {
     for (const k of rows.keys()) {
       const r = rows.get(k)!
       const pre = r.provider + "/"
-      const name = k.startsWith(pre) ? k.slice(pre.byteLength) : k
+      const name = k.startsWith(pre) ? k.slice(strLen(pre)) : k
       if (provider !== "" && r.provider !== provider) continue
       if (q !== "" && !name.toLowerCase().includes(q)) continue
       out.push({ name: name, provider: r.provider, input_cost_per_token: r.price.input, output_cost_per_token: r.price.output, cache_read_input_token_cost: r.price.cacheRead, cache_creation_input_token_cost: r.price.cacheWrite })
@@ -3443,8 +3448,8 @@ export class Ops {
     const limitRaw = params.get("limit")
     const offsetRaw = params.get("offset")
     const paged = limitRaw !== undefined || offsetRaw !== undefined
-    const limit = limitRaw === undefined ? 25 : Math.min(100, Math.max(1, parseInt(limitRaw) ?? 25))
-    const offset = offsetRaw === undefined ? 0 : parseInt(offsetRaw) ?? 0
+    const limit = limitRaw === undefined ? 25 : Math.min(100, Math.max(1, strToInt(limitRaw) ?? 25))
+    const offset = offsetRaw === undefined ? 0 : strToInt(offsetRaw) ?? 0
     if (offset < 0) return badRequest("offset must not be negative")
     const matched: { inc: Incident, status: string, dur: f64 }[] = []
     for (const inc of this.engine.health.holds.allIncidents()) {
@@ -3465,7 +3470,7 @@ export class Ops {
       return b.inc.openedAt - a.inc.openedAt
     })
     // the summary: counts by status, the median time to resolve, and the longest open incident
-    const resolved: number[] = []
+    const resolved: f64[] = []
     let attention = 0
     let recovering = 0
     let longestOngoing = 0
@@ -3575,12 +3580,12 @@ export class Ops {
     if (m !== "GET") return { status: 405, body: errorJson("use GET", "invalid_request_error", undefined), contentType: "application/json" }
     if (path === "/api/logs") return this.logList(sp, store, sc)
     if (path === "/api/logs/stats") return this.logStats(sp, store, sc)
-    const sub = path.slice("/api/logs/".byteLength)
-    if (sub.startsWith("sessions/")) return this.sessionLogs(sub.slice("sessions/".byteLength), sp, store, sc)
+    const sub = path.slice(strLen("/api/logs/"))
+    if (sub.startsWith("sessions/")) return this.sessionLogs(sub.slice(strLen("sessions/")), sp, store, sc)
     if (path === "/api/logs/dropped") return okJson(`{"dropped_requests":${store.dropped}}`)
     if (path === "/api/logs/filterdata") return okJson(this.logFilterData(store, sc))
     // GET /api/logs/{id}: one log (the names of the other /api/logs routes are not ids)
-    const seg = path.slice("/api/logs/".byteLength)
+    const seg = path.slice(strLen("/api/logs/"))
     if (seg !== "" && !seg.includes("/") && !LOG_ROUTE_NAMES.includes(seg)) return this.logById(seg, store, sc, rv)
     const end = epochParam(sp.get("end_time") ?? undefined, now)
     const start = this.windowStart(sp, end)
@@ -3683,7 +3688,7 @@ export class Ops {
   // rest is the path after "sessions/": the session id, or the id and "/summary".
   private sessionLogs(rest: string, sp: URLSearchParams, store: LogStore, sc: DataScope): Reply {
     const summary = rest.endsWith("/summary")
-    const raw = summary ? rest.slice(0, rest.byteLength - "/summary".byteLength) : rest
+    const raw = summary ? rest.slice(0, strLen(rest) - strLen("/summary")) : rest
     const sid = pctDecode(raw) ?? ""
     if (sid === "" || sid.includes("/")) return { status: 404, body: errorJson("no such route", "invalid_request_error", undefined), contentType: "application/json" }
     const es = this.readView(store, sc, 0.0)
@@ -3841,9 +3846,9 @@ export class Ops {
     const sem = this.engine.semantic
     if (ex === undefined && sem === undefined) return { status: 400, body: errorJson("semantic_cache plugin is not loaded", "invalid_request_error", undefined), contentType: "application/json" }
     let removed = 0
-    const rest = path.slice("/api/cache/".byteLength)
+    const rest = path.slice(strLen("/api/cache/"))
     if (rest.startsWith("clear-by-key/")) {
-      const key = pctDecode(rest.slice("clear-by-key/".byteLength))
+      const key = pctDecode(rest.slice(strLen("clear-by-key/")))
       if (key === undefined) return badRequest("Invalid cache key encoding")
       if (key === "") return badRequest("Invalid cache key")
       if (ex !== undefined) removed += ex.clearKey(key)
@@ -3856,7 +3861,7 @@ export class Ops {
         return { status: 500, body: errorJson("Failed to clear cache", "api_error", undefined), contentType: "application/json" }
       }
     } else if (rest.startsWith("clear/")) {
-      const id = rest.slice("clear/".byteLength)
+      const id = rest.slice(strLen("clear/"))
       if (id === "") return badRequest("Invalid cache ID")
       if (ex !== undefined) removed += ex.clearId(id)
       if (sem !== undefined && sem.clearId(id)) removed += 1
@@ -3896,7 +3901,7 @@ export class Ops {
       for (const sp of this.store.cfg.plugins ?? []) rows.push(pluginJson(sp, this.pluginStats(sp.name)))
       return okJson(jobj([jkv("plugins", jarr(rows)), jkv("count", jn(rows.length))]))
     }
-    const name = pctDecode(path.slice("/api/plugins/".byteLength)) ?? ""
+    const name = pctDecode(path.slice(strLen("/api/plugins/"))) ?? ""
     if (name === "" || name.includes("/")) return pluginError(404, "plugin not found")
     if (method === "PUT") return this.updatePlugin(name, body)
     if (method === "DELETE") return this.deletePlugin(name)
@@ -3919,7 +3924,7 @@ export class Ops {
       } catch (e) {
         url = ""
       }
-      const name = method === "PUT" ? pctDecode(path.slice("/api/plugins/".byteLength)) ?? "" : ""
+      const name = method === "PUT" ? pctDecode(path.slice(strLen("/api/plugins/"))) ?? "" : ""
       if (isPluginUrl(url) && !this.authOn && !builtinPlugins().includes(name)) return pluginError(403, pathAuthMessage(method === "POST"))
       if (isPluginUrl(url)) {
         // a name the route answers with 404, or a built-in plugin (which takes no path), downloads nothing
@@ -4061,7 +4066,8 @@ export class Ops {
     let span = 86400000.0
     if (period !== "") {
       const unit = period.endsWith("d") ? 86400000.0 : period.endsWith("h") ? 3600000.0 : period.endsWith("m") ? 60000.0 : 0.0
-      const n = parseFloat(period.slice(0, period.byteLength - 1)) ?? 0.0
+      // the number is cut only once the last character is known to be a unit letter
+      const n = unit > 0.0 ? strToFloat(period.slice(0, strLen(period) - 1)) ?? 0.0 : 0.0
       if (unit > 0.0 && n > 0.0) span = n * unit
     }
     return epochParam(sp.get("start_time") ?? undefined, end - span)
@@ -4072,7 +4078,7 @@ export class Ops {
     if ((sp.get("all") ?? "") === "true") return 0
     const raw = sp.get("limit") ?? ""
     if (raw === "") return 10
-    const v = parseInt(raw) ?? -1
+    const v = strToInt(raw) ?? -1
     return v >= 1 ? v : -1
   }
 
@@ -4152,8 +4158,8 @@ export class Ops {
     if (path === "/api/mcp-logs") {
       const f = filterFrom(sp, "mcp", epochParam(sp.get("start_time") ?? undefined, 0.0), epochParam(sp.get("end_time") ?? undefined, now + 1.0))
       const es = selectAll(this.logRows(store, sc, f.since - 1.0), f)
-      const limit = Math.min(1000, Math.max(1, parseInt(sp.get("limit") ?? "25") ?? 25))
-      const offset = Math.max(0, parseInt(sp.get("offset") ?? "0") ?? 0)
+      const limit = Math.min(1000, Math.max(1, strToInt(sp.get("limit") ?? "25") ?? 25))
+      const offset = Math.max(0, strToInt(sp.get("offset") ?? "0") ?? 0)
       const rows: string[] = []
       for (let i = es.length - 1 - offset; i >= 0 && rows.length < limit; i--) rows.push(mcpLogJson(es[i]!))
       let hasLogs = false
@@ -4180,10 +4186,10 @@ export class Ops {
       if (path === "/api/mcp-logs/stats") return okJson(mcpStatsView(es))
       if (path === "/api/mcp-logs/histogram") return okJson(requestsView(es, g))
       if (path === "/api/mcp-logs/histogram/cost") return okJson(mcpCostView(es, g))
-      const lim = parseInt(sp.get("limit") ?? "10") ?? 10
+      const lim = strToInt(sp.get("limit") ?? "10") ?? 10
       return okJson(topToolsView(es, lim))
     }
-    const id = path.slice("/api/mcp-logs/".byteLength)
+    const id = path.slice(strLen("/api/mcp-logs/"))
     if (id !== "" && !id.includes("/")) {
       for (const e of this.logRows(store, sc, 0.0)) {
         if (e.id === id && kindOf(e) === "mcp") return okJson(withMapping(mcpLogJson(e), reveal ? this.openedMapping(e) : ""))
@@ -4598,7 +4604,8 @@ export class Ops {
     const w: CardWire = { url: url, fetched_at: at, card: card }
     const e = adoptCard(this.engine.cfg.agents ?? [], name, w)
     if (e !== undefined) {
-      let c = this.engine.cfg
+      // a config record of its own: whoever else holds the running config's record keeps the agents it has
+      let c = copyConfig(this.engine.cfg)
       c.agents = e
       this.engine.cfg = c
     }
@@ -4672,8 +4679,8 @@ export class Ops {
       return await this.a2aCall(agent, routed.call, "rpc", id, h, gate.vk, base)
     }
     const qi = req.url.indexOf("?")
-    const query = qi < 0 ? "" : req.url.slice(qi + 1, req.url.byteLength)
-    const routed = restCall(req.method, rest.slice(REST_PREFIX.byteLength, rest.byteLength), query, body)
+    const query = qi < 0 ? "" : req.url.slice(qi + 1, strLen(req.url))
+    const routed = restCall(req.method, rest.slice(strLen(REST_PREFIX), strLen(rest)), query, body)
     if (routed.kind === "fail") return a2aDeny(true, routed.status, routed.message, "invalid_request_error")
     if (gate.grant) return this.grantDenied(true, name, routed.call, "", gate.message, h)
     return await this.a2aCall(agent, routed.call, "rest", "\"1\"", h, gate.vk, base)
@@ -4800,7 +4807,7 @@ export class Ops {
     if (useRest) {
       const rr = restRequestOf(call)
       let base = c.url
-      while (base.endsWith("/")) base = base.slice(0, base.byteLength - 1)
+      while (base.endsWith("/")) base = base.slice(0, strLen(base) - 1)
       const path = call.v03 ? (call.op === "GetExtendedAgentCard" ? "/v1/card" : "/v1" + rr.path) : rr.path
       url = base + path + (rr.query === "" ? "" : "?" + rr.query)
       method = rr.method
@@ -5054,8 +5061,8 @@ export class Ops {
     const store = pushStore()
     if (segs.length === 3) {
       if (method !== "GET") return { status: 405, body: errorJson("use GET", "invalid_request_error", undefined), contentType: "application/json" }
-      let limit = parseInt(sp.get("limit") ?? "") ?? 0
-      let offset = parseInt(sp.get("offset") ?? "") ?? 0
+      let limit = strToInt(sp.get("limit") ?? "") ?? 0
+      let offset = strToInt(sp.get("offset") ?? "") ?? 0
       if (limit <= 0) limit = 25
       if (limit > 100) limit = 100
       if (offset < 0) offset = 0
@@ -5191,13 +5198,14 @@ export class Ops {
     cardShare().known(name, w)
     const s = adoptCard(this.store.cfg.agents ?? [], name, w)
     if (s !== undefined) {
-      let c = this.store.cfg
+      // config records of their own, as in installCard
+      let c = copyConfig(this.store.cfg)
       c.agents = s
       this.store.cfg = c
     }
     const e = adoptCard(this.engine.cfg.agents ?? [], name, w)
     if (e !== undefined) {
-      let c = this.engine.cfg
+      let c = copyConfig(this.engine.cfg)
       c.agents = e
       this.engine.cfg = c
     }
@@ -5617,7 +5625,8 @@ export class Ops {
     if (own !== undefined && (own.role_map !== undefined || own.default_role !== undefined)) return { kind: "none" }
     const c = sc.config ?? {}
     const g = this.store.cfg.governance ?? {}
-    let users = g.users ?? []
+    // a copy: the stored list changes only when the save goes through
+    let users = (g.users ?? []).slice()
     const at = findUser(users, sub, email)
     const who = (email ?? "") !== "" ? (email ?? "") : sub
     const dir: Directory = { teams: g.teams ?? [], businessUnits: g.business_units ?? [], projects: g.projects ?? [], profiles: g.access_profiles ?? [] }
@@ -6142,9 +6151,9 @@ export class Ops {
   async provisionRoute(method: string, path: string, body: string): Promise<Reply> {
     const ok = (status: int, b: string): Reply => ({ status: status, body: b, contentType: "application/json" })
     const bad = (status: int, msg: string): Reply => ok(status, errorJson(msg, "invalid_request_error", undefined))
-    const sub = path.slice("/api/scim/provision".byteLength)
+    const sub = path.slice(strLen("/api/scim/provision"))
     const known = ["/status", "/jobs", "/preview", "/import", "/sync", "/reconcile", "/reconcile/preview", "/reconcile/preview/user"]
-    if (!known.includes(sub) && !(sub.startsWith("/jobs/") && sub.byteLength > 6)) return bad(404, `no route for ${path}`)
+    if (!known.includes(sub) && !(sub.startsWith("/jobs/") && strLen(sub) > 6)) return bad(404, `no route for ${path}`)
     const wants = sub === "/status" || sub.startsWith("/jobs") ? "GET" : "POST"
     if (method !== wants) return bad(405, `use ${wants}`)
     const sc = this.store.cfg.scim_config
@@ -6246,7 +6255,7 @@ export class Ops {
       if (out.length >= 50) continue
       const name = accountName(du)
       const p = planDirectory(users, this.dirNow(), [du], c, this.roleBook(), (x: string): string => x + "preview", [name]).plan
-      const ch = p.changes[0]
+      const ch = elemAt(p.changes, 0)
       out.push(jobj([jkv("id", JSON.stringify(du.id)), jkv("email", JSON.stringify(du.email)), jkv("name", JSON.stringify(du.displayName)), jkv("active", du.active ? "true" : "false"), jkv("groups", JSON.stringify(du.claims.get("groups") ?? [])), jkv("exists", findUser(users, name, du.email) >= 0 ? "true" : "false"), jkv("plan", ch === undefined ? "null" : JSON.stringify(ch))]))
     }
     return `{"users":[${out.join(",")}],"total":${total},"truncated":${total > out.length},"groups":${JSON.stringify(listing.groups)}${listing.error === "" ? "" : `,"warning":${JSON.stringify(listing.error)}`}}`
@@ -6829,7 +6838,7 @@ export class Ops {
         if (!bids.includes(b)) bids.push(b)
       }
       const row: QuotaModel = { model_name: mc.model_name, provider: mc.provider, budgets: quotaBudgets(bids, "", undefined) }
-      const rl = quotaRates(mc.rate_limit_id ?? "", "", undefined)[0]
+      const rl = elemAt(quotaRates(mc.rate_limit_id ?? "", "", undefined), 0)
       if (rl !== undefined) row.rate_limit = rl
       models.push(row)
     }
@@ -6970,9 +6979,9 @@ export class Ops {
   userByEmailRoute(method: string, path: string): Reply {
     if (method !== "GET") return { status: 405, body: errorJson(`method ${method} is not allowed on this route`, "invalid_request_error", undefined), contentType: "application/json" }
     const segs = path.split("/").filter((s) => s !== "")
-    const at = segs[1] === "governance" ? 4 : 3
+    const at = elemAt(segs, 1) === "governance" ? 4 : 3
     const raw = segs[at] ?? ""
-    const keys = segs.length === at + 2 && segs[at + 1] === "virtual-keys"
+    const keys = segs.length === at + 2 && elemAt(segs, at + 1) === "virtual-keys"
     if (raw === "" || !(segs.length === at + 1 || keys)) return { status: 404, body: errorJson(`no route for ${path}`, "invalid_request_error", undefined), contentType: "application/json" }
     const email = pctDecode(raw)
     if (email === undefined || email.trim() === "") return { status: 400, body: errorJson("email must be a URL-encoded email address", "invalid_request_error", undefined), contentType: "application/json" }
@@ -7102,11 +7111,11 @@ export class Ops {
     const name = segs[2] ?? ""
     const pid = segs[4] ?? ""
     const notFound: Reply = { status: 404, body: errorJson(`no route for ${path}`, "invalid_request_error", undefined), contentType: "application/json" }
-    if (segs.length < 4 || segs.length > 8 || segs[3] !== "access-profiles") return notFound
+    if (segs.length < 4 || segs.length > 8 || elemAt(segs, 3) !== "access-profiles") return notFound
     const g = this.store.cfg.governance
     // PUT and DELETE .../access-profiles/{profile}/budgets/{budget}/override: the user's budget override
     if (segs.length === 8) {
-      if (segs[5] !== "budgets" || segs[7] !== "override") return notFound
+      if (elemAt(segs, 5) !== "budgets" || elemAt(segs, 7) !== "override") return notFound
       if (method !== "PUT" && method !== "DELETE") return { status: 405, body: errorJson(`method ${method} is not allowed on this route`, "invalid_request_error", undefined), contentType: "application/json" }
       const bid = segs[6] ?? ""
       let o: BudgetOverride | undefined = undefined
@@ -7138,7 +7147,7 @@ export class Ops {
     }
     const add = method === "PUT"
     if (method !== "PUT" && method !== "DELETE") return { status: 405, body: errorJson(`method ${method} is not allowed on this route`, "invalid_request_error", undefined), contentType: "application/json" }
-    const r = segs.length === 5 ? this.store.setUserProfile(name, pid, add) : segs.length === 7 && segs[5] === "virtual-keys" ? this.store.setVkProfile(name, segs[6] ?? "", pid, add) : undefined
+    const r = segs.length === 5 ? this.store.setUserProfile(name, pid, add) : segs.length === 7 && elemAt(segs, 5) === "virtual-keys" ? this.store.setVkProfile(name, segs[6] ?? "", pid, add) : undefined
     if (r === undefined) return notFound
     if (r.kind === "error") return { status: r.status, body: errorJson(r.message, "invalid_request_error", undefined), contentType: "application/json" }
     return { status: 200, body: JSON.stringify({ user: name, access_profile_id: pid, linked: add }), contentType: "application/json" }
@@ -7220,7 +7229,7 @@ export class Ops {
       return { status: 200, body: JSON.stringify({ message: "roles attached", users_applied: n }), contentType: "application/json" }
     }
     if (segs.length === 6 && method === "DELETE") {
-      const rid = parseInt(segs[5] ?? "") ?? 0
+      const rid = strToInt(segs[5] ?? "") ?? 0
       const r = this.store.detachProfileRole(id, rid)
       if (r.kind === "error") return { status: r.status, body: errorJson(r.message, "invalid_request_error", undefined), contentType: "application/json" }
       return { status: 200, body: JSON.stringify({ message: "role detached" }), contentType: "application/json" }
@@ -7232,8 +7241,8 @@ export class Ops {
   profiles(method: string, path: string, body: string): Reply {
     const gov = this.store.cfg.governance
     const segs0 = path.split("/").filter((s) => s !== "")
-    if (method === "POST" && segs0.length === 5 && segs0[4] === "propagate") return this.propagateProfile(segs0[3] ?? "", body)
-    if (segs0.length >= 5 && segs0[4] === "roles") return this.profileRoles(method, segs0, body)
+    if (method === "POST" && segs0.length === 5 && elemAt(segs0, 4) === "propagate") return this.propagateProfile(segs0[3] ?? "", body)
+    if (segs0.length >= 5 && elemAt(segs0, 4) === "roles") return this.profileRoles(method, segs0, body)
     // A profile attached to a role is detached first, because deletion is refused while the role holds it.
     if (method === "DELETE") {
       const did = segs0[3] ?? ""
@@ -7279,7 +7288,7 @@ export class Ops {
     let since = -1.0
     for (const u of this.engine.gov.budgetUsage()) {
       if (!u.id.endsWith(suffix)) continue
-      const src = u.id.slice(0, u.id.byteLength - suffix.byteLength)
+      const src = u.id.slice(0, strLen(u.id) - strLen(suffix))
       const st = this.engine.gov.budgetCycleStart(u.id, now) ?? now
       if (since < 0.0 || st < since) since = st
       budgets.push(jobj([jkv("source_budget_id", JSON.stringify(src)), jkv("budget_id", JSON.stringify(u.id)), jkv("max_limit", jn(u.limit)), jkv("current_usage", jn(u.used))]))
@@ -7296,7 +7305,7 @@ export class Ops {
     }
     const limits: string[] = []
     for (const id of order) {
-      const src = id.slice(0, id.byteLength - suffix.byteLength)
+      const src = id.slice(0, strLen(id) - strLen(suffix))
       limits.push(jobj([jkv("source_rate_limit_id", JSON.stringify(src)), jkv("rate_limit_id", JSON.stringify(id))].concat(rates.get(id) ?? [])))
     }
     const ls = this.engine.logStore
@@ -7314,14 +7323,14 @@ export class Ops {
   // returns access-profile changes from the audit trail (audit.tov profileAuditJson), with limit, offset, action,
   // and user_id. Returns an empty list while the audit log is off.
   profileAudit(req: Request, path: string): Reply {
-    const rest = path.startsWith("/api/governance/") ? path.slice("/api/governance/".byteLength) : path.slice("/api/".byteLength)
+    const rest = path.startsWith("/api/governance/") ? path.slice(strLen("/api/governance/")) : path.slice(strLen("/api/"))
     const segs = rest.split("/").filter((s) => s !== "")
     const profile = segs.length === 3 ? pctDecode(segs[1] ?? "") ?? "" : undefined
     if (profile !== undefined && !(this.store.cfg.governance?.access_profiles ?? []).some((p) => p.id === profile)) return { status: 404, body: errorJson(`no access profile ${profile}`, "not_found_error", undefined), contentType: "application/json" }
     const u = URL.parse(req.url)
     const sp = u === undefined ? new URLSearchParams("") : u.searchParams
-    const limit = parseInt(sp.get("limit") ?? "") ?? 50
-    const offset = parseInt(sp.get("offset") ?? "") ?? 0
+    const limit = strToInt(sp.get("limit") ?? "") ?? 50
+    const offset = strToInt(sp.get("offset") ?? "") ?? 0
     const log = this.audit
     if (log === undefined) return okJson(`{"audit_logs":[],"total_count":0}`)
     const page = log.query({ paths: ["/api/governance/access-profiles"], limit: 1000, order: "desc" })
@@ -7351,10 +7360,10 @@ export class Ops {
     // GET /api/audit-logs/{id}: returns one event by its sequence-number id in an {audit_log} wrapper.
     // GET /api/audit-logs/{id}/verify: recomputes its signature and compares it with the stored signature.
     if (p.startsWith("/api/audit-logs/")) {
-      const rest = p.slice("/api/audit-logs/".byteLength)
+      const rest = p.slice(strLen("/api/audit-logs/"))
       const verify = rest.endsWith("/verify")
-      const idText = verify ? rest.slice(0, rest.byteLength - "/verify".byteLength) : rest
-      const seq = idText.includes("/") ? -1 : parseInt(idText) ?? -1
+      const idText = verify ? rest.slice(0, strLen(rest) - strLen("/verify")) : rest
+      const seq = idText.includes("/") ? -1 : strToInt(idText) ?? -1
       if (seq < 0 && verify) return badRequest("invalid audit log id")
       let ev: AuditEvent | undefined = undefined
       try {
@@ -7364,7 +7373,7 @@ export class Ops {
       }
       if (ev === undefined) return { status: 404, body: errorJson("audit log not found", "not_found_error", undefined), contentType: "application/json" }
       if (verify) return { status: 200, body: JSON.stringify(log.verifyOne(ev)), contentType: "application/json" }
-      const shown: AuditEvent = ev
+      const shown: AuditEvent = copyAuditEvent(ev)
       if (omitIps) shown.ip = undefined
       return { status: 200, body: JSON.stringify({ audit_log: shown }), contentType: "application/json" }
     }
@@ -7575,7 +7584,7 @@ export function sharePid(name: string): int | undefined {
     }
     rest = rest.slice(0, dash)
   }
-  const pid = parseInt(rest)
+  const pid = strToInt(rest)
   if (pid === undefined || "" + pid !== rest) return undefined
   return pid
 }

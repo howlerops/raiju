@@ -13,6 +13,9 @@ import {
   WebhookEndpoint, AgentConfig, AgentGrant, AgentAuth, AgentOAuth, AgentTls, ProjectConfig, BusinessUnitConfig, RoleConfig, PermissionPair, UserAgentMapping, PluginSpec,
   BudgetOverride, PricingSyncConfig, ComplexitySettings, BedrockKeyConfig, ProjectMember, MemberShare, RateLimitShare, EntityDac, ProfileRole, ApiKeyConfig, UserBudgetOverride, VertexAwsWorkloadIdentity,
   loadRawConfig, rawConfigOf,
+  copyConfig, copyGovernanceConfig, copyClientConfig, copyProviderConfig, copyProxyConfig, copyKeyConfig, copyAzureKeyConfig, copyVertexKeyConfig, copyVertexAwsWorkloadIdentity,
+  copyBedrockKeyConfig, copyWatsonxKeyConfig, copyDatabricksKeyConfig, copyGithubCopilotKeyConfig, copyOAuthKeyConfig, copyVirtualKeyConfig, copyAdminUserConfig, copyAdminAuthConfig,
+  copyAccessProfile, copyProjectConfig, copyPricingSyncConfig, copyScimConfig, copyScimProviderConfig, copyWebhookEndpoint, copyAgentConfig,
 } from "./config"
 import { clusterState } from "./clusterstate"
 import { nodeOf } from "./cluster"
@@ -27,8 +30,9 @@ import { analyzerStatus, retryWarmup, generationsJson, deleteGeneration } from "
 import { Held, holds, isBuiltinRole, customRole, customRoles, systemRole, withRoleIds, roleIdOf, roleNameById, anyRoleName, builtinRoleName, builtinRoles } from "./rbac"
 import { DataScope, allScope, inScope, scopeOf } from "./scope"
 import { setGlobalProxy } from "./providers/types"
-import { McpClientConfig, McpUserCredential } from "./mcp"
-import { McpUserToken } from "./mcpuser"
+import { McpClientConfig, McpUserCredential, copyMcpConfig, copyMcpClientConfig, copyMcpUserCredential } from "./mcp"
+import { McpUserToken, copyMcpUserToken } from "./mcpuser"
+import { copyMcpAuthConfig } from "./mcpauth"
 import { decode, encode } from "./base64"
 import { gcmSeal, gcmOpen, pbkdf2Sha256 } from "./aesgcm"
 import { Field, fields, find, isNull, quote, elements, decodeString, rawStr, rawBool, rawNum, build, setField, without, floorInt } from "./json"
@@ -37,6 +41,9 @@ import { Policy, Verdict, hostVerdict, urlVerdict } from "./netguard"
 import { rfc3339Ms, rfc3339Of } from "./vkexpiry"
 import { durationMs, effectiveBudgetLimit, cyclesLeft } from "./governance"
 import { membershipSource } from "./provision"
+import { strToInt, strToFloat } from "./num"
+import { strLen } from "./text"
+import { elemAt } from "./arrays"
 
 export type AdminAuth = AdminAuthConfig
 
@@ -102,13 +109,16 @@ export function newVkValue(): string {
 }
 
 // Shows the first and last four characters of a long secret (a provider key, say), enough to tell two apart. Anything
-// under 24 bytes becomes "****": eight shown characters of a twelve-character password would leave four to guess.
-// Empty values and "env.NAME" references are not secrets and pass through.
+// under 24 characters becomes "****": eight shown characters of a twelve-character password would leave four to guess.
+// Empty values and "env.NAME" references are not secrets and pass through. The secret is counted and cut in
+// characters, so a shown piece is never part of a character.
 export function maskSecret(v: string): string {
   if (v === "" || v.startsWith("env.")) return v
-  const n = v.byteLength
+  if (v.byteLength < 24) return "****"
+  const cs = v.chars()
+  const n = cs.length
   if (n < 24) return "****"
-  return v.slice(0, 4) + "…" + v.slice(n - 4)
+  return cs.slice(0, 4).join("") + "…" + cs.slice(n - 4).join("")
 }
 
 function maskOpt(v: string | undefined): string | undefined {
@@ -131,7 +141,7 @@ function keepOpt(incoming: string | undefined, existing: string | undefined): st
 export function looksMasked(v: string | undefined): bool {
   if (v === undefined) return false
   if (v === "****") return true
-  return v.includes("…") && v.byteLength === 4 + "…".byteLength + 4
+  return v.includes("…") && v.chars().length === 9
 }
 
 // The secrets of a key that are still masked after prepKey: masked values that matched no stored key.
@@ -158,11 +168,13 @@ export function validProviderName(name: string): bool {
 
 // A positive number and one unit: s m h d w M (30 days) Q (90 days) Y.
 export function validDuration(s: string): bool {
+  // walked by character: a position inside a character cannot be sliced
+  const cs = s.chars()
   let i = 0
-  while (i < s.byteLength && DIGITS.includes(s.slice(i, i + 1))) i += 1
-  if (i === 0 || i + 1 !== s.byteLength) return false
-  if (!UNITS.includes(s.slice(i))) return false
-  const n = parseInt(s.slice(0, i)) ?? 0
+  while (i < cs.length && DIGITS.includes(cs[i]!)) i += 1
+  if (i === 0 || i + 1 !== cs.length) return false
+  if (!UNITS.includes(cs[i]!)) return false
+  const n = strToInt(s.slice(0, i)) ?? 0
   return n > 0
 }
 
@@ -173,14 +185,16 @@ function fail(status: int, message: string): Failure {
 // These copy the whole value and replace one field, so config sections and
 // fields this file doesn't know about (auth_config, routing_rules, plugins,
 // otel, ...) survive every save.
+// The governance section as a record of the caller's own (a copy; the lists it holds are the config's): callers set
+// its fields and hand it to withGov, and the config it came from keeps its section.
 function gov(c: Config): GovernanceConfig {
   const g = c.governance
   if (g === undefined) return {}
-  return g
+  return copyGovernanceConfig(g)
 }
 
 function withGov(c: Config, g: GovernanceConfig): Config {
-  let n = c
+  let n = copyConfig(c)
   n.governance = g
   return n
 }
@@ -195,13 +209,13 @@ function copyProviders(c: Config): Map<string, ProviderConfig> {
 }
 
 function withProviders(c: Config, ps: Map<string, ProviderConfig>): Config {
-  let n = c
+  let n = copyConfig(c)
   n.providers = ps
   return n
 }
 
 function withKeys(p: ProviderConfig, keys: KeyConfig[]): ProviderConfig {
-  let n = p
+  let n = copyProviderConfig(p)
   n.keys = keys
   return n
 }
@@ -342,21 +356,22 @@ function keyWithSecrets(k: KeyConfig, old: KeyConfig | undefined, restore: bool)
     }
     ocExtra = out
   }
-  let n = k
+  // copies: k and the blocks it holds (often the stored config's) stay as they are
+  let n = copyKeyConfig(k)
   n.value = value
   if (az !== undefined) {
-    let a = az
+    let a = copyAzureKeyConfig(az)
     a.client_secret = azSecret
     n.azure_key_config = a
   }
   if (vx !== undefined) {
     // The aws_workload_identity role ARN is masked on reads.
     const wi: VertexAwsWorkloadIdentity | undefined = vx.aws_workload_identity
-    let v = vx
+    let v = copyVertexKeyConfig(vx)
     v.auth_credentials = vxCreds
     if (wi !== undefined) {
       const arn = sec(wi.aws_role_arn, old?.vertex_key_config?.aws_workload_identity?.aws_role_arn)
-      let w = wi
+      let w = copyVertexAwsWorkloadIdentity(wi)
       w.aws_role_arn = arn
       v.aws_workload_identity = w
     }
@@ -365,22 +380,22 @@ function keyWithSecrets(k: KeyConfig, old: KeyConfig | undefined, restore: bool)
   if (bkNew !== undefined) n.bedrock_key_config = bkNew
   if (bmNew !== undefined) n.bedrock_mantle_key_config = bmNew
   if (wx !== undefined) {
-    let w = wx
+    let w = copyWatsonxKeyConfig(wx)
     w.api_key = wxKey
     n.watsonx_key_config = w
   }
   if (db !== undefined) {
-    let d = db
+    let d = copyDatabricksKeyConfig(db)
     d.client_secret = dbSecret
     n.databricks_key_config = d
   }
   if (gc !== undefined) {
-    let g = gc
+    let g = copyGithubCopilotKeyConfig(gc)
     g.private_key = gcKey
     n.github_copilot_key_config = g
   }
   if (oc !== undefined) {
-    let o = oc
+    let o = copyOAuthKeyConfig(oc)
     o.client_secret = ocSecret
     o.private_key = ocKey
     if (ocExtra !== undefined) o.extra_params = ocExtra
@@ -392,7 +407,7 @@ function keyWithSecrets(k: KeyConfig, old: KeyConfig | undefined, restore: bool)
 function bedrockSecrets(b: BedrockKeyConfig, old: BedrockKeyConfig | undefined, restore: bool): BedrockKeyConfig {
   const sk = restore ? keepOpt(b.secret_key, old?.secret_key) : maskOpt(b.secret_key)
   const st = restore ? keepOpt(b.session_token, old?.session_token) : maskOpt(b.session_token)
-  let n = b
+  let n = copyBedrockKeyConfig(b)
   n.secret_key = sk
   n.session_token = st
   return n
@@ -408,7 +423,7 @@ function oldKeyFor(k: KeyConfig, i: int, old: KeyConfig[]): KeyConfig | undefine
     const byName = findKey(old, name)
     if (byName !== undefined) return byName
   }
-  const at = old[i]
+  const at = elemAt(old, i)
   if (name === "" && at !== undefined && (at.id ?? "") === "" && (at.name ?? "") === "") return at
   return undefined
 }
@@ -609,7 +624,7 @@ function pricingView(o: PricingOverrideConfig): string {
     match_type: o.match_type,
     pattern: o.pattern,
   })
-  return head.slice(0, head.byteLength - 1) + ",\"patch\":" + o.pricing_patch + "}"
+  return head.slice(0, strLen(head) - 1) + ",\"patch\":" + o.pricing_patch + "}"
 }
 
 function pricingList(c: Config): string {
@@ -792,8 +807,10 @@ function redactKey(k: KeyConfig): KeyConfig {
 // The whole provider with its secrets masked, so settings added later survive a GET then PUT.
 function redactProvider(p: ProviderConfig): ProviderConfig {
   const ks = p.keys
-  let px = p.proxy_config
-  let n = p
+  // copies: p (the stored config's provider) and its proxy block keep their secrets
+  const px0 = p.proxy_config
+  let px = px0 === undefined ? undefined : copyProxyConfig(px0)
+  let n = copyProviderConfig(p)
   n.keys = ks === undefined ? undefined : ks.map((k) => redactKey(k))
   if (px !== undefined) {
     px.password = maskOpt(px.password)
@@ -866,12 +883,13 @@ function redactConfig(c: Config): Config {
   const sc = c.scim_config
   const tok = sc?.config?.provisioningToken
   const g0 = c.governance
-  let n = c
+  // copies: c (the stored config) and the sections changed below keep their secrets
+  let n = copyConfig(c)
   n.providers = ps
   if (g0 !== undefined) {
     const vks = g0.virtual_keys
     const auth = g0.auth_config
-    let g = g0
+    let g = copyGovernanceConfig(g0)
     if (vks !== undefined) g.virtual_keys = vks.map((vk) => redactVk(vk))
     if (auth !== undefined) {
       g.auth_config = {
@@ -889,8 +907,8 @@ function redactConfig(c: Config): Config {
   }
   // the SCIM provisioning token and the provider's secrets are masked too (an env. reference shows as written)
   if (sc !== undefined) {
-    let ms = sc
-    let mc = sc.config ?? {}
+    let ms = copyScimConfig(sc)
+    let mc = copyScimProviderConfig(sc.config ?? {})
     if (tok !== undefined) mc.provisioningToken = maskSecret(tok)
     const cs = mc.clientSecret
     if (cs !== undefined) mc.clientSecret = maskSecret(cs)
@@ -1037,7 +1055,7 @@ function openValue(c: ConfigCipher | undefined, v: string): string | undefined {
   if (c === undefined) return undefined
   let raw: u8[] = []
   try {
-    raw = decode(v.slice(SEALED.byteLength))
+    raw = decode(v.slice(strLen(SEALED)))
   } catch (e) {
     return undefined
   }
@@ -1157,16 +1175,17 @@ function transformSecrets(c: Config, cipher: ConfigCipher | undefined, seal: boo
   const ps = c.providers
   const gov = c.governance
   const mcp = c.mcp
-  let out = c
+  // every record changed below is a copy: c and what it holds are not changed
+  let out = copyConfig(c)
   if (ps !== undefined) {
     const np: Map<string, ProviderConfig> = new Map()
     for (const name of ps.keys()) {
-      let p = ps.get(name)!
+      let p = copyProviderConfig(ps.get(name)!)
       const keys = p.keys
       if (keys !== undefined) {
         let nk: KeyConfig[] = []
         for (const k of keys) {
-          let kk = k
+          let kk = copyKeyConfig(k)
           const v = kk.value
           if (v !== undefined) kk.value = try secretValue(cipher, seal, v, `providers.${name}.keys.value`, &errors)
           nk.push(kk)
@@ -1181,7 +1200,7 @@ function transformSecrets(c: Config, cipher: ConfigCipher | undefined, seal: boo
   if (whs !== undefined) {
     let nw: WebhookEndpoint[] = []
     for (const w of whs) {
-      let x = w
+      let x = copyWebhookEndpoint(w)
       const sec = x.secret
       if (sec !== undefined) x.secret = try secretValue(cipher, seal, sec, `webhooks.${x.name}.secret`, &errors)
       const hs = x.headers
@@ -1198,7 +1217,7 @@ function transformSecrets(c: Config, cipher: ConfigCipher | undefined, seal: boo
   if (ags !== undefined) {
     let na: AgentConfig[] = []
     for (const a of ags) {
-      let x = a
+      let x = copyAgentConfig(a)
       x.discovery_auth = try sealAuth(cipher, seal, x.discovery_auth, `agents.${x.name}.discovery_auth`, &errors)
       x.runtime_auth = try sealAuth(cipher, seal, x.runtime_auth, `agents.${x.name}.runtime_auth`, &errors)
       na.push(x)
@@ -1206,10 +1225,10 @@ function transformSecrets(c: Config, cipher: ConfigCipher | undefined, seal: boo
     out.agents = na
   }
   if (gov !== undefined) {
-    let g = gov
+    let g = copyGovernanceConfig(gov)
     const au = g.auth_config
     if (au !== undefined) {
-      let a = au
+      let a = copyAdminAuthConfig(au)
       const pw = a.password
       const tok = a.token
       if (pw !== undefined) a.password = try secretValue(cipher, seal, pw, "governance.auth_config.password", &errors)
@@ -1220,7 +1239,7 @@ function transformSecrets(c: Config, cipher: ConfigCipher | undefined, seal: boo
     if (vks !== undefined) {
       let nv: VirtualKeyConfig[] = []
       for (const vk of vks) {
-        let x = vk
+        let x = copyVirtualKeyConfig(vk)
         x.value = try secretValue(cipher, seal, x.value, `governance.virtual_keys.${x.id}.value`, &errors)
         nv.push(x)
       }
@@ -1230,13 +1249,13 @@ function transformSecrets(c: Config, cipher: ConfigCipher | undefined, seal: boo
   }
   // the secrets of MCP clients: static tokens, client secrets, and the tokens an OAuth flow saved
   if (mcp !== undefined && mcp.client_configs !== undefined) {
-    let nm = mcp
+    let nm = copyMcpConfig(mcp)
     let nl: McpClientConfig[] = []
     for (const cc of mcp.client_configs) {
-      let x = cc
+      let x = copyMcpClientConfig(cc)
       const au = x.auth
       if (au !== undefined) {
-        let a = au
+        let a = copyMcpAuthConfig(au)
         const where = `mcp.client_configs.${x.name}.auth`
         const tk = a.token
         if (tk !== undefined && tk !== "") a.token = try secretValue(cipher, seal, tk, `${where}.token`, &errors)
@@ -1257,12 +1276,12 @@ function transformSecrets(c: Config, cipher: ConfigCipher | undefined, seal: boo
   if (out.mcp !== undefined && out.mcp.user_tokens !== undefined) {
     let nt: McpUserToken[] = []
     for (const ut of out.mcp.user_tokens) {
-      let x = ut
+      let x = copyMcpUserToken(ut)
       x.access_token = try secretValue(cipher, seal, x.access_token, `mcp.user_tokens.${x.id}.access_token`, &errors)
       x.refresh_token = try secretValue(cipher, seal, x.refresh_token, `mcp.user_tokens.${x.id}.refresh_token`, &errors)
       nt.push(x)
     }
-    let mt = out.mcp
+    let mt = copyMcpConfig(out.mcp)
     mt.user_tokens = nt
     out.mcp = mt
   }
@@ -1270,12 +1289,12 @@ function transformSecrets(c: Config, cipher: ConfigCipher | undefined, seal: boo
   if (out.mcp !== undefined && out.mcp.exchange_admin !== undefined) {
     let na: McpUserToken[] = []
     for (const ea of out.mcp.exchange_admin) {
-      let x = ea
+      let x = copyMcpUserToken(ea)
       x.access_token = try secretValue(cipher, seal, x.access_token, `mcp.exchange_admin.${x.mcp_client_name}.access_token`, &errors)
       x.refresh_token = try secretValue(cipher, seal, x.refresh_token, `mcp.exchange_admin.${x.mcp_client_name}.refresh_token`, &errors)
       na.push(x)
     }
-    let ma = out.mcp
+    let ma = copyMcpConfig(out.mcp)
     ma.exchange_admin = na
     out.mcp = ma
   }
@@ -1283,13 +1302,13 @@ function transformSecrets(c: Config, cipher: ConfigCipher | undefined, seal: boo
   if (out.mcp !== undefined && out.mcp.user_credentials !== undefined) {
     let nu: McpUserCredential[] = []
     for (const uc of out.mcp.user_credentials) {
-      let x = uc
+      let x = copyMcpUserCredential(uc)
       const hs: Map<string, string> = new Map()
       for (const k of x.headers.keys()) hs.set(k, try secretValue(cipher, seal, x.headers.get(k) ?? "", `mcp.user_credentials.${x.id}.headers.${k}`, &errors))
       x.headers = hs
       nu.push(x)
     }
-    let mo = out.mcp
+    let mo = copyMcpConfig(out.mcp)
     mo.user_credentials = nu
     out.mcp = mo
   }
@@ -1591,7 +1610,7 @@ export class ConfigStore {
     this.keepNewerAdmin()
     let text = JSON.stringify(try sealConfig(this.cfg, this.cipher), undefined, 2)
     if (this.extras.length > 0) {
-      const end = text.byteLength - 1
+      const end = strLen(text) - 1
       const sep = text.trim() === "{}" ? "\n" : ",\n"
       text = text.slice(0, end).trimEnd() + sep + this.extras.map((f) => `  ${quote(f.key)}: ${f.raw}`).join(",\n") + "\n}"
     }
@@ -1736,8 +1755,9 @@ export class ConfigStore {
       kept.push(keep)
     }
     if (!changed) return
-    let c = this.cfg
-    let m = c.mcp ?? {}
+    // copies: a config held from before this save (group's and commit's prev, baseCfg) keeps its rows
+    let c = copyConfig(this.cfg)
+    let m = copyMcpConfig(c.mcp ?? {})
     m.exchange_admin = kept
     c.mcp = m
     this.cfg = c
@@ -1788,70 +1808,70 @@ export class ConfigStore {
 
   // Replaces the prompt repository (prompts with their versions, and deployments); see prompts.tov.
   setPromptRepo(r: PromptRepoConfig): Result {
-    let n: Config = this.cfg
+    let n: Config = copyConfig(this.cfg)
     n.prompt_repo = r
     return this.commit(n, "prompt-repo")
   }
 
   // Replaces the registered A2A agents; see agents.tov.
   setAgents(a: AgentConfig[]): Result {
-    let n: Config = this.cfg
+    let n: Config = copyConfig(this.cfg)
     n.agents = a
     return this.commit(n, "agents")
   }
 
   // Replaces the webhook endpoints; see webhooks.tov.
   setWebhooks(w: WebhookEndpoint[]): Result {
-    let n: Config = this.cfg
+    let n: Config = copyConfig(this.cfg)
     n.webhooks = w
     return this.commit(n, "webhooks")
   }
 
   // Replaces the feature flag overrides; see flags.tov.
   setFeatureFlags(f: FeatureFlagsConfig): Result {
-    let n: Config = this.cfg
+    let n: Config = copyConfig(this.cfg)
     n.feature_flags = f
     return this.commit(n, "feature-flags")
   }
 
   // Replaces the User-Agent to app mappings of the request logs (logapi.tov).
   setUserAgentMappings(m: UserAgentMapping[]): Result {
-    let n: Config = this.cfg
+    let n: Config = copyConfig(this.cfg)
     n.user_agent_mappings = m
     return this.commit(n, "user-agent-mappings")
   }
 
   // Replaces the plugin list (plugins[]); the save rebuilds the live plugin chain (see /api/plugins in ops.tov).
   setPlugins(list: PluginSpec[]): Result {
-    let n: Config = this.cfg
+    let n: Config = copyConfig(this.cfg)
     n.plugins = list
     return this.commit(n, "plugins")
   }
 
   // Replaces the alerts section (rules, channels and CEL rules); see alertapi.tov.
   setAlerts(a: AlertsConfig): Result {
-    let n = this.cfg
+    let n = copyConfig(this.cfg)
     n.alerts = a
     return this.commit(n, "alerts")
   }
 
   // Replaces the access profiles (governance.access_profiles); see profiles.tov.
   setProfiles(profiles: AccessProfile[]): Result {
-    let g: GovernanceConfig = this.cfg.governance ?? {}
+    let g: GovernanceConfig = gov(this.cfg)
     g.access_profiles = profiles
     return this.commit(withGov(this.cfg, g), "access-profiles")
   }
 
   // Replaces the management API keys (governance.api_keys); see apikeys.tov.
   setApiKeys(keys: ApiKeyConfig[]): Result {
-    let g: GovernanceConfig = this.cfg.governance ?? {}
+    let g: GovernanceConfig = gov(this.cfg)
     g.api_keys = keys
     return this.commit(withGov(this.cfg, g), "api-keys")
   }
 
   // Replaces the admin users (governance.users); see rbac.tov.
   setUsers(users: AdminUserConfig[]): Result {
-    let g: GovernanceConfig = this.cfg.governance ?? {}
+    let g: GovernanceConfig = gov(this.cfg)
     g.users = users
     return this.commit(withGov(this.cfg, g), "users")
   }
@@ -1862,7 +1882,7 @@ export class ConfigStore {
     const users: AdminUserConfig[] = []
     let changed = 0
     for (const u of this.cfg.governance?.users ?? []) {
-      let next = u
+      let next = copyAdminUserConfig(u)
       for (const up of ups) {
         if (u.name === up.name && u.password_sha256 !== undefined && u.password_sha256 === up.old && u.password_hash === undefined) {
           next.password_hash = up.hash
@@ -1879,7 +1899,7 @@ export class ConfigStore {
 
   // Replaces the users, teams and business units a sign-in's claims changed, as one save (claimsync.tov).
   setClaimSync(users: AdminUserConfig[], teams: TeamConfig[], bus: BusinessUnitConfig[]): Result {
-    let g: GovernanceConfig = this.cfg.governance ?? {}
+    let g: GovernanceConfig = gov(this.cfg)
     g.users = users
     g.teams = teams
     g.business_units = bus
@@ -1888,11 +1908,11 @@ export class ConfigStore {
 
   // Replaces the SCIM provisioning token (the identity provider's connector must be given the new one).
   setScimToken(token: string): Result {
-    let sc = this.cfg.scim_config ?? {}
-    let c = sc.config ?? {}
+    let sc = copyScimConfig(this.cfg.scim_config ?? {})
+    let c = copyScimProviderConfig(sc.config ?? {})
     c.provisioningToken = token
     sc.config = c
-    let n: Config = this.cfg
+    let n: Config = copyConfig(this.cfg)
     n.scim_config = sc
     return this.commit(n, "scim-token")
   }
@@ -1900,7 +1920,7 @@ export class ConfigStore {
   // Saves the users, teams and business units remaining after directory sync, import, reconciliation or SCIM push
   // in one operation, removing deleted users' assigned virtual keys and project memberships.
   setProvisioned(users: AdminUserConfig[], teams: TeamConfig[], bus: BusinessUnitConfig[], removed: string[]): Result {
-    let g: GovernanceConfig = this.cfg.governance ?? {}
+    let g: GovernanceConfig = gov(this.cfg)
     g.users = users
     g.teams = teams
     g.business_units = bus
@@ -1911,7 +1931,7 @@ export class ConfigStore {
       const pjs = g.projects
       if (pjs !== undefined) {
         g.projects = pjs.map((p) => {
-          let n = p
+          let n = copyProjectConfig(p)
           const ms = p.members
           if (ms !== undefined) n.members = ms.filter((m) => !lower.includes(m.user_id.toLowerCase()))
           return n
@@ -1923,7 +1943,7 @@ export class ConfigStore {
 
   // Replaces the users and teams a SCIM request changed, as one save (scim.tov).
   setScim(users: AdminUserConfig[], teams: TeamConfig[]): Result {
-    let g: GovernanceConfig = this.cfg.governance ?? {}
+    let g: GovernanceConfig = gov(this.cfg)
     g.users = users
     g.teams = teams
     return this.commit(withGov(this.cfg, g), "scim")
@@ -1931,7 +1951,7 @@ export class ConfigStore {
 
   // Adds or removes one access profile a user holds (users API); the profile must exist.
   setUserProfile(name: string, profileId: string, add: bool): Result {
-    const g: GovernanceConfig = this.cfg.governance ?? {}
+    const g: GovernanceConfig = gov(this.cfg)
     if (findById(g.access_profiles, profileId) === undefined) return fail(404, `no access profile ${profileId}`)
     const users: AdminUserConfig[] = []
     let found = false
@@ -1941,7 +1961,7 @@ export class ConfigStore {
         continue
       }
       found = true
-      let nu = u
+      let nu = copyAdminUserConfig(u)
       const held: string[] = (u.access_profile_ids ?? []).filter((id) => id !== profileId)
       if (add) held.push(profileId)
       nu.access_profile_ids = held
@@ -1955,7 +1975,7 @@ export class ConfigStore {
   // Sets or clears (undefined) a user's budget override for an access profile the user holds via PUT or
   // DELETE /api/users/{user}/access-profiles/{profile}/budgets/{budget}/override. The budget must belong to the profile.
   setUserBudgetOverride(name: string, profileId: string, budgetId: string, o: BudgetOverride | undefined): Result {
-    const g: GovernanceConfig = this.cfg.governance ?? {}
+    const g: GovernanceConfig = gov(this.cfg)
     const p = findById(g.access_profiles, profileId)
     if (p === undefined) return fail(404, `no access profile ${profileId}`)
     if (findById(g.budgets, budgetId) === undefined || p.budget_id !== budgetId) return fail(404, `budget ${budgetId} is not on access profile ${profileId}`)
@@ -1967,7 +1987,7 @@ export class ConfigStore {
         users.push(u)
         continue
       }
-      let nu = u
+      let nu = copyAdminUserConfig(u)
       const kept: UserBudgetOverride[] = (u.budget_overrides ?? []).filter((x) => !(x.profile_id === profileId && x.budget_id === budgetId))
       if (o !== undefined) kept.push({ profile_id: profileId, budget_id: budgetId, override: { amount: o.amount, mode: o.mode, cycles: o.cycles, started_at: o.mode === "cycles" ? rfc3339Of(Date.now()) : undefined } })
       nu.budget_overrides = kept.length === 0 ? undefined : kept
@@ -1979,11 +1999,11 @@ export class ConfigStore {
 
   // Links or unlinks an access profile on a virtual key the user is assigned (users API).
   setVkProfile(name: string, vkId: string, profileId: string, add: bool): Result {
-    const g: GovernanceConfig = this.cfg.governance ?? {}
+    const g: GovernanceConfig = gov(this.cfg)
     const vk = findById(g.virtual_keys, vkId)
     if (vk === undefined || (vk.user_id ?? "") !== name) return fail(404, `no virtual key ${vkId} assigned to user ${name}`)
     if (findById(g.access_profiles, profileId) === undefined) return fail(404, `no access profile ${profileId}`)
-    let nvk = vk
+    let nvk = copyVirtualKeyConfig(vk)
     const held: string[] = (vk.access_profile_ids ?? []).filter((id) => id !== profileId)
     if (add) held.push(profileId)
     nvk.access_profile_ids = held
@@ -1993,56 +2013,56 @@ export class ConfigStore {
 
   // Replaces the virtual keys as a whole (a propagate changes several at once).
   replaceVirtualKeys(vks: VirtualKeyConfig[]): Result {
-    const g: GovernanceConfig = this.cfg.governance ?? {}
+    const g: GovernanceConfig = gov(this.cfg)
     g.virtual_keys = vks
     return this.commit(withGov(this.cfg, g), "propagate")
   }
 
   // Replaces the global proxy (proxy_config); see proxyRoute.
   setProxy(px: GlobalProxyConfig | undefined): Result {
-    let n: Config = this.cfg
+    let n: Config = copyConfig(this.cfg)
     n.proxy_config = px
     return this.commit(n, "proxy-config")
   }
 
   // Replaces circuit breaker policies (circuit_breaker_config.policies); see circuitPoliciesRoute.
   setCircuitPolicies(list: CircuitPolicyConfig[]): Result {
-    let n: Config = this.cfg
+    let n: Config = copyConfig(this.cfg)
     n.circuit_breaker_policies = list
     return this.commit(n, "circuit-breaker-policies")
   }
 
   // Replaces the UI and admin metadata map; see postMetadata.
   setMetadata(m: Map<string, string | f64 | bool>): Result {
-    let n: Config = this.cfg
+    let n: Config = copyConfig(this.cfg)
     n.metadata = m
     return this.commit(n, "metadata")
   }
 
   // Replaces the client section (client_config); see putConfig.
   setClient(c: ClientConfig): Result {
-    let n: Config = this.cfg
+    let n: Config = copyConfig(this.cfg)
     n.client = c
     return this.commit(n, "client")
   }
 
   // Replaces the pricing sync section; see putConfig.
   setPricingSync(ps: PricingSyncConfig | undefined): Result {
-    let n: Config = this.cfg
+    let n: Config = copyConfig(this.cfg)
     n.pricing_sync = ps
     return this.commit(n, "framework-config")
   }
 
   // Replaces the admin credential (governance.auth_config); see putConfig.
   setAdminAuth(a: AdminAuthConfig): Result {
-    const g: GovernanceConfig = this.cfg.governance ?? {}
+    const g: GovernanceConfig = gov(this.cfg)
     g.auth_config = a
     return this.commit(withGov(this.cfg, g), "auth-config")
   }
 
   // Sets or clears (undefined) a budget's override. The budget must be one the key draws on (keyBudgetIds).
   setBudgetOverride(vkId: string, budgetId: string, o: BudgetOverride | undefined): Result {
-    const g: GovernanceConfig = this.cfg.governance ?? {}
+    const g: GovernanceConfig = gov(this.cfg)
     const vk = findById(g.virtual_keys, vkId)
     if (vk === undefined) return fail(404, `no virtual-keys ${vkId}`)
     if (!keyBudgetIds(vk).includes(budgetId)) return fail(404, `budget ${budgetId} is not on virtual key ${vkId}`)
@@ -2060,13 +2080,13 @@ export class ConfigStore {
   upsertRoutingRule(rule: RoutingRule): Result {
     const err = ruleError(rule)
     if (err !== "") return fail(400, err)
-    const g: GovernanceConfig = this.cfg.governance ?? {}
+    const g: GovernanceConfig = gov(this.cfg)
     g.routing_rules = putById(g.routing_rules ?? [], rule)
     return this.commit(withGov(this.cfg, g), "routing-rules")
   }
 
   deleteRoutingRule(id: string): Result {
-    const g: GovernanceConfig = this.cfg.governance ?? {}
+    const g: GovernanceConfig = gov(this.cfg)
     const rules: RoutingRule[] = g.routing_rules ?? []
     if (findById(rules, id) === undefined) return fail(404, `no routing rule ${id}`)
     g.routing_rules = dropById(rules, id)
@@ -2075,7 +2095,7 @@ export class ConfigStore {
 
   // Replaces the complexity analyzer config (complexity_router); undefined turns it off.
   setComplexity(cs: ComplexitySettings | undefined): Result {
-    let n: Config = this.cfg
+    let n: Config = copyConfig(this.cfg)
     n.complexity_router = cs
     return this.commit(n, "complexity-analyzer-config")
   }
@@ -2241,7 +2261,7 @@ export class ConfigStore {
 
   // Rotates a key's value. The old value keeps working for cooldownMs when positive;
   // otherwise it stops working immediately.
-  rotateVirtualKey(id: string, cooldownMs: number): Result {
+  rotateVirtualKey(id: string, cooldownMs: f64): Result {
     const g = gov(this.cfg)
     const old = findById(g.virtual_keys, id)
     if (old === undefined) return fail(404, `no virtual key ${id}`)
@@ -2445,7 +2465,7 @@ export class ConfigStore {
     }
     const eq = equalRateError(g, pj, members.length)
     if (eq !== "") return fail(400, eq)
-    let np = pj
+    let np = copyProjectConfig(pj)
     np.members = members
     g.projects = putById(g.projects ?? [], np)
     return this.commit(withGov(this.cfg, g), pid)
@@ -2461,7 +2481,7 @@ export class ConfigStore {
     for (const m of pj.members ?? []) {
       if (m.id !== mid) members.push(m)
     }
-    let np = pj
+    let np = copyProjectConfig(pj)
     np.members = members
     g.projects = putById(g.projects ?? [], np)
     return this.commit(withGov(this.cfg, g), pid)
@@ -2493,7 +2513,7 @@ export class ConfigStore {
     for (const m of pj.members ?? []) {
       members.push(m.id === mid ? { id: m.id, user_id: m.user_id, budget_shares: shares, rate_limit_shares: rshares } : m)
     }
-    let np = pj
+    let np = copyProjectConfig(pj)
     np.members = members
     g.projects = putById(g.projects ?? [], np)
     return this.commit(withGov(this.cfg, g), pid)
@@ -2594,7 +2614,7 @@ export class ConfigStore {
     if (rid !== undefined) {
       const profiles: AccessProfile[] = []
       for (const p of g.access_profiles ?? []) {
-        let np = p
+        let np = copyAccessProfile(p)
         if (np.roles !== undefined) np.roles = np.roles.filter((b) => b.role_id !== rid)
         profiles.push(np)
       }
@@ -2615,7 +2635,7 @@ export class ConfigStore {
     }
     const profiles: AccessProfile[] = []
     for (const p of g.access_profiles ?? []) {
-      let np = p
+      let np = copyAccessProfile(p)
       if (p.id === profileId) {
         const kept: ProfileRole[] = []
         for (const b of np.roles ?? []) {
@@ -2646,7 +2666,7 @@ export class ConfigStore {
     if (!(cur.roles ?? []).some((b) => b.role_id === roleId)) return fail(404, `role_id ${roleId} is not attached to ${profileId}`)
     const profiles: AccessProfile[] = []
     for (const p of g.access_profiles ?? []) {
-      let np = p
+      let np = copyAccessProfile(p)
       if (np.id === profileId) np.roles = (np.roles ?? []).filter((b) => b.role_id !== roleId)
       profiles.push(np)
     }
@@ -3241,10 +3261,10 @@ function teamMembers(store: ConfigStore, m: string, team: string, scope: DataSco
 }
 
 // The grace period for a rotated key's old value, from client.vk_rotation_cooldown (0 when unset).
-function rotationCooldownMs(c: Config): number {
+function rotationCooldownMs(c: Config): f64 {
   const s = c.client?.vk_rotation_cooldown ?? ""
   if (s === "") return 0.0
-  const ms: number = durationMs(s)
+  const ms: f64 = durationMs(s)
   return ms
 }
 
@@ -3320,19 +3340,19 @@ export function rotatedKeyIds(replyBody: string): string[] {
 // Whether a path is a virtual-key rotate route (the collection or one key).
 export function isRotatePath(path: string): bool {
   const segs = path.split("?")[0]!.split("/").filter((x) => x !== "")
-  if (segs[0] !== "api" || segs[1] !== "governance" || segs[2] !== "virtual-keys") return false
-  return segs.length === 4 && segs[3] === "rotate" || segs.length === 5 && segs[4] === "rotate"
+  if (elemAt(segs, 0) !== "api" || elemAt(segs, 1) !== "governance" || elemAt(segs, 2) !== "virtual-keys") return false
+  return segs.length === 4 && elemAt(segs, 3) === "rotate" || segs.length === 5 && elemAt(segs, 4) === "rotate"
 }
 
 function governanceRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, sp: URLSearchParams, scope: DataScope, grant?: Held): ApiReply {
   const coll = segs[2] ?? ""
-  if (coll === "virtual-keys" && (segs.length === 4 && segs[3] === "rotate" || segs.length === 5 && segs[4] === "rotate")) {
+  if (coll === "virtual-keys" && (segs.length === 4 && elemAt(segs, 3) === "rotate" || segs.length === 5 && elemAt(segs, 4) === "rotate")) {
     return rotateVkRoute(store, m, segs, body, path, scope)
   }
   // the quota view is served before the admin gate (server.tov); here only its method is judged
-  if (coll === "virtual-keys" && segs.length === 4 && segs[3] === "quota") return notAllowed(m)
-  if (coll === "virtual-keys" && segs.length === 5 && segs[4] === "users") return vkUsers(store, m, segs[3] ?? "", scope)
-  if (coll === "virtual-keys" && segs.length === 7 && segs[4] === "budgets" && segs[6] === "override") {
+  if (coll === "virtual-keys" && segs.length === 4 && elemAt(segs, 3) === "quota") return notAllowed(m)
+  if (coll === "virtual-keys" && segs.length === 5 && elemAt(segs, 4) === "users") return vkUsers(store, m, segs[3] ?? "", scope)
+  if (coll === "virtual-keys" && segs.length === 7 && elemAt(segs, 4) === "budgets" && elemAt(segs, 6) === "override") {
     return budgetOverrideRoute(store, m, segs[3] ?? "", segs[5] ?? "", body, scope)
   }
   if (coll === "routing-rules") return routingRulesRoute(store, m, segs, body, path, scope)
@@ -3349,7 +3369,7 @@ function governanceRoute(store: ConfigStore, m: string, segs: string[], body: st
   if (coll === "pricing-overrides") return pricingRoute(store, m, segs, body, path)
   if (coll === "projects") return projectRoute(store, m, segs, body, path, sp, scope)
   if (coll === "business-units") return businessUnitRoute(store, m, segs, body, path, sp, scope)
-  if (coll === "teams" && segs.length === 5 && segs[4] === "members") return teamMembers(store, m, segs[3] ?? "", scope)
+  if (coll === "teams" && segs.length === 5 && elemAt(segs, 4) === "members") return teamMembers(store, m, segs[3] ?? "", scope)
   if (!COLLECTIONS.includes(coll) || segs.length > 4) return notFound(path)
   // a scoped user reaches the teams, customers and keys in its scope; budgets and rate limits are all-data
   if (!scope.all && !SCOPED_COLLECTIONS.includes(coll)) return reply(403, errorBody(`the data access scope of this role does not cover ${coll}`))
@@ -3458,11 +3478,11 @@ function scopeDenied(): ApiReply {
 
 // One page of a list: limit (default 25, at most 100), offset or page (counted from 1).
 function pageOf<T>(xs: T[], sp: URLSearchParams): { items: T[], limit: int, offset: int, total: int } {
-  let limit: int = parseInt(sp.get("limit") ?? "25") ?? 25
+  let limit: int = strToInt(sp.get("limit") ?? "25") ?? 25
   if (limit < 1) limit = 25
   if (limit > 100) limit = 100
-  let offset: int = parseInt(sp.get("offset") ?? "0") ?? 0
-  const page: int = parseInt(sp.get("page") ?? "0") ?? 0
+  let offset: int = strToInt(sp.get("offset") ?? "0") ?? 0
+  const page: int = strToInt(sp.get("page") ?? "0") ?? 0
   if (offset === 0 && page > 1) offset = (page - 1) * limit
   if (offset < 0) offset = 0
   return { items: xs.slice(offset, offset + limit), limit: limit, offset: offset, total: xs.length }
@@ -3530,7 +3550,7 @@ function projectsView(c: Config, sp: URLSearchParams, scope: DataScope): string 
 // a scoped user may change projects within its scope.
 function projectRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, sp: URLSearchParams, scope: DataScope): ApiReply {
   if (segs.length > 6) return notFound(path)
-  const id = segs[3]
+  const id = elemAt(segs, 3)
   if (id === undefined) {
     if (m === "GET") return reply(200, projectsView(store.cfg, sp, scope))
     if (m !== "POST") return notAllowed(m)
@@ -3622,10 +3642,10 @@ function equalRateError(c: GovernanceConfig, pj: ProjectConfig, members: int): s
 // /api/governance/projects/{id}/members[/{member_id}]: the roster and, under split_policy none, a member's
 // own caps. Changing the roster or the caps needs all-data.
 function projectMembersRoute(store: ConfigStore, m: string, pid: string, segs: string[], body: string, path: string, scope: DataScope): ApiReply {
-  if (segs.length > 6 || segs[4] !== "members") return notFound(path)
+  if (segs.length > 6 || elemAt(segs, 4) !== "members") return notFound(path)
   const pj = findById(gov(store.cfg).projects, pid)
   if (pj === undefined) return reply(404, errorBody(`no project ${pid}`))
-  const mid = segs[5]
+  const mid = elemAt(segs, 5)
   if (mid === undefined) {
     if (m === "GET") return reply(200, JSON.stringify({ members: pj.members ?? [], total_count: (pj.members ?? []).length }))
     if (m !== "POST") return notAllowed(m)
@@ -3692,9 +3712,9 @@ function businessUnitsView(c: Config, sp: URLSearchParams, scope: DataScope): st
 
 // /api/governance/business-units[/{id}]
 function businessUnitRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, sp: URLSearchParams, scope: DataScope): ApiReply {
-  if ((segs.length === 5 || segs.length === 6) && segs[4] === "users") return businessUnitUsers(store, m, segs[3] ?? "", segs[5], body, scope)
+  if ((segs.length === 5 || segs.length === 6) && elemAt(segs, 4) === "users") return businessUnitUsers(store, m, segs[3] ?? "", elemAt(segs, 5), body, scope)
   if (segs.length > 4) return notFound(path)
-  const id = segs[3]
+  const id = elemAt(segs, 3)
   if (id === undefined) {
     if (m === "GET") return reply(200, businessUnitsView(store.cfg, sp, scope))
     if (m !== "POST") return notAllowed(m)
@@ -3766,8 +3786,9 @@ function businessUnitUsers(store: ConfigStore, m: string, bu: string, member: st
     for (const id of ids) {
       const i = at(id)
       if (i < 0) return reply(400, errorBody(`no user ${id}`))
-      let u = next[i]!
-      const held: string[] = u.business_units ?? []
+      // a copy of the user and of its list: the stored user stays as it is until setUsers saves
+      let u = copyAdminUserConfig(next[i]!)
+      const held: string[] = (u.business_units ?? []).slice()
       if (!held.includes(bu)) held.push(bu)
       u.business_units = held
       next[i] = u
@@ -3781,7 +3802,7 @@ function businessUnitUsers(store: ConfigStore, m: string, bu: string, member: st
     if (i < 0 || !(users[i]!.business_units ?? []).includes(bu)) return reply(404, errorBody(`user ${member} is not a member of ${bu}`))
     if (membershipSource(users[i]!, "business_units", bu) === "synced") return reply(409, errorBody(`the identity provider manages ${member}'s membership of ${bu}; change the mapping rules or the user's attributes instead`))
     let next = users.slice()
-    let u = next[i]!
+    let u = copyAdminUserConfig(next[i]!)
     u.business_units = (u.business_units ?? []).filter((x) => x !== bu)
     next[i] = u
     const r = store.setUsers(next)
@@ -3815,10 +3836,10 @@ function grantRefusal(grant: Held | undefined, cur: PermissionPair[] | undefined
 }
 
 function roleRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, scope: DataScope, system: bool, grant?: Held): ApiReply {
-  if (segs.length > 4 || segs.length === 4 && segs[3] !== "permissions") return notFound(path)
+  if (segs.length > 4 || segs.length === 4 && elemAt(segs, 3) !== "permissions") return notFound(path)
   if (!scope.all && m !== "GET") return scopeDenied()
-  const name = segs[2]
-  if (name !== undefined && isNumeric(name)) return roleByIdRoute(store, m, parseInt(name) ?? 0, segs, body, grant)
+  const name = elemAt(segs, 2)
+  if (name !== undefined && isNumeric(name)) return roleByIdRoute(store, m, strToInt(name) ?? 0, segs, body, grant)
   if (name !== undefined && isBuiltinRole(name)) return systemRoleRoute(store, m, name, segs, body, false, grant)
   if (segs.length === 4 && name !== undefined) return rolePermissions(store, m, name, body, grant)
   if (name === undefined) {
@@ -3963,10 +3984,8 @@ function systemRoleRoute(store: ConfigStore, m: string, name: string, segs: stri
 // Whether a path segment is a number (a role id): digits only, at least one.
 function isNumeric(s: string): bool {
   if (s === "") return false
-  let i = 0
-  while (i < s.byteLength) {
-    if (!"0123456789".includes(s.slice(i, i + 1))) return false
-    i += 1
+  for (const ch of s.chars()) {
+    if (!"0123456789".includes(ch)) return false
   }
   return true
 }
@@ -4006,7 +4025,7 @@ function permissionIdsOf(body: string): { pairs: PermissionPair[], error: string
   const raw = find(fs, "permission_ids") ?? ""
   try {
     for (const el of elements(raw)) {
-      const id = parseFloat(el)
+      const id = strToFloat(el)
       const pair = id === undefined ? undefined : pairOfId(RESOURCES, OPERATIONS, floorInt(id) ?? -1)
       if (pair === undefined) return { pairs: pairs, error: `unknown permission id ${el}` }
       pairs.push(pair)
@@ -4105,7 +4124,7 @@ export function baseUrlProblem(nc: NetworkConfig | undefined): string {
 // address checked (the request is then answered by handleApi, which checks the literal again).
 export async function providerBaseUrlProblem(method: string, path: string, body: string): Promise<string> {
   const create = method === "POST" && path === "/api/providers"
-  const update = method === "PUT" && path.startsWith("/api/providers/") && !path.slice("/api/providers/".byteLength).includes("/")
+  const update = method === "PUT" && path.startsWith("/api/providers/") && !path.slice(strLen("/api/providers/")).includes("/")
   if (!create && !update) return ""
   const p = parseProvider(body)
   if (p === undefined) return ""
@@ -4181,7 +4200,7 @@ function providerRoute(store: ConfigStore, m: string, segs: string[], body: stri
     }
     return notAllowed(m)
   }
-  if (segs[3] !== "keys" || segs.length > 5) return notFound(path)
+  if (elemAt(segs, 3) !== "keys" || segs.length > 5) return notFound(path)
   if (segs.length === 4) {
     if (m === "GET") return listProviderKeys(store, name)
     if (m !== "POST") return notAllowed(m)
@@ -4303,7 +4322,8 @@ function frameworkPlan(raw: string, cur: PricingSyncConfig | undefined): Framewo
     live = Math.floor(Math.min(lv, 1.0e12))
   }
   if (url === undefined && interval === undefined && cur?.enabled === undefined && mpu === undefined && live === undefined && cur?.mcp_library_url === undefined && cur?.mcp_library_sync_interval === undefined) return { kind: "ok", ps: undefined }
-  let ps: PricingSyncConfig = cur ?? {}
+  // a copy: cur is the stored config's section
+  let ps: PricingSyncConfig = copyPricingSyncConfig(cur ?? {})
   ps.url = url
   ps.interval_seconds = interval
   ps.model_parameters_url = mpu
@@ -4399,7 +4419,8 @@ function putConfig(store: ConfigStore, body: string, grant?: Held): ApiReply {
   let disable: bool | undefined = undefined
   if (ap !== undefined && ap.kind === "ok") disable = ap.disable
   if (c !== undefined || disable !== undefined) {
-    let cl: ClientConfig = c ?? store.cfg.client ?? {}
+    // the stored section is copied (c is this request's own)
+    let cl: ClientConfig = c ?? copyClientConfig(store.cfg.client ?? {})
     if (disable !== undefined) cl.enforce_auth_on_inference = !disable
     const r = store.setClient(cl)
     if (r.kind === "error") return errReply(r)
@@ -4525,7 +4546,7 @@ function routingRulesRoute(store: ConfigStore, m: string, segs: string[], body: 
 // replaced, or reset to none.
 function complexityRoute(store: ConfigStore, m: string, segs: string[], body: string, path: string, scope: DataScope): ApiReply {
   if (!scope.all && m !== "GET") return scopeDenied()
-  const reset = segs.length === 4 && segs[3] === "reset"
+  const reset = segs.length === 4 && elemAt(segs, 3) === "reset"
   if (segs.length === 3 && m === "GET") return reply(200, JSON.stringify(store.cfg.complexity_router ?? {}))
   if (segs.length === 3 && m === "PUT") {
     const problem = complexityProblem(body)
@@ -4551,9 +4572,9 @@ function complexityRoute(store: ConfigStore, m: string, segs: string[], body: st
 function complexityStateRoute(store: ConfigStore, m: string, segs: string[], path: string, scope: DataScope): ApiReply {
   const cx = store.cfg.complexity_router ?? {}
   const on = cx.enabled === true
-  if (segs[2] === "complexity-analyzer-status") {
+  if (elemAt(segs, 2) === "complexity-analyzer-status") {
     if (segs.length === 3) return m === "GET" ? reply(200, analyzerStatus(on, cx.classifier, cx.semantic, cx.llm)) : notAllowed(m)
-    if (segs.length === 4 && segs[3] === "retry") {
+    if (segs.length === 4 && elemAt(segs, 3) === "retry") {
       if (m !== "POST") return notAllowed(m)
       if (!scope.all) return scopeDenied()
       const r = retryWarmup(on, cx.classifier, cx.semantic, cx.llm)
@@ -4573,7 +4594,7 @@ function complexityStateRoute(store: ConfigStore, m: string, segs: string[], pat
 
 // Expired-key cleanup deletes keys named by expiredToDelete and returns their ids.
 // The supervisor runs it on a timer (ops.tov sweepExpiredKeys).
-export function sweepExpiredKeys(store: ConfigStore, nowMs: number): string[] {
+export function sweepExpiredKeys(store: ConfigStore, nowMs: f64): string[] {
   const done: string[] = []
   for (const id of expiredToDelete(store.cfg.governance, store.cfg.client, nowMs)) {
     const r = store.deleteVirtualKey(id)
@@ -4612,7 +4633,7 @@ function postMetadata(store: ConfigStore, body: string): ApiReply {
     } else if (raw === "true" || raw === "false") {
       m.set(f.key, raw === "true")
     } else {
-      const n = parseFloat(raw)
+      const n = strToFloat(raw)
       if (n === undefined) return reply(400, errorBody(`metadata ${f.key} must be a string, number, boolean or null`))
       m.set(f.key, n)
     }
@@ -4664,12 +4685,12 @@ export function handleApi(store: ConfigStore, method: string, path: string, body
   const sc: DataScope = scope ?? allScope()
   const qp = new URLSearchParams(q < 0 ? "" : path.slice(q + 1))
   const segs = p.split("/").filter((s) => s !== "")
-  if (segs.length === 0 || segs[0] !== "api") return notFound(p)
+  if (segs.length === 0 || elemAt(segs, 0) !== "api") return notFound(p)
   const area = segs[1] ?? ""
   // /api/routing/... maps to the governance routes.
-  if (area === "routing" && (segs[2] === "complexity-analyzer-status" || segs[2] === "complexity-analyzer-generations")) return complexityStateRoute(store, m, segs, p, sc)
+  if (area === "routing" && (elemAt(segs, 2) === "complexity-analyzer-status" || elemAt(segs, 2) === "complexity-analyzer-generations")) return complexityStateRoute(store, m, segs, p, sc)
   if (area === "routing" && segs.length >= 3) {
-    const sub = segs[2] === "rules" ? "routing-rules" : segs[2] ?? ""
+    const sub = elemAt(segs, 2) === "rules" ? "routing-rules" : segs[2] ?? ""
     return governanceRoute(store, m, ["api", "governance", sub].concat(segs.slice(3)), body, p, qp, sc, grant)
   }
   // Read-only RBAC catalogue: resources, operations and permission pairs.
@@ -4678,14 +4699,14 @@ export function handleApi(store: ConfigStore, method: string, path: string, body
     return rbacListing(area, m)
   }
   if (area === "config") {
-    if (segs.length === 3 && segs[2] === "metadata") return m === "POST" ? postMetadata(store, body) : notAllowed(m)
+    if (segs.length === 3 && elemAt(segs, 2) === "metadata") return m === "POST" ? postMetadata(store, body) : notAllowed(m)
     if (segs.length !== 2) return notFound(p)
     if (m === "PUT") return putConfig(store, body, grant)
     return m === "GET" ? reply(200, store.redacted()) : notAllowed(m)
   }
   // POST /api/scim/provisioning-token: a new SCIM provisioning token, shown once; the old one stops working
   if (area === "scim") {
-    if (segs.length !== 3 || segs[2] !== "provisioning-token") return notFound(p)
+    if (segs.length !== 3 || elemAt(segs, 2) !== "provisioning-token") return notFound(p)
     if (m !== "POST") return notAllowed(m)
     if (store.cfg.scim_config?.enabled !== true) return reply(400, errorBody("SCIM is not enabled (scim_config.enabled)"))
     let tok = ""
@@ -4709,8 +4730,8 @@ export function handleApi(store: ConfigStore, method: string, path: string, body
   if (area === "models") {
     if (m !== "GET") return notAllowed(m)
     const sp = new URLSearchParams(q < 0 ? "" : path.slice(q + 1))
-    const limit: f64 = parseFloat(sp.get("limit") ?? "5") ?? 5.0
-    const offset: f64 = parseFloat(sp.get("offset") ?? "0") ?? 0.0
+    const limit: f64 = strToFloat(sp.get("limit") ?? "5") ?? 5.0
+    const offset: f64 = strToFloat(sp.get("offset") ?? "0") ?? 0.0
     if (segs.length === 2) return reply(200, modelList(store.cfg, sp.get("provider") ?? "", sp.get("query") ?? "", limit, offset))
     if (segs.length === 3) {
       const pn = segs[2]!
@@ -5118,7 +5139,7 @@ test("virtual keys: generated id and value format, masked update, refs and dupli
   const vk = s.cfg.governance!.virtual_keys![0]!
   expect(vk.id.startsWith("vk-")).toBe(true)
   expect(vk.value.startsWith("sk-raiju-")).toBe(true)
-  const randomPart = vk.value.slice("sk-raiju-".byteLength)
+  const randomPart = vk.value.slice(strLen("sk-raiju-"))
   expect(randomPart.byteLength >= 32).toBe(true)
   let hexOk = true
   for (const ch of randomPart.chars()) {
@@ -5510,10 +5531,10 @@ test("version, keys and models: masked keys, configured models in Raiju's shape"
   const ks = handleApi(s, "GET", "/api/keys", "")
   expect(ks.body.includes("sk-abcdefghijkl")).toBe(false)
   expect(ks.body.includes(`"provider":"openai"`)).toBe(true)
-  const all = try JSON.parse(handleApi(s, "GET", "/api/models?limit=10", "").body) as { models: { name: string, provider: string }[], total: number }
+  const all = try JSON.parse(handleApi(s, "GET", "/api/models?limit=10", "").body) as { models: { name: string, provider: string }[], total: f64 }
   expect(all.total).toBe(3)
   expect(all.models[0]!.name).toBe("gpt-4o")
-  const one = try JSON.parse(handleApi(s, "GET", "/api/models/anthropic?query=HAIKU", "").body) as { models: { name: string, provider: string }[], total: number }
+  const one = try JSON.parse(handleApi(s, "GET", "/api/models/anthropic?query=HAIKU", "").body) as { models: { name: string, provider: string }[], total: f64 }
   expect(one.total).toBe(1)
   expect(one.models[0]!.provider).toBe("anthropic")
   expect(handleApi(s, "GET", "/api/models/nope", "").status).toBe(404)
@@ -6249,7 +6270,7 @@ test("a save that cannot take the config file's lock answers 503 at once, withou
 })
 
 function agentsSet(c: Config, list: AgentConfig[]): Config {
-  let n = c
+  let n = copyConfig(c)
   n.agents = list
   return n
 }
@@ -6590,4 +6611,24 @@ test("a caller who is not an admin adds to a role only the permissions it holds,
   } finally {
     cleanup(path)
   }
+})
+
+test("a secret is masked in characters, after 2, 3 and 4-byte characters", () => {
+  const secret = "é日🙂" + "abcdefghijklmnopqrstu" + "🙂日é"
+  expect(maskSecret(secret)).toBe("é日🙂a…u🙂日é")
+  expect(looksMasked(maskSecret(secret))).toBe(true)
+  expect(looksMasked("é日🙂a…u🙂日")).toBe(false)
+  expect(keepSecret(maskSecret(secret), secret)).toBe(secret)
+  // twelve characters are under the limit however many bytes they take
+  expect(maskSecret("日".repeat(12))).toBe("****")
+  expect(maskSecret("🙂".repeat(23))).toBe("****")
+  expect(maskSecret("🙂".repeat(24))).toBe("🙂🙂🙂🙂…🙂🙂🙂🙂")
+  expect(try maskJson(`{"note":"é日🙂","api_key":"é日🙂abcdefghijklmnopqrstu🙂日é","n":1}`, false)).toBe(`{"note":"é日🙂","api_key":"é日🙂a…u🙂日é","n":1}`)
+  expect(validDuration("15m")).toBe(true)
+  expect(validDuration("é5m")).toBe(false)
+  expect(validDuration("5é")).toBe(false)
+  expect(validDuration("5🙂")).toBe(false)
+  expect(isNumeric("12")).toBe(true)
+  expect(isNumeric("1日")).toBe(false)
+  expect(isNumeric("🙂")).toBe(false)
 })

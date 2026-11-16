@@ -22,13 +22,16 @@ import { compileLocal, localVerdict } from "./guard_local"
 import { GuardConfig, FindingCursor, applyToText, scan } from "./guardrails"
 import { Field, fields, elements, find, decodeString, quote, rawStr } from "./json"
 import { errorJson } from "./schemas"
+import { strLen, asciiShape } from "./text"
+import { elemAt } from "./arrays"
 
 export type GuardedProvider = { id: string, rules: CompiledRule[] }
 
 // the format of a streamed answer on the wire
 export type StreamFormat = "chat" | "text" | "responses"
 
-// bytes of the newest text that are held back from release, and how far back a release point is looked for
+// how much of the newest text is held back from release, and how far back a release point is looked for.
+// These, cut and checked are positions in the answer (strLen), as its slices take them.
 const HOLD = 256
 const SEARCH = 512
 // how far before the release point the redaction check looks for matches that cross it
@@ -59,7 +62,7 @@ export function pieceOf(ev: string, format: StreamFormat): Piece | undefined {
     }
     const choices = find(fs, "choices")
     if (choices === undefined) return undefined
-    const first = (try elements(choices))[0]
+    const first = elemAt((try elements(choices)), 0)
     if (first === undefined) return undefined
     const cf = try fields(first)
     if (format === "text") return stringPiece(cf, "text")
@@ -83,13 +86,13 @@ function stringPiece(fs: Field[], key: string): Piece | undefined {
 export function spliceText(ev: string, key: string, raw: string, text: string): string | undefined {
   const at = ev.indexOf(`"${key}"`)
   if (at < 0) return undefined
-  let rest = ev.slice(at + key.byteLength + 2, ev.byteLength)
+  let rest = ev.slice(at + strLen(key) + 2)
   while (rest.startsWith(":") || rest.startsWith(" ") || rest.startsWith("\t")) {
-    rest = rest.slice(1, rest.byteLength)
+    rest = rest.slice(1)
   }
   if (!rest.startsWith(raw)) return undefined
-  const head = ev.slice(0, ev.byteLength - rest.byteLength)
-  return head + quote(text) + rest.slice(raw.byteLength, rest.byteLength)
+  const head = ev.slice(0, strLen(ev) - strLen(rest))
+  return head + quote(text) + rest.slice(strLen(raw))
 }
 
 // The text one OpenAI chat chunk adds: choices[0].delta.content. "" for anything else, such as
@@ -107,6 +110,9 @@ export class OutputStreamGuard {
   // the kinds of the spans that redact rules rewrote, in order (for the findings metric)
   kinds: string[] = []
   private answer = ""
+  // asciiShape of the answer, as far as it has been needed: the release point is looked for one position at a
+  // time, which the answer itself does not allow inside a character
+  private shape = ""
   // bytes of the answer released so far (the text after them is held)
   private cut = 0
   // the redacted text released so far
@@ -275,7 +281,7 @@ export class OutputStreamGuard {
       }
       this.answer += piece.text
       // a held stream is checked at growing steps and once more at its end
-      const skip = this.holding && this.answer.byteLength - this.checked < Math.max(CHECK_STEP, Math.floor(this.checked / 4))
+      const skip = this.holding && strLen(this.answer) - this.checked < Math.max(CHECK_STEP, Math.floor(this.checked / 4))
       const hit = skip ? undefined : this.check()
       if (hit !== undefined) return out + this.block(hit.id, hit.reason)
       if (!this.redacting) {
@@ -283,7 +289,7 @@ export class OutputStreamGuard {
         continue
       }
       // a finish event releases all the held text, so it goes out before the finish
-      const end = ev.includes("\"finish_reason\":\"") ? this.answer.byteLength : this.cutPoint()
+      const end = ev.includes("\"finish_reason\":\"") ? strLen(this.answer) : this.cutPoint()
       const seg = this.answer.slice(this.cut, end)
       this.cut = end
       const built = this.emit(seg, ev, piece)
@@ -310,7 +316,7 @@ export class OutputStreamGuard {
   }
 
   private check(): GuardHit | undefined {
-    this.checked = this.answer.byteLength
+    this.checked = strLen(this.answer)
     for (let i = 0; i < this.blockers.length; i++) {
       const p = this.blockers[i]!
       // the cursor says whether the whole scan would block; the whole scan then gives the verdict and its reason
@@ -335,15 +341,24 @@ export class OutputStreamGuard {
     return undefined
   }
 
+  // The shape of the whole answer: what was added since the last call is appended (the shape of a text that
+  // grows by whole characters grows the same way).
+  private shapeNow(): string {
+    const have = strLen(this.shape)
+    if (have < strLen(this.answer)) this.shape += asciiShape(this.answer.slice(have))
+    return this.shape
+  }
+
   // The release point: the last whitespace at least HOLD bytes behind the newest text, looked for no
   // further back than SEARCH bytes. The point moves back to the start of any match it would cross, and
   // to the start of an unfinished private key block. The cut stays where it is when there is none.
   private cutPoint(): int {
-    const limit = this.answer.byteLength - HOLD
+    const a = this.shapeNow()
+    const limit = strLen(a) - HOLD
     let at = -1
     let i = limit
     while (i > this.cut && i > limit - SEARCH) {
-      const c = this.answer.slice(i - 1, i)
+      const c = a.slice(i - 1, i)
       if (c === " " || c === "\n" || c === "\t" || c === "\r") {
         at = i
         break
@@ -371,7 +386,7 @@ export class OutputStreamGuard {
   // text from LOOKBACK bytes before the cut on is scanned, so a check does not grow with the length of the answer.
   private spans(): ByteSpan[] {
     const from = this.windowFrom()
-    const text = this.answer.slice(from, this.answer.byteLength)
+    const text = this.answer.slice(from)
     const out: ByteSpan[] = []
     for (const p of this.providers) {
       for (const f of applyRegex(text, p.rules).findings) {
@@ -390,9 +405,10 @@ export class OutputStreamGuard {
   private windowFrom(): int {
     const first = this.cut - LOOKBACK
     if (first <= 0) return 0
+    const a = this.shapeNow()
     let i = first
     while (i < this.cut) {
-      const c = this.answer.slice(i, i + 1)
+      const c = a.slice(i, i + 1)
       if (c === " " || c === "\n" || c === "\t" || c === "\r") return i
       i += 1
     }
@@ -402,15 +418,15 @@ export class OutputStreamGuard {
   // The start of the first PEM block after the cut that is not closed yet (-1 for none). A block is closed
   // when its END line has its closing dashes, as the built-in scanner needs them to see the whole block.
   private openBlock(): int {
-    const tail = this.answer.slice(this.cut, this.answer.byteLength)
+    const tail = this.answer.slice(this.cut)
     let from = 0
     while (true) {
-      const at = tail.slice(from, tail.byteLength).indexOf("-----BEGIN ")
+      const at = tail.slice(from).indexOf("-----BEGIN ")
       if (at < 0) return -1
       const p = from + at
-      const rest = tail.slice(p, tail.byteLength)
+      const rest = tail.slice(p)
       const e = rest.indexOf("-----END ")
-      if (e < 0 || !rest.slice(e + 9, rest.byteLength).includes("-----")) return this.cut + p
+      if (e < 0 || !rest.slice(e + 9).includes("-----")) return this.cut + p
       from = p + 11
     }
   }
@@ -419,9 +435,9 @@ export class OutputStreamGuard {
   // undefined when that event cannot carry it.
   private release(): string | undefined {
     const tpl = this.tpl
-    if (!this.redacting || tpl === undefined || this.cut >= this.answer.byteLength) return ""
-    const seg = this.answer.slice(this.cut, this.answer.byteLength)
-    this.cut = this.answer.byteLength
+    if (!this.redacting || tpl === undefined || this.cut >= strLen(this.answer)) return ""
+    const seg = this.answer.slice(this.cut)
+    this.cut = strLen(this.answer)
     return this.emit(seg, this.tplEv, tpl)
   }
 
@@ -667,7 +683,7 @@ test("a private key that spans release points is held until its end, then redact
   const g = new OutputStreamGuard([], "chat")
   g.useBuiltin({ detect: ["private_key"], mode: "redact" })
   let out = ""
-  for (let at = 0; at < key.byteLength; at += 50) out += g.filter(chunk(key.slice(at, at + 50)))
+  for (let at = 0; at < strLen(key); at += 50) out += g.filter(chunk(key.slice(at, at + 50)))
   out += g.finish("data: [DONE]\n\n")
   expect(out.includes("MIIEpAIBAAKCAQEAu")).toBe(false)
   expect(out.includes("-----BEGIN")).toBe(false)
@@ -681,7 +697,7 @@ test("a rule's match is redacted whole when it sits in a long text across releas
   for (let k = 0; k < 40; k++) filler += "word" + k + " "
   const text = filler + "call 555-1234 now " + filler
   let out = ""
-  for (let at = 0; at < text.byteLength; at += 37) out += g.filter(textChunk(text.slice(at, at + 37)))
+  for (let at = 0; at < strLen(text); at += 37) out += g.filter(textChunk(text.slice(at, at + 37)))
   out += g.finish("data: [DONE]\n\n")
   expect(out.includes("555-1234")).toBe(false)
   expect(joined(out, "text")).toBe(text.split("555-1234").join("[REDACTED:PHONE]"))
@@ -757,7 +773,7 @@ test("the built-in guard in block mode holds and blocks a Responses stream", () 
   expect(ok.finish(`event: response.completed\ndata: {"type":"response.completed"}\n\n`)).toBe("")
   const rep = ok.takeReplay()
   expect(rep.length).toBe(2)
-  expect(rep[0]).toBe(deltaEv("nothing to see"))
+  expect(elemAt(rep, 0)).toBe(deltaEv("nothing to see"))
 })
 
 test("a held stream with a redact rule replays the redacted text", () => {
@@ -771,7 +787,7 @@ test("a held stream with a redact rule replays the redacted text", () => {
   for (const e of rep) all += e
   expect(all.includes("555-1234")).toBe(false)
   expect(joined(all, "chat")).toBe("call [REDACTED:PHONE] now")
-  expect(rep[rep.length - 1]).toBe("data: [DONE]\n\n")
+  expect(elemAt(rep, rep.length - 1)).toBe("data: [DONE]\n\n")
 })
 
 test("the size cap blocks a held stream, or releases it on the live path with on_limit release", () => {
@@ -795,7 +811,7 @@ test("the size cap blocks a held stream, or releases it on the live path with on
   expect(r.stopped).toBe(false)
   const rep = r.takeReplay()
   expect(rep.length).toBe(2)
-  expect(rep[0]).toBe(chunk("first part of the answer"))
+  expect(elemAt(rep, 0)).toBe(chunk("first part of the answer"))
   // after the release the stream runs live: a later event passes at once, and a match still blocks
   expect(r.filter(chunk(" and on"))).toBe(chunk(" and on"))
   const late = r.filter(chunk(" forbidden"))
@@ -824,7 +840,7 @@ test("a stream that ends without a closing blank line keeps its last piece as it
   expect(g.finish("data: [DONE]")).toBe("")
   const rep = g.takeReplay()
   expect(rep.length).toBe(2)
-  expect(rep[1]).toBe("data: [DONE]")
+  expect(elemAt(rep, 1)).toBe("data: [DONE]")
 })
 
 // The whole output of a guard fed the text as chat chunks of `step` bytes, with what blocked it.
@@ -834,8 +850,8 @@ function streamed(p: GuardedProvider[], text: string, step: int, whole: bool, bu
   g.wholeChecks = whole
   let out = ""
   let at = 0
-  while (at < text.byteLength) {
-    const end = at + step < text.byteLength ? at + step : text.byteLength
+  while (at < strLen(text)) {
+    const end = at + step < strLen(text) ? at + step : strLen(text)
     out += g.filter(chunk(text.slice(at, end)))
     at = end
   }
@@ -933,5 +949,80 @@ test("the built-in guard's check of the answer's new end gives the stream the wh
     expect(out.includes("6789")).toBe(false)
     outs.push(out)
   }
-  expect(outs[0] === outs[1]).toBe(true)
+  expect(elemAt(outs, 0) === elemAt(outs, 1)).toBe(true)
+})
+
+// The text in pieces of whole characters, each of at least `step` bytes (the last may be shorter).
+function charPieces(text: string, step: int): string[] {
+  const out: string[] = []
+  let part = ""
+  for (const c of text.chars()) {
+    part += c
+    if (part.byteLength >= step) {
+      out.push(part)
+      part = ""
+    }
+  }
+  if (part !== "") out.push(part)
+  return out
+}
+
+// A long text around the pieces, with `w` (non-ASCII) before and after every word.
+function fillerOf(w: string): string {
+  let filler = ""
+  for (let k = 0; k < 40; k++) filler += w + "word" + k + w + " "
+  return filler
+}
+
+test("non-ASCII answers are released and redacted whole by the built-in detectors, in any chunking", () => {
+  for (const w of ["é", "日本", "🙂", "é 日本語 🙂"]) {
+    const filler = fillerOf(w)
+    const head = "-----BEGIN " + "RSA PRIVATE KEY-----"
+    const foot = "-----END " + "RSA PRIVATE KEY-----"
+    let lines = ""
+    for (let k = 0; k < 12; k++) lines += "MIIEpAIBAAKCAQEAu" + "Qz3cY0kP8mW2nR5tV7xB9dF1gH3jK5lM7nP9qR1sT3uV5wX7yZ9\n"
+    const text = filler + w + " ssn 123-45-6789 now " + w + filler + "\n" + head + "\n" + lines + foot + "\n" + w + filler + "mail jane@example.com" + w + " end " + w
+    const want = filler + w + " ssn [REDACTED:SSN] now " + w + filler + "\n[REDACTED:PRIVATE_KEY]\n" + w + filler + "mail [REDACTED:EMAIL]" + w + " end " + w
+    for (const step of [1, 5, 37, 300, 100000]) {
+      const formats: StreamFormat[] = ["text", "chat"]
+      for (const format of formats) {
+        const g = new OutputStreamGuard([], format)
+        g.useBuiltin({ detect: ["private_key", "email", "ssn"], mode: "redact" })
+        let out = ""
+        for (const piece of charPieces(text, step)) out += g.filter(format === "text" ? textChunk(piece) : chunk(piece))
+        out += g.finish("data: [DONE]\n\n")
+        expect(joined(out, format)).toBe(want)
+        expect(out.includes("123-45-6789") || out.includes("MIIEpAIBAAKCAQEAu") || out.includes("jane@")).toBe(false)
+      }
+    }
+    // a blocked stream stops at the event that completes the match, after non-ASCII text
+    const b = new OutputStreamGuard([], "chat")
+    b.useBuiltin({ detect: ["email"], mode: "block" })
+    let bout = ""
+    for (const piece of charPieces(filler + w + "mail jane@example.com " + w + filler, 7)) bout += b.filter(chunk(piece))
+    expect(b.stopped).toBe(true)
+    expect(b.blockedBy).toBe("builtin")
+    expect(joined(bout, "chat").includes("jane@example.com")).toBe(false)
+    // spliceText puts the text back after non-ASCII keys and values
+    const ev = `data: {"${w}":"${w}","text":"old ${w}","after":"${w}"}\n\n`
+    expect(spliceText(ev, "text", quote("old " + w), "new " + w + w)).toBe(`data: {"${w}":"${w}","text":"new ${w}${w}","after":"${w}"}\n\n`)
+    expect(spliceText(`{"${w}k": "x${w}", "t":1}`, w + "k", quote("x" + w), w)).toBe(`{"${w}k": "${w}", "t":1}`)
+  }
+})
+
+// This one also goes through guard_regex's scan of the window.
+test("non-ASCII answers are released and redacted whole by a regex rule, in any chunking", () => {
+  for (const w of ["é", "日本", "🙂", "é 日本語 🙂"]) {
+    const filler = fillerOf(w)
+    const text = filler + w + " call 555-1234 now " + w + filler + w + " and 555-9876" + w + " end " + w
+    const want = filler + w + " call [REDACTED:PHONE] now " + w + filler + w + " and [REDACTED:PHONE]" + w + " end " + w
+    for (const step of [1, 5, 37, 300, 100000]) {
+      const g = new OutputStreamGuard([{ id: "pii", rules: try phone() }], "text")
+      let out = ""
+      for (const piece of charPieces(text, step)) out += g.filter(textChunk(piece))
+      out += g.finish("data: [DONE]\n\n")
+      expect(joined(out, "text")).toBe(want)
+      expect(out.includes("555-1234") || out.includes("555-9876")).toBe(false)
+    }
+  }
 })

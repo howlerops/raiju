@@ -8,7 +8,7 @@
 // Flows and temp tokens persist in a state file beside config.json (openFlowState). PKCE verifiers are
 // sealed like config secrets, and temp tokens are stored only as SHA-256 hashes. Flows therefore survive
 // restarts between consent and callback and are visible to every worker on the node.
-import { McpAuthConfig, authorizeUrl, pkceVerifier, pkceChallenge, codeTokenRequest, tokenRequest, tokenFields } from "./mcpauth"
+import { McpAuthConfig, authorizeUrl, pkceVerifier, pkceChallenge, codeTokenRequest, tokenRequest, tokenFields, copyMcpAuthConfig } from "./mcpauth"
 import { secureHex, sha256, utf8, toHex } from "./crypto"
 import { deadline } from "./deadline"
 import { existsSync, readFileSync, unlinkSync } from "node:fs"
@@ -16,6 +16,8 @@ import { writeFileAtomic } from "./atomicfile"
 import { readState, stateVersion } from "./statever"
 import { lockFile, unlockFile } from "./filelock"
 import { resolvedTargetProblem, peerOf, strictPolicy } from "./netguard"
+import { strLen } from "./text"
+import { elemAt } from "./arrays"
 
 // One caller's tokens for one per_user_oauth client. At most one of virtual_key_id, session_id and user_id is set:
 // user_id for a user-mode token, else virtual_key_id, else session_id in session mode (the x-raiju-mcp-session-id header
@@ -41,6 +43,16 @@ export type McpUserToken = {
   user_id?: string,
 }
 
+// A new record with r's fields (the values the fields hold are shared); see "copies of records" in config.tov.
+export function copyMcpUserToken(r: McpUserToken): McpUserToken {
+  return {
+    id: r.id, mcp_client_name: r.mcp_client_name, virtual_key_id: r.virtual_key_id, session_id: r.session_id,
+    access_token: r.access_token, refresh_token: r.refresh_token, token_expires_at: r.token_expires_at,
+    scopes: r.scopes, created_at: r.created_at, last_refreshed_at: r.last_refreshed_at, status: r.status,
+    status_reason: r.status_reason, user_id: r.user_id,
+  }
+}
+
 // A caller's consent flow. Its state is the authorization request's state, and the supplied link names
 // its id. Its lifetime is FLOW_TTL_MS.
 export type UserFlow = {
@@ -63,6 +75,15 @@ export type UserFlow = {
   // request failed (the row is kept so the status route can say so)
   status?: string,
   updated_at?: f64,
+}
+
+// A new record with r's fields (the values the fields hold are shared); see "copies of records" in config.tov.
+export function copyUserFlow(r: UserFlow): UserFlow {
+  return {
+    id: r.id, state: r.state, client: r.client, virtual_key_id: r.virtual_key_id, session_id: r.session_id, verifier: r.verifier,
+    redirect: r.redirect, authorize_url: r.authorize_url, temp_token: r.temp_token, expires_at: r.expires_at, created_at: r.created_at,
+    mode: r.mode, user_id: r.user_id, status: r.status, updated_at: r.updated_at,
+  }
 }
 
 // A temp token by its SHA-256: the flow it opens and the routes of its scope ("mcp_auth": the per-user OAuth
@@ -175,7 +196,8 @@ function writeFlows(nowMs: f64): void {
     // a verifier that could not be sealed ("") is not written: that flow lives in this process only
     const sv = seal === undefined ? f.verifier : seal(f.verifier)
     if (sv === "") continue
-    let n = f
+    // the flow in memory keeps its verifier and temporary token: the file gets a sealed copy
+    let n = copyUserFlow(f)
     n.verifier = sv
     n.temp_token = ""
     flows.push(n)
@@ -246,7 +268,7 @@ export function endTempTokens(flowId: string): void {
 // What a tool call needs from its caller's token at time nowMs.
 // "valid": use access_token. "refresh": expired or about to expire, and a refresh_token exists.
 // "consent": no row, or expired with no refresh_token; the caller must complete a consent flow.
-export function tokenAction(t: McpUserToken | undefined, nowMs: number): string {
+export function tokenAction(t: McpUserToken | undefined, nowMs: f64): string {
   if (t === undefined) return "consent"
   if (t.access_token !== "" && t.token_expires_at - nowMs > USER_EXPIRY_MARGIN_MS) return "valid"
   if (t.refresh_token !== "") return "refresh"
@@ -277,7 +299,7 @@ export function userTokenIndex(list: McpUserToken[], client: string, vk: string,
 export function userTokenOf(list: McpUserToken[] | undefined, client: string, vk: string, sessionId: string, userId?: string): McpUserToken | undefined {
   const all = list ?? []
   const i = userTokenIndex(all, client, vk, sessionId, userId)
-  return i < 0 ? undefined : all[i]
+  return i < 0 ? undefined : elemAt(all, i)
 }
 
 // Request identity precedence: the user of a user-mode token, then the virtual key, then the
@@ -317,7 +339,7 @@ export function markUser(user: string): string {
 export function userOfMark(v: string | undefined): string {
   const s = v ?? ""
   if (USER_MARK === "" || !s.startsWith(USER_MARK + ":")) return ""
-  return s.slice(USER_MARK.byteLength + 1)
+  return s.slice(strLen(USER_MARK) + 1)
 }
 
 // The consent wording of a tool call that needs the caller's login. The link is the flow's start URL;
@@ -433,7 +455,7 @@ export function peekFlow(state: string): UserFlow | undefined {
 // Marks an admin flow failed (the authorization server refused it, or the token request failed). The row stays,
 // so the status route can report it, until it expires.
 export function failAdminFlow(f: UserFlow, nowMs: f64): void {
-  let n = f
+  let n = copyUserFlow(f)
   n.status = "failed"
   n.updated_at = nowMs
   USER_FLOWS.set(n.state, n)
@@ -543,9 +565,9 @@ export function flowIdOfPath(path: string): string {
   const q = path.indexOf("?")
   const p = q < 0 ? path : path.slice(0, q)
   const segs = p.split("/").filter((s) => s !== "")
-  if (segs.length < 5 || segs[0] !== "api" || segs[1] !== "oauth" || segs[2] !== "per-user" || segs[3] !== "flows") return ""
+  if (segs.length < 5 || elemAt(segs, 0) !== "api" || elemAt(segs, 1) !== "oauth" || elemAt(segs, 2) !== "per-user" || elemAt(segs, 3) !== "flows") return ""
   if (segs.length === 5) return segs[4]!
-  if (segs.length === 6 && segs[5] === "start") return segs[4]!
+  if (segs.length === 6 && elemAt(segs, 5) === "start") return segs[4]!
   return ""
 }
 
@@ -554,7 +576,7 @@ export function headersFlowIdOfPath(path: string): string {
   const q = path.indexOf("?")
   const p = q < 0 ? path : path.slice(0, q)
   const segs = p.split("/").filter((s) => s !== "")
-  if (segs.length !== 5 || segs[0] !== "api" || segs[1] !== "mcp" || segs[2] !== "per-user-headers" || segs[3] !== "flows") return ""
+  if (segs.length !== 5 || elemAt(segs, 0) !== "api" || elemAt(segs, 1) !== "mcp" || elemAt(segs, 2) !== "per-user-headers" || elemAt(segs, 3) !== "flows") return ""
   return segs[4]!
 }
 
@@ -577,7 +599,8 @@ export async function exchangeUserCode(a: McpAuthConfig, code: string, verifier:
 // Refreshes a caller's access token with its refresh token. The result is the new row (same id).
 export async function refreshUserRow(a: McpAuthConfig, row: McpUserToken, nowMs: f64, allow: string[]): Promise<McpUserToken> throws Error {
   if (row.refresh_token === "") throw new Error("no refresh token")
-  let req = a
+  // a is the client's configured auth, shared by every user: this user's refresh token goes into a copy
+  let req = copyMcpAuthConfig(a)
   req.refresh_token = row.refresh_token
   const tr = try tokenRequest(req)
   const text = try await postForm(tr.url, tr.headers, tr.body, allow)
@@ -809,4 +832,9 @@ test("flows and temp tokens survive a restart through the state file, with the v
   GONE.clear()
   openFlowState("", seal, open)
   try unlinkSync(file)
+})
+
+test("a marked user is read back after 2, 3 and 4-byte characters", () => {
+  expect(userOfMark(markUser("é日🙂"))).toBe("é日🙂")
+  expect(userOfMark("é日🙂:" + "x")).toBe("")
 })

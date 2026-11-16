@@ -7,10 +7,9 @@
 # (CVE-2026-84243, CVE-2026-53613, CVE-2026-53615), and noble is the release CI builds the compiler on.
 ARG BASE=ubuntu:noble-20261024.1@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
 
-# Build stage. Tov is built from source with the patches in tov-patches/ (applied in name order by
-# scripts/build-tov.sh: streamed bodies, child sockets, ALPN, UDP, WAMR, libdatachannel, the fetch pool with
-# nghttp2, request body streams, node:fs rename and fsync, a WASM time limit, the server lifecycle), so it needs
-# Rust and a C and C++ compiler: the vendored BoringSSL, WAMR, libdatachannel and nghttp2 compile on first use.
+# Build stage. Tov v0.1.0 is built from source with the patches in tov-patches/ (applied in name order by
+# scripts/build-tov.sh: Raiju's runtime and compiler changes, then the vendored nghttp2, WAMR and libdatachannel
+# trees), so it needs Rust and a C and C++ compiler: the vendored libraries compile on first use.
 # The gateway imports node:* modules, which run on JavaScriptCore. It is built here too (scripts/build-jsc.sh:
 # WebKit's JSCOnly port at the release Tov pins, the engine alone) and linked into the binary, so the runtime image
 # carries no WebKitGTK package: the distribution's libjavascriptcoregtk comes from the whole browser's source

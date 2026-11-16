@@ -11,6 +11,7 @@ import { readFileSync, rmSync } from "node:fs"
 import { encodeUrl, decode, decodeText } from "./base64"
 import { signRs256, bigOf, verifyPkcs1Sha256 } from "./jwt"
 import { cookieValue, sameSecret } from "./setupsession"
+import { strLen } from "./text"
 
 export type OidcConfig = {
   enabled: bool,
@@ -35,6 +36,17 @@ export type OidcConfig = {
   // "access_token": the claims are read from the access token (Keycloak puts its roles there), checked against the
   // same signing keys; else the ID token's.
   claims_token?: string,
+}
+
+// A new record with r's fields (the values the fields hold are shared); see "copies of records" in config.tov.
+export function copyOidcConfig(r: OidcConfig): OidcConfig {
+  return {
+    enabled: r.enabled, issuer: r.issuer, client_id: r.client_id, client_secret: r.client_secret, redirect_uri: r.redirect_uri,
+    scopes: r.scopes, role_claim: r.role_claim, role_map: r.role_map, default_role: r.default_role,
+    allowed_email_domains: r.allowed_email_domains, allowed_hosted_domains: r.allowed_hosted_domains,
+    require_verified_email: r.require_verified_email, session_ttl_seconds: r.session_ttl_seconds, audiences: r.audiences,
+    claims_token: r.claims_token,
+  }
 }
 
 export type Discovery = { authorization_endpoint: string, token_endpoint: string, jwks_uri: string, issuer: string }
@@ -67,7 +79,7 @@ const enc = new TextEncoder()
 
 export function discoveryUrl(issuer: string): string {
   let base = issuer
-  while (base.endsWith("/")) base = base.slice(0, base.byteLength - 1)
+  while (base.endsWith("/")) base = base.slice(0, strLen(base) - 1)
   return base + "/.well-known/openid-configuration"
 }
 
@@ -104,7 +116,7 @@ function kv(k: string, v: string): string {
 
 // A sign-in in flight, as its state carries it: the PKCE verifier, the nonce, the expiry and where the sign-in returns
 // (a consent page that sent its user to sign in; absent for the dashboard).
-type Pending = { v: string, n: string, e: number, b?: string }
+type Pending = { v: string, n: string, e: f64, b?: string }
 
 // Seals a secret kept in a shared file (the config's encryption key, store.tov sealStored), and opens it again
 // (undefined when it cannot be opened). The default keeps it as it is (0600 file, tests).
@@ -182,7 +194,7 @@ export function stateBound(cookieHeader: string, state: string): bool {
 export class OidcFlows {
   private key: u8[] = []
   // hashes of states already used here, with their expiry
-  private used: Map<string, number> = new Map()
+  private used: Map<string, f64> = new Map()
 
   setKey(key: u8[]): void {
     this.key = key
@@ -201,7 +213,7 @@ export class OidcFlows {
   private open(state: string): Pending | undefined {
     if (!state.startsWith(STATE_PREFIX) || state.byteLength > 4096) return undefined
     try {
-      const raw = try decode(state.slice(STATE_PREFIX.byteLength))
+      const raw = try decode(state.slice(strLen(STATE_PREFIX)))
       if (raw.length < 28) return undefined
       const pt = gcmOpen(try this.sealKey(), raw.slice(0, 12), raw.slice(12), utf8(STATE_AAD))
       if (pt === undefined) return undefined
@@ -212,14 +224,14 @@ export class OidcFlows {
   }
 
   // Remembers a used state until it expires; past MAX_USED the ones that expire first are forgotten.
-  private remember(h: string, expires: number, nowMs: number): void {
+  private remember(h: string, expires: f64, nowMs: f64): void {
     if (this.used.size >= MAX_USED) {
       for (const k of this.used.keys()) {
         if ((this.used.get(k) ?? 0.0) <= nowMs) this.used.delete(k)
       }
       if (this.used.size >= MAX_USED) {
         const live = this.used.keys().map((k) => ({ k: k, e: this.used.get(k) ?? 0.0 }))
-        live.sort((a: { k: string, e: number }, b: { k: string, e: number }): int => (a.e < b.e ? -1 : (a.e > b.e ? 1 : 0)))
+        live.sort((a: { k: string, e: f64 }, b: { k: string, e: f64 }): int => (a.e < b.e ? -1 : (a.e > b.e ? 1 : 0)))
         for (let i = 0; i < live.length - MAX_USED / 2; i++) this.used.delete(live[i]!.k)
       }
     }
@@ -228,7 +240,7 @@ export class OidcFlows {
 
   // Starts a login: seals state, nonce and PKCE verifier (and where to return, when back is set) into the state, and
   // returns the authorize URL.
-  begin(cfg: OidcConfig, disc: Discovery, nowMs: number, back?: string): { url: string, state: string } throws Error {
+  begin(cfg: OidcConfig, disc: Discovery, nowMs: f64, back?: string): { url: string, state: string } throws Error {
     if (disc.issuer !== cfg.issuer) throw new Error("oidc: discovery issuer does not match the configured issuer")
     const nonce = try secureHex(32)
     // 64 hex characters are a valid PKCE verifier (43 to 128 unreserved characters).
@@ -253,7 +265,7 @@ export class OidcFlows {
 
   // Returns the verifier, nonce and return path a state carries, once per worker. A state that was not sealed with this
   // key, was changed, has expired or was used here already gets undefined.
-  complete(state: string, nowMs: number): { verifier: string, nonce: string, back: string } | undefined {
+  complete(state: string, nowMs: f64): { verifier: string, nonce: string, back: string } | undefined {
     if (state === "") return undefined
     const p = this.open(state)
     if (p === undefined || p.e <= nowMs || p.v === "" || p.n === "") return undefined
@@ -346,8 +358,7 @@ function validDomain(domain: string): bool {
   if (domain === "" || domain.byteLength > 253 || domain !== domain.trim() || !domain.includes(".")) return false
   for (const label of domain.toLowerCase().split(".")) {
     if (label === "" || label.byteLength > 63 || label.startsWith("-") || label.endsWith("-")) return false
-    for (let i = 0; i < label.byteLength; i++) {
-      const c = label.slice(i, i + 1)
+    for (const c of label.chars()) {
       if (!(c >= "a" && c <= "z") && !(c >= "0" && c <= "9") && c !== "-") return false
     }
   }
@@ -357,8 +368,7 @@ function validDomain(domain: string): bool {
 function validEmailLocal(local: string): bool {
   if (local === "" || local.byteLength > 64 || local.startsWith(".") || local.endsWith(".") || local.includes("..")) return false
   const normalized = local.toLowerCase()
-  for (let i = 0; i < normalized.byteLength; i++) {
-    const c = normalized.slice(i, i + 1)
+  for (const c of normalized.chars()) {
     if (!(c >= "a" && c <= "z") && !(c >= "0" && c <= "9") && !"!#$%&'*+-/=?^_`{|}~.".includes(c)) return false
   }
   return true
@@ -443,7 +453,7 @@ export function acceptedAudiences(cfg: OidcConfig): string[] {
   return out.length > 0 ? out : [cfg.client_id]
 }
 
-function timesValid(pfs: Field[], nowMs: number, what: string): void throws Error {
+function timesValid(pfs: Field[], nowMs: f64, what: string): void throws Error {
   const nowS = nowMs / 1000.0
   const exp = rawNum(pfs, "exp")
   if (exp === undefined) throw new Error(`oidc: ${what} has no exp`)
@@ -453,7 +463,7 @@ function timesValid(pfs: Field[], nowMs: number, what: string): void throws Erro
 }
 
 // nonce undefined: a token from a refresh, which carries no new nonce (OIDC Core 12.2).
-function checkToken(idToken: string, jwksJson: string, cfg: OidcConfig, issuer: string, nonce: string | undefined, nowMs: number): IdTokenResult throws Error {
+function checkToken(idToken: string, jwksJson: string, cfg: OidcConfig, issuer: string, nonce: string | undefined, nowMs: f64): IdTokenResult throws Error {
   const payload = try signedPayload(idToken, jwksJson, "ID token")
   const pfs = try fields(payload)
 
@@ -487,7 +497,7 @@ function checkToken(idToken: string, jwksJson: string, cfg: OidcConfig, issuer: 
 }
 
 // Checks an ID token from the token endpoint. Every failure is returned as kind "error".
-export function verifyIdToken(idToken: string, jwksJson: string, cfg: OidcConfig, issuer: string, nonce: string | undefined, nowMs: number): IdTokenResult {
+export function verifyIdToken(idToken: string, jwksJson: string, cfg: OidcConfig, issuer: string, nonce: string | undefined, nowMs: f64): IdTokenResult {
   try {
     return try checkToken(idToken, jwksJson, cfg, issuer, nonce, nowMs)
   } catch (e) {
@@ -498,7 +508,7 @@ export function verifyIdToken(idToken: string, jwksJson: string, cfg: OidcConfig
 // The claims of an access token that is a JWT signed by the same keys (Keycloak's, which carry its roles): the
 // signature, issuer and lifetime are checked, and its audience must be an accepted one or its azp this client
 // (Keycloak's access tokens name the account service as their audience and the client as azp).
-export function accessTokenClaims(token: string, jwksJson: string, cfg: OidcConfig, issuer: string, nowMs: number): { kind: "ok", claims: string } | { kind: "error", message: string } {
+export function accessTokenClaims(token: string, jwksJson: string, cfg: OidcConfig, issuer: string, nowMs: f64): { kind: "ok", claims: string } | { kind: "error", message: string } {
   try {
     const payload = try signedPayload(token, jwksJson, "access token")
     const pfs = try fields(payload)
@@ -520,7 +530,7 @@ export function accessTokenClaims(token: string, jwksJson: string, cfg: OidcConf
 
 // refresh: the identity provider's refresh token, kept on the server; a session that has one outlives its expiry by
 // REFRESH_GRACE_MS so the next request can refresh it silently.
-type SessionRecord = { sub: string, role: string, email?: string, expires: number, refresh?: string }
+type SessionRecord = { sub: string, role: string, email?: string, expires: f64, refresh?: string }
 
 // A session that is due for a silent refresh: its token, user and refresh token.
 export type DueSession = { token: string, sub: string, email?: string, refresh: string }
@@ -539,9 +549,9 @@ export class UiSessions {
   private table: SharedTable = new SharedTable("", SESSION_CAP)
   sealer: Sealer = plainSealer()
 
-  ttlSeconds: number
+  ttlSeconds: f64
 
-  constructor(ttlSeconds?: number) {
+  constructor(ttlSeconds?: f64) {
     this.ttlSeconds = ttlSeconds ?? SESSION_TTL_S
   }
 
@@ -554,7 +564,7 @@ export class UiSessions {
     return token.startsWith(SESSION_PREFIX) ? hashKey(token) : token
   }
 
-  private record(key: string, nowMs: number): SessionRecord | undefined {
+  private record(key: string, nowMs: f64): SessionRecord | undefined {
     const v = this.table.get(key, nowMs)
     if (v === undefined) return undefined
     try {
@@ -565,12 +575,12 @@ export class UiSessions {
   }
 
   // The last moment a record is kept: its expiry, or with a refresh token the grace for a refresh after it.
-  private until(r: SessionRecord): number {
+  private until(r: SessionRecord): f64 {
     return r.refresh === undefined ? r.expires : r.expires + REFRESH_GRACE_MS
   }
 
   // Throws when the sessions file's lock cannot be had (sharedtable.tov): the caller fails its request.
-  private keep(key: string, r: SessionRecord, nowMs: number): void throws Error {
+  private keep(key: string, r: SessionRecord, nowMs: f64): void throws Error {
     try this.table.put(key, JSON.stringify(r), this.until(r), nowMs)
   }
 
@@ -582,7 +592,7 @@ export class UiSessions {
   }
 
   // email is kept so a session can be checked against the user it names (governance lists users by email)
-  create(sub: string, role: string, nowMs: number, email?: string, refresh?: string): string throws Error {
+  create(sub: string, role: string, nowMs: f64, email?: string, refresh?: string): string throws Error {
     const token = SESSION_PREFIX + (try secureHex(48))
     let sealed: string | undefined = undefined
     if (refresh !== undefined && refresh !== "") {
@@ -594,7 +604,7 @@ export class UiSessions {
     return token
   }
 
-  get(token: string, nowMs: number): Session | undefined {
+  get(token: string, nowMs: f64): Session | undefined {
     const s = this.record(this.keyOf(token), nowMs)
     // an expired session with a refresh token waits for its refresh (refreshable, renew) until its row expires
     if (s === undefined || s.expires <= nowMs) return undefined
@@ -602,7 +612,7 @@ export class UiSessions {
   }
 
   // The session behind a token when it has expired and holds a refresh token (the next request refreshes it).
-  refreshable(token: string, nowMs: number): DueSession | undefined {
+  refreshable(token: string, nowMs: f64): DueSession | undefined {
     const key = this.keyOf(token)
     const s = this.record(key, nowMs)
     if (s === undefined || s.expires > nowMs) return undefined
@@ -612,7 +622,7 @@ export class UiSessions {
   }
 
   // The sessions with a refresh token that expire before limitMs (the daily sweep refreshes them ahead of time).
-  dueBy(limitMs: number, nowMs?: number): DueSession[] {
+  dueBy(limitMs: f64, nowMs?: f64): DueSession[] {
     const out: DueSession[] = []
     for (const row of this.table.entries(nowMs ?? Date.now())) {
       let s: SessionRecord | undefined = undefined
@@ -630,7 +640,7 @@ export class UiSessions {
 
   // A refreshed session: a new lifetime from now, the role the fresh claims gave, and the new refresh token when the
   // identity provider rotated it.
-  renew(token: string, role: string | undefined, nowMs: number, refresh: string | undefined): void throws Error {
+  renew(token: string, role: string | undefined, nowMs: f64, refresh: string | undefined): void throws Error {
     const key = this.keyOf(token)
     const s = this.record(key, nowMs)
     if (s === undefined) return
@@ -645,7 +655,7 @@ export class UiSessions {
   }
 
   // Ends every session of a user (by subject or email, without regard to case): a removed user is signed out.
-  endUser(names: string[], nowMs?: number): int throws Error {
+  endUser(names: string[], nowMs?: f64): int throws Error {
     const now = nowMs ?? Date.now()
     const lower = names.filter((x) => x !== "").map((x) => x.toLowerCase())
     const gone: string[] = []
@@ -750,7 +760,7 @@ function paramOf(url: string, name: string): string | undefined {
   let at = url.indexOf("?" + name + "=")
   if (at < 0) at = url.indexOf("&" + name + "=")
   if (at < 0) return undefined
-  const start = at + name.byteLength + 2
+  const start = at + strLen(name) + 2
   const rest = url.slice(start)
   const end = rest.indexOf("&")
   return end < 0 ? rest : rest.slice(0, end)
@@ -1104,7 +1114,7 @@ test("a session with a refresh token waits past its expiry for a refresh, is ren
 
 test("sessions on a shared file: made on one worker, used, refreshed and ended on another, kept across a restart", () => {
   const file = "/tmp/raiju-ui-sessions-test-" + process.pid + "-" + Math.floor(Date.now()) + ".json"
-  const sealer: Sealer = { seal: (v: string): string => "sealed:" + v, open: (v: string): string | undefined => v.startsWith("sealed:") ? v.slice(7, v.byteLength) : undefined }
+  const sealer: Sealer = { seal: (v: string): string => "sealed:" + v, open: (v: string): string | undefined => v.startsWith("sealed:") ? v.slice(7, strLen(v)) : undefined }
   const a = new UiSessions(60)
   a.setFile(file)
   a.sealer = sealer
@@ -1168,7 +1178,7 @@ test("a forged, changed or expired state is refused", () => {
   f.setKey(stateKeyFrom(utf8("k")))
   const r = try f.begin(testCfg({}), TEST_DISC, TEST_NOW_MS)
   // one character changed anywhere in the sealed part fails its tag
-  const mid = r.state.byteLength - 10
+  const mid = strLen(r.state) - 10
   const flip = r.state.slice(mid, mid + 1) === "A" ? "B" : "A"
   expect(f.complete(r.state.slice(0, mid) + flip + r.state.slice(mid + 1), TEST_NOW_MS)).toBeUndefined()
   expect(f.complete("s1." + encodeUrl(utf8(`{"v":"x","n":"y","e":1e15}`)), TEST_NOW_MS)).toBeUndefined()
@@ -1226,7 +1236,7 @@ test("the state cookie binds a sign-in to its browser: HttpOnly, SameSite=Lax, S
   expect(set.includes("Secure")).toBe(false)
   expect(stateCookie(r.state, true).endsWith("; Secure")).toBe(true)
   // the cookie holds the state's hash, not the state
-  const value = set.slice(STATE_COOKIE.byteLength + 1, set.indexOf(";"))
+  const value = set.slice(strLen(STATE_COOKIE) + 1, set.indexOf(";"))
   expect(value.byteLength).toBe(64)
   expect(r.state.includes(value)).toBe(false)
   expect(stateBound(`other=1; ${STATE_COOKIE}=${value}`, r.state)).toBe(true)
@@ -1350,4 +1360,17 @@ test("email role keys ignore case but group roles retain case and unresolved map
   for (const map of invalidMaps) {
     expect(verifyIdToken(token, TEST_JWKS, testCfg(map), TEST_ISS, "n-1", TEST_NOW_MS).kind).toBe("error")
   }
+})
+
+test("domains, mailbox names and URL parameters with non-ASCII text", () => {
+  expect(validDomain("example.com")).toBe(true)
+  expect(validDomain("exämple.com")).toBe(false)
+  expect(validDomain("日本.jp")).toBe(false)
+  expect(validDomain("a.🙂")).toBe(false)
+  expect(validEmailLocal("jane.doe+x")).toBe(true)
+  expect(validEmailLocal("jané")).toBe(false)
+  expect(validEmailLocal("🙂")).toBe(false)
+  expect(paramOf("https://x/é日🙂?a=1&state=s🙂&b=é", "state")).toBe("s🙂")
+  expect(paramOf("https://x/🙂?é=1&🙂k=v日", "🙂k")).toBe("v日")
+  expect(discoveryUrl("https://idp.example/é🙂//")).toBe("https://idp.example/é🙂/.well-known/openid-configuration")
 })

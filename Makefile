@@ -21,6 +21,8 @@ jsc:
 
 tov-test:
 	tov-patches/tests/run.sh
+	tov-patches/tests/run-fetch.sh
+	tov-patches/tests/run-misc.sh
 
 build:
 	mkdir -p build && $(TOV) build src/main.tov -o build/raiju
@@ -63,7 +65,7 @@ unit: build/h2_echo
 	python3 -m unittest tests/h2_test.py
 	python3 -m unittest tests/test_crew_priors.py
 	python3 -m unittest tests/test_smoke_config.py
-	python3 -m unittest tests/test_fetch_lint.py
+	python3 -m unittest tests/test_fetch_lint.py tests/test_copy_lint.py
 	python3 -m unittest tests/test_gen_config_doc.py
 	python3 -m unittest tests/test_deploy.py
 	python3 -m unittest tests/test_staging.py
