@@ -11,6 +11,11 @@ use the pinned compiler, and stay that way until every gate passes on the new on
   are the vendored nghttp2, WAMR and libdatachannel trees. `PORT-NOTES-*.md` say, patch by patch,
   what was ported and how it was tested; `tests/` are the patch tests (`run.sh`, `run-s2.sh`,
   `run-s3.sh`).
+- An upstream bug fixed in `0001` (present in v0.1.0 and in upstream at `1959aef`): an `async`
+  function run as a task, or a generator, that reassigns a reference-counted parameter released the
+  new value twice (a use-after-free; Raiju's `externalGuard` hit it). The frame now keeps what it
+  was given in a slot of its own. `tests/upstream-bug/` holds the two small programs that show it on
+  an unpatched compiler under AddressSanitizer; worth sending upstream.
 - JavaScriptCore: v0.1.0 pins the same WebKit release (`webkitgtk-2.54.1`), but its own patch set on
   top changed, so `scripts/build-jsc.sh` has to be run again with the new compiler's
   `scripts/jsc/build.sh`.
