@@ -19,6 +19,12 @@ This page records what changed, how the source handles it, and what was checked.
 New code should follow the right-hand column. `docs/tov-0.1.0-audit/` keeps the per-site verdicts of
 the reviews for shared values and string positions.
 
+The JSON scanner caches whether byte offsets already equal string positions and skips conversion on that
+path. `asciiShape` returns ASCII input before constructing a character array. The process-local MCP
+tool-name memo keeps at most 4,096 entries and 1 MiB of definition/name text, and does not retain entries
+larger than 64 KiB; larger tool definitions still work but are parsed without memoization. These bounds
+limit memo retention, not the size of tool definitions accepted from an MCP server.
+
 ## The compiler patches
 
 `tov-patches/` holds the patches re-derived for v0.1.0 (see its README and `PORT-NOTES-*.md`). Two of
