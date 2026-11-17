@@ -46,7 +46,29 @@ page.on('request', (request) => {
 })
 await context.route('**/*', (route) => allowed.has(new URL(route.request().url()).origin) ? route.continue() : route.abort())
 const targetIs = async (gateway) => {
-  await page.waitForFunction(({url,name}) => document.querySelector('#target-endpoint')?.textContent === url || document.querySelector('#auth h1')?.textContent === 'Sign in to ' + name, gateway)
+  try {
+    await page.waitForFunction(({url,name}) => document.querySelector('#target-endpoint')?.textContent === url || document.querySelector('#auth h1')?.textContent === 'Sign in to ' + name, gateway)
+  } catch (error) {
+    // Preserve the original failure; never print regional credentials or request headers.
+    try {
+      console.error('Regional navigation state:', JSON.stringify({
+        expectedGateway: gateway.id,
+        page: await page.evaluate(() => ({
+          url: location.href,
+          selection: sessionStorage.getItem('raiju.console.gateway'),
+          selectedOption: document.querySelector('#gateway-select')?.value ?? null,
+          endpoint: document.querySelector('#target-endpoint')?.textContent ?? null,
+          signInHeading: document.querySelector('#auth h1')?.textContent ?? null,
+          headings: [...document.querySelectorAll('h1')].map((node) => node.textContent),
+        })),
+        errors,
+      }))
+      await page.screenshot({path:join(root,'build/console-preview.png'), fullPage:true, timeout:5000})
+    } catch (diagnosticError) {
+      console.error('Regional navigation diagnostics unavailable:', diagnosticError.message)
+    }
+    throw error
+  }
 }
 const select = async (gateway) => {
   await page.locator('#gateway-select').selectOption(gateway.id)
