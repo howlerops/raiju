@@ -12,7 +12,7 @@
 // are observed within RECHECK_MS even then. A row another worker wrote is found when the file changes; a miss on an
 // unchanged file reads nothing, and a take of a key the file does not hold takes no lock, so requests that name unknown
 // tokens or codes cost neither a read nor a lock. With no file the table is this process's memory (one process, or tests).
-import { readFileSync, rmSync, statSync, closeSync } from "node:fs"
+import { readFileSync, writeFileSync, rmSync, statSync, closeSync } from "node:fs"
 import { writeFileAtomic, PRIVATE_FILE } from "./atomicfile"
 import { FileLock, lockFile, unlockFile, lockPathOf, holdAsAnother } from "./filelock"
 
@@ -232,4 +232,61 @@ test("a change or a take whose lock another process keeps fails and writes nothi
   expect(try b.take("k", now)).toBe("v")
   try rmSync(file, { force: true })
   try rmSync(file + ".flock", { force: true })
+})
+
+// Fixture only: identical timestamps emulate missed replacements that reuse an inode.
+async function fixedTableMtime(file: string): Promise<void> throws Error {
+  let output = ""
+  let done: () => void = () => {}
+  let failed: (e: Error) => void = (e) => {}
+  const completed = new Promise<void>((resolve, reject) => { done = resolve; failed = reject })
+  const timer = setTimeout(() => failed(new Error("timestamp fixture timed out")), 10000)
+  let end: () => void = () => {}
+  try {
+    const child = try await Bun.spawnSocket({
+      cmd: ["sh", "-c", "touch -t 202001010000.00 \"$1\" && printf ok", "raiju-cache-fixture", file],
+      socket: {
+        data(sock, bytes) {
+          try { output += new TextDecoder().decode(bytes) }
+          catch (e) { failed(new Error(e.message)) }
+        },
+        close(sock) {
+          if (output === "ok") done()
+          else failed(new Error("timestamp fixture failed"))
+        },
+      },
+    })
+    end = () => child.end()
+    try await completed
+  } finally {
+    clearTimeout(timer)
+    end()
+  }
+}
+
+test("unchanged metadata cannot hide a revoked row beyond one second, even with repeated reads", async () => {
+  const file = tableFile()
+  const now = 1000000.0
+  const before = `{"rows":[{"k":"old","v":"live","exp":1005000}]}`
+  const after = `{"rows":[{"k":"new","v":"live","exp":1005000}]}`
+  try {
+    try writeFileAtomic(file, before, { mode: PRIVATE_FILE, exact: true })
+    try await fixedTableMtime(file)
+    const stamp = try statSync(file)
+    const table = new SharedTable(file, 100)
+    expect(table.get("old", now)).toBe("live")
+    try writeFileSync(file, after)
+    try await fixedTableMtime(file)
+    const same = try statSync(file)
+    expect(same.dev).toBe(stamp.dev)
+    expect(same.ino).toBe(stamp.ino)
+    expect(same.size).toBe(stamp.size)
+    expect(same.mtimeMs).toBe(stamp.mtimeMs)
+    // Earlier freshness is allowed; a cache hit must not extend the deadline.
+    table.get("old", now + 999.0)
+    expect(table.get("old", now + 1000.0)).toBeUndefined()
+    expect(table.get("new", now + 1000.0)).toBe("live")
+  } finally {
+    try rmSync(file, { force: true })
+  }
 })
