@@ -24,6 +24,8 @@ path. `asciiShape` returns ASCII input before constructing a character array. Th
 tool-name memo keeps at most 4,096 entries and 1 MiB of definition/name text, and does not retain entries
 larger than 64 KiB; larger tool definitions still work but are parsed without memoization. These bounds
 limit memo retention, not the size of tool definitions accepted from an MCP server.
+When full, the memo keeps its warm entries and parses uncached definitions without admitting them;
+walking a working set larger than the budget does not repeatedly evict the whole cache.
 
 ## The compiler patches
 
