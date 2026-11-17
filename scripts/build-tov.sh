@@ -4,7 +4,7 @@
 # streamed bodies, child processes as sockets, ALPN, UDP, WebAssembly on WAMR, WebRTC on libdatachannel, the
 # fetch pool and HTTP/2, request body streams, the server lifecycle, the address policy checked at connect
 # time, client certificates, worker supervision, flockSync, random seeding, GCC without scalar replacement,
-# and two fixes for upstream bugs); 0002-0004 are the vendored nghttp2, WAMR and libdatachannel trees.
+# and two fixes for upstream bugs); 0002-0004 vendor C libraries, and 0005 fixes string-view cache lifetime.
 # Raiju needs this build until the patches are upstream. Usage: scripts/build-tov.sh  (needs git and cargo)
 set -eu
 REV=${TOV_REV:-ca1e3d24c44eb0d81b27cfefd1c308912c1d9f19}

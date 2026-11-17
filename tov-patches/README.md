@@ -9,6 +9,11 @@ Raiju builds against [Tov](https://github.com/richiemcilroy/Tov) v0.1.0
   they apply together). The section numbers below are the changes' original patch numbers.
 - `0002-vendor-nghttp2.patch`, `0003-vendor-wamr.patch`, `0004-vendor-libdatachannel.patch` — the
   vendored C libraries the fetch HTTP/2 client, `std/wasm` and `std/rtc` are built on.
+- `0005-string-view-cache-lifetime.patch` — classify strings before caching UTF-16 offsets so freeing a
+  non-ASCII string invalidates its pointer-keyed view. Without this, a later string at the same address
+  can inherit stale offsets; a streamed image conversion exposed `image/png` becoming `image/p`.
+  `tests/string_view_cache.c` deterministically checks the actual C runtime's release/invalidation
+  boundary and the subsequent MIME slice. The compiler CI job runs it on cold and warm caches.
 
 `make tov-test` checks them with the patched compiler (`tests/run.sh`: the HTTP server and worker
 supervision; `tests/run-fetch.sh`: fetch and sockets; `tests/run-misc.sh`: WebAssembly, WebRTC,
