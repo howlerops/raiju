@@ -570,24 +570,36 @@ export function injectTools(chatBody: string, toolJsons: string[]): string throw
   return added ? build(fs) : chatBody
 }
 
-// The names of tool definitions offered before, by definition text: the same definitions are offered on
-// every request, and reading a name parses the definition twice. Emptied when it grows past its cap.
+// Keep repeated name parsing off the request path without retaining unbounded schema text.
+const TOOL_MEMO_ENTRIES = 4096
+const TOOL_MEMO_ENTRY_BYTES = 64 * 1024
+const TOOL_MEMO_BYTES = 1024 * 1024
+
 class ToolNameMemo {
   items: Map<string, string> = new Map()
+  bytes = 0
+
+  name(json: string): string | undefined throws SyntaxError {
+    const size = json.byteLength
+    if (size <= TOOL_MEMO_ENTRY_BYTES) {
+      const hit = this.items.get(json)
+      if (hit !== undefined) return hit
+    }
+    const n = try toolName(json)
+    if (n !== undefined) {
+      const cost = size + n.byteLength
+      // Keep warm entries when a stable working set exceeds the budget; clearing
+      // them during each sequential scan would make every request parse again.
+      if (cost <= TOOL_MEMO_ENTRY_BYTES && this.items.size < TOOL_MEMO_ENTRIES && this.bytes + cost <= TOOL_MEMO_BYTES) {
+        this.items.set(json, n)
+        this.bytes += cost
+      }
+    }
+    return n
+  }
 }
 
 const toolNameMemo = new ToolNameMemo()
-
-function offeredToolName(json: string): string | undefined throws SyntaxError {
-  const hit = toolNameMemo.items.get(json)
-  if (hit !== undefined) return hit
-  const n = try toolName(json)
-  if (n !== undefined) {
-    if (toolNameMemo.items.size >= 4096) toolNameMemo.items.clear()
-    toolNameMemo.items.set(json, n)
-  }
-  return n
-}
 
 // injectTools on a request's fields: sets "tools" and returns true when a definition was added; otherwise
 // leaves the fields as they were.
@@ -604,7 +616,7 @@ export function injectToolFields(inout fs: Field[], toolJsons: string[]): bool t
   }
   let added = 0
   for (const tj of toolJsons) {
-    const n = try offeredToolName(tj)
+    const n = try toolNameMemo.name(tj)
     if (n === undefined || have.includes(n)) continue
     have.push(n)
     out.push(tj)
@@ -2290,4 +2302,28 @@ test("tool names are sanitized and split after non-ASCII text", () => {
   expect(patternMatches("é🙂tool", "é🙂*")).toBe(true)
   expect(patternMatches("é🙂tool", "é日*")).toBe(false)
   expect(sseData("data: é日🙂\r\n\r\n")).toEqual(sseData("data: é日🙂\n\n"))
+})
+
+test("tool-name memo bounds retained schema bytes under relisting and bypasses oversized definitions", () => {
+  const memo = new ToolNameMemo()
+  const description = "x".repeat(40 * 1024)
+  for (let i = 0; i < 64; i++) {
+    const name = `tool-${i}`
+    const definition = `{"type":"function","function":{"name":"${name}","description":"${description}","parameters":{}}}`
+    expect(try memo.name(definition)).toBe(name)
+    expect(try memo.name(definition)).toBe(name)
+    let retained = 0
+    for (const key of memo.items.keys()) retained += key.byteLength + memo.items.get(key)!.byteLength
+    expect(memo.bytes).toBe(retained)
+    expect(retained <= TOOL_MEMO_BYTES).toBe(true)
+    expect(memo.items.size <= TOOL_MEMO_ENTRIES).toBe(true)
+  }
+  const first = `{"type":"function","function":{"name":"tool-0","description":"${description}","parameters":{}}}`
+  expect(memo.items.get(first)).toBe("tool-0")
+  expect(try memo.name(first)).toBe("tool-0")
+  const before = memo.bytes
+  const large = `{"type":"function","function":{"name":"large","description":"${"x".repeat(TOOL_MEMO_ENTRY_BYTES)}","parameters":{}}}`
+  expect(try memo.name(large)).toBe("large")
+  expect(memo.bytes).toBe(before)
+  expect(memo.items.has(large)).toBe(false)
 })
