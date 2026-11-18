@@ -59,6 +59,7 @@ parity-count:
 
 unit: build/h2_echo
 	$(TOV) test src/main.tov
+	$(TOV) run tests/sharedtable_metadata.tov
 	$(TOV) build tests/config_env.tov -o build/config_env
 	RAIJU_PATCH_ENV=fixture RAIJU_PATCH_ENV_EMPTY= build/config_env RAIJU_PATCH_ENV fixture
 	python3 -m unittest tests/test_gen_pricing.py
