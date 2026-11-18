@@ -1,11 +1,13 @@
 import { createMemo, createSignal, For, refresh, Show, untrack } from "solid-js"
 import { api } from "../api/client"
+import { ChoiceSelect } from "../ChoiceSelect"
 import type { Key, Provider } from "../api/types"
 import { splitList } from "../fmt"
 import { CanCall, DangerButton, fieldValue, FormError, Guard, initValue, Pill, notify, Table, Toolbar, useFormRun, tf } from "../ui"
 
 const PROVIDERS = "/api/providers"
 const KEYS = "/api/providers/{provider}/keys"
+const BUILTIN_KINDS = ["openai", "anthropic", "gemini", "vertex", "bedrock", "cohere"]
 
 // A key is addressed by its id; older records without one fall back to the name.
 function keyRef(k: Key): string {
@@ -16,7 +18,7 @@ function baseUrlOf(p: Provider): string {
   return p.network_config?.base_url || p.base_url || ""
 }
 
-function KeyEditForm(props: { provider: string; k: Key; onClose: () => void; onSaved: () => void }) {
+function KeyEditForm(props: { provider: string; models: string[]; k: Key; onClose: () => void; onSaved: () => void }) {
   const { busy, error, run } = useFormRun()
   // the form edits the key it was opened with
   const key = untrack(() => props.k)
@@ -48,10 +50,8 @@ function KeyEditForm(props: { provider: string; k: Key; onClose: () => void; onS
         New API key
         <input class="input input-sm" name="value" type="password" autocomplete="new-password" spellcheck={false} placeholder="leave blank to keep it" />
       </label>
-      <label>
-        Models
-        <input class="input input-sm" name="models" ref={initValue((key.models ?? []).join(", "))} placeholder="blank = all models" autocomplete="off" />
-      </label>
+      <ChoiceSelect label="Models" name="models" multiple options={props.models} defaultValue={key.models ?? []}
+        allowCustom placeholder="All models when empty" emptyText="No model identifiers configured for this provider yet." />
       <label>
         Weight
         <input class="input input-sm" name="weight" type="number" min="0" step="0.1" ref={initValue(key.weight === undefined ? "1" : String(key.weight))} />
@@ -69,7 +69,7 @@ function KeyEditForm(props: { provider: string; k: Key; onClose: () => void; onS
   )
 }
 
-function AddKeyForm(props: { provider: string; onSaved: () => void }) {
+function AddKeyForm(props: { provider: string; models: string[]; onSaved: () => void }) {
   const { busy, error, run } = useFormRun()
   const submit = (ev: SubmitEvent) => {
     ev.preventDefault()
@@ -102,10 +102,8 @@ function AddKeyForm(props: { provider: string; onSaved: () => void }) {
           API key
           <input class="input input-sm" name="value" type="password" required autocomplete="new-password" spellcheck={false} />
         </label>
-        <label>
-          Models
-          <input class="input input-sm" name="models" placeholder="blank = all models" autocomplete="off" />
-        </label>
+        <ChoiceSelect label="Models" name="models" multiple options={props.models} allowCustom
+          placeholder="All models when empty" emptyText="No model identifiers configured for this provider yet." />
         <label>
           Weight
           <input class="input input-sm" name="weight" type="number" min="0" step="0.1" value="1" />
@@ -167,10 +165,8 @@ function ProviderEditForm(props: { p: Provider; onClose: () => void; onSaved: ()
         />
       </label>
       <Show when={custom()}>
-        <label>
-          Base provider type
-          <input class="input input-sm" name="base_provider_type" ref={initValue(String(prov.custom_provider_config?.base_provider_type ?? ""))} autocomplete="off" />
-        </label>
+        <ChoiceSelect label="Base provider type" name="base_provider_type" options={BUILTIN_KINDS} required allowCustom
+          defaultValue={String(prov.custom_provider_config?.base_provider_type ?? "")} />
       </Show>
       <div class="actions wide">
         <button type="button" class="btn btn-sm btn-ghost" onClick={props.onClose}>
@@ -189,6 +185,8 @@ function ProviderCard(props: { p: Provider; onChange: () => void }) {
   const [editing, setEditing] = createSignal(false)
   const [editKey, setEditKey] = createSignal<Key | undefined>(undefined)
   const keys = () => props.p.keys ?? []
+  // These are configured identifiers only; no provider credentials are read or probed for suggestions.
+  const modelOptions = createMemo(() => [...new Set(keys().flatMap((k) => k.models ?? []))].sort())
   return (
     <article class="card panel bg-base-100 border border-base-300" aria-label={"Provider " + props.p.name}>
       <header class="toolbar" style="margin-bottom:8px">
@@ -262,6 +260,7 @@ function ProviderCard(props: { p: Provider; onChange: () => void }) {
           {(k) => (
             <KeyEditForm
               provider={props.p.name}
+              models={modelOptions()}
               k={k}
               onClose={() => setEditKey(undefined)}
               onSaved={() => {
@@ -273,7 +272,7 @@ function ProviderCard(props: { p: Provider; onChange: () => void }) {
         </Show>
       </div>
       <CanCall method="POST" path={KEYS}>
-        <AddKeyForm provider={props.p.name} onSaved={props.onChange} />
+        <AddKeyForm provider={props.p.name} models={modelOptions()} onSaved={props.onChange} />
       </CanCall>
     </article>
   )
@@ -318,19 +317,13 @@ function AddProvider(props: { names: () => string[]; onSaved: () => void }) {
         <label>
           Kind
           <select class="select select-sm" name="kind" id="pv-kind" value={kind()} onChange={(e) => setKind(e.currentTarget.value)}>
-            <option value="openai">openai</option>
-            <option value="anthropic">anthropic</option>
-            <option value="gemini">gemini</option>
-            <option value="vertex">vertex</option>
-            <option value="bedrock">bedrock</option>
-            <option value="cohere">cohere</option>
+            <For each={BUILTIN_KINDS}>{(name) => <option value={name}>{name}</option>}</For>
             <option value="custom">custom (base type)</option>
           </select>
         </label>
-        <label hidden={kind() !== "custom"}>
-          Base provider type
-          <input class="input input-sm" name="base_provider_type" placeholder="openai, anthropic, ..." autocomplete="off" />
-        </label>
+        <div hidden={kind() !== "custom"}>
+          <ChoiceSelect label="Base provider type" name="base_provider_type" options={BUILTIN_KINDS} allowCustom required={kind() === "custom"} />
+        </div>
         <label>
           Base URL (optional)
           <input class="input input-sm" name="base_url" type="url" placeholder="https://..." autocomplete="off" />

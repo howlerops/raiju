@@ -521,6 +521,13 @@ hashed files under `/assets/` as immutable, and gzip to clients that accept it. 
 a directory instead of the binary (a dev build, or a CDN copy), set `RAIJU_UI_DIR=/path/to/dist`;
 files there are revalidated on every request.
 
+Model catalogs and other known identifiers use searchable, keyboard-accessible choices.
+Custom model identifiers require an explicit opt-in; catalog visibility does not grant
+virtual-key permissions. Form controls share responsive grid rows and stack on narrow screens.
+Configuration and virtual-tool defaults use a locally bundled JSON editor with syntax
+highlighting, line/column validation and lossless format/minify actions. Reload preserves
+unsaved configuration drafts; Discard explicitly restores the latest server baseline.
+
 ### One console, independent gateways
 
 Raiju's optional consolidated console manages any operator-configured gateways;

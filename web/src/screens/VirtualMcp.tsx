@@ -2,13 +2,28 @@
 // served at /mcp/{name}; a tool group is the same record at /api/mcp/tool-groups,
 // with its tools given as client plus tool names and its keys reached through teams, customers and
 // providers as well as directly. Both lists are the same records; the two editors write them.
-import { createMemo, createSignal, createStore, For, refresh, Show, snapshot, untrack } from "solid-js"
+import { createMemo, createSignal, createStore, For, lazy, Loading, refresh, Show, snapshot, untrack } from "solid-js"
 import { getData, listOr, message, send } from "../api/client"
 import { loadOptions } from "../api/options"
 import { canCall } from "../perm"
 import { idLabel, listOf } from "../fmt"
 import { ClientToolsRows, type ClientTools, DangerButton, fieldValue, FormError, Guard, initChecked, initValue, notify, Pill, Toolbar, tf, useFormRun } from "../ui"
 import { targetURL } from "../gateway"
+import { ChoiceSelect } from "../ChoiceSelect"
+const JsonEditor = lazy(() => import("../JsonEditor"), { export: "JsonEditor" })
+function DefaultsEditor(props: { value: string; onInput: (value: string) => void; onValidityChange: (valid: boolean) => void }) {
+  const [open, setOpen] = createSignal(false)
+  return (
+    <details class="wide" onToggle={(e) => setOpen(e.currentTarget.open)}>
+      <summary>Argument defaults</summary>
+      <Show when={open()}>
+        <Loading fallback={<div class="skeleton h-32 w-full" aria-label="Loading JSON editor" />}>
+          <JsonEditor label="Argument defaults" rows={4} value={props.value} onInput={props.onInput} onValidityChange={props.onValidityChange} />
+        </Loading>
+      </Show>
+    </details>
+  )
+}
 
 const VMCPS = "/api/mcp/virtual-mcps"
 // key boxes drawn at a time in an open card; the filter reaches the rest
@@ -46,6 +61,7 @@ interface Opts {
   providers: string[]
   clients: string[]
   sources: string[]
+  tools: Record<string, string[]>
 }
 
 // The records themselves: the only read a key toggle repeats.
@@ -64,8 +80,12 @@ async function loadOpts(): Promise<Opts> {
     listOr<{ name: string; tools_list?: { name: string }[] }>("/api/mcp", "clients"),
   ])
   const sources: string[] = []
-  for (const c of status) for (const t of c.tools_list ?? []) sources.push(c.name + "-" + t.name)
-  return { keys: o.keys, teams: o.teams, customers: o.customers, providers: o.providers.map((p) => p.name), clients: status.map((c) => c.name), sources }
+  const tools: Record<string, string[]> = {}
+  for (const c of status) {
+    tools[c.name] = (c.tools_list ?? []).map((t) => t.name)
+    for (const t of c.tools_list ?? []) sources.push(c.name + "-" + t.name)
+  }
+  return { keys: o.keys, teams: o.teams, customers: o.customers, providers: o.providers.map((p) => p.name), clients: status.map((c) => c.name), sources, tools }
 }
 
 // ---- the virtual MCP editor ----
@@ -75,13 +95,14 @@ interface ToolRow {
   as: string
   description: string
   defaults: string
+  valid: boolean
 }
 
 function McpForm(props: { current: VMcp | undefined; opts: Opts; onClose: () => void; onSaved: () => void }) {
   const { busy, error, run } = useFormRun()
   const cur = untrack(() => props.current)
   const [rows, setRows] = createStore<{ tools: ToolRow[] }>({
-    tools: (cur?.tools ?? []).map((t) => ({ source: t.source, as: t.as ?? "", description: t.description ?? "", defaults: t.defaults ? JSON.stringify(t.defaults) : "" })),
+    tools: (cur?.tools ?? []).map((t) => ({ source: t.source, as: t.as ?? "", description: t.description ?? "", defaults: t.defaults ? JSON.stringify(t.defaults) : "", valid: true })),
   })
   const submit = (ev: SubmitEvent) => {
     ev.preventDefault()
@@ -144,46 +165,41 @@ function McpForm(props: { current: VMcp | undefined; opts: Opts; onClose: () => 
           A source is a client and tool name joined with a dash (weather-get_forecast), or the client and * for all of its tools. As renames the tool; defaults are arguments
           filled in when the caller leaves them out.
         </p>
-        <datalist id="vm-sources">
-          <For each={props.opts.sources}>{(s) => <option value={s} />}</For>
-        </datalist>
         <div id="vm-tools">
           <For each={rows.tools}>
             {(row, i) => (
               <div class="rule">
-                <input class="input input-sm"
-                  aria-label="Source tool"
-                  list="vm-sources"
-                  placeholder="client-tool or client-*"
-                  autocomplete="off"
+                <ChoiceSelect
+                  label="Source tool"
+                  options={[...props.opts.sources, ...props.opts.clients.map((client) => client + "-*")]}
+                  placeholder="Choose a client tool"
+                  allowCustom
                   value={row.source}
-                  onInput={(e) => setRows((s) => void (s.tools[i()]!.source = e.currentTarget.value))}
+                  onChange={(value) => setRows((s) => void (s.tools[i()]!.source = value))}
                 />
-                <input class="input input-sm" aria-label="Renamed as" placeholder="as (optional)" autocomplete="off" value={row.as} onInput={(e) => setRows((s) => void (s.tools[i()]!.as = e.currentTarget.value))} />
-                <input class="input input-sm"
-                  aria-label="Tool description"
-                  placeholder="description (optional)"
-                  autocomplete="off"
-                  value={row.description}
-                  onInput={(e) => setRows((s) => void (s.tools[i()]!.description = e.currentTarget.value))}
-                />
-                <input
-                  aria-label="Argument defaults"
-                  class="input input-sm mono"
-                  placeholder='defaults, e.g. {"limit": 10}'
-                  autocomplete="off"
-                  spellcheck={false}
+                <label>
+                  Renamed as
+                  <input class="input input-sm" aria-label="Renamed as" placeholder="Optional alias" autocomplete="off" value={row.as} onInput={(e) => setRows((s) => void (s.tools[i()]!.as = e.currentTarget.value))} />
+                </label>
+                <label>
+                  Tool description
+                  <input class="input input-sm" aria-label="Tool description" placeholder="Optional description" autocomplete="off" value={row.description} onInput={(e) => setRows((s) => void (s.tools[i()]!.description = e.currentTarget.value))} />
+                </label>
+                <div class="field-action">
+                  <button type="button" class="btn btn-sm btn-ghost" onClick={() => setRows((s) => void s.tools.splice(i(), 1))}>
+                    Remove
+                  </button>
+                </div>
+                <DefaultsEditor
                   value={row.defaults}
-                  onInput={(e) => setRows((s) => void (s.tools[i()]!.defaults = e.currentTarget.value))}
+                  onInput={(value) => setRows((s) => void (s.tools[i()]!.defaults = value))}
+                  onValidityChange={(valid) => setRows((s) => void (s.tools[i()]!.valid = valid))}
                 />
-                <button type="button" class="btn btn-sm btn-ghost" onClick={() => setRows((s) => void s.tools.splice(i(), 1))}>
-                  Remove
-                </button>
               </div>
             )}
           </For>
         </div>
-        <button type="button" id="vm-add-tool" class="btn btn-sm btn-ghost" onClick={() => setRows((s) => void s.tools.push({ source: "", as: "", description: "", defaults: "" }))}>
+        <button type="button" id="vm-add-tool" class="btn btn-sm btn-ghost" onClick={() => setRows((s) => void s.tools.push({ source: "", as: "", description: "", defaults: "", valid: true }))}>
           Add tool
         </button>
       </fieldset>
@@ -192,7 +208,7 @@ function McpForm(props: { current: VMcp | undefined; opts: Opts; onClose: () => 
         <button type="button" id="vm-cancel" class="btn btn-sm btn-ghost" onClick={props.onClose}>
           Cancel
         </button>
-        <button type="submit" id="vm-save" class="btn btn-sm btn-primary" disabled={busy()}>
+        <button type="submit" id="vm-save" class="btn btn-sm btn-primary" disabled={busy() || rows.tools.some((row) => !row.valid)}>
           {cur ? "Save changes" : "Create virtual MCP"}
         </button>
       </div>
@@ -310,6 +326,7 @@ function GroupForm(props: { current: VMcp | undefined; opts: Opts; onClose: () =
           <ClientToolsRows
             rows={rows.tools}
             clients={props.opts.clients}
+            tools={props.opts.tools}
             update={(change) => setRows((s) => change(s.tools))}
             toolsLabel="Tool names"
             toolsPlaceholder="* for all, or a comma list"

@@ -196,8 +196,8 @@ function SignIn(props: { account?: boolean }) {
 }
 
 export function App() {
-  setView(viewFromHash())
   onSettled(() => {
+    setView(viewFromHash())
     const onHash = () => setView(viewFromHash())
     const expired = () => { setVerified(false) }
     window.addEventListener("raiju-session-expired", expired)

@@ -1,21 +1,30 @@
 import { createMemo, createSignal, createStore, For, refresh, Show, snapshot, untrack } from "solid-js"
-import { api } from "../api/client"
+import { api, listOr } from "../api/client"
+import { ChoiceSelect } from "../ChoiceSelect"
 import { loadOptions, type Options as AllOptions } from "../api/options"
 import { canCall } from "../perm"
-import type { VirtualKey, VkProviderConfig } from "../api/types"
+import type { McpStatus, VirtualKey, VkProviderConfig } from "../api/types"
 import { fmtInt, idLabel, splitList } from "../fmt"
-import { CanCall, ClientToolsRows, type ClientTools, copyText, DangerButton, fieldValue, FormError, Guard, initChecked, initSelected, initValue, notify, Table, Toolbar, useFormRun, useRun, tf } from "../ui"
+import { CanCall, ClientToolsRows, type ClientTools, copyText, DangerButton, fieldValue, FormError, Guard, initChecked, initValue, notify, Table, Toolbar, useFormRun, useRun, tf } from "../ui"
 
 const VK = "/api/governance/virtual-keys"
 // rows of the key table shown at a time
 const PAGE_SIZE = 50
 
-type Options = Pick<AllOptions, "providers" | "teams" | "customers" | "budgets" | "rate_limits" | "clients">
+type Options = Pick<AllOptions, "providers" | "teams" | "customers" | "budgets" | "rate_limits" | "clients"> & {
+  toolChoices: Record<string, string[]>
+}
 
 type McpCfg = NonNullable<VirtualKey["mcp_configs"]>[number]
 
 const loadKeys = async (): Promise<VirtualKey[]> => (await api.get("/api/governance/virtual-keys")).virtual_keys
-const loadOpts = (): Promise<Options> => loadOptions("providers", "teams", "customers", "budgets", "rate_limits", "clients")
+const loadOpts = async (): Promise<Options> => {
+  const [options, status] = await Promise.all([
+    loadOptions("providers", "teams", "customers", "budgets", "rate_limits", "clients"),
+    canCall("GET", "/api/mcp") ? listOr<McpStatus>("/api/mcp", "clients") : Promise.resolve([]),
+  ])
+  return { ...options, toolChoices: Object.fromEntries(status.map((c) => [c.name, (c.tools_list ?? []).map((t) => t.name)])) }
+}
 
 interface Named {
   id: string
@@ -32,9 +41,9 @@ function nameOf(names: Map<string, string>, id: string | undefined): string {
   return names.get(id) ?? id
 }
 
-// What a key may run on MCP: absent means no list (not limited), an empty list means none.
+// Without explicit rules only clients configured allow_by_default are accessible.
 function mcpSummary(list: McpCfg[] | undefined): string {
-  if (list === undefined || list === null) return "Not limited"
+  if (list === undefined || list === null) return "Default-allowed clients only"
   if (!list.length) return "None"
   return list
     .map((c) => {
@@ -66,29 +75,12 @@ function recordBody(vk: VirtualKey, patch?: Record<string, unknown>): Record<str
 }
 
 function SelectOf(props: { name: string; items: Named[]; selected: string | undefined; label: string }) {
-  const missing = () => !!props.selected && !props.items.some((i) => i.id === props.selected)
-  return (
-    <label>
-      {props.label}
-      <select class="select select-sm" name={props.name}>
-        <option value="" ref={initSelected(!props.selected)}>
-          None
-        </option>
-        <For each={props.items} keyed={(i) => i.id}>
-          {(it) => (
-            <option value={it().id} ref={initSelected(it().id === props.selected)}>
-              {idLabel(it())}
-            </option>
-          )}
-        </For>
-        <Show when={missing()}>
-          <option value={props.selected} ref={initSelected(true)}>
-            {props.selected + " (missing)"}
-          </option>
-        </Show>
-      </select>
-    </label>
-  )
+  const options = () => {
+    const choices = props.items.map((item) => ({ value: item.id, label: idLabel(item) }))
+    if (props.selected && !choices.some((item) => item.value === props.selected)) choices.push({ value: props.selected, label: props.selected + " (missing)" })
+    return choices
+  }
+  return <ChoiceSelect label={props.label} name={props.name} options={options()} defaultValue={props.selected ?? ""} placeholder="None" />
 }
 
 interface RuleRow {
@@ -190,37 +182,22 @@ function VkForm(props: { vk: VirtualKey | undefined; opts: Options; onClose: () 
 
       <fieldset class="wide" style="margin-top:12px">
         <legend>Provider access</legend>
-        <p class="hint">Blank models means every model of that provider.</p>
+        <p class="hint">No selected models means every model of that provider. Suggestions are configured gateway identifiers; custom names and patterns can be added explicitly.</p>
         <div id="vk-rules">
           <For each={rows.rules}>
             {(row, i) => (
               <div class="rule">
-                <select class="select select-sm"
-                  aria-label="Provider"
-                  onChange={(e) => setRows((s) => void (s.rules[i()]!.provider = e.currentTarget.value))}
-                >
-                  <option value="" selected={!row.provider}>
-                    Choose provider
-                  </option>
-                  <For each={untrack(() => providerNames(row.provider))}>
-                    {(n) => (
-                      <option value={n} selected={n === row.provider}>
-                        {n}
-                      </option>
-                    )}
-                  </For>
-                </select>
-                <input class="input input-sm"
-                  type="text"
-                  aria-label="Allowed models"
-                  placeholder="all models"
-                  autocomplete="off"
-                  value={row.models}
-                  onInput={(e) => setRows((s) => void (s.rules[i()]!.models = e.currentTarget.value))}
-                />
-                <button type="button" class="btn btn-sm btn-ghost" onClick={() => setRows((s) => void s.rules.splice(i(), 1))}>
-                  Remove
-                </button>
+                <ChoiceSelect label="Provider" options={providerNames(row.provider)} value={row.provider}
+                  placeholder="Choose provider" onChange={(value) => setRows((s) => void (s.rules[i()]!.provider = value))} />
+                <ChoiceSelect label="Allowed models" multiple allowCustom
+                  options={props.opts.providers.find((p) => p.name === row.provider)?.keys?.flatMap((key) => key.models ?? []) ?? []}
+                  value={splitList(row.models)} placeholder="All models when empty"
+                  onChange={(values) => setRows((s) => void (s.rules[i()]!.models = values.join(", ")))} />
+                <div class="field-action">
+                  <button type="button" class="btn btn-sm btn-ghost" onClick={() => setRows((s) => void s.rules.splice(i(), 1))}>
+                    Remove
+                  </button>
+                </div>
               </div>
             )}
           </For>
@@ -232,11 +209,12 @@ function VkForm(props: { vk: VirtualKey | undefined; opts: Options; onClose: () 
 
       <fieldset class="wide" style="margin-top:12px">
         <legend>MCP tools</legend>
-        <p class="hint">With no rows the key is not limited to MCP tools. Tools: * for all, blank for none, or a comma list.</p>
+        <p class="hint">With no rows only clients configured allow_by_default are accessible. Select * for all tools on a client; no selected tools means none.</p>
         <div id="vk-mcp">
           <ClientToolsRows
             rows={rows.mcp}
             clients={clientNames}
+            tools={props.opts.toolChoices}
             update={(change) => setRows((s) => change(s.mcp))}
             rowClass="mcp-rule"
             toolsLabel="Allowed MCP tools"

@@ -1,6 +1,7 @@
 import { createMemo, createSignal, Errored, For, Loading, Show } from "solid-js"
 import { LoadingSkeleton } from "../LoadingSkeleton"
-import { api } from "../api/client"
+import { api, message } from "../api/client"
+import { ChoiceSelect } from "../ChoiceSelect"
 import type { LogEntry } from "../api/types"
 import { fmtInt } from "../fmt"
 import { ErrP, fieldValue, Toolbar, tf } from "../ui"
@@ -109,10 +110,12 @@ export function Logs() {
     return q
   })
 
+  const [filterError, setFilterError] = createSignal("")
   const filters = createMemo(async () => {
     try {
       return await api.get("/api/logs/filterdata")
-    } catch {
+    } catch (error) {
+      setFilterError("Filter choices unavailable: " + message(error))
       return {}
     }
   })
@@ -195,35 +198,18 @@ export function Logs() {
         </span>
       </Toolbar>
       <form id="lg-filter" class="card panel bg-base-100 border border-base-300 filters" role="search" aria-label="Filter logs" ref={(el) => (form = el)} onSubmit={apply}>
-        <label>
-          Provider
-          <input class="input input-sm" name="provider" list="lg-providers" autocomplete="off" />
-        </label>
-        <datalist id="lg-providers">
-          <Loading>
-            <For each={filters().providers ?? []}>{(n) => <option value={n} />}</For>
-          </Loading>
-        </datalist>
-        <label>
-          Model
-          <input class="input input-sm" name="model" list="lg-models" autocomplete="off" />
-        </label>
-        <datalist id="lg-models">
-          <Loading>
-            <For each={filters().models ?? []}>{(n) => <option value={n} />}</For>
-          </Loading>
-        </datalist>
-        <label>
-          Virtual key
-          <select class="select select-sm" name="virtual_key">
-            <option value="">Any</option>
-            <Loading>
-              <For each={filters().virtual_keys ?? []}>
-                {(v) => <option value={v.id}>{v.name ? v.name + " (" + v.id + ")" : v.id}</option>}
-              </For>
-            </Loading>
-          </select>
-        </label>
+        <Loading fallback={<ChoiceSelect label="Provider" options={[]} loading disabled />}>
+          <ChoiceSelect label="Provider" name="provider" options={filters().providers ?? []} allowCustom
+            placeholder="Any provider" error={filterError()} />
+        </Loading>
+        <Loading fallback={<ChoiceSelect label="Model" options={[]} loading disabled />}>
+          <ChoiceSelect label="Model" name="model" options={filters().models ?? []} allowCustom
+            placeholder="Any model" error={filterError()} />
+        </Loading>
+        <Loading fallback={<ChoiceSelect label="Virtual key" options={[]} loading disabled />}>
+          <ChoiceSelect label="Virtual key" name="virtual_key" placeholder="Any virtual key" error={filterError()} allowCustom
+            options={(filters().virtual_keys ?? []).flatMap((v) => v.id ? [{ value: v.id, label: v.name ? v.name + " (" + v.id + ")" : v.id }] : [])} />
+        </Loading>
         <label>
           Status
           <select class="select select-sm" name="status">

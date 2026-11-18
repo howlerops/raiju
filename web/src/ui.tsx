@@ -1,11 +1,13 @@
 // Small shared pieces: toasts, pills, tables, the two-step delete button,
 // busy wrappers and the error line.
-import { createSignal, Errored, For, Loading, Show, untrack } from "solid-js"
+import { createSignal, Errored, For, Loading, Show } from "solid-js"
 import { LoadingSkeleton } from "./LoadingSkeleton"
 import type { JSX } from "@solidjs/web"
 import { message } from "./api/client"
 import { canCall } from "./perm"
 import { targetLabel } from "./gateway"
+import { ChoiceSelect } from "./ChoiceSelect"
+import { splitList } from "./fmt"
 
 // ---- initial values for uncontrolled fields ----
 
@@ -212,6 +214,7 @@ export interface ClientTools {
 export function ClientToolsRows(props: {
   rows: ClientTools[]
   clients: string[]
+  tools?: Readonly<Record<string, readonly string[]>>
   update: (change: (rows: ClientTools[]) => void) => void
   toolsLabel: string
   toolsPlaceholder: string
@@ -223,29 +226,17 @@ export function ClientToolsRows(props: {
     <For each={props.rows}>
       {(row, i) => (
         <div class={["rule", props.rowClass]}>
-          <select class="select select-sm" aria-label="MCP client" onChange={(e) => props.update((r) => void (r[i()]!.client = e.currentTarget.value))}>
-            <option value="" selected={!row.client}>
-              Choose MCP client
-            </option>
-            <For each={untrack(() => names(row.client))}>
-              {(n) => (
-                <option value={n} selected={n === row.client}>
-                  {n}
-                </option>
-              )}
-            </For>
-          </select>
-          <input class="input input-sm"
-            type="text"
-            aria-label={props.toolsLabel}
+          <ChoiceSelect label="MCP client" options={names(row.client)} value={row.client} placeholder="Choose MCP client"
+            onChange={(value) => props.update((r) => void (r[i()]!.client = value))} />
+          <ChoiceSelect label={props.toolsLabel} multiple allowCustom
+            options={["*", ...(props.tools?.[row.client] ?? [])]} value={splitList(row.tools)}
             placeholder={props.toolsPlaceholder}
-            autocomplete="off"
-            value={row.tools}
-            onInput={(e) => props.update((r) => void (r[i()]!.tools = e.currentTarget.value))}
-          />
-          <button type="button" class="btn btn-sm btn-ghost" onClick={() => props.update((r) => void r.splice(i(), 1))}>
-            Remove
-          </button>
+            onChange={(values) => props.update((r) => void (r[i()]!.tools = values.join(", ")))} />
+          <div class="field-action">
+            <button type="button" class="btn btn-sm btn-ghost" onClick={() => props.update((r) => void r.splice(i(), 1))}>
+              Remove
+            </button>
+          </div>
         </div>
       )}
     </For>

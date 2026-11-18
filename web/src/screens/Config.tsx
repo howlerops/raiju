@@ -1,10 +1,21 @@
-import { createMemo, createSignal, refresh, Show, untrack } from "solid-js"
+import { createEffect, createMemo, createSignal, refresh, Show } from "solid-js"
+import type { Accessor, Setter } from "solid-js"
 import { api } from "../api/client"
 import { canCall } from "../perm"
 import { pretty } from "../fmt"
+import { JsonEditor, parseJson } from "../JsonEditor"
 import { FormError, Guard, notify, Toolbar, useFormRun } from "../ui"
 
 type Obj = Record<string, any>
+
+interface ConfigDraft {
+  text: Accessor<string>
+  setText: Setter<string>
+  baseline: Accessor<string>
+  setBaseline: Setter<string>
+  serverChanged: Accessor<boolean>
+  setServerChanged: Setter<boolean>
+}
 
 // The settings the editor shows, in the shape PUT /api/config takes.
 function editableConfig(full: Obj): Obj {
@@ -26,18 +37,28 @@ function editableConfig(full: Obj): Obj {
   return out
 }
 
-function Editor(props: { cfg: Obj; onSaved: () => void }) {
+function Editor(props: { cfg: Obj; onSaved: () => void; draft: ConfigDraft }) {
   const { busy, error, setError, run } = useFormRun()
-  const initial = () => JSON.stringify(editableConfig(props.cfg), null, 2)
-  const [text, setText] = createSignal(untrack(initial))
-  const save = () =>
-    run(async () => {
-      let body: unknown
-      try {
-        body = JSON.parse(text())
-      } catch (e) {
-        throw new Error("The settings are not valid JSON: " + (e as Error).message)
-      }
+  const { text, setText, baseline, setBaseline, serverChanged, setServerChanged } = props.draft
+  const [valid, setValid] = createSignal(false)
+  const dirty = createMemo(() => text() !== baseline())
+  createEffect(
+    () => props.cfg,
+    (cfg) => {
+      const next = JSON.stringify(editableConfig(cfg), null, 2)
+      if (text() === baseline()) {
+        setText(next)
+        setServerChanged(false)
+      } else if (next !== baseline()) setServerChanged(true)
+      setBaseline(next)
+    },
+  )
+  const save = () => {
+    if (!valid() || busy() || !canCall("PUT", "/api/config")) return
+    return run(async () => {
+      const parsed = parseJson(text(), true)
+      if (!parsed.valid) throw new Error(parsed.message)
+      const body = parsed.value
       if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("The settings must be a JSON object.")
       const send: Obj = {}
       for (const k of ["client_config", "client", "framework_config", "auth_config"]) {
@@ -45,9 +66,12 @@ function Editor(props: { cfg: Obj; onSaved: () => void }) {
       }
       if (!Object.keys(send).length) throw new Error("Nothing to save: the object needs client_config, framework_config or auth_config.")
       await api.put("/api/config", { body: send })
+      setBaseline(text())
+      setServerChanged(false)
       notify("Configuration saved", "ok")
       props.onSaved()
     })
+  }
   return (
     <section class="card panel bg-base-100 border border-base-300" id="cfg-box" aria-labelledby="cfg-edit-h">
       <h2 id="cfg-edit-h">Settings</h2>
@@ -55,19 +79,20 @@ function Editor(props: { cfg: Obj; onSaved: () => void }) {
         Saves three sections with PUT /api/config: client_config, framework_config (pricing sync) and auth_config (admin login). Other sections are
         changed on their own pages. A secret shown as &lt;redacted&gt; keeps its stored value.
       </p>
-      <label class="wide">
-        Settings as JSON
-        <textarea
-          id="cfg-json"
-          class="textarea textarea-sm mono"
-          rows="16"
-          spellcheck={false}
-          aria-describedby="cfg-edit-h"
-          value={text()}
-          readonly={!canCall("PUT", "/api/config")}
-          onInput={(e) => setText(e.currentTarget.value)}
-        />
-      </label>
+      <JsonEditor
+        id="cfg-json"
+        label="Settings as JSON"
+        value={text()}
+        onInput={(value) => { setText(value); setError("") }}
+        rows={20}
+        required
+        disabled={busy() || !canCall("PUT", "/api/config")}
+        onValidityChange={setValid}
+      />
+      <p class="hint" role="status">{dirty() ? "Unsaved changes. Reload keeps your edits; Discard changes uses the latest server settings." : "No unsaved changes."}</p>
+      <Show when={serverChanged() && dirty()}>
+        <p class="alert alert-warning" role="status">Server settings changed after this draft was started. Your edits were kept. Discard changes to load the latest settings, or save to overwrite their editable sections.</p>
+      </Show>
       <FormError text={error()} wide={false} />
       <Show when={!canCall("PUT", "/api/config")}>
         <p class="hint" id="cfg-readonly">
@@ -79,14 +104,16 @@ function Editor(props: { cfg: Obj; onSaved: () => void }) {
           type="button"
           id="cfg-discard"
           class="btn btn-sm btn-ghost"
+          disabled={busy() || !dirty()}
           onClick={() => {
             setError("")
-            setText(initial())
+            setText(baseline())
+            setServerChanged(false)
           }}
         >
           Discard changes
         </button>
-        <button type="button" id="cfg-save" class="btn btn-sm btn-primary" disabled={busy()} onClick={save}>
+        <button type="button" id="cfg-save" class="btn btn-sm btn-primary" disabled={busy() || !valid() || !dirty()} onClick={save}>
           Save configuration
         </button>
       </div>
@@ -95,6 +122,12 @@ function Editor(props: { cfg: Obj; onSaved: () => void }) {
 }
 
 export function Config() {
+  // Keep drafts outside the async boundary, including when a reload fails.
+  // This is page-local memory only: never store configuration in browser storage.
+  const [text, setText] = createSignal("")
+  const [baseline, setBaseline] = createSignal("")
+  const [serverChanged, setServerChanged] = createSignal(false)
+  const draft: ConfigDraft = { text, setText, baseline, setBaseline, serverChanged, setServerChanged }
   const cfg = createMemo(() => api.get("/api/config") as Promise<Obj>)
   const reload = () => refresh(cfg)
   return (
@@ -105,8 +138,8 @@ export function Config() {
         </button>
       </Toolbar>
       <Guard variant="form">
-        <Show when={cfg()} keyed>
-          {(c) => <Editor cfg={c} onSaved={reload} />}
+        <Show when={cfg()}>
+          {(c) => <Editor cfg={c()} draft={draft} onSaved={reload} />}
         </Show>
         <details class="card panel bg-base-100 border border-base-300" id="cfg-full-box">
           <summary>Full configuration (read only, secrets redacted)</summary>
